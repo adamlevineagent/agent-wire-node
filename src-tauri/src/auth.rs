@@ -457,23 +457,23 @@ pub async fn set_tokens_from_deep_link(
                 ),
                 Err(e) => {
                     tracing::error!("Failed to parse user response: {}", e);
-                    (None, None)
+                    return; // Don't store unverified tokens
                 }
             }
         }
         Ok(resp) => {
-            tracing::error!("Failed to fetch user info: {}", resp.status());
-            (None, None)
+            tracing::error!("Failed to fetch user info: {} — not storing tokens", resp.status());
+            return; // Don't store tokens if user verification failed
         }
         Err(e) => {
-            tracing::error!("Network error fetching user info: {}", e);
-            (None, None)
+            tracing::error!("Network error fetching user info: {} — not storing tokens", e);
+            return; // Don't store tokens on network failure
         }
     };
 
     tracing::info!("Deep link auth: user_id={:?}, email={:?}", user_id, email);
 
-    // Update auth state
+    // Only update auth state after successful user verification
     let mut auth = app_state.auth.write().await;
     auth.access_token = Some(access_token.to_string());
     auth.refresh_token = Some(refresh_token.to_string());

@@ -416,7 +416,7 @@ pub async fn pull_document(
     if actual_hash != doc.body_hash {
         return Err(format!(
             "Hash mismatch for {}: expected {}, got {}",
-            doc.id, &doc.body_hash[..12], &actual_hash[..12]
+            doc.id, doc.body_hash.get(..12).unwrap_or(&doc.body_hash), actual_hash.get(..12).unwrap_or(&actual_hash)
         ));
     }
 
@@ -474,7 +474,7 @@ pub async fn cache_document_for_serving(
     if actual_hash != expected_hash {
         return Err(format!(
             "Hash mismatch: expected {}, got {}",
-            &expected_hash[..12], &actual_hash[..12]
+            expected_hash.get(..12).unwrap_or(expected_hash), actual_hash.get(..12).unwrap_or(&actual_hash)
         ));
     }
 

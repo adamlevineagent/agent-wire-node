@@ -953,7 +953,11 @@ fn main() {
                                 .filter_map(|pair| {
                                     let mut parts = pair.splitn(2, '=');
                                     let key = parts.next()?.to_string();
-                                    let val = parts.next()?.to_string();
+                                    let raw_val = parts.next()?.to_string();
+                                    let val = match urlencoding::decode(&raw_val) {
+                                        Ok(decoded) => decoded.into_owned(),
+                                        Err(_) => raw_val,
+                                    };
                                     Some((key, val))
                                 })
                                 .collect();
