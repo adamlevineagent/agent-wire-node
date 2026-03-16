@@ -38,8 +38,13 @@ export interface Achievement {
     progress_pct: number;
 }
 
+export interface LinkedFolder {
+    corpus_slug: string;
+    direction: "Upload" | "Download";
+}
+
 export interface SyncState {
-    linked_folders: Record<string, string>; // folder_path -> corpus_slug
+    linked_folders: Record<string, LinkedFolder>; // folder_path -> LinkedFolder
     cached_documents: CachedDocument[];
     total_size_bytes: number;
     last_sync_at: string | null;

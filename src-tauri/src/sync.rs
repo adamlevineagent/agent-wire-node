@@ -5,10 +5,22 @@ use std::path::{Path, PathBuf};
 use tokio::fs;
 use walkdir::WalkDir;
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum SyncDirection {
+    Upload,    // Push local → Wire (steward)
+    Download,  // Pull Wire → local (reader)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LinkedFolder {
+    pub corpus_slug: String,
+    pub direction: SyncDirection,
+}
+
 /// Tracks the state of document sync
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
 pub struct SyncState {
-    pub linked_folders: HashMap<String, String>,  // folder_path -> corpus_slug
+    pub linked_folders: HashMap<String, LinkedFolder>,  // folder_path -> LinkedFolder
     pub cached_documents: Vec<CachedDocument>,
     pub total_size_bytes: u64,
     pub last_sync_at: Option<String>,
@@ -59,13 +71,20 @@ pub fn link_folder(
     sync_state: &mut SyncState,
     folder_path: &str,
     corpus_slug: &str,
+    direction: SyncDirection,
 ) -> Result<(), String> {
     let path = Path::new(folder_path);
     if !path.exists() || !path.is_dir() {
         return Err(format!("Directory does not exist: {}", folder_path));
     }
-    sync_state.linked_folders.insert(folder_path.to_string(), corpus_slug.to_string());
-    tracing::info!("Linked folder {} -> corpus {}", folder_path, corpus_slug);
+    tracing::info!("Linked folder {} -> corpus {} ({:?})", folder_path, corpus_slug, direction);
+    sync_state.linked_folders.insert(
+        folder_path.to_string(),
+        LinkedFolder {
+            corpus_slug: corpus_slug.to_string(),
+            direction,
+        },
+    );
     Ok(())
 }
 
@@ -84,36 +103,57 @@ pub fn unlink_folder(
 
 // --- Document Sync ----------------------------------------------------------
 
-/// Fetch document list for a corpus from the Wire API
+#[derive(Deserialize)]
+struct DocumentListResponse {
+    items: Vec<DocumentInfo>,
+    total: Option<i64>,
+}
+
+/// Fetch document list for a corpus from the Wire API (with pagination)
 pub async fn fetch_corpus_documents(
     api_url: &str,
     access_token: &str,
     corpus_slug: &str,
 ) -> Result<Vec<DocumentInfo>, String> {
     let client = reqwest::Client::new();
-    let url = format!(
-        "{}/api/v1/wire/corpora/{}/documents",
-        api_url, corpus_slug
-    );
+    let mut all_docs = Vec::new();
+    let mut offset: i64 = 0;
+    let limit: i64 = 100;
 
-    let resp = client
-        .get(&url)
-        .header("Authorization", format!("Bearer {}", access_token))
-        .send()
-        .await
-        .map_err(|e| format!("Failed to fetch corpus documents: {}", e))?;
+    loop {
+        let url = format!(
+            "{}/api/v1/wire/corpora/{}/documents?limit={}&offset={}",
+            api_url, corpus_slug, limit, offset
+        );
 
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        return Err(format!("Corpus fetch failed ({}): {}", status, text));
+        let resp = client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", access_token))
+            .send()
+            .await
+            .map_err(|e| format!("Failed to fetch corpus documents: {}", e))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(format!("Corpus fetch failed ({}): {}", status, text));
+        }
+
+        let page: DocumentListResponse = resp.json().await
+            .map_err(|e| format!("Failed to parse documents response: {}", e))?;
+
+        let page_count = page.items.len() as i64;
+        all_docs.extend(page.items);
+
+        let total = page.total.unwrap_or(all_docs.len() as i64);
+        offset += limit;
+        if offset >= total || page_count == 0 {
+            break;
+        }
     }
 
-    let docs: Vec<DocumentInfo> = resp.json().await
-        .map_err(|e| format!("Failed to parse documents: {}", e))?;
-
-    tracing::info!("Found {} documents in corpus {}", docs.len(), corpus_slug);
-    Ok(docs)
+    tracing::info!("Found {} documents in corpus {}", all_docs.len(), corpus_slug);
+    Ok(all_docs)
 }
 
 /// Walk a local directory and compute hashes for all files
@@ -216,10 +256,26 @@ pub async fn push_document(
     let body_text = std::fs::read_to_string(&local_doc.path)
         .map_err(|e| format!("Failed to read file: {}", e))?;
 
+    // Derive title from filename
+    let title = Path::new(&local_doc.relative_path)
+        .file_stem()
+        .map(|s| s.to_string_lossy().replace('-', " ").replace('_', " "))
+        .unwrap_or_else(|| local_doc.relative_path.clone().into());
+
+    // Infer format from extension
+    let format = match Path::new(&local_doc.relative_path).extension().and_then(|e| e.to_str()) {
+        Some("md" | "markdown") => "text/markdown",
+        Some("html" | "htm") => "text/html",
+        Some("txt") => "text/plain",
+        Some("pdf") => "application/pdf",
+        _ => "text/markdown",  // default
+    };
+
     let body = serde_json::json!({
-        "source_path": local_doc.relative_path,
+        "title": title,
         "body": body_text,
-        "body_hash": local_doc.body_hash,
+        "format": format,
+        "source_path": local_doc.relative_path,
     });
 
     let resp = client
@@ -259,9 +315,16 @@ pub async fn update_document(
     let body_text = std::fs::read_to_string(&local_doc.path)
         .map_err(|e| format!("Failed to read file: {}", e))?;
 
+    // Derive title from filename for update too
+    let title = Path::new(&local_doc.relative_path)
+        .file_stem()
+        .map(|s| s.to_string_lossy().replace('-', " ").replace('_', " "))
+        .unwrap_or_else(|| local_doc.relative_path.clone().into());
+
     let body = serde_json::json!({
+        "title": title,
         "body": body_text,
-        "body_hash": local_doc.body_hash,
+        "source_path": local_doc.relative_path,
     });
 
     let resp = client
@@ -364,11 +427,11 @@ pub async fn pull_document(
             .map_err(|e| format!("Failed to create directory: {}", e))?;
     }
 
-    fs::write(&target_path, &body_text)
+    fs::write(&resolved, &body_text)
         .await
         .map_err(|e| format!("Failed to write document: {}", e))?;
 
-    tracing::info!("Pulled document: {} -> {}", doc.id, target_path.display());
+    tracing::info!("Pulled document: {} -> {}", doc.id, resolved.display());
 
     Ok(CachedDocument {
         document_id: doc.id.clone(),

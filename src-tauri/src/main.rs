@@ -22,6 +22,15 @@ use wire_node_lib::{
     auth, sync, server, credits, tunnel, messaging, market, retention,
 };
 
+// --- Auth Token Helper ------------------------------------------------------
+
+async fn get_api_token(auth: &Arc<RwLock<auth::AuthState>>) -> Result<String, String> {
+    let auth = auth.read().await;
+    auth.api_token.clone()
+        .filter(|t| !t.is_empty())
+        .ok_or_else(|| "No API token — please log in".to_string())
+}
+
 // --- Tauri Commands ---------------------------------------------------------
 
 #[tauri::command]
@@ -54,21 +63,23 @@ async fn verify_magic_link(
 
     let user_id = auth_state.user_id.clone().unwrap_or_default();
 
-    // Register as Wire node using machine token (api_token)
-    let registration = auth::register_wire_node(
+    // Register with Wire using Supabase session token
+    let supabase_token = auth_state.access_token.clone().unwrap_or_default();
+    let registration = auth::register_with_session(
         &config.api_url,
-        &config.api_token,
+        &supabase_token,
         &config.node_name(),
-        config.storage_cap_gb,
     ).await.ok();
 
     let node_id = registration.as_ref().map(|r| r.node_id.clone());
+    let api_token = registration.as_ref().map(|r| r.api_token.clone());
 
     let mut auth_write = state.auth.write().await;
     let first_started = auth_write.first_started_at.clone()
         .or_else(|| Some(chrono::Utc::now().to_rfc3339()));
     *auth_write = auth::AuthState {
         node_id: node_id.clone(),
+        api_token: api_token.clone(),
         first_started_at: first_started.clone(),
         ..auth_state
     };
@@ -79,20 +90,84 @@ async fn verify_magic_link(
 
     save_session(&config, &auth_write);
 
-    // Start Cloudflare Tunnel in background — use api_token for Wire API calls
+    // Start Cloudflare Tunnel in background
     if let Some(ref nid) = node_id {
-        let tunnel_state = state.tunnel_state.clone();
-        let data_dir = config.data_dir();
-        let api_url = config.tunnel_api_url.clone();
-        let api_token = config.api_token.clone();
-        let nid = nid.clone();
+        if let Some(ref token) = api_token {
+            let tunnel_state = state.tunnel_state.clone();
+            let data_dir = config.data_dir();
+            let api_url = config.tunnel_api_url.clone();
+            let token = token.clone();
+            let nid = nid.clone();
 
-        tauri::async_runtime::spawn(async move {
-            start_tunnel_flow(tunnel_state, data_dir, &api_url, &api_token, &nid).await;
-        });
+            tauri::async_runtime::spawn(async move {
+                start_tunnel_flow(tunnel_state, data_dir, &api_url, &token, &nid).await;
+            });
+        }
     }
 
     tracing::info!("Wire Node loaded, ready to serve");
+    Ok(user_id)
+}
+
+#[tauri::command]
+async fn verify_otp(
+    state: tauri::State<'_, SharedState>,
+    email: String,
+    otp_code: String,
+) -> Result<String, String> {
+    let config = &state.config;
+    let auth_state = auth::verify_otp(
+        &config.supabase_url,
+        &config.supabase_anon_key,
+        &email,
+        &otp_code,
+    ).await?;
+
+    let user_id = auth_state.user_id.clone().unwrap_or_default();
+
+    // Register with Wire using Supabase session token
+    let supabase_token = auth_state.access_token.clone().unwrap_or_default();
+    let registration = auth::register_with_session(
+        &config.api_url,
+        &supabase_token,
+        &config.node_name(),
+    ).await.ok();
+
+    let node_id = registration.as_ref().map(|r| r.node_id.clone());
+    let api_token = registration.as_ref().map(|r| r.api_token.clone());
+
+    let mut auth_write = state.auth.write().await;
+    let first_started = auth_write.first_started_at.clone()
+        .or_else(|| Some(chrono::Utc::now().to_rfc3339()));
+    *auth_write = auth::AuthState {
+        node_id: node_id.clone(),
+        api_token: api_token.clone(),
+        first_started_at: first_started.clone(),
+        ..auth_state
+    };
+
+    let mut cr = state.credits.write().await;
+    cr.init_session();
+    cr.first_started_at = first_started;
+
+    save_session(&config, &auth_write);
+
+    // Start Cloudflare Tunnel in background
+    if let Some(ref nid) = node_id {
+        if let Some(ref token) = api_token {
+            let tunnel_state = state.tunnel_state.clone();
+            let data_dir = config.data_dir();
+            let api_url = config.tunnel_api_url.clone();
+            let token = token.clone();
+            let nid = nid.clone();
+
+            tauri::async_runtime::spawn(async move {
+                start_tunnel_flow(tunnel_state, data_dir, &api_url, &token, &nid).await;
+            });
+        }
+    }
+
+    tracing::info!("OTP verified, Wire Node loaded");
     Ok(user_id)
 }
 
@@ -112,33 +187,47 @@ async fn login(
 
     let user_id = auth_state.user_id.clone().unwrap_or_default();
 
-    // Register as Wire node using machine token (api_token)
-    let registration = auth::register_wire_node(
+    // Register with Wire using Supabase session token
+    let supabase_token = auth_state.access_token.clone().unwrap_or_default();
+    let registration = auth::register_with_session(
         &config.api_url,
-        &config.api_token,
+        &supabase_token,
         &config.node_name(),
-        config.storage_cap_gb,
     ).await?;
 
+    let node_id = Some(registration.node_id.clone());
+    let api_token = Some(registration.api_token.clone());
+
     let mut auth_write = state.auth.write().await;
+    let first_started = auth_write.first_started_at.clone()
+        .or_else(|| Some(chrono::Utc::now().to_rfc3339()));
     *auth_write = auth::AuthState {
-        node_id: Some(registration.node_id.clone()),
+        node_id: node_id.clone(),
+        api_token: api_token.clone(),
+        first_started_at: first_started.clone(),
         ..auth_state
     };
 
     let mut cr = state.credits.write().await;
     cr.init_session();
+    cr.first_started_at = first_started;
 
-    // Start Cloudflare Tunnel in background — use api_token for Wire API calls
-    let tunnel_state = state.tunnel_state.clone();
-    let data_dir = config.data_dir();
-    let api_url = config.tunnel_api_url.clone();
-    let api_token = config.api_token.clone();
-    let node_id = registration.node_id.clone();
+    save_session(&config, &auth_write);
 
-    tauri::async_runtime::spawn(async move {
-        start_tunnel_flow(tunnel_state, data_dir, &api_url, &api_token, &node_id).await;
-    });
+    // Start Cloudflare Tunnel in background
+    if let Some(ref nid) = node_id {
+        if let Some(ref token) = api_token {
+            let tunnel_state = state.tunnel_state.clone();
+            let data_dir = config.data_dir();
+            let api_url = config.tunnel_api_url.clone();
+            let token = token.clone();
+            let nid = nid.clone();
+
+            tauri::async_runtime::spawn(async move {
+                start_tunnel_flow(tunnel_state, data_dir, &api_url, &token, &nid).await;
+            });
+        }
+    }
 
     Ok(user_id)
 }
@@ -179,9 +268,10 @@ async fn link_folder(
     state: tauri::State<'_, SharedState>,
     folder_path: String,
     corpus_slug: String,
+    direction: sync::SyncDirection,
 ) -> Result<(), String> {
     let mut ss = state.sync_state.write().await;
-    sync::link_folder(&mut ss, &folder_path, &corpus_slug)
+    sync::link_folder(&mut ss, &folder_path, &corpus_slug, direction)
 }
 
 #[tauri::command]
@@ -217,10 +307,7 @@ async fn get_market_surface(
 
 #[tauri::command]
 async fn retry_tunnel(state: tauri::State<'_, SharedState>) -> Result<String, String> {
-    let api_token = &state.config.api_token;
-    if api_token.is_empty() {
-        return Err("No API token configured".to_string());
-    }
+    let api_token = get_api_token(&state.auth).await?;
 
     let node_id = {
         let auth = state.auth.read().await;
@@ -236,7 +323,7 @@ async fn retry_tunnel(state: tauri::State<'_, SharedState>) -> Result<String, St
     let api_url = state.config.tunnel_api_url.clone();
 
     tracing::info!("Retrying tunnel provisioning...");
-    start_tunnel_flow(tunnel_state, data_dir, &api_url, api_token, &nid).await;
+    start_tunnel_flow(tunnel_state, data_dir, &api_url, &api_token, &nid).await;
 
     let ts = state.tunnel_state.read().await;
     match &ts.status {
@@ -261,13 +348,10 @@ async fn get_tunnel_status(
 async fn get_messages(
     state: tauri::State<'_, SharedState>,
 ) -> Result<Vec<messaging::WireMessage>, String> {
-    let api_token = &state.config.api_token;
-    if api_token.is_empty() {
-        return Err("No API token configured".to_string());
-    }
+    let api_token = get_api_token(&state.auth).await?;
     let auth = state.auth.read().await;
     let node_id = auth.node_id.as_deref().ok_or("No node registered")?;
-    messaging::get_messages(&state.config.api_url, api_token, node_id).await
+    messaging::get_messages(&state.config.api_url, &api_token, node_id).await
 }
 
 #[tauri::command]
@@ -277,10 +361,7 @@ async fn send_message(
     message_type: String,
     subject: Option<String>,
 ) -> Result<(), String> {
-    let api_token = &state.config.api_token;
-    if api_token.is_empty() {
-        return Err("No API token configured".to_string());
-    }
+    let api_token = get_api_token(&state.auth).await?;
     let auth = state.auth.read().await;
     let node_id = auth.node_id.as_deref().ok_or("No node registered")?;
 
@@ -310,7 +391,7 @@ async fn send_message(
     };
 
     messaging::send_message(
-        &state.config.api_url, api_token, node_id,
+        &state.config.api_url, &api_token, node_id,
         &body, &message_type, subject.as_deref(), metadata,
     ).await
 }
@@ -320,11 +401,8 @@ async fn dismiss_message(
     state: tauri::State<'_, SharedState>,
     message_id: String,
 ) -> Result<(), String> {
-    let api_token = &state.config.api_token;
-    if api_token.is_empty() {
-        return Err("No API token configured".to_string());
-    }
-    messaging::dismiss_message(&state.config.api_url, api_token, &message_id).await
+    let api_token = get_api_token(&state.auth).await?;
+    messaging::dismiss_message(&state.config.api_url, &api_token, &message_id).await
 }
 
 #[tauri::command]
@@ -437,8 +515,10 @@ async fn do_sync(
 
     let mut all_cached: Vec<sync::CachedDocument> = Vec::new();
 
-    for (folder_path, corpus_slug) in &linked_folders {
-        tracing::info!("Syncing folder {} -> corpus {}", folder_path, corpus_slug);
+    for (folder_path, linked) in &linked_folders {
+        let corpus_slug = &linked.corpus_slug;
+        let direction = &linked.direction;
+        tracing::info!("Syncing folder {} -> corpus {} ({:?})", folder_path, corpus_slug, direction);
 
         // Fetch remote document list
         let remote_docs = match sync::fetch_corpus_documents(&config.api_url, token, corpus_slug).await {
@@ -466,51 +546,71 @@ async fn do_sync(
             corpus_slug, diff.to_push.len(), diff.to_pull.len(), diff.to_update.len()
         );
 
-        // Push new documents
-        for local_doc in &diff.to_push {
-            match sync::push_document(&config.api_url, token, corpus_slug, local_doc).await {
-                Ok(doc_id) => {
-                    all_cached.push(sync::CachedDocument {
-                        document_id: doc_id,
-                        corpus_slug: corpus_slug.clone(),
-                        source_path: local_doc.relative_path.clone(),
-                        body_hash: local_doc.body_hash.clone(),
-                        file_size_bytes: local_doc.size,
-                        cached_at: chrono::Utc::now().to_rfc3339(),
-                    });
-                }
-                Err(e) => tracing::warn!("Push failed for {}: {}", local_doc.relative_path, e),
+        // Add already-in-sync documents to the cached list
+        for local_doc in &local_docs {
+            if let Some(remote_doc) = remote_docs.iter().find(|r| {
+                r.source_path.as_deref() == Some(local_doc.relative_path.as_str())
+                    && r.body_hash == local_doc.body_hash
+            }) {
+                all_cached.push(sync::CachedDocument {
+                    document_id: remote_doc.id.clone(),
+                    corpus_slug: corpus_slug.clone(),
+                    source_path: local_doc.relative_path.clone(),
+                    body_hash: local_doc.body_hash.clone(),
+                    file_size_bytes: local_doc.size,
+                    cached_at: chrono::Utc::now().to_rfc3339(),
+                });
             }
         }
 
-        // Update changed documents
-        for (local_doc, remote_doc) in &diff.to_update {
-            match sync::update_document(&config.api_url, token, &remote_doc.id, local_doc).await {
-                Ok(_) => {
-                    all_cached.push(sync::CachedDocument {
-                        document_id: remote_doc.id.clone(),
-                        corpus_slug: corpus_slug.clone(),
-                        source_path: local_doc.relative_path.clone(),
-                        body_hash: local_doc.body_hash.clone(),
-                        file_size_bytes: local_doc.size,
-                        cached_at: chrono::Utc::now().to_rfc3339(),
-                    });
+        // Upload direction: push new and updated local files, skip pull
+        if *direction == sync::SyncDirection::Upload {
+            for local_doc in &diff.to_push {
+                match sync::push_document(&config.api_url, token, corpus_slug, local_doc).await {
+                    Ok(doc_id) => {
+                        all_cached.push(sync::CachedDocument {
+                            document_id: doc_id,
+                            corpus_slug: corpus_slug.clone(),
+                            source_path: local_doc.relative_path.clone(),
+                            body_hash: local_doc.body_hash.clone(),
+                            file_size_bytes: local_doc.size,
+                            cached_at: chrono::Utc::now().to_rfc3339(),
+                        });
+                    }
+                    Err(e) => tracing::warn!("Push failed for {}: {}", local_doc.relative_path, e),
                 }
-                Err(e) => tracing::warn!("Update failed for {}: {}", local_doc.relative_path, e),
+            }
+
+            for (local_doc, remote_doc) in &diff.to_update {
+                match sync::update_document(&config.api_url, token, &remote_doc.id, local_doc).await {
+                    Ok(_) => {
+                        all_cached.push(sync::CachedDocument {
+                            document_id: remote_doc.id.clone(),
+                            corpus_slug: corpus_slug.clone(),
+                            source_path: local_doc.relative_path.clone(),
+                            body_hash: local_doc.body_hash.clone(),
+                            file_size_bytes: local_doc.size,
+                            cached_at: chrono::Utc::now().to_rfc3339(),
+                        });
+                    }
+                    Err(e) => tracing::warn!("Update failed for {}: {}", local_doc.relative_path, e),
+                }
             }
         }
 
-        // Pull missing documents
-        let sync_root = std::path::Path::new(folder_path);
-        for remote_doc in &diff.to_pull {
-            match sync::pull_document(&config.api_url, token, remote_doc, sync_root).await {
-                Ok(cached) => {
-                    all_cached.push(sync::CachedDocument {
-                        corpus_slug: corpus_slug.clone(),
-                        ..cached
-                    });
+        // Download direction: pull missing remote docs, skip push
+        if *direction == sync::SyncDirection::Download {
+            let sync_root = std::path::Path::new(folder_path);
+            for remote_doc in &diff.to_pull {
+                match sync::pull_document(&config.api_url, token, remote_doc, sync_root).await {
+                    Ok(cached) => {
+                        all_cached.push(sync::CachedDocument {
+                            corpus_slug: corpus_slug.clone(),
+                            ..cached
+                        });
+                    }
+                    Err(e) => tracing::warn!("Pull failed for {}: {}", remote_doc.id, e),
                 }
-                Err(e) => tracing::warn!("Pull failed for {}: {}", remote_doc.id, e),
             }
         }
     }
@@ -530,11 +630,8 @@ async fn do_sync(
 
 #[tauri::command]
 async fn sync_content(state: tauri::State<'_, SharedState>) -> Result<(), String> {
-    let api_token = &state.config.api_token;
-    if api_token.is_empty() {
-        return Err("No API token configured".to_string());
-    }
-    do_sync(&state.config, api_token, &state.sync_state, &state.credits).await
+    let api_token = get_api_token(&state.auth).await?;
+    do_sync(&state.config, &api_token, &state.sync_state, &state.credits).await
 }
 
 // --- Tunnel Flow ------------------------------------------------------------
@@ -795,6 +892,7 @@ fn main() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_deep_link::init())
+        .plugin(tauri_plugin_dialog::init())
         .manage(state.clone())
         .setup(move |app| {
             let state = state.clone();
@@ -876,40 +974,50 @@ fn main() {
                                         &s,
                                     ).await;
 
-                                    let mut auth_write = s.auth.write().await;
+                                    // Read access token without holding write lock
+                                    let supabase_token = {
+                                        let auth = s.auth.read().await;
+                                        auth.access_token.clone().unwrap_or_default()
+                                    };
 
-                                    // Register as Wire node using machine token (api_token)
-                                    let registration = auth::register_wire_node(
+                                    // Call register_with_session WITHOUT holding any lock
+                                    let registration = auth::register_with_session(
                                         &c.api_url,
-                                        &c.api_token,
+                                        &supabase_token,
                                         &c.node_name(),
-                                        c.storage_cap_gb,
                                     ).await.ok();
 
                                     let node_id = registration.as_ref().map(|r| r.node_id.clone());
-                                    auth_write.node_id = node_id.clone();
-                                    let first_started = auth_write.first_started_at.clone()
-                                        .or_else(|| Some(chrono::Utc::now().to_rfc3339()));
-                                    auth_write.first_started_at = first_started.clone();
+                                    let api_token = registration.as_ref().map(|r| r.api_token.clone());
 
-                                    save_session(&c, &auth_write);
+                                    // Now briefly acquire write lock to update state
+                                    {
+                                        let mut auth_write = s.auth.write().await;
+                                        auth_write.node_id = node_id.clone();
+                                        auth_write.api_token = api_token.clone();
+                                        let first_started = auth_write.first_started_at.clone()
+                                            .or_else(|| Some(chrono::Utc::now().to_rfc3339()));
+                                        auth_write.first_started_at = first_started.clone();
 
-                                    if let Some(ref nid) = node_id {
-                                        let ts = s.tunnel_state.clone();
-                                        let data_dir = c.data_dir();
-                                        let api_token = c.api_token.clone();
-                                        let nid = nid.clone();
-                                        let api_url = c.tunnel_api_url.clone();
+                                        save_session(&c, &auth_write);
 
                                         let mut cr = s.credits.write().await;
                                         cr.init_session();
                                         cr.first_started_at = first_started;
-                                        drop(auth_write);
-                                        drop(cr);
+                                    }
 
-                                        tauri::async_runtime::spawn(async move {
-                                            start_tunnel_flow(ts, data_dir, &api_url, &api_token, &nid).await;
-                                        });
+                                    // Start tunnel
+                                    if let Some(ref nid) = node_id {
+                                        if let Some(ref token) = api_token {
+                                            let ts = s.tunnel_state.clone();
+                                            let data_dir = c.data_dir();
+                                            let token = token.clone();
+                                            let nid = nid.clone();
+                                            let api_url = c.tunnel_api_url.clone();
+                                            tauri::async_runtime::spawn(async move {
+                                                start_tunnel_flow(ts, data_dir, &api_url, &token, &nid).await;
+                                            });
+                                        }
                                     }
                                 });
                             }
@@ -951,21 +1059,31 @@ fn main() {
                 if let Some(ref rt) = refresh_token_owned {
                     match auth::refresh_session(&startup_config.supabase_url, &startup_config.supabase_anon_key, rt).await {
                         Ok((new_access, new_refresh)) => {
-                            let mut auth_write = startup_state.auth.write().await;
-                            auth_write.access_token = Some(new_access);
-                            auth_write.refresh_token = Some(new_refresh);
+                            // Briefly acquire write lock to update tokens
+                            let has_api_token = {
+                                let mut auth_write = startup_state.auth.write().await;
+                                auth_write.access_token = Some(new_access.clone());
+                                auth_write.refresh_token = Some(new_refresh);
+                                auth_write.api_token.as_ref()
+                                    .map(|t| !t.is_empty()).unwrap_or(false)
+                            };
+                            // Write lock dropped here
 
-                            // Register Wire node using machine token (api_token)
-                            if !startup_config.api_token.is_empty() {
-                                match auth::register_wire_node(
+                            if !has_api_token {
+                                // Register with Wire using refreshed Supabase session token — no lock held
+                                match auth::register_with_session(
                                     &startup_config.api_url,
-                                    &startup_config.api_token,
+                                    &new_access,
                                     &startup_config.node_name(),
-                                    startup_config.storage_cap_gb,
                                 ).await {
                                     Ok(reg) => {
                                         tracing::info!("Wire node registered on startup: {}", reg.node_id);
-                                        auth_write.node_id = Some(reg.node_id.clone());
+                                        // Briefly acquire write lock to store registration results
+                                        {
+                                            let mut auth_write = startup_state.auth.write().await;
+                                            auth_write.node_id = Some(reg.node_id.clone());
+                                            auth_write.api_token = Some(reg.api_token.clone());
+                                        }
                                         // Update shared JWT public key and node ID
                                         {
                                             let mut pk = startup_jwt_pk.write().await;
@@ -985,8 +1103,10 @@ fn main() {
                                 }
                             }
 
-                            save_session(&startup_config, &auth_write);
-                            drop(auth_write);
+                            {
+                                let auth_write = startup_state.auth.read().await;
+                                save_session(&startup_config, &auth_write);
+                            }
                             tracing::info!("Token refreshed on startup");
                         }
                         Err(e) => {
@@ -995,25 +1115,27 @@ fn main() {
                     }
                 }
 
-                // Start tunnel — use api_token for Wire API calls
-                let node_id = {
+                // Start tunnel and initial sync — use api_token from auth state
+                let (node_id, api_token) = {
                     let auth = startup_state.auth.read().await;
-                    auth.node_id.clone()
+                    (auth.node_id.clone(), auth.api_token.clone())
                 };
-                if let Some(nid) = node_id {
-                    if !startup_config.api_token.is_empty() {
+                if let (Some(nid), Some(ref token)) = (&node_id, &api_token) {
+                    if !token.is_empty() {
                         let tunnel_state = startup_state.tunnel_state.clone();
                         let data_dir = startup_config.data_dir();
                         let api_url = startup_config.tunnel_api_url.clone();
-                        start_tunnel_flow(tunnel_state, data_dir, &api_url, &startup_config.api_token, &nid).await;
+                        start_tunnel_flow(tunnel_state, data_dir, &api_url, token, nid).await;
                     }
                 }
 
-                // Initial sync — use machine token (api_token) for Wire API calls
-                if !startup_config.api_token.is_empty() {
-                    match do_sync(&startup_config, &startup_config.api_token, &startup_state.sync_state, &startup_state.credits).await {
-                        Ok(_) => tracing::info!("Initial sync complete"),
-                        Err(e) => tracing::warn!("Initial sync failed: {}", e),
+                // Initial sync
+                if let Some(ref token) = api_token {
+                    if !token.is_empty() {
+                        match do_sync(&startup_config, token, &startup_state.sync_state, &startup_state.credits).await {
+                            Ok(_) => tracing::info!("Initial sync complete"),
+                            Err(e) => tracing::warn!("Initial sync failed: {}", e),
+                        }
                     }
                 }
             });
@@ -1024,9 +1146,15 @@ fn main() {
             tauri::async_runtime::spawn(async move {
                 loop {
                     tokio::time::sleep(tokio::time::Duration::from_secs(30 * 60)).await;
-                    if !sync_loop_config.api_token.is_empty() {
-                        tracing::info!("Periodic sync starting...");
-                        let _ = do_sync(&sync_loop_config, &sync_loop_config.api_token, &sync_loop_state.sync_state, &sync_loop_state.credits).await;
+                    let token = {
+                        let auth = sync_loop_state.auth.read().await;
+                        auth.api_token.clone()
+                    };
+                    if let Some(ref token) = token {
+                        if !token.is_empty() {
+                            tracing::info!("Periodic sync starting...");
+                            let _ = do_sync(&sync_loop_config, token, &sync_loop_state.sync_state, &sync_loop_state.credits).await;
+                        }
                     }
                 }
             });
@@ -1039,19 +1167,18 @@ fn main() {
                 loop {
                     tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
 
-                    // Use machine token (api_token) for all Wire API calls
-                    let api_token = &heartbeat_config.api_token;
-                    if api_token.is_empty() {
-                        continue;
-                    }
-
-                    let node_id = {
+                    // Read api_token from auth state each iteration
+                    let (api_token, node_id) = {
                         let auth = heartbeat_state.auth.read().await;
-                        auth.node_id.clone()
+                        (auth.api_token.clone(), auth.node_id.clone())
+                    };
+                    let api_token = match api_token {
+                        Some(ref t) if !t.is_empty() => t.clone(),
+                        _ => continue,
                     };
 
                     if let Some(node_id) = &node_id {
-                        let token = api_token;
+                        let token = &api_token;
                         let tunnel_url = {
                             let ts = heartbeat_state.tunnel_state.read().await;
                             match ts.status {
@@ -1138,19 +1265,19 @@ fn main() {
             tauri::async_runtime::spawn(async move {
                 tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
                 loop {
-                    let (pending_serves, node_id) = {
+                    let (pending_serves, node_id, api_token) = {
                         let auth = credit_state.auth.read().await;
                         let node_id = auth.node_id.clone();
+                        let api_token = auth.api_token.clone();
                         drop(auth);
                         let mut cr = credit_state.credits.write().await;
                         let pending = cr.take_pending_serves();
-                        (pending, node_id)
+                        (pending, node_id, api_token)
                     };
 
-                    let api_token = &credit_config.api_token;
-                    if let Some(ref nid) = node_id {
-                        if !api_token.is_empty() && !pending_serves.is_empty() {
-                            match credits::report_serves(&credit_config.api_url, api_token, nid, &pending_serves).await {
+                    if let (Some(ref nid), Some(ref token)) = (&node_id, &api_token) {
+                        if !token.is_empty() && !pending_serves.is_empty() {
+                            match credits::report_serves(&credit_config.api_url, token, nid, &pending_serves).await {
                                 Ok(_) => tracing::debug!("Reported {} serves", pending_serves.len()),
                                 Err(e) => tracing::warn!("Serve report error: {}", e),
                             }
@@ -1215,6 +1342,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             send_magic_link,
             verify_magic_link,
+            verify_otp,
             login,
             get_auth_state,
             logout,

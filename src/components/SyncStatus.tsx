@@ -1,6 +1,6 @@
 import { useState, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import type { SyncState, CachedDocument } from "./Dashboard";
+import type { SyncState, CachedDocument, LinkedFolder } from "./Dashboard";
 import { FolderLink } from "./FolderLink";
 
 interface SyncStatusProps {
@@ -61,7 +61,6 @@ export function SyncStatus({ syncState, syncing, onSync }: SyncStatusProps) {
             <FolderLink
                 linkedFolders={linkedFolders}
                 onLinked={() => {
-                    // Trigger a refresh of sync state
                     onSync();
                 }}
             />
@@ -70,8 +69,8 @@ export function SyncStatus({ syncState, syncing, onSync }: SyncStatusProps) {
             {folderEntries.length > 0 && (
                 <div className="folder-sync-list">
                     <div className="section-header">Linked Folders</div>
-                    {folderEntries.map(([folderPath, corpusSlug]) => {
-                        const corpusDocs = docsByCorpus[corpusSlug] || [];
+                    {folderEntries.map(([folderPath, linked]) => {
+                        const corpusDocs = docsByCorpus[linked.corpus_slug] || [];
                         const isExpanded = expandedFolder === folderPath;
                         const folderSize = corpusDocs.reduce((sum, d) => sum + d.file_size_bytes, 0);
 
@@ -87,7 +86,10 @@ export function SyncStatus({ syncState, syncing, onSync }: SyncStatusProps) {
                                                 ? "..." + folderPath.slice(-37)
                                                 : folderPath}
                                         </span>
-                                        <span className="folder-corpus">{corpusSlug}</span>
+                                        <span className="folder-corpus">{linked.corpus_slug}</span>
+                                        <span className={`folder-direction ${linked.direction.toLowerCase()}`}>
+                                            {linked.direction === "Upload" ? "\u2191 Upload" : "\u2193 Download"}
+                                        </span>
                                     </div>
                                     <div className="folder-sync-meta">
                                         <span className="folder-doc-count">

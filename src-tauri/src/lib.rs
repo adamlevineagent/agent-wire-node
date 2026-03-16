@@ -37,7 +37,6 @@ pub struct AppState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WireNodeConfig {
     pub api_url: String,
-    pub api_token: String,
     pub node_id: String,
     pub storage_cap_gb: f64,
     pub mesh_hosting_enabled: bool,
@@ -59,7 +58,6 @@ impl Default for WireNodeConfig {
 
         Self {
             api_url: "https://newsbleach.com".to_string(),
-            api_token: String::new(),
             node_id: String::new(),
             storage_cap_gb: 10.0,
             mesh_hosting_enabled: false,

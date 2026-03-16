@@ -1,15 +1,19 @@
 import { useState, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
+import type { LinkedFolder } from "./Dashboard";
+
+type SyncDirection = "Upload" | "Download";
 
 interface FolderLinkProps {
-    linkedFolders: Record<string, string>; // folder_path -> corpus_slug
+    linkedFolders: Record<string, LinkedFolder>;
     onLinked: () => void;
 }
 
 export function FolderLink({ linkedFolders, onLinked }: FolderLinkProps) {
     const [corpusSlug, setCorpusSlug] = useState("");
     const [selectedPath, setSelectedPath] = useState("");
+    const [direction, setDirection] = useState<SyncDirection>("Download");
     const [linking, setLinking] = useState(false);
     const [unlinking, setUnlinking] = useState<string | null>(null);
     const [error, setError] = useState("");
@@ -39,9 +43,11 @@ export function FolderLink({ linkedFolders, onLinked }: FolderLinkProps) {
             await invoke("link_folder", {
                 folderPath: selectedPath,
                 corpusSlug: corpusSlug.trim(),
+                direction,
             });
             setSelectedPath("");
             setCorpusSlug("");
+            setDirection("Download");
             setShowForm(false);
             onLinked();
         } catch (err: any) {
@@ -49,7 +55,7 @@ export function FolderLink({ linkedFolders, onLinked }: FolderLinkProps) {
         } finally {
             setLinking(false);
         }
-    }, [selectedPath, corpusSlug, onLinked]);
+    }, [selectedPath, corpusSlug, direction, onLinked]);
 
     const handleUnlink = useCallback(async (folderPath: string) => {
         setUnlinking(folderPath);
@@ -70,13 +76,16 @@ export function FolderLink({ linkedFolders, onLinked }: FolderLinkProps) {
             {/* Currently linked folders */}
             {folderEntries.length > 0 && (
                 <div className="linked-folders-list">
-                    {folderEntries.map(([path, slug]) => (
+                    {folderEntries.map(([path, linked]) => (
                         <div key={path} className="linked-folder-item">
                             <div className="linked-folder-info">
                                 <span className="linked-folder-path" title={path}>
                                     {path.length > 45 ? "..." + path.slice(-42) : path}
                                 </span>
-                                <span className="linked-folder-corpus">{slug}</span>
+                                <span className="linked-folder-corpus">{linked.corpus_slug}</span>
+                                <span className={`linked-folder-direction ${linked.direction.toLowerCase()}`}>
+                                    {linked.direction === "Upload" ? "\u2191 Upload" : "\u2193 Download"}
+                                </span>
                             </div>
                             <button
                                 className="unlink-btn"
@@ -126,6 +135,24 @@ export function FolderLink({ linkedFolders, onLinked }: FolderLinkProps) {
                         />
                     </div>
 
+                    {/* Sync Direction Toggle */}
+                    <div className="direction-toggle-row">
+                        <button
+                            type="button"
+                            className={`direction-btn ${direction === "Upload" ? "active" : ""}`}
+                            onClick={() => setDirection("Upload")}
+                        >
+                            Upload to Agent Wire Automatically
+                        </button>
+                        <button
+                            type="button"
+                            className={`direction-btn ${direction === "Download" ? "active" : ""}`}
+                            onClick={() => setDirection("Download")}
+                        >
+                            Download from Agent Wire Automatically
+                        </button>
+                    </div>
+
                     {error && <div className="folder-link-error">{error}</div>}
 
                     <div className="folder-link-actions">
@@ -142,6 +169,7 @@ export function FolderLink({ linkedFolders, onLinked }: FolderLinkProps) {
                                 setShowForm(false);
                                 setSelectedPath("");
                                 setCorpusSlug("");
+                                setDirection("Download");
                                 setError("");
                             }}
                         >

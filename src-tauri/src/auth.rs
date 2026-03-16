@@ -8,6 +8,8 @@ pub struct AuthState {
     pub user_id: Option<String>,
     pub email: Option<String>,
     pub node_id: Option<String>,       // wire node ID after registration
+    #[serde(default)]
+    pub api_token: Option<String>,     // gne_live_ machine token from register-with-session
     pub first_started_at: Option<String>, // node age — first ever login
 }
 
@@ -57,8 +59,7 @@ pub async fn send_magic_link(
     );
 
     let body = serde_json::json!({
-        "email": email,
-        "create_user": false
+        "email": email
     });
 
     let resp = client
@@ -138,6 +139,60 @@ pub async fn verify_magic_link_token(
         user_id: Some(login_resp.user.id),
         email: login_resp.user.email,
         node_id: None,
+        api_token: None,
+        first_started_at: None,
+    })
+}
+
+// --- OTP Code Verification --------------------------------------------------
+
+/// Verify a 6-digit OTP code from email
+pub async fn verify_otp(
+    supabase_url: &str,
+    supabase_key: &str,
+    email: &str,
+    otp_code: &str,
+) -> Result<AuthState, String> {
+    let client = reqwest::Client::new();
+    let verify_url = format!("{}/auth/v1/verify", supabase_url);
+
+    let body = serde_json::json!({
+        "type": "email",
+        "token": otp_code,
+        "email": email,
+    });
+
+    tracing::info!("Verifying OTP code for {}", email);
+
+    let resp = client
+        .post(&verify_url)
+        .header("apikey", supabase_key)
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("OTP verification request failed: {}", e))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(format!("OTP verification failed ({}): {}", status, text));
+    }
+
+    let login_resp: LoginResponse = resp
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse OTP verify response: {}", e))?;
+
+    tracing::info!("OTP verified for user {}", login_resp.user.id);
+
+    Ok(AuthState {
+        access_token: Some(login_resp.access_token),
+        refresh_token: Some(login_resp.refresh_token),
+        user_id: Some(login_resp.user.id),
+        email: login_resp.user.email,
+        node_id: None,
+        api_token: None,
         first_started_at: None,
     })
 }
@@ -185,6 +240,7 @@ pub async fn login(
         user_id: Some(login_resp.user.id),
         email: login_resp.user.email,
         node_id: None,
+        api_token: None,
         first_started_at: None,
     })
 }
@@ -263,6 +319,58 @@ pub async fn register_wire_node(
 
     tracing::info!("Wire node registered: {}", registration.node_id);
     Ok(registration)
+}
+
+// --- Session-based Registration ---------------------------------------------
+
+/// Response from POST /api/v1/node/register-with-session
+#[derive(Debug, Deserialize)]
+pub struct SessionRegistrationResponse {
+    pub api_token: String,
+    pub node_id: String,
+    pub agent_id: String,
+    pub operator_id: String,
+    pub jwt_public_key: Option<String>,
+}
+
+/// Register this desktop node using a Supabase session token.
+/// POST to /api/v1/node/register-with-session
+/// Returns a gne_live_ machine token for all subsequent Wire API calls.
+pub async fn register_with_session(
+    api_url: &str,
+    supabase_access_token: &str,
+    node_name: &str,
+) -> Result<SessionRegistrationResponse, String> {
+    let client = reqwest::Client::new();
+    let url = format!("{}/api/v1/node/register-with-session", api_url);
+
+    let body = serde_json::json!({
+        "supabase_access_token": supabase_access_token,
+        "name": node_name,
+        "capabilities": ["cache", "verify", "storage"],
+    });
+
+    let resp = client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("Session registration request failed: {}", e))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(format!("Session registration failed ({}): {}", status, text));
+    }
+
+    let reg: SessionRegistrationResponse = resp
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse session registration response: {}", e))?;
+
+    tracing::info!("Session registration complete: node_id={}, agent_id={}", reg.node_id, reg.agent_id);
+    Ok(reg)
 }
 
 // --- Heartbeat --------------------------------------------------------------

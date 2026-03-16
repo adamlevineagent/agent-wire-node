@@ -297,14 +297,11 @@ pub async fn start_server(
                     tracing::info!("Auth callback received - user_id={:?}", body.user_id);
 
                     let mut auth = state.auth.write().await;
-                    *auth = AuthState {
-                        access_token: Some(body.access_token),
-                        refresh_token: body.refresh_token,
-                        user_id: body.user_id,
-                        email: body.email,
-                        node_id: None,
-                        first_started_at: None,
-                    };
+                    auth.access_token = Some(body.access_token);
+                    auth.refresh_token = body.refresh_token;
+                    auth.user_id = body.user_id;
+                    auth.email = body.email;
+                    // Preserve api_token and node_id from previous registration
 
                     tracing::info!("Auth state updated via magic link callback");
                     Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({"status": "ok"})))

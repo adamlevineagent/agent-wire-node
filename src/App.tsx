@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { CommandCenter } from "./components/CommandCenter";
 import { LoginScreen } from "./components/LoginScreen";
 import { OnboardingWizard } from "./components/OnboardingWizard";
@@ -26,8 +27,13 @@ export default function App() {
                 setAuthState(state);
                 setOnboarded(isOnboarded);
                 setChecking(false);
+                // Show the window now that the frontend is ready
+                getCurrentWindow().show();
             })
-            .catch(() => setChecking(false));
+            .catch(() => {
+                setChecking(false);
+                getCurrentWindow().show();
+            });
     }, []);
 
     // Poll for auth state changes (deep link callback)
@@ -52,6 +58,12 @@ export default function App() {
 
     const handleVerifyLink = useCallback(async (magicLinkUrl: string, email: string) => {
         await invoke("verify_magic_link", { magicLinkUrl, email });
+    }, []);
+
+    const handleVerifyOtp = useCallback(async (email: string, otpCode: string) => {
+        await invoke("verify_otp", { email, otpCode });
+        const state = await invoke<AuthState>("get_auth_state");
+        setAuthState(state);
     }, []);
 
     const handleLogin = useCallback(async (email: string, password: string) => {
@@ -88,6 +100,7 @@ export default function App() {
             <LoginScreen
                 onMagicLink={handleMagicLink}
                 onVerifyLink={handleVerifyLink}
+                onVerifyOtp={handleVerifyOtp}
                 onLogin={handleLogin}
             />
         );

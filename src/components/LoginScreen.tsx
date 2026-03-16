@@ -3,17 +3,19 @@ import { useState } from "react";
 interface LoginScreenProps {
     onMagicLink: (email: string) => Promise<void>;
     onVerifyLink: (magicLinkUrl: string, email: string) => Promise<void>;
+    onVerifyOtp: (email: string, otpCode: string) => Promise<void>;
     onLogin: (email: string, password: string) => Promise<void>;
 }
 
 type Step = "email" | "waiting";
 type AuthMode = "magic" | "password";
 
-export function LoginScreen({ onMagicLink, onVerifyLink, onLogin }: LoginScreenProps) {
+export function LoginScreen({ onMagicLink, onVerifyLink, onVerifyOtp, onLogin }: LoginScreenProps) {
     const [step, setStep] = useState<Step>("email");
     const [email, setEmail] = useState("");
     const [password, setPassword] = useState("");
     const [linkUrl, setLinkUrl] = useState("");
+    const [otpCode, setOtpCode] = useState("");
     const [error, setError] = useState("");
     const [loading, setLoading] = useState(false);
     const [showManualPaste, setShowManualPaste] = useState(false);
@@ -54,6 +56,19 @@ export function LoginScreen({ onMagicLink, onVerifyLink, onLogin }: LoginScreenP
             await onVerifyLink(linkUrl.trim(), email);
         } catch (err: any) {
             setError(err?.toString() || "Verification failed");
+        } finally {
+            setLoading(false);
+        }
+    };
+
+    const handleOtpSubmit = async (e: React.FormEvent) => {
+        e.preventDefault();
+        setError("");
+        setLoading(true);
+        try {
+            await onVerifyOtp(email, otpCode.trim());
+        } catch (err: any) {
+            setError(err?.toString() || "Code verification failed");
         } finally {
             setLoading(false);
         }
@@ -162,17 +177,50 @@ export function LoginScreen({ onMagicLink, onVerifyLink, onLogin }: LoginScreenP
                 ) : (
                     <div className="login-form">
                         <div className="login-success">
-                            Check your email and click the link
+                            Check your email for a verification code
                         </div>
 
                         <p className="login-waiting-text">
-                            Click the button in the email we just sent to <strong>{email}</strong>.
-                            This app will log you in automatically via <code>agentwire://</code> deep link.
+                            We sent a 6-digit code to <strong>{email}</strong>.
+                            Enter it below to sign in.
                         </p>
 
-                        <div className="login-pulse-container">
+                        <form onSubmit={handleOtpSubmit} className="otp-form">
+                            <div className="form-group">
+                                <input
+                                    id="otp-code"
+                                    type="text"
+                                    inputMode="numeric"
+                                    pattern="[0-9]*"
+                                    maxLength={6}
+                                    value={otpCode}
+                                    onChange={(e) => setOtpCode(e.target.value.replace(/\D/g, ""))}
+                                    placeholder="000000"
+                                    required
+                                    autoFocus
+                                    style={{
+                                        textAlign: "center",
+                                        fontSize: "1.75rem",
+                                        letterSpacing: "0.5em",
+                                        fontFamily: "monospace",
+                                    }}
+                                />
+                            </div>
+
+                            {error && <div className="login-error">{error}</div>}
+
+                            <button
+                                type="submit"
+                                className="login-button"
+                                disabled={loading || otpCode.length < 6}
+                            >
+                                {loading ? "Verifying..." : "Verify Code"}
+                            </button>
+                        </form>
+
+                        <div className="login-pulse-container" style={{ marginTop: "1rem" }}>
                             <div className="login-pulse" />
-                            <span>Waiting for you to click the link...</span>
+                            <span>Or click the link in your email...</span>
                         </div>
 
                         {/* Manual paste fallback for Linux / edge cases */}
@@ -201,8 +249,6 @@ export function LoginScreen({ onMagicLink, onVerifyLink, onLogin }: LoginScreenP
                                     />
                                 </div>
 
-                                {error && <div className="login-error">{error}</div>}
-
                                 <button
                                     type="submit"
                                     className="login-button"
@@ -219,6 +265,7 @@ export function LoginScreen({ onMagicLink, onVerifyLink, onLogin }: LoginScreenP
                             onClick={() => {
                                 setStep("email");
                                 setLinkUrl("");
+                                setOtpCode("");
                                 setError("");
                                 setShowManualPaste(false);
                             }}
