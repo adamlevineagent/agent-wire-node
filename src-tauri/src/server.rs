@@ -290,10 +290,28 @@ pub async fn start_server(
         let state = state.clone();
         warp::path!("auth" / "complete")
             .and(warp::post())
+            .and(warp::header::optional::<String>("origin"))
             .and(warp::body::json())
-            .and_then(move |body: AuthCompleteRequest| {
+            .and_then(move |origin: Option<String>, body: AuthCompleteRequest| {
                 let state = state.clone();
                 async move {
+                    // Restrict to trusted origins only — prevents arbitrary web pages
+                    // from overwriting auth state via cross-origin POST
+                    let allowed = match origin.as_deref() {
+                        None => true, // No origin header = same-origin or non-browser client
+                        Some(o) if o.starts_with("https://newsbleach.com") => true,
+                        Some(o) if o.starts_with("http://localhost") || o.starts_with("http://127.0.0.1") => true,
+                        Some(o) if o == "tauri://localhost" => true,
+                        Some(o) => {
+                            tracing::warn!("Auth complete rejected from origin: {}", o);
+                            false
+                        }
+                    };
+
+                    if !allowed {
+                        return Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({"error": "forbidden"})));
+                    }
+
                     tracing::info!("Auth callback received - user_id={:?}", body.user_id);
 
                     let mut auth = state.auth.write().await;

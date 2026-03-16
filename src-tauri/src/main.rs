@@ -63,16 +63,16 @@ async fn verify_magic_link(
 
     let user_id = auth_state.user_id.clone().unwrap_or_default();
 
-    // Register with Wire using Supabase session token
+    // Register with Wire using Supabase session token — propagate errors
     let supabase_token = auth_state.access_token.clone().unwrap_or_default();
     let registration = auth::register_with_session(
         &config.api_url,
         &supabase_token,
         &config.node_name(),
-    ).await.ok();
+    ).await?;
 
-    let node_id = registration.as_ref().map(|r| r.node_id.clone());
-    let api_token = registration.as_ref().map(|r| r.api_token.clone());
+    let node_id = Some(registration.node_id.clone());
+    let api_token = Some(registration.api_token.clone());
 
     let mut auth_write = state.auth.write().await;
     let first_started = auth_write.first_started_at.clone()
@@ -125,16 +125,16 @@ async fn verify_otp(
 
     let user_id = auth_state.user_id.clone().unwrap_or_default();
 
-    // Register with Wire using Supabase session token
+    // Register with Wire using Supabase session token — propagate errors
     let supabase_token = auth_state.access_token.clone().unwrap_or_default();
     let registration = auth::register_with_session(
         &config.api_url,
         &supabase_token,
         &config.node_name(),
-    ).await.ok();
+    ).await?;
 
-    let node_id = registration.as_ref().map(|r| r.node_id.clone());
-    let api_token = registration.as_ref().map(|r| r.api_token.clone());
+    let node_id = Some(registration.node_id.clone());
+    let api_token = Some(registration.api_token.clone());
 
     let mut auth_write = state.auth.write().await;
     let first_started = auth_write.first_started_at.clone()
