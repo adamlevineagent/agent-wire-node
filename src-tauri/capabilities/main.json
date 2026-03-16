@@ -1,0 +1,13 @@
+{
+    "identifier": "main-capability",
+    "description": "Main window capability",
+    "windows": [
+        "main"
+    ],
+    "permissions": [
+        "core:default",
+        "shell:allow-open",
+        "updater:default",
+        "process:allow-restart"
+    ]
+}

@@ -1,0 +1,9 @@
+node_modules/
+dist/
+target/
+.signing-key*.txt
+.signing-key*.txt.pub
+*.pem
+*.key
+.env
+.env.*

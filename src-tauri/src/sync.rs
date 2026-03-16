@@ -1,0 +1,551 @@
+use serde::{Deserialize, Serialize};
+use sha2::{Sha256, Digest};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use tokio::fs;
+use walkdir::WalkDir;
+
+/// Tracks the state of document sync
+#[derive(Debug, Default, Serialize, Deserialize, Clone)]
+pub struct SyncState {
+    pub linked_folders: HashMap<String, String>,  // folder_path -> corpus_slug
+    pub cached_documents: Vec<CachedDocument>,
+    pub total_size_bytes: u64,
+    pub last_sync_at: Option<String>,
+    pub is_syncing: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CachedDocument {
+    pub document_id: String,
+    pub corpus_slug: String,
+    pub source_path: String,
+    pub body_hash: String,
+    pub file_size_bytes: u64,
+    pub cached_at: String,
+}
+
+/// Document info returned from Wire API
+#[derive(Debug, Clone, Deserialize)]
+pub struct DocumentInfo {
+    pub id: String,
+    pub body_hash: String,
+    pub source_path: Option<String>,
+    pub title: Option<String>,
+    pub status: Option<String>,
+}
+
+/// Diff result for a single corpus
+#[derive(Debug)]
+pub struct SyncDiff {
+    pub to_push: Vec<LocalDocument>,    // local files not on server
+    pub to_pull: Vec<DocumentInfo>,     // server docs not on local
+    pub to_update: Vec<(LocalDocument, DocumentInfo)>,  // local files with different hash
+}
+
+/// Local document found via directory walking
+#[derive(Debug, Clone)]
+pub struct LocalDocument {
+    pub path: PathBuf,
+    pub relative_path: String,
+    pub body_hash: String,
+    pub size: u64,
+}
+
+// --- Folder Linking ---------------------------------------------------------
+
+/// Link a local folder to a Wire corpus
+pub fn link_folder(
+    sync_state: &mut SyncState,
+    folder_path: &str,
+    corpus_slug: &str,
+) -> Result<(), String> {
+    let path = Path::new(folder_path);
+    if !path.exists() || !path.is_dir() {
+        return Err(format!("Directory does not exist: {}", folder_path));
+    }
+    sync_state.linked_folders.insert(folder_path.to_string(), corpus_slug.to_string());
+    tracing::info!("Linked folder {} -> corpus {}", folder_path, corpus_slug);
+    Ok(())
+}
+
+/// Unlink a folder from a corpus
+pub fn unlink_folder(
+    sync_state: &mut SyncState,
+    folder_path: &str,
+) -> Result<(), String> {
+    if sync_state.linked_folders.remove(folder_path).is_some() {
+        tracing::info!("Unlinked folder {}", folder_path);
+        Ok(())
+    } else {
+        Err(format!("Folder not linked: {}", folder_path))
+    }
+}
+
+// --- Document Sync ----------------------------------------------------------
+
+/// Fetch document list for a corpus from the Wire API
+pub async fn fetch_corpus_documents(
+    api_url: &str,
+    access_token: &str,
+    corpus_slug: &str,
+) -> Result<Vec<DocumentInfo>, String> {
+    let client = reqwest::Client::new();
+    let url = format!(
+        "{}/api/v1/wire/corpora/{}/documents",
+        api_url, corpus_slug
+    );
+
+    let resp = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {}", access_token))
+        .send()
+        .await
+        .map_err(|e| format!("Failed to fetch corpus documents: {}", e))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(format!("Corpus fetch failed ({}): {}", status, text));
+    }
+
+    let docs: Vec<DocumentInfo> = resp.json().await
+        .map_err(|e| format!("Failed to parse documents: {}", e))?;
+
+    tracing::info!("Found {} documents in corpus {}", docs.len(), corpus_slug);
+    Ok(docs)
+}
+
+/// Walk a local directory and compute hashes for all files
+pub fn scan_local_folder(folder_path: &str) -> Result<Vec<LocalDocument>, String> {
+    let root = Path::new(folder_path);
+    if !root.exists() || !root.is_dir() {
+        return Err(format!("Directory does not exist: {}", folder_path));
+    }
+
+    let mut docs = Vec::new();
+    for entry in WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        // Skip symlinks entirely — they could point outside the directory boundary
+        if entry.file_type().is_symlink() {
+            continue;
+        }
+        if entry.file_type().is_file() {
+            let path = entry.path().to_path_buf();
+            let relative_path = path.strip_prefix(root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .to_string();
+
+            // Read file as UTF-8 string and compute hash (matches TS TextEncoder)
+            match std::fs::read_to_string(&path) {
+                Ok(content) => {
+                    let body_hash = compute_sha256(&content);
+                    let size = content.len() as u64;
+                    docs.push(LocalDocument {
+                        path,
+                        relative_path,
+                        body_hash,
+                        size,
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to read {}: {}", path.display(), e);
+                }
+            }
+        }
+    }
+
+    Ok(docs)
+}
+
+/// Compute diff between local folder and remote corpus
+pub fn compute_diff(
+    local_docs: &[LocalDocument],
+    remote_docs: &[DocumentInfo],
+) -> SyncDiff {
+    let remote_by_path: HashMap<&str, &DocumentInfo> = remote_docs.iter()
+        .filter_map(|d| d.source_path.as_deref().map(|p| (p, d)))
+        .collect();
+
+    let local_by_path: HashMap<&str, &LocalDocument> = local_docs.iter()
+        .map(|d| (d.relative_path.as_str(), d))
+        .collect();
+
+    let mut to_push = Vec::new();
+    let mut to_update = Vec::new();
+
+    for local_doc in local_docs {
+        match remote_by_path.get(local_doc.relative_path.as_str()) {
+            Some(remote_doc) => {
+                if local_doc.body_hash != remote_doc.body_hash {
+                    to_update.push((local_doc.clone(), (*remote_doc).clone()));
+                }
+            }
+            None => {
+                to_push.push(local_doc.clone());
+            }
+        }
+    }
+
+    let to_pull: Vec<DocumentInfo> = remote_docs.iter()
+        .filter(|d| {
+            d.source_path.as_deref()
+                .map(|p| !local_by_path.contains_key(p))
+                .unwrap_or(false)
+        })
+        .cloned()
+        .collect();
+
+    SyncDiff { to_push, to_pull, to_update }
+}
+
+/// Push a new document to the Wire API
+pub async fn push_document(
+    api_url: &str,
+    access_token: &str,
+    corpus_slug: &str,
+    local_doc: &LocalDocument,
+) -> Result<String, String> {
+    let client = reqwest::Client::new();
+    let url = format!("{}/api/v1/wire/corpora/{}/documents", api_url, corpus_slug);
+
+    let body_text = std::fs::read_to_string(&local_doc.path)
+        .map_err(|e| format!("Failed to read file: {}", e))?;
+
+    let body = serde_json::json!({
+        "source_path": local_doc.relative_path,
+        "body": body_text,
+        "body_hash": local_doc.body_hash,
+    });
+
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", access_token))
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("Push failed: {}", e))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(format!("Push failed ({}): {}", status, text));
+    }
+
+    #[derive(Deserialize)]
+    struct PushResponse { id: String }
+    let result: PushResponse = resp.json().await
+        .map_err(|e| format!("Failed to parse push response: {}", e))?;
+
+    tracing::info!("Pushed document: {} -> {}", local_doc.relative_path, result.id);
+    Ok(result.id)
+}
+
+/// Update an existing document (create new version for published docs)
+pub async fn update_document(
+    api_url: &str,
+    access_token: &str,
+    doc_id: &str,
+    local_doc: &LocalDocument,
+) -> Result<(), String> {
+    let client = reqwest::Client::new();
+    let url = format!("{}/api/v1/wire/documents/{}", api_url, doc_id);
+
+    let body_text = std::fs::read_to_string(&local_doc.path)
+        .map_err(|e| format!("Failed to read file: {}", e))?;
+
+    let body = serde_json::json!({
+        "body": body_text,
+        "body_hash": local_doc.body_hash,
+    });
+
+    let resp = client
+        .patch(&url)
+        .header("Authorization", format!("Bearer {}", access_token))
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("Update failed: {}", e))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(format!("Update failed ({}): {}", status, text));
+    }
+
+    tracing::info!("Updated document: {} ({})", doc_id, local_doc.relative_path);
+    Ok(())
+}
+
+/// Pull a document from the Wire API and write to local file
+pub async fn pull_document(
+    api_url: &str,
+    access_token: &str,
+    doc: &DocumentInfo,
+    sync_root: &Path,
+) -> Result<CachedDocument, String> {
+    let source_path = doc.source_path.as_deref()
+        .ok_or_else(|| "Document has no source_path".to_string())?;
+
+    // Reject any source_path containing ".." segments
+    if source_path.split('/').any(|seg| seg == "..") || source_path.split('\\').any(|seg| seg == "..") {
+        return Err(format!("Path traversal detected (.. segment): {}", source_path));
+    }
+
+    // Client-side path validation: resolve path, confirm within sync root
+    let target_path = sync_root.join(source_path);
+
+    // Canonicalize the sync root
+    let sync_root_canonical = sync_root.canonicalize()
+        .map_err(|e| format!("Failed to canonicalize sync root: {}", e))?;
+
+    // Ensure parent directory exists before canonicalizing
+    if let Some(parent) = target_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create parent directory: {}", e))?;
+    }
+
+    // Canonicalize the parent directory (which now exists), then join the filename
+    let filename = target_path.file_name()
+        .ok_or_else(|| format!("Invalid file path: {}", source_path))?;
+    let canonical_parent = target_path.parent()
+        .ok_or_else(|| format!("No parent directory for: {}", source_path))?
+        .canonicalize()
+        .map_err(|e| format!("Failed to canonicalize parent: {}", e))?;
+    let resolved = canonical_parent.join(filename);
+
+    if !resolved.starts_with(&sync_root_canonical) {
+        return Err(format!("Path traversal detected: {}", source_path));
+    }
+
+    let client = reqwest::Client::new();
+    let url = format!("{}/api/v1/wire/documents/{}/body", api_url, doc.id);
+
+    let resp = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {}", access_token))
+        .send()
+        .await
+        .map_err(|e| format!("Pull failed for {}: {}", doc.id, e))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(format!("Pull failed ({}): {}", status, text));
+    }
+
+    let body_text = resp.text().await
+        .map_err(|e| format!("Failed to read document body: {}", e))?;
+
+    let file_size = body_text.len() as u64;
+    if file_size == 0 {
+        return Err(format!("Downloaded empty document: {}", doc.id));
+    }
+
+    // Verify hash
+    let actual_hash = compute_sha256(&body_text);
+    if actual_hash != doc.body_hash {
+        return Err(format!(
+            "Hash mismatch for {}: expected {}, got {}",
+            doc.id, &doc.body_hash[..12], &actual_hash[..12]
+        ));
+    }
+
+    // Ensure parent directory exists
+    if let Some(parent) = target_path.parent() {
+        fs::create_dir_all(parent)
+            .await
+            .map_err(|e| format!("Failed to create directory: {}", e))?;
+    }
+
+    fs::write(&target_path, &body_text)
+        .await
+        .map_err(|e| format!("Failed to write document: {}", e))?;
+
+    tracing::info!("Pulled document: {} -> {}", doc.id, target_path.display());
+
+    Ok(CachedDocument {
+        document_id: doc.id.clone(),
+        corpus_slug: String::new(),
+        source_path: source_path.to_string(),
+        body_hash: actual_hash,
+        file_size_bytes: file_size,
+        cached_at: chrono::Utc::now().to_rfc3339(),
+    })
+}
+
+/// Download a document body to the local cache for serving
+pub async fn cache_document_for_serving(
+    api_url: &str,
+    access_token: &str,
+    document_id: &str,
+    corpus_id: &str,
+    expected_hash: &str,
+    cache_dir: &Path,
+) -> Result<u64, String> {
+    let client = reqwest::Client::new();
+    let url = format!("{}/api/v1/wire/documents/{}/body", api_url, document_id);
+
+    let resp = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {}", access_token))
+        .send()
+        .await
+        .map_err(|e| format!("Document download failed: {}", e))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("Document download failed ({})", resp.status()));
+    }
+
+    let body_text = resp.text().await
+        .map_err(|e| format!("Failed to read document body: {}", e))?;
+
+    // Verify hash
+    let actual_hash = compute_sha256(&body_text);
+    if actual_hash != expected_hash {
+        return Err(format!(
+            "Hash mismatch: expected {}, got {}",
+            &expected_hash[..12], &actual_hash[..12]
+        ));
+    }
+
+    // Store in cache: {cache_dir}/{corpus_id}/{document_id}.body
+    let corpus_dir = cache_dir.join(corpus_id);
+    fs::create_dir_all(&corpus_dir)
+        .await
+        .map_err(|e| format!("Failed to create corpus cache dir: {}", e))?;
+
+    let file_path = corpus_dir.join(format!("{}.body", document_id));
+    let file_size = body_text.len() as u64;
+
+    fs::write(&file_path, &body_text)
+        .await
+        .map_err(|e| format!("Failed to write cached document: {}", e))?;
+
+    tracing::info!("Cached document {}/{} ({} bytes)", corpus_id, document_id, file_size);
+    Ok(file_size)
+}
+
+// --- Hash Verification ------------------------------------------------------
+
+/// Compute SHA-256 hash of a UTF-8 string (matches TypeScript's TextEncoder round-trip)
+pub fn compute_sha256(content: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(content.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+/// Get total size of all files in cache directory
+pub async fn get_cache_size(cache_dir: &Path) -> u64 {
+    let mut total = 0u64;
+    let mut dirs_to_scan = vec![cache_dir.to_path_buf()];
+    while let Some(dir) = dirs_to_scan.pop() {
+        if let Ok(mut entries) = fs::read_dir(&dir).await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                if let Ok(meta) = entry.metadata().await {
+                    if meta.is_dir() {
+                        dirs_to_scan.push(entry.path());
+                    } else {
+                        total += meta.len();
+                    }
+                }
+            }
+        }
+    }
+    total
+}
+
+/// Check if a document is cached for serving
+pub fn is_document_cached(cache_dir: &Path, corpus_id: &str, document_id: &str) -> bool {
+    cache_dir.join(corpus_id).join(format!("{}.body", document_id)).exists()
+}
+
+/// Get the local file path for a cached document body
+pub fn get_cached_document_path(cache_dir: &Path, corpus_id: &str, document_id: &str) -> PathBuf {
+    cache_dir.join(corpus_id).join(format!("{}.body", document_id))
+}
+
+/// Compute SHA-256 hash of a specific byte range in a file (raw bytes).
+/// Uses std::fs::read (not read_to_string) to avoid panics on multi-byte
+/// UTF-8 boundaries. This matches PostgreSQL's byte-level behavior.
+pub fn hash_byte_range(file_path: &Path, start: usize, end: usize) -> Result<String, String> {
+    let bytes = std::fs::read(file_path)
+        .map_err(|e| format!("Failed to read file: {}", e))?;
+
+    if end > bytes.len() {
+        return Err(format!(
+            "Byte range {}-{} exceeds file size {}",
+            start, end, bytes.len()
+        ));
+    }
+
+    let slice = &bytes[start..end];
+    let mut hasher = Sha256::new();
+    hasher.update(slice);
+    Ok(hex::encode(hasher.finalize()))
+}
+
+/// Delete a cached document file
+pub async fn delete_cached_document(
+    cache_dir: &Path,
+    corpus_id: &str,
+    document_id: &str,
+) -> Result<(), String> {
+    let file_path = cache_dir.join(corpus_id).join(format!("{}.body", document_id));
+    if file_path.exists() {
+        fs::remove_file(&file_path)
+            .await
+            .map_err(|e| format!("Failed to delete document: {}", e))?;
+        tracing::info!("Deleted cached document {}/{}", corpus_id, document_id);
+    }
+    Ok(())
+}
+
+/// Find a cached document by ID across all corpus subdirectories.
+/// Returns (corpus_id, file_path) if found.
+pub async fn find_cached_document_by_id(
+    cache_dir: &Path,
+    document_id: &str,
+) -> Option<(String, PathBuf)> {
+    let target_filename = format!("{}.body", document_id);
+
+    if let Ok(mut entries) = fs::read_dir(cache_dir).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            if entry.file_type().await.map(|ft| ft.is_dir()).unwrap_or(false) {
+                let candidate = entry.path().join(&target_filename);
+                if candidate.exists() {
+                    let corpus_id = entry.file_name().to_string_lossy().to_string();
+                    return Some((corpus_id, candidate));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Delete a cached document by scanning all corpus subdirectories.
+/// Used when corpus_id is not known.
+pub async fn delete_cached_document_by_id(
+    cache_dir: &Path,
+    document_id: &str,
+) -> Result<(), String> {
+    match find_cached_document_by_id(cache_dir, document_id).await {
+        Some((corpus_id, file_path)) => {
+            fs::remove_file(&file_path)
+                .await
+                .map_err(|e| format!("Failed to delete document: {}", e))?;
+            tracing::info!("Deleted cached document {}/{}", corpus_id, document_id);
+            Ok(())
+        }
+        None => {
+            tracing::debug!("Document {} not found in cache, nothing to purge", document_id);
+            Ok(())
+        }
+    }
+}

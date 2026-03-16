@@ -1,0 +1,59 @@
+{
+  "$schema": "https://raw.githubusercontent.com/nicegui/nicegui/main/.schemas/tauri-conf.schema.json",
+  "productName": "Wire Node",
+  "version": "0.1.0",
+  "identifier": "com.agentwire.node",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:5173",
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Wire Node",
+        "width": 1200,
+        "height": 800,
+        "resizable": true,
+        "decorations": true,
+        "visible": false
+      }
+    ],
+    "trayIcon": {
+      "iconPath": "icons/icon.png",
+      "iconAsTemplate": true,
+      "tooltip": "Wire Node"
+    },
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "createUpdaterArtifacts": true,
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "",
+      "endpoints": [
+        "https://newsbleach.com/api/releases/wire-node/{{target}}/{{arch}}/{{current_version}}"
+      ]
+    },
+    "deep-link": {
+      "desktop": {
+        "schemes": [
+          "agentwire"
+        ]
+      }
+    }
+  }
+}
