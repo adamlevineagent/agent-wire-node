@@ -1711,7 +1711,7 @@ async fn bulk_publish(
     // Fetch all draft documents for this corpus
     let docs = sync::fetch_corpus_documents(&config.api_url, &api_token, &corpus_slug).await?;
     let draft_ids: Vec<String> = docs.iter()
-        .filter(|d| d.status.as_deref() == Some("draft"))
+        .filter(|d| d.status.as_deref() != Some("published") && d.status.as_deref() != Some("retracted"))
         .map(|d| d.id.clone())
         .collect();
 

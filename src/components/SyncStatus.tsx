@@ -336,7 +336,7 @@ export function SyncStatus({ syncState, syncing, onSync }: SyncStatusProps) {
                                     </div>
                                     <div className="folder-sync-meta">
                                         {(() => {
-                                            const draftCount = corpusDocs.filter(d => d.document_status === "draft").length;
+                                            const draftCount = corpusDocs.filter(d => d.document_id && d.document_status !== "published" && d.document_status !== "retracted").length;
                                             const isPublishing = bulkPublishing === linked.corpus_slug;
                                             const progress = bulkProgress[linked.corpus_slug];
                                             if (isPublishing && progress) {
@@ -443,7 +443,7 @@ export function SyncStatus({ syncState, syncing, onSync }: SyncStatusProps) {
                                                                 failed
                                                             </span>
                                                         )}
-                                                        {doc.document_id && doc.document_status === "draft" && (
+                                                        {doc.document_id && doc.document_status !== "published" && doc.document_status !== "retracted" && (
                                                             <button
                                                                 className="file-publish-btn"
                                                                 onClick={(e) => {
