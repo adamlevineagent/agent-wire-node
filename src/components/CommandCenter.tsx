@@ -8,6 +8,7 @@ import { TunnelStatus } from "./TunnelStatus";
 import { MarketView } from "./MarketView";
 import { Messages } from "./Messages";
 import { Settings } from "./Settings";
+import { LogViewer } from "./LogViewer";
 import type { CreditStats, SyncState } from "./Dashboard";
 
 interface CommandCenterProps {
@@ -24,7 +25,7 @@ interface TunnelStatusData {
     status: string | { Error: string };
 }
 
-type TabKey = "dashboard" | "sync" | "market" | "messages" | "settings";
+type TabKey = "dashboard" | "sync" | "market" | "messages" | "settings" | "logs";
 
 function getTunnelLabel(status: TunnelStatusData["status"]): { text: string; className: string } {
     if (typeof status === "object" && "Error" in status) {
@@ -231,6 +232,7 @@ export function CommandCenter({ authState, onLogout }: CommandCenterProps) {
                     { key: "market" as const, label: "Market" },
                     { key: "messages" as const, label: "Messages" },
                     { key: "settings" as const, label: "Settings" },
+                    { key: "logs" as const, label: "Logs" },
                 ]).map((tab) => (
                     <button
                         key={tab.key}
@@ -291,7 +293,7 @@ export function CommandCenter({ authState, onLogout }: CommandCenterProps) {
                                 </div>
                                 <div className="net-divider" />
                                 <div className="net-stat">
-                                    <span className="net-value glow">{(credits?.credits_earned || 0).toFixed(2)}</span>
+                                    <span className="net-value glow">{Math.floor((credits?.server_credit_balance || 0) > 0 ? credits!.server_credit_balance : (credits?.credits_earned || 0))}</span>
                                     <span className="net-label">credits earned</span>
                                 </div>
                             </div>
@@ -325,6 +327,12 @@ export function CommandCenter({ authState, onLogout }: CommandCenterProps) {
             {activeTab === "settings" && (
                 <div className="cc-tab-content">
                     <Settings />
+                </div>
+            )}
+
+            {activeTab === "logs" && (
+                <div className="cc-tab-content">
+                    <LogViewer />
                 </div>
             )}
         </div>

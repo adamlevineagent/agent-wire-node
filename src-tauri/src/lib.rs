@@ -18,6 +18,7 @@ pub mod tunnel;
 pub mod messaging;
 pub mod market;
 pub mod retention;
+pub mod work;
 
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -31,7 +32,8 @@ pub struct AppState {
     pub credits: Arc<RwLock<credits::CreditTracker>>,
     pub tunnel_state: Arc<RwLock<tunnel::TunnelState>>,
     pub market_state: Arc<RwLock<market::MarketState>>,
-    pub config: WireNodeConfig,
+    pub work_stats: Arc<RwLock<work::WorkStats>>,
+    pub config: Arc<RwLock<WireNodeConfig>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,6 +42,7 @@ pub struct WireNodeConfig {
     pub node_id: String,
     pub storage_cap_gb: f64,
     pub mesh_hosting_enabled: bool,
+    pub auto_update_enabled: bool,
     pub document_cache_dir: String,
     pub server_port: u16,
     pub jwt_public_key: String,
@@ -61,11 +64,12 @@ impl Default for WireNodeConfig {
             node_id: String::new(),
             storage_cap_gb: 10.0,
             mesh_hosting_enabled: false,
+            auto_update_enabled: false,
             document_cache_dir: document_cache_dir.to_string_lossy().to_string(),
             server_port: 8765,
             jwt_public_key: String::new(),
             supabase_url: "https://supabase.newsbleach.com".to_string(),
-            supabase_anon_key: String::new(),
+            supabase_anon_key: "eyJhbGciOiAiSFMyNTYiLCAidHlwIjogIkpXVCJ9.eyJyb2xlIjogImFub24iLCAiaXNzIjogInN1cGFiYXNlIiwgImlhdCI6IDE3NDAwMDAwMDAsICJleHAiOiAyMDg3MTI3MzM4fQ.5Og0cJw4IkDdCQVYztlzJSoptuyeWjjtKjwOKUukd-Y".to_string(),
             tunnel_api_url: "https://newsbleach.com".to_string(),
         }
     }

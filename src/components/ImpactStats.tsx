@@ -1,4 +1,16 @@
+import { useState, useEffect } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import type { CreditStats } from "./Dashboard";
+
+interface WorkStats {
+    total_jobs_completed: number;
+    total_credits_earned: number;
+    session_jobs_completed: number;
+    session_credits_earned: number;
+    consecutive_errors: number;
+    last_work_at: string | null;
+    is_polling: boolean;
+}
 
 interface ImpactStatsProps {
     credits: CreditStats | null;
@@ -18,9 +30,9 @@ function formatBytes(bytes: number): string {
 }
 
 function formatCredits(n: number): string {
-    if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(2)}M`;
+    if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
     if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
-    return n.toFixed(2);
+    return Math.floor(n).toString();
 }
 
 function parseUptimeHours(uptime: string): number {
@@ -43,6 +55,22 @@ function calcPerHour(count: number, uptimeHours: number): string {
 }
 
 export function ImpactStats({ credits }: ImpactStatsProps) {
+    const [workStats, setWorkStats] = useState<WorkStats | null>(null);
+
+    useEffect(() => {
+        const fetchWork = async () => {
+            try {
+                const ws = await invoke<WorkStats>("get_work_stats");
+                setWorkStats(ws);
+            } catch {
+                // Work stats not available yet
+            }
+        };
+        fetchWork();
+        const interval = setInterval(fetchWork, 3000);
+        return () => clearInterval(interval);
+    }, []);
+
     const totalDocs = credits?.documents_served || 0;
     const totalPulls = credits?.pulls_served_total || 0;
     const creditsEarned = credits?.credits_earned || 0;
@@ -53,17 +81,29 @@ export function ImpactStats({ credits }: ImpactStatsProps) {
     const sessionBytes = credits?.session_bytes_served || 0;
     const uptimeHours = parseUptimeHours(credits?.session_uptime || "0m");
 
+    const totalJobs = workStats?.total_jobs_completed || 0;
+    const sessionJobs = workStats?.session_jobs_completed || 0;
+    const sessionWorkCredits = workStats?.session_credits_earned || 0;
+    const isPolling = workStats?.is_polling ?? false;
+    const serverBalance = credits?.server_credit_balance || 0;
+
     return (
         <div className="impact-stats">
-            {/* Hero -- Credits + Total Pulls */}
+            {/* Hero -- Balance + Earned + Jobs */}
             <div className="impact-hero">
                 <div className="hero-row">
                     <div className="hero-stat primary">
                         <div className="hero-value glow">
-                            {formatCredits(creditsEarned)}
+                            {formatCredits(serverBalance > 0 ? serverBalance : creditsEarned)}
                         </div>
                         <div className="hero-label">
-                            credits earned
+                            {serverBalance > 0 ? "credit balance" : "credits earned"}
+                        </div>
+                    </div>
+                    <div className="hero-stat secondary">
+                        <div className="hero-value">{formatNumber(totalJobs)}</div>
+                        <div className="hero-label">
+                            jobs completed {isPolling && <span className="work-polling-dot" title="Polling for work">*</span>}
                         </div>
                     </div>
                     <div className="hero-stat secondary">
@@ -73,8 +113,16 @@ export function ImpactStats({ credits }: ImpactStatsProps) {
                 </div>
             </div>
 
-            {/* Row 1 -- Network Contribution */}
+            {/* Row 1 -- Work + Network */}
             <div className="impact-grid">
+                <div className="impact-card">
+                    <div className="impact-number">{formatNumber(sessionJobs)}</div>
+                    <div className="impact-caption">session jobs</div>
+                </div>
+                <div className="impact-card">
+                    <div className="impact-number">{formatCredits(sessionWorkCredits)}</div>
+                    <div className="impact-caption">session credits</div>
+                </div>
                 <div className="impact-card">
                     <div className="impact-number">{formatNumber(totalDocs)}</div>
                     <div className="impact-caption">documents served</div>
@@ -83,18 +131,18 @@ export function ImpactStats({ credits }: ImpactStatsProps) {
                     <div className="impact-number">{bytesFormatted}</div>
                     <div className="impact-caption">total data served</div>
                 </div>
+            </div>
+
+            {/* Row 2 -- Session + Uptime */}
+            <div className="impact-grid">
                 <div className="impact-card">
-                    <div className="impact-number">{calcPerHour(sessionDocs, uptimeHours)}</div>
-                    <div className="impact-caption">docs / hr</div>
+                    <div className="impact-number">{calcPerHour(sessionJobs, uptimeHours)}</div>
+                    <div className="impact-caption">jobs / hr</div>
                 </div>
                 <div className="impact-card">
                     <div className="impact-number">{credits?.session_uptime || "0m"}</div>
                     <div className="impact-caption">session uptime</div>
                 </div>
-            </div>
-
-            {/* Row 2 -- Today's Activity */}
-            <div className="impact-grid">
                 <div className="impact-card">
                     <div className="impact-number">{formatNumber(todayDocs)}</div>
                     <div className="impact-caption">served today</div>
@@ -102,14 +150,6 @@ export function ImpactStats({ credits }: ImpactStatsProps) {
                 <div className="impact-card">
                     <div className="impact-number">{formatBytes(todayBytes)}</div>
                     <div className="impact-caption">data today</div>
-                </div>
-                <div className="impact-card">
-                    <div className="impact-number">{formatNumber(sessionDocs)}</div>
-                    <div className="impact-caption">session docs</div>
-                </div>
-                <div className="impact-card">
-                    <div className="impact-number">{formatBytes(sessionBytes)}</div>
-                    <div className="impact-caption">session data</div>
                 </div>
             </div>
 

@@ -9,6 +9,7 @@ use walkdir::WalkDir;
 pub enum SyncDirection {
     Upload,    // Push local → Wire (steward)
     Download,  // Pull Wire → local (reader)
+    Both,      // Bidirectional sync
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -25,6 +26,38 @@ pub struct SyncState {
     pub total_size_bytes: u64,
     pub last_sync_at: Option<String>,
     pub is_syncing: bool,
+    #[serde(default)]
+    pub auto_sync_enabled: bool,
+    #[serde(default = "default_auto_sync_interval")]
+    pub auto_sync_interval_secs: u64,
+    #[serde(default)]
+    pub sync_progress: Option<String>,  // e.g. "Pulling 3/52..."
+    #[serde(default)]
+    pub pinned_versions: Vec<String>,  // document IDs of pinned versions
+    #[serde(default = "default_storage_quota")]
+    pub storage_quota_mb: u64,
+    #[serde(default)]
+    pub conflicts: Vec<ConflictInfo>,
+}
+
+fn default_auto_sync_interval() -> u64 { 900 } // 15 minutes
+fn default_storage_quota() -> u64 { 500 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum FileStatus {
+    InSync,       // Local matches remote
+    NeedsPull,    // Remote has newer version (or file doesn't exist locally)
+    NeedsPush,    // Local has newer version (or file doesn't exist remotely)
+    Pulling,      // Currently downloading
+    Pushing,      // Currently uploading
+    Skipped,      // Already exists remotely (409) or no action needed
+    Error,        // Last sync attempt failed
+}
+
+impl Default for FileStatus {
+    fn default() -> Self {
+        FileStatus::InSync
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,16 +68,59 @@ pub struct CachedDocument {
     pub body_hash: String,
     pub file_size_bytes: u64,
     pub cached_at: String,
+    #[serde(default)]
+    pub sync_status: FileStatus,
+    #[serde(default)]
+    pub error_message: Option<String>,
+    /// Document publish status on the server: "draft", "published", "retracted"
+    #[serde(default)]
+    pub document_status: Option<String>,
 }
 
 /// Document info returned from Wire API
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocumentInfo {
     pub id: String,
     pub body_hash: String,
     pub source_path: Option<String>,
     pub title: Option<String>,
     pub status: Option<String>,
+    pub format: Option<String>,
+    #[serde(default)]
+    pub family_id: Option<String>,
+    #[serde(default)]
+    pub version_number: Option<i32>,
+    #[serde(default)]
+    pub updated_at: Option<String>,
+}
+
+impl DocumentInfo {
+    /// Get the effective local path for this document.
+    /// Falls back to generating a filename from the title or document ID.
+    pub fn effective_path(&self) -> String {
+        if let Some(ref p) = self.source_path {
+            if !p.is_empty() {
+                return p.clone();
+            }
+        }
+        // Generate filename from title or ID
+        let base = self.title.as_deref().unwrap_or(&self.id);
+        let slug: String = base.chars()
+            .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '-' })
+            .collect::<String>()
+            .trim_matches('-')
+            .to_string();
+        let slug = if slug.is_empty() { self.id.clone() } else { slug };
+        // Add extension based on format
+        let ext = match self.format.as_deref() {
+            Some("text/markdown") => ".md",
+            Some("text/html") => ".html",
+            Some("text/plain") => ".txt",
+            Some("application/pdf") => ".pdf",
+            _ => ".md",
+        };
+        if slug.ends_with(ext) { slug } else { format!("{}{}", slug, ext) }
+    }
 }
 
 /// Diff result for a single corpus
@@ -53,6 +129,7 @@ pub struct SyncDiff {
     pub to_push: Vec<LocalDocument>,    // local files not on server
     pub to_pull: Vec<DocumentInfo>,     // server docs not on local
     pub to_update: Vec<(LocalDocument, DocumentInfo)>,  // local files with different hash
+    pub hash_matched: Vec<(LocalDocument, DocumentInfo)>,  // local files matched to remote by body_hash (path mismatch)
 }
 
 /// Local document found via directory walking
@@ -62,6 +139,65 @@ pub struct LocalDocument {
     pub relative_path: String,
     pub body_hash: String,
     pub size: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VersionInfo {
+    pub id: String,
+    pub family_id: Option<String>,
+    pub version_number: i32,
+    pub title: Option<String>,
+    pub status: String,
+    pub body_hash: String,
+    pub word_count: Option<i32>,
+    pub format: Option<String>,
+    pub source_path: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VersionHistoryResponse {
+    pub family_id: String,
+    pub document_id: String,
+    pub total_versions: i32,
+    pub versions: Vec<VersionInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiffHunk {
+    pub tag: String,       // "equal", "insert", "delete"
+    pub content: String,
+    pub old_offset: Option<usize>,
+    pub new_offset: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConflictInfo {
+    pub source_path: String,
+    pub corpus_slug: String,
+    pub local_hash: String,
+    pub remote_hash: String,
+    pub local_mtime: Option<String>,
+    pub remote_updated_at: Option<String>,
+}
+
+// --- Persistence ------------------------------------------------------------
+
+/// Save sync state to disk
+pub fn save_sync_state(data_dir: &Path, state: &SyncState) {
+    let path = data_dir.join("sync_state.json");
+    if let Ok(json) = serde_json::to_string_pretty(state) {
+        let _ = std::fs::write(&path, json);
+        tracing::debug!("Sync state saved ({} linked folders)", state.linked_folders.len());
+    }
+}
+
+/// Load sync state from disk
+pub fn load_sync_state(data_dir: &Path) -> Option<SyncState> {
+    let path = data_dir.join("sync_state.json");
+    let data = std::fs::read_to_string(&path).ok()?;
+    serde_json::from_str(&data).ok()
 }
 
 // --- Folder Linking ---------------------------------------------------------
@@ -175,6 +311,19 @@ pub fn scan_local_folder(folder_path: &str) -> Result<Vec<LocalDocument>, String
         }
         if entry.file_type().is_file() {
             let path = entry.path().to_path_buf();
+
+            // Skip hidden/system files
+            let file_name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            if file_name.starts_with('.') || file_name == "Thumbs.db" || file_name == "desktop.ini" {
+                continue;
+            }
+
+            // Skip .versions directory (used for pinned version archives)
+            let path_str = path.to_string_lossy();
+            if path_str.contains("/.versions/") || path_str.contains("\\.versions\\") {
+                continue;
+            }
+
             let relative_path = path.strip_prefix(root)
                 .unwrap_or(&path)
                 .to_string_lossy()
@@ -207,8 +356,12 @@ pub fn compute_diff(
     local_docs: &[LocalDocument],
     remote_docs: &[DocumentInfo],
 ) -> SyncDiff {
-    let remote_by_path: HashMap<&str, &DocumentInfo> = remote_docs.iter()
-        .filter_map(|d| d.source_path.as_deref().map(|p| (p, d)))
+    // Build remote lookup using effective_path (handles missing source_path)
+    let remote_paths: Vec<(String, &DocumentInfo)> = remote_docs.iter()
+        .map(|d| (d.effective_path(), d))
+        .collect();
+    let remote_by_path: HashMap<&str, &DocumentInfo> = remote_paths.iter()
+        .map(|(p, d)| (p.as_str(), *d))
         .collect();
 
     let local_by_path: HashMap<&str, &LocalDocument> = local_docs.iter()
@@ -217,30 +370,69 @@ pub fn compute_diff(
 
     let mut to_push = Vec::new();
     let mut to_update = Vec::new();
+    // Track which remote docs were matched by path so we can do hash fallback on the rest
+    let mut matched_remote_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut unmatched_local: Vec<LocalDocument> = Vec::new();
 
     for local_doc in local_docs {
         match remote_by_path.get(local_doc.relative_path.as_str()) {
             Some(remote_doc) => {
+                matched_remote_ids.insert(remote_doc.id.as_str());
                 if local_doc.body_hash != remote_doc.body_hash {
                     to_update.push((local_doc.clone(), (*remote_doc).clone()));
                 }
             }
             None => {
-                to_push.push(local_doc.clone());
+                unmatched_local.push(local_doc.clone());
             }
         }
     }
 
+    // Build a set of body_hash -> DocumentInfo for unmatched remote docs (hash-based fallback)
+    let unmatched_remote: Vec<&DocumentInfo> = remote_docs.iter()
+        .filter(|d| !matched_remote_ids.contains(d.id.as_str()))
+        .collect();
+    let mut remote_by_hash: HashMap<&str, &DocumentInfo> = HashMap::new();
+    for doc in &unmatched_remote {
+        // First match wins; duplicates are ignored
+        remote_by_hash.entry(doc.body_hash.as_str()).or_insert(doc);
+    }
+
+    // Collect local file hashes for the pull-side fallback
+    let local_hashes: std::collections::HashSet<&str> = local_docs.iter()
+        .map(|d| d.body_hash.as_str())
+        .collect();
+
+    // Hash-based fallback for unmatched local files
+    let mut hash_matched_remote_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut hash_matched: Vec<(LocalDocument, DocumentInfo)> = Vec::new();
+    for local_doc in unmatched_local {
+        if let Some(remote_doc) = remote_by_hash.get(local_doc.body_hash.as_str()) {
+            // Same content exists on server — treat as in sync (path mismatch only)
+            hash_matched_remote_ids.insert(remote_doc.id.as_str());
+            tracing::debug!(
+                "Hash fallback match: local '{}' == remote '{}' (hash {})",
+                local_doc.relative_path, remote_doc.id, &local_doc.body_hash[..12]
+            );
+            hash_matched.push((local_doc, (*remote_doc).clone()));
+        } else {
+            to_push.push(local_doc);
+        }
+    }
+
+    // Pull: remote docs whose effective_path doesn't exist locally,
+    // excluding those matched by hash fallback (content already exists locally)
     let to_pull: Vec<DocumentInfo> = remote_docs.iter()
         .filter(|d| {
-            d.source_path.as_deref()
-                .map(|p| !local_by_path.contains_key(p))
-                .unwrap_or(false)
+            let path = d.effective_path();
+            !local_by_path.contains_key(path.as_str())
+                && !hash_matched_remote_ids.contains(d.id.as_str())
+                && !local_hashes.contains(d.body_hash.as_str())
         })
         .cloned()
         .collect();
 
-    SyncDiff { to_push, to_pull, to_update }
+    SyncDiff { to_push, to_pull, to_update, hash_matched }
 }
 
 /// Push a new document to the Wire API
@@ -352,9 +544,10 @@ pub async fn pull_document(
     access_token: &str,
     doc: &DocumentInfo,
     sync_root: &Path,
+    corpus_slug: &str,
 ) -> Result<CachedDocument, String> {
-    let source_path = doc.source_path.as_deref()
-        .ok_or_else(|| "Document has no source_path".to_string())?;
+    let effective = doc.effective_path();
+    let source_path = effective.as_str();
 
     // Reject any source_path containing ".." segments
     if source_path.split('/').any(|seg| seg == "..") || source_path.split('\\').any(|seg| seg == "..") {
@@ -435,11 +628,14 @@ pub async fn pull_document(
 
     Ok(CachedDocument {
         document_id: doc.id.clone(),
-        corpus_slug: String::new(),
+        corpus_slug: corpus_slug.to_string(),
         source_path: source_path.to_string(),
         body_hash: actual_hash,
         file_size_bytes: file_size,
         cached_at: chrono::Utc::now().to_rfc3339(),
+        sync_status: FileStatus::InSync,
+        error_message: None,
+        document_status: doc.status.clone(),
     })
 }
 
@@ -611,4 +807,130 @@ pub async fn delete_cached_document_by_id(
             Ok(())
         }
     }
+}
+
+// --- Version History --------------------------------------------------------
+
+pub async fn fetch_version_history(
+    api_url: &str,
+    access_token: &str,
+    document_id: &str,
+) -> Result<VersionHistoryResponse, String> {
+    let client = reqwest::Client::new();
+    let url = format!("{}/api/v1/wire/documents/{}/versions", api_url, document_id);
+
+    let resp = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {}", access_token))
+        .send()
+        .await
+        .map_err(|e| format!("Failed to fetch version history: {}", e))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(format!("Version history request failed ({}): {}", status, text));
+    }
+
+    resp.json::<VersionHistoryResponse>()
+        .await
+        .map_err(|e| format!("Failed to parse version history: {}", e))
+}
+
+pub async fn create_version(
+    api_url: &str,
+    access_token: &str,
+    original_doc_id: &str,
+    body: &str,
+    source_path: &str,
+) -> Result<String, String> {
+    let client = reqwest::Client::new();
+    let url = format!("{}/api/v1/wire/documents/version", api_url);
+
+    let payload = serde_json::json!({
+        "original_document_id": original_doc_id,
+        "body": body,
+        "source_path": source_path,
+    });
+
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", access_token))
+        .header("Content-Type", "application/json")
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|e| format!("Version creation failed: {}", e))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(format!("Version creation failed ({}): {}", status, text));
+    }
+
+    let result: serde_json::Value = resp.json().await
+        .map_err(|e| format!("Failed to parse version response: {}", e))?;
+
+    result["id"].as_str()
+        .map(|s| s.to_string())
+        .ok_or_else(|| "No id in version response".to_string())
+}
+
+// --- Word Diff --------------------------------------------------------------
+
+pub fn compute_word_diff(old_text: &str, new_text: &str) -> Vec<DiffHunk> {
+    use similar::{ChangeTag, TextDiff};
+
+    let diff = TextDiff::configure()
+        .timeout(std::time::Duration::from_secs(5))
+        .diff_words(old_text, new_text);
+
+    let mut hunks = Vec::new();
+    let mut old_offset = 0usize;
+    let mut new_offset = 0usize;
+
+    for change in diff.iter_all_changes() {
+        let tag = match change.tag() {
+            ChangeTag::Equal => "equal",
+            ChangeTag::Insert => "insert",
+            ChangeTag::Delete => "delete",
+        };
+
+        let content = change.value().to_string();
+        let len = content.len();
+
+        hunks.push(DiffHunk {
+            tag: tag.to_string(),
+            content,
+            old_offset: Some(old_offset),
+            new_offset: Some(new_offset),
+        });
+
+        match change.tag() {
+            ChangeTag::Equal => {
+                old_offset += len;
+                new_offset += len;
+            }
+            ChangeTag::Delete => {
+                old_offset += len;
+            }
+            ChangeTag::Insert => {
+                new_offset += len;
+            }
+        }
+    }
+
+    // Merge consecutive equal hunks to reduce payload size
+    let mut merged: Vec<DiffHunk> = Vec::new();
+    for hunk in hunks {
+        if let Some(last) = merged.last_mut() {
+            if last.tag == "equal" && hunk.tag == "equal" {
+                last.content.push_str(&hunk.content);
+                continue;
+            }
+        }
+        merged.push(hunk);
+    }
+
+    merged
 }

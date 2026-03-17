@@ -54,6 +54,7 @@ function formatCurrentValue(id: string, value: number): string {
 export function TunnelStatus({ credits, tunnelStatus }: TunnelStatusProps) {
     const totalServed = credits?.documents_served || 0;
     const creditsEarned = credits?.credits_earned || 0;
+    const serverBalance = credits?.server_credit_balance || 0;
     const uptime = credits?.session_uptime || "0m";
     const firstStarted = credits?.first_started_at;
     const tunnelUrl = tunnelStatus?.tunnel_url;
@@ -81,7 +82,7 @@ export function TunnelStatus({ credits, tunnelStatus }: TunnelStatusProps) {
                 </div>
                 <div className="tier-name">Wire Node</div>
                 <div className="tier-served">{totalServed.toLocaleString()} documents served</div>
-                <div className="tier-credits">{creditsEarned.toFixed(2)} credits earned</div>
+                <div className="tier-credits">{Math.floor(serverBalance > 0 ? serverBalance : creditsEarned)} credits earned</div>
             </div>
 
             {/* Tunnel Info */}

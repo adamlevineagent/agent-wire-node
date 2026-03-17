@@ -25,6 +25,8 @@ export interface CreditStats {
     total_uptime_seconds: number;
     first_started_at: string | null;
     achievements: Achievement[];
+    recent_events: ServeEvent[];
+    server_credit_balance: number;
 }
 
 export interface Achievement {
@@ -40,7 +42,7 @@ export interface Achievement {
 
 export interface LinkedFolder {
     corpus_slug: string;
-    direction: "Upload" | "Download";
+    direction: "Upload" | "Download" | "Both";
 }
 
 export interface SyncState {
@@ -49,7 +51,52 @@ export interface SyncState {
     total_size_bytes: number;
     last_sync_at: string | null;
     is_syncing: boolean;
+    auto_sync_enabled: boolean;
+    auto_sync_interval_secs: number;
+    sync_progress: string | null;
+    pinned_versions: string[];
+    storage_quota_mb: number;
+    conflicts: ConflictInfo[];
 }
+
+export interface ConflictInfo {
+    source_path: string;
+    corpus_slug: string;
+    local_hash: string;
+    remote_hash: string;
+    local_mtime: string | null;
+    remote_updated_at: string | null;
+}
+
+export interface VersionInfo {
+    id: string;
+    family_id: string | null;
+    version_number: number;
+    title: string | null;
+    status: string;
+    body_hash: string;
+    word_count: number | null;
+    format: string | null;
+    source_path: string | null;
+    created_at: string;
+    updated_at: string;
+}
+
+export interface VersionHistoryResponse {
+    family_id: string;
+    document_id: string;
+    total_versions: number;
+    versions: VersionInfo[];
+}
+
+export interface DiffHunk {
+    tag: "equal" | "insert" | "delete";
+    content: string;
+    old_offset: number | null;
+    new_offset: number | null;
+}
+
+export type FileStatus = "InSync" | "NeedsPull" | "NeedsPush" | "Pulling" | "Pushing" | "Skipped" | "Error";
 
 export interface CachedDocument {
     document_id: string;
@@ -58,6 +105,9 @@ export interface CachedDocument {
     body_hash: string;
     file_size_bytes: number;
     cached_at: string;
+    sync_status: FileStatus;
+    error_message: string | null;
+    document_status: string | null; // "draft" | "published" | "retracted"
 }
 
 export interface ServeEvent {
@@ -72,8 +122,10 @@ export interface ServeEvent {
 export function Dashboard({ authState }: DashboardProps) {
     const [credits, setCredits] = useState<CreditStats | null>(null);
     const [syncState, setSyncState] = useState<SyncState | null>(null);
-    const [syncing, setSyncing] = useState(false);
     const [activeTab, setActiveTab] = useState<"impact" | "feed" | "sync">("impact");
+
+    // Derive syncing from backend state (updated by polling)
+    const syncing = syncState?.is_syncing ?? false;
 
     // Poll for credit stats + sync status every 2 seconds
     useEffect(() => {
@@ -96,16 +148,12 @@ export function Dashboard({ authState }: DashboardProps) {
     }, []);
 
     const handleSync = useCallback(async () => {
-        setSyncing(true);
         try {
             await invoke("sync_content");
-            const sync = await invoke<SyncState>("get_sync_status");
-            setSyncState(sync);
         } catch (err) {
             console.error("Sync failed:", err);
-        } finally {
-            setSyncing(false);
         }
+        // State will be updated by the 2-second polling interval
     }, []);
 
     return (

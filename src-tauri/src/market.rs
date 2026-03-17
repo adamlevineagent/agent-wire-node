@@ -42,6 +42,21 @@ pub struct MarketOpportunity {
     pub body_hash: String,
 }
 
+/// Load market state from disk
+pub fn load_market_state(data_dir: &Path) -> Option<MarketState> {
+    let path = data_dir.join("market_state.json");
+    let data = std::fs::read_to_string(&path).ok()?;
+    serde_json::from_str(&data).ok()
+}
+
+/// Save market state to disk
+pub fn save_market_state(data_dir: &Path, state: &MarketState) {
+    let path = data_dir.join("market_state.json");
+    if let Ok(json) = serde_json::to_string(state) {
+        let _ = std::fs::write(&path, json);
+    }
+}
+
 /// Evaluate market opportunities and decide what to host/drop
 pub async fn evaluate_opportunities(
     api_url: &str,

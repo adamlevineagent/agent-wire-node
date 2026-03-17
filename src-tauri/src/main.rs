@@ -19,7 +19,7 @@ use tokio::io::AsyncBufReadExt;
 
 use wire_node_lib::{
     AppState, WireNodeConfig, SharedState,
-    auth, sync, server, credits, tunnel, messaging, market, retention,
+    auth, sync, server, credits, tunnel, messaging, market, retention, work,
 };
 
 // --- Auth Token Helper ------------------------------------------------------
@@ -38,7 +38,8 @@ async fn send_magic_link(
     state: tauri::State<'_, SharedState>,
     email: String,
 ) -> Result<(), String> {
-    let config = &state.config;
+    let config = state.config.read().await;
+    let config = &*config;
     auth::send_magic_link(
         &config.supabase_url,
         &config.supabase_anon_key,
@@ -53,7 +54,8 @@ async fn verify_magic_link(
     magic_link_url: String,
     email: String,
 ) -> Result<String, String> {
-    let config = &state.config;
+    let config = state.config.read().await;
+    let config = &*config;
     let auth_state = auth::verify_magic_link_token(
         &config.supabase_url,
         &config.supabase_anon_key,
@@ -105,6 +107,12 @@ async fn verify_magic_link(
         }
     }
 
+    // Auto-acquire operator session (best-effort, don't block login)
+    {
+        let state_ref: &AppState = &state;
+        try_acquire_operator_session(state_ref).await;
+    }
+
     tracing::info!("Wire Node loaded, ready to serve");
     Ok(user_id)
 }
@@ -115,7 +123,8 @@ async fn verify_otp(
     email: String,
     otp_code: String,
 ) -> Result<String, String> {
-    let config = &state.config;
+    let config = state.config.read().await;
+    let config = &*config;
     let auth_state = auth::verify_otp(
         &config.supabase_url,
         &config.supabase_anon_key,
@@ -167,6 +176,12 @@ async fn verify_otp(
         }
     }
 
+    // Auto-acquire operator session (best-effort, don't block login)
+    {
+        let state_ref: &AppState = &state;
+        try_acquire_operator_session(state_ref).await;
+    }
+
     tracing::info!("OTP verified, Wire Node loaded");
     Ok(user_id)
 }
@@ -177,7 +192,8 @@ async fn login(
     email: String,
     password: String,
 ) -> Result<String, String> {
-    let config = &state.config;
+    let config = state.config.read().await;
+    let config = &*config;
     let auth_state = auth::login(
         &config.supabase_url,
         &config.supabase_anon_key,
@@ -229,7 +245,130 @@ async fn login(
         }
     }
 
+    // Auto-acquire operator session (best-effort, don't block login)
+    {
+        let state_ref: &AppState = &state;
+        try_acquire_operator_session(state_ref).await;
+    }
+
     Ok(user_id)
+}
+
+// --- Operator Session Commands -----------------------------------------------
+
+/// Acquire an operator session from the Wire API using the current Supabase access token
+#[tauri::command]
+async fn get_operator_session(state: tauri::State<'_, SharedState>) -> Result<serde_json::Value, String> {
+    let auth = state.auth.read().await;
+    let access_token = auth.access_token.clone()
+        .ok_or("Not authenticated")?;
+    let config = state.config.read().await;
+    let api_url = config.api_url.clone();
+    drop(config);
+    drop(auth);
+
+    let client = reqwest::Client::new();
+    let resp = client.post(format!("{}/api/v1/operator/auth/session", api_url))
+        .header("Authorization", format!("Bearer {}", access_token))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if !resp.status().is_success() {
+        return Err(format!("Session endpoint returned {}", resp.status()));
+    }
+
+    let body: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+
+    // Store in auth state
+    let mut auth = state.auth.write().await;
+    auth.operator_session_token = body["session_token"].as_str().map(String::from);
+    auth.operator_id = body["operator_id"].as_str().map(String::from);
+    auth.operator_session_expires_at = body["expires_at"].as_str().map(String::from);
+
+    // Save to session file
+    let config = state.config.read().await;
+    save_session(&config, &auth);
+
+    Ok(body)
+}
+
+/// Make an authenticated API call using the operator session token
+#[tauri::command]
+async fn operator_api_call(
+    state: tauri::State<'_, SharedState>,
+    method: String,
+    path: String,
+    body: Option<serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    let auth = state.auth.read().await;
+    let token = auth.operator_session_token.clone()
+        .ok_or("No operator session")?;
+    let config = state.config.read().await;
+    let api_url = config.api_url.clone();
+    drop(config);
+    drop(auth);
+
+    let client = reqwest::Client::new();
+    let mut req = match method.as_str() {
+        "GET" => client.get(format!("{}{}", api_url, path)),
+        "POST" => client.post(format!("{}{}", api_url, path)),
+        "PATCH" => client.patch(format!("{}{}", api_url, path)),
+        "DELETE" => client.delete(format!("{}{}", api_url, path)),
+        _ => return Err("Invalid method".to_string()),
+    };
+    req = req.header("Authorization", format!("Bearer {}", token));
+    if let Some(b) = body {
+        req = req.json(&b);
+    }
+
+    let resp = req.send().await.map_err(|e| e.to_string())?;
+    let status = resp.status();
+    let result: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+
+    if !status.is_success() {
+        return Err(format!("API error {}: {}", status, result));
+    }
+
+    Ok(result)
+}
+
+/// Try to acquire an operator session (best-effort, non-blocking).
+/// Called after successful login/verify flows.
+async fn try_acquire_operator_session(state: &AppState) {
+    let auth = state.auth.read().await;
+    let access_token = match auth.access_token.clone() {
+        Some(t) => t,
+        None => return,
+    };
+    let config = state.config.read().await;
+    let api_url = config.api_url.clone();
+    drop(config);
+    drop(auth);
+
+    let client = reqwest::Client::new();
+    match client.post(format!("{}/api/v1/operator/auth/session", api_url))
+        .header("Authorization", format!("Bearer {}", access_token))
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            match resp.json::<serde_json::Value>().await {
+                Ok(body) => {
+                    let mut auth = state.auth.write().await;
+                    auth.operator_session_token = body["session_token"].as_str().map(String::from);
+                    auth.operator_id = body["operator_id"].as_str().map(String::from);
+                    auth.operator_session_expires_at = body["expires_at"].as_str().map(String::from);
+                    let config = state.config.read().await;
+                    save_session(&config, &auth);
+                    tracing::info!("Operator session acquired for {:?}", auth.operator_id);
+                }
+                Err(e) => tracing::warn!("Failed to parse operator session response: {}", e),
+            }
+        }
+        Ok(resp) => tracing::warn!("Operator session endpoint returned {}", resp.status()),
+        Err(e) => tracing::warn!("Failed to acquire operator session: {}", e),
+    }
 }
 
 #[tauri::command]
@@ -242,7 +381,8 @@ async fn get_auth_state(state: tauri::State<'_, SharedState>) -> Result<auth::Au
 async fn logout(state: tauri::State<'_, SharedState>) -> Result<(), String> {
     let mut auth = state.auth.write().await;
     *auth = auth::AuthState::default();
-    let session_path = session_file_path(&state.config);
+    let cfg = state.config.read().await;
+    let session_path = session_file_path(&cfg);
     let _ = std::fs::remove_file(&session_path);
     tracing::info!("Logged out, session cleared");
     Ok(())
@@ -250,7 +390,13 @@ async fn logout(state: tauri::State<'_, SharedState>) -> Result<(), String> {
 
 #[tauri::command]
 async fn get_config(state: tauri::State<'_, SharedState>) -> Result<WireNodeConfig, String> {
-    Ok(state.config.clone())
+    let mut cfg = state.config.read().await.clone();
+    // Overlay runtime values that aren't in the static config
+    let auth = state.auth.read().await;
+    if let Some(ref nid) = auth.node_id {
+        cfg.node_id = nid.clone();
+    }
+    Ok(cfg)
 }
 
 #[tauri::command]
@@ -270,8 +416,11 @@ async fn link_folder(
     corpus_slug: String,
     direction: sync::SyncDirection,
 ) -> Result<(), String> {
+    let cfg = state.config.read().await;
     let mut ss = state.sync_state.write().await;
-    sync::link_folder(&mut ss, &folder_path, &corpus_slug, direction)
+    sync::link_folder(&mut ss, &folder_path, &corpus_slug, direction)?;
+    sync::save_sync_state(&cfg.data_dir(), &ss);
+    Ok(())
 }
 
 #[tauri::command]
@@ -279,14 +428,117 @@ async fn unlink_folder(
     state: tauri::State<'_, SharedState>,
     folder_path: String,
 ) -> Result<(), String> {
+    let cfg = state.config.read().await;
     let mut ss = state.sync_state.write().await;
-    sync::unlink_folder(&mut ss, &folder_path)
+    sync::unlink_folder(&mut ss, &folder_path)?;
+    sync::save_sync_state(&cfg.data_dir(), &ss);
+    Ok(())
 }
 
 #[tauri::command]
 async fn get_sync_status(state: tauri::State<'_, SharedState>) -> Result<sync::SyncState, String> {
     let ss = state.sync_state.read().await;
     Ok(ss.clone())
+}
+
+#[derive(serde::Deserialize)]
+struct CorporaListResponse {
+    items: Vec<CorpusInfo>,
+}
+
+#[derive(serde::Deserialize, serde::Serialize, Clone, Debug)]
+struct CorpusInfo {
+    slug: String,
+    title: String,
+    visibility: Option<String>,
+    document_count: Option<i64>,
+}
+
+#[tauri::command]
+async fn list_my_corpora(state: tauri::State<'_, SharedState>) -> Result<Vec<CorpusInfo>, String> {
+    let api_token = get_api_token(&state.auth).await?;
+    let config = state.config.read().await;
+    let config = &*config;
+    let url = format!("{}/api/v1/wire/corpora?steward=me&limit=100", config.api_url);
+
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .header("Authorization", format!("Bearer {}", api_token))
+        .send()
+        .await
+        .map_err(|e| format!("Failed to fetch corpora: {}", e))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("Failed to list corpora ({status}): {body}"));
+    }
+
+    let parsed: CorporaListResponse = resp.json().await
+        .map_err(|e| format!("Failed to parse corpora response: {}", e))?;
+    Ok(parsed.items)
+}
+
+#[tauri::command]
+async fn list_public_corpora(state: tauri::State<'_, SharedState>) -> Result<Vec<CorpusInfo>, String> {
+    let api_token = get_api_token(&state.auth).await?;
+    let config = state.config.read().await;
+    let config = &*config;
+    let url = format!("{}/api/v1/wire/corpora?visibility=public&limit=50", config.api_url);
+
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .header("Authorization", format!("Bearer {}", api_token))
+        .send()
+        .await
+        .map_err(|e| format!("Failed to fetch public corpora: {}", e))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("Failed to list public corpora ({status}): {body}"));
+    }
+
+    let parsed: CorporaListResponse = resp.json().await
+        .map_err(|e| format!("Failed to parse public corpora response: {}", e))?;
+    Ok(parsed.items)
+}
+
+#[tauri::command]
+async fn create_corpus(
+    state: tauri::State<'_, SharedState>,
+    slug: String,
+    title: String,
+) -> Result<CorpusInfo, String> {
+    let api_token = get_api_token(&state.auth).await?;
+    let config = state.config.read().await;
+    let config = &*config;
+    let url = format!("{}/api/v1/wire/corpora", config.api_url);
+
+    let body = serde_json::json!({
+        "slug": slug,
+        "title": title,
+        "visibility": "private",
+        "material_class": "precursor",
+    });
+
+    let resp = reqwest::Client::new()
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", api_token))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to create corpus: {}", e))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("Failed to create corpus ({status}): {body}"));
+    }
+
+    let corpus: CorpusInfo = resp.json().await
+        .map_err(|e| format!("Failed to parse create corpus response: {}", e))?;
+    Ok(corpus)
 }
 
 #[tauri::command]
@@ -306,6 +558,14 @@ async fn get_market_surface(
 }
 
 #[tauri::command]
+async fn get_work_stats(
+    state: tauri::State<'_, SharedState>,
+) -> Result<work::WorkStats, String> {
+    let ws = state.work_stats.read().await;
+    Ok(ws.clone())
+}
+
+#[tauri::command]
 async fn retry_tunnel(state: tauri::State<'_, SharedState>) -> Result<String, String> {
     let api_token = get_api_token(&state.auth).await?;
 
@@ -315,12 +575,13 @@ async fn retry_tunnel(state: tauri::State<'_, SharedState>) -> Result<String, St
     };
     let nid = node_id.ok_or("No node_id - log in first")?;
 
-    let data_dir = state.config.data_dir();
+    let cfg = state.config.read().await;
+    let data_dir = cfg.data_dir();
     let tunnel_json = data_dir.join("tunnel.json");
     let _ = std::fs::remove_file(&tunnel_json);
 
     let tunnel_state = state.tunnel_state.clone();
-    let api_url = state.config.tunnel_api_url.clone();
+    let api_url = cfg.tunnel_api_url.clone();
 
     tracing::info!("Retrying tunnel provisioning...");
     start_tunnel_flow(tunnel_state, data_dir, &api_url, &api_token, &nid).await;
@@ -351,7 +612,8 @@ async fn get_messages(
     let api_token = get_api_token(&state.auth).await?;
     let auth = state.auth.read().await;
     let node_id = auth.node_id.as_deref().ok_or("No node registered")?;
-    messaging::get_messages(&state.config.api_url, &api_token, node_id).await
+    let cfg = state.config.read().await;
+    messaging::get_messages(&cfg.api_url, &api_token, node_id).await
 }
 
 #[tauri::command]
@@ -374,9 +636,10 @@ async fn send_message(
             let ss = state.sync_state.read().await;
             ss.last_sync_at.clone()
         };
+        let cfg = state.config.read().await;
         let health = messaging::check_health(
-            &state.config.cache_dir(),
-            state.config.storage_cap_gb,
+            &cfg.cache_dir(),
+            cfg.storage_cap_gb,
             tunnel_url.as_deref(),
             last_sync.as_deref(),
         ).await;
@@ -390,8 +653,9 @@ async fn send_message(
         None
     };
 
+    let cfg = state.config.read().await;
     messaging::send_message(
-        &state.config.api_url, &api_token, node_id,
+        &cfg.api_url, &api_token, node_id,
         &body, &message_type, subject.as_deref(), metadata,
     ).await
 }
@@ -402,7 +666,8 @@ async fn dismiss_message(
     message_id: String,
 ) -> Result<(), String> {
     let api_token = get_api_token(&state.auth).await?;
-    messaging::dismiss_message(&state.config.api_url, &api_token, &message_id).await
+    let cfg = state.config.read().await;
+    messaging::dismiss_message(&cfg.api_url, &api_token, &message_id).await
 }
 
 #[tauri::command]
@@ -417,9 +682,10 @@ async fn get_health_status(
         let ss = state.sync_state.read().await;
         ss.last_sync_at.clone()
     };
+    let cfg = state.config.read().await;
     Ok(messaging::check_health(
-        &state.config.cache_dir(),
-        state.config.storage_cap_gb,
+        &cfg.cache_dir(),
+        cfg.storage_cap_gb,
         tunnel_url.as_deref(),
         last_sync.as_deref(),
     ).await)
@@ -511,9 +777,11 @@ async fn do_sync(
     {
         let mut ss = sync_state.write().await;
         ss.is_syncing = true;
+        ss.sync_progress = Some("Checking...".to_string());
     }
 
-    let mut all_cached: Vec<sync::CachedDocument> = Vec::new();
+    // Note: we track state entirely in sync_state.cached_documents (updated per-file during sync)
+    // No separate all_cached vec needed.
 
     for (folder_path, linked) in &linked_folders {
         let corpus_slug = &linked.corpus_slug;
@@ -538,6 +806,17 @@ async fn do_sync(
             }
         };
 
+        // Deduplicate remote docs by effective_path — keep the latest version
+        // (prevents duplicate UI entries when multiple remote docs share a path)
+        let remote_docs = {
+            let mut seen: std::collections::HashMap<String, sync::DocumentInfo> = std::collections::HashMap::new();
+            for doc in remote_docs {
+                let path = doc.effective_path();
+                seen.entry(path).or_insert(doc);
+            }
+            seen.into_values().collect::<Vec<_>>()
+        };
+
         // Compute diff
         let diff = sync::compute_diff(&local_docs, &remote_docs);
 
@@ -546,54 +825,313 @@ async fn do_sync(
             corpus_slug, diff.to_push.len(), diff.to_pull.len(), diff.to_update.len()
         );
 
-        // Add already-in-sync documents to the cached list
-        for local_doc in &local_docs {
-            if let Some(remote_doc) = remote_docs.iter().find(|r| {
-                r.source_path.as_deref() == Some(local_doc.relative_path.as_str())
-                    && r.body_hash == local_doc.body_hash
-            }) {
-                all_cached.push(sync::CachedDocument {
-                    document_id: remote_doc.id.clone(),
-                    corpus_slug: corpus_slug.clone(),
-                    source_path: local_doc.relative_path.clone(),
-                    body_hash: local_doc.body_hash.clone(),
-                    file_size_bytes: local_doc.size,
-                    cached_at: chrono::Utc::now().to_rfc3339(),
-                });
-            }
-        }
+        // Build initial file list with statuses and push to sync_state immediately
+        // so the UI can show what's pending
+        {
+            let mut initial_docs: Vec<sync::CachedDocument> = Vec::new();
 
-        // Upload direction: push new and updated local files, skip pull
-        if *direction == sync::SyncDirection::Upload {
-            for local_doc in &diff.to_push {
-                match sync::push_document(&config.api_url, token, corpus_slug, local_doc).await {
-                    Ok(doc_id) => {
-                        all_cached.push(sync::CachedDocument {
-                            document_id: doc_id,
-                            corpus_slug: corpus_slug.clone(),
-                            source_path: local_doc.relative_path.clone(),
-                            body_hash: local_doc.body_hash.clone(),
-                            file_size_bytes: local_doc.size,
-                            cached_at: chrono::Utc::now().to_rfc3339(),
-                        });
-                    }
-                    Err(e) => tracing::warn!("Push failed for {}: {}", local_doc.relative_path, e),
-                }
-            }
-
-            for (local_doc, remote_doc) in &diff.to_update {
-                match sync::update_document(&config.api_url, token, &remote_doc.id, local_doc).await {
-                    Ok(_) => {
-                        all_cached.push(sync::CachedDocument {
+            // In-sync files
+            for local_doc in &local_docs {
+                let effective_paths: Vec<String> = remote_docs.iter().map(|r| r.effective_path()).collect();
+                if let Some((idx, _)) = effective_paths.iter().enumerate().find(|(_, p)| p.as_str() == local_doc.relative_path.as_str()) {
+                    let remote_doc = &remote_docs[idx];
+                    if local_doc.body_hash == remote_doc.body_hash {
+                        initial_docs.push(sync::CachedDocument {
                             document_id: remote_doc.id.clone(),
                             corpus_slug: corpus_slug.clone(),
                             source_path: local_doc.relative_path.clone(),
                             body_hash: local_doc.body_hash.clone(),
                             file_size_bytes: local_doc.size,
                             cached_at: chrono::Utc::now().to_rfc3339(),
+                            sync_status: sync::FileStatus::InSync,
+                            error_message: None,
+                            document_status: remote_doc.status.clone(),
                         });
                     }
-                    Err(e) => tracing::warn!("Update failed for {}: {}", local_doc.relative_path, e),
+                }
+            }
+
+            // Hash-matched files (same content, different path) — always InSync
+            for (local_doc, remote_doc) in &diff.hash_matched {
+                initial_docs.push(sync::CachedDocument {
+                    document_id: remote_doc.id.clone(),
+                    corpus_slug: corpus_slug.clone(),
+                    source_path: local_doc.relative_path.clone(),
+                    body_hash: local_doc.body_hash.clone(),
+                    file_size_bytes: local_doc.size,
+                    cached_at: chrono::Utc::now().to_rfc3339(),
+                    sync_status: sync::FileStatus::InSync,
+                    error_message: None,
+                    document_status: remote_doc.status.clone(),
+                });
+            }
+
+            // Files to pull — only relevant for Download/Both directions
+            if *direction != sync::SyncDirection::Upload {
+                for remote_doc in &diff.to_pull {
+                    initial_docs.push(sync::CachedDocument {
+                        document_id: remote_doc.id.clone(),
+                        corpus_slug: corpus_slug.clone(),
+                        source_path: remote_doc.effective_path(),
+                        body_hash: remote_doc.body_hash.clone(),
+                        file_size_bytes: 0,
+                        cached_at: String::new(),
+                        sync_status: sync::FileStatus::NeedsPull,
+                        error_message: None,
+                        document_status: remote_doc.status.clone(),
+                    });
+                }
+            }
+
+            // Files to push — only relevant for Upload/Both directions
+            if *direction != sync::SyncDirection::Download {
+                for local_doc in &diff.to_push {
+                    initial_docs.push(sync::CachedDocument {
+                        document_id: String::new(),
+                        corpus_slug: corpus_slug.clone(),
+                        source_path: local_doc.relative_path.clone(),
+                        body_hash: local_doc.body_hash.clone(),
+                        file_size_bytes: local_doc.size,
+                        cached_at: String::new(),
+                        sync_status: sync::FileStatus::NeedsPush,
+                        error_message: None,
+                        document_status: None, // not yet on server
+                    });
+                }
+            }
+
+            // Files to update (exist on both sides with different hashes)
+            for (local_doc, remote_doc) in &diff.to_update {
+                let status = match direction {
+                    sync::SyncDirection::Upload => sync::FileStatus::NeedsPush,
+                    sync::SyncDirection::Download => sync::FileStatus::NeedsPull,
+                    sync::SyncDirection::Both => sync::FileStatus::NeedsPush, // will be resolved during sync
+                };
+                initial_docs.push(sync::CachedDocument {
+                    document_id: remote_doc.id.clone(),
+                    corpus_slug: corpus_slug.clone(),
+                    source_path: local_doc.relative_path.clone(),
+                    body_hash: local_doc.body_hash.clone(),
+                    file_size_bytes: local_doc.size,
+                    cached_at: String::new(),
+                    sync_status: status,
+                    error_message: None,
+                    document_status: remote_doc.status.clone(),
+                });
+            }
+
+            // Deduplicate initial_docs by (source_path, corpus_slug)
+            {
+                let mut seen: std::collections::HashMap<(String, String), usize> = std::collections::HashMap::new();
+                for (i, doc) in initial_docs.iter().enumerate() {
+                    seen.insert((doc.source_path.clone(), doc.corpus_slug.clone()), i);
+                }
+                let mut keep_indices: Vec<usize> = seen.into_values().collect();
+                keep_indices.sort();
+                initial_docs = keep_indices.into_iter().map(|i| initial_docs[i].clone()).collect();
+            }
+
+            let total_actions = match direction {
+                sync::SyncDirection::Upload => diff.to_push.len() + diff.to_update.len(),
+                sync::SyncDirection::Download => diff.to_pull.len() + diff.to_update.len(),
+                sync::SyncDirection::Both => diff.to_pull.len() + diff.to_push.len() + diff.to_update.len(),
+            };
+            let mut ss = sync_state.write().await;
+            // Remove ONLY this corpus's entries, then add the new ones
+            // This preserves entries from other corpora/folders
+            ss.cached_documents.retain(|c| c.corpus_slug != *corpus_slug);
+            ss.cached_documents.extend(initial_docs);
+            ss.sync_progress = if total_actions > 0 {
+                Some(format!("0/{} synced", total_actions))
+            } else {
+                Some("All in sync".to_string())
+            };
+        }
+
+        // Now perform actual sync operations, updating state after each file
+
+        let total_actions = match direction {
+            sync::SyncDirection::Upload => diff.to_push.len() + diff.to_update.len(),
+            sync::SyncDirection::Download => diff.to_pull.len() + diff.to_update.len(),
+            sync::SyncDirection::Both => diff.to_pull.len() + diff.to_push.len() + diff.to_update.len(),
+        };
+        let mut completed = 0usize;
+        // Throttle delay between API calls to avoid rate limiting on large corpora
+        let throttle = std::time::Duration::from_millis(200);
+        // Track document IDs created/modified during this sync cycle so the
+        // "remotely deleted" check doesn't erroneously remove them
+        let mut synced_doc_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // Pre-populate with hash-matched doc IDs (content exists, path mismatched)
+        for (_local_doc, remote_doc) in &diff.hash_matched {
+            synced_doc_ids.insert(remote_doc.id.clone());
+        }
+        // Build a remote body_hash → document lookup so we can resolve 409s
+        let remote_by_hash: std::collections::HashMap<&str, &sync::DocumentInfo> = remote_docs.iter()
+            .map(|d| (d.body_hash.as_str(), d))
+            .collect();
+
+        // Upload direction: push new and updated local files, skip pull
+        if *direction == sync::SyncDirection::Upload {
+            for local_doc in &diff.to_push {
+                // Mark as Pushing
+                {
+                    let mut ss = sync_state.write().await;
+                    if let Some(cd) = ss.cached_documents.iter_mut().find(|c| c.source_path == local_doc.relative_path && c.corpus_slug == *corpus_slug) {
+                        cd.sync_status = sync::FileStatus::Pushing;
+                    }
+                    ss.sync_progress = Some(format!("Pushing {}", local_doc.relative_path));
+                }
+
+                tokio::time::sleep(throttle).await;
+                match sync::push_document(&config.api_url, token, corpus_slug, local_doc).await {
+                    Ok(doc_id) => {
+                        completed += 1;
+                        synced_doc_ids.insert(doc_id.clone());
+                        let cached = sync::CachedDocument {
+                            document_id: doc_id,
+                            corpus_slug: corpus_slug.clone(),
+                            source_path: local_doc.relative_path.clone(),
+                            body_hash: local_doc.body_hash.clone(),
+                            file_size_bytes: local_doc.size,
+                            cached_at: chrono::Utc::now().to_rfc3339(),
+                            sync_status: sync::FileStatus::InSync,
+                            error_message: None,
+                            document_status: Some("draft".to_string()),
+                        };
+                        {
+                            let mut ss = sync_state.write().await;
+                            if let Some(cd) = ss.cached_documents.iter_mut().find(|c| c.source_path == local_doc.relative_path && c.corpus_slug == *corpus_slug) {
+                                *cd = cached.clone();
+                            }
+                            ss.sync_progress = Some(format!("{}/{} synced", completed, total_actions));
+                        }
+                    }
+                    Err(e) => {
+                        completed += 1;
+                        let is_duplicate = e.contains("409") || e.contains("Duplicate");
+                        if is_duplicate {
+                            tracing::info!("Skipped {} (already exists remotely)", local_doc.relative_path);
+                            // Resolve the matching remote doc by body_hash so we can mark InSync
+                            let resolved_id = remote_by_hash.get(local_doc.body_hash.as_str())
+                                .map(|rd| rd.id.clone())
+                                .unwrap_or_default();
+                            if !resolved_id.is_empty() {
+                                synced_doc_ids.insert(resolved_id.clone());
+                            }
+                            let mut ss = sync_state.write().await;
+                            if let Some(cd) = ss.cached_documents.iter_mut().find(|c| c.source_path == local_doc.relative_path && c.corpus_slug == *corpus_slug) {
+                                if !resolved_id.is_empty() {
+                                    // We found the remote doc — mark as InSync
+                                    cd.document_id = resolved_id;
+                                    cd.sync_status = sync::FileStatus::InSync;
+                                    cd.error_message = None;
+                                } else {
+                                    cd.sync_status = sync::FileStatus::Skipped;
+                                    cd.error_message = Some("Already exists on server".to_string());
+                                }
+                            }
+                        } else {
+                            tracing::warn!("Push failed for {}: {}", local_doc.relative_path, e);
+                            let mut ss = sync_state.write().await;
+                            if let Some(cd) = ss.cached_documents.iter_mut().find(|c| c.source_path == local_doc.relative_path && c.corpus_slug == *corpus_slug) {
+                                cd.sync_status = sync::FileStatus::Error;
+                                cd.error_message = Some(e.clone());
+                            }
+                        }
+                        {
+                            let mut ss = sync_state.write().await;
+                            ss.sync_progress = Some(format!("{}/{} synced", completed, total_actions));
+                        }
+                    }
+                }
+            }
+
+            for (local_doc, remote_doc) in &diff.to_update {
+                // Mark as Pushing
+                {
+                    let mut ss = sync_state.write().await;
+                    if let Some(cd) = ss.cached_documents.iter_mut().find(|c| c.source_path == local_doc.relative_path && c.corpus_slug == *corpus_slug) {
+                        cd.sync_status = sync::FileStatus::Pushing;
+                    }
+                    ss.sync_progress = Some(format!("Updating {}", local_doc.relative_path));
+                }
+
+                tokio::time::sleep(throttle).await;
+                match sync::update_document(&config.api_url, token, &remote_doc.id, local_doc).await {
+                    Ok(_) => {
+                        completed += 1;
+                        synced_doc_ids.insert(remote_doc.id.clone());
+                        let cached = sync::CachedDocument {
+                            document_id: remote_doc.id.clone(),
+                            corpus_slug: corpus_slug.clone(),
+                            source_path: local_doc.relative_path.clone(),
+                            body_hash: local_doc.body_hash.clone(),
+                            file_size_bytes: local_doc.size,
+                            cached_at: chrono::Utc::now().to_rfc3339(),
+                            sync_status: sync::FileStatus::InSync,
+                            error_message: None,
+                            document_status: remote_doc.status.clone(),
+                        };
+                        {
+                            let mut ss = sync_state.write().await;
+                            if let Some(cd) = ss.cached_documents.iter_mut().find(|c| c.source_path == local_doc.relative_path && c.corpus_slug == *corpus_slug) {
+                                *cd = cached.clone();
+                            }
+                            ss.sync_progress = Some(format!("{}/{} synced", completed, total_actions));
+                        }
+                    }
+                    Err(e) => {
+                        // If PATCH fails (e.g., published doc), try creating a version instead
+                        if e.contains("Cannot modify body") || e.contains("403") {
+                            tracing::info!("Document {} is published, creating new version", remote_doc.id);
+                            let local_path = std::path::Path::new(folder_path).join(&local_doc.relative_path);
+                            if let Ok(body) = std::fs::read_to_string(&local_path) {
+                                match sync::create_version(&config.api_url, token, &remote_doc.id, &body, local_doc.relative_path.as_str()).await {
+                                    Ok(new_id) => {
+                                        completed += 1;
+                                        synced_doc_ids.insert(new_id.clone());
+                                        let cached = sync::CachedDocument {
+                                            document_id: new_id,
+                                            corpus_slug: corpus_slug.clone(),
+                                            source_path: local_doc.relative_path.clone(),
+                                            body_hash: local_doc.body_hash.clone(),
+                                            file_size_bytes: local_doc.size,
+                                            cached_at: chrono::Utc::now().to_rfc3339(),
+                                            sync_status: sync::FileStatus::InSync,
+                                            error_message: None,
+                                            document_status: Some("draft".to_string()),
+                                        };
+                                        {
+                                            let mut ss = sync_state.write().await;
+                                            if let Some(cd) = ss.cached_documents.iter_mut().find(|c| c.source_path == local_doc.relative_path && c.corpus_slug == *corpus_slug) {
+                                                *cd = cached.clone();
+                                            }
+                                            ss.sync_progress = Some(format!("{}/{} synced", completed, total_actions));
+                                        }
+                                        // State already updated in ss.cached_documents above
+                                    }
+                                    Err(ve) => {
+                                        tracing::warn!("Version creation failed for {}: {}", remote_doc.id, ve);
+                                        completed += 1;
+                                        let mut ss = sync_state.write().await;
+                                        if let Some(cd) = ss.cached_documents.iter_mut().find(|c| c.source_path == local_doc.relative_path && c.corpus_slug == *corpus_slug) {
+                                            cd.sync_status = sync::FileStatus::Error;
+                                            cd.error_message = Some(ve);
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            tracing::warn!("Update failed for {}: {}", local_doc.relative_path, e);
+                            completed += 1;
+                            let mut ss = sync_state.write().await;
+                            if let Some(cd) = ss.cached_documents.iter_mut().find(|c| c.source_path == local_doc.relative_path && c.corpus_slug == *corpus_slug) {
+                                cd.sync_status = sync::FileStatus::Error;
+                                cd.error_message = Some(e.clone());
+                            }
+                            ss.sync_progress = Some(format!("{}/{} synced", completed, total_actions));
+                        }
+                    }
                 }
             }
         }
@@ -602,26 +1140,433 @@ async fn do_sync(
         if *direction == sync::SyncDirection::Download {
             let sync_root = std::path::Path::new(folder_path);
             for remote_doc in &diff.to_pull {
-                match sync::pull_document(&config.api_url, token, remote_doc, sync_root).await {
-                    Ok(cached) => {
-                        all_cached.push(sync::CachedDocument {
-                            corpus_slug: corpus_slug.clone(),
-                            ..cached
-                        });
+                let effective = remote_doc.effective_path();
+                // Mark as Pulling
+                {
+                    let mut ss = sync_state.write().await;
+                    if let Some(cd) = ss.cached_documents.iter_mut().find(|c| c.source_path == effective && c.corpus_slug == *corpus_slug) {
+                        cd.sync_status = sync::FileStatus::Pulling;
                     }
-                    Err(e) => tracing::warn!("Pull failed for {}: {}", remote_doc.id, e),
+                    ss.sync_progress = Some(format!("Pulling {}", effective));
                 }
+
+                tokio::time::sleep(throttle).await;
+                match sync::pull_document(&config.api_url, token, remote_doc, sync_root, corpus_slug).await {
+                    Ok(cached) => {
+                        completed += 1;
+                        let cached = sync::CachedDocument {
+                            corpus_slug: corpus_slug.clone(),
+                            sync_status: sync::FileStatus::InSync,
+                            error_message: None,
+                            ..cached
+                        };
+                        // Update in sync_state immediately
+                        {
+                            let mut ss = sync_state.write().await;
+                            if let Some(cd) = ss.cached_documents.iter_mut().find(|c| c.source_path == cached.source_path && c.corpus_slug == *corpus_slug) {
+                                *cd = cached.clone();
+                            }
+                            ss.sync_progress = Some(format!("{}/{} synced", completed, total_actions));
+                        }
+                        // State already updated in ss.cached_documents above
+                    }
+                    Err(e) => {
+                        tracing::warn!("Pull failed for {}: {}", remote_doc.id, e);
+                        completed += 1;
+                        let mut ss = sync_state.write().await;
+                        if let Some(cd) = ss.cached_documents.iter_mut().find(|c| c.source_path == effective && c.corpus_slug == *corpus_slug) {
+                            cd.sync_status = sync::FileStatus::Error;
+                            cd.error_message = Some(e.clone());
+                        }
+                        ss.sync_progress = Some(format!("{}/{} synced", completed, total_actions));
+                    }
+                }
+            }
+
+            // Handle updates in download direction too
+            for (_local_doc, remote_doc) in &diff.to_update {
+                let effective = remote_doc.effective_path();
+                {
+                    let mut ss = sync_state.write().await;
+                    if let Some(cd) = ss.cached_documents.iter_mut().find(|c| c.source_path == effective && c.corpus_slug == *corpus_slug) {
+                        cd.sync_status = sync::FileStatus::Pulling;
+                    }
+                    ss.sync_progress = Some(format!("Updating {}", effective));
+                }
+
+                tokio::time::sleep(throttle).await;
+                match sync::pull_document(&config.api_url, token, remote_doc, sync_root, corpus_slug).await {
+                    Ok(cached) => {
+                        completed += 1;
+                        let cached = sync::CachedDocument {
+                            corpus_slug: corpus_slug.clone(),
+                            sync_status: sync::FileStatus::InSync,
+                            error_message: None,
+                            ..cached
+                        };
+                        {
+                            let mut ss = sync_state.write().await;
+                            if let Some(cd) = ss.cached_documents.iter_mut().find(|c| c.source_path == cached.source_path && c.corpus_slug == *corpus_slug) {
+                                *cd = cached.clone();
+                            }
+                            ss.sync_progress = Some(format!("{}/{} synced", completed, total_actions));
+                        }
+                        // State already updated in ss.cached_documents above
+                    }
+                    Err(e) => {
+                        tracing::warn!("Pull update failed for {}: {}", remote_doc.id, e);
+                        completed += 1;
+                        let mut ss = sync_state.write().await;
+                        if let Some(cd) = ss.cached_documents.iter_mut().find(|c| c.source_path == effective && c.corpus_slug == *corpus_slug) {
+                            cd.sync_status = sync::FileStatus::Error;
+                            cd.error_message = Some(e.clone());
+                        }
+                        ss.sync_progress = Some(format!("{}/{} synced", completed, total_actions));
+                    }
+                }
+            }
+        }
+
+        // Bidirectional sync: push local-only, pull remote-only, resolve conflicts
+        if *direction == sync::SyncDirection::Both {
+            let sync_root = std::path::Path::new(folder_path);
+
+            // Phase 1: Push local-only files
+            for local_doc in &diff.to_push {
+                {
+                    let mut ss = sync_state.write().await;
+                    if let Some(cd) = ss.cached_documents.iter_mut().find(|c| c.source_path == local_doc.relative_path && c.corpus_slug == *corpus_slug) {
+                        cd.sync_status = sync::FileStatus::Pushing;
+                    }
+                    ss.sync_progress = Some(format!("Pushing {}", local_doc.relative_path));
+                }
+
+                tokio::time::sleep(throttle).await;
+                match sync::push_document(&config.api_url, token, corpus_slug, local_doc).await {
+                    Ok(doc_id) => {
+                        completed += 1;
+                        synced_doc_ids.insert(doc_id.clone());
+                        let cached = sync::CachedDocument {
+                            document_id: doc_id,
+                            corpus_slug: corpus_slug.clone(),
+                            source_path: local_doc.relative_path.clone(),
+                            body_hash: local_doc.body_hash.clone(),
+                            file_size_bytes: local_doc.size,
+                            cached_at: chrono::Utc::now().to_rfc3339(),
+                            sync_status: sync::FileStatus::InSync,
+                            error_message: None,
+                            document_status: Some("draft".to_string()),
+                        };
+                        {
+                            let mut ss = sync_state.write().await;
+                            if let Some(cd) = ss.cached_documents.iter_mut().find(|c| c.source_path == local_doc.relative_path && c.corpus_slug == *corpus_slug) {
+                                *cd = cached.clone();
+                            }
+                            ss.sync_progress = Some(format!("{}/{} synced", completed, total_actions));
+                        }
+                    }
+                    Err(e) => {
+                        completed += 1;
+                        let is_duplicate = e.contains("409") || e.contains("Duplicate");
+                        if is_duplicate {
+                            tracing::info!("Skipped {} (already exists remotely)", local_doc.relative_path);
+                            let resolved_id = remote_by_hash.get(local_doc.body_hash.as_str())
+                                .map(|rd| rd.id.clone())
+                                .unwrap_or_default();
+                            if !resolved_id.is_empty() {
+                                synced_doc_ids.insert(resolved_id.clone());
+                            }
+                            let mut ss = sync_state.write().await;
+                            if let Some(cd) = ss.cached_documents.iter_mut().find(|c| c.source_path == local_doc.relative_path && c.corpus_slug == *corpus_slug) {
+                                if !resolved_id.is_empty() {
+                                    cd.document_id = resolved_id;
+                                    cd.sync_status = sync::FileStatus::InSync;
+                                    cd.error_message = None;
+                                } else {
+                                    cd.sync_status = sync::FileStatus::Skipped;
+                                    cd.error_message = Some("Already exists on server".to_string());
+                                }
+                            }
+                        } else {
+                            tracing::warn!("Push failed for {}: {}", local_doc.relative_path, e);
+                            let mut ss = sync_state.write().await;
+                            if let Some(cd) = ss.cached_documents.iter_mut().find(|c| c.source_path == local_doc.relative_path && c.corpus_slug == *corpus_slug) {
+                                cd.sync_status = sync::FileStatus::Error;
+                                cd.error_message = Some(e.clone());
+                            }
+                        }
+                        {
+                            let mut ss = sync_state.write().await;
+                            ss.sync_progress = Some(format!("{}/{} synced", completed, total_actions));
+                        }
+                    }
+                }
+            }
+
+            // Phase 2: Pull remote-only files
+            for remote_doc in &diff.to_pull {
+                let effective = remote_doc.effective_path();
+                {
+                    let mut ss = sync_state.write().await;
+                    if let Some(cd) = ss.cached_documents.iter_mut().find(|c| c.source_path == effective && c.corpus_slug == *corpus_slug) {
+                        cd.sync_status = sync::FileStatus::Pulling;
+                    }
+                    ss.sync_progress = Some(format!("Pulling {}", effective));
+                }
+
+                tokio::time::sleep(throttle).await;
+                match sync::pull_document(&config.api_url, token, remote_doc, sync_root, corpus_slug).await {
+                    Ok(cached) => {
+                        completed += 1;
+                        let cached = sync::CachedDocument {
+                            corpus_slug: corpus_slug.clone(),
+                            sync_status: sync::FileStatus::InSync,
+                            error_message: None,
+                            ..cached
+                        };
+                        {
+                            let mut ss = sync_state.write().await;
+                            if let Some(cd) = ss.cached_documents.iter_mut().find(|c| c.source_path == cached.source_path && c.corpus_slug == *corpus_slug) {
+                                *cd = cached.clone();
+                            }
+                            ss.sync_progress = Some(format!("{}/{} synced", completed, total_actions));
+                        }
+                        // State already updated in ss.cached_documents above
+                    }
+                    Err(e) => {
+                        tracing::warn!("Pull failed for {}: {}", remote_doc.id, e);
+                        completed += 1;
+                        let effective = remote_doc.effective_path();
+                        let mut ss = sync_state.write().await;
+                        if let Some(cd) = ss.cached_documents.iter_mut().find(|c| c.source_path == effective && c.corpus_slug == *corpus_slug) {
+                            cd.sync_status = sync::FileStatus::Error;
+                            cd.error_message = Some(e.clone());
+                        }
+                        ss.sync_progress = Some(format!("{}/{} synced", completed, total_actions));
+                    }
+                }
+            }
+
+            // Phase 3: Handle conflicts (files that exist both sides with different hashes)
+            for (local_doc, remote_doc) in &diff.to_update {
+                let local_path = std::path::Path::new(folder_path).join(&local_doc.relative_path);
+                let local_mtime = std::fs::metadata(&local_path)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs());
+
+                // Parse remote updated_at if available
+                let remote_time = remote_doc.updated_at.as_ref()
+                    .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
+                    .map(|dt| dt.timestamp() as u64);
+
+                let pull_wins = match (local_mtime, remote_time) {
+                    (Some(local_t), Some(remote_t)) => remote_t > local_t,
+                    (None, Some(_)) => true,   // no local mtime, trust remote
+                    (Some(_), None) => false,   // no remote time, trust local
+                    (None, None) => true,       // default: server wins
+                };
+
+                if pull_wins {
+                    // Save local as .conflict before overwriting
+                    if local_path.exists() {
+                        let conflict_path = local_path.with_extension(
+                            format!("{}.conflict", local_path.extension().unwrap_or_default().to_string_lossy())
+                        );
+                        let _ = std::fs::copy(&local_path, &conflict_path);
+                    }
+
+                    // Pull remote version
+                    {
+                        let effective = remote_doc.effective_path();
+                        let mut ss = sync_state.write().await;
+                        if let Some(cd) = ss.cached_documents.iter_mut().find(|c| c.source_path == effective && c.corpus_slug == *corpus_slug) {
+                            cd.sync_status = sync::FileStatus::Pulling;
+                        }
+                        ss.sync_progress = Some(format!("Pulling {}", effective));
+                    }
+
+                    tokio::time::sleep(throttle).await;
+                match sync::pull_document(&config.api_url, token, remote_doc, sync_root, corpus_slug).await {
+                        Ok(cached) => {
+                            completed += 1;
+                            let cached = sync::CachedDocument {
+                                corpus_slug: corpus_slug.clone(),
+                                sync_status: sync::FileStatus::InSync,
+                                error_message: None,
+                                ..cached
+                            };
+                            {
+                                let mut ss = sync_state.write().await;
+                                if let Some(cd) = ss.cached_documents.iter_mut().find(|c| c.source_path == cached.source_path && c.corpus_slug == *corpus_slug) {
+                                    *cd = cached.clone();
+                                }
+                                ss.sync_progress = Some(format!("{}/{} synced", completed, total_actions));
+                            }
+                            // State already updated in ss.cached_documents above
+                        }
+                        Err(e) => {
+                            tracing::warn!("Pull failed for {}: {}", remote_doc.id, e);
+                            completed += 1;
+                            let effective = remote_doc.effective_path();
+                            let mut ss = sync_state.write().await;
+                            if let Some(cd) = ss.cached_documents.iter_mut().find(|c| c.source_path == effective && c.corpus_slug == *corpus_slug) {
+                                cd.sync_status = sync::FileStatus::Error;
+                                cd.error_message = Some(e.clone());
+                            }
+                            ss.sync_progress = Some(format!("{}/{} synced", completed, total_actions));
+                        }
+                    }
+                } else {
+                    // Push local version
+                    {
+                        let mut ss = sync_state.write().await;
+                        if let Some(cd) = ss.cached_documents.iter_mut().find(|c| c.source_path == local_doc.relative_path && c.corpus_slug == *corpus_slug) {
+                            cd.sync_status = sync::FileStatus::Pushing;
+                        }
+                        ss.sync_progress = Some(format!("Pushing {}", local_doc.relative_path));
+                    }
+
+                    tokio::time::sleep(throttle).await;
+                match sync::update_document(&config.api_url, token, &remote_doc.id, local_doc).await {
+                        Ok(_) => {
+                            completed += 1;
+                            let cached = sync::CachedDocument {
+                                document_id: remote_doc.id.clone(),
+                                corpus_slug: corpus_slug.clone(),
+                                source_path: local_doc.relative_path.clone(),
+                                body_hash: local_doc.body_hash.clone(),
+                                file_size_bytes: local_doc.size,
+                                cached_at: chrono::Utc::now().to_rfc3339(),
+                                sync_status: sync::FileStatus::InSync,
+                                error_message: None,
+                                document_status: remote_doc.status.clone(),
+                            };
+                            {
+                                let mut ss = sync_state.write().await;
+                                if let Some(cd) = ss.cached_documents.iter_mut().find(|c| c.source_path == local_doc.relative_path && c.corpus_slug == *corpus_slug) {
+                                    *cd = cached.clone();
+                                }
+                                ss.sync_progress = Some(format!("{}/{} synced", completed, total_actions));
+                            }
+                            // State already updated in ss.cached_documents above
+                        }
+                        Err(e) => {
+                            // If PATCH fails (e.g., published doc), try creating a version instead
+                            if e.contains("Cannot modify body") || e.contains("403") {
+                                tracing::info!("Document {} is published, creating new version", remote_doc.id);
+                                let local_body_path = std::path::Path::new(folder_path).join(&local_doc.relative_path);
+                                if let Ok(body) = std::fs::read_to_string(&local_body_path) {
+                                    match sync::create_version(&config.api_url, token, &remote_doc.id, &body, local_doc.relative_path.as_str()).await {
+                                        Ok(new_id) => {
+                                            completed += 1;
+                                            let cached = sync::CachedDocument {
+                                                document_id: new_id,
+                                                corpus_slug: corpus_slug.clone(),
+                                                source_path: local_doc.relative_path.clone(),
+                                                body_hash: local_doc.body_hash.clone(),
+                                                file_size_bytes: local_doc.size,
+                                                cached_at: chrono::Utc::now().to_rfc3339(),
+                                                sync_status: sync::FileStatus::InSync,
+                                                error_message: None,
+                                                document_status: Some("draft".to_string()),
+                                            };
+                                            {
+                                                let mut ss = sync_state.write().await;
+                                                if let Some(cd) = ss.cached_documents.iter_mut().find(|c| c.source_path == local_doc.relative_path && c.corpus_slug == *corpus_slug) {
+                                                    *cd = cached.clone();
+                                                }
+                                                ss.sync_progress = Some(format!("{}/{} synced", completed, total_actions));
+                                            }
+                                            // State already updated in ss.cached_documents above
+                                        }
+                                        Err(ve) => {
+                                            tracing::warn!("Version creation failed for {}: {}", remote_doc.id, ve);
+                                            completed += 1;
+                                            let mut ss = sync_state.write().await;
+                                            if let Some(cd) = ss.cached_documents.iter_mut().find(|c| c.source_path == local_doc.relative_path && c.corpus_slug == *corpus_slug) {
+                                                cd.sync_status = sync::FileStatus::Error;
+                                                cd.error_message = Some(ve);
+                                            }
+                                        }
+                                    }
+                                }
+                            } else {
+                                tracing::warn!("Update failed for {}: {}", local_doc.relative_path, e);
+                                completed += 1;
+                                let mut ss = sync_state.write().await;
+                                if let Some(cd) = ss.cached_documents.iter_mut().find(|c| c.source_path == local_doc.relative_path && c.corpus_slug == *corpus_slug) {
+                                    cd.sync_status = sync::FileStatus::Error;
+                                    cd.error_message = Some(e.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Detect remotely deleted documents — only meaningful for Download/Both directions
+        // For Upload dirs, the local folder is the source of truth, not the server.
+        // Also skip documents that were just created/synced during THIS cycle (not in pre-sync remote_paths).
+        if *direction != sync::SyncDirection::Upload {
+            let remote_paths: std::collections::HashSet<String> = remote_docs.iter()
+                .map(|d| d.effective_path())
+                .collect();
+
+            let mut ss = sync_state.write().await;
+            let before_len = ss.cached_documents.len();
+            ss.cached_documents.retain(|cd| {
+                if cd.corpus_slug == *corpus_slug && !cd.document_id.is_empty() {
+                    // Don't remove docs that were just synced in this cycle
+                    if synced_doc_ids.contains(&cd.document_id) {
+                        return true;
+                    }
+                    if !remote_paths.contains(&cd.source_path) {
+                        tracing::info!(
+                            "Document {} ({}) removed remotely, clearing from cache",
+                            cd.document_id, cd.source_path
+                        );
+                        return false;
+                    }
+                }
+                true
+            });
+            let removed = before_len - ss.cached_documents.len();
+            if removed > 0 {
+                tracing::info!("Filtered out {} remotely-deleted documents from corpus {}", removed, corpus_slug);
             }
         }
     }
 
-    let total_size = sync::get_cache_size(&config.cache_dir()).await;
+    // Compute total size from linked folders (not cache dir)
+    let mut total_size: u64 = 0;
+    for (folder_path, _) in &linked_folders {
+        let p = std::path::Path::new(folder_path);
+        if p.exists() {
+            total_size += sync::get_cache_size(p).await;
+        }
+    }
+
     {
         let mut ss = sync_state.write().await;
-        ss.cached_documents = all_cached;
+
+        // Final dedup of cached_documents by (source_path, corpus_slug) — keep last
+        {
+            let mut seen: std::collections::HashMap<(String, String), usize> = std::collections::HashMap::new();
+            for (i, doc) in ss.cached_documents.iter().enumerate() {
+                seen.insert((doc.source_path.clone(), doc.corpus_slug.clone()), i);
+            }
+            let mut keep_indices: Vec<usize> = seen.into_values().collect();
+            keep_indices.sort();
+            ss.cached_documents = keep_indices.into_iter().map(|i| ss.cached_documents[i].clone()).collect();
+        }
+
         ss.total_size_bytes = total_size;
         ss.last_sync_at = Some(chrono::Utc::now().to_rfc3339());
         ss.is_syncing = false;
+        ss.sync_progress = None;
+        sync::save_sync_state(&config.data_dir(), &ss);
     }
 
     tracing::info!("Sync complete");
@@ -631,7 +1576,276 @@ async fn do_sync(
 #[tauri::command]
 async fn sync_content(state: tauri::State<'_, SharedState>) -> Result<(), String> {
     let api_token = get_api_token(&state.auth).await?;
-    do_sync(&state.config, &api_token, &state.sync_state, &state.credits).await
+    let cfg = state.config.read().await;
+    do_sync(&cfg, &api_token, &state.sync_state, &state.credits).await
+}
+
+#[tauri::command]
+async fn set_auto_sync(
+    state: tauri::State<'_, SharedState>,
+    enabled: bool,
+    interval_secs: Option<u64>,
+) -> Result<(), String> {
+    let mut ss = state.sync_state.write().await;
+    ss.auto_sync_enabled = enabled;
+    if let Some(interval) = interval_secs {
+        ss.auto_sync_interval_secs = interval.max(60); // minimum 1 minute
+    }
+    let cfg = state.config.read().await;
+    sync::save_sync_state(&cfg.data_dir(), &ss);
+    tracing::info!("Auto-sync set: enabled={}, interval={}s", ss.auto_sync_enabled, ss.auto_sync_interval_secs);
+    Ok(())
+}
+
+// --- Version & Diff Commands ------------------------------------------------
+
+#[tauri::command]
+async fn open_file(path: String) -> Result<(), String> {
+    let p = std::path::Path::new(&path);
+    if !p.exists() {
+        return Err(format!("File not found: {}", path));
+    }
+    open::that(&path).map_err(|e| format!("Failed to open file: {}", e))
+}
+
+#[tauri::command]
+async fn fetch_document_versions(
+    state: tauri::State<'_, SharedState>,
+    document_id: String,
+) -> Result<sync::VersionHistoryResponse, String> {
+    let api_token = get_api_token(&state.auth).await?;
+    let cfg = state.config.read().await;
+    sync::fetch_version_history(&cfg.api_url, &api_token, &document_id).await
+}
+
+#[tauri::command]
+async fn compute_diff(
+    state: tauri::State<'_, SharedState>,
+    old_doc_id: String,
+    new_doc_id: String,
+) -> Result<Vec<sync::DiffHunk>, String> {
+    let api_token = get_api_token(&state.auth).await?;
+    let config = state.config.read().await;
+    let config = &*config;
+
+    // Fetch both document bodies
+    let client = reqwest::Client::new();
+
+    let old_resp = client
+        .get(format!("{}/api/v1/wire/documents/{}/body", config.api_url, old_doc_id))
+        .header("Authorization", format!("Bearer {}", api_token))
+        .send()
+        .await
+        .map_err(|e| format!("Failed to fetch old document: {}", e))?;
+
+    if !old_resp.status().is_success() {
+        return Err(format!("Failed to fetch old document: {}", old_resp.status()));
+    }
+    let old_body = old_resp.text().await.map_err(|e| format!("Failed to read old document: {}", e))?;
+
+    let new_resp = client
+        .get(format!("{}/api/v1/wire/documents/{}/body", config.api_url, new_doc_id))
+        .header("Authorization", format!("Bearer {}", api_token))
+        .send()
+        .await
+        .map_err(|e| format!("Failed to fetch new document: {}", e))?;
+
+    if !new_resp.status().is_success() {
+        return Err(format!("Failed to fetch new document: {}", new_resp.status()));
+    }
+    let new_body = new_resp.text().await.map_err(|e| format!("Failed to read new document: {}", e))?;
+
+    // Check size limits (50K words max)
+    let word_count = old_body.split_whitespace().count() + new_body.split_whitespace().count();
+    if word_count > 100_000 {
+        return Err("Documents too large for diff (>50K words each). Download both versions to compare manually.".to_string());
+    }
+
+    Ok(sync::compute_word_diff(&old_body, &new_body))
+}
+
+#[tauri::command]
+async fn update_document_status(
+    state: tauri::State<'_, SharedState>,
+    document_id: String,
+    status: String,
+) -> Result<serde_json::Value, String> {
+    let api_token = get_api_token(&state.auth).await?;
+    let config = state.config.read().await;
+    let config = &*config;
+
+    let client = reqwest::Client::new();
+    let url = format!("{}/api/v1/wire/documents/{}", config.api_url, document_id);
+
+    let resp = client
+        .patch(&url)
+        .header("Authorization", format!("Bearer {}", api_token))
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({ "status": status }))
+        .send()
+        .await
+        .map_err(|e| format!("Status update failed: {}", e))?;
+
+    if !resp.status().is_success() {
+        let status_code = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(format!("Status update failed ({}): {}", status_code, text));
+    }
+
+    let result: serde_json::Value = resp.json().await
+        .map_err(|e| format!("Failed to parse response: {}", e))?;
+
+    tracing::info!("Document {} status changed to {}", document_id, status);
+    Ok(result)
+}
+
+#[tauri::command]
+async fn bulk_publish(
+    state: tauri::State<'_, SharedState>,
+    corpus_slug: String,
+) -> Result<serde_json::Value, String> {
+    let api_token = get_api_token(&state.auth).await?;
+    let config = state.config.read().await;
+    let config = &*config;
+
+    // Fetch all draft documents for this corpus
+    let docs = sync::fetch_corpus_documents(&config.api_url, &api_token, &corpus_slug).await?;
+    let drafts: Vec<&sync::DocumentInfo> = docs.iter()
+        .filter(|d| d.status.as_deref() == Some("draft"))
+        .collect();
+
+    let total = drafts.len();
+    if total == 0 {
+        return Ok(serde_json::json!({ "published": 0, "errors": 0, "message": "No draft documents to publish" }));
+    }
+
+    let client = reqwest::Client::new();
+    let mut published = 0usize;
+    let mut errors = 0usize;
+    let mut error_details: Vec<String> = Vec::new();
+
+    for (i, doc) in drafts.iter().enumerate() {
+        let url = format!("{}/api/v1/wire/documents/{}", config.api_url, doc.id);
+        let resp = client
+            .patch(&url)
+            .header("Authorization", format!("Bearer {}", api_token))
+            .header("Content-Type", "application/json")
+            .json(&serde_json::json!({ "status": "published" }))
+            .send()
+            .await;
+
+        match resp {
+            Ok(r) if r.status().is_success() => {
+                published += 1;
+                tracing::info!("Published {}/{}: {}", i + 1, total, doc.id);
+            }
+            Ok(r) => {
+                errors += 1;
+                let text = r.text().await.unwrap_or_default();
+                let title = doc.title.as_deref().unwrap_or(&doc.id);
+                error_details.push(format!("{}: {}", title, text));
+                tracing::warn!("Failed to publish {}: {}", doc.id, text);
+            }
+            Err(e) => {
+                errors += 1;
+                error_details.push(format!("{}: {}", doc.id, e));
+            }
+        }
+
+        // Throttle to avoid rate limits
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    tracing::info!("Bulk publish complete: {}/{} published, {} errors", published, total, errors);
+    Ok(serde_json::json!({
+        "published": published,
+        "errors": errors,
+        "total": total,
+        "error_details": error_details,
+    }))
+}
+
+#[tauri::command]
+async fn pin_version(
+    state: tauri::State<'_, SharedState>,
+    document_id: String,
+    folder_path: String,
+) -> Result<(), String> {
+    let api_token = get_api_token(&state.auth).await?;
+    let config = state.config.read().await;
+    let config = &*config;
+
+    // Check storage quota
+    let versions_dir = std::path::Path::new(&folder_path).join(".versions");
+    let current_size = if versions_dir.exists() {
+        sync::get_cache_size(&versions_dir).await
+    } else { 0 };
+
+    let quota_bytes = {
+        let ss = state.sync_state.read().await;
+        ss.storage_quota_mb * 1024 * 1024
+    };
+
+    if current_size > quota_bytes {
+        return Err(format!("Storage quota exceeded ({:.1} MB / {} MB). Unpin older versions first.",
+            current_size as f64 / (1024.0 * 1024.0),
+            quota_bytes / (1024 * 1024)));
+    }
+
+    // Fetch the document info
+    let client = reqwest::Client::new();
+    let doc_resp = client
+        .get(format!("{}/api/v1/wire/documents/{}", config.api_url, document_id))
+        .header("Authorization", format!("Bearer {}", api_token))
+        .send()
+        .await
+        .map_err(|e| format!("Failed to fetch document: {}", e))?;
+
+    if !doc_resp.status().is_success() {
+        return Err(format!("Failed to fetch document: {}", doc_resp.status()));
+    }
+    let doc_info: serde_json::Value = doc_resp.json().await
+        .map_err(|e| format!("Failed to parse document: {}", e))?;
+
+    let body_resp = client
+        .get(format!("{}/api/v1/wire/documents/{}/body", config.api_url, document_id))
+        .header("Authorization", format!("Bearer {}", api_token))
+        .send()
+        .await
+        .map_err(|e| format!("Failed to fetch document body: {}", e))?;
+
+    if !body_resp.status().is_success() {
+        return Err(format!("Failed to fetch document body: {}", body_resp.status()));
+    }
+    let body = body_resp.text().await.map_err(|e| format!("Failed to read body: {}", e))?;
+
+    // Save to .versions/
+    let version_num = doc_info["version_number"].as_i64().unwrap_or(1);
+    let source_path = doc_info["source_path"].as_str().unwrap_or(&document_id);
+    let stem = std::path::Path::new(source_path).file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| document_id.clone());
+    let ext = std::path::Path::new(source_path).extension()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "md".to_string());
+
+    let version_file = versions_dir.join(format!("{}.v{}.{}", stem, version_num, ext));
+
+    tokio::fs::create_dir_all(&versions_dir).await
+        .map_err(|e| format!("Failed to create .versions dir: {}", e))?;
+    tokio::fs::write(&version_file, &body).await
+        .map_err(|e| format!("Failed to save version: {}", e))?;
+
+    // Track in sync state
+    {
+        let mut ss = state.sync_state.write().await;
+        if !ss.pinned_versions.contains(&document_id) {
+            ss.pinned_versions.push(document_id);
+        }
+        sync::save_sync_state(&config.data_dir(), &ss);
+    }
+
+    Ok(())
 }
 
 // --- Tunnel Flow ------------------------------------------------------------
@@ -814,7 +2028,8 @@ fn onboarding_file_path(config: &WireNodeConfig) -> std::path::PathBuf {
 
 #[tauri::command]
 async fn is_onboarded(state: tauri::State<'_, SharedState>) -> Result<bool, String> {
-    let path = onboarding_file_path(&state.config);
+    let cfg = state.config.read().await;
+    let path = onboarding_file_path(&cfg);
     Ok(path.exists())
 }
 
@@ -824,33 +2039,90 @@ async fn save_onboarding(
     node_name: String,
     storage_cap_gb: f64,
     mesh_hosting_enabled: bool,
+    auto_update_enabled: Option<bool>,
 ) -> Result<(), String> {
-    let config = &state.config;
-
+    let auto_update = auto_update_enabled.unwrap_or(false);
     let onboarding = serde_json::json!({
         "node_name": node_name,
         "storage_cap_gb": storage_cap_gb,
         "mesh_hosting_enabled": mesh_hosting_enabled,
+        "auto_update_enabled": auto_update,
         "completed_at": chrono::Utc::now().to_rfc3339(),
     });
 
-    let path = onboarding_file_path(config);
+    // Write to disk
+    let path = {
+        let cfg = state.config.read().await;
+        onboarding_file_path(&cfg)
+    };
     let _ = std::fs::create_dir_all(path.parent().unwrap_or(&path));
     std::fs::write(&path, serde_json::to_string_pretty(&onboarding).unwrap())
         .map_err(|e| format!("Failed to save onboarding: {}", e))?;
 
-    tracing::info!("Onboarding saved: name={}, storage={}GB, mesh={}",
-        node_name, storage_cap_gb, mesh_hosting_enabled);
+    // Update in-memory config so changes take effect immediately
+    {
+        let mut cfg = state.config.write().await;
+        cfg.storage_cap_gb = storage_cap_gb;
+        cfg.mesh_hosting_enabled = mesh_hosting_enabled;
+        cfg.auto_update_enabled = auto_update;
+    }
+
+    tracing::info!("Onboarding saved: name={}, storage={}GB, mesh={}, auto_update={}",
+        node_name, storage_cap_gb, mesh_hosting_enabled, auto_update);
 
     Ok(())
+}
+
+#[tauri::command]
+async fn get_logs(state: tauri::State<'_, SharedState>) -> Result<Vec<String>, String> {
+    let cfg = state.config.read().await;
+    let log_path = cfg.data_dir().join("wire-node.log");
+    let content = std::fs::read_to_string(&log_path).unwrap_or_default();
+    let lines: Vec<String> = content.lines().rev().take(500).map(String::from).collect();
+    Ok(lines)
 }
 
 // --- App Setup --------------------------------------------------------------
 
 fn main() {
-    tracing_subscriber::fmt::init();
+    let mut config = WireNodeConfig::default();
 
-    let config = WireNodeConfig::default();
+    // Load saved settings from onboarding.json
+    let onboarding_path = config.data_dir().join("onboarding.json");
+    if let Ok(data) = std::fs::read_to_string(&onboarding_path) {
+        if let Ok(saved) = serde_json::from_str::<serde_json::Value>(&data) {
+            if let Some(cap) = saved.get("storage_cap_gb").and_then(|v| v.as_f64()) {
+                config.storage_cap_gb = cap;
+            }
+            if let Some(mesh) = saved.get("mesh_hosting_enabled").and_then(|v| v.as_bool()) {
+                config.mesh_hosting_enabled = mesh;
+            }
+            if let Some(auto) = saved.get("auto_update_enabled").and_then(|v| v.as_bool()) {
+                config.auto_update_enabled = auto;
+            }
+        }
+    }
+
+    // Set up logging to both stdout and a log file
+    let log_path = config.data_dir().join("wire-node.log");
+    let _ = std::fs::create_dir_all(config.data_dir());
+    // Truncate log on startup to keep it manageable
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&log_path)
+        .expect("Failed to open log file");
+
+    use tracing_subscriber::prelude::*;
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stdout))
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(std::sync::Mutex::new(log_file))
+        )
+        .init();
 
     // Try loading a saved session
     let initial_auth = load_session(&config).unwrap_or_default();
@@ -880,11 +2152,16 @@ fn main() {
 
     let state = Arc::new(AppState {
         auth: Arc::new(RwLock::new(initial_auth.clone())),
-        sync_state: Arc::new(RwLock::new(sync::SyncState::default())),
+        sync_state: Arc::new(RwLock::new(
+            sync::load_sync_state(&config.data_dir()).unwrap_or_default()
+        )),
         credits: Arc::new(RwLock::new(initial_credits)),
         tunnel_state: Arc::new(RwLock::new(initial_tunnel)),
-        market_state: Arc::new(RwLock::new(market::MarketState::default())),
-        config: config.clone(),
+        market_state: Arc::new(RwLock::new(
+            market::load_market_state(&config.data_dir()).unwrap_or_default()
+        )),
+        work_stats: Arc::new(RwLock::new(work::WorkStats::default())),
+        config: Arc::new(RwLock::new(config.clone())),
     });
 
     tauri::Builder::default()
@@ -1035,9 +2312,13 @@ fn main() {
             let jwt_pk = jwt_public_key.clone();
             let nid_shared = node_id_shared.clone();
             tauri::async_runtime::spawn(async move {
+                let srv_cfg = server_state.config.read().await;
+                let server_port = srv_cfg.server_port;
+                let cache_dir = srv_cfg.cache_dir();
+                drop(srv_cfg);
                 server::start_server(
-                    server_state.config.server_port,
-                    server_state.config.cache_dir(),
+                    server_port,
+                    cache_dir,
                     server_state.credits.clone(),
                     server_state.auth.clone(),
                     server_state.sync_state.clone(),
@@ -1144,22 +2425,39 @@ fn main() {
                 }
             });
 
-            // --- Periodic document sync loop (every 30 minutes) ---
+            // --- Auto-sync loop (checks auto_sync_enabled + interval from settings) ---
             let sync_loop_state = state.clone();
             let sync_loop_config = config.clone();
             tauri::async_runtime::spawn(async move {
+                // Initial delay before first auto-sync check
+                tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
                 loop {
-                    tokio::time::sleep(tokio::time::Duration::from_secs(30 * 60)).await;
-                    let token = {
-                        let auth = sync_loop_state.auth.read().await;
-                        auth.api_token.clone()
+                    let (auto_enabled, interval_secs) = {
+                        let ss = sync_loop_state.sync_state.read().await;
+                        (ss.auto_sync_enabled, ss.auto_sync_interval_secs)
                     };
-                    if let Some(ref token) = token {
-                        if !token.is_empty() {
-                            tracing::info!("Periodic sync starting...");
-                            let _ = do_sync(&sync_loop_config, token, &sync_loop_state.sync_state, &sync_loop_state.credits).await;
+
+                    if auto_enabled {
+                        let token = {
+                            let auth = sync_loop_state.auth.read().await;
+                            auth.api_token.clone()
+                        };
+                        if let Some(ref token) = token {
+                            if !token.is_empty() {
+                                let is_already_syncing = {
+                                    let ss = sync_loop_state.sync_state.read().await;
+                                    ss.is_syncing
+                                };
+                                if !is_already_syncing {
+                                    tracing::info!("Auto-sync starting...");
+                                    let _ = do_sync(&sync_loop_config, token, &sync_loop_state.sync_state, &sync_loop_state.credits).await;
+                                }
+                            }
                         }
                     }
+
+                    let sleep_secs = if auto_enabled { interval_secs.max(60) } else { 30 };
+                    tokio::time::sleep(tokio::time::Duration::from_secs(sleep_secs)).await;
                 }
             });
 
@@ -1208,13 +2506,18 @@ fn main() {
                                 if let Some(challenges) = response.get("retention_challenges") {
                                     if let Ok(challenges) = serde_json::from_value::<Vec<retention::RetentionChallenge>>(challenges.clone()) {
                                         if !challenges.is_empty() {
-                                            let _ = retention::handle_retention_challenges(
+                                            if let Ok(passed) = retention::handle_retention_challenges(
                                                 &heartbeat_config.api_url,
                                                 token,
                                                 node_id,
                                                 &challenges,
                                                 &heartbeat_config.cache_dir(),
-                                            ).await;
+                                            ).await {
+                                                if passed > 0 {
+                                                    let mut cr = heartbeat_state.credits.write().await;
+                                                    cr.retention_challenges_passed += passed as u64;
+                                                }
+                                            }
                                         }
                                     }
                                 }
@@ -1234,8 +2537,16 @@ fn main() {
                                     }
                                 }
 
-                                // Handle market surface from heartbeat
-                                if let Some(market_surface) = response.get("market_surface") {
+                                // Update credit balance from server
+                                if let Some(balance) = response.get("credit_balance").and_then(|v| v.as_f64()) {
+                                    let mut cr = heartbeat_state.credits.write().await;
+                                    cr.server_credit_balance = balance;
+                                }
+
+                                // Handle market surface from heartbeat (server sends "storage_market")
+                                let market_value = response.get("storage_market")
+                                    .or_else(|| response.get("market_surface"));
+                                if let Some(market_surface) = market_value {
                                     if let Ok(opportunities) = serde_json::from_value::<Vec<market::MarketOpportunity>>(market_surface.clone()) {
                                         if !opportunities.is_empty() {
                                             let mut ms = heartbeat_state.market_state.write().await;
@@ -1249,6 +2560,7 @@ fn main() {
                                                 heartbeat_config.storage_cap_gb,
                                                 heartbeat_config.mesh_hosting_enabled,
                                             ).await;
+                                            market::save_market_state(&heartbeat_config.data_dir(), &ms);
                                         }
                                     }
                                 }
@@ -1300,11 +2612,136 @@ fn main() {
                 loop {
                     tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
                     tick_count += 1;
-                    let mut cr = stats_save_state.credits.write().await;
-                    cr.tick_uptime();
-                    if tick_count % 5 == 0 {
-                        let path = stats_save_config.data_dir().join("stats.json");
-                        cr.save_to_file(&path);
+                    // Sync achievement counters from WorkStats and MarketState
+                    {
+                        let ws = stats_save_state.work_stats.read().await;
+                        let ms = stats_save_state.market_state.read().await;
+                        let mut cr = stats_save_state.credits.write().await;
+                        cr.tick_uptime();
+                        cr.total_jobs_completed = ws.total_jobs_completed;
+                        cr.documents_hosted = ms.hosted_documents.len() as u64;
+                        cr.bytes_hosted = ms.total_hosted_bytes;
+                        // Count unique corpora from hosted documents
+                        let corpora: std::collections::HashSet<&str> = ms.hosted_documents.values()
+                            .map(|d| d.corpus_id.as_str())
+                            .collect();
+                        cr.unique_corpora_hosted = corpora.len() as u64;
+                        if tick_count % 5 == 0 {
+                            let path = stats_save_config.data_dir().join("stats.json");
+                            cr.save_to_file(&path);
+                        }
+                    }
+                }
+            });
+
+            // --- Work polling loop (every 5s, with exponential backoff) ---
+            let work_state = state.clone();
+            let work_config = config.clone();
+            tauri::async_runtime::spawn(async move {
+                // Wait for auth to be ready
+                tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+
+                let initial_interval = 5_000u64; // 5 seconds
+                let max_interval = 30_000u64; // 30 seconds
+                let mut consecutive_errors: u32 = 0;
+
+                loop {
+                    // Get auth credentials
+                    let (api_token, node_id) = {
+                        let auth = work_state.auth.read().await;
+                        (auth.api_token.clone(), auth.node_id.clone())
+                    };
+
+                    let token = match api_token.as_deref() {
+                        Some(t) if !t.is_empty() => t.to_string(),
+                        _ => {
+                            tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+                            continue;
+                        }
+                    };
+
+                    let nid = match node_id.as_deref() {
+                        Some(n) if !n.is_empty() => n.to_string(),
+                        _ => {
+                            tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+                            continue;
+                        }
+                    };
+
+                    // Update polling status
+                    {
+                        let mut ws = work_state.work_stats.write().await;
+                        ws.is_polling = true;
+                    }
+
+                    // Poll for work
+                    match work::poll_work(&work_config.api_url, &token, &nid).await {
+                        Ok(Some(work_item)) => {
+                            consecutive_errors = 0;
+                            let work_type = work_item.work_type.clone();
+                            let work_id = work_item.id.clone();
+                            tracing::info!("Work received: {} ({}...)", work_type, &work_id[..8.min(work_id.len())]);
+
+                            // Execute the work
+                            let result = work::execute_work(&work_item).await;
+
+                            // Submit the result
+                            match work::submit_result(&work_config.api_url, &token, &work_id, &result.data).await {
+                                Ok(submission) => {
+                                    let credits = submission.credits_awarded;
+                                    tracing::info!("Work completed: {} +{:.0} credits", work_type, credits);
+
+                                    // Update work stats
+                                    {
+                                        let mut ws = work_state.work_stats.write().await;
+                                        ws.total_jobs_completed += 1;
+                                        ws.total_credits_earned += credits;
+                                        ws.session_jobs_completed += 1;
+                                        ws.session_credits_earned += credits;
+                                        ws.consecutive_errors = 0;
+                                        ws.last_work_at = Some(chrono::Utc::now().to_rfc3339());
+                                    }
+
+                                    // Record in activity feed
+                                    {
+                                        let mut cr = work_state.credits.write().await;
+                                        cr.record_work_event(&work_type, &work_id, credits);
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!("Work submit failed: {}", e);
+                                }
+                            }
+
+                            // Don't sleep after work — immediately poll for more
+                            continue;
+                        }
+                        Ok(None) => {
+                            // No work available — wait before polling again
+                            consecutive_errors = 0;
+                            tokio::time::sleep(tokio::time::Duration::from_millis(initial_interval)).await;
+                        }
+                        Err(e) => {
+                            consecutive_errors += 1;
+                            let backoff = std::cmp::min(
+                                initial_interval * 2u64.pow(consecutive_errors),
+                                max_interval,
+                            );
+
+                            // Update error count in stats
+                            {
+                                let mut ws = work_state.work_stats.write().await;
+                                ws.consecutive_errors = consecutive_errors;
+                            }
+
+                            if consecutive_errors == 1 {
+                                tracing::warn!("Work poll error: {}", e);
+                            } else if consecutive_errors % 10 == 0 {
+                                tracing::warn!("Work poll errors: {} consecutive (backing off to {}s)", consecutive_errors, backoff / 1000);
+                            }
+
+                            tokio::time::sleep(tokio::time::Duration::from_millis(backoff)).await;
+                        }
                     }
                 }
             });
@@ -1355,7 +2792,11 @@ fn main() {
             link_folder,
             unlink_folder,
             get_sync_status,
+            list_my_corpora,
+            list_public_corpora,
+            create_corpus,
             sync_content,
+            set_auto_sync,
             get_credits,
             get_market_surface,
             retry_tunnel,
@@ -1368,6 +2809,16 @@ fn main() {
             install_update,
             is_onboarded,
             save_onboarding,
+            get_logs,
+            open_file,
+            fetch_document_versions,
+            compute_diff,
+            pin_version,
+            update_document_status,
+            bulk_publish,
+            get_work_stats,
+            get_operator_session,
+            operator_api_call,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Wire Node");

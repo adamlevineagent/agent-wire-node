@@ -55,30 +55,43 @@ export function ActivityFeed({ credits }: ActivityFeedProps) {
         <div className="activity-feed">
             {events.map((event, i) => {
                 const isSync = event.event_type === "sync_push" || event.event_type === "sync_pull";
-                const isPull = event.event_type === "serve";
+                const isWork = event.event_type.startsWith("work_");
+                const isServe = event.event_type === "serve";
+
+                const iconChar = isSync
+                    ? (event.event_type === "sync_push" ? "^" : "v")
+                    : isWork ? "+" : "W";
+                const iconClass = isSync
+                    ? "activity-icon-sync"
+                    : isWork ? "activity-icon-work" : "";
+                const itemClass = isSync
+                    ? "activity-sync"
+                    : isWork ? "activity-work" : "activity-serve";
 
                 return (
                     <div
                         key={`${event.timestamp}-${i}`}
-                        className={`activity-item ${isSync ? "activity-sync" : "activity-serve"}`}
+                        className={`activity-item ${itemClass}`}
                         style={{ animationDelay: `${i * 50}ms` }}
                     >
                         <div className="activity-left">
                             <div
-                                className={`activity-icon ${isSync ? "activity-icon-sync" : ""}`}
-                                title={isSync ? "Sync event" : "Document served"}
+                                className={`activity-icon ${iconClass}`}
+                                title={isSync ? "Sync event" : isWork ? "Work completed" : "Document served"}
                             >
-                                {isSync ? (event.event_type === "sync_push" ? "^" : "v") : "W"}
+                                {iconChar}
                             </div>
                             <div className="activity-details">
-                                <span className={`activity-track-name ${isSync ? "activity-track-sync" : ""}`}>
-                                    {event.document_id.length > 20
+                                <span className={`activity-track-name ${isSync ? "activity-track-sync" : isWork ? "activity-track-work" : ""}`}>
+                                    {event.message || (event.document_id.length > 20
                                         ? event.document_id.slice(0, 8) + "..." + event.document_id.slice(-8)
-                                        : event.document_id}
+                                        : event.document_id)}
                                 </span>
                                 <span className="activity-meta">
                                     {isSync
                                         ? `${event.event_type === "sync_push" ? "Pushed" : "Pulled"} - ${formatBytes(event.bytes)}`
+                                        : isWork
+                                        ? event.event_type.replace("work_", "")
                                         : `${formatBytes(event.bytes)} served`}
                                 </span>
                             </div>

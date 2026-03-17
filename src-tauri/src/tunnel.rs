@@ -192,7 +192,7 @@ pub async fn provision_tunnel(
 ) -> Result<TunnelState, String> {
     let client = reqwest::Client::new();
 
-    let url = format!("{}/api/relay/tunnel", api_base_url);
+    let url = format!("{}/api/v1/node/tunnel", api_base_url);
 
     let resp = client
         .post(&url)

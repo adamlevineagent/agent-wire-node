@@ -1,7 +1,8 @@
 import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { CommandCenter } from "./components/CommandCenter";
+import { AppShell } from "./components/AppShell";
+import { AppProvider } from "./contexts/AppContext";
 import { LoginScreen } from "./components/LoginScreen";
 import { OnboardingWizard } from "./components/OnboardingWizard";
 
@@ -117,12 +118,8 @@ export default function App() {
     }
 
     return (
-        <CommandCenter
-            authState={{
-                email: authState.email,
-                node_id: authState.node_id,
-            }}
-            onLogout={handleLogout}
-        />
+        <AppProvider email={authState.email}>
+            <AppShell onLogout={handleLogout} />
+        </AppProvider>
     );
 }

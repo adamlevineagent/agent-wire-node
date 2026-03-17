@@ -27,7 +27,7 @@ function formatBytes(bytes: number): string {
 
 function formatCredits(n: number): string {
     if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
-    return n.toFixed(2);
+    return Math.floor(n).toString();
 }
 
 function formatRelativeTime(timestamp: string): string {

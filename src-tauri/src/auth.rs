@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-/// Auth state — stores Supabase session + Wire node registration
+/// Auth state — stores Supabase session + Wire node registration + operator session
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AuthState {
     pub access_token: Option<String>,
@@ -11,6 +11,12 @@ pub struct AuthState {
     #[serde(default)]
     pub api_token: Option<String>,     // gne_live_ machine token from register-with-session
     pub first_started_at: Option<String>, // node age — first ever login
+    #[serde(default)]
+    pub operator_session_token: Option<String>,
+    #[serde(default)]
+    pub operator_id: Option<String>,
+    #[serde(default)]
+    pub operator_session_expires_at: Option<String>,
 }
 
 impl AuthState {
@@ -141,6 +147,9 @@ pub async fn verify_magic_link_token(
         node_id: None,
         api_token: None,
         first_started_at: None,
+        operator_session_token: None,
+        operator_id: None,
+        operator_session_expires_at: None,
     })
 }
 
@@ -194,6 +203,9 @@ pub async fn verify_otp(
         node_id: None,
         api_token: None,
         first_started_at: None,
+        operator_session_token: None,
+        operator_id: None,
+        operator_session_expires_at: None,
     })
 }
 
@@ -242,6 +254,9 @@ pub async fn login(
         node_id: None,
         api_token: None,
         first_started_at: None,
+        operator_session_token: None,
+        operator_id: None,
+        operator_session_expires_at: None,
     })
 }
 
@@ -294,7 +309,7 @@ pub async fn register_wire_node(
     let url = format!("{}/api/v1/node/register", api_url);
     let body = serde_json::json!({
         "name": node_name,
-        "capabilities": ["cache", "verify", "storage"],
+        "capabilities": ["cache", "verify", "grade", "enrich", "storage"],
     });
 
     let resp = client
@@ -347,7 +362,7 @@ pub async fn register_with_session(
     let body = serde_json::json!({
         "supabase_access_token": supabase_access_token,
         "name": node_name,
-        "capabilities": ["cache", "verify", "storage"],
+        "capabilities": ["cache", "verify", "grade", "enrich", "storage"],
     });
 
     let resp = client

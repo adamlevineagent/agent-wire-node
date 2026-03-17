@@ -9,6 +9,7 @@ interface WireNodeConfig {
     node_id: string;
     storage_cap_gb: number;
     mesh_hosting_enabled: boolean;
+    auto_update_enabled: boolean;
     document_cache_dir: string;
     server_port: number;
     jwt_public_key: string;
@@ -34,8 +35,6 @@ export function Settings() {
     const [config, setConfig] = useState<WireNodeConfig | null>(null);
     const [storageCap, setStorageCap] = useState(10);
     const [meshHosting, setMeshHosting] = useState(false);
-    const [apiUrl, setApiUrl] = useState("");
-    const [apiToken, setApiToken] = useState("");
     const [health, setHealth] = useState<HealthStatus | null>(null);
     const [saving, setSaving] = useState(false);
     const [saved, setSaved] = useState(false);
@@ -54,8 +53,7 @@ export function Settings() {
             setHealth(healthStatus);
             setStorageCap(cfg.storage_cap_gb);
             setMeshHosting(cfg.mesh_hosting_enabled);
-            setApiUrl(cfg.api_url);
-            setApiToken(cfg.api_token);
+            setAutoUpdate(cfg.auto_update_enabled);
         } catch (err) {
             console.error("Settings fetch error:", err);
         }
@@ -72,6 +70,7 @@ export function Settings() {
                 nodeName: config.node_id || "Wire Node",
                 storageCapGb: storageCap,
                 meshHostingEnabled: meshHosting,
+                autoUpdateEnabled: autoUpdate,
             });
             setSaved(true);
             setTimeout(() => setSaved(false), 2000);
@@ -205,33 +204,6 @@ export function Settings() {
                     />
                     <span>Enable mesh hosting</span>
                 </label>
-            </div>
-
-            {/* API Configuration */}
-            <div className="settings-section">
-                <div className="settings-section-header">API Configuration</div>
-                <div className="form-group">
-                    <label htmlFor="api-url">Wire API URL</label>
-                    <input
-                        id="api-url"
-                        type="text"
-                        value={apiUrl}
-                        onChange={(e) => setApiUrl(e.target.value)}
-                        placeholder="https://newsbleach.com"
-                        className="settings-input"
-                    />
-                </div>
-                <div className="form-group">
-                    <label htmlFor="api-token">API Token</label>
-                    <input
-                        id="api-token"
-                        type="password"
-                        value={apiToken}
-                        onChange={(e) => setApiToken(e.target.value)}
-                        placeholder="Your Wire API token"
-                        className="settings-input"
-                    />
-                </div>
             </div>
 
             {/* Auto-Update */}

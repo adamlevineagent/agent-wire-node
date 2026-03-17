@@ -18,6 +18,20 @@ pub struct CreditTracker {
     pub first_started_at: Option<String>,
     pub total_uptime_seconds: u64,
     pub total_unique_consumers: u64,
+    #[serde(default)]
+    pub server_credit_balance: f64,
+
+    // Achievement-synced counters (updated from WorkStats / MarketState each tick)
+    #[serde(default)]
+    pub total_jobs_completed: u64,
+    #[serde(default)]
+    pub documents_hosted: u64,
+    #[serde(default)]
+    pub bytes_hosted: u64,
+    #[serde(default)]
+    pub retention_challenges_passed: u64,
+    #[serde(default)]
+    pub unique_corpora_hosted: u64,
 
     // Batched serve log — accumulated between reports, flushed every 60s
     #[serde(skip)]
@@ -75,62 +89,197 @@ struct AchievementTrack {
     levels: &'static [(&'static str, u64)],
 }
 
+const KB: u64 = 1024;
+const MB: u64 = 1024 * KB;
+const GB: u64 = 1024 * MB;
+const TB: u64 = 1024 * GB;
+const DAY: u64 = 24 * 3600;
+
 const TRACKS: &[AchievementTrack] = &[
+    // 1. The Wire — pulls served (signal distribution)
     AchievementTrack {
-        id: "documents_served",
-        emoji: "W",
+        id: "pulls_served",
+        emoji: "\u{1F4E1}",  // 📡
         levels: &[
-            ("First Pull", 1),
-            ("Courier", 10),
-            ("Librarian", 50),
-            ("Archivist", 100),
+            ("Tipster", 1),
+            ("Stringer", 25),
+            ("Reporter", 100),
+            ("Correspondent", 500),
+            ("Bureau Chief", 2_500),
+            ("Editor", 10_000),
+            ("Syndicate", 50_000),
+            ("Wire Service", 250_000),
+            ("Press Empire", 1_000_000),
+            ("Voice of Record", 10_000_000),
+        ],
+    },
+    // 2. Bandwidth — bytes served (data moved)
+    AchievementTrack {
+        id: "bytes_served",
+        emoji: "\u{1F4BE}",  // 💾
+        levels: &[
+            ("First Byte", 1 * MB),
+            ("Packet Runner", 100 * MB),
+            ("Megabyte Mark", 500 * MB),
+            ("Gigabyte Club", 1 * GB),
+            ("Heavy Lifter", 10 * GB),
+            ("Freight Line", 50 * GB),
+            ("Data Mountain", 250 * GB),
+            ("Terabyte Club", 1 * TB),
+            ("Petabyte Path", 10 * TB),
+            ("Backbone", 100 * TB),
+        ],
+    },
+    // 3. On The Beat — total uptime (always available)
+    AchievementTrack {
+        id: "uptime",
+        emoji: "\u{23F1}",  // ⏱
+        levels: &[
+            ("First Shift", 1 * DAY),
+            ("Night Owl", 3 * DAY),
+            ("Week Strong", 7 * DAY),
+            ("Deadline Keeper", 14 * DAY),
+            ("Monthly", 30 * DAY),
+            ("Old Reliable", 90 * DAY),
+            ("Half Year", 182 * DAY),
+            ("Annual", 365 * DAY),
+            ("Veteran", 730 * DAY),
+            ("Lifer", 1825 * DAY),
+        ],
+    },
+    // 4. Follow The Money — credits earned
+    AchievementTrack {
+        id: "credits_earned",
+        emoji: "\u{1F4B0}",  // 💰
+        levels: &[
+            ("Penny Press", 10),
+            ("Tip Jar", 100),
+            ("Side Hustle", 500),
+            ("Funded", 2_500),
+            ("Bankrolled", 10_000),
+            ("Syndicated", 50_000),
+            ("Wire Transfer", 250_000),
+            ("Deep Pockets", 1_000_000),
+            ("Endowed", 10_000_000),
+            ("The Mint", 100_000_000),
+        ],
+    },
+    // 5. The Grind — jobs completed (work engine)
+    AchievementTrack {
+        id: "jobs_completed",
+        emoji: "\u{1F527}",  // 🔧
+        levels: &[
+            ("Intern", 1),
+            ("Copy Runner", 10),
+            ("Desk Jockey", 50),
+            ("Beat Worker", 250),
+            ("Workhorse", 1_000),
+            ("Machine", 5_000),
+            ("Engine", 25_000),
+            ("Powerplant", 100_000),
+            ("Perpetual Motion", 500_000),
+            ("Force of Nature", 5_000_000),
+        ],
+    },
+    // 6. Mesh Weaver — documents hosted (market inventory count)
+    AchievementTrack {
+        id: "docs_hosted",
+        emoji: "\u{1F578}",  // 🕸
+        levels: &[
+            ("First Pin", 1),
+            ("Collector", 5),
+            ("Curator", 25),
+            ("Archive", 100),
             ("Repository", 500),
-            ("Digital Library", 1_000),
-            ("Knowledge Hub", 5_000),
-            ("Wire Backbone", 10_000),
-            ("Infrastructure", 100_000),
-            ("Foundation", 1_000_000),
+            ("Vault", 2_000),
+            ("Citadel", 10_000),
+            ("Fortress", 50_000),
+            ("Atlas", 250_000),
+            ("World Library", 1_000_000),
         ],
     },
+    // 7. Reach — unique consumers served
     AchievementTrack {
-        id: "data_shared",
-        emoji: "D",
+        id: "unique_consumers",
+        emoji: "\u{1F91D}",  // 🤝
         levels: &[
-            ("First Byte", 100 * 1024 * 1024),
-            ("Packet Runner", 500 * 1024 * 1024),
-            ("Gigabyte Club", 1024 * 1024 * 1024),
-            ("Heavy Lifter", 5 * 1024 * 1024 * 1024),
-            ("Freight Line", 10 * 1024 * 1024 * 1024),
-            ("Cargo Fleet", 50 * 1024 * 1024 * 1024),
-            ("Data Mountain", 100 * 1024 * 1024 * 1024),
-            ("Petabyte Path", 500 * 1024 * 1024 * 1024),
-            ("Terabyte Club", 1024 * 1024 * 1024 * 1024),
-            ("Wire Legend", 10 * 1024 * 1024 * 1024 * 1024),
+            ("First Contact", 1),
+            ("Pen Pal", 5),
+            ("Socialite", 25),
+            ("Connector", 100),
+            ("Hub", 500),
+            ("Nexus", 2_000),
+            ("Switchboard", 10_000),
+            ("Exchange", 50_000),
+            ("Gateway", 250_000),
+            ("Grand Central", 1_000_000),
         ],
     },
+    // 8. Integrity — retention challenges passed
     AchievementTrack {
-        id: "time_hosting",
-        emoji: "T",
+        id: "retention",
+        emoji: "\u{1F6E1}",  // 🛡
         levels: &[
-            ("First Shift", 24 * 3600),
-            ("Long Weekend", 3 * 24 * 3600),
-            ("Week Strong", 7 * 24 * 3600),
-            ("Monthly", 30 * 24 * 3600),
-            ("Seasonal", 90 * 24 * 3600),
-            ("Half Year", 182 * 24 * 3600),
-            ("Annual", 365 * 24 * 3600),
-            ("Veteran", 2 * 365 * 24 * 3600),
-            ("Dedicated", 5 * 365 * 24 * 3600),
-            ("Lifer", 10 * 365 * 24 * 3600),
+            ("Tested", 1),
+            ("Verified", 10),
+            ("Proven", 50),
+            ("Reliable", 250),
+            ("Steadfast", 1_000),
+            ("Ironclad", 5_000),
+            ("Unshakeable", 25_000),
+            ("Bulwark", 100_000),
+            ("Bastion", 500_000),
+            ("Unbreakable", 5_000_000),
+        ],
+    },
+    // 9. Stockpile — bytes committed to mesh hosting
+    AchievementTrack {
+        id: "bytes_hosted",
+        emoji: "\u{1F4E6}",  // 📦
+        levels: &[
+            ("Shelf Space", 100 * MB),
+            ("Filing Cabinet", 500 * MB),
+            ("Closet", 1 * GB),
+            ("Warehouse", 5 * GB),
+            ("Hangar", 25 * GB),
+            ("Silo", 100 * GB),
+            ("Bunker", 500 * GB),
+            ("Data Center", 1 * TB),
+            ("Server Farm", 10 * TB),
+            ("The Cloud", 100 * TB),
+        ],
+    },
+    // 10. Coverage — unique corpora hosted
+    AchievementTrack {
+        id: "corpora_hosted",
+        emoji: "\u{1F4DA}",  // 📚
+        levels: &[
+            ("Niche", 1),
+            ("Specialist", 3),
+            ("Generalist", 10),
+            ("Polymath", 25),
+            ("Encyclopedia", 50),
+            ("Omnivore", 100),
+            ("Renaissance", 250),
+            ("Universal", 500),
+            ("Alexandrian", 1_000),
+            ("Akashic Record", 5_000),
         ],
     },
 ];
 
 fn compute_achievements(tracker: &CreditTracker) -> Vec<Achievement> {
     let values: Vec<(&str, u64)> = vec![
-        ("documents_served", tracker.documents_served),
-        ("data_shared", tracker.total_bytes_served),
-        ("time_hosting", tracker.total_uptime_seconds),
+        ("pulls_served", tracker.pulls_served_total),
+        ("bytes_served", tracker.total_bytes_served),
+        ("uptime", tracker.total_uptime_seconds),
+        ("credits_earned", tracker.credits_earned),
+        ("jobs_completed", tracker.total_jobs_completed),
+        ("docs_hosted", tracker.documents_hosted),
+        ("unique_consumers", tracker.total_unique_consumers),
+        ("retention", tracker.retention_challenges_passed),
+        ("bytes_hosted", tracker.bytes_hosted),
+        ("corpora_hosted", tracker.unique_corpora_hosted),
     ];
 
     TRACKS.iter().map(|track| {
@@ -218,6 +367,12 @@ impl CreditTracker {
             first_started_at: persisted.first_started_at,
             total_uptime_seconds: persisted.total_uptime_seconds,
             total_unique_consumers: persisted.total_unique_consumers,
+            // Achievement counters (persisted across sessions)
+            total_jobs_completed: persisted.total_jobs_completed,
+            documents_hosted: persisted.documents_hosted,
+            bytes_hosted: persisted.bytes_hosted,
+            retention_challenges_passed: persisted.retention_challenges_passed,
+            unique_corpora_hosted: persisted.unique_corpora_hosted,
             // Reset session-specific fields
             session_documents_served: 0,
             session_bytes_served: 0,
@@ -229,6 +384,7 @@ impl CreditTracker {
             pending_serve_log: Vec::new(),
             delta_documents_served: 0,
             delta_bytes_served: 0,
+            server_credit_balance: 0.0,
         }
     }
 
@@ -326,8 +482,56 @@ impl CreditTracker {
         }
     }
 
+    /// Record a work completion event for the activity feed
+    pub fn record_work_event(&mut self, work_type: &str, work_id: &str, credits_earned: f64) {
+        let now = chrono::Utc::now();
+
+        self.credits_earned += credits_earned as u64;
+
+        let msg = format!("{} completed (+{:.0} cr)", work_type, credits_earned);
+
+        let event = ServeEvent {
+            document_id: work_id.to_string(),
+            bytes: 0,
+            timestamp: now.to_rfc3339(),
+            message: msg,
+            token_id: String::new(),
+            event_type: format!("work_{}", work_type),
+        };
+
+        self.recent_events.insert(0, event);
+        if self.recent_events.len() > MAX_RECENT_EVENTS {
+            self.recent_events.truncate(MAX_RECENT_EVENTS);
+        }
+    }
+
+    /// Record a sync event for the activity feed
+    pub fn record_sync_event(&mut self, direction: &str, document_id: &str, bytes: u64) {
+        let now = chrono::Utc::now();
+
+        let event_type = if direction == "push" { "sync_push" } else { "sync_pull" };
+        let msg = format!("{} {} ({})", if direction == "push" { "Pushed" } else { "Pulled" }, document_id, format_bytes(bytes));
+
+        let event = ServeEvent {
+            document_id: document_id.to_string(),
+            bytes,
+            timestamp: now.to_rfc3339(),
+            message: msg,
+            token_id: String::new(),
+            event_type: event_type.to_string(),
+        };
+
+        self.recent_events.insert(0, event);
+        if self.recent_events.len() > MAX_RECENT_EVENTS {
+            self.recent_events.truncate(MAX_RECENT_EVENTS);
+        }
+    }
+
     /// Get stats for dashboard
     pub fn dashboard_stats(&self) -> DashboardStats {
+        // Return most recent 100 events for the UI
+        let recent: Vec<ServeEvent> = self.recent_events.iter().take(100).cloned().collect();
+
         DashboardStats {
             documents_served: self.documents_served,
             pulls_served_total: self.pulls_served_total,
@@ -342,6 +546,8 @@ impl CreditTracker {
             total_uptime_seconds: self.total_uptime_seconds,
             first_started_at: self.first_started_at.clone(),
             achievements: compute_achievements(self),
+            recent_events: recent,
+            server_credit_balance: self.server_credit_balance,
         }
     }
 }
@@ -374,6 +580,8 @@ pub struct DashboardStats {
     pub total_uptime_seconds: u64,
     pub first_started_at: Option<String>,
     pub achievements: Vec<Achievement>,
+    pub recent_events: Vec<ServeEvent>,
+    pub server_credit_balance: f64,
 }
 
 /// Report batched serves to the Wire API
