@@ -1,0 +1,29 @@
+# Wire sync exclusions — supplements .gitignore
+# (gitignore rules already handle node_modules, dist, target, .env, keys)
+
+# Lock files — mechanical, no intelligence value
+package-lock.json
+
+# Build artifacts and generated files
+*.js.map
+vite.config.ts.timestamp-*
+
+# Rust build artifacts (in case target/ leaks through)
+src-tauri/target/
+
+# Binary / media assets
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.ico
+*.dmg
+*.app
+*.exe
+*.msi
+
+# Scripts (deployment tooling, not app source)
+scripts/
+
+# Claude state
+.claude/
