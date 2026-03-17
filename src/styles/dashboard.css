@@ -4291,6 +4291,35 @@ body {
     padding: 2px 6px;
 }
 
+.bulk-progress {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 180px;
+}
+
+.bulk-progress-bar {
+    flex: 1;
+    height: 6px;
+    background: rgba(255, 255, 255, 0.08);
+    border-radius: 3px;
+    overflow: hidden;
+    min-width: 80px;
+}
+
+.bulk-progress-fill {
+    height: 100%;
+    background: var(--accent-green, #4ade80);
+    border-radius: 3px;
+    transition: width 0.3s ease;
+}
+
+.bulk-progress-label {
+    font-size: 10px;
+    color: var(--text-dim, #a0a0a0);
+    white-space: nowrap;
+}
+
 /* ─── Direction: Both ───────────────────────────────────────────── */
 
 .folder-direction.both {

@@ -11,7 +11,7 @@ use tauri_plugin_updater::UpdaterExt;
 use tauri_plugin_deep_link::DeepLinkExt;
 
 use std::sync::Arc;
-use tauri::Manager;
+use tauri::{Manager, Emitter};
 use tauri::tray::{TrayIconBuilder, MouseButton, MouseButtonState, TrayIconEvent};
 use tauri::menu::{MenuBuilder, MenuItemBuilder};
 use tokio::sync::RwLock;
@@ -1539,14 +1539,13 @@ async fn do_sync(
         }
     }
 
-    // Compute total size from linked folders (not cache dir)
-    let mut total_size: u64 = 0;
-    for (folder_path, _) in &linked_folders {
-        let p = std::path::Path::new(folder_path);
-        if p.exists() {
-            total_size += sync::get_cache_size(p).await;
-        }
-    }
+    // Compute total size from synced documents only (not the entire folder tree).
+    // The old approach used get_cache_size on each linked folder, which recursively
+    // summed ALL files including node_modules, .next, etc. — producing wildly wrong totals.
+    let total_size: u64 = {
+        let ss = sync_state.read().await;
+        ss.cached_documents.iter().map(|d| d.file_size_bytes).sum()
+    };
 
     {
         let mut ss = sync_state.write().await;
@@ -1701,6 +1700,7 @@ async fn update_document_status(
 
 #[tauri::command]
 async fn bulk_publish(
+    app: tauri::AppHandle,
     state: tauri::State<'_, SharedState>,
     corpus_slug: String,
 ) -> Result<serde_json::Value, String> {
@@ -1710,50 +1710,84 @@ async fn bulk_publish(
 
     // Fetch all draft documents for this corpus
     let docs = sync::fetch_corpus_documents(&config.api_url, &api_token, &corpus_slug).await?;
-    let drafts: Vec<&sync::DocumentInfo> = docs.iter()
+    let draft_ids: Vec<String> = docs.iter()
         .filter(|d| d.status.as_deref() == Some("draft"))
+        .map(|d| d.id.clone())
         .collect();
 
-    let total = drafts.len();
+    let total = draft_ids.len();
     if total == 0 {
-        return Ok(serde_json::json!({ "published": 0, "errors": 0, "message": "No draft documents to publish" }));
+        return Ok(serde_json::json!({ "published": 0, "errors": 0, "total": 0, "message": "No draft documents to publish" }));
     }
 
-    let client = reqwest::Client::new();
+    // Use the server's bulk endpoint instead of one-by-one PATCH calls.
+    // Process in batches of 200 to avoid request size limits.
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+
     let mut published = 0usize;
     let mut errors = 0usize;
     let mut error_details: Vec<String> = Vec::new();
+    let batch_size = 200;
 
-    for (i, doc) in drafts.iter().enumerate() {
-        let url = format!("{}/api/v1/wire/documents/{}", config.api_url, doc.id);
+    for (batch_idx, chunk) in draft_ids.chunks(batch_size).enumerate() {
+        let url = format!("{}/api/v1/wire/corpora/{}/bulk", config.api_url, corpus_slug);
+        tracing::info!(
+            "Bulk publish batch {}: {} documents ({}–{}/{})",
+            batch_idx + 1, chunk.len(),
+            batch_idx * batch_size + 1,
+            batch_idx * batch_size + chunk.len(),
+            total
+        );
+
         let resp = client
-            .patch(&url)
+            .post(&url)
             .header("Authorization", format!("Bearer {}", api_token))
             .header("Content-Type", "application/json")
-            .json(&serde_json::json!({ "status": "published" }))
+            .json(&serde_json::json!({
+                "action": "publish",
+                "document_ids": chunk,
+            }))
             .send()
             .await;
 
         match resp {
             Ok(r) if r.status().is_success() => {
-                published += 1;
-                tracing::info!("Published {}/{}: {}", i + 1, total, doc.id);
+                let body: serde_json::Value = r.json().await.unwrap_or_default();
+                let batch_applied = body["applied"].as_u64().unwrap_or(0) as usize;
+                let batch_errors = body["errors"].as_array().map(|a| a.len()).unwrap_or(0);
+                published += batch_applied;
+                errors += batch_errors;
+                if let Some(errs) = body["errors"].as_array() {
+                    for err in errs {
+                        error_details.push(err.to_string());
+                    }
+                }
             }
             Ok(r) => {
-                errors += 1;
+                let status = r.status();
                 let text = r.text().await.unwrap_or_default();
-                let title = doc.title.as_deref().unwrap_or(&doc.id);
-                error_details.push(format!("{}: {}", title, text));
-                tracing::warn!("Failed to publish {}: {}", doc.id, text);
+                errors += chunk.len();
+                error_details.push(format!("Batch {} failed ({}): {}", batch_idx + 1, status, text));
+                tracing::warn!("Bulk publish batch {} failed ({}): {}", batch_idx + 1, status, text);
             }
             Err(e) => {
-                errors += 1;
-                error_details.push(format!("{}: {}", doc.id, e));
+                errors += chunk.len();
+                error_details.push(format!("Batch {} error: {}", batch_idx + 1, e));
+                tracing::error!("Bulk publish batch {} error: {}", batch_idx + 1, e);
             }
         }
 
-        // Throttle to avoid rate limits
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // Emit progress event so the frontend can show a progress bar
+        let _ = app.emit("bulk-publish-progress", serde_json::json!({
+            "corpus_slug": corpus_slug,
+            "published": published,
+            "errors": errors,
+            "total": total,
+            "batch": batch_idx + 1,
+        }));
     }
 
     tracing::info!("Bulk publish complete: {}/{} published, {} errors", published, total, errors);

@@ -1,5 +1,6 @@
-import { useState, useCallback } from "react";
+import { useState, useCallback, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import type { SyncState, CachedDocument, LinkedFolder, FileStatus, VersionHistoryResponse, DiffHunk } from "./Dashboard";
 import { FolderLink } from "./FolderLink";
 import { VersionHistory } from "./VersionHistory";
@@ -174,11 +175,24 @@ export function SyncStatus({ syncState, syncing, onSync }: SyncStatusProps) {
 
     const [bulkPublishing, setBulkPublishing] = useState<string | null>(null);
     const [bulkResults, setBulkResults] = useState<Record<string, { published: number; errors: number; total: number }>>({});
+    const [bulkProgress, setBulkProgress] = useState<Record<string, { published: number; errors: number; total: number; batch: number }>>({});
+
+    // Listen for bulk-publish-progress events from Rust
+    useEffect(() => {
+        const unlisten = listen<{ corpus_slug: string; published: number; errors: number; total: number; batch: number }>(
+            "bulk-publish-progress",
+            (event) => {
+                setBulkProgress(prev => ({ ...prev, [event.payload.corpus_slug]: event.payload }));
+            }
+        );
+        return () => { unlisten.then(fn => fn()); };
+    }, []);
 
     const handleBulkPublish = useCallback(async (corpusSlug: string) => {
         if (!confirm(`Publish ALL draft documents in ${corpusSlug}? This makes them immutable.`)) return;
         setBulkPublishing(corpusSlug);
         setBulkResults(prev => { const next = { ...prev }; delete next[corpusSlug]; return next; });
+        setBulkProgress(prev => { const next = { ...prev }; delete next[corpusSlug]; return next; });
         try {
             const result = await invoke<{ published: number; errors: number; total: number }>(
                 "bulk_publish", { corpusSlug }
@@ -190,6 +204,7 @@ export function SyncStatus({ syncState, syncing, onSync }: SyncStatusProps) {
             alert(`Bulk publish failed: ${err}`);
         } finally {
             setBulkPublishing(null);
+            setBulkProgress(prev => { const next = { ...prev }; delete next[corpusSlug]; return next; });
         }
     }, [onSync]);
 
@@ -323,6 +338,31 @@ export function SyncStatus({ syncState, syncing, onSync }: SyncStatusProps) {
                                         {(() => {
                                             const draftCount = corpusDocs.filter(d => d.document_status === "draft").length;
                                             const isPublishing = bulkPublishing === linked.corpus_slug;
+                                            const progress = bulkProgress[linked.corpus_slug];
+                                            if (isPublishing && progress) {
+                                                const pct = Math.round((progress.published + progress.errors) / progress.total * 100);
+                                                return (
+                                                    <div className="bulk-progress" onClick={(e) => e.stopPropagation()}>
+                                                        <div className="bulk-progress-bar">
+                                                            <div
+                                                                className="bulk-progress-fill"
+                                                                style={{ width: `${pct}%` }}
+                                                            />
+                                                        </div>
+                                                        <span className="bulk-progress-label">
+                                                            {progress.published}/{progress.total} published
+                                                            {progress.errors > 0 && ` (${progress.errors} failed)`}
+                                                        </span>
+                                                    </div>
+                                                );
+                                            }
+                                            if (isPublishing) {
+                                                return (
+                                                    <span className="bulk-progress-label" onClick={(e) => e.stopPropagation()}>
+                                                        Starting publish...
+                                                    </span>
+                                                );
+                                            }
                                             return draftCount > 0 && !syncing ? (
                                                 <button
                                                     className="folder-publish-btn"
@@ -330,10 +370,9 @@ export function SyncStatus({ syncState, syncing, onSync }: SyncStatusProps) {
                                                         e.stopPropagation();
                                                         handleBulkPublish(linked.corpus_slug);
                                                     }}
-                                                    disabled={isPublishing}
                                                     title={`Publish all ${draftCount} draft documents`}
                                                 >
-                                                    {isPublishing ? "Publishing..." : `Publish ${draftCount} drafts`}
+                                                    Publish {draftCount} drafts
                                                 </button>
                                             ) : null;
                                         })()}
