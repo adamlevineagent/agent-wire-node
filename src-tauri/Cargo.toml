@@ -35,7 +35,7 @@ urlencoding = "2"
 jsonwebtoken = "9"
 ed25519-dalek = { version = "2", features = ["pkcs8", "pem"] }
 base64 = "0.22"
-walkdir = "2"
+ignore = "0.4"
 similar = { version = "2", features = ["inline"] }
 open = "5"
 

@@ -3,7 +3,7 @@ use sha2::{Sha256, Digest};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tokio::fs;
-use walkdir::WalkDir;
+use ignore::WalkBuilder;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum SyncDirection {
@@ -292,29 +292,44 @@ pub async fn fetch_corpus_documents(
     Ok(all_docs)
 }
 
-/// Walk a local directory and compute hashes for all files
+/// Walk a local directory and compute hashes for all files.
+/// Respects .gitignore at every directory level (via the `ignore` crate).
+/// Also respects .wireignore if present (same glob syntax as .gitignore).
 pub fn scan_local_folder(folder_path: &str) -> Result<Vec<LocalDocument>, String> {
     let root = Path::new(folder_path);
     if !root.exists() || !root.is_dir() {
         return Err(format!("Directory does not exist: {}", folder_path));
     }
 
-    let mut docs = Vec::new();
-    for entry in WalkDir::new(root)
+    // Build walker that respects .gitignore files at every level.
+    // The `ignore` crate automatically reads .gitignore, .git/info/exclude,
+    // and the global gitignore. We also add .wireignore as a custom ignore file.
+    let mut builder = WalkBuilder::new(root);
+    builder
         .follow_links(false)
-        .into_iter()
-        .filter_map(|e| e.ok())
-    {
+        .hidden(true)           // skip hidden files/dirs (dotfiles)
+        .git_ignore(true)       // respect .gitignore
+        .git_global(true)       // respect global gitignore
+        .git_exclude(true);     // respect .git/info/exclude
+
+    // Add .wireignore support — same syntax as .gitignore, project-specific overrides
+    let wireignore_path = root.join(".wireignore");
+    if wireignore_path.exists() {
+        builder.add_custom_ignore_filename(".wireignore");
+    }
+
+    let mut docs = Vec::new();
+    for entry in builder.build().filter_map(|e| e.ok()) {
         // Skip symlinks entirely — they could point outside the directory boundary
-        if entry.file_type().is_symlink() {
+        if entry.file_type().map(|ft| ft.is_symlink()).unwrap_or(false) {
             continue;
         }
-        if entry.file_type().is_file() {
+        if entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
             let path = entry.path().to_path_buf();
 
-            // Skip hidden/system files
+            // Skip system files that may not be in .gitignore
             let file_name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-            if file_name.starts_with('.') || file_name == "Thumbs.db" || file_name == "desktop.ini" {
+            if file_name == "Thumbs.db" || file_name == "desktop.ini" {
                 continue;
             }
 
@@ -342,12 +357,14 @@ pub fn scan_local_folder(folder_path: &str) -> Result<Vec<LocalDocument>, String
                     });
                 }
                 Err(e) => {
-                    tracing::warn!("Failed to read {}: {}", path.display(), e);
+                    // Binary files will fail read_to_string — this is expected and fine
+                    tracing::debug!("Skipping non-UTF8 file {}: {}", path.display(), e);
                 }
             }
         }
     }
 
+    tracing::info!("Scanned {} files in {} (gitignore-aware)", docs.len(), folder_path);
     Ok(docs)
 }
 
@@ -454,13 +471,13 @@ pub async fn push_document(
         .map(|s| s.to_string_lossy().replace('-', " ").replace('_', " "))
         .unwrap_or_else(|| local_doc.relative_path.clone().into());
 
-    // Infer format from extension
+    // Infer format from extension.
+    // Code files and unknown extensions default to text/plain (not markdown).
     let format = match Path::new(&local_doc.relative_path).extension().and_then(|e| e.to_str()) {
         Some("md" | "markdown") => "text/markdown",
         Some("html" | "htm") => "text/html",
-        Some("txt") => "text/plain",
         Some("pdf") => "application/pdf",
-        _ => "text/markdown",  // default
+        _ => "text/plain",  // code files, .txt, and anything else
     };
 
     let body = serde_json::json!({
