@@ -1,13 +1,17 @@
 // pyramid/ingest.rs — Phase 2: Ingestion
 //
 // Three ingestion pipelines (conversation, code, documents) plus continuation support.
-// Each reads source material, chunks it, and stores it in the pyramid SQLite database.
+// Each reads source material, chunks it, and stores it in the pyramid SQLite database
+// using the pyramid_slugs / pyramid_batches / pyramid_chunks schema.
 
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+
+use super::db;
+use super::types::ContentType;
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -23,24 +27,10 @@ fn skip_dirs() -> HashSet<&'static str> {
         "build",
         ".next",
         "__pycache__",
-        "assets",
-        "icons",
-        ".claude",
         ".vscode",
         ".idea",
         "coverage",
-        ".turbo",
-        ".vercel",
         ".cache",
-        "relay-app",
-        "pyramid-prototype",
-        "agentwire",
-        "agentspace",
-        "playfularchelogyunzipped",
-        "docs copy",
-        "scratch",
-        "plans",
-        "packages",
     ]
     .into_iter()
     .collect()
@@ -266,47 +256,6 @@ fn chunk_transcript(transcript: &str) -> Vec<String> {
     chunks
 }
 
-/// Insert a source record and return its ID.
-fn insert_source(
-    conn: &Connection,
-    source_type: &str,
-    source_path: &str,
-    metadata_json: &str,
-) -> Result<i64> {
-    conn.execute(
-        "INSERT INTO sources (source_type, source_path, metadata) VALUES (?1, ?2, ?3)",
-        rusqlite::params![source_type, source_path, metadata_json],
-    )?;
-    Ok(conn.last_insert_rowid())
-}
-
-/// Insert a chunk record.
-fn insert_chunk(
-    conn: &Connection,
-    source_id: i64,
-    chunk_index: i64,
-    content: &str,
-    line_count: i64,
-    char_count: i64,
-) -> Result<()> {
-    conn.execute(
-        "INSERT INTO chunks (source_id, chunk_index, content, line_count, char_count) VALUES (?1, ?2, ?3, ?4, ?5)",
-        rusqlite::params![source_id, chunk_index, content, line_count, char_count],
-    )?;
-    Ok(())
-}
-
-/// Check if a source_path has already been ingested.
-fn existing_source_id(conn: &Connection, source_path: &str) -> Result<Option<i64>> {
-    let mut stmt = conn.prepare("SELECT id FROM sources WHERE source_path = ?1")?;
-    let result = stmt.query_row(rusqlite::params![source_path], |row| row.get::<_, i64>(0));
-    match result {
-        Ok(id) => Ok(Some(id)),
-        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-        Err(e) => Err(e.into()),
-    }
-}
-
 /// Recursively walk a directory, respecting skip_dirs and hidden-file rules.
 /// Returns sorted list of (absolute_path, relative_path) pairs.
 fn walk_dir(
@@ -375,14 +324,14 @@ fn walk_dir_inner(
 /// - Filters for user/assistant messages, skipping toolUseResult entries
 /// - Labels speakers as PLAYFUL (user) or CONDUCTOR (assistant) with timestamps
 /// - Chunks at ~100 lines with soft boundaries at speaker labels
-/// - Returns the source_id
-pub fn ingest_conversation(conn: &Connection, jsonl_path: &Path) -> Result<i64> {
+/// - Returns the slug name
+pub fn ingest_conversation(conn: &Connection, slug: &str, jsonl_path: &Path) -> Result<String> {
     let path_str = jsonl_path.to_string_lossy().to_string();
 
     // Check if already ingested
-    if let Some(id) = existing_source_id(conn, &path_str)? {
-        tracing::info!("Already ingested as source {id}. Use 'build' to continue pipeline.");
-        return Ok(id);
+    if let Some(_info) = db::get_slug(conn, slug)? {
+        tracing::info!("Slug '{slug}' already exists. Use 'build' to continue pipeline.");
+        return Ok(slug.to_string());
     }
 
     let (messages, _total) = parse_conversation_messages(jsonl_path, 0)?;
@@ -394,25 +343,20 @@ pub fn ingest_conversation(conn: &Connection, jsonl_path: &Path) -> Result<i64> 
         transcript.len()
     );
 
-    // Create source
-    let metadata = serde_json::json!({
-        "messages": messages.len(),
-        "chars": transcript.len(),
-    });
-    let source_id = insert_source(conn, "conversation", &path_str, &metadata.to_string())?;
+    // Create slug and batch
+    db::create_slug(conn, slug, &ContentType::Conversation, &path_str)?;
+    let batch_id = db::create_batch(conn, slug, "initial", &path_str, 0)?;
 
     // Chunk
     let chunks = chunk_transcript(&transcript);
 
     // Save chunks
     for (i, chunk_text) in chunks.iter().enumerate() {
-        let line_count = chunk_text.matches('\n').count() as i64 + 1;
-        let char_count = chunk_text.len() as i64;
-        insert_chunk(conn, source_id, i as i64, chunk_text, line_count, char_count)?;
+        db::insert_chunk(conn, slug, batch_id, i as i64, chunk_text)?;
     }
 
-    tracing::info!("Source {source_id}: {} chunks saved", chunks.len());
-    Ok(source_id)
+    tracing::info!("Slug '{slug}': {} chunks saved", chunks.len());
+    Ok(slug.to_string())
 }
 
 /// Ingest only the NEW portion of a JSONL (messages after skip_messages).
@@ -421,9 +365,10 @@ pub fn ingest_conversation(conn: &Connection, jsonl_path: &Path) -> Result<i64> 
 /// Returns `None` if no new messages were found.
 pub fn ingest_continuation(
     conn: &Connection,
+    slug: &str,
     jsonl_path: &Path,
     skip_messages: usize,
-) -> Result<Option<i64>> {
+) -> Result<Option<String>> {
     let (messages, total_count) = parse_conversation_messages(jsonl_path, skip_messages)?;
 
     if messages.is_empty() {
@@ -441,31 +386,28 @@ pub fn ingest_continuation(
         transcript.len()
     );
 
-    // Source path includes continuation marker, matching Python format
-    let path_str = format!(
+    // Continuation batch source path includes marker
+    let cont_path = format!(
         "{}:continuation:{}+",
         jsonl_path.to_string_lossy(),
         skip_messages
     );
-    let metadata = serde_json::json!({
-        "messages": messages.len(),
-        "chars": transcript.len(),
-        "skip_messages": skip_messages,
-        "total_messages": total_count,
-    });
-    let source_id = insert_source(conn, "conversation", &path_str, &metadata.to_string())?;
+
+    // Get existing chunk count for offset
+    let chunk_offset = db::count_chunks(conn, slug)?;
+
+    let batch_id = db::create_batch(conn, slug, "continuation", &cont_path, chunk_offset)?;
 
     // Chunk
     let chunks = chunk_transcript(&transcript);
 
     for (i, chunk_text) in chunks.iter().enumerate() {
-        let line_count = chunk_text.matches('\n').count() as i64 + 1;
-        let char_count = chunk_text.len() as i64;
-        insert_chunk(conn, source_id, i as i64, chunk_text, line_count, char_count)?;
+        let chunk_index = chunk_offset + i as i64;
+        db::insert_chunk(conn, slug, batch_id, chunk_index, chunk_text)?;
     }
 
-    tracing::info!("Source {source_id}: {} chunks saved", chunks.len());
-    Ok(Some(source_id))
+    tracing::info!("Slug '{slug}': {} continuation chunks saved", chunks.len());
+    Ok(Some(slug.to_string()))
 }
 
 /// Ingest a code directory into the pyramid database.
@@ -473,14 +415,14 @@ pub fn ingest_continuation(
 /// - Walks the directory recursively, skipping SKIP_DIRS and hidden files
 /// - Collects files matching CODE_EXTENSIONS or CONFIG_FILES
 /// - Each file = 1 chunk, formatted with metadata header
-/// - Returns the source_id
-pub fn ingest_code(conn: &Connection, dir_path: &Path) -> Result<i64> {
+/// - Returns the slug name
+pub fn ingest_code(conn: &Connection, slug: &str, dir_path: &Path) -> Result<String> {
     let path_str = dir_path.to_string_lossy().to_string();
 
     // Check if already ingested
-    if let Some(id) = existing_source_id(conn, &path_str)? {
-        tracing::info!("Already ingested as source {id}. Use 'build' to continue pipeline.");
-        return Ok(id);
+    if let Some(_info) = db::get_slug(conn, slug)? {
+        tracing::info!("Slug '{slug}' already exists. Use 'build' to continue pipeline.");
+        return Ok(slug.to_string());
     }
 
     let skip = skip_dirs();
@@ -554,7 +496,7 @@ pub fn ingest_code(conn: &Connection, dir_path: &Path) -> Result<i64> {
         });
     }
 
-    let total_lines: usize = files.iter().map(|f| f.lines).collect::<Vec<_>>().iter().sum();
+    let total_lines: usize = files.iter().map(|f| f.lines).sum();
     let languages: HashSet<&str> = files.iter().map(|f| f.language).collect();
     tracing::info!(
         "Ingesting code from {}: {} files ({total_lines} lines)",
@@ -562,13 +504,18 @@ pub fn ingest_code(conn: &Connection, dir_path: &Path) -> Result<i64> {
         files.len()
     );
 
-    // Create source
+    // Create slug and batch
     let metadata = serde_json::json!({
         "files": files.len(),
         "total_lines": total_lines,
         "languages": languages.into_iter().collect::<Vec<_>>(),
     });
-    let source_id = insert_source(conn, "code", &path_str, &metadata.to_string())?;
+    db::create_slug(conn, slug, &ContentType::Code, &path_str)?;
+    let batch_id = db::create_batch(conn, slug, "initial", &path_str, 0)?;
+
+    // Store metadata in batch (via the batch's source_path field, which already has the path)
+    // The metadata JSON is logged but not stored separately — batch tracks chunk counts automatically
+    tracing::info!("Code metadata: {}", metadata);
 
     // Create chunks — 1 file = 1 chunk
     for (i, f) in files.iter().enumerate() {
@@ -576,30 +523,29 @@ pub fn ingest_code(conn: &Connection, dir_path: &Path) -> Result<i64> {
             "## FILE: {}\n## LANGUAGE: {}\n## TYPE: {}\n## LINES: {}\n\n{}",
             f.rel_path, f.language, f.file_type, f.lines, f.content
         );
-        insert_chunk(
-            conn,
-            source_id,
-            i as i64,
-            &chunk_content,
-            f.lines as i64,
-            f.content.len() as i64,
-        )?;
+        db::insert_chunk(conn, slug, batch_id, i as i64, &chunk_content)?;
     }
 
     tracing::info!(
-        "Source {source_id}: {} chunks saved (1 file = 1 chunk)",
+        "Slug '{slug}': {} chunks saved (1 file = 1 chunk)",
         files.len()
     );
-    Ok(source_id)
+    Ok(slug.to_string())
 }
 
 /// Ingest a directory of documents (.txt, .md) into the pyramid database.
 ///
 /// - Walks the directory, skipping hidden dirs/files
 /// - Each document = 1 chunk, formatted as `## DOCUMENT: <rel_path>\n\n<content>`
-/// - Returns the source_id, or None if no documents found
-pub fn ingest_docs(conn: &Connection, dir_path: &Path) -> Result<i64> {
+/// - Returns the slug name
+pub fn ingest_docs(conn: &Connection, slug: &str, dir_path: &Path) -> Result<String> {
     let path_str = dir_path.to_string_lossy().to_string();
+
+    // Check if already ingested
+    if let Some(_info) = db::get_slug(conn, slug)? {
+        tracing::info!("Slug '{slug}' already exists. Use 'build' to continue pipeline.");
+        return Ok(slug.to_string());
+    }
 
     let doc_exts = doc_extensions();
     let empty_skip: HashSet<&str> = HashSet::new();
@@ -650,28 +596,21 @@ pub fn ingest_docs(conn: &Connection, dir_path: &Path) -> Result<i64> {
         doc_contents.len()
     );
 
-    // Create source
-    let file_list: Vec<&str> = doc_contents.iter().map(|(r, _)| r.as_str()).collect();
-    let metadata = serde_json::json!({
-        "files": doc_contents.len(),
-        "lines": total_lines,
-        "file_list": file_list,
-    });
-    let source_id = insert_source(conn, "document", &path_str, &metadata.to_string())?;
+    // Create slug and batch
+    db::create_slug(conn, slug, &ContentType::Document, &path_str)?;
+    let batch_id = db::create_batch(conn, slug, "initial", &path_str, 0)?;
 
     // Each document = 1 chunk
     for (i, (rel_path, content)) in doc_contents.iter().enumerate() {
         let chunk_content = format!("## DOCUMENT: {rel_path}\n\n{content}");
-        let line_count = content.matches('\n').count() as i64 + 1;
-        let char_count = content.len() as i64;
-        insert_chunk(conn, source_id, i as i64, &chunk_content, line_count, char_count)?;
+        db::insert_chunk(conn, slug, batch_id, i as i64, &chunk_content)?;
     }
 
     tracing::info!(
-        "Source {source_id}: {} documents saved",
+        "Slug '{slug}': {} documents saved",
         doc_contents.len()
     );
-    Ok(source_id)
+    Ok(slug.to_string())
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -778,5 +717,10 @@ mod tests {
         assert!(dirs.contains("__pycache__"));
         assert!(dirs.contains(".cache"));
         assert!(dirs.contains("coverage"));
+        // Project-specific entries removed
+        assert!(!dirs.contains("relay-app"));
+        assert!(!dirs.contains("pyramid-prototype"));
+        assert!(!dirs.contains("agentwire"));
+        assert!(!dirs.contains("agentspace"));
     }
 }

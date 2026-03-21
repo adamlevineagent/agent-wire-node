@@ -12,6 +12,8 @@ use super::PyramidState;
 use super::types::*;
 use super::query;
 use super::slug;
+use super::build::{self, WriteOp};
+use super::db;
 
 // ── Auth middleware ──────────────────────────────────────────────────
 
@@ -445,14 +447,16 @@ async fn handle_build(
 
     // Spawn the build task
     let reader = state.reader.clone();
+    let writer = state.writer.clone();
+    let config = state.config.clone();
     let active_build = state.active_build.clone();
     let build_status = status.clone();
 
     tokio::spawn(async move {
         let start = std::time::Instant::now();
 
-        // Read slug info to determine content type (for future use)
-        let _content_type = {
+        // Read slug info to determine content type
+        let content_type = {
             let conn = reader.lock().await;
             match super::slug::get_slug(&conn, &slug_name) {
                 Ok(Some(info)) => info.content_type,
@@ -465,18 +469,94 @@ async fn handle_build(
             }
         };
 
-        // TODO: When build.rs is implemented, call the appropriate pipeline here:
-        // match _content_type {
-        //     ContentType::Conversation => build::build_conversation(...),
-        //     ContentType::Code => build::build_code(...),
-        //     ContentType::Document => build::build_docs(...),
-        // }
+        // Snapshot LLM config
+        let llm_config = {
+            let cfg = config.read().await;
+            cfg.clone()
+        };
 
-        // For now, mark as complete (build.rs is a stub)
+        // Create mpsc channel for WriteOps
+        let (write_tx, mut write_rx) = tokio::sync::mpsc::channel::<WriteOp>(256);
+
+        // Spawn the writer task that consumes WriteOps using the writer connection
+        let writer_handle = {
+            let writer_conn = writer.clone();
+            tokio::spawn(async move {
+                while let Some(op) = write_rx.recv().await {
+                    let result = {
+                        let conn = writer_conn.lock().await;
+                        match op {
+                            WriteOp::SaveNode { ref node, ref topics_json } => {
+                                db::save_node(&conn, node, topics_json.as_deref())
+                            }
+                            WriteOp::SaveStep {
+                                ref slug, ref step_type, chunk_index, depth,
+                                ref node_id, ref output_json, ref model, elapsed,
+                            } => {
+                                db::save_step(&conn, slug, step_type, chunk_index, depth, node_id, output_json, model, elapsed)
+                            }
+                            WriteOp::UpdateParent { ref slug, ref node_id, ref parent_id } => {
+                                conn.execute(
+                                    "UPDATE pyramid_nodes SET parent_id = ?1 WHERE slug = ?2 AND id = ?3",
+                                    rusqlite::params![parent_id, slug, node_id],
+                                )
+                                .map(|_| ())
+                                .map_err(|e| anyhow::anyhow!(e))
+                            }
+                        }
+                    };
+                    if let Err(e) = result {
+                        tracing::error!("WriteOp failed: {e}");
+                    }
+                }
+            })
+        };
+
+        // Create progress channel — forward updates into the build status
+        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel::<BuildProgress>(64);
+        let progress_status = build_status.clone();
+        let progress_start = start;
+        let progress_handle = tokio::spawn(async move {
+            while let Some(prog) = progress_rx.recv().await {
+                let mut s = progress_status.write().await;
+                s.progress = prog;
+                s.elapsed_seconds = progress_start.elapsed().as_secs_f64();
+            }
+        });
+
+        // Call the appropriate build pipeline
+        let result = match content_type {
+            ContentType::Conversation => {
+                build::build_conversation(
+                    reader.clone(), &write_tx, &llm_config, &slug_name, &cancel, &progress_tx,
+                ).await
+            }
+            ContentType::Code => {
+                build::build_code(
+                    reader.clone(), &write_tx, &llm_config, &slug_name, &cancel, &progress_tx,
+                ).await
+            }
+            ContentType::Document => {
+                build::build_docs(
+                    reader.clone(), &write_tx, &llm_config, &slug_name, &cancel, &progress_tx,
+                ).await
+            }
+        };
+
+        // Drop the write sender so the writer task can finish
+        drop(write_tx);
+        drop(progress_tx);
+        let _ = writer_handle.await;
+        let _ = progress_handle.await;
+
+        // Update final status
         {
             let mut s = build_status.write().await;
             if cancel.is_cancelled() {
                 s.status = "cancelled".to_string();
+            } else if let Err(ref e) = result {
+                s.status = "failed".to_string();
+                tracing::error!("Build failed for '{}': {e}", slug_name);
             } else {
                 s.status = "complete".to_string();
             }

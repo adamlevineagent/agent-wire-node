@@ -2225,19 +2225,137 @@ async fn pyramid_build(
         *active = Some(handle);
     }
 
-    let _reader = state.pyramid.reader.clone();
+    let reader = state.pyramid.reader.clone();
+    let writer = state.pyramid.writer.clone();
+    let config = state.pyramid.config.clone();
     let active_build = state.pyramid.active_build.clone();
     let build_status = status.clone();
 
     tokio::spawn(async move {
         let start = std::time::Instant::now();
 
-        // TODO: Call build pipeline when build.rs is implemented
+        // Read slug info to determine content type
+        let content_type = {
+            let conn = reader.lock().await;
+            match wire_node_lib::pyramid::slug::get_slug(&conn, &slug) {
+                Ok(Some(info)) => info.content_type,
+                _ => {
+                    let mut s = build_status.write().await;
+                    s.status = "failed".to_string();
+                    s.elapsed_seconds = start.elapsed().as_secs_f64();
+                    return;
+                }
+            }
+        };
 
+        // Snapshot LLM config
+        let llm_config = {
+            let cfg = config.read().await;
+            cfg.clone()
+        };
+
+        // Create mpsc channel for WriteOps
+        let (write_tx, mut write_rx) =
+            tokio::sync::mpsc::channel::<wire_node_lib::pyramid::build::WriteOp>(256);
+
+        // Spawn the writer task
+        let writer_handle = {
+            let writer_conn = writer.clone();
+            tokio::spawn(async move {
+                while let Some(op) = write_rx.recv().await {
+                    let result = {
+                        let conn = writer_conn.lock().await;
+                        match op {
+                            wire_node_lib::pyramid::build::WriteOp::SaveNode {
+                                ref node,
+                                ref topics_json,
+                            } => wire_node_lib::pyramid::db::save_node(
+                                &conn,
+                                node,
+                                topics_json.as_deref(),
+                            ),
+                            wire_node_lib::pyramid::build::WriteOp::SaveStep {
+                                ref slug,
+                                ref step_type,
+                                chunk_index,
+                                depth,
+                                ref node_id,
+                                ref output_json,
+                                ref model,
+                                elapsed,
+                            } => wire_node_lib::pyramid::db::save_step(
+                                &conn, slug, step_type, chunk_index, depth, node_id, output_json,
+                                model, elapsed,
+                            ),
+                            wire_node_lib::pyramid::build::WriteOp::UpdateParent {
+                                ref slug,
+                                ref node_id,
+                                ref parent_id,
+                            } => conn
+                                .execute(
+                                    "UPDATE pyramid_nodes SET parent_id = ?1 WHERE slug = ?2 AND id = ?3",
+                                    rusqlite::params![parent_id, slug, node_id],
+                                )
+                                .map(|_| ())
+                                .map_err(|e| anyhow::anyhow!(e)),
+                        }
+                    };
+                    if let Err(e) = result {
+                        tracing::error!("WriteOp failed: {e}");
+                    }
+                }
+            })
+        };
+
+        // Create progress channel
+        let (progress_tx, mut progress_rx) =
+            tokio::sync::mpsc::channel::<BuildProgress>(64);
+        let progress_status = build_status.clone();
+        let progress_start = start;
+        let progress_handle = tokio::spawn(async move {
+            while let Some(prog) = progress_rx.recv().await {
+                let mut s = progress_status.write().await;
+                s.progress = prog;
+                s.elapsed_seconds = progress_start.elapsed().as_secs_f64();
+            }
+        });
+
+        // Call the appropriate build pipeline
+        let result = match content_type {
+            ContentType::Conversation => {
+                wire_node_lib::pyramid::build::build_conversation(
+                    reader.clone(), &write_tx, &llm_config, &slug, &cancel, &progress_tx,
+                )
+                .await
+            }
+            ContentType::Code => {
+                wire_node_lib::pyramid::build::build_code(
+                    reader.clone(), &write_tx, &llm_config, &slug, &cancel, &progress_tx,
+                )
+                .await
+            }
+            ContentType::Document => {
+                wire_node_lib::pyramid::build::build_docs(
+                    reader.clone(), &write_tx, &llm_config, &slug, &cancel, &progress_tx,
+                )
+                .await
+            }
+        };
+
+        // Drop senders so tasks finish
+        drop(write_tx);
+        drop(progress_tx);
+        let _ = writer_handle.await;
+        let _ = progress_handle.await;
+
+        // Update final status
         {
             let mut s = build_status.write().await;
             if cancel.is_cancelled() {
                 s.status = "cancelled".to_string();
+            } else if let Err(ref e) = result {
+                s.status = "failed".to_string();
+                tracing::error!("Build failed for '{}': {e}", slug);
             } else {
                 s.status = "complete".to_string();
             }
