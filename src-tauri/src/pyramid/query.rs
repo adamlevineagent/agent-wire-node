@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use tracing::warn;
 
+use super::db;
 use super::types::*;
 
 // ── Query-specific response types ────────────────────────────────────
@@ -122,20 +123,6 @@ pub fn get_apex(conn: &Connection, slug: &str) -> Result<Option<PyramidNode>> {
     Ok(node)
 }
 
-/// Get a specific node by ID.
-pub fn get_node(conn: &Connection, slug: &str, node_id: &str) -> Result<Option<PyramidNode>> {
-    let mut stmt = conn.prepare(
-        "SELECT * FROM pyramid_nodes WHERE slug = ? AND id = ?",
-    )?;
-
-    let node = stmt
-        .query_row(rusqlite::params![slug, node_id], row_to_node)
-        .optional()
-        .context("Failed to query node")?;
-
-    Ok(node)
-}
-
 /// Get the full tree structure from the apex down.
 ///
 /// Loads all nodes for the slug into memory, finds the apex (highest depth),
@@ -195,14 +182,14 @@ pub fn get_tree(conn: &Connection, slug: &str) -> Result<Vec<TreeNode>> {
 
 /// Drill into a node — returns the node plus its direct children.
 pub fn drill(conn: &Connection, slug: &str, node_id: &str) -> Result<Option<DrillResult>> {
-    let parent = match get_node(conn, slug, node_id)? {
+    let parent = match db::get_node(conn, slug, node_id)? {
         Some(n) => n,
         None => return Ok(None),
     };
 
     let mut children = Vec::new();
     for child_id in &parent.children {
-        if let Some(child) = get_node(conn, slug, child_id)? {
+        if let Some(child) = db::get_node(conn, slug, child_id)? {
             children.push(child);
         }
     }

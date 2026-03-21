@@ -16,6 +16,7 @@ use std::time::Instant;
 use anyhow::{anyhow, Result};
 use regex::Regex;
 use rusqlite::Connection;
+use std::sync::LazyLock;
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -81,6 +82,9 @@ pub enum WriteOp {
         node_id: String,
         parent_id: String,
     },
+    UpdateStats {
+        slug: String,
+    },
 }
 
 // ── PROMPT CONSTANTS ─────────────────────────────────────────────────────────
@@ -102,7 +106,7 @@ Output valid JSON only (no markdown fences, no extra text):
   "distilled": "The chunk compressed to maximum density. Every decision, name, mechanism, correction preserved. Target: 10-15% of input length.",
   "corrections": [{"wrong": "what was believed", "right": "what replaced it", "who": "who corrected"}],
   "decisions": [{"decided": "what was chosen", "rejected": "what was rejected", "why": "reasoning"}],
-  "terms_defined": [{"term": "exact term", "definition": "concrete definition from the conversation"}],
+  "terms": [{"term": "exact term", "definition": "concrete definition from the conversation"}],
   "running_context": "1-2 sentences: what the conversation now knows that it didn't before"
 }
 
@@ -460,6 +464,7 @@ fn flatten_analysis(analysis: &Value) -> (String, Vec<Correction>, Vec<Decision>
                     decisions.push(Decision {
                         decided: d.get("decided").and_then(|v| v.as_str()).unwrap_or("").into(),
                         why: d.get("why").and_then(|v| v.as_str()).unwrap_or("").into(),
+                        rejected: d.get("rejected").and_then(|v| v.as_str()).unwrap_or("").into(),
                     });
                 }
             }
@@ -802,15 +807,8 @@ pub async fn build_conversation(
 
     // Update slug stats
     writer_tx
-        .send(WriteOp::SaveStep {
+        .send(WriteOp::UpdateStats {
             slug: slug.to_string(),
-            step_type: "update_stats".to_string(),
-            chunk_index: -1,
-            depth: -1,
-            node_id: String::new(),
-            output_json: String::new(),
-            model: String::new(),
-            elapsed: 0.0,
         })
         .await
         .ok();
@@ -1102,6 +1100,14 @@ pub async fn build_code(
     // ── L3+: Normal pairing ──────────────────────────────────────────
     build_upper_layers(db.clone(), writer_tx, llm_config, slug, 2, cancel, progress_tx, &mut done, estimated_total).await?;
 
+    // Update slug stats
+    writer_tx
+        .send(WriteOp::UpdateStats {
+            slug: slug.to_string(),
+        })
+        .await
+        .ok();
+
     info!("Code pyramid build complete for '{slug}'");
     Ok(())
 }
@@ -1359,6 +1365,14 @@ pub async fn build_docs(
 
     // ── L3+: Normal pairing ──────────────────────────────────────────
     build_upper_layers(db.clone(), writer_tx, llm_config, slug, 2, cancel, progress_tx, &mut done, estimated_total).await?;
+
+    // Update slug stats
+    writer_tx
+        .send(WriteOp::UpdateStats {
+            slug: slug.to_string(),
+        })
+        .await
+        .ok();
 
     info!("Document pyramid build complete for '{slug}'");
     Ok(())
@@ -1889,24 +1903,41 @@ fn extract_import_graph(conn: &Connection, slug: &str) -> Result<ImportGraph> {
     let num_chunks = db::count_chunks(conn, slug)?;
     let mut graph = ImportGraph::default();
 
-    let rust_use_re = Regex::new(r"use\s+(?:crate::)?(\w+)").unwrap();
-    let rust_mod_re = Regex::new(r"mod\s+(\w+)\s*;").unwrap();
-    let rust_pub_re = Regex::new(r"pub\s+(?:async\s+)?(?:fn|struct|enum|type)\s+(\w+)").unwrap();
-    let rust_tauri_cmd_re = Regex::new(r"#\[tauri::command\]\s*(?:pub\s+)?(?:async\s+)?fn\s+(\w+)").unwrap();
-    let ts_import_re = Regex::new(r#"import\s+.*?from\s+['"]([^'"]+)['"]"#).unwrap();
-    let ts_export_re = Regex::new(r"export\s+(?:default\s+)?(?:function|const|class|interface|type|enum)\s+(\w+)").unwrap();
-    let ts_invoke_re = Regex::new(r#"invoke\s*[<(]\s*['"](\w+)['"]"#).unwrap();
+    static RUST_USE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"use\s+(?:crate::)?(\w+)").unwrap());
+    static RUST_MOD_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"mod\s+(\w+)\s*;").unwrap());
+    static RUST_PUB_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"pub\s+(?:async\s+)?(?:fn|struct|enum|type)\s+(\w+)").unwrap());
+    static RUST_TAURI_CMD_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"#\[tauri::command\]\s*(?:pub\s+)?(?:async\s+)?fn\s+(\w+)").unwrap());
+    static TS_IMPORT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"import\s+.*?from\s+['"]([^'"]+)['"]"#).unwrap());
+    static TS_EXPORT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"export\s+(?:default\s+)?(?:function|const|class|interface|type|enum)\s+(\w+)").unwrap());
+    static TS_INVOKE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"invoke\s*[<(]\s*['"](\w+)['"]"#).unwrap());
 
-    let spawn_re = Regex::new(r"(?:tokio::)?(?:async_runtime::)?spawn\s*\(").unwrap();
-    let timer_re = Regex::new(r"(setInterval|setTimeout)\s*\(").unwrap();
-    let tokio_time_re = Regex::new(r"tokio::time::(interval|sleep)\s*\(").unwrap();
+    static SPAWN_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?:tokio::)?(?:async_runtime::)?spawn\s*\(").unwrap());
+    static TIMER_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(setInterval|setTimeout)\s*\(").unwrap());
+    static TOKIO_TIME_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"tokio::time::(interval|sleep)\s*\(").unwrap());
 
-    let table_re = Regex::new(r#"\.from\s*\(\s*['"](\w+)['"]"#).unwrap();
-    let storage_re = Regex::new(r#"storage\s*\(\s*\)\s*\.from\s*\(\s*['"]([^'"]+)['"]"#).unwrap();
-    let url_re = Regex::new(r#"['"]((https?://[^'"]+)|(\/api\/[^'"]+))['"]"#).unwrap();
-    let file_re = Regex::new(r#"['"]([^'"]*\.(json|toml|db|sqlite|log|txt|png|jpg|mp3|wav|ogg))['"]"#).unwrap();
-    let rust_fn_re = Regex::new(r"(?:pub\s+)?(?:async\s+)?fn\s+\w+").unwrap();
-    let ts_fn_re = Regex::new(r"(?:export\s+)?(?:default\s+)?(?:function|const\s+\w+\s*=\s*(?:async\s+)?\()").unwrap();
+    static TABLE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"\.from\s*\(\s*['"](\w+)['"]"#).unwrap());
+    static STORAGE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"storage\s*\(\s*\)\s*\.from\s*\(\s*['"]([^'"]+)['"]"#).unwrap());
+    static URL_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"['"]((https?://[^'"]+)|(\/api\/[^'"]+))['"]"#).unwrap());
+    static FILE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"['"]([^'"]*\.(json|toml|db|sqlite|log|txt|png|jpg|mp3|wav|ogg))['"]"#).unwrap());
+    static RUST_FN_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?:pub\s+)?(?:async\s+)?fn\s+\w+").unwrap());
+    static TS_FN_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?:export\s+)?(?:default\s+)?(?:function|const\s+\w+\s*=\s*(?:async\s+)?\()").unwrap());
+
+    let rust_use_re = &*RUST_USE_RE;
+    let rust_mod_re = &*RUST_MOD_RE;
+    let rust_pub_re = &*RUST_PUB_RE;
+    let rust_tauri_cmd_re = &*RUST_TAURI_CMD_RE;
+    let ts_import_re = &*TS_IMPORT_RE;
+    let ts_export_re = &*TS_EXPORT_RE;
+    let ts_invoke_re = &*TS_INVOKE_RE;
+    let spawn_re = &*SPAWN_RE;
+    let timer_re = &*TIMER_RE;
+    let tokio_time_re = &*TOKIO_TIME_RE;
+    let table_re = &*TABLE_RE;
+    let storage_re = &*STORAGE_RE;
+    let url_re = &*URL_RE;
+    let file_re = &*FILE_RE;
+    let rust_fn_re = &*RUST_FN_RE;
+    let ts_fn_re = &*TS_FN_RE;
 
     for ci in 0..num_chunks {
         let content = match db::get_chunk(conn, slug, ci)? {

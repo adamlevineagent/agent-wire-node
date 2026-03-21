@@ -40,11 +40,11 @@ fn with_auth_state(
                 None => return Err(warp::reject::custom(Unauthorized)),
             };
 
-            let api_key = {
+            let auth_token = {
                 let config = state.config.read().await;
-                config.api_key.clone()
+                config.auth_token.clone()
             };
-            if api_key.is_empty() || !ct_eq(&token, &api_key) {
+            if auth_token.is_empty() || !ct_eq(&token, &auth_token) {
                 return Err(warp::reject::custom(Unauthorized));
             }
 
@@ -309,7 +309,7 @@ async fn handle_node(
     state: Arc<PyramidState>,
 ) -> Result<warp::reply::Response, warp::Rejection> {
     let conn = state.reader.lock().await;
-    match query::get_node(&conn, &slug_name, &node_id) {
+    match db::get_node(&conn, &slug_name, &node_id) {
         Ok(Some(node)) => Ok(json_ok(&node)),
         Ok(None) => Ok(json_error(warp::http::StatusCode::NOT_FOUND, "Node not found")),
         Err(e) => Ok(json_error(warp::http::StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())),
@@ -496,12 +496,10 @@ async fn handle_build(
                                 db::save_step(&conn, slug, step_type, chunk_index, depth, node_id, output_json, model, elapsed)
                             }
                             WriteOp::UpdateParent { ref slug, ref node_id, ref parent_id } => {
-                                conn.execute(
-                                    "UPDATE pyramid_nodes SET parent_id = ?1 WHERE slug = ?2 AND id = ?3",
-                                    rusqlite::params![parent_id, slug, node_id],
-                                )
-                                .map(|_| ())
-                                .map_err(|e| anyhow::anyhow!(e))
+                                db::update_parent(&conn, slug, node_id, parent_id)
+                            }
+                            WriteOp::UpdateStats { ref slug } => {
+                                db::update_slug_stats(&conn, slug)
                             }
                         }
                     };

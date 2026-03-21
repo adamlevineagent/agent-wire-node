@@ -441,6 +441,15 @@ pub fn delete_nodes_above(conn: &Connection, slug: &str, depth: i64) -> Result<i
     Ok(deleted as i64)
 }
 
+/// Update a node's parent_id.
+pub fn update_parent(conn: &Connection, slug: &str, node_id: &str, parent_id: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE pyramid_nodes SET parent_id = ?3 WHERE slug = ?1 AND id = ?2",
+        rusqlite::params![slug, node_id, parent_id],
+    )?;
+    Ok(())
+}
+
 // ── Pipeline Step Tracking ───────────────────────────────────────────────────
 
 /// Save a pipeline step record (for resumability).
@@ -601,6 +610,7 @@ mod tests {
                 decisions: vec![Decision {
                     decided: "Use JWT".to_string(),
                     why: "Standard".to_string(),
+                    rejected: String::new(),
                 }],
             }],
             corrections: vec![],

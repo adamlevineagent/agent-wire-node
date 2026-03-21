@@ -8,6 +8,7 @@ use tracing::info;
 #[derive(Debug, Clone)]
 pub struct LlmConfig {
     pub api_key: String,
+    pub auth_token: String,
     pub primary_model: String,
     pub fallback_model_1: String,
     pub fallback_model_2: String,
@@ -19,6 +20,7 @@ impl Default for LlmConfig {
     fn default() -> Self {
         Self {
             api_key: String::new(),
+            auth_token: String::new(),
             primary_model: "inception/mercury-2".into(),
             fallback_model_1: "qwen/qwen3.5-flash-02-23".into(),
             fallback_model_2: "x-ai/grok-4.20-beta".into(),

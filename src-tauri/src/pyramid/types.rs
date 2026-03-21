@@ -84,6 +84,8 @@ pub struct Correction {
 pub struct Decision {
     pub decided: String,
     pub why: String,
+    #[serde(default)]
+    pub rejected: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -2120,6 +2120,7 @@ async fn get_logs(state: tauri::State<'_, SharedState>) -> Result<Vec<String>, S
 
 use wire_node_lib::pyramid::types::*;
 use wire_node_lib::pyramid::query as pyramid_query;
+use wire_node_lib::pyramid::db as pyramid_db;
 
 #[tauri::command]
 async fn pyramid_list_slugs(
@@ -2147,7 +2148,7 @@ async fn pyramid_node(
     node_id: String,
 ) -> Result<PyramidNode, String> {
     let conn = state.pyramid.reader.lock().await;
-    pyramid_query::get_node(&conn, &slug, &node_id)
+    pyramid_db::get_node(&conn, &slug, &node_id)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "Node not found".to_string())
 }
@@ -2291,13 +2292,14 @@ async fn pyramid_build(
                                 ref slug,
                                 ref node_id,
                                 ref parent_id,
-                            } => conn
-                                .execute(
-                                    "UPDATE pyramid_nodes SET parent_id = ?1 WHERE slug = ?2 AND id = ?3",
-                                    rusqlite::params![parent_id, slug, node_id],
-                                )
-                                .map(|_| ())
-                                .map_err(|e| anyhow::anyhow!(e)),
+                            } => wire_node_lib::pyramid::db::update_parent(
+                                &conn, slug, node_id, parent_id,
+                            ),
+                            wire_node_lib::pyramid::build::WriteOp::UpdateStats {
+                                ref slug,
+                            } => wire_node_lib::pyramid::db::update_slug_stats(
+                                &conn, slug,
+                            ),
                         }
                     };
                     if let Err(e) = result {
