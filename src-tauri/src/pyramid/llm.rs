@@ -179,31 +179,38 @@ pub fn extract_json(text: &str) -> Result<Value> {
         text = lines.join("\n").trim().to_string();
     }
 
-    // Find first { and last }
-    let start = text.find('{');
-    let end = text.rfind('}');
+    // Find JSON delimiters — try both object {…} and array […]
+    let obj_start = text.find('{');
+    let obj_end = text.rfind('}');
+    let arr_start = text.find('[');
+    let arr_end = text.rfind(']');
 
-    match (start, end) {
-        (Some(s), Some(e)) if e >= s => {
-            let slice = &text[s..=e];
-
-            // Try parsing as-is
-            if let Ok(v) = serde_json::from_str::<Value>(slice) {
-                return Ok(v);
-            }
-
-            // Fix trailing commas and retry
-            let comma_brace = Regex::new(r",\s*}").unwrap();
-            let comma_bracket = Regex::new(r",\s*]").unwrap();
-            let fixed = comma_brace.replace_all(slice, "}");
-            let fixed = comma_bracket.replace_all(&fixed, "]");
-
-            if let Ok(v) = serde_json::from_str::<Value>(&fixed) {
-                return Ok(v);
-            }
-
-            Err(anyhow!("No JSON found in: {}", &text[..text.len().min(200)]))
+    // Pick the outermost valid JSON range (object or array, whichever starts first)
+    let (start, end) = match ((obj_start, obj_end), (arr_start, arr_end)) {
+        ((Some(os), Some(oe)), (Some(as_), Some(ae))) if oe >= os && ae >= as_ => {
+            if os <= as_ { (os, oe) } else { (as_, ae) }
         }
-        _ => Err(anyhow!("No JSON found in: {}", &text[..text.len().min(200)])),
+        ((Some(os), Some(oe)), _) if oe >= os => (os, oe),
+        (_, (Some(as_), Some(ae))) if ae >= as_ => (as_, ae),
+        _ => return Err(anyhow!("No JSON found in: {}", &text[..text.len().min(200)])),
+    };
+
+    let slice = &text[start..=end];
+
+    // Try parsing as-is
+    if let Ok(v) = serde_json::from_str::<Value>(slice) {
+        return Ok(v);
     }
+
+    // Fix trailing commas and retry
+    let comma_brace = Regex::new(r",\s*}").unwrap();
+    let comma_bracket = Regex::new(r",\s*]").unwrap();
+    let fixed = comma_brace.replace_all(slice, "}");
+    let fixed = comma_bracket.replace_all(&fixed, "]");
+
+    if let Ok(v) = serde_json::from_str::<Value>(&fixed) {
+        return Ok(v);
+    }
+
+    Err(anyhow!("No JSON found in: {}", &text[..text.len().min(200)]))
 }

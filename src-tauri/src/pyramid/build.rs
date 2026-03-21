@@ -10,6 +10,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{anyhow, Result};
@@ -23,6 +24,37 @@ use tracing::info;
 use super::db;
 use super::llm::{call_model, extract_json, LlmConfig};
 use super::types::*;
+
+// ── UTF-8 safe slicing helpers ───────────────────────────────────────────────
+
+fn safe_slice_end(s: &str, max: usize) -> &str {
+    if s.len() <= max { return s; }
+    let mut e = max;
+    while e > 0 && !s.is_char_boundary(e) { e -= 1; }
+    &s[..e]
+}
+
+fn safe_slice_start(s: &str, max: usize) -> &str {
+    if s.len() <= max { return s; }
+    let mut s_idx = s.len() - max;
+    while s_idx < s.len() && !s.is_char_boundary(s_idx) { s_idx += 1; }
+    &s[s_idx..]
+}
+
+// ── DB read helper (moves Connection access to blocking task) ────────────────
+
+async fn db_read<F, T>(db: &Arc<tokio::sync::Mutex<Connection>>, f: F) -> Result<T>
+where
+    F: FnOnce(&Connection) -> Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    let db = db.clone();
+    tokio::task::spawn_blocking(move || {
+        let conn = db.blocking_lock();
+        f(&conn)
+    })
+    .await?
+}
 
 // ── WriteOp ──────────────────────────────────────────────────────────────────
 
@@ -560,14 +592,18 @@ async fn send_update_parent(
 
 /// Build a conversation pyramid (forward -> reverse -> combine -> L1 pairing -> L2 threads -> L3+).
 pub async fn build_conversation(
-    conn: &Connection,
+    db: Arc<tokio::sync::Mutex<Connection>>,
     writer_tx: &mpsc::Sender<WriteOp>,
     llm_config: &LlmConfig,
     slug: &str,
     cancel: &CancellationToken,
     progress_tx: &mpsc::Sender<BuildProgress>,
 ) -> Result<()> {
-    let num_chunks = db::count_chunks(conn, slug)?;
+    let slug_owned = slug.to_string();
+    let num_chunks = db_read(&db, {
+        let s = slug_owned.clone();
+        move |conn| db::count_chunks(conn, &s)
+    }).await?;
     if num_chunks == 0 {
         return Err(anyhow!("No chunks found for slug '{slug}'"));
     }
@@ -590,13 +626,15 @@ pub async fn build_conversation(
 
     // Recover running_context from last completed forward step
     for ci in 0..num_chunks {
-        if db::step_exists(conn, slug, "forward", ci, -1, "")? {
-            if let Some(output) = db::get_step_output(conn, slug, "forward", ci)? {
+        let exists = db_read(&db, { let s = slug_owned.clone(); move |conn| db::step_exists(conn, &s, "forward", ci, -1, "") }).await?;
+        if exists {
+            let output = db_read(&db, { let s = slug_owned.clone(); move |conn| db::get_step_output(conn, &s, "forward", ci) }).await?;
+            if let Some(output) = output {
                 if let Ok(parsed) = serde_json::from_str::<Value>(&output) {
                     if let Some(ctx) = parsed.get("running_context").and_then(|v| v.as_str()) {
                         running_context = format!("{running_context} {ctx}");
                         if running_context.len() > 1500 {
-                            running_context = running_context[running_context.len() - 1200..].to_string();
+                            running_context = safe_slice_start(&running_context, 1200).to_string();
                         }
                     }
                 }
@@ -612,12 +650,12 @@ pub async fn build_conversation(
             return Ok(());
         }
 
-        if db::step_exists(conn, slug, "forward", ci, -1, "")? {
-            // Already counted above, just recover context if needed
+        let exists = db_read(&db, { let s = slug_owned.clone(); move |conn| db::step_exists(conn, &s, "forward", ci, -1, "") }).await?;
+        if exists {
             continue;
         }
 
-        let chunk_content = db::get_chunk(conn, slug, ci)?
+        let chunk_content = db_read(&db, { let s = slug_owned.clone(); move |conn| db::get_chunk(conn, &s, ci) }).await?
             .ok_or_else(|| anyhow!("Missing chunk {ci} for slug '{slug}'"))?;
 
         let user_prompt = format!(
@@ -639,7 +677,7 @@ pub async fn build_conversation(
         if let Some(ctx) = analysis.get("running_context").and_then(|v| v.as_str()) {
             running_context = format!("{running_context} {ctx}");
             if running_context.len() > 1500 {
-                running_context = running_context[running_context.len() - 1200..].to_string();
+                running_context = safe_slice_start(&running_context, 1200).to_string();
             }
         }
 
@@ -657,14 +695,15 @@ pub async fn build_conversation(
             return Ok(());
         }
 
-        if db::step_exists(conn, slug, "reverse", ci, -1, "")? {
-            // Recover running_context
-            if let Some(output) = db::get_step_output(conn, slug, "reverse", ci)? {
+        let exists = db_read(&db, { let s = slug_owned.clone(); move |conn| db::step_exists(conn, &s, "reverse", ci, -1, "") }).await?;
+        if exists {
+            let output = db_read(&db, { let s = slug_owned.clone(); move |conn| db::get_step_output(conn, &s, "reverse", ci) }).await?;
+            if let Some(output) = output {
                 if let Ok(parsed) = serde_json::from_str::<Value>(&output) {
                     if let Some(ctx) = parsed.get("running_context").and_then(|v| v.as_str()) {
                         running_context = format!("{ctx} {running_context}");
                         if running_context.len() > 1500 {
-                            running_context = running_context[..1200].to_string();
+                            running_context = safe_slice_end(&running_context, 1200).to_string();
                         }
                     }
                 }
@@ -674,7 +713,7 @@ pub async fn build_conversation(
             continue;
         }
 
-        let chunk_content = db::get_chunk(conn, slug, ci)?
+        let chunk_content = db_read(&db, { let s = slug_owned.clone(); move |conn| db::get_chunk(conn, &s, ci) }).await?
             .ok_or_else(|| anyhow!("Missing chunk {ci}"))?;
 
         let user_prompt = format!(
@@ -695,7 +734,7 @@ pub async fn build_conversation(
         if let Some(ctx) = analysis.get("running_context").and_then(|v| v.as_str()) {
             running_context = format!("{ctx} {running_context}");
             if running_context.len() > 1500 {
-                running_context = running_context[..1200].to_string();
+                running_context = safe_slice_end(&running_context, 1200).to_string();
             }
         }
 
@@ -713,15 +752,16 @@ pub async fn build_conversation(
 
         let node_id = format!("L0-{ci:03}");
 
-        if db::step_exists(conn, slug, "combine", ci, 0, &node_id)? {
+        let exists = db_read(&db, { let s = slug_owned.clone(); let nid = node_id.clone(); move |conn| db::step_exists(conn, &s, "combine", ci, 0, &nid) }).await?;
+        if exists {
             done += 1;
             let _ = progress_tx.send(BuildProgress { done, total: estimated_total }).await;
             continue;
         }
 
-        let fwd_json = db::get_step_output(conn, slug, "forward", ci)?
+        let fwd_json = db_read(&db, { let s = slug_owned.clone(); move |conn| db::get_step_output(conn, &s, "forward", ci) }).await?
             .ok_or_else(|| anyhow!("Missing forward step for chunk {ci}"))?;
-        let rev_json = db::get_step_output(conn, slug, "reverse", ci)?
+        let rev_json = db_read(&db, { let s = slug_owned.clone(); move |conn| db::get_step_output(conn, &s, "reverse", ci) }).await?
             .ok_or_else(|| anyhow!("Missing reverse step for chunk {ci}"))?;
 
         let fwd: Value = serde_json::from_str(&fwd_json)?;
@@ -752,13 +792,13 @@ pub async fn build_conversation(
     }
 
     // ── L1: Positional pairing ───────────────────────────────────────
-    build_l1_pairing(conn, writer_tx, llm_config, slug, cancel, progress_tx, &mut done, estimated_total).await?;
+    build_l1_pairing(db.clone(), writer_tx, llm_config, slug, cancel, progress_tx, &mut done, estimated_total).await?;
 
     // ── L2: Thread clustering ────────────────────────────────────────
-    build_threads_layer(conn, writer_tx, llm_config, slug, cancel, progress_tx, &mut done, estimated_total).await?;
+    build_threads_layer(db.clone(), writer_tx, llm_config, slug, cancel, progress_tx, &mut done, estimated_total).await?;
 
     // ── L3+: Normal pairing until apex ───────────────────────────────
-    build_upper_layers(conn, writer_tx, llm_config, slug, 2, cancel, progress_tx, &mut done, estimated_total).await?;
+    build_upper_layers(db.clone(), writer_tx, llm_config, slug, 2, cancel, progress_tx, &mut done, estimated_total).await?;
 
     // Update slug stats
     writer_tx
@@ -783,14 +823,15 @@ pub async fn build_conversation(
 
 /// Build a code pyramid (mechanical passes -> concurrent L0 -> import clustering L1 -> L2 threads -> L3+).
 pub async fn build_code(
-    conn: &Connection,
+    db: Arc<tokio::sync::Mutex<Connection>>,
     writer_tx: &mpsc::Sender<WriteOp>,
     llm_config: &LlmConfig,
     slug: &str,
     cancel: &CancellationToken,
     progress_tx: &mpsc::Sender<BuildProgress>,
 ) -> Result<()> {
-    let num_chunks = db::count_chunks(conn, slug)?;
+    let slug_owned = slug.to_string();
+    let num_chunks = db_read(&db, { let s = slug_owned.clone(); move |conn| db::count_chunks(conn, &s) }).await?;
     if num_chunks == 0 {
         return Err(anyhow!("No chunks found for slug '{slug}'"));
     }
@@ -805,7 +846,7 @@ pub async fn build_code(
     let mut done: i64 = 0;
 
     // ── Step 1: Mechanical passes (import graph, spawns, strings) ────
-    let import_graph = extract_import_graph(conn, slug)?;
+    let import_graph = db_read(&db, { let s = slug_owned.clone(); move |conn| extract_import_graph(conn, &s) }).await?;
 
     // ── Step 2: Concurrent L0 extraction ─────────────────────────────
     info!("=== CODE L0: EXTRACT {num_chunks} files ===");
@@ -814,11 +855,13 @@ pub async fn build_code(
     let mut work_items: Vec<(i64, String, String)> = Vec::new();
     for ci in 0..num_chunks {
         let node_id = format!("C-L0-{ci:03}");
-        if db::step_exists(conn, slug, "code_extract", ci, 0, &node_id)? {
+        let exists = db_read(&db, { let s = slug_owned.clone(); let nid = node_id.clone(); move |conn| db::step_exists(conn, &s, "code_extract", ci, 0, &nid) }).await?;
+        if exists {
             done += 1;
             continue;
         }
-        if let Some(content) = db::get_chunk(conn, slug, ci)? {
+        let content = db_read(&db, { let s = slug_owned.clone(); move |conn| db::get_chunk(conn, &s, ci) }).await?;
+        if let Some(content) = content {
             work_items.push((ci, node_id, content));
         }
     }
@@ -971,7 +1014,8 @@ pub async fn build_code(
         }
 
         let node_id = format!("C-L1-{ci_idx:03}");
-        if db::step_exists(conn, slug, "synth", -1, 1, &node_id)? {
+        let exists = db_read(&db, { let s = slug_owned.clone(); let nid = node_id.clone(); move |conn| db::step_exists(conn, &s, "synth", -1, 1, &nid) }).await?;
+        if exists {
             done += 1;
             let _ = progress_tx.send(BuildProgress { done, total: estimated_total }).await;
             continue;
@@ -982,7 +1026,8 @@ pub async fn build_code(
         let mut child_data: Vec<Value> = Vec::new();
 
         for chunk_ci in 0..num_chunks {
-            if let Some(content) = db::get_chunk(conn, slug, chunk_ci)? {
+            let content = db_read(&db, { let s = slug_owned.clone(); move |conn| db::get_chunk(conn, &s, chunk_ci) }).await?;
+            if let Some(content) = content {
                 let file_path = content
                     .lines()
                     .take(4)
@@ -992,7 +1037,8 @@ pub async fn build_code(
 
                 if cluster_files.contains(&file_path) {
                     let l0_id = format!("C-L0-{chunk_ci:03}");
-                    if let Some(l0_node) = db::get_node(conn, slug, &l0_id)? {
+                    let l0_node = db_read(&db, { let s = slug_owned.clone(); let lid = l0_id.clone(); move |conn| db::get_node(conn, &s, &lid) }).await?;
+                    if let Some(l0_node) = l0_node {
                         child_ids.push(l0_id);
                         let topics_val: Value = serde_json::to_value(&l0_node.topics)?;
                         child_data.push(topics_val);
@@ -1051,10 +1097,10 @@ pub async fn build_code(
     }
 
     // ── L2: Thread clustering ────────────────────────────────────────
-    build_threads_layer(conn, writer_tx, llm_config, slug, cancel, progress_tx, &mut done, estimated_total).await?;
+    build_threads_layer(db.clone(), writer_tx, llm_config, slug, cancel, progress_tx, &mut done, estimated_total).await?;
 
     // ── L3+: Normal pairing ──────────────────────────────────────────
-    build_upper_layers(conn, writer_tx, llm_config, slug, 2, cancel, progress_tx, &mut done, estimated_total).await?;
+    build_upper_layers(db.clone(), writer_tx, llm_config, slug, 2, cancel, progress_tx, &mut done, estimated_total).await?;
 
     info!("Code pyramid build complete for '{slug}'");
     Ok(())
@@ -1064,14 +1110,15 @@ pub async fn build_code(
 
 /// Build a document pyramid (concurrent L0 -> entity clustering L1 -> L2 threads -> L3+).
 pub async fn build_docs(
-    conn: &Connection,
+    db: Arc<tokio::sync::Mutex<Connection>>,
     writer_tx: &mpsc::Sender<WriteOp>,
     llm_config: &LlmConfig,
     slug: &str,
     cancel: &CancellationToken,
     progress_tx: &mpsc::Sender<BuildProgress>,
 ) -> Result<()> {
-    let num_chunks = db::count_chunks(conn, slug)?;
+    let slug_owned = slug.to_string();
+    let num_chunks = db_read(&db, { let s = slug_owned.clone(); move |conn| db::count_chunks(conn, &s) }).await?;
     if num_chunks == 0 {
         return Err(anyhow!("No chunks found for slug '{slug}'"));
     }
@@ -1091,11 +1138,13 @@ pub async fn build_docs(
     let mut work_items: Vec<(i64, String, String)> = Vec::new();
     for ci in 0..num_chunks {
         let node_id = format!("L0-{ci:03}");
-        if db::step_exists(conn, slug, "doc_extract", ci, 0, &node_id)? {
+        let exists = db_read(&db, { let s = slug_owned.clone(); let nid = node_id.clone(); move |conn| db::step_exists(conn, &s, "doc_extract", ci, 0, &nid) }).await?;
+        if exists {
             done += 1;
             continue;
         }
-        if let Some(content) = db::get_chunk(conn, slug, ci)? {
+        let content = db_read(&db, { let s = slug_owned.clone(); move |conn| db::get_chunk(conn, &s, ci) }).await?;
+        if let Some(content) = content {
             work_items.push((ci, node_id, content));
         }
     }
@@ -1188,8 +1237,8 @@ pub async fn build_docs(
     }
 
     // ── L1: Entity-overlap clustering ────────────────────────────────
-    let l0_nodes = db::get_nodes_at_depth(conn, slug, 0)?;
-    let l1_count = db::count_nodes_at_depth(conn, slug, 1)?;
+    let l0_nodes = db_read(&db, { let s = slug_owned.clone(); move |conn| db::get_nodes_at_depth(conn, &s, 0) }).await?;
+    let l1_count = db_read(&db, { let s = slug_owned.clone(); move |conn| db::count_nodes_at_depth(conn, &s, 1) }).await?;
 
     if l1_count == 0 && l0_nodes.len() > 1 {
         info!("=== DOC L1: CLUSTER {} documents ===", l0_nodes.len());
@@ -1243,7 +1292,8 @@ pub async fn build_docs(
             }
 
             let node_id = format!("L1-{ci_idx:03}");
-            if db::step_exists(conn, slug, "doc_group", -1, 1, &node_id)? {
+            let exists = db_read(&db, { let s = slug_owned.clone(); let nid = node_id.clone(); move |conn| db::step_exists(conn, &s, "doc_group", -1, 1, &nid) }).await?;
+            if exists {
                 done += 1;
                 let _ = progress_tx.send(BuildProgress { done, total: estimated_total }).await;
                 continue;
@@ -1259,7 +1309,8 @@ pub async fn build_docs(
             let mut doc_names = Vec::new();
             for n in cluster.iter() {
                 if let Some(ci) = n.chunk_index {
-                    if let Some(content) = db::get_chunk(conn, slug, ci)? {
+                    let content = db_read(&db, { let s = slug_owned.clone(); move |conn| db::get_chunk(conn, &s, ci) }).await?;
+                    if let Some(content) = content {
                         let name = content
                             .lines()
                             .next()
@@ -1304,10 +1355,10 @@ pub async fn build_docs(
     }
 
     // ── L2: Thread clustering ────────────────────────────────────────
-    build_threads_layer(conn, writer_tx, llm_config, slug, cancel, progress_tx, &mut done, estimated_total).await?;
+    build_threads_layer(db.clone(), writer_tx, llm_config, slug, cancel, progress_tx, &mut done, estimated_total).await?;
 
     // ── L3+: Normal pairing ──────────────────────────────────────────
-    build_upper_layers(conn, writer_tx, llm_config, slug, 2, cancel, progress_tx, &mut done, estimated_total).await?;
+    build_upper_layers(db.clone(), writer_tx, llm_config, slug, 2, cancel, progress_tx, &mut done, estimated_total).await?;
 
     info!("Document pyramid build complete for '{slug}'");
     Ok(())
@@ -1317,7 +1368,7 @@ pub async fn build_docs(
 
 /// L1 positional pairing: pair adjacent L0 nodes with DISTILL_PROMPT.
 async fn build_l1_pairing(
-    conn: &Connection,
+    db: Arc<tokio::sync::Mutex<Connection>>,
     writer_tx: &mpsc::Sender<WriteOp>,
     llm_config: &LlmConfig,
     slug: &str,
@@ -1326,13 +1377,14 @@ async fn build_l1_pairing(
     done: &mut i64,
     total: i64,
 ) -> Result<()> {
-    let l0_nodes = db::get_nodes_at_depth(conn, slug, 0)?;
+    let slug_owned = slug.to_string();
+    let l0_nodes = db_read(&db, { let s = slug_owned.clone(); move |conn| db::get_nodes_at_depth(conn, &s, 0) }).await?;
     if l0_nodes.len() <= 1 {
         return Ok(());
     }
 
     let expected_l1 = (l0_nodes.len() + 1) / 2;
-    let existing_l1 = db::count_nodes_at_depth(conn, slug, 1)?;
+    let existing_l1 = db_read(&db, { let s = slug_owned.clone(); move |conn| db::count_nodes_at_depth(conn, &s, 1) }).await?;
     if existing_l1 >= expected_l1 as i64 {
         info!("  L1: {} nodes (already complete)", existing_l1);
         return Ok(());
@@ -1349,7 +1401,8 @@ async fn build_l1_pairing(
 
         let node_id = format!("L1-{pair_idx:03}");
 
-        if db::step_exists(conn, slug, "synth", -1, 1, &node_id)? {
+        let exists = db_read(&db, { let s = slug_owned.clone(); let nid = node_id.clone(); move |conn| db::step_exists(conn, &s, "synth", -1, 1, &nid) }).await?;
+        if exists {
             pair_idx += 1;
             i += 2;
             *done += 1;
@@ -1420,7 +1473,7 @@ async fn build_l1_pairing(
 
 /// L2 thread clustering: collect all L1 topics, cluster into threads, synthesize thread narratives.
 async fn build_threads_layer(
-    conn: &Connection,
+    db: Arc<tokio::sync::Mutex<Connection>>,
     writer_tx: &mpsc::Sender<WriteOp>,
     llm_config: &LlmConfig,
     slug: &str,
@@ -1429,17 +1482,19 @@ async fn build_threads_layer(
     done: &mut i64,
     total: i64,
 ) -> Result<()> {
-    let l1_nodes = db::get_nodes_at_depth(conn, slug, 1)?;
+    let slug_owned = slug.to_string();
+    let l1_nodes = db_read(&db, { let s = slug_owned.clone(); move |conn| db::get_nodes_at_depth(conn, &s, 1) }).await?;
     if l1_nodes.len() < 2 {
         return Ok(());
     }
 
     // Check if L2 already built
-    let l2_count = db::count_nodes_at_depth(conn, slug, 2)?;
+    let l2_count = db_read(&db, { let s = slug_owned.clone(); move |conn| db::count_nodes_at_depth(conn, &s, 2) }).await?;
 
     // Step 1: Cluster topics
-    let clusters: Value = if db::step_exists(conn, slug, "thread_cluster", -1, 1, "")? {
-        let output = db::get_step_output(conn, slug, "thread_cluster", -1)?
+    let tc_exists = db_read(&db, { let s = slug_owned.clone(); move |conn| db::step_exists(conn, &s, "thread_cluster", -1, 1, "") }).await?;
+    let clusters: Value = if tc_exists {
+        let output = db_read(&db, { let s = slug_owned.clone(); move |conn| db::get_step_output(conn, &s, "thread_cluster", -1) }).await?
             .unwrap_or_else(|| "{}".to_string());
         serde_json::from_str(&output)?
     } else {
@@ -1450,7 +1505,7 @@ async fn build_threads_layer(
                 topic_inventory.push(serde_json::json!({
                     "source_node": node.id,
                     "topic_index": 0,
-                    "name": &node.distilled[..node.distilled.len().min(60)],
+                    "name": safe_slice_end(&node.distilled, 60),
                     "entities": [],
                 }));
             } else {
@@ -1494,13 +1549,12 @@ async fn build_threads_layer(
                 batch_results.push(bc);
             }
 
-            // Merge batch results
-            let merge_threads: Vec<Value> = batch_results
+            // Merge batch results — preserve per-batch arrays for the merge prompt
+            let per_batch_threads: Vec<Value> = batch_results
                 .iter()
-                .filter_map(|bc| bc.get("threads").and_then(|t| t.as_array()).map(|a| a.clone()))
-                .flatten()
+                .filter_map(|bc| bc.get("threads").cloned())
                 .collect();
-            let merge_input = serde_json::to_string_pretty(&vec![&merge_threads])?;
+            let merge_input = serde_json::to_string_pretty(&per_batch_threads)?;
 
             info!("  Merging {} batch results", batch_results.len());
             call_and_parse(llm_config, MERGE_PROMPT, &merge_input, "thread-merge").await?
@@ -1544,7 +1598,8 @@ async fn build_threads_layer(
         }
 
         let node_id = format!("L2-{thread_idx:03}");
-        if db::step_exists(conn, slug, "synth", -1, 2, &node_id)? {
+        let exists = db_read(&db, { let s = slug_owned.clone(); let nid = node_id.clone(); move |conn| db::step_exists(conn, &s, "synth", -1, 2, &nid) }).await?;
+        if exists {
             *done += 1;
             let _ = progress_tx.send(BuildProgress { done: *done, total }).await;
             continue;
@@ -1575,7 +1630,8 @@ async fn build_threads_layer(
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0) as usize;
 
-            if let Some(l1_node) = db::get_node(conn, slug, src_node_id)? {
+            let l1_node = db_read(&db, { let s = slug_owned.clone(); let snid = src_node_id.to_string(); move |conn| db::get_node(conn, &s, &snid) }).await?;
+            if let Some(l1_node) = l1_node {
                 if topic_idx < l1_node.topics.len() {
                     let mut topic_val = serde_json::to_value(&l1_node.topics[topic_idx])?;
                     if let Some(obj) = topic_val.as_object_mut() {
@@ -1584,7 +1640,7 @@ async fn build_threads_layer(
                     assigned_topics.push(topic_val);
                 } else {
                     assigned_topics.push(serde_json::json!({
-                        "name": &l1_node.distilled[..l1_node.distilled.len().min(60)],
+                        "name": safe_slice_end(&l1_node.distilled, 60),
                         "current": l1_node.distilled,
                         "entities": [],
                         "corrections": l1_node.corrections,
@@ -1654,7 +1710,7 @@ async fn build_threads_layer(
 
 /// Build upper layers (L3+) by pairing adjacent nodes until only one apex remains.
 async fn build_upper_layers(
-    conn: &Connection,
+    db: Arc<tokio::sync::Mutex<Connection>>,
     writer_tx: &mpsc::Sender<WriteOp>,
     llm_config: &LlmConfig,
     slug: &str,
@@ -1664,10 +1720,11 @@ async fn build_upper_layers(
     done: &mut i64,
     total: i64,
 ) -> Result<()> {
+    let slug_owned = slug.to_string();
     let mut depth = start_depth;
 
     loop {
-        let current_nodes = db::get_nodes_at_depth(conn, slug, depth)?;
+        let current_nodes = db_read(&db, { let s = slug_owned.clone(); move |conn| db::get_nodes_at_depth(conn, &s, depth) }).await?;
         if current_nodes.len() <= 1 {
             if let Some(apex) = current_nodes.first() {
                 info!("=== APEX: {} ===", apex.id);
@@ -1677,7 +1734,7 @@ async fn build_upper_layers(
 
         depth += 1;
         let expected = (current_nodes.len() + 1) / 2;
-        let existing = db::count_nodes_at_depth(conn, slug, depth)?;
+        let existing = db_read(&db, { let s = slug_owned.clone(); move |conn| db::count_nodes_at_depth(conn, &s, depth) }).await?;
         if existing >= expected as i64 {
             info!("  Depth {depth}: {existing} nodes (already complete)");
             continue;
@@ -1694,7 +1751,8 @@ async fn build_upper_layers(
 
             let node_id = format!("L{depth}-{pair_idx:03}");
 
-            if db::step_exists(conn, slug, "synth", -1, depth, &node_id)? {
+            let exists = db_read(&db, { let s = slug_owned.clone(); let nid = node_id.clone(); move |conn| db::step_exists(conn, &s, "synth", -1, depth, &nid) }).await?;
+            if exists {
                 pair_idx += 1;
                 i += 2;
                 *done += 1;
@@ -1937,7 +1995,7 @@ fn extract_import_graph(conn: &Connection, slug: &str) -> Result<ImportGraph> {
                     .join(" ");
                 spawns.push(SpawnEntry {
                     call_type: "spawn".into(),
-                    context: ctx[..ctx.len().min(120)].to_string(),
+                    context: safe_slice_end(&ctx, 120).to_string(),
                     line: li,
                 });
             }
@@ -1949,7 +2007,7 @@ fn extract_import_graph(conn: &Connection, slug: &str) -> Result<ImportGraph> {
                     .join(" ");
                 spawns.push(SpawnEntry {
                     call_type: m[1].to_string(),
-                    context: ctx[..ctx.len().min(120)].to_string(),
+                    context: safe_slice_end(&ctx, 120).to_string(),
                     line: li,
                 });
             }
@@ -1961,7 +2019,7 @@ fn extract_import_graph(conn: &Connection, slug: &str) -> Result<ImportGraph> {
                     .join(" ");
                 spawns.push(SpawnEntry {
                     call_type: format!("tokio::{}", &m[1]),
-                    context: ctx[..ctx.len().min(120)].to_string(),
+                    context: safe_slice_end(&ctx, 120).to_string(),
                     line: li,
                 });
             }

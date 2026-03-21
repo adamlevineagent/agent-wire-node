@@ -15,6 +15,14 @@ use super::slug;
 
 // ── Auth middleware ──────────────────────────────────────────────────
 
+/// Constant-time string comparison to prevent timing attacks on auth tokens.
+fn ct_eq(a: &str, b: &str) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.bytes().zip(b.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
 /// Validate bearer token and pass state through. Returns PyramidState on success.
 fn with_auth_state(
     state: Arc<PyramidState>,
@@ -34,7 +42,7 @@ fn with_auth_state(
                 let config = state.config.read().await;
                 config.api_key.clone()
             };
-            if api_key.is_empty() || token != api_key {
+            if api_key.is_empty() || !ct_eq(&token, &api_key) {
                 return Err(warp::reject::custom(Unauthorized));
             }
 
@@ -390,20 +398,7 @@ async fn handle_build(
     slug_name: String,
     state: Arc<PyramidState>,
 ) -> Result<warp::reply::Response, warp::Rejection> {
-    // Check if a build is already running
-    {
-        let active = state.active_build.read().await;
-        if let Some(ref handle) = *active {
-            if !handle.cancel.is_cancelled() {
-                return Ok(json_error(
-                    warp::http::StatusCode::CONFLICT,
-                    &format!("Build already running for slug '{}'", handle.slug),
-                ));
-            }
-        }
-    }
-
-    // Verify slug exists
+    // Verify slug exists before taking the write lock
     {
         let conn = state.reader.lock().await;
         match slug::get_slug(&conn, &slug_name) {
@@ -420,7 +415,7 @@ async fn handle_build(
         }
     }
 
-    // Create build handle
+    // Use write lock for atomic check-and-set (prevents TOCTOU race)
     let cancel = tokio_util::sync::CancellationToken::new();
     let status = Arc::new(tokio::sync::RwLock::new(BuildStatus {
         slug: slug_name.clone(),
@@ -429,15 +424,22 @@ async fn handle_build(
         elapsed_seconds: 0.0,
     }));
 
-    let handle = super::BuildHandle {
-        slug: slug_name.clone(),
-        cancel: cancel.clone(),
-        status: status.clone(),
-    };
-
-    // Store the build handle
     {
         let mut active = state.active_build.write().await;
+        if let Some(ref handle) = *active {
+            if !handle.cancel.is_cancelled() {
+                return Ok(json_error(
+                    warp::http::StatusCode::CONFLICT,
+                    &format!("Build already running for slug '{}'", handle.slug),
+                ));
+            }
+        }
+
+        let handle = super::BuildHandle {
+            slug: slug_name.clone(),
+            cancel: cancel.clone(),
+            status: status.clone(),
+        };
         *active = Some(handle);
     }
 

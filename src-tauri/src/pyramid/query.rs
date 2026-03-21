@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use tracing::warn;
 
 use super::types::*;
 
@@ -146,7 +147,7 @@ pub fn get_tree(conn: &Connection, slug: &str) -> Result<Vec<TreeNode>> {
 
     let nodes: Vec<PyramidNode> = stmt
         .query_map(rusqlite::params![slug], row_to_node)?
-        .filter_map(|r| r.ok())
+        .filter_map(|r| match r { Ok(v) => Some(v), Err(e) => { warn!("Skipping row: {e}"); None } })
         .collect();
 
     if nodes.is_empty() {
@@ -224,12 +225,13 @@ pub fn search(conn: &Connection, slug: &str, term: &str) -> Result<Vec<SearchHit
          WHERE slug = ? AND (\
              LOWER(distilled) LIKE ? \
              OR LOWER(topics) LIKE ? \
-             OR LOWER(corrections) LIKE ?\
+             OR LOWER(corrections) LIKE ? \
+             OR LOWER(terms) LIKE ?\
          ) ORDER BY depth DESC",
     )?;
 
     let hits: Vec<SearchHit> = stmt
-        .query_map(rusqlite::params![slug, &pattern, &pattern, &pattern], |row| {
+        .query_map(rusqlite::params![slug, &pattern, &pattern, &pattern, &pattern], |row| {
             let id: String = row.get("id")?;
             let depth: i64 = row.get("depth")?;
             let distilled: String = row.get("distilled")?;
@@ -238,11 +240,14 @@ pub fn search(conn: &Connection, slug: &str, term: &str) -> Result<Vec<SearchHit
             let term_lower = term.to_lowercase();
             let distilled_lower = distilled.to_lowercase();
             let snippet = if let Some(idx) = distilled_lower.find(&term_lower) {
-                let start = idx.saturating_sub(40);
-                let end = (idx + term.len() + 40).min(distilled.len());
+                let mut start = idx.saturating_sub(40);
+                while start > 0 && !distilled.is_char_boundary(start) { start -= 1; }
+                let mut end = (idx + term.len() + 40).min(distilled.len());
+                while end < distilled.len() && !distilled.is_char_boundary(end) { end += 1; }
                 format!("...{}...", &distilled[start..end])
             } else {
-                let end = distilled.len().min(80);
+                let mut end = distilled.len().min(80);
+                while end < distilled.len() && !distilled.is_char_boundary(end) { end += 1; }
                 distilled[..end].to_string()
             };
 
@@ -256,7 +261,7 @@ pub fn search(conn: &Connection, slug: &str, term: &str) -> Result<Vec<SearchHit
                 score,
             })
         })?
-        .filter_map(|r| r.ok())
+        .filter_map(|r| match r { Ok(v) => Some(v), Err(e) => { warn!("Skipping row: {e}"); None } })
         .collect();
 
     Ok(hits)
@@ -274,7 +279,7 @@ pub fn entities(conn: &Connection, slug: &str) -> Result<Vec<EntityEntry>> {
 
     let nodes: Vec<PyramidNode> = stmt
         .query_map(rusqlite::params![slug], row_to_node)?
-        .filter_map(|r| r.ok())
+        .filter_map(|r| match r { Ok(v) => Some(v), Err(e) => { warn!("Skipping row: {e}"); None } })
         .collect();
 
     // entity_normalized -> { name, locations: [(node_id, depth, topic_name)] }
@@ -341,7 +346,7 @@ pub fn resolved(conn: &Connection, slug: &str) -> Result<Vec<ResolvedCorrection>
     )?;
     let l0_nodes: Vec<PyramidNode> = stmt_l0
         .query_map(rusqlite::params![slug], row_to_node)?
-        .filter_map(|r| r.ok())
+        .filter_map(|r| match r { Ok(v) => Some(v), Err(e) => { warn!("Skipping row: {e}"); None } })
         .collect();
 
     // Gather upper corrections (depth > 0)
@@ -351,7 +356,7 @@ pub fn resolved(conn: &Connection, slug: &str) -> Result<Vec<ResolvedCorrection>
     )?;
     let upper_nodes: Vec<PyramidNode> = stmt_upper
         .query_map(rusqlite::params![slug], row_to_node)?
-        .filter_map(|r| r.ok())
+        .filter_map(|r| match r { Ok(v) => Some(v), Err(e) => { warn!("Skipping row: {e}"); None } })
         .collect();
 
     // Build correction chains from L0 nodes.
@@ -489,7 +494,7 @@ pub fn corrections(conn: &Connection, slug: &str) -> Result<Vec<CorrectionWithSo
 
     let nodes: Vec<PyramidNode> = stmt
         .query_map(rusqlite::params![slug], row_to_node)?
-        .filter_map(|r| r.ok())
+        .filter_map(|r| match r { Ok(v) => Some(v), Err(e) => { warn!("Skipping row: {e}"); None } })
         .collect();
 
     // Dedup: (wrong_norm, right_norm) -> CorrectionWithSource
@@ -529,7 +534,7 @@ pub fn terms(conn: &Connection, slug: &str) -> Result<Vec<TermWithSource>> {
 
     let nodes: Vec<PyramidNode> = stmt
         .query_map(rusqlite::params![slug], row_to_node)?
-        .filter_map(|r| r.ok())
+        .filter_map(|r| match r { Ok(v) => Some(v), Err(e) => { warn!("Skipping row: {e}"); None } })
         .collect();
 
     // Dedup by normalized term name — first occurrence wins (highest depth)

@@ -9,6 +9,17 @@ use rusqlite::Connection;
 
 use super::types::*;
 
+// ── Database Opening ─────────────────────────────────────────────────────────
+
+/// Open (or create) the pyramid SQLite database at the given path, initialize
+/// tables and pragmas, and return the connection.
+pub fn open_pyramid_db(path: &std::path::Path) -> Result<Connection> {
+    let conn = Connection::open(path)
+        .with_context(|| format!("Failed to open pyramid DB at {}", path.display()))?;
+    init_pyramid_db(&conn)?;
+    Ok(conn)
+}
+
 // ── Schema Initialization ────────────────────────────────────────────────────
 
 /// Initialize pyramid tables. Call on app startup.
