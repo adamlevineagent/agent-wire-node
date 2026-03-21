@@ -1,0 +1,209 @@
+// pyramid/llm.rs — OpenRouter API client with 3-tier model cascade
+
+use anyhow::{anyhow, Result};
+use regex::Regex;
+use serde_json::Value;
+use tracing::info;
+
+#[derive(Debug, Clone)]
+pub struct LlmConfig {
+    pub api_key: String,
+    pub primary_model: String,
+    pub fallback_model_1: String,
+    pub fallback_model_2: String,
+    pub primary_context_limit: usize,
+    pub fallback_1_context_limit: usize,
+}
+
+impl Default for LlmConfig {
+    fn default() -> Self {
+        Self {
+            api_key: String::new(),
+            primary_model: "inception/mercury-2".into(),
+            fallback_model_1: "qwen/qwen3.5-flash-02-23".into(),
+            fallback_model_2: "x-ai/grok-4.20-beta".into(),
+            primary_context_limit: 120_000,
+            fallback_1_context_limit: 900_000,
+        }
+    }
+}
+
+/// Short model name for logging (part after the slash).
+fn short_name(model: &str) -> &str {
+    model.rsplit('/').next().unwrap_or(model)
+}
+
+/// Call OpenRouter with automatic model cascade and retry logic.
+/// Falls back to larger-context models when input exceeds primary model's limit.
+/// Retries on 429/403/502/503, null content, and JSON parse failures.
+pub async fn call_model(
+    config: &LlmConfig,
+    system_prompt: &str,
+    user_prompt: &str,
+    temperature: f32,
+    max_tokens: usize,
+) -> Result<String> {
+    let est_total = (system_prompt.len() + user_prompt.len()) / 4 + max_tokens;
+
+    // Pick initial model based on estimated token usage
+    let mut use_model = if est_total > config.fallback_1_context_limit {
+        info!("[fallback->{}]", short_name(&config.fallback_model_2));
+        config.fallback_model_2.clone()
+    } else if est_total > config.primary_context_limit {
+        info!("[fallback->{}]", short_name(&config.fallback_model_1));
+        config.fallback_model_1.clone()
+    } else {
+        config.primary_model.clone()
+    };
+
+    let client = reqwest::Client::new();
+    let url = "https://openrouter.ai/api/v1/chat/completions";
+
+    for attempt in 0..5u32 {
+        let body = serde_json::json!({
+            "model": use_model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            "temperature": temperature,
+            "max_tokens": max_tokens
+        });
+
+        let resp = client
+            .post(url)
+            .header("Authorization", format!("Bearer {}", config.api_key))
+            .header("Content-Type", "application/json")
+            .header("HTTP-Referer", "https://newsbleach.com")
+            .header("X-Title", "Wire Pyramid Engine")
+            .timeout(std::time::Duration::from_secs(300))
+            .json(&body)
+            .send()
+            .await;
+
+        let resp = match resp {
+            Ok(r) => r,
+            Err(e) => {
+                if attempt < 4 {
+                    info!("  request error, retry {}...", attempt + 1);
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    continue;
+                }
+                return Err(anyhow!("Request failed after 5 attempts: {}", e));
+            }
+        };
+
+        let status = resp.status().as_u16();
+
+        // HTTP 400: cascade to next model if not already on last fallback
+        if status == 400 && use_model != config.fallback_model_2 {
+            if use_model == config.primary_model {
+                use_model = config.fallback_model_1.clone();
+            } else {
+                use_model = config.fallback_model_2.clone();
+            }
+            info!("[400->{}]", short_name(&use_model));
+            continue;
+        }
+
+        // Retryable HTTP errors with exponential backoff
+        if matches!(status, 429 | 403 | 502 | 503) {
+            let wait = 2u64.pow(attempt + 1);
+            info!("  HTTP {}, waiting {}s...", status, wait);
+            tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+            continue;
+        }
+
+        // Other non-success status
+        if !resp.status().is_success() {
+            let body_text = resp.text().await.unwrap_or_default();
+            if attempt < 4 {
+                info!("  HTTP {}, retry {}...", status, attempt + 1);
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                continue;
+            }
+            return Err(anyhow!("HTTP {} after 5 attempts: {}", status, body_text));
+        }
+
+        // Parse response JSON
+        let data: Value = match resp.json().await {
+            Ok(v) => v,
+            Err(e) => {
+                if attempt < 4 {
+                    info!("  parse error, retry {}...", attempt + 1);
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    continue;
+                }
+                return Err(anyhow!("Failed to parse response after 5 attempts: {}", e));
+            }
+        };
+
+        // Extract content from choices[0].message.content
+        let content = data
+            .get("choices")
+            .and_then(|c| c.get(0))
+            .and_then(|c| c.get("message"))
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_str());
+
+        match content {
+            Some(text) => return Ok(text.to_string()),
+            None => {
+                if attempt < 4 {
+                    info!("  null content, retry {}...", attempt + 1);
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    continue;
+                }
+                return Err(anyhow!("Model returned null content after 5 attempts"));
+            }
+        }
+    }
+
+    Err(anyhow!("Max retries exceeded"))
+}
+
+/// Extract JSON from a response that may include markdown fences or thinking tags.
+pub fn extract_json(text: &str) -> Result<Value> {
+    let mut text = text.trim().to_string();
+
+    // Strip <think>...</think> tags
+    let think_re = Regex::new(r"(?s)<think>.*?</think>").unwrap();
+    text = think_re.replace_all(&text, "").trim().to_string();
+
+    // Remove markdown fences (``` lines)
+    if text.contains("```") {
+        let lines: Vec<&str> = text
+            .lines()
+            .filter(|l| !l.trim().starts_with("```"))
+            .collect();
+        text = lines.join("\n").trim().to_string();
+    }
+
+    // Find first { and last }
+    let start = text.find('{');
+    let end = text.rfind('}');
+
+    match (start, end) {
+        (Some(s), Some(e)) if e >= s => {
+            let slice = &text[s..=e];
+
+            // Try parsing as-is
+            if let Ok(v) = serde_json::from_str::<Value>(slice) {
+                return Ok(v);
+            }
+
+            // Fix trailing commas and retry
+            let comma_brace = Regex::new(r",\s*}").unwrap();
+            let comma_bracket = Regex::new(r",\s*]").unwrap();
+            let fixed = comma_brace.replace_all(slice, "}");
+            let fixed = comma_bracket.replace_all(&fixed, "]");
+
+            if let Ok(v) = serde_json::from_str::<Value>(&fixed) {
+                return Ok(v);
+            }
+
+            Err(anyhow!("No JSON found in: {}", &text[..text.len().min(200)]))
+        }
+        _ => Err(anyhow!("No JSON found in: {}", &text[..text.len().min(200)])),
+    }
+}

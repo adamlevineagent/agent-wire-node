@@ -8,6 +8,7 @@ use crate::credits::CreditTracker;
 use crate::auth::AuthState;
 use crate::sync::SyncState;
 use crate::tunnel;
+use crate::pyramid;
 
 /// HTTP server state
 #[derive(Clone)]
@@ -19,6 +20,7 @@ pub struct ServerState {
     pub tunnel_state: Arc<RwLock<tunnel::TunnelState>>,
     pub jwt_public_key: Arc<RwLock<String>>,
     pub node_id: Arc<RwLock<String>>,
+    pub pyramid: Arc<pyramid::PyramidState>,
 }
 
 #[derive(Serialize)]
@@ -69,6 +71,7 @@ pub async fn start_server(
     tunnel_state: Arc<RwLock<tunnel::TunnelState>>,
     jwt_public_key: Arc<RwLock<String>>,
     node_id: Arc<RwLock<String>>,
+    pyramid: Arc<pyramid::PyramidState>,
 ) {
     let state = ServerState {
         cache_dir,
@@ -78,12 +81,13 @@ pub async fn start_server(
         tunnel_state,
         jwt_public_key,
         node_id,
+        pyramid,
     };
 
     // CORS headers for browser access
     let cors = warp::cors()
         .allow_any_origin()
-        .allow_methods(vec!["GET", "POST", "OPTIONS"])
+        .allow_methods(vec!["GET", "POST", "DELETE", "OPTIONS"])
         .allow_headers(vec!["Content-Type", "Range", "Authorization", "Access-Control-Request-Private-Network"]);
 
     // GET /health
@@ -382,7 +386,11 @@ pub async fn start_server(
                 .unwrap()
         });
 
+    // Pyramid Knowledge Engine routes
+    let pyramid_routes = pyramid::routes::pyramid_routes(state.pyramid.clone());
+
     let routes = preflight
+        .or(pyramid_routes)
         .or(auth_callback.or(auth_complete).or(health).or(tunnel_debug).or(documents).or(stats))
         .with(cors);
 

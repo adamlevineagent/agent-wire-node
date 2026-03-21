@@ -19,13 +19,13 @@ pub mod messaging;
 pub mod market;
 pub mod retention;
 pub mod work;
+pub mod pyramid;
 
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
 /// Shared application state
-#[derive(Debug)]
 pub struct AppState {
     pub auth: Arc<RwLock<auth::AuthState>>,
     pub sync_state: Arc<RwLock<sync::SyncState>>,
@@ -34,6 +34,7 @@ pub struct AppState {
     pub market_state: Arc<RwLock<market::MarketState>>,
     pub work_stats: Arc<RwLock<work::WorkStats>>,
     pub config: Arc<RwLock<WireNodeConfig>>,
+    pub pyramid: Arc<pyramid::PyramidState>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

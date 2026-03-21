@@ -2116,6 +2116,165 @@ async fn get_logs(state: tauri::State<'_, SharedState>) -> Result<Vec<String>, S
     Ok(lines)
 }
 
+// --- Pyramid Commands -------------------------------------------------------
+
+use wire_node_lib::pyramid::types::*;
+use wire_node_lib::pyramid::query as pyramid_query;
+
+#[tauri::command]
+async fn pyramid_list_slugs(
+    state: tauri::State<'_, SharedState>,
+) -> Result<Vec<SlugInfo>, String> {
+    let conn = state.pyramid.reader.lock().await;
+    wire_node_lib::pyramid::slug::list_slugs(&conn).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn pyramid_apex(
+    state: tauri::State<'_, SharedState>,
+    slug: String,
+) -> Result<PyramidNode, String> {
+    let conn = state.pyramid.reader.lock().await;
+    pyramid_query::get_apex(&conn, &slug)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "No apex node found".to_string())
+}
+
+#[tauri::command]
+async fn pyramid_node(
+    state: tauri::State<'_, SharedState>,
+    slug: String,
+    node_id: String,
+) -> Result<PyramidNode, String> {
+    let conn = state.pyramid.reader.lock().await;
+    pyramid_query::get_node(&conn, &slug, &node_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "Node not found".to_string())
+}
+
+#[tauri::command]
+async fn pyramid_tree(
+    state: tauri::State<'_, SharedState>,
+    slug: String,
+) -> Result<Vec<TreeNode>, String> {
+    let conn = state.pyramid.reader.lock().await;
+    pyramid_query::get_tree(&conn, &slug).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn pyramid_drill(
+    state: tauri::State<'_, SharedState>,
+    slug: String,
+    node_id: String,
+) -> Result<DrillResult, String> {
+    let conn = state.pyramid.reader.lock().await;
+    pyramid_query::drill(&conn, &slug, &node_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "Node not found".to_string())
+}
+
+#[tauri::command]
+async fn pyramid_search(
+    state: tauri::State<'_, SharedState>,
+    slug: String,
+    term: String,
+) -> Result<Vec<SearchHit>, String> {
+    let conn = state.pyramid.reader.lock().await;
+    pyramid_query::search(&conn, &slug, &term).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn pyramid_build(
+    state: tauri::State<'_, SharedState>,
+    slug: String,
+) -> Result<BuildStatus, String> {
+    // Check if a build is already running
+    {
+        let active = state.pyramid.active_build.read().await;
+        if let Some(ref handle) = *active {
+            if !handle.cancel.is_cancelled() {
+                return Err(format!("Build already running for slug '{}'", handle.slug));
+            }
+        }
+    }
+
+    // Verify slug exists
+    {
+        let conn = state.pyramid.reader.lock().await;
+        wire_node_lib::pyramid::slug::get_slug(&conn, &slug)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("Slug '{}' not found", slug))?;
+    }
+
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let status = Arc::new(tokio::sync::RwLock::new(BuildStatus {
+        slug: slug.clone(),
+        status: "running".to_string(),
+        progress: BuildProgress { done: 0, total: 0 },
+        elapsed_seconds: 0.0,
+    }));
+
+    let handle = wire_node_lib::pyramid::BuildHandle {
+        slug: slug.clone(),
+        cancel: cancel.clone(),
+        status: status.clone(),
+    };
+
+    {
+        let mut active = state.pyramid.active_build.write().await;
+        *active = Some(handle);
+    }
+
+    let _reader = state.pyramid.reader.clone();
+    let active_build = state.pyramid.active_build.clone();
+    let build_status = status.clone();
+
+    tokio::spawn(async move {
+        let start = std::time::Instant::now();
+
+        // TODO: Call build pipeline when build.rs is implemented
+
+        {
+            let mut s = build_status.write().await;
+            if cancel.is_cancelled() {
+                s.status = "cancelled".to_string();
+            } else {
+                s.status = "complete".to_string();
+            }
+            s.elapsed_seconds = start.elapsed().as_secs_f64();
+        }
+
+        {
+            let mut active = active_build.write().await;
+            *active = None;
+        }
+    });
+
+    let s = status.read().await;
+    Ok(s.clone())
+}
+
+#[tauri::command]
+async fn pyramid_build_status(
+    state: tauri::State<'_, SharedState>,
+    slug: String,
+) -> Result<BuildStatus, String> {
+    let active = state.pyramid.active_build.read().await;
+    if let Some(ref handle) = *active {
+        if handle.slug == slug {
+            let s = handle.status.read().await;
+            return Ok(s.clone());
+        }
+    }
+
+    Ok(BuildStatus {
+        slug,
+        status: "idle".to_string(),
+        progress: BuildProgress { done: 0, total: 0 },
+        elapsed_seconds: 0.0,
+    })
+}
+
 // --- App Setup --------------------------------------------------------------
 
 fn main() {
@@ -2184,6 +2343,29 @@ fn main() {
     let jwt_public_key = Arc::new(RwLock::new(config.jwt_public_key.clone()));
     let node_id_shared = Arc::new(RwLock::new(config.node_id.clone()));
 
+    // Initialize pyramid SQLite database (reader + writer connections)
+    let pyramid_db_path = config.data_dir().join("pyramid.db");
+    let _ = std::fs::create_dir_all(config.data_dir());
+
+    let pyramid_writer = rusqlite::Connection::open(&pyramid_db_path)
+        .expect("Failed to open pyramid.db writer connection");
+    wire_node_lib::pyramid::db::init_pyramid_db(&pyramid_writer)
+        .expect("Failed to initialize pyramid schema on writer");
+
+    let pyramid_reader = rusqlite::Connection::open(&pyramid_db_path)
+        .expect("Failed to open pyramid.db reader connection");
+    wire_node_lib::pyramid::db::init_pyramid_db(&pyramid_reader)
+        .expect("Failed to initialize pyramid schema on reader");
+
+    let pyramid_state = Arc::new(wire_node_lib::pyramid::PyramidState {
+        reader: Arc::new(tokio::sync::Mutex::new(pyramid_reader)),
+        writer: Arc::new(tokio::sync::Mutex::new(pyramid_writer)),
+        config: Arc::new(RwLock::new(wire_node_lib::pyramid::llm::LlmConfig::default())),
+        active_build: Arc::new(RwLock::new(None)),
+    });
+
+    tracing::info!("Pyramid engine initialized at {:?}", pyramid_db_path);
+
     let state = Arc::new(AppState {
         auth: Arc::new(RwLock::new(initial_auth.clone())),
         sync_state: Arc::new(RwLock::new(
@@ -2196,6 +2378,7 @@ fn main() {
         )),
         work_stats: Arc::new(RwLock::new(work::WorkStats::default())),
         config: Arc::new(RwLock::new(config.clone())),
+        pyramid: pyramid_state,
     });
 
     tauri::Builder::default()
@@ -2359,6 +2542,7 @@ fn main() {
                     server_state.tunnel_state.clone(),
                     jwt_pk,
                     nid_shared,
+                    server_state.pyramid.clone(),
                 ).await;
             });
 
@@ -2853,6 +3037,14 @@ fn main() {
             get_work_stats,
             get_operator_session,
             operator_api_call,
+            pyramid_list_slugs,
+            pyramid_apex,
+            pyramid_node,
+            pyramid_tree,
+            pyramid_drill,
+            pyramid_search,
+            pyramid_build,
+            pyramid_build_status,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Wire Node");

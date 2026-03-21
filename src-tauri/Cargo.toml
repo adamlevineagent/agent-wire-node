@@ -38,6 +38,10 @@ base64 = "0.22"
 ignore = "0.4"
 similar = { version = "2", features = ["inline"] }
 open = "5"
+rusqlite = { version = "0.31", features = ["bundled"] }
+regex = "1"
+anyhow = "1"
+tokio-util = { version = "0.7", features = ["rt"] }
 
 [features]
 default = ["custom-protocol"]
