@@ -79,7 +79,7 @@ pub async fn call_model(
             .header("Content-Type", "application/json")
             .header("HTTP-Referer", "https://newsbleach.com")
             .header("X-Title", "Wire Pyramid Engine")
-            .timeout(std::time::Duration::from_secs(300))
+            .timeout(std::time::Duration::from_secs(120))
             .json(&body)
             .send()
             .await;

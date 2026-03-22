@@ -4,7 +4,7 @@ import type { CreditStats, SyncState } from '../components/Dashboard';
 
 // --- Types -------------------------------------------------------------------
 
-export type Mode = 'dashboard' | 'search' | 'warroom' | 'compose' | 'agents' | 'node' | 'activity' | 'identity' | 'settings';
+export type Mode = 'dashboard' | 'pyramids' | 'search' | 'warroom' | 'compose' | 'agents' | 'node' | 'activity' | 'identity' | 'settings';
 
 export interface ViewStackEntry {
     view: string;
@@ -46,7 +46,7 @@ type AppAction =
 
 // --- Initial State -----------------------------------------------------------
 
-const ALL_MODES: Mode[] = ['dashboard', 'search', 'warroom', 'compose', 'agents', 'node', 'activity', 'identity', 'settings'];
+const ALL_MODES: Mode[] = ['dashboard', 'pyramids', 'search', 'warroom', 'compose', 'agents', 'node', 'activity', 'identity', 'settings'];
 
 function createInitialModeStacks(): Record<Mode, ViewStackEntry[]> {
     const stacks: Record<string, ViewStackEntry[]> = {};
@@ -65,7 +65,7 @@ const initialState: AppState = {
     credits: null,
     syncState: null,
     notificationCount: 0,
-    activeMode: 'dashboard',
+    activeMode: 'pyramids',
     modeStacks: createInitialModeStacks(),
 };
 

@@ -16,7 +16,8 @@ export function Sidebar() {
     const curationCount = 0;
 
     const modeItems: ModeItem[] = [
-        { key: 'dashboard', icon: '\u{1F3E0}', label: 'Dashboard' },
+        { key: 'pyramids', icon: '\u{1F3D4}\uFE0F', label: 'Pyramids' },
+        { key: 'dashboard', icon: '\u{1F3E0}', label: 'Network' },
         { key: 'search', icon: '\u{1F50D}', label: 'Search' },
         { key: 'warroom', icon: '\u{1F4E1}', label: 'Warroom' },
         { key: 'compose', icon: '\u{270D}\uFE0F', label: 'Compose' },

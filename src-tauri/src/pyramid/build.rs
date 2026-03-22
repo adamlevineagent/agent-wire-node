@@ -20,7 +20,7 @@ use std::sync::LazyLock;
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::info;
+use tracing::{info, warn};
 
 use super::db;
 use super::llm::{call_model, extract_json, LlmConfig};
@@ -538,18 +538,22 @@ fn node_from_analysis(
 }
 
 /// Send a SaveNode WriteOp through the channel.
+/// Logs and continues if the writer channel has closed.
 async fn send_save_node(
     writer_tx: &mpsc::Sender<WriteOp>,
     node: PyramidNode,
     topics_json: Option<String>,
-) -> Result<()> {
-    writer_tx
+) {
+    if let Err(e) = writer_tx
         .send(WriteOp::SaveNode { node, topics_json })
         .await
-        .map_err(|e| anyhow!("Failed to send SaveNode: {e}"))
+    {
+        warn!("Writer channel closed, SaveNode dropped: {e}");
+    }
 }
 
 /// Send a SaveStep WriteOp through the channel.
+/// Logs and continues if the writer channel has closed.
 async fn send_save_step(
     writer_tx: &mpsc::Sender<WriteOp>,
     slug: &str,
@@ -560,8 +564,8 @@ async fn send_save_step(
     output_json: &str,
     model: &str,
     elapsed: f64,
-) -> Result<()> {
-    writer_tx
+) {
+    if let Err(e) = writer_tx
         .send(WriteOp::SaveStep {
             slug: slug.to_string(),
             step_type: step_type.to_string(),
@@ -573,29 +577,35 @@ async fn send_save_step(
             elapsed,
         })
         .await
-        .map_err(|e| anyhow!("Failed to send SaveStep: {e}"))
+    {
+        warn!("Writer channel closed, SaveStep dropped: {e}");
+    }
 }
 
 /// Send an UpdateParent WriteOp through the channel.
+/// Logs and continues if the writer channel has closed.
 async fn send_update_parent(
     writer_tx: &mpsc::Sender<WriteOp>,
     slug: &str,
     node_id: &str,
     parent_id: &str,
-) -> Result<()> {
-    writer_tx
+) {
+    if let Err(e) = writer_tx
         .send(WriteOp::UpdateParent {
             slug: slug.to_string(),
             node_id: node_id.to_string(),
             parent_id: parent_id.to_string(),
         })
         .await
-        .map_err(|e| anyhow!("Failed to send UpdateParent: {e}"))
+    {
+        warn!("Writer channel closed, UpdateParent dropped: {e}");
+    }
 }
 
 // ── CONVERSATION PIPELINE ────────────────────────────────────────────────────
 
 /// Build a conversation pyramid (forward -> reverse -> combine -> L1 pairing -> L2 threads -> L3+).
+/// Returns the number of node failures (0 = perfect build).
 pub async fn build_conversation(
     db: Arc<tokio::sync::Mutex<Connection>>,
     writer_tx: &mpsc::Sender<WriteOp>,
@@ -603,7 +613,7 @@ pub async fn build_conversation(
     slug: &str,
     cancel: &CancellationToken,
     progress_tx: &mpsc::Sender<BuildProgress>,
-) -> Result<()> {
+) -> Result<i32> {
     let slug_owned = slug.to_string();
     let num_chunks = db_read(&db, {
         let s = slug_owned.clone();
@@ -623,6 +633,7 @@ pub async fn build_conversation(
         })
         .await;
     let mut done: i64 = 0;
+    let mut failures: i32 = 0;
 
     // ── FORWARD PASS ─────────────────────────────────────────────────
     info!("=== FORWARD PASS ({num_chunks} chunks) ===");
@@ -652,7 +663,7 @@ pub async fn build_conversation(
 
     for ci in 0..num_chunks {
         if cancel.is_cancelled() {
-            return Ok(());
+            return Ok(failures);
         }
 
         let exists = db_read(&db, { let s = slug_owned.clone(); move |conn| db::step_exists(conn, &s, "forward", ci, -1, "") }).await?;
@@ -669,20 +680,26 @@ pub async fn build_conversation(
 
         info!("  Forward [{ci:02}/{num_chunks}]");
         let t0 = Instant::now();
-        let analysis = call_and_parse(llm_config, FORWARD_PROMPT, &user_prompt, &format!("forward-{ci}")).await?;
-        let elapsed = t0.elapsed().as_secs_f64();
+        match call_and_parse(llm_config, FORWARD_PROMPT, &user_prompt, &format!("forward-{ci}")).await {
+            Ok(analysis) => {
+                let elapsed = t0.elapsed().as_secs_f64();
+                let output_json = serde_json::to_string(&analysis)?;
+                send_save_step(
+                    writer_tx, slug, "forward", ci, -1, "", &output_json,
+                    &llm_config.primary_model, elapsed,
+                ).await;
 
-        let output_json = serde_json::to_string(&analysis)?;
-        send_save_step(
-            writer_tx, slug, "forward", ci, -1, "", &output_json,
-            &llm_config.primary_model, elapsed,
-        ).await?;
-
-        // Update running context
-        if let Some(ctx) = analysis.get("running_context").and_then(|v| v.as_str()) {
-            running_context = format!("{running_context} {ctx}");
-            if running_context.len() > 1500 {
-                running_context = safe_slice_start(&running_context, 1200).to_string();
+                // Update running context
+                if let Some(ctx) = analysis.get("running_context").and_then(|v| v.as_str()) {
+                    running_context = format!("{running_context} {ctx}");
+                    if running_context.len() > 1500 {
+                        running_context = safe_slice_start(&running_context, 1200).to_string();
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("  Forward pass failed for chunk {ci}, skipping: {e}");
+                failures += 1;
             }
         }
 
@@ -697,7 +714,7 @@ pub async fn build_conversation(
 
     for ci in (0..num_chunks).rev() {
         if cancel.is_cancelled() {
-            return Ok(());
+            return Ok(failures);
         }
 
         let exists = db_read(&db, { let s = slug_owned.clone(); move |conn| db::step_exists(conn, &s, "reverse", ci, -1, "") }).await?;
@@ -727,19 +744,25 @@ pub async fn build_conversation(
 
         info!("  Reverse [{ci:02}/{num_chunks}]");
         let t0 = Instant::now();
-        let analysis = call_and_parse(llm_config, REVERSE_PROMPT, &user_prompt, &format!("reverse-{ci}")).await?;
-        let elapsed = t0.elapsed().as_secs_f64();
+        match call_and_parse(llm_config, REVERSE_PROMPT, &user_prompt, &format!("reverse-{ci}")).await {
+            Ok(analysis) => {
+                let elapsed = t0.elapsed().as_secs_f64();
+                let output_json = serde_json::to_string(&analysis)?;
+                send_save_step(
+                    writer_tx, slug, "reverse", ci, -1, "", &output_json,
+                    &llm_config.primary_model, elapsed,
+                ).await;
 
-        let output_json = serde_json::to_string(&analysis)?;
-        send_save_step(
-            writer_tx, slug, "reverse", ci, -1, "", &output_json,
-            &llm_config.primary_model, elapsed,
-        ).await?;
-
-        if let Some(ctx) = analysis.get("running_context").and_then(|v| v.as_str()) {
-            running_context = format!("{ctx} {running_context}");
-            if running_context.len() > 1500 {
-                running_context = safe_slice_end(&running_context, 1200).to_string();
+                if let Some(ctx) = analysis.get("running_context").and_then(|v| v.as_str()) {
+                    running_context = format!("{ctx} {running_context}");
+                    if running_context.len() > 1500 {
+                        running_context = safe_slice_end(&running_context, 1200).to_string();
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("  Reverse pass failed for chunk {ci}, skipping: {e}");
+                failures += 1;
             }
         }
 
@@ -752,7 +775,7 @@ pub async fn build_conversation(
 
     for ci in 0..num_chunks {
         if cancel.is_cancelled() {
-            return Ok(());
+            return Ok(failures);
         }
 
         let node_id = format!("L0-{ci:03}");
@@ -764,10 +787,20 @@ pub async fn build_conversation(
             continue;
         }
 
-        let fwd_json = db_read(&db, { let s = slug_owned.clone(); move |conn| db::get_step_output(conn, &s, "forward", ci) }).await?
-            .ok_or_else(|| anyhow!("Missing forward step for chunk {ci}"))?;
-        let rev_json = db_read(&db, { let s = slug_owned.clone(); move |conn| db::get_step_output(conn, &s, "reverse", ci) }).await?
-            .ok_or_else(|| anyhow!("Missing reverse step for chunk {ci}"))?;
+        let fwd_json = db_read(&db, { let s = slug_owned.clone(); move |conn| db::get_step_output(conn, &s, "forward", ci) }).await?;
+        let rev_json = db_read(&db, { let s = slug_owned.clone(); move |conn| db::get_step_output(conn, &s, "reverse", ci) }).await?;
+
+        // If forward or reverse step is missing (prior failure), skip this combine
+        let (fwd_json, rev_json) = match (fwd_json, rev_json) {
+            (Some(f), Some(r)) => (f, r),
+            _ => {
+                warn!("  Combine skipped for chunk {ci}: missing forward/reverse step (prior failure)");
+                failures += 1;
+                done += 1;
+                let _ = progress_tx.send(BuildProgress { done, total: estimated_total }).await;
+                continue;
+            }
+        };
 
         let fwd: Value = serde_json::from_str(&fwd_json)?;
         let rev: Value = serde_json::from_str(&rev_json)?;
@@ -780,30 +813,39 @@ pub async fn build_conversation(
 
         info!("  Combine [{ci:02}/{num_chunks}]");
         let t0 = Instant::now();
-        let analysis = call_and_parse(llm_config, COMBINE_PROMPT, &user_prompt, &format!("combine-{ci}")).await?;
-        let elapsed = t0.elapsed().as_secs_f64();
+        match call_and_parse(llm_config, COMBINE_PROMPT, &user_prompt, &format!("combine-{ci}")).await {
+            Ok(analysis) => {
+                let elapsed = t0.elapsed().as_secs_f64();
+                let output_json = serde_json::to_string(&analysis)?;
+                send_save_step(
+                    writer_tx, slug, "combine", ci, 0, &node_id, &output_json,
+                    &llm_config.primary_model, elapsed,
+                ).await;
 
-        let output_json = serde_json::to_string(&analysis)?;
-        send_save_step(
-            writer_tx, slug, "combine", ci, 0, &node_id, &output_json,
-            &llm_config.primary_model, elapsed,
-        ).await?;
-
-        let node = node_from_analysis(&analysis, &node_id, slug, 0, Some(ci), vec![]);
-        send_save_node(writer_tx, node, None).await?;
+                let node = node_from_analysis(&analysis, &node_id, slug, 0, Some(ci), vec![]);
+                send_save_node(writer_tx, node, None).await;
+            }
+            Err(e) => {
+                warn!("  Combine failed for chunk {ci}, skipping: {e}");
+                failures += 1;
+            }
+        }
 
         done += 1;
         let _ = progress_tx.send(BuildProgress { done, total: estimated_total }).await;
     }
 
     // ── L1: Positional pairing ───────────────────────────────────────
-    build_l1_pairing(db.clone(), writer_tx, llm_config, slug, cancel, progress_tx, &mut done, estimated_total).await?;
+    let l1_failures = build_l1_pairing(db.clone(), writer_tx, llm_config, slug, cancel, progress_tx, &mut done, estimated_total).await?;
+    failures += l1_failures;
 
     // ── L2: Thread clustering ────────────────────────────────────────
-    build_threads_layer(db.clone(), writer_tx, llm_config, slug, cancel, progress_tx, &mut done, estimated_total).await?;
+    let l2_failures = build_threads_layer(db.clone(), writer_tx, llm_config, slug, cancel, progress_tx, &mut done, estimated_total).await?;
+    failures += l2_failures;
 
     // ── L3+: Normal pairing until apex ───────────────────────────────
-    build_upper_layers(db.clone(), writer_tx, llm_config, slug, 2, cancel, progress_tx, &mut done, estimated_total).await?;
+    let upper_failures = build_upper_layers(db.clone(), writer_tx, llm_config, slug, 2, cancel, progress_tx, &mut done, estimated_total).await?;
+    failures += upper_failures;
 
     // Update slug stats
     writer_tx
@@ -813,13 +855,18 @@ pub async fn build_conversation(
         .await
         .ok();
 
-    info!("Conversation pyramid build complete for '{slug}'");
-    Ok(())
+    if failures > 0 {
+        warn!("Conversation pyramid build for '{slug}' completed with {failures} failure(s)");
+    } else {
+        info!("Conversation pyramid build complete for '{slug}'");
+    }
+    Ok(failures)
 }
 
 // ── CODE PIPELINE ────────────────────────────────────────────────────────────
 
 /// Build a code pyramid (mechanical passes -> concurrent L0 -> import clustering L1 -> L2 threads -> L3+).
+/// Returns the number of node failures (0 = perfect build).
 pub async fn build_code(
     db: Arc<tokio::sync::Mutex<Connection>>,
     writer_tx: &mpsc::Sender<WriteOp>,
@@ -827,7 +874,7 @@ pub async fn build_code(
     slug: &str,
     cancel: &CancellationToken,
     progress_tx: &mpsc::Sender<BuildProgress>,
-) -> Result<()> {
+) -> Result<i32> {
     let slug_owned = slug.to_string();
     let num_chunks = db_read(&db, { let s = slug_owned.clone(); move |conn| db::count_chunks(conn, &s) }).await?;
     if num_chunks == 0 {
@@ -842,6 +889,7 @@ pub async fn build_code(
         })
         .await;
     let mut done: i64 = 0;
+    let mut failures: i32 = 0;
 
     // ── Step 1: Mechanical passes (import graph, spawns, strings) ────
     let import_graph = db_read(&db, { let s = slug_owned.clone(); let wtx = writer_tx.clone(); move |conn| extract_import_graph(conn, &s, Some(&wtx)) }).await?;
@@ -867,7 +915,7 @@ pub async fn build_code(
     let _ = progress_tx.send(BuildProgress { done, total: estimated_total }).await;
 
     if !work_items.is_empty() {
-        let concurrency = work_items.len().min(10);
+        let concurrency = work_items.len().min(3);
         info!("  {concurrency} concurrent workers for {} files", work_items.len());
 
         // Spawn concurrent extraction tasks
@@ -982,11 +1030,11 @@ pub async fn build_code(
                     send_save_step(
                         writer_tx, slug, "code_extract", ci, 0, &node_id, &output_json,
                         &llm_config.primary_model, elapsed,
-                    ).await?;
+                    ).await;
 
                     let mut node = node_from_analysis(&analysis, &node_id, slug, 0, Some(ci), vec![]);
                     node.distilled = purpose;
-                    send_save_node(writer_tx, node, Some(topics_json)).await?;
+                    send_save_node(writer_tx, node, Some(topics_json)).await;
 
                     done += 1;
                     let _ = progress_tx.send(BuildProgress { done, total: estimated_total }).await;
@@ -1019,7 +1067,7 @@ pub async fn build_code(
 
     for (ci_idx, cluster_files) in clusters.iter().enumerate() {
         if cancel.is_cancelled() {
-            return Ok(());
+            return Ok(failures);
         }
 
         let node_id = format!("C-L1-{ci_idx:03}");
@@ -1082,23 +1130,29 @@ pub async fn build_code(
 
         info!("  L1 cluster [{ci_idx}] ({} files)", cluster_files.len());
         let t0 = Instant::now();
-        let analysis = call_and_parse(llm_config, CODE_GROUP_PROMPT, &user_prompt, &format!("code-l1-{ci_idx}")).await?;
-        let elapsed = t0.elapsed().as_secs_f64();
+        match call_and_parse(llm_config, CODE_GROUP_PROMPT, &user_prompt, &format!("code-l1-{ci_idx}")).await {
+            Ok(analysis) => {
+                let elapsed = t0.elapsed().as_secs_f64();
+                let topics_json = serde_json::to_string(
+                    analysis.get("topics").unwrap_or(&serde_json::json!([]))
+                )?;
+                let output_json = serde_json::to_string(&analysis)?;
+                send_save_step(
+                    writer_tx, slug, "synth", -1, 1, &node_id, &output_json,
+                    &llm_config.primary_model, elapsed,
+                ).await;
 
-        let topics_json = serde_json::to_string(
-            analysis.get("topics").unwrap_or(&serde_json::json!([]))
-        )?;
-        let output_json = serde_json::to_string(&analysis)?;
-        send_save_step(
-            writer_tx, slug, "synth", -1, 1, &node_id, &output_json,
-            &llm_config.primary_model, elapsed,
-        ).await?;
+                let node = node_from_analysis(&analysis, &node_id, slug, 1, None, child_ids.clone());
+                send_save_node(writer_tx, node, Some(topics_json)).await;
 
-        let node = node_from_analysis(&analysis, &node_id, slug, 1, None, child_ids.clone());
-        send_save_node(writer_tx, node, Some(topics_json)).await?;
-
-        for cid in &child_ids {
-            send_update_parent(writer_tx, slug, cid, &node_id).await?;
+                for cid in &child_ids {
+                    send_update_parent(writer_tx, slug, cid, &node_id).await;
+                }
+            }
+            Err(e) => {
+                warn!("  Code L1 cluster [{ci_idx}] failed, skipping: {e}");
+                failures += 1;
+            }
         }
 
         done += 1;
@@ -1106,10 +1160,12 @@ pub async fn build_code(
     }
 
     // ── L2: Thread clustering ────────────────────────────────────────
-    build_threads_layer(db.clone(), writer_tx, llm_config, slug, cancel, progress_tx, &mut done, estimated_total).await?;
+    let l2_failures = build_threads_layer(db.clone(), writer_tx, llm_config, slug, cancel, progress_tx, &mut done, estimated_total).await?;
+    failures += l2_failures;
 
     // ── L3+: Normal pairing ──────────────────────────────────────────
-    build_upper_layers(db.clone(), writer_tx, llm_config, slug, 2, cancel, progress_tx, &mut done, estimated_total).await?;
+    let upper_failures = build_upper_layers(db.clone(), writer_tx, llm_config, slug, 2, cancel, progress_tx, &mut done, estimated_total).await?;
+    failures += upper_failures;
 
     // Update slug stats
     writer_tx
@@ -1119,13 +1175,18 @@ pub async fn build_code(
         .await
         .ok();
 
-    info!("Code pyramid build complete for '{slug}'");
-    Ok(())
+    if failures > 0 {
+        warn!("Code pyramid build for '{slug}' completed with {failures} failure(s)");
+    } else {
+        info!("Code pyramid build complete for '{slug}'");
+    }
+    Ok(failures)
 }
 
 // ── DOCUMENT PIPELINE ────────────────────────────────────────────────────────
 
 /// Build a document pyramid (concurrent L0 -> entity clustering L1 -> L2 threads -> L3+).
+/// Returns the number of node failures (0 = perfect build).
 pub async fn build_docs(
     db: Arc<tokio::sync::Mutex<Connection>>,
     writer_tx: &mpsc::Sender<WriteOp>,
@@ -1133,7 +1194,7 @@ pub async fn build_docs(
     slug: &str,
     cancel: &CancellationToken,
     progress_tx: &mpsc::Sender<BuildProgress>,
-) -> Result<()> {
+) -> Result<i32> {
     let slug_owned = slug.to_string();
     let num_chunks = db_read(&db, { let s = slug_owned.clone(); move |conn| db::count_chunks(conn, &s) }).await?;
     if num_chunks == 0 {
@@ -1148,6 +1209,7 @@ pub async fn build_docs(
         })
         .await;
     let mut done: i64 = 0;
+    let mut failures: i32 = 0;
 
     // ── L0: Concurrent document extraction ───────────────────────────
     info!("=== DOC L0: EXTRACT {num_chunks} documents ===");
@@ -1169,7 +1231,7 @@ pub async fn build_docs(
     let _ = progress_tx.send(BuildProgress { done, total: estimated_total }).await;
 
     if !work_items.is_empty() {
-        let concurrency = work_items.len().min(10);
+        let concurrency = work_items.len().min(3);
         info!("  {concurrency} concurrent workers for {} documents", work_items.len());
 
         let (result_tx, mut result_rx) = mpsc::channel::<Result<(i64, String, Value, f64)>>(concurrency * 2);
@@ -1233,12 +1295,12 @@ pub async fn build_docs(
                     send_save_step(
                         writer_tx, slug, "doc_extract", ci, 0, &node_id, &output_json,
                         &llm_config.primary_model, elapsed,
-                    ).await?;
+                    ).await;
 
                     let mut node = node_from_analysis(&analysis, &node_id, slug, 0, Some(ci), vec![]);
                     node.distilled = summary.to_string();
                     node.terms = entities.iter().map(|e| Term { term: e.clone(), definition: String::new() }).collect();
-                    send_save_node(writer_tx, node, Some(topics_json)).await?;
+                    send_save_node(writer_tx, node, Some(topics_json)).await;
 
                     done += 1;
                     let _ = progress_tx.send(BuildProgress { done, total: estimated_total }).await;
@@ -1316,7 +1378,7 @@ pub async fn build_docs(
 
         for (ci_idx, cluster) in clusters.iter().enumerate() {
             if cancel.is_cancelled() {
-                return Ok(());
+                return Ok(failures);
             }
 
             let node_id = format!("L1-{ci_idx:03}");
@@ -1358,23 +1420,29 @@ pub async fn build_docs(
 
             info!("  L1 cluster [{ci_idx}] ({} docs)", cluster.len());
             let t0 = Instant::now();
-            let analysis = call_and_parse(llm_config, DOC_GROUP_PROMPT, &user_prompt, &format!("doc-l1-{ci_idx}")).await?;
-            let elapsed = t0.elapsed().as_secs_f64();
+            match call_and_parse(llm_config, DOC_GROUP_PROMPT, &user_prompt, &format!("doc-l1-{ci_idx}")).await {
+                Ok(analysis) => {
+                    let elapsed = t0.elapsed().as_secs_f64();
+                    let topics_json = serde_json::to_string(
+                        analysis.get("topics").unwrap_or(&serde_json::json!([]))
+                    )?;
+                    let output_json = serde_json::to_string(&analysis)?;
+                    send_save_step(
+                        writer_tx, slug, "doc_group", -1, 1, &node_id, &output_json,
+                        &llm_config.primary_model, elapsed,
+                    ).await;
 
-            let topics_json = serde_json::to_string(
-                analysis.get("topics").unwrap_or(&serde_json::json!([]))
-            )?;
-            let output_json = serde_json::to_string(&analysis)?;
-            send_save_step(
-                writer_tx, slug, "doc_group", -1, 1, &node_id, &output_json,
-                &llm_config.primary_model, elapsed,
-            ).await?;
+                    let node = node_from_analysis(&analysis, &node_id, slug, 1, None, child_ids.clone());
+                    send_save_node(writer_tx, node, Some(topics_json)).await;
 
-            let node = node_from_analysis(&analysis, &node_id, slug, 1, None, child_ids.clone());
-            send_save_node(writer_tx, node, Some(topics_json)).await?;
-
-            for cid in &child_ids {
-                send_update_parent(writer_tx, slug, cid, &node_id).await?;
+                    for cid in &child_ids {
+                        send_update_parent(writer_tx, slug, cid, &node_id).await;
+                    }
+                }
+                Err(e) => {
+                    warn!("  Doc L1 cluster [{ci_idx}] failed, skipping: {e}");
+                    failures += 1;
+                }
             }
 
             done += 1;
@@ -1383,10 +1451,12 @@ pub async fn build_docs(
     }
 
     // ── L2: Thread clustering ────────────────────────────────────────
-    build_threads_layer(db.clone(), writer_tx, llm_config, slug, cancel, progress_tx, &mut done, estimated_total).await?;
+    let l2_failures = build_threads_layer(db.clone(), writer_tx, llm_config, slug, cancel, progress_tx, &mut done, estimated_total).await?;
+    failures += l2_failures;
 
     // ── L3+: Normal pairing ──────────────────────────────────────────
-    build_upper_layers(db.clone(), writer_tx, llm_config, slug, 2, cancel, progress_tx, &mut done, estimated_total).await?;
+    let upper_failures = build_upper_layers(db.clone(), writer_tx, llm_config, slug, 2, cancel, progress_tx, &mut done, estimated_total).await?;
+    failures += upper_failures;
 
     // Update slug stats
     writer_tx
@@ -1396,13 +1466,18 @@ pub async fn build_docs(
         .await
         .ok();
 
-    info!("Document pyramid build complete for '{slug}'");
-    Ok(())
+    if failures > 0 {
+        warn!("Document pyramid build for '{slug}' completed with {failures} failure(s)");
+    } else {
+        info!("Document pyramid build complete for '{slug}'");
+    }
+    Ok(failures)
 }
 
 // ── SHARED PIPELINE STAGES ───────────────────────────────────────────────────
 
 /// L1 positional pairing: pair adjacent L0 nodes with DISTILL_PROMPT.
+/// Returns the number of node failures.
 async fn build_l1_pairing(
     db: Arc<tokio::sync::Mutex<Connection>>,
     writer_tx: &mpsc::Sender<WriteOp>,
@@ -1412,18 +1487,19 @@ async fn build_l1_pairing(
     progress_tx: &mpsc::Sender<BuildProgress>,
     done: &mut i64,
     total: i64,
-) -> Result<()> {
+) -> Result<i32> {
+    let mut failures: i32 = 0;
     let slug_owned = slug.to_string();
     let l0_nodes = db_read(&db, { let s = slug_owned.clone(); move |conn| db::get_nodes_at_depth(conn, &s, 0) }).await?;
     if l0_nodes.len() <= 1 {
-        return Ok(());
+        return Ok(0);
     }
 
     let expected_l1 = (l0_nodes.len() + 1) / 2;
     let existing_l1 = db_read(&db, { let s = slug_owned.clone(); move |conn| db::count_nodes_at_depth(conn, &s, 1) }).await?;
     if existing_l1 >= expected_l1 as i64 {
         info!("  L1: {} nodes (already complete)", existing_l1);
-        return Ok(());
+        return Ok(0);
     }
 
     info!("=== DEPTH 1: DISTILL {} -> {} ===", l0_nodes.len(), expected_l1);
@@ -1432,7 +1508,7 @@ async fn build_l1_pairing(
     let mut i = 0usize;
     while i < l0_nodes.len() {
         if cancel.is_cancelled() {
-            return Ok(());
+            return Ok(failures);
         }
 
         let node_id = format!("L1-{pair_idx:03}");
@@ -1461,26 +1537,41 @@ async fn build_l1_pairing(
 
             info!("  [{} + {}] -> {node_id}", left.id, right.id);
             let t0 = Instant::now();
-            let analysis = call_and_parse(llm_config, DISTILL_PROMPT, &user_prompt, &format!("l1-{pair_idx}")).await?;
-            let elapsed = t0.elapsed().as_secs_f64();
+            match call_and_parse(llm_config, DISTILL_PROMPT, &user_prompt, &format!("l1-{pair_idx}")).await {
+                Ok(analysis) => {
+                    let elapsed = t0.elapsed().as_secs_f64();
+                    let topics_json = serde_json::to_string(
+                        analysis.get("topics").unwrap_or(&serde_json::json!([]))
+                    )?;
+                    let output_json = serde_json::to_string(&analysis)?;
+                    send_save_step(
+                        writer_tx, slug, "synth", -1, 1, &node_id, &output_json,
+                        &llm_config.primary_model, elapsed,
+                    ).await;
 
-            let topics_json = serde_json::to_string(
-                analysis.get("topics").unwrap_or(&serde_json::json!([]))
-            )?;
-            let output_json = serde_json::to_string(&analysis)?;
-            send_save_step(
-                writer_tx, slug, "synth", -1, 1, &node_id, &output_json,
-                &llm_config.primary_model, elapsed,
-            ).await?;
+                    let node = node_from_analysis(
+                        &analysis, &node_id, slug, 1, None,
+                        vec![left.id.clone(), right.id.clone()],
+                    );
+                    send_save_node(writer_tx, node, Some(topics_json)).await;
 
-            let node = node_from_analysis(
-                &analysis, &node_id, slug, 1, None,
-                vec![left.id.clone(), right.id.clone()],
-            );
-            send_save_node(writer_tx, node, Some(topics_json)).await?;
-
-            send_update_parent(writer_tx, slug, &left.id, &node_id).await?;
-            send_update_parent(writer_tx, slug, &right.id, &node_id).await?;
+                    send_update_parent(writer_tx, slug, &left.id, &node_id).await;
+                    send_update_parent(writer_tx, slug, &right.id, &node_id).await;
+                }
+                Err(e) => {
+                    warn!("  L1 pairing failed for {node_id}, carrying left node: {e}");
+                    failures += 1;
+                    // Carry left node as fallback
+                    let mut node = left.clone();
+                    node.id = node_id.clone();
+                    node.depth = 1;
+                    node.chunk_index = None;
+                    node.children = vec![left.id.clone(), right.id.clone()];
+                    send_save_node(writer_tx, node, None).await;
+                    send_update_parent(writer_tx, slug, &left.id, &node_id).await;
+                    send_update_parent(writer_tx, slug, &right.id, &node_id).await;
+                }
+            }
 
             i += 2;
         } else {
@@ -1493,8 +1584,8 @@ async fn build_l1_pairing(
             node.depth = 1;
             node.chunk_index = None;
             node.children = vec![carry.id.clone()];
-            send_save_node(writer_tx, node, None).await?;
-            send_update_parent(writer_tx, slug, &carry.id, &node_id).await?;
+            send_save_node(writer_tx, node, None).await;
+            send_update_parent(writer_tx, slug, &carry.id, &node_id).await;
 
             i += 1;
         }
@@ -1504,10 +1595,11 @@ async fn build_l1_pairing(
         let _ = progress_tx.send(BuildProgress { done: *done, total }).await;
     }
 
-    Ok(())
+    Ok(failures)
 }
 
 /// L2 thread clustering: collect all L1 topics, cluster into threads, synthesize thread narratives.
+/// Returns the number of node failures.
 async fn build_threads_layer(
     db: Arc<tokio::sync::Mutex<Connection>>,
     writer_tx: &mpsc::Sender<WriteOp>,
@@ -1517,11 +1609,12 @@ async fn build_threads_layer(
     progress_tx: &mpsc::Sender<BuildProgress>,
     done: &mut i64,
     total: i64,
-) -> Result<()> {
+) -> Result<i32> {
+    let mut failures: i32 = 0;
     let slug_owned = slug.to_string();
     let l1_nodes = db_read(&db, { let s = slug_owned.clone(); move |conn| db::get_nodes_at_depth(conn, &s, 1) }).await?;
     if l1_nodes.len() < 2 {
-        return Ok(());
+        return Ok(0);
     }
 
     // Check if L2 already built
@@ -1565,7 +1658,7 @@ async fn build_threads_layer(
 
         let t0 = Instant::now();
 
-        let result = if est_tokens > batch_threshold {
+        let clustering_result = if est_tokens > batch_threshold {
             // Batched clustering
             let batch_size = topic_inventory.len() / ((est_tokens / batch_threshold) + 1);
             let batches: Vec<Vec<Value>> = topic_inventory
@@ -1575,28 +1668,75 @@ async fn build_threads_layer(
             info!("  Splitting into {} batches (~{batch_size} topics each)", batches.len());
 
             let mut batch_results: Vec<Value> = Vec::new();
+            let mut batch_failed = false;
             for (bi, batch) in batches.iter().enumerate() {
                 if cancel.is_cancelled() {
-                    return Ok(());
+                    return Ok(failures);
                 }
                 info!("  Batch {}/{} ({} topics)", bi + 1, batches.len(), batch.len());
                 let batch_json = serde_json::to_string_pretty(batch)?;
-                let bc = call_and_parse(llm_config, THREAD_CLUSTER_PROMPT, &batch_json, &format!("thread-batch-{bi}")).await?;
-                batch_results.push(bc);
+                match call_and_parse(llm_config, THREAD_CLUSTER_PROMPT, &batch_json, &format!("thread-batch-{bi}")).await {
+                    Ok(bc) => batch_results.push(bc),
+                    Err(e) => {
+                        warn!("  Thread clustering batch {bi} failed: {e}");
+                        batch_failed = true;
+                        break;
+                    }
+                }
             }
 
-            // Merge batch results — preserve per-batch arrays for the merge prompt
-            let per_batch_threads: Vec<Value> = batch_results
-                .iter()
-                .filter_map(|bc| bc.get("threads").cloned())
-                .collect();
-            let merge_input = serde_json::to_string_pretty(&per_batch_threads)?;
+            if batch_failed || batch_results.is_empty() {
+                Err(anyhow!("Thread clustering batch failed"))
+            } else {
+                // Merge batch results
+                let per_batch_threads: Vec<Value> = batch_results
+                    .iter()
+                    .filter_map(|bc| bc.get("threads").cloned())
+                    .collect();
+                let merge_input = serde_json::to_string_pretty(&per_batch_threads)?;
 
-            info!("  Merging {} batch results", batch_results.len());
-            call_and_parse(llm_config, MERGE_PROMPT, &merge_input, "thread-merge").await?
+                info!("  Merging {} batch results", batch_results.len());
+                call_and_parse(llm_config, MERGE_PROMPT, &merge_input, "thread-merge").await
+            }
         } else {
             // Single call
-            call_and_parse(llm_config, THREAD_CLUSTER_PROMPT, &inv_json, "thread-cluster").await?
+            call_and_parse(llm_config, THREAD_CLUSTER_PROMPT, &inv_json, "thread-cluster").await
+        };
+
+        // If clustering failed, fall back to simple positional pairing (same as L1)
+        let result = match clustering_result {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("Thread clustering LLM failed, falling back to positional pairing: {e}");
+                failures += 1;
+                // Build synthetic threads by pairing adjacent L1 nodes
+                let mut fallback_threads: Vec<Value> = Vec::new();
+                for (idx, chunk) in l1_nodes.chunks(2).enumerate() {
+                    let assignments: Vec<Value> = chunk.iter().enumerate().flat_map(|(_, node)| {
+                        if node.topics.is_empty() {
+                            vec![serde_json::json!({
+                                "source_node": node.id,
+                                "topic_index": 0,
+                                "topic_name": safe_slice_end(&node.distilled, 60),
+                            })]
+                        } else {
+                            node.topics.iter().enumerate().map(|(ti, t)| {
+                                serde_json::json!({
+                                    "source_node": node.id,
+                                    "topic_index": ti,
+                                    "topic_name": t.name,
+                                })
+                            }).collect()
+                        }
+                    }).collect();
+                    fallback_threads.push(serde_json::json!({
+                        "name": format!("Group {}", idx + 1),
+                        "description": "Positional grouping (clustering fallback)",
+                        "assignments": assignments,
+                    }));
+                }
+                serde_json::json!({ "threads": fallback_threads })
+            }
         };
 
         let elapsed = t0.elapsed().as_secs_f64();
@@ -1604,7 +1744,7 @@ async fn build_threads_layer(
         send_save_step(
             writer_tx, slug, "thread_cluster", -1, 1, "", &output_json,
             &llm_config.primary_model, elapsed,
-        ).await?;
+        ).await;
 
         result
     };
@@ -1617,7 +1757,7 @@ async fn build_threads_layer(
 
     if threads.is_empty() {
         info!("  No threads found!");
-        return Ok(());
+        return Ok(failures);
     }
 
     // Validate all L1 nodes are assigned to at least one thread
@@ -1653,7 +1793,7 @@ async fn build_threads_layer(
 
     if l2_count >= threads.len() as i64 {
         info!("  L2: {} thread nodes (already complete)", l2_count);
-        return Ok(());
+        return Ok(failures);
     }
 
     // Step 2: Build L2 nodes from thread narratives
@@ -1661,7 +1801,7 @@ async fn build_threads_layer(
 
     for (thread_idx, thread) in threads.iter().enumerate() {
         if cancel.is_cancelled() {
-            return Ok(());
+            return Ok(failures);
         }
 
         let node_id = format!("L2-{thread_idx:03}");
@@ -1753,34 +1893,41 @@ async fn build_threads_layer(
 
         info!("  {node_id} ({thread_name}, {} topics)", assigned_topics.len());
         let t0 = Instant::now();
-        let analysis = call_and_parse(llm_config, THREAD_NARRATIVE_PROMPT, &user_prompt, &format!("thread-{thread_idx}")).await?;
-        let elapsed = t0.elapsed().as_secs_f64();
+        match call_and_parse(llm_config, THREAD_NARRATIVE_PROMPT, &user_prompt, &format!("thread-{thread_idx}")).await {
+            Ok(analysis) => {
+                let elapsed = t0.elapsed().as_secs_f64();
+                let topics_json = serde_json::to_string(
+                    analysis.get("topics").unwrap_or(&serde_json::json!([]))
+                )?;
+                let output_json = serde_json::to_string(&analysis)?;
+                send_save_step(
+                    writer_tx, slug, "synth", -1, 2, &node_id, &output_json,
+                    &llm_config.primary_model, elapsed,
+                ).await;
 
-        let topics_json = serde_json::to_string(
-            analysis.get("topics").unwrap_or(&serde_json::json!([]))
-        )?;
-        let output_json = serde_json::to_string(&analysis)?;
-        send_save_step(
-            writer_tx, slug, "synth", -1, 2, &node_id, &output_json,
-            &llm_config.primary_model, elapsed,
-        ).await?;
+                let node = node_from_analysis(&analysis, &node_id, slug, 2, None, contributing_nodes.clone());
+                send_save_node(writer_tx, node, Some(topics_json)).await;
 
-        let node = node_from_analysis(&analysis, &node_id, slug, 2, None, contributing_nodes.clone());
-        send_save_node(writer_tx, node, Some(topics_json)).await?;
-
-        // Update parent_id for each contributing L1 node
-        for child_id in &contributing_nodes {
-            send_update_parent(writer_tx, slug, child_id, &node_id).await?;
+                // Update parent_id for each contributing L1 node
+                for child_id in &contributing_nodes {
+                    send_update_parent(writer_tx, slug, child_id, &node_id).await;
+                }
+            }
+            Err(e) => {
+                warn!("  Thread narrative failed for {node_id} ({thread_name}), skipping: {e}");
+                failures += 1;
+            }
         }
 
         *done += 1;
         let _ = progress_tx.send(BuildProgress { done: *done, total }).await;
     }
 
-    Ok(())
+    Ok(failures)
 }
 
 /// Build upper layers (L3+) by pairing adjacent nodes until only one apex remains.
+/// Returns the number of node failures.
 async fn build_upper_layers(
     db: Arc<tokio::sync::Mutex<Connection>>,
     writer_tx: &mpsc::Sender<WriteOp>,
@@ -1791,7 +1938,8 @@ async fn build_upper_layers(
     progress_tx: &mpsc::Sender<BuildProgress>,
     done: &mut i64,
     total: i64,
-) -> Result<()> {
+) -> Result<i32> {
+    let mut failures: i32 = 0;
     let slug_owned = slug.to_string();
     let mut depth = start_depth;
 
@@ -1818,7 +1966,7 @@ async fn build_upper_layers(
         let mut i = 0usize;
         while i < current_nodes.len() {
             if cancel.is_cancelled() {
-                return Ok(());
+                return Ok(failures);
             }
 
             let node_id = format!("L{depth}-{pair_idx:03}");
@@ -1847,26 +1995,54 @@ async fn build_upper_layers(
 
                 info!("  [{} + {}] -> {node_id}", left.id, right.id);
                 let t0 = Instant::now();
-                let analysis = call_and_parse(llm_config, DISTILL_PROMPT, &user_prompt, &format!("synth-d{depth}-{pair_idx}")).await?;
-                let elapsed = t0.elapsed().as_secs_f64();
 
-                let topics_json = serde_json::to_string(
-                    analysis.get("topics").unwrap_or(&serde_json::json!([]))
-                )?;
-                let output_json = serde_json::to_string(&analysis)?;
-                send_save_step(
-                    writer_tx, slug, "synth", -1, depth, &node_id, &output_json,
-                    &llm_config.primary_model, elapsed,
-                ).await?;
+                // Retry up to 3 times on LLM failure, then carry left node on final failure
+                let mut analysis_result = None;
+                for attempt in 0..3 {
+                    match call_and_parse(llm_config, DISTILL_PROMPT, &user_prompt, &format!("synth-d{depth}-{pair_idx}")).await {
+                        Ok(a) => { analysis_result = Some(a); break; }
+                        Err(e) => {
+                            tracing::warn!("  Synthesis attempt {}/{} failed for {node_id}: {e}", attempt + 1, 3);
+                            if attempt < 2 {
+                                tokio::time::sleep(std::time::Duration::from_secs(2u64.pow(attempt as u32 + 1))).await;
+                            }
+                        }
+                    }
+                }
 
-                let node = node_from_analysis(
-                    &analysis, &node_id, slug, depth, None,
-                    vec![left.id.clone(), right.id.clone()],
-                );
-                send_save_node(writer_tx, node, Some(topics_json)).await?;
+                if let Some(analysis) = analysis_result {
+                    let elapsed = t0.elapsed().as_secs_f64();
 
-                send_update_parent(writer_tx, slug, &left.id, &node_id).await?;
-                send_update_parent(writer_tx, slug, &right.id, &node_id).await?;
+                    let topics_json = serde_json::to_string(
+                        analysis.get("topics").unwrap_or(&serde_json::json!([]))
+                    )?;
+                    let output_json = serde_json::to_string(&analysis)?;
+                    send_save_step(
+                        writer_tx, slug, "synth", -1, depth, &node_id, &output_json,
+                        &llm_config.primary_model, elapsed,
+                    ).await;
+
+                    let node = node_from_analysis(
+                        &analysis, &node_id, slug, depth, None,
+                        vec![left.id.clone(), right.id.clone()],
+                    );
+                    send_save_node(writer_tx, node, Some(topics_json)).await;
+
+                    send_update_parent(writer_tx, slug, &left.id, &node_id).await;
+                    send_update_parent(writer_tx, slug, &right.id, &node_id).await;
+                } else {
+                    // All retries failed — carry left node up as fallback
+                    tracing::error!("  All 3 synthesis attempts failed for {node_id}. Carrying left node.");
+                    failures += 1;
+                    let mut node = left.clone();
+                    node.id = node_id.clone();
+                    node.depth = depth;
+                    node.chunk_index = None;
+                    node.children = vec![left.id.clone(), right.id.clone()];
+                    send_save_node(writer_tx, node, None).await;
+                    send_update_parent(writer_tx, slug, &left.id, &node_id).await;
+                    send_update_parent(writer_tx, slug, &right.id, &node_id).await;
+                }
 
                 i += 2;
             } else {
@@ -1879,8 +2055,8 @@ async fn build_upper_layers(
                 node.depth = depth;
                 node.chunk_index = None;
                 node.children = vec![carry.id.clone()];
-                send_save_node(writer_tx, node, None).await?;
-                send_update_parent(writer_tx, slug, &carry.id, &node_id).await?;
+                send_save_node(writer_tx, node, None).await;
+                send_update_parent(writer_tx, slug, &carry.id, &node_id).await;
 
                 i += 1;
             }
@@ -1891,7 +2067,7 @@ async fn build_upper_layers(
         }
     }
 
-    Ok(())
+    Ok(failures)
 }
 
 /// Build a JSON payload from a node, preferring topics if available.

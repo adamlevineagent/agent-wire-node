@@ -2213,6 +2213,7 @@ async fn pyramid_build(
         status: "running".to_string(),
         progress: BuildProgress { done: 0, total: 0 },
         elapsed_seconds: 0.0,
+        failures: 0,
     }));
 
     let handle = wire_node_lib::pyramid::BuildHandle {
@@ -2355,11 +2356,25 @@ async fn pyramid_build(
             let mut s = build_status.write().await;
             if cancel.is_cancelled() {
                 s.status = "cancelled".to_string();
-            } else if let Err(ref e) = result {
-                s.status = "failed".to_string();
-                tracing::error!("Build failed for '{}': {e}", slug);
             } else {
-                s.status = "complete".to_string();
+                match result {
+                    Ok(failures) => {
+                        s.failures = failures;
+                        if failures > 0 {
+                            s.status = "complete_with_errors".to_string();
+                            tracing::warn!(
+                                "Build completed for '{}' with {failures} node failure(s)",
+                                slug
+                            );
+                        } else {
+                            s.status = "complete".to_string();
+                        }
+                    }
+                    Err(ref e) => {
+                        s.status = "failed".to_string();
+                        tracing::error!("Build failed for '{}': {e}", slug);
+                    }
+                }
             }
             s.elapsed_seconds = start.elapsed().as_secs_f64();
         }
@@ -2392,6 +2407,7 @@ async fn pyramid_build_status(
         status: "idle".to_string(),
         progress: BuildProgress { done: 0, total: 0 },
         elapsed_seconds: 0.0,
+        failures: 0,
     })
 }
 
@@ -2413,14 +2429,21 @@ async fn pyramid_ingest(
     let slug_clone = slug.clone();
     let writer = state.pyramid.writer.clone();
 
-    let result = tokio::task::spawn_blocking(move || {
+    // Parse source_path as JSON array, falling back to single-path for backward compat
+    let paths: Vec<String> = serde_json::from_str(&source_path)
+        .unwrap_or_else(|_| vec![source_path.clone()]);
+
+    tokio::task::spawn_blocking(move || {
         let conn = writer.blocking_lock();
-        let path = std::path::Path::new(&source_path);
-        match content_type {
-            ContentType::Code => wire_node_lib::pyramid::ingest::ingest_code(&conn, &slug_clone, path),
-            ContentType::Conversation => wire_node_lib::pyramid::ingest::ingest_conversation(&conn, &slug_clone, path),
-            ContentType::Document => wire_node_lib::pyramid::ingest::ingest_docs(&conn, &slug_clone, path),
+        for path_str in &paths {
+            let path = std::path::Path::new(path_str);
+            match content_type {
+                ContentType::Code => { wire_node_lib::pyramid::ingest::ingest_code(&conn, &slug_clone, path).map_err(|e| e.to_string())?; }
+                ContentType::Conversation => { wire_node_lib::pyramid::ingest::ingest_conversation(&conn, &slug_clone, path).map_err(|e| e.to_string())?; }
+                ContentType::Document => { wire_node_lib::pyramid::ingest::ingest_docs(&conn, &slug_clone, path).map_err(|e| e.to_string())?; }
+            }
         }
+        Ok::<(), String>(())
     })
     .await
     .map_err(|e| format!("Ingest task panicked: {e}"))?
@@ -2431,7 +2454,7 @@ async fn pyramid_ingest(
     let chunk_count = pyramid_db::count_chunks(&conn, &slug).unwrap_or(0);
 
     Ok(serde_json::json!({
-        "slug": result,
+        "slug": slug,
         "chunks": chunk_count,
         "status": "ingested"
     }))
@@ -2459,6 +2482,57 @@ async fn pyramid_set_config(
     }
 
     Ok(())
+}
+
+#[tauri::command]
+async fn pyramid_create_slug(
+    state: tauri::State<'_, SharedState>,
+    slug: String,
+    content_type: String,
+    source_path: String,
+) -> Result<SlugInfo, String> {
+    let ct = ContentType::from_str(&content_type)
+        .ok_or_else(|| format!("Invalid content_type: '{}'. Use 'code', 'document', or 'conversation'", content_type))?;
+    let conn = state.pyramid.writer.lock().await;
+    wire_node_lib::pyramid::slug::create_slug(&conn, &slug, &ct, &source_path)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn pyramid_delete_slug(
+    state: tauri::State<'_, SharedState>,
+    slug: String,
+) -> Result<(), String> {
+    let conn = state.pyramid.writer.lock().await;
+    wire_node_lib::pyramid::slug::delete_slug(&conn, &slug)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn pyramid_get_config(
+    state: tauri::State<'_, SharedState>,
+) -> Result<serde_json::Value, String> {
+    let config = state.pyramid.config.read().await;
+    Ok(serde_json::json!({
+        "api_key_set": !config.api_key.is_empty(),
+        "auth_token_set": !config.auth_token.is_empty(),
+        "primary_model": config.primary_model,
+        "fallback_model_1": config.fallback_model_1,
+        "fallback_model_2": config.fallback_model_2,
+    }))
+}
+
+#[tauri::command]
+async fn pyramid_build_cancel(
+    state: tauri::State<'_, SharedState>,
+) -> Result<(), String> {
+    let active = state.pyramid.active_build.read().await;
+    if let Some(ref handle) = *active {
+        handle.cancel.cancel();
+        Ok(())
+    } else {
+        Err("No active build to cancel".to_string())
+    }
 }
 
 // --- App Setup --------------------------------------------------------------
@@ -3236,8 +3310,12 @@ fn main() {
             pyramid_search,
             pyramid_build,
             pyramid_build_status,
+            pyramid_build_cancel,
             pyramid_ingest,
             pyramid_set_config,
+            pyramid_create_slug,
+            pyramid_delete_slug,
+            pyramid_get_config,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Wire Node");

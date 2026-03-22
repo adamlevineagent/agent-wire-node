@@ -127,10 +127,13 @@ pub struct EntityEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BuildStatus {
     pub slug: String,
-    /// One of: "idle", "running", "complete", "failed"
+    /// One of: "idle", "running", "complete", "complete_with_errors", "failed", "cancelled"
     pub status: String,
     pub progress: BuildProgress,
     pub elapsed_seconds: f64,
+    /// Number of nodes that failed during the build (LLM errors, timeouts, etc.)
+    #[serde(default)]
+    pub failures: i32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -418,11 +418,13 @@ pub fn ingest_continuation(
 pub fn ingest_code(conn: &Connection, slug: &str, dir_path: &Path) -> Result<String> {
     let path_str = dir_path.to_string_lossy().to_string();
 
-    // Check if already ingested
-    if let Some(_info) = db::get_slug(conn, slug)? {
-        tracing::info!("Slug '{slug}' already exists. Use 'build' to continue pipeline.");
-        return Ok(slug.to_string());
-    }
+    // Check if slug exists — create if not, otherwise append chunks
+    let chunk_offset = if let Some(_info) = db::get_slug(conn, slug)? {
+        db::count_chunks(conn, slug)?
+    } else {
+        db::create_slug(conn, slug, &ContentType::Code, &path_str)?;
+        0
+    };
 
     let skip = skip_dirs();
     let code_exts = code_extensions();
@@ -495,22 +497,20 @@ pub fn ingest_code(conn: &Connection, slug: &str, dir_path: &Path) -> Result<Str
     let total_lines: usize = files.iter().map(|f| f.lines).sum();
     let languages: HashSet<&str> = files.iter().map(|f| f.language).collect();
     tracing::info!(
-        "Ingesting code from {}: {} files ({total_lines} lines)",
+        "Ingesting code from {}: {} files ({total_lines} lines), chunk_offset={chunk_offset}",
         dir_path.display(),
         files.len()
     );
 
-    // Create slug and batch
+    // Create batch for this path
     let metadata = serde_json::json!({
         "files": files.len(),
         "total_lines": total_lines,
         "languages": languages.into_iter().collect::<Vec<_>>(),
     });
-    db::create_slug(conn, slug, &ContentType::Code, &path_str)?;
-    let batch_id = db::create_batch(conn, slug, "initial", &path_str, 0)?;
+    let batch_type = if chunk_offset == 0 { "initial" } else { "additional" };
+    let batch_id = db::create_batch(conn, slug, batch_type, &path_str, chunk_offset)?;
 
-    // Store metadata in batch (via the batch's source_path field, which already has the path)
-    // The metadata JSON is logged but not stored separately — batch tracks chunk counts automatically
     tracing::info!("Code metadata: {}", metadata);
 
     // Create chunks — 1 file = 1 chunk
@@ -519,11 +519,12 @@ pub fn ingest_code(conn: &Connection, slug: &str, dir_path: &Path) -> Result<Str
             "## FILE: {}\n## LANGUAGE: {}\n## TYPE: {}\n## LINES: {}\n\n{}",
             f.rel_path, f.language, f.file_type, f.lines, f.content
         );
-        db::insert_chunk(conn, slug, batch_id, i as i64, &chunk_content)?;
+        let chunk_index = chunk_offset + i as i64;
+        db::insert_chunk(conn, slug, batch_id, chunk_index, &chunk_content)?;
     }
 
     tracing::info!(
-        "Slug '{slug}': {} chunks saved (1 file = 1 chunk)",
+        "Slug '{slug}': {} chunks saved (1 file = 1 chunk, offset {chunk_offset})",
         files.len()
     );
     Ok(slug.to_string())
@@ -537,11 +538,13 @@ pub fn ingest_code(conn: &Connection, slug: &str, dir_path: &Path) -> Result<Str
 pub fn ingest_docs(conn: &Connection, slug: &str, dir_path: &Path) -> Result<String> {
     let path_str = dir_path.to_string_lossy().to_string();
 
-    // Check if already ingested
-    if let Some(_info) = db::get_slug(conn, slug)? {
-        tracing::info!("Slug '{slug}' already exists. Use 'build' to continue pipeline.");
-        return Ok(slug.to_string());
-    }
+    // Check if slug exists — create if not, otherwise append chunks
+    let chunk_offset = if let Some(_info) = db::get_slug(conn, slug)? {
+        db::count_chunks(conn, slug)?
+    } else {
+        db::create_slug(conn, slug, &ContentType::Document, &path_str)?;
+        0
+    };
 
     let doc_exts = doc_extensions();
     let empty_skip: HashSet<&str> = HashSet::new();
@@ -587,23 +590,24 @@ pub fn ingest_docs(conn: &Connection, slug: &str, dir_path: &Path) -> Result<Str
         .map(|(_, c)| c.matches('\n').count() + 1)
         .sum();
     tracing::info!(
-        "Ingesting documents from {}: {} files ({total_lines} lines)",
+        "Ingesting documents from {}: {} files ({total_lines} lines), chunk_offset={chunk_offset}",
         dir_path.display(),
         doc_contents.len()
     );
 
-    // Create slug and batch
-    db::create_slug(conn, slug, &ContentType::Document, &path_str)?;
-    let batch_id = db::create_batch(conn, slug, "initial", &path_str, 0)?;
+    // Create batch for this path
+    let batch_type = if chunk_offset == 0 { "initial" } else { "additional" };
+    let batch_id = db::create_batch(conn, slug, batch_type, &path_str, chunk_offset)?;
 
     // Each document = 1 chunk
     for (i, (rel_path, content)) in doc_contents.iter().enumerate() {
         let chunk_content = format!("## DOCUMENT: {rel_path}\n\n{content}");
-        db::insert_chunk(conn, slug, batch_id, i as i64, &chunk_content)?;
+        let chunk_index = chunk_offset + i as i64;
+        db::insert_chunk(conn, slug, batch_id, chunk_index, &chunk_content)?;
     }
 
     tracing::info!(
-        "Slug '{slug}': {} documents saved",
+        "Slug '{slug}': {} documents saved (offset {chunk_offset})",
         doc_contents.len()
     );
     Ok(slug.to_string())

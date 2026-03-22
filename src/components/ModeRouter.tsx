@@ -1,5 +1,6 @@
 import { useAppContext } from '../contexts/AppContext';
 import { DashboardMode } from './modes/DashboardMode';
+import { PyramidsMode } from './modes/PyramidsMode';
 import { SearchMode } from './modes/SearchMode';
 import { WarroomMode } from './modes/WarroomMode';
 import { ComposeMode } from './modes/ComposeMode';
@@ -13,6 +14,8 @@ export function ModeRouter() {
     const { state } = useAppContext();
 
     switch (state.activeMode) {
+        case 'pyramids':
+            return <PyramidsMode />;
         case 'dashboard':
             return <DashboardMode />;
         case 'search':
@@ -32,6 +35,6 @@ export function ModeRouter() {
         case 'settings':
             return <SettingsMode />;
         default:
-            return <DashboardMode />;
+            return <PyramidsMode />;
     }
 }

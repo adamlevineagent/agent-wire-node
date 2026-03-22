@@ -455,6 +455,7 @@ async fn handle_build(
         status: "running".to_string(),
         progress: BuildProgress { done: 0, total: 0 },
         elapsed_seconds: 0.0,
+        failures: 0,
     }));
 
     {
@@ -583,11 +584,25 @@ async fn handle_build(
             let mut s = build_status.write().await;
             if cancel.is_cancelled() {
                 s.status = "cancelled".to_string();
-            } else if let Err(ref e) = result {
-                s.status = "failed".to_string();
-                tracing::error!("Build failed for '{}': {e}", slug_name);
             } else {
-                s.status = "complete".to_string();
+                match result {
+                    Ok(failures) => {
+                        s.failures = failures;
+                        if failures > 0 {
+                            s.status = "complete_with_errors".to_string();
+                            tracing::warn!(
+                                "Build completed for '{}' with {failures} node failure(s)",
+                                slug_name
+                            );
+                        } else {
+                            s.status = "complete".to_string();
+                        }
+                    }
+                    Err(ref e) => {
+                        s.status = "failed".to_string();
+                        tracing::error!("Build failed for '{}': {e}", slug_name);
+                    }
+                }
             }
             s.elapsed_seconds = start.elapsed().as_secs_f64();
         }
@@ -626,6 +641,7 @@ async fn handle_build_status(
         status: "idle".to_string(),
         progress: BuildProgress { done: 0, total: 0 },
         elapsed_seconds: 0.0,
+        failures: 0,
     }))
 }
 
@@ -672,16 +688,23 @@ async fn handle_ingest(
     let content_type = slug_info.content_type.clone();
     let slug_clone = slug_name.clone();
 
+    // Parse source_path as JSON array, falling back to single-path for backward compat
+    let paths: Vec<String> = serde_json::from_str(&source_path)
+        .unwrap_or_else(|_| vec![source_path.clone()]);
+
     // Run synchronous ingest on a blocking thread
     let writer = state.writer.clone();
     let result = tokio::task::spawn_blocking(move || {
         let conn = writer.blocking_lock();
-        let path = std::path::Path::new(&source_path);
-        match content_type {
-            ContentType::Code => ingest::ingest_code(&conn, &slug_clone, path),
-            ContentType::Conversation => ingest::ingest_conversation(&conn, &slug_clone, path),
-            ContentType::Document => ingest::ingest_docs(&conn, &slug_clone, path),
+        for path_str in &paths {
+            let path = std::path::Path::new(path_str);
+            match content_type {
+                ContentType::Code => { ingest::ingest_code(&conn, &slug_clone, path)?; }
+                ContentType::Conversation => { ingest::ingest_conversation(&conn, &slug_clone, path)?; }
+                ContentType::Document => { ingest::ingest_docs(&conn, &slug_clone, path)?; }
+            }
         }
+        Ok::<String, anyhow::Error>(slug_clone)
     })
     .await;
 
