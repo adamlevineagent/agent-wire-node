@@ -199,14 +199,58 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
             {/* Step 1: Pick Directories */}
             {step === 'directory' && (
                 <div className="workspace-step-content">
-                    <h2>Select Workspace Directories</h2>
+                    <h2>Select Workspace</h2>
                     <p className="step-description">
-                        Choose one or more directories to include in this pyramid.
-                        The pyramid engine will analyze all files across the selected directories.
+                        Browse for directories or paste a path directly.
                     </p>
-                    <button className="btn btn-primary btn-lg" onClick={handlePickDirectory}>
-                        Browse...
-                    </button>
+
+                    {paths.length > 0 && (
+                        <div className="selected-paths" style={{ marginBottom: '12px' }}>
+                            {paths.map((p, i) => (
+                                <div key={p} className="selected-path-row">
+                                    <span className="selected-path-text">{p}</span>
+                                    <button className="btn btn-ghost btn-sm" onClick={() => handleRemovePath(i)} title="Remove">&times;</button>
+                                </div>
+                            ))}
+                        </div>
+                    )}
+
+                    <div style={{ display: 'flex', gap: '8px', marginBottom: '12px' }}>
+                        <input
+                            type="text"
+                            placeholder="Paste a path (file or directory)..."
+                            className="input"
+                            style={{ flex: 1 }}
+                            onKeyDown={(e) => {
+                                if (e.key === 'Enter') {
+                                    const val = (e.target as HTMLInputElement).value.trim();
+                                    if (val) {
+                                        setPaths(prev => {
+                                            if (prev.includes(val)) return prev;
+                                            const updated = [...prev, val];
+                                            if (updated.length === 1) {
+                                                const parts = val.split('/');
+                                                const name = (parts[parts.length - 1] || parts[parts.length - 2] || 'workspace').replace('.jsonl', '');
+                                                setSlug(slugify(name));
+                                            }
+                                            return updated;
+                                        });
+                                        (e.target as HTMLInputElement).value = '';
+                                        setStep('content-type');
+                                    }
+                                }
+                            }}
+                        />
+                        <button className="btn btn-primary" onClick={handlePickDirectory}>
+                            Browse...
+                        </button>
+                    </div>
+
+                    {paths.length > 0 && (
+                        <button className="btn btn-primary" onClick={() => setStep('content-type')} style={{ marginRight: '8px' }}>
+                            Next
+                        </button>
+                    )}
                     <button className="btn btn-ghost" onClick={onCancel}>
                         Cancel
                     </button>
