@@ -327,12 +327,6 @@ fn walk_dir_inner(
 pub fn ingest_conversation(conn: &Connection, slug: &str, jsonl_path: &Path) -> Result<String> {
     let path_str = jsonl_path.to_string_lossy().to_string();
 
-    // Check if already ingested
-    if let Some(_info) = db::get_slug(conn, slug)? {
-        tracing::info!("Slug '{slug}' already exists. Use 'build' to continue pipeline.");
-        return Ok(slug.to_string());
-    }
-
     let (messages, _total) = parse_conversation_messages(jsonl_path, 0)?;
     let transcript = messages.join("\n");
     tracing::info!(
@@ -342,8 +336,10 @@ pub fn ingest_conversation(conn: &Connection, slug: &str, jsonl_path: &Path) -> 
         transcript.len()
     );
 
-    // Create slug and batch
-    db::create_slug(conn, slug, &ContentType::Conversation, &path_str)?;
+    // Create slug if it doesn't exist yet (may have been pre-created by the wizard)
+    if db::get_slug(conn, slug)?.is_none() {
+        db::create_slug(conn, slug, &ContentType::Conversation, &path_str)?;
+    }
     let batch_id = db::create_batch(conn, slug, "initial", &path_str, 0)?;
 
     // Chunk
