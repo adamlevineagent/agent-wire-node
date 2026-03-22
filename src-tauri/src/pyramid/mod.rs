@@ -48,7 +48,7 @@ pub struct PyramidConfig {
 fn default_primary_model() -> String { "inception/mercury-2".into() }
 fn default_fallback_1() -> String { "qwen/qwen3.5-flash-02-23".into() }
 fn default_fallback_2() -> String { "x-ai/grok-4.20-beta".into() }
-fn default_partner_model() -> String { "anthropic/claude-sonnet-4-20250514".into() }
+fn default_partner_model() -> String { "anthropic/claude-sonnet-4".into() }
 
 impl Default for PyramidConfig {
     fn default() -> Self {

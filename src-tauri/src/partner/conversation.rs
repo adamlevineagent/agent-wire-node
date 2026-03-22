@@ -133,7 +133,6 @@ pub async fn call_partner(
             "temperature": 0.7,
             "max_tokens": 4096,
             "provider": {
-                "order": ["Anthropic"],
                 "allow_fallbacks": true
             }
         });
@@ -437,7 +436,9 @@ pub async fn handle_message(
 
         messages_for_llm.push(LlmMessage {
             role: "assistant".to_string(),
-            content: serde_json::to_string(&assistant_msg).unwrap_or_default(),
+            content: response.content.clone().unwrap_or_default(),
+            tool_call_id: None,
+            tool_calls: Some(serde_json::json!(tc_json)),
         });
 
         for tc in &response.tool_calls {
@@ -457,19 +458,17 @@ pub async fn handle_message(
                             // Add tool result message
                             messages_for_llm.push(LlmMessage {
                                 role: "tool".to_string(),
-                                content: serde_json::to_string(&serde_json::json!({
-                                    "tool_call_id": tc.id,
-                                    "content": result_text,
-                                })).unwrap_or_default(),
+                                content: result_text,
+                                tool_call_id: Some(tc.id.clone()),
+                                tool_calls: None,
                             });
                         }
                         Err(e) => {
                             messages_for_llm.push(LlmMessage {
                                 role: "tool".to_string(),
-                                content: serde_json::to_string(&serde_json::json!({
-                                    "tool_call_id": tc.id,
-                                    "content": format!("Error: {}", e),
-                                })).unwrap_or_default(),
+                                content: format!("Error: {}", e),
+                                tool_call_id: Some(tc.id.clone()),
+                                tool_calls: None,
                             });
                         }
                     }
@@ -495,20 +494,18 @@ pub async fn handle_message(
                     // context_schedule doesn't produce a tool result for the model
                     messages_for_llm.push(LlmMessage {
                         role: "tool".to_string(),
-                        content: serde_json::to_string(&serde_json::json!({
-                            "tool_call_id": tc.id,
-                            "content": "Context schedule applied.",
-                        })).unwrap_or_default(),
+                        content: "Context schedule applied.".to_string(),
+                        tool_call_id: Some(tc.id.clone()),
+                        tool_calls: None,
                     });
                 }
                 _ => {
                     // Unknown tool — send error back
                     messages_for_llm.push(LlmMessage {
                         role: "tool".to_string(),
-                        content: serde_json::to_string(&serde_json::json!({
-                            "tool_call_id": tc.id,
-                            "content": format!("Unknown tool: {}", tc.name),
-                        })).unwrap_or_default(),
+                        content: format!("Unknown tool: {}", tc.name),
+                        tool_call_id: Some(tc.id.clone()),
+                        tool_calls: None,
                     });
                 }
             }

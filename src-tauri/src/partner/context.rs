@@ -28,6 +28,10 @@ use crate::pyramid::slug;
 pub struct LlmMessage {
     pub role: String,
     pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<serde_json::Value>,
 }
 
 // ── System Prompt ───────────────────────────────────────────────────
@@ -252,7 +256,7 @@ pub fn build_conversation_history(session: &Session) -> Vec<LlmMessage> {
             MessageRole::Partner => "assistant",
         };
         messages.push(LlmMessage {
-            role: role.to_string(),
+            tool_call_id: None, tool_calls: None, role: role.to_string(),
             content: msg.content.clone(),
         });
     }
@@ -345,6 +349,8 @@ pub fn assemble_context_window(
     messages.push(LlmMessage {
         role: "system".to_string(),
         content: system_content,
+        tool_call_id: None,
+        tool_calls: None,
     });
 
     // §4. Conversation history (multi-turn messages)
@@ -355,6 +361,8 @@ pub fn assemble_context_window(
     messages.push(LlmMessage {
         role: "user".to_string(),
         content: user_message.to_string(),
+        tool_call_id: None,
+        tool_calls: None,
     });
 
     messages
