@@ -3,9 +3,10 @@ import { invoke } from '@tauri-apps/api/core';
 
 interface BuildStatus {
     slug: string;
-    status: string; // "idle" | "running" | "complete" | "failed"
+    status: string; // "idle" | "running" | "complete" | "complete_with_errors" | "failed" | "cancelled"
     progress: { done: number; total: number };
     elapsed_seconds: number;
+    failures: number;
 }
 
 interface BuildProgressProps {
@@ -28,7 +29,7 @@ export function BuildProgress({ slug, onComplete, onClose }: BuildProgressProps)
                     if (!active) break;
                     setStatus(s);
 
-                    if (s.status === 'complete' || s.status === 'failed') {
+                    if (['complete', 'complete_with_errors', 'failed', 'cancelled'].includes(s.status)) {
                         onComplete?.(s);
                         break;
                     }
@@ -61,8 +62,9 @@ export function BuildProgress({ slug, onComplete, onClose }: BuildProgressProps)
         ? `${Math.floor(status.elapsed_seconds / 60)}m ${Math.floor(status.elapsed_seconds % 60)}s`
         : '0s';
 
-    const isComplete = status?.status === 'complete';
+    const isComplete = status?.status === 'complete' || status?.status === 'complete_with_errors';
     const isFailed = status?.status === 'failed';
+    const isCancelled = status?.status === 'cancelled';
     const isRunning = status?.status === 'running';
 
     return (
@@ -77,6 +79,9 @@ export function BuildProgress({ slug, onComplete, onClose }: BuildProgressProps)
                 )}
                 {isFailed && (
                     <span className="build-status-badge failed">Failed</span>
+                )}
+                {isCancelled && (
+                    <span className="build-status-badge failed">Cancelled</span>
                 )}
             </div>
 
@@ -101,7 +106,7 @@ export function BuildProgress({ slug, onComplete, onClose }: BuildProgressProps)
 
             {isComplete && status && (
                 <div className="build-complete-summary">
-                    Pyramid built! {status.progress.done} nodes processed.
+                    Pyramid built! {status.progress.done} nodes processed.{status.failures > 0 ? ` (${status.failures} failures)` : ''}
                     <div className="build-complete-actions">
                         <button
                             className="btn btn-primary"

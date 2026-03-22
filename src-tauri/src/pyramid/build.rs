@@ -839,6 +839,22 @@ pub async fn build_conversation(
     let l1_failures = build_l1_pairing(db.clone(), writer_tx, llm_config, slug, cancel, progress_tx, &mut done, estimated_total).await?;
     failures += l1_failures;
 
+    // ── Update progress total now that L1 is done ─────────────────────
+    let l1_count = {
+        let slug_s = slug.to_string();
+        db_read(&db, { let s = slug_s; move |conn| db::count_nodes_at_depth(conn, &s, 1) }).await.unwrap_or(0)
+    };
+    // Estimate: L2 ~ l1_count/2 threads, L3+ ~ log2 upper layers
+    let est_l2 = (l1_count + 1) / 2;
+    let mut est_upper = est_l2;
+    let mut remaining = est_l2;
+    while remaining > 1 {
+        remaining = (remaining + 1) / 2;
+        est_upper += remaining;
+    }
+    let estimated_total = done + est_l2 + est_upper;
+    let _ = progress_tx.send(BuildProgress { done, total: estimated_total }).await;
+
     // ── L2: Thread clustering ────────────────────────────────────────
     let l2_failures = build_threads_layer(db.clone(), writer_tx, llm_config, slug, cancel, progress_tx, &mut done, estimated_total).await?;
     failures += l2_failures;
@@ -1159,6 +1175,21 @@ pub async fn build_code(
         let _ = progress_tx.send(BuildProgress { done, total: estimated_total }).await;
     }
 
+    // ── Update progress total now that L1 is done ─────────────────────
+    let l1_count_code = {
+        let slug_s = slug.to_string();
+        db_read(&db, { let s = slug_s; move |conn| db::count_nodes_at_depth(conn, &s, 1) }).await.unwrap_or(0)
+    };
+    let est_l2_code = (l1_count_code + 1) / 2;
+    let mut est_upper_code = est_l2_code;
+    let mut remaining_code = est_l2_code;
+    while remaining_code > 1 {
+        remaining_code = (remaining_code + 1) / 2;
+        est_upper_code += remaining_code;
+    }
+    let estimated_total = done + est_l2_code + est_upper_code;
+    let _ = progress_tx.send(BuildProgress { done, total: estimated_total }).await;
+
     // ── L2: Thread clustering ────────────────────────────────────────
     let l2_failures = build_threads_layer(db.clone(), writer_tx, llm_config, slug, cancel, progress_tx, &mut done, estimated_total).await?;
     failures += l2_failures;
@@ -1449,6 +1480,21 @@ pub async fn build_docs(
             let _ = progress_tx.send(BuildProgress { done, total: estimated_total }).await;
         }
     }
+
+    // ── Update progress total now that L1 is done ─────────────────────
+    let l1_count_doc = {
+        let slug_s = slug.to_string();
+        db_read(&db, { let s = slug_s; move |conn| db::count_nodes_at_depth(conn, &s, 1) }).await.unwrap_or(0)
+    };
+    let est_l2_doc = (l1_count_doc + 1) / 2;
+    let mut est_upper_doc = est_l2_doc;
+    let mut remaining_doc = est_l2_doc;
+    while remaining_doc > 1 {
+        remaining_doc = (remaining_doc + 1) / 2;
+        est_upper_doc += remaining_doc;
+    }
+    let estimated_total = done + est_l2_doc + est_upper_doc;
+    let _ = progress_tx.send(BuildProgress { done, total: estimated_total }).await;
 
     // ── L2: Thread clustering ────────────────────────────────────────
     let l2_failures = build_threads_layer(db.clone(), writer_tx, llm_config, slug, cancel, progress_tx, &mut done, estimated_total).await?;
@@ -1805,122 +1851,133 @@ async fn build_threads_layer(
         }
 
         let node_id = format!("L2-{thread_idx:03}");
-        let exists = db_read(&db, { let s = slug_owned.clone(); let nid = node_id.clone(); move |conn| db::step_exists(conn, &s, "synth", -1, 2, &nid) }).await?;
-        if exists {
+
+        let thread_result: Result<()> = async {
+            let exists = db_read(&db, { let s = slug_owned.clone(); let nid = node_id.clone(); move |conn| db::step_exists(conn, &s, "synth", -1, 2, &nid) }).await?;
+            if exists {
+                *done += 1;
+                let _ = progress_tx.send(BuildProgress { done: *done, total }).await;
+                return Ok(());
+            }
+
+            let thread_name = thread
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Thread");
+
+            let assignments = thread
+                .get("assignments")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+
+            // Gather full topic data
+            let mut assigned_topics: Vec<Value> = Vec::new();
+            let mut contributing_nodes: Vec<String> = Vec::new();
+
+            for assignment in &assignments {
+                let src_node_id = assignment
+                    .get("source_node")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let topic_idx = assignment
+                    .get("topic_index")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as usize;
+
+                let l1_node = db_read(&db, { let s = slug_owned.clone(); let snid = src_node_id.to_string(); move |conn| db::get_node(conn, &s, &snid) }).await?;
+                if let Some(l1_node) = l1_node {
+                    if topic_idx < l1_node.topics.len() {
+                        let mut topic_val = serde_json::to_value(&l1_node.topics[topic_idx])?;
+                        if let Some(obj) = topic_val.as_object_mut() {
+                            obj.insert("source_node".to_string(), serde_json::json!(src_node_id));
+                        }
+                        assigned_topics.push(topic_val);
+                    } else {
+                        assigned_topics.push(serde_json::json!({
+                            "name": safe_slice_end(&l1_node.distilled, 60),
+                            "current": l1_node.distilled,
+                            "entities": [],
+                            "corrections": l1_node.corrections,
+                            "decisions": l1_node.decisions,
+                            "source_node": src_node_id,
+                        }));
+                    }
+
+                    if !contributing_nodes.contains(&src_node_id.to_string()) {
+                        contributing_nodes.push(src_node_id.to_string());
+                    }
+                }
+            }
+
+            if assigned_topics.is_empty() {
+                info!("  {node_id} ({thread_name}): no topics found, skipping");
+                return Ok(());
+            }
+
+            // Sort by source_node for chronological order, add order numbers + temporal authority
+            assigned_topics.sort_by(|a, b| {
+                let sa = a.get("source_node").and_then(|v| v.as_str()).unwrap_or("");
+                let sb = b.get("source_node").and_then(|v| v.as_str()).unwrap_or("");
+                sa.cmp(sb)
+            });
+            let late_threshold = (assigned_topics.len() as f64 * 0.7) as usize;
+            for (idx, topic) in assigned_topics.iter_mut().enumerate() {
+                if let Some(obj) = topic.as_object_mut() {
+                    obj.insert("order".to_string(), serde_json::json!(idx + 1));
+                    if idx >= late_threshold {
+                        obj.insert(
+                            "temporal_authority".to_string(),
+                            serde_json::json!("LATE — AUTHORITATIVE"),
+                        );
+                    }
+                }
+            }
+
+            let user_prompt = format!(
+                "## THREAD: {thread_name}\n\n## TOPICS (chronological — higher order = later = more authoritative)\n{}",
+                serde_json::to_string_pretty(&assigned_topics)?
+            );
+
+            info!("  {node_id} ({thread_name}, {} topics)", assigned_topics.len());
+            let t0 = Instant::now();
+            match call_and_parse(llm_config, THREAD_NARRATIVE_PROMPT, &user_prompt, &format!("thread-{thread_idx}")).await {
+                Ok(analysis) => {
+                    let elapsed = t0.elapsed().as_secs_f64();
+                    let topics_json = serde_json::to_string(
+                        analysis.get("topics").unwrap_or(&serde_json::json!([]))
+                    )?;
+                    let output_json = serde_json::to_string(&analysis)?;
+                    send_save_step(
+                        writer_tx, slug, "synth", -1, 2, &node_id, &output_json,
+                        &llm_config.primary_model, elapsed,
+                    ).await;
+
+                    let node = node_from_analysis(&analysis, &node_id, slug, 2, None, contributing_nodes.clone());
+                    send_save_node(writer_tx, node, Some(topics_json)).await;
+
+                    // Update parent_id for each contributing L1 node
+                    for child_id in &contributing_nodes {
+                        send_update_parent(writer_tx, slug, child_id, &node_id).await;
+                    }
+                }
+                Err(e) => {
+                    warn!("  Thread narrative failed for {node_id} ({thread_name}), skipping: {e}");
+                    failures += 1;
+                }
+            }
+
             *done += 1;
             let _ = progress_tx.send(BuildProgress { done: *done, total }).await;
-            continue;
+            Ok(())
+        }.await;
+
+        if let Err(e) = thread_result {
+            warn!("  Thread {node_id} processing failed, skipping: {e}");
+            failures += 1;
+            *done += 1;
+            let _ = progress_tx.send(BuildProgress { done: *done, total }).await;
         }
-
-        let thread_name = thread
-            .get("name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("Thread");
-
-        let assignments = thread
-            .get("assignments")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
-
-        // Gather full topic data
-        let mut assigned_topics: Vec<Value> = Vec::new();
-        let mut contributing_nodes: Vec<String> = Vec::new();
-
-        for assignment in &assignments {
-            let src_node_id = assignment
-                .get("source_node")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let topic_idx = assignment
-                .get("topic_index")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0) as usize;
-
-            let l1_node = db_read(&db, { let s = slug_owned.clone(); let snid = src_node_id.to_string(); move |conn| db::get_node(conn, &s, &snid) }).await?;
-            if let Some(l1_node) = l1_node {
-                if topic_idx < l1_node.topics.len() {
-                    let mut topic_val = serde_json::to_value(&l1_node.topics[topic_idx])?;
-                    if let Some(obj) = topic_val.as_object_mut() {
-                        obj.insert("source_node".to_string(), serde_json::json!(src_node_id));
-                    }
-                    assigned_topics.push(topic_val);
-                } else {
-                    assigned_topics.push(serde_json::json!({
-                        "name": safe_slice_end(&l1_node.distilled, 60),
-                        "current": l1_node.distilled,
-                        "entities": [],
-                        "corrections": l1_node.corrections,
-                        "decisions": l1_node.decisions,
-                        "source_node": src_node_id,
-                    }));
-                }
-
-                if !contributing_nodes.contains(&src_node_id.to_string()) {
-                    contributing_nodes.push(src_node_id.to_string());
-                }
-            }
-        }
-
-        if assigned_topics.is_empty() {
-            info!("  {node_id} ({thread_name}): no topics found, skipping");
-            continue;
-        }
-
-        // Sort by source_node for chronological order, add order numbers + temporal authority
-        assigned_topics.sort_by(|a, b| {
-            let sa = a.get("source_node").and_then(|v| v.as_str()).unwrap_or("");
-            let sb = b.get("source_node").and_then(|v| v.as_str()).unwrap_or("");
-            sa.cmp(sb)
-        });
-        let late_threshold = (assigned_topics.len() as f64 * 0.7) as usize;
-        for (idx, topic) in assigned_topics.iter_mut().enumerate() {
-            if let Some(obj) = topic.as_object_mut() {
-                obj.insert("order".to_string(), serde_json::json!(idx + 1));
-                if idx >= late_threshold {
-                    obj.insert(
-                        "temporal_authority".to_string(),
-                        serde_json::json!("LATE — AUTHORITATIVE"),
-                    );
-                }
-            }
-        }
-
-        let user_prompt = format!(
-            "## THREAD: {thread_name}\n\n## TOPICS (chronological — higher order = later = more authoritative)\n{}",
-            serde_json::to_string_pretty(&assigned_topics)?
-        );
-
-        info!("  {node_id} ({thread_name}, {} topics)", assigned_topics.len());
-        let t0 = Instant::now();
-        match call_and_parse(llm_config, THREAD_NARRATIVE_PROMPT, &user_prompt, &format!("thread-{thread_idx}")).await {
-            Ok(analysis) => {
-                let elapsed = t0.elapsed().as_secs_f64();
-                let topics_json = serde_json::to_string(
-                    analysis.get("topics").unwrap_or(&serde_json::json!([]))
-                )?;
-                let output_json = serde_json::to_string(&analysis)?;
-                send_save_step(
-                    writer_tx, slug, "synth", -1, 2, &node_id, &output_json,
-                    &llm_config.primary_model, elapsed,
-                ).await;
-
-                let node = node_from_analysis(&analysis, &node_id, slug, 2, None, contributing_nodes.clone());
-                send_save_node(writer_tx, node, Some(topics_json)).await;
-
-                // Update parent_id for each contributing L1 node
-                for child_id in &contributing_nodes {
-                    send_update_parent(writer_tx, slug, child_id, &node_id).await;
-                }
-            }
-            Err(e) => {
-                warn!("  Thread narrative failed for {node_id} ({thread_name}), skipping: {e}");
-                failures += 1;
-            }
-        }
-
-        *done += 1;
-        let _ = progress_tx.send(BuildProgress { done: *done, total }).await;
     }
 
     Ok(failures)

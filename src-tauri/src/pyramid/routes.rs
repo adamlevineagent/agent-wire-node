@@ -461,7 +461,13 @@ async fn handle_build(
     {
         let mut active = state.active_build.write().await;
         if let Some(ref handle) = *active {
-            if !handle.cancel.is_cancelled() {
+            let s = handle.status.read().await;
+            let is_terminal = matches!(
+                s.status.as_str(),
+                "complete" | "complete_with_errors" | "failed" | "cancelled"
+            );
+            drop(s);
+            if !handle.cancel.is_cancelled() && !is_terminal {
                 return Ok(json_error(
                     warp::http::StatusCode::CONFLICT,
                     &format!("Build already running for slug '{}'", handle.slug),
@@ -481,7 +487,6 @@ async fn handle_build(
     let reader = state.reader.clone();
     let writer = state.writer.clone();
     let config = state.config.clone();
-    let active_build = state.active_build.clone();
     let build_status = status.clone();
 
     tokio::spawn(async move {
@@ -607,11 +612,6 @@ async fn handle_build(
             s.elapsed_seconds = start.elapsed().as_secs_f64();
         }
 
-        // Clear the active build handle
-        {
-            let mut active = active_build.write().await;
-            *active = None;
-        }
     });
 
     // Return initial status

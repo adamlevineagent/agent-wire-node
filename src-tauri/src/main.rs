@@ -2193,7 +2193,13 @@ async fn pyramid_build(
     {
         let active = state.pyramid.active_build.read().await;
         if let Some(ref handle) = *active {
-            if !handle.cancel.is_cancelled() {
+            let s = handle.status.read().await;
+            let is_terminal = matches!(
+                s.status.as_str(),
+                "complete" | "complete_with_errors" | "failed" | "cancelled"
+            );
+            drop(s);
+            if !handle.cancel.is_cancelled() && !is_terminal {
                 return Err(format!("Build already running for slug '{}'", handle.slug));
             }
         }
@@ -2230,7 +2236,6 @@ async fn pyramid_build(
     let reader = state.pyramid.reader.clone();
     let writer = state.pyramid.writer.clone();
     let config = state.pyramid.config.clone();
-    let active_build = state.pyramid.active_build.clone();
     let build_status = status.clone();
 
     tokio::spawn(async move {
@@ -2379,10 +2384,6 @@ async fn pyramid_build(
             s.elapsed_seconds = start.elapsed().as_secs_f64();
         }
 
-        {
-            let mut active = active_build.write().await;
-            *active = None;
-        }
     });
 
     let s = status.read().await;
