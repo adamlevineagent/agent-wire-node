@@ -27,7 +27,7 @@ function slugify(name: string): string {
 export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
     const [step, setStep] = useState<Step>('directory');
     const [paths, setPaths] = useState<string[]>([]);
-    const [contentType, setContentType] = useState<'code' | 'document' | null>(null);
+    const [contentType, setContentType] = useState<'code' | 'document' | 'conversation' | null>(null);
     const [customIgnores, setCustomIgnores] = useState('');
     const [slug, setSlug] = useState('');
     const [creating, setCreating] = useState(false);
@@ -96,10 +96,35 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
         });
     }, []);
 
-    const handleContentTypeSelect = useCallback((type: 'code' | 'document') => {
-        setContentType(type);
-        setStep('configure');
+    const handlePickConversation = useCallback(async () => {
+        try {
+            const selected = await open({
+                directory: false,
+                title: 'Select Conversation JSONL',
+                filters: [{ name: 'JSONL', extensions: ['jsonl'] }],
+            });
+            if (selected) {
+                const filePath = selected as string;
+                setPaths([filePath]);
+                const parts = filePath.split('/');
+                const fileName = (parts[parts.length - 1] || 'conversation').replace('.jsonl', '');
+                setSlug(slugify(fileName));
+                setContentType('conversation');
+                setStep('confirm');
+            }
+        } catch (err) {
+            setError(String(err));
+        }
     }, []);
+
+    const handleContentTypeSelect = useCallback((type: 'code' | 'document' | 'conversation') => {
+        setContentType(type);
+        if (type === 'conversation') {
+            handlePickConversation();
+        } else {
+            setStep('configure');
+        }
+    }, [handlePickConversation]);
 
     const handleContinueToConfirm = useCallback(() => {
         setStep('confirm');
@@ -236,6 +261,20 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
                                 Written documents. The pyramid will analyze content, themes,
                                 entities, and relationships. Choose this for: design docs,
                                 research notes, creative writing, specifications.
+                            </div>
+                        </button>
+
+                        <button
+                            className={`content-type-card ${contentType === 'conversation' ? 'selected' : ''}`}
+                            onClick={() => handleContentTypeSelect('conversation')}
+                        >
+                            <div className="content-type-icon">&#x1F4AC;</div>
+                            <div className="content-type-name">Conversation</div>
+                            <div className="content-type-desc">
+                                AI conversation transcript (JSONL). The pyramid will run
+                                forward and reverse passes to extract what was decided,
+                                what was corrected, and what mattered. Choose this for:
+                                Claude Code sessions, chat logs, design discussions.
                             </div>
                         </button>
                     </div>

@@ -625,7 +625,7 @@ pub async fn build_conversation(
 
     // Total steps: forward(N) + reverse(N) + combine(N) + L1(N/2) + L2(threads) + L3+(variable)
     // Estimate conservatively; we update total as we discover more.
-    let estimated_total = num_chunks * 3 + num_chunks; // forward + reverse + combine + upper layers
+    let estimated_total = num_chunks * 3 + num_chunks / 2; // forward + reverse + combine + rough L1 estimate
     let _ = progress_tx
         .send(BuildProgress {
             done: 0,
@@ -846,7 +846,7 @@ pub async fn build_conversation(
     };
     // Estimate: L2 ~ l1_count/2 threads, L3+ ~ log2 upper layers
     let est_l2 = (l1_count + 1) / 2;
-    let mut est_upper = est_l2;
+    let mut est_upper = 0i64;
     let mut remaining = est_l2;
     while remaining > 1 {
         remaining = (remaining + 1) / 2;
@@ -897,7 +897,7 @@ pub async fn build_code(
         return Err(anyhow!("No chunks found for slug '{slug}'"));
     }
 
-    let estimated_total = num_chunks * 2 + num_chunks; // L0 + L1 clusters + upper
+    let estimated_total = num_chunks + num_chunks / 2; // L0 + rough L1 estimate
     let _ = progress_tx
         .send(BuildProgress {
             done: 0,
@@ -1182,7 +1182,7 @@ pub async fn build_code(
         db_read(&db, { let s = slug_s; move |conn| db::count_nodes_at_depth(conn, &s, 1) }).await.unwrap_or(0)
     };
     let est_l2_code = (l1_count_code + 1) / 2;
-    let mut est_upper_code = est_l2_code;
+    let mut est_upper_code = 0i64;
     let mut remaining_code = est_l2_code;
     while remaining_code > 1 {
         remaining_code = (remaining_code + 1) / 2;
@@ -1233,7 +1233,7 @@ pub async fn build_docs(
         return Err(anyhow!("No chunks found for slug '{slug}'"));
     }
 
-    let estimated_total = num_chunks * 2 + num_chunks;
+    let estimated_total = num_chunks + num_chunks / 2; // L0 + rough L1 estimate
     let _ = progress_tx
         .send(BuildProgress {
             done: 0,
@@ -1489,7 +1489,7 @@ pub async fn build_docs(
         db_read(&db, { let s = slug_s; move |conn| db::count_nodes_at_depth(conn, &s, 1) }).await.unwrap_or(0)
     };
     let est_l2_doc = (l1_count_doc + 1) / 2;
-    let mut est_upper_doc = est_l2_doc;
+    let mut est_upper_doc = 0i64;
     let mut remaining_doc = est_l2_doc;
     while remaining_doc > 1 {
         remaining_doc = (remaining_doc + 1) / 2;
@@ -1547,6 +1547,8 @@ async fn build_l1_pairing(
     let existing_l1 = db_read(&db, { let s = slug_owned.clone(); move |conn| db::count_nodes_at_depth(conn, &s, 1) }).await?;
     if existing_l1 >= expected_l1 as i64 {
         info!("  L1: {} nodes (already complete)", existing_l1);
+        *done += existing_l1;
+        let _ = progress_tx.send(BuildProgress { done: *done, total }).await;
         return Ok(0);
     }
 
@@ -1841,6 +1843,8 @@ async fn build_threads_layer(
 
     if l2_count >= threads.len() as i64 {
         info!("  L2: {} thread nodes (already complete)", l2_count);
+        *done += l2_count;
+        let _ = progress_tx.send(BuildProgress { done: *done, total }).await;
         return Ok(failures);
     }
 
@@ -2016,6 +2020,8 @@ async fn build_upper_layers(
         let existing = db_read(&db, { let s = slug_owned.clone(); move |conn| db::count_nodes_at_depth(conn, &s, depth) }).await?;
         if existing >= expected as i64 {
             info!("  Depth {depth}: {existing} nodes (already complete)");
+            *done += existing;
+            let _ = progress_tx.send(BuildProgress { done: *done, total }).await;
             continue;
         }
 

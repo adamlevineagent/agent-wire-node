@@ -2374,9 +2374,11 @@ async fn pyramid_build(
                         } else {
                             s.status = "complete".to_string();
                         }
+                        s.progress = BuildProgress { done: s.progress.total, total: s.progress.total };
                     }
                     Err(ref e) => {
                         s.status = "failed".to_string();
+                        s.progress = BuildProgress { done: s.progress.total, total: s.progress.total };
                         tracing::error!("Build failed for '{}': {e}", slug);
                     }
                 }
