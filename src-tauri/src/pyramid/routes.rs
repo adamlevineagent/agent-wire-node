@@ -12,6 +12,7 @@ use super::PyramidState;
 use super::types::*;
 use super::query;
 use super::slug;
+use super::ingest;
 use super::build::{self, WriteOp};
 use super::db;
 
@@ -82,6 +83,15 @@ struct CreateSlugBody {
 #[derive(Deserialize)]
 struct SearchQuery {
     q: String,
+}
+
+#[derive(Deserialize)]
+struct ConfigBody {
+    openrouter_api_key: Option<String>,
+    auth_token: Option<String>,
+    primary_model: Option<String>,
+    fallback_model_1: Option<String>,
+    fallback_model_2: Option<String>,
 }
 
 // ── Route definitions ───────────────────────────────────────────────
@@ -228,6 +238,24 @@ pub fn pyramid_routes(
         .and(with_auth_state(state.clone()))
         .and_then(handle_terms));
 
+    // POST /pyramid/:slug/ingest
+    let ingest_route = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("ingest"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_ingest));
+
+    // POST /pyramid/config
+    let config_route = route!(prefix
+        .and(warp::path("config"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(with_auth_state(state.clone()))
+        .and(warp::body::json())
+        .and_then(handle_config));
+
     // DELETE /pyramid/:slug
     let delete_slug_route = route!(prefix
         .and(warp::path::param::<String>())
@@ -245,17 +273,20 @@ pub fn pyramid_routes(
     let r5 = drill.or(search).unify().boxed();
     let r6 = entities.or(resolved).unify().boxed();
     let r7 = corrections.or(terms).unify().boxed();
+    let r8 = ingest_route.or(config_route).unify().boxed();
 
     // Combine the groups (each is BoxedFilter<(Response,)>)
     let g1 = r1.or(r2).unify().boxed();
     let g2 = r3.or(r4).unify().boxed();
     let g3 = r5.or(r6).unify().boxed();
     let g4 = r7.or(delete_slug_route).unify().boxed();
+    let g5 = r8;
 
     let h1 = g1.or(g2).unify().boxed();
     let h2 = g3.or(g4).unify().boxed();
 
-    h1.or(h2).unify().boxed()
+    let top = h1.or(h2).unify().boxed();
+    top.or(g5).unify().boxed()
 }
 
 // ── Route handlers ──────────────────────────────────────────────────
@@ -614,6 +645,110 @@ async fn handle_build_cancel(
         warp::http::StatusCode::NOT_FOUND,
         "No active build for this slug",
     ))
+}
+
+async fn handle_ingest(
+    slug_name: String,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    // Look up slug info to get source_path and content_type
+    let slug_info = {
+        let conn = state.reader.lock().await;
+        match slug::get_slug(&conn, &slug_name) {
+            Ok(Some(info)) => info,
+            Ok(None) => {
+                return Ok(json_error(warp::http::StatusCode::NOT_FOUND, "Slug not found"));
+            }
+            Err(e) => {
+                return Ok(json_error(
+                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    &e.to_string(),
+                ));
+            }
+        }
+    };
+
+    let source_path = slug_info.source_path.clone();
+    let content_type = slug_info.content_type.clone();
+    let slug_clone = slug_name.clone();
+
+    // Run synchronous ingest on a blocking thread
+    let writer = state.writer.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let conn = writer.blocking_lock();
+        let path = std::path::Path::new(&source_path);
+        match content_type {
+            ContentType::Code => ingest::ingest_code(&conn, &slug_clone, path),
+            ContentType::Conversation => ingest::ingest_conversation(&conn, &slug_clone, path),
+            ContentType::Document => ingest::ingest_docs(&conn, &slug_clone, path),
+        }
+    })
+    .await;
+
+    match result {
+        Ok(Ok(_slug)) => {
+            // Count chunks to return
+            let conn = state.reader.lock().await;
+            let chunk_count = db::count_chunks(&conn, &slug_name).unwrap_or(0);
+            Ok(json_ok(&serde_json::json!({
+                "slug": slug_name,
+                "chunks": chunk_count,
+                "status": "ingested"
+            })))
+        }
+        Ok(Err(e)) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Ingest task panicked: {e}"),
+        )),
+    }
+}
+
+async fn handle_config(
+    state: Arc<PyramidState>,
+    body: ConfigBody,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let mut config = state.config.write().await;
+
+    if let Some(ref key) = body.openrouter_api_key {
+        config.api_key = key.clone();
+    }
+    if let Some(ref token) = body.auth_token {
+        config.auth_token = token.clone();
+    }
+    if let Some(ref model) = body.primary_model {
+        config.primary_model = model.clone();
+    }
+    if let Some(ref model) = body.fallback_model_1 {
+        config.fallback_model_1 = model.clone();
+    }
+    if let Some(ref model) = body.fallback_model_2 {
+        config.fallback_model_2 = model.clone();
+    }
+
+    // Persist to config file if data_dir is set
+    if let Some(ref data_dir) = state.data_dir {
+        let pyramid_config = super::PyramidConfig {
+            openrouter_api_key: config.api_key.clone(),
+            auth_token: config.auth_token.clone(),
+            primary_model: config.primary_model.clone(),
+            fallback_model_1: config.fallback_model_1.clone(),
+            fallback_model_2: config.fallback_model_2.clone(),
+        };
+        if let Err(e) = pyramid_config.save(data_dir) {
+            tracing::error!("Failed to save pyramid config: {e}");
+        }
+    }
+
+    Ok(json_ok(&serde_json::json!({
+        "status": "updated",
+        "primary_model": config.primary_model,
+        "fallback_model_1": config.fallback_model_1,
+        "fallback_model_2": config.fallback_model_2,
+    })))
 }
 
 async fn handle_delete_slug(

@@ -54,7 +54,6 @@ fn config_files() -> HashSet<&'static str> {
         "tsconfig.json",
         "vite.config.ts",
         "vite.config.js",
-        ".env",
         "build.rs",
         "pyproject.toml",
     ]
@@ -429,7 +428,7 @@ pub fn ingest_code(conn: &Connection, slug: &str, dir_path: &Path) -> Result<Str
     let code_exts = code_extensions();
     let config_fnames = config_files();
 
-    let all_files = walk_dir(dir_path, &skip, false);
+    let all_files = walk_dir(dir_path, &skip, true);
 
     // Filter to code + config files
     struct FileEntry {
@@ -449,11 +448,8 @@ pub fn ingest_code(conn: &Connection, slug: &str, dir_path: &Path) -> Result<Str
             .unwrap_or_default();
 
         // Skip hidden files
-        if fname.starts_with('.') && !config_fnames.contains(fname.as_str()) {
-            // .env is in config_files, so it passes through
-            if fname != ".env" {
-                continue;
-            }
+        if fname.starts_with('.') {
+            continue;
         }
 
         let ext = abs_path

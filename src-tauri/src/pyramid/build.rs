@@ -844,7 +844,7 @@ pub async fn build_code(
     let mut done: i64 = 0;
 
     // ── Step 1: Mechanical passes (import graph, spawns, strings) ────
-    let import_graph = db_read(&db, { let s = slug_owned.clone(); move |conn| extract_import_graph(conn, &s) }).await?;
+    let import_graph = db_read(&db, { let s = slug_owned.clone(); let wtx = writer_tx.clone(); move |conn| extract_import_graph(conn, &s, Some(&wtx)) }).await?;
 
     // ── Step 2: Concurrent L0 extraction ─────────────────────────────
     info!("=== CODE L0: EXTRACT {num_chunks} files ===");
@@ -932,6 +932,7 @@ pub async fn build_code(
         drop(result_tx); // Close sender so receiver terminates when all tasks done
 
         // Collect results and write to DB
+        let mut l0_failures: i64 = 0;
         while let Some(result) = result_rx.recv().await {
             match result {
                 Ok((ci, node_id, analysis, file_path, elapsed)) => {
@@ -991,7 +992,8 @@ pub async fn build_code(
                     let _ = progress_tx.send(BuildProgress { done, total: estimated_total }).await;
                 }
                 Err(e) => {
-                    info!("  Code L0 extraction error: {e}");
+                    l0_failures += 1;
+                    tracing::warn!("  Code L0 extraction error (failure #{}): {e}", l0_failures);
                 }
             }
         }
@@ -999,6 +1001,15 @@ pub async fn build_code(
         // Wait for all spawn handles
         for h in handles {
             let _ = h.await;
+        }
+
+        // Check for missing L0 nodes
+        let actual_l0 = db_read(&db, { let s = slug_owned.clone(); move |conn| db::count_nodes_at_depth(conn, &s, 0) }).await?;
+        if actual_l0 < num_chunks {
+            tracing::warn!(
+                "Code L0 extraction: {actual_l0}/{num_chunks} nodes created ({} missing, {} failures)",
+                num_chunks - actual_l0, l0_failures
+            );
         }
     }
 
@@ -1186,6 +1197,7 @@ pub async fn build_docs(
         }
         drop(result_tx);
 
+        let mut l0_failures: i64 = 0;
         while let Some(result) = result_rx.recv().await {
             match result {
                 Ok((ci, node_id, analysis, elapsed)) => {
@@ -1232,13 +1244,23 @@ pub async fn build_docs(
                     let _ = progress_tx.send(BuildProgress { done, total: estimated_total }).await;
                 }
                 Err(e) => {
-                    info!("  Doc L0 extraction error: {e}");
+                    l0_failures += 1;
+                    tracing::warn!("  Doc L0 extraction error (failure #{}): {e}", l0_failures);
                 }
             }
         }
 
         for h in handles {
             let _ = h.await;
+        }
+
+        // Check for missing L0 nodes
+        let actual_l0 = db_read(&db, { let s = slug_owned.clone(); move |conn| db::count_nodes_at_depth(conn, &s, 0) }).await?;
+        if actual_l0 < num_chunks {
+            tracing::warn!(
+                "Doc L0 extraction: {actual_l0}/{num_chunks} nodes created ({} missing, {} failures)",
+                num_chunks - actual_l0, l0_failures
+            );
         }
     }
 
@@ -1598,6 +1620,37 @@ async fn build_threads_layer(
         return Ok(());
     }
 
+    // Validate all L1 nodes are assigned to at least one thread
+    let assigned_l1_ids: HashSet<String> = threads
+        .iter()
+        .flat_map(|t| {
+            t.get("assignments")
+                .and_then(|a| a.as_array())
+                .into_iter()
+                .flatten()
+                .filter_map(|a| a.get("source_node").and_then(|v| v.as_str()).map(String::from))
+        })
+        .collect();
+    let all_l1_ids: HashSet<String> = l1_nodes.iter().map(|n| n.id.clone()).collect();
+    let orphaned: Vec<&String> = all_l1_ids.difference(&assigned_l1_ids).collect();
+    let mut threads = threads;
+    if !orphaned.is_empty() {
+        tracing::warn!(
+            "Thread clustering left {} L1 nodes unassigned: {:?}. Adding to 'Other' catch-all thread.",
+            orphaned.len(),
+            orphaned
+        );
+        let other_assignments: Vec<Value> = orphaned
+            .iter()
+            .map(|id| serde_json::json!({ "source_node": id, "topic_index": 0, "topic_name": "Unassigned" }))
+            .collect();
+        threads.push(serde_json::json!({
+            "name": "Other",
+            "description": "Catch-all thread for topics not assigned by the LLM clustering step.",
+            "assignments": other_assignments,
+        }));
+    }
+
     if l2_count >= threads.len() as i64 {
         info!("  L2: {} thread nodes (already complete)", l2_count);
         return Ok(());
@@ -1712,8 +1765,13 @@ async fn build_threads_layer(
             &llm_config.primary_model, elapsed,
         ).await?;
 
-        let node = node_from_analysis(&analysis, &node_id, slug, 2, None, contributing_nodes);
+        let node = node_from_analysis(&analysis, &node_id, slug, 2, None, contributing_nodes.clone());
         send_save_node(writer_tx, node, Some(topics_json)).await?;
+
+        // Update parent_id for each contributing L1 node
+        for child_id in &contributing_nodes {
+            send_update_parent(writer_tx, slug, child_id, &node_id).await?;
+        }
 
         *done += 1;
         let _ = progress_tx.send(BuildProgress { done: *done, total }).await;
@@ -1890,7 +1948,7 @@ pub struct FileComplexity {
 
 /// Mechanical pass: extract import graph, IPC map, spawn counts, string resources,
 /// and per-file complexity from code chunks.  Pure regex, no LLM.
-fn extract_import_graph(conn: &Connection, slug: &str) -> Result<ImportGraph> {
+fn extract_import_graph(conn: &Connection, slug: &str, writer_tx: Option<&mpsc::Sender<WriteOp>>) -> Result<ImportGraph> {
     // Check if already computed
     if db::step_exists(conn, slug, "import_graph", -1, -1, "")? {
         if let Some(output) = db::get_step_output(conn, slug, "import_graph", -1)? {
@@ -2117,9 +2175,22 @@ fn extract_import_graph(conn: &Connection, slug: &str) -> Result<ImportGraph> {
         }
     }
 
-    // Save the import graph step
+    // Save the import graph step via writer channel if available, else direct write
     let output = serde_json::to_string(&graph)?;
-    db::save_step(conn, slug, "import_graph", -1, -1, "", &output, "mechanical", 0.0)?;
+    if let Some(tx) = writer_tx {
+        tx.blocking_send(WriteOp::SaveStep {
+            slug: slug.to_string(),
+            step_type: "import_graph".to_string(),
+            chunk_index: -1,
+            depth: -1,
+            node_id: String::new(),
+            output_json: output,
+            model: "mechanical".to_string(),
+            elapsed: 0.0,
+        }).map_err(|e| anyhow!("Failed to send SaveStep for import_graph: {e}"))?;
+    } else {
+        db::save_step(conn, slug, "import_graph", -1, -1, "", &output, "mechanical", 0.0)?;
+    }
 
     info!("Mechanical analysis: {} files with imports, {} IPC bindings, {} spawn sites",
         graph.imports.len(), graph.ipc_map.len(),

@@ -2395,6 +2395,72 @@ async fn pyramid_build_status(
     })
 }
 
+#[tauri::command]
+async fn pyramid_ingest(
+    state: tauri::State<'_, SharedState>,
+    slug: String,
+) -> Result<serde_json::Value, String> {
+    // Look up slug info
+    let slug_info = {
+        let conn = state.pyramid.reader.lock().await;
+        wire_node_lib::pyramid::slug::get_slug(&conn, &slug)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("Slug '{}' not found", slug))?
+    };
+
+    let source_path = slug_info.source_path.clone();
+    let content_type = slug_info.content_type.clone();
+    let slug_clone = slug.clone();
+    let writer = state.pyramid.writer.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        let conn = writer.blocking_lock();
+        let path = std::path::Path::new(&source_path);
+        match content_type {
+            ContentType::Code => wire_node_lib::pyramid::ingest::ingest_code(&conn, &slug_clone, path),
+            ContentType::Conversation => wire_node_lib::pyramid::ingest::ingest_conversation(&conn, &slug_clone, path),
+            ContentType::Document => wire_node_lib::pyramid::ingest::ingest_docs(&conn, &slug_clone, path),
+        }
+    })
+    .await
+    .map_err(|e| format!("Ingest task panicked: {e}"))?
+    .map_err(|e| e.to_string())?;
+
+    // Count chunks
+    let conn = state.pyramid.reader.lock().await;
+    let chunk_count = pyramid_db::count_chunks(&conn, &slug).unwrap_or(0);
+
+    Ok(serde_json::json!({
+        "slug": result,
+        "chunks": chunk_count,
+        "status": "ingested"
+    }))
+}
+
+#[tauri::command]
+async fn pyramid_set_config(
+    state: tauri::State<'_, SharedState>,
+    api_key: String,
+    auth_token: String,
+) -> Result<(), String> {
+    // Update in-memory LLM config
+    {
+        let mut config = state.pyramid.config.write().await;
+        config.api_key = api_key.clone();
+        config.auth_token = auth_token.clone();
+    }
+
+    // Persist to disk
+    if let Some(ref data_dir) = state.pyramid.data_dir {
+        let mut pyramid_config = wire_node_lib::pyramid::PyramidConfig::load(data_dir);
+        pyramid_config.openrouter_api_key = api_key;
+        pyramid_config.auth_token = auth_token;
+        pyramid_config.save(data_dir).map_err(|e| e.to_string())?;
+    }
+
+    Ok(())
+}
+
 // --- App Setup --------------------------------------------------------------
 
 fn main() {
@@ -2477,11 +2543,16 @@ fn main() {
     wire_node_lib::pyramid::db::init_pyramid_db(&pyramid_reader)
         .expect("Failed to initialize pyramid schema on reader");
 
+    // Load pyramid config from disk (or use defaults)
+    let pyramid_config = wire_node_lib::pyramid::PyramidConfig::load(&config.data_dir());
+    tracing::info!("Pyramid config loaded (api_key set: {})", !pyramid_config.openrouter_api_key.is_empty());
+
     let pyramid_state = Arc::new(wire_node_lib::pyramid::PyramidState {
         reader: Arc::new(tokio::sync::Mutex::new(pyramid_reader)),
         writer: Arc::new(tokio::sync::Mutex::new(pyramid_writer)),
-        config: Arc::new(RwLock::new(wire_node_lib::pyramid::llm::LlmConfig::default())),
+        config: Arc::new(RwLock::new(pyramid_config.to_llm_config())),
         active_build: Arc::new(RwLock::new(None)),
+        data_dir: Some(config.data_dir()),
     });
 
     tracing::info!("Pyramid engine initialized at {:?}", pyramid_db_path);
@@ -3165,6 +3236,8 @@ fn main() {
             pyramid_search,
             pyramid_build,
             pyramid_build_status,
+            pyramid_ingest,
+            pyramid_set_config,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Wire Node");

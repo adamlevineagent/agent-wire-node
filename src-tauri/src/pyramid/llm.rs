@@ -3,6 +3,7 @@
 use anyhow::{anyhow, Result};
 use regex::Regex;
 use serde_json::Value;
+use std::sync::LazyLock;
 use tracing::info;
 
 #[derive(Debug, Clone)]
@@ -169,8 +170,8 @@ pub fn extract_json(text: &str) -> Result<Value> {
     let mut text = text.trim().to_string();
 
     // Strip <think>...</think> tags
-    let think_re = Regex::new(r"(?s)<think>.*?</think>").unwrap();
-    text = think_re.replace_all(&text, "").trim().to_string();
+    static THINK_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?s)<think>.*?</think>").unwrap());
+    text = THINK_RE.replace_all(&text, "").trim().to_string();
 
     // Remove markdown fences (``` lines)
     if text.contains("```") {
@@ -205,10 +206,10 @@ pub fn extract_json(text: &str) -> Result<Value> {
     }
 
     // Fix trailing commas and retry
-    let comma_brace = Regex::new(r",\s*}").unwrap();
-    let comma_bracket = Regex::new(r",\s*]").unwrap();
-    let fixed = comma_brace.replace_all(slice, "}");
-    let fixed = comma_bracket.replace_all(&fixed, "]");
+    static COMMA_BRACE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r",\s*}").unwrap());
+    static COMMA_BRACKET: LazyLock<Regex> = LazyLock::new(|| Regex::new(r",\s*]").unwrap());
+    let fixed = COMMA_BRACE.replace_all(slice, "}");
+    let fixed = COMMA_BRACKET.replace_all(&fixed, "]");
 
     if let Ok(v) = serde_json::from_str::<Value>(&fixed) {
         return Ok(v);

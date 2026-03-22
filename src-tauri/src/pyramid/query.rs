@@ -110,17 +110,66 @@ fn collect_entities(node: &PyramidNode) -> Vec<(String, String)> {
 // ── Public query API ─────────────────────────────────────────────────
 
 /// Get the apex node (highest depth, single node at that depth).
+/// If multiple nodes exist at the max depth (e.g. cancelled build), logs a warning
+/// and falls back one level to find the completed apex.
 pub fn get_apex(conn: &Connection, slug: &str) -> Result<Option<PyramidNode>> {
-    let mut stmt = conn.prepare(
-        "SELECT * FROM pyramid_nodes WHERE slug = ? ORDER BY depth DESC LIMIT 1",
-    )?;
-
-    let node = stmt
-        .query_row(rusqlite::params![slug], row_to_node)
+    // Find max depth
+    let max_depth: Option<i64> = conn
+        .prepare("SELECT MAX(depth) FROM pyramid_nodes WHERE slug = ?")?
+        .query_row(rusqlite::params![slug], |row| row.get(0))
         .optional()
-        .context("Failed to query apex node")?;
+        .context("Failed to query max depth")?
+        .flatten();
 
-    Ok(node)
+    let max_depth = match max_depth {
+        Some(d) => d,
+        None => return Ok(None),
+    };
+
+    // Count nodes at max depth
+    let count: i64 = conn
+        .prepare("SELECT COUNT(*) FROM pyramid_nodes WHERE slug = ? AND depth = ?")?
+        .query_row(rusqlite::params![slug, max_depth], |row| row.get(0))?;
+
+    if count == 1 {
+        let node = conn
+            .prepare("SELECT * FROM pyramid_nodes WHERE slug = ? AND depth = ?")?
+            .query_row(rusqlite::params![slug, max_depth], row_to_node)
+            .optional()
+            .context("Failed to query apex node")?;
+        return Ok(node);
+    }
+
+    // Multiple nodes at max depth (likely cancelled mid-layer build).
+    // Scan downward to find the highest depth with exactly ONE node.
+    if count > 1 {
+        for d in (0..max_depth).rev() {
+            let d_count: i64 = conn
+                .prepare("SELECT COUNT(*) FROM pyramid_nodes WHERE slug = ? AND depth = ?")?
+                .query_row(rusqlite::params![slug, d], |row| row.get(0))?;
+
+            if d_count == 1 {
+                warn!(
+                    "Multiple nodes ({}) at max depth {} for slug '{}' (likely cancelled build). Using single node at depth {} as apex.",
+                    count, max_depth, slug, d
+                );
+                let node = conn
+                    .prepare("SELECT * FROM pyramid_nodes WHERE slug = ? AND depth = ?")?
+                    .query_row(rusqlite::params![slug, d], row_to_node)
+                    .optional()
+                    .context("Failed to query apex node at lower depth")?;
+                return Ok(node);
+            }
+        }
+
+        // No single-node depth exists — return an error
+        anyhow::bail!(
+            "No valid apex for slug '{}': multiple nodes at every depth (max depth {}, {} nodes). Build may have been cancelled before completing any layer.",
+            slug, max_depth, count
+        );
+    }
+
+    Ok(None)
 }
 
 /// Get the full tree structure from the apex down.
@@ -329,7 +378,7 @@ pub fn resolved(conn: &Connection, slug: &str) -> Result<Vec<ResolvedCorrection>
     // Gather L0 corrections (depth == 0)
     let mut stmt_l0 = conn.prepare(
         "SELECT * FROM pyramid_nodes WHERE slug = ? AND depth = 0 \
-         AND corrections != '[]' ORDER BY chunk_index",
+         ORDER BY chunk_index",
     )?;
     let l0_nodes: Vec<PyramidNode> = stmt_l0
         .query_map(rusqlite::params![slug], row_to_node)?
@@ -339,7 +388,7 @@ pub fn resolved(conn: &Connection, slug: &str) -> Result<Vec<ResolvedCorrection>
     // Gather upper corrections (depth > 0)
     let mut stmt_upper = conn.prepare(
         "SELECT * FROM pyramid_nodes WHERE slug = ? AND depth > 0 \
-         AND corrections != '[]' ORDER BY depth, id",
+         ORDER BY depth, id",
     )?;
     let upper_nodes: Vec<PyramidNode> = stmt_upper
         .query_map(rusqlite::params![slug], row_to_node)?
@@ -475,7 +524,7 @@ pub fn resolved(conn: &Connection, slug: &str) -> Result<Vec<ResolvedCorrection>
 /// keeping the version from the highest depth node.
 pub fn corrections(conn: &Connection, slug: &str) -> Result<Vec<CorrectionWithSource>> {
     let mut stmt = conn.prepare(
-        "SELECT * FROM pyramid_nodes WHERE slug = ? AND corrections != '[]' \
+        "SELECT * FROM pyramid_nodes WHERE slug = ? \
          ORDER BY depth DESC, id",
     )?;
 
