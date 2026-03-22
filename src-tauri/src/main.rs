@@ -2526,6 +2526,13 @@ async fn pyramid_get_config(
 }
 
 #[tauri::command]
+fn get_home_dir() -> Result<String, String> {
+    dirs::home_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .ok_or_else(|| "Could not determine home directory".to_string())
+}
+
+#[tauri::command]
 async fn pyramid_build_cancel(
     state: tauri::State<'_, SharedState>,
 ) -> Result<(), String> {
@@ -3305,6 +3312,7 @@ fn main() {
             get_work_stats,
             get_operator_session,
             operator_api_call,
+            get_home_dir,
             pyramid_list_slugs,
             pyramid_apex,
             pyramid_node,

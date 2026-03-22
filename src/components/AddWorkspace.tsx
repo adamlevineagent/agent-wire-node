@@ -98,33 +98,54 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
 
     const handlePickConversation = useCallback(async () => {
         try {
+            // Default to Claude Code projects directory
+            const homeDir = await invoke<string>('get_home_dir').catch(() => '');
+            const claudeDir = homeDir ? `${homeDir}/.claude/projects` : undefined;
+
             const selected = await open({
                 directory: false,
                 title: 'Select Conversation JSONL',
+                defaultPath: claudeDir,
                 filters: [{ name: 'JSONL', extensions: ['jsonl'] }],
             });
             if (selected) {
                 const filePath = selected as string;
-                setPaths([filePath]);
-                const parts = filePath.split('/');
-                const fileName = (parts[parts.length - 1] || 'conversation').replace('.jsonl', '');
-                setSlug(slugify(fileName));
+                addPathAndAutoSlug(filePath);
                 setContentType('conversation');
-                setStep('confirm');
+                setStep('confirm');  // Skip configure for conversations (no ignore patterns needed)
             }
         } catch (err) {
             setError(String(err));
         }
     }, []);
 
+    // Helper to add a path and auto-generate slug from it
+    const addPathAndAutoSlug = useCallback((newPath: string) => {
+        setPaths(prev => {
+            if (prev.includes(newPath)) return prev;
+            const updated = [...prev, newPath];
+            if (updated.length === 1) {
+                const parts = newPath.split('/');
+                const name = (parts[parts.length - 1] || parts[parts.length - 2] || 'workspace').replace('.jsonl', '');
+                setSlug(slugify(name));
+            }
+            return updated;
+        });
+    }, []);
+
     const handleContentTypeSelect = useCallback((type: 'code' | 'document' | 'conversation') => {
         setContentType(type);
         if (type === 'conversation') {
-            handlePickConversation();
+            // If path already pasted and it's a .jsonl, skip picker
+            if (paths.length > 0 && paths[0].endsWith('.jsonl')) {
+                setStep('confirm');
+            } else {
+                handlePickConversation();
+            }
         } else {
             setStep('configure');
         }
-    }, [handlePickConversation]);
+    }, [handlePickConversation, paths]);
 
     const handleContinueToConfirm = useCallback(() => {
         setStep('confirm');
