@@ -379,7 +379,7 @@ pub async fn start_server(
             warp::http::Response::builder()
                 .status(204)
                 .header("Access-Control-Allow-Origin", "*")
-                .header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+                .header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
                 .header("Access-Control-Allow-Headers", "Content-Type, Range, Authorization")
                 .header("Access-Control-Allow-Private-Network", "true")
                 .body("")

@@ -1075,6 +1075,7 @@ pub async fn build_code(
                 num_chunks - actual_l0, l0_failures
             );
         }
+        failures += l0_failures as i32;
     }
 
     // ── Step 3: L1 — Import-graph clustering ─────────────────────────
@@ -1355,6 +1356,7 @@ pub async fn build_docs(
                 num_chunks - actual_l0, l0_failures
             );
         }
+        failures += l0_failures as i32;
     }
 
     // ── L1: Entity-overlap clustering ────────────────────────────────
