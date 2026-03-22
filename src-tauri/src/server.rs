@@ -9,6 +9,7 @@ use crate::auth::AuthState;
 use crate::sync::SyncState;
 use crate::tunnel;
 use crate::pyramid;
+use crate::partner;
 
 /// HTTP server state
 #[derive(Clone)]
@@ -21,6 +22,7 @@ pub struct ServerState {
     pub jwt_public_key: Arc<RwLock<String>>,
     pub node_id: Arc<RwLock<String>>,
     pub pyramid: Arc<pyramid::PyramidState>,
+    pub partner: Arc<partner::PartnerState>,
 }
 
 #[derive(Serialize)]
@@ -72,6 +74,7 @@ pub async fn start_server(
     jwt_public_key: Arc<RwLock<String>>,
     node_id: Arc<RwLock<String>>,
     pyramid: Arc<pyramid::PyramidState>,
+    partner: Arc<partner::PartnerState>,
 ) {
     let state = ServerState {
         cache_dir,
@@ -82,6 +85,7 @@ pub async fn start_server(
         jwt_public_key,
         node_id,
         pyramid,
+        partner,
     };
 
     // CORS headers for browser access
@@ -389,8 +393,12 @@ pub async fn start_server(
     // Pyramid Knowledge Engine routes
     let pyramid_routes = pyramid::routes::pyramid_routes(state.pyramid.clone());
 
+    // Partner (Dennis) routes
+    let partner_routes = partner::routes::partner_routes(state.partner.clone());
+
     let routes = preflight
         .or(pyramid_routes)
+        .or(partner_routes)
         .or(auth_callback.or(auth_complete).or(health).or(tunnel_debug).or(documents).or(stats))
         .with(cors);
 

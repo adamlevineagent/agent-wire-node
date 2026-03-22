@@ -756,13 +756,13 @@ async fn handle_config(
 
     // Persist to config file if data_dir is set
     if let Some(ref data_dir) = state.data_dir {
-        let pyramid_config = super::PyramidConfig {
-            openrouter_api_key: config.api_key.clone(),
-            auth_token: config.auth_token.clone(),
-            primary_model: config.primary_model.clone(),
-            fallback_model_1: config.fallback_model_1.clone(),
-            fallback_model_2: config.fallback_model_2.clone(),
-        };
+        // Load existing config to preserve fields not managed by this endpoint
+        let mut pyramid_config = super::PyramidConfig::load(data_dir);
+        pyramid_config.openrouter_api_key = config.api_key.clone();
+        pyramid_config.auth_token = config.auth_token.clone();
+        pyramid_config.primary_model = config.primary_model.clone();
+        pyramid_config.fallback_model_1 = config.fallback_model_1.clone();
+        pyramid_config.fallback_model_2 = config.fallback_model_2.clone();
         if let Err(e) = pyramid_config.save(data_dir) {
             tracing::error!("Failed to save pyramid config: {e}");
         }

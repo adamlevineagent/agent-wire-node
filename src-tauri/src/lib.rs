@@ -20,6 +20,7 @@ pub mod market;
 pub mod retention;
 pub mod work;
 pub mod pyramid;
+pub mod partner;
 
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -35,6 +36,7 @@ pub struct AppState {
     pub work_stats: Arc<RwLock<work::WorkStats>>,
     pub config: Arc<RwLock<WireNodeConfig>>,
     pub pyramid: Arc<pyramid::PyramidState>,
+    pub partner: Arc<partner::PartnerState>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

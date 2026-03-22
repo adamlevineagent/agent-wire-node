@@ -41,11 +41,14 @@ pub struct PyramidConfig {
     pub fallback_model_1: String,
     #[serde(default = "default_fallback_2")]
     pub fallback_model_2: String,
+    #[serde(default = "default_partner_model")]
+    pub partner_model: String,
 }
 
 fn default_primary_model() -> String { "inception/mercury-2".into() }
 fn default_fallback_1() -> String { "qwen/qwen3.5-flash-02-23".into() }
 fn default_fallback_2() -> String { "x-ai/grok-4.20-beta".into() }
+fn default_partner_model() -> String { "anthropic/claude-sonnet-4-20250514".into() }
 
 impl Default for PyramidConfig {
     fn default() -> Self {
@@ -55,6 +58,7 @@ impl Default for PyramidConfig {
             primary_model: default_primary_model(),
             fallback_model_1: default_fallback_1(),
             fallback_model_2: default_fallback_2(),
+            partner_model: default_partner_model(),
         }
     }
 }

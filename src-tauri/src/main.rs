@@ -2641,6 +2641,29 @@ fn main() {
 
     tracing::info!("Pyramid engine initialized at {:?}", pyramid_db_path);
 
+    // Initialize partner (Dennis) state with its own pyramid reader and partner.db
+    let partner_db_path = config.data_dir().join("partner.db");
+    let partner_db_conn = wire_node_lib::partner::open_partner_db(&partner_db_path)
+        .expect("Failed to open partner.db");
+
+    let partner_pyramid_reader = rusqlite::Connection::open(&pyramid_db_path)
+        .expect("Failed to open pyramid.db partner reader connection");
+    wire_node_lib::pyramid::db::init_pyramid_db(&partner_pyramid_reader)
+        .expect("Failed to initialize pyramid schema on partner reader");
+
+    let partner_state = Arc::new(wire_node_lib::partner::PartnerState {
+        sessions: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+        pyramid: pyramid_state.clone(),
+        pyramid_reader: Arc::new(tokio::sync::Mutex::new(partner_pyramid_reader)),
+        partner_db: Arc::new(tokio::sync::Mutex::new(partner_db_conn)),
+        llm_config: tokio::sync::RwLock::new(wire_node_lib::partner::PartnerLlmConfig {
+            api_key: pyramid_config.openrouter_api_key.clone(),
+            partner_model: pyramid_config.partner_model.clone(),
+        }),
+    });
+
+    tracing::info!("Partner (Dennis) initialized at {:?}", partner_db_path);
+
     let state = Arc::new(AppState {
         auth: Arc::new(RwLock::new(initial_auth.clone())),
         sync_state: Arc::new(RwLock::new(
@@ -2654,6 +2677,7 @@ fn main() {
         work_stats: Arc::new(RwLock::new(work::WorkStats::default())),
         config: Arc::new(RwLock::new(config.clone())),
         pyramid: pyramid_state,
+        partner: partner_state,
     });
 
     tauri::Builder::default()
@@ -2818,6 +2842,7 @@ fn main() {
                     jwt_pk,
                     nid_shared,
                     server_state.pyramid.clone(),
+                    server_state.partner.clone(),
                 ).await;
             });
 
