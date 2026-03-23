@@ -26,21 +26,9 @@ use super::db;
 use super::llm::{call_model, extract_json, LlmConfig};
 use super::types::*;
 
-// ── UTF-8 safe slicing helpers ───────────────────────────────────────────────
+// ── UTF-8 safe slicing helpers (delegated to shared utils) ──────────────────
 
-fn safe_slice_end(s: &str, max: usize) -> &str {
-    if s.len() <= max { return s; }
-    let mut e = max;
-    while e > 0 && !s.is_char_boundary(e) { e -= 1; }
-    &s[..e]
-}
-
-fn safe_slice_start(s: &str, max: usize) -> &str {
-    if s.len() <= max { return s; }
-    let mut s_idx = s.len() - max;
-    while s_idx < s.len() && !s.is_char_boundary(s_idx) { s_idx += 1; }
-    &s[s_idx..]
-}
+use crate::utils::{safe_slice_end, safe_slice_start};
 
 // ── DB read helper (moves Connection access to blocking task) ────────────────
 
@@ -533,6 +521,7 @@ fn node_from_analysis(
         self_prompt,
         children,
         parent_id: None,
+        superseded_by: None,
         created_at: String::new(),
     }
 }

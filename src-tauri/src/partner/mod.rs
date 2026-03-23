@@ -7,7 +7,9 @@
 
 pub mod context;
 pub mod conversation;
+pub mod crystal;
 pub mod routes;
+pub mod warm;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -53,6 +55,15 @@ pub struct Message {
 pub enum MessageRole {
     User,
     Partner,
+}
+
+impl MessageRole {
+    pub fn as_str(&self) -> &str {
+        match self {
+            MessageRole::User => "user",
+            MessageRole::Partner => "partner",
+        }
+    }
 }
 
 /// A topic summary from the warm layer (session-level L1).
@@ -127,6 +138,9 @@ pub struct PartnerState {
     pub partner_db: Arc<Mutex<Connection>>,
     /// Partner LLM config (model, API key).
     pub llm_config: tokio::sync::RwLock<PartnerLlmConfig>,
+    /// Guard: set of slugs currently running a warm pass (prevents double-runs).
+    /// Wrapped in Arc so it can be cloned into spawned background tasks.
+    pub warm_in_progress: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 // ── Database ────────────────────────────────────────────────────────

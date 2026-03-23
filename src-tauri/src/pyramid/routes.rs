@@ -2,11 +2,14 @@
 //
 // All routes require bearer token authentication.
 // Routes delegate to query:: and slug:: modules for actual logic.
+// Auto-stale endpoints (Phase 5/6) handle freeze, breaker, config, cost observatory.
 
 use std::sync::Arc;
 use warp::Filter;
 use warp::Reply;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex;
+use rusqlite::Connection;
 
 use super::PyramidState;
 use super::types::*;
@@ -15,16 +18,13 @@ use super::slug;
 use super::ingest;
 use super::build::{self, WriteOp};
 use super::db;
+use super::delta;
+use super::webbing;
+use super::meta;
+use super::faq;
+use crate::http_utils::{ct_eq, Unauthorized, json_error, json_ok};
 
 // ── Auth middleware ──────────────────────────────────────────────────
-
-/// Constant-time string comparison to prevent timing attacks on auth tokens.
-fn ct_eq(a: &str, b: &str) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    a.bytes().zip(b.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
-}
 
 /// Validate bearer token and pass state through. Returns PyramidState on success.
 fn with_auth_state(
@@ -53,24 +53,6 @@ fn with_auth_state(
         })
 }
 
-#[derive(Debug)]
-struct Unauthorized;
-impl warp::reject::Reject for Unauthorized {}
-
-// ── JSON reply helpers ──────────────────────────────────────────────
-
-fn json_error(status: warp::http::StatusCode, msg: &str) -> warp::reply::Response {
-    warp::reply::with_status(
-        warp::reply::json(&serde_json::json!({"error": msg})),
-        status,
-    )
-    .into_response()
-}
-
-fn json_ok<T: serde::Serialize>(val: &T) -> warp::reply::Response {
-    warp::reply::json(val).into_response()
-}
-
 // ── Request body types ──────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -86,12 +68,101 @@ struct SearchQuery {
 }
 
 #[derive(Deserialize)]
+struct AnnotateBody {
+    node_id: String,
+    annotation_type: String,
+    content: String,
+    question_context: Option<String>,
+    author: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct AnnotationsQuery {
+    node_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct FaqMatchQuery {
+    q: String,
+}
+
+#[derive(Deserialize)]
 struct ConfigBody {
     openrouter_api_key: Option<String>,
     auth_token: Option<String>,
     primary_model: Option<String>,
     fallback_model_1: Option<String>,
     fallback_model_2: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct UsageQuery {
+    limit: Option<i64>,
+}
+
+// ── Phase 5 & 6: Auto-update request/response types ─────────────────
+
+#[derive(Deserialize)]
+struct AutoUpdateConfigBody {
+    debounce_minutes: Option<i32>,
+    min_changed_files: Option<i32>,
+    runaway_threshold: Option<f64>,
+    auto_update: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct StaleLogQuery {
+    layer: Option<i32>,
+    stale: Option<String>,   // "yes" or "no"
+    limit: Option<i64>,
+    offset: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct CostQuery {
+    window: Option<String>,  // "24h", "7d", "30d"
+}
+
+#[derive(Serialize)]
+struct AutoUpdateStatusResponse {
+    auto_update: bool,
+    frozen: bool,
+    breaker_tripped: bool,
+    pending_mutations_by_layer: std::collections::HashMap<i32, i64>,
+    last_check_at: Option<String>,
+}
+
+// ── Agent ID filter ─────────────────────────────────────────────────
+
+fn with_agent_id() -> impl Filter<Extract = (Option<String>,), Error = warp::Rejection> + Clone {
+    warp::header::optional::<String>("x-agent-id")
+}
+
+// ── Usage logging helper (non-blocking) ─────────────────────────────
+
+fn log_query_usage(
+    writer: Arc<Mutex<Connection>>,
+    slug: String,
+    query_type: String,
+    query_params: String,
+    result_node_ids: Vec<String>,
+    agent_id: Option<String>,
+) {
+    tokio::spawn(async move {
+        let conn = writer.lock().await;
+        let entry = UsageLogEntry {
+            id: 0,
+            slug,
+            query_type,
+            query_params,
+            result_node_ids: serde_json::to_string(&result_node_ids).unwrap_or_default(),
+            agent_id,
+            created_at: String::new(),
+        };
+        if let Err(e) = db::log_usage(&conn, &entry) {
+            tracing::warn!("[usage] Failed to log query: {}", e);
+        }
+    });
 }
 
 // ── Route definitions ───────────────────────────────────────────────
@@ -161,6 +232,7 @@ pub fn pyramid_routes(
         .and(warp::path::end())
         .and(warp::get())
         .and(with_auth_state(state.clone()))
+        .and(with_agent_id())
         .and_then(handle_apex));
 
     // GET /pyramid/:slug/node/:id
@@ -171,6 +243,7 @@ pub fn pyramid_routes(
         .and(warp::path::end())
         .and(warp::get())
         .and(with_auth_state(state.clone()))
+        .and(with_agent_id())
         .and_then(handle_node));
 
     // GET /pyramid/:slug/tree
@@ -190,6 +263,7 @@ pub fn pyramid_routes(
         .and(warp::path::end())
         .and(warp::get())
         .and(with_auth_state(state.clone()))
+        .and(with_agent_id())
         .and_then(handle_drill));
 
     // GET /pyramid/:slug/search?q=term
@@ -200,6 +274,7 @@ pub fn pyramid_routes(
         .and(warp::get())
         .and(with_auth_state(state.clone()))
         .and(warp::query::<SearchQuery>())
+        .and(with_agent_id())
         .and_then(handle_search));
 
     // GET /pyramid/:slug/entities
@@ -256,6 +331,92 @@ pub fn pyramid_routes(
         .and(warp::body::json())
         .and_then(handle_config));
 
+    // GET /pyramid/:slug/threads
+    let threads = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("threads"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_threads));
+
+    // POST /pyramid/:slug/annotate
+    let annotate = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("annotate"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(with_auth_state(state.clone()))
+        .and(warp::body::json())
+        .and_then(handle_annotate));
+
+    // GET /pyramid/:slug/annotations?node_id=...
+    let annotations = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("annotations"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(with_auth_state(state.clone()))
+        .and(warp::query::<AnnotationsQuery>())
+        .and_then(handle_annotations));
+
+    // GET /pyramid/:slug/edges
+    let edges = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("edges"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_edges));
+
+    // POST /pyramid/:slug/meta (run all meta passes)
+    let meta_run = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("meta"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_meta_run));
+
+    // GET /pyramid/:slug/meta (read meta nodes)
+    let meta_read = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("meta"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_meta_read));
+
+    // GET /pyramid/:slug/usage?limit=100
+    let usage = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("usage"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(with_auth_state(state.clone()))
+        .and(warp::query::<UsageQuery>())
+        .and_then(handle_usage));
+
+    // GET /pyramid/:slug/faq — list all FAQ nodes for the slug
+    let faq_list = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("faq"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_list_faq));
+
+    // GET /pyramid/:slug/faq/match?q=<question> — find best matching FAQ
+    let faq_match = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("faq"))
+        .and(warp::path("match"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(with_auth_state(state.clone()))
+        .and(warp::query::<FaqMatchQuery>())
+        .and_then(handle_match_faq));
+
     // DELETE /pyramid/:slug
     let delete_slug_route = route!(prefix
         .and(warp::path::param::<String>())
@@ -263,6 +424,103 @@ pub fn pyramid_routes(
         .and(warp::delete())
         .and(with_auth_state(state.clone()))
         .and_then(handle_delete_slug));
+
+    // ── Phase 5: Breaker & Freeze routes ────────────────────────────
+
+    // GET /pyramid/:slug/auto-update/config
+    let auto_update_config_get = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("auto-update"))
+        .and(warp::path("config"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_auto_update_config_get));
+
+    // POST /pyramid/:slug/auto-update/config
+    let auto_update_config_post = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("auto-update"))
+        .and(warp::path("config"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(with_auth_state(state.clone()))
+        .and(warp::body::json())
+        .and_then(handle_auto_update_config_post));
+
+    // POST /pyramid/:slug/auto-update/freeze
+    let auto_update_freeze = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("auto-update"))
+        .and(warp::path("freeze"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_auto_update_freeze));
+
+    // POST /pyramid/:slug/auto-update/unfreeze
+    let auto_update_unfreeze = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("auto-update"))
+        .and(warp::path("unfreeze"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_auto_update_unfreeze));
+
+    // POST /pyramid/:slug/auto-update/breaker/resume
+    let breaker_resume = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("auto-update"))
+        .and(warp::path("breaker"))
+        .and(warp::path("resume"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_breaker_resume));
+
+    // POST /pyramid/:slug/auto-update/breaker/build-new
+    let breaker_build_new = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("auto-update"))
+        .and(warp::path("breaker"))
+        .and(warp::path("build-new"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_breaker_build_new));
+
+    // GET /pyramid/:slug/auto-update/status
+    let auto_update_status = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("auto-update"))
+        .and(warp::path("status"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_auto_update_status));
+
+    // GET /pyramid/:slug/stale-log
+    let stale_log = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("stale-log"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(with_auth_state(state.clone()))
+        .and(warp::query::<StaleLogQuery>())
+        .and_then(handle_stale_log));
+
+    // ── Phase 6: Cost Observatory route ─────────────────────────────
+
+    // GET /pyramid/:slug/cost
+    let cost = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("cost"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(with_auth_state(state.clone()))
+        .and(warp::query::<CostQuery>())
+        .and_then(handle_cost));
 
     // Combine routes. Box in groups to keep the nested Either type manageable.
     // Each .or().unify() flattens a pair, and .boxed() erases the type.
@@ -274,19 +532,38 @@ pub fn pyramid_routes(
     let r6 = entities.or(resolved).unify().boxed();
     let r7 = corrections.or(terms).unify().boxed();
     let r8 = ingest_route.or(config_route).unify().boxed();
+    let r9 = threads.or(delete_slug_route).unify().boxed();
+    let r10 = annotate.or(annotations).unify().boxed();
+    let r11 = edges.or(usage).unify().boxed();
+    let r12 = meta_run.or(meta_read).unify().boxed();
+    let r13 = faq_match.or(faq_list).unify().boxed();
+    // Phase 5 & 6 routes
+    let r14 = auto_update_config_get.or(auto_update_config_post).unify().boxed();
+    let r15 = auto_update_freeze.or(auto_update_unfreeze).unify().boxed();
+    let r16 = breaker_resume.or(breaker_build_new).unify().boxed();
+    let r17 = auto_update_status.or(stale_log).unify().boxed();
+    let r18 = cost;
 
     // Combine the groups (each is BoxedFilter<(Response,)>)
     let g1 = r1.or(r2).unify().boxed();
     let g2 = r3.or(r4).unify().boxed();
     let g3 = r5.or(r6).unify().boxed();
-    let g4 = r7.or(delete_slug_route).unify().boxed();
-    let g5 = r8;
+    let g4 = r7.or(r8).unify().boxed();
+    let g5 = r9.or(r10).unify().boxed();
+    let g6 = r11.or(r12).unify().boxed();
+    let g7 = r13.or(r14).unify().boxed();
+    let g8 = r15.or(r16).unify().boxed();
+    let g9 = r17.or(r18).unify().boxed();
 
     let h1 = g1.or(g2).unify().boxed();
     let h2 = g3.or(g4).unify().boxed();
+    let h3 = g5.or(g6).unify().boxed();
+    let h4 = g7.or(g8).unify().boxed();
 
     let top = h1.or(h2).unify().boxed();
-    top.or(g5).unify().boxed()
+    let top2 = top.or(h3).unify().boxed();
+    let top3 = top2.or(h4).unify().boxed();
+    top3.or(g9).unify().boxed()
 }
 
 // ── Route handlers ──────────────────────────────────────────────────
@@ -325,10 +602,22 @@ async fn handle_create_slug(
 async fn handle_apex(
     slug_name: String,
     state: Arc<PyramidState>,
+    agent_id: Option<String>,
 ) -> Result<warp::reply::Response, warp::Rejection> {
     let conn = state.reader.lock().await;
     match query::get_apex(&conn, &slug_name) {
-        Ok(Some(node)) => Ok(json_ok(&node)),
+        Ok(Some(node)) => {
+            let response = json_ok(&node);
+            log_query_usage(
+                state.writer.clone(),
+                slug_name,
+                "apex".to_string(),
+                "{}".to_string(),
+                vec![node.id.clone()],
+                agent_id,
+            );
+            Ok(response)
+        }
         Ok(None) => Ok(json_error(warp::http::StatusCode::NOT_FOUND, "No apex node found")),
         Err(e) => Ok(json_error(warp::http::StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())),
     }
@@ -338,10 +627,22 @@ async fn handle_node(
     slug_name: String,
     node_id: String,
     state: Arc<PyramidState>,
+    agent_id: Option<String>,
 ) -> Result<warp::reply::Response, warp::Rejection> {
     let conn = state.reader.lock().await;
     match db::get_node(&conn, &slug_name, &node_id) {
-        Ok(Some(node)) => Ok(json_ok(&node)),
+        Ok(Some(node)) => {
+            let response = json_ok(&node);
+            log_query_usage(
+                state.writer.clone(),
+                slug_name,
+                "node".to_string(),
+                serde_json::json!({"node_id": node_id}).to_string(),
+                vec![node.id.clone()],
+                agent_id,
+            );
+            Ok(response)
+        }
         Ok(None) => Ok(json_error(warp::http::StatusCode::NOT_FOUND, "Node not found")),
         Err(e) => Ok(json_error(warp::http::StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())),
     }
@@ -362,10 +663,26 @@ async fn handle_drill(
     slug_name: String,
     node_id: String,
     state: Arc<PyramidState>,
+    agent_id: Option<String>,
 ) -> Result<warp::reply::Response, warp::Rejection> {
     let conn = state.reader.lock().await;
     match query::drill(&conn, &slug_name, &node_id) {
-        Ok(Some(result)) => Ok(json_ok(&result)),
+        Ok(Some(result)) => {
+            let response = json_ok(&result);
+            let mut ids = vec![result.node.id.clone()];
+            for child in &result.children {
+                ids.push(child.id.clone());
+            }
+            log_query_usage(
+                state.writer.clone(),
+                slug_name,
+                "drill".to_string(),
+                serde_json::json!({"node_id": node_id}).to_string(),
+                ids,
+                agent_id,
+            );
+            Ok(response)
+        }
         Ok(None) => Ok(json_error(warp::http::StatusCode::NOT_FOUND, "Node not found")),
         Err(e) => Ok(json_error(warp::http::StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())),
     }
@@ -375,10 +692,36 @@ async fn handle_search(
     slug_name: String,
     state: Arc<PyramidState>,
     params: SearchQuery,
+    agent_id: Option<String>,
 ) -> Result<warp::reply::Response, warp::Rejection> {
     let conn = state.reader.lock().await;
     match query::search(&conn, &slug_name, &params.q) {
-        Ok(hits) => Ok(json_ok(&hits)),
+        Ok(hits) => {
+            let response = json_ok(&hits);
+            let ids: Vec<String> = hits.iter().map(|h| h.node_id.clone()).collect();
+            log_query_usage(
+                state.writer.clone(),
+                slug_name,
+                "search".to_string(),
+                serde_json::json!({"q": params.q}).to_string(),
+                ids,
+                agent_id,
+            );
+            Ok(response)
+        }
+        Err(e) => Ok(json_error(warp::http::StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())),
+    }
+}
+
+async fn handle_usage(
+    slug_name: String,
+    state: Arc<PyramidState>,
+    params: UsageQuery,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let limit = params.limit.unwrap_or(100);
+    let conn = state.reader.lock().await;
+    match db::get_usage_log(&conn, &slug_name, limit) {
+        Ok(entries) => Ok(json_ok(&entries)),
         Err(e) => Ok(json_error(warp::http::StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())),
     }
 }
@@ -805,5 +1148,874 @@ async fn handle_delete_slug(
             }
         }
     }
+}
+
+async fn handle_threads(
+    slug_name: String,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let conn = state.reader.lock().await;
+    match db::get_threads(&conn, &slug_name) {
+        Ok(threads) => Ok(json_ok(&threads)),
+        Err(e) => Ok(json_error(warp::http::StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())),
+    }
+}
+
+async fn handle_annotate(
+    slug_name: String,
+    state: Arc<PyramidState>,
+    body: AnnotateBody,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    // Validate slug and node exist
+    {
+        let conn = state.reader.lock().await;
+        match slug::get_slug(&conn, &slug_name) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return Ok(json_error(warp::http::StatusCode::NOT_FOUND, "Slug not found"));
+            }
+            Err(e) => {
+                return Ok(json_error(
+                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    &e.to_string(),
+                ));
+            }
+        }
+        match db::get_node(&conn, &slug_name, &body.node_id) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return Ok(json_error(
+                    warp::http::StatusCode::NOT_FOUND,
+                    &format!("Node '{}' not found in slug '{}'", body.node_id, slug_name),
+                ));
+            }
+            Err(e) => {
+                return Ok(json_error(
+                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    &e.to_string(),
+                ));
+            }
+        }
+    }
+
+    let annotation = PyramidAnnotation {
+        id: 0, // will be set by DB
+        slug: slug_name,
+        node_id: body.node_id,
+        annotation_type: AnnotationType::from_str(&body.annotation_type),
+        content: body.content,
+        question_context: body.question_context,
+        author: body.author.unwrap_or_else(|| "system".to_string()),
+        created_at: String::new(), // will be set by DB default
+    };
+
+    let saved = {
+        let conn = state.writer.lock().await;
+        match db::save_annotation(&conn, &annotation) {
+            Ok(saved_annotation) => saved_annotation,
+            Err(e) => {
+                return Ok(json_error(
+                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    &e.to_string(),
+                ));
+            }
+        }
+    };
+
+    // Post-save hook: process annotation in background (non-blocking)
+    let annotation_clone = saved.clone();
+    let writer_clone = state.writer.clone();
+    let reader_clone = state.reader.clone();
+    let api_key = { state.config.read().await.api_key.clone() };
+    let model = { state.config.read().await.primary_model.clone() };
+    let slug_clone = saved.slug.clone();
+
+    tokio::spawn(async move {
+        if let Err(e) = process_annotation_hook(
+            &reader_clone, &writer_clone,
+            &slug_clone, &annotation_clone,
+            &api_key, &model,
+        ).await {
+            tracing::warn!("[annotation] post-save hook failed: {}", e);
+        }
+    });
+
+    Ok(warp::reply::with_status(
+        warp::reply::json(&saved),
+        warp::http::StatusCode::CREATED,
+    )
+    .into_response())
+}
+
+/// Background hook that runs after an annotation is saved.
+/// Correction annotations create deltas on the matching thread.
+/// Other types are logged for future FAQ/review processing.
+async fn process_annotation_hook(
+    reader: &Arc<tokio::sync::Mutex<rusqlite::Connection>>,
+    writer: &Arc<tokio::sync::Mutex<rusqlite::Connection>>,
+    slug: &str,
+    annotation: &PyramidAnnotation,
+    api_key: &str,
+    model: &str,
+) -> anyhow::Result<()> {
+    match annotation.annotation_type {
+        AnnotationType::Correction => {
+            // Correction annotations create deltas on the relevant thread
+            let threads = {
+                let conn = reader.lock().await;
+                db::get_threads(&conn, slug)?
+            };
+
+            // Find the thread whose canonical node matches the annotated node
+            let target_thread = threads.iter().find(|t| t.current_canonical_id == annotation.node_id);
+
+            if let Some(thread) = target_thread {
+                let delta_content = format!(
+                    "CORRECTION (from annotation #{}): {}",
+                    annotation.id, annotation.content
+                );
+
+                delta::create_delta(
+                    reader, writer, slug,
+                    &thread.thread_id,
+                    &delta_content,
+                    Some(&annotation.node_id),
+                    api_key,
+                    model,
+                ).await?;
+
+                tracing::info!("[annotation] correction annotation #{} created delta on thread '{}'",
+                    annotation.id, thread.thread_id);
+            } else {
+                tracing::info!("[annotation] correction annotation #{} on node '{}' — no matching thread found, skipping delta",
+                    annotation.id, annotation.node_id);
+            }
+        }
+
+        AnnotationType::Observation | AnnotationType::Idea => {
+            // Observations and ideas flag the thread for review
+            tracing::info!("[annotation] {} annotation #{} on node '{}' — logged for FAQ processing",
+                annotation.annotation_type.as_str(), annotation.id, annotation.node_id);
+        }
+
+        AnnotationType::Question => {
+            // Questions get processed by the FAQ system (separate workstream)
+            tracing::info!("[annotation] question annotation #{} on node '{}' — logged for FAQ processing",
+                annotation.id, annotation.node_id);
+        }
+
+        AnnotationType::Friction => {
+            // Friction is logged but doesn't trigger deltas
+            tracing::info!("[annotation] friction annotation #{} on node '{}' — logged",
+                annotation.id, annotation.node_id);
+        }
+    }
+
+    // FAQ processing — for any annotation with question_context
+    if annotation.question_context.is_some() {
+        match faq::process_annotation(
+            reader, writer, slug, annotation, api_key, model
+        ).await {
+            Ok(Some(faq_node)) => {
+                tracing::info!(
+                    "[annotation] FAQ processed: annotation #{} → FAQ '{}'",
+                    annotation.id, faq_node.id
+                );
+            }
+            Ok(None) => {
+                tracing::debug!("[annotation] no FAQ generated for annotation #{}", annotation.id);
+            }
+            Err(e) => {
+                tracing::warn!("[annotation] FAQ processing failed for annotation #{}: {}", annotation.id, e);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn handle_annotations(
+    slug_name: String,
+    state: Arc<PyramidState>,
+    params: AnnotationsQuery,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let conn = state.reader.lock().await;
+    let result = if let Some(ref node_id) = params.node_id {
+        db::get_annotations(&conn, &slug_name, node_id)
+    } else {
+        db::get_all_annotations(&conn, &slug_name)
+    };
+    match result {
+        Ok(annotations) => Ok(json_ok(&annotations)),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
+    }
+}
+
+async fn handle_edges(
+    slug_name: String,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let conn = state.reader.lock().await;
+    match webbing::get_active_edges(&conn, &slug_name, 0.1) {
+        Ok(edges) => Ok(json_ok(&edges)),
+        Err(e) => Ok(json_error(warp::http::StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())),
+    }
+}
+
+async fn handle_meta_run(
+    slug_name: String,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    // Verify slug exists
+    {
+        let conn = state.reader.lock().await;
+        match slug::get_slug(&conn, &slug_name) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return Ok(json_error(warp::http::StatusCode::NOT_FOUND, "Slug not found"));
+            }
+            Err(e) => {
+                return Ok(json_error(
+                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    &e.to_string(),
+                ));
+            }
+        }
+    }
+
+    // Get LLM config
+    let (api_key, model) = {
+        let config = state.config.read().await;
+        (config.api_key.clone(), config.primary_model.clone())
+    };
+
+    let reader = state.reader.clone();
+    let writer = state.writer.clone();
+
+    match meta::run_all_meta_passes(&reader, &writer, &slug_name, &api_key, &model).await {
+        Ok(quickstart) => Ok(json_ok(&serde_json::json!({
+            "slug": slug_name,
+            "status": "complete",
+            "quickstart": quickstart,
+        }))),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
+    }
+}
+
+async fn handle_meta_read(
+    slug_name: String,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let conn = state.reader.lock().await;
+    match meta::get_meta_nodes(&conn, &slug_name) {
+        Ok(nodes) => Ok(json_ok(&nodes)),
+        Err(e) => Ok(json_error(warp::http::StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())),
+    }
+}
+
+// ── FAQ route handlers ──────────────────────────────────────────────
+
+async fn handle_list_faq(
+    slug_name: String,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let conn = state.reader.lock().await;
+    match db::get_faq_nodes(&conn, &slug_name) {
+        Ok(faqs) => Ok(json_ok(&faqs)),
+        Err(e) => Ok(json_error(warp::http::StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())),
+    }
+}
+
+async fn handle_match_faq(
+    slug_name: String,
+    state: Arc<PyramidState>,
+    params: FaqMatchQuery,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let config = state.config.read().await;
+    let api_key = config.api_key.clone();
+    let model = config.primary_model.clone();
+    drop(config);
+
+    match faq::match_faq(&state.reader, &state.writer, &slug_name, &params.q, &api_key, &model).await {
+        Ok(Some(faq_node)) => Ok(json_ok(&faq_node)),
+        Ok(None) => Ok(json_ok(&serde_json::json!(null))),
+        Err(e) => Ok(json_error(warp::http::StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())),
+    }
+}
+
+// ── Phase 5: Breaker & Freeze route handlers ────────────────────────
+
+/// Helper: load AutoUpdateConfig from DB for a given slug.
+fn load_auto_update_config_from_db(conn: &Connection, slug: &str) -> Option<AutoUpdateConfig> {
+    conn.query_row(
+        "SELECT slug, auto_update, debounce_minutes, min_changed_files,
+                runaway_threshold, breaker_tripped, breaker_tripped_at, frozen, frozen_at
+         FROM pyramid_auto_update_config WHERE slug = ?1",
+        rusqlite::params![slug],
+        |row| {
+            Ok(AutoUpdateConfig {
+                slug: row.get(0)?,
+                auto_update: row.get::<_, i32>(1)? != 0,
+                debounce_minutes: row.get(2)?,
+                min_changed_files: row.get(3)?,
+                runaway_threshold: row.get(4)?,
+                breaker_tripped: row.get::<_, i32>(5)? != 0,
+                breaker_tripped_at: row.get(6)?,
+                frozen: row.get::<_, i32>(7)? != 0,
+                frozen_at: row.get(8)?,
+            })
+        },
+    )
+    .ok()
+}
+
+/// GET /pyramid/:slug/auto-update/config
+async fn handle_auto_update_config_get(
+    slug_name: String,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let conn = state.reader.lock().await;
+    match load_auto_update_config_from_db(&conn, &slug_name) {
+        Some(config) => Ok(json_ok(&config)),
+        None => Ok(json_error(
+            warp::http::StatusCode::NOT_FOUND,
+            &format!("No auto-update config for slug '{}'", slug_name),
+        )),
+    }
+}
+
+/// POST /pyramid/:slug/auto-update/config
+async fn handle_auto_update_config_post(
+    slug_name: String,
+    state: Arc<PyramidState>,
+    body: AutoUpdateConfigBody,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let conn = state.writer.lock().await;
+
+    // Build a dynamic UPDATE query from supplied fields
+    let mut sets: Vec<String> = Vec::new();
+    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+    if let Some(d) = body.debounce_minutes {
+        if d < 1 {
+            return Ok(json_error(warp::http::StatusCode::BAD_REQUEST, "debounce_minutes must be >= 1"));
+        }
+        sets.push(format!("debounce_minutes = ?{}", params.len() + 1));
+        params.push(Box::new(d));
+    }
+    if let Some(m) = body.min_changed_files {
+        sets.push(format!("min_changed_files = ?{}", params.len() + 1));
+        params.push(Box::new(m));
+    }
+    if let Some(r) = body.runaway_threshold {
+        if r <= 0.0 || r > 1.0 {
+            return Ok(json_error(warp::http::StatusCode::BAD_REQUEST, "runaway_threshold must be > 0.0 and <= 1.0"));
+        }
+        sets.push(format!("runaway_threshold = ?{}", params.len() + 1));
+        params.push(Box::new(r));
+    }
+    if let Some(a) = body.auto_update {
+        sets.push(format!("auto_update = ?{}", params.len() + 1));
+        params.push(Box::new(if a { 1i32 } else { 0i32 }));
+    }
+
+    if sets.is_empty() {
+        return Ok(json_error(warp::http::StatusCode::BAD_REQUEST, "No fields to update"));
+    }
+
+    let slug_idx = params.len() + 1;
+    params.push(Box::new(slug_name.clone()));
+    let sql = format!(
+        "UPDATE pyramid_auto_update_config SET {} WHERE slug = ?{}",
+        sets.join(", "),
+        slug_idx
+    );
+
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+    match conn.execute(&sql, param_refs.as_slice()) {
+        Ok(0) => Ok(json_error(
+            warp::http::StatusCode::NOT_FOUND,
+            &format!("No auto-update config for slug '{}'", slug_name),
+        )),
+        Ok(_) => {
+            // Return the updated config
+            match load_auto_update_config_from_db(&conn, &slug_name) {
+                Some(config) => Ok(json_ok(&config)),
+                None => Ok(json_ok(&serde_json::json!({"status": "updated"}))),
+            }
+        }
+        Err(e) => Ok(json_error(warp::http::StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())),
+    }
+}
+
+/// POST /pyramid/:slug/auto-update/freeze
+async fn handle_auto_update_freeze(
+    slug_name: String,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let mut engines = state.stale_engines.lock().await;
+    if let Some(engine) = engines.get_mut(&slug_name) {
+        engine.freeze();
+    } else {
+        // No engine in memory — update DB directly
+        let conn = state.writer.lock().await;
+        let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let _ = conn.execute(
+            "UPDATE pyramid_auto_update_config SET frozen = 1, frozen_at = ?1 WHERE slug = ?2",
+            rusqlite::params![now, slug_name],
+        );
+        let _ = conn.execute(
+            "UPDATE pyramid_pending_mutations SET processed = 1 WHERE processed = 0 AND slug = ?1",
+            rusqlite::params![slug_name],
+        );
+    }
+    // Pause file watcher
+    let mut watchers = state.file_watchers.lock().await;
+    if let Some(watcher) = watchers.get_mut(&slug_name) {
+        watcher.pause();
+    }
+
+    Ok(json_ok(&serde_json::json!({"status": "frozen", "slug": slug_name})))
+}
+
+/// POST /pyramid/:slug/auto-update/unfreeze
+/// Unfreezes the engine and triggers a hash rescan of all watched files.
+async fn handle_auto_update_unfreeze(
+    slug_name: String,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    // Unfreeze the engine
+    let mut engines = state.stale_engines.lock().await;
+    if let Some(engine) = engines.get_mut(&slug_name) {
+        engine.unfreeze();
+    } else {
+        // No engine in memory — update DB directly
+        let conn = state.writer.lock().await;
+        let _ = conn.execute(
+            "UPDATE pyramid_auto_update_config SET frozen = 0, frozen_at = NULL WHERE slug = ?1",
+            rusqlite::params![slug_name],
+        );
+    }
+    drop(engines);
+
+    // Resume file watcher
+    let mut watchers = state.file_watchers.lock().await;
+    if let Some(watcher) = watchers.get_mut(&slug_name) {
+        watcher.resume();
+    }
+    drop(watchers);
+
+    // Hash rescan: read all files in pyramid_file_hashes, compute current hashes,
+    // compare, write mutations for any differences.
+    let mutations_written = {
+        let conn = state.writer.lock().await;
+        hash_rescan(&conn, &slug_name)
+    };
+
+    // Notify the engine about new mutations so it restarts timers
+    if mutations_written > 0 {
+        let mut engines = state.stale_engines.lock().await;
+        if let Some(engine) = engines.get_mut(&slug_name) {
+            engine.notify_mutation(0);
+        }
+    }
+
+    Ok(json_ok(&serde_json::json!({
+        "status": "unfrozen",
+        "slug": slug_name,
+        "mutations_from_rescan": mutations_written,
+    })))
+}
+
+/// Rescan all tracked files for a slug, comparing current hashes against stored hashes.
+/// Writes `file_change` mutations for any differences. Returns count of mutations written.
+fn hash_rescan(conn: &Connection, slug: &str) -> i64 {
+    use sha2::{Digest, Sha256};
+    use hex;
+
+    let mut stmt = match conn.prepare(
+        "SELECT file_path, hash FROM pyramid_file_hashes WHERE slug = ?1"
+    ) {
+        Ok(s) => s,
+        Err(_) => return 0,
+    };
+
+    let rows: Vec<(String, String)> = stmt
+        .query_map(rusqlite::params![slug], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .ok()
+        .map(|iter| iter.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default();
+
+    let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let mut count = 0i64;
+
+    for (file_path, stored_hash) in &rows {
+        let current_hash = match std::fs::read(file_path) {
+            Ok(data) => {
+                let mut hasher = Sha256::new();
+                hasher.update(&data);
+                hex::encode(hasher.finalize())
+            }
+            Err(_) => {
+                // File was deleted during freeze — write deleted_file mutation
+                let _ = conn.execute(
+                    "INSERT INTO pyramid_pending_mutations
+                     (slug, layer, mutation_type, target_ref, detail, cascade_depth, detected_at)
+                     VALUES (?1, 0, 'deleted_file', ?2, 'Detected during unfreeze rescan', 0, ?3)",
+                    rusqlite::params![slug, file_path, now],
+                );
+                count += 1;
+                continue;
+            }
+        };
+
+        if current_hash != *stored_hash {
+            let _ = conn.execute(
+                "INSERT INTO pyramid_pending_mutations
+                 (slug, layer, mutation_type, target_ref, detail, cascade_depth, detected_at)
+                 VALUES (?1, 0, 'file_change', ?2, 'Detected during unfreeze rescan', 0, ?3)",
+                rusqlite::params![slug, file_path, now],
+            );
+            count += 1;
+        }
+    }
+
+    count
+}
+
+/// POST /pyramid/:slug/auto-update/breaker/resume
+async fn handle_breaker_resume(
+    slug_name: String,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let mut engines = state.stale_engines.lock().await;
+    if let Some(engine) = engines.get_mut(&slug_name) {
+        engine.resume_breaker();
+        Ok(json_ok(&serde_json::json!({"status": "resumed", "slug": slug_name})))
+    } else {
+        // No engine in memory — update DB directly
+        let conn = state.writer.lock().await;
+        let _ = conn.execute(
+            "UPDATE pyramid_auto_update_config SET breaker_tripped = 0, breaker_tripped_at = NULL WHERE slug = ?1",
+            rusqlite::params![slug_name],
+        );
+        Ok(json_ok(&serde_json::json!({"status": "resumed", "slug": slug_name, "note": "No active engine, breaker cleared in DB"})))
+    }
+}
+
+/// POST /pyramid/:slug/auto-update/breaker/build-new
+/// Creates a new slug `{slug}-{YYYYMMDD}`, archives the old one, triggers full build on new.
+async fn handle_breaker_build_new(
+    slug_name: String,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    // Get old slug info
+    let slug_info = {
+        let conn = state.reader.lock().await;
+        match slug::get_slug(&conn, &slug_name) {
+            Ok(Some(info)) => info,
+            Ok(None) => {
+                return Ok(json_error(warp::http::StatusCode::NOT_FOUND, "Slug not found"));
+            }
+            Err(e) => {
+                return Ok(json_error(warp::http::StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()));
+            }
+        }
+    };
+
+    // Freeze the old pyramid
+    {
+        let mut engines = state.stale_engines.lock().await;
+        if let Some(engine) = engines.get_mut(&slug_name) {
+            engine.freeze();
+        }
+        // Also remove it from active watchers (archived = excluded from watcher)
+        let mut watchers = state.file_watchers.lock().await;
+        if let Some(watcher) = watchers.get_mut(&slug_name) {
+            watcher.stop();
+        }
+        watchers.remove(&slug_name);
+        engines.remove(&slug_name);
+    }
+
+    // Create new slug with date suffix
+    let date_suffix = chrono::Utc::now().format("%Y%m%d").to_string();
+    let new_slug = format!("{}-{}", slug_name, date_suffix);
+
+    {
+        let conn = state.writer.lock().await;
+        match slug::create_slug(&conn, &new_slug, &slug_info.content_type, &slug_info.source_path) {
+            Ok(_) => {}
+            Err(e) => {
+                return Ok(json_error(warp::http::StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()));
+            }
+        }
+        // Create auto-update config for the new slug with defaults
+        let _ = conn.execute(
+            "INSERT OR IGNORE INTO pyramid_auto_update_config (slug) VALUES (?1)",
+            rusqlite::params![new_slug],
+        );
+    }
+
+    Ok(warp::reply::with_status(
+        warp::reply::json(&serde_json::json!({
+            "status": "created",
+            "old_slug": slug_name,
+            "new_slug": new_slug,
+            "note": "Old pyramid archived (frozen + no watcher). Trigger POST /pyramid/{new_slug}/build to start full build."
+        })),
+        warp::http::StatusCode::CREATED,
+    )
+    .into_response())
+}
+
+/// GET /pyramid/:slug/auto-update/status
+async fn handle_auto_update_status(
+    slug_name: String,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let conn = state.reader.lock().await;
+    let config = match load_auto_update_config_from_db(&conn, &slug_name) {
+        Some(c) => c,
+        None => {
+            return Ok(json_error(
+                warp::http::StatusCode::NOT_FOUND,
+                &format!("No auto-update config for slug '{}'", slug_name),
+            ));
+        }
+    };
+
+    // Count pending mutations by layer
+    let mut pending_by_layer = std::collections::HashMap::new();
+    for layer in 0..=3 {
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pyramid_pending_mutations
+                 WHERE processed = 0 AND slug = ?1 AND layer = ?2",
+                rusqlite::params![slug_name, layer],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        pending_by_layer.insert(layer, count);
+    }
+
+    // Get last check time
+    let last_check_at: Option<String> = conn
+        .query_row(
+            "SELECT MAX(checked_at) FROM pyramid_stale_check_log WHERE slug = ?1",
+            rusqlite::params![slug_name],
+            |row| row.get(0),
+        )
+        .ok()
+        .flatten();
+
+    let response = AutoUpdateStatusResponse {
+        auto_update: config.auto_update,
+        frozen: config.frozen,
+        breaker_tripped: config.breaker_tripped,
+        pending_mutations_by_layer: pending_by_layer,
+        last_check_at,
+    };
+
+    Ok(json_ok(&response))
+}
+
+/// GET /pyramid/:slug/stale-log
+async fn handle_stale_log(
+    slug_name: String,
+    state: Arc<PyramidState>,
+    params: StaleLogQuery,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let limit = params.limit.unwrap_or(100);
+    let offset = params.offset.unwrap_or(0);
+    let conn = state.reader.lock().await;
+
+    let mut sql = String::from(
+        "SELECT id, slug, batch_id, layer, target_id, stale, reason,
+                checker_index, checker_batch_size, checked_at, cost_tokens, cost_usd
+         FROM pyramid_stale_check_log WHERE slug = ?1"
+    );
+    let mut param_vals: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+    param_vals.push(Box::new(slug_name.clone()));
+
+    if let Some(layer) = params.layer {
+        param_vals.push(Box::new(layer));
+        sql.push_str(&format!(" AND layer = ?{}", param_vals.len()));
+    }
+    if let Some(ref stale_str) = params.stale {
+        let stale_val: i32 = if stale_str == "yes" { 1 } else { 0 };
+        param_vals.push(Box::new(stale_val));
+        sql.push_str(&format!(" AND stale = ?{}", param_vals.len()));
+    }
+
+    param_vals.push(Box::new(limit));
+    sql.push_str(&format!(" ORDER BY checked_at DESC LIMIT ?{}", param_vals.len()));
+    param_vals.push(Box::new(offset));
+    sql.push_str(&format!(" OFFSET ?{}", param_vals.len()));
+
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> = param_vals.iter().map(|p| p.as_ref()).collect();
+    let mut stmt = match conn.prepare(&sql) {
+        Ok(s) => s,
+        Err(e) => return Ok(json_error(warp::http::StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())),
+    };
+
+    let rows: Vec<serde_json::Value> = stmt
+        .query_map(param_refs.as_slice(), |row| {
+            Ok(serde_json::json!({
+                "id": row.get::<_, i64>(0)?,
+                "slug": row.get::<_, String>(1)?,
+                "batch_id": row.get::<_, String>(2)?,
+                "layer": row.get::<_, i32>(3)?,
+                "target_id": row.get::<_, String>(4)?,
+                "stale": row.get::<_, String>(5)?,
+                "reason": row.get::<_, String>(6)?,
+                "checker_index": row.get::<_, i32>(7)?,
+                "checker_batch_size": row.get::<_, i32>(8)?,
+                "checked_at": row.get::<_, String>(9)?,
+                "cost_tokens": row.get::<_, Option<i64>>(10)?,
+                "cost_usd": row.get::<_, Option<f64>>(11)?,
+            }))
+        })
+        .map(|iter| iter.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default();
+
+    Ok(json_ok(&rows))
+}
+
+// ── Phase 6: Cost Observatory route handler ─────────────────────────
+
+/// GET /pyramid/:slug/cost
+async fn handle_cost(
+    slug_name: String,
+    state: Arc<PyramidState>,
+    params: CostQuery,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let conn = state.reader.lock().await;
+
+    // Parse time window
+    let window_clause = match params.window.as_deref() {
+        Some("24h") => "AND created_at >= datetime('now', '-1 day')",
+        Some("7d") => "AND created_at >= datetime('now', '-7 days')",
+        Some("30d") => "AND created_at >= datetime('now', '-30 days')",
+        _ => "", // all time
+    };
+
+    // Total spend and calls
+    let (total_spend, total_calls): (f64, i64) = conn
+        .query_row(
+            &format!(
+                "SELECT COALESCE(SUM(cost_usd), 0.0), COUNT(*) FROM pyramid_cost_log
+                 WHERE slug = ?1 {}", window_clause
+            ),
+            rusqlite::params![slug_name],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap_or((0.0, 0));
+
+    // By source (manual vs auto_stale)
+    let by_source = {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT COALESCE(source, 'manual'), COALESCE(SUM(cost_usd), 0.0), COUNT(*)
+             FROM pyramid_cost_log WHERE slug = ?1 {}
+             GROUP BY COALESCE(source, 'manual')", window_clause
+        )).unwrap();
+        let rows: Vec<serde_json::Value> = stmt
+            .query_map(rusqlite::params![slug_name], |row| {
+                Ok(serde_json::json!({
+                    "source": row.get::<_, String>(0)?,
+                    "spend": row.get::<_, f64>(1)?,
+                    "calls": row.get::<_, i64>(2)?,
+                }))
+            })
+            .map(|iter| iter.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default();
+        rows
+    };
+
+    // By check_type
+    let by_check_type = {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT COALESCE(check_type, 'unknown'), COALESCE(SUM(cost_usd), 0.0), COUNT(*)
+             FROM pyramid_cost_log WHERE slug = ?1 {}
+             GROUP BY COALESCE(check_type, 'unknown')", window_clause
+        )).unwrap();
+        let rows: Vec<serde_json::Value> = stmt
+            .query_map(rusqlite::params![slug_name], |row| {
+                Ok(serde_json::json!({
+                    "check_type": row.get::<_, String>(0)?,
+                    "spend": row.get::<_, f64>(1)?,
+                    "calls": row.get::<_, i64>(2)?,
+                }))
+            })
+            .map(|iter| iter.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default();
+        rows
+    };
+
+    // By layer
+    let by_layer = {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT COALESCE(layer, -1), COALESCE(SUM(cost_usd), 0.0), COUNT(*)
+             FROM pyramid_cost_log WHERE slug = ?1 {}
+             GROUP BY COALESCE(layer, -1)", window_clause
+        )).unwrap();
+        let rows: Vec<serde_json::Value> = stmt
+            .query_map(rusqlite::params![slug_name], |row| {
+                Ok(serde_json::json!({
+                    "layer": row.get::<_, i32>(0)?,
+                    "spend": row.get::<_, f64>(1)?,
+                    "calls": row.get::<_, i64>(2)?,
+                }))
+            })
+            .map(|iter| iter.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default();
+        rows
+    };
+
+    // Recent calls (last 20)
+    let recent_calls = {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT id, operation, model, input_tokens, output_tokens, cost_usd,
+                    COALESCE(source, 'manual'), layer, check_type, created_at
+             FROM pyramid_cost_log WHERE slug = ?1 {}
+             ORDER BY created_at DESC LIMIT 20", window_clause
+        )).unwrap();
+        let rows: Vec<serde_json::Value> = stmt
+            .query_map(rusqlite::params![slug_name], |row| {
+                Ok(serde_json::json!({
+                    "id": row.get::<_, i64>(0)?,
+                    "operation": row.get::<_, String>(1)?,
+                    "model": row.get::<_, String>(2)?,
+                    "input_tokens": row.get::<_, i64>(3)?,
+                    "output_tokens": row.get::<_, i64>(4)?,
+                    "cost_usd": row.get::<_, f64>(5)?,
+                    "source": row.get::<_, String>(6)?,
+                    "layer": row.get::<_, Option<i32>>(7)?,
+                    "check_type": row.get::<_, Option<String>>(8)?,
+                    "created_at": row.get::<_, String>(9)?,
+                }))
+            })
+            .map(|iter| iter.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default();
+        rows
+    };
+
+    Ok(json_ok(&serde_json::json!({
+        "slug": slug_name,
+        "total_spend": total_spend,
+        "total_calls": total_calls,
+        "by_source": by_source,
+        "by_check_type": by_check_type,
+        "by_layer": by_layer,
+        "recent_calls": recent_calls,
+    })))
 }
 

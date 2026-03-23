@@ -2637,6 +2637,8 @@ fn main() {
         config: Arc::new(RwLock::new(pyramid_config.to_llm_config())),
         active_build: Arc::new(RwLock::new(None)),
         data_dir: Some(config.data_dir()),
+        stale_engines: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        file_watchers: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
     });
 
     tracing::info!("Pyramid engine initialized at {:?}", pyramid_db_path);
@@ -2660,6 +2662,7 @@ fn main() {
             api_key: pyramid_config.openrouter_api_key.clone(),
             partner_model: pyramid_config.partner_model.clone(),
         }),
+        warm_in_progress: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
     });
 
     tracing::info!("Partner (Dennis) initialized at {:?}", partner_db_path);

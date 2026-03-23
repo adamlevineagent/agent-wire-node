@@ -6,6 +6,8 @@ use serde_json::Value;
 use std::sync::LazyLock;
 use tracing::info;
 
+use super::types::TokenUsage;
+
 #[derive(Debug, Clone)]
 pub struct LlmConfig {
     pub api_key: String,
@@ -151,6 +153,142 @@ pub async fn call_model(
 
         match content {
             Some(text) => return Ok(text.to_string()),
+            None => {
+                if attempt < 4 {
+                    info!("  null content, retry {}...", attempt + 1);
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    continue;
+                }
+                return Err(anyhow!("Model returned null content after 5 attempts"));
+            }
+        }
+    }
+
+    Err(anyhow!("Max retries exceeded"))
+}
+
+/// Call OpenRouter with automatic model cascade and retry logic.
+/// Same as `call_model()` but also returns token usage from the API response.
+pub async fn call_model_with_usage(
+    config: &LlmConfig,
+    system_prompt: &str,
+    user_prompt: &str,
+    temperature: f32,
+    max_tokens: usize,
+) -> Result<(String, TokenUsage)> {
+    let est_total = (system_prompt.len() + user_prompt.len()) / 4 + max_tokens;
+
+    let mut use_model = if est_total > config.fallback_1_context_limit {
+        info!("[fallback->{}]", short_name(&config.fallback_model_2));
+        config.fallback_model_2.clone()
+    } else if est_total > config.primary_context_limit {
+        info!("[fallback->{}]", short_name(&config.fallback_model_1));
+        config.fallback_model_1.clone()
+    } else {
+        config.primary_model.clone()
+    };
+
+    let client = reqwest::Client::new();
+    let url = "https://openrouter.ai/api/v1/chat/completions";
+
+    for attempt in 0..5u32 {
+        let body = serde_json::json!({
+            "model": use_model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            "temperature": temperature,
+            "max_tokens": max_tokens
+        });
+
+        let resp = client
+            .post(url)
+            .header("Authorization", format!("Bearer {}", config.api_key))
+            .header("Content-Type", "application/json")
+            .header("HTTP-Referer", "https://newsbleach.com")
+            .header("X-Title", "Wire Pyramid Engine")
+            .timeout(std::time::Duration::from_secs(120))
+            .json(&body)
+            .send()
+            .await;
+
+        let resp = match resp {
+            Ok(r) => r,
+            Err(e) => {
+                if attempt < 4 {
+                    info!("  request error, retry {}...", attempt + 1);
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    continue;
+                }
+                return Err(anyhow!("Request failed after 5 attempts: {}", e));
+            }
+        };
+
+        let status = resp.status().as_u16();
+
+        if status == 400 && use_model != config.fallback_model_2 {
+            if use_model == config.primary_model {
+                use_model = config.fallback_model_1.clone();
+            } else {
+                use_model = config.fallback_model_2.clone();
+            }
+            info!("[400->{}]", short_name(&use_model));
+            continue;
+        }
+
+        if matches!(status, 429 | 403 | 502 | 503) {
+            let wait = 2u64.pow(attempt + 1);
+            info!("  HTTP {}, waiting {}s...", status, wait);
+            tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+            continue;
+        }
+
+        if !resp.status().is_success() {
+            let body_text = resp.text().await.unwrap_or_default();
+            if attempt < 4 {
+                info!("  HTTP {}, retry {}...", status, attempt + 1);
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                continue;
+            }
+            return Err(anyhow!("HTTP {} after 5 attempts: {}", status, body_text));
+        }
+
+        let data: Value = match resp.json().await {
+            Ok(v) => v,
+            Err(e) => {
+                if attempt < 4 {
+                    info!("  parse error, retry {}...", attempt + 1);
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    continue;
+                }
+                return Err(anyhow!("Failed to parse response after 5 attempts: {}", e));
+            }
+        };
+
+        let content = data
+            .get("choices")
+            .and_then(|c| c.get(0))
+            .and_then(|c| c.get("message"))
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_str());
+
+        // Extract token usage, falling back to zeros if missing
+        let usage = TokenUsage {
+            prompt_tokens: data
+                .get("usage")
+                .and_then(|u| u.get("prompt_tokens"))
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0),
+            completion_tokens: data
+                .get("usage")
+                .and_then(|u| u.get("completion_tokens"))
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0),
+        };
+
+        match content {
+            Some(text) => return Ok((text.to_string(), usage)),
             None => {
                 if attempt < 4 {
                     info!("  null content, retry {}...", attempt + 1);

@@ -101,7 +101,7 @@ pub fn build_nav_skeleton(reader: &Connection, budget_tokens: usize) -> String {
         let apex_summary = match query::get_apex(reader, slug_name) {
             Ok(Some(node)) => {
                 let distilled = if node.distilled.len() > 200 {
-                    format!("{}...", &node.distilled[..200])
+                    format!("{}...", crate::utils::safe_slice_end(&node.distilled, 200))
                 } else {
                     node.distilled.clone()
                 };
@@ -147,7 +147,7 @@ pub fn build_nav_skeleton(reader: &Connection, budget_tokens: usize) -> String {
                     "  Thread {}: {} (topics: {}, entities: {})\n",
                     node.id,
                     if node.distilled.len() > 100 {
-                        format!("{}...", &node.distilled[..100])
+                        format!("{}...", crate::utils::safe_slice_end(&node.distilled, 100))
                     } else {
                         node.distilled.clone()
                     },
@@ -178,6 +178,59 @@ pub fn build_nav_skeleton(reader: &Connection, budget_tokens: usize) -> String {
                     total_tokens += line_tokens;
                 }
                 sections.push(corr_section);
+            }
+        }
+
+        // Delta chain state (thread chain tips + distillations + web edges)
+        {
+            let threads = pyramid_db::get_threads(reader, slug_name);
+            if let Ok(ref thread_list) = threads {
+                if !thread_list.is_empty() && total_tokens < budget_tokens {
+                    let mut delta_section = String::from("  Delta Chain State:\n");
+                    for thread in thread_list {
+                        if total_tokens >= budget_tokens { break; }
+
+                        // Get distillation for this thread
+                        if let Ok(Some(distillation)) = pyramid_db::get_distillation(reader, slug_name, &thread.thread_id) {
+                            if !distillation.content.is_empty() {
+                                let line = format!(
+                                    "    {} ({}Δ): {}\n",
+                                    thread.thread_name,
+                                    thread.delta_count,
+                                    crate::utils::safe_slice_end(&distillation.content, 150),
+                                );
+                                let line_tokens = estimate_tokens(&line);
+                                if total_tokens + line_tokens <= budget_tokens {
+                                    delta_section.push_str(&line);
+                                    total_tokens += line_tokens;
+                                }
+                            }
+                        }
+                    }
+
+                    // Web edges (connections between threads)
+                    if let Ok(edges) = pyramid_db::get_active_edges(reader, slug_name, 0.1) {
+                        if !edges.is_empty() {
+                            delta_section.push_str("  Connections:\n");
+                            for edge in edges.iter().take(10) {
+                                if total_tokens >= budget_tokens { break; }
+                                let line = format!(
+                                    "    {} ↔ {}: {}\n",
+                                    edge.thread_a_id,
+                                    edge.thread_b_id,
+                                    crate::utils::safe_slice_end(&edge.relationship, 100),
+                                );
+                                let line_tokens = estimate_tokens(&line);
+                                if total_tokens + line_tokens <= budget_tokens {
+                                    delta_section.push_str(&line);
+                                    total_tokens += line_tokens;
+                                }
+                            }
+                        }
+                    }
+
+                    sections.push(delta_section);
+                }
             }
         }
 

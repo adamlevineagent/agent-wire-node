@@ -20,16 +20,9 @@ use super::{
     BUFFER_HARD_LIMIT,
 };
 use super::conversation::handle_message;
+use crate::http_utils::{ct_eq, Unauthorized, json_error, json_ok};
 
-// ── Auth middleware (reuses the same pattern as pyramid routes) ──────
-
-/// Constant-time string comparison.
-fn ct_eq(a: &str, b: &str) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    a.bytes().zip(b.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
-}
+// ── Auth middleware ──────────────────────────────────────────────────
 
 /// Validate bearer token and pass PartnerState through.
 fn with_auth_state(
@@ -57,24 +50,6 @@ fn with_auth_state(
 
             Ok(state)
         })
-}
-
-#[derive(Debug)]
-struct Unauthorized;
-impl warp::reject::Reject for Unauthorized {}
-
-// ── JSON reply helpers ──────────────────────────────────────────────
-
-fn json_error(status: warp::http::StatusCode, msg: &str) -> warp::reply::Response {
-    warp::reply::with_status(
-        warp::reply::json(&serde_json::json!({"error": msg})),
-        status,
-    )
-    .into_response()
-}
-
-fn json_ok<T: serde::Serialize>(val: &T) -> warp::reply::Response {
-    warp::reply::json(val).into_response()
 }
 
 // ── Request body types ──────────────────────────────────────────────

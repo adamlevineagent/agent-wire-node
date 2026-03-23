@@ -18,7 +18,17 @@ pub mod query;
 pub mod llm;
 pub mod slug;
 pub mod routes;
+pub mod delta;
+pub mod webbing;
+pub mod meta;
+pub mod faq;
+pub mod config_helper;
+pub mod watcher;
+pub mod stale_engine;
+pub mod stale_helpers;
+pub mod stale_helpers_upper;
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -26,7 +36,9 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
 use self::llm::LlmConfig;
+use self::stale_engine::PyramidStaleEngine;
 use self::types::BuildStatus;
+use self::watcher::PyramidFileWatcher;
 
 /// Persistent pyramid configuration stored in `pyramid_config.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,12 +55,15 @@ pub struct PyramidConfig {
     pub fallback_model_2: String,
     #[serde(default = "default_partner_model")]
     pub partner_model: String,
+    #[serde(default = "default_collapse_model")]
+    pub collapse_model: String,
 }
 
 fn default_primary_model() -> String { "inception/mercury-2".into() }
 fn default_fallback_1() -> String { "qwen/qwen3.5-flash-02-23".into() }
 fn default_fallback_2() -> String { "x-ai/grok-4.20-beta".into() }
 fn default_partner_model() -> String { "xiaomi/mimo-v2-pro".into() }
+fn default_collapse_model() -> String { "x-ai/grok-4.20-beta".into() }
 
 impl Default for PyramidConfig {
     fn default() -> Self {
@@ -59,6 +74,7 @@ impl Default for PyramidConfig {
             fallback_model_1: default_fallback_1(),
             fallback_model_2: default_fallback_2(),
             partner_model: default_partner_model(),
+            collapse_model: default_collapse_model(),
         }
     }
 }
@@ -111,6 +127,10 @@ pub struct PyramidState {
     pub active_build: Arc<tokio::sync::RwLock<Option<BuildHandle>>>,
     /// Data directory for persisting config files. None if not set.
     pub data_dir: Option<PathBuf>,
+    /// Per-slug stale engines for auto-update (Phase 7). Keyed by slug name.
+    pub stale_engines: Arc<Mutex<HashMap<String, PyramidStaleEngine>>>,
+    /// Per-slug file watchers for auto-update (Phase 7). Keyed by slug name.
+    pub file_watchers: Arc<Mutex<HashMap<String, PyramidFileWatcher>>>,
 }
 
 /// Handle to a running pyramid build.

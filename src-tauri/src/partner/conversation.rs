@@ -15,7 +15,7 @@
 
 use anyhow::{anyhow, Result};
 use serde_json::Value;
-use tracing::info;
+use tracing::{info, warn};
 
 use super::{
     PartnerState, Session, Message, MessageRole, DennisState,
@@ -535,6 +535,75 @@ pub async fn handle_message(
     };
     session.conversation_buffer.push(partner_msg);
 
+    // ── Warm pass: progressive crystallization ──────────────────────
+
+    // Tier 1: zero-cost regex extraction on every user message
+    let tier1 = super::warm::tier1_extract(user_message);
+    if !tier1.entities.is_empty() {
+        info!("[partner] Tier 1 extracted {} entities", tier1.entities.len());
+    }
+
+    // Tier 2: check if warm pass should run (background, non-blocking)
+    if let Some(slug) = &session.slug {
+        if super::warm::should_run_warm_pass(&session) {
+            let slug = slug.clone();
+            let new_messages: Vec<_> = session.conversation_buffer[session.warm_cursor..].to_vec();
+            let new_cursor = session.conversation_buffer.len();
+
+            // Update cursor BEFORE spawning to prevent double-run
+            session.warm_cursor = new_cursor;
+
+            // Check concurrent-execution guard
+            let should_spawn = {
+                let mut in_progress = state.warm_in_progress.lock().unwrap();
+                if in_progress.contains(&slug) {
+                    false // Another warm pass is already running for this slug
+                } else {
+                    in_progress.insert(slug.clone());
+                    true
+                }
+            };
+
+            if should_spawn {
+                let reader = state.pyramid_reader.clone();
+                let writer = state.pyramid.writer.clone();
+                let api_key = llm_config.api_key.clone();
+                let model = llm_config.partner_model.clone();
+                let collapse_model = state.pyramid.data_dir.as_ref()
+                    .map(|d| crate::pyramid::PyramidConfig::load(d).collapse_model)
+                    .unwrap_or_else(|| "x-ai/grok-4.20-beta".into());
+                let warm_in_progress = state.warm_in_progress.clone();
+                let slug_for_cleanup = slug.clone();
+
+                tokio::spawn(async move {
+                    let result = super::warm::warm_pass(
+                        new_messages, &slug, &reader, &writer, &api_key, &model, &collapse_model,
+                    )
+                    .await;
+
+                    // Remove from in-progress guard
+                    {
+                        let mut guard = warm_in_progress.lock().unwrap();
+                        guard.remove(&slug_for_cleanup);
+                    }
+
+                    match result {
+                        Ok(result) => {
+                            info!(
+                                "[partner] Warm pass complete: {} deltas, {} topics",
+                                result.deltas_created,
+                                result.new_topics.len()
+                            );
+                        }
+                        Err(e) => {
+                            warn!("[partner] Warm pass failed: {}", e);
+                        }
+                    }
+                });
+            }
+        }
+    }
+
     // Update state
     session.dennis_state = DennisState::Idle;
 
@@ -579,17 +648,41 @@ pub async fn handle_message(
 /// In the future this will crystallize via forward pass → provisional L0 nodes.
 /// For now, it simply truncates the oldest messages to stay under the soft limit.
 fn handle_buffer_overflow(session: &mut Session) {
-    let mut total: usize = session.conversation_buffer.iter()
+    let total: usize = session.conversation_buffer.iter()
         .map(|m| m.token_estimate)
         .sum();
 
-    // Remove oldest messages until under soft limit
-    while total > BUFFER_SOFT_LIMIT && session.conversation_buffer.len() > 2 {
-        let removed = session.conversation_buffer.remove(0);
-        total -= removed.token_estimate;
+    if total <= BUFFER_SOFT_LIMIT || session.conversation_buffer.len() <= 2 {
+        return;
+    }
+
+    let mut running = total;
+    let mut remove_count = 0;
+    for msg in &session.conversation_buffer {
+        if running <= BUFFER_SOFT_LIMIT || session.conversation_buffer.len() - remove_count <= 2 {
+            break;
+        }
+        running -= msg.token_estimate;
+        remove_count += 1;
+    }
+
+    if remove_count > 0 {
+        let removed: Vec<_> = session.conversation_buffer.drain(0..remove_count).collect();
+        let new_total: usize = session.conversation_buffer.iter()
+            .map(|m| m.token_estimate)
+            .sum();
         info!(
-            "[partner] Buffer overflow: removed oldest message ({} tokens), buffer now {} tokens",
-            removed.token_estimate, total,
+            "[partner] Buffer overflow: removed {} oldest messages ({} tokens removed), buffer now {} tokens",
+            removed.len(),
+            total - new_total,
+            new_total,
         );
+
+        // Adjust warm_cursor to account for removed messages
+        if session.warm_cursor >= remove_count {
+            session.warm_cursor -= remove_count;
+        } else {
+            session.warm_cursor = 0;
+        }
     }
 }

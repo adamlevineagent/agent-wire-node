@@ -9,6 +9,9 @@ use crate::auth::AuthState;
 use crate::sync::SyncState;
 use crate::tunnel;
 use crate::pyramid;
+use crate::pyramid::stale_engine::PyramidStaleEngine;
+use crate::pyramid::types::AutoUpdateConfig;
+use crate::pyramid::watcher::PyramidFileWatcher;
 use crate::partner;
 
 /// HTTP server state
@@ -57,6 +60,168 @@ struct DocumentClaims {
     iss: Option<String>,
 }
 
+/// Initialize stale engines for all pyramids with auto_update enabled and not frozen.
+/// Also runs WAL cleanup on startup. Called after pyramid DB is initialized.
+pub async fn init_stale_engines(pyramid_state: &Arc<pyramid::PyramidState>) {
+    // WAL cleanup: delete processed mutations older than 30 days
+    {
+        let conn = pyramid_state.writer.lock().await;
+        let deleted_processed = conn.execute(
+            "DELETE FROM pyramid_pending_mutations
+             WHERE processed = 1 AND detected_at < datetime('now', '-30 days')",
+            [],
+        ).unwrap_or(0);
+
+        let deleted_runaway = conn.execute(
+            "DELETE FROM pyramid_pending_mutations
+             WHERE processed = 0 AND cascade_depth >= 10 AND detected_at < datetime('now', '-30 days')",
+            [],
+        ).unwrap_or(0);
+
+        if deleted_processed > 0 || deleted_runaway > 0 {
+            tracing::info!(
+                "WAL cleanup: removed {} processed and {} runaway mutations older than 30 days",
+                deleted_processed, deleted_runaway
+            );
+        }
+    }
+
+    // Get API key and model from pyramid config
+    let (api_key, model) = {
+        let config = pyramid_state.config.read().await;
+        (config.api_key.clone(), config.primary_model.clone())
+    };
+
+    // Get the DB path from data_dir
+    let db_path = match &pyramid_state.data_dir {
+        Some(dir) => dir.join("pyramid.db").to_string_lossy().to_string(),
+        None => {
+            tracing::warn!("No data_dir set on PyramidState, skipping stale engine initialization");
+            return;
+        }
+    };
+
+    // Load all pyramid configs where auto_update = 1
+    let configs: Vec<AutoUpdateConfig> = {
+        let conn = pyramid_state.reader.lock().await;
+        let mut stmt = match conn.prepare(
+            "SELECT slug, auto_update, debounce_minutes, min_changed_files,
+                    runaway_threshold, breaker_tripped, breaker_tripped_at, frozen, frozen_at
+             FROM pyramid_auto_update_config WHERE auto_update = 1"
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("Failed to query auto_update configs: {}", e);
+                return;
+            }
+        };
+
+        stmt.query_map([], |row| {
+            Ok(AutoUpdateConfig {
+                slug: row.get(0)?,
+                auto_update: row.get::<_, i32>(1)? != 0,
+                debounce_minutes: row.get(2)?,
+                min_changed_files: row.get(3)?,
+                runaway_threshold: row.get(4)?,
+                breaker_tripped: row.get::<_, i32>(5)? != 0,
+                breaker_tripped_at: row.get(6)?,
+                frozen: row.get::<_, i32>(7)? != 0,
+                frozen_at: row.get(8)?,
+            })
+        })
+        .map(|iter| iter.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
+    };
+
+    if configs.is_empty() {
+        tracing::info!("No pyramids with auto_update enabled, skipping stale engine init");
+        return;
+    }
+
+    let mut engines = pyramid_state.stale_engines.lock().await;
+    let mut watchers = pyramid_state.file_watchers.lock().await;
+
+    for config in configs {
+        let slug = config.slug.clone();
+
+        if config.breaker_tripped {
+            tracing::warn!(
+                "Pyramid '{}' has breaker tripped — starting in breaker state (UI notification is frontend concern)",
+                slug
+            );
+        }
+
+        // Create the engine
+        let mut engine = PyramidStaleEngine::new(
+            &slug, config.clone(), &db_path, &api_key, &model,
+        );
+
+        // Skip frozen pyramids — engine exists but timers don't start
+        if config.frozen {
+            tracing::info!("Pyramid '{}' is frozen — engine created but no timers started", slug);
+            engines.insert(slug.clone(), engine);
+            continue;
+        }
+
+        // Check for unprocessed WAL entries and feed them into the engine's layer timers
+        {
+            let conn = pyramid_state.reader.lock().await;
+            for layer in 0..=3 {
+                let count: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM pyramid_pending_mutations
+                         WHERE processed = 0 AND slug = ?1 AND layer = ?2",
+                        rusqlite::params![slug, layer],
+                        |row| row.get(0),
+                    )
+                    .unwrap_or(0);
+
+                if count > 0 {
+                    tracing::info!(
+                        "Pyramid '{}' layer {} has {} unprocessed WAL entries — starting timer",
+                        slug, layer, count
+                    );
+                    engine.notify_mutation(layer);
+                }
+            }
+        }
+
+        engines.insert(slug.clone(), engine);
+
+        // Create and start file watcher
+        let source_paths: Vec<String> = {
+            let conn = pyramid_state.reader.lock().await;
+            // Get source paths from slug info
+            match pyramid::slug::get_slug(&conn, &slug) {
+                Ok(Some(info)) => {
+                    serde_json::from_str(&info.source_path)
+                        .unwrap_or_else(|_| vec![info.source_path.clone()])
+                }
+                _ => Vec::new(),
+            }
+        };
+
+        if !source_paths.is_empty() {
+            let mut watcher = PyramidFileWatcher::new(&slug, source_paths);
+            match watcher.start(&db_path) {
+                Ok(()) => {
+                    tracing::info!("File watcher started for pyramid '{}'", slug);
+                    watchers.insert(slug, watcher);
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to start file watcher for '{}': {}", slug, e);
+                }
+            }
+        }
+    }
+
+    tracing::info!(
+        "Stale engine init complete: {} engines, {} watchers",
+        engines.len(),
+        watchers.len()
+    );
+}
+
 /// Start the HTTP server on the given port
 ///
 /// Endpoints:
@@ -87,6 +252,9 @@ pub async fn start_server(
         pyramid,
         partner,
     };
+
+    // Phase 7: Initialize stale engines for auto-update pyramids
+    init_stale_engines(&state.pyramid).await;
 
     // CORS headers for browser access
     let cors = warp::cors()

@@ -1,6 +1,6 @@
 // pyramid/query.rs — Query functions for the Knowledge Pyramid
 //
-// All queries operate on `pyramid_nodes` table filtered by `slug`.
+// All queries operate on `live_pyramid_nodes` view (excludes superseded and provisional nodes).
 // JSON columns (topics, corrections, decisions, terms, dead_ends, children)
 // are parsed with serde_json.
 
@@ -43,42 +43,8 @@ pub struct TermWithSource {
 
 // ── Internal helpers ─────────────────────────────────────────────────
 
-/// Parse a row from `pyramid_nodes` into a `PyramidNode`.
-fn row_to_node(row: &rusqlite::Row<'_>) -> rusqlite::Result<PyramidNode> {
-    let topics_json: String = row.get::<_, String>("topics").unwrap_or_default();
-    let corrections_json: String = row.get::<_, String>("corrections").unwrap_or_default();
-    let decisions_json: String = row.get::<_, String>("decisions").unwrap_or_default();
-    let terms_json: String = row.get::<_, String>("terms").unwrap_or_default();
-    let dead_ends_json: String = row.get::<_, String>("dead_ends").unwrap_or_default();
-    let children_json: String = row.get::<_, String>("children").unwrap_or_default();
-
-    Ok(PyramidNode {
-        id: row.get("id")?,
-        slug: row.get("slug")?,
-        depth: row.get("depth")?,
-        chunk_index: row.get("chunk_index").ok(),
-        distilled: row.get("distilled")?,
-        topics: parse_json_vec(&topics_json),
-        corrections: parse_json_vec(&corrections_json),
-        decisions: parse_json_vec(&decisions_json),
-        terms: parse_json_vec(&terms_json),
-        dead_ends: parse_json_vec(&dead_ends_json),
-        self_prompt: row.get::<_, String>("self_prompt").unwrap_or_default(),
-        children: parse_json_vec(&children_json),
-        parent_id: row.get("parent_id").ok().and_then(|v: String| {
-            if v.is_empty() { None } else { Some(v) }
-        }),
-        created_at: row.get::<_, String>("created_at").unwrap_or_default(),
-    })
-}
-
-/// Parse a JSON string into a Vec<T>, returning an empty vec on failure.
-fn parse_json_vec<T: serde::de::DeserializeOwned>(json: &str) -> Vec<T> {
-    if json.is_empty() || json == "null" {
-        return Vec::new();
-    }
-    serde_json::from_str(json).unwrap_or_default()
-}
+/// Delegate to the canonical node_from_row in db.rs.
+use super::db::node_from_row as row_to_node;
 
 /// Collect all corrections from a node — from both top-level `corrections`
 /// and from `topics[].corrections`.
@@ -115,7 +81,7 @@ fn collect_entities(node: &PyramidNode) -> Vec<(String, String)> {
 pub fn get_apex(conn: &Connection, slug: &str) -> Result<Option<PyramidNode>> {
     // Find max depth
     let max_depth: Option<i64> = conn
-        .prepare("SELECT MAX(depth) FROM pyramid_nodes WHERE slug = ?")?
+        .prepare("SELECT MAX(depth) FROM live_pyramid_nodes WHERE slug = ?")?
         .query_row(rusqlite::params![slug], |row| row.get(0))
         .optional()
         .context("Failed to query max depth")?
@@ -128,12 +94,12 @@ pub fn get_apex(conn: &Connection, slug: &str) -> Result<Option<PyramidNode>> {
 
     // Count nodes at max depth
     let count: i64 = conn
-        .prepare("SELECT COUNT(*) FROM pyramid_nodes WHERE slug = ? AND depth = ?")?
+        .prepare("SELECT COUNT(*) FROM live_pyramid_nodes WHERE slug = ? AND depth = ?")?
         .query_row(rusqlite::params![slug, max_depth], |row| row.get(0))?;
 
     if count == 1 {
         let node = conn
-            .prepare("SELECT * FROM pyramid_nodes WHERE slug = ? AND depth = ?")?
+            .prepare("SELECT * FROM live_pyramid_nodes WHERE slug = ? AND depth = ?")?
             .query_row(rusqlite::params![slug, max_depth], row_to_node)
             .optional()
             .context("Failed to query apex node")?;
@@ -145,7 +111,7 @@ pub fn get_apex(conn: &Connection, slug: &str) -> Result<Option<PyramidNode>> {
     if count > 1 {
         for d in (0..max_depth).rev() {
             let d_count: i64 = conn
-                .prepare("SELECT COUNT(*) FROM pyramid_nodes WHERE slug = ? AND depth = ?")?
+                .prepare("SELECT COUNT(*) FROM live_pyramid_nodes WHERE slug = ? AND depth = ?")?
                 .query_row(rusqlite::params![slug, d], |row| row.get(0))?;
 
             if d_count == 1 {
@@ -154,7 +120,7 @@ pub fn get_apex(conn: &Connection, slug: &str) -> Result<Option<PyramidNode>> {
                     count, max_depth, slug, d
                 );
                 let node = conn
-                    .prepare("SELECT * FROM pyramid_nodes WHERE slug = ? AND depth = ?")?
+                    .prepare("SELECT * FROM live_pyramid_nodes WHERE slug = ? AND depth = ?")?
                     .query_row(rusqlite::params![slug, d], row_to_node)
                     .optional()
                     .context("Failed to query apex node at lower depth")?;
@@ -178,7 +144,7 @@ pub fn get_apex(conn: &Connection, slug: &str) -> Result<Option<PyramidNode>> {
 /// then recursively builds the tree by following `children` arrays.
 pub fn get_tree(conn: &Connection, slug: &str) -> Result<Vec<TreeNode>> {
     let mut stmt = conn.prepare(
-        "SELECT * FROM pyramid_nodes WHERE slug = ? ORDER BY id",
+        "SELECT * FROM live_pyramid_nodes WHERE slug = ? ORDER BY id",
     )?;
 
     let nodes: Vec<PyramidNode> = stmt
@@ -257,7 +223,7 @@ pub fn search(conn: &Connection, slug: &str, term: &str) -> Result<Vec<SearchHit
     let pattern = format!("%{}%", term.to_lowercase());
 
     let mut stmt = conn.prepare(
-        "SELECT id, depth, distilled, topics, corrections FROM pyramid_nodes \
+        "SELECT id, depth, distilled, topics, corrections FROM live_pyramid_nodes \
          WHERE slug = ? AND (\
              LOWER(distilled) LIKE ? \
              OR LOWER(topics) LIKE ? \
@@ -310,7 +276,7 @@ pub fn search(conn: &Connection, slug: &str, term: &str) -> Result<Vec<SearchHit
 /// Sorted by node count descending.
 pub fn entities(conn: &Connection, slug: &str) -> Result<Vec<EntityEntry>> {
     let mut stmt = conn.prepare(
-        "SELECT * FROM pyramid_nodes WHERE slug = ? ORDER BY depth, id",
+        "SELECT * FROM live_pyramid_nodes WHERE slug = ? ORDER BY depth, id",
     )?;
 
     let nodes: Vec<PyramidNode> = stmt
@@ -377,7 +343,7 @@ pub fn entities(conn: &Connection, slug: &str) -> Result<Vec<EntityEntry>> {
 pub fn resolved(conn: &Connection, slug: &str) -> Result<Vec<ResolvedCorrection>> {
     // Gather L0 corrections (depth == 0)
     let mut stmt_l0 = conn.prepare(
-        "SELECT * FROM pyramid_nodes WHERE slug = ? AND depth = 0 \
+        "SELECT * FROM live_pyramid_nodes WHERE slug = ? AND depth = 0 \
          ORDER BY chunk_index",
     )?;
     let l0_nodes: Vec<PyramidNode> = stmt_l0
@@ -387,7 +353,7 @@ pub fn resolved(conn: &Connection, slug: &str) -> Result<Vec<ResolvedCorrection>
 
     // Gather upper corrections (depth > 0)
     let mut stmt_upper = conn.prepare(
-        "SELECT * FROM pyramid_nodes WHERE slug = ? AND depth > 0 \
+        "SELECT * FROM live_pyramid_nodes WHERE slug = ? AND depth > 0 \
          ORDER BY depth, id",
     )?;
     let upper_nodes: Vec<PyramidNode> = stmt_upper
@@ -524,7 +490,7 @@ pub fn resolved(conn: &Connection, slug: &str) -> Result<Vec<ResolvedCorrection>
 /// keeping the version from the highest depth node.
 pub fn corrections(conn: &Connection, slug: &str) -> Result<Vec<CorrectionWithSource>> {
     let mut stmt = conn.prepare(
-        "SELECT * FROM pyramid_nodes WHERE slug = ? \
+        "SELECT * FROM live_pyramid_nodes WHERE slug = ? \
          ORDER BY depth DESC, id",
     )?;
 
@@ -564,7 +530,7 @@ pub fn corrections(conn: &Connection, slug: &str) -> Result<Vec<CorrectionWithSo
 /// Terms list (deduped by term name, highest-depth wins).
 pub fn terms(conn: &Connection, slug: &str) -> Result<Vec<TermWithSource>> {
     let mut stmt = conn.prepare(
-        "SELECT * FROM pyramid_nodes WHERE slug = ? AND terms != '[]' \
+        "SELECT * FROM live_pyramid_nodes WHERE slug = ? AND terms != '[]' \
          ORDER BY depth DESC, id",
     )?;
 

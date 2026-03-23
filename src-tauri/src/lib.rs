@@ -21,6 +21,8 @@ pub mod retention;
 pub mod work;
 pub mod pyramid;
 pub mod partner;
+pub mod utils;
+pub mod http_utils;
 
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;

@@ -1,0 +1,409 @@
+// pyramid/faq.rs — FAQ engine: auto-generates FAQ nodes from annotations
+//
+// Three core functions:
+//   process_annotation — called after every annotation save; creates/updates FAQ
+//   match_faq          — given a free-text question, find the best matching FAQ
+//   update_faq_answer  — merge new annotation content into an existing FAQ answer
+
+use std::sync::Arc;
+use tokio::sync::Mutex;
+use rusqlite::Connection;
+use anyhow::Result;
+use tracing::{info, warn};
+use uuid::Uuid;
+
+use super::db;
+use super::llm::LlmConfig;
+use super::types::{FaqNode, PyramidAnnotation};
+
+/// Called after every annotation is saved.
+///
+/// Uses LLM to check if the annotation's question_context matches any existing FAQ.
+/// - If match found: updates the existing FAQ with new info, returns it.
+/// - If no match AND annotation has question_context: creates new FAQ node, returns it.
+/// - If no question_context: returns None (nothing to FAQ-ify).
+pub async fn process_annotation(
+    reader: &Arc<Mutex<Connection>>,
+    writer: &Arc<Mutex<Connection>>,
+    slug: &str,
+    annotation: &PyramidAnnotation,
+    api_key: &str,
+    model: &str,
+) -> Result<Option<FaqNode>> {
+    // Only process annotations that have a question_context
+    let question_context = match &annotation.question_context {
+        Some(q) if !q.trim().is_empty() => q.clone(),
+        _ => {
+            info!("[faq] annotation {} has no question_context, skipping", annotation.id);
+            return Ok(None);
+        }
+    };
+
+    // Load existing FAQs for this slug
+    let existing_faqs = {
+        let conn = reader.lock().await;
+        db::get_faq_nodes(&conn, slug)?
+    };
+
+    if existing_faqs.is_empty() {
+        // No existing FAQs — create a new one directly
+        info!("[faq] no existing FAQs for slug '{}', creating new FAQ", slug);
+        let faq = create_new_faq(writer, slug, &question_context, annotation, api_key, model).await?;
+        return Ok(Some(faq));
+    }
+
+    // Build a numbered list of existing FAQ questions for the LLM (Change 3: include match_triggers)
+    let faq_list: String = existing_faqs
+        .iter()
+        .enumerate()
+        .map(|(i, f)| format!("{}. [{}] {} (triggers: {})", i + 1, f.id, f.question, f.match_triggers.join("; ")))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let system_prompt = "You are a FAQ deduplication engine. Given a new question and a list of existing FAQ entries, determine if the new question matches an existing FAQ. Respond with EXACTLY one line: either 'MATCH:<faq_id>' (using the bracketed ID from the list) if it matches an existing FAQ, or 'NEW' if it's a genuinely new question. No explanation.";
+
+    let user_prompt = format!(
+        "New question: {}\n\nExisting FAQs:\n{}",
+        question_context, faq_list
+    );
+
+    let config = LlmConfig {
+        api_key: api_key.to_string(),
+        auth_token: String::new(),
+        primary_model: model.to_string(),
+        fallback_model_1: model.to_string(),
+        fallback_model_2: model.to_string(),
+        ..Default::default()
+    };
+
+    let response = super::llm::call_model(&config, system_prompt, &user_prompt, 0.1, 100).await?;
+    let response = response.trim();
+
+    if let Some(faq_id) = response.strip_prefix("MATCH:") {
+        let faq_id = faq_id.trim();
+        info!("[faq] annotation {} matched existing FAQ {}", annotation.id, faq_id);
+
+        // Update the matched FAQ with new annotation content
+        let updated = update_faq_answer(reader, writer, faq_id, annotation, api_key, model).await?;
+        Ok(Some(updated))
+    } else {
+        // NEW — create a fresh FAQ
+        info!("[faq] annotation {} generates new FAQ for slug '{}'", annotation.id, slug);
+        let faq = create_new_faq(writer, slug, &question_context, annotation, api_key, model).await?;
+        Ok(Some(faq))
+    }
+}
+
+/// Given a free-text question, find the best matching FAQ.
+///
+/// First tries keyword search across FAQ questions.
+/// If ambiguous, uses LLM to pick the best match.
+/// Increments hit_count on the matched FAQ.
+pub async fn match_faq(
+    reader: &Arc<Mutex<Connection>>,
+    writer: &Arc<Mutex<Connection>>,
+    slug: &str,
+    question: &str,
+    api_key: &str,
+    model: &str,
+) -> Result<Option<FaqNode>> {
+    let all_faqs = {
+        let conn = reader.lock().await;
+        db::get_faq_nodes(&conn, slug)?
+    };
+
+    if all_faqs.is_empty() {
+        return Ok(None);
+    }
+
+    // Keyword-based pre-filter: split question into words and score each FAQ
+    let query_words: Vec<String> = question
+        .to_lowercase()
+        .split_whitespace()
+        .filter(|w| w.len() > 2) // skip very short words
+        .map(|w| w.to_string())
+        .collect();
+
+    // Change 2: Score against BOTH faq.question AND each string in faq.match_triggers,
+    // taking the maximum score across all strings
+    let mut scored: Vec<(usize, &FaqNode)> = all_faqs
+        .iter()
+        .map(|faq| {
+            // Score against the canonical question
+            let question_lower = faq.question.to_lowercase();
+            let question_score = query_words.iter().filter(|w| question_lower.contains(w.as_str())).count();
+
+            // Score against each match trigger and take the max
+            let trigger_score = faq.match_triggers.iter().map(|trigger| {
+                let trigger_lower = trigger.to_lowercase();
+                query_words.iter().filter(|w| trigger_lower.contains(w.as_str())).count()
+            }).max().unwrap_or(0);
+
+            let best_score = question_score.max(trigger_score);
+            (best_score, faq)
+        })
+        .collect();
+
+    scored.sort_by(|a, b| b.0.cmp(&a.0));
+
+    // If there's a clear winner with good overlap, use it directly
+    if scored.len() == 1 && scored[0].0 > 0 {
+        let matched = scored[0].1.clone();
+        let conn = writer.lock().await;
+        let _ = db::increment_faq_hit(&conn, &matched.id);
+        return Ok(Some(matched));
+    }
+
+    // Filter to candidates with at least 1 keyword match
+    let candidates: Vec<&FaqNode> = scored
+        .iter()
+        .filter(|(score, _)| *score > 0)
+        .map(|(_, faq)| *faq)
+        .collect();
+
+    if candidates.is_empty() {
+        // No keyword matches — try LLM against all FAQs
+        return match_faq_with_llm(writer, question, &all_faqs, api_key, model).await;
+    }
+
+    if candidates.len() == 1 {
+        let matched = candidates[0].clone();
+        let conn = writer.lock().await;
+        let _ = db::increment_faq_hit(&conn, &matched.id);
+        return Ok(Some(matched));
+    }
+
+    // Multiple candidates — use LLM to disambiguate
+    match_faq_with_llm(writer, question, &candidates.into_iter().cloned().collect::<Vec<_>>(), api_key, model).await
+}
+
+/// Use LLM to pick the best matching FAQ from a list.
+async fn match_faq_with_llm(
+    writer: &Arc<Mutex<Connection>>,
+    question: &str,
+    candidates: &[FaqNode],
+    api_key: &str,
+    model: &str,
+) -> Result<Option<FaqNode>> {
+    // Change 2: Include match_triggers in the LLM disambiguation prompt
+    let faq_list: String = candidates
+        .iter()
+        .enumerate()
+        .map(|(i, f)| format!("{}. [{}] {} (triggers: {})", i + 1, f.id, f.question, f.match_triggers.join("; ")))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let system_prompt = "You are a FAQ matching engine. Given a user question and a list of FAQ entries, pick the best match. Respond with EXACTLY one line: either the FAQ ID in brackets (e.g. 'FAQ-abc123') if there's a good match, or 'NONE' if no FAQ adequately answers the question. No explanation.";
+
+    let user_prompt = format!(
+        "User question: {}\n\nAvailable FAQs:\n{}",
+        question, faq_list
+    );
+
+    let config = LlmConfig {
+        api_key: api_key.to_string(),
+        auth_token: String::new(),
+        primary_model: model.to_string(),
+        fallback_model_1: model.to_string(),
+        fallback_model_2: model.to_string(),
+        ..Default::default()
+    };
+
+    let response = super::llm::call_model(&config, system_prompt, &user_prompt, 0.1, 100).await?;
+    let response = response.trim();
+
+    if response == "NONE" {
+        return Ok(None);
+    }
+
+    // Find the matched FAQ by ID
+    let matched = candidates.iter().find(|f| response.contains(&f.id));
+    if let Some(faq) = matched {
+        let conn = writer.lock().await;
+        let _ = db::increment_faq_hit(&conn, &faq.id);
+        Ok(Some(faq.clone()))
+    } else {
+        warn!("[faq] LLM returned unrecognized FAQ id: {}", response);
+        Ok(None)
+    }
+}
+
+/// Given an existing FAQ and a new annotation, use LLM to produce an updated answer.
+///
+/// Reads the current answer + new annotation content and produces a refined answer.
+/// Also appends the annotation's question_context to match_triggers (deduplicated)
+/// and optionally re-generalizes the canonical question.
+/// Saves the updated FAQ with the new annotation_id appended.
+pub async fn update_faq_answer(
+    reader: &Arc<Mutex<Connection>>,
+    writer: &Arc<Mutex<Connection>>,
+    faq_id: &str,
+    new_annotation: &PyramidAnnotation,
+    api_key: &str,
+    model: &str,
+) -> Result<FaqNode> {
+    // Load the existing FAQ
+    let mut faq = {
+        let conn = reader.lock().await;
+        db::get_faq_node(&conn, faq_id)?
+            .ok_or_else(|| anyhow::anyhow!("FAQ node '{}' not found", faq_id))?
+    };
+
+    let config = LlmConfig {
+        api_key: api_key.to_string(),
+        auth_token: String::new(),
+        primary_model: model.to_string(),
+        fallback_model_1: model.to_string(),
+        fallback_model_2: model.to_string(),
+        ..Default::default()
+    };
+
+    // --- Answer refinement ---
+    let system_prompt = "You are a FAQ answer refiner. Given an existing FAQ answer and a new piece of information from an annotation, produce an updated, comprehensive answer that incorporates the new information. Keep it concise and well-structured. Return ONLY the updated answer text, no preamble.";
+
+    let user_prompt = format!(
+        "FAQ Question: {}\n\nCurrent Answer:\n{}\n\nNew Annotation Content:\n{}\n\nAnnotation Context: {}",
+        faq.question,
+        faq.answer,
+        new_annotation.content,
+        new_annotation.question_context.as_deref().unwrap_or("(none)")
+    );
+
+    let updated_answer = super::llm::call_model(&config, system_prompt, &user_prompt, 0.3, 2000).await?;
+
+    // Append the new annotation ID
+    if !faq.annotation_ids.contains(&new_annotation.id) {
+        faq.annotation_ids.push(new_annotation.id);
+    }
+
+    // Add the node_id if not already present
+    if !faq.related_node_ids.contains(&new_annotation.node_id) {
+        faq.related_node_ids.push(new_annotation.node_id.clone());
+    }
+
+    faq.answer = updated_answer.trim().to_string();
+
+    // --- Change 4: Accumulate match_triggers (deduplicated) ---
+    if let Some(ref qc) = new_annotation.question_context {
+        let qc_trimmed = qc.trim().to_string();
+        if !qc_trimmed.is_empty() && !faq.match_triggers.contains(&qc_trimmed) {
+            faq.match_triggers.push(qc_trimmed);
+            info!("[faq] appended new match trigger to FAQ {}", faq.id);
+        }
+    }
+
+    // --- Change 4: Optionally re-generalize the canonical question ---
+    if faq.match_triggers.len() > 1 {
+        let triggers_list = faq.match_triggers.join(", ");
+        let regen_system = "You are a question generalization engine. Given a current canonical question, accumulated trigger questions, and a new annotation, decide if the canonical question should be broadened to cover all triggers. Reply with ONLY the updated question if it should change, or 'NO_CHANGE' if the current question is sufficient.";
+        let regen_user = format!(
+            "Current question: {}\nAccumulated triggers: {}\nNew annotation: {}",
+            faq.question, triggers_list, new_annotation.content
+        );
+        match super::llm::call_model(&config, regen_system, &regen_user, 0.2, 200).await {
+            Ok(regen_response) => {
+                let regen_response = regen_response.trim();
+                if regen_response != "NO_CHANGE" && !regen_response.is_empty() {
+                    info!("[faq] re-generalized FAQ {} question: '{}' -> '{}'", faq.id, faq.question, regen_response);
+                    faq.question = regen_response.to_string();
+                }
+            }
+            Err(e) => {
+                warn!("[faq] re-generalization LLM call failed for FAQ {}: {}, keeping current question", faq.id, e);
+            }
+        }
+    }
+
+    faq.updated_at = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+
+    // Save the updated FAQ
+    {
+        let conn = writer.lock().await;
+        db::save_faq_node(&conn, &faq)?;
+    }
+
+    info!("[faq] updated FAQ {} with annotation {}", faq.id, new_annotation.id);
+    Ok(faq)
+}
+
+/// Create a brand-new FAQ node from an annotation.
+///
+/// Change 1: If the annotation content contains "Generalized understanding:",
+/// uses LLM to produce a generalized canonical question and stores the original
+/// question_context as the first match trigger. Otherwise, gracefully degrades
+/// to the old behavior (specific question, no triggers).
+async fn create_new_faq(
+    writer: &Arc<Mutex<Connection>>,
+    slug: &str,
+    question: &str,
+    annotation: &PyramidAnnotation,
+    api_key: &str,
+    model: &str,
+) -> Result<FaqNode> {
+    let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+
+    // Check for the generalization signal in annotation content
+    let (final_question, match_triggers) = if let Some(gen_pos) = annotation.content.find("Generalized understanding:") {
+        // Extract the generalized text after the signal
+        let generalized_text = annotation.content[gen_pos + "Generalized understanding:".len()..].trim();
+
+        // Call LLM to produce a generalized question
+        let config = LlmConfig {
+            api_key: api_key.to_string(),
+            auth_token: String::new(),
+            primary_model: model.to_string(),
+            fallback_model_1: model.to_string(),
+            fallback_model_2: model.to_string(),
+            ..Default::default()
+        };
+
+        let gen_system = "You are a question generalization engine. Produce a single one-sentence generalized question about the underlying mechanism. Output only the question, nothing else.";
+        let gen_user = format!(
+            "Given this specific question: {}\nand this analysis: {}\nproduce a single one-sentence generalized question about the underlying mechanism. Output only the question, nothing else.",
+            question, generalized_text
+        );
+
+        match super::llm::call_model(&config, gen_system, &gen_user, 0.2, 200).await {
+            Ok(generalized_question) => {
+                let generalized_question = generalized_question.trim().to_string();
+                if generalized_question.is_empty() {
+                    warn!("[faq] LLM returned empty generalized question, falling back to original");
+                    (question.to_string(), Vec::new())
+                } else {
+                    info!("[faq] generalized question: '{}' -> '{}'", question, generalized_question);
+                    // Original question becomes the first match trigger
+                    (generalized_question, vec![question.to_string()])
+                }
+            }
+            Err(e) => {
+                warn!("[faq] generalization LLM call failed: {}, falling back to original question", e);
+                (question.to_string(), Vec::new())
+            }
+        }
+    } else {
+        // No generalization signal — graceful degradation
+        warn!("[faq] annotation {} lacks 'Generalized understanding:' signal, using specific question as-is", annotation.id);
+        (question.to_string(), Vec::new())
+    };
+
+    let faq = FaqNode {
+        id: format!("FAQ-{}", Uuid::new_v4()),
+        slug: slug.to_string(),
+        question: final_question,
+        answer: annotation.content.clone(),
+        related_node_ids: vec![annotation.node_id.clone()],
+        annotation_ids: vec![annotation.id],
+        hit_count: 0,
+        match_triggers,
+        created_at: now.clone(),
+        updated_at: now,
+    };
+
+    {
+        let conn = writer.lock().await;
+        db::save_faq_node(&conn, &faq)?;
+    }
+
+    info!("[faq] created new FAQ {} for slug '{}'", faq.id, slug);
+    Ok(faq)
+}
