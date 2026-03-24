@@ -47,7 +47,7 @@ steps:
   # Continues until single apex node remains.
   - name: upper_layer_synthesis
     primitive: synthesize
-    instruction: "$prompts/conversation/distill.md"
+    instruction: "$prompts/code/code_distill.md"
     recursive_pair: true
     depth: 0
     save_as: node
