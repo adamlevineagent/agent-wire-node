@@ -139,7 +139,20 @@ async fn dispatch_llm(
         user_prompt.len()
     );
 
-    // First attempt at configured temperature
+    // If step has a response_schema, use structured outputs for guaranteed JSON
+    if let Some(ref schema) = step.response_schema {
+        let schema_name = step.name.replace('-', "_");
+        info!("[CHAIN] step '{}' → using structured output (schema: {})", step.name, schema_name);
+        let response = llm::call_model_structured(
+            config_ref, system_prompt, &user_prompt, temperature, max_tokens,
+            schema, &schema_name,
+        ).await?;
+        return llm::extract_json(&response).map_err(|e| {
+            anyhow!("Step '{}': structured output JSON parse failed: {}", step.name, e)
+        });
+    }
+
+    // Standard path: call model, parse JSON, retry at temp 0.1 on failure
     let response = llm::call_model(config_ref, system_prompt, &user_prompt, temperature, max_tokens).await?;
 
     match llm::extract_json(&response) {
@@ -390,7 +403,7 @@ pub fn build_node_from_output(
             .and_then(|v| v.as_array())
             .map(|arr| {
                 arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
+                    .filter_map(|v| v.as_str().map(|s| normalize_node_id(s)))
                     .collect()
             })
             .unwrap_or_default(),
@@ -398,6 +411,35 @@ pub fn build_node_from_output(
         superseded_by: None,
         created_at: String::new(),
     })
+}
+
+// ── Node ID normalization ────────────────────────────────────────────────────
+
+/// Normalize a node ID to match the zero-padded format used by generate_node_id.
+///
+/// LLMs sometimes return unpadded IDs like "C-L0-70" when the actual node is
+/// "C-L0-070". This function detects the pattern and zero-pads the numeric
+/// suffix to 3 digits.
+///
+/// Examples:
+/// - "C-L0-70" → "C-L0-070"
+/// - "C-L0-5"  → "C-L0-005"
+/// - "C-L0-070" → "C-L0-070" (already correct)
+/// - "L1-003" → "L1-003" (already correct)
+/// - "L2-1" → "L2-001"
+fn normalize_node_id(id: &str) -> String {
+    // Match patterns like "PREFIX-DIGITS" where prefix contains letters/hyphens
+    if let Some(last_dash) = id.rfind('-') {
+        let prefix = &id[..last_dash];
+        let suffix = &id[last_dash + 1..];
+        if let Ok(num) = suffix.parse::<u32>() {
+            // Only pad if suffix is purely numeric and shorter than 3 digits
+            if suffix.len() < 3 && suffix.chars().all(|c| c.is_ascii_digit()) {
+                return format!("{}-{:03}", prefix, num);
+            }
+        }
+    }
+    id.to_string()
 }
 
 // ── Node ID generation ──────────────────────────────────────────────────────
@@ -473,6 +515,19 @@ mod tests {
     #[test]
     fn test_generate_node_id_four_digit_pad() {
         assert_eq!(generate_node_id("N{index:04}", 3, None), "N0003");
+    }
+
+    #[test]
+    fn test_normalize_node_id() {
+        // Unpadded → padded
+        assert_eq!(normalize_node_id("C-L0-70"), "C-L0-070");
+        assert_eq!(normalize_node_id("C-L0-5"), "C-L0-005");
+        assert_eq!(normalize_node_id("L2-1"), "L2-001");
+        // Already padded → unchanged
+        assert_eq!(normalize_node_id("C-L0-070"), "C-L0-070");
+        assert_eq!(normalize_node_id("L1-003"), "L1-003");
+        // No numeric suffix → unchanged
+        assert_eq!(normalize_node_id("apex"), "apex");
     }
 
     #[test]
@@ -574,6 +629,10 @@ mod tests {
             for_each: None,
             pair_adjacent: false,
             recursive_pair: false,
+            recursive_cluster: false,
+            cluster_instruction: None,
+            cluster_model: None,
+            target_clusters: None,
             batch_threshold: None,
             merge_instruction: None,
             when: None,
@@ -610,6 +669,10 @@ mod tests {
             for_each: None,
             pair_adjacent: false,
             recursive_pair: false,
+            recursive_cluster: false,
+            cluster_instruction: None,
+            cluster_model: None,
+            target_clusters: None,
             batch_threshold: None,
             merge_instruction: None,
             when: None,

@@ -1329,6 +1329,8 @@ async fn execute_recursive_cluster(
         let cluster_model = step.cluster_model.clone().or_else(|| step.model.clone());
         let mut cluster_step = step.clone();
         cluster_step.model = cluster_model;
+        // Use cluster_response_schema if available for structured output
+        cluster_step.response_schema = step.cluster_response_schema.clone();
 
         let cluster_system = match resolve_prompt_template(cluster_instruction, &cluster_input_value) {
             Ok(s) => s,

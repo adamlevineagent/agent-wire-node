@@ -130,7 +130,11 @@ pub struct ChainStep {
     #[serde(default)]
     pub cluster_model: Option<String>,
     #[serde(default)]
+    pub cluster_response_schema: Option<serde_json::Value>,
+    #[serde(default)]
     pub target_clusters: Option<String>,
+    #[serde(default)]
+    pub response_schema: Option<serde_json::Value>,
     #[serde(default)]
     pub batch_threshold: Option<usize>,
     #[serde(default)]
@@ -379,6 +383,12 @@ mod tests {
                 for_each: None,
                 pair_adjacent: false,
                 recursive_pair: false,
+                recursive_cluster: false,
+                cluster_instruction: None,
+                cluster_model: None,
+                cluster_response_schema: None,
+                target_clusters: None,
+                response_schema: None,
                 batch_threshold: None,
                 merge_instruction: None,
                 when: None,

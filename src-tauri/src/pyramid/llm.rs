@@ -48,6 +48,38 @@ pub async fn call_model(
     temperature: f32,
     max_tokens: usize,
 ) -> Result<String> {
+    call_model_inner(config, system_prompt, user_prompt, temperature, max_tokens, None).await
+}
+
+/// Call OpenRouter with structured output enforcement via JSON schema.
+pub async fn call_model_structured(
+    config: &LlmConfig,
+    system_prompt: &str,
+    user_prompt: &str,
+    temperature: f32,
+    max_tokens: usize,
+    response_schema: &serde_json::Value,
+    schema_name: &str,
+) -> Result<String> {
+    let response_format = serde_json::json!({
+        "type": "json_schema",
+        "json_schema": {
+            "name": schema_name,
+            "strict": true,
+            "schema": response_schema
+        }
+    });
+    call_model_inner(config, system_prompt, user_prompt, temperature, max_tokens, Some(&response_format)).await
+}
+
+async fn call_model_inner(
+    config: &LlmConfig,
+    system_prompt: &str,
+    user_prompt: &str,
+    temperature: f32,
+    max_tokens: usize,
+    response_format: Option<&serde_json::Value>,
+) -> Result<String> {
     let est_total = (system_prompt.len() + user_prompt.len()) / 4 + max_tokens;
 
     // Pick initial model based on estimated token usage
@@ -65,7 +97,7 @@ pub async fn call_model(
     let url = "https://openrouter.ai/api/v1/chat/completions";
 
     for attempt in 0..5u32 {
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "model": use_model,
             "messages": [
                 {"role": "system", "content": system_prompt},
@@ -74,6 +106,9 @@ pub async fn call_model(
             "temperature": temperature,
             "max_tokens": max_tokens
         });
+        if let Some(rf) = response_format {
+            body.as_object_mut().unwrap().insert("response_format".to_string(), rf.clone());
+        }
 
         let resp = client
             .post(url)
