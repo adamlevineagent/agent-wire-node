@@ -397,6 +397,47 @@ pub async fn execute_chain_from(
             let writer = state.writer.clone();
             move || {
                 let conn = writer.blocking_lock();
+
+                // Disable FK checks for the cleanup block — we manually handle all references
+                conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
+
+                // Clear parent_id on nodes below from_depth that point to nodes being deleted
+                conn.execute(
+                    "UPDATE pyramid_nodes SET parent_id = NULL WHERE slug = ?1 AND depth < ?2",
+                    rusqlite::params![slug_c, fd],
+                )?;
+                // Delete annotations referencing nodes being deleted
+                conn.execute(
+                    "DELETE FROM pyramid_annotations WHERE slug = ?1 AND node_id IN \
+                     (SELECT id FROM pyramid_nodes WHERE slug = ?1 AND depth >= ?2)",
+                    rusqlite::params![slug_c, fd],
+                )?;
+                // Delete threads referencing nodes being deleted (NOT NULL constraint on canonical_id)
+                conn.execute(
+                    "DELETE FROM pyramid_threads WHERE slug = ?1 AND current_canonical_id IN \
+                     (SELECT id FROM pyramid_nodes WHERE slug = ?1 AND depth >= ?2)",
+                    rusqlite::params![slug_c, fd],
+                ).ok();
+                // Delete web edges referencing deleted threads
+                conn.execute(
+                    "DELETE FROM pyramid_web_edges WHERE slug = ?1 AND (thread_a_id NOT IN \
+                     (SELECT thread_id FROM pyramid_threads WHERE slug = ?1) OR thread_b_id NOT IN \
+                     (SELECT thread_id FROM pyramid_threads WHERE slug = ?1))",
+                    rusqlite::params![slug_c],
+                ).ok();
+                // Delete distillations for deleted threads
+                conn.execute(
+                    "DELETE FROM pyramid_distillations WHERE slug = ?1 AND thread_id NOT IN \
+                     (SELECT thread_id FROM pyramid_threads WHERE slug = ?1)",
+                    rusqlite::params![slug_c],
+                ).ok();
+                // Delete deltas for deleted threads
+                conn.execute(
+                    "DELETE FROM pyramid_deltas WHERE slug = ?1 AND thread_id NOT IN \
+                     (SELECT thread_id FROM pyramid_threads WHERE slug = ?1)",
+                    rusqlite::params![slug_c],
+                ).ok();
+                // Now safe to delete the nodes
                 conn.execute(
                     "DELETE FROM pyramid_nodes WHERE slug = ?1 AND depth >= ?2",
                     rusqlite::params![slug_c, fd],
@@ -405,6 +446,9 @@ pub async fn execute_chain_from(
                     "DELETE FROM pyramid_pipeline_steps WHERE slug = ?1 AND depth >= ?2",
                     rusqlite::params![slug_c, fd],
                 )?;
+
+                // Re-enable FK checks
+                conn.execute_batch("PRAGMA foreign_keys = ON;")?;
                 // Also delete steps that don't have a depth but produce nodes at/above from_depth
                 // (thread_cluster steps have depth = -1 but produce L1+ nodes)
                 if fd <= 1 {
