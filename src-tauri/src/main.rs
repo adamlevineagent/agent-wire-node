@@ -2903,36 +2903,14 @@ async fn pyramid_build(
         *active = Some(handle);
     }
 
-    let reader = state.pyramid.reader.clone();
     let writer = state.pyramid.writer.clone();
-    let config = state.pyramid.config.clone();
     let build_status = status.clone();
     let pyramid_state = state.pyramid.clone(); // Arc<PyramidState> for post-build seeding
 
     tokio::spawn(async move {
         let start = std::time::Instant::now();
 
-        // Read slug info to determine content type
-        let content_type = {
-            let conn = reader.lock().await;
-            match wire_node_lib::pyramid::slug::get_slug(&conn, &slug) {
-                Ok(Some(info)) => info.content_type,
-                _ => {
-                    let mut s = build_status.write().await;
-                    s.status = "failed".to_string();
-                    s.elapsed_seconds = start.elapsed().as_secs_f64();
-                    return;
-                }
-            }
-        };
-
-        // Snapshot LLM config
-        let llm_config = {
-            let cfg = config.read().await;
-            cfg.clone()
-        };
-
-        // Create mpsc channel for WriteOps
+        // Create mpsc channel for WriteOps (used by legacy build path)
         let (write_tx, mut write_rx) =
             tokio::sync::mpsc::channel::<wire_node_lib::pyramid::build::WriteOp>(256);
 
@@ -3003,44 +2981,23 @@ async fn pyramid_build(
             }
         });
 
-        // Call the appropriate build pipeline
-        let result = match content_type {
-            ContentType::Conversation => {
-                wire_node_lib::pyramid::build::build_conversation(
-                    reader.clone(),
-                    &write_tx,
-                    &llm_config,
-                    &slug,
-                    &cancel,
-                    &progress_tx,
-                )
-                .await
-            }
-            ContentType::Code => {
-                wire_node_lib::pyramid::build::build_code(
-                    reader.clone(),
-                    &write_tx,
-                    &llm_config,
-                    &slug,
-                    &cancel,
-                    &progress_tx,
-                )
-                .await
-            }
-            ContentType::Document => {
-                wire_node_lib::pyramid::build::build_docs(
-                    reader.clone(),
-                    &write_tx,
-                    &llm_config,
-                    &slug,
-                    &cancel,
-                    &progress_tx,
-                )
-                .await
-            }
-            ContentType::Vine => Err(anyhow::anyhow!(
-                "Use vine-specific build endpoint for vine pyramids"
-            )),
+        // Unified build dispatch — chain engine or legacy based on feature flag
+        let result = wire_node_lib::pyramid::build_runner::run_build(
+            &pyramid_state,
+            &slug,
+            &cancel,
+            Some(progress_tx.clone()),
+            &write_tx,
+        )
+        .await;
+
+        // Read content_type for post-build seeding (before dropping channels)
+        let content_type = {
+            let conn = pyramid_state.reader.lock().await;
+            wire_node_lib::pyramid::slug::get_slug(&conn, &slug)
+                .ok()
+                .flatten()
+                .map(|info| info.content_type)
         };
 
         // Drop senders so tasks finish
@@ -3056,7 +3013,7 @@ async fn pyramid_build(
                 s.status = "cancelled".to_string();
             } else {
                 match result {
-                    Ok(failures) => {
+                    Ok((_apex_id, failures)) => {
                         s.failures = failures;
                         if failures > 0 {
                             s.status = "complete_with_errors".to_string();
@@ -3096,8 +3053,10 @@ async fn pyramid_build(
             drop(status_check);
 
             if should_seed {
-                if let Err(e) = post_build_seed(&pyramid_state, &slug, &content_type).await {
-                    tracing::error!("Post-build seeding failed for '{}': {}", slug, e);
+                if let Some(ref ct) = content_type {
+                    if let Err(e) = post_build_seed(&pyramid_state, &slug, ct).await {
+                        tracing::error!("Post-build seeding failed for '{}': {}", slug, e);
+                    }
                 }
             }
         }
@@ -3324,6 +3283,9 @@ async fn pyramid_vine_build(
         stale_engines: state.pyramid.stale_engines.clone(),
         file_watchers: state.pyramid.file_watchers.clone(),
         vine_builds: state.pyramid.vine_builds.clone(),
+        use_chain_engine: std::sync::atomic::AtomicBool::new(
+            state.pyramid.use_chain_engine.load(std::sync::atomic::Ordering::Relaxed),
+        ),
     });
 
     let slug_for_task = vine_slug_clean.clone();
@@ -3483,6 +3445,9 @@ async fn pyramid_vine_integrity(
         stale_engines: state.pyramid.stale_engines.clone(),
         file_watchers: state.pyramid.file_watchers.clone(),
         vine_builds: state.pyramid.vine_builds.clone(),
+        use_chain_engine: std::sync::atomic::AtomicBool::new(
+            state.pyramid.use_chain_engine.load(std::sync::atomic::Ordering::Relaxed),
+        ),
     });
 
     let summary = vine::run_integrity_check(&pyramid_state, &slug).await.map_err(|e| e.to_string())?;
@@ -3508,6 +3473,9 @@ async fn pyramid_vine_rebuild_upper(
         stale_engines: state.pyramid.stale_engines.clone(),
         file_watchers: state.pyramid.file_watchers.clone(),
         vine_builds: state.pyramid.vine_builds.clone(),
+        use_chain_engine: std::sync::atomic::AtomicBool::new(
+            state.pyramid.use_chain_engine.load(std::sync::atomic::Ordering::Relaxed),
+        ),
     });
 
     let cancel = tokio_util::sync::CancellationToken::new();
@@ -4074,6 +4042,12 @@ fn main() {
         !pyramid_config.openrouter_api_key.is_empty()
     );
 
+    // Ensure default chain YAML files exist on disk
+    let chains_dir = config.data_dir().join("chains");
+    if let Err(e) = wire_node_lib::pyramid::chain_loader::ensure_default_chains(&chains_dir) {
+        tracing::warn!("Failed to write default chain files: {e}");
+    }
+
     let pyramid_state = Arc::new(wire_node_lib::pyramid::PyramidState {
         reader: Arc::new(tokio::sync::Mutex::new(pyramid_reader)),
         writer: Arc::new(tokio::sync::Mutex::new(pyramid_writer)),
@@ -4083,6 +4057,7 @@ fn main() {
         stale_engines: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         file_watchers: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         vine_builds: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        use_chain_engine: std::sync::atomic::AtomicBool::new(pyramid_config.use_chain_engine),
     });
 
     tracing::info!("Pyramid engine initialized at {:?}", pyramid_db_path);

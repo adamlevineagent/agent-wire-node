@@ -11,6 +11,7 @@
 //   routes  — Warp HTTP route handlers
 
 pub mod build;
+pub mod build_runner;
 pub mod chain_dispatch;
 pub mod chain_engine;
 pub mod chain_executor;
@@ -41,6 +42,7 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -162,6 +164,8 @@ pub struct PyramidState {
     pub file_watchers: Arc<Mutex<HashMap<String, PyramidFileWatcher>>>,
     /// Active vine builds, keyed by vine slug. Prevents concurrent builds per slug.
     pub vine_builds: Arc<Mutex<HashMap<String, VineBuildHandle>>>,
+    /// Whether to use the chain engine for builds (feature flag).
+    pub use_chain_engine: AtomicBool,
 }
 
 /// Handle to a running pyramid build.

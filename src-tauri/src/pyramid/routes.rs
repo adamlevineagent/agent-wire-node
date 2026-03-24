@@ -11,7 +11,7 @@ use tokio::sync::Mutex;
 use warp::Filter;
 use warp::Reply;
 
-use super::build::{self, WriteOp};
+use super::build::WriteOp;
 use super::db;
 use super::delta;
 use super::faq;
@@ -1041,35 +1041,14 @@ async fn handle_build(
     }
 
     // Spawn the build task
-    let reader = state.reader.clone();
+    let build_state = state.clone();
     let writer = state.writer.clone();
-    let config = state.config.clone();
     let build_status = status.clone();
 
     tokio::spawn(async move {
         let start = std::time::Instant::now();
 
-        // Read slug info to determine content type
-        let content_type = {
-            let conn = reader.lock().await;
-            match super::slug::get_slug(&conn, &slug_name) {
-                Ok(Some(info)) => info.content_type,
-                _ => {
-                    let mut s = build_status.write().await;
-                    s.status = "failed".to_string();
-                    s.elapsed_seconds = start.elapsed().as_secs_f64();
-                    return;
-                }
-            }
-        };
-
-        // Snapshot LLM config
-        let llm_config = {
-            let cfg = config.read().await;
-            cfg.clone()
-        };
-
-        // Create mpsc channel for WriteOps
+        // Create mpsc channel for WriteOps (used by legacy path)
         let (write_tx, mut write_rx) = tokio::sync::mpsc::channel::<WriteOp>(256);
 
         // Spawn the writer task that consumes WriteOps using the writer connection
@@ -1131,50 +1110,15 @@ async fn handle_build(
             }
         });
 
-        // Call the appropriate build pipeline
-        let result = match content_type {
-            ContentType::Conversation => {
-                build::build_conversation(
-                    reader.clone(),
-                    &write_tx,
-                    &llm_config,
-                    &slug_name,
-                    &cancel,
-                    &progress_tx,
-                )
-                .await
-            }
-            ContentType::Code => {
-                build::build_code(
-                    reader.clone(),
-                    &write_tx,
-                    &llm_config,
-                    &slug_name,
-                    &cancel,
-                    &progress_tx,
-                )
-                .await
-            }
-            ContentType::Document => {
-                build::build_docs(
-                    reader.clone(),
-                    &write_tx,
-                    &llm_config,
-                    &slug_name,
-                    &cancel,
-                    &progress_tx,
-                )
-                .await
-            }
-            ContentType::Vine => {
-                tracing::error!(
-                    "Vine builds use POST /pyramid/vine/build, not the standard build endpoint"
-                );
-                Err(anyhow::anyhow!(
-                    "Use POST /pyramid/vine/build for vine pyramids"
-                ))
-            }
-        };
+        // Unified build dispatch — chain engine or legacy based on feature flag
+        let result = super::build_runner::run_build(
+            &build_state,
+            &slug_name,
+            &cancel,
+            Some(progress_tx.clone()),
+            &write_tx,
+        )
+        .await;
 
         // Drop the write sender so the writer task can finish
         drop(write_tx);
@@ -1189,7 +1133,7 @@ async fn handle_build(
                 s.status = "cancelled".to_string();
             } else {
                 match result {
-                    Ok(failures) => {
+                    Ok((_apex_id, failures)) => {
                         s.failures = failures;
                         if failures > 0 {
                             s.status = "complete_with_errors".to_string();
