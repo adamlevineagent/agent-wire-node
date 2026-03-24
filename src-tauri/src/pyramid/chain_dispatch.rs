@@ -111,7 +111,7 @@ async fn dispatch_llm(
 ) -> Result<Value> {
     let temperature = resolve_temperature(step, defaults);
     let resolved_model = resolve_model(step, defaults, &ctx.config);
-    let max_tokens: usize = 4096;
+    let max_tokens: usize = 100_000;
 
     // Apply model override: if the resolved model differs from the config's
     // primary model, create a modified config so call_model() uses it.
