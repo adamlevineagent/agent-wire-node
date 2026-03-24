@@ -431,6 +431,17 @@ pub async fn execute_chain(
             apex_node_id = apex_id;
             total_failures += failures;
             Ok(Value::Null)
+        } else if step.recursive_cluster {
+            let starting_depth = step.depth.unwrap_or(1);
+            let (apex_id, failures) = execute_recursive_cluster(
+                step, starting_depth, &mut ctx, &dispatch_ctx, &chain.defaults,
+                &error_strategy, saves_node, &writer_tx, &state.reader,
+                cancel, &progress_tx, &mut done, total,
+            )
+            .await?;
+            apex_node_id = apex_id;
+            total_failures += failures;
+            Ok(Value::Null)
         } else if step.pair_adjacent {
             let source_depth = step.depth.unwrap_or(0);
             let (outputs, failures) = execute_pair_adjacent(
@@ -1160,6 +1171,453 @@ async fn execute_recursive_pair(
 
         depth = target_depth;
     }
+}
+
+// ── Recursive cluster execution ─────────────────────────────────────────────
+
+/// Execute a recursive clustering step: at each layer, LLM clusters current nodes
+/// into 3-5 semantic groups, then synthesizes each group into a parent node.
+/// Repeats until single apex.
+#[allow(clippy::too_many_arguments)]
+async fn execute_recursive_cluster(
+    step: &ChainStep,
+    starting_depth: i64,
+    ctx: &mut ChainContext,
+    dispatch_ctx: &chain_dispatch::StepContext,
+    defaults: &super::chain_engine::ChainDefaults,
+    error_strategy: &ErrorStrategy,
+    saves_node: bool,
+    writer_tx: &mpsc::Sender<WriteOp>,
+    reader: &Arc<Mutex<Connection>>,
+    cancel: &CancellationToken,
+    progress_tx: &Option<mpsc::Sender<BuildProgress>>,
+    done: &mut i64,
+    total: i64,
+) -> Result<(String, i32)> {
+    let mut depth = starting_depth;
+    let mut failures: i32 = 0;
+
+    let synthesis_instruction = step.instruction.as_deref().unwrap_or("Synthesize these nodes.");
+    let cluster_instruction = step.cluster_instruction.as_deref()
+        .unwrap_or("Group these nodes into 3-5 semantic clusters.");
+
+    loop {
+        if cancel.is_cancelled() {
+            return Ok((String::new(), failures));
+        }
+
+        // Read current nodes at this depth
+        let slug_owned = ctx.slug.clone();
+        let d = depth;
+        let current_nodes: Vec<PyramidNode> = db_read(reader, move |conn| {
+            db::get_nodes_at_depth(conn, &slug_owned, d)
+        })
+        .await?;
+
+        info!(
+            "[CHAIN] recursive_cluster depth {}: {} nodes",
+            depth,
+            current_nodes.len()
+        );
+
+        // Done — single node = apex
+        if current_nodes.len() <= 1 {
+            let apex_id = current_nodes
+                .first()
+                .map(|n| n.id.clone())
+                .unwrap_or_default();
+            if !apex_id.is_empty() {
+                info!("[CHAIN] === APEX: {apex_id} at depth {depth} ===");
+            }
+            return Ok((apex_id, failures));
+        }
+
+        let target_depth = depth + 1;
+
+        // Check if target depth already has nodes (resume)
+        let slug_owned = ctx.slug.clone();
+        let td = target_depth;
+        let existing: i64 = db_read(reader, move |conn| {
+            db::count_nodes_at_depth(conn, &slug_owned, td)
+        })
+        .await?;
+
+        if existing > 0 {
+            info!(
+                "[CHAIN] depth {target_depth}: {existing} nodes (already complete)"
+            );
+            depth = target_depth;
+            continue;
+        }
+
+        // ≤4 nodes: synthesize directly into apex without clustering
+        if current_nodes.len() <= 4 {
+            info!(
+                "[CHAIN] [{}] direct synthesis: {} nodes → apex at depth {}",
+                step.name,
+                current_nodes.len(),
+                target_depth
+            );
+            let node_id = generate_node_id(
+                step.node_id_pattern.as_deref().unwrap_or("L{depth}-{index:03}"),
+                0,
+                Some(target_depth),
+            );
+            let result = dispatch_group(
+                step,
+                ctx,
+                dispatch_ctx,
+                defaults,
+                error_strategy,
+                synthesis_instruction,
+                &current_nodes,
+                &node_id,
+                target_depth,
+                0,
+                saves_node,
+                writer_tx,
+            )
+            .await;
+
+            match result {
+                Ok(_) => {
+                    *done += 1;
+                    send_progress(progress_tx, *done, total).await;
+                }
+                Err(e) => {
+                    warn!("[CHAIN] [{}] direct synthesis FAILED: {e}", step.name);
+                    failures += 1;
+                }
+            }
+
+            // Flush writer
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+            info!("[CHAIN] === APEX: {node_id} at depth {target_depth} ===");
+            return Ok((node_id, failures));
+        }
+
+        // Step A: CLUSTER — ask LLM to group current nodes into semantic clusters
+        info!(
+            "[CHAIN] [{}] clustering {} nodes at depth {} → depth {}",
+            step.name,
+            current_nodes.len(),
+            depth,
+            target_depth
+        );
+
+        let cluster_input: Vec<serde_json::Value> = current_nodes
+            .iter()
+            .map(|n| {
+                let topic_names: Vec<String> = n.topics.iter().map(|t| t.name.clone()).collect();
+                serde_json::json!({
+                    "node_id": n.id,
+                    "headline": n.headline,
+                    "orientation": if n.distilled.len() > 500 {
+                        format!("{}...", &n.distilled[..500])
+                    } else {
+                        n.distilled.clone()
+                    },
+                    "topics": topic_names,
+                })
+            })
+            .collect();
+
+        let cluster_input_value = serde_json::json!(cluster_input);
+
+        // Build a temporary step-like config for the clustering LLM call
+        let cluster_model = step.cluster_model.clone().or_else(|| step.model.clone());
+        let mut cluster_step = step.clone();
+        cluster_step.model = cluster_model;
+
+        let cluster_system = match resolve_prompt_template(cluster_instruction, &cluster_input_value) {
+            Ok(s) => s,
+            Err(_) => cluster_instruction.to_string(),
+        };
+
+        let cluster_result = dispatch_with_retry(
+            &cluster_step,
+            &cluster_input_value,
+            &cluster_system,
+            defaults,
+            dispatch_ctx,
+            &ErrorStrategy::Retry(3),
+            &format!("{}-cluster-d{target_depth}", step.name),
+        )
+        .await;
+
+        let cluster_assignments = match cluster_result {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(
+                    "[CHAIN] [{}] clustering FAILED at depth {}, falling back to positional groups of 3: {e}",
+                    step.name, depth
+                );
+                // Fallback: chunk into groups of 3
+                let mut fallback_clusters = Vec::new();
+                for (i, chunk) in current_nodes.chunks(3).enumerate() {
+                    let ids: Vec<String> = chunk.iter().map(|n| n.id.clone()).collect();
+                    fallback_clusters.push(serde_json::json!({
+                        "name": format!("Group {}", i + 1),
+                        "description": "Positional fallback group",
+                        "node_ids": ids,
+                    }));
+                }
+                serde_json::json!({ "clusters": fallback_clusters })
+            }
+        };
+
+        // Parse cluster assignments
+        let clusters = cluster_assignments
+            .get("clusters")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        if clusters.is_empty() {
+            warn!("[CHAIN] [{}] clustering returned 0 clusters, aborting", step.name);
+            return Ok((String::new(), failures + 1));
+        }
+
+        info!(
+            "[CHAIN] [{}] clustering produced {} clusters",
+            step.name,
+            clusters.len()
+        );
+
+        // Validate: check all current nodes are assigned
+        let mut assigned_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for cluster in &clusters {
+            if let Some(ids) = cluster.get("node_ids").and_then(|v| v.as_array()) {
+                for id in ids {
+                    if let Some(s) = id.as_str() {
+                        assigned_ids.insert(s.to_string());
+                    }
+                }
+            }
+        }
+        let missing: Vec<&str> = current_nodes
+            .iter()
+            .filter(|n| !assigned_ids.contains(&n.id))
+            .map(|n| n.id.as_str())
+            .collect();
+        if !missing.is_empty() {
+            warn!(
+                "[CHAIN] [{}] clustering missed {} nodes: {:?}",
+                step.name,
+                missing.len(),
+                missing
+            );
+        }
+
+        // Step B: SYNTHESIZE — for each cluster, synthesize assigned nodes into one parent
+        for (cluster_idx, cluster) in clusters.iter().enumerate() {
+            if cancel.is_cancelled() {
+                return Ok((String::new(), failures));
+            }
+
+            let cluster_name = cluster
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Unnamed");
+
+            let cluster_node_ids: Vec<String> = cluster
+                .get("node_ids")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            // Gather the actual nodes for this cluster
+            let cluster_nodes: Vec<&PyramidNode> = cluster_node_ids
+                .iter()
+                .filter_map(|id| current_nodes.iter().find(|n| n.id == *id))
+                .collect();
+
+            if cluster_nodes.is_empty() {
+                warn!(
+                    "[CHAIN] [{}] cluster '{}' has no valid nodes, skipping",
+                    step.name, cluster_name
+                );
+                continue;
+            }
+
+            let node_id = generate_node_id(
+                step.node_id_pattern.as_deref().unwrap_or("L{depth}-{index:03}"),
+                cluster_idx,
+                Some(target_depth),
+            );
+
+            // Resume check
+            let resume = get_resume_state(
+                reader,
+                &ctx.slug,
+                &step.name,
+                -1,
+                target_depth,
+                &node_id,
+                saves_node,
+            )
+            .await?;
+            match resume {
+                ResumeState::Complete => {
+                    info!(
+                        "[CHAIN] [{}] {node_id} -- resumed (complete)",
+                        step.name
+                    );
+                    *done += 1;
+                    send_progress(progress_tx, *done, total).await;
+                    continue;
+                }
+                ResumeState::StaleStep => {
+                    warn!(
+                        "[CHAIN] [{}] {node_id} -- stale, rebuilding",
+                        step.name
+                    );
+                }
+                ResumeState::Missing => {}
+            }
+
+            info!(
+                "[CHAIN] [{}] synthesizing cluster '{}' ({} nodes) → {node_id}",
+                step.name,
+                cluster_name,
+                cluster_nodes.len()
+            );
+
+            let owned_nodes: Vec<PyramidNode> = cluster_nodes.iter().map(|n| (*n).clone()).collect();
+            let result = dispatch_group(
+                step,
+                ctx,
+                dispatch_ctx,
+                defaults,
+                error_strategy,
+                synthesis_instruction,
+                &owned_nodes,
+                &node_id,
+                target_depth,
+                cluster_idx,
+                saves_node,
+                writer_tx,
+            )
+            .await;
+
+            match result {
+                Ok(_) => {
+                    *done += 1;
+                    send_progress(progress_tx, *done, total).await;
+                }
+                Err(e) => {
+                    warn!(
+                        "[CHAIN] [{}] cluster '{}' synthesis FAILED: {e}",
+                        step.name, cluster_name
+                    );
+                    failures += 1;
+                }
+            }
+        }
+
+        // Flush writer before reading next layer
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        depth = target_depth;
+    }
+}
+
+/// Dispatch synthesis for a group of N nodes (generalized dispatch_pair).
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_group(
+    step: &ChainStep,
+    ctx: &mut ChainContext,
+    dispatch_ctx: &chain_dispatch::StepContext,
+    defaults: &super::chain_engine::ChainDefaults,
+    error_strategy: &ErrorStrategy,
+    instruction: &str,
+    nodes: &[PyramidNode],
+    node_id: &str,
+    target_depth: i64,
+    group_idx: usize,
+    saves_node: bool,
+    writer_tx: &mpsc::Sender<WriteOp>,
+) -> Result<Value> {
+    // Build input: array of child payloads with headers
+    let mut sections = Vec::new();
+    for (i, node) in nodes.iter().enumerate() {
+        sections.push(format!(
+            "## CHILD NODE {}: \"{}\"\n{}",
+            i + 1,
+            node.headline,
+            serde_json::to_string_pretty(&child_payload_json(node))?
+        ));
+    }
+    let combined_input = sections.join("\n\n");
+
+    let resolved_input = serde_json::json!({
+        "children": combined_input,
+        "child_count": nodes.len(),
+    });
+
+    let system_prompt = match resolve_prompt_template(instruction, &resolved_input) {
+        Ok(s) => s,
+        Err(_) => instruction.to_string(),
+    };
+
+    let fallback_key = format!("{}-d{target_depth}-g{group_idx}", step.name);
+    let t0 = Instant::now();
+
+    let analysis = dispatch_with_retry(
+        step,
+        &resolved_input,
+        &system_prompt,
+        defaults,
+        dispatch_ctx,
+        error_strategy,
+        &fallback_key,
+    )
+    .await?;
+
+    let elapsed = t0.elapsed().as_secs_f64();
+
+    // Save step
+    let output_json = serde_json::to_string(&analysis)?;
+    send_save_step(
+        writer_tx,
+        &ctx.slug,
+        &step.name,
+        -1,
+        target_depth,
+        node_id,
+        &output_json,
+        &dispatch_ctx.config.primary_model,
+        elapsed,
+    )
+    .await;
+
+    // Save node
+    if saves_node {
+        let mut node = build_node_from_output(&analysis, node_id, &ctx.slug, target_depth, None)?;
+        node.children = nodes.iter().map(|n| n.id.clone()).collect();
+        let topics_json = serde_json::to_string(
+            analysis.get("topics").unwrap_or(&serde_json::json!([])),
+        )?;
+        send_save_node(writer_tx, node, Some(topics_json)).await;
+
+        // Update parent pointers for all children
+        for child in nodes {
+            send_update_parent(writer_tx, &ctx.slug, &child.id, node_id).await;
+        }
+    }
+
+    let child_ids: Vec<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
+    info!(
+        "[CHAIN] [{:?}] -> {node_id} ({elapsed:.1}s)",
+        child_ids
+    );
+
+    Ok(analysis)
 }
 
 // ── Single step execution ───────────────────────────────────────────────────

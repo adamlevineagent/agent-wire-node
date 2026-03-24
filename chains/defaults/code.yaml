@@ -67,12 +67,16 @@ steps:
     temperature: 0.3
     on_error: skip
 
-  # ── Step 4: Upper layers (recursive pairing L1 → apex) ───────────────
-  # Recursive adjacent pairing from L1 thread nodes to single apex.
+  # ── Step 4: Upper layers (recursive clustering L1 → apex) ────────────
+  # Semantic re-clustering at each layer instead of blind 2:1 pairing.
+  # Each layer: LLM groups nodes into 3-5 clusters → synthesize each cluster.
+  # Produces 2-3 upper layers instead of 4-5, with better semantic structure.
   - name: upper_layer_synthesis
     primitive: synthesize
     instruction: "$prompts/code/code_distill.md"
-    recursive_pair: true
+    recursive_cluster: true
+    cluster_instruction: "$prompts/code/code_recluster.md"
+    cluster_model: "qwen/qwen3.5-flash-02-23"
     depth: 1
     save_as: node
     node_id_pattern: "L{depth}-{index:03}"

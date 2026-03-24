@@ -124,6 +124,14 @@ pub struct ChainStep {
     #[serde(default)]
     pub recursive_pair: bool,
     #[serde(default)]
+    pub recursive_cluster: bool,
+    #[serde(default)]
+    pub cluster_instruction: Option<String>,
+    #[serde(default)]
+    pub cluster_model: Option<String>,
+    #[serde(default)]
+    pub target_clusters: Option<String>,
+    #[serde(default)]
     pub batch_threshold: Option<usize>,
     #[serde(default)]
     pub merge_instruction: Option<String>,
@@ -255,10 +263,22 @@ pub fn validate_chain(def: &ChainDefinition) -> ValidationResult {
             validate_on_error(on_err, &format!("{}.on_error", prefix), &mut errors);
         }
 
-        // recursive_pair and pair_adjacent are mutually exclusive
-        if step.recursive_pair && step.pair_adjacent {
+        // recursive_pair, pair_adjacent, and recursive_cluster are mutually exclusive
+        let mode_count = [step.recursive_pair, step.pair_adjacent, step.recursive_cluster]
+            .iter()
+            .filter(|&&b| b)
+            .count();
+        if mode_count > 1 {
             errors.push(format!(
-                "{}: recursive_pair and pair_adjacent are mutually exclusive",
+                "{}: recursive_pair, pair_adjacent, and recursive_cluster are mutually exclusive",
+                prefix
+            ));
+        }
+
+        // recursive_cluster needs cluster_instruction
+        if step.recursive_cluster && step.cluster_instruction.is_none() {
+            errors.push(format!(
+                "{}: recursive_cluster requires cluster_instruction",
                 prefix
             ));
         }
