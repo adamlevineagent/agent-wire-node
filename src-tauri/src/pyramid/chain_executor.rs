@@ -24,7 +24,7 @@ use tracing::{info, warn, error};
 use super::build::{
     WriteOp, child_payload_json, send_save_node, send_save_step, send_update_parent,
 };
-use super::chain_dispatch::{self, build_node_from_output, generate_node_id};
+use super::chain_dispatch::{self, build_node_from_output, generate_node_id, normalize_node_id};
 use super::chain_engine::{ChainDefinition, ChainStep};
 use super::chain_resolve::{ChainContext, resolve_prompt_template};
 use super::db;
@@ -757,13 +757,53 @@ async fn execute_for_each(
 
                 // Save node if configured
                 if saves_node {
-                    let node = build_node_from_output(
+                    let mut node = build_node_from_output(
                         &analysis, &node_id, &ctx.slug, depth, Some(chunk_index),
                     )?;
+
+                    // If the LLM returned invalid children (headlines instead of IDs),
+                    // try to extract real node IDs from the forEach item's assignments
+                    let has_valid_children = !node.children.is_empty()
+                        && node.children.iter().all(|c| c.contains("-L") || c.contains("-l"));
+                    if !has_valid_children {
+                        // Try to extract source_node IDs from $item.assignments
+                        if let Some(assignments) = item.get("assignments").and_then(|v| v.as_array()) {
+                            let extracted: Vec<String> = assignments
+                                .iter()
+                                .filter_map(|a| a.get("source_node").and_then(|v| v.as_str()))
+                                .map(|s| normalize_node_id(s))
+                                .collect();
+                            if !extracted.is_empty() {
+                                info!(
+                                    "[CHAIN] [{}] {node_id}: overriding {} LLM children with {} assignment IDs",
+                                    step.name, node.children.len(), extracted.len()
+                                );
+                                node.children = extracted;
+                            }
+                        }
+                        // Also try node_ids from cluster items
+                        if node.children.is_empty() || !node.children.iter().all(|c| c.contains("-L") || c.contains("-l")) {
+                            if let Some(node_ids) = item.get("node_ids").and_then(|v| v.as_array()) {
+                                let extracted: Vec<String> = node_ids
+                                    .iter()
+                                    .filter_map(|v| v.as_str())
+                                    .map(|s| normalize_node_id(s))
+                                    .collect();
+                                if !extracted.is_empty() {
+                                    info!(
+                                        "[CHAIN] [{}] {node_id}: overriding children with {} node_ids",
+                                        step.name, extracted.len()
+                                    );
+                                    node.children = extracted;
+                                }
+                            }
+                        }
+                    }
+
                     let topics_json = serde_json::to_string(
                         analysis.get("topics").unwrap_or(&serde_json::json!([])),
                     )?;
-                    // Wire parent_id on children (e.g., L1 thread → L0 source nodes)
+                    // Wire parent_id on children
                     let child_ids = node.children.clone();
                     send_save_node(writer_tx, node, Some(topics_json)).await;
                     for child_id in &child_ids {

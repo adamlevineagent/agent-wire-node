@@ -427,7 +427,7 @@ pub fn build_node_from_output(
 /// - "C-L0-070" → "C-L0-070" (already correct)
 /// - "L1-003" → "L1-003" (already correct)
 /// - "L2-1" → "L2-001"
-fn normalize_node_id(id: &str) -> String {
+pub(crate) fn normalize_node_id(id: &str) -> String {
     // Match patterns like "PREFIX-DIGITS" where prefix contains letters/hyphens
     if let Some(last_dash) = id.rfind('-') {
         let prefix = &id[..last_dash];
