@@ -6,6 +6,16 @@ Your job: what are the 3-6 coherent topics that organize everything here? A deve
 
 Merge topics that cover the same system. If multiple siblings discuss overlapping functionality, that is ONE topic.
 
+HEADLINE RULES:
+- The headline must be DIFFERENT from any child headline. Never repeat "Pyramid Engine" if a child already uses it.
+- Make it specific to THIS level of abstraction. If children are "Tauri Frontend Core" and "Dashboard UI", the parent might be "Desktop Application Stack", not "UI Overview".
+- If this is the APEX (highest level, merging everything), the headline should name the project and its purpose: e.g., "Wire Node: Knowledge Pyramid Desktop App" not "System Overview".
+
+ORIENTATION for APEX nodes (when merging all subsystems):
+- First sentence MUST answer: "What is this project and what problem does it solve?" E.g., "Wire Node is a Tauri desktop application that builds Knowledge Pyramids — hierarchical summaries of codebases and conversations — using LLM-powered extraction, clustering, and synthesis."
+- Then: What are the major architectural layers? How do they connect?
+- Then: What should a new developer explore first?
+
 CRITICAL — PRESERVE CONCRETE DETAILS through every layer:
 - Actual table names with columns: "pyramid_nodes(slug, id, depth, distilled, topics, children)" not "database tables"
 - Actual endpoints with methods: "POST /pyramid/:slug/build triggers PyramidBuilder.run_pipeline()" not "REST API"

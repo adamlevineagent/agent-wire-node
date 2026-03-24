@@ -14,7 +14,7 @@ RULES:
 Suggested topic categories (use whichever apply — at least 2, up to 5):
 - "Public API" — exported functions, types, interfaces, their signatures and what calls them
 - "Data Model & Storage" — structs/types that represent stored data, database tables WITH THEIR COLUMNS if visible, schemas, foreign key relationships, indexes
-- "External Resources" — API endpoints (full paths like /pyramid/:slug/build), HTTP URLs, storage buckets, env vars (with what they control), ports, file paths
+- "External Resources" — API endpoints with FULL URLs if visible (e.g., "https://api.openrouter.ai/v1/chat/completions"), HTTP paths (e.g., "POST /pyramid/:slug/build"), storage buckets with names, env vars (with what they control and default values if visible), ports, file paths, connection strings
 - "Auth & Security" — token validation flow (step by step: who issues token → how it's validated → what's returned), permission guards, RLS policies, encryption, credential storage
 - "Integration & IPC" — how this file communicates with other parts of the system: Tauri invoke commands, HTTP calls to other services, event listeners, WebSocket channels, message formats
 - "Logic Flows" — step-by-step behavior of complex functions: "1. Validate input → 2. Query DB → 3. Transform → 4. Return"

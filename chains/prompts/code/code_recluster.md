@@ -6,6 +6,7 @@ RULES:
 - Every node must be assigned to exactly ONE cluster
 - 3-5 clusters. Fewer is better if the coverage is complete.
 - Cluster names should be concrete and developer-friendly: "Desktop UI & Frontend Components", not "Group 1"
+- Cluster names must be DISTINCT from the child node headlines they contain — use a higher-level architectural framing
 - Balance: each cluster should have at least 2 nodes
 - If a node doesn't fit cleanly, assign it to the closest match — do not create a singleton cluster
 - Think about what a NEW DEVELOPER would want to explore: "I want to understand the UI" → one cluster. "I want to understand the data pipeline" → another cluster. "I want to understand the backend services" → another.
