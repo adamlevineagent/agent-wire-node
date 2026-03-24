@@ -253,10 +253,11 @@ pub fn build_node_from_output(
     depth: i64,
     chunk_index: Option<i64>,
 ) -> Result<PyramidNode> {
-    // Extract distilled text (try "orientation" first, then "distilled")
+    // Extract distilled text (try multiple field names for compatibility)
     let distilled = output
         .get("orientation")
         .or_else(|| output.get("distilled"))
+        .or_else(|| output.get("purpose"))
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
