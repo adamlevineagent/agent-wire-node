@@ -62,6 +62,7 @@ steps:
     for_each: $chunks
     node_id_pattern: "C-L0-{index:03}"
     depth: 0
+    save_as: node
     model_tier: mid
     temperature: 0.3
     on_error: skip
@@ -104,6 +105,7 @@ steps:
     for_each: $import_graph_clustering
     node_id_pattern: "C-L1-{index:03}"
     depth: 1
+    save_as: node
     input:
       context:
         - import_graph
@@ -142,6 +144,7 @@ steps:
     for_each: $l2_thread_clustering
     node_id_pattern: "L2-{index:03}"
     depth: 2
+    save_as: node
     model_tier: mid
     temperature: 0.3
     on_error: skip
@@ -160,6 +163,7 @@ steps:
     instruction: "$prompts/conversation/distill.md"
     recursive_pair: true
     depth: 2
+    save_as: node
     node_id_pattern: "L{depth}-{index:03}"
     model_tier: mid
     temperature: 0.3
