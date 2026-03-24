@@ -686,7 +686,12 @@ async fn execute_for_each(
                     let topics_json = serde_json::to_string(
                         analysis.get("topics").unwrap_or(&serde_json::json!([])),
                     )?;
+                    // Wire parent_id on children (e.g., L1 thread → L0 source nodes)
+                    let child_ids = node.children.clone();
                     send_save_node(writer_tx, node, Some(topics_json)).await;
+                    for child_id in &child_ids {
+                        send_update_parent(writer_tx, &ctx.slug, child_id, &node_id).await;
+                    }
                 }
 
                 // Update accumulators for sequential steps

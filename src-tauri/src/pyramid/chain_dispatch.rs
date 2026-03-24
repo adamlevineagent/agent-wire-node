@@ -384,7 +384,15 @@ pub fn build_node_from_output(
         terms,
         dead_ends,
         self_prompt,
-        children: Vec::new(),
+        children: output
+            .get("source_nodes")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default(),
         parent_id: None,
         superseded_by: None,
         created_at: String::new(),
