@@ -77,6 +77,29 @@ steps:
     recursive_cluster: true
     cluster_instruction: "$prompts/code/code_recluster.md"
     cluster_model: "qwen/qwen3.5-flash-02-23"
+    cluster_response_schema:
+      type: object
+      properties:
+        clusters:
+          type: array
+          items:
+            type: object
+            properties:
+              name:
+                type: string
+                description: "2-6 word cluster label — must be unique across all clusters"
+              description:
+                type: string
+                description: "1-2 sentences on what this architectural area covers"
+              node_ids:
+                type: array
+                items:
+                  type: string
+                description: "IDs of nodes in this cluster (e.g., L1-000, L1-003)"
+            required: ["name", "description", "node_ids"]
+            additionalProperties: false
+      required: ["clusters"]
+      additionalProperties: false
     depth: 1
     save_as: node
     node_id_pattern: "L{depth}-{index:03}"
