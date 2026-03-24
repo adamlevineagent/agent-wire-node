@@ -43,6 +43,18 @@ pub async fn run_build(
     progress_tx: Option<mpsc::Sender<BuildProgress>>,
     write_tx: &mpsc::Sender<WriteOp>,
 ) -> Result<(String, i32)> {
+    run_build_from(state, slug_name, 0, cancel, progress_tx, write_tx).await
+}
+
+/// Run a build from a specific depth, reusing nodes below that depth.
+pub async fn run_build_from(
+    state: &PyramidState,
+    slug_name: &str,
+    from_depth: i64,
+    cancel: &CancellationToken,
+    progress_tx: Option<mpsc::Sender<BuildProgress>>,
+    write_tx: &mpsc::Sender<WriteOp>,
+) -> Result<(String, i32)> {
     // ── 1. Determine content type ────────────────────────────────────────
     let content_type = {
         let conn = state.reader.lock().await;
@@ -62,8 +74,11 @@ pub async fn run_build(
     let use_chain = state.use_chain_engine.load(Ordering::Relaxed);
 
     if use_chain {
-        run_chain_build(state, slug_name, &content_type, cancel, progress_tx).await
+        run_chain_build(state, slug_name, &content_type, from_depth, cancel, progress_tx).await
     } else {
+        if from_depth > 0 {
+            return Err(anyhow!("from_depth is only supported with the chain engine (set use_chain_engine: true)"));
+        }
         run_legacy_build(state, slug_name, &content_type, cancel, progress_tx, write_tx).await
     }
 }
@@ -73,6 +88,7 @@ async fn run_chain_build(
     state: &PyramidState,
     slug_name: &str,
     content_type: &ContentType,
+    from_depth: i64,
     cancel: &CancellationToken,
     progress_tx: Option<mpsc::Sender<BuildProgress>>,
 ) -> Result<(String, i32)> {
@@ -124,7 +140,7 @@ async fn run_chain_build(
         "starting chain engine build"
     );
 
-    chain_executor::execute_chain(state, &chain, slug_name, cancel, progress_tx).await
+    chain_executor::execute_chain_from(state, &chain, slug_name, from_depth, cancel, progress_tx).await
 }
 
 /// Legacy path: dispatch to the old build_conversation/build_code/build_docs.

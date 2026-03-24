@@ -227,12 +227,13 @@ pub fn pyramid_routes(
         .and(with_auth_state(state.clone()))
         .and_then(handle_build_cancel));
 
-    // POST /pyramid/:slug/build
+    // POST /pyramid/:slug/build?from_depth=N
     let build = route!(prefix
         .and(warp::path::param::<String>())
         .and(warp::path("build"))
         .and(warp::path::end())
         .and(warp::post())
+        .and(warp::query::<std::collections::HashMap<String, String>>())
         .and(with_auth_state(state.clone()))
         .and_then(handle_build));
 
@@ -983,8 +984,13 @@ async fn handle_terms(
 
 async fn handle_build(
     slug_name: String,
+    query: std::collections::HashMap<String, String>,
     state: Arc<PyramidState>,
 ) -> Result<warp::reply::Response, warp::Rejection> {
+    let from_depth: i64 = query
+        .get("from_depth")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
     // Verify slug exists before taking the write lock
     {
         let conn = state.reader.lock().await;
@@ -1111,9 +1117,10 @@ async fn handle_build(
         });
 
         // Unified build dispatch — chain engine or legacy based on feature flag
-        let result = super::build_runner::run_build(
+        let result = super::build_runner::run_build_from(
             &build_state,
             &slug_name,
+            from_depth,
             &cancel,
             Some(progress_tx.clone()),
             &write_tx,

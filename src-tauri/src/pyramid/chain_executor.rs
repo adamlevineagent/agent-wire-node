@@ -323,10 +323,24 @@ async fn carry_node_up(
 
 /// Execute a chain definition against a pyramid slug.
 /// Returns (apex_node_id, failure_count).
+/// If `from_depth` > 0, skips steps producing nodes below that depth and
+/// deletes existing nodes/steps at `from_depth` and above before running.
 pub async fn execute_chain(
     state: &PyramidState,
     chain: &ChainDefinition,
     slug: &str,
+    cancel: &CancellationToken,
+    progress_tx: Option<mpsc::Sender<BuildProgress>>,
+) -> Result<(String, i32)> {
+    execute_chain_from(state, chain, slug, 0, cancel, progress_tx).await
+}
+
+/// Execute a chain from a specific depth, reusing nodes below that depth.
+pub async fn execute_chain_from(
+    state: &PyramidState,
+    chain: &ChainDefinition,
+    slug: &str,
+    from_depth: i64,
     cancel: &CancellationToken,
     progress_tx: Option<mpsc::Sender<BuildProgress>>,
 ) -> Result<(String, i32)> {
@@ -372,6 +386,39 @@ pub async fn execute_chain(
     })
     .await?;
 
+    // If from_depth > 0, clean up nodes and steps at/above that depth
+    if from_depth > 0 {
+        info!(
+            "[CHAIN] Layered rebuild from depth {from_depth}: deleting nodes and steps at depth >= {from_depth}"
+        );
+        let slug_c = slug.to_string();
+        let fd = from_depth;
+        tokio::task::spawn_blocking({
+            let writer = state.writer.clone();
+            move || {
+                let conn = writer.blocking_lock();
+                conn.execute(
+                    "DELETE FROM pyramid_nodes WHERE slug = ?1 AND depth >= ?2",
+                    rusqlite::params![slug_c, fd],
+                )?;
+                conn.execute(
+                    "DELETE FROM pyramid_pipeline_steps WHERE slug = ?1 AND depth >= ?2",
+                    rusqlite::params![slug_c, fd],
+                )?;
+                // Also delete steps that don't have a depth but produce nodes at/above from_depth
+                // (thread_cluster steps have depth = -1 but produce L1+ nodes)
+                if fd <= 1 {
+                    conn.execute(
+                        "DELETE FROM pyramid_pipeline_steps WHERE slug = ?1 AND step_type IN ('thread_cluster', 'thread_narrative', 'synth')",
+                        rusqlite::params![slug_c],
+                    )?;
+                }
+                Ok::<_, anyhow::Error>(())
+            }
+        })
+        .await??;
+    }
+
     let total = estimate_total(chain, num_chunks);
     let mut done: i64 = 0;
     let mut total_failures: i32 = 0;
@@ -405,6 +452,20 @@ pub async fn execute_chain(
         if !evaluate_when(step.when.as_deref(), &ctx) {
             info!("  Step '{}' skipped (when condition false)", step.name);
             continue;
+        }
+
+        // Skip steps below from_depth (layered rebuild)
+        if from_depth > 0 {
+            let step_depth = step.depth.unwrap_or(0);
+            // Skip forEach/single steps that produce nodes below from_depth
+            // But don't skip recursive_cluster/recursive_pair (they span multiple depths)
+            if step_depth < from_depth && !step.recursive_cluster && !step.recursive_pair {
+                info!(
+                    "[CHAIN] step \"{}\" skipped (depth {} < from_depth {})",
+                    step.name, step_depth, from_depth
+                );
+                continue;
+            }
         }
 
         let error_strategy = resolve_error_strategy(step, &chain.defaults);
