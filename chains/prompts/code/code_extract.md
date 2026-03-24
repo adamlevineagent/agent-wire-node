@@ -25,11 +25,11 @@ Suggested topic categories (use whichever apply — at least 2, up to 5):
 Output valid JSON only:
 {
   "headline": "2-6 word file label",
-  "orientation": "2-3 sentences: what this file does, its role in the system, and what a developer should know about it. Be specific — name the key function, the table it writes to, the endpoint it exposes, and what calls this file.",
+  "orientation": "3-5 sentences: what this file does, its architectural role, key entry points, what it connects to. Name the key function, the table it writes to, the endpoint it exposes, what calls this file, and what a developer must know before modifying it.",
   "topics": [
     {
       "name": "Topic Name",
-      "current": "2-3 sentences describing this aspect. Be specific. Include data flows: X calls Y which writes to table Z.",
+      "current": "3-5 sentences describing this aspect in full operational detail. Include data flows: X calls Y which writes to table Z. Describe the complete lifecycle, not just what exists.",
       "entities": ["functionName()", "StructName", "table: table_name(col1, col2, col3)", "env: VAR_NAME — controls X", "HTTP: POST /api/endpoint — does Y", "IPC: invoke('command_name')"],
       "corrections": [],
       "decisions": []
