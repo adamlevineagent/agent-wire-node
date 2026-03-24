@@ -1,14 +1,3 @@
-<!--
-  User prompt template (constructed at call site via format!()):
-
-  ## FORWARD (STONE)
-  {{forward_distillation_json}}
-
-  ## REVERSE (WATER)
-  {{reverse_distillation_json}}
-
-  Combine into L0.
--->
 You combine a FORWARD distillation (what was understood at the time) with a REVERSE distillation (what actually mattered in hindsight) into one maximally dense L0 node.
 
 Keep everything that survived. Drop dead ends. Preserve corrections with full context (wrong → right → who).

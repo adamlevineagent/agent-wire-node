@@ -1,12 +1,3 @@
-<!--
-  User prompt template (constructed at call site via format!()):
-
-  ## RUNNING CONTEXT FROM PRIOR CHUNKS
-  {{running_context}}
-
-  ## CHUNK {{chunk_index}}
-  {{chunk_content}}
--->
 You are a distillation engine. Compress this conversation chunk into the fewest possible words while preserving ALL information. Zero loss. Maximum density.
 
 RULES:

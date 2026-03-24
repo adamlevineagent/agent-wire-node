@@ -1,17 +1,3 @@
-<!--
-  User prompt template (constructed at call site via format!()):
-
-  The user prompt is the JSON-serialized topic inventory array directly.
-  Each element has the shape:
-  {
-    "source_node": "{{source_node_id}}",
-    "topic_index": {{topic_index}},
-    "name": "{{topic_name}}",
-    "entities": [{{entities}}]
-  }
-
-  When batched, each batch is a subset of the full topic inventory.
--->
 You are given a flat list of topics extracted from L1 nodes of a knowledge pyramid. Each topic has a name, a summary, and an entity list. Topics come from different L1 nodes (different parts of the conversation).
 
 Your job: identify the 6-12 coherent THREADS that organize ALL these topics. A thread is a narrative strand that weaves through the conversation — "Privacy Architecture" is a thread, "Pipeline Mechanics" is a thread.

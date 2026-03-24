@@ -1,14 +1,3 @@
-<!--
-  User prompt template (constructed at call site via format!()):
-
-  ## THREAD: {{thread_name}}
-
-  ## TOPICS (chronological — higher order = later = more authoritative)
-  {{assigned_topics_json}}
-
-  Each topic in the array has an "order" field (1-based, higher = later)
-  and topics in the top 30% have "temporal_authority": "LATE — AUTHORITATIVE".
--->
 You are given all the topics from a single THREAD — a coherent narrative strand pulled from across a knowledge pyramid. These topics come from different L1 nodes (different parts of the conversation) but all relate to the same subject.
 
 Your job: synthesize this thread into coherent sub-topics. What is the CURRENT TRUTH? Organize by sub-theme, not by source.

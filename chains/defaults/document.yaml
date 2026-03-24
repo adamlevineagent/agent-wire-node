@@ -1,0 +1,132 @@
+# Document Pipeline Chain Definition
+# Mirrors build_docs() from src-tauri/src/pyramid/build.rs
+#
+# Pipeline sequence:
+#   1. Concurrent L0 document extraction (per-document LLM analysis)
+#   2. Entity overlap clustering (mechanical: group docs sharing >=1 entity)
+#   3. Document group synthesis (per-cluster LLM synthesis)
+#   4. Thread clustering (LLM groups L1 topics into 6-12 threads; batched if >30k est. tokens)
+#   5. Thread narrative synthesis (per-thread LLM narrative with temporal authority ordering)
+#   6. Upper layers (recursive adjacent pairing from L2 to apex via DISTILL_PROMPT)
+
+schema_version: 1
+id: document-default
+name: Document Pyramid
+description: >
+  Creative fiction / document analysis pipeline: concurrent per-document LLM extraction,
+  entity-overlap clustering, document group synthesis, thread clustering, thread narrative
+  synthesis, and recursive pairing to apex.
+content_type: document
+version: "1.0.0"
+author: agent-wire
+
+defaults:
+  model_tier: mid
+  temperature: 0.3
+  on_error: "retry(2)"
+
+steps:
+  # ── Step 1: Concurrent L0 document extraction ──────────────────────────
+  # Rust: for ci in 0..num_chunks, spawns concurrent tasks (concurrency = min(num_chunks, 3))
+  # Node IDs: "L0-{ci:03}" (e.g., L0-000, L0-001, ...)
+  # User prompt prepends metadata: "## METADATA\nLines: {lines}, Characters: {chars}\n\n{content}"
+  # Entities extracted from analysis.characters[].name and analysis.locations[].name.
+  # Step type saved as "doc_extract".
+  - name: l0_doc_extract
+    primitive: extract
+    instruction: "prompts/document/doc_extract.md"
+    for_each: chunks
+    node_id_pattern: "L0-{index:03}"
+    depth: 0
+    model_tier: mid
+    temperature: 0.3
+    on_error: skip
+
+  # ── Step 2: Entity overlap clustering ──────────────────────────────────
+  # Rust: builds entity sets per L0 node (lowercased, trimmed from node.topics[].entities),
+  # then greedy clustering: iterate L0 nodes in order, for each unvisited node start a cluster,
+  # then absorb any other unvisited node sharing >=1 entity with the growing cluster's entity set.
+  # Pure mechanical — no LLM call.
+  - name: entity_overlap_clustering
+    primitive: classify
+    mechanical: true
+    rust_function: cluster_by_entity_overlap
+    input:
+      source: l0_nodes
+      algorithm: greedy_entity_overlap
+      min_overlap: 1
+    save_as: clusters
+    on_error: abort
+
+  # ── Step 3: Document group synthesis ───────────────────────────────────
+  # Rust: for each cluster, gathers child L0 nodes, builds user prompt with:
+  #   - DOCUMENTS IN THIS CLUSTER (comma-separated document names from chunk headers)
+  #   - CONTENT (pretty-printed JSON of child topics)
+  # Node IDs: "L1-{ci_idx:03}"
+  # Step type saved as "doc_group" at depth 1.
+  - name: l1_doc_group_synthesis
+    primitive: synthesize
+    instruction: "prompts/document/doc_group.md"
+    for_each: clusters
+    node_id_pattern: "L1-{index:03}"
+    depth: 1
+    model_tier: mid
+    temperature: 0.3
+    on_error: skip
+
+  # ── Step 4: Thread clustering ──────────────────────────────────────────
+  # Rust: build_threads_layer() — shared between all pipelines.
+  # Builds topic inventory from all L1 nodes (with top 6 entities per topic),
+  # then LLM groups into 6-12 threads via THREAD_CLUSTER_PROMPT.
+  # If estimated tokens >30,000: splits into batches, clusters each independently,
+  #   then merges via MERGE_PROMPT.
+  # If clustering fails: falls back to positional pairing of adjacent L1 nodes.
+  # Orphaned L1 nodes (not assigned to any thread) go into "Other" catch-all thread.
+  # Step type saved as "thread_cluster" at depth 1.
+  - name: l2_thread_clustering
+    primitive: classify
+    instruction: "prompts/conversation/thread_cluster.md"
+    batch_threshold: 30000
+    merge_instruction: "prompts/conversation/merge.md"
+    depth: 1
+    save_as: thread_assignments
+    model_tier: mid
+    temperature: 0.3
+    on_error: skip
+
+  # ── Step 5: Thread narrative synthesis ─────────────────────────────────
+  # Rust: for each thread, gathers assigned topics from L1 nodes, sorts chronologically
+  #   by source_node ID, marks topics at >=70% position as "[LATE -- AUTHORITATIVE]",
+  #   then synthesizes via THREAD_NARRATIVE_PROMPT.
+  # Node IDs: "L2-{thread_idx:03}"
+  # Step type saved as "synth" at depth 2.
+  - name: l2_thread_narrative
+    primitive: synthesize
+    instruction: "prompts/conversation/thread_narrative.md"
+    for_each: thread_assignments
+    node_id_pattern: "L2-{index:03}"
+    depth: 2
+    model_tier: mid
+    temperature: 0.3
+    on_error: skip
+
+  # ── Step 6: Upper layers (L3+ recursive pairing to apex) ──────────────
+  # Rust: build_upper_layers(db, writer_tx, llm_config, slug, 2, ...)
+  # Starts at depth 2 (L2 thread nodes). At each depth:
+  #   - Gets all nodes at current depth
+  #   - If <=1 node, that's the apex — done
+  #   - Otherwise pairs adjacent nodes, synthesizes with DISTILL_PROMPT
+  #   - Node IDs: "L{depth}-{pair_idx:03}"
+  #   - On LLM failure: retries up to 3 times, then carries left node forward
+  # Continues until single apex node remains.
+  - name: upper_layer_synthesis
+    primitive: synthesize
+    instruction: "prompts/conversation/distill.md"
+    recursive_pair: true
+    depth: 2
+    node_id_pattern: "L{depth}-{index:03}"
+    model_tier: mid
+    temperature: 0.3
+    on_error: "retry(3)"
+
+post_build: []

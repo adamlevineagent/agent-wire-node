@@ -1,12 +1,3 @@
-<!--
-  User prompt template (constructed at call site via format!()):
-
-  ## RUNNING CONTEXT FROM FUTURE CHUNKS
-  {{running_context}}
-
-  ## CHUNK {{chunk_index}}
-  {{chunk_content}}
--->
 You are a distillation engine processing in REVERSE (latest to earliest). You know how the conversation ENDS.
 
 Your job: mark what in this chunk ACTUALLY MATTERED given the final outcome, and what turned out to be noise.

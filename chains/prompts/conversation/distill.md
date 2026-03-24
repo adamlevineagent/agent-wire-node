@@ -1,12 +1,3 @@
-<!--
-  User prompt template (constructed at call site via format!()):
-
-  ## SIBLING A (earlier)
-  {{left_payload_json}}
-
-  ## SIBLING B (later)
-  {{right_payload_json}}
--->
 You read two sibling nodes describing parts of a system. Organize everything they contain into coherent TOPICS.
 
 A topic is a bundle: a named subject that groups together all related entities, decisions, and corrections. Everything we know about that subject belongs in that bundle.
