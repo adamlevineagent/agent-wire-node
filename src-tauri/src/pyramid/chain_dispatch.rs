@@ -50,7 +50,7 @@ pub async fn dispatch_step(
             .as_deref()
             .ok_or_else(|| anyhow!("Mechanical step '{}' missing rust_function", step.name))?;
         info!(
-            "[chain] step '{}' → mechanical fn '{}'",
+            "[CHAIN] step '{}' → mechanical fn '{}'",
             step.name, fn_name
         );
         dispatch_mechanical(fn_name, resolved_input, ctx)
@@ -85,7 +85,7 @@ fn resolve_model(step: &ChainStep, defaults: &ChainDefaults, config: &LlmConfig)
         "max" => config.fallback_model_2.clone(),
         other => {
             warn!(
-                "[chain] Unknown model_tier '{}', falling back to primary",
+                "[CHAIN] Unknown model_tier '{}', falling back to primary",
                 other
             );
             config.primary_model.clone()
@@ -115,7 +115,7 @@ async fn dispatch_llm(
         .unwrap_or_else(|_| resolved_input.to_string());
 
     info!(
-        "[chain] step '{}' → LLM (temp={}, prompt_len={})",
+        "[CHAIN] step '{}' → LLM (temp={}, prompt_len={})",
         step.name,
         temperature,
         user_prompt.len()
@@ -126,13 +126,13 @@ async fn dispatch_llm(
 
     match llm::extract_json(&response) {
         Ok(json) => {
-            info!("[chain] step '{}' → JSON parsed OK", step.name);
+            info!("[CHAIN] step '{}' → JSON parsed OK", step.name);
             Ok(json)
         }
         Err(_first_err) => {
             // JSON-retry guarantee: retry at temperature 0.1
             info!(
-                "[chain] step '{}' → JSON parse failed, retrying at temp 0.1",
+                "[CHAIN] step '{}' → JSON parse failed, retrying at temp 0.1",
                 step.name
             );
             let retry_response =

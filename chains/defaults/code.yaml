@@ -136,7 +136,7 @@ steps:
     merge_instruction: "prompts/conversation/merge.md"
     depth: 1
     save_as: thread_assignments
-    model_tier: mid
+    model: "qwen/qwen3.5-flash-02-23"
     temperature: 0.3
     on_error: skip
 

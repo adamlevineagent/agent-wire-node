@@ -7,3 +7,5 @@ target/
 *.key
 .env
 .env.*
+.lab/
+run.log

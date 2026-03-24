@@ -411,10 +411,10 @@ pub async fn execute_chain(
         let saves_node = step.save_as.as_deref() == Some("node");
 
         info!(
-            "=== Step {}/{}: '{}' (primitive: {}) ===",
+            "[CHAIN] step \"{}\" started ({}/{}, primitive: {})",
+            step.name,
             step_idx + 1,
             chain.steps.len(),
-            step.name,
             step.primitive,
         );
 
@@ -463,6 +463,7 @@ pub async fn execute_chain(
 
         match step_result {
             Ok(output) => {
+                info!("[CHAIN] step \"{}\" complete", step.name);
                 if !output.is_null() {
                     ctx.step_outputs.insert(step.name.clone(), output);
                 }
@@ -470,17 +471,17 @@ pub async fn execute_chain(
             Err(e) => {
                 match error_strategy {
                     ErrorStrategy::Abort => {
-                        error!("Step '{}' failed (abort): {e}", step.name);
+                        error!("[CHAIN] step \"{}\" FAILED (abort): {e}", step.name);
                         drop(writer_tx);
                         let _ = writer_handle.await;
                         return Err(anyhow!("Chain aborted at step '{}': {e}", step.name));
                     }
                     ErrorStrategy::Skip => {
-                        warn!("Step '{}' failed (skip): {e}", step.name);
+                        warn!("[CHAIN] step \"{}\" FAILED (skip): {e}", step.name);
                         total_failures += 1;
                     }
                     _ => {
-                        warn!("Step '{}' failed: {e}", step.name);
+                        warn!("[CHAIN] step \"{}\" FAILED: {e}", step.name);
                         total_failures += 1;
                     }
                 }
@@ -558,6 +559,7 @@ async fn execute_for_each(
         }
     };
 
+    info!("[CHAIN] [{}] forEach: {} items", step.name, items.len());
     let mut outputs: Vec<Value> = Vec::with_capacity(items.len());
     let mut failures: i32 = 0;
 
@@ -602,7 +604,7 @@ async fn execute_for_each(
 
         match resume {
             ResumeState::Complete => {
-                info!("  [{}] {} -- resumed (complete)", step.name, node_id);
+                info!("[CHAIN] [{}] {} -- resumed (complete)", step.name, node_id);
 
                 // For sequential steps, replay output to reconstruct accumulators
                 if step.sequential {
@@ -632,7 +634,7 @@ async fn execute_for_each(
                 continue;
             }
             ResumeState::StaleStep => {
-                warn!("  [{}] {} -- stale step (node missing), rebuilding", step.name, node_id);
+                warn!("[CHAIN] [{}] {} -- stale step (node missing), rebuilding", step.name, node_id);
             }
             ResumeState::Missing => {}
         }
@@ -693,7 +695,7 @@ async fn execute_for_each(
                 }
 
                 outputs.push(analysis);
-                info!("  [{}] {node_id} complete ({elapsed:.1}s)", step.name);
+                info!("[CHAIN] [{}] {node_id} complete ({elapsed:.1}s)", step.name);
             }
             Err(e) => {
                 match error_strategy {
@@ -701,7 +703,7 @@ async fn execute_for_each(
                         return Err(anyhow!("forEach abort at index {index}: {e}"));
                     }
                     _ => {
-                        warn!("  [{}] {node_id} failed (skip): {e}", step.name);
+                        warn!("[CHAIN] [{}] {node_id} FAILED (skip): {e}", step.name);
                         failures += 1;
                         outputs.push(Value::Null);
                     }
@@ -802,7 +804,7 @@ async fn execute_pair_adjacent(
     .await?;
 
     if source_nodes.len() <= 1 {
-        info!("  pair_adjacent: {} node(s) at depth {source_depth}, nothing to pair", source_nodes.len());
+        info!("[CHAIN] pair_adjacent: {} node(s) at depth {source_depth}, nothing to pair", source_nodes.len());
         return Ok((Vec::new(), 0));
     }
 
@@ -841,7 +843,7 @@ async fn execute_pair_adjacent(
                 continue;
             }
             ResumeState::StaleStep => {
-                warn!("  [{}] {node_id} -- stale, rebuilding", step.name);
+                warn!("[CHAIN] [{}] {node_id} -- stale, rebuilding", step.name);
             }
             ResumeState::Missing => {}
         }
@@ -864,7 +866,7 @@ async fn execute_pair_adjacent(
                             return Err(anyhow!("pair_adjacent abort at pair {pair_idx}: {e}"));
                         }
                         ErrorStrategy::CarryLeft | ErrorStrategy::CarryUp => {
-                            warn!("  [{}] Pair {pair_idx} failed, carrying left node: {e}", step.name);
+                            warn!("[CHAIN] [{}] pair {pair_idx} FAILED, carrying left node: {e}", step.name);
                             carry_node_up(
                                 writer_tx, left, &node_id, &ctx.slug, target_depth,
                                 &[&left.id, &right.id],
@@ -874,7 +876,7 @@ async fn execute_pair_adjacent(
                             outputs.push(Value::Null);
                         }
                         _ => {
-                            warn!("  [{}] Pair {pair_idx} failed (skip): {e}", step.name);
+                            warn!("[CHAIN] [{}] pair {pair_idx} FAILED (skip): {e}", step.name);
                             failures += 1;
                             outputs.push(Value::Null);
                         }
@@ -886,7 +888,7 @@ async fn execute_pair_adjacent(
         } else {
             // Odd node: carry up without LLM call
             let carry = &source_nodes[i];
-            info!("  [{}] Carry up odd node: {} -> {node_id}", step.name, carry.id);
+            info!("[CHAIN] [{}] carry up odd node: {} -> {node_id}", step.name, carry.id);
             carry_node_up(writer_tx, carry, &node_id, &ctx.slug, target_depth, &[&carry.id]).await;
             outputs.push(Value::Null);
             i += 1;
@@ -983,7 +985,7 @@ async fn dispatch_pair(
         send_update_parent(writer_tx, &ctx.slug, &right.id, node_id).await;
     }
 
-    info!("  [{} + {}] -> {node_id} ({elapsed:.1}s)", left.id, right.id);
+    info!("[CHAIN] [{} + {}] -> {node_id} ({elapsed:.1}s)", left.id, right.id);
 
     Ok(analysis)
 }
@@ -1027,7 +1029,7 @@ async fn execute_recursive_pair(
                 .map(|n| n.id.clone())
                 .unwrap_or_default();
             if !apex_id.is_empty() {
-                info!("=== APEX: {apex_id} at depth {depth} ===");
+                info!("[CHAIN] === APEX: {apex_id} at depth {depth} ===");
             }
             return Ok((apex_id, total_failures));
         }
@@ -1043,7 +1045,7 @@ async fn execute_recursive_pair(
         .await?;
 
         if existing >= expected as i64 {
-            info!("  Depth {target_depth}: {existing} nodes (already complete)");
+            info!("[CHAIN] depth {target_depth}: {existing} nodes (already complete)");
             *done += existing;
             send_progress(progress_tx, *done, total).await;
             depth = target_depth;
@@ -1084,7 +1086,7 @@ async fn execute_recursive_pair(
                     continue;
                 }
                 ResumeState::StaleStep => {
-                    warn!("  [{}] {node_id} -- stale, rebuilding", step.name);
+                    warn!("[CHAIN] [{}] {node_id} -- stale, rebuilding", step.name);
                 }
                 ResumeState::Missing => {}
             }
@@ -1135,7 +1137,7 @@ async fn execute_recursive_pair(
             } else {
                 // Carry up odd node
                 let carry = &current_nodes[i];
-                info!("  [{}] Carry up odd: {} -> {node_id}", step.name, carry.id);
+                info!("[CHAIN] [{}] carry up odd: {} -> {node_id}", step.name, carry.id);
                 carry_node_up(writer_tx, carry, &node_id, &ctx.slug, target_depth, &[&carry.id]).await;
                 i += 1;
             }
@@ -1199,7 +1201,7 @@ async fn execute_single(
     }
 
     if resume == ResumeState::StaleStep {
-        warn!("  [{}] {node_id} -- stale, rebuilding", step.name);
+        warn!("[CHAIN] [{}] {node_id} -- stale, rebuilding", step.name);
     }
 
     let instruction = step.instruction.as_deref().unwrap_or("");
@@ -1250,7 +1252,7 @@ async fn execute_single(
     *done += 1;
     send_progress(progress_tx, *done, total).await;
 
-    info!("  [{}] {node_id} complete ({elapsed:.1}s)", step.name);
+    info!("[CHAIN] [{}] {node_id} complete ({elapsed:.1}s)", step.name);
 
     Ok(analysis)
 }
@@ -1264,7 +1266,7 @@ async fn execute_mechanical(
     dispatch_ctx: &chain_dispatch::StepContext,
     defaults: &super::chain_engine::ChainDefaults,
 ) -> Result<Value> {
-    info!("  Mechanical step '{}' dispatching...", step.name);
+    info!("[CHAIN] mechanical step \"{}\" dispatching...", step.name);
 
     // Resolve input
     let resolved_input = if let Some(ref input) = step.input {
