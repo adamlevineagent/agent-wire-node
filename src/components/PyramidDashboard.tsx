@@ -1,9 +1,12 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { open } from '@tauri-apps/plugin-dialog';
 import { AddWorkspace } from './AddWorkspace';
 import { BuildProgress } from './BuildProgress';
+import { VineBuildProgress } from './VineBuildProgress';
 import { DADBEARPanel } from './DADBEARPanel';
 import { FAQDirectory } from './FAQDirectory';
+import { VineViewer } from './VineViewer';
 
 interface SlugInfo {
     slug: string;
@@ -27,7 +30,7 @@ interface DadbearStatus {
     breaker_tripped: boolean;
 }
 
-type View = 'list' | 'add' | 'building' | 'dadbear' | 'faq';
+type View = 'list' | 'add' | 'building' | 'dadbear' | 'faq' | 'vine';
 
 export function PyramidDashboard() {
     const [slugs, setSlugs] = useState<SlugInfo[]>([]);
@@ -39,6 +42,9 @@ export function PyramidDashboard() {
     const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
     const [selectedSlug, setSelectedSlug] = useState<string | null>(null);
     const [dadbearStatuses, setDadbearStatuses] = useState<Record<string, DadbearStatus>>({});
+    const [vineAddFolders, setVineAddFolders] = useState<string | null>(null); // slug being edited
+    const [vineNewPaths, setVineNewPaths] = useState<string[]>([]);
+    const [vinePastePath, setVinePastePath] = useState('');
 
     const fetchDadbearStatuses = useCallback(async (slugList: SlugInfo[]) => {
         const statuses: Record<string, DadbearStatus> = {};
@@ -99,6 +105,74 @@ export function PyramidDashboard() {
         window.open(`http://localhost:3333/space/${slug}`, '_blank');
     }, []);
 
+    const handleVineAddFoldersOpen = useCallback((s: SlugInfo) => {
+        // Parse existing directories from source_path (semicolon-joined)
+        const existingDirs = s.source_path ? s.source_path.split(';').filter(Boolean) : [];
+        setVineNewPaths(existingDirs);
+        setVineAddFolders(s.slug);
+        setVinePastePath('');
+    }, []);
+
+    const handleVinePickNewDir = useCallback(async () => {
+        try {
+            const selected = await open({
+                directory: true,
+                title: 'Add JSONL Directory to Vine',
+                multiple: true,
+            });
+            if (selected) {
+                const newPaths = Array.isArray(selected) ? selected : [selected];
+                setVineNewPaths(prev => {
+                    const combined = [...prev];
+                    for (const p of newPaths) {
+                        if (!combined.includes(p)) combined.push(p);
+                    }
+                    return combined;
+                });
+            }
+        } catch (err) {
+            setError(String(err));
+        }
+    }, []);
+
+    const handleVineAddPastePath = useCallback(() => {
+        const val = vinePastePath.trim();
+        if (!val) return;
+        setVineNewPaths(prev => {
+            if (prev.includes(val)) return prev;
+            return [...prev, val];
+        });
+        setVinePastePath('');
+    }, [vinePastePath]);
+
+    const handleVineRebuildWithFolders = useCallback(async () => {
+        if (!vineAddFolders || vineNewPaths.length === 0) return;
+        setError(null);
+        try {
+            // Update the slug's source_path
+            const newSourcePath = vineNewPaths.join(';');
+            await invoke('pyramid_create_slug', {
+                slug: vineAddFolders,
+                contentType: 'vine',
+                sourcePath: newSourcePath,
+            }).catch(() => {
+                // Slug may already exist — that's fine, we just need to rebuild
+            });
+
+            // Trigger vine rebuild via Tauri command
+            await invoke('pyramid_vine_build', {
+                vineSlug: vineAddFolders,
+                jsonlDirs: vineNewPaths,
+            });
+
+            setBuildingSlug(vineAddFolders);
+            setVineAddFolders(null);
+            setView('building');
+        } catch (err) {
+            setError(String(err));
+        }
+    }, [vineAddFolders, vineNewPaths]);
+
     const handleAddComplete = useCallback(() => {
         setView('list');
         fetchSlugs();
@@ -119,6 +193,7 @@ export function PyramidDashboard() {
             case 'code': return 'Code';
             case 'document': return 'Documents';
             case 'conversation': return 'Conversation';
+            case 'vine': return 'Vine';
             default: return ct;
         }
     };
@@ -128,6 +203,7 @@ export function PyramidDashboard() {
             case 'code': return 'badge-code';
             case 'document': return 'badge-document';
             case 'conversation': return 'badge-conversation';
+            case 'vine': return 'badge-vine';
             default: return '';
         }
     };
@@ -217,7 +293,41 @@ Always include the "Generalized understanding:" section — this triggers FAQ ge
         );
     }
 
+    if (view === 'vine' && selectedSlug) {
+        const vineInfo = slugs.find(s => s.slug === selectedSlug);
+        return (
+            <VineViewer
+                slug={selectedSlug}
+                nodeCount={vineInfo?.node_count ?? 0}
+                lastBuiltAt={vineInfo?.last_built_at ?? null}
+                onBack={() => {
+                    setSelectedSlug(null);
+                    setView('list');
+                    fetchSlugs();
+                }}
+                onOpenBunch={(bunchSlug) => {
+                    window.open(`http://localhost:3333/space/${bunchSlug}`, '_blank');
+                }}
+            />
+        );
+    }
+
     if (view === 'building' && buildingSlug) {
+        const buildSlugInfo = slugs.find(s => s.slug === buildingSlug);
+        const isVineBuild = buildSlugInfo?.content_type === 'vine';
+        if (isVineBuild) {
+            return (
+                <VineBuildProgress
+                    slug={buildingSlug}
+                    onComplete={handleBuildComplete}
+                    onClose={() => {
+                        setBuildingSlug(null);
+                        setView('list');
+                        fetchSlugs();
+                    }}
+                />
+            );
+        }
         return (
             <BuildProgress
                 slug={buildingSlug}
@@ -330,13 +440,32 @@ Always include the "Generalized understanding:" section — this triggers FAQ ge
                             </div>
 
                             <div className="pyramid-card-actions">
-                                <button
-                                    className="btn btn-small btn-primary"
-                                    onClick={() => handleOpenVibesmithy(s.slug)}
-                                    disabled={s.node_count === 0}
-                                >
-                                    Open in Vibesmithy
-                                </button>
+                                {s.content_type === 'vine' ? (
+                                    <>
+                                        <button
+                                            className="btn btn-small btn-primary"
+                                            onClick={() => { setSelectedSlug(s.slug); setView('vine'); }}
+                                            disabled={s.node_count === 0}
+                                        >
+                                            Open Vine
+                                        </button>
+                                        <button
+                                            className="btn btn-small btn-secondary vine-add-folders-btn"
+                                            onClick={() => handleVineAddFoldersOpen(s)}
+                                            title="Add folders to vine"
+                                        >
+                                            &#x1F4C1;+ Add Folders
+                                        </button>
+                                    </>
+                                ) : (
+                                    <button
+                                        className="btn btn-small btn-primary"
+                                        onClick={() => handleOpenVibesmithy(s.slug)}
+                                        disabled={s.node_count === 0}
+                                    >
+                                        Open in Vibesmithy
+                                    </button>
+                                )}
                                 <button
                                     className={`pyramid-card-dadbear-btn${dadbearStatuses[s.slug]?.frozen ? ' dadbear-attention-frozen' : ''}${dadbearStatuses[s.slug]?.breaker_tripped ? ' dadbear-attention-tripped' : ''}`}
                                     onClick={() => { setSelectedSlug(s.slug); setView('dadbear'); }}
@@ -387,6 +516,74 @@ Always include the "Generalized understanding:" section — this triggers FAQ ge
                             </div>
                         </div>
                     ))}
+                </div>
+            )}
+
+            {/* Vine Add Folders Dialog */}
+            {vineAddFolders && (
+                <div className="vine-add-folders-overlay">
+                    <div className="vine-add-folders-dialog">
+                        <h3>Add Folders to Vine: {vineAddFolders}</h3>
+                        <p className="step-description">
+                            Add directories containing JSONL conversation files.
+                        </p>
+
+                        <div className="selected-paths" style={{ marginBottom: '12px', maxHeight: '200px', overflowY: 'auto' }}>
+                            {vineNewPaths.map((p, i) => (
+                                <div key={p} className="selected-path-row">
+                                    <span className="selected-path-text">{p}</span>
+                                    <button
+                                        className="btn btn-ghost btn-sm"
+                                        onClick={() => setVineNewPaths(prev => prev.filter((_, idx) => idx !== i))}
+                                        title="Remove"
+                                    >
+                                        &times;
+                                    </button>
+                                </div>
+                            ))}
+                        </div>
+
+                        <div style={{ display: 'flex', gap: '8px', marginBottom: '8px' }}>
+                            <input
+                                type="text"
+                                placeholder="Paste a path..."
+                                className="input"
+                                style={{ flex: 1 }}
+                                value={vinePastePath}
+                                onChange={(e) => setVinePastePath(e.target.value)}
+                                onKeyDown={(e) => {
+                                    if (e.key === 'Enter') handleVineAddPastePath();
+                                }}
+                            />
+                            <button
+                                className="btn btn-secondary"
+                                onClick={handleVineAddPastePath}
+                                disabled={!vinePastePath.trim()}
+                            >
+                                +
+                            </button>
+                            <button className="btn btn-primary" onClick={handleVinePickNewDir}>
+                                Browse...
+                            </button>
+                        </div>
+
+                        <div className="vine-hint">
+                            Use <kbd>Cmd+Shift+.</kbd> to show hidden folders in the file picker.
+                        </div>
+
+                        <div className="step-nav" style={{ marginTop: '16px' }}>
+                            <button className="btn btn-ghost" onClick={() => { setVineAddFolders(null); setVineNewPaths([]); }}>
+                                Cancel
+                            </button>
+                            <button
+                                className="btn btn-primary"
+                                onClick={handleVineRebuildWithFolders}
+                                disabled={vineNewPaths.length === 0}
+                            >
+                                Rebuild Vine
+                            </button>
+                        </div>
+                    </div>
                 </div>
             )}
         </div>

@@ -10,8 +10,8 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use tokio::process::{Child, Command};
 use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::{Child, Command};
 
 /// Tunnel state stored locally
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -217,7 +217,11 @@ pub async fn provision_tunnel(
     tracing::info!(
         "Tunnel provisioned: {} ({})",
         provision.tunnel_url,
-        if provision.existing { "existing" } else { "new" }
+        if provision.existing {
+            "existing"
+        } else {
+            "new"
+        }
     );
 
     Ok(TunnelState {
@@ -231,10 +235,7 @@ pub async fn provision_tunnel(
 // --- Tunnel Process Management ----------------------------------------------
 
 /// Start cloudflared tunnel run with the given token
-pub async fn start_tunnel(
-    data_dir: &Path,
-    tunnel_token: &str,
-) -> Result<Child, String> {
+pub async fn start_tunnel(data_dir: &Path, tunnel_token: &str) -> Result<Child, String> {
     let binary_path = cloudflared_binary_path(data_dir);
 
     if !binary_path.exists() {
@@ -295,41 +296,40 @@ pub async fn monitor_tunnel_output(child: &mut Child) -> TunnelConnectionStatus 
 
         let mut connected = false;
         for _ in 0..50 {
-            match tokio::time::timeout(
-                tokio::time::Duration::from_secs(10),
-                lines.next_line(),
-            ).await {
+            match tokio::time::timeout(tokio::time::Duration::from_secs(10), lines.next_line())
+                .await
+            {
                 Ok(Ok(Some(line))) => {
                     tracing::debug!("cloudflared: {}", line);
 
-                    if line.contains("Registered tunnel connection") ||
-                       line.contains("Connection registered") ||
-                       line.contains("connIndex=") {
+                    if line.contains("Registered tunnel connection")
+                        || line.contains("Connection registered")
+                        || line.contains("connIndex=")
+                    {
                         connected = true;
                         break;
                     }
 
                     let lower = line.to_lowercase();
-                    let is_benign =
-                        lower.contains("failed to sufficiently") ||
-                        lower.contains("update check") ||
-                        lower.contains("buffer size") ||
-                        lower.contains("metrics server") ||
-                        lower.contains("capacity") ||
-                        (lower.contains(" inf ") && !lower.contains("tunnel connection failed"));
+                    let is_benign = lower.contains("failed to sufficiently")
+                        || lower.contains("update check")
+                        || lower.contains("buffer size")
+                        || lower.contains("metrics server")
+                        || lower.contains("capacity")
+                        || (lower.contains(" inf ") && !lower.contains("tunnel connection failed"));
 
-                    if !is_benign && (
-                        lower.contains(" err ") ||
-                        lower.contains("\"level\":\"error\"") ||
-                        lower.contains("failed to connect to edge") ||
-                        lower.contains("tunnel connection failed") ||
-                        lower.contains("authentication failed") ||
-                        lower.contains("credential") && lower.contains("error")
-                    ) {
+                    if !is_benign
+                        && (lower.contains(" err ")
+                            || lower.contains("\"level\":\"error\"")
+                            || lower.contains("failed to connect to edge")
+                            || lower.contains("tunnel connection failed")
+                            || lower.contains("authentication failed")
+                            || lower.contains("credential") && lower.contains("error"))
+                    {
                         tracing::warn!("cloudflared error: {}", line);
-                        tokio::spawn(async move {
-                            while let Ok(Some(_)) = lines.next_line().await {}
-                        });
+                        tokio::spawn(
+                            async move { while let Ok(Some(_)) = lines.next_line().await {} },
+                        );
                         return TunnelConnectionStatus::Error(line);
                     }
                 }

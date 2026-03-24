@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "pyramid": {
+      "command": "node",
+      "args": ["/Users/adamlevine/AI Project Files/agent-wire-node/mcp-server/dist/index.js"],
+      "env": {
+        "PYRAMID_AUTH_TOKEN": "vibesmithy-test-token"
+      }
+    }
+  }
+}

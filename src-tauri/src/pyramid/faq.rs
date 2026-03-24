@@ -5,18 +5,18 @@
 //   match_faq          — given a free-text question, find the best matching FAQ
 //   update_faq_answer  — merge new annotation content into an existing FAQ answer
 
+use anyhow::Result;
+use rusqlite::Connection;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use rusqlite::Connection;
-use anyhow::Result;
 use tracing::{info, warn};
 use uuid::Uuid;
 
+use super::config_helper::{config_for_model, estimate_cost};
 use super::db;
 use super::llm::LlmConfig;
-use super::config_helper::{config_for_model, estimate_cost};
 use super::llm::{call_model_with_usage, extract_json};
-use super::types::{FaqNode, FaqCategory, FaqDirectory, FaqCategoryEntry, PyramidAnnotation};
+use super::types::{FaqCategory, FaqCategoryEntry, FaqDirectory, FaqNode, PyramidAnnotation};
 
 /// Called after every annotation is saved.
 ///
@@ -36,7 +36,10 @@ pub async fn process_annotation(
     let question_context = match &annotation.question_context {
         Some(q) if !q.trim().is_empty() => q.clone(),
         _ => {
-            info!("[faq] annotation {} has no question_context, skipping", annotation.id);
+            info!(
+                "[faq] annotation {} has no question_context, skipping",
+                annotation.id
+            );
             return Ok(None);
         }
     };
@@ -49,8 +52,12 @@ pub async fn process_annotation(
 
     if existing_faqs.is_empty() {
         // No existing FAQs — create a new one directly
-        info!("[faq] no existing FAQs for slug '{}', creating new FAQ", slug);
-        let faq = create_new_faq(writer, slug, &question_context, annotation, api_key, model).await?;
+        info!(
+            "[faq] no existing FAQs for slug '{}', creating new FAQ",
+            slug
+        );
+        let faq =
+            create_new_faq(writer, slug, &question_context, annotation, api_key, model).await?;
         return Ok(Some(faq));
     }
 
@@ -58,7 +65,15 @@ pub async fn process_annotation(
     let faq_list: String = existing_faqs
         .iter()
         .enumerate()
-        .map(|(i, f)| format!("{}. [{}] {} (triggers: {})", i + 1, f.id, f.question, f.match_triggers.join("; ")))
+        .map(|(i, f)| {
+            format!(
+                "{}. [{}] {} (triggers: {})",
+                i + 1,
+                f.id,
+                f.question,
+                f.match_triggers.join("; ")
+            )
+        })
         .collect::<Vec<_>>()
         .join("\n");
 
@@ -83,15 +98,22 @@ pub async fn process_annotation(
 
     if let Some(faq_id) = response.strip_prefix("MATCH:") {
         let faq_id = faq_id.trim();
-        info!("[faq] annotation {} matched existing FAQ {}", annotation.id, faq_id);
+        info!(
+            "[faq] annotation {} matched existing FAQ {}",
+            annotation.id, faq_id
+        );
 
         // Update the matched FAQ with new annotation content
         let updated = update_faq_answer(reader, writer, faq_id, annotation, api_key, model).await?;
         Ok(Some(updated))
     } else {
         // NEW — create a fresh FAQ
-        info!("[faq] annotation {} generates new FAQ for slug '{}'", annotation.id, slug);
-        let faq = create_new_faq(writer, slug, &question_context, annotation, api_key, model).await?;
+        info!(
+            "[faq] annotation {} generates new FAQ for slug '{}'",
+            annotation.id, slug
+        );
+        let faq =
+            create_new_faq(writer, slug, &question_context, annotation, api_key, model).await?;
         Ok(Some(faq))
     }
 }
@@ -133,13 +155,24 @@ pub async fn match_faq(
         .map(|faq| {
             // Score against the canonical question
             let question_lower = faq.question.to_lowercase();
-            let question_score = query_words.iter().filter(|w| question_lower.contains(w.as_str())).count();
+            let question_score = query_words
+                .iter()
+                .filter(|w| question_lower.contains(w.as_str()))
+                .count();
 
             // Score against each match trigger and take the max
-            let trigger_score = faq.match_triggers.iter().map(|trigger| {
-                let trigger_lower = trigger.to_lowercase();
-                query_words.iter().filter(|w| trigger_lower.contains(w.as_str())).count()
-            }).max().unwrap_or(0);
+            let trigger_score = faq
+                .match_triggers
+                .iter()
+                .map(|trigger| {
+                    let trigger_lower = trigger.to_lowercase();
+                    query_words
+                        .iter()
+                        .filter(|w| trigger_lower.contains(w.as_str()))
+                        .count()
+                })
+                .max()
+                .unwrap_or(0);
 
             let best_score = question_score.max(trigger_score);
             (best_score, faq)
@@ -176,7 +209,14 @@ pub async fn match_faq(
     }
 
     // Multiple candidates — use LLM to disambiguate
-    match_faq_with_llm(writer, question, &candidates.into_iter().cloned().collect::<Vec<_>>(), api_key, model).await
+    match_faq_with_llm(
+        writer,
+        question,
+        &candidates.into_iter().cloned().collect::<Vec<_>>(),
+        api_key,
+        model,
+    )
+    .await
 }
 
 /// Use LLM to pick the best matching FAQ from a list.
@@ -191,7 +231,15 @@ async fn match_faq_with_llm(
     let faq_list: String = candidates
         .iter()
         .enumerate()
-        .map(|(i, f)| format!("{}. [{}] {} (triggers: {})", i + 1, f.id, f.question, f.match_triggers.join("; ")))
+        .map(|(i, f)| {
+            format!(
+                "{}. [{}] {} (triggers: {})",
+                i + 1,
+                f.id,
+                f.question,
+                f.match_triggers.join("; ")
+            )
+        })
         .collect::<Vec<_>>()
         .join("\n");
 
@@ -271,7 +319,8 @@ pub async fn update_faq_answer(
         new_annotation.question_context.as_deref().unwrap_or("(none)")
     );
 
-    let updated_answer = super::llm::call_model(&config, system_prompt, &user_prompt, 0.3, 2000).await?;
+    let updated_answer =
+        super::llm::call_model(&config, system_prompt, &user_prompt, 0.3, 2000).await?;
 
     // Append the new annotation ID
     if !faq.annotation_ids.contains(&new_annotation.id) {
@@ -306,7 +355,10 @@ pub async fn update_faq_answer(
             Ok(regen_response) => {
                 let regen_response = regen_response.trim();
                 if regen_response != "NO_CHANGE" && !regen_response.is_empty() {
-                    info!("[faq] re-generalized FAQ {} question: '{}' -> '{}'", faq.id, faq.question, regen_response);
+                    info!(
+                        "[faq] re-generalized FAQ {} question: '{}' -> '{}'",
+                        faq.id, faq.question, regen_response
+                    );
                     faq.question = regen_response.to_string();
                 }
             }
@@ -324,7 +376,10 @@ pub async fn update_faq_answer(
         db::save_faq_node(&conn, &faq)?;
     }
 
-    info!("[faq] updated FAQ {} with annotation {}", faq.id, new_annotation.id);
+    info!(
+        "[faq] updated FAQ {} with annotation {}",
+        faq.id, new_annotation.id
+    );
     Ok(faq)
 }
 
@@ -345,9 +400,12 @@ async fn create_new_faq(
     let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
 
     // Check for the generalization signal in annotation content
-    let (final_question, match_triggers) = if let Some(gen_pos) = annotation.content.find("Generalized understanding:") {
+    let (final_question, match_triggers) = if let Some(gen_pos) =
+        annotation.content.find("Generalized understanding:")
+    {
         // Extract the generalized text after the signal
-        let generalized_text = annotation.content[gen_pos + "Generalized understanding:".len()..].trim();
+        let generalized_text =
+            annotation.content[gen_pos + "Generalized understanding:".len()..].trim();
 
         // Call LLM to produce a generalized question
         let config = LlmConfig {
@@ -369,16 +427,24 @@ async fn create_new_faq(
             Ok(generalized_question) => {
                 let generalized_question = generalized_question.trim().to_string();
                 if generalized_question.is_empty() {
-                    warn!("[faq] LLM returned empty generalized question, falling back to original");
+                    warn!(
+                        "[faq] LLM returned empty generalized question, falling back to original"
+                    );
                     (question.to_string(), Vec::new())
                 } else {
-                    info!("[faq] generalized question: '{}' -> '{}'", question, generalized_question);
+                    info!(
+                        "[faq] generalized question: '{}' -> '{}'",
+                        question, generalized_question
+                    );
                     // Original question becomes the first match trigger
                     (generalized_question, vec![question.to_string()])
                 }
             }
             Err(e) => {
-                warn!("[faq] generalization LLM call failed: {}, falling back to original question", e);
+                warn!(
+                    "[faq] generalization LLM call failed: {}, falling back to original question",
+                    e
+                );
                 (question.to_string(), Vec::new())
             }
         }
@@ -457,7 +523,10 @@ pub async fn get_faq_directory(
         match run_faq_category_meta_pass(reader, writer, slug, &all_faqs, api_key, model).await {
             Ok(cats) => cats,
             Err(e) => {
-                warn!("[faq] category meta-pass failed for '{}': {}, falling back to flat mode", slug, e);
+                warn!(
+                    "[faq] category meta-pass failed for '{}': {}, falling back to flat mode",
+                    slug, e
+                );
                 return Ok(FaqDirectory {
                     slug: slug.to_string(),
                     mode: "flat".to_string(),
@@ -472,7 +541,8 @@ pub async fn get_faq_directory(
     };
 
     // Build category entries
-    let mut categorized_faq_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut categorized_faq_ids: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
     let mut entries: Vec<FaqCategoryEntry> = Vec::new();
 
     for cat in categories {
@@ -516,7 +586,14 @@ pub async fn run_faq_category_meta_pass(
 ) -> Result<Vec<FaqCategory>> {
     let faq_list: String = faqs
         .iter()
-        .map(|f| format!("- [{}] Q: {} | A: {}", f.id, f.question, &f.answer[..f.answer.len().min(200)]))
+        .map(|f| {
+            format!(
+                "- [{}] Q: {} | A: {}",
+                f.id,
+                f.question,
+                &f.answer[..f.answer.len().min(200)]
+            )
+        })
         .collect::<Vec<_>>()
         .join("\n");
 
@@ -534,7 +611,8 @@ Return ONLY valid JSON: an array of objects with fields "name", "faq_ids", and "
     );
 
     let config = config_for_model(api_key, model);
-    let (response, usage) = call_model_with_usage(&config, system_prompt, &user_prompt, 0.3, 4096).await?;
+    let (response, usage) =
+        call_model_with_usage(&config, system_prompt, &user_prompt, 0.3, 4096).await?;
 
     // Log cost
     let cost = estimate_cost(&usage);
@@ -571,19 +649,26 @@ Return ONLY valid JSON: an array of objects with fields "name", "faq_ids", and "
     }
 
     for raw in categories_raw {
-        let name = raw.get("name")
+        let name = raw
+            .get("name")
             .and_then(|v| v.as_str())
             .unwrap_or("Uncategorized")
             .to_string();
 
-        let summary = raw.get("summary")
+        let summary = raw
+            .get("summary")
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
 
-        let faq_ids: Vec<String> = raw.get("faq_ids")
+        let faq_ids: Vec<String> = raw
+            .get("faq_ids")
             .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
             .unwrap_or_default();
 
         let cat = FaqCategory {
@@ -604,7 +689,11 @@ Return ONLY valid JSON: an array of objects with fields "name", "faq_ids", and "
         result.push(cat);
     }
 
-    info!("[faq] created {} categories for slug '{}'", result.len(), slug);
+    info!(
+        "[faq] created {} categories for slug '{}'",
+        result.len(),
+        slug
+    );
     Ok(result)
 }
 
@@ -620,7 +709,11 @@ pub async fn drill_faq_category(
         .ok_or_else(|| anyhow::anyhow!("FAQ category '{}' not found", category_id))?;
 
     if cat.slug != slug {
-        anyhow::bail!("Category '{}' does not belong to slug '{}'", category_id, slug);
+        anyhow::bail!(
+            "Category '{}' does not belong to slug '{}'",
+            category_id,
+            slug
+        );
     }
 
     // Load child FAQs by their IDs

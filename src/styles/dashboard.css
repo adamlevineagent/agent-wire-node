@@ -7556,6 +7556,12 @@ body {
     border: 1px solid rgba(64, 208, 128, 0.3);
 }
 
+.badge-vine {
+    background: rgba(240, 192, 64, 0.15);
+    color: var(--accent-warm);
+    border: 1px solid rgba(240, 192, 64, 0.3);
+}
+
 .pyramid-card-path {
     font-size: 12px;
     color: var(--text-muted);
@@ -9487,4 +9493,1161 @@ body {
     font-family: monospace;
     opacity: 0.4;
     pointer-events: none;
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   Vine Viewer — Timeline-based conversation viewer
+   ═══════════════════════════════════════════════════════════════════ */
+
+.vine-viewer {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    gap: 16px;
+    padding: 24px;
+    overflow: hidden;
+}
+
+.vine-viewer-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-shrink: 0;
+    gap: 16px;
+}
+
+.vine-viewer-header-left {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+
+.vine-viewer-title {
+    font-size: 20px;
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.vine-viewer-header-right {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+}
+
+.vine-viewer-stats {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 13px;
+    color: var(--text-secondary);
+}
+
+.vine-stat-sep {
+    color: var(--text-muted);
+}
+
+.vine-viewer-actions {
+    display: flex;
+    gap: 8px;
+}
+
+/* ── Apex Section ──────────────────────────────────────────────── */
+
+.vine-apex-section {
+    flex-shrink: 0;
+    background: var(--bg-card);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-md);
+    overflow: hidden;
+}
+
+.vine-apex-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 16px;
+    cursor: pointer;
+    user-select: none;
+    transition: background var(--transition);
+}
+
+.vine-apex-header:hover {
+    background: var(--bg-card-hover);
+}
+
+.vine-apex-header h3 {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--accent-purple);
+}
+
+.vine-apex-toggle {
+    color: var(--text-muted);
+    font-size: 12px;
+}
+
+.vine-apex-content {
+    padding: 0 16px 16px;
+    font-size: 13px;
+    line-height: 1.6;
+    color: var(--text-secondary);
+    white-space: pre-wrap;
+}
+
+/* ── Timeline Container ────────────────────────────────────────── */
+
+.vine-timeline-container {
+    flex: 1;
+    min-height: 0;
+    overflow: hidden;
+    position: relative;
+}
+
+.vine-timeline-scroll {
+    overflow-x: auto;
+    overflow-y: hidden;
+    height: 100%;
+    padding: 24px 0 16px;
+    scroll-behavior: smooth;
+    position: relative;
+}
+
+.vine-timeline-line {
+    position: absolute;
+    top: 50%;
+    left: 0;
+    right: 0;
+    height: 2px;
+    background: rgba(34, 211, 238, 0.15);
+    pointer-events: none;
+    z-index: 0;
+}
+
+.vine-timeline-items {
+    display: flex;
+    gap: 16px;
+    padding: 0 24px;
+    position: relative;
+    z-index: 1;
+    min-width: min-content;
+}
+
+/* ── Timeline Slot (era marker + card) ─────────────────────────── */
+
+.vine-timeline-slot {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+    flex-shrink: 0;
+}
+
+/* ── ERA Marker ────────────────────────────────────────────────── */
+
+.vine-era-marker {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 4px;
+    margin-bottom: 4px;
+}
+
+.vine-era-line {
+    width: 2px;
+    height: 20px;
+    background: var(--accent-purple);
+    opacity: 0.5;
+}
+
+.vine-era-label {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--accent-purple);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    white-space: nowrap;
+}
+
+.vine-transition-badge {
+    font-size: 10px;
+    font-weight: 500;
+    padding: 1px 8px;
+    border-radius: 8px;
+    border: 1px solid;
+    white-space: nowrap;
+    text-transform: lowercase;
+}
+
+/* ── Bunch Card ────────────────────────────────────────────────── */
+
+.vine-bunch-card {
+    width: 200px;
+    background: var(--bg-card);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-md);
+    padding: 14px;
+    cursor: pointer;
+    transition: all var(--transition);
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.vine-bunch-card:hover {
+    background: var(--bg-card-hover);
+    border-color: rgba(34, 211, 238, 0.25);
+    box-shadow: 0 0 20px rgba(34, 211, 238, 0.08);
+    transform: translateY(-2px);
+}
+
+.vine-bunch-date {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.vine-bunch-meta {
+    font-size: 12px;
+    color: var(--text-secondary);
+}
+
+.vine-bunch-divider {
+    height: 1px;
+    background: var(--glass-border);
+    margin: 4px 0;
+}
+
+.vine-bunch-topics {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+}
+
+.vine-bunch-topic {
+    font-size: 12px;
+    color: var(--text-secondary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.vine-bunch-topic::before {
+    content: '• ';
+    color: var(--accent-cyan);
+}
+
+.vine-bunch-status {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 11px;
+    color: var(--text-muted);
+    text-transform: capitalize;
+    margin-top: 4px;
+}
+
+.vine-status-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--text-muted);
+}
+
+.vine-status-dot.built {
+    background: var(--accent-green);
+}
+
+.vine-status-dot.pending {
+    background: var(--accent-warm);
+}
+
+/* ── Vine Wizard & Add Folders ─────────────────────────────────────── */
+
+.vine-hint {
+    font-size: 12px;
+    color: var(--text-muted);
+    margin-top: 4px;
+    line-height: 1.5;
+}
+
+.vine-hint kbd {
+    display: inline-block;
+    padding: 1px 6px;
+    font-size: 11px;
+    font-family: var(--font-mono, monospace);
+    color: var(--text-primary);
+    background: rgba(255, 255, 255, 0.08);
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    border-radius: 4px;
+}
+
+.vine-hint code {
+    font-family: var(--font-mono, monospace);
+    color: var(--accent-warm);
+    font-size: 12px;
+}
+
+.vine-add-folders-btn {
+    gap: 4px;
+}
+
+.vine-add-folders-overlay {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: rgba(0, 0, 0, 0.6);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 1000;
+    backdrop-filter: blur(4px);
+}
+
+.vine-add-folders-dialog {
+    background: var(--bg-card);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-lg, 12px);
+    padding: 24px;
+    width: 560px;
+    max-width: 90vw;
+    max-height: 80vh;
+    overflow-y: auto;
+    box-shadow: 0 16px 48px rgba(0, 0, 0, 0.4);
+}
+
+.vine-add-folders-dialog h3 {
+    margin: 0 0 8px;
+    font-size: 18px;
+    color: var(--text-primary);
+}
+
+/* ── Vine Build Progress — Bunch List ──────────────────────────────── */
+
+.vine-bunch-list {
+    margin: 16px 0;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.vine-bunch-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 8px 12px;
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-sm, 6px);
+    font-size: 13px;
+}
+
+.vine-bunch-slug {
+    color: var(--text-primary);
+    font-family: var(--font-mono, monospace);
+    font-size: 12px;
+}
+
+.vine-bunch-status {
+    font-size: 12px;
+    padding: 2px 8px;
+    border-radius: 10px;
+}
+
+.vine-bunch-status.done {
+    background: rgba(64, 208, 128, 0.15);
+    color: var(--accent-green);
+}
+
+.vine-bunch-status.pending {
+    background: rgba(255, 255, 255, 0.06);
+    color: var(--text-muted);
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   Vine Drill-Down (WS3) — hierarchical structure navigation
+   ═══════════════════════════════════════════════════════════════════ */
+
+.vine-drilldown {
+    padding: 20px;
+    max-width: 1200px;
+    margin: 0 auto;
+}
+
+.vine-drilldown-header {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 20px;
+}
+
+.vine-drilldown-header h2 {
+    margin: 0;
+    font-size: 18px;
+    color: var(--text-primary);
+}
+
+.vine-drilldown-meta {
+    font-size: 12px;
+    color: var(--text-muted);
+}
+
+.vine-drilldown-empty {
+    text-align: center;
+    padding: 40px;
+    color: var(--text-muted);
+    font-size: 13px;
+}
+
+.vine-drilldown-layout {
+    display: grid;
+    grid-template-columns: 340px 1fr;
+    gap: 20px;
+    min-height: 300px;
+}
+
+/* Sub-apex nodes (left panel) */
+.vine-drilldown-nodes {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    overflow-y: auto;
+    max-height: calc(100vh - 200px);
+}
+
+.vine-subapex-card {
+    background: var(--bg-card);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-md);
+    overflow: hidden;
+    transition: border-color var(--transition);
+}
+
+.vine-subapex-card:hover {
+    border-color: rgba(34, 211, 238, 0.3);
+}
+
+.vine-subapex-card-expanded {
+    border-color: rgba(34, 211, 238, 0.3);
+}
+
+.vine-subapex-card-header {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    padding: 14px 16px;
+    cursor: pointer;
+    user-select: none;
+}
+
+.vine-subapex-expand {
+    font-size: 10px;
+    color: var(--accent-cyan);
+    width: 14px;
+    flex-shrink: 0;
+    margin-top: 3px;
+}
+
+.vine-subapex-card-info {
+    flex: 1;
+    min-width: 0;
+}
+
+.vine-subapex-card-info h3 {
+    margin: 0;
+    font-size: 14px;
+    color: var(--text-primary);
+    font-weight: 600;
+    line-height: 1.4;
+}
+
+.vine-subapex-count {
+    font-size: 11px;
+    color: var(--text-muted);
+    background: rgba(34, 211, 238, 0.08);
+    padding: 2px 8px;
+    border-radius: 10px;
+    display: inline-block;
+    margin-top: 4px;
+}
+
+.vine-subapex-children {
+    border-top: 1px solid var(--glass-border);
+    padding: 8px 12px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.vine-l1-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 8px;
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+    transition: background var(--transition);
+    font-size: 13px;
+    color: var(--text-secondary);
+}
+
+.vine-l1-item:hover {
+    background: rgba(34, 211, 238, 0.06);
+    color: var(--text-primary);
+}
+
+.vine-l1-item-active {
+    background: rgba(34, 211, 238, 0.1);
+    color: var(--accent-cyan);
+}
+
+.vine-l1-bullet {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--accent-cyan);
+    flex-shrink: 0;
+    opacity: 0.5;
+}
+
+.vine-l1-item-active .vine-l1-bullet {
+    opacity: 1;
+}
+
+.vine-l1-headline {
+    flex: 1;
+    line-height: 1.4;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* Detail panel (right) */
+.vine-drilldown-detail {
+    background: var(--bg-card);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-md);
+    padding: 20px;
+    overflow-y: auto;
+    max-height: calc(100vh - 200px);
+}
+
+.vine-drilldown-detail-placeholder {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 200px;
+    color: var(--text-muted);
+    font-size: 13px;
+}
+
+.vine-l1-detail-title {
+    font-size: 16px;
+    font-weight: 600;
+    color: var(--text-primary);
+    margin: 0 0 12px;
+}
+
+.vine-l1-detail-text {
+    font-size: 13px;
+    color: var(--text-secondary);
+    line-height: 1.6;
+    white-space: pre-wrap;
+    margin: 0 0 20px;
+}
+
+.vine-l1-bunches {
+    border-top: 1px solid var(--glass-border);
+    padding-top: 16px;
+}
+
+.vine-l1-bunches-label {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    display: block;
+    margin-bottom: 10px;
+}
+
+.vine-drill-bunch-card {
+    background: var(--glass);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-sm);
+    padding: 12px 14px;
+    margin-bottom: 8px;
+    transition: border-color var(--transition);
+}
+
+.vine-drill-bunch-card:hover {
+    border-color: rgba(34, 211, 238, 0.2);
+}
+
+.vine-drill-bunch-card-header {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+
+.vine-drill-bunch-headline {
+    font-size: 13px;
+    color: var(--text-primary);
+    font-weight: 500;
+    flex: 1;
+    min-width: 0;
+}
+
+.vine-drill-bunch-text {
+    font-size: 12px;
+    color: var(--text-secondary);
+    line-height: 1.5;
+    margin: 8px 0 0;
+}
+
+/* Shared pill for bunch references (used across drilldown + intel) */
+.vine-bunch-ref-pill {
+    display: inline-flex;
+    align-items: center;
+    font-size: 11px;
+    background: rgba(139, 92, 246, 0.08);
+    color: var(--accent-purple);
+    padding: 2px 8px;
+    border-radius: 10px;
+    border: 1px solid rgba(139, 92, 246, 0.15);
+    font-family: var(--font-mono, monospace);
+    cursor: pointer;
+    transition: background var(--transition), border-color var(--transition);
+}
+
+.vine-bunch-ref-pill:hover {
+    background: rgba(139, 92, 246, 0.16);
+    border-color: rgba(139, 92, 246, 0.3);
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   Vine Intelligence (WS3) — tabbed intelligence display
+   ═══════════════════════════════════════════════════════════════════ */
+
+.vine-intel {
+    padding: 20px;
+    max-width: 960px;
+    margin: 0 auto;
+}
+
+/* Tab bar */
+.vine-intel-tabbar {
+    display: flex;
+    gap: 0;
+    border-bottom: 1px solid var(--glass-border);
+    margin-bottom: 20px;
+    overflow-x: auto;
+}
+
+.vine-intel-tab {
+    padding: 10px 16px;
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--text-muted);
+    background: none;
+    border: none;
+    border-bottom: 2px solid transparent;
+    cursor: pointer;
+    transition: color var(--transition), border-color var(--transition);
+    white-space: nowrap;
+    font-family: inherit;
+}
+
+.vine-intel-tab:hover {
+    color: var(--text-secondary);
+}
+
+.vine-intel-tab-active {
+    color: var(--accent-cyan);
+    border-bottom-color: var(--accent-cyan);
+}
+
+/* Tab content area */
+.vine-intel-content {
+    min-height: 200px;
+}
+
+.vine-intel-list {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.vine-intel-empty {
+    text-align: center;
+    padding: 40px;
+    color: var(--text-muted);
+    font-size: 13px;
+}
+
+/* Shared search input for intel tabs */
+.vine-intel-search {
+    margin-bottom: 14px;
+}
+
+.vine-intel-search-input {
+    width: 100%;
+    padding: 10px 14px;
+    background: var(--bg-card);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-md);
+    color: var(--text-primary);
+    font-size: 13px;
+    outline: none;
+    transition: border-color var(--transition);
+    font-family: inherit;
+}
+
+.vine-intel-search-input:focus {
+    border-color: var(--accent-cyan);
+}
+
+.vine-intel-search-input::placeholder {
+    color: var(--text-muted);
+}
+
+/* Shared label (small caps) */
+.vine-intel-label {
+    font-size: 11px;
+    color: var(--text-muted);
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    flex-shrink: 0;
+}
+
+/* ── ERAs (intel tab) ─────────────────────────────────────────────── */
+
+.vine-intel-era-card {
+    background: var(--bg-card);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-md);
+    padding: 16px;
+    cursor: pointer;
+    transition: border-color var(--transition);
+}
+
+.vine-intel-era-card:hover {
+    border-color: rgba(34, 211, 238, 0.3);
+}
+
+.vine-intel-era-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 8px;
+}
+
+.vine-intel-era-label {
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.vine-intel-era-date {
+    font-size: 12px;
+    color: var(--text-muted);
+    font-family: var(--font-mono, monospace);
+}
+
+.vine-intel-era-topics {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-bottom: 10px;
+}
+
+.vine-topic-pill {
+    font-size: 11px;
+    background: rgba(34, 211, 238, 0.08);
+    color: var(--accent-cyan);
+    padding: 2px 8px;
+    border-radius: 10px;
+    border: 1px solid rgba(34, 211, 238, 0.15);
+}
+
+.vine-intel-era-narrative {
+    font-size: 13px;
+    color: var(--text-secondary);
+    line-height: 1.6;
+    margin: 0 0 10px;
+}
+
+.vine-intel-era-refs {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+
+.vine-ref-tag {
+    font-size: 11px;
+    background: rgba(139, 92, 246, 0.08);
+    color: var(--accent-purple);
+    padding: 2px 8px;
+    border-radius: 10px;
+    border: 1px solid rgba(139, 92, 246, 0.15);
+    font-family: var(--font-mono, monospace);
+}
+
+/* ── Decisions ─────────────────────────────────────────────────────── */
+
+.vine-decision-entry {
+    background: var(--bg-card);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-sm);
+    overflow: hidden;
+    transition: border-color var(--transition);
+}
+
+.vine-decision-entry:hover {
+    border-color: rgba(34, 211, 238, 0.2);
+}
+
+.vine-decision-entry-expanded {
+    border-color: rgba(34, 211, 238, 0.3);
+}
+
+.vine-decision-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 14px;
+    cursor: pointer;
+    user-select: none;
+}
+
+.vine-decision-expand {
+    font-size: 9px;
+    color: var(--accent-cyan);
+    width: 12px;
+    flex-shrink: 0;
+}
+
+.vine-decision-question {
+    font-size: 13px;
+    color: var(--text-primary);
+    flex: 1;
+    line-height: 1.4;
+}
+
+.vine-decision-body {
+    padding: 0 14px 14px 34px;
+}
+
+.vine-decision-answer {
+    font-size: 13px;
+    color: var(--text-secondary);
+    line-height: 1.6;
+    white-space: pre-wrap;
+    margin: 0 0 10px;
+}
+
+.vine-decision-chain {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+}
+
+/* ── Entities ──────────────────────────────────────────────────────── */
+
+.vine-entity-card {
+    background: var(--bg-card);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-sm);
+    padding: 14px 16px;
+    transition: border-color var(--transition);
+}
+
+.vine-entity-card:hover {
+    border-color: rgba(34, 211, 238, 0.2);
+}
+
+.vine-entity-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 6px;
+}
+
+.vine-entity-name {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.vine-entity-alias-count {
+    font-size: 11px;
+    color: var(--text-muted);
+}
+
+.vine-entity-aliases {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-bottom: 8px;
+}
+
+.vine-alias-pill {
+    font-size: 11px;
+    background: rgba(240, 192, 64, 0.08);
+    color: var(--accent-warm);
+    padding: 2px 8px;
+    border-radius: 10px;
+    border: 1px solid rgba(240, 192, 64, 0.15);
+}
+
+.vine-entity-refs {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+}
+
+/* ── Threads ───────────────────────────────────────────────────────── */
+
+.vine-thread-card {
+    background: var(--bg-card);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-sm);
+    padding: 14px 16px;
+    transition: border-color var(--transition);
+}
+
+.vine-thread-card:hover {
+    border-color: rgba(34, 211, 238, 0.2);
+}
+
+.vine-thread-header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 8px;
+}
+
+.vine-thread-name {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-primary);
+    flex: 1;
+}
+
+.vine-lifecycle-pill {
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    padding: 2px 8px;
+    border-radius: 10px;
+}
+
+.vine-lifecycle-active {
+    background: rgba(64, 208, 128, 0.1);
+    color: var(--accent-green);
+    border: 1px solid rgba(64, 208, 128, 0.2);
+}
+
+.vine-lifecycle-dormant {
+    background: rgba(240, 192, 64, 0.1);
+    color: var(--accent-warm);
+    border: 1px solid rgba(240, 192, 64, 0.2);
+}
+
+.vine-lifecycle-resolved {
+    background: rgba(136, 136, 170, 0.1);
+    color: var(--text-secondary);
+    border: 1px solid rgba(136, 136, 170, 0.2);
+}
+
+.vine-thread-span,
+.vine-thread-edges {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 6px;
+}
+
+.vine-edge-pill {
+    font-size: 11px;
+    background: rgba(34, 211, 238, 0.08);
+    color: var(--accent-cyan);
+    padding: 2px 8px;
+    border-radius: 10px;
+    border: 1px solid rgba(34, 211, 238, 0.15);
+}
+
+/* ── Corrections ───────────────────────────────────────────────────── */
+
+.vine-correction-card {
+    background: var(--bg-card);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-sm);
+    padding: 14px 16px;
+    transition: border-color var(--transition);
+}
+
+.vine-correction-card:hover {
+    border-color: rgba(34, 211, 238, 0.2);
+}
+
+.vine-correction-diff {
+    display: grid;
+    grid-template-columns: 1fr auto 1fr;
+    gap: 12px;
+    align-items: flex-start;
+    margin-bottom: 10px;
+}
+
+.vine-correction-before,
+.vine-correction-after {
+    font-size: 13px;
+    color: var(--text-secondary);
+    line-height: 1.5;
+}
+
+.vine-correction-before p,
+.vine-correction-after p {
+    margin: 4px 0 0;
+    white-space: pre-wrap;
+}
+
+.vine-correction-label {
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+
+.vine-correction-before .vine-correction-label {
+    color: #f06060;
+}
+
+.vine-correction-after .vine-correction-label {
+    color: var(--accent-green);
+}
+
+.vine-correction-arrow {
+    font-size: 16px;
+    color: var(--text-muted);
+    padding-top: 16px;
+}
+
+.vine-correction-refs {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    border-top: 1px solid var(--glass-border);
+    padding-top: 10px;
+}
+
+/* ── Integrity ─────────────────────────────────────────────────────── */
+
+.vine-integrity-status {
+    margin-bottom: 16px;
+}
+
+.vine-integrity-ok,
+.vine-integrity-warn {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 14px 16px;
+    border-radius: var(--radius-md);
+    font-size: 14px;
+    font-weight: 500;
+}
+
+.vine-integrity-ok {
+    background: rgba(64, 208, 128, 0.08);
+    border: 1px solid rgba(64, 208, 128, 0.2);
+    color: var(--accent-green);
+}
+
+.vine-integrity-warn {
+    background: rgba(240, 192, 64, 0.08);
+    border: 1px solid rgba(240, 192, 64, 0.2);
+    color: var(--accent-warm);
+}
+
+.vine-integrity-icon {
+    font-size: 18px;
+}
+
+.vine-integrity-icon-ok {
+    color: var(--accent-green);
+}
+
+.vine-integrity-icon-warn {
+    color: var(--accent-warm);
+}
+
+.vine-integrity-checks {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.vine-integrity-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 10px 16px;
+    background: var(--bg-card);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-sm);
+    font-size: 13px;
+}
+
+.vine-integrity-check-label {
+    color: var(--text-secondary);
+}
+
+.vine-integrity-check-value {
+    font-weight: 600;
+    color: var(--accent-green);
+    font-family: var(--font-mono, monospace);
+}
+
+.vine-integrity-check-warn {
+    color: var(--accent-warm);
+}
+
+/* ── Vine Viewer top-level tab bar (WS3 integration) ───────────────── */
+
+.vine-viewer-tabs {
+    display: flex;
+    gap: 0;
+    border-bottom: 1px solid var(--glass-border);
+    margin-bottom: 0;
+}
+
+.vine-viewer-tab {
+    padding: 10px 20px;
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--text-muted);
+    background: none;
+    border: none;
+    border-bottom: 2px solid transparent;
+    cursor: pointer;
+    transition: color var(--transition), border-color var(--transition);
+    font-family: inherit;
+}
+
+.vine-viewer-tab:hover {
+    color: var(--text-secondary);
+}
+
+.vine-viewer-tab-active {
+    color: var(--accent-cyan);
+    border-bottom-color: var(--accent-cyan);
 }

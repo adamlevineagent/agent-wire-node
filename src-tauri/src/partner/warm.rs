@@ -7,13 +7,13 @@
 // The warm pass runs in the background after every WARM_PASS_THRESHOLD new messages.
 // It does NOT block the partner response.
 
+use rusqlite::Connection;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use rusqlite::Connection;
 use tracing::info;
 
-use crate::partner::{Session, Message, SessionTopic};
 use crate::partner::crystal;
+use crate::partner::{Message, Session, SessionTopic};
 use crate::pyramid::delta;
 use tracing::warn;
 
@@ -134,16 +134,32 @@ pub async fn warm_pass(
     let messages_processed = conversation_chunk.len();
 
     // Generate a provisional node ID for the warm pass content
-    let provisional_node_id = format!("warm-{}", uuid::Uuid::new_v4().to_string().split('-').next().unwrap_or("0000"));
+    let provisional_node_id = format!(
+        "warm-{}",
+        uuid::Uuid::new_v4()
+            .to_string()
+            .split('-')
+            .next()
+            .unwrap_or("0000")
+    );
 
     // Match to a thread
-    let thread_id =
-        delta::match_or_create_thread(reader, writer, slug, &combined, &provisional_node_id, api_key, model).await?;
+    let thread_id = delta::match_or_create_thread(
+        reader,
+        writer,
+        slug,
+        &combined,
+        &provisional_node_id,
+        api_key,
+        model,
+    )
+    .await?;
 
     // Create a delta
-    let delta =
-        delta::create_delta(reader, writer, slug, &thread_id, &combined, None, api_key, model)
-            .await?;
+    let delta = delta::create_delta(
+        reader, writer, slug, &thread_id, &combined, None, api_key, model,
+    )
+    .await?;
 
     info!(
         "[warm] Created delta for thread {} (relevance: {})",
@@ -153,10 +169,7 @@ pub async fn warm_pass(
 
     // Create a session topic summary
     let topic_summary = if delta.content.len() > 200 {
-        format!(
-            "{}...",
-            crate::utils::safe_slice_end(&delta.content, 200)
-        )
+        format!("{}...", crate::utils::safe_slice_end(&delta.content, 200))
     } else {
         delta.content.clone()
     };
@@ -177,7 +190,10 @@ pub async fn warm_pass(
             match crystal::crystallize(&reader, &writer, &slug, &api_key, &collapse_model).await {
                 Ok(result) => {
                     if result.collapses > 0 {
-                        info!("[warm] crystallization pass collapsed {} threads", result.collapses);
+                        info!(
+                            "[warm] crystallization pass collapsed {} threads",
+                            result.collapses
+                        );
                     }
                 }
                 Err(e) => {
@@ -199,7 +215,7 @@ pub async fn warm_pass(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::partner::{Message, MessageRole, Session, DennisState};
+    use crate::partner::{DennisState, Message, MessageRole, Session};
 
     #[test]
     fn test_tier1_extract_entities() {

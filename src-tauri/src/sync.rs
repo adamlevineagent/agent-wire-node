@@ -1,15 +1,15 @@
+use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tokio::fs;
-use ignore::WalkBuilder;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum SyncDirection {
-    Upload,    // Push local → Wire (steward)
-    Download,  // Pull Wire → local (reader)
-    Both,      // Bidirectional sync
+    Upload,   // Push local → Wire (steward)
+    Download, // Pull Wire → local (reader)
+    Both,     // Bidirectional sync
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -21,7 +21,7 @@ pub struct LinkedFolder {
 /// Tracks the state of document sync
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
 pub struct SyncState {
-    pub linked_folders: HashMap<String, LinkedFolder>,  // folder_path -> LinkedFolder
+    pub linked_folders: HashMap<String, LinkedFolder>, // folder_path -> LinkedFolder
     pub cached_documents: Vec<CachedDocument>,
     pub total_size_bytes: u64,
     pub last_sync_at: Option<String>,
@@ -31,27 +31,31 @@ pub struct SyncState {
     #[serde(default = "default_auto_sync_interval")]
     pub auto_sync_interval_secs: u64,
     #[serde(default)]
-    pub sync_progress: Option<String>,  // e.g. "Pulling 3/52..."
+    pub sync_progress: Option<String>, // e.g. "Pulling 3/52..."
     #[serde(default)]
-    pub pinned_versions: Vec<String>,  // document IDs of pinned versions
+    pub pinned_versions: Vec<String>, // document IDs of pinned versions
     #[serde(default = "default_storage_quota")]
     pub storage_quota_mb: u64,
     #[serde(default)]
     pub conflicts: Vec<ConflictInfo>,
 }
 
-fn default_auto_sync_interval() -> u64 { 900 } // 15 minutes
-fn default_storage_quota() -> u64 { 500 }
+fn default_auto_sync_interval() -> u64 {
+    900
+} // 15 minutes
+fn default_storage_quota() -> u64 {
+    500
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum FileStatus {
-    InSync,       // Local matches remote
-    NeedsPull,    // Remote has newer version (or file doesn't exist locally)
-    NeedsPush,    // Local has newer version (or file doesn't exist remotely)
-    Pulling,      // Currently downloading
-    Pushing,      // Currently uploading
-    Skipped,      // Already exists remotely (409) or no action needed
-    Error,        // Last sync attempt failed
+    InSync,    // Local matches remote
+    NeedsPull, // Remote has newer version (or file doesn't exist locally)
+    NeedsPush, // Local has newer version (or file doesn't exist remotely)
+    Pulling,   // Currently downloading
+    Pushing,   // Currently uploading
+    Skipped,   // Already exists remotely (409) or no action needed
+    Error,     // Last sync attempt failed
 }
 
 impl Default for FileStatus {
@@ -105,12 +109,23 @@ impl DocumentInfo {
         }
         // Generate filename from title or ID
         let base = self.title.as_deref().unwrap_or(&self.id);
-        let slug: String = base.chars()
-            .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '-' })
+        let slug: String = base
+            .chars()
+            .map(|c| {
+                if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                    c
+                } else {
+                    '-'
+                }
+            })
             .collect::<String>()
             .trim_matches('-')
             .to_string();
-        let slug = if slug.is_empty() { self.id.clone() } else { slug };
+        let slug = if slug.is_empty() {
+            self.id.clone()
+        } else {
+            slug
+        };
         // Add extension based on format
         let ext = match self.format.as_deref() {
             Some("text/markdown") => ".md",
@@ -119,17 +134,21 @@ impl DocumentInfo {
             Some("application/pdf") => ".pdf",
             _ => ".md",
         };
-        if slug.ends_with(ext) { slug } else { format!("{}{}", slug, ext) }
+        if slug.ends_with(ext) {
+            slug
+        } else {
+            format!("{}{}", slug, ext)
+        }
     }
 }
 
 /// Diff result for a single corpus
 #[derive(Debug)]
 pub struct SyncDiff {
-    pub to_push: Vec<LocalDocument>,    // local files not on server
-    pub to_pull: Vec<DocumentInfo>,     // server docs not on local
-    pub to_update: Vec<(LocalDocument, DocumentInfo)>,  // local files with different hash
-    pub hash_matched: Vec<(LocalDocument, DocumentInfo)>,  // local files matched to remote by body_hash (path mismatch)
+    pub to_push: Vec<LocalDocument>, // local files not on server
+    pub to_pull: Vec<DocumentInfo>,  // server docs not on local
+    pub to_update: Vec<(LocalDocument, DocumentInfo)>, // local files with different hash
+    pub hash_matched: Vec<(LocalDocument, DocumentInfo)>, // local files matched to remote by body_hash (path mismatch)
 }
 
 /// Local document found via directory walking
@@ -166,7 +185,7 @@ pub struct VersionHistoryResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiffHunk {
-    pub tag: String,       // "equal", "insert", "delete"
+    pub tag: String, // "equal", "insert", "delete"
     pub content: String,
     pub old_offset: Option<usize>,
     pub new_offset: Option<usize>,
@@ -189,7 +208,10 @@ pub fn save_sync_state(data_dir: &Path, state: &SyncState) {
     let path = data_dir.join("sync_state.json");
     if let Ok(json) = serde_json::to_string_pretty(state) {
         let _ = std::fs::write(&path, json);
-        tracing::debug!("Sync state saved ({} linked folders)", state.linked_folders.len());
+        tracing::debug!(
+            "Sync state saved ({} linked folders)",
+            state.linked_folders.len()
+        );
     }
 }
 
@@ -213,7 +235,12 @@ pub fn link_folder(
     if !path.exists() || !path.is_dir() {
         return Err(format!("Directory does not exist: {}", folder_path));
     }
-    tracing::info!("Linked folder {} -> corpus {} ({:?})", folder_path, corpus_slug, direction);
+    tracing::info!(
+        "Linked folder {} -> corpus {} ({:?})",
+        folder_path,
+        corpus_slug,
+        direction
+    );
     sync_state.linked_folders.insert(
         folder_path.to_string(),
         LinkedFolder {
@@ -225,10 +252,7 @@ pub fn link_folder(
 }
 
 /// Unlink a folder from a corpus
-pub fn unlink_folder(
-    sync_state: &mut SyncState,
-    folder_path: &str,
-) -> Result<(), String> {
+pub fn unlink_folder(sync_state: &mut SyncState, folder_path: &str) -> Result<(), String> {
     if sync_state.linked_folders.remove(folder_path).is_some() {
         tracing::info!("Unlinked folder {}", folder_path);
         Ok(())
@@ -275,7 +299,9 @@ pub async fn fetch_corpus_documents(
             return Err(format!("Corpus fetch failed ({}): {}", status, text));
         }
 
-        let page: DocumentListResponse = resp.json().await
+        let page: DocumentListResponse = resp
+            .json()
+            .await
             .map_err(|e| format!("Failed to parse documents response: {}", e))?;
 
         let page_count = page.items.len() as i64;
@@ -288,7 +314,11 @@ pub async fn fetch_corpus_documents(
         }
     }
 
-    tracing::info!("Found {} documents in corpus {}", all_docs.len(), corpus_slug);
+    tracing::info!(
+        "Found {} documents in corpus {}",
+        all_docs.len(),
+        corpus_slug
+    );
     Ok(all_docs)
 }
 
@@ -307,10 +337,10 @@ pub fn scan_local_folder(folder_path: &str) -> Result<Vec<LocalDocument>, String
     let mut builder = WalkBuilder::new(root);
     builder
         .follow_links(false)
-        .hidden(true)           // skip hidden files/dirs (dotfiles)
-        .git_ignore(true)       // respect .gitignore
-        .git_global(true)       // respect global gitignore
-        .git_exclude(true);     // respect .git/info/exclude
+        .hidden(true) // skip hidden files/dirs (dotfiles)
+        .git_ignore(true) // respect .gitignore
+        .git_global(true) // respect global gitignore
+        .git_exclude(true); // respect .git/info/exclude
 
     // Add .wireignore support — same syntax as .gitignore, project-specific overrides
     let wireignore_path = root.join(".wireignore");
@@ -328,7 +358,10 @@ pub fn scan_local_folder(folder_path: &str) -> Result<Vec<LocalDocument>, String
             let path = entry.path().to_path_buf();
 
             // Skip system files that may not be in .gitignore
-            let file_name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            let file_name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
             if file_name == "Thumbs.db" || file_name == "desktop.ini" {
                 continue;
             }
@@ -339,7 +372,8 @@ pub fn scan_local_folder(folder_path: &str) -> Result<Vec<LocalDocument>, String
                 continue;
             }
 
-            let relative_path = path.strip_prefix(root)
+            let relative_path = path
+                .strip_prefix(root)
                 .unwrap_or(&path)
                 .to_string_lossy()
                 .to_string();
@@ -364,24 +398,26 @@ pub fn scan_local_folder(folder_path: &str) -> Result<Vec<LocalDocument>, String
         }
     }
 
-    tracing::info!("Scanned {} files in {} (gitignore-aware)", docs.len(), folder_path);
+    tracing::info!(
+        "Scanned {} files in {} (gitignore-aware)",
+        docs.len(),
+        folder_path
+    );
     Ok(docs)
 }
 
 /// Compute diff between local folder and remote corpus
-pub fn compute_diff(
-    local_docs: &[LocalDocument],
-    remote_docs: &[DocumentInfo],
-) -> SyncDiff {
+pub fn compute_diff(local_docs: &[LocalDocument], remote_docs: &[DocumentInfo]) -> SyncDiff {
     // Build remote lookup using effective_path (handles missing source_path)
-    let remote_paths: Vec<(String, &DocumentInfo)> = remote_docs.iter()
+    let remote_paths: Vec<(String, &DocumentInfo)> = remote_docs
+        .iter()
         .map(|d| (d.effective_path(), d))
         .collect();
-    let remote_by_path: HashMap<&str, &DocumentInfo> = remote_paths.iter()
-        .map(|(p, d)| (p.as_str(), *d))
-        .collect();
+    let remote_by_path: HashMap<&str, &DocumentInfo> =
+        remote_paths.iter().map(|(p, d)| (p.as_str(), *d)).collect();
 
-    let local_by_path: HashMap<&str, &LocalDocument> = local_docs.iter()
+    let local_by_path: HashMap<&str, &LocalDocument> = local_docs
+        .iter()
         .map(|d| (d.relative_path.as_str(), d))
         .collect();
 
@@ -406,7 +442,8 @@ pub fn compute_diff(
     }
 
     // Build a set of body_hash -> DocumentInfo for unmatched remote docs (hash-based fallback)
-    let unmatched_remote: Vec<&DocumentInfo> = remote_docs.iter()
+    let unmatched_remote: Vec<&DocumentInfo> = remote_docs
+        .iter()
         .filter(|d| !matched_remote_ids.contains(d.id.as_str()))
         .collect();
     let mut remote_by_hash: HashMap<&str, &DocumentInfo> = HashMap::new();
@@ -416,12 +453,12 @@ pub fn compute_diff(
     }
 
     // Collect local file hashes for the pull-side fallback
-    let local_hashes: std::collections::HashSet<&str> = local_docs.iter()
-        .map(|d| d.body_hash.as_str())
-        .collect();
+    let local_hashes: std::collections::HashSet<&str> =
+        local_docs.iter().map(|d| d.body_hash.as_str()).collect();
 
     // Hash-based fallback for unmatched local files
-    let mut hash_matched_remote_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut hash_matched_remote_ids: std::collections::HashSet<&str> =
+        std::collections::HashSet::new();
     let mut hash_matched: Vec<(LocalDocument, DocumentInfo)> = Vec::new();
     for local_doc in unmatched_local {
         if let Some(remote_doc) = remote_by_hash.get(local_doc.body_hash.as_str()) {
@@ -429,7 +466,9 @@ pub fn compute_diff(
             hash_matched_remote_ids.insert(remote_doc.id.as_str());
             tracing::debug!(
                 "Hash fallback match: local '{}' == remote '{}' (hash {})",
-                local_doc.relative_path, remote_doc.id, &local_doc.body_hash[..12]
+                local_doc.relative_path,
+                remote_doc.id,
+                &local_doc.body_hash[..12]
             );
             hash_matched.push((local_doc, (*remote_doc).clone()));
         } else {
@@ -439,7 +478,8 @@ pub fn compute_diff(
 
     // Pull: remote docs whose effective_path doesn't exist locally,
     // excluding those matched by hash fallback (content already exists locally)
-    let to_pull: Vec<DocumentInfo> = remote_docs.iter()
+    let to_pull: Vec<DocumentInfo> = remote_docs
+        .iter()
         .filter(|d| {
             let path = d.effective_path();
             !local_by_path.contains_key(path.as_str())
@@ -449,7 +489,12 @@ pub fn compute_diff(
         .cloned()
         .collect();
 
-    SyncDiff { to_push, to_pull, to_update, hash_matched }
+    SyncDiff {
+        to_push,
+        to_pull,
+        to_update,
+        hash_matched,
+    }
 }
 
 /// Push a new document to the Wire API
@@ -473,11 +518,14 @@ pub async fn push_document(
 
     // Infer format from extension.
     // Code files and unknown extensions default to text/plain (not markdown).
-    let format = match Path::new(&local_doc.relative_path).extension().and_then(|e| e.to_str()) {
+    let format = match Path::new(&local_doc.relative_path)
+        .extension()
+        .and_then(|e| e.to_str())
+    {
         Some("md" | "markdown") => "text/markdown",
         Some("html" | "htm") => "text/html",
         Some("pdf") => "application/pdf",
-        _ => "text/plain",  // code files, .txt, and anything else
+        _ => "text/plain", // code files, .txt, and anything else
     };
 
     let body = serde_json::json!({
@@ -503,11 +551,19 @@ pub async fn push_document(
     }
 
     #[derive(Deserialize)]
-    struct PushResponse { id: String }
-    let result: PushResponse = resp.json().await
+    struct PushResponse {
+        id: String,
+    }
+    let result: PushResponse = resp
+        .json()
+        .await
         .map_err(|e| format!("Failed to parse push response: {}", e))?;
 
-    tracing::info!("Pushed document: {} -> {}", local_doc.relative_path, result.id);
+    tracing::info!(
+        "Pushed document: {} -> {}",
+        local_doc.relative_path,
+        result.id
+    );
     Ok(result.id)
 }
 
@@ -567,15 +623,21 @@ pub async fn pull_document(
     let source_path = effective.as_str();
 
     // Reject any source_path containing ".." segments
-    if source_path.split('/').any(|seg| seg == "..") || source_path.split('\\').any(|seg| seg == "..") {
-        return Err(format!("Path traversal detected (.. segment): {}", source_path));
+    if source_path.split('/').any(|seg| seg == "..")
+        || source_path.split('\\').any(|seg| seg == "..")
+    {
+        return Err(format!(
+            "Path traversal detected (.. segment): {}",
+            source_path
+        ));
     }
 
     // Client-side path validation: resolve path, confirm within sync root
     let target_path = sync_root.join(source_path);
 
     // Canonicalize the sync root
-    let sync_root_canonical = sync_root.canonicalize()
+    let sync_root_canonical = sync_root
+        .canonicalize()
         .map_err(|e| format!("Failed to canonicalize sync root: {}", e))?;
 
     // Ensure parent directory exists before canonicalizing
@@ -585,9 +647,11 @@ pub async fn pull_document(
     }
 
     // Canonicalize the parent directory (which now exists), then join the filename
-    let filename = target_path.file_name()
+    let filename = target_path
+        .file_name()
         .ok_or_else(|| format!("Invalid file path: {}", source_path))?;
-    let canonical_parent = target_path.parent()
+    let canonical_parent = target_path
+        .parent()
         .ok_or_else(|| format!("No parent directory for: {}", source_path))?
         .canonicalize()
         .map_err(|e| format!("Failed to canonicalize parent: {}", e))?;
@@ -613,7 +677,9 @@ pub async fn pull_document(
         return Err(format!("Pull failed ({}): {}", status, text));
     }
 
-    let body_text = resp.text().await
+    let body_text = resp
+        .text()
+        .await
         .map_err(|e| format!("Failed to read document body: {}", e))?;
 
     let file_size = body_text.len() as u64;
@@ -626,7 +692,9 @@ pub async fn pull_document(
     if actual_hash != doc.body_hash {
         return Err(format!(
             "Hash mismatch for {}: expected {}, got {}",
-            doc.id, doc.body_hash.get(..12).unwrap_or(&doc.body_hash), actual_hash.get(..12).unwrap_or(&actual_hash)
+            doc.id,
+            doc.body_hash.get(..12).unwrap_or(&doc.body_hash),
+            actual_hash.get(..12).unwrap_or(&actual_hash)
         ));
     }
 
@@ -679,7 +747,9 @@ pub async fn cache_document_for_serving(
         return Err(format!("Document download failed ({})", resp.status()));
     }
 
-    let body_text = resp.text().await
+    let body_text = resp
+        .text()
+        .await
         .map_err(|e| format!("Failed to read document body: {}", e))?;
 
     // Verify hash
@@ -687,7 +757,8 @@ pub async fn cache_document_for_serving(
     if actual_hash != expected_hash {
         return Err(format!(
             "Hash mismatch: expected {}, got {}",
-            expected_hash.get(..12).unwrap_or(expected_hash), actual_hash.get(..12).unwrap_or(&actual_hash)
+            expected_hash.get(..12).unwrap_or(expected_hash),
+            actual_hash.get(..12).unwrap_or(&actual_hash)
         ));
     }
 
@@ -704,7 +775,12 @@ pub async fn cache_document_for_serving(
         .await
         .map_err(|e| format!("Failed to write cached document: {}", e))?;
 
-    tracing::info!("Cached document {}/{} ({} bytes)", corpus_id, document_id, file_size);
+    tracing::info!(
+        "Cached document {}/{} ({} bytes)",
+        corpus_id,
+        document_id,
+        file_size
+    );
     Ok(file_size)
 }
 
@@ -739,25 +815,31 @@ pub async fn get_cache_size(cache_dir: &Path) -> u64 {
 
 /// Check if a document is cached for serving
 pub fn is_document_cached(cache_dir: &Path, corpus_id: &str, document_id: &str) -> bool {
-    cache_dir.join(corpus_id).join(format!("{}.body", document_id)).exists()
+    cache_dir
+        .join(corpus_id)
+        .join(format!("{}.body", document_id))
+        .exists()
 }
 
 /// Get the local file path for a cached document body
 pub fn get_cached_document_path(cache_dir: &Path, corpus_id: &str, document_id: &str) -> PathBuf {
-    cache_dir.join(corpus_id).join(format!("{}.body", document_id))
+    cache_dir
+        .join(corpus_id)
+        .join(format!("{}.body", document_id))
 }
 
 /// Compute SHA-256 hash of a specific byte range in a file (raw bytes).
 /// Uses std::fs::read (not read_to_string) to avoid panics on multi-byte
 /// UTF-8 boundaries. This matches PostgreSQL's byte-level behavior.
 pub fn hash_byte_range(file_path: &Path, start: usize, end: usize) -> Result<String, String> {
-    let bytes = std::fs::read(file_path)
-        .map_err(|e| format!("Failed to read file: {}", e))?;
+    let bytes = std::fs::read(file_path).map_err(|e| format!("Failed to read file: {}", e))?;
 
     if end > bytes.len() {
         return Err(format!(
             "Byte range {}-{} exceeds file size {}",
-            start, end, bytes.len()
+            start,
+            end,
+            bytes.len()
         ));
     }
 
@@ -773,7 +855,9 @@ pub async fn delete_cached_document(
     corpus_id: &str,
     document_id: &str,
 ) -> Result<(), String> {
-    let file_path = cache_dir.join(corpus_id).join(format!("{}.body", document_id));
+    let file_path = cache_dir
+        .join(corpus_id)
+        .join(format!("{}.body", document_id));
     if file_path.exists() {
         fs::remove_file(&file_path)
             .await
@@ -793,7 +877,12 @@ pub async fn find_cached_document_by_id(
 
     if let Ok(mut entries) = fs::read_dir(cache_dir).await {
         while let Ok(Some(entry)) = entries.next_entry().await {
-            if entry.file_type().await.map(|ft| ft.is_dir()).unwrap_or(false) {
+            if entry
+                .file_type()
+                .await
+                .map(|ft| ft.is_dir())
+                .unwrap_or(false)
+            {
                 let candidate = entry.path().join(&target_filename);
                 if candidate.exists() {
                     let corpus_id = entry.file_name().to_string_lossy().to_string();
@@ -820,7 +909,10 @@ pub async fn delete_cached_document_by_id(
             Ok(())
         }
         None => {
-            tracing::debug!("Document {} not found in cache, nothing to purge", document_id);
+            tracing::debug!(
+                "Document {} not found in cache, nothing to purge",
+                document_id
+            );
             Ok(())
         }
     }
@@ -846,7 +938,10 @@ pub async fn fetch_version_history(
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        return Err(format!("Version history request failed ({}): {}", status, text));
+        return Err(format!(
+            "Version history request failed ({}): {}",
+            status, text
+        ));
     }
 
     resp.json::<VersionHistoryResponse>()
@@ -885,10 +980,13 @@ pub async fn create_version(
         return Err(format!("Version creation failed ({}): {}", status, text));
     }
 
-    let result: serde_json::Value = resp.json().await
+    let result: serde_json::Value = resp
+        .json()
+        .await
         .map_err(|e| format!("Failed to parse version response: {}", e))?;
 
-    result["id"].as_str()
+    result["id"]
+        .as_str()
         .map(|s| s.to_string())
         .ok_or_else(|| "No id in version response".to_string())
 }

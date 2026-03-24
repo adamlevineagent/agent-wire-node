@@ -11,12 +11,12 @@ pub mod crystal;
 pub mod routes;
 pub mod warm;
 
+use rusqlite::Connection;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use rusqlite::Connection;
-use serde::{Deserialize, Serialize};
 
 use crate::pyramid::PyramidState;
 
@@ -244,13 +244,35 @@ pub fn load_session(conn: &Connection, session_id: &str) -> anyhow::Result<Optio
         let created_at: String = row.get(9)?;
         let last_active_at: String = row.get(10)?;
 
-        Ok((id, slug, is_lobby, buffer_str, topics_str, hydrated_str,
-            lifted_str, state_str, warm_cursor, created_at, last_active_at))
+        Ok((
+            id,
+            slug,
+            is_lobby,
+            buffer_str,
+            topics_str,
+            hydrated_str,
+            lifted_str,
+            state_str,
+            warm_cursor,
+            created_at,
+            last_active_at,
+        ))
     });
 
     match result {
-        Ok((id, slug, is_lobby, buffer_str, topics_str, hydrated_str,
-            lifted_str, state_str, warm_cursor, created_at, last_active_at)) => {
+        Ok((
+            id,
+            slug,
+            is_lobby,
+            buffer_str,
+            topics_str,
+            hydrated_str,
+            lifted_str,
+            state_str,
+            warm_cursor,
+            created_at,
+            last_active_at,
+        )) => {
             let conversation_buffer: Vec<Message> =
                 serde_json::from_str(&buffer_str).unwrap_or_default();
             let session_topics: Vec<SessionTopic> =
@@ -259,8 +281,7 @@ pub fn load_session(conn: &Connection, session_id: &str) -> anyhow::Result<Optio
                 serde_json::from_str(&hydrated_str).unwrap_or_default();
             let lifted_results: Vec<LiftedResult> =
                 serde_json::from_str(&lifted_str).unwrap_or_default();
-            let dennis_state: DennisState =
-                serde_json::from_str(&state_str).unwrap_or_default();
+            let dennis_state: DennisState = serde_json::from_str(&state_str).unwrap_or_default();
 
             Ok(Some(Session {
                 id,

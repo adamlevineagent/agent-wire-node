@@ -11,10 +11,10 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
-use crate::pyramid::db;
-use crate::pyramid::types::*;
-use crate::pyramid::llm;
 use crate::pyramid::config_helper::config_for_model;
+use crate::pyramid::db;
+use crate::pyramid::llm;
+use crate::pyramid::types::*;
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -184,7 +184,8 @@ pub async fn collapse_web_edge(
         .join("\n");
 
     // 2. Call LLM
-    let system_prompt = "You are summarizing how two knowledge threads are connected. Output JSON only.";
+    let system_prompt =
+        "You are summarizing how two knowledge threads are connected. Output JSON only.";
     let user_prompt = format!(
         r#"You are summarizing how two knowledge threads are connected.
 
@@ -228,7 +229,10 @@ Output JSON only:
 
     info!(
         "[webbing] collapsed edge {} ({} <-> {}): absorbed {} deltas",
-        edge_id, thread_a_name, thread_b_name, deltas.len()
+        edge_id,
+        thread_a_name,
+        thread_b_name,
+        deltas.len()
     );
 
     Ok(())
@@ -264,7 +268,10 @@ pub async fn check_and_collapse_edges(
         let conn = writer.lock().await;
         let archived = db::decay_web_edges(&conn, slug, EDGE_DECAY_RATE)?;
         if archived > 0 {
-            info!("[webbing] archived {} stale edges (relevance < {})", archived, EDGE_MIN_RELEVANCE);
+            info!(
+                "[webbing] archived {} stale edges (relevance < {})",
+                archived, EDGE_MIN_RELEVANCE
+            );
         }
     }
 
@@ -274,11 +281,7 @@ pub async fn check_and_collapse_edges(
 // ── decay_web_edges (module-level wrapper) ───────────────────────────────────
 
 /// Reduces relevance of stale edges. Wrapper around db::decay_web_edges.
-pub fn decay_web_edges(
-    conn: &Connection,
-    slug: &str,
-    decay_rate: f64,
-) -> anyhow::Result<usize> {
+pub fn decay_web_edges(conn: &Connection, slug: &str, decay_rate: f64) -> anyhow::Result<usize> {
     let archived = db::decay_web_edges(conn, slug, decay_rate)?;
     Ok(archived)
 }
@@ -327,6 +330,20 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         db::init_pyramid_db(&conn).unwrap();
 
+        // Insert prerequisite slug + nodes (FK: threads.current_canonical_id → nodes.id)
+        conn.execute(
+            "INSERT INTO pyramid_slugs (slug, content_type, source_path) VALUES ('test', 'code', '/tmp')",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO pyramid_nodes (id, slug, depth, headline) VALUES ('node-1', 'test', 1, 'Node 1')",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO pyramid_nodes (id, slug, depth, headline) VALUES ('node-2', 'test', 1, 'Node 2')",
+            [],
+        ).unwrap();
+
         // Create two threads first (needed for FK constraints)
         let thread_a = PyramidThread {
             slug: "test".into(),
@@ -351,25 +368,30 @@ mod tests {
         db::save_thread(&conn, &thread_a).unwrap();
         db::save_thread(&conn, &thread_b).unwrap();
 
-        // Create an edge with low relevance
+        // Create an edge with low relevance — use 0.20 to avoid IEEE 754 rounding
+        // (0.15 - 0.05 = 0.09999999999999998 in float, which is < 0.1)
         let edge = WebEdge {
             id: 0,
             slug: "test".into(),
             thread_a_id: "thread-aaa".into(),
             thread_b_id: "thread-bbb".into(),
             relationship: "test relationship".into(),
-            relevance: 0.15,
+            relevance: 0.20,
             delta_count: 0,
             created_at: now_ts(),
             updated_at: now_ts(),
         };
         db::save_web_edge(&conn, &edge).unwrap();
 
-        // Decay should archive the edge (0.15 - 0.05 = 0.10, still >= 0.1, not archived)
+        // First decay: 0.20 - 0.05 = 0.15, still >= 0.1, not archived
         let archived = decay_web_edges(&conn, "test", EDGE_DECAY_RATE).unwrap();
         assert_eq!(archived, 0);
 
-        // Decay again (0.10 - 0.05 = 0.05, below 0.1, should be archived)
+        // Second decay: 0.15 - 0.05 = 0.10, still >= 0.1 (exact in float), not archived
+        let archived = decay_web_edges(&conn, "test", EDGE_DECAY_RATE).unwrap();
+        assert_eq!(archived, 0);
+
+        // Third decay: 0.10 - 0.05 = 0.05, below 0.1, should be archived
         let archived = decay_web_edges(&conn, "test", EDGE_DECAY_RATE).unwrap();
         assert_eq!(archived, 1);
 
@@ -382,6 +404,20 @@ mod tests {
     fn test_web_edge_delta_crud() {
         let conn = Connection::open_in_memory().unwrap();
         db::init_pyramid_db(&conn).unwrap();
+
+        // Insert prerequisite slug + nodes (FK: threads.current_canonical_id → nodes.id)
+        conn.execute(
+            "INSERT INTO pyramid_slugs (slug, content_type, source_path) VALUES ('test', 'code', '/tmp')",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO pyramid_nodes (id, slug, depth, headline) VALUES ('node-1', 'test', 1, 'Node 1')",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO pyramid_nodes (id, slug, depth, headline) VALUES ('node-2', 'test', 1, 'Node 2')",
+            [],
+        ).unwrap();
 
         // Create threads
         let thread_a = PyramidThread {

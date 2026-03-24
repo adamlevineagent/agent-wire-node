@@ -18,6 +18,17 @@
  *   annotations <slug> [node_id]    List annotations (optionally for a specific node)
  *   annotate <slug> <node_id> <content>  Add annotation
  *
+ * Vine Commands:
+ *   vine-build <slug> <dir1> [dir2...]   Build vine from JSONL directories
+ *   vine-bunches <slug>                  List all bunches with metadata
+ *   vine-eras <slug>                     List ERA annotations
+ *   vine-decisions <slug>                List decision FAQ entries
+ *   vine-entities <slug>                 List entity resolution FAQ entries
+ *   vine-threads <slug>                  List vine thread continuity + web edges
+ *   vine-drill <slug>                    Directory-wired drill (navigation structure)
+ *   vine-rebuild-upper <slug>            Force rebuild L2+ layers
+ *   vine-integrity <slug>                Run integrity check, return results
+ *
  * Annotation flags:
  *   --question "..."     Question this answers (triggers FAQ)
  *   --author "..."       Your agent name
@@ -255,6 +266,70 @@ async function run(): Promise<void> {
       break;
     }
 
+    // ── Vine Conversation System commands ─────────────────────────────
+
+    case "vine-build": {
+      const slug = requireArg(1, "vine_slug");
+      const dirs = positional.slice(2);
+      if (dirs.length === 0) {
+        process.stderr.write("Error: at least one JSONL directory is required\n");
+        process.exit(1);
+      }
+      output(await pf("/pyramid/vine/build", {
+        method: "POST",
+        body: { vine_slug: slug, jsonl_dirs: dirs },
+      }));
+      break;
+    }
+
+    case "vine-bunches": {
+      const slug = requireArg(1, "slug");
+      output(await pf(`/pyramid/${enc(slug)}/vine/bunches`));
+      break;
+    }
+
+    case "vine-eras": {
+      const slug = requireArg(1, "slug");
+      output(await pf(`/pyramid/${enc(slug)}/vine/eras`));
+      break;
+    }
+
+    case "vine-decisions": {
+      const slug = requireArg(1, "slug");
+      output(await pf(`/pyramid/${enc(slug)}/vine/decisions`));
+      break;
+    }
+
+    case "vine-entities": {
+      const slug = requireArg(1, "slug");
+      output(await pf(`/pyramid/${enc(slug)}/vine/entities`));
+      break;
+    }
+
+    case "vine-threads": {
+      const slug = requireArg(1, "slug");
+      output(await pf(`/pyramid/${enc(slug)}/vine/threads`));
+      break;
+    }
+
+    case "vine-drill": {
+      const slug = requireArg(1, "slug");
+      output(await pf(`/pyramid/${enc(slug)}/vine/drill`));
+      break;
+    }
+
+    case "vine-rebuild-upper": {
+      const slug = requireArg(1, "slug");
+      output(await pf(`/pyramid/${enc(slug)}/vine/rebuild-upper`, { method: "POST" }));
+      break;
+    }
+
+    case "vine-integrity": {
+      const slug = requireArg(1, "slug");
+      output(await pf(`/pyramid/${enc(slug)}/vine/integrity`, { method: "POST" }));
+      break;
+    }
+
     default: {
       process.stderr.write(`Unknown command: ${command}\n\n`);
       printUsage();
@@ -278,6 +353,17 @@ Commands:
   annotations <slug> [node_id]    List annotations (optionally for a specific node)
   annotate <slug> <node_id> <content>  Add annotation
 
+Vine Commands:
+  vine-build <slug> <dir1> [dir2...]   Build vine from JSONL directories
+  vine-bunches <slug>                  List all bunches with metadata
+  vine-eras <slug>                     List ERA annotations
+  vine-decisions <slug>                List decision FAQ entries
+  vine-entities <slug>                 List entity resolution FAQ entries
+  vine-threads <slug>                  List vine thread continuity + web edges
+  vine-drill <slug>                    Directory-wired drill (navigation structure)
+  vine-rebuild-upper <slug>            Force rebuild L2+ layers
+  vine-integrity <slug>                Run integrity check, return results
+
 Annotation flags:
   --question "..."     Question this answers (triggers FAQ)
   --author "..."       Your agent name
@@ -291,6 +377,8 @@ Examples:
   pyramid-cli apex agent-wire-nodepostdadbear
   pyramid-cli search agent-wire-nodepostdadbear "stale engine"
   pyramid-cli annotate agent-wire-nodepostdadbear C-L0-071 "Finding text" --question "Q?" --author "my-agent"
+  pyramid-cli vine-build my-vine /path/to/jsonl-dir1 /path/to/jsonl-dir2
+  pyramid-cli vine-bunches my-vine
 `);
 }
 

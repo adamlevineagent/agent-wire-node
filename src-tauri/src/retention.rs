@@ -62,12 +62,13 @@ pub async fn handle_retention_challenges(
     for challenge in challenges {
         // Find the document file — use corpus_id if available, otherwise scan all dirs
         let file_path = if let Some(ref corpus_id) = challenge.corpus_id {
-            let p = crate::sync::get_cached_document_path(
-                cache_dir,
-                corpus_id,
-                &challenge.document_id,
-            );
-            if p.exists() { Some(p) } else { None }
+            let p =
+                crate::sync::get_cached_document_path(cache_dir, corpus_id, &challenge.document_id);
+            if p.exists() {
+                Some(p)
+            } else {
+                None
+            }
         } else {
             crate::sync::find_cached_document_by_id(cache_dir, &challenge.document_id)
                 .await
@@ -79,7 +80,8 @@ pub async fn handle_retention_challenges(
             None => {
                 tracing::warn!(
                     "Retention challenge for missing document: {:?}/{}",
-                    challenge.corpus_id, challenge.document_id
+                    challenge.corpus_id,
+                    challenge.document_id
                 );
                 continue;
             }
@@ -108,7 +110,9 @@ pub async fn handle_retention_challenges(
                     Ok(resp) if resp.status().is_success() => {
                         tracing::debug!(
                             "Retention challenge {} passed for {:?}/{}",
-                            challenge.challenge_id, challenge.corpus_id, challenge.document_id
+                            challenge.challenge_id,
+                            challenge.corpus_id,
+                            challenge.document_id
                         );
                         successful += 1;
                     }
@@ -116,13 +120,15 @@ pub async fn handle_retention_challenges(
                         let text = resp.text().await.unwrap_or_default();
                         tracing::warn!(
                             "Retention challenge {} response error: {}",
-                            challenge.challenge_id, text
+                            challenge.challenge_id,
+                            text
                         );
                     }
                     Err(e) => {
                         tracing::warn!(
                             "Retention challenge {} failed to submit: {}",
-                            challenge.challenge_id, e
+                            challenge.challenge_id,
+                            e
                         );
                     }
                 }
@@ -130,7 +136,8 @@ pub async fn handle_retention_challenges(
             Err(e) => {
                 tracing::warn!(
                     "Failed to compute hash for retention challenge {}: {}",
-                    challenge.challenge_id, e
+                    challenge.challenge_id,
+                    e
                 );
             }
         }
@@ -152,20 +159,15 @@ pub async fn handle_purge_directives(
     for directive in directives {
         tracing::info!(
             "Purging document {:?}/{} (reason: {:?})",
-            directive.corpus_id, directive.document_id, directive.reason
+            directive.corpus_id,
+            directive.document_id,
+            directive.reason
         );
 
         let result = if let Some(ref corpus_id) = directive.corpus_id {
-            crate::sync::delete_cached_document(
-                cache_dir,
-                corpus_id,
-                &directive.document_id,
-            ).await
+            crate::sync::delete_cached_document(cache_dir, corpus_id, &directive.document_id).await
         } else {
-            crate::sync::delete_cached_document_by_id(
-                cache_dir,
-                &directive.document_id,
-            ).await
+            crate::sync::delete_cached_document_by_id(cache_dir, &directive.document_id).await
         };
 
         match result {
@@ -175,7 +177,9 @@ pub async fn handle_purge_directives(
             Err(e) => {
                 tracing::warn!(
                     "Failed to purge {:?}/{}: {}",
-                    directive.corpus_id, directive.document_id, e
+                    directive.corpus_id,
+                    directive.document_id,
+                    e
                 );
             }
         }
@@ -198,14 +202,19 @@ pub async fn report_inventory(
     node_id: &str,
     cache_dir: &Path,
 ) -> Result<(), String> {
-    use sha2::{Sha256, Digest};
+    use sha2::{Digest, Sha256};
 
     // Scan cache directory for all hosted documents
     let mut inventory: Vec<serde_json::Value> = Vec::new();
 
     if let Ok(mut entries) = tokio::fs::read_dir(cache_dir).await {
         while let Ok(Some(corpus_entry)) = entries.next_entry().await {
-            if corpus_entry.file_type().await.map(|ft| ft.is_dir()).unwrap_or(false) {
+            if corpus_entry
+                .file_type()
+                .await
+                .map(|ft| ft.is_dir())
+                .unwrap_or(false)
+            {
                 if let Ok(mut doc_entries) = tokio::fs::read_dir(corpus_entry.path()).await {
                     while let Ok(Some(doc_entry)) = doc_entries.next_entry().await {
                         if let Some(name) = doc_entry.file_name().to_str() {
@@ -220,7 +229,11 @@ pub async fn report_inventory(
                                         hex::encode(hasher.finalize())
                                     }
                                     Err(e) => {
-                                        tracing::warn!("Failed to read {} for hashing: {}", file_path.display(), e);
+                                        tracing::warn!(
+                                            "Failed to read {} for hashing: {}",
+                                            file_path.display(),
+                                            e
+                                        );
                                         continue;
                                     }
                                 };

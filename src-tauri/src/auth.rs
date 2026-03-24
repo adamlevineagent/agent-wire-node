@@ -7,9 +7,9 @@ pub struct AuthState {
     pub refresh_token: Option<String>,
     pub user_id: Option<String>,
     pub email: Option<String>,
-    pub node_id: Option<String>,       // wire node ID after registration
+    pub node_id: Option<String>, // wire node ID after registration
     #[serde(default)]
-    pub api_token: Option<String>,     // gne_live_ machine token from register-with-session
+    pub api_token: Option<String>, // gne_live_ machine token from register-with-session
     pub first_started_at: Option<String>, // node age — first ever login
     #[serde(default)]
     pub operator_session_token: Option<String>,
@@ -94,20 +94,25 @@ pub async fn verify_magic_link_token(
     magic_link_url: &str,
     _email: &str,
 ) -> Result<AuthState, String> {
-    let url = reqwest::Url::parse(magic_link_url)
-        .map_err(|e| format!("Invalid URL: {}", e))?;
+    let url = reqwest::Url::parse(magic_link_url).map_err(|e| format!("Invalid URL: {}", e))?;
 
-    let token_hash = url.query_pairs()
+    let token_hash = url
+        .query_pairs()
         .find(|(k, _)| k == "token_hash" || k == "token")
         .map(|(_, v)| v.to_string())
         .ok_or_else(|| "No token found in magic link URL".to_string())?;
 
-    let link_type = url.query_pairs()
+    let link_type = url
+        .query_pairs()
         .find(|(k, _)| k == "type")
         .map(|(_, v)| v.to_string())
         .unwrap_or_else(|| "magiclink".to_string());
 
-    tracing::info!("Verifying magic link token_hash (type={}, hash_len={})", link_type, token_hash.len());
+    tracing::info!(
+        "Verifying magic link token_hash (type={}, hash_len={})",
+        link_type,
+        token_hash.len()
+    );
 
     let client = reqwest::Client::new();
     let verify_url = format!("{}/auth/v1/verify", supabase_url);
@@ -287,7 +292,9 @@ pub async fn refresh_session(
         return Err(format!("Refresh failed: {}", text));
     }
 
-    let lr: LoginResponse = resp.json().await
+    let lr: LoginResponse = resp
+        .json()
+        .await
         .map_err(|e| format!("Refresh parse error: {}", e))?;
 
     tracing::info!("Session refreshed successfully");
@@ -376,7 +383,10 @@ pub async fn register_with_session(
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        return Err(format!("Session registration failed ({}): {}", status, text));
+        return Err(format!(
+            "Session registration failed ({}): {}",
+            status, text
+        ));
     }
 
     let reg: SessionRegistrationResponse = resp
@@ -384,7 +394,11 @@ pub async fn register_with_session(
         .await
         .map_err(|e| format!("Failed to parse session registration response: {}", e))?;
 
-    tracing::info!("Session registration complete: node_id={}, agent_id={}", reg.node_id, reg.agent_id);
+    tracing::info!(
+        "Session registration complete: node_id={}, agent_id={}",
+        reg.node_id,
+        reg.agent_id
+    );
     Ok(reg)
 }
 
@@ -434,10 +448,7 @@ pub async fn heartbeat(
         return Err(format!("Heartbeat failed ({}): {}", status, text));
     }
 
-    let response_body: serde_json::Value = resp
-        .json()
-        .await
-        .unwrap_or(serde_json::json!({}));
+    let response_body: serde_json::Value = resp.json().await.unwrap_or(serde_json::json!({}));
 
     tracing::debug!("Heartbeat sent for node {}", node_id);
     Ok(response_body)
@@ -477,11 +488,17 @@ pub async fn set_tokens_from_deep_link(
             }
         }
         Ok(resp) => {
-            tracing::error!("Failed to fetch user info: {} — not storing tokens", resp.status());
+            tracing::error!(
+                "Failed to fetch user info: {} — not storing tokens",
+                resp.status()
+            );
             return; // Don't store tokens if user verification failed
         }
         Err(e) => {
-            tracing::error!("Network error fetching user info: {} — not storing tokens", e);
+            tracing::error!(
+                "Network error fetching user info: {} — not storing tokens",
+                e
+            );
             return; // Don't store tokens on network failure
         }
     };

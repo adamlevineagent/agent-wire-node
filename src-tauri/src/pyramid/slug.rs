@@ -13,7 +13,7 @@ use super::types::*;
 
 /// Normalize a string into a valid slug: lowercase, alphanumeric + hyphens,
 /// no leading/trailing hyphens, no consecutive hyphens.
-fn slugify(input: &str) -> String {
+pub fn slugify(input: &str) -> String {
     let mut slug = String::with_capacity(input.len());
 
     for ch in input.chars() {
@@ -32,7 +32,7 @@ fn slugify(input: &str) -> String {
 }
 
 /// Validate that a slug name is acceptable (non-empty, reasonable length).
-fn validate_slug(slug: &str) -> Result<()> {
+pub fn validate_slug(slug: &str) -> Result<()> {
     if slug.is_empty() {
         return Err(anyhow!("Slug cannot be empty"));
     }

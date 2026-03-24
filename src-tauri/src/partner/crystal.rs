@@ -5,13 +5,13 @@
 // This runs less frequently than the warm pass (typically triggered by
 // buffer overflow or explicit request).
 
+use rusqlite::Connection;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use rusqlite::Connection;
 use tracing::{info, warn};
 
-use crate::pyramid::delta;
 use crate::pyramid::db;
+use crate::pyramid::delta;
 use crate::pyramid::webbing;
 
 /// Result of a crystallization pass.
@@ -46,7 +46,15 @@ pub async fn crystallize(
                 "[crystal] Collapsing thread {} ({} deltas)",
                 thread.thread_id, thread.delta_count
             );
-            match delta::collapse_thread(reader, writer, slug, &thread.thread_id, api_key, collapse_model).await
+            match delta::collapse_thread(
+                reader,
+                writer,
+                slug,
+                &thread.thread_id,
+                api_key,
+                collapse_model,
+            )
+            .await
             {
                 Ok(new_id) => {
                     info!(
@@ -74,10 +82,21 @@ pub async fn crystallize(
         let api_key = api_key.to_string();
         let collapse_model = collapse_model.to_string();
         tokio::spawn(async move {
-            match webbing::check_and_collapse_edges(&reader, &writer, &slug, &api_key, &collapse_model).await {
+            match webbing::check_and_collapse_edges(
+                &reader,
+                &writer,
+                &slug,
+                &api_key,
+                &collapse_model,
+            )
+            .await
+            {
                 Ok(collapsed) => {
                     if collapsed > 0 {
-                        info!("[crystal] web edge collapse pass collapsed {} edges", collapsed);
+                        info!(
+                            "[crystal] web edge collapse pass collapsed {} edges",
+                            collapsed
+                        );
                     }
                 }
                 Err(e) => {

@@ -19,12 +19,13 @@ pub struct SlugInfo {
     pub created_at: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ContentType {
     Code,
     Conversation,
     Document,
+    Vine,
 }
 
 impl ContentType {
@@ -34,6 +35,7 @@ impl ContentType {
             ContentType::Code => "code",
             ContentType::Conversation => "conversation",
             ContentType::Document => "document",
+            ContentType::Vine => "vine",
         }
     }
 
@@ -43,7 +45,11 @@ impl ContentType {
             "code" => Some(ContentType::Code),
             "conversation" => Some(ContentType::Conversation),
             "document" => Some(ContentType::Document),
-            _ => None,
+            "vine" => Some(ContentType::Vine),
+            other => {
+                tracing::warn!("Unknown content type: '{other}', returning None");
+                None
+            }
         }
     }
 }
@@ -285,9 +291,9 @@ pub struct WebEdgeNote {
 pub struct UsageLogEntry {
     pub id: i64,
     pub slug: String,
-    pub query_type: String,       // "search", "drill", "apex", "node", "entities", "corrections", "terms", "resolved", "tree"
-    pub query_params: String,     // JSON string of the query details
-    pub result_node_ids: String,  // JSON array of node IDs returned
+    pub query_type: String, // "search", "drill", "apex", "node", "entities", "corrections", "terms", "resolved", "tree"
+    pub query_params: String, // JSON string of the query details
+    pub result_node_ids: String, // JSON array of node IDs returned
     pub agent_id: Option<String>, // From X-Agent-Id header
     pub created_at: String,
 }
@@ -313,6 +319,12 @@ pub enum AnnotationType {
     Question,
     Friction,
     Idea,
+    Era,
+    Transition,
+    #[serde(rename = "health_check")]
+    HealthCheck,
+    #[serde(rename = "directory")]
+    Directory,
 }
 
 // ── FAQ Types ────────────────────────────────────────────────────────────────
@@ -320,13 +332,13 @@ pub enum AnnotationType {
 /// A FAQ node — aggregated question/answer derived from annotations.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FaqNode {
-    pub id: String,               // "FAQ-{uuid}" format
+    pub id: String, // "FAQ-{uuid}" format
     pub slug: String,
-    pub question: String,         // The canonical question
-    pub answer: String,           // Accumulated answer from annotations
+    pub question: String,              // The canonical question
+    pub answer: String,                // Accumulated answer from annotations
     pub related_node_ids: Vec<String>, // Pyramid nodes that help answer this
-    pub annotation_ids: Vec<i64>, // Annotation IDs that contributed to this FAQ
-    pub hit_count: i64,           // Times this FAQ was matched by a query
+    pub annotation_ids: Vec<i64>,      // Annotation IDs that contributed to this FAQ
+    pub hit_count: i64,                // Times this FAQ was matched by a query
     #[serde(default)]
     pub match_triggers: Vec<String>, // Trigger patterns for auto-matching
     pub created_at: String,
@@ -341,6 +353,10 @@ impl AnnotationType {
             AnnotationType::Question => "question",
             AnnotationType::Friction => "friction",
             AnnotationType::Idea => "idea",
+            AnnotationType::Era => "era",
+            AnnotationType::Transition => "transition",
+            AnnotationType::HealthCheck => "health_check",
+            AnnotationType::Directory => "directory",
         }
     }
 
@@ -351,7 +367,14 @@ impl AnnotationType {
             "question" => AnnotationType::Question,
             "friction" => AnnotationType::Friction,
             "idea" => AnnotationType::Idea,
-            _ => AnnotationType::Observation,
+            "era" => AnnotationType::Era,
+            "transition" => AnnotationType::Transition,
+            "health_check" => AnnotationType::HealthCheck,
+            "directory" => AnnotationType::Directory,
+            other => {
+                tracing::warn!("Unknown annotation type: '{other}', defaulting to Observation");
+                AnnotationType::Observation
+            }
         }
     }
 }
@@ -498,4 +521,63 @@ pub struct ConnectionResult {
 pub struct RenameResult {
     pub rename: bool,
     pub reason: String,
+}
+
+// ── Vine Types ──────────────────────────────────────────────────────────────
+
+/// A bunch in the vine — one complete conversation pyramid from a single session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VineBunch {
+    pub id: i64,
+    pub vine_slug: String,
+    pub bunch_slug: String,
+    pub session_id: String,
+    pub jsonl_path: String,
+    pub bunch_index: i64,
+    pub first_ts: Option<String>,
+    pub last_ts: Option<String>,
+    pub message_count: Option<i64>,
+    pub chunk_count: Option<i64>,
+    pub apex_node_id: Option<String>,
+    pub penultimate_node_ids: Vec<String>,
+    pub status: String,
+    pub metadata: Option<VineBunchMetadata>,
+}
+
+/// Metadata extracted from a bunch's apex + penultimate layer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VineBunchMetadata {
+    pub topics: Vec<String>,
+    pub entities: Vec<String>,
+    pub decisions: Vec<VineDecision>,
+    pub corrections: Vec<VineCorrection>,
+    pub open_questions: Vec<String>,
+    #[serde(default)]
+    pub penultimate_summaries: Vec<String>,
+}
+
+/// Decision with temporal context for cross-bunch evolution chains.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VineDecision {
+    pub decision: Decision,
+    pub bunch_index: i64,
+    pub bunch_ts: String,
+}
+
+/// Correction with temporal context for cross-bunch correction chains.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VineCorrection {
+    pub correction: Correction,
+    pub bunch_index: i64,
+    pub bunch_ts: String,
+}
+
+/// Discovery result for a JSONL conversation file.
+#[derive(Debug, Clone)]
+pub struct BunchDiscovery {
+    pub session_id: String,
+    pub jsonl_path: std::path::PathBuf,
+    pub first_ts: String,
+    pub last_ts: String,
+    pub message_count: i64,
 }

@@ -12,13 +12,10 @@
 
 use rusqlite::Connection;
 
-use super::{
-    Session, Message, MessageRole,
-    NAV_SKELETON_BUDGET,
-};
 use super::conversation::estimate_tokens;
-use crate::pyramid::query;
+use super::{Message, MessageRole, Session, NAV_SKELETON_BUDGET};
 use crate::pyramid::db as pyramid_db;
+use crate::pyramid::query;
 use crate::pyramid::slug;
 
 // ── LLM Message format ─────────────────────────────────────────────
@@ -136,12 +133,8 @@ pub fn build_nav_skeleton(reader: &Connection, budget_tokens: usize) -> String {
                     break;
                 }
 
-                let topic_names: Vec<String> = node.topics.iter()
-                    .map(|t| t.name.clone())
-                    .collect();
-                let entity_count: usize = node.topics.iter()
-                    .map(|t| t.entities.len())
-                    .sum();
+                let topic_names: Vec<String> = node.topics.iter().map(|t| t.name.clone()).collect();
+                let entity_count: usize = node.topics.iter().map(|t| t.entities.len()).sum();
 
                 let thread_line = format!(
                     "  Thread {}: {} (topics: {}, entities: {})\n",
@@ -188,10 +181,14 @@ pub fn build_nav_skeleton(reader: &Connection, budget_tokens: usize) -> String {
                 if !thread_list.is_empty() && total_tokens < budget_tokens {
                     let mut delta_section = String::from("  Delta Chain State:\n");
                     for thread in thread_list {
-                        if total_tokens >= budget_tokens { break; }
+                        if total_tokens >= budget_tokens {
+                            break;
+                        }
 
                         // Get distillation for this thread
-                        if let Ok(Some(distillation)) = pyramid_db::get_distillation(reader, slug_name, &thread.thread_id) {
+                        if let Ok(Some(distillation)) =
+                            pyramid_db::get_distillation(reader, slug_name, &thread.thread_id)
+                        {
                             if !distillation.content.is_empty() {
                                 let line = format!(
                                     "    {} ({}Δ): {}\n",
@@ -213,7 +210,9 @@ pub fn build_nav_skeleton(reader: &Connection, budget_tokens: usize) -> String {
                         if !edges.is_empty() {
                             delta_section.push_str("  Connections:\n");
                             for edge in edges.iter().take(10) {
-                                if total_tokens >= budget_tokens { break; }
+                                if total_tokens >= budget_tokens {
+                                    break;
+                                }
                                 let line = format!(
                                     "    {} ↔ {}: {}\n",
                                     edge.thread_a_id,
@@ -309,7 +308,9 @@ pub fn build_conversation_history(session: &Session) -> Vec<LlmMessage> {
             MessageRole::Partner => "assistant",
         };
         messages.push(LlmMessage {
-            tool_call_id: None, tool_calls: None, role: role.to_string(),
+            tool_call_id: None,
+            tool_calls: None,
+            role: role.to_string(),
             content: msg.content.clone(),
         });
     }
@@ -331,7 +332,9 @@ pub fn build_hydrated_content(reader: &Connection, session: &Session) -> String 
         // We need the slug to look them up. Use the session's slug if available.
         if let Some(ref slug_name) = session.slug {
             if let Ok(Some(node)) = pyramid_db::get_node(reader, slug_name, node_id) {
-                let topics_str: String = node.topics.iter()
+                let topics_str: String = node
+                    .topics
+                    .iter()
                     .map(|t| format!("  Topic: {} — {}", t.name, t.current))
                     .collect::<Vec<_>>()
                     .join("\n");
@@ -356,7 +359,10 @@ pub fn build_hydrated_content(reader: &Connection, session: &Session) -> String 
         return String::new();
     }
 
-    format!("## Hydrated Content & Lifted Results\n\n{}", parts.join("\n"))
+    format!(
+        "## Hydrated Content & Lifted Results\n\n{}",
+        parts.join("\n")
+    )
 }
 
 // ── Full Context Assembly ───────────────────────────────────────────
@@ -427,13 +433,11 @@ pub fn assemble_context_window(
 ///
 /// Hydrates new nodes (adds to hydrated_node_ids).
 /// Dehydrates old nodes (removes from hydrated_node_ids).
-pub fn apply_context_schedule(
-    session: &mut Session,
-    hydrate: Vec<String>,
-    dehydrate: Vec<String>,
-) {
+pub fn apply_context_schedule(session: &mut Session, hydrate: Vec<String>, dehydrate: Vec<String>) {
     // Remove dehydrated nodes
-    session.hydrated_node_ids.retain(|id| !dehydrate.contains(id));
+    session
+        .hydrated_node_ids
+        .retain(|id| !dehydrate.contains(id));
 
     // Add hydrated nodes (avoid duplicates)
     for id in hydrate {

@@ -8,19 +8,19 @@
 //   propagate_staleness    — propagate change signals upward through the pyramid
 //   check_collapse_needed  — determine if a thread needs collapsing
 
-use std::collections::HashSet;
-use std::time::Instant;
 use rusqlite::Connection;
-use tokio::sync::Mutex;
+use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Instant;
+use tokio::sync::Mutex;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::pyramid::db;
-use crate::pyramid::types::*;
-use crate::pyramid::llm;
 use crate::pyramid::config_helper::config_for_model;
+use crate::pyramid::db;
+use crate::pyramid::llm;
 use crate::pyramid::naming::{clean_headline, headline_for_node};
+use crate::pyramid::types::*;
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -82,7 +82,10 @@ pub async fn match_or_create_thread(
         };
         let conn = writer.lock().await;
         db::save_thread(&conn, &thread)?;
-        info!("[delta] created first thread '{}' for slug '{}'", thread.thread_name, slug);
+        info!(
+            "[delta] created first thread '{}' for slug '{}'",
+            thread.thread_name, slug
+        );
         return Ok(thread_id);
     }
 
@@ -111,7 +114,10 @@ Output JSON:
     let raw = llm::call_model(&cfg, system_prompt, &user_prompt, 0.2, 200).await?;
     let parsed = llm::extract_json(&raw)?;
 
-    let match_val = parsed.get("match").and_then(|v| v.as_str()).unwrap_or("NEW");
+    let match_val = parsed
+        .get("match")
+        .and_then(|v| v.as_str())
+        .unwrap_or("NEW");
 
     if match_val != "NEW" {
         // Verify the thread_id actually exists
@@ -119,7 +125,10 @@ Output JSON:
             info!("[delta] matched content to thread '{}'", match_val);
             return Ok(match_val.to_string());
         }
-        warn!("[delta] LLM returned thread_id '{}' which doesn't exist, creating new", match_val);
+        warn!(
+            "[delta] LLM returned thread_id '{}' which doesn't exist, creating new",
+            match_val
+        );
     }
 
     // Create a new thread
@@ -142,7 +151,10 @@ Output JSON:
     };
     let conn = writer.lock().await;
     db::save_thread(&conn, &thread)?;
-    info!("[delta] created new thread '{}' ({})", thread_name, thread_id);
+    info!(
+        "[delta] created new thread '{}' ({})",
+        thread_name, thread_id
+    );
     Ok(thread_id)
 }
 
@@ -186,10 +198,12 @@ pub async fn create_delta(
     // 1. Load canonical node
     let (canonical_distilled, canonical_id) = {
         let conn = reader.lock().await;
-        let thread = db::get_thread(&conn, slug, thread_id)?
-            .ok_or_else(|| anyhow::anyhow!("Thread '{}' not found in slug '{}'", thread_id, slug))?;
-        let node = db::get_node(&conn, slug, &thread.current_canonical_id)?
-            .ok_or_else(|| anyhow::anyhow!("Canonical node '{}' not found", thread.current_canonical_id))?;
+        let thread = db::get_thread(&conn, slug, thread_id)?.ok_or_else(|| {
+            anyhow::anyhow!("Thread '{}' not found in slug '{}'", thread_id, slug)
+        })?;
+        let node = db::get_node(&conn, slug, &thread.current_canonical_id)?.ok_or_else(|| {
+            anyhow::anyhow!("Canonical node '{}' not found", thread.current_canonical_id)
+        })?;
         (node.distilled, thread.current_canonical_id)
     };
 
@@ -218,7 +232,14 @@ pub async fn create_delta(
     } else {
         recent_deltas
             .iter()
-            .map(|d| format!("delta-{} ({}): {}", d.sequence, d.relevance.as_str(), d.content))
+            .map(|d| {
+                format!(
+                    "delta-{} ({}): {}",
+                    d.sequence,
+                    d.relevance.as_str(),
+                    d.content
+                )
+            })
             .collect::<Vec<_>>()
             .join("\n")
     };
@@ -230,7 +251,8 @@ pub async fn create_delta(
     };
 
     // 4. Call LLM
-    let system_prompt = "You are analyzing what changed relative to existing understanding. Output JSON only.";
+    let system_prompt =
+        "You are analyzing what changed relative to existing understanding. Output JSON only.";
     let user_prompt = format!(
         r#"You are analyzing what changed relative to existing understanding.
 
@@ -275,11 +297,13 @@ Output JSON only:
         .unwrap_or("medium");
     let relevance = DeltaRelevance::from_str(relevance_str);
 
-    let flag = parsed
-        .get("flag")
-        .and_then(|v| {
-            if v.is_null() { None } else { v.as_str().map(|s| s.to_string()) }
-        });
+    let flag = parsed.get("flag").and_then(|v| {
+        if v.is_null() {
+            None
+        } else {
+            v.as_str().map(|s| s.to_string())
+        }
+    });
 
     // 6. Save delta with transaction-wrapped sequence
     let delta = {
@@ -314,7 +338,10 @@ Output JSON only:
 
         tx.commit()?;
 
-        Delta { id: row_id, ..delta }
+        Delta {
+            id: row_id,
+            ..delta
+        }
     };
 
     if let Some(ref f) = flag {
@@ -329,14 +356,17 @@ Output JSON only:
     );
 
     // 7. Rewrite distillation
-    let web_edge_notes = rewrite_distillation(reader, writer, slug, thread_id, &delta, api_key, model).await?;
+    let web_edge_notes =
+        rewrite_distillation(reader, writer, slug, thread_id, &delta, api_key, model).await?;
 
     // 7b. Process web edge notes (cross-thread connections)
     if let Some(notes) = web_edge_notes {
         if !notes.is_empty() {
             if let Err(e) = crate::pyramid::webbing::process_web_edge_notes(
                 reader, writer, slug, thread_id, &notes,
-            ).await {
+            )
+            .await
+            {
                 warn!("[delta] web edge processing failed: {}", e);
             }
         }
@@ -349,7 +379,10 @@ Output JSON only:
     };
 
     if needs_collapse {
-        info!("[delta] collapse threshold reached for thread '{}', collapse should be triggered", thread_id);
+        info!(
+            "[delta] collapse threshold reached for thread '{}', collapse should be triggered",
+            thread_id
+        );
         // Note: actual collapse is triggered by the caller or warm pass with a frontier model.
         // We log the signal here rather than auto-collapsing, because collapse uses a different
         // (more expensive) model that the caller provides.
@@ -359,10 +392,21 @@ Output JSON only:
     {
         let conn = reader.lock().await;
         let mut visited = HashSet::new();
-        match propagate_staleness(&conn, slug, &canonical_id, 1, &mut visited, MAX_PROPAGATION_DEPTH) {
+        match propagate_staleness(
+            &conn,
+            slug,
+            &canonical_id,
+            1,
+            &mut visited,
+            MAX_PROPAGATION_DEPTH,
+        ) {
             Ok(affected) => {
                 if !affected.is_empty() {
-                    info!("[delta] staleness propagated to {} nodes: {:?}", affected.len(), affected);
+                    info!(
+                        "[delta] staleness propagated to {} nodes: {:?}",
+                        affected.len(),
+                        affected
+                    );
                     // Note: Do NOT write confirmed_stale WAL entries here.
                     // DADBEAR handles upward propagation through its own per-layer timer system.
                     // Writing WAL entries from create_delta caused false L1 firings
@@ -445,7 +489,11 @@ Output JSON only:
 }}"#,
         content = delta.content,
         relevance = delta.relevance.as_str(),
-        thread_names = if thread_names_list.is_empty() { "No other threads.".to_string() } else { thread_names_list },
+        thread_names = if thread_names_list.is_empty() {
+            "No other threads.".to_string()
+        } else {
+            thread_names_list
+        },
         budget = DISTILLATION_TOKEN_BUDGET,
     );
 
@@ -466,7 +514,10 @@ Output JSON only:
         .unwrap_or(false);
 
     if drift_detected {
-        warn!("[delta] drift detected in distillation for thread '{}'", thread_id);
+        warn!(
+            "[delta] drift detected in distillation for thread '{}'",
+            thread_id
+        );
     }
 
     // Parse web edge notes
@@ -545,8 +596,9 @@ pub async fn collapse_thread(
         let conn = reader.lock().await;
         let thread = db::get_thread(&conn, slug, thread_id)?
             .ok_or_else(|| anyhow::anyhow!("Thread '{}' not found", thread_id))?;
-        let node = db::get_node(&conn, slug, &thread.current_canonical_id)?
-            .ok_or_else(|| anyhow::anyhow!("Canonical node '{}' not found", thread.current_canonical_id))?;
+        let node = db::get_node(&conn, slug, &thread.current_canonical_id)?.ok_or_else(|| {
+            anyhow::anyhow!("Canonical node '{}' not found", thread.current_canonical_id)
+        })?;
         (node, thread)
     };
 
@@ -572,7 +624,14 @@ pub async fn collapse_thread(
 
     let deltas_text = all_deltas
         .iter()
-        .map(|d| format!("delta-{} ({}): {}", d.sequence, d.relevance.as_str(), d.content))
+        .map(|d| {
+            format!(
+                "delta-{} ({}): {}",
+                d.sequence,
+                d.relevance.as_str(),
+                d.content
+            )
+        })
         .collect::<Vec<_>>()
         .join("\n");
 
@@ -726,15 +785,15 @@ Output valid JSON matching this schema:
                     )
                     .unwrap_or_default();
 
-                let mut children: Vec<String> = serde_json::from_str(&parent_children_json)
-                    .unwrap_or_default();
+                let mut children: Vec<String> =
+                    serde_json::from_str(&parent_children_json).unwrap_or_default();
                 for child in children.iter_mut() {
                     if *child == canonical_node.id {
                         *child = new_node_id.clone();
                     }
                 }
-                let updated_children_json = serde_json::to_string(&children)
-                    .unwrap_or_else(|_| "[]".to_string());
+                let updated_children_json =
+                    serde_json::to_string(&children).unwrap_or_else(|_| "[]".to_string());
 
                 tx.execute(
                     "UPDATE pyramid_nodes SET children = ?1 WHERE slug = ?2 AND id = ?3",
@@ -792,10 +851,21 @@ Output valid JSON matching this schema:
     {
         let conn = reader.lock().await;
         let mut visited = HashSet::new();
-        match propagate_staleness(&conn, slug, &new_node_id, 1, &mut visited, MAX_PROPAGATION_DEPTH) {
+        match propagate_staleness(
+            &conn,
+            slug,
+            &new_node_id,
+            1,
+            &mut visited,
+            MAX_PROPAGATION_DEPTH,
+        ) {
             Ok(affected) => {
                 if !affected.is_empty() {
-                    info!("[delta] collapse staleness propagated to {} nodes: {:?}", affected.len(), affected);
+                    info!(
+                        "[delta] collapse staleness propagated to {} nodes: {:?}",
+                        affected.len(),
+                        affected
+                    );
                     // Note: Do NOT write confirmed_stale WAL entries here.
                     // DADBEAR handles upward propagation through its own per-layer timer system.
                     // Writing WAL entries from collapse_thread caused false L1 firings.
@@ -874,7 +944,8 @@ pub fn propagate_staleness(
         if superseded.is_none() {
             affected.push(pid.clone());
             // Recurse upward
-            let mut upstream = propagate_staleness(conn, slug, &pid, changed_depth + 1, visited, max_depth)?;
+            let mut upstream =
+                propagate_staleness(conn, slug, &pid, changed_depth + 1, visited, max_depth)?;
             affected.append(&mut upstream);
         }
     }
@@ -928,7 +999,8 @@ mod tests {
     #[test]
     fn test_truncate_for_name() {
         assert_eq!(truncate_for_name("short", 60), "short");
-        let long = "This is a very long piece of content that should get truncated at a word boundary";
+        let long =
+            "This is a very long piece of content that should get truncated at a word boundary";
         let result = truncate_for_name(long, 40);
         assert!(result.len() <= 43); // 40 + "..."
         assert!(result.ends_with("..."));
@@ -961,6 +1033,16 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         db::init_pyramid_db(&conn).unwrap();
 
+        // Insert prerequisite slug + node (FK: threads.current_canonical_id → nodes.id)
+        conn.execute(
+            "INSERT INTO pyramid_slugs (slug, content_type, source_path) VALUES ('test', 'code', '/tmp')",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO pyramid_nodes (id, slug, depth, headline) VALUES ('node-1', 'test', 1, 'Test Node')",
+            [],
+        ).unwrap();
+
         // Create a thread
         let thread = PyramidThread {
             slug: "test".into(),
@@ -981,7 +1063,8 @@ mod tests {
         conn.execute(
             "UPDATE pyramid_threads SET delta_count = ?1 WHERE slug = 'test' AND thread_id = 't1'",
             rusqlite::params![COLLAPSE_THRESHOLD],
-        ).unwrap();
+        )
+        .unwrap();
         assert!(check_collapse_needed(&conn, "test", "t1").unwrap());
     }
 }

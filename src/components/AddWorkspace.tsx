@@ -2,13 +2,16 @@ import { useState, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-dialog';
 import { BuildProgress } from './BuildProgress';
+import { VineBuildProgress } from './VineBuildProgress';
 
 interface AddWorkspaceProps {
     onComplete: () => void;
     onCancel: () => void;
 }
 
-type Step = 'directory' | 'content-type' | 'configure' | 'confirm' | 'building';
+type Step = 'directory' | 'content-type' | 'vine-dirs' | 'configure' | 'confirm' | 'building';
+
+const PYRAMID_API_BASE = 'http://localhost:8765';
 
 const DEFAULT_IGNORES = [
     'node_modules', '.git', 'target', 'dist', 'build', '.next',
@@ -27,7 +30,8 @@ function slugify(name: string): string {
 export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
     const [step, setStep] = useState<Step>('directory');
     const [paths, setPaths] = useState<string[]>([]);
-    const [contentType, setContentType] = useState<'code' | 'document' | 'conversation' | null>(null);
+    const [contentType, setContentType] = useState<'code' | 'document' | 'conversation' | 'vine' | null>(null);
+    const [vinePastePath, setVinePastePath] = useState('');
     const [customIgnores, setCustomIgnores] = useState('');
     const [slug, setSlug] = useState('');
     const [creating, setCreating] = useState(false);
@@ -133,9 +137,15 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
         });
     }, []);
 
-    const handleContentTypeSelect = useCallback((type: 'code' | 'document' | 'conversation') => {
+    const handleContentTypeSelect = useCallback((type: 'code' | 'document' | 'conversation' | 'vine') => {
         setContentType(type);
-        if (type === 'conversation') {
+        if (type === 'vine') {
+            // Go to vine directory selection step
+            // Clear paths from step 1 since vine uses its own directory list
+            setPaths([]);
+            setSlug('');
+            setStep('vine-dirs');
+        } else if (type === 'conversation') {
             // If path already pasted and it's a .jsonl, skip picker
             if (paths.length > 0 && paths[0].endsWith('.jsonl')) {
                 setStep('confirm');
@@ -146,6 +156,77 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
             setStep('configure');
         }
     }, [handlePickConversation, paths]);
+
+    const handleVinePickDirectory = useCallback(async () => {
+        try {
+            const selected = await open({
+                directory: true,
+                title: 'Select JSONL Directory for Vine',
+                multiple: true,
+            });
+            if (selected) {
+                const newPaths = Array.isArray(selected) ? selected : [selected];
+                setPaths(prev => {
+                    const combined = [...prev];
+                    for (const p of newPaths) {
+                        if (!combined.includes(p)) combined.push(p);
+                    }
+                    if (combined.length > 0 && !slug) {
+                        const parts = combined[0].split('/');
+                        const folderName = parts[parts.length - 1] || parts[parts.length - 2] || 'vine';
+                        setSlug(slugify(folderName + '-vine'));
+                    }
+                    return combined;
+                });
+            }
+        } catch (err) {
+            setError(String(err));
+        }
+    }, [slug]);
+
+    const handleVineAddPastePath = useCallback(() => {
+        const val = vinePastePath.trim();
+        if (!val) return;
+        setPaths(prev => {
+            if (prev.includes(val)) return prev;
+            const updated = [...prev, val];
+            if (updated.length === 1 && !slug) {
+                const parts = val.split('/');
+                const folderName = parts[parts.length - 1] || parts[parts.length - 2] || 'vine';
+                setSlug(slugify(folderName + '-vine'));
+            }
+            return updated;
+        });
+        setVinePastePath('');
+    }, [vinePastePath, slug]);
+
+    const handleVineCreate = useCallback(async () => {
+        if (paths.length === 0 || !slug) return;
+        setCreating(true);
+        setError(null);
+
+        try {
+            // Create the slug via Tauri so it appears in the dashboard
+            const sourcePath = paths.join(';');
+            await invoke('pyramid_create_slug', {
+                slug,
+                contentType: 'vine',
+                sourcePath,
+            });
+
+            // Kick off vine build via Tauri command
+            await invoke('pyramid_vine_build', {
+                vineSlug: slug,
+                jsonlDirs: paths,
+            });
+
+            setStep('building');
+        } catch (err) {
+            setError(String(err));
+        } finally {
+            setCreating(false);
+        }
+    }, [paths, slug]);
 
     const handleContinueToConfirm = useCallback(() => {
         setStep('confirm');
@@ -193,19 +274,28 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
         <div className="add-workspace-panel">
             {/* Step indicator */}
             <div className="workspace-steps">
-                {(['directory', 'content-type', 'configure', 'confirm'] as Step[]).map((s, i) => (
-                    <div
-                        key={s}
-                        className={`workspace-step ${step === s ? 'active' : ''} ${
-                            ['directory', 'content-type', 'configure', 'confirm'].indexOf(step) > i ? 'done' : ''
-                        }`}
-                    >
-                        <span className="step-number">{i + 1}</span>
-                        <span className="step-label">
-                            {s === 'directory' ? 'Directories' : s === 'content-type' ? 'Type' : s === 'configure' ? 'Configure' : 'Confirm'}
-                        </span>
-                    </div>
-                ))}
+                {(contentType === 'vine'
+                    ? (['directory', 'content-type', 'vine-dirs', 'confirm'] as Step[])
+                    : (['directory', 'content-type', 'configure', 'confirm'] as Step[])
+                ).map((s, i) => {
+                    const stepOrder = contentType === 'vine'
+                        ? ['directory', 'content-type', 'vine-dirs', 'confirm']
+                        : ['directory', 'content-type', 'configure', 'confirm'];
+                    const currentIndex = stepOrder.indexOf(step);
+                    return (
+                        <div
+                            key={s}
+                            className={`workspace-step ${step === s ? 'active' : ''} ${
+                                currentIndex > i ? 'done' : ''
+                            }`}
+                        >
+                            <span className="step-number">{i + 1}</span>
+                            <span className="step-label">
+                                {s === 'directory' ? (contentType === 'vine' ? 'Source' : 'Directories') : s === 'content-type' ? 'Type' : s === 'vine-dirs' ? 'Folders' : s === 'configure' ? 'Configure' : 'Confirm'}
+                            </span>
+                        </div>
+                    );
+                })}
             </div>
 
             {error && (
@@ -342,6 +432,19 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
                                 Claude Code sessions, chat logs, design discussions.
                             </div>
                         </button>
+
+                        <button
+                            className={`content-type-card ${contentType === 'vine' ? 'selected' : ''}`}
+                            onClick={() => handleContentTypeSelect('vine')}
+                        >
+                            <div className="content-type-icon">&#x1F347;</div>
+                            <div className="content-type-name">Vine</div>
+                            <div className="content-type-desc">
+                                Conversation Vine &mdash; connects multiple conversation
+                                sessions into a temporal meta-pyramid. Pick folders
+                                containing Claude Code JSONL files.
+                            </div>
+                        </button>
                     </div>
 
                     <div className="content-type-notice">
@@ -354,6 +457,71 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
                     <div className="step-nav">
                         <button className="btn btn-ghost" onClick={() => setStep('directory')}>
                             Back
+                        </button>
+                    </div>
+                </div>
+            )}
+
+            {/* Step 2b: Vine Directory Selection */}
+            {step === 'vine-dirs' && (
+                <div className="workspace-step-content">
+                    <h2>Select JSONL Directories</h2>
+                    <p className="step-description">
+                        Pick folders containing Claude Code JSONL conversation files.
+                        Each folder becomes a bunch in the vine.
+                    </p>
+
+                    {paths.length > 0 && (
+                        <div className="selected-paths" style={{ marginBottom: '12px' }}>
+                            {paths.map((p, i) => (
+                                <div key={p} className="selected-path-row">
+                                    <span className="selected-path-text">{p}</span>
+                                    <button className="btn btn-ghost btn-sm" onClick={() => handleRemovePath(i)} title="Remove">&times;</button>
+                                </div>
+                            ))}
+                        </div>
+                    )}
+
+                    <div style={{ display: 'flex', gap: '8px', marginBottom: '8px' }}>
+                        <input
+                            type="text"
+                            placeholder="Paste a path (e.g. ~/.claude/projects/my-app)..."
+                            className="input"
+                            style={{ flex: 1 }}
+                            value={vinePastePath}
+                            onChange={(e) => setVinePastePath(e.target.value)}
+                            onKeyDown={(e) => {
+                                if (e.key === 'Enter') handleVineAddPastePath();
+                            }}
+                        />
+                        <button
+                            className="btn btn-secondary"
+                            onClick={handleVineAddPastePath}
+                            disabled={!vinePastePath.trim()}
+                            title="Add path"
+                        >
+                            +
+                        </button>
+                        <button className="btn btn-primary" onClick={handleVinePickDirectory}>
+                            Browse...
+                        </button>
+                    </div>
+
+                    <div className="vine-hint">
+                        Tip: Hidden folders like <code>.claude/</code> may not appear in the
+                        file picker. Use <kbd>Cmd+Shift+.</kbd> to show them, or paste the path above.
+                    </div>
+
+                    <div className="step-nav" style={{ marginTop: '16px' }}>
+                        <button className="btn btn-ghost" onClick={() => { setStep('content-type'); setContentType(null); }}>
+                            Back
+                        </button>
+                        <button
+                            className="btn btn-primary"
+                            onClick={() => setStep('confirm')}
+                            disabled={paths.length === 0}
+                        >
+                            Next
                         </button>
                     </div>
                 </div>
@@ -423,13 +591,21 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
                         <div className="summary-row">
                             <span className="summary-label">Type:</span>
                             <span className="summary-value">
-                                {contentType === 'code' ? 'Code Project' : 'Documents'}
+                                {contentType === 'code' ? 'Code Project' : contentType === 'vine' ? 'Conversation Vine' : contentType === 'conversation' ? 'Conversation' : 'Documents'}
                             </span>
                         </div>
-                        <div className="summary-row">
-                            <span className="summary-label">Ignoring:</span>
-                            <span className="summary-value">{allIgnores.length} patterns</span>
-                        </div>
+                        {contentType !== 'vine' && contentType !== 'conversation' && (
+                            <div className="summary-row">
+                                <span className="summary-label">Ignoring:</span>
+                                <span className="summary-value">{allIgnores.length} patterns</span>
+                            </div>
+                        )}
+                        {contentType === 'vine' && (
+                            <div className="summary-row">
+                                <span className="summary-label">Directories:</span>
+                                <span className="summary-value">{paths.length} folder{paths.length !== 1 ? 's' : ''}</span>
+                            </div>
+                        )}
                     </div>
 
                     <div className="confirm-estimate">
@@ -437,29 +613,52 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
                     </div>
 
                     <div className="step-nav">
-                        <button className="btn btn-ghost" onClick={() => setStep('configure')}>
+                        <button className="btn btn-ghost" onClick={() => {
+                            if (contentType === 'vine') setStep('vine-dirs');
+                            else if (contentType === 'conversation') setStep('content-type');
+                            else setStep('configure');
+                        }}>
                             Back
                         </button>
-                        <button
-                            className="btn btn-secondary"
-                            onClick={() => handleCreate(false)}
-                            disabled={creating || !slug}
-                        >
-                            {creating ? 'Creating...' : 'Create Only'}
-                        </button>
-                        <button
-                            className="btn btn-primary"
-                            onClick={() => handleCreate(true)}
-                            disabled={creating || !slug}
-                        >
-                            {creating ? 'Creating...' : 'Create & Build'}
-                        </button>
+                        {contentType === 'vine' ? (
+                            <button
+                                className="btn btn-primary"
+                                onClick={handleVineCreate}
+                                disabled={creating || !slug || paths.length === 0}
+                            >
+                                {creating ? 'Creating...' : 'Create & Build Vine'}
+                            </button>
+                        ) : (
+                            <>
+                                <button
+                                    className="btn btn-secondary"
+                                    onClick={() => handleCreate(false)}
+                                    disabled={creating || !slug}
+                                >
+                                    {creating ? 'Creating...' : 'Create Only'}
+                                </button>
+                                <button
+                                    className="btn btn-primary"
+                                    onClick={() => handleCreate(true)}
+                                    disabled={creating || !slug}
+                                >
+                                    {creating ? 'Creating...' : 'Create & Build'}
+                                </button>
+                            </>
+                        )}
                     </div>
                 </div>
             )}
 
             {/* Step 5: Building */}
-            {step === 'building' && (
+            {step === 'building' && contentType === 'vine' && (
+                <VineBuildProgress
+                    slug={slug}
+                    onComplete={() => {}}
+                    onClose={onComplete}
+                />
+            )}
+            {step === 'building' && contentType !== 'vine' && (
                 <BuildProgress
                     slug={slug}
                     onComplete={() => {}}

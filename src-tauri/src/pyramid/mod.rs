@@ -10,31 +10,33 @@
 //   slug    — Slug/namespace management
 //   routes  — Warp HTTP route handlers
 
-pub mod db;
-pub mod types;
-pub mod ingest;
 pub mod build;
-pub mod query;
-pub mod llm;
-pub mod naming;
-pub mod slug;
-pub mod routes;
-pub mod delta;
-pub mod webbing;
-pub mod meta;
-pub mod faq;
 pub mod config_helper;
-pub mod watcher;
+pub mod db;
+pub mod delta;
+pub mod faq;
+pub mod ingest;
+pub mod llm;
+pub mod meta;
+pub mod naming;
+pub mod query;
+pub mod routes;
+pub mod slug;
 pub mod stale_engine;
 pub mod stale_helpers;
 pub mod stale_helpers_upper;
+pub mod types;
+pub mod vine;
+pub mod vine_prompts;
+pub mod watcher;
+pub mod webbing;
 
+use rusqlite::Connection;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use rusqlite::Connection;
-use serde::{Deserialize, Serialize};
 
 use self::llm::LlmConfig;
 use self::stale_engine::PyramidStaleEngine;
@@ -60,11 +62,21 @@ pub struct PyramidConfig {
     pub collapse_model: String,
 }
 
-fn default_primary_model() -> String { "inception/mercury-2".into() }
-fn default_fallback_1() -> String { "qwen/qwen3.5-flash-02-23".into() }
-fn default_fallback_2() -> String { "x-ai/grok-4.20-beta".into() }
-fn default_partner_model() -> String { "xiaomi/mimo-v2-pro".into() }
-fn default_collapse_model() -> String { "x-ai/grok-4.20-beta".into() }
+fn default_primary_model() -> String {
+    "inception/mercury-2".into()
+}
+fn default_fallback_1() -> String {
+    "qwen/qwen3.5-flash-02-23".into()
+}
+fn default_fallback_2() -> String {
+    "x-ai/grok-4.20-beta".into()
+}
+fn default_partner_model() -> String {
+    "xiaomi/mimo-v2-pro".into()
+}
+fn default_collapse_model() -> String {
+    "x-ai/grok-4.20-beta".into()
+}
 
 impl Default for PyramidConfig {
     fn default() -> Self {
@@ -113,6 +125,13 @@ impl PyramidConfig {
     }
 }
 
+/// State for a running vine build — cancellation token + status.
+pub struct VineBuildHandle {
+    pub cancel: tokio_util::sync::CancellationToken,
+    pub status: String,        // "running", "complete", "failed"
+    pub error: Option<String>, // error message if failed
+}
+
 /// Shared state for the pyramid engine.
 ///
 /// Two SQLite connections: `reader` for concurrent reads, `writer` for
@@ -132,6 +151,8 @@ pub struct PyramidState {
     pub stale_engines: Arc<Mutex<HashMap<String, PyramidStaleEngine>>>,
     /// Per-slug file watchers for auto-update (Phase 7). Keyed by slug name.
     pub file_watchers: Arc<Mutex<HashMap<String, PyramidFileWatcher>>>,
+    /// Active vine builds, keyed by vine slug. Prevents concurrent builds per slug.
+    pub vine_builds: Arc<Mutex<HashMap<String, VineBuildHandle>>>,
 }
 
 /// Handle to a running pyramid build.

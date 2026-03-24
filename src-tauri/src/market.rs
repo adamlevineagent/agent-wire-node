@@ -80,7 +80,8 @@ pub async fn evaluate_opportunities(
     market_state.last_evaluation_at = Some(chrono::Utc::now().to_rfc3339());
 
     // Sort opportunities by efficiency: pulls_30d / current_replicas (higher = more demand per replica)
-    let mut scored: Vec<(&MarketOpportunity, f64)> = opportunities.iter()
+    let mut scored: Vec<(&MarketOpportunity, f64)> = opportunities
+        .iter()
         .filter(|o| !market_state.hosted_documents.contains_key(&o.document_id))
         .map(|o| {
             let efficiency = if o.current_replicas > 0 {
@@ -104,19 +105,12 @@ pub async fn evaluate_opportunities(
         }
 
         // Pull document from origin, verify hash, store locally
-        match host_document(
-            api_url,
-            access_token,
-            node_id,
-            opportunity,
-            cache_dir,
-        ).await {
+        match host_document(api_url, access_token, node_id, opportunity, cache_dir).await {
             Ok(hosted) => {
                 bytes_used += hosted.size_bytes;
-                market_state.hosted_documents.insert(
-                    hosted.document_id.clone(),
-                    hosted,
-                );
+                market_state
+                    .hosted_documents
+                    .insert(hosted.document_id.clone(), hosted);
                 market_state.total_hosted_bytes = bytes_used;
             }
             Err(e) => {
@@ -126,17 +120,26 @@ pub async fn evaluate_opportunities(
     }
 
     // Auto-drop underperformers — documents with zero pulls and low expected value
-    let drop_candidates: Vec<String> = market_state.hosted_documents.iter()
-        .filter(|(_, doc)| {
-            doc.pulls_served == 0 && doc.credits_earned == 0.0
-        })
+    let drop_candidates: Vec<String> = market_state
+        .hosted_documents
+        .iter()
+        .filter(|(_, doc)| doc.pulls_served == 0 && doc.credits_earned == 0.0)
         .map(|(id, _)| id.clone())
         .collect();
 
     // Only drop if we're near capacity (>90% full)
     if bytes_used as f64 > cap_bytes as f64 * 0.9 {
         for doc_id in drop_candidates.iter().take(5) {
-            match drop_document(api_url, access_token, node_id, doc_id, cache_dir, market_state).await {
+            match drop_document(
+                api_url,
+                access_token,
+                node_id,
+                doc_id,
+                cache_dir,
+                market_state,
+            )
+            .await
+            {
                 Ok(_) => {
                     tracing::info!("Dropped underperforming document: {}", doc_id);
                 }
@@ -166,7 +169,8 @@ async fn host_document(
         &opportunity.corpus_id,
         &opportunity.body_hash,
         cache_dir,
-    ).await?;
+    )
+    .await?;
 
     // Report pin to Wire API
     let client = reqwest::Client::new();
@@ -193,7 +197,11 @@ async fn host_document(
         tracing::warn!("Host report failed: {}", text);
     }
 
-    tracing::info!("Hosted document: {} ({} bytes)", opportunity.document_id, file_size);
+    tracing::info!(
+        "Hosted document: {} ({} bytes)",
+        opportunity.document_id,
+        file_size
+    );
 
     Ok(HostedDocument {
         document_id: opportunity.document_id.clone(),
@@ -216,7 +224,9 @@ async fn drop_document(
     market_state: &mut MarketState,
 ) -> Result<(), String> {
     // Find corpus_id for this document
-    let corpus_id = market_state.hosted_documents.get(document_id)
+    let corpus_id = market_state
+        .hosted_documents
+        .get(document_id)
         .map(|d| d.corpus_id.clone())
         .unwrap_or_default();
 
@@ -248,7 +258,9 @@ async fn drop_document(
 
     // Remove from hosted documents
     if let Some(doc) = market_state.hosted_documents.remove(document_id) {
-        market_state.total_hosted_bytes = market_state.total_hosted_bytes.saturating_sub(doc.size_bytes);
+        market_state.total_hosted_bytes = market_state
+            .total_hosted_bytes
+            .saturating_sub(doc.size_bytes);
     }
 
     Ok(())

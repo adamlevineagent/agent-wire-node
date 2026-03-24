@@ -10,7 +10,7 @@ use std::fs;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use rusqlite::Connection;
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use super::config_helper::{config_for_model, estimate_cost};
@@ -33,19 +33,20 @@ fn lookup_thread_target_by_canonical(
     slug: &str,
     node_id: &str,
 ) -> Result<Option<ThreadTarget>> {
-    Ok(conn.query_row(
-        "SELECT thread_id, current_canonical_id, depth FROM pyramid_threads
+    Ok(conn
+        .query_row(
+            "SELECT thread_id, current_canonical_id, depth FROM pyramid_threads
          WHERE slug = ?1 AND current_canonical_id = ?2",
-        rusqlite::params![slug, node_id],
-        |row| {
-            Ok(ThreadTarget {
-                thread_id: row.get(0)?,
-                canonical_node_id: row.get(1)?,
-                depth: row.get(2)?,
-            })
-        },
-    )
-    .ok())
+            rusqlite::params![slug, node_id],
+            |row| {
+                Ok(ThreadTarget {
+                    thread_id: row.get(0)?,
+                    canonical_node_id: row.get(1)?,
+                    depth: row.get(2)?,
+                })
+            },
+        )
+        .ok())
 }
 
 fn lookup_thread_target_by_thread_id(
@@ -53,19 +54,20 @@ fn lookup_thread_target_by_thread_id(
     slug: &str,
     node_id: &str,
 ) -> Result<Option<ThreadTarget>> {
-    Ok(conn.query_row(
-        "SELECT thread_id, current_canonical_id, depth FROM pyramid_threads
+    Ok(conn
+        .query_row(
+            "SELECT thread_id, current_canonical_id, depth FROM pyramid_threads
          WHERE slug = ?1 AND thread_id = ?2",
-        rusqlite::params![slug, node_id],
-        |row| {
-            Ok(ThreadTarget {
-                thread_id: row.get(0)?,
-                canonical_node_id: row.get(1)?,
-                depth: row.get(2)?,
-            })
-        },
-    )
-    .ok())
+            rusqlite::params![slug, node_id],
+            |row| {
+                Ok(ThreadTarget {
+                    thread_id: row.get(0)?,
+                    canonical_node_id: row.get(1)?,
+                    depth: row.get(2)?,
+                })
+            },
+        )
+        .ok())
 }
 
 fn summarize_for_thread_name(text: &str, max_chars: usize) -> String {
@@ -395,7 +397,8 @@ pub async fn dispatch_node_stale_check(
     }
 
     // Build Template 2 prompt
-    let system_prompt = "You are evaluating whether changes to lower-level knowledge nodes require \
+    let system_prompt =
+        "You are evaluating whether changes to lower-level knowledge nodes require \
         updating higher-level distillations. Output JSON only.";
 
     let mut user_prompt = String::from(
@@ -547,112 +550,114 @@ pub async fn dispatch_connection_check(
         content: String,
     }
 
-    let (old_content, new_content, connections) = tokio::task::spawn_blocking(move || -> Result<(String, String, Vec<ConnectionItem>)> {
-        let conn = Connection::open(&db).context("Failed to open DB for connection check")?;
+    let (old_content, new_content, connections) =
+        tokio::task::spawn_blocking(move || -> Result<(String, String, Vec<ConnectionItem>)> {
+            let conn = Connection::open(&db).context("Failed to open DB for connection check")?;
 
-        // Get old and new node content
-        let old_content: String = conn
-            .query_row(
-                "SELECT distilled FROM pyramid_nodes WHERE id = ?1 AND slug = ?2",
-                rusqlite::params![nid, s],
-                |row| row.get(0),
-            )
-            .unwrap_or_default();
+            // Get old and new node content
+            let old_content: String = conn
+                .query_row(
+                    "SELECT distilled FROM pyramid_nodes WHERE id = ?1 AND slug = ?2",
+                    rusqlite::params![nid, s],
+                    |row| row.get(0),
+                )
+                .unwrap_or_default();
 
-        let new_content: String = conn
-            .query_row(
-                "SELECT distilled FROM pyramid_nodes WHERE id = ?1 AND slug = ?2",
-                rusqlite::params![new_nid, s],
-                |row| row.get(0),
-            )
-            .unwrap_or_default();
+            let new_content: String = conn
+                .query_row(
+                    "SELECT distilled FROM pyramid_nodes WHERE id = ?1 AND slug = ?2",
+                    rusqlite::params![new_nid, s],
+                    |row| row.get(0),
+                )
+                .unwrap_or_default();
 
-        let mut items: Vec<ConnectionItem> = Vec::new();
+            let mut items: Vec<ConnectionItem> = Vec::new();
 
-        // Get annotations on the old node
-        {
-            let mut stmt = conn.prepare(
-                "SELECT id, annotation_type, content FROM pyramid_annotations
+            // Get annotations on the old node
+            {
+                let mut stmt = conn.prepare(
+                    "SELECT id, annotation_type, content FROM pyramid_annotations
                  WHERE node_id = ?1 AND slug = ?2",
-            )?;
-            let rows = stmt.query_map(rusqlite::params![nid, s], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            })?;
-            for row in rows {
-                let (id, ann_type, content) = row?;
-                items.push(ConnectionItem {
-                    connection_type: "annotation".to_string(),
-                    connection_id: id.to_string(),
-                    content: format!("{}: {}", ann_type, content),
-                });
-            }
-        }
-
-        // Get FAQ entries that reference the old node
-        {
-            let mut stmt = conn.prepare(
-                "SELECT id, question, answer, match_triggers FROM pyramid_faq_nodes
-                 WHERE slug = ?1",
-            )?;
-            let rows = stmt.query_map(rusqlite::params![s], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                ))
-            })?;
-            for row in rows {
-                let (faq_id, question, answer, triggers_json) = row?;
-
-                // Check if this FAQ references our old node
-                let related: String = conn
-                    .query_row(
-                        "SELECT related_node_ids FROM pyramid_faq_nodes WHERE id = ?1",
-                        rusqlite::params![faq_id],
-                        |row| row.get(0),
-                    )
-                    .unwrap_or_else(|_| "[]".to_string());
-
-                let related_ids: Vec<String> =
-                    serde_json::from_str(&related).unwrap_or_default();
-
-                if related_ids.contains(&nid) {
-                    let triggers: Vec<String> =
-                        serde_json::from_str(&triggers_json).unwrap_or_default();
-                    let triggers_str = triggers.join(", ");
-                    let answer_truncated: String = answer.chars().take(200).collect();
+                )?;
+                let rows = stmt.query_map(rusqlite::params![nid, s], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })?;
+                for row in rows {
+                    let (id, ann_type, content) = row?;
                     items.push(ConnectionItem {
-                        connection_type: "faq".to_string(),
-                        connection_id: faq_id,
-                        content: format!(
-                            "FAQ — {}: Q: {} / Triggers: {} / A: {}",
-                            items.last().map(|i| &i.connection_id).unwrap_or(&String::new()),
-                            question,
-                            triggers_str,
-                            answer_truncated
-                        ),
+                        connection_type: "annotation".to_string(),
+                        connection_id: id.to_string(),
+                        content: format!("{}: {}", ann_type, content),
                     });
-                    // Fix: use the actual faq_id in the content
-                    if let Some(last) = items.last_mut() {
-                        last.content = format!(
-                            "Q: {} / Triggers: {} / A: {}",
-                            question,
-                            triggers_str,
-                            answer_truncated
-                        );
+                }
+            }
+
+            // Get FAQ entries that reference the old node
+            {
+                let mut stmt = conn.prepare(
+                    "SELECT id, question, answer, match_triggers FROM pyramid_faq_nodes
+                 WHERE slug = ?1",
+                )?;
+                let rows = stmt.query_map(rusqlite::params![s], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })?;
+                for row in rows {
+                    let (faq_id, question, answer, triggers_json) = row?;
+
+                    // Check if this FAQ references our old node
+                    let related: String = conn
+                        .query_row(
+                            "SELECT related_node_ids FROM pyramid_faq_nodes WHERE id = ?1",
+                            rusqlite::params![faq_id],
+                            |row| row.get(0),
+                        )
+                        .unwrap_or_else(|_| "[]".to_string());
+
+                    let related_ids: Vec<String> =
+                        serde_json::from_str(&related).unwrap_or_default();
+
+                    if related_ids.contains(&nid) {
+                        let triggers: Vec<String> =
+                            serde_json::from_str(&triggers_json).unwrap_or_default();
+                        let triggers_str = triggers.join(", ");
+                        let answer_truncated: String = answer.chars().take(200).collect();
+                        items.push(ConnectionItem {
+                            connection_type: "faq".to_string(),
+                            connection_id: faq_id,
+                            content: format!(
+                                "FAQ — {}: Q: {} / Triggers: {} / A: {}",
+                                items
+                                    .last()
+                                    .map(|i| &i.connection_id)
+                                    .unwrap_or(&String::new()),
+                                question,
+                                triggers_str,
+                                answer_truncated
+                            ),
+                        });
+                        // Fix: use the actual faq_id in the content
+                        if let Some(last) = items.last_mut() {
+                            last.content = format!(
+                                "Q: {} / Triggers: {} / A: {}",
+                                question, triggers_str, answer_truncated
+                            );
+                        }
                     }
                 }
             }
-        }
 
-        Ok((old_content, new_content, items))
-    })
-    .await??;
+            Ok((old_content, new_content, items))
+        })
+        .await??;
 
     if connections.is_empty() {
         info!(
@@ -767,13 +772,12 @@ pub async fn dispatch_connection_check(
             .collect();
 
         tokio::task::spawn_blocking(move || -> Result<()> {
-            let conn = Connection::open(&db).context("Failed to open DB for connection post-processing")?;
+            let conn = Connection::open(&db)
+                .context("Failed to open DB for connection post-processing")?;
 
             for cr in &results_for_db {
                 // Find the connection type for this result
-                let conn_info = batch_for_db
-                    .iter()
-                    .find(|(_, id)| id == &cr.connection_id);
+                let conn_info = batch_for_db.iter().find(|(_, id)| id == &cr.connection_id);
 
                 let conn_type = conn_info.map(|(t, _)| t.as_str()).unwrap_or("unknown");
 
@@ -783,7 +787,11 @@ pub async fn dispatch_connection_check(
                         conn.execute(
                             "UPDATE pyramid_annotations SET node_id = ?1
                              WHERE id = ?2 AND slug = ?3",
-                            rusqlite::params![new_nid, cr.connection_id.parse::<i64>().unwrap_or(0), s],
+                            rusqlite::params![
+                                new_nid,
+                                cr.connection_id.parse::<i64>().unwrap_or(0),
+                                s
+                            ],
                         )?;
                     }
                     // still_valid: false → annotation stays on old node (no action)
@@ -811,7 +819,8 @@ pub async fn dispatch_connection_check(
                         related_ids.retain(|id| id != &old_nid);
                     }
 
-                    let updated_json = serde_json::to_string(&related_ids).unwrap_or_else(|_| "[]".to_string());
+                    let updated_json =
+                        serde_json::to_string(&related_ids).unwrap_or_else(|_| "[]".to_string());
                     conn.execute(
                         "UPDATE pyramid_faq_nodes SET related_node_ids = ?1, updated_at = ?2
                          WHERE id = ?3",
@@ -1085,10 +1094,7 @@ pub async fn dispatch_edge_stale_check(
         }
 
         let json = extract_json(&response)?;
-        let is_stale = json
-            .get("stale")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        let is_stale = json.get("stale").and_then(|v| v.as_bool()).unwrap_or(false);
         let reason = json
             .get("reason")
             .and_then(|v| v.as_str())
@@ -1414,27 +1420,29 @@ pub async fn execute_supersession(
         .and_then(|json| json.get("headline"))
         .and_then(|value| value.as_str())
         .and_then(clean_headline)
-        .unwrap_or_else(|| headline_for_node(
-            &super::types::PyramidNode {
-                id: nid.clone(),
-                slug: s.clone(),
-                depth: node_data.depth,
-                chunk_index: None,
-                headline: node_data.headline.clone(),
-                distilled: node_data.distilled.clone(),
-                topics: serde_json::from_str(&node_data.topics).unwrap_or_default(),
-                corrections: serde_json::from_str(&node_data.corrections).unwrap_or_default(),
-                decisions: serde_json::from_str(&node_data.decisions).unwrap_or_default(),
-                terms: serde_json::from_str(&node_data.terms).unwrap_or_default(),
-                dead_ends: serde_json::from_str(&node_data.dead_ends).unwrap_or_default(),
-                self_prompt: node_data.self_prompt.clone(),
-                children: node_data.children.clone(),
-                parent_id: node_data.parent_id.clone(),
-                superseded_by: None,
-                created_at: String::new(),
-            },
-            node_data.source_file_path.as_deref(),
-        ));
+        .unwrap_or_else(|| {
+            headline_for_node(
+                &super::types::PyramidNode {
+                    id: nid.clone(),
+                    slug: s.clone(),
+                    depth: node_data.depth,
+                    chunk_index: None,
+                    headline: node_data.headline.clone(),
+                    distilled: node_data.distilled.clone(),
+                    topics: serde_json::from_str(&node_data.topics).unwrap_or_default(),
+                    corrections: serde_json::from_str(&node_data.corrections).unwrap_or_default(),
+                    decisions: serde_json::from_str(&node_data.decisions).unwrap_or_default(),
+                    terms: serde_json::from_str(&node_data.terms).unwrap_or_default(),
+                    dead_ends: serde_json::from_str(&node_data.dead_ends).unwrap_or_default(),
+                    self_prompt: node_data.self_prompt.clone(),
+                    children: node_data.children.clone(),
+                    parent_id: node_data.parent_id.clone(),
+                    superseded_by: None,
+                    created_at: String::new(),
+                },
+                node_data.source_file_path.as_deref(),
+            )
+        });
     let new_distillation = supersession_json
         .as_ref()
         .and_then(|json| json.get("distilled"))
@@ -1639,10 +1647,8 @@ pub async fn execute_supersession(
     .await??;
 
     // Run connection check on the superseded node
-    let conn_results = dispatch_connection_check(
-        node_id, &new_node_id, db_path, slug, api_key, model,
-    )
-    .await;
+    let conn_results =
+        dispatch_connection_check(node_id, &new_node_id, db_path, slug, api_key, model).await;
 
     match conn_results {
         Ok(results) => {

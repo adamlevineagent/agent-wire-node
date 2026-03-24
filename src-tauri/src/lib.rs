@@ -11,18 +11,18 @@
 //   retention — Proof-of-retention challenges and purge handling
 
 pub mod auth;
-pub mod sync;
-pub mod server;
 pub mod credits;
-pub mod tunnel;
-pub mod messaging;
-pub mod market;
-pub mod retention;
-pub mod work;
-pub mod pyramid;
-pub mod partner;
-pub mod utils;
 pub mod http_utils;
+pub mod market;
+pub mod messaging;
+pub mod partner;
+pub mod pyramid;
+pub mod retention;
+pub mod server;
+pub mod sync;
+pub mod tunnel;
+pub mod utils;
+pub mod work;
 
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;

@@ -17,15 +17,10 @@ use anyhow::{anyhow, Result};
 use serde_json::Value;
 use tracing::{info, warn};
 
+use super::context::{apply_context_schedule, assemble_context_window, LlmMessage};
 use super::{
-    PartnerState, Session, Message, MessageRole, DennisState,
-    PartnerResponse, BrainState, LiftedResult,
-    PartnerLlmConfig,
-    BUFFER_SOFT_LIMIT, MAX_TOOL_CALLS,
-    save_session, load_session,
-};
-use super::context::{
-    assemble_context_window, apply_context_schedule, LlmMessage,
+    load_session, save_session, BrainState, DennisState, LiftedResult, Message, MessageRole,
+    PartnerLlmConfig, PartnerResponse, PartnerState, Session, BUFFER_SOFT_LIMIT, MAX_TOOL_CALLS,
 };
 use crate::pyramid::query;
 
@@ -181,7 +176,11 @@ pub async fn call_partner(
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 continue;
             }
-            return Err(anyhow!("Partner HTTP {} after 5 attempts: {}", status, body_text));
+            return Err(anyhow!(
+                "Partner HTTP {} after 5 attempts: {}",
+                status,
+                body_text
+            ));
         }
 
         // Parse response
@@ -225,28 +224,38 @@ pub async fn call_partner(
         let mut tool_calls = Vec::new();
         if let Some(tc_array) = message.get("tool_calls").and_then(|v| v.as_array()) {
             for tc in tc_array {
-                let id = tc.get("id")
+                let id = tc
+                    .get("id")
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                let name = tc.get("function")
+                let name = tc
+                    .get("function")
                     .and_then(|f| f.get("name"))
                     .and_then(|n| n.as_str())
                     .unwrap_or("")
                     .to_string();
-                let arguments = tc.get("function")
+                let arguments = tc
+                    .get("function")
                     .and_then(|f| f.get("arguments"))
                     .and_then(|a| a.as_str())
                     .unwrap_or("{}")
                     .to_string();
 
                 if !name.is_empty() {
-                    tool_calls.push(ToolCall { id, name, arguments });
+                    tool_calls.push(ToolCall {
+                        id,
+                        name,
+                        arguments,
+                    });
                 }
             }
         }
 
-        return Ok(PartnerLlmResponse { content, tool_calls });
+        return Ok(PartnerLlmResponse {
+            content,
+            tool_calls,
+        });
     }
 
     Err(anyhow!("Partner max retries exceeded"))
@@ -262,26 +271,27 @@ fn execute_pyramid_query(
     let args: Value = serde_json::from_str(arguments)
         .map_err(|e| anyhow!("Invalid pyramid_query arguments: {}", e))?;
 
-    let action = args.get("action")
+    let action = args
+        .get("action")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("Missing 'action' in pyramid_query"))?;
 
-    let slug_name = args.get("slug")
+    let slug_name = args
+        .get("slug")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("Missing 'slug' in pyramid_query"))?;
 
     match action {
         "search" => {
-            let term = args.get("term")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let term = args.get("term").and_then(|v| v.as_str()).unwrap_or("");
             let hits = query::search(reader, slug_name, term)?;
             let node_ids: Vec<String> = hits.iter().map(|h| h.node_id.clone()).collect();
             let result = serde_json::to_string_pretty(&hits)?;
             Ok((result, node_ids))
         }
         "drill" => {
-            let node_id = args.get("node_id")
+            let node_id = args
+                .get("node_id")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| anyhow!("Missing 'node_id' for drill action"))?;
             let drill_result = query::drill(reader, slug_name, node_id)?;
@@ -353,7 +363,9 @@ pub async fn handle_message(
     session.conversation_buffer.push(user_msg);
 
     // 3. Check buffer overflow
-    let buffer_tokens: usize = session.conversation_buffer.iter()
+    let buffer_tokens: usize = session
+        .conversation_buffer
+        .iter()
         .map(|m| m.token_estimate)
         .sum();
     if buffer_tokens > BUFFER_SOFT_LIMIT {
@@ -381,15 +393,19 @@ pub async fn handle_message(
         let response = call_partner(
             &llm_config,
             messages_for_llm.clone(),
-            if round < MAX_TOOL_CALLS { Some(tools.clone()) } else { None },
-        ).await;
+            if round < MAX_TOOL_CALLS {
+                Some(tools.clone())
+            } else {
+                None
+            },
+        )
+        .await;
 
         let response = match response {
             Ok(r) => r,
             Err(e) => {
-                session.dennis_state = DennisState::Error(
-                    "I got a bit lost there — want to try again?".to_string(),
-                );
+                session.dennis_state =
+                    DennisState::Error("I got a bit lost there — want to try again?".to_string());
                 // Save session state even on error
                 {
                     let db = state.partner_db.lock().await;
@@ -422,16 +438,20 @@ pub async fn handle_message(
             assistant_msg["content"] = serde_json::json!(content);
         }
         // Build tool_calls array
-        let tc_json: Vec<Value> = response.tool_calls.iter().map(|tc| {
-            serde_json::json!({
-                "id": tc.id,
-                "type": "function",
-                "function": {
-                    "name": tc.name,
-                    "arguments": tc.arguments
-                }
+        let tc_json: Vec<Value> = response
+            .tool_calls
+            .iter()
+            .map(|tc| {
+                serde_json::json!({
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.name,
+                        "arguments": tc.arguments
+                    }
+                })
             })
-        }).collect();
+            .collect();
         assistant_msg["tool_calls"] = serde_json::json!(tc_json);
 
         messages_for_llm.push(LlmMessage {
@@ -524,7 +544,8 @@ pub async fn handle_message(
 
     // 9. Add partner response to buffer
     if final_content.is_empty() {
-        final_content = "I seem to have lost my train of thought. Could you repeat that?".to_string();
+        final_content =
+            "I seem to have lost my train of thought. Could you repeat that?".to_string();
     }
 
     let partner_msg = Message {
@@ -540,7 +561,10 @@ pub async fn handle_message(
     // Tier 1: zero-cost regex extraction on every user message
     let tier1 = super::warm::tier1_extract(user_message);
     if !tier1.entities.is_empty() {
-        info!("[partner] Tier 1 extracted {} entities", tier1.entities.len());
+        info!(
+            "[partner] Tier 1 extracted {} entities",
+            tier1.entities.len()
+        );
     }
 
     // Tier 2: check if warm pass should run (background, non-blocking)
@@ -569,7 +593,10 @@ pub async fn handle_message(
                 let writer = state.pyramid.writer.clone();
                 let api_key = llm_config.api_key.clone();
                 let model = llm_config.partner_model.clone();
-                let collapse_model = state.pyramid.data_dir.as_ref()
+                let collapse_model = state
+                    .pyramid
+                    .data_dir
+                    .as_ref()
                     .map(|d| crate::pyramid::PyramidConfig::load(d).collapse_model)
                     .unwrap_or_else(|| "x-ai/grok-4.20-beta".into());
                 let warm_in_progress = state.warm_in_progress.clone();
@@ -577,7 +604,13 @@ pub async fn handle_message(
 
                 tokio::spawn(async move {
                     let result = super::warm::warm_pass(
-                        new_messages, &slug, &reader, &writer, &api_key, &model, &collapse_model,
+                        new_messages,
+                        &slug,
+                        &reader,
+                        &writer,
+                        &api_key,
+                        &model,
+                        &collapse_model,
                     )
                     .await;
 
@@ -608,7 +641,9 @@ pub async fn handle_message(
     session.dennis_state = DennisState::Idle;
 
     // Calculate brain state
-    let buffer_tokens: usize = session.conversation_buffer.iter()
+    let buffer_tokens: usize = session
+        .conversation_buffer
+        .iter()
         .map(|m| m.token_estimate)
         .sum();
 
@@ -648,7 +683,9 @@ pub async fn handle_message(
 /// In the future this will crystallize via forward pass → provisional L0 nodes.
 /// For now, it simply truncates the oldest messages to stay under the soft limit.
 fn handle_buffer_overflow(session: &mut Session) {
-    let total: usize = session.conversation_buffer.iter()
+    let total: usize = session
+        .conversation_buffer
+        .iter()
         .map(|m| m.token_estimate)
         .sum();
 
@@ -668,7 +705,9 @@ fn handle_buffer_overflow(session: &mut Session) {
 
     if remove_count > 0 {
         let removed: Vec<_> = session.conversation_buffer.drain(0..remove_count).collect();
-        let new_total: usize = session.conversation_buffer.iter()
+        let new_total: usize = session
+            .conversation_buffer
+            .iter()
             .map(|m| m.token_estimate)
             .sum();
         info!(

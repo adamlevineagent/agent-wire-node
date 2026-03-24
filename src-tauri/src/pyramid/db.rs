@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 use std::collections::HashMap;
 
-use super::naming::{headline_for_node, clean_headline};
+use super::naming::{clean_headline, headline_for_node};
 use super::types::*;
 
 // ── Database Opening ─────────────────────────────────────────────────────────
@@ -35,7 +35,7 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
         "
         CREATE TABLE IF NOT EXISTS pyramid_slugs (
             slug TEXT PRIMARY KEY,
-            content_type TEXT NOT NULL CHECK(content_type IN ('code', 'conversation', 'document')),
+            content_type TEXT NOT NULL CHECK(content_type IN ('code', 'conversation', 'document', 'vine')),
             source_path TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL DEFAULT (datetime('now')),
             last_built_at TEXT,
@@ -365,10 +365,7 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
         "ALTER TABLE pyramid_cost_log ADD COLUMN source TEXT DEFAULT 'manual'",
         [],
     );
-    let _ = conn.execute(
-        "ALTER TABLE pyramid_cost_log ADD COLUMN layer INTEGER",
-        [],
-    );
+    let _ = conn.execute("ALTER TABLE pyramid_cost_log ADD COLUMN layer INTEGER", []);
     let _ = conn.execute(
         "ALTER TABLE pyramid_cost_log ADD COLUMN check_type TEXT",
         [],
@@ -422,7 +419,104 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
     // Migrate existing L2+ nodes into threads
     migrate_existing_threads(conn)?;
 
+    // ── Vine tables ────────────────────────────────────────────────────────────
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS vine_bunches (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            vine_slug       TEXT NOT NULL REFERENCES pyramid_slugs(slug) ON DELETE CASCADE,
+            bunch_slug      TEXT NOT NULL REFERENCES pyramid_slugs(slug) ON DELETE CASCADE,
+            session_id      TEXT NOT NULL,
+            jsonl_path      TEXT NOT NULL,
+            bunch_index     INTEGER NOT NULL,
+            first_ts        TEXT,
+            last_ts         TEXT,
+            message_count   INTEGER,
+            chunk_count     INTEGER,
+            apex_node_id    TEXT,
+            penultimate_node_ids TEXT,
+            status          TEXT NOT NULL DEFAULT 'pending',
+            metadata        TEXT,
+            created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at      TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(vine_slug, bunch_slug)
+        );
+        CREATE INDEX IF NOT EXISTS idx_vine_bunches_vine ON vine_bunches(vine_slug);
+        CREATE INDEX IF NOT EXISTS idx_vine_bunches_order ON vine_bunches(vine_slug, bunch_index);
+        ",
+    )?;
+
+    // ── Migrate CHECK constraint to include 'vine' ────────────────────────────
+    migrate_slugs_check_constraint(conn)?;
+
     Ok(())
+}
+
+/// Migrate `pyramid_slugs` CHECK constraint to include 'vine' content type.
+/// Idempotent: skips if CHECK already includes 'vine'.
+fn migrate_slugs_check_constraint(conn: &Connection) -> Result<()> {
+    // Check if the table's CHECK constraint already includes 'vine'
+    // by reading the table's SQL definition from sqlite_master
+    let table_sql: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='pyramid_slugs'",
+            [],
+            |row| row.get(0),
+        )
+        .ok();
+
+    let needs_migration = match &table_sql {
+        Some(sql) => sql.contains("CHECK") && !sql.contains("vine"),
+        None => false, // Table doesn't exist yet (will be created with vine on next startup)
+    };
+
+    if !needs_migration {
+        return Ok(());
+    }
+
+    tracing::info!("Migrating pyramid_slugs CHECK constraint to include 'vine'...");
+
+    // Must disable FK checks during table rebuild.
+    // CRITICAL: Always re-enable FK checks, even on error.
+    conn.execute_batch("PRAGMA foreign_keys=OFF;")?;
+
+    let result = (|| -> Result<()> {
+        let tx = conn.unchecked_transaction()?;
+
+        tx.execute_batch(
+            "
+            CREATE TABLE pyramid_slugs_new (
+                slug TEXT PRIMARY KEY,
+                content_type TEXT NOT NULL CHECK(content_type IN ('code', 'conversation', 'document', 'vine')),
+                source_path TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                last_built_at TEXT,
+                node_count INTEGER NOT NULL DEFAULT 0,
+                max_depth INTEGER NOT NULL DEFAULT 0
+            );
+            INSERT INTO pyramid_slugs_new SELECT * FROM pyramid_slugs;
+            DROP TABLE pyramid_slugs;
+            ALTER TABLE pyramid_slugs_new RENAME TO pyramid_slugs;
+            ",
+        )?;
+
+        tx.commit()?;
+        Ok(())
+    })();
+
+    // Always re-enable FK enforcement, regardless of success or failure
+    conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+
+    match result {
+        Ok(()) => {
+            tracing::info!("pyramid_slugs CHECK constraint migrated successfully.");
+            Ok(())
+        }
+        Err(e) => {
+            tracing::error!("pyramid_slugs migration failed (FK re-enabled): {e}");
+            Err(e)
+        }
+    }
 }
 
 // ── Slug CRUD ────────────────────────────────────────────────────────────────
@@ -441,8 +535,7 @@ pub fn create_slug(
     .with_context(|| format!("Failed to create slug '{slug}'"))?;
 
     // Read back the row to get server-generated defaults (created_at)
-    get_slug(conn, slug)?
-        .ok_or_else(|| anyhow::anyhow!("Slug '{slug}' not found after insert"))
+    get_slug(conn, slug)?.ok_or_else(|| anyhow::anyhow!("Slug '{slug}' not found after insert"))
 }
 
 /// Fetch a slug by name. Returns None if not found.
@@ -454,9 +547,13 @@ pub fn get_slug(conn: &Connection, slug: &str) -> Result<Option<SlugInfo>> {
 
     let result = stmt.query_row(rusqlite::params![slug], |row| {
         let ct_str: String = row.get(1)?;
+        let content_type = ContentType::from_str(&ct_str).unwrap_or_else(|| {
+            tracing::warn!("Unknown content_type '{ct_str}' for slug, defaulting to Document");
+            ContentType::Document
+        });
         Ok(SlugInfo {
             slug: row.get(0)?,
-            content_type: ContentType::from_str(&ct_str).unwrap_or(ContentType::Document),
+            content_type,
             source_path: row.get(2)?,
             node_count: row.get(3)?,
             max_depth: row.get(4)?,
@@ -473,17 +570,31 @@ pub fn get_slug(conn: &Connection, slug: &str) -> Result<Option<SlugInfo>> {
 }
 
 /// List all slugs, ordered by created_at descending.
+/// Optionally excludes bunch slugs (those containing "--bunch-") from the listing.
 pub fn list_slugs(conn: &Connection) -> Result<Vec<SlugInfo>> {
-    let mut stmt = conn.prepare(
+    list_slugs_filtered(conn, true)
+}
+
+/// List slugs with optional bunch filtering.
+pub fn list_slugs_filtered(conn: &Connection, exclude_bunches: bool) -> Result<Vec<SlugInfo>> {
+    let sql = if exclude_bunches {
         "SELECT slug, content_type, source_path, node_count, max_depth, last_built_at, created_at
-         FROM pyramid_slugs ORDER BY created_at DESC",
-    )?;
+         FROM pyramid_slugs WHERE slug NOT LIKE '%--bunch-%' ORDER BY created_at DESC"
+    } else {
+        "SELECT slug, content_type, source_path, node_count, max_depth, last_built_at, created_at
+         FROM pyramid_slugs ORDER BY created_at DESC"
+    };
+    let mut stmt = conn.prepare(sql)?;
 
     let rows = stmt.query_map([], |row| {
         let ct_str: String = row.get(1)?;
+        let content_type = ContentType::from_str(&ct_str).unwrap_or_else(|| {
+            tracing::warn!("Unknown content_type '{ct_str}' in list_slugs, defaulting to Document");
+            ContentType::Document
+        });
         Ok(SlugInfo {
             slug: row.get(0)?,
-            content_type: ContentType::from_str(&ct_str).unwrap_or(ContentType::Document),
+            content_type,
             source_path: row.get(2)?,
             node_count: row.get(3)?,
             max_depth: row.get(4)?,
@@ -506,6 +617,16 @@ pub fn delete_slug(conn: &Connection, slug: &str) -> Result<()> {
         rusqlite::params![slug],
     )?;
     Ok(())
+}
+
+/// Delete pipeline steps above a given depth for a slug.
+/// Needed for force-rebuild: step_exists() would skip work if old steps remain.
+pub fn delete_steps_above_depth(conn: &Connection, slug: &str, depth: i64) -> Result<i64> {
+    let count = conn.execute(
+        "DELETE FROM pyramid_pipeline_steps WHERE slug = ?1 AND depth > ?2",
+        rusqlite::params![slug, depth],
+    )?;
+    Ok(count as i64)
 }
 
 /// Recompute node_count, max_depth, and last_built_at from the nodes table.
@@ -569,9 +690,8 @@ pub fn insert_chunk(
 
 /// Get chunk content by slug and chunk_index.
 pub fn get_chunk(conn: &Connection, slug: &str, chunk_index: i64) -> Result<Option<String>> {
-    let mut stmt = conn.prepare(
-        "SELECT content FROM pyramid_chunks WHERE slug = ?1 AND chunk_index = ?2",
-    )?;
+    let mut stmt =
+        conn.prepare("SELECT content FROM pyramid_chunks WHERE slug = ?1 AND chunk_index = ?2")?;
 
     let result = stmt.query_row(rusqlite::params![slug, chunk_index], |row| {
         row.get::<_, String>(0)
@@ -605,9 +725,8 @@ fn parse_json_vec<T: serde::de::DeserializeOwned>(json: &str) -> Vec<T> {
 }
 
 fn load_source_paths_by_node_id(conn: &Connection) -> Result<HashMap<String, String>> {
-    let mut stmt = conn.prepare(
-        "SELECT file_path, node_ids FROM pyramid_file_hashes ORDER BY file_path",
-    )?;
+    let mut stmt =
+        conn.prepare("SELECT file_path, node_ids FROM pyramid_file_hashes ORDER BY file_path")?;
     let rows = stmt.query_map([], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
     })?;
@@ -639,7 +758,9 @@ fn backfill_missing_headlines(conn: &Connection) -> Result<()> {
         let node = row?;
         let headline = headline_for_node(
             &node,
-            source_path_by_node_id.get(&node.id).map(|path| path.as_str()),
+            source_path_by_node_id
+                .get(&node.id)
+                .map(|path| path.as_str()),
         );
         conn.execute(
             "UPDATE pyramid_nodes SET headline = ?1 WHERE slug = ?2 AND id = ?3",
@@ -676,10 +797,18 @@ pub fn node_from_row(row: &rusqlite::Row) -> rusqlite::Result<PyramidNode> {
         dead_ends: parse_json_vec(&dead_ends_json),
         self_prompt: row.get::<_, String>("self_prompt").unwrap_or_default(),
         children: parse_json_vec(&children_json),
-        parent_id: row.get("parent_id").ok().and_then(|v: String| {
-            if v.is_empty() { None } else { Some(v) }
-        }),
-        superseded_by: row.get::<_, Option<String>>("superseded_by").unwrap_or(None),
+        parent_id: row.get("parent_id").ok().and_then(
+            |v: String| {
+                if v.is_empty() {
+                    None
+                } else {
+                    Some(v)
+                }
+            },
+        ),
+        superseded_by: row
+            .get::<_, Option<String>>("superseded_by")
+            .unwrap_or(None),
         created_at: row.get::<_, String>("created_at").unwrap_or_default(),
     })
 }
@@ -693,11 +822,7 @@ const NODE_SELECT_COLS: &str =
 /// The optional `topics_json` parameter allows passing a pre-serialized topics
 /// string (useful when the build pipeline already has the raw JSON). If None,
 /// topics are serialized from `node.topics`.
-pub fn save_node(
-    conn: &Connection,
-    node: &PyramidNode,
-    topics_json: Option<&str>,
-) -> Result<()> {
+pub fn save_node(conn: &Connection, node: &PyramidNode, topics_json: Option<&str>) -> Result<()> {
     let topics = match topics_json {
         Some(s) => s.to_string(),
         None => serde_json::to_string(&node.topics)?,
@@ -707,8 +832,7 @@ pub fn save_node(
     let terms = serde_json::to_string(&node.terms)?;
     let dead_ends = serde_json::to_string(&node.dead_ends)?;
     let children = serde_json::to_string(&node.children)?;
-    let headline = clean_headline(&node.headline)
-        .unwrap_or_else(|| headline_for_node(node, None));
+    let headline = clean_headline(&node.headline).unwrap_or_else(|| headline_for_node(node, None));
 
     conn.execute(
         "INSERT INTO pyramid_nodes
@@ -754,9 +878,7 @@ pub fn save_node(
 
 /// Get a single node by slug and node ID.
 pub fn get_node(conn: &Connection, slug: &str, node_id: &str) -> Result<Option<PyramidNode>> {
-    let sql = format!(
-        "SELECT {NODE_SELECT_COLS} FROM pyramid_nodes WHERE slug = ?1 AND id = ?2"
-    );
+    let sql = format!("SELECT {NODE_SELECT_COLS} FROM pyramid_nodes WHERE slug = ?1 AND id = ?2");
     let mut stmt = conn.prepare(&sql)?;
 
     let result = stmt.query_row(rusqlite::params![slug, node_id], node_from_row);
@@ -769,11 +891,7 @@ pub fn get_node(conn: &Connection, slug: &str, node_id: &str) -> Result<Option<P
 }
 
 /// Get all nodes at a given depth for a slug, ordered by chunk_index.
-pub fn get_nodes_at_depth(
-    conn: &Connection,
-    slug: &str,
-    depth: i64,
-) -> Result<Vec<PyramidNode>> {
+pub fn get_nodes_at_depth(conn: &Connection, slug: &str, depth: i64) -> Result<Vec<PyramidNode>> {
     let sql = format!(
         "SELECT {NODE_SELECT_COLS} FROM live_pyramid_nodes
          WHERE slug = ?1 AND depth = ?2
@@ -841,7 +959,16 @@ pub fn save_step(
             output_json = excluded.output_json,
             model = excluded.model,
             elapsed_seconds = excluded.elapsed_seconds",
-        rusqlite::params![slug, step_type, chunk_index, depth, node_id, output_json, model, elapsed],
+        rusqlite::params![
+            slug,
+            step_type,
+            chunk_index,
+            depth,
+            node_id,
+            output_json,
+            model,
+            elapsed
+        ],
     )?;
     Ok(())
 }
@@ -1390,10 +1517,7 @@ pub fn get_annotations(
 }
 
 /// Get all annotations for a slug (across all nodes).
-pub fn get_all_annotations(
-    conn: &Connection,
-    slug: &str,
-) -> Result<Vec<PyramidAnnotation>> {
+pub fn get_all_annotations(conn: &Connection, slug: &str) -> Result<Vec<PyramidAnnotation>> {
     let mut stmt = conn.prepare(
         "SELECT id, slug, node_id, annotation_type, content, question_context, author, created_at
          FROM pyramid_annotations WHERE slug = ?1
@@ -1422,7 +1546,10 @@ pub fn get_all_annotations(
 }
 
 /// Save an annotation. Returns the new row ID.
-pub fn save_annotation(conn: &Connection, annotation: &PyramidAnnotation) -> Result<PyramidAnnotation> {
+pub fn save_annotation(
+    conn: &Connection,
+    annotation: &PyramidAnnotation,
+) -> Result<PyramidAnnotation> {
     conn.execute(
         "INSERT INTO pyramid_annotations (slug, node_id, annotation_type, content, question_context, author)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -1722,7 +1849,11 @@ pub fn get_usage_stats(conn: &Connection, slug: &str) -> Result<Vec<(String, i64
 }
 
 /// Get the most accessed node IDs for a slug, ranked by access count.
-pub fn get_most_accessed_nodes(conn: &Connection, slug: &str, limit: i64) -> Result<Vec<(String, i64)>> {
+pub fn get_most_accessed_nodes(
+    conn: &Connection,
+    slug: &str,
+    limit: i64,
+) -> Result<Vec<(String, i64)>> {
     // result_node_ids is a JSON array, so we use json_each to unnest
     let mut stmt = conn.prepare(
         "SELECT j.value as node_id, COUNT(*) as cnt
@@ -1745,10 +1876,11 @@ pub fn get_most_accessed_nodes(conn: &Connection, slug: &str, limit: i64) -> Res
 // ── Watcher Cache Helpers ─────────────────────────────────────────────────────
 
 /// Get all tracked file paths for a slug from pyramid_file_hashes.
-pub fn get_tracked_paths(conn: &Connection, slug: &str) -> Result<std::collections::HashSet<String>> {
-    let mut stmt = conn.prepare(
-        "SELECT file_path FROM pyramid_file_hashes WHERE slug = ?1",
-    )?;
+pub fn get_tracked_paths(
+    conn: &Connection,
+    slug: &str,
+) -> Result<std::collections::HashSet<String>> {
+    let mut stmt = conn.prepare("SELECT file_path FROM pyramid_file_hashes WHERE slug = ?1")?;
     let rows = stmt.query_map(rusqlite::params![slug], |row| row.get::<_, String>(0))?;
     let mut paths = std::collections::HashSet::new();
     for row in rows {
@@ -1832,7 +1964,10 @@ pub fn upsert_file_hash(
 // ── Shared Query Functions (used by both HTTP routes and Tauri IPC commands) ──
 
 /// Load auto-update config for a slug. Returns None if not found.
-pub fn get_auto_update_config(conn: &Connection, slug: &str) -> Option<super::types::AutoUpdateConfig> {
+pub fn get_auto_update_config(
+    conn: &Connection,
+    slug: &str,
+) -> Option<super::types::AutoUpdateConfig> {
     conn.query_row(
         "SELECT slug, auto_update, debounce_minutes, min_changed_files,
                 runaway_threshold, breaker_tripped, breaker_tripped_at, frozen, frozen_at
@@ -1905,7 +2040,7 @@ pub fn get_stale_log(
     let mut sql = String::from(
         "SELECT id, slug, batch_id, layer, target_id, stale, reason,
                 checker_index, checker_batch_size, checked_at, cost_tokens, cost_usd
-         FROM pyramid_stale_check_log WHERE slug = ?1"
+         FROM pyramid_stale_check_log WHERE slug = ?1",
     );
     let mut param_vals: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
     param_vals.push(Box::new(slug.to_string()));
@@ -1915,17 +2050,25 @@ pub fn get_stale_log(
         sql.push_str(&format!(" AND layer = ?{}", param_vals.len()));
     }
     if let Some(stale_str) = stale {
-        let stale_val: i32 = if stale_str == "yes" || stale_str == "true" || stale_str == "1" { 1 } else { 0 };
+        let stale_val: i32 = if stale_str == "yes" || stale_str == "true" || stale_str == "1" {
+            1
+        } else {
+            0
+        };
         param_vals.push(Box::new(stale_val));
         sql.push_str(&format!(" AND stale = ?{}", param_vals.len()));
     }
 
     param_vals.push(Box::new(limit));
-    sql.push_str(&format!(" ORDER BY checked_at DESC LIMIT ?{}", param_vals.len()));
+    sql.push_str(&format!(
+        " ORDER BY checked_at DESC LIMIT ?{}",
+        param_vals.len()
+    ));
     param_vals.push(Box::new(offset));
     sql.push_str(&format!(" OFFSET ?{}", param_vals.len()));
 
-    let param_refs: Vec<&dyn rusqlite::types::ToSql> = param_vals.iter().map(|p| p.as_ref()).collect();
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+        param_vals.iter().map(|p| p.as_ref()).collect();
     let mut stmt = conn.prepare(&sql)?;
 
     let rows: Vec<serde_json::Value> = stmt
@@ -1953,7 +2096,11 @@ pub fn get_stale_log(
 
 /// Get cost summary for a slug within an optional time window.
 /// Note: The actual column in pyramid_cost_log is `estimated_cost`, not `cost_usd`.
-pub fn get_cost_summary(conn: &Connection, slug: &str, window: Option<&str>) -> Result<serde_json::Value> {
+pub fn get_cost_summary(
+    conn: &Connection,
+    slug: &str,
+    window: Option<&str>,
+) -> Result<serde_json::Value> {
     let window_clause = match window {
         Some("24h") => "AND created_at >= datetime('now', '-1 day')",
         Some("7d") => "AND created_at >= datetime('now', '-7 days')",
@@ -1965,7 +2112,8 @@ pub fn get_cost_summary(conn: &Connection, slug: &str, window: Option<&str>) -> 
         .query_row(
             &format!(
                 "SELECT COALESCE(SUM(estimated_cost), 0.0), COUNT(*) FROM pyramid_cost_log
-                 WHERE slug = ?1 {}", window_clause
+                 WHERE slug = ?1 {}",
+                window_clause
             ),
             rusqlite::params![slug],
             |row| Ok((row.get(0)?, row.get(1)?)),
@@ -1976,7 +2124,8 @@ pub fn get_cost_summary(conn: &Connection, slug: &str, window: Option<&str>) -> 
         let mut stmt = conn.prepare(&format!(
             "SELECT COALESCE(source, 'manual'), COALESCE(SUM(estimated_cost), 0.0), COUNT(*)
              FROM pyramid_cost_log WHERE slug = ?1 {}
-             GROUP BY COALESCE(source, 'manual')", window_clause
+             GROUP BY COALESCE(source, 'manual')",
+            window_clause
         ))?;
         let rows: Vec<serde_json::Value> = stmt
             .query_map(rusqlite::params![slug], |row| {
@@ -1995,7 +2144,8 @@ pub fn get_cost_summary(conn: &Connection, slug: &str, window: Option<&str>) -> 
         let mut stmt = conn.prepare(&format!(
             "SELECT COALESCE(check_type, 'unknown'), COALESCE(SUM(estimated_cost), 0.0), COUNT(*)
              FROM pyramid_cost_log WHERE slug = ?1 {}
-             GROUP BY COALESCE(check_type, 'unknown')", window_clause
+             GROUP BY COALESCE(check_type, 'unknown')",
+            window_clause
         ))?;
         let rows: Vec<serde_json::Value> = stmt
             .query_map(rusqlite::params![slug], |row| {
@@ -2014,7 +2164,8 @@ pub fn get_cost_summary(conn: &Connection, slug: &str, window: Option<&str>) -> 
         let mut stmt = conn.prepare(&format!(
             "SELECT COALESCE(layer, -1), COALESCE(SUM(estimated_cost), 0.0), COUNT(*)
              FROM pyramid_cost_log WHERE slug = ?1 {}
-             GROUP BY COALESCE(layer, -1)", window_clause
+             GROUP BY COALESCE(layer, -1)",
+            window_clause
         ))?;
         let rows: Vec<serde_json::Value> = stmt
             .query_map(rusqlite::params![slug], |row| {
@@ -2034,7 +2185,8 @@ pub fn get_cost_summary(conn: &Connection, slug: &str, window: Option<&str>) -> 
             "SELECT id, operation, model, input_tokens, output_tokens, estimated_cost,
                     COALESCE(source, 'manual'), layer, check_type, created_at
              FROM pyramid_cost_log WHERE slug = ?1 {}
-             ORDER BY created_at DESC LIMIT 20", window_clause
+             ORDER BY created_at DESC LIMIT 20",
+            window_clause
         ))?;
         let rows: Vec<serde_json::Value> = stmt
             .query_map(rusqlite::params![slug], |row| {
@@ -2065,6 +2217,114 @@ pub fn get_cost_summary(conn: &Connection, slug: &str, window: Option<&str>) -> 
         "by_layer": by_layer,
         "recent_calls": recent_calls,
     }))
+}
+
+// ── Vine DB Helpers ──────────────────────────────────────────────────────────
+
+/// List all vine bunches for a given vine slug.
+pub fn list_vine_bunches(conn: &Connection, vine_slug: &str) -> Result<Vec<VineBunch>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, vine_slug, bunch_slug, session_id, jsonl_path, bunch_index,
+                first_ts, last_ts, message_count, chunk_count, apex_node_id,
+                penultimate_node_ids, status, metadata, created_at, updated_at
+         FROM vine_bunches WHERE vine_slug = ?1 ORDER BY bunch_index ASC",
+    )?;
+
+    let rows = stmt.query_map(rusqlite::params![vine_slug], |row| {
+        let pen_json: String = row
+            .get::<_, String>(11)
+            .unwrap_or_else(|_| "[]".to_string());
+        let pen_ids: Vec<String> = serde_json::from_str(&pen_json).unwrap_or_default();
+        let meta_json: Option<String> = row.get(13).ok();
+        let metadata: Option<VineBunchMetadata> =
+            meta_json.and_then(|s| serde_json::from_str(&s).ok());
+
+        Ok(VineBunch {
+            id: row.get(0)?,
+            vine_slug: row.get(1)?,
+            bunch_slug: row.get(2)?,
+            session_id: row.get(3)?,
+            jsonl_path: row.get(4)?,
+            bunch_index: row.get(5)?,
+            first_ts: row.get(6)?,
+            last_ts: row.get(7)?,
+            message_count: row.get(8)?,
+            chunk_count: row.get(9)?,
+            apex_node_id: row.get(10)?,
+            penultimate_node_ids: pen_ids,
+            status: row.get(12)?,
+            metadata,
+        })
+    })?;
+
+    let bunches: Vec<VineBunch> = rows.filter_map(|r| r.ok()).collect();
+    Ok(bunches)
+}
+
+/// Get all annotations of a specific type for a slug.
+pub fn get_annotations_by_type(
+    conn: &Connection,
+    slug: &str,
+    annotation_type: &str,
+) -> Result<Vec<PyramidAnnotation>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, slug, node_id, annotation_type, content, question_context, author, created_at
+         FROM pyramid_annotations WHERE slug = ?1 AND annotation_type = ?2
+         ORDER BY created_at DESC",
+    )?;
+
+    let rows = stmt.query_map(rusqlite::params![slug, annotation_type], |row| {
+        let at_str: String = row.get(3)?;
+        Ok(PyramidAnnotation {
+            id: row.get(0)?,
+            slug: row.get(1)?,
+            node_id: row.get(2)?,
+            annotation_type: serde_json::from_value(serde_json::Value::String(at_str.clone()))
+                .unwrap_or(AnnotationType::Observation),
+            content: row.get(4)?,
+            question_context: row.get(5)?,
+            author: row.get(6)?,
+            created_at: row.get(7)?,
+        })
+    })?;
+
+    let annotations: Vec<PyramidAnnotation> = rows.filter_map(|r| r.ok()).collect();
+    Ok(annotations)
+}
+
+/// Get FAQ nodes filtered by ID prefix for a given slug.
+pub fn get_faq_nodes_by_prefix(
+    conn: &Connection,
+    slug: &str,
+    id_prefix: &str,
+) -> Result<Vec<FaqNode>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, slug, question, answer, related_node_ids, annotation_ids, hit_count, match_triggers, created_at, updated_at
+         FROM pyramid_faq_nodes WHERE slug = ?1 AND id LIKE ?2
+         ORDER BY hit_count DESC, updated_at DESC",
+    )?;
+
+    let like_pattern = format!("{}%", id_prefix);
+    let rows = stmt.query_map(rusqlite::params![slug, like_pattern], |row| {
+        let related_str: String = row.get(4)?;
+        let annotation_str: String = row.get(5)?;
+        let triggers_str: String = row.get::<_, String>(7).unwrap_or_else(|_| "[]".to_string());
+        Ok(FaqNode {
+            id: row.get(0)?,
+            slug: row.get(1)?,
+            question: row.get(2)?,
+            answer: row.get(3)?,
+            related_node_ids: serde_json::from_str(&related_str).unwrap_or_default(),
+            annotation_ids: serde_json::from_str(&annotation_str).unwrap_or_default(),
+            hit_count: row.get(6)?,
+            match_triggers: serde_json::from_str(&triggers_str).unwrap_or_default(),
+            created_at: row.get(8)?,
+            updated_at: row.get(9)?,
+        })
+    })?;
+
+    let faqs: Vec<FaqNode> = rows.filter_map(|r| r.ok()).collect();
+    Ok(faqs)
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -2256,14 +2516,36 @@ mod tests {
 
         assert!(!step_exists(&conn, "s", "extract", 0, 0, "").unwrap());
 
-        save_step(&conn, "s", "extract", 0, 0, "", r#"{"ok":true}"#, "gpt-4", 1.5).unwrap();
+        save_step(
+            &conn,
+            "s",
+            "extract",
+            0,
+            0,
+            "",
+            r#"{"ok":true}"#,
+            "gpt-4",
+            1.5,
+        )
+        .unwrap();
         assert!(step_exists(&conn, "s", "extract", 0, 0, "").unwrap());
 
         let output = get_step_output(&conn, "s", "extract", 0).unwrap().unwrap();
         assert!(output.contains("ok"));
 
         // Upsert overwrites
-        save_step(&conn, "s", "extract", 0, 0, "", r#"{"ok":false}"#, "gpt-4", 2.0).unwrap();
+        save_step(
+            &conn,
+            "s",
+            "extract",
+            0,
+            0,
+            "",
+            r#"{"ok":false}"#,
+            "gpt-4",
+            2.0,
+        )
+        .unwrap();
         let output2 = get_step_output(&conn, "s", "extract", 0).unwrap().unwrap();
         assert!(output2.contains("false"));
 

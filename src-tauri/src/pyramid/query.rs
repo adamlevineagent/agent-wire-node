@@ -143,13 +143,17 @@ pub fn get_apex(conn: &Connection, slug: &str) -> Result<Option<PyramidNode>> {
 /// Loads all nodes for the slug into memory, finds the apex (highest depth),
 /// then recursively builds the tree by following `children` arrays.
 pub fn get_tree(conn: &Connection, slug: &str) -> Result<Vec<TreeNode>> {
-    let mut stmt = conn.prepare(
-        "SELECT * FROM live_pyramid_nodes WHERE slug = ? ORDER BY id",
-    )?;
+    let mut stmt = conn.prepare("SELECT * FROM live_pyramid_nodes WHERE slug = ? ORDER BY id")?;
 
     let nodes: Vec<PyramidNode> = stmt
         .query_map(rusqlite::params![slug], row_to_node)?
-        .filter_map(|r| match r { Ok(v) => Some(v), Err(e) => { warn!("Skipping row: {e}"); None } })
+        .filter_map(|r| match r {
+            Ok(v) => Some(v),
+            Err(e) => {
+                warn!("Skipping row: {e}");
+                None
+            }
+        })
         .collect();
 
     if nodes.is_empty() {
@@ -171,7 +175,9 @@ pub fn get_tree(conn: &Connection, slug: &str) -> Result<Vec<TreeNode>> {
             };
             let node_ids: Vec<String> = serde_json::from_str(&node_ids_json).unwrap_or_default();
             for node_id in node_ids {
-                source_path_by_node_id.entry(node_id).or_insert_with(|| file_path.clone());
+                source_path_by_node_id
+                    .entry(node_id)
+                    .or_insert_with(|| file_path.clone());
             }
         }
     }
@@ -212,9 +218,14 @@ pub fn get_tree(conn: &Connection, slug: &str) -> Result<Vec<TreeNode>> {
             .children
             .iter()
             .filter_map(|child_id| {
-                node_map
-                    .get(child_id.as_str())
-                    .map(|child| build_tree_node(child, node_map, thread_id_by_canonical_id, source_path_by_node_id))
+                node_map.get(child_id.as_str()).map(|child| {
+                    build_tree_node(
+                        child,
+                        node_map,
+                        thread_id_by_canonical_id,
+                        source_path_by_node_id,
+                    )
+                })
             })
             .collect();
 
@@ -231,7 +242,14 @@ pub fn get_tree(conn: &Connection, slug: &str) -> Result<Vec<TreeNode>> {
 
     let trees = apex_nodes
         .into_iter()
-        .map(|apex| build_tree_node(apex, &node_map, &thread_id_by_canonical_id, &source_path_by_node_id))
+        .map(|apex| {
+            build_tree_node(
+                apex,
+                &node_map,
+                &thread_id_by_canonical_id,
+                &source_path_by_node_id,
+            )
+        })
         .collect();
 
     Ok(trees)
@@ -285,18 +303,18 @@ pub fn search(conn: &Connection, slug: &str, term: &str) -> Result<Vec<SearchHit
     for word in &words {
         let pattern = format!("%{}%", word);
         let idx = params.len();
+        // Search distilled, topics (which includes entity names), corrections, and terms
         conditions.push(format!(
-            "(LOWER(distilled) LIKE ?{p1} OR LOWER(topics) LIKE ?{p2} OR LOWER(corrections) LIKE ?{p3} OR LOWER(terms) LIKE ?{p4} OR LOWER(entities) LIKE ?{p5})",
-            p1 = idx + 1, p2 = idx + 2, p3 = idx + 3, p4 = idx + 4, p5 = idx + 5
+            "(LOWER(distilled) LIKE ?{p1} OR LOWER(topics) LIKE ?{p2} OR LOWER(corrections) LIKE ?{p3} OR LOWER(terms) LIKE ?{p4})",
+            p1 = idx + 1, p2 = idx + 2, p3 = idx + 3, p4 = idx + 4
         ));
-        // Same pattern for all 5 fields
-        for _ in 0..5 {
+        for _ in 0..4 {
             params.push(Box::new(pattern.clone()));
         }
     }
 
     let sql = format!(
-        "SELECT id, depth, distilled, topics, corrections, terms, entities FROM live_pyramid_nodes \
+        "SELECT id, depth, headline, distilled, topics, corrections, terms FROM live_pyramid_nodes \
          WHERE slug = ?1 AND {} ORDER BY depth DESC",
         conditions.join(" AND ")
     );
@@ -308,13 +326,14 @@ pub fn search(conn: &Connection, slug: &str, term: &str) -> Result<Vec<SearchHit
         .query_map(param_refs.as_slice(), |row| {
             let id: String = row.get("id")?;
             let depth: i64 = row.get("depth")?;
+            let headline: String = row.get::<_, String>("headline").unwrap_or_default();
             let distilled: String = row.get("distilled")?;
             let topics: String = row.get::<_, String>("topics").unwrap_or_default();
             let terms_str: String = row.get::<_, String>("terms").unwrap_or_default();
-            let entities: String = row.get::<_, String>("entities").unwrap_or_default();
 
             // Combine all searchable text for snippet extraction and scoring
-            let all_text = format!("{} {} {} {}", distilled, topics, terms_str, entities);
+            // (topics JSON already contains entity names, so they're searched implicitly)
+            let all_text = format!("{} {} {} {}", distilled, topics, terms_str, headline);
             let all_lower = all_text.to_lowercase();
 
             // Count how many query words appear and find first match for snippet
@@ -337,18 +356,26 @@ pub fn search(conn: &Connection, slug: &str, term: &str) -> Result<Vec<SearchHit
                 let source_lower = source.to_lowercase();
                 if let Some(sidx) = source_lower.find(&words[0]) {
                     let mut start = sidx.saturating_sub(50);
-                    while start > 0 && !source.is_char_boundary(start) { start -= 1; }
+                    while start > 0 && !source.is_char_boundary(start) {
+                        start -= 1;
+                    }
                     let mut end = (sidx + words[0].len() + 80).min(source.len());
-                    while end < source.len() && !source.is_char_boundary(end) { end += 1; }
+                    while end < source.len() && !source.is_char_boundary(end) {
+                        end += 1;
+                    }
                     format!("...{}...", &source[start..end])
                 } else {
                     let mut end = distilled.len().min(120);
-                    while end < distilled.len() && !distilled.is_char_boundary(end) { end += 1; }
+                    while end < distilled.len() && !distilled.is_char_boundary(end) {
+                        end += 1;
+                    }
                     distilled[..end].to_string()
                 }
             } else {
                 let mut end = distilled.len().min(120);
-                while end < distilled.len() && !distilled.is_char_boundary(end) { end += 1; }
+                while end < distilled.len() && !distilled.is_char_boundary(end) {
+                    end += 1;
+                }
                 distilled[..end].to_string()
             };
 
@@ -364,12 +391,22 @@ pub fn search(conn: &Connection, slug: &str, term: &str) -> Result<Vec<SearchHit
                 score,
             })
         })?
-        .filter_map(|r| match r { Ok(v) => Some(v), Err(e) => { warn!("Skipping row: {e}"); None } })
+        .filter_map(|r| match r {
+            Ok(v) => Some(v),
+            Err(e) => {
+                warn!("Skipping row: {e}");
+                None
+            }
+        })
         .collect();
 
     // Sort by score descending (best matches first)
     let mut sorted = hits;
-    sorted.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    sorted.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     Ok(sorted)
 }
@@ -380,13 +417,18 @@ pub fn search(conn: &Connection, slug: &str, term: &str) -> Result<Vec<SearchHit
 /// (entity -> list of nodes), and returns only entities appearing in 2+ distinct nodes.
 /// Sorted by node count descending.
 pub fn entities(conn: &Connection, slug: &str) -> Result<Vec<EntityEntry>> {
-    let mut stmt = conn.prepare(
-        "SELECT * FROM live_pyramid_nodes WHERE slug = ? ORDER BY depth, id",
-    )?;
+    let mut stmt =
+        conn.prepare("SELECT * FROM live_pyramid_nodes WHERE slug = ? ORDER BY depth, id")?;
 
     let nodes: Vec<PyramidNode> = stmt
         .query_map(rusqlite::params![slug], row_to_node)?
-        .filter_map(|r| match r { Ok(v) => Some(v), Err(e) => { warn!("Skipping row: {e}"); None } })
+        .filter_map(|r| match r {
+            Ok(v) => Some(v),
+            Err(e) => {
+                warn!("Skipping row: {e}");
+                None
+            }
+        })
         .collect();
 
     // entity_normalized -> { name, locations: [(node_id, depth, topic_name)] }
@@ -408,7 +450,9 @@ pub fn entities(conn: &Connection, slug: &str) -> Result<Vec<EntityEntry>> {
                 name: entity.clone(),
                 locations: Vec::new(),
             });
-            entry.locations.push((node.id.clone(), node.depth, topic_name));
+            entry
+                .locations
+                .push((node.id.clone(), node.depth, topic_name));
         }
     }
 
@@ -416,15 +460,29 @@ pub fn entities(conn: &Connection, slug: &str) -> Result<Vec<EntityEntry>> {
     let mut results: Vec<EntityEntry> = index
         .into_values()
         .filter_map(|data| {
-            let unique_nodes: HashSet<&str> = data.locations.iter().map(|(n, _, _)| n.as_str()).collect();
+            let unique_nodes: HashSet<&str> =
+                data.locations.iter().map(|(n, _, _)| n.as_str()).collect();
             if unique_nodes.len() < 2 {
                 return None;
             }
-            let mut nodes_sorted: Vec<String> = unique_nodes.into_iter().map(|s| s.to_string()).collect();
+            let mut nodes_sorted: Vec<String> =
+                unique_nodes.into_iter().map(|s| s.to_string()).collect();
             nodes_sorted.sort();
-            let mut depths: Vec<i64> = data.locations.iter().map(|(_, d, _)| *d).collect::<HashSet<_>>().into_iter().collect();
+            let mut depths: Vec<i64> = data
+                .locations
+                .iter()
+                .map(|(_, d, _)| *d)
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .collect();
             depths.sort();
-            let mut topics: Vec<String> = data.locations.iter().map(|(_, _, t)| t.clone()).collect::<HashSet<_>>().into_iter().collect();
+            let mut topics: Vec<String> = data
+                .locations
+                .iter()
+                .map(|(_, _, t)| t.clone())
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .collect();
             topics.sort();
 
             Some(EntityEntry {
@@ -453,7 +511,13 @@ pub fn resolved(conn: &Connection, slug: &str) -> Result<Vec<ResolvedCorrection>
     )?;
     let l0_nodes: Vec<PyramidNode> = stmt_l0
         .query_map(rusqlite::params![slug], row_to_node)?
-        .filter_map(|r| match r { Ok(v) => Some(v), Err(e) => { warn!("Skipping row: {e}"); None } })
+        .filter_map(|r| match r {
+            Ok(v) => Some(v),
+            Err(e) => {
+                warn!("Skipping row: {e}");
+                None
+            }
+        })
         .collect();
 
     // Gather upper corrections (depth > 0)
@@ -463,7 +527,13 @@ pub fn resolved(conn: &Connection, slug: &str) -> Result<Vec<ResolvedCorrection>
     )?;
     let upper_nodes: Vec<PyramidNode> = stmt_upper
         .query_map(rusqlite::params![slug], row_to_node)?
-        .filter_map(|r| match r { Ok(v) => Some(v), Err(e) => { warn!("Skipping row: {e}"); None } })
+        .filter_map(|r| match r {
+            Ok(v) => Some(v),
+            Err(e) => {
+                warn!("Skipping row: {e}");
+                None
+            }
+        })
         .collect();
 
     // Build correction chains from L0 nodes.
@@ -493,7 +563,8 @@ pub fn resolved(conn: &Connection, slug: &str) -> Result<Vec<ResolvedCorrection>
             let mut found_chain_idx: Option<usize> = None;
             for (idx, (_, chain)) in chains.iter().enumerate() {
                 for entry in chain {
-                    let entry_right_norm: String = entry.right.to_lowercase().chars().take(80).collect();
+                    let entry_right_norm: String =
+                        entry.right.to_lowercase().chars().take(80).collect();
                     if entry_right_norm == wrong_norm {
                         found_chain_idx = Some(idx);
                         break;
@@ -514,13 +585,16 @@ pub fn resolved(conn: &Connection, slug: &str) -> Result<Vec<ResolvedCorrection>
                 });
             } else {
                 // New chain
-                chains.push((right_norm, vec![ChainEntry {
-                    wrong,
-                    right,
-                    who: c.who.clone(),
-                    source: node.id.clone(),
-                    chunk_index: ci,
-                }]));
+                chains.push((
+                    right_norm,
+                    vec![ChainEntry {
+                        wrong,
+                        right,
+                        who: c.who.clone(),
+                        source: node.id.clone(),
+                        chunk_index: ci,
+                    }],
+                ));
             }
         }
     }
@@ -544,13 +618,16 @@ pub fn resolved(conn: &Connection, slug: &str) -> Result<Vec<ResolvedCorrection>
             });
 
             if !already_covered {
-                chains.push((right_norm, vec![ChainEntry {
-                    wrong,
-                    right,
-                    who: c.who.clone(),
-                    source: node.id.clone(),
-                    chunk_index: -1,
-                }]));
+                chains.push((
+                    right_norm,
+                    vec![ChainEntry {
+                        wrong,
+                        right,
+                        who: c.who.clone(),
+                        source: node.id.clone(),
+                        chunk_index: -1,
+                    }],
+                ));
             }
         }
     }
@@ -601,7 +678,13 @@ pub fn corrections(conn: &Connection, slug: &str) -> Result<Vec<CorrectionWithSo
 
     let nodes: Vec<PyramidNode> = stmt
         .query_map(rusqlite::params![slug], row_to_node)?
-        .filter_map(|r| match r { Ok(v) => Some(v), Err(e) => { warn!("Skipping row: {e}"); None } })
+        .filter_map(|r| match r {
+            Ok(v) => Some(v),
+            Err(e) => {
+                warn!("Skipping row: {e}");
+                None
+            }
+        })
         .collect();
 
     // Dedup: (wrong_norm, right_norm) -> CorrectionWithSource
@@ -627,7 +710,11 @@ pub fn corrections(conn: &Connection, slug: &str) -> Result<Vec<CorrectionWithSo
 
     // Sort by depth descending, then node_id
     let mut entries: Vec<CorrectionWithSource> = seen.into_values().collect();
-    entries.sort_by(|a, b| b.depth.cmp(&a.depth).then_with(|| a.node_id.cmp(&b.node_id)));
+    entries.sort_by(|a, b| {
+        b.depth
+            .cmp(&a.depth)
+            .then_with(|| a.node_id.cmp(&b.node_id))
+    });
 
     Ok(entries)
 }
@@ -641,7 +728,13 @@ pub fn terms(conn: &Connection, slug: &str) -> Result<Vec<TermWithSource>> {
 
     let nodes: Vec<PyramidNode> = stmt
         .query_map(rusqlite::params![slug], row_to_node)?
-        .filter_map(|r| match r { Ok(v) => Some(v), Err(e) => { warn!("Skipping row: {e}"); None } })
+        .filter_map(|r| match r {
+            Ok(v) => Some(v),
+            Err(e) => {
+                warn!("Skipping row: {e}");
+                None
+            }
+        })
         .collect();
 
     // Dedup by normalized term name — first occurrence wins (highest depth)
@@ -660,7 +753,11 @@ pub fn terms(conn: &Connection, slug: &str) -> Result<Vec<TermWithSource>> {
     }
 
     let mut entries: Vec<TermWithSource> = seen.into_values().collect();
-    entries.sort_by(|a, b| b.depth.cmp(&a.depth).then_with(|| a.node_id.cmp(&b.node_id)));
+    entries.sort_by(|a, b| {
+        b.depth
+            .cmp(&a.depth)
+            .then_with(|| a.node_id.cmp(&b.node_id))
+    });
 
     Ok(entries)
 }

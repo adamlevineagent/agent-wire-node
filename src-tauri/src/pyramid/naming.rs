@@ -16,9 +16,12 @@ pub fn clean_headline(raw: &str) -> Option<String> {
         .collect::<Vec<_>>()
         .join(" ");
 
-    let trimmed = collapsed
-        .trim()
-        .trim_matches(|ch: char| matches!(ch, '"' | '\'' | '`' | '.' | ',' | ';' | ':' | '-' | '|' | ' '));
+    let trimmed = collapsed.trim().trim_matches(|ch: char| {
+        matches!(
+            ch,
+            '"' | '\'' | '`' | '.' | ',' | ';' | ':' | '-' | '|' | ' '
+        )
+    });
 
     if trimmed.is_empty() {
         return None;
@@ -54,7 +57,10 @@ pub fn clean_headline(raw: &str) -> Option<String> {
         "orientation ",
         "summary ",
     ];
-    if banned_prefixes.iter().any(|prefix| lower.starts_with(prefix)) {
+    if banned_prefixes
+        .iter()
+        .any(|prefix| lower.starts_with(prefix))
+    {
         return None;
     }
 
@@ -67,14 +73,20 @@ pub fn clean_headline(raw: &str) -> Option<String> {
 
     let char_count = shortened.chars().count();
     let final_text = if char_count > MAX_HEADLINE_CHARS {
-        shortened.chars().take(MAX_HEADLINE_CHARS).collect::<String>()
+        shortened
+            .chars()
+            .take(MAX_HEADLINE_CHARS)
+            .collect::<String>()
     } else {
         shortened
     };
 
-    let final_text = final_text
-        .trim()
-        .trim_matches(|ch: char| matches!(ch, '"' | '\'' | '`' | '.' | ',' | ';' | ':' | '-' | '|' | ' '));
+    let final_text = final_text.trim().trim_matches(|ch: char| {
+        matches!(
+            ch,
+            '"' | '\'' | '`' | '.' | ',' | ';' | ':' | '-' | '|' | ' '
+        )
+    });
 
     if final_text.is_empty() {
         None
@@ -94,7 +106,11 @@ fn title_case_token(token: &str) -> String {
 
     let mut chars = token.chars();
     let first = chars.next().unwrap();
-    format!("{}{}", first.to_ascii_uppercase(), chars.as_str().to_ascii_lowercase())
+    format!(
+        "{}{}",
+        first.to_ascii_uppercase(),
+        chars.as_str().to_ascii_lowercase()
+    )
 }
 
 fn humanize_identifier(input: &str) -> Option<String> {
@@ -174,12 +190,37 @@ pub fn headline_from_analysis(analysis: &Value, node_id: &str) -> String {
         .get("headline")
         .and_then(|value| value.as_str())
         .and_then(clean_headline)
-        .or_else(|| analysis.get("title").and_then(|value| value.as_str()).and_then(clean_headline))
-        .or_else(|| analysis.get("name").and_then(|value| value.as_str()).and_then(clean_headline))
-        .or_else(|| analysis.get("purpose").and_then(|value| value.as_str()).and_then(clean_headline))
+        .or_else(|| {
+            analysis
+                .get("title")
+                .and_then(|value| value.as_str())
+                .and_then(clean_headline)
+        })
+        .or_else(|| {
+            analysis
+                .get("name")
+                .and_then(|value| value.as_str())
+                .and_then(clean_headline)
+        })
+        .or_else(|| {
+            analysis
+                .get("purpose")
+                .and_then(|value| value.as_str())
+                .and_then(clean_headline)
+        })
         .or_else(|| headline_from_analysis_topics(analysis))
-        .or_else(|| analysis.get("orientation").and_then(|value| value.as_str()).and_then(headline_from_distilled))
-        .or_else(|| analysis.get("distilled").and_then(|value| value.as_str()).and_then(headline_from_distilled))
+        .or_else(|| {
+            analysis
+                .get("orientation")
+                .and_then(|value| value.as_str())
+                .and_then(headline_from_distilled)
+        })
+        .or_else(|| {
+            analysis
+                .get("distilled")
+                .and_then(|value| value.as_str())
+                .and_then(headline_from_distilled)
+        })
         .unwrap_or_else(|| format!("Node {node_id}"))
 }
 

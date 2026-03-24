@@ -115,8 +115,7 @@ impl PyramidFileWatcher {
         let ingested_config_files_clone = Arc::clone(&self.ingested_config_files);
         let mutation_sender_clone = self.mutation_sender.clone();
         // Shared recent-removes tracker for rename-candidate detection
-        let recent_removes: Arc<Mutex<Vec<RecentRemove>>> =
-            Arc::new(Mutex::new(Vec::new()));
+        let recent_removes: Arc<Mutex<Vec<RecentRemove>>> = Arc::new(Mutex::new(Vec::new()));
         let recent_removes_clone = Arc::clone(&recent_removes);
 
         // Store the paused flag reference so pause/resume can update it
@@ -187,7 +186,11 @@ impl PyramidFileWatcher {
     /// Repopulates caches from DB to pick up any changes made while paused.
     pub fn resume(&mut self, db_path: &str) {
         if let Err(e) = self.populate_caches(db_path) {
-            tracing::warn!("Failed to repopulate watcher caches on resume for slug='{}': {}", self.slug, e);
+            tracing::warn!(
+                "Failed to repopulate watcher caches on resume for slug='{}': {}",
+                self.slug,
+                e
+            );
         }
         *self.paused_flag.lock().unwrap() = false;
     }
@@ -206,8 +209,17 @@ fn is_trackable_path(
 ) -> bool {
     // Fast reject: skip obvious non-source paths
     let skip_patterns = [
-        "/target/", "/node_modules/", "/.git/", "/dist/", "/.next/",
-        "/.DS_Store", ".tmp.", ".swp", ".swo", "~", "/build/",
+        "/target/",
+        "/node_modules/",
+        "/.git/",
+        "/dist/",
+        "/.next/",
+        "/.DS_Store",
+        ".tmp.",
+        ".swp",
+        ".swo",
+        "~",
+        "/build/",
     ];
     for pat in &skip_patterns {
         if path.contains(pat) {
@@ -316,7 +328,14 @@ fn handle_event_with_rename_tracking(
                     }
                     // Also write for the current slug if not already covered
                     if !slugs.contains(&slug.to_string()) {
-                        write_mutation(&conn, slug, 0, "rename_candidate", path_str, Some(&detail))?;
+                        write_mutation(
+                            &conn,
+                            slug,
+                            0,
+                            "rename_candidate",
+                            path_str,
+                            Some(&detail),
+                        )?;
                     }
                     // Update tracked_paths cache for rename
                     if let Ok(mut cache) = tracked_paths.lock() {
@@ -391,14 +410,26 @@ fn filenames_similar(a: &str, b: &str) -> bool {
     if a == b {
         return true;
     }
-    let ext_a = Path::new(a).extension().and_then(|e| e.to_str()).unwrap_or("");
-    let ext_b = Path::new(b).extension().and_then(|e| e.to_str()).unwrap_or("");
+    let ext_a = Path::new(a)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    let ext_b = Path::new(b)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
     if ext_a != ext_b {
         return false;
     }
     // Same extension — check character overlap
-    let stem_a = Path::new(a).file_stem().and_then(|s| s.to_str()).unwrap_or("");
-    let stem_b = Path::new(b).file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    let stem_a = Path::new(a)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    let stem_b = Path::new(b)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
     if stem_a == stem_b {
         return true;
     }
@@ -619,8 +650,8 @@ pub fn get_watched_slugs_for_path(conn: &Connection, path: &str) -> Result<Vec<S
 
 /// Open a new database connection (short-lived, per the design spec).
 fn open_conn(db_path: &str) -> Result<Connection> {
-    let conn = Connection::open(db_path)
-        .with_context(|| format!("Failed to open DB at {}", db_path))?;
+    let conn =
+        Connection::open(db_path).with_context(|| format!("Failed to open DB at {}", db_path))?;
     // Ensure WAL mode for concurrent reads
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
         .ok();

@@ -15,15 +15,13 @@ use chrono::Utc;
 use rusqlite::Connection;
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
-use tracing::{debug, info, warn, error};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+use super::faq;
 use super::stale_helpers;
 use super::stale_helpers_upper;
-use super::faq;
-use super::types::{
-    AutoUpdateConfig, ConnectionCheckResult, PendingMutation, StaleCheckResult,
-};
+use super::types::{AutoUpdateConfig, ConnectionCheckResult, PendingMutation, StaleCheckResult};
 
 // cascade_depth is tracked for observability (cost observatory) but NOT enforced as a cap.
 // The LLM naturally terminates cascades by answering "not stale" on unchanged content.
@@ -71,7 +69,13 @@ pub struct PyramidStaleEngine {
 
 impl PyramidStaleEngine {
     /// Create an engine with layer timers for L0, L1, L2, L3 (apex).
-    pub fn new(slug: &str, config: AutoUpdateConfig, db_path: &str, api_key: &str, model: &str) -> Self {
+    pub fn new(
+        slug: &str,
+        config: AutoUpdateConfig,
+        db_path: &str,
+        api_key: &str,
+        model: &str,
+    ) -> Self {
         let debounce = Duration::from_secs((config.debounce_minutes as u64) * 60);
         let mut layers = HashMap::new();
         for layer in 0..=3 {
@@ -116,7 +120,11 @@ impl PyramidStaleEngine {
 
         let slug = self.slug.clone();
         let db_path = self.db_path.clone();
-        let _debounce = self.layers.get(&0).map(|t| t.debounce).unwrap_or(Duration::from_secs(300));
+        let _debounce = self
+            .layers
+            .get(&0)
+            .map(|t| t.debounce)
+            .unwrap_or(Duration::from_secs(300));
         let semaphore = self.concurrent_helpers.clone();
         let min_changed_files = self.config.min_changed_files;
         let api_key = self.api_key.clone();
@@ -156,7 +164,9 @@ impl PyramidStaleEngine {
                         }
                         results
                     }
-                }).await {
+                })
+                .await
+                {
                     Ok(r) => r,
                     Err(_) => continue,
                 };
@@ -179,7 +189,10 @@ impl PyramidStaleEngine {
                     }
                     {
                         let mut tfa = timer_fires_arc.lock().unwrap();
-                        *tfa = Some((Utc::now() + chrono::Duration::seconds(debounce_secs as i64)).to_rfc3339());
+                        *tfa = Some(
+                            (Utc::now() + chrono::Duration::seconds(debounce_secs as i64))
+                                .to_rfc3339(),
+                        );
                     }
 
                     tokio::time::sleep(_debounce).await;
@@ -200,7 +213,9 @@ impl PyramidStaleEngine {
                         phase_arc.clone(),
                         detail_arc.clone(),
                         summary_arc.clone(),
-                    ).await {
+                    )
+                    .await
+                    {
                         error!(slug = %slug, layer, error = %e, "Poll-triggered drain failed");
                     }
                 }
@@ -254,7 +269,9 @@ impl PyramidStaleEngine {
                 *phase = "debounce".to_string();
             }
             {
-                let fires_at = Utc::now() + chrono::Duration::from_std(timer.debounce).unwrap_or(chrono::Duration::seconds(300));
+                let fires_at = Utc::now()
+                    + chrono::Duration::from_std(timer.debounce)
+                        .unwrap_or(chrono::Duration::seconds(300));
                 let mut tfa = self.timer_fires_at.lock().unwrap();
                 *tfa = Some(fires_at.to_rfc3339());
             }
@@ -296,7 +313,8 @@ impl PyramidStaleEngine {
 
         // Update timer_fires_at
         {
-            let fires_at = Utc::now() + chrono::Duration::from_std(debounce).unwrap_or(chrono::Duration::seconds(300));
+            let fires_at = Utc::now()
+                + chrono::Duration::from_std(debounce).unwrap_or(chrono::Duration::seconds(300));
             let mut tfa = tfa_arc.lock().unwrap();
             *tfa = Some(fires_at.to_rfc3339());
         }
@@ -306,7 +324,10 @@ impl PyramidStaleEngine {
             info!(slug = %slug, layer, "Debounce timer fired, draining WAL");
 
             // Clear timer_fires_at since debounce has expired
-            { let mut tfa = tfa_arc.lock().unwrap(); *tfa = None; }
+            {
+                let mut tfa = tfa_arc.lock().unwrap();
+                *tfa = None;
+            }
 
             if let Err(e) = drain_and_dispatch(
                 &slug,
@@ -400,9 +421,18 @@ impl PyramidStaleEngine {
 
         // min_changed_files = 0 to force run regardless of threshold
         let _ = drain_and_dispatch(
-            &slug, layer, 0, &db_path, semaphore, &api_key, &model,
-            self.current_phase.clone(), self.phase_detail.clone(), self.last_result_summary.clone(),
-        ).await;
+            &slug,
+            layer,
+            0,
+            &db_path,
+            semaphore,
+            &api_key,
+            &model,
+            self.current_phase.clone(),
+            self.phase_detail.clone(),
+            self.last_result_summary.clone(),
+        )
+        .await;
     }
 
     /// Freeze the engine: cancel timers, mark all WAL entries processed.
@@ -483,7 +513,11 @@ pub async fn drain_and_dispatch(
     let phase_started_at = std::time::Instant::now();
     {
         let mut phase = phase_arc.lock().unwrap();
-        *phase = if layer > 0 { "cascading".to_string() } else { "evaluating".to_string() };
+        *phase = if layer > 0 {
+            "cascading".to_string()
+        } else {
+            "evaluating".to_string()
+        };
     }
     {
         let mut detail = detail_arc.lock().unwrap();
@@ -546,8 +580,7 @@ pub async fn drain_and_dispatch(
         let s = slug_owned.clone();
         let db = db_owned.clone();
         tokio::task::spawn_blocking(move || -> Result<Vec<PendingMutation>> {
-            let conn = Connection::open(&db)
-                .context("Failed to open DB for drain")?;
+            let conn = Connection::open(&db).context("Failed to open DB for drain")?;
 
             if layer == 0 {
                 let count: i64 = conn.query_row(
@@ -614,7 +647,10 @@ pub async fn drain_and_dispatch(
         }
         let mut deduped_indices: Vec<usize> = seen.into_values().collect();
         deduped_indices.sort();
-        let deduped: Vec<PendingMutation> = deduped_indices.into_iter().map(|i| mutations[i].clone()).collect();
+        let deduped: Vec<PendingMutation> = deduped_indices
+            .into_iter()
+            .map(|i| mutations[i].clone())
+            .collect();
         if deduped.len() < pre_dedup {
             info!(
                 slug = %slug_owned,
@@ -676,8 +712,13 @@ pub async fn drain_and_dispatch(
     let edge_batches = batch_items(edge_stales, BATCH_CAP_CONNECTIONS);
     let node_batches = batch_items(node_stales, BATCH_CAP_NODES);
 
-    let total_batches = file_batches.len() + new_file_batches.len() + deleted_batches.len()
-        + rename_batches.len() + confirmed_batches.len() + edge_batches.len() + node_batches.len();
+    let total_batches = file_batches.len()
+        + new_file_batches.len()
+        + deleted_batches.len()
+        + rename_batches.len()
+        + confirmed_batches.len()
+        + edge_batches.len()
+        + node_batches.len();
     {
         let mut detail = detail_arc.lock().unwrap();
         *detail = format!("L{}: {} batches to process", layer, total_batches);
@@ -759,7 +800,11 @@ pub async fn drain_and_dispatch(
         let key = api_key_owned.clone();
         let mdl = model_owned.clone();
         handles.push(tokio::spawn(async move {
-            let results = match stale_helpers_upper::dispatch_node_stale_check(batch, &db, &key, &mdl).await {
+            let results = match stale_helpers_upper::dispatch_node_stale_check(
+                batch, &db, &key, &mdl,
+            )
+            .await
+            {
                 Ok(r) => r,
                 Err(e) => {
                     error!(slug = %s, error = %e, "dispatch_node_stale_check (upper) failed");
@@ -771,7 +816,8 @@ pub async fn drain_and_dispatch(
                     let _ = log_stale_results(&conn, &s, &bid, layer, &results);
                     let _ = propagate_confirmed_stales(&conn, &s, layer, &results);
                 }
-            }).await;
+            })
+            .await;
             drop(permit);
         }));
     }
@@ -826,7 +872,11 @@ pub async fn drain_and_dispatch(
         let key = api_key_owned.clone();
         let mdl = model_owned.clone();
         handles.push(tokio::spawn(async move {
-            let results = match stale_helpers_upper::dispatch_edge_stale_check(batch, &db, &key, &mdl).await {
+            let results = match stale_helpers_upper::dispatch_edge_stale_check(
+                batch, &db, &key, &mdl,
+            )
+            .await
+            {
                 Ok(r) => r,
                 Err(e) => {
                     error!(slug = %s, error = %e, "dispatch_edge_stale_check (upper) failed");
@@ -838,7 +888,8 @@ pub async fn drain_and_dispatch(
                     let _ = log_stale_results(&conn, &s, &bid, layer, &results);
                     let _ = propagate_confirmed_stales(&conn, &s, layer, &results);
                 }
-            }).await;
+            })
+            .await;
             drop(permit);
         }));
     }
@@ -979,18 +1030,25 @@ pub async fn drain_and_dispatch(
                      WHERE slug = ?1 AND batch_id = ?2 AND stale = 1",
                     rusqlite::params![s, bid],
                     |row| row.get(0),
-                ).unwrap_or(0)
+                )
+                .unwrap_or(0)
             } else {
                 0
             }
-        }).await.unwrap_or(0)
+        })
+        .await
+        .unwrap_or(0)
     };
 
     if stale_count > 0 {
         let mut phase = phase_arc.lock().unwrap();
         *phase = "done_stale".to_string();
         let mut summary = summary_arc.lock().unwrap();
-        *summary = Some(format!("updated {} understanding{}", stale_count, if stale_count != 1 { "s" } else { "" }));
+        *summary = Some(format!(
+            "updated {} understanding{}",
+            stale_count,
+            if stale_count != 1 { "s" } else { "" }
+        ));
     } else {
         let mut phase = phase_arc.lock().unwrap();
         *phase = "done_clean".to_string();
@@ -1029,9 +1087,8 @@ fn atomic_drain(
              ORDER BY id ASC",
         )?;
 
-        let result: Vec<PendingMutation> = stmt.query_map(
-            rusqlite::params![slug, layer],
-            |row| {
+        let result: Vec<PendingMutation> = stmt
+            .query_map(rusqlite::params![slug, layer], |row| {
                 Ok(PendingMutation {
                     id: row.get(0)?,
                     slug: row.get(1)?,
@@ -1044,14 +1101,14 @@ fn atomic_drain(
                     processed: row.get::<_, i32>(8)? != 0,
                     batch_id: row.get(9)?,
                 })
-            },
-        )?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
         result
     };
 
     if !mutations.is_empty() {
-        let update_sql = "UPDATE pyramid_pending_mutations SET processed = 1, batch_id = ?1 WHERE id = ?2";
+        let update_sql =
+            "UPDATE pyramid_pending_mutations SET processed = 1, batch_id = ?1 WHERE id = ?2";
         for m in &mutations {
             tx.execute(update_sql, rusqlite::params![batch_id, m.id])?;
         }
@@ -1147,7 +1204,11 @@ fn propagate_confirmed_stales(
         // For L0, target_id is a file path — resolve via pyramid_file_hashes.
         // For L1+, target_id is a node ID — look up its parent directly.
         let propagation_targets = if layer == 0 {
-            let targets = stale_helpers_upper::resolve_parent_targets_for_file(conn, slug, &result.target_id)?;
+            let targets = stale_helpers_upper::resolve_parent_targets_for_file(
+                conn,
+                slug,
+                &result.target_id,
+            )?;
             if targets.is_empty() {
                 warn!(
                     slug = %slug,
@@ -1245,9 +1306,7 @@ async fn dispatch_node_stale_check(batch: Vec<PendingMutation>) -> Vec<StaleChec
 }
 
 #[allow(dead_code)]
-async fn dispatch_connection_check(
-    batch: Vec<PendingMutation>,
-) -> Vec<ConnectionCheckResult> {
+async fn dispatch_connection_check(batch: Vec<PendingMutation>) -> Vec<ConnectionCheckResult> {
     let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
 
     info!(
@@ -1366,14 +1425,12 @@ mod tests {
             frozen: false,
             frozen_at: None,
         };
-        let engine = PyramidStaleEngine::new("test", config, "/tmp/test.db", "", "inception/mercury-2");
+        let engine =
+            PyramidStaleEngine::new("test", config, "/tmp/test.db", "", "inception/mercury-2");
         assert_eq!(engine.slug, "test");
         assert_eq!(engine.layers.len(), 4);
         assert!(!engine.breaker_tripped);
         assert!(!engine.frozen);
-        assert_eq!(
-            engine.layers[&0].debounce,
-            Duration::from_secs(5 * 60)
-        );
+        assert_eq!(engine.layers[&0].debounce, Duration::from_secs(5 * 60));
     }
 }

@@ -8,8 +8,8 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::info;
 
-use crate::pyramid::{db, types::*, llm};
 use crate::pyramid::config_helper::config_for_model;
+use crate::pyramid::{db, llm, types::*};
 
 // ── Meta analysis passes ─────────────────────────────────────────────────────
 
@@ -59,11 +59,19 @@ Output the timeline as plain text (not JSON). Be concise but capture the arc."#,
     );
 
     let cfg = config_for_model(api_key, model);
-    let system_prompt = "You are a meta-analysis engine for a knowledge pyramid. Produce clear, concise analysis.";
+    let system_prompt =
+        "You are a meta-analysis engine for a knowledge pyramid. Produce clear, concise analysis.";
     let result = llm::call_model(&cfg, system_prompt, &prompt, 0.3, 2000).await?;
 
     // Save as META node
-    save_meta_node(writer, slug, "META-timeline-forward", "Timeline (Forward)", &result).await?;
+    save_meta_node(
+        writer,
+        slug,
+        "META-timeline-forward",
+        "Timeline (Forward)",
+        &result,
+    )
+    .await?;
 
     Ok(result)
 }
@@ -91,10 +99,18 @@ Output the reverse analysis as plain text. Be concise."#,
     );
 
     let cfg = config_for_model(api_key, model);
-    let system_prompt = "You are a meta-analysis engine for a knowledge pyramid. Produce clear, concise analysis.";
+    let system_prompt =
+        "You are a meta-analysis engine for a knowledge pyramid. Produce clear, concise analysis.";
     let result = llm::call_model(&cfg, system_prompt, &prompt, 0.3, 2000).await?;
 
-    save_meta_node(writer, slug, "META-timeline-backward", "Timeline (Backward)", &result).await?;
+    save_meta_node(
+        writer,
+        slug,
+        "META-timeline-backward",
+        "Timeline (Backward)",
+        &result,
+    )
+    .await?;
 
     Ok(result)
 }
@@ -125,7 +141,8 @@ Output the narrative as plain text. This should read like a story, not a report.
     );
 
     let cfg = config_for_model(api_key, model);
-    let system_prompt = "You are a meta-analysis engine for a knowledge pyramid. Produce clear, concise analysis.";
+    let system_prompt =
+        "You are a meta-analysis engine for a knowledge pyramid. Produce clear, concise analysis.";
     let result = llm::call_model(&cfg, system_prompt, &prompt, 0.3, 2000).await?;
 
     save_meta_node(writer, slug, "META-narrative", "Narrative", &result).await?;
@@ -150,8 +167,11 @@ pub async fn quickstart(
         context.push_str("THREAD CHAIN TIPS:\n");
         for t in &threads {
             if let Ok(Some(dist)) = db::get_distillation(&conn, slug, &t.thread_id) {
-                context.push_str(&format!("- {}: {}\n", t.thread_name,
-                    crate::utils::safe_slice_end(&dist.content, 200)));
+                context.push_str(&format!(
+                    "- {}: {}\n",
+                    t.thread_name,
+                    crate::utils::safe_slice_end(&dist.content, 200)
+                ));
             }
         }
 
@@ -159,8 +179,12 @@ pub async fn quickstart(
         if !edges.is_empty() {
             context.push_str("\nCONNECTIONS:\n");
             for e in &edges {
-                context.push_str(&format!("- {} ↔ {}: {}\n", e.thread_a_id, e.thread_b_id,
-                    crate::utils::safe_slice_end(&e.relationship, 100)));
+                context.push_str(&format!(
+                    "- {} ↔ {}: {}\n",
+                    e.thread_a_id,
+                    e.thread_b_id,
+                    crate::utils::safe_slice_end(&e.relationship, 100)
+                ));
             }
         }
     }
@@ -181,7 +205,8 @@ Produce the quickstart (target: under 1500 tokens). The reader should have the s
     );
 
     let cfg = config_for_model(api_key, model);
-    let system_prompt = "You are a meta-analysis engine for a knowledge pyramid. Produce clear, concise analysis.";
+    let system_prompt =
+        "You are a meta-analysis engine for a knowledge pyramid. Produce clear, concise analysis.";
     let result = llm::call_model(&cfg, system_prompt, &prompt, 0.2, 2000).await?;
 
     save_meta_node(writer, slug, "META-quickstart", "Quickstart", &result).await?;

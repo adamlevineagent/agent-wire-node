@@ -146,10 +146,7 @@ fn extract_text_from_content(content: &Value) -> String {
                             }
                         }
                         Some("tool_use") => {
-                            let name = obj
-                                .get("name")
-                                .and_then(|n| n.as_str())
-                                .unwrap_or("?");
+                            let name = obj.get("name").and_then(|n| n.as_str()).unwrap_or("?");
                             parts.push(format!("[Tool: {name}]"));
                         }
                         _ => {}
@@ -203,9 +200,7 @@ fn parse_conversation_messages(
         };
 
         // Extract text
-        let text = extract_text_from_content(
-            msg.get("content").unwrap_or(&Value::Null),
-        );
+        let text = extract_text_from_content(msg.get("content").unwrap_or(&Value::Null));
         if text.trim().is_empty() {
             continue;
         }
@@ -223,17 +218,15 @@ fn parse_conversation_messages(
         }
 
         // Determine role and label
-        let role = msg
-            .get("role")
-            .and_then(|r| r.as_str())
-            .unwrap_or(msg_type);
-        let label = if role == "user" { "PLAYFUL" } else { "CONDUCTOR" };
+        let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or(msg_type);
+        let label = if role == "user" {
+            "PLAYFUL"
+        } else {
+            "CONDUCTOR"
+        };
 
         // Timestamp: take first 19 chars
-        let ts = d
-            .get("timestamp")
-            .and_then(|t| t.as_str())
-            .unwrap_or("");
+        let ts = d.get("timestamp").and_then(|t| t.as_str()).unwrap_or("");
         let ts = if ts.len() >= 19 { &ts[..19] } else { ts };
 
         messages.push(format!("--- {label} [{ts}] ---\n{}\n", text.trim()));
@@ -288,11 +281,7 @@ fn chunk_transcript(transcript: &str) -> Vec<String> {
 
 /// Recursively walk a directory, respecting skip_dirs and hidden-file rules.
 /// Returns sorted list of (absolute_path, relative_path) pairs.
-fn walk_dir(
-    dir: &Path,
-    skip: &HashSet<&str>,
-    skip_hidden: bool,
-) -> Vec<(PathBuf, PathBuf)> {
+fn walk_dir(dir: &Path, skip: &HashSet<&str>, skip_hidden: bool) -> Vec<(PathBuf, PathBuf)> {
     let mut results = Vec::new();
     walk_dir_inner(dir, dir, skip, skip_hidden, &mut results);
     results.sort_by(|a, b| a.1.cmp(&b.1));
@@ -398,9 +387,7 @@ pub fn ingest_continuation(
     let (messages, total_count) = parse_conversation_messages(jsonl_path, skip_messages)?;
 
     if messages.is_empty() {
-        tracing::info!(
-            "No new messages found (total: {total_count}, skipped: {skip_messages})"
-        );
+        tracing::info!("No new messages found (total: {total_count}, skipped: {skip_messages})");
         return Ok(None);
     }
 
@@ -556,7 +543,11 @@ pub fn ingest_code(conn: &Connection, slug: &str, dir_path: &Path) -> Result<Ing
         "total_lines": total_lines,
         "languages": languages.into_iter().collect::<Vec<_>>(),
     });
-    let batch_type = if chunk_offset == 0 { "initial" } else { "additional" };
+    let batch_type = if chunk_offset == 0 {
+        "initial"
+    } else {
+        "additional"
+    };
     let batch_id = db::create_batch(conn, slug, batch_type, &path_str, chunk_offset)?;
 
     tracing::info!("Code metadata: {}", metadata);
@@ -680,7 +671,11 @@ pub fn ingest_docs(conn: &Connection, slug: &str, dir_path: &Path) -> Result<Ing
     }
 
     // Create batch for this path
-    let batch_type = if chunk_offset == 0 { "initial" } else { "additional" };
+    let batch_type = if chunk_offset == 0 {
+        "initial"
+    } else {
+        "additional"
+    };
     let batch_id = db::create_batch(conn, slug, batch_type, &path_str, chunk_offset)?;
 
     // Each document = 1 chunk, collect file hash info

@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
 use chrono::Utc;
+use serde::{Deserialize, Serialize};
 
 /// Tracks document pulls served and credits earned
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
@@ -99,7 +99,7 @@ const TRACKS: &[AchievementTrack] = &[
     // 1. The Wire — pulls served (signal distribution)
     AchievementTrack {
         id: "pulls_served",
-        emoji: "\u{1F4E1}",  // 📡
+        emoji: "\u{1F4E1}", // 📡
         levels: &[
             ("Tipster", 1),
             ("Stringer", 25),
@@ -116,7 +116,7 @@ const TRACKS: &[AchievementTrack] = &[
     // 2. Bandwidth — bytes served (data moved)
     AchievementTrack {
         id: "bytes_served",
-        emoji: "\u{1F4BE}",  // 💾
+        emoji: "\u{1F4BE}", // 💾
         levels: &[
             ("First Byte", 1 * MB),
             ("Packet Runner", 100 * MB),
@@ -133,7 +133,7 @@ const TRACKS: &[AchievementTrack] = &[
     // 3. On The Beat — total uptime (always available)
     AchievementTrack {
         id: "uptime",
-        emoji: "\u{23F1}",  // ⏱
+        emoji: "\u{23F1}", // ⏱
         levels: &[
             ("First Shift", 1 * DAY),
             ("Night Owl", 3 * DAY),
@@ -150,7 +150,7 @@ const TRACKS: &[AchievementTrack] = &[
     // 4. Follow The Money — credits earned
     AchievementTrack {
         id: "credits_earned",
-        emoji: "\u{1F4B0}",  // 💰
+        emoji: "\u{1F4B0}", // 💰
         levels: &[
             ("Penny Press", 10),
             ("Tip Jar", 100),
@@ -167,7 +167,7 @@ const TRACKS: &[AchievementTrack] = &[
     // 5. The Grind — jobs completed (work engine)
     AchievementTrack {
         id: "jobs_completed",
-        emoji: "\u{1F527}",  // 🔧
+        emoji: "\u{1F527}", // 🔧
         levels: &[
             ("Intern", 1),
             ("Copy Runner", 10),
@@ -184,7 +184,7 @@ const TRACKS: &[AchievementTrack] = &[
     // 6. Mesh Weaver — documents hosted (market inventory count)
     AchievementTrack {
         id: "docs_hosted",
-        emoji: "\u{1F578}",  // 🕸
+        emoji: "\u{1F578}", // 🕸
         levels: &[
             ("First Pin", 1),
             ("Collector", 5),
@@ -201,7 +201,7 @@ const TRACKS: &[AchievementTrack] = &[
     // 7. Reach — unique consumers served
     AchievementTrack {
         id: "unique_consumers",
-        emoji: "\u{1F91D}",  // 🤝
+        emoji: "\u{1F91D}", // 🤝
         levels: &[
             ("First Contact", 1),
             ("Pen Pal", 5),
@@ -218,7 +218,7 @@ const TRACKS: &[AchievementTrack] = &[
     // 8. Integrity — retention challenges passed
     AchievementTrack {
         id: "retention",
-        emoji: "\u{1F6E1}",  // 🛡
+        emoji: "\u{1F6E1}", // 🛡
         levels: &[
             ("Tested", 1),
             ("Verified", 10),
@@ -235,7 +235,7 @@ const TRACKS: &[AchievementTrack] = &[
     // 9. Stockpile — bytes committed to mesh hosting
     AchievementTrack {
         id: "bytes_hosted",
-        emoji: "\u{1F4E6}",  // 📦
+        emoji: "\u{1F4E6}", // 📦
         levels: &[
             ("Shelf Space", 100 * MB),
             ("Filing Cabinet", 500 * MB),
@@ -252,7 +252,7 @@ const TRACKS: &[AchievementTrack] = &[
     // 10. Coverage — unique corpora hosted
     AchievementTrack {
         id: "corpora_hosted",
-        emoji: "\u{1F4DA}",  // 📚
+        emoji: "\u{1F4DA}", // 📚
         levels: &[
             ("Niche", 1),
             ("Specialist", 3),
@@ -282,58 +282,66 @@ fn compute_achievements(tracker: &CreditTracker) -> Vec<Achievement> {
         ("corpora_hosted", tracker.unique_corpora_hosted),
     ];
 
-    TRACKS.iter().map(|track| {
-        let current_value = values.iter()
-            .find(|(id, _)| *id == track.id)
-            .map(|(_, v)| *v)
-            .unwrap_or(0);
+    TRACKS
+        .iter()
+        .map(|track| {
+            let current_value = values
+                .iter()
+                .find(|(id, _)| *id == track.id)
+                .map(|(_, v)| *v)
+                .unwrap_or(0);
 
-        let mut current_level: u32 = 0;
-        let mut current_name = String::new();
-        for (i, (name, threshold)) in track.levels.iter().enumerate() {
-            if current_value >= *threshold {
-                current_level = (i + 1) as u32;
-                current_name = name.to_string();
-            }
-        }
-
-        let next_idx = current_level as usize;
-        let (next_name, next_threshold) = if next_idx < track.levels.len() {
-            let (name, thresh) = track.levels[next_idx];
-            (Some(name.to_string()), Some(thresh))
-        } else {
-            (None, None)
-        };
-
-        let progress_pct = match next_threshold {
-            Some(next_t) => {
-                let prev_t = if current_level > 0 {
-                    track.levels[(current_level - 1) as usize].1
-                } else {
-                    0
-                };
-                let range = next_t - prev_t;
-                if range > 0 {
-                    let progress = current_value.saturating_sub(prev_t);
-                    (progress as f64 / range as f64 * 100.0).min(100.0)
-                } else {
-                    0.0
+            let mut current_level: u32 = 0;
+            let mut current_name = String::new();
+            for (i, (name, threshold)) in track.levels.iter().enumerate() {
+                if current_value >= *threshold {
+                    current_level = (i + 1) as u32;
+                    current_name = name.to_string();
                 }
             }
-            None => 100.0,
-        };
 
-        Achievement {
-            id: track.id.to_string(),
-            emoji: track.emoji.to_string(),
-            current_level,
-            current_name: if current_level > 0 { current_name } else { "--".to_string() },
-            next_name,
-            next_threshold,
-            current_value,
-            progress_pct,
-        }
-    }).collect()
+            let next_idx = current_level as usize;
+            let (next_name, next_threshold) = if next_idx < track.levels.len() {
+                let (name, thresh) = track.levels[next_idx];
+                (Some(name.to_string()), Some(thresh))
+            } else {
+                (None, None)
+            };
+
+            let progress_pct = match next_threshold {
+                Some(next_t) => {
+                    let prev_t = if current_level > 0 {
+                        track.levels[(current_level - 1) as usize].1
+                    } else {
+                        0
+                    };
+                    let range = next_t - prev_t;
+                    if range > 0 {
+                        let progress = current_value.saturating_sub(prev_t);
+                        (progress as f64 / range as f64 * 100.0).min(100.0)
+                    } else {
+                        0.0
+                    }
+                }
+                None => 100.0,
+            };
+
+            Achievement {
+                id: track.id.to_string(),
+                emoji: track.emoji.to_string(),
+                current_level,
+                current_name: if current_level > 0 {
+                    current_name
+                } else {
+                    "--".to_string()
+                },
+                next_name,
+                next_threshold,
+                current_value,
+                progress_pct,
+            }
+        })
+        .collect()
 }
 
 impl CreditTracker {
@@ -396,7 +404,13 @@ impl CreditTracker {
     }
 
     /// Record a document serve event
-    pub fn record_serve(&mut self, bytes: u64, document_id: &str, token_id: &str, consumer_operator_id: &str) {
+    pub fn record_serve(
+        &mut self,
+        bytes: u64,
+        document_id: &str,
+        token_id: &str,
+        consumer_operator_id: &str,
+    ) {
         let now = Utc::now();
         let today = now.format("%Y-%m-%d").to_string();
 
@@ -509,8 +523,21 @@ impl CreditTracker {
     pub fn record_sync_event(&mut self, direction: &str, document_id: &str, bytes: u64) {
         let now = chrono::Utc::now();
 
-        let event_type = if direction == "push" { "sync_push" } else { "sync_pull" };
-        let msg = format!("{} {} ({})", if direction == "push" { "Pushed" } else { "Pulled" }, document_id, format_bytes(bytes));
+        let event_type = if direction == "push" {
+            "sync_push"
+        } else {
+            "sync_pull"
+        };
+        let msg = format!(
+            "{} {} ({})",
+            if direction == "push" {
+                "Pushed"
+            } else {
+                "Pulled"
+            },
+            document_id,
+            format_bytes(bytes)
+        );
 
         let event = ServeEvent {
             document_id: document_id.to_string(),

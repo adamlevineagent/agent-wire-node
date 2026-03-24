@@ -308,7 +308,8 @@ pub fn extract_json(text: &str) -> Result<Value> {
     let mut text = text.trim().to_string();
 
     // Strip <think>...</think> tags
-    static THINK_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?s)<think>.*?</think>").unwrap());
+    static THINK_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?s)<think>.*?</think>").unwrap());
     text = THINK_RE.replace_all(&text, "").trim().to_string();
 
     // Remove markdown fences (``` lines)
@@ -329,11 +330,20 @@ pub fn extract_json(text: &str) -> Result<Value> {
     // Pick the outermost valid JSON range (object or array, whichever starts first)
     let (start, end) = match ((obj_start, obj_end), (arr_start, arr_end)) {
         ((Some(os), Some(oe)), (Some(as_), Some(ae))) if oe >= os && ae >= as_ => {
-            if os <= as_ { (os, oe) } else { (as_, ae) }
+            if os <= as_ {
+                (os, oe)
+            } else {
+                (as_, ae)
+            }
         }
         ((Some(os), Some(oe)), _) if oe >= os => (os, oe),
         (_, (Some(as_), Some(ae))) if ae >= as_ => (as_, ae),
-        _ => return Err(anyhow!("No JSON found in: {}", &text[..text.len().min(200)])),
+        _ => {
+            return Err(anyhow!(
+                "No JSON found in: {}",
+                &text[..text.len().min(200)]
+            ))
+        }
     };
 
     let slice = &text[start..=end];
@@ -353,5 +363,8 @@ pub fn extract_json(text: &str) -> Result<Value> {
         return Ok(v);
     }
 
-    Err(anyhow!("No JSON found in: {}", &text[..text.len().min(200)]))
+    Err(anyhow!(
+        "No JSON found in: {}",
+        &text[..text.len().min(200)]
+    ))
 }

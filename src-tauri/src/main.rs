@@ -7,26 +7,27 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use tauri_plugin_updater::UpdaterExt;
 use tauri_plugin_deep_link::DeepLinkExt;
+use tauri_plugin_updater::UpdaterExt;
 
 use std::sync::Arc;
-use tauri::{Manager, Emitter};
-use tauri::tray::{TrayIconBuilder, MouseButton, MouseButtonState, TrayIconEvent};
 use tauri::menu::{MenuBuilder, MenuItemBuilder};
-use tokio::sync::RwLock;
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::{Emitter, Manager};
 use tokio::io::AsyncBufReadExt;
+use tokio::sync::RwLock;
 
 use wire_node_lib::{
-    AppState, WireNodeConfig, SharedState,
-    auth, sync, server, credits, tunnel, messaging, market, retention, work,
+    auth, credits, market, messaging, retention, server, sync, tunnel, work, AppState, SharedState,
+    WireNodeConfig,
 };
 
 // --- Auth Token Helper ------------------------------------------------------
 
 async fn get_api_token(auth: &Arc<RwLock<auth::AuthState>>) -> Result<String, String> {
     let auth = auth.read().await;
-    auth.api_token.clone()
+    auth.api_token
+        .clone()
         .filter(|t| !t.is_empty())
         .ok_or_else(|| "No API token — please log in".to_string())
 }
@@ -45,7 +46,8 @@ async fn send_magic_link(
         &config.supabase_anon_key,
         &email,
         config.server_port,
-    ).await
+    )
+    .await
 }
 
 #[tauri::command]
@@ -61,23 +63,23 @@ async fn verify_magic_link(
         &config.supabase_anon_key,
         &magic_link_url,
         &email,
-    ).await?;
+    )
+    .await?;
 
     let user_id = auth_state.user_id.clone().unwrap_or_default();
 
     // Register with Wire using Supabase session token — propagate errors
     let supabase_token = auth_state.access_token.clone().unwrap_or_default();
-    let registration = auth::register_with_session(
-        &config.api_url,
-        &supabase_token,
-        &config.node_name(),
-    ).await?;
+    let registration =
+        auth::register_with_session(&config.api_url, &supabase_token, &config.node_name()).await?;
 
     let node_id = Some(registration.node_id.clone());
     let api_token = Some(registration.api_token.clone());
 
     let mut auth_write = state.auth.write().await;
-    let first_started = auth_write.first_started_at.clone()
+    let first_started = auth_write
+        .first_started_at
+        .clone()
         .or_else(|| Some(chrono::Utc::now().to_rfc3339()));
     *auth_write = auth::AuthState {
         node_id: node_id.clone(),
@@ -130,23 +132,23 @@ async fn verify_otp(
         &config.supabase_anon_key,
         &email,
         &otp_code,
-    ).await?;
+    )
+    .await?;
 
     let user_id = auth_state.user_id.clone().unwrap_or_default();
 
     // Register with Wire using Supabase session token — propagate errors
     let supabase_token = auth_state.access_token.clone().unwrap_or_default();
-    let registration = auth::register_with_session(
-        &config.api_url,
-        &supabase_token,
-        &config.node_name(),
-    ).await?;
+    let registration =
+        auth::register_with_session(&config.api_url, &supabase_token, &config.node_name()).await?;
 
     let node_id = Some(registration.node_id.clone());
     let api_token = Some(registration.api_token.clone());
 
     let mut auth_write = state.auth.write().await;
-    let first_started = auth_write.first_started_at.clone()
+    let first_started = auth_write
+        .first_started_at
+        .clone()
         .or_else(|| Some(chrono::Utc::now().to_rfc3339()));
     *auth_write = auth::AuthState {
         node_id: node_id.clone(),
@@ -199,23 +201,23 @@ async fn login(
         &config.supabase_anon_key,
         &email,
         &password,
-    ).await?;
+    )
+    .await?;
 
     let user_id = auth_state.user_id.clone().unwrap_or_default();
 
     // Register with Wire using Supabase session token
     let supabase_token = auth_state.access_token.clone().unwrap_or_default();
-    let registration = auth::register_with_session(
-        &config.api_url,
-        &supabase_token,
-        &config.node_name(),
-    ).await?;
+    let registration =
+        auth::register_with_session(&config.api_url, &supabase_token, &config.node_name()).await?;
 
     let node_id = Some(registration.node_id.clone());
     let api_token = Some(registration.api_token.clone());
 
     let mut auth_write = state.auth.write().await;
-    let first_started = auth_write.first_started_at.clone()
+    let first_started = auth_write
+        .first_started_at
+        .clone()
         .or_else(|| Some(chrono::Utc::now().to_rfc3339()));
     *auth_write = auth::AuthState {
         node_id: node_id.clone(),
@@ -258,17 +260,19 @@ async fn login(
 
 /// Acquire an operator session from the Wire API using the current Supabase access token
 #[tauri::command]
-async fn get_operator_session(state: tauri::State<'_, SharedState>) -> Result<serde_json::Value, String> {
+async fn get_operator_session(
+    state: tauri::State<'_, SharedState>,
+) -> Result<serde_json::Value, String> {
     let auth = state.auth.read().await;
-    let access_token = auth.access_token.clone()
-        .ok_or("Not authenticated")?;
+    let access_token = auth.access_token.clone().ok_or("Not authenticated")?;
     let config = state.config.read().await;
     let api_url = config.api_url.clone();
     drop(config);
     drop(auth);
 
     let client = reqwest::Client::new();
-    let resp = client.post(format!("{}/api/v1/operator/auth/session", api_url))
+    let resp = client
+        .post(format!("{}/api/v1/operator/auth/session", api_url))
         .header("Authorization", format!("Bearer {}", access_token))
         .send()
         .await
@@ -302,7 +306,9 @@ async fn operator_api_call(
     body: Option<serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
     let auth = state.auth.read().await;
-    let token = auth.operator_session_token.clone()
+    let token = auth
+        .operator_session_token
+        .clone()
         .ok_or("No operator session")?;
     let config = state.config.read().await;
     let api_url = config.api_url.clone();
@@ -347,25 +353,24 @@ async fn try_acquire_operator_session(state: &AppState) {
     drop(auth);
 
     let client = reqwest::Client::new();
-    match client.post(format!("{}/api/v1/operator/auth/session", api_url))
+    match client
+        .post(format!("{}/api/v1/operator/auth/session", api_url))
         .header("Authorization", format!("Bearer {}", access_token))
         .send()
         .await
     {
-        Ok(resp) if resp.status().is_success() => {
-            match resp.json::<serde_json::Value>().await {
-                Ok(body) => {
-                    let mut auth = state.auth.write().await;
-                    auth.operator_session_token = body["session_token"].as_str().map(String::from);
-                    auth.operator_id = body["operator_id"].as_str().map(String::from);
-                    auth.operator_session_expires_at = body["expires_at"].as_str().map(String::from);
-                    let config = state.config.read().await;
-                    save_session(&config, &auth);
-                    tracing::info!("Operator session acquired for {:?}", auth.operator_id);
-                }
-                Err(e) => tracing::warn!("Failed to parse operator session response: {}", e),
+        Ok(resp) if resp.status().is_success() => match resp.json::<serde_json::Value>().await {
+            Ok(body) => {
+                let mut auth = state.auth.write().await;
+                auth.operator_session_token = body["session_token"].as_str().map(String::from);
+                auth.operator_id = body["operator_id"].as_str().map(String::from);
+                auth.operator_session_expires_at = body["expires_at"].as_str().map(String::from);
+                let config = state.config.read().await;
+                save_session(&config, &auth);
+                tracing::info!("Operator session acquired for {:?}", auth.operator_id);
             }
-        }
+            Err(e) => tracing::warn!("Failed to parse operator session response: {}", e),
+        },
         Ok(resp) => tracing::warn!("Operator session endpoint returned {}", resp.status()),
         Err(e) => tracing::warn!("Failed to acquire operator session: {}", e),
     }
@@ -459,7 +464,10 @@ async fn list_my_corpora(state: tauri::State<'_, SharedState>) -> Result<Vec<Cor
     let api_token = get_api_token(&state.auth).await?;
     let config = state.config.read().await;
     let config = &*config;
-    let url = format!("{}/api/v1/wire/corpora?steward=me&limit=100", config.api_url);
+    let url = format!(
+        "{}/api/v1/wire/corpora?steward=me&limit=100",
+        config.api_url
+    );
 
     let resp = reqwest::Client::new()
         .get(&url)
@@ -474,17 +482,24 @@ async fn list_my_corpora(state: tauri::State<'_, SharedState>) -> Result<Vec<Cor
         return Err(format!("Failed to list corpora ({status}): {body}"));
     }
 
-    let parsed: CorporaListResponse = resp.json().await
+    let parsed: CorporaListResponse = resp
+        .json()
+        .await
         .map_err(|e| format!("Failed to parse corpora response: {}", e))?;
     Ok(parsed.items)
 }
 
 #[tauri::command]
-async fn list_public_corpora(state: tauri::State<'_, SharedState>) -> Result<Vec<CorpusInfo>, String> {
+async fn list_public_corpora(
+    state: tauri::State<'_, SharedState>,
+) -> Result<Vec<CorpusInfo>, String> {
     let api_token = get_api_token(&state.auth).await?;
     let config = state.config.read().await;
     let config = &*config;
-    let url = format!("{}/api/v1/wire/corpora?visibility=public&limit=50", config.api_url);
+    let url = format!(
+        "{}/api/v1/wire/corpora?visibility=public&limit=50",
+        config.api_url
+    );
 
     let resp = reqwest::Client::new()
         .get(&url)
@@ -499,7 +514,9 @@ async fn list_public_corpora(state: tauri::State<'_, SharedState>) -> Result<Vec
         return Err(format!("Failed to list public corpora ({status}): {body}"));
     }
 
-    let parsed: CorporaListResponse = resp.json().await
+    let parsed: CorporaListResponse = resp
+        .json()
+        .await
         .map_err(|e| format!("Failed to parse public corpora response: {}", e))?;
     Ok(parsed.items)
 }
@@ -536,7 +553,9 @@ async fn create_corpus(
         return Err(format!("Failed to create corpus ({status}): {body}"));
     }
 
-    let corpus: CorpusInfo = resp.json().await
+    let corpus: CorpusInfo = resp
+        .json()
+        .await
         .map_err(|e| format!("Failed to parse create corpus response: {}", e))?;
     Ok(corpus)
 }
@@ -558,9 +577,7 @@ async fn get_market_surface(
 }
 
 #[tauri::command]
-async fn get_work_stats(
-    state: tauri::State<'_, SharedState>,
-) -> Result<work::WorkStats, String> {
+async fn get_work_stats(state: tauri::State<'_, SharedState>) -> Result<work::WorkStats, String> {
     let ws = state.work_stats.read().await;
     Ok(ws.clone())
 }
@@ -642,7 +659,8 @@ async fn send_message(
             cfg.storage_cap_gb,
             tunnel_url.as_deref(),
             last_sync.as_deref(),
-        ).await;
+        )
+        .await;
         Some(messaging::collect_diagnostics(
             &health,
             env!("CARGO_PKG_VERSION"),
@@ -655,9 +673,15 @@ async fn send_message(
 
     let cfg = state.config.read().await;
     messaging::send_message(
-        &cfg.api_url, &api_token, node_id,
-        &body, &message_type, subject.as_deref(), metadata,
-    ).await
+        &cfg.api_url,
+        &api_token,
+        node_id,
+        &body,
+        &message_type,
+        subject.as_deref(),
+        metadata,
+    )
+    .await
 }
 
 #[tauri::command]
@@ -688,7 +712,8 @@ async fn get_health_status(
         cfg.storage_cap_gb,
         tunnel_url.as_deref(),
         last_sync.as_deref(),
-    ).await)
+    )
+    .await)
 }
 
 // --- Update Commands --------------------------------------------------------
@@ -701,10 +726,9 @@ struct UpdateInfo {
 }
 
 #[tauri::command]
-async fn check_for_update(
-    app: tauri::AppHandle,
-) -> Result<UpdateInfo, String> {
-    let updater = app.updater()
+async fn check_for_update(app: tauri::AppHandle) -> Result<UpdateInfo, String> {
+    let updater = app
+        .updater()
         .map_err(|e| format!("Updater not available: {}", e))?;
 
     match updater.check().await {
@@ -730,26 +754,30 @@ async fn check_for_update(
 }
 
 #[tauri::command]
-async fn install_update(
-    app: tauri::AppHandle,
-) -> Result<(), String> {
-    let updater = app.updater()
+async fn install_update(app: tauri::AppHandle) -> Result<(), String> {
+    let updater = app
+        .updater()
         .map_err(|e| format!("Updater not available: {}", e))?;
 
-    let update = updater.check().await
+    let update = updater
+        .check()
+        .await
         .map_err(|e| format!("Update check failed: {}", e))?
         .ok_or_else(|| "No update available".to_string())?;
 
     tracing::info!("Downloading update v{}...", update.version);
 
-    update.download_and_install(
-        |chunk_len, _content_len| {
-            tracing::debug!("Downloaded {} bytes", chunk_len);
-        },
-        || {
-            tracing::info!("Update download complete, installing...");
-        },
-    ).await.map_err(|e| format!("Update install failed: {}", e))?;
+    update
+        .download_and_install(
+            |chunk_len, _content_len| {
+                tracing::debug!("Downloaded {} bytes", chunk_len);
+            },
+            || {
+                tracing::info!("Update download complete, installing...");
+            },
+        )
+        .await
+        .map_err(|e| format!("Update install failed: {}", e))?;
 
     tracing::info!("Restarting app...");
     app.restart();
@@ -786,16 +814,22 @@ async fn do_sync(
     for (folder_path, linked) in &linked_folders {
         let corpus_slug = &linked.corpus_slug;
         let direction = &linked.direction;
-        tracing::info!("Syncing folder {} -> corpus {} ({:?})", folder_path, corpus_slug, direction);
+        tracing::info!(
+            "Syncing folder {} -> corpus {} ({:?})",
+            folder_path,
+            corpus_slug,
+            direction
+        );
 
         // Fetch remote document list
-        let remote_docs = match sync::fetch_corpus_documents(&config.api_url, token, corpus_slug).await {
-            Ok(docs) => docs,
-            Err(e) => {
-                tracing::warn!("Failed to fetch corpus {}: {}", corpus_slug, e);
-                continue;
-            }
-        };
+        let remote_docs =
+            match sync::fetch_corpus_documents(&config.api_url, token, corpus_slug).await {
+                Ok(docs) => docs,
+                Err(e) => {
+                    tracing::warn!("Failed to fetch corpus {}: {}", corpus_slug, e);
+                    continue;
+                }
+            };
 
         // Scan local folder
         let local_docs = match sync::scan_local_folder(folder_path) {
@@ -809,7 +843,8 @@ async fn do_sync(
         // Deduplicate remote docs by effective_path — keep the latest version
         // (prevents duplicate UI entries when multiple remote docs share a path)
         let remote_docs = {
-            let mut seen: std::collections::HashMap<String, sync::DocumentInfo> = std::collections::HashMap::new();
+            let mut seen: std::collections::HashMap<String, sync::DocumentInfo> =
+                std::collections::HashMap::new();
             for doc in remote_docs {
                 let path = doc.effective_path();
                 seen.entry(path).or_insert(doc);
@@ -822,7 +857,10 @@ async fn do_sync(
 
         tracing::info!(
             "Sync diff for {}: {} to push, {} to pull, {} to update",
-            corpus_slug, diff.to_push.len(), diff.to_pull.len(), diff.to_update.len()
+            corpus_slug,
+            diff.to_push.len(),
+            diff.to_pull.len(),
+            diff.to_update.len()
         );
 
         // Build initial file list with statuses and push to sync_state immediately
@@ -832,8 +870,13 @@ async fn do_sync(
 
             // In-sync files
             for local_doc in &local_docs {
-                let effective_paths: Vec<String> = remote_docs.iter().map(|r| r.effective_path()).collect();
-                if let Some((idx, _)) = effective_paths.iter().enumerate().find(|(_, p)| p.as_str() == local_doc.relative_path.as_str()) {
+                let effective_paths: Vec<String> =
+                    remote_docs.iter().map(|r| r.effective_path()).collect();
+                if let Some((idx, _)) = effective_paths
+                    .iter()
+                    .enumerate()
+                    .find(|(_, p)| p.as_str() == local_doc.relative_path.as_str())
+                {
                     let remote_doc = &remote_docs[idx];
                     if local_doc.body_hash == remote_doc.body_hash {
                         initial_docs.push(sync::CachedDocument {
@@ -922,24 +965,31 @@ async fn do_sync(
 
             // Deduplicate initial_docs by (source_path, corpus_slug)
             {
-                let mut seen: std::collections::HashMap<(String, String), usize> = std::collections::HashMap::new();
+                let mut seen: std::collections::HashMap<(String, String), usize> =
+                    std::collections::HashMap::new();
                 for (i, doc) in initial_docs.iter().enumerate() {
                     seen.insert((doc.source_path.clone(), doc.corpus_slug.clone()), i);
                 }
                 let mut keep_indices: Vec<usize> = seen.into_values().collect();
                 keep_indices.sort();
-                initial_docs = keep_indices.into_iter().map(|i| initial_docs[i].clone()).collect();
+                initial_docs = keep_indices
+                    .into_iter()
+                    .map(|i| initial_docs[i].clone())
+                    .collect();
             }
 
             let total_actions = match direction {
                 sync::SyncDirection::Upload => diff.to_push.len() + diff.to_update.len(),
                 sync::SyncDirection::Download => diff.to_pull.len() + diff.to_update.len(),
-                sync::SyncDirection::Both => diff.to_pull.len() + diff.to_push.len() + diff.to_update.len(),
+                sync::SyncDirection::Both => {
+                    diff.to_pull.len() + diff.to_push.len() + diff.to_update.len()
+                }
             };
             let mut ss = sync_state.write().await;
             // Remove ONLY this corpus's entries, then add the new ones
             // This preserves entries from other corpora/folders
-            ss.cached_documents.retain(|c| c.corpus_slug != *corpus_slug);
+            ss.cached_documents
+                .retain(|c| c.corpus_slug != *corpus_slug);
             ss.cached_documents.extend(initial_docs);
             ss.sync_progress = if total_actions > 0 {
                 Some(format!("0/{} synced", total_actions))
@@ -953,20 +1003,24 @@ async fn do_sync(
         let total_actions = match direction {
             sync::SyncDirection::Upload => diff.to_push.len() + diff.to_update.len(),
             sync::SyncDirection::Download => diff.to_pull.len() + diff.to_update.len(),
-            sync::SyncDirection::Both => diff.to_pull.len() + diff.to_push.len() + diff.to_update.len(),
+            sync::SyncDirection::Both => {
+                diff.to_pull.len() + diff.to_push.len() + diff.to_update.len()
+            }
         };
         let mut completed = 0usize;
         // Throttle delay between API calls to avoid rate limiting on large corpora
         let throttle = std::time::Duration::from_millis(200);
         // Track document IDs created/modified during this sync cycle so the
         // "remotely deleted" check doesn't erroneously remove them
-        let mut synced_doc_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut synced_doc_ids: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         // Pre-populate with hash-matched doc IDs (content exists, path mismatched)
         for (_local_doc, remote_doc) in &diff.hash_matched {
             synced_doc_ids.insert(remote_doc.id.clone());
         }
         // Build a remote body_hash → document lookup so we can resolve 409s
-        let remote_by_hash: std::collections::HashMap<&str, &sync::DocumentInfo> = remote_docs.iter()
+        let remote_by_hash: std::collections::HashMap<&str, &sync::DocumentInfo> = remote_docs
+            .iter()
             .map(|d| (d.body_hash.as_str(), d))
             .collect();
 
@@ -976,7 +1030,9 @@ async fn do_sync(
                 // Mark as Pushing
                 {
                     let mut ss = sync_state.write().await;
-                    if let Some(cd) = ss.cached_documents.iter_mut().find(|c| c.source_path == local_doc.relative_path && c.corpus_slug == *corpus_slug) {
+                    if let Some(cd) = ss.cached_documents.iter_mut().find(|c| {
+                        c.source_path == local_doc.relative_path && c.corpus_slug == *corpus_slug
+                    }) {
                         cd.sync_status = sync::FileStatus::Pushing;
                     }
                     ss.sync_progress = Some(format!("Pushing {}", local_doc.relative_path));
@@ -1000,26 +1056,37 @@ async fn do_sync(
                         };
                         {
                             let mut ss = sync_state.write().await;
-                            if let Some(cd) = ss.cached_documents.iter_mut().find(|c| c.source_path == local_doc.relative_path && c.corpus_slug == *corpus_slug) {
+                            if let Some(cd) = ss.cached_documents.iter_mut().find(|c| {
+                                c.source_path == local_doc.relative_path
+                                    && c.corpus_slug == *corpus_slug
+                            }) {
                                 *cd = cached.clone();
                             }
-                            ss.sync_progress = Some(format!("{}/{} synced", completed, total_actions));
+                            ss.sync_progress =
+                                Some(format!("{}/{} synced", completed, total_actions));
                         }
                     }
                     Err(e) => {
                         completed += 1;
                         let is_duplicate = e.contains("409") || e.contains("Duplicate");
                         if is_duplicate {
-                            tracing::info!("Skipped {} (already exists remotely)", local_doc.relative_path);
+                            tracing::info!(
+                                "Skipped {} (already exists remotely)",
+                                local_doc.relative_path
+                            );
                             // Resolve the matching remote doc by body_hash so we can mark InSync
-                            let resolved_id = remote_by_hash.get(local_doc.body_hash.as_str())
+                            let resolved_id = remote_by_hash
+                                .get(local_doc.body_hash.as_str())
                                 .map(|rd| rd.id.clone())
                                 .unwrap_or_default();
                             if !resolved_id.is_empty() {
                                 synced_doc_ids.insert(resolved_id.clone());
                             }
                             let mut ss = sync_state.write().await;
-                            if let Some(cd) = ss.cached_documents.iter_mut().find(|c| c.source_path == local_doc.relative_path && c.corpus_slug == *corpus_slug) {
+                            if let Some(cd) = ss.cached_documents.iter_mut().find(|c| {
+                                c.source_path == local_doc.relative_path
+                                    && c.corpus_slug == *corpus_slug
+                            }) {
                                 if !resolved_id.is_empty() {
                                     // We found the remote doc — mark as InSync
                                     cd.document_id = resolved_id;
@@ -1033,14 +1100,18 @@ async fn do_sync(
                         } else {
                             tracing::warn!("Push failed for {}: {}", local_doc.relative_path, e);
                             let mut ss = sync_state.write().await;
-                            if let Some(cd) = ss.cached_documents.iter_mut().find(|c| c.source_path == local_doc.relative_path && c.corpus_slug == *corpus_slug) {
+                            if let Some(cd) = ss.cached_documents.iter_mut().find(|c| {
+                                c.source_path == local_doc.relative_path
+                                    && c.corpus_slug == *corpus_slug
+                            }) {
                                 cd.sync_status = sync::FileStatus::Error;
                                 cd.error_message = Some(e.clone());
                             }
                         }
                         {
                             let mut ss = sync_state.write().await;
-                            ss.sync_progress = Some(format!("{}/{} synced", completed, total_actions));
+                            ss.sync_progress =
+                                Some(format!("{}/{} synced", completed, total_actions));
                         }
                     }
                 }
@@ -1050,14 +1121,17 @@ async fn do_sync(
                 // Mark as Pushing
                 {
                     let mut ss = sync_state.write().await;
-                    if let Some(cd) = ss.cached_documents.iter_mut().find(|c| c.source_path == local_doc.relative_path && c.corpus_slug == *corpus_slug) {
+                    if let Some(cd) = ss.cached_documents.iter_mut().find(|c| {
+                        c.source_path == local_doc.relative_path && c.corpus_slug == *corpus_slug
+                    }) {
                         cd.sync_status = sync::FileStatus::Pushing;
                     }
                     ss.sync_progress = Some(format!("Updating {}", local_doc.relative_path));
                 }
 
                 tokio::time::sleep(throttle).await;
-                match sync::update_document(&config.api_url, token, &remote_doc.id, local_doc).await {
+                match sync::update_document(&config.api_url, token, &remote_doc.id, local_doc).await
+                {
                     Ok(_) => {
                         completed += 1;
                         synced_doc_ids.insert(remote_doc.id.clone());
@@ -1074,19 +1148,35 @@ async fn do_sync(
                         };
                         {
                             let mut ss = sync_state.write().await;
-                            if let Some(cd) = ss.cached_documents.iter_mut().find(|c| c.source_path == local_doc.relative_path && c.corpus_slug == *corpus_slug) {
+                            if let Some(cd) = ss.cached_documents.iter_mut().find(|c| {
+                                c.source_path == local_doc.relative_path
+                                    && c.corpus_slug == *corpus_slug
+                            }) {
                                 *cd = cached.clone();
                             }
-                            ss.sync_progress = Some(format!("{}/{} synced", completed, total_actions));
+                            ss.sync_progress =
+                                Some(format!("{}/{} synced", completed, total_actions));
                         }
                     }
                     Err(e) => {
                         // If PATCH fails (e.g., published doc), try creating a version instead
                         if e.contains("Cannot modify body") || e.contains("403") {
-                            tracing::info!("Document {} is published, creating new version", remote_doc.id);
-                            let local_path = std::path::Path::new(folder_path).join(&local_doc.relative_path);
+                            tracing::info!(
+                                "Document {} is published, creating new version",
+                                remote_doc.id
+                            );
+                            let local_path =
+                                std::path::Path::new(folder_path).join(&local_doc.relative_path);
                             if let Ok(body) = std::fs::read_to_string(&local_path) {
-                                match sync::create_version(&config.api_url, token, &remote_doc.id, &body, local_doc.relative_path.as_str()).await {
+                                match sync::create_version(
+                                    &config.api_url,
+                                    token,
+                                    &remote_doc.id,
+                                    &body,
+                                    local_doc.relative_path.as_str(),
+                                )
+                                .await
+                                {
                                     Ok(new_id) => {
                                         completed += 1;
                                         synced_doc_ids.insert(new_id.clone());
@@ -1103,18 +1193,33 @@ async fn do_sync(
                                         };
                                         {
                                             let mut ss = sync_state.write().await;
-                                            if let Some(cd) = ss.cached_documents.iter_mut().find(|c| c.source_path == local_doc.relative_path && c.corpus_slug == *corpus_slug) {
+                                            if let Some(cd) =
+                                                ss.cached_documents.iter_mut().find(|c| {
+                                                    c.source_path == local_doc.relative_path
+                                                        && c.corpus_slug == *corpus_slug
+                                                })
+                                            {
                                                 *cd = cached.clone();
                                             }
-                                            ss.sync_progress = Some(format!("{}/{} synced", completed, total_actions));
+                                            ss.sync_progress = Some(format!(
+                                                "{}/{} synced",
+                                                completed, total_actions
+                                            ));
                                         }
                                         // State already updated in ss.cached_documents above
                                     }
                                     Err(ve) => {
-                                        tracing::warn!("Version creation failed for {}: {}", remote_doc.id, ve);
+                                        tracing::warn!(
+                                            "Version creation failed for {}: {}",
+                                            remote_doc.id,
+                                            ve
+                                        );
                                         completed += 1;
                                         let mut ss = sync_state.write().await;
-                                        if let Some(cd) = ss.cached_documents.iter_mut().find(|c| c.source_path == local_doc.relative_path && c.corpus_slug == *corpus_slug) {
+                                        if let Some(cd) = ss.cached_documents.iter_mut().find(|c| {
+                                            c.source_path == local_doc.relative_path
+                                                && c.corpus_slug == *corpus_slug
+                                        }) {
                                             cd.sync_status = sync::FileStatus::Error;
                                             cd.error_message = Some(ve);
                                         }
@@ -1125,11 +1230,15 @@ async fn do_sync(
                             tracing::warn!("Update failed for {}: {}", local_doc.relative_path, e);
                             completed += 1;
                             let mut ss = sync_state.write().await;
-                            if let Some(cd) = ss.cached_documents.iter_mut().find(|c| c.source_path == local_doc.relative_path && c.corpus_slug == *corpus_slug) {
+                            if let Some(cd) = ss.cached_documents.iter_mut().find(|c| {
+                                c.source_path == local_doc.relative_path
+                                    && c.corpus_slug == *corpus_slug
+                            }) {
                                 cd.sync_status = sync::FileStatus::Error;
                                 cd.error_message = Some(e.clone());
                             }
-                            ss.sync_progress = Some(format!("{}/{} synced", completed, total_actions));
+                            ss.sync_progress =
+                                Some(format!("{}/{} synced", completed, total_actions));
                         }
                     }
                 }
@@ -1144,14 +1253,26 @@ async fn do_sync(
                 // Mark as Pulling
                 {
                     let mut ss = sync_state.write().await;
-                    if let Some(cd) = ss.cached_documents.iter_mut().find(|c| c.source_path == effective && c.corpus_slug == *corpus_slug) {
+                    if let Some(cd) = ss
+                        .cached_documents
+                        .iter_mut()
+                        .find(|c| c.source_path == effective && c.corpus_slug == *corpus_slug)
+                    {
                         cd.sync_status = sync::FileStatus::Pulling;
                     }
                     ss.sync_progress = Some(format!("Pulling {}", effective));
                 }
 
                 tokio::time::sleep(throttle).await;
-                match sync::pull_document(&config.api_url, token, remote_doc, sync_root, corpus_slug).await {
+                match sync::pull_document(
+                    &config.api_url,
+                    token,
+                    remote_doc,
+                    sync_root,
+                    corpus_slug,
+                )
+                .await
+                {
                     Ok(cached) => {
                         completed += 1;
                         let cached = sync::CachedDocument {
@@ -1163,10 +1284,13 @@ async fn do_sync(
                         // Update in sync_state immediately
                         {
                             let mut ss = sync_state.write().await;
-                            if let Some(cd) = ss.cached_documents.iter_mut().find(|c| c.source_path == cached.source_path && c.corpus_slug == *corpus_slug) {
+                            if let Some(cd) = ss.cached_documents.iter_mut().find(|c| {
+                                c.source_path == cached.source_path && c.corpus_slug == *corpus_slug
+                            }) {
                                 *cd = cached.clone();
                             }
-                            ss.sync_progress = Some(format!("{}/{} synced", completed, total_actions));
+                            ss.sync_progress =
+                                Some(format!("{}/{} synced", completed, total_actions));
                         }
                         // State already updated in ss.cached_documents above
                     }
@@ -1174,7 +1298,11 @@ async fn do_sync(
                         tracing::warn!("Pull failed for {}: {}", remote_doc.id, e);
                         completed += 1;
                         let mut ss = sync_state.write().await;
-                        if let Some(cd) = ss.cached_documents.iter_mut().find(|c| c.source_path == effective && c.corpus_slug == *corpus_slug) {
+                        if let Some(cd) = ss
+                            .cached_documents
+                            .iter_mut()
+                            .find(|c| c.source_path == effective && c.corpus_slug == *corpus_slug)
+                        {
                             cd.sync_status = sync::FileStatus::Error;
                             cd.error_message = Some(e.clone());
                         }
@@ -1188,14 +1316,26 @@ async fn do_sync(
                 let effective = remote_doc.effective_path();
                 {
                     let mut ss = sync_state.write().await;
-                    if let Some(cd) = ss.cached_documents.iter_mut().find(|c| c.source_path == effective && c.corpus_slug == *corpus_slug) {
+                    if let Some(cd) = ss
+                        .cached_documents
+                        .iter_mut()
+                        .find(|c| c.source_path == effective && c.corpus_slug == *corpus_slug)
+                    {
                         cd.sync_status = sync::FileStatus::Pulling;
                     }
                     ss.sync_progress = Some(format!("Updating {}", effective));
                 }
 
                 tokio::time::sleep(throttle).await;
-                match sync::pull_document(&config.api_url, token, remote_doc, sync_root, corpus_slug).await {
+                match sync::pull_document(
+                    &config.api_url,
+                    token,
+                    remote_doc,
+                    sync_root,
+                    corpus_slug,
+                )
+                .await
+                {
                     Ok(cached) => {
                         completed += 1;
                         let cached = sync::CachedDocument {
@@ -1206,10 +1346,13 @@ async fn do_sync(
                         };
                         {
                             let mut ss = sync_state.write().await;
-                            if let Some(cd) = ss.cached_documents.iter_mut().find(|c| c.source_path == cached.source_path && c.corpus_slug == *corpus_slug) {
+                            if let Some(cd) = ss.cached_documents.iter_mut().find(|c| {
+                                c.source_path == cached.source_path && c.corpus_slug == *corpus_slug
+                            }) {
                                 *cd = cached.clone();
                             }
-                            ss.sync_progress = Some(format!("{}/{} synced", completed, total_actions));
+                            ss.sync_progress =
+                                Some(format!("{}/{} synced", completed, total_actions));
                         }
                         // State already updated in ss.cached_documents above
                     }
@@ -1217,7 +1360,11 @@ async fn do_sync(
                         tracing::warn!("Pull update failed for {}: {}", remote_doc.id, e);
                         completed += 1;
                         let mut ss = sync_state.write().await;
-                        if let Some(cd) = ss.cached_documents.iter_mut().find(|c| c.source_path == effective && c.corpus_slug == *corpus_slug) {
+                        if let Some(cd) = ss
+                            .cached_documents
+                            .iter_mut()
+                            .find(|c| c.source_path == effective && c.corpus_slug == *corpus_slug)
+                        {
                             cd.sync_status = sync::FileStatus::Error;
                             cd.error_message = Some(e.clone());
                         }
@@ -1235,7 +1382,9 @@ async fn do_sync(
             for local_doc in &diff.to_push {
                 {
                     let mut ss = sync_state.write().await;
-                    if let Some(cd) = ss.cached_documents.iter_mut().find(|c| c.source_path == local_doc.relative_path && c.corpus_slug == *corpus_slug) {
+                    if let Some(cd) = ss.cached_documents.iter_mut().find(|c| {
+                        c.source_path == local_doc.relative_path && c.corpus_slug == *corpus_slug
+                    }) {
                         cd.sync_status = sync::FileStatus::Pushing;
                     }
                     ss.sync_progress = Some(format!("Pushing {}", local_doc.relative_path));
@@ -1259,25 +1408,36 @@ async fn do_sync(
                         };
                         {
                             let mut ss = sync_state.write().await;
-                            if let Some(cd) = ss.cached_documents.iter_mut().find(|c| c.source_path == local_doc.relative_path && c.corpus_slug == *corpus_slug) {
+                            if let Some(cd) = ss.cached_documents.iter_mut().find(|c| {
+                                c.source_path == local_doc.relative_path
+                                    && c.corpus_slug == *corpus_slug
+                            }) {
                                 *cd = cached.clone();
                             }
-                            ss.sync_progress = Some(format!("{}/{} synced", completed, total_actions));
+                            ss.sync_progress =
+                                Some(format!("{}/{} synced", completed, total_actions));
                         }
                     }
                     Err(e) => {
                         completed += 1;
                         let is_duplicate = e.contains("409") || e.contains("Duplicate");
                         if is_duplicate {
-                            tracing::info!("Skipped {} (already exists remotely)", local_doc.relative_path);
-                            let resolved_id = remote_by_hash.get(local_doc.body_hash.as_str())
+                            tracing::info!(
+                                "Skipped {} (already exists remotely)",
+                                local_doc.relative_path
+                            );
+                            let resolved_id = remote_by_hash
+                                .get(local_doc.body_hash.as_str())
                                 .map(|rd| rd.id.clone())
                                 .unwrap_or_default();
                             if !resolved_id.is_empty() {
                                 synced_doc_ids.insert(resolved_id.clone());
                             }
                             let mut ss = sync_state.write().await;
-                            if let Some(cd) = ss.cached_documents.iter_mut().find(|c| c.source_path == local_doc.relative_path && c.corpus_slug == *corpus_slug) {
+                            if let Some(cd) = ss.cached_documents.iter_mut().find(|c| {
+                                c.source_path == local_doc.relative_path
+                                    && c.corpus_slug == *corpus_slug
+                            }) {
                                 if !resolved_id.is_empty() {
                                     cd.document_id = resolved_id;
                                     cd.sync_status = sync::FileStatus::InSync;
@@ -1290,14 +1450,18 @@ async fn do_sync(
                         } else {
                             tracing::warn!("Push failed for {}: {}", local_doc.relative_path, e);
                             let mut ss = sync_state.write().await;
-                            if let Some(cd) = ss.cached_documents.iter_mut().find(|c| c.source_path == local_doc.relative_path && c.corpus_slug == *corpus_slug) {
+                            if let Some(cd) = ss.cached_documents.iter_mut().find(|c| {
+                                c.source_path == local_doc.relative_path
+                                    && c.corpus_slug == *corpus_slug
+                            }) {
                                 cd.sync_status = sync::FileStatus::Error;
                                 cd.error_message = Some(e.clone());
                             }
                         }
                         {
                             let mut ss = sync_state.write().await;
-                            ss.sync_progress = Some(format!("{}/{} synced", completed, total_actions));
+                            ss.sync_progress =
+                                Some(format!("{}/{} synced", completed, total_actions));
                         }
                     }
                 }
@@ -1308,14 +1472,26 @@ async fn do_sync(
                 let effective = remote_doc.effective_path();
                 {
                     let mut ss = sync_state.write().await;
-                    if let Some(cd) = ss.cached_documents.iter_mut().find(|c| c.source_path == effective && c.corpus_slug == *corpus_slug) {
+                    if let Some(cd) = ss
+                        .cached_documents
+                        .iter_mut()
+                        .find(|c| c.source_path == effective && c.corpus_slug == *corpus_slug)
+                    {
                         cd.sync_status = sync::FileStatus::Pulling;
                     }
                     ss.sync_progress = Some(format!("Pulling {}", effective));
                 }
 
                 tokio::time::sleep(throttle).await;
-                match sync::pull_document(&config.api_url, token, remote_doc, sync_root, corpus_slug).await {
+                match sync::pull_document(
+                    &config.api_url,
+                    token,
+                    remote_doc,
+                    sync_root,
+                    corpus_slug,
+                )
+                .await
+                {
                     Ok(cached) => {
                         completed += 1;
                         let cached = sync::CachedDocument {
@@ -1326,10 +1502,13 @@ async fn do_sync(
                         };
                         {
                             let mut ss = sync_state.write().await;
-                            if let Some(cd) = ss.cached_documents.iter_mut().find(|c| c.source_path == cached.source_path && c.corpus_slug == *corpus_slug) {
+                            if let Some(cd) = ss.cached_documents.iter_mut().find(|c| {
+                                c.source_path == cached.source_path && c.corpus_slug == *corpus_slug
+                            }) {
                                 *cd = cached.clone();
                             }
-                            ss.sync_progress = Some(format!("{}/{} synced", completed, total_actions));
+                            ss.sync_progress =
+                                Some(format!("{}/{} synced", completed, total_actions));
                         }
                         // State already updated in ss.cached_documents above
                     }
@@ -1338,7 +1517,11 @@ async fn do_sync(
                         completed += 1;
                         let effective = remote_doc.effective_path();
                         let mut ss = sync_state.write().await;
-                        if let Some(cd) = ss.cached_documents.iter_mut().find(|c| c.source_path == effective && c.corpus_slug == *corpus_slug) {
+                        if let Some(cd) = ss
+                            .cached_documents
+                            .iter_mut()
+                            .find(|c| c.source_path == effective && c.corpus_slug == *corpus_slug)
+                        {
                             cd.sync_status = sync::FileStatus::Error;
                             cd.error_message = Some(e.clone());
                         }
@@ -1353,26 +1536,33 @@ async fn do_sync(
                 let local_mtime = std::fs::metadata(&local_path)
                     .and_then(|m| m.modified())
                     .ok()
-                    .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs());
+                    .map(|t| {
+                        t.duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs()
+                    });
 
                 // Parse remote updated_at if available
-                let remote_time = remote_doc.updated_at.as_ref()
+                let remote_time = remote_doc
+                    .updated_at
+                    .as_ref()
                     .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
                     .map(|dt| dt.timestamp() as u64);
 
                 let pull_wins = match (local_mtime, remote_time) {
                     (Some(local_t), Some(remote_t)) => remote_t > local_t,
-                    (None, Some(_)) => true,   // no local mtime, trust remote
-                    (Some(_), None) => false,   // no remote time, trust local
-                    (None, None) => true,       // default: server wins
+                    (None, Some(_)) => true,  // no local mtime, trust remote
+                    (Some(_), None) => false, // no remote time, trust local
+                    (None, None) => true,     // default: server wins
                 };
 
                 if pull_wins {
                     // Save local as .conflict before overwriting
                     if local_path.exists() {
-                        let conflict_path = local_path.with_extension(
-                            format!("{}.conflict", local_path.extension().unwrap_or_default().to_string_lossy())
-                        );
+                        let conflict_path = local_path.with_extension(format!(
+                            "{}.conflict",
+                            local_path.extension().unwrap_or_default().to_string_lossy()
+                        ));
                         let _ = std::fs::copy(&local_path, &conflict_path);
                     }
 
@@ -1380,14 +1570,26 @@ async fn do_sync(
                     {
                         let effective = remote_doc.effective_path();
                         let mut ss = sync_state.write().await;
-                        if let Some(cd) = ss.cached_documents.iter_mut().find(|c| c.source_path == effective && c.corpus_slug == *corpus_slug) {
+                        if let Some(cd) = ss
+                            .cached_documents
+                            .iter_mut()
+                            .find(|c| c.source_path == effective && c.corpus_slug == *corpus_slug)
+                        {
                             cd.sync_status = sync::FileStatus::Pulling;
                         }
                         ss.sync_progress = Some(format!("Pulling {}", effective));
                     }
 
                     tokio::time::sleep(throttle).await;
-                match sync::pull_document(&config.api_url, token, remote_doc, sync_root, corpus_slug).await {
+                    match sync::pull_document(
+                        &config.api_url,
+                        token,
+                        remote_doc,
+                        sync_root,
+                        corpus_slug,
+                    )
+                    .await
+                    {
                         Ok(cached) => {
                             completed += 1;
                             let cached = sync::CachedDocument {
@@ -1398,10 +1600,14 @@ async fn do_sync(
                             };
                             {
                                 let mut ss = sync_state.write().await;
-                                if let Some(cd) = ss.cached_documents.iter_mut().find(|c| c.source_path == cached.source_path && c.corpus_slug == *corpus_slug) {
+                                if let Some(cd) = ss.cached_documents.iter_mut().find(|c| {
+                                    c.source_path == cached.source_path
+                                        && c.corpus_slug == *corpus_slug
+                                }) {
                                     *cd = cached.clone();
                                 }
-                                ss.sync_progress = Some(format!("{}/{} synced", completed, total_actions));
+                                ss.sync_progress =
+                                    Some(format!("{}/{} synced", completed, total_actions));
                             }
                             // State already updated in ss.cached_documents above
                         }
@@ -1410,25 +1616,33 @@ async fn do_sync(
                             completed += 1;
                             let effective = remote_doc.effective_path();
                             let mut ss = sync_state.write().await;
-                            if let Some(cd) = ss.cached_documents.iter_mut().find(|c| c.source_path == effective && c.corpus_slug == *corpus_slug) {
+                            if let Some(cd) = ss.cached_documents.iter_mut().find(|c| {
+                                c.source_path == effective && c.corpus_slug == *corpus_slug
+                            }) {
                                 cd.sync_status = sync::FileStatus::Error;
                                 cd.error_message = Some(e.clone());
                             }
-                            ss.sync_progress = Some(format!("{}/{} synced", completed, total_actions));
+                            ss.sync_progress =
+                                Some(format!("{}/{} synced", completed, total_actions));
                         }
                     }
                 } else {
                     // Push local version
                     {
                         let mut ss = sync_state.write().await;
-                        if let Some(cd) = ss.cached_documents.iter_mut().find(|c| c.source_path == local_doc.relative_path && c.corpus_slug == *corpus_slug) {
+                        if let Some(cd) = ss.cached_documents.iter_mut().find(|c| {
+                            c.source_path == local_doc.relative_path
+                                && c.corpus_slug == *corpus_slug
+                        }) {
                             cd.sync_status = sync::FileStatus::Pushing;
                         }
                         ss.sync_progress = Some(format!("Pushing {}", local_doc.relative_path));
                     }
 
                     tokio::time::sleep(throttle).await;
-                match sync::update_document(&config.api_url, token, &remote_doc.id, local_doc).await {
+                    match sync::update_document(&config.api_url, token, &remote_doc.id, local_doc)
+                        .await
+                    {
                         Ok(_) => {
                             completed += 1;
                             let cached = sync::CachedDocument {
@@ -1444,20 +1658,36 @@ async fn do_sync(
                             };
                             {
                                 let mut ss = sync_state.write().await;
-                                if let Some(cd) = ss.cached_documents.iter_mut().find(|c| c.source_path == local_doc.relative_path && c.corpus_slug == *corpus_slug) {
+                                if let Some(cd) = ss.cached_documents.iter_mut().find(|c| {
+                                    c.source_path == local_doc.relative_path
+                                        && c.corpus_slug == *corpus_slug
+                                }) {
                                     *cd = cached.clone();
                                 }
-                                ss.sync_progress = Some(format!("{}/{} synced", completed, total_actions));
+                                ss.sync_progress =
+                                    Some(format!("{}/{} synced", completed, total_actions));
                             }
                             // State already updated in ss.cached_documents above
                         }
                         Err(e) => {
                             // If PATCH fails (e.g., published doc), try creating a version instead
                             if e.contains("Cannot modify body") || e.contains("403") {
-                                tracing::info!("Document {} is published, creating new version", remote_doc.id);
-                                let local_body_path = std::path::Path::new(folder_path).join(&local_doc.relative_path);
+                                tracing::info!(
+                                    "Document {} is published, creating new version",
+                                    remote_doc.id
+                                );
+                                let local_body_path = std::path::Path::new(folder_path)
+                                    .join(&local_doc.relative_path);
                                 if let Ok(body) = std::fs::read_to_string(&local_body_path) {
-                                    match sync::create_version(&config.api_url, token, &remote_doc.id, &body, local_doc.relative_path.as_str()).await {
+                                    match sync::create_version(
+                                        &config.api_url,
+                                        token,
+                                        &remote_doc.id,
+                                        &body,
+                                        local_doc.relative_path.as_str(),
+                                    )
+                                    .await
+                                    {
                                         Ok(new_id) => {
                                             completed += 1;
                                             let cached = sync::CachedDocument {
@@ -1473,18 +1703,35 @@ async fn do_sync(
                                             };
                                             {
                                                 let mut ss = sync_state.write().await;
-                                                if let Some(cd) = ss.cached_documents.iter_mut().find(|c| c.source_path == local_doc.relative_path && c.corpus_slug == *corpus_slug) {
+                                                if let Some(cd) =
+                                                    ss.cached_documents.iter_mut().find(|c| {
+                                                        c.source_path == local_doc.relative_path
+                                                            && c.corpus_slug == *corpus_slug
+                                                    })
+                                                {
                                                     *cd = cached.clone();
                                                 }
-                                                ss.sync_progress = Some(format!("{}/{} synced", completed, total_actions));
+                                                ss.sync_progress = Some(format!(
+                                                    "{}/{} synced",
+                                                    completed, total_actions
+                                                ));
                                             }
                                             // State already updated in ss.cached_documents above
                                         }
                                         Err(ve) => {
-                                            tracing::warn!("Version creation failed for {}: {}", remote_doc.id, ve);
+                                            tracing::warn!(
+                                                "Version creation failed for {}: {}",
+                                                remote_doc.id,
+                                                ve
+                                            );
                                             completed += 1;
                                             let mut ss = sync_state.write().await;
-                                            if let Some(cd) = ss.cached_documents.iter_mut().find(|c| c.source_path == local_doc.relative_path && c.corpus_slug == *corpus_slug) {
+                                            if let Some(cd) =
+                                                ss.cached_documents.iter_mut().find(|c| {
+                                                    c.source_path == local_doc.relative_path
+                                                        && c.corpus_slug == *corpus_slug
+                                                })
+                                            {
                                                 cd.sync_status = sync::FileStatus::Error;
                                                 cd.error_message = Some(ve);
                                             }
@@ -1492,10 +1739,17 @@ async fn do_sync(
                                     }
                                 }
                             } else {
-                                tracing::warn!("Update failed for {}: {}", local_doc.relative_path, e);
+                                tracing::warn!(
+                                    "Update failed for {}: {}",
+                                    local_doc.relative_path,
+                                    e
+                                );
                                 completed += 1;
                                 let mut ss = sync_state.write().await;
-                                if let Some(cd) = ss.cached_documents.iter_mut().find(|c| c.source_path == local_doc.relative_path && c.corpus_slug == *corpus_slug) {
+                                if let Some(cd) = ss.cached_documents.iter_mut().find(|c| {
+                                    c.source_path == local_doc.relative_path
+                                        && c.corpus_slug == *corpus_slug
+                                }) {
                                     cd.sync_status = sync::FileStatus::Error;
                                     cd.error_message = Some(e.clone());
                                 }
@@ -1510,9 +1764,8 @@ async fn do_sync(
         // For Upload dirs, the local folder is the source of truth, not the server.
         // Also skip documents that were just created/synced during THIS cycle (not in pre-sync remote_paths).
         if *direction != sync::SyncDirection::Upload {
-            let remote_paths: std::collections::HashSet<String> = remote_docs.iter()
-                .map(|d| d.effective_path())
-                .collect();
+            let remote_paths: std::collections::HashSet<String> =
+                remote_docs.iter().map(|d| d.effective_path()).collect();
 
             let mut ss = sync_state.write().await;
             let before_len = ss.cached_documents.len();
@@ -1525,7 +1778,8 @@ async fn do_sync(
                     if !remote_paths.contains(&cd.source_path) {
                         tracing::info!(
                             "Document {} ({}) removed remotely, clearing from cache",
-                            cd.document_id, cd.source_path
+                            cd.document_id,
+                            cd.source_path
                         );
                         return false;
                     }
@@ -1534,7 +1788,11 @@ async fn do_sync(
             });
             let removed = before_len - ss.cached_documents.len();
             if removed > 0 {
-                tracing::info!("Filtered out {} remotely-deleted documents from corpus {}", removed, corpus_slug);
+                tracing::info!(
+                    "Filtered out {} remotely-deleted documents from corpus {}",
+                    removed,
+                    corpus_slug
+                );
             }
         }
     }
@@ -1552,13 +1810,17 @@ async fn do_sync(
 
         // Final dedup of cached_documents by (source_path, corpus_slug) — keep last
         {
-            let mut seen: std::collections::HashMap<(String, String), usize> = std::collections::HashMap::new();
+            let mut seen: std::collections::HashMap<(String, String), usize> =
+                std::collections::HashMap::new();
             for (i, doc) in ss.cached_documents.iter().enumerate() {
                 seen.insert((doc.source_path.clone(), doc.corpus_slug.clone()), i);
             }
             let mut keep_indices: Vec<usize> = seen.into_values().collect();
             keep_indices.sort();
-            ss.cached_documents = keep_indices.into_iter().map(|i| ss.cached_documents[i].clone()).collect();
+            ss.cached_documents = keep_indices
+                .into_iter()
+                .map(|i| ss.cached_documents[i].clone())
+                .collect();
         }
 
         ss.total_size_bytes = total_size;
@@ -1592,7 +1854,11 @@ async fn set_auto_sync(
     }
     let cfg = state.config.read().await;
     sync::save_sync_state(&cfg.data_dir(), &ss);
-    tracing::info!("Auto-sync set: enabled={}, interval={}s", ss.auto_sync_enabled, ss.auto_sync_interval_secs);
+    tracing::info!(
+        "Auto-sync set: enabled={}, interval={}s",
+        ss.auto_sync_enabled,
+        ss.auto_sync_interval_secs
+    );
     Ok(())
 }
 
@@ -1631,28 +1897,46 @@ async fn compute_diff(
     let client = reqwest::Client::new();
 
     let old_resp = client
-        .get(format!("{}/api/v1/wire/documents/{}/body", config.api_url, old_doc_id))
+        .get(format!(
+            "{}/api/v1/wire/documents/{}/body",
+            config.api_url, old_doc_id
+        ))
         .header("Authorization", format!("Bearer {}", api_token))
         .send()
         .await
         .map_err(|e| format!("Failed to fetch old document: {}", e))?;
 
     if !old_resp.status().is_success() {
-        return Err(format!("Failed to fetch old document: {}", old_resp.status()));
+        return Err(format!(
+            "Failed to fetch old document: {}",
+            old_resp.status()
+        ));
     }
-    let old_body = old_resp.text().await.map_err(|e| format!("Failed to read old document: {}", e))?;
+    let old_body = old_resp
+        .text()
+        .await
+        .map_err(|e| format!("Failed to read old document: {}", e))?;
 
     let new_resp = client
-        .get(format!("{}/api/v1/wire/documents/{}/body", config.api_url, new_doc_id))
+        .get(format!(
+            "{}/api/v1/wire/documents/{}/body",
+            config.api_url, new_doc_id
+        ))
         .header("Authorization", format!("Bearer {}", api_token))
         .send()
         .await
         .map_err(|e| format!("Failed to fetch new document: {}", e))?;
 
     if !new_resp.status().is_success() {
-        return Err(format!("Failed to fetch new document: {}", new_resp.status()));
+        return Err(format!(
+            "Failed to fetch new document: {}",
+            new_resp.status()
+        ));
     }
-    let new_body = new_resp.text().await.map_err(|e| format!("Failed to read new document: {}", e))?;
+    let new_body = new_resp
+        .text()
+        .await
+        .map_err(|e| format!("Failed to read new document: {}", e))?;
 
     // Check size limits (50K words max)
     let word_count = old_body.split_whitespace().count() + new_body.split_whitespace().count();
@@ -1691,7 +1975,9 @@ async fn update_document_status(
         return Err(format!("Status update failed ({}): {}", status_code, text));
     }
 
-    let result: serde_json::Value = resp.json().await
+    let result: serde_json::Value = resp
+        .json()
+        .await
         .map_err(|e| format!("Failed to parse response: {}", e))?;
 
     tracing::info!("Document {} status changed to {}", document_id, status);
@@ -1710,14 +1996,19 @@ async fn bulk_publish(
 
     // Fetch all draft documents for this corpus
     let docs = sync::fetch_corpus_documents(&config.api_url, &api_token, &corpus_slug).await?;
-    let draft_ids: Vec<String> = docs.iter()
-        .filter(|d| d.status.as_deref() != Some("published") && d.status.as_deref() != Some("retracted"))
+    let draft_ids: Vec<String> = docs
+        .iter()
+        .filter(|d| {
+            d.status.as_deref() != Some("published") && d.status.as_deref() != Some("retracted")
+        })
         .map(|d| d.id.clone())
         .collect();
 
     let total = draft_ids.len();
     if total == 0 {
-        return Ok(serde_json::json!({ "published": 0, "errors": 0, "total": 0, "message": "No draft documents to publish" }));
+        return Ok(
+            serde_json::json!({ "published": 0, "errors": 0, "total": 0, "message": "No draft documents to publish" }),
+        );
     }
 
     // Use the server's bulk endpoint instead of one-by-one PATCH calls.
@@ -1733,10 +2024,14 @@ async fn bulk_publish(
     let batch_size = 200;
 
     for (batch_idx, chunk) in draft_ids.chunks(batch_size).enumerate() {
-        let url = format!("{}/api/v1/wire/corpora/{}/bulk", config.api_url, corpus_slug);
+        let url = format!(
+            "{}/api/v1/wire/corpora/{}/bulk",
+            config.api_url, corpus_slug
+        );
         tracing::info!(
             "Bulk publish batch {}: {} documents ({}–{}/{})",
-            batch_idx + 1, chunk.len(),
+            batch_idx + 1,
+            chunk.len(),
             batch_idx * batch_size + 1,
             batch_idx * batch_size + chunk.len(),
             total
@@ -1770,8 +2065,18 @@ async fn bulk_publish(
                 let status = r.status();
                 let text = r.text().await.unwrap_or_default();
                 errors += chunk.len();
-                error_details.push(format!("Batch {} failed ({}): {}", batch_idx + 1, status, text));
-                tracing::warn!("Bulk publish batch {} failed ({}): {}", batch_idx + 1, status, text);
+                error_details.push(format!(
+                    "Batch {} failed ({}): {}",
+                    batch_idx + 1,
+                    status,
+                    text
+                ));
+                tracing::warn!(
+                    "Bulk publish batch {} failed ({}): {}",
+                    batch_idx + 1,
+                    status,
+                    text
+                );
             }
             Err(e) => {
                 errors += chunk.len();
@@ -1781,16 +2086,24 @@ async fn bulk_publish(
         }
 
         // Emit progress event so the frontend can show a progress bar
-        let _ = app.emit("bulk-publish-progress", serde_json::json!({
-            "corpus_slug": corpus_slug,
-            "published": published,
-            "errors": errors,
-            "total": total,
-            "batch": batch_idx + 1,
-        }));
+        let _ = app.emit(
+            "bulk-publish-progress",
+            serde_json::json!({
+                "corpus_slug": corpus_slug,
+                "published": published,
+                "errors": errors,
+                "total": total,
+                "batch": batch_idx + 1,
+            }),
+        );
     }
 
-    tracing::info!("Bulk publish complete: {}/{} published, {} errors", published, total, errors);
+    tracing::info!(
+        "Bulk publish complete: {}/{} published, {} errors",
+        published,
+        total,
+        errors
+    );
     Ok(serde_json::json!({
         "published": published,
         "errors": errors,
@@ -1813,7 +2126,9 @@ async fn pin_version(
     let versions_dir = std::path::Path::new(&folder_path).join(".versions");
     let current_size = if versions_dir.exists() {
         sync::get_cache_size(&versions_dir).await
-    } else { 0 };
+    } else {
+        0
+    };
 
     let quota_bytes = {
         let ss = state.sync_state.read().await;
@@ -1821,15 +2136,20 @@ async fn pin_version(
     };
 
     if current_size > quota_bytes {
-        return Err(format!("Storage quota exceeded ({:.1} MB / {} MB). Unpin older versions first.",
+        return Err(format!(
+            "Storage quota exceeded ({:.1} MB / {} MB). Unpin older versions first.",
             current_size as f64 / (1024.0 * 1024.0),
-            quota_bytes / (1024 * 1024)));
+            quota_bytes / (1024 * 1024)
+        ));
     }
 
     // Fetch the document info
     let client = reqwest::Client::new();
     let doc_resp = client
-        .get(format!("{}/api/v1/wire/documents/{}", config.api_url, document_id))
+        .get(format!(
+            "{}/api/v1/wire/documents/{}",
+            config.api_url, document_id
+        ))
         .header("Authorization", format!("Bearer {}", api_token))
         .send()
         .await
@@ -1838,36 +2158,51 @@ async fn pin_version(
     if !doc_resp.status().is_success() {
         return Err(format!("Failed to fetch document: {}", doc_resp.status()));
     }
-    let doc_info: serde_json::Value = doc_resp.json().await
+    let doc_info: serde_json::Value = doc_resp
+        .json()
+        .await
         .map_err(|e| format!("Failed to parse document: {}", e))?;
 
     let body_resp = client
-        .get(format!("{}/api/v1/wire/documents/{}/body", config.api_url, document_id))
+        .get(format!(
+            "{}/api/v1/wire/documents/{}/body",
+            config.api_url, document_id
+        ))
         .header("Authorization", format!("Bearer {}", api_token))
         .send()
         .await
         .map_err(|e| format!("Failed to fetch document body: {}", e))?;
 
     if !body_resp.status().is_success() {
-        return Err(format!("Failed to fetch document body: {}", body_resp.status()));
+        return Err(format!(
+            "Failed to fetch document body: {}",
+            body_resp.status()
+        ));
     }
-    let body = body_resp.text().await.map_err(|e| format!("Failed to read body: {}", e))?;
+    let body = body_resp
+        .text()
+        .await
+        .map_err(|e| format!("Failed to read body: {}", e))?;
 
     // Save to .versions/
     let version_num = doc_info["version_number"].as_i64().unwrap_or(1);
     let source_path = doc_info["source_path"].as_str().unwrap_or(&document_id);
-    let stem = std::path::Path::new(source_path).file_stem()
+    let stem = std::path::Path::new(source_path)
+        .file_stem()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| document_id.clone());
-    let ext = std::path::Path::new(source_path).extension()
+    let ext = std::path::Path::new(source_path)
+        .extension()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "md".to_string());
 
     let version_file = versions_dir.join(format!("{}.v{}.{}", stem, version_num, ext));
 
-    tokio::fs::create_dir_all(&versions_dir).await
+    tokio::fs::create_dir_all(&versions_dir)
+        .await
         .map_err(|e| format!("Failed to create .versions dir: {}", e))?;
-    tokio::fs::write(&version_file, &body).await
+    tokio::fs::write(&version_file, &body)
+        .await
         .map_err(|e| format!("Failed to save version: {}", e))?;
 
     // Track in sync state
@@ -1904,9 +2239,10 @@ async fn start_tunnel_flow(
         Err(e) => {
             tracing::error!("Failed to download cloudflared: {}", e);
             let mut ts = tunnel_state.write().await;
-            ts.status = tunnel::TunnelConnectionStatus::Error(
-                format!("Failed to download cloudflared: {}", e)
-            );
+            ts.status = tunnel::TunnelConnectionStatus::Error(format!(
+                "Failed to download cloudflared: {}",
+                e
+            ));
             return;
         }
     }
@@ -2021,9 +2357,8 @@ async fn provision_new_tunnel(
         Err(e) => {
             tracing::error!("Tunnel provisioning failed: {}", e);
             let mut ts = tunnel_state.write().await;
-            ts.status = tunnel::TunnelConnectionStatus::Error(
-                format!("Provisioning failed: {}", e)
-            );
+            ts.status =
+                tunnel::TunnelConnectionStatus::Error(format!("Provisioning failed: {}", e));
             ts.clone()
         }
     }
@@ -2101,8 +2436,13 @@ async fn save_onboarding(
         cfg.auto_update_enabled = auto_update;
     }
 
-    tracing::info!("Onboarding saved: name={}, storage={}GB, mesh={}, auto_update={}",
-        node_name, storage_cap_gb, mesh_hosting_enabled, auto_update);
+    tracing::info!(
+        "Onboarding saved: name={}, storage={}GB, mesh={}, auto_update={}",
+        node_name,
+        storage_cap_gb,
+        mesh_hosting_enabled,
+        auto_update
+    );
 
     Ok(())
 }
@@ -2118,15 +2458,13 @@ async fn get_logs(state: tauri::State<'_, SharedState>) -> Result<Vec<String>, S
 
 // --- Pyramid Commands -------------------------------------------------------
 
-use wire_node_lib::pyramid::types::*;
-use wire_node_lib::pyramid::query as pyramid_query;
 use wire_node_lib::pyramid::db as pyramid_db;
 use wire_node_lib::pyramid::faq as pyramid_faq;
+use wire_node_lib::pyramid::query as pyramid_query;
+use wire_node_lib::pyramid::types::*;
 
 #[tauri::command]
-async fn pyramid_list_slugs(
-    state: tauri::State<'_, SharedState>,
-) -> Result<Vec<SlugInfo>, String> {
+async fn pyramid_list_slugs(state: tauri::State<'_, SharedState>) -> Result<Vec<SlugInfo>, String> {
     let conn = state.pyramid.reader.lock().await;
     wire_node_lib::pyramid::slug::list_slugs(&conn).map_err(|e| e.to_string())
 }
@@ -2192,7 +2530,9 @@ async fn post_build_seed(
     slug: &str,
     content_type: &ContentType,
 ) -> Result<(), String> {
-    let db_path = pyramid_state.data_dir.as_ref()
+    let db_path = pyramid_state
+        .data_dir
+        .as_ref()
         .expect("data_dir not set")
         .join("pyramid.db")
         .to_string_lossy()
@@ -2202,16 +2542,14 @@ async fn post_build_seed(
     let source_paths: Vec<String> = {
         let conn = pyramid_state.reader.lock().await;
         match wire_node_lib::pyramid::slug::get_slug(&conn, slug) {
-            Ok(Some(info)) => {
-                serde_json::from_str(&info.source_path)
-                    .unwrap_or_else(|_| vec![info.source_path.clone()])
-            }
+            Ok(Some(info)) => serde_json::from_str(&info.source_path)
+                .unwrap_or_else(|_| vec![info.source_path.clone()]),
             _ => Vec::new(),
         }
     };
 
     // Determine extensions and config files based on content type, and hash files
-    let (extensions_json, config_files_json) = match content_type {
+    let (extensions_json, config_files_json) = match &content_type {
         ContentType::Code => {
             // Re-walk the source dirs to compute hashes and collect extensions
             let db_path_clone = db_path.clone();
@@ -2220,21 +2558,30 @@ async fn post_build_seed(
             tokio::task::spawn_blocking(move || {
                 let conn = rusqlite::Connection::open(&db_path_clone).map_err(|e| e.to_string())?;
                 let code_exts: Vec<String> = wire_node_lib::pyramid::ingest::code_extensions()
-                    .into_iter().map(|e| e.to_string()).collect();
+                    .into_iter()
+                    .map(|e| e.to_string())
+                    .collect();
                 let config_fnames: Vec<String> = wire_node_lib::pyramid::ingest::config_files()
-                    .into_iter().map(|e| e.to_string()).collect();
+                    .into_iter()
+                    .map(|e| e.to_string())
+                    .collect();
 
                 // Hash each tracked file
                 for path_str in &source_paths_clone {
                     let dir = std::path::Path::new(path_str);
-                    if !dir.is_dir() { continue; }
+                    if !dir.is_dir() {
+                        continue;
+                    }
                     hash_source_files(&conn, &slug_owned, dir, &code_exts, &config_fnames)?;
                 }
 
                 let exts_json = serde_json::to_string(&code_exts).unwrap_or("[]".to_string());
-                let configs_json = serde_json::to_string(&config_fnames).unwrap_or("[]".to_string());
+                let configs_json =
+                    serde_json::to_string(&config_fnames).unwrap_or("[]".to_string());
                 Ok::<(String, String), String>((exts_json, configs_json))
-            }).await.map_err(|e| format!("Spawn blocking failed: {e}"))??
+            })
+            .await
+            .map_err(|e| format!("Spawn blocking failed: {e}"))??
         }
         ContentType::Document => {
             let db_path_clone = db_path.clone();
@@ -2243,20 +2590,26 @@ async fn post_build_seed(
             tokio::task::spawn_blocking(move || {
                 let conn = rusqlite::Connection::open(&db_path_clone).map_err(|e| e.to_string())?;
                 let doc_exts: Vec<String> = wire_node_lib::pyramid::ingest::doc_extensions()
-                    .into_iter().map(|e| e.to_string()).collect();
+                    .into_iter()
+                    .map(|e| e.to_string())
+                    .collect();
 
                 for path_str in &source_paths_clone {
                     let dir = std::path::Path::new(path_str);
-                    if !dir.is_dir() { continue; }
+                    if !dir.is_dir() {
+                        continue;
+                    }
                     hash_source_files(&conn, &slug_owned, dir, &doc_exts, &[])?;
                 }
 
                 let exts_json = serde_json::to_string(&doc_exts).unwrap_or("[]".to_string());
                 Ok::<(String, String), String>((exts_json, "[]".to_string()))
-            }).await.map_err(|e| format!("Spawn blocking failed: {e}"))??
+            })
+            .await
+            .map_err(|e| format!("Spawn blocking failed: {e}"))??
         }
-        ContentType::Conversation => {
-            // Conversations don't use file watching
+        ContentType::Conversation | ContentType::Vine => {
+            // Conversations and vines don't use file watching
             ("[]".to_string(), "[]".to_string())
         }
     };
@@ -2265,8 +2618,12 @@ async fn post_build_seed(
     {
         let conn = pyramid_state.writer.lock().await;
         wire_node_lib::pyramid::db::insert_auto_update_config_defaults(
-            &conn, slug, &extensions_json, &config_files_json,
-        ).map_err(|e| e.to_string())?;
+            &conn,
+            slug,
+            &extensions_json,
+            &config_files_json,
+        )
+        .map_err(|e| e.to_string())?;
     }
 
     // Backfill node_ids in pyramid_file_hashes
@@ -2275,18 +2632,20 @@ async fn post_build_seed(
         let slug_owned = slug.to_string();
         let ct = content_type.clone();
         tokio::task::spawn_blocking(move || {
-            if matches!(ct, ContentType::Conversation) {
-                return Ok::<(), String>(()); // skip for conversations
+            if matches!(ct, ContentType::Conversation | ContentType::Vine) {
+                return Ok::<(), String>(()); // skip for conversations and vines
             }
             let conn = rusqlite::Connection::open(&db_path_clone).map_err(|e| e.to_string())?;
             backfill_node_ids(&conn, &slug_owned).map_err(|e| e.to_string())
-        }).await.map_err(|e| format!("Spawn blocking failed: {e}"))??;
+        })
+        .await
+        .map_err(|e| format!("Spawn blocking failed: {e}"))??;
     }
 
     tracing::info!("Post-build seeding complete for slug='{}'", slug);
 
-    // Skip engine + watcher for conversations (no file watching)
-    if matches!(content_type, ContentType::Conversation) {
+    // Skip engine + watcher for conversations and vines (no file watching)
+    if matches!(content_type, ContentType::Conversation | ContentType::Vine) {
         return Ok(());
     }
 
@@ -2316,7 +2675,8 @@ async fn post_build_seed(
                     frozen_at: row.get(8)?,
                 })
             },
-        ).map_err(|e| e.to_string())?
+        )
+        .map_err(|e| e.to_string())?
     };
 
     let mut engine = wire_node_lib::pyramid::stale_engine::PyramidStaleEngine::new(
@@ -2333,10 +2693,12 @@ async fn post_build_seed(
     drop(engines);
 
     if !source_paths.is_empty() {
-        let mut watcher = wire_node_lib::pyramid::watcher::PyramidFileWatcher::new(slug, source_paths);
+        let mut watcher =
+            wire_node_lib::pyramid::watcher::PyramidFileWatcher::new(slug, source_paths);
 
         // Create mutation channel and wire it to the stale engine
-        let (mutation_tx, mut mutation_rx) = tokio::sync::mpsc::unbounded_channel::<(String, i32)>();
+        let (mutation_tx, mut mutation_rx) =
+            tokio::sync::mpsc::unbounded_channel::<(String, i32)>();
         watcher.set_mutation_sender(mutation_tx);
 
         // Spawn receiver task to bridge watcher -> engine notifications
@@ -2357,7 +2719,11 @@ async fn post_build_seed(
                 watchers.insert(slug.to_string(), watcher);
             }
             Err(e) => {
-                tracing::warn!("Post-build: failed to start file watcher for '{}': {}", slug, e);
+                tracing::warn!(
+                    "Post-build: failed to start file watcher for '{}': {}",
+                    slug,
+                    e
+                );
             }
         }
     }
@@ -2384,7 +2750,16 @@ fn hash_source_files(
         config_filenames: &[String],
     ) -> Result<(), String> {
         let entries = std::fs::read_dir(current).map_err(|e| e.to_string())?;
-        let skip_dirs = [".git", "node_modules", "target", "dist", "build", ".next", "__pycache__", ".cache"];
+        let skip_dirs = [
+            ".git",
+            "node_modules",
+            "target",
+            "dist",
+            "build",
+            ".next",
+            "__pycache__",
+            ".cache",
+        ];
 
         for entry in entries.flatten() {
             let path = entry.path();
@@ -2403,7 +2778,8 @@ fn hash_source_files(
             }
 
             let fname = name_str.to_string();
-            let ext = path.extension()
+            let ext = path
+                .extension()
                 .map(|e| format!(".{}", e.to_string_lossy().to_lowercase()))
                 .unwrap_or_default();
 
@@ -2437,19 +2813,21 @@ fn hash_source_files(
 /// L0 node IDs are zero-padded (e.g. C-L0-003), so lexicographic ORDER BY preserves chunk order.
 fn backfill_node_ids(conn: &rusqlite::Connection, slug: &str) -> Result<(), String> {
     // Get all L0 nodes in order
-    let mut stmt = conn.prepare(
-        "SELECT id FROM live_pyramid_nodes WHERE slug = ?1 AND depth = 0 ORDER BY id ASC"
-    ).map_err(|e| e.to_string())?;
-    let node_ids: Vec<String> = stmt.query_map(rusqlite::params![slug], |row| row.get::<_, String>(0))
+    let mut stmt = conn
+        .prepare("SELECT id FROM live_pyramid_nodes WHERE slug = ?1 AND depth = 0 ORDER BY id ASC")
+        .map_err(|e| e.to_string())?;
+    let node_ids: Vec<String> = stmt
+        .query_map(rusqlite::params![slug], |row| row.get::<_, String>(0))
         .map_err(|e| e.to_string())?
         .filter_map(|r| r.ok())
         .collect();
 
     // Get all file hashes in order (by file_path for deterministic mapping)
-    let mut file_stmt = conn.prepare(
-        "SELECT file_path FROM pyramid_file_hashes WHERE slug = ?1 ORDER BY file_path ASC"
-    ).map_err(|e| e.to_string())?;
-    let file_paths: Vec<String> = file_stmt.query_map(rusqlite::params![slug], |row| row.get::<_, String>(0))
+    let mut file_stmt = conn
+        .prepare("SELECT file_path FROM pyramid_file_hashes WHERE slug = ?1 ORDER BY file_path ASC")
+        .map_err(|e| e.to_string())?;
+    let file_paths: Vec<String> = file_stmt
+        .query_map(rusqlite::params![slug], |row| row.get::<_, String>(0))
         .map_err(|e| e.to_string())?
         .filter_map(|r| r.ok())
         .collect();
@@ -2462,13 +2840,16 @@ fn backfill_node_ids(conn: &rusqlite::Connection, slug: &str) -> Result<(), Stri
             conn.execute(
                 "UPDATE pyramid_file_hashes SET node_ids = ?1 WHERE slug = ?2 AND file_path = ?3",
                 rusqlite::params![node_ids_json, slug, file_path],
-            ).map_err(|e| e.to_string())?;
+            )
+            .map_err(|e| e.to_string())?;
         }
     }
 
     tracing::info!(
         "Backfilled node_ids for slug='{}': {} files, {} L0 nodes",
-        slug, file_paths.len(), node_ids.len()
+        slug,
+        file_paths.len(),
+        node_ids.len()
     );
     Ok(())
 }
@@ -2581,8 +2962,15 @@ async fn pyramid_build(
                                 ref model,
                                 elapsed,
                             } => wire_node_lib::pyramid::db::save_step(
-                                &conn, slug, step_type, chunk_index, depth, node_id, output_json,
-                                model, elapsed,
+                                &conn,
+                                slug,
+                                step_type,
+                                chunk_index,
+                                depth,
+                                node_id,
+                                output_json,
+                                model,
+                                elapsed,
                             ),
                             wire_node_lib::pyramid::build::WriteOp::UpdateParent {
                                 ref slug,
@@ -2591,11 +2979,9 @@ async fn pyramid_build(
                             } => wire_node_lib::pyramid::db::update_parent(
                                 &conn, slug, node_id, parent_id,
                             ),
-                            wire_node_lib::pyramid::build::WriteOp::UpdateStats {
-                                ref slug,
-                            } => wire_node_lib::pyramid::db::update_slug_stats(
-                                &conn, slug,
-                            ),
+                            wire_node_lib::pyramid::build::WriteOp::UpdateStats { ref slug } => {
+                                wire_node_lib::pyramid::db::update_slug_stats(&conn, slug)
+                            }
                         }
                     };
                     if let Err(e) = result {
@@ -2606,8 +2992,7 @@ async fn pyramid_build(
         };
 
         // Create progress channel
-        let (progress_tx, mut progress_rx) =
-            tokio::sync::mpsc::channel::<BuildProgress>(64);
+        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel::<BuildProgress>(64);
         let progress_status = build_status.clone();
         let progress_start = start;
         let progress_handle = tokio::spawn(async move {
@@ -2622,22 +3007,40 @@ async fn pyramid_build(
         let result = match content_type {
             ContentType::Conversation => {
                 wire_node_lib::pyramid::build::build_conversation(
-                    reader.clone(), &write_tx, &llm_config, &slug, &cancel, &progress_tx,
+                    reader.clone(),
+                    &write_tx,
+                    &llm_config,
+                    &slug,
+                    &cancel,
+                    &progress_tx,
                 )
                 .await
             }
             ContentType::Code => {
                 wire_node_lib::pyramid::build::build_code(
-                    reader.clone(), &write_tx, &llm_config, &slug, &cancel, &progress_tx,
+                    reader.clone(),
+                    &write_tx,
+                    &llm_config,
+                    &slug,
+                    &cancel,
+                    &progress_tx,
                 )
                 .await
             }
             ContentType::Document => {
                 wire_node_lib::pyramid::build::build_docs(
-                    reader.clone(), &write_tx, &llm_config, &slug, &cancel, &progress_tx,
+                    reader.clone(),
+                    &write_tx,
+                    &llm_config,
+                    &slug,
+                    &cancel,
+                    &progress_tx,
                 )
                 .await
             }
+            ContentType::Vine => Err(anyhow::anyhow!(
+                "Use vine-specific build endpoint for vine pyramids"
+            )),
         };
 
         // Drop senders so tasks finish
@@ -2664,11 +3067,17 @@ async fn pyramid_build(
                         } else {
                             s.status = "complete".to_string();
                         }
-                        s.progress = BuildProgress { done: s.progress.total, total: s.progress.total };
+                        s.progress = BuildProgress {
+                            done: s.progress.total,
+                            total: s.progress.total,
+                        };
                     }
                     Err(ref e) => {
                         s.status = "failed".to_string();
-                        s.progress = BuildProgress { done: s.progress.total, total: s.progress.total };
+                        s.progress = BuildProgress {
+                            done: s.progress.total,
+                            total: s.progress.total,
+                        };
                         tracing::error!("Build failed for '{}': {e}", slug);
                     }
                 }
@@ -2680,7 +3089,10 @@ async fn pyramid_build(
         // Only seed if build succeeded (not cancelled, not failed)
         {
             let status_check = build_status.read().await;
-            let should_seed = matches!(status_check.status.as_str(), "complete" | "complete_with_errors");
+            let should_seed = matches!(
+                status_check.status.as_str(),
+                "complete" | "complete_with_errors"
+            );
             drop(status_check);
 
             if should_seed {
@@ -2689,7 +3101,6 @@ async fn pyramid_build(
                 }
             }
         }
-
     });
 
     let s = status.read().await;
@@ -2737,17 +3148,29 @@ async fn pyramid_ingest(
     let writer = state.pyramid.writer.clone();
 
     // Parse source_path as JSON array, falling back to single-path for backward compat
-    let paths: Vec<String> = serde_json::from_str(&source_path)
-        .unwrap_or_else(|_| vec![source_path.clone()]);
+    let paths: Vec<String> =
+        serde_json::from_str(&source_path).unwrap_or_else(|_| vec![source_path.clone()]);
 
     tokio::task::spawn_blocking(move || {
         let conn = writer.blocking_lock();
         for path_str in &paths {
             let path = std::path::Path::new(path_str);
             match content_type {
-                ContentType::Code => { let _ = wire_node_lib::pyramid::ingest::ingest_code(&conn, &slug_clone, path).map_err(|e| e.to_string())?; }
-                ContentType::Conversation => { wire_node_lib::pyramid::ingest::ingest_conversation(&conn, &slug_clone, path).map_err(|e| e.to_string())?; }
-                ContentType::Document => { let _ = wire_node_lib::pyramid::ingest::ingest_docs(&conn, &slug_clone, path).map_err(|e| e.to_string())?; }
+                ContentType::Code => {
+                    let _ = wire_node_lib::pyramid::ingest::ingest_code(&conn, &slug_clone, path)
+                        .map_err(|e| e.to_string())?;
+                }
+                ContentType::Conversation => {
+                    wire_node_lib::pyramid::ingest::ingest_conversation(&conn, &slug_clone, path)
+                        .map_err(|e| e.to_string())?;
+                }
+                ContentType::Document => {
+                    let _ = wire_node_lib::pyramid::ingest::ingest_docs(&conn, &slug_clone, path)
+                        .map_err(|e| e.to_string())?;
+                }
+                ContentType::Vine => {
+                    return Err("Use vine-specific build endpoint for vine ingestion".to_string());
+                }
             }
         }
         Ok::<(), String>(())
@@ -2798,8 +3221,12 @@ async fn pyramid_create_slug(
     content_type: String,
     source_path: String,
 ) -> Result<SlugInfo, String> {
-    let ct = ContentType::from_str(&content_type)
-        .ok_or_else(|| format!("Invalid content_type: '{}'. Use 'code', 'document', or 'conversation'", content_type))?;
+    let ct = ContentType::from_str(&content_type).ok_or_else(|| {
+        format!(
+            "Invalid content_type: '{}'. Use 'code', 'document', 'conversation', or 'vine'",
+            content_type
+        )
+    })?;
     let conn = state.pyramid.writer.lock().await;
     wire_node_lib::pyramid::slug::create_slug(&conn, &slug, &ct, &source_path)
         .map_err(|e| e.to_string())
@@ -2811,8 +3238,7 @@ async fn pyramid_delete_slug(
     slug: String,
 ) -> Result<(), String> {
     let conn = state.pyramid.writer.lock().await;
-    wire_node_lib::pyramid::slug::delete_slug(&conn, &slug)
-        .map_err(|e| e.to_string())
+    wire_node_lib::pyramid::slug::delete_slug(&conn, &slug).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -2842,9 +3268,7 @@ fn get_app_version() -> String {
 }
 
 #[tauri::command]
-async fn pyramid_build_cancel(
-    state: tauri::State<'_, SharedState>,
-) -> Result<(), String> {
+async fn pyramid_build_cancel(state: tauri::State<'_, SharedState>) -> Result<(), String> {
     let active = state.pyramid.active_build.read().await;
     if let Some(ref handle) = *active {
         handle.cancel.cancel();
@@ -2852,6 +3276,242 @@ async fn pyramid_build_cancel(
     } else {
         Err("No active build to cancel".to_string())
     }
+}
+
+#[tauri::command]
+async fn pyramid_vine_build(
+    state: tauri::State<'_, SharedState>,
+    vine_slug: String,
+    jsonl_dirs: Vec<String>,
+) -> Result<String, String> {
+    use std::path::PathBuf;
+    use wire_node_lib::pyramid::vine;
+
+    let dirs: Vec<PathBuf> = jsonl_dirs.iter().map(PathBuf::from).collect();
+
+    // Validate slug
+    let vine_slug_clean = wire_node_lib::pyramid::slug::slugify(&vine_slug);
+    wire_node_lib::pyramid::slug::validate_slug(&vine_slug_clean)
+        .map_err(|e| e.to_string())?;
+
+    // Check for concurrent vine build on same slug
+    {
+        let builds = state.pyramid.vine_builds.lock().await;
+        if let Some(handle) = builds.get(&vine_slug_clean) {
+            if handle.status == "running" {
+                return Err(format!("Vine build already running for '{}'", vine_slug_clean));
+            }
+        }
+    }
+
+    // Register vine build
+    let cancel = tokio_util::sync::CancellationToken::new();
+    {
+        let mut builds = state.pyramid.vine_builds.lock().await;
+        builds.insert(vine_slug_clean.clone(), wire_node_lib::pyramid::VineBuildHandle {
+            cancel: cancel.clone(),
+            status: "running".to_string(),
+            error: None,
+        });
+    }
+
+    let pyramid_state = Arc::new(wire_node_lib::pyramid::PyramidState {
+        reader: state.pyramid.reader.clone(),
+        writer: state.pyramid.writer.clone(),
+        config: state.pyramid.config.clone(),
+        active_build: state.pyramid.active_build.clone(),
+        data_dir: state.pyramid.data_dir.clone(),
+        stale_engines: state.pyramid.stale_engines.clone(),
+        file_watchers: state.pyramid.file_watchers.clone(),
+        vine_builds: state.pyramid.vine_builds.clone(),
+    });
+
+    let slug_for_task = vine_slug_clean.clone();
+    let vine_builds = state.pyramid.vine_builds.clone();
+
+    tokio::spawn(async move {
+        let result = vine::build_vine(&pyramid_state, &slug_for_task, &dirs, &cancel).await;
+        let mut builds = vine_builds.lock().await;
+        if let Some(handle) = builds.get_mut(&slug_for_task) {
+            match result {
+                Ok(_) => {
+                    handle.status = "complete".to_string();
+                }
+                Err(e) => {
+                    handle.status = "failed".to_string();
+                    handle.error = Some(e.to_string());
+                }
+            }
+        }
+    });
+
+    Ok(format!("Vine build started for '{}'", vine_slug_clean))
+}
+
+#[tauri::command]
+async fn pyramid_vine_build_status(
+    state: tauri::State<'_, SharedState>,
+    slug: String,
+) -> Result<serde_json::Value, String> {
+    let builds = state.pyramid.vine_builds.lock().await;
+    if let Some(handle) = builds.get(&slug) {
+        Ok(serde_json::json!({
+            "vine_slug": slug,
+            "status": handle.status,
+            "error": handle.error,
+        }))
+    } else {
+        Ok(serde_json::json!({
+            "vine_slug": slug,
+            "status": "not_found",
+            "error": null,
+        }))
+    }
+}
+
+#[tauri::command]
+async fn pyramid_vine_bunches(
+    state: tauri::State<'_, SharedState>,
+    slug: String,
+) -> Result<serde_json::Value, String> {
+    let conn = state.pyramid.reader.lock().await;
+    let bunches = pyramid_db::list_vine_bunches(&conn, &slug).map_err(|e| e.to_string())?;
+    Ok(serde_json::to_value(&bunches).map_err(|e| e.to_string())?)
+}
+
+#[tauri::command]
+async fn pyramid_vine_eras(
+    state: tauri::State<'_, SharedState>,
+    slug: String,
+) -> Result<serde_json::Value, String> {
+    let conn = state.pyramid.reader.lock().await;
+    let eras = pyramid_db::get_annotations_by_type(&conn, &slug, "era").map_err(|e| e.to_string())?;
+    Ok(serde_json::to_value(&eras).map_err(|e| e.to_string())?)
+}
+
+#[tauri::command]
+async fn pyramid_vine_decisions(
+    state: tauri::State<'_, SharedState>,
+    slug: String,
+) -> Result<serde_json::Value, String> {
+    let conn = state.pyramid.reader.lock().await;
+    let faqs = pyramid_db::get_faq_nodes_by_prefix(&conn, &slug, "FAQ-vine-decision-").map_err(|e| e.to_string())?;
+    Ok(serde_json::to_value(&faqs).map_err(|e| e.to_string())?)
+}
+
+#[tauri::command]
+async fn pyramid_vine_entities(
+    state: tauri::State<'_, SharedState>,
+    slug: String,
+) -> Result<serde_json::Value, String> {
+    let conn = state.pyramid.reader.lock().await;
+    let faqs = pyramid_db::get_faq_nodes_by_prefix(&conn, &slug, "FAQ-vine-entity-").map_err(|e| e.to_string())?;
+    Ok(serde_json::to_value(&faqs).map_err(|e| e.to_string())?)
+}
+
+#[tauri::command]
+async fn pyramid_vine_threads(
+    state: tauri::State<'_, SharedState>,
+    slug: String,
+) -> Result<serde_json::Value, String> {
+    let conn = state.pyramid.reader.lock().await;
+    let threads: Vec<_> = conn.prepare(
+        "SELECT thread_id, thread_name, current_canonical_id, depth, delta_count FROM pyramid_threads WHERE slug = ?1"
+    ).map_err(|e| e.to_string())?
+    .query_map(rusqlite::params![slug], |row| {
+        Ok(serde_json::json!({
+            "thread_id": row.get::<_, String>(0)?,
+            "thread_name": row.get::<_, String>(1)?,
+            "canonical_id": row.get::<_, String>(2)?,
+            "depth": row.get::<_, i64>(3)?,
+            "delta_count": row.get::<_, i64>(4)?,
+        }))
+    }).map_err(|e| e.to_string())?
+    .filter_map(|r| r.ok())
+    .collect();
+
+    let edges: Vec<_> = conn.prepare(
+        "SELECT thread_a_id, thread_b_id, relationship, relevance FROM pyramid_web_edges WHERE slug = ?1 AND relevance > 0.1"
+    ).map_err(|e| e.to_string())?
+    .query_map(rusqlite::params![slug], |row| {
+        Ok(serde_json::json!({
+            "thread_a": row.get::<_, String>(0)?,
+            "thread_b": row.get::<_, String>(1)?,
+            "relationship": row.get::<_, String>(2)?,
+            "relevance": row.get::<_, f64>(3)?,
+        }))
+    }).map_err(|e| e.to_string())?
+    .filter_map(|r| r.ok())
+    .collect();
+
+    Ok(serde_json::json!({ "threads": threads, "edges": edges }))
+}
+
+#[tauri::command]
+async fn pyramid_vine_drill(
+    state: tauri::State<'_, SharedState>,
+    slug: String,
+) -> Result<serde_json::Value, String> {
+    let conn = state.pyramid.reader.lock().await;
+    let annotations = pyramid_db::get_annotations_by_type(&conn, &slug, "directory").map_err(|e| e.to_string())?;
+    Ok(serde_json::to_value(&annotations).map_err(|e| e.to_string())?)
+}
+
+#[tauri::command]
+async fn pyramid_vine_corrections(
+    state: tauri::State<'_, SharedState>,
+    slug: String,
+) -> Result<serde_json::Value, String> {
+    let conn = state.pyramid.reader.lock().await;
+    let corrections = pyramid_query::corrections(&conn, &slug).map_err(|e| e.to_string())?;
+    Ok(serde_json::to_value(&corrections).map_err(|e| e.to_string())?)
+}
+
+#[tauri::command]
+async fn pyramid_vine_integrity(
+    state: tauri::State<'_, SharedState>,
+    slug: String,
+) -> Result<serde_json::Value, String> {
+    use wire_node_lib::pyramid::vine;
+
+    let pyramid_state = Arc::new(wire_node_lib::pyramid::PyramidState {
+        reader: state.pyramid.reader.clone(),
+        writer: state.pyramid.writer.clone(),
+        config: state.pyramid.config.clone(),
+        active_build: state.pyramid.active_build.clone(),
+        data_dir: state.pyramid.data_dir.clone(),
+        stale_engines: state.pyramid.stale_engines.clone(),
+        file_watchers: state.pyramid.file_watchers.clone(),
+        vine_builds: state.pyramid.vine_builds.clone(),
+    });
+
+    let summary = vine::run_integrity_check(&pyramid_state, &slug).await.map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({
+        "vine_slug": slug,
+        "summary": summary,
+    }))
+}
+
+#[tauri::command]
+async fn pyramid_vine_rebuild_upper(
+    state: tauri::State<'_, SharedState>,
+    slug: String,
+) -> Result<String, String> {
+    use wire_node_lib::pyramid::vine;
+
+    let pyramid_state = Arc::new(wire_node_lib::pyramid::PyramidState {
+        reader: state.pyramid.reader.clone(),
+        writer: state.pyramid.writer.clone(),
+        config: state.pyramid.config.clone(),
+        active_build: state.pyramid.active_build.clone(),
+        data_dir: state.pyramid.data_dir.clone(),
+        stale_engines: state.pyramid.stale_engines.clone(),
+        file_watchers: state.pyramid.file_watchers.clone(),
+        vine_builds: state.pyramid.vine_builds.clone(),
+    });
+
+    let cancel = tokio_util::sync::CancellationToken::new();
+    vine::force_rebuild_vine_upper(&pyramid_state, &slug, &cancel).await.map_err(|e| e.to_string())
 }
 
 // --- DADBEAR IPC Commands ---------------------------------------------------
@@ -2885,7 +3545,9 @@ async fn pyramid_auto_update_config_set(
         let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
 
         if let Some(d) = debounce_minutes {
-            if d < 1 { return Err("debounce_minutes must be >= 1".to_string()); }
+            if d < 1 {
+                return Err("debounce_minutes must be >= 1".to_string());
+            }
             sets.push(format!("debounce_minutes = ?{}", params.len() + 1));
             params.push(Box::new(d));
         }
@@ -2894,7 +3556,9 @@ async fn pyramid_auto_update_config_set(
             params.push(Box::new(m));
         }
         if let Some(r) = runaway_threshold {
-            if r <= 0.0 || r > 1.0 { return Err("runaway_threshold must be > 0.0 and <= 1.0".to_string()); }
+            if r <= 0.0 || r > 1.0 {
+                return Err("runaway_threshold must be > 0.0 and <= 1.0".to_string());
+            }
             sets.push(format!("runaway_threshold = ?{}", params.len() + 1));
             params.push(Box::new(r));
         }
@@ -2911,31 +3575,34 @@ async fn pyramid_auto_update_config_set(
         params.push(Box::new(slug.clone()));
         let sql = format!(
             "UPDATE pyramid_auto_update_config SET {} WHERE slug = ?{}",
-            sets.join(", "), slug_idx
+            sets.join(", "),
+            slug_idx
         );
 
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(|p| p.as_ref()).collect();
         let result = match conn.execute(&sql, param_refs.as_slice()) {
             Ok(0) => Err(format!("No auto-update config for slug '{}'", slug)),
-            Ok(_) => {
-                match pyramid_db::get_auto_update_config(&conn, &slug) {
-                    Some(config) => {
-                        if config.breaker_tripped && !wire_node_lib::pyramid::watcher::check_runaway(&conn, &slug, &config) {
-                            let _ = conn.execute(
-                                "UPDATE pyramid_auto_update_config
+            Ok(_) => match pyramid_db::get_auto_update_config(&conn, &slug) {
+                Some(config) => {
+                    if config.breaker_tripped
+                        && !wire_node_lib::pyramid::watcher::check_runaway(&conn, &slug, &config)
+                    {
+                        let _ = conn.execute(
+                            "UPDATE pyramid_auto_update_config
                                  SET breaker_tripped = 0, breaker_tripped_at = NULL
                                  WHERE slug = ?1",
-                                rusqlite::params![slug],
-                            );
-                            should_resume_breaker = true;
-                        }
-
-                        let refreshed = pyramid_db::get_auto_update_config(&conn, &slug).unwrap_or(config);
-                        serde_json::to_value(&refreshed).map_err(|e| e.to_string())
+                            rusqlite::params![slug],
+                        );
+                        should_resume_breaker = true;
                     }
-                    None => Ok(serde_json::json!({"status": "updated"})),
+
+                    let refreshed =
+                        pyramid_db::get_auto_update_config(&conn, &slug).unwrap_or(config);
+                    serde_json::to_value(&refreshed).map_err(|e| e.to_string())
                 }
-            }
+                None => Ok(serde_json::json!({"status": "updated"})),
+            },
             Err(e) => Err(e.to_string()),
         };
 
@@ -2996,7 +3663,10 @@ async fn pyramid_auto_update_unfreeze(
     }
     drop(engines);
 
-    let db_path = state.pyramid.data_dir.as_ref()
+    let db_path = state
+        .pyramid
+        .data_dir
+        .as_ref()
         .expect("data_dir not set")
         .join("pyramid.db")
         .to_string_lossy()
@@ -3035,7 +3705,7 @@ async fn pyramid_auto_update_status(
                 status["last_result_summary"] = serde_json::json!(null);
             }
             Ok(status)
-        },
+        }
         None => Err(format!("No auto-update config for slug '{}'", slug)),
     }
 }
@@ -3066,8 +3736,7 @@ async fn pyramid_cost_summary(
     window: Option<String>,
 ) -> Result<serde_json::Value, String> {
     let conn = state.pyramid.reader.lock().await;
-    pyramid_db::get_cost_summary(&conn, &slug, window.as_deref())
-        .map_err(|e| e.to_string())
+    pyramid_db::get_cost_summary(&conn, &slug, window.as_deref()).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -3085,7 +3754,9 @@ async fn pyramid_breaker_resume(
             "UPDATE pyramid_auto_update_config SET breaker_tripped = 0, breaker_tripped_at = NULL WHERE slug = ?1",
             rusqlite::params![slug],
         );
-        Ok(serde_json::json!({"status": "resumed", "slug": slug, "note": "No active engine, breaker cleared in DB"}))
+        Ok(
+            serde_json::json!({"status": "resumed", "slug": slug, "note": "No active engine, breaker cleared in DB"}),
+        )
     }
 }
 
@@ -3097,7 +3768,9 @@ async fn pyramid_auto_update_run_now(
     // Extract what we need from the engine while briefly holding the lock, then release
     let (db_path, api_key, model, semaphore, phase_arc, detail_arc, summary_arc) = {
         let engines = state.pyramid.stale_engines.lock().await;
-        let engine = engines.get(&slug).ok_or("No active stale engine for this pyramid")?;
+        let engine = engines
+            .get(&slug)
+            .ok_or("No active stale engine for this pyramid")?;
         (
             engine.db_path.clone(),
             engine.api_key.clone(),
@@ -3113,9 +3786,18 @@ async fn pyramid_auto_update_run_now(
     // Drain and dispatch each layer sequentially: L0 → L1 → L2 → L3
     for layer in 0..=3 {
         let _ = wire_node_lib::pyramid::stale_engine::drain_and_dispatch(
-            &slug, layer, 0, &db_path, semaphore.clone(), &api_key, &model,
-            phase_arc.clone(), detail_arc.clone(), summary_arc.clone(),
-        ).await;
+            &slug,
+            layer,
+            0,
+            &db_path,
+            semaphore.clone(),
+            &api_key,
+            &model,
+            phase_arc.clone(),
+            detail_arc.clone(),
+            summary_arc.clone(),
+        )
+        .await;
     }
     Ok(serde_json::json!({"status": "completed", "slug": slug}))
 }
@@ -3132,7 +3814,9 @@ async fn pyramid_auto_update_l0_sweep(
 
     let (db_path, api_key, model, semaphore, phase_arc, detail_arc, summary_arc) = {
         let engines = state.pyramid.stale_engines.lock().await;
-        let engine = engines.get(&slug).ok_or("No active stale engine for this pyramid")?;
+        let engine = engines
+            .get(&slug)
+            .ok_or("No active stale engine for this pyramid")?;
         (
             engine.db_path.clone(),
             engine.api_key.clone(),
@@ -3202,8 +3886,13 @@ async fn pyramid_breaker_archive_and_rebuild(
 
     {
         let conn = state.pyramid.writer.lock().await;
-        wire_node_lib::pyramid::slug::create_slug(&conn, &new_slug, &slug_info.content_type, &slug_info.source_path)
-            .map_err(|e| e.to_string())?;
+        wire_node_lib::pyramid::slug::create_slug(
+            &conn,
+            &new_slug,
+            &slug_info.content_type,
+            &slug_info.source_path,
+        )
+        .map_err(|e| e.to_string())?;
         let _ = conn.execute(
             "INSERT OR IGNORE INTO pyramid_auto_update_config (slug) VALUES (?1)",
             rusqlite::params![new_slug],
@@ -3287,13 +3976,9 @@ async fn pyramid_faq_category_drill(
     slug: String,
     category_id: String,
 ) -> Result<serde_json::Value, String> {
-    let entry = pyramid_faq::drill_faq_category(
-        &state.pyramid.reader,
-        &slug,
-        &category_id,
-    )
-    .await
-    .map_err(|e| e.to_string())?;
+    let entry = pyramid_faq::drill_faq_category(&state.pyramid.reader, &slug, &category_id)
+        .await
+        .map_err(|e| e.to_string())?;
 
     serde_json::to_value(&entry).map_err(|e| e.to_string())
 }
@@ -3336,7 +4021,7 @@ fn main() {
         .with(
             tracing_subscriber::fmt::layer()
                 .with_ansi(false)
-                .with_writer(std::sync::Mutex::new(log_file))
+                .with_writer(std::sync::Mutex::new(log_file)),
         )
         .init();
 
@@ -3350,7 +4035,10 @@ fn main() {
     let stats_path = config.data_dir().join("stats.json");
     let mut initial_credits = credits::CreditTracker::load_from_file(&stats_path);
     if initial_credits.documents_served > 0 {
-        tracing::info!("Loaded persisted stats: {} documents served", initial_credits.documents_served);
+        tracing::info!(
+            "Loaded persisted stats: {} documents served",
+            initial_credits.documents_served
+        );
     }
     if let Some(ref fsa) = initial_auth.first_started_at {
         initial_credits.first_started_at = Some(fsa.clone());
@@ -3359,8 +4047,7 @@ fn main() {
 
     // Load persisted tunnel state
     let data_dir = config.data_dir();
-    let initial_tunnel = tunnel::load_tunnel_state(&data_dir)
-        .unwrap_or_default();
+    let initial_tunnel = tunnel::load_tunnel_state(&data_dir).unwrap_or_default();
 
     // Shared JWT public key and node ID for the server module
     let jwt_public_key = Arc::new(RwLock::new(config.jwt_public_key.clone()));
@@ -3382,7 +4069,10 @@ fn main() {
 
     // Load pyramid config from disk (or use defaults)
     let pyramid_config = wire_node_lib::pyramid::PyramidConfig::load(&config.data_dir());
-    tracing::info!("Pyramid config loaded (api_key set: {})", !pyramid_config.openrouter_api_key.is_empty());
+    tracing::info!(
+        "Pyramid config loaded (api_key set: {})",
+        !pyramid_config.openrouter_api_key.is_empty()
+    );
 
     let pyramid_state = Arc::new(wire_node_lib::pyramid::PyramidState {
         reader: Arc::new(tokio::sync::Mutex::new(pyramid_reader)),
@@ -3392,6 +4082,7 @@ fn main() {
         data_dir: Some(config.data_dir()),
         stale_engines: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         file_watchers: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        vine_builds: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
     });
 
     tracing::info!("Pyramid engine initialized at {:?}", pyramid_db_path);
@@ -3423,12 +4114,12 @@ fn main() {
     let state = Arc::new(AppState {
         auth: Arc::new(RwLock::new(initial_auth.clone())),
         sync_state: Arc::new(RwLock::new(
-            sync::load_sync_state(&config.data_dir()).unwrap_or_default()
+            sync::load_sync_state(&config.data_dir()).unwrap_or_default(),
         )),
         credits: Arc::new(RwLock::new(initial_credits)),
         tunnel_state: Arc::new(RwLock::new(initial_tunnel)),
         market_state: Arc::new(RwLock::new(
-            market::load_market_state(&config.data_dir()).unwrap_or_default()
+            market::load_market_state(&config.data_dir()).unwrap_or_default(),
         )),
         work_stats: Arc::new(RwLock::new(work::WorkStats::default())),
         config: Arc::new(RwLock::new(config.clone())),
@@ -4111,6 +4802,17 @@ fn main() {
             pyramid_build,
             pyramid_build_status,
             pyramid_build_cancel,
+            pyramid_vine_build,
+            pyramid_vine_build_status,
+            pyramid_vine_bunches,
+            pyramid_vine_eras,
+            pyramid_vine_decisions,
+            pyramid_vine_entities,
+            pyramid_vine_threads,
+            pyramid_vine_drill,
+            pyramid_vine_corrections,
+            pyramid_vine_integrity,
+            pyramid_vine_rebuild_upper,
             pyramid_ingest,
             pyramid_set_config,
             pyramid_create_slug,

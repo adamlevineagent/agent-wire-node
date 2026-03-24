@@ -16,8 +16,8 @@ use std::time::Instant;
 use anyhow::{anyhow, Result};
 use regex::Regex;
 use rusqlite::Connection;
-use std::sync::LazyLock;
 use serde_json::Value;
+use std::sync::LazyLock;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -412,7 +412,7 @@ Output valid JSON only:
 
 /// Call the LLM and parse JSON from the response.  On parse failure, retry once
 /// at temperature 0.1.  Returns the parsed JSON value.
-async fn call_and_parse(
+pub(crate) async fn call_and_parse(
     config: &LlmConfig,
     system: &str,
     user: &str,
@@ -424,13 +424,16 @@ async fn call_and_parse(
         Err(_) => {
             info!("  JSON parse error on {fallback_key}, retrying at temp 0.1...");
             let resp2 = call_model(config, system, user, 0.1, 50_000).await?;
-            extract_json(&resp2).map_err(|e| anyhow!("JSON parse failed twice for {fallback_key}: {e}"))
+            extract_json(&resp2)
+                .map_err(|e| anyhow!("JSON parse failed twice for {fallback_key}: {e}"))
         }
     }
 }
 
 /// Flatten a topics-bearing analysis into the legacy node columns.
-fn flatten_analysis(analysis: &Value) -> (String, Vec<Correction>, Vec<Decision>, Vec<Term>, String) {
+fn flatten_analysis(
+    analysis: &Value,
+) -> (String, Vec<Correction>, Vec<Decision>, Vec<Term>, String) {
     let distilled = analysis
         .get("orientation")
         .or_else(|| analysis.get("distilled"))
@@ -463,9 +466,17 @@ fn flatten_analysis(analysis: &Value) -> (String, Vec<Correction>, Vec<Decision>
             if let Some(decs) = topic.get("decisions").and_then(|d| d.as_array()) {
                 for d in decs {
                     decisions.push(Decision {
-                        decided: d.get("decided").and_then(|v| v.as_str()).unwrap_or("").into(),
+                        decided: d
+                            .get("decided")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .into(),
                         why: d.get("why").and_then(|v| v.as_str()).unwrap_or("").into(),
-                        rejected: d.get("rejected").and_then(|v| v.as_str()).unwrap_or("").into(),
+                        rejected: d
+                            .get("rejected")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .into(),
                     });
                 }
             }
@@ -491,7 +502,7 @@ fn flatten_analysis(analysis: &Value) -> (String, Vec<Correction>, Vec<Decision>
 }
 
 /// Build a PyramidNode from an LLM analysis JSON value.
-fn node_from_analysis(
+pub(crate) fn node_from_analysis(
     analysis: &Value,
     id: &str,
     slug: &str,
@@ -511,14 +522,15 @@ fn node_from_analysis(
         })
         .unwrap_or_default();
 
-    let topics: Vec<Topic> = if let Some(topics_arr) = analysis.get("topics").and_then(|t| t.as_array()) {
-        topics_arr
-            .iter()
-            .filter_map(|t| serde_json::from_value(t.clone()).ok())
-            .collect()
-    } else {
-        Vec::new()
-    };
+    let topics: Vec<Topic> =
+        if let Some(topics_arr) = analysis.get("topics").and_then(|t| t.as_array()) {
+            topics_arr
+                .iter()
+                .filter_map(|t| serde_json::from_value(t.clone()).ok())
+                .collect()
+        } else {
+            Vec::new()
+        };
 
     PyramidNode {
         id: id.to_string(),
@@ -542,7 +554,7 @@ fn node_from_analysis(
 
 /// Send a SaveNode WriteOp through the channel.
 /// Logs and continues if the writer channel has closed.
-async fn send_save_node(
+pub(crate) async fn send_save_node(
     writer_tx: &mpsc::Sender<WriteOp>,
     node: PyramidNode,
     topics_json: Option<String>,
@@ -557,7 +569,7 @@ async fn send_save_node(
 
 /// Send a SaveStep WriteOp through the channel.
 /// Logs and continues if the writer channel has closed.
-async fn send_save_step(
+pub(crate) async fn send_save_step(
     writer_tx: &mpsc::Sender<WriteOp>,
     slug: &str,
     step_type: &str,
@@ -587,7 +599,7 @@ async fn send_save_step(
 
 /// Send an UpdateParent WriteOp through the channel.
 /// Logs and continues if the writer channel has closed.
-async fn send_update_parent(
+pub(crate) async fn send_update_parent(
     writer_tx: &mpsc::Sender<WriteOp>,
     slug: &str,
     node_id: &str,
@@ -603,6 +615,46 @@ async fn send_update_parent(
     {
         warn!("Writer channel closed, UpdateParent dropped: {e}");
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResumeState {
+    Missing,
+    Complete,
+    StaleStep,
+}
+
+async fn get_resume_state(
+    db: &Arc<tokio::sync::Mutex<Connection>>,
+    slug: &str,
+    step_type: &str,
+    chunk_index: i64,
+    depth: i64,
+    node_id: &str,
+) -> Result<ResumeState> {
+    let slug_owned = slug.to_string();
+    let step_type_owned = step_type.to_string();
+    let node_id_owned = node_id.to_string();
+
+    db_read(&db, move |conn| {
+        if !db::step_exists(
+            conn,
+            &slug_owned,
+            &step_type_owned,
+            chunk_index,
+            depth,
+            &node_id_owned,
+        )? {
+            return Ok(ResumeState::Missing);
+        }
+
+        if db::get_node(conn, &slug_owned, &node_id_owned)?.is_some() {
+            Ok(ResumeState::Complete)
+        } else {
+            Ok(ResumeState::StaleStep)
+        }
+    })
+    .await
 }
 
 // ── CONVERSATION PIPELINE ────────────────────────────────────────────────────
@@ -621,7 +673,8 @@ pub async fn build_conversation(
     let num_chunks = db_read(&db, {
         let s = slug_owned.clone();
         move |conn| db::count_chunks(conn, &s)
-    }).await?;
+    })
+    .await?;
     if num_chunks == 0 {
         return Err(anyhow!("No chunks found for slug '{slug}'"));
     }
@@ -645,9 +698,17 @@ pub async fn build_conversation(
 
     // Recover running_context from last completed forward step
     for ci in 0..num_chunks {
-        let exists = db_read(&db, { let s = slug_owned.clone(); move |conn| db::step_exists(conn, &s, "forward", ci, -1, "") }).await?;
+        let exists = db_read(&db, {
+            let s = slug_owned.clone();
+            move |conn| db::step_exists(conn, &s, "forward", ci, -1, "")
+        })
+        .await?;
         if exists {
-            let output = db_read(&db, { let s = slug_owned.clone(); move |conn| db::get_step_output(conn, &s, "forward", ci) }).await?;
+            let output = db_read(&db, {
+                let s = slug_owned.clone();
+                move |conn| db::get_step_output(conn, &s, "forward", ci)
+            })
+            .await?;
             if let Some(output) = output {
                 if let Ok(parsed) = serde_json::from_str::<Value>(&output) {
                     if let Some(ctx) = parsed.get("running_context").and_then(|v| v.as_str()) {
@@ -669,13 +730,21 @@ pub async fn build_conversation(
             return Ok(failures);
         }
 
-        let exists = db_read(&db, { let s = slug_owned.clone(); move |conn| db::step_exists(conn, &s, "forward", ci, -1, "") }).await?;
+        let exists = db_read(&db, {
+            let s = slug_owned.clone();
+            move |conn| db::step_exists(conn, &s, "forward", ci, -1, "")
+        })
+        .await?;
         if exists {
             continue;
         }
 
-        let chunk_content = db_read(&db, { let s = slug_owned.clone(); move |conn| db::get_chunk(conn, &s, ci) }).await?
-            .ok_or_else(|| anyhow!("Missing chunk {ci} for slug '{slug}'"))?;
+        let chunk_content = db_read(&db, {
+            let s = slug_owned.clone();
+            move |conn| db::get_chunk(conn, &s, ci)
+        })
+        .await?
+        .ok_or_else(|| anyhow!("Missing chunk {ci} for slug '{slug}'"))?;
 
         let user_prompt = format!(
             "## RUNNING CONTEXT FROM PRIOR CHUNKS\n{running_context}\n\n## CHUNK {ci}\n{chunk_content}"
@@ -683,14 +752,29 @@ pub async fn build_conversation(
 
         info!("  Forward [{ci:02}/{num_chunks}]");
         let t0 = Instant::now();
-        match call_and_parse(llm_config, FORWARD_PROMPT, &user_prompt, &format!("forward-{ci}")).await {
+        match call_and_parse(
+            llm_config,
+            FORWARD_PROMPT,
+            &user_prompt,
+            &format!("forward-{ci}"),
+        )
+        .await
+        {
             Ok(analysis) => {
                 let elapsed = t0.elapsed().as_secs_f64();
                 let output_json = serde_json::to_string(&analysis)?;
                 send_save_step(
-                    writer_tx, slug, "forward", ci, -1, "", &output_json,
-                    &llm_config.primary_model, elapsed,
-                ).await;
+                    writer_tx,
+                    slug,
+                    "forward",
+                    ci,
+                    -1,
+                    "",
+                    &output_json,
+                    &llm_config.primary_model,
+                    elapsed,
+                )
+                .await;
 
                 // Update running context
                 if let Some(ctx) = analysis.get("running_context").and_then(|v| v.as_str()) {
@@ -707,7 +791,12 @@ pub async fn build_conversation(
         }
 
         done += 1;
-        let _ = progress_tx.send(BuildProgress { done, total: estimated_total }).await;
+        let _ = progress_tx
+            .send(BuildProgress {
+                done,
+                total: estimated_total,
+            })
+            .await;
     }
 
     // ── REVERSE PASS ─────────────────────────────────────────────────
@@ -720,9 +809,17 @@ pub async fn build_conversation(
             return Ok(failures);
         }
 
-        let exists = db_read(&db, { let s = slug_owned.clone(); move |conn| db::step_exists(conn, &s, "reverse", ci, -1, "") }).await?;
+        let exists = db_read(&db, {
+            let s = slug_owned.clone();
+            move |conn| db::step_exists(conn, &s, "reverse", ci, -1, "")
+        })
+        .await?;
         if exists {
-            let output = db_read(&db, { let s = slug_owned.clone(); move |conn| db::get_step_output(conn, &s, "reverse", ci) }).await?;
+            let output = db_read(&db, {
+                let s = slug_owned.clone();
+                move |conn| db::get_step_output(conn, &s, "reverse", ci)
+            })
+            .await?;
             if let Some(output) = output {
                 if let Ok(parsed) = serde_json::from_str::<Value>(&output) {
                     if let Some(ctx) = parsed.get("running_context").and_then(|v| v.as_str()) {
@@ -734,12 +831,21 @@ pub async fn build_conversation(
                 }
             }
             done += 1;
-            let _ = progress_tx.send(BuildProgress { done, total: estimated_total }).await;
+            let _ = progress_tx
+                .send(BuildProgress {
+                    done,
+                    total: estimated_total,
+                })
+                .await;
             continue;
         }
 
-        let chunk_content = db_read(&db, { let s = slug_owned.clone(); move |conn| db::get_chunk(conn, &s, ci) }).await?
-            .ok_or_else(|| anyhow!("Missing chunk {ci}"))?;
+        let chunk_content = db_read(&db, {
+            let s = slug_owned.clone();
+            move |conn| db::get_chunk(conn, &s, ci)
+        })
+        .await?
+        .ok_or_else(|| anyhow!("Missing chunk {ci}"))?;
 
         let user_prompt = format!(
             "## RUNNING CONTEXT FROM FUTURE CHUNKS\n{running_context}\n\n## CHUNK {ci}\n{chunk_content}"
@@ -747,14 +853,29 @@ pub async fn build_conversation(
 
         info!("  Reverse [{ci:02}/{num_chunks}]");
         let t0 = Instant::now();
-        match call_and_parse(llm_config, REVERSE_PROMPT, &user_prompt, &format!("reverse-{ci}")).await {
+        match call_and_parse(
+            llm_config,
+            REVERSE_PROMPT,
+            &user_prompt,
+            &format!("reverse-{ci}"),
+        )
+        .await
+        {
             Ok(analysis) => {
                 let elapsed = t0.elapsed().as_secs_f64();
                 let output_json = serde_json::to_string(&analysis)?;
                 send_save_step(
-                    writer_tx, slug, "reverse", ci, -1, "", &output_json,
-                    &llm_config.primary_model, elapsed,
-                ).await;
+                    writer_tx,
+                    slug,
+                    "reverse",
+                    ci,
+                    -1,
+                    "",
+                    &output_json,
+                    &llm_config.primary_model,
+                    elapsed,
+                )
+                .await;
 
                 if let Some(ctx) = analysis.get("running_context").and_then(|v| v.as_str()) {
                     running_context = format!("{ctx} {running_context}");
@@ -770,7 +891,12 @@ pub async fn build_conversation(
         }
 
         done += 1;
-        let _ = progress_tx.send(BuildProgress { done, total: estimated_total }).await;
+        let _ = progress_tx
+            .send(BuildProgress {
+                done,
+                total: estimated_total,
+            })
+            .await;
     }
 
     // ── COMBINE (forward + reverse -> L0) ────────────────────────────
@@ -783,15 +909,33 @@ pub async fn build_conversation(
 
         let node_id = format!("L0-{ci:03}");
 
-        let exists = db_read(&db, { let s = slug_owned.clone(); let nid = node_id.clone(); move |conn| db::step_exists(conn, &s, "combine", ci, 0, &nid) }).await?;
-        if exists {
-            done += 1;
-            let _ = progress_tx.send(BuildProgress { done, total: estimated_total }).await;
-            continue;
+        match get_resume_state(&db, slug, "combine", ci, 0, &node_id).await? {
+            ResumeState::Complete => {
+                done += 1;
+                let _ = progress_tx
+                    .send(BuildProgress {
+                        done,
+                        total: estimated_total,
+                    })
+                    .await;
+                continue;
+            }
+            ResumeState::StaleStep => {
+                warn!("  Combine step exists but node is missing for {node_id}; rebuilding chunk {ci}");
+            }
+            ResumeState::Missing => {}
         }
 
-        let fwd_json = db_read(&db, { let s = slug_owned.clone(); move |conn| db::get_step_output(conn, &s, "forward", ci) }).await?;
-        let rev_json = db_read(&db, { let s = slug_owned.clone(); move |conn| db::get_step_output(conn, &s, "reverse", ci) }).await?;
+        let fwd_json = db_read(&db, {
+            let s = slug_owned.clone();
+            move |conn| db::get_step_output(conn, &s, "forward", ci)
+        })
+        .await?;
+        let rev_json = db_read(&db, {
+            let s = slug_owned.clone();
+            move |conn| db::get_step_output(conn, &s, "reverse", ci)
+        })
+        .await?;
 
         // If forward or reverse step is missing (prior failure), skip this combine
         let (fwd_json, rev_json) = match (fwd_json, rev_json) {
@@ -800,7 +944,12 @@ pub async fn build_conversation(
                 warn!("  Combine skipped for chunk {ci}: missing forward/reverse step (prior failure)");
                 failures += 1;
                 done += 1;
-                let _ = progress_tx.send(BuildProgress { done, total: estimated_total }).await;
+                let _ = progress_tx
+                    .send(BuildProgress {
+                        done,
+                        total: estimated_total,
+                    })
+                    .await;
                 continue;
             }
         };
@@ -816,14 +965,29 @@ pub async fn build_conversation(
 
         info!("  Combine [{ci:02}/{num_chunks}]");
         let t0 = Instant::now();
-        match call_and_parse(llm_config, COMBINE_PROMPT, &user_prompt, &format!("combine-{ci}")).await {
+        match call_and_parse(
+            llm_config,
+            COMBINE_PROMPT,
+            &user_prompt,
+            &format!("combine-{ci}"),
+        )
+        .await
+        {
             Ok(analysis) => {
                 let elapsed = t0.elapsed().as_secs_f64();
                 let output_json = serde_json::to_string(&analysis)?;
                 send_save_step(
-                    writer_tx, slug, "combine", ci, 0, &node_id, &output_json,
-                    &llm_config.primary_model, elapsed,
-                ).await;
+                    writer_tx,
+                    slug,
+                    "combine",
+                    ci,
+                    0,
+                    &node_id,
+                    &output_json,
+                    &llm_config.primary_model,
+                    elapsed,
+                )
+                .await;
 
                 let node = node_from_analysis(&analysis, &node_id, slug, 0, Some(ci), vec![]);
                 send_save_node(writer_tx, node, None).await;
@@ -835,17 +999,37 @@ pub async fn build_conversation(
         }
 
         done += 1;
-        let _ = progress_tx.send(BuildProgress { done, total: estimated_total }).await;
+        let _ = progress_tx
+            .send(BuildProgress {
+                done,
+                total: estimated_total,
+            })
+            .await;
     }
 
     // ── L1: Positional pairing ───────────────────────────────────────
-    let l1_failures = build_l1_pairing(db.clone(), writer_tx, llm_config, slug, cancel, progress_tx, &mut done, estimated_total).await?;
+    let l1_failures = build_l1_pairing(
+        db.clone(),
+        writer_tx,
+        llm_config,
+        slug,
+        cancel,
+        progress_tx,
+        &mut done,
+        estimated_total,
+    )
+    .await?;
     failures += l1_failures;
 
     // ── Update progress total now that L1 is done ─────────────────────
     let l1_count = {
         let slug_s = slug.to_string();
-        db_read(&db, { let s = slug_s; move |conn| db::count_nodes_at_depth(conn, &s, 1) }).await.unwrap_or(0)
+        db_read(&db, {
+            let s = slug_s;
+            move |conn| db::count_nodes_at_depth(conn, &s, 1)
+        })
+        .await
+        .unwrap_or(0)
     };
     // Estimate: L2 ~ l1_count/2 threads, L3+ ~ log2 upper layers
     let est_l2 = (l1_count + 1) / 2;
@@ -856,14 +1040,40 @@ pub async fn build_conversation(
         est_upper += remaining;
     }
     let estimated_total = done + est_l2 + est_upper;
-    let _ = progress_tx.send(BuildProgress { done, total: estimated_total }).await;
+    let _ = progress_tx
+        .send(BuildProgress {
+            done,
+            total: estimated_total,
+        })
+        .await;
 
     // ── L2: Thread clustering ────────────────────────────────────────
-    let l2_failures = build_threads_layer(db.clone(), writer_tx, llm_config, slug, cancel, progress_tx, &mut done, estimated_total).await?;
+    let l2_failures = build_threads_layer(
+        db.clone(),
+        writer_tx,
+        llm_config,
+        slug,
+        cancel,
+        progress_tx,
+        &mut done,
+        estimated_total,
+    )
+    .await?;
     failures += l2_failures;
 
     // ── L3+: Normal pairing until apex ───────────────────────────────
-    let upper_failures = build_upper_layers(db.clone(), writer_tx, llm_config, slug, 2, cancel, progress_tx, &mut done, estimated_total).await?;
+    let upper_failures = build_upper_layers(
+        db.clone(),
+        writer_tx,
+        llm_config,
+        slug,
+        2,
+        cancel,
+        progress_tx,
+        &mut done,
+        estimated_total,
+    )
+    .await?;
     failures += upper_failures;
 
     // Update slug stats
@@ -895,7 +1105,11 @@ pub async fn build_code(
     progress_tx: &mpsc::Sender<BuildProgress>,
 ) -> Result<i32> {
     let slug_owned = slug.to_string();
-    let num_chunks = db_read(&db, { let s = slug_owned.clone(); move |conn| db::count_chunks(conn, &s) }).await?;
+    let num_chunks = db_read(&db, {
+        let s = slug_owned.clone();
+        move |conn| db::count_chunks(conn, &s)
+    })
+    .await?;
     if num_chunks == 0 {
         return Err(anyhow!("No chunks found for slug '{slug}'"));
     }
@@ -911,7 +1125,12 @@ pub async fn build_code(
     let mut failures: i32 = 0;
 
     // ── Step 1: Mechanical passes (import graph, spawns, strings) ────
-    let import_graph = db_read(&db, { let s = slug_owned.clone(); let wtx = writer_tx.clone(); move |conn| extract_import_graph(conn, &s, Some(&wtx)) }).await?;
+    let import_graph = db_read(&db, {
+        let s = slug_owned.clone();
+        let wtx = writer_tx.clone();
+        move |conn| extract_import_graph(conn, &s, Some(&wtx))
+    })
+    .await?;
 
     // ── Step 2: Concurrent L0 extraction ─────────────────────────────
     info!("=== CODE L0: EXTRACT {num_chunks} files ===");
@@ -920,25 +1139,43 @@ pub async fn build_code(
     let mut work_items: Vec<(i64, String, String)> = Vec::new();
     for ci in 0..num_chunks {
         let node_id = format!("C-L0-{ci:03}");
-        let exists = db_read(&db, { let s = slug_owned.clone(); let nid = node_id.clone(); move |conn| db::step_exists(conn, &s, "code_extract", ci, 0, &nid) }).await?;
-        if exists {
-            done += 1;
-            continue;
+        match get_resume_state(&db, slug, "code_extract", ci, 0, &node_id).await? {
+            ResumeState::Complete => {
+                done += 1;
+                continue;
+            }
+            ResumeState::StaleStep => {
+                warn!("  Code extract step exists but node is missing for {node_id}; rebuilding chunk {ci}");
+            }
+            ResumeState::Missing => {}
         }
-        let content = db_read(&db, { let s = slug_owned.clone(); move |conn| db::get_chunk(conn, &s, ci) }).await?;
+        let content = db_read(&db, {
+            let s = slug_owned.clone();
+            move |conn| db::get_chunk(conn, &s, ci)
+        })
+        .await?;
         if let Some(content) = content {
             work_items.push((ci, node_id, content));
         }
     }
 
-    let _ = progress_tx.send(BuildProgress { done, total: estimated_total }).await;
+    let _ = progress_tx
+        .send(BuildProgress {
+            done,
+            total: estimated_total,
+        })
+        .await;
 
     if !work_items.is_empty() {
         let concurrency = work_items.len().min(3);
-        info!("  {concurrency} concurrent workers for {} files", work_items.len());
+        info!(
+            "  {concurrency} concurrent workers for {} files",
+            work_items.len()
+        );
 
         // Spawn concurrent extraction tasks
-        let (result_tx, mut result_rx) = mpsc::channel::<Result<(i64, String, Value, String, f64)>>(concurrency * 2);
+        let (result_tx, mut result_rx) =
+            mpsc::channel::<Result<(i64, String, Value, String, f64)>>(concurrency * 2);
 
         let mut handles = Vec::new();
         for (ci, node_id, content) in work_items {
@@ -948,14 +1185,25 @@ pub async fn build_code(
 
             let handle = tokio::spawn(async move {
                 let is_config = content.contains("## TYPE: config");
-                let prompt = if is_config { CONFIG_EXTRACT_PROMPT } else { CODE_EXTRACT_PROMPT };
+                let prompt = if is_config {
+                    CONFIG_EXTRACT_PROMPT
+                } else {
+                    CODE_EXTRACT_PROMPT
+                };
 
                 // Parse file path from chunk header
                 let file_path = content
                     .lines()
                     .take(4)
                     .find(|l| l.starts_with("## FILE: "))
-                    .map(|l| l.trim_start_matches("## FILE: ").split(" [").next().unwrap_or("").trim().to_string())
+                    .map(|l| {
+                        l.trim_start_matches("## FILE: ")
+                            .split(" [")
+                            .next()
+                            .unwrap_or("")
+                            .trim()
+                            .to_string()
+                    })
                     .unwrap_or_default();
 
                 // Append mechanical metadata
@@ -963,13 +1211,22 @@ pub async fn build_code(
                 if !file_path.is_empty() && !is_config {
                     let mut meta_parts = Vec::new();
                     if let Some(spawns) = ig.spawn_counts.get(&file_path) {
-                        meta_parts.push(format!("## MECHANICAL: {} async spawn/timer calls found:", spawns.len()));
+                        meta_parts.push(format!(
+                            "## MECHANICAL: {} async spawn/timer calls found:",
+                            spawns.len()
+                        ));
                         for s in spawns {
-                            meta_parts.push(format!("  - {} near line {}: {}", s.call_type, s.line, s.context));
+                            meta_parts.push(format!(
+                                "  - {} near line {}: {}",
+                                s.call_type, s.line, s.context
+                            ));
                         }
                     }
                     if let Some(resources) = ig.string_resources.get(&file_path) {
-                        meta_parts.push(format!("## MECHANICAL: {} string literal resources found:", resources.len()));
+                        meta_parts.push(format!(
+                            "## MECHANICAL: {} string literal resources found:",
+                            resources.len()
+                        ));
                         for r in resources {
                             meta_parts.push(format!("  - {r}"));
                         }
@@ -986,12 +1243,17 @@ pub async fn build_code(
                 }
 
                 let t0 = Instant::now();
-                let analysis = call_and_parse(&config, prompt, &user_content, &format!("code-l0-{ci}")).await;
+                let analysis =
+                    call_and_parse(&config, prompt, &user_content, &format!("code-l0-{ci}")).await;
                 let elapsed = t0.elapsed().as_secs_f64();
 
                 match analysis {
-                    Ok(a) => { let _ = tx.send(Ok((ci, node_id, a, file_path, elapsed))).await; }
-                    Err(e) => { let _ = tx.send(Err(e)).await; }
+                    Ok(a) => {
+                        let _ = tx.send(Ok((ci, node_id, a, file_path, elapsed))).await;
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(e)).await;
+                    }
                 }
             });
             handles.push(handle);
@@ -1004,7 +1266,11 @@ pub async fn build_code(
             match result {
                 Ok((ci, node_id, analysis, file_path, elapsed)) => {
                     // Build topics for code node
-                    let purpose = analysis.get("purpose").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let purpose = analysis
+                        .get("purpose")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
 
                     let mut entities: Vec<String> = Vec::new();
                     if let Some(exports) = analysis.get("exports").and_then(|v| v.as_array()) {
@@ -1021,7 +1287,8 @@ pub async fn build_code(
                             }
                         }
                     }
-                    if let Some(key_fns) = analysis.get("key_functions").and_then(|v| v.as_array()) {
+                    if let Some(key_fns) = analysis.get("key_functions").and_then(|v| v.as_array())
+                    {
                         for kf in key_fns {
                             if let Some(name) = kf.get("name").and_then(|v| v.as_str()) {
                                 entities.push(name.to_string());
@@ -1047,16 +1314,30 @@ pub async fn build_code(
 
                     let output_json = serde_json::to_string(&analysis)?;
                     send_save_step(
-                        writer_tx, slug, "code_extract", ci, 0, &node_id, &output_json,
-                        &llm_config.primary_model, elapsed,
-                    ).await;
+                        writer_tx,
+                        slug,
+                        "code_extract",
+                        ci,
+                        0,
+                        &node_id,
+                        &output_json,
+                        &llm_config.primary_model,
+                        elapsed,
+                    )
+                    .await;
 
-                    let mut node = node_from_analysis(&analysis, &node_id, slug, 0, Some(ci), vec![]);
+                    let mut node =
+                        node_from_analysis(&analysis, &node_id, slug, 0, Some(ci), vec![]);
                     node.distilled = purpose;
                     send_save_node(writer_tx, node, Some(topics_json)).await;
 
                     done += 1;
-                    let _ = progress_tx.send(BuildProgress { done, total: estimated_total }).await;
+                    let _ = progress_tx
+                        .send(BuildProgress {
+                            done,
+                            total: estimated_total,
+                        })
+                        .await;
                 }
                 Err(e) => {
                     l0_failures += 1;
@@ -1071,7 +1352,11 @@ pub async fn build_code(
         }
 
         // Check for missing L0 nodes
-        let actual_l0 = db_read(&db, { let s = slug_owned.clone(); move |conn| db::count_nodes_at_depth(conn, &s, 0) }).await?;
+        let actual_l0 = db_read(&db, {
+            let s = slug_owned.clone();
+            move |conn| db::count_nodes_at_depth(conn, &s, 0)
+        })
+        .await?;
         if actual_l0 < num_chunks {
             tracing::warn!(
                 "Code L0 extraction: {actual_l0}/{num_chunks} nodes created ({} missing, {} failures)",
@@ -1083,7 +1368,10 @@ pub async fn build_code(
 
     // ── Step 3: L1 — Import-graph clustering ─────────────────────────
     let clusters = cluster_by_imports(&import_graph);
-    info!("=== CODE L1: {} clusters from import graph ===", clusters.len());
+    info!(
+        "=== CODE L1: {} clusters from import graph ===",
+        clusters.len()
+    );
 
     for (ci_idx, cluster_files) in clusters.iter().enumerate() {
         if cancel.is_cancelled() {
@@ -1091,10 +1379,20 @@ pub async fn build_code(
         }
 
         let node_id = format!("C-L1-{ci_idx:03}");
-        let exists = db_read(&db, { let s = slug_owned.clone(); let nid = node_id.clone(); move |conn| db::step_exists(conn, &s, "synth", -1, 1, &nid) }).await?;
+        let exists = db_read(&db, {
+            let s = slug_owned.clone();
+            let nid = node_id.clone();
+            move |conn| db::step_exists(conn, &s, "synth", -1, 1, &nid)
+        })
+        .await?;
         if exists {
             done += 1;
-            let _ = progress_tx.send(BuildProgress { done, total: estimated_total }).await;
+            let _ = progress_tx
+                .send(BuildProgress {
+                    done,
+                    total: estimated_total,
+                })
+                .await;
             continue;
         }
 
@@ -1103,18 +1401,34 @@ pub async fn build_code(
         let mut child_data: Vec<Value> = Vec::new();
 
         for chunk_ci in 0..num_chunks {
-            let content = db_read(&db, { let s = slug_owned.clone(); move |conn| db::get_chunk(conn, &s, chunk_ci) }).await?;
+            let content = db_read(&db, {
+                let s = slug_owned.clone();
+                move |conn| db::get_chunk(conn, &s, chunk_ci)
+            })
+            .await?;
             if let Some(content) = content {
                 let file_path = content
                     .lines()
                     .take(4)
                     .find(|l| l.starts_with("## FILE: "))
-                    .map(|l| l.trim_start_matches("## FILE: ").split(" [").next().unwrap_or("").trim().to_string())
+                    .map(|l| {
+                        l.trim_start_matches("## FILE: ")
+                            .split(" [")
+                            .next()
+                            .unwrap_or("")
+                            .trim()
+                            .to_string()
+                    })
                     .unwrap_or_default();
 
                 if cluster_files.contains(&file_path) {
                     let l0_id = format!("C-L0-{chunk_ci:03}");
-                    let l0_node = db_read(&db, { let s = slug_owned.clone(); let lid = l0_id.clone(); move |conn| db::get_node(conn, &s, &lid) }).await?;
+                    let l0_node = db_read(&db, {
+                        let s = slug_owned.clone();
+                        let lid = l0_id.clone();
+                        move |conn| db::get_node(conn, &s, &lid)
+                    })
+                    .await?;
                     if let Some(l0_node) = l0_node {
                         child_ids.push(l0_id);
                         let topics_val: Value = serde_json::to_value(&l0_node.topics)?;
@@ -1131,13 +1445,20 @@ pub async fn build_code(
         // Build cluster metadata
         let cluster_imports: HashMap<&str, &Vec<String>> = cluster_files
             .iter()
-            .filter_map(|f| import_graph.imports.get(f.as_str()).map(|v| (f.as_str(), v)))
+            .filter_map(|f| {
+                import_graph
+                    .imports
+                    .get(f.as_str())
+                    .map(|v| (f.as_str(), v))
+            })
             .collect();
 
         let cluster_ipc: Vec<&IpcBinding> = import_graph
             .ipc_map
             .iter()
-            .filter(|ipc| cluster_files.contains(&ipc.frontend) || cluster_files.contains(&ipc.backend))
+            .filter(|ipc| {
+                cluster_files.contains(&ipc.frontend) || cluster_files.contains(&ipc.backend)
+            })
             .collect();
 
         let user_prompt = format!(
@@ -1150,19 +1471,35 @@ pub async fn build_code(
 
         info!("  L1 cluster [{ci_idx}] ({} files)", cluster_files.len());
         let t0 = Instant::now();
-        match call_and_parse(llm_config, CODE_GROUP_PROMPT, &user_prompt, &format!("code-l1-{ci_idx}")).await {
+        match call_and_parse(
+            llm_config,
+            CODE_GROUP_PROMPT,
+            &user_prompt,
+            &format!("code-l1-{ci_idx}"),
+        )
+        .await
+        {
             Ok(analysis) => {
                 let elapsed = t0.elapsed().as_secs_f64();
                 let topics_json = serde_json::to_string(
-                    analysis.get("topics").unwrap_or(&serde_json::json!([]))
+                    analysis.get("topics").unwrap_or(&serde_json::json!([])),
                 )?;
                 let output_json = serde_json::to_string(&analysis)?;
                 send_save_step(
-                    writer_tx, slug, "synth", -1, 1, &node_id, &output_json,
-                    &llm_config.primary_model, elapsed,
-                ).await;
+                    writer_tx,
+                    slug,
+                    "synth",
+                    -1,
+                    1,
+                    &node_id,
+                    &output_json,
+                    &llm_config.primary_model,
+                    elapsed,
+                )
+                .await;
 
-                let node = node_from_analysis(&analysis, &node_id, slug, 1, None, child_ids.clone());
+                let node =
+                    node_from_analysis(&analysis, &node_id, slug, 1, None, child_ids.clone());
                 send_save_node(writer_tx, node, Some(topics_json)).await;
 
                 for cid in &child_ids {
@@ -1176,13 +1513,23 @@ pub async fn build_code(
         }
 
         done += 1;
-        let _ = progress_tx.send(BuildProgress { done, total: estimated_total }).await;
+        let _ = progress_tx
+            .send(BuildProgress {
+                done,
+                total: estimated_total,
+            })
+            .await;
     }
 
     // ── Update progress total now that L1 is done ─────────────────────
     let l1_count_code = {
         let slug_s = slug.to_string();
-        db_read(&db, { let s = slug_s; move |conn| db::count_nodes_at_depth(conn, &s, 1) }).await.unwrap_or(0)
+        db_read(&db, {
+            let s = slug_s;
+            move |conn| db::count_nodes_at_depth(conn, &s, 1)
+        })
+        .await
+        .unwrap_or(0)
     };
     let est_l2_code = (l1_count_code + 1) / 2;
     let mut est_upper_code = 0i64;
@@ -1192,14 +1539,40 @@ pub async fn build_code(
         est_upper_code += remaining_code;
     }
     let estimated_total = done + est_l2_code + est_upper_code;
-    let _ = progress_tx.send(BuildProgress { done, total: estimated_total }).await;
+    let _ = progress_tx
+        .send(BuildProgress {
+            done,
+            total: estimated_total,
+        })
+        .await;
 
     // ── L2: Thread clustering ────────────────────────────────────────
-    let l2_failures = build_threads_layer(db.clone(), writer_tx, llm_config, slug, cancel, progress_tx, &mut done, estimated_total).await?;
+    let l2_failures = build_threads_layer(
+        db.clone(),
+        writer_tx,
+        llm_config,
+        slug,
+        cancel,
+        progress_tx,
+        &mut done,
+        estimated_total,
+    )
+    .await?;
     failures += l2_failures;
 
     // ── L3+: Normal pairing ──────────────────────────────────────────
-    let upper_failures = build_upper_layers(db.clone(), writer_tx, llm_config, slug, 2, cancel, progress_tx, &mut done, estimated_total).await?;
+    let upper_failures = build_upper_layers(
+        db.clone(),
+        writer_tx,
+        llm_config,
+        slug,
+        2,
+        cancel,
+        progress_tx,
+        &mut done,
+        estimated_total,
+    )
+    .await?;
     failures += upper_failures;
 
     // Update slug stats
@@ -1231,7 +1604,11 @@ pub async fn build_docs(
     progress_tx: &mpsc::Sender<BuildProgress>,
 ) -> Result<i32> {
     let slug_owned = slug.to_string();
-    let num_chunks = db_read(&db, { let s = slug_owned.clone(); move |conn| db::count_chunks(conn, &s) }).await?;
+    let num_chunks = db_read(&db, {
+        let s = slug_owned.clone();
+        move |conn| db::count_chunks(conn, &s)
+    })
+    .await?;
     if num_chunks == 0 {
         return Err(anyhow!("No chunks found for slug '{slug}'"));
     }
@@ -1252,24 +1629,42 @@ pub async fn build_docs(
     let mut work_items: Vec<(i64, String, String)> = Vec::new();
     for ci in 0..num_chunks {
         let node_id = format!("L0-{ci:03}");
-        let exists = db_read(&db, { let s = slug_owned.clone(); let nid = node_id.clone(); move |conn| db::step_exists(conn, &s, "doc_extract", ci, 0, &nid) }).await?;
-        if exists {
-            done += 1;
-            continue;
+        match get_resume_state(&db, slug, "doc_extract", ci, 0, &node_id).await? {
+            ResumeState::Complete => {
+                done += 1;
+                continue;
+            }
+            ResumeState::StaleStep => {
+                warn!("  Doc extract step exists but node is missing for {node_id}; rebuilding chunk {ci}");
+            }
+            ResumeState::Missing => {}
         }
-        let content = db_read(&db, { let s = slug_owned.clone(); move |conn| db::get_chunk(conn, &s, ci) }).await?;
+        let content = db_read(&db, {
+            let s = slug_owned.clone();
+            move |conn| db::get_chunk(conn, &s, ci)
+        })
+        .await?;
         if let Some(content) = content {
             work_items.push((ci, node_id, content));
         }
     }
 
-    let _ = progress_tx.send(BuildProgress { done, total: estimated_total }).await;
+    let _ = progress_tx
+        .send(BuildProgress {
+            done,
+            total: estimated_total,
+        })
+        .await;
 
     if !work_items.is_empty() {
         let concurrency = work_items.len().min(3);
-        info!("  {concurrency} concurrent workers for {} documents", work_items.len());
+        info!(
+            "  {concurrency} concurrent workers for {} documents",
+            work_items.len()
+        );
 
-        let (result_tx, mut result_rx) = mpsc::channel::<Result<(i64, String, Value, f64)>>(concurrency * 2);
+        let (result_tx, mut result_rx) =
+            mpsc::channel::<Result<(i64, String, Value, f64)>>(concurrency * 2);
 
         let mut handles = Vec::new();
         for (ci, node_id, content) in work_items {
@@ -1279,15 +1674,26 @@ pub async fn build_docs(
             let handle = tokio::spawn(async move {
                 let lines = content.matches('\n').count() + 1;
                 let chars = content.len();
-                let user_prompt = format!("## METADATA\nLines: {lines}, Characters: {chars}\n\n{content}");
+                let user_prompt =
+                    format!("## METADATA\nLines: {lines}, Characters: {chars}\n\n{content}");
 
                 let t0 = Instant::now();
-                let analysis = call_and_parse(&config, DOC_EXTRACT_PROMPT, &user_prompt, &format!("doc-l0-{ci}")).await;
+                let analysis = call_and_parse(
+                    &config,
+                    DOC_EXTRACT_PROMPT,
+                    &user_prompt,
+                    &format!("doc-l0-{ci}"),
+                )
+                .await;
                 let elapsed = t0.elapsed().as_secs_f64();
 
                 match analysis {
-                    Ok(a) => { let _ = tx.send(Ok((ci, node_id, a, elapsed))).await; }
-                    Err(e) => { let _ = tx.send(Err(e)).await; }
+                    Ok(a) => {
+                        let _ = tx.send(Ok((ci, node_id, a, elapsed))).await;
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(e)).await;
+                    }
                 }
             });
             handles.push(handle);
@@ -1315,8 +1721,14 @@ pub async fn build_docs(
                         }
                     }
 
-                    let purpose = analysis.get("purpose").and_then(|v| v.as_str()).unwrap_or("Document");
-                    let summary = analysis.get("summary").and_then(|v| v.as_str()).unwrap_or("");
+                    let purpose = analysis
+                        .get("purpose")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("Document");
+                    let summary = analysis
+                        .get("summary")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
 
                     let topics_json = serde_json::to_string(&serde_json::json!([{
                         "name": purpose,
@@ -1328,17 +1740,37 @@ pub async fn build_docs(
 
                     let output_json = serde_json::to_string(&analysis)?;
                     send_save_step(
-                        writer_tx, slug, "doc_extract", ci, 0, &node_id, &output_json,
-                        &llm_config.primary_model, elapsed,
-                    ).await;
+                        writer_tx,
+                        slug,
+                        "doc_extract",
+                        ci,
+                        0,
+                        &node_id,
+                        &output_json,
+                        &llm_config.primary_model,
+                        elapsed,
+                    )
+                    .await;
 
-                    let mut node = node_from_analysis(&analysis, &node_id, slug, 0, Some(ci), vec![]);
+                    let mut node =
+                        node_from_analysis(&analysis, &node_id, slug, 0, Some(ci), vec![]);
                     node.distilled = summary.to_string();
-                    node.terms = entities.iter().map(|e| Term { term: e.clone(), definition: String::new() }).collect();
+                    node.terms = entities
+                        .iter()
+                        .map(|e| Term {
+                            term: e.clone(),
+                            definition: String::new(),
+                        })
+                        .collect();
                     send_save_node(writer_tx, node, Some(topics_json)).await;
 
                     done += 1;
-                    let _ = progress_tx.send(BuildProgress { done, total: estimated_total }).await;
+                    let _ = progress_tx
+                        .send(BuildProgress {
+                            done,
+                            total: estimated_total,
+                        })
+                        .await;
                 }
                 Err(e) => {
                     l0_failures += 1;
@@ -1352,7 +1784,11 @@ pub async fn build_docs(
         }
 
         // Check for missing L0 nodes
-        let actual_l0 = db_read(&db, { let s = slug_owned.clone(); move |conn| db::count_nodes_at_depth(conn, &s, 0) }).await?;
+        let actual_l0 = db_read(&db, {
+            let s = slug_owned.clone();
+            move |conn| db::count_nodes_at_depth(conn, &s, 0)
+        })
+        .await?;
         if actual_l0 < num_chunks {
             tracing::warn!(
                 "Doc L0 extraction: {actual_l0}/{num_chunks} nodes created ({} missing, {} failures)",
@@ -1363,8 +1799,16 @@ pub async fn build_docs(
     }
 
     // ── L1: Entity-overlap clustering ────────────────────────────────
-    let l0_nodes = db_read(&db, { let s = slug_owned.clone(); move |conn| db::get_nodes_at_depth(conn, &s, 0) }).await?;
-    let l1_count = db_read(&db, { let s = slug_owned.clone(); move |conn| db::count_nodes_at_depth(conn, &s, 1) }).await?;
+    let l0_nodes = db_read(&db, {
+        let s = slug_owned.clone();
+        move |conn| db::get_nodes_at_depth(conn, &s, 0)
+    })
+    .await?;
+    let l1_count = db_read(&db, {
+        let s = slug_owned.clone();
+        move |conn| db::count_nodes_at_depth(conn, &s, 1)
+    })
+    .await?;
 
     if l1_count == 0 && l0_nodes.len() > 1 {
         info!("=== DOC L1: CLUSTER {} documents ===", l0_nodes.len());
@@ -1418,11 +1862,21 @@ pub async fn build_docs(
             }
 
             let node_id = format!("L1-{ci_idx:03}");
-            let exists = db_read(&db, { let s = slug_owned.clone(); let nid = node_id.clone(); move |conn| db::step_exists(conn, &s, "doc_group", -1, 1, &nid) }).await?;
-            if exists {
-                done += 1;
-                let _ = progress_tx.send(BuildProgress { done, total: estimated_total }).await;
-                continue;
+            match get_resume_state(&db, slug, "doc_group", -1, 1, &node_id).await? {
+                ResumeState::Complete => {
+                    done += 1;
+                    let _ = progress_tx
+                        .send(BuildProgress {
+                            done,
+                            total: estimated_total,
+                        })
+                        .await;
+                    continue;
+                }
+                ResumeState::StaleStep => {
+                    warn!("  Doc group step exists but node is missing for {node_id}; rebuilding");
+                }
+                ResumeState::Missing => {}
             }
 
             let child_ids: Vec<String> = cluster.iter().map(|n| n.id.clone()).collect();
@@ -1435,7 +1889,11 @@ pub async fn build_docs(
             let mut doc_names = Vec::new();
             for n in cluster.iter() {
                 if let Some(ci) = n.chunk_index {
-                    let content = db_read(&db, { let s = slug_owned.clone(); move |conn| db::get_chunk(conn, &s, ci) }).await?;
+                    let content = db_read(&db, {
+                        let s = slug_owned.clone();
+                        move |conn| db::get_chunk(conn, &s, ci)
+                    })
+                    .await?;
                     if let Some(content) = content {
                         let name = content
                             .lines()
@@ -1456,19 +1914,35 @@ pub async fn build_docs(
 
             info!("  L1 cluster [{ci_idx}] ({} docs)", cluster.len());
             let t0 = Instant::now();
-            match call_and_parse(llm_config, DOC_GROUP_PROMPT, &user_prompt, &format!("doc-l1-{ci_idx}")).await {
+            match call_and_parse(
+                llm_config,
+                DOC_GROUP_PROMPT,
+                &user_prompt,
+                &format!("doc-l1-{ci_idx}"),
+            )
+            .await
+            {
                 Ok(analysis) => {
                     let elapsed = t0.elapsed().as_secs_f64();
                     let topics_json = serde_json::to_string(
-                        analysis.get("topics").unwrap_or(&serde_json::json!([]))
+                        analysis.get("topics").unwrap_or(&serde_json::json!([])),
                     )?;
                     let output_json = serde_json::to_string(&analysis)?;
                     send_save_step(
-                        writer_tx, slug, "doc_group", -1, 1, &node_id, &output_json,
-                        &llm_config.primary_model, elapsed,
-                    ).await;
+                        writer_tx,
+                        slug,
+                        "doc_group",
+                        -1,
+                        1,
+                        &node_id,
+                        &output_json,
+                        &llm_config.primary_model,
+                        elapsed,
+                    )
+                    .await;
 
-                    let node = node_from_analysis(&analysis, &node_id, slug, 1, None, child_ids.clone());
+                    let node =
+                        node_from_analysis(&analysis, &node_id, slug, 1, None, child_ids.clone());
                     send_save_node(writer_tx, node, Some(topics_json)).await;
 
                     for cid in &child_ids {
@@ -1482,14 +1956,24 @@ pub async fn build_docs(
             }
 
             done += 1;
-            let _ = progress_tx.send(BuildProgress { done, total: estimated_total }).await;
+            let _ = progress_tx
+                .send(BuildProgress {
+                    done,
+                    total: estimated_total,
+                })
+                .await;
         }
     }
 
     // ── Update progress total now that L1 is done ─────────────────────
     let l1_count_doc = {
         let slug_s = slug.to_string();
-        db_read(&db, { let s = slug_s; move |conn| db::count_nodes_at_depth(conn, &s, 1) }).await.unwrap_or(0)
+        db_read(&db, {
+            let s = slug_s;
+            move |conn| db::count_nodes_at_depth(conn, &s, 1)
+        })
+        .await
+        .unwrap_or(0)
     };
     let est_l2_doc = (l1_count_doc + 1) / 2;
     let mut est_upper_doc = 0i64;
@@ -1499,14 +1983,40 @@ pub async fn build_docs(
         est_upper_doc += remaining_doc;
     }
     let estimated_total = done + est_l2_doc + est_upper_doc;
-    let _ = progress_tx.send(BuildProgress { done, total: estimated_total }).await;
+    let _ = progress_tx
+        .send(BuildProgress {
+            done,
+            total: estimated_total,
+        })
+        .await;
 
     // ── L2: Thread clustering ────────────────────────────────────────
-    let l2_failures = build_threads_layer(db.clone(), writer_tx, llm_config, slug, cancel, progress_tx, &mut done, estimated_total).await?;
+    let l2_failures = build_threads_layer(
+        db.clone(),
+        writer_tx,
+        llm_config,
+        slug,
+        cancel,
+        progress_tx,
+        &mut done,
+        estimated_total,
+    )
+    .await?;
     failures += l2_failures;
 
     // ── L3+: Normal pairing ──────────────────────────────────────────
-    let upper_failures = build_upper_layers(db.clone(), writer_tx, llm_config, slug, 2, cancel, progress_tx, &mut done, estimated_total).await?;
+    let upper_failures = build_upper_layers(
+        db.clone(),
+        writer_tx,
+        llm_config,
+        slug,
+        2,
+        cancel,
+        progress_tx,
+        &mut done,
+        estimated_total,
+    )
+    .await?;
     failures += upper_failures;
 
     // Update slug stats
@@ -1541,13 +2051,21 @@ async fn build_l1_pairing(
 ) -> Result<i32> {
     let mut failures: i32 = 0;
     let slug_owned = slug.to_string();
-    let l0_nodes = db_read(&db, { let s = slug_owned.clone(); move |conn| db::get_nodes_at_depth(conn, &s, 0) }).await?;
+    let l0_nodes = db_read(&db, {
+        let s = slug_owned.clone();
+        move |conn| db::get_nodes_at_depth(conn, &s, 0)
+    })
+    .await?;
     if l0_nodes.len() <= 1 {
         return Ok(0);
     }
 
     let expected_l1 = (l0_nodes.len() + 1) / 2;
-    let existing_l1 = db_read(&db, { let s = slug_owned.clone(); move |conn| db::count_nodes_at_depth(conn, &s, 1) }).await?;
+    let existing_l1 = db_read(&db, {
+        let s = slug_owned.clone();
+        move |conn| db::count_nodes_at_depth(conn, &s, 1)
+    })
+    .await?;
     if existing_l1 >= expected_l1 as i64 {
         info!("  L1: {} nodes (already complete)", existing_l1);
         *done += existing_l1;
@@ -1555,7 +2073,11 @@ async fn build_l1_pairing(
         return Ok(0);
     }
 
-    info!("=== DEPTH 1: DISTILL {} -> {} ===", l0_nodes.len(), expected_l1);
+    info!(
+        "=== DEPTH 1: DISTILL {} -> {} ===",
+        l0_nodes.len(),
+        expected_l1
+    );
 
     let mut pair_idx = 0usize;
     let mut i = 0usize;
@@ -1566,13 +2088,18 @@ async fn build_l1_pairing(
 
         let node_id = format!("L1-{pair_idx:03}");
 
-        let exists = db_read(&db, { let s = slug_owned.clone(); let nid = node_id.clone(); move |conn| db::step_exists(conn, &s, "synth", -1, 1, &nid) }).await?;
-        if exists {
-            pair_idx += 1;
-            i += 2;
-            *done += 1;
-            let _ = progress_tx.send(BuildProgress { done: *done, total }).await;
-            continue;
+        match get_resume_state(&db, slug, "synth", -1, 1, &node_id).await? {
+            ResumeState::Complete => {
+                pair_idx += 1;
+                i += 2;
+                *done += 1;
+                let _ = progress_tx.send(BuildProgress { done: *done, total }).await;
+                continue;
+            }
+            ResumeState::StaleStep => {
+                warn!("  L1 synth step exists but node is missing for {node_id}; rebuilding");
+            }
+            ResumeState::Missing => {}
         }
 
         if i + 1 < l0_nodes.len() {
@@ -1590,20 +2117,39 @@ async fn build_l1_pairing(
 
             info!("  [{} + {}] -> {node_id}", left.id, right.id);
             let t0 = Instant::now();
-            match call_and_parse(llm_config, DISTILL_PROMPT, &user_prompt, &format!("l1-{pair_idx}")).await {
+            match call_and_parse(
+                llm_config,
+                DISTILL_PROMPT,
+                &user_prompt,
+                &format!("l1-{pair_idx}"),
+            )
+            .await
+            {
                 Ok(analysis) => {
                     let elapsed = t0.elapsed().as_secs_f64();
                     let topics_json = serde_json::to_string(
-                        analysis.get("topics").unwrap_or(&serde_json::json!([]))
+                        analysis.get("topics").unwrap_or(&serde_json::json!([])),
                     )?;
                     let output_json = serde_json::to_string(&analysis)?;
                     send_save_step(
-                        writer_tx, slug, "synth", -1, 1, &node_id, &output_json,
-                        &llm_config.primary_model, elapsed,
-                    ).await;
+                        writer_tx,
+                        slug,
+                        "synth",
+                        -1,
+                        1,
+                        &node_id,
+                        &output_json,
+                        &llm_config.primary_model,
+                        elapsed,
+                    )
+                    .await;
 
                     let node = node_from_analysis(
-                        &analysis, &node_id, slug, 1, None,
+                        &analysis,
+                        &node_id,
+                        slug,
+                        1,
+                        None,
                         vec![left.id.clone(), right.id.clone()],
                     );
                     send_save_node(writer_tx, node, Some(topics_json)).await;
@@ -1665,19 +2211,35 @@ async fn build_threads_layer(
 ) -> Result<i32> {
     let mut failures: i32 = 0;
     let slug_owned = slug.to_string();
-    let l1_nodes = db_read(&db, { let s = slug_owned.clone(); move |conn| db::get_nodes_at_depth(conn, &s, 1) }).await?;
+    let l1_nodes = db_read(&db, {
+        let s = slug_owned.clone();
+        move |conn| db::get_nodes_at_depth(conn, &s, 1)
+    })
+    .await?;
     if l1_nodes.len() < 2 {
         return Ok(0);
     }
 
     // Check if L2 already built
-    let l2_count = db_read(&db, { let s = slug_owned.clone(); move |conn| db::count_nodes_at_depth(conn, &s, 2) }).await?;
+    let l2_count = db_read(&db, {
+        let s = slug_owned.clone();
+        move |conn| db::count_nodes_at_depth(conn, &s, 2)
+    })
+    .await?;
 
     // Step 1: Cluster topics
-    let tc_exists = db_read(&db, { let s = slug_owned.clone(); move |conn| db::step_exists(conn, &s, "thread_cluster", -1, 1, "") }).await?;
+    let tc_exists = db_read(&db, {
+        let s = slug_owned.clone();
+        move |conn| db::step_exists(conn, &s, "thread_cluster", -1, 1, "")
+    })
+    .await?;
     let clusters: Value = if tc_exists {
-        let output = db_read(&db, { let s = slug_owned.clone(); move |conn| db::get_step_output(conn, &s, "thread_cluster", -1) }).await?
-            .unwrap_or_else(|| "{}".to_string());
+        let output = db_read(&db, {
+            let s = slug_owned.clone();
+            move |conn| db::get_step_output(conn, &s, "thread_cluster", -1)
+        })
+        .await?
+        .unwrap_or_else(|| "{}".to_string());
         serde_json::from_str(&output)?
     } else {
         // Build topic inventory from L1 nodes
@@ -1692,7 +2254,8 @@ async fn build_threads_layer(
                 }));
             } else {
                 for (idx, topic) in node.topics.iter().enumerate() {
-                    let top_entities: Vec<&str> = topic.entities.iter().take(6).map(|s| s.as_str()).collect();
+                    let top_entities: Vec<&str> =
+                        topic.entities.iter().take(6).map(|s| s.as_str()).collect();
                     topic_inventory.push(serde_json::json!({
                         "source_node": node.id,
                         "topic_index": idx,
@@ -1703,7 +2266,11 @@ async fn build_threads_layer(
             }
         }
 
-        info!("=== HORIZONTAL SCAN: {} topics across {} L1 nodes ===", topic_inventory.len(), l1_nodes.len());
+        info!(
+            "=== HORIZONTAL SCAN: {} topics across {} L1 nodes ===",
+            topic_inventory.len(),
+            l1_nodes.len()
+        );
 
         let inv_json = serde_json::to_string_pretty(&topic_inventory)?;
         let est_tokens = inv_json.len() / 4;
@@ -1718,7 +2285,10 @@ async fn build_threads_layer(
                 .chunks(batch_size.max(1))
                 .map(|c| c.to_vec())
                 .collect();
-            info!("  Splitting into {} batches (~{batch_size} topics each)", batches.len());
+            info!(
+                "  Splitting into {} batches (~{batch_size} topics each)",
+                batches.len()
+            );
 
             let mut batch_results: Vec<Value> = Vec::new();
             let mut batch_failed = false;
@@ -1726,9 +2296,21 @@ async fn build_threads_layer(
                 if cancel.is_cancelled() {
                     return Ok(failures);
                 }
-                info!("  Batch {}/{} ({} topics)", bi + 1, batches.len(), batch.len());
+                info!(
+                    "  Batch {}/{} ({} topics)",
+                    bi + 1,
+                    batches.len(),
+                    batch.len()
+                );
                 let batch_json = serde_json::to_string_pretty(batch)?;
-                match call_and_parse(llm_config, THREAD_CLUSTER_PROMPT, &batch_json, &format!("thread-batch-{bi}")).await {
+                match call_and_parse(
+                    llm_config,
+                    THREAD_CLUSTER_PROMPT,
+                    &batch_json,
+                    &format!("thread-batch-{bi}"),
+                )
+                .await
+                {
                     Ok(bc) => batch_results.push(bc),
                     Err(e) => {
                         warn!("  Thread clustering batch {bi} failed: {e}");
@@ -1753,7 +2335,13 @@ async fn build_threads_layer(
             }
         } else {
             // Single call
-            call_and_parse(llm_config, THREAD_CLUSTER_PROMPT, &inv_json, "thread-cluster").await
+            call_and_parse(
+                llm_config,
+                THREAD_CLUSTER_PROMPT,
+                &inv_json,
+                "thread-cluster",
+            )
+            .await
         };
 
         // If clustering failed, fall back to simple positional pairing (same as L1)
@@ -1765,23 +2353,31 @@ async fn build_threads_layer(
                 // Build synthetic threads by pairing adjacent L1 nodes
                 let mut fallback_threads: Vec<Value> = Vec::new();
                 for (idx, chunk) in l1_nodes.chunks(2).enumerate() {
-                    let assignments: Vec<Value> = chunk.iter().enumerate().flat_map(|(_, node)| {
-                        if node.topics.is_empty() {
-                            vec![serde_json::json!({
-                                "source_node": node.id,
-                                "topic_index": 0,
-                                "topic_name": node.headline,
-                            })]
-                        } else {
-                            node.topics.iter().enumerate().map(|(ti, t)| {
-                                serde_json::json!({
+                    let assignments: Vec<Value> = chunk
+                        .iter()
+                        .enumerate()
+                        .flat_map(|(_, node)| {
+                            if node.topics.is_empty() {
+                                vec![serde_json::json!({
                                     "source_node": node.id,
-                                    "topic_index": ti,
-                                    "topic_name": t.name,
-                                })
-                            }).collect()
-                        }
-                    }).collect();
+                                    "topic_index": 0,
+                                    "topic_name": node.headline,
+                                })]
+                            } else {
+                                node.topics
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(ti, t)| {
+                                        serde_json::json!({
+                                            "source_node": node.id,
+                                            "topic_index": ti,
+                                            "topic_name": t.name,
+                                        })
+                                    })
+                                    .collect()
+                            }
+                        })
+                        .collect();
                     fallback_threads.push(serde_json::json!({
                         "name": format!("Group {}", idx + 1),
                         "description": "Positional grouping (clustering fallback)",
@@ -1795,9 +2391,17 @@ async fn build_threads_layer(
         let elapsed = t0.elapsed().as_secs_f64();
         let output_json = serde_json::to_string(&result)?;
         send_save_step(
-            writer_tx, slug, "thread_cluster", -1, 1, "", &output_json,
-            &llm_config.primary_model, elapsed,
-        ).await;
+            writer_tx,
+            slug,
+            "thread_cluster",
+            -1,
+            1,
+            "",
+            &output_json,
+            &llm_config.primary_model,
+            elapsed,
+        )
+        .await;
 
         result
     };
@@ -1821,7 +2425,11 @@ async fn build_threads_layer(
                 .and_then(|a| a.as_array())
                 .into_iter()
                 .flatten()
-                .filter_map(|a| a.get("source_node").and_then(|v| v.as_str()).map(String::from))
+                .filter_map(|a| {
+                    a.get("source_node")
+                        .and_then(|v| v.as_str())
+                        .map(String::from)
+                })
         })
         .collect();
     let all_l1_ids: HashSet<String> = l1_nodes.iter().map(|n| n.id.clone()).collect();
@@ -1862,11 +2470,16 @@ async fn build_threads_layer(
         let node_id = format!("L2-{thread_idx:03}");
 
         let thread_result: Result<()> = async {
-            let exists = db_read(&db, { let s = slug_owned.clone(); let nid = node_id.clone(); move |conn| db::step_exists(conn, &s, "synth", -1, 2, &nid) }).await?;
-            if exists {
-                *done += 1;
-                let _ = progress_tx.send(BuildProgress { done: *done, total }).await;
-                return Ok(());
+            match get_resume_state(&db, slug, "synth", -1, 2, &node_id).await? {
+                ResumeState::Complete => {
+                    *done += 1;
+                    let _ = progress_tx.send(BuildProgress { done: *done, total }).await;
+                    return Ok(());
+                }
+                ResumeState::StaleStep => {
+                    warn!("  Thread synth step exists but node is missing for {node_id}; rebuilding");
+                }
+                ResumeState::Missing => {}
             }
 
             let thread_name = thread
@@ -2010,7 +2623,11 @@ async fn build_upper_layers(
     let mut depth = start_depth;
 
     loop {
-        let current_nodes = db_read(&db, { let s = slug_owned.clone(); move |conn| db::get_nodes_at_depth(conn, &s, depth) }).await?;
+        let current_nodes = db_read(&db, {
+            let s = slug_owned.clone();
+            move |conn| db::get_nodes_at_depth(conn, &s, depth)
+        })
+        .await?;
         if current_nodes.len() <= 1 {
             if let Some(apex) = current_nodes.first() {
                 info!("=== APEX: {} ===", apex.id);
@@ -2020,15 +2637,22 @@ async fn build_upper_layers(
 
         depth += 1;
         let expected = (current_nodes.len() + 1) / 2;
-        let existing = db_read(&db, { let s = slug_owned.clone(); move |conn| db::count_nodes_at_depth(conn, &s, depth) }).await?;
-        if existing >= expected as i64 {
+        let existing = db_read(&db, {
+            let s = slug_owned.clone();
+            move |conn| db::count_nodes_at_depth(conn, &s, depth)
+        })
+        .await?;
+        if existing == expected as i64 {
             info!("  Depth {depth}: {existing} nodes (already complete)");
             *done += existing;
             let _ = progress_tx.send(BuildProgress { done: *done, total }).await;
             continue;
         }
 
-        info!("=== DEPTH {depth}: DISTILL {} -> {expected} ===", current_nodes.len());
+        info!(
+            "=== DEPTH {depth}: DISTILL {} -> {expected} ===",
+            current_nodes.len()
+        );
 
         let mut pair_idx = 0usize;
         let mut i = 0usize;
@@ -2039,13 +2663,18 @@ async fn build_upper_layers(
 
             let node_id = format!("L{depth}-{pair_idx:03}");
 
-            let exists = db_read(&db, { let s = slug_owned.clone(); let nid = node_id.clone(); move |conn| db::step_exists(conn, &s, "synth", -1, depth, &nid) }).await?;
-            if exists {
-                pair_idx += 1;
-                i += 2;
-                *done += 1;
-                let _ = progress_tx.send(BuildProgress { done: *done, total }).await;
-                continue;
+            match get_resume_state(&db, slug, "synth", -1, depth, &node_id).await? {
+                ResumeState::Complete => {
+                    pair_idx += 1;
+                    i += 2;
+                    *done += 1;
+                    let _ = progress_tx.send(BuildProgress { done: *done, total }).await;
+                    continue;
+                }
+                ResumeState::StaleStep => {
+                    warn!("  Upper-layer synth step exists but node is missing for {node_id}; rebuilding");
+                }
+                ResumeState::Missing => {}
             }
 
             if i + 1 < current_nodes.len() {
@@ -2067,12 +2696,29 @@ async fn build_upper_layers(
                 // Retry up to 3 times on LLM failure, then carry left node on final failure
                 let mut analysis_result = None;
                 for attempt in 0..3 {
-                    match call_and_parse(llm_config, DISTILL_PROMPT, &user_prompt, &format!("synth-d{depth}-{pair_idx}")).await {
-                        Ok(a) => { analysis_result = Some(a); break; }
+                    match call_and_parse(
+                        llm_config,
+                        DISTILL_PROMPT,
+                        &user_prompt,
+                        &format!("synth-d{depth}-{pair_idx}"),
+                    )
+                    .await
+                    {
+                        Ok(a) => {
+                            analysis_result = Some(a);
+                            break;
+                        }
                         Err(e) => {
-                            tracing::warn!("  Synthesis attempt {}/{} failed for {node_id}: {e}", attempt + 1, 3);
+                            tracing::warn!(
+                                "  Synthesis attempt {}/{} failed for {node_id}: {e}",
+                                attempt + 1,
+                                3
+                            );
                             if attempt < 2 {
-                                tokio::time::sleep(std::time::Duration::from_secs(2u64.pow(attempt as u32 + 1))).await;
+                                tokio::time::sleep(std::time::Duration::from_secs(
+                                    2u64.pow(attempt as u32 + 1),
+                                ))
+                                .await;
                             }
                         }
                     }
@@ -2082,16 +2728,28 @@ async fn build_upper_layers(
                     let elapsed = t0.elapsed().as_secs_f64();
 
                     let topics_json = serde_json::to_string(
-                        analysis.get("topics").unwrap_or(&serde_json::json!([]))
+                        analysis.get("topics").unwrap_or(&serde_json::json!([])),
                     )?;
                     let output_json = serde_json::to_string(&analysis)?;
                     send_save_step(
-                        writer_tx, slug, "synth", -1, depth, &node_id, &output_json,
-                        &llm_config.primary_model, elapsed,
-                    ).await;
+                        writer_tx,
+                        slug,
+                        "synth",
+                        -1,
+                        depth,
+                        &node_id,
+                        &output_json,
+                        &llm_config.primary_model,
+                        elapsed,
+                    )
+                    .await;
 
                     let node = node_from_analysis(
-                        &analysis, &node_id, slug, depth, None,
+                        &analysis,
+                        &node_id,
+                        slug,
+                        depth,
+                        None,
                         vec![left.id.clone(), right.id.clone()],
                     );
                     send_save_node(writer_tx, node, Some(topics_json)).await;
@@ -2100,7 +2758,9 @@ async fn build_upper_layers(
                     send_update_parent(writer_tx, slug, &right.id, &node_id).await;
                 } else {
                     // All retries failed — carry left node up as fallback
-                    tracing::error!("  All 3 synthesis attempts failed for {node_id}. Carrying left node.");
+                    tracing::error!(
+                        "  All 3 synthesis attempts failed for {node_id}. Carrying left node."
+                    );
                     failures += 1;
                     let mut node = left.clone();
                     node.id = node_id.clone();
@@ -2139,7 +2799,7 @@ async fn build_upper_layers(
 }
 
 /// Build a JSON payload from a node, preferring topics if available.
-fn child_payload_json(node: &PyramidNode) -> Value {
+pub(crate) fn child_payload_json(node: &PyramidNode) -> Value {
     if !node.topics.is_empty() {
         serde_json::json!({
             "headline": node.headline,
@@ -2197,7 +2857,11 @@ pub struct FileComplexity {
 
 /// Mechanical pass: extract import graph, IPC map, spawn counts, string resources,
 /// and per-file complexity from code chunks.  Pure regex, no LLM.
-fn extract_import_graph(conn: &Connection, slug: &str, writer_tx: Option<&mpsc::Sender<WriteOp>>) -> Result<ImportGraph> {
+fn extract_import_graph(
+    conn: &Connection,
+    slug: &str,
+    writer_tx: Option<&mpsc::Sender<WriteOp>>,
+) -> Result<ImportGraph> {
     // Check if already computed
     if db::step_exists(conn, slug, "import_graph", -1, -1, "")? {
         if let Some(output) = db::get_step_output(conn, slug, "import_graph", -1)? {
@@ -2210,24 +2874,48 @@ fn extract_import_graph(conn: &Connection, slug: &str, writer_tx: Option<&mpsc::
     let num_chunks = db::count_chunks(conn, slug)?;
     let mut graph = ImportGraph::default();
 
-    static RUST_USE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"use\s+(?:crate::)?(\w+)").unwrap());
+    static RUST_USE_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"use\s+(?:crate::)?(\w+)").unwrap());
     static RUST_MOD_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"mod\s+(\w+)\s*;").unwrap());
-    static RUST_PUB_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"pub\s+(?:async\s+)?(?:fn|struct|enum|type)\s+(\w+)").unwrap());
-    static RUST_TAURI_CMD_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"#\[tauri::command\]\s*(?:pub\s+)?(?:async\s+)?fn\s+(\w+)").unwrap());
-    static TS_IMPORT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"import\s+.*?from\s+['"]([^'"]+)['"]"#).unwrap());
-    static TS_EXPORT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"export\s+(?:default\s+)?(?:function|const|class|interface|type|enum)\s+(\w+)").unwrap());
-    static TS_INVOKE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"invoke\s*[<(]\s*['"](\w+)['"]"#).unwrap());
+    static RUST_PUB_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"pub\s+(?:async\s+)?(?:fn|struct|enum|type)\s+(\w+)").unwrap()
+    });
+    static RUST_TAURI_CMD_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"#\[tauri::command\]\s*(?:pub\s+)?(?:async\s+)?fn\s+(\w+)").unwrap()
+    });
+    static TS_IMPORT_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r#"import\s+.*?from\s+['"]([^'"]+)['"]"#).unwrap());
+    static TS_EXPORT_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"export\s+(?:default\s+)?(?:function|const|class|interface|type|enum)\s+(\w+)")
+            .unwrap()
+    });
+    static TS_INVOKE_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r#"invoke\s*[<(]\s*['"](\w+)['"]"#).unwrap());
 
-    static SPAWN_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?:tokio::)?(?:async_runtime::)?spawn\s*\(").unwrap());
-    static TIMER_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(setInterval|setTimeout)\s*\(").unwrap());
-    static TOKIO_TIME_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"tokio::time::(interval|sleep)\s*\(").unwrap());
+    static SPAWN_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?:tokio::)?(?:async_runtime::)?spawn\s*\(").unwrap());
+    static TIMER_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(setInterval|setTimeout)\s*\(").unwrap());
+    static TOKIO_TIME_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"tokio::time::(interval|sleep)\s*\(").unwrap());
 
-    static TABLE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"\.from\s*\(\s*['"](\w+)['"]"#).unwrap());
-    static STORAGE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"storage\s*\(\s*\)\s*\.from\s*\(\s*['"]([^'"]+)['"]"#).unwrap());
-    static URL_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"['"]((https?://[^'"]+)|(\/api\/[^'"]+))['"]"#).unwrap());
-    static FILE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"['"]([^'"]*\.(json|toml|db|sqlite|log|txt|png|jpg|mp3|wav|ogg))['"]"#).unwrap());
-    static RUST_FN_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?:pub\s+)?(?:async\s+)?fn\s+\w+").unwrap());
-    static TS_FN_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?:export\s+)?(?:default\s+)?(?:function|const\s+\w+\s*=\s*(?:async\s+)?\()").unwrap());
+    static TABLE_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r#"\.from\s*\(\s*['"](\w+)['"]"#).unwrap());
+    static STORAGE_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"storage\s*\(\s*\)\s*\.from\s*\(\s*['"]([^'"]+)['"]"#).unwrap()
+    });
+    static URL_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r#"['"]((https?://[^'"]+)|(\/api\/[^'"]+))['"]"#).unwrap());
+    static FILE_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"['"]([^'"]*\.(json|toml|db|sqlite|log|txt|png|jpg|mp3|wav|ogg))['"]"#)
+            .unwrap()
+    });
+    static RUST_FN_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?:pub\s+)?(?:async\s+)?fn\s+\w+").unwrap());
+    static TS_FN_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?:export\s+)?(?:default\s+)?(?:function|const\s+\w+\s*=\s*(?:async\s+)?\()")
+            .unwrap()
+    });
 
     let rust_use_re = &*RUST_USE_RE;
     let rust_mod_re = &*RUST_MOD_RE;
@@ -2315,10 +3003,14 @@ fn extract_import_graph(conn: &Connection, slug: &str, writer_tx: Option<&mpsc::
         file_exports.dedup();
 
         if !file_imports.is_empty() {
-            graph.imports.insert(file_path.clone(), file_imports.clone());
+            graph
+                .imports
+                .insert(file_path.clone(), file_imports.clone());
         }
         if !file_exports.is_empty() {
-            graph.exports.insert(file_path.clone(), file_exports.clone());
+            graph
+                .exports
+                .insert(file_path.clone(), file_exports.clone());
         }
 
         // Spawn/timer detection
@@ -2398,9 +3090,21 @@ fn extract_import_graph(conn: &Connection, slug: &str, writer_tx: Option<&mpsc::
             FileComplexity {
                 lines: content.matches('\n').count() as i64 + 1,
                 functions: fn_count,
-                imports: graph.imports.get(&file_path).map(|v| v.len() as i64).unwrap_or(0),
-                exports: graph.exports.get(&file_path).map(|v| v.len() as i64).unwrap_or(0),
-                spawn_count: graph.spawn_counts.get(&file_path).map(|v| v.len() as i64).unwrap_or(0),
+                imports: graph
+                    .imports
+                    .get(&file_path)
+                    .map(|v| v.len() as i64)
+                    .unwrap_or(0),
+                exports: graph
+                    .exports
+                    .get(&file_path)
+                    .map(|v| v.len() as i64)
+                    .unwrap_or(0),
+                spawn_count: graph
+                    .spawn_counts
+                    .get(&file_path)
+                    .map(|v| v.len() as i64)
+                    .unwrap_or(0),
             },
         );
     }
@@ -2436,14 +3140,28 @@ fn extract_import_graph(conn: &Connection, slug: &str, writer_tx: Option<&mpsc::
             output_json: output,
             model: "mechanical".to_string(),
             elapsed: 0.0,
-        }).map_err(|e| anyhow!("Failed to send SaveStep for import_graph: {e}"))?;
+        })
+        .map_err(|e| anyhow!("Failed to send SaveStep for import_graph: {e}"))?;
     } else {
-        db::save_step(conn, slug, "import_graph", -1, -1, "", &output, "mechanical", 0.0)?;
+        db::save_step(
+            conn,
+            slug,
+            "import_graph",
+            -1,
+            -1,
+            "",
+            &output,
+            "mechanical",
+            0.0,
+        )?;
     }
 
-    info!("Mechanical analysis: {} files with imports, {} IPC bindings, {} spawn sites",
-        graph.imports.len(), graph.ipc_map.len(),
-        graph.spawn_counts.values().map(|v| v.len()).sum::<usize>());
+    info!(
+        "Mechanical analysis: {} files with imports, {} IPC bindings, {} spawn sites",
+        graph.imports.len(),
+        graph.ipc_map.len(),
+        graph.spawn_counts.values().map(|v| v.len()).sum::<usize>()
+    );
 
     Ok(graph)
 }
@@ -2479,8 +3197,14 @@ fn cluster_by_imports(graph: &ImportGraph) -> Vec<Vec<String>> {
             // Rust: module name -> module.rs
             if let Some(target) = file_by_module.get(mod_name) {
                 if target != f {
-                    adjacency.entry(f.clone()).or_default().insert(target.clone());
-                    adjacency.entry(target.clone()).or_default().insert(f.clone());
+                    adjacency
+                        .entry(f.clone())
+                        .or_default()
+                        .insert(target.clone());
+                    adjacency
+                        .entry(target.clone())
+                        .or_default()
+                        .insert(f.clone());
                 }
             }
             // TS/JS relative imports
@@ -2488,8 +3212,14 @@ fn cluster_by_imports(graph: &ImportGraph) -> Vec<Vec<String>> {
                 let last_part = mod_name.rsplit('/').next().unwrap_or("");
                 for candidate in &all_files {
                     if candidate != f && candidate.contains(last_part) {
-                        adjacency.entry(f.clone()).or_default().insert(candidate.clone());
-                        adjacency.entry(candidate.clone()).or_default().insert(f.clone());
+                        adjacency
+                            .entry(f.clone())
+                            .or_default()
+                            .insert(candidate.clone());
+                        adjacency
+                            .entry(candidate.clone())
+                            .or_default()
+                            .insert(f.clone());
                     }
                 }
             }
@@ -2538,4 +3268,97 @@ fn cluster_by_imports(graph: &ImportGraph) -> Vec<Vec<String>> {
     }
 
     final_clusters
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    fn test_node(slug: &str, node_id: &str, depth: i64) -> PyramidNode {
+        PyramidNode {
+            id: node_id.to_string(),
+            slug: slug.to_string(),
+            depth,
+            chunk_index: None,
+            headline: "Test".to_string(),
+            distilled: "Test distilled".to_string(),
+            topics: Vec::new(),
+            corrections: Vec::new(),
+            decisions: Vec::new(),
+            terms: Vec::new(),
+            dead_ends: Vec::new(),
+            self_prompt: String::new(),
+            children: Vec::new(),
+            parent_id: None,
+            superseded_by: None,
+            created_at: String::new(),
+        }
+    }
+
+    async fn setup_resume_test_db() -> Arc<tokio::sync::Mutex<Connection>> {
+        let conn = Connection::open_in_memory().unwrap();
+        db::init_pyramid_db(&conn).unwrap();
+        db::create_slug(
+            &conn,
+            "resume-test",
+            &ContentType::Conversation,
+            "/tmp/resume-test",
+        )
+        .unwrap();
+        Arc::new(tokio::sync::Mutex::new(conn))
+    }
+
+    #[tokio::test]
+    async fn resume_state_marks_step_without_node_as_stale() {
+        let db = setup_resume_test_db().await;
+        {
+            let conn = db.lock().await;
+            db::save_step(
+                &conn,
+                "resume-test",
+                "synth",
+                -1,
+                3,
+                "L3-000",
+                "{\"headline\":\"x\",\"distilled\":\"y\"}",
+                "test-model",
+                0.1,
+            )
+            .unwrap();
+        }
+
+        let state = get_resume_state(&db, "resume-test", "synth", -1, 3, "L3-000")
+            .await
+            .unwrap();
+
+        assert_eq!(state, ResumeState::StaleStep);
+    }
+
+    #[tokio::test]
+    async fn resume_state_marks_step_with_node_as_complete() {
+        let db = setup_resume_test_db().await;
+        {
+            let conn = db.lock().await;
+            db::save_step(
+                &conn,
+                "resume-test",
+                "synth",
+                -1,
+                3,
+                "L3-000",
+                "{\"headline\":\"x\",\"distilled\":\"y\"}",
+                "test-model",
+                0.1,
+            )
+            .unwrap();
+            db::save_node(&conn, &test_node("resume-test", "L3-000", 3), None).unwrap();
+        }
+
+        let state = get_resume_state(&db, "resume-test", "synth", -1, 3, "L3-000")
+            .await
+            .unwrap();
+
+        assert_eq!(state, ResumeState::Complete);
+    }
 }

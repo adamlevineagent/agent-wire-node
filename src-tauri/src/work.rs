@@ -5,7 +5,7 @@
 // Each completed job earns credits for the node operator.
 
 use serde::{Deserialize, Serialize};
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 
 /// A work item received from the server
 #[derive(Debug, Clone, Deserialize)]
@@ -68,7 +68,9 @@ pub async fn poll_work(
         return Err(format!("Work poll returned {}: {}", status, text));
     }
 
-    let body: serde_json::Value = resp.json().await
+    let body: serde_json::Value = resp
+        .json()
+        .await
         .map_err(|e| format!("Work poll parse error: {}", e))?;
 
     // The response has { work: null } when no work available
@@ -115,7 +117,9 @@ pub async fn submit_result(
         return Err(format!("Result submit returned {}: {}", status, text));
     }
 
-    let submit_resp: SubmitResponse = resp.json().await
+    let submit_resp: SubmitResponse = resp
+        .json()
+        .await
         .map_err(|e| format!("Result response parse error: {}", e))?;
 
     Ok(submit_resp)
@@ -141,7 +145,10 @@ pub async fn execute_work(work: &WorkItem) -> WorkResult {
 /// cache_item: HEAD request to URL, check accessibility
 async fn execute_cache_item(payload: &serde_json::Value) -> WorkResult {
     let url = payload.get("url").and_then(|v| v.as_str()).unwrap_or("");
-    let item_id = payload.get("item_id").and_then(|v| v.as_str()).unwrap_or("");
+    let item_id = payload
+        .get("item_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
 
     if url.is_empty() {
         return WorkResult {
@@ -160,12 +167,14 @@ async fn execute_cache_item(payload: &serde_json::Value) -> WorkResult {
     {
         Ok(res) => {
             let status = res.status().as_u16();
-            let content_type = res.headers()
+            let content_type = res
+                .headers()
                 .get("content-type")
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("unknown")
                 .to_string();
-            let content_length: Option<u64> = res.headers()
+            let content_length: Option<u64> = res
+                .headers()
                 .get("content-length")
                 .and_then(|v| v.to_str().ok())
                 .and_then(|v| v.parse().ok());
@@ -196,9 +205,18 @@ async fn execute_cache_item(payload: &serde_json::Value) -> WorkResult {
 
 /// verify_item: SHA-256 hash verification
 fn execute_verify_item(payload: &serde_json::Value) -> WorkResult {
-    let item_id = payload.get("item_id").and_then(|v| v.as_str()).unwrap_or("");
-    let expected_hash = payload.get("content_hash").and_then(|v| v.as_str()).unwrap_or("");
-    let content = payload.get("content").and_then(|v| v.as_str()).unwrap_or("");
+    let item_id = payload
+        .get("item_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let expected_hash = payload
+        .get("content_hash")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let content = payload
+        .get("content")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
 
     let mut hasher = Sha256::new();
     hasher.update(content.as_bytes());
@@ -233,7 +251,8 @@ fn execute_verify_item(payload: &serde_json::Value) -> WorkResult {
 fn execute_grade_contribution(payload: &serde_json::Value) -> WorkResult {
     let title = payload.get("title").and_then(|v| v.as_str()).unwrap_or("");
     let body = payload.get("body").and_then(|v| v.as_str()).unwrap_or("");
-    let entities = payload.get("entities")
+    let entities = payload
+        .get("entities")
         .and_then(|v| v.as_array())
         .map(|a| a.len())
         .unwrap_or(0);
@@ -273,11 +292,15 @@ fn execute_grade_contribution(payload: &serde_json::Value) -> WorkResult {
 /// enrich_item: Fetch URL, extract text, extract entities
 async fn execute_enrich_item(payload: &serde_json::Value) -> WorkResult {
     let url = payload.get("url").and_then(|v| v.as_str()).unwrap_or("");
-    let expected_title = payload.get("expected_title").and_then(|v| v.as_str()).unwrap_or("");
+    let expected_title = payload
+        .get("expected_title")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
 
     // If no URL, fall back to entity extraction on content snippet
     if url.is_empty() {
-        let content = payload.get("content_snippet")
+        let content = payload
+            .get("content_snippet")
             .or_else(|| payload.get("content"))
             .or_else(|| payload.get("body"))
             .and_then(|v| v.as_str())
@@ -380,8 +403,14 @@ async fn execute_enrich_item(payload: &serde_json::Value) -> WorkResult {
 
 /// extract_source_document: Extract text from source documents
 fn execute_extract_source_document(payload: &serde_json::Value) -> WorkResult {
-    let document_id = payload.get("document_id").and_then(|v| v.as_str()).unwrap_or("");
-    let format = payload.get("format").and_then(|v| v.as_str()).unwrap_or("text/markdown");
+    let document_id = payload
+        .get("document_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let format = payload
+        .get("format")
+        .and_then(|v| v.as_str())
+        .unwrap_or("text/markdown");
     let body = payload.get("body").and_then(|v| v.as_str()).unwrap_or("");
 
     if document_id.is_empty() {
@@ -399,7 +428,8 @@ fn execute_extract_source_document(payload: &serde_json::Value) -> WorkResult {
             Ok(pdf_bytes) => {
                 // Basic heuristic: extract printable ASCII sequences from PDF
                 // This is a fallback — proper PDF parsing would use pdf-extract crate
-                let text: String = pdf_bytes.iter()
+                let text: String = pdf_bytes
+                    .iter()
                     .filter(|&&b| b >= 0x20 && b < 0x7f || b == b'\n' || b == b'\r' || b == b'\t')
                     .map(|&b| b as char)
                     .collect();
@@ -435,7 +465,10 @@ fn execute_extract_source_document(payload: &serde_json::Value) -> WorkResult {
     let body_hash = hex::encode(hasher.finalize());
 
     // Word count
-    let word_count = extracted_text.split_whitespace().filter(|s| !s.is_empty()).count();
+    let word_count = extracted_text
+        .split_whitespace()
+        .filter(|s| !s.is_empty())
+        .count();
 
     WorkResult {
         success: true,
@@ -469,7 +502,9 @@ fn strip_html(html: &str) -> String {
             let slice: String = lower_chars[i..i + 7].iter().collect();
             if slice == "<script" {
                 in_script = true;
-            } else if slice == "<style " || (i + 6 < len && lower_chars[i..i + 6].iter().collect::<String>() == "<style") {
+            } else if slice == "<style "
+                || (i + 6 < len && lower_chars[i..i + 6].iter().collect::<String>() == "<style")
+            {
                 in_style = true;
             }
         }
@@ -572,7 +607,9 @@ fn extract_entities(text: &str) -> Vec<serde_json::Value> {
             }
 
             // Clean trailing punctuation
-            let clean = phrase.trim_end_matches(|c: char| !c.is_alphanumeric()).to_string();
+            let clean = phrase
+                .trim_end_matches(|c: char| !c.is_alphanumeric())
+                .to_string();
 
             if clean.len() > 2 && !seen.contains(&clean) {
                 seen.insert(clean.clone());
@@ -602,7 +639,10 @@ fn extract_entities(text: &str) -> Vec<serde_json::Value> {
 
 /// Check if a word starts with a capital letter
 fn is_capitalized(word: &str) -> bool {
-    word.chars().next().map(|c| c.is_uppercase()).unwrap_or(false)
+    word.chars()
+        .next()
+        .map(|c| c.is_uppercase())
+        .unwrap_or(false)
 }
 
 use base64::Engine as _; // needed for base64::engine::general_purpose::STANDARD.decode()

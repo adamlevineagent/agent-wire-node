@@ -9,18 +9,17 @@
 //
 // All routes require bearer token authentication (same as pyramid routes).
 
+use serde::Deserialize;
 use std::sync::Arc;
 use warp::Filter;
 use warp::Reply;
-use serde::Deserialize;
 
+use super::conversation::handle_message;
 use super::{
-    PartnerState, Session, DennisState, BrainState,
-    save_session, load_session, list_sessions,
+    list_sessions, load_session, save_session, BrainState, DennisState, PartnerState, Session,
     BUFFER_HARD_LIMIT,
 };
-use super::conversation::handle_message;
-use crate::http_utils::{ct_eq, Unauthorized, json_error, json_ok};
+use crate::http_utils::{ct_eq, json_error, json_ok, Unauthorized};
 
 // ── Auth middleware ──────────────────────────────────────────────────
 
@@ -30,26 +29,28 @@ fn with_auth_state(
 ) -> impl Filter<Extract = (Arc<PartnerState>,), Error = warp::Rejection> + Clone {
     warp::header::optional::<String>("authorization")
         .and(warp::any().map(move || state.clone()))
-        .and_then(|auth_header: Option<String>, state: Arc<PartnerState>| async move {
-            let token = match auth_header {
-                Some(h) => match h.strip_prefix("Bearer ") {
-                    Some(t) => t.to_string(),
+        .and_then(
+            |auth_header: Option<String>, state: Arc<PartnerState>| async move {
+                let token = match auth_header {
+                    Some(h) => match h.strip_prefix("Bearer ") {
+                        Some(t) => t.to_string(),
+                        None => return Err(warp::reject::custom(Unauthorized)),
+                    },
                     None => return Err(warp::reject::custom(Unauthorized)),
-                },
-                None => return Err(warp::reject::custom(Unauthorized)),
-            };
+                };
 
-            // Read auth token from the pyramid config (shared auth)
-            let auth_token = {
-                let config = state.pyramid.config.read().await;
-                config.auth_token.clone()
-            };
-            if auth_token.is_empty() || !ct_eq(&token, &auth_token) {
-                return Err(warp::reject::custom(Unauthorized));
-            }
+                // Read auth token from the pyramid config (shared auth)
+                let auth_token = {
+                    let config = state.pyramid.config.read().await;
+                    config.auth_token.clone()
+                };
+                if auth_token.is_empty() || !ct_eq(&token, &auth_token) {
+                    return Err(warp::reject::custom(Unauthorized));
+                }
 
-            Ok(state)
-        })
+                Ok(state)
+            },
+        )
 }
 
 // ── Request body types ──────────────────────────────────────────────
@@ -145,7 +146,10 @@ async fn handle_send_message(
             if msg.contains("not found") {
                 Ok(json_error(warp::http::StatusCode::NOT_FOUND, &msg))
             } else {
-                Ok(json_error(warp::http::StatusCode::INTERNAL_SERVER_ERROR, &msg))
+                Ok(json_error(
+                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    &msg,
+                ))
             }
         }
     }
@@ -167,8 +171,14 @@ async fn handle_get_session(
     let db = state.partner_db.lock().await;
     match load_session(&db, &session_id) {
         Ok(Some(session)) => Ok(json_ok(&session)),
-        Ok(None) => Ok(json_error(warp::http::StatusCode::NOT_FOUND, "Session not found")),
-        Err(e) => Ok(json_error(warp::http::StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())),
+        Ok(None) => Ok(json_error(
+            warp::http::StatusCode::NOT_FOUND,
+            "Session not found",
+        )),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
     }
 }
 
@@ -214,10 +224,10 @@ async fn handle_new_session(
         sessions.insert(session_id.clone(), session.clone());
     }
 
-    Ok(warp::reply::with_status(
-        warp::reply::json(&session),
-        warp::http::StatusCode::CREATED,
-    ).into_response())
+    Ok(
+        warp::reply::with_status(warp::reply::json(&session), warp::http::StatusCode::CREATED)
+            .into_response(),
+    )
 }
 
 async fn handle_get_brain(
@@ -238,7 +248,10 @@ async fn handle_get_brain(
             match load_session(&db, &session_id) {
                 Ok(Some(s)) => s,
                 Ok(None) => {
-                    return Ok(json_error(warp::http::StatusCode::NOT_FOUND, "Session not found"));
+                    return Ok(json_error(
+                        warp::http::StatusCode::NOT_FOUND,
+                        "Session not found",
+                    ));
                 }
                 Err(e) => {
                     return Ok(json_error(
@@ -250,7 +263,9 @@ async fn handle_get_brain(
         }
     };
 
-    let buffer_tokens: usize = session.conversation_buffer.iter()
+    let buffer_tokens: usize = session
+        .conversation_buffer
+        .iter()
         .map(|m| m.token_estimate)
         .sum();
 
@@ -271,6 +286,9 @@ async fn handle_list_sessions(
     let db = state.partner_db.lock().await;
     match list_sessions(&db) {
         Ok(sessions) => Ok(json_ok(&sessions)),
-        Err(e) => Ok(json_error(warp::http::StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
     }
 }

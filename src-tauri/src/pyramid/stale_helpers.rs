@@ -19,9 +19,7 @@ use super::config_helper::{config_for_model, estimate_cost};
 use super::llm::{call_model_with_usage, extract_json};
 use super::naming::{headline_from_path, tombstone_headline};
 use super::stale_helpers_upper::resolve_parent_targets_for_node_ids;
-use super::types::{
-    FileStaleResult, PendingMutation, RenameResult, StaleCheckResult,
-};
+use super::types::{FileStaleResult, PendingMutation, RenameResult, StaleCheckResult};
 
 // ── Utility Functions ────────────────────────────────────────────────────────
 
@@ -69,12 +67,7 @@ fn get_file_node_ids(conn: &Connection, slug: &str, file_path: &str) -> Result<V
             rusqlite::params![slug, file_path],
             |row| row.get::<_, String>(0),
         )
-        .with_context(|| {
-            format!(
-                "Failed to get file node_ids for {}:{}",
-                slug, file_path
-            )
-        })?;
+        .with_context(|| format!("Failed to get file node_ids for {}:{}", slug, file_path))?;
 
     let ids: Vec<String> = serde_json::from_str(&json_str)
         .with_context(|| format!("Failed to parse node_ids JSON: {}", json_str))?;
@@ -146,10 +139,9 @@ pub async fn dispatch_file_stale_check(
     let slug_c = slug.clone();
     let batch_c = batch.clone();
 
-    let prompt_sections: Vec<(String, String, String, String)> = tokio::task::spawn_blocking(
-        move || -> Result<Vec<(String, String, String, String)>> {
-            let conn =
-                Connection::open(&db).context("Failed to open DB for file stale check")?;
+    let prompt_sections: Vec<(String, String, String, String)> =
+        tokio::task::spawn_blocking(move || -> Result<Vec<(String, String, String, String)>> {
+            let conn = Connection::open(&db).context("Failed to open DB for file stale check")?;
             let mut sections = Vec::new();
 
             for m in &batch_c {
@@ -214,9 +206,8 @@ pub async fn dispatch_file_stale_check(
             }
 
             Ok(sections)
-        },
-    )
-    .await??;
+        })
+        .await??;
 
     // Check if any sections actually have content to evaluate
     let has_content = prompt_sections
@@ -365,10 +356,7 @@ Output JSON only. Array of objects, one per file:
 /// 4. Write confirmed_stale mutations to WAL for the L1 layer
 ///
 /// NOTE: No LLM stale-check needed — new files are always "stale" by definition.
-pub async fn dispatch_new_file_ingest(
-    batch: Vec<PendingMutation>,
-    db_path: &str,
-) -> Result<()> {
+pub async fn dispatch_new_file_ingest(batch: Vec<PendingMutation>, db_path: &str) -> Result<()> {
     if batch.is_empty() {
         return Ok(());
     }
@@ -472,10 +460,7 @@ pub async fn dispatch_new_file_ingest(
 /// 4. Re-parent children to tombstone
 /// 5. Remove from pyramid_file_hashes
 /// 6. Write confirmed_stale mutations to WAL for parent layer
-pub async fn dispatch_tombstone(
-    batch: Vec<PendingMutation>,
-    db_path: &str,
-) -> Result<()> {
+pub async fn dispatch_tombstone(batch: Vec<PendingMutation>, db_path: &str) -> Result<()> {
     if batch.is_empty() {
         return Ok(());
     }
@@ -618,10 +603,7 @@ pub async fn dispatch_rename_check(
     );
 
     let slug = mutation.slug.clone();
-    let detail = mutation
-        .detail
-        .as_deref()
-        .unwrap_or("{}");
+    let detail = mutation.detail.as_deref().unwrap_or("{}");
 
     // Parse detail JSON to get old_path and new_path
     let detail_json: serde_json::Value =
@@ -645,27 +627,26 @@ pub async fn dispatch_rename_check(
     let old_path_c = old_path.clone();
     let new_path_c = new_path.clone();
 
-    let (old_distilled, new_content_head) = tokio::task::spawn_blocking(move || -> Result<(String, String)> {
-        let conn = Connection::open(&db)
-            .context("Failed to open DB for rename check")?;
+    let (old_distilled, new_content_head) =
+        tokio::task::spawn_blocking(move || -> Result<(String, String)> {
+            let conn = Connection::open(&db).context("Failed to open DB for rename check")?;
 
-        // Look up old node content
-        let node_ids = get_file_node_ids(&conn, &slug_c, &old_path_c)
-            .unwrap_or_default();
+            // Look up old node content
+            let node_ids = get_file_node_ids(&conn, &slug_c, &old_path_c).unwrap_or_default();
 
-        let old_distilled = node_ids
-            .first()
-            .and_then(|nid| get_node_content(&conn, &slug_c, nid).ok())
-            .unwrap_or_else(|| format!("(no pyramid content found for {})", old_path_c));
+            let old_distilled = node_ids
+                .first()
+                .and_then(|nid| get_node_content(&conn, &slug_c, nid).ok())
+                .unwrap_or_else(|| format!("(no pyramid content found for {})", old_path_c));
 
-        // Read new file (first 200 lines)
-        let new_content = read_file_content(&new_path_c).unwrap_or_default();
-        let head_lines: Vec<&str> = new_content.lines().take(200).collect();
-        let new_content_head = head_lines.join("\n");
+            // Read new file (first 200 lines)
+            let new_content = read_file_content(&new_path_c).unwrap_or_default();
+            let head_lines: Vec<&str> = new_content.lines().take(200).collect();
+            let new_content_head = head_lines.join("\n");
 
-        Ok((old_distilled, new_content_head))
-    })
-    .await??;
+            Ok((old_distilled, new_content_head))
+        })
+        .await??;
 
     // Build Template 4 prompt
     let system_prompt = "\
@@ -770,12 +751,13 @@ Output JSON only:
                 );
 
                 // Insert new L0 node
+                let headline = headline_from_path(&new_path_c).unwrap_or_else(|| "Renamed File".to_string());
                 conn.execute(
                     "INSERT OR REPLACE INTO pyramid_nodes
-                     (id, slug, depth, chunk_index, distilled, topics, corrections, decisions,
+                     (id, slug, depth, chunk_index, headline, distilled, topics, corrections, decisions,
                       terms, dead_ends, self_prompt, children, parent_id, build_version, created_at)
-                     VALUES (?1, ?2, 0, NULL, ?3, '[]', '[]', '[]', '[]', '[]', '', '[]', NULL, 1, ?4)",
-                    rusqlite::params![new_node_id, slug_c, distilled, now],
+                     VALUES (?1, ?2, 0, NULL, ?3, ?4, '[]', '[]', '[]', '[]', '[]', '', '[]', NULL, 1, ?5)",
+                    rusqlite::params![new_node_id, slug_c, headline, distilled, now],
                 )?;
 
                 // Supersede all old nodes
@@ -914,12 +896,13 @@ Output JSON only:
                     distilled_lines.join("\n")
                 );
 
+                let headline = headline_from_path(&new_path_c).unwrap_or_else(|| "New File".to_string());
                 conn.execute(
                     "INSERT OR REPLACE INTO pyramid_nodes
-                     (id, slug, depth, chunk_index, distilled, topics, corrections, decisions,
+                     (id, slug, depth, chunk_index, headline, distilled, topics, corrections, decisions,
                       terms, dead_ends, self_prompt, children, parent_id, build_version, created_at)
-                     VALUES (?1, ?2, 0, NULL, ?3, '[]', '[]', '[]', '[]', '[]', '', '[]', NULL, 1, ?4)",
-                    rusqlite::params![new_node_id, slug_c, distilled, now],
+                     VALUES (?1, ?2, 0, NULL, ?3, ?4, '[]', '[]', '[]', '[]', '[]', '', '[]', NULL, 1, ?5)",
+                    rusqlite::params![new_node_id, slug_c, headline, distilled, now],
                 )?;
 
                 let node_ids_json = serde_json::to_string(&vec![&new_node_id])?;

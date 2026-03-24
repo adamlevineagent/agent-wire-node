@@ -8,10 +8,10 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WireMessage {
     pub id: String,
-    pub sender_type: String,    // "system" | "admin" | "operator"
+    pub sender_type: String, // "system" | "admin" | "operator"
     pub subject: Option<String>,
     pub body: String,
-    pub message_type: String,   // "message" | "bug_report" | "announcement" | "market_update"
+    pub message_type: String, // "message" | "bug_report" | "announcement" | "market_update"
     pub read_at: Option<String>,
     pub created_at: String,
     #[serde(default)]
@@ -22,7 +22,9 @@ pub struct WireMessage {
     pub dismissed_at: Option<String>,
 }
 
-fn default_status() -> String { "open".to_string() }
+fn default_status() -> String {
+    "open".to_string()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct NodeSettings {
@@ -34,14 +36,14 @@ pub struct NodeSettings {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthStatus {
-    pub overall: String,   // "healthy" | "warning" | "error"
+    pub overall: String, // "healthy" | "warning" | "error"
     pub checks: Vec<HealthCheck>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthCheck {
     pub name: String,
-    pub status: String,    // "ok" | "warning" | "error"
+    pub status: String, // "ok" | "warning" | "error"
     pub message: String,
 }
 
@@ -166,7 +168,10 @@ pub async fn dismiss_message(
     let client = reqwest::Client::new();
 
     let resp = client
-        .post(&format!("{}/api/v1/node/messages/{}/dismiss", api_url, message_id))
+        .post(&format!(
+            "{}/api/v1/node/messages/{}/dismiss",
+            api_url, message_id
+        ))
         .header("Authorization", format!("Bearer {}", access_token))
         .timeout(std::time::Duration::from_secs(10))
         .send()
@@ -208,7 +213,10 @@ pub async fn check_health(
         checks.push(HealthCheck {
             name: "Disk Space".into(),
             status: "error".into(),
-            message: format!("Cache {:.0}% full - consider increasing storage cap", usage_pct),
+            message: format!(
+                "Cache {:.0}% full - consider increasing storage cap",
+                usage_pct
+            ),
         });
     } else if usage_pct > 80.0 {
         checks.push(HealthCheck {

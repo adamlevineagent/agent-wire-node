@@ -4,26 +4,28 @@
 // Routes delegate to query:: and slug:: modules for actual logic.
 // Auto-stale endpoints (Phase 5/6) handle freeze, breaker, config, cost observatory.
 
+use rusqlite::Connection;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use tokio::sync::Mutex;
 use warp::Filter;
 use warp::Reply;
-use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
-use rusqlite::Connection;
 
-use super::PyramidState;
-use super::types::*;
-use super::query;
-use super::slug;
-use super::ingest;
 use super::build::{self, WriteOp};
 use super::db;
 use super::delta;
-use super::webbing;
-use super::meta;
 use super::faq;
+use super::ingest;
+use super::meta;
+use super::query;
+use super::slug;
 use super::stale_engine;
-use crate::http_utils::{ct_eq, Unauthorized, json_error, json_ok};
+use super::types::*;
+use super::vine;
+use super::webbing;
+use super::PyramidState;
+use crate::http_utils::{ct_eq, json_error, json_ok, Unauthorized};
+use std::path::PathBuf;
 
 // ── Auth middleware ──────────────────────────────────────────────────
 
@@ -33,25 +35,27 @@ fn with_auth_state(
 ) -> impl Filter<Extract = (Arc<PyramidState>,), Error = warp::Rejection> + Clone {
     warp::header::optional::<String>("authorization")
         .and(warp::any().map(move || state.clone()))
-        .and_then(|auth_header: Option<String>, state: Arc<PyramidState>| async move {
-            let token = match auth_header {
-                Some(h) => match h.strip_prefix("Bearer ") {
-                    Some(t) => t.to_string(),
+        .and_then(
+            |auth_header: Option<String>, state: Arc<PyramidState>| async move {
+                let token = match auth_header {
+                    Some(h) => match h.strip_prefix("Bearer ") {
+                        Some(t) => t.to_string(),
+                        None => return Err(warp::reject::custom(Unauthorized)),
+                    },
                     None => return Err(warp::reject::custom(Unauthorized)),
-                },
-                None => return Err(warp::reject::custom(Unauthorized)),
-            };
+                };
 
-            let auth_token = {
-                let config = state.config.read().await;
-                config.auth_token.clone()
-            };
-            if auth_token.is_empty() || !ct_eq(&token, &auth_token) {
-                return Err(warp::reject::custom(Unauthorized));
-            }
+                let auth_token = {
+                    let config = state.config.read().await;
+                    config.auth_token.clone()
+                };
+                if auth_token.is_empty() || !ct_eq(&token, &auth_token) {
+                    return Err(warp::reject::custom(Unauthorized));
+                }
 
-            Ok(state)
-        })
+                Ok(state)
+            },
+        )
 }
 
 // ── Request body types ──────────────────────────────────────────────
@@ -88,6 +92,12 @@ struct FaqMatchQuery {
 }
 
 #[derive(Deserialize)]
+struct VineBuildBody {
+    vine_slug: String,
+    jsonl_dirs: Vec<String>,
+}
+
+#[derive(Deserialize)]
 struct ConfigBody {
     openrouter_api_key: Option<String>,
     auth_token: Option<String>,
@@ -114,14 +124,14 @@ struct AutoUpdateConfigBody {
 #[derive(Deserialize)]
 struct StaleLogQuery {
     layer: Option<i32>,
-    stale: Option<String>,   // "yes" or "no"
+    stale: Option<String>, // "yes" or "no"
     limit: Option<i64>,
     offset: Option<i64>,
 }
 
 #[derive(Deserialize)]
 struct CostQuery {
-    window: Option<String>,  // "24h", "7d", "30d"
+    window: Option<String>, // "24h", "7d", "30d"
 }
 
 #[derive(Serialize)]
@@ -554,6 +564,109 @@ pub fn pyramid_routes(
         .and(warp::query::<CostQuery>())
         .and_then(handle_cost));
 
+    // ── Vine Conversation System routes ─────────────────────────────
+
+    // POST /pyramid/vine/build — must come BEFORE :slug param routes
+    let vine_build = route!(prefix
+        .and(warp::path("vine"))
+        .and(warp::path("build"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(with_auth_state(state.clone()))
+        .and(warp::body::json())
+        .and_then(handle_vine_build));
+
+    // GET /pyramid/:slug/vine/bunches
+    let vine_bunches = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("vine"))
+        .and(warp::path("bunches"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_vine_bunches));
+
+    // GET /pyramid/:slug/vine/eras
+    let vine_eras = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("vine"))
+        .and(warp::path("eras"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_vine_eras));
+
+    // GET /pyramid/:slug/vine/decisions
+    let vine_decisions = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("vine"))
+        .and(warp::path("decisions"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_vine_decisions));
+
+    // GET /pyramid/:slug/vine/entities
+    let vine_entities = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("vine"))
+        .and(warp::path("entities"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_vine_entities));
+
+    // GET /pyramid/:slug/vine/threads
+    let vine_threads = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("vine"))
+        .and(warp::path("threads"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_vine_threads));
+
+    // GET /pyramid/:slug/vine/drill
+    let vine_drill = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("vine"))
+        .and(warp::path("drill"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_vine_drill));
+
+    // POST /pyramid/:slug/vine/rebuild-upper
+    let vine_rebuild_upper = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("vine"))
+        .and(warp::path("rebuild-upper"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_vine_rebuild_upper));
+
+    // POST /pyramid/:slug/vine/integrity
+    let vine_integrity = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("vine"))
+        .and(warp::path("integrity"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_vine_integrity));
+
+    // GET /pyramid/:slug/vine/build/status
+    let vine_build_status = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("vine"))
+        .and(warp::path("build"))
+        .and(warp::path("status"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_vine_build_status));
+
     // Combine routes. Box in groups to keep the nested Either type manageable.
     // Each .or().unify() flattens a pair, and .boxed() erases the type.
     let r1 = list_slugs.or(create_slug_route).unify().boxed();
@@ -571,12 +684,21 @@ pub fn pyramid_routes(
     let r13 = faq_match.or(faq_list).unify().boxed();
     let r19 = faq_directory.or(faq_category_drill).unify().boxed();
     // Phase 5 & 6 routes
-    let r14 = auto_update_config_get.or(auto_update_config_post).unify().boxed();
+    let r14 = auto_update_config_get
+        .or(auto_update_config_post)
+        .unify()
+        .boxed();
     let r15 = auto_update_freeze.or(auto_update_unfreeze).unify().boxed();
     let r16 = breaker_resume.or(breaker_build_new).unify().boxed();
     let r17 = auto_update_status.or(stale_log).unify().boxed();
     let r20 = auto_update_l0_sweep;
     let r18 = cost;
+    // Vine routes
+    let r21 = vine_build.or(vine_bunches).unify().boxed();
+    let r22 = vine_eras.or(vine_decisions).unify().boxed();
+    let r23 = vine_entities.or(vine_threads).unify().boxed();
+    let r24 = vine_drill.or(vine_rebuild_upper).unify().boxed();
+    let r25 = vine_integrity.or(vine_build_status).unify().boxed();
 
     // Combine the groups (each is BoxedFilter<(Response,)>)
     let g1 = r1.or(r2).unify().boxed();
@@ -589,17 +711,27 @@ pub fn pyramid_routes(
     let g8 = r15.or(r16).unify().boxed();
     let g9 = r17.or(r18).unify().boxed();
     let g10 = r19.or(r20).unify().boxed();
+    let g11 = r21.or(r22).unify().boxed();
+    let g12 = r23.or(r24).unify().boxed();
+    let g13 = r25;
 
     let h1 = g1.or(g2).unify().boxed();
     let h2 = g3.or(g4).unify().boxed();
     let h3 = g5.or(g6).unify().boxed();
     let h4 = g7.or(g8).unify().boxed();
     let h5 = g9.or(g10).unify().boxed();
+    let h6 = g11.or(g12).unify().boxed();
+    let h7 = g13;
 
-    let top = h1.or(h2).unify().boxed();
-    let top2 = top.or(h3).unify().boxed();
-    let top3 = top2.or(h4).unify().boxed();
-    top3.or(h5).unify().boxed()
+    // CRITICAL: Vine routes (h6, h7) with literal "vine" path segments MUST come
+    // BEFORE slug-parameterized routes, otherwise "vine" gets captured as a :slug param.
+    let top = h6.or(h7).unify().boxed(); // Vine routes first (literal paths)
+    let top2 = top.or(h1).unify().boxed(); // Then everything else
+    let top3 = top2.or(h2).unify().boxed();
+    let top4 = top3.or(h3).unify().boxed();
+    let top5 = top4.or(h4).unify().boxed();
+    let top6 = top5.or(h5).unify().boxed();
+    top6
 }
 
 // ── Route handlers ──────────────────────────────────────────────────
@@ -610,7 +742,10 @@ async fn handle_list_slugs(
     let conn = state.reader.lock().await;
     match slug::list_slugs(&conn) {
         Ok(slugs) => Ok(json_ok(&slugs)),
-        Err(e) => Ok(json_error(warp::http::StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
     }
 }
 
@@ -623,7 +758,8 @@ async fn handle_create_slug(
         Ok(info) => Ok(warp::reply::with_status(
             warp::reply::json(&info),
             warp::http::StatusCode::CREATED,
-        ).into_response()),
+        )
+        .into_response()),
         Err(e) => {
             let msg = e.to_string();
             if msg.contains("already exists") {
@@ -654,8 +790,14 @@ async fn handle_apex(
             );
             Ok(response)
         }
-        Ok(None) => Ok(json_error(warp::http::StatusCode::NOT_FOUND, "No apex node found")),
-        Err(e) => Ok(json_error(warp::http::StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())),
+        Ok(None) => Ok(json_error(
+            warp::http::StatusCode::NOT_FOUND,
+            "No apex node found",
+        )),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
     }
 }
 
@@ -679,8 +821,14 @@ async fn handle_node(
             );
             Ok(response)
         }
-        Ok(None) => Ok(json_error(warp::http::StatusCode::NOT_FOUND, "Node not found")),
-        Err(e) => Ok(json_error(warp::http::StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())),
+        Ok(None) => Ok(json_error(
+            warp::http::StatusCode::NOT_FOUND,
+            "Node not found",
+        )),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
     }
 }
 
@@ -691,7 +839,10 @@ async fn handle_tree(
     let conn = state.reader.lock().await;
     match query::get_tree(&conn, &slug_name) {
         Ok(tree) => Ok(json_ok(&tree)),
-        Err(e) => Ok(json_error(warp::http::StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
     }
 }
 
@@ -719,8 +870,14 @@ async fn handle_drill(
             );
             Ok(response)
         }
-        Ok(None) => Ok(json_error(warp::http::StatusCode::NOT_FOUND, "Node not found")),
-        Err(e) => Ok(json_error(warp::http::StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())),
+        Ok(None) => Ok(json_error(
+            warp::http::StatusCode::NOT_FOUND,
+            "Node not found",
+        )),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
     }
 }
 
@@ -745,7 +902,10 @@ async fn handle_search(
             );
             Ok(response)
         }
-        Err(e) => Ok(json_error(warp::http::StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
     }
 }
 
@@ -758,7 +918,10 @@ async fn handle_usage(
     let conn = state.reader.lock().await;
     match db::get_usage_log(&conn, &slug_name, limit) {
         Ok(entries) => Ok(json_ok(&entries)),
-        Err(e) => Ok(json_error(warp::http::StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
     }
 }
 
@@ -769,7 +932,10 @@ async fn handle_entities(
     let conn = state.reader.lock().await;
     match query::entities(&conn, &slug_name) {
         Ok(entries) => Ok(json_ok(&entries)),
-        Err(e) => Ok(json_error(warp::http::StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
     }
 }
 
@@ -780,7 +946,10 @@ async fn handle_resolved(
     let conn = state.reader.lock().await;
     match query::resolved(&conn, &slug_name) {
         Ok(entries) => Ok(json_ok(&entries)),
-        Err(e) => Ok(json_error(warp::http::StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
     }
 }
 
@@ -791,7 +960,10 @@ async fn handle_corrections(
     let conn = state.reader.lock().await;
     match query::corrections(&conn, &slug_name) {
         Ok(entries) => Ok(json_ok(&entries)),
-        Err(e) => Ok(json_error(warp::http::StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
     }
 }
 
@@ -802,7 +974,10 @@ async fn handle_terms(
     let conn = state.reader.lock().await;
     match query::terms(&conn, &slug_name) {
         Ok(entries) => Ok(json_ok(&entries)),
-        Err(e) => Ok(json_error(warp::http::StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
     }
 }
 
@@ -816,7 +991,10 @@ async fn handle_build(
         match slug::get_slug(&conn, &slug_name) {
             Ok(Some(_)) => {}
             Ok(None) => {
-                return Ok(json_error(warp::http::StatusCode::NOT_FOUND, "Slug not found"));
+                return Ok(json_error(
+                    warp::http::StatusCode::NOT_FOUND,
+                    "Slug not found",
+                ));
             }
             Err(e) => {
                 return Ok(json_error(
@@ -902,21 +1080,36 @@ async fn handle_build(
                     let result = {
                         let conn = writer_conn.lock().await;
                         match op {
-                            WriteOp::SaveNode { ref node, ref topics_json } => {
-                                db::save_node(&conn, node, topics_json.as_deref())
-                            }
+                            WriteOp::SaveNode {
+                                ref node,
+                                ref topics_json,
+                            } => db::save_node(&conn, node, topics_json.as_deref()),
                             WriteOp::SaveStep {
-                                ref slug, ref step_type, chunk_index, depth,
-                                ref node_id, ref output_json, ref model, elapsed,
-                            } => {
-                                db::save_step(&conn, slug, step_type, chunk_index, depth, node_id, output_json, model, elapsed)
-                            }
-                            WriteOp::UpdateParent { ref slug, ref node_id, ref parent_id } => {
-                                db::update_parent(&conn, slug, node_id, parent_id)
-                            }
-                            WriteOp::UpdateStats { ref slug } => {
-                                db::update_slug_stats(&conn, slug)
-                            }
+                                ref slug,
+                                ref step_type,
+                                chunk_index,
+                                depth,
+                                ref node_id,
+                                ref output_json,
+                                ref model,
+                                elapsed,
+                            } => db::save_step(
+                                &conn,
+                                slug,
+                                step_type,
+                                chunk_index,
+                                depth,
+                                node_id,
+                                output_json,
+                                model,
+                                elapsed,
+                            ),
+                            WriteOp::UpdateParent {
+                                ref slug,
+                                ref node_id,
+                                ref parent_id,
+                            } => db::update_parent(&conn, slug, node_id, parent_id),
+                            WriteOp::UpdateStats { ref slug } => db::update_slug_stats(&conn, slug),
                         }
                     };
                     if let Err(e) = result {
@@ -942,18 +1135,44 @@ async fn handle_build(
         let result = match content_type {
             ContentType::Conversation => {
                 build::build_conversation(
-                    reader.clone(), &write_tx, &llm_config, &slug_name, &cancel, &progress_tx,
-                ).await
+                    reader.clone(),
+                    &write_tx,
+                    &llm_config,
+                    &slug_name,
+                    &cancel,
+                    &progress_tx,
+                )
+                .await
             }
             ContentType::Code => {
                 build::build_code(
-                    reader.clone(), &write_tx, &llm_config, &slug_name, &cancel, &progress_tx,
-                ).await
+                    reader.clone(),
+                    &write_tx,
+                    &llm_config,
+                    &slug_name,
+                    &cancel,
+                    &progress_tx,
+                )
+                .await
             }
             ContentType::Document => {
                 build::build_docs(
-                    reader.clone(), &write_tx, &llm_config, &slug_name, &cancel, &progress_tx,
-                ).await
+                    reader.clone(),
+                    &write_tx,
+                    &llm_config,
+                    &slug_name,
+                    &cancel,
+                    &progress_tx,
+                )
+                .await
+            }
+            ContentType::Vine => {
+                tracing::error!(
+                    "Vine builds use POST /pyramid/vine/build, not the standard build endpoint"
+                );
+                Err(anyhow::anyhow!(
+                    "Use POST /pyramid/vine/build for vine pyramids"
+                ))
             }
         };
 
@@ -981,27 +1200,31 @@ async fn handle_build(
                         } else {
                             s.status = "complete".to_string();
                         }
-                        s.progress = super::types::BuildProgress { done: s.progress.total, total: s.progress.total };
+                        s.progress = super::types::BuildProgress {
+                            done: s.progress.total,
+                            total: s.progress.total,
+                        };
                     }
                     Err(ref e) => {
                         s.status = "failed".to_string();
-                        s.progress = super::types::BuildProgress { done: s.progress.total, total: s.progress.total };
+                        s.progress = super::types::BuildProgress {
+                            done: s.progress.total,
+                            total: s.progress.total,
+                        };
                         tracing::error!("Build failed for '{}': {e}", slug_name);
                     }
                 }
             }
             s.elapsed_seconds = start.elapsed().as_secs_f64();
         }
-
     });
 
     // Return initial status
     let s = status.read().await;
-    Ok(warp::reply::with_status(
-        warp::reply::json(&*s),
-        warp::http::StatusCode::ACCEPTED,
+    Ok(
+        warp::reply::with_status(warp::reply::json(&*s), warp::http::StatusCode::ACCEPTED)
+            .into_response(),
     )
-    .into_response())
 }
 
 async fn handle_build_status(
@@ -1054,7 +1277,10 @@ async fn handle_ingest(
         match slug::get_slug(&conn, &slug_name) {
             Ok(Some(info)) => info,
             Ok(None) => {
-                return Ok(json_error(warp::http::StatusCode::NOT_FOUND, "Slug not found"));
+                return Ok(json_error(
+                    warp::http::StatusCode::NOT_FOUND,
+                    "Slug not found",
+                ));
             }
             Err(e) => {
                 return Ok(json_error(
@@ -1070,8 +1296,8 @@ async fn handle_ingest(
     let slug_clone = slug_name.clone();
 
     // Parse source_path as JSON array, falling back to single-path for backward compat
-    let paths: Vec<String> = serde_json::from_str(&source_path)
-        .unwrap_or_else(|_| vec![source_path.clone()]);
+    let paths: Vec<String> =
+        serde_json::from_str(&source_path).unwrap_or_else(|_| vec![source_path.clone()]);
 
     // Run synchronous ingest on a blocking thread
     let writer = state.writer.clone();
@@ -1080,9 +1306,20 @@ async fn handle_ingest(
         for path_str in &paths {
             let path = std::path::Path::new(path_str);
             match content_type {
-                ContentType::Code => { let _ = ingest::ingest_code(&conn, &slug_clone, path)?; }
-                ContentType::Conversation => { ingest::ingest_conversation(&conn, &slug_clone, path)?; }
-                ContentType::Document => { let _ = ingest::ingest_docs(&conn, &slug_clone, path)?; }
+                ContentType::Code => {
+                    let _ = ingest::ingest_code(&conn, &slug_clone, path)?;
+                }
+                ContentType::Conversation => {
+                    ingest::ingest_conversation(&conn, &slug_clone, path)?;
+                }
+                ContentType::Document => {
+                    let _ = ingest::ingest_docs(&conn, &slug_clone, path)?;
+                }
+                ContentType::Vine => {
+                    return Err(anyhow::anyhow!(
+                        "Use POST /pyramid/vine/build for vine ingestion"
+                    ));
+                }
             }
         }
         Ok::<String, anyhow::Error>(slug_clone)
@@ -1180,7 +1417,10 @@ async fn handle_delete_slug(
             if msg.contains("not found") {
                 Ok(json_error(warp::http::StatusCode::NOT_FOUND, &msg))
             } else {
-                Ok(json_error(warp::http::StatusCode::INTERNAL_SERVER_ERROR, &msg))
+                Ok(json_error(
+                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    &msg,
+                ))
             }
         }
     }
@@ -1193,7 +1433,10 @@ async fn handle_threads(
     let conn = state.reader.lock().await;
     match db::get_threads(&conn, &slug_name) {
         Ok(threads) => Ok(json_ok(&threads)),
-        Err(e) => Ok(json_error(warp::http::StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
     }
 }
 
@@ -1208,7 +1451,10 @@ async fn handle_annotate(
         match slug::get_slug(&conn, &slug_name) {
             Ok(Some(_)) => {}
             Ok(None) => {
-                return Ok(json_error(warp::http::StatusCode::NOT_FOUND, "Slug not found"));
+                return Ok(json_error(
+                    warp::http::StatusCode::NOT_FOUND,
+                    "Slug not found",
+                ));
             }
             Err(e) => {
                 return Ok(json_error(
@@ -1268,19 +1514,23 @@ async fn handle_annotate(
 
     tokio::spawn(async move {
         if let Err(e) = process_annotation_hook(
-            &reader_clone, &writer_clone,
-            &slug_clone, &annotation_clone,
-            &api_key, &model,
-        ).await {
+            &reader_clone,
+            &writer_clone,
+            &slug_clone,
+            &annotation_clone,
+            &api_key,
+            &model,
+        )
+        .await
+        {
             tracing::warn!("[annotation] post-save hook failed: {}", e);
         }
     });
 
-    Ok(warp::reply::with_status(
-        warp::reply::json(&saved),
-        warp::http::StatusCode::CREATED,
+    Ok(
+        warp::reply::with_status(warp::reply::json(&saved), warp::http::StatusCode::CREATED)
+            .into_response(),
     )
-    .into_response())
 }
 
 /// Background hook that runs after an annotation is saved.
@@ -1303,7 +1553,9 @@ async fn process_annotation_hook(
             };
 
             // Find the thread whose canonical node matches the annotated node
-            let target_thread = threads.iter().find(|t| t.current_canonical_id == annotation.node_id);
+            let target_thread = threads
+                .iter()
+                .find(|t| t.current_canonical_id == annotation.node_id);
 
             if let Some(thread) = target_thread {
                 let delta_content = format!(
@@ -1312,16 +1564,22 @@ async fn process_annotation_hook(
                 );
 
                 delta::create_delta(
-                    reader, writer, slug,
+                    reader,
+                    writer,
+                    slug,
                     &thread.thread_id,
                     &delta_content,
                     Some(&annotation.node_id),
                     api_key,
                     model,
-                ).await?;
+                )
+                .await?;
 
-                tracing::info!("[annotation] correction annotation #{} created delta on thread '{}'",
-                    annotation.id, thread.thread_id);
+                tracing::info!(
+                    "[annotation] correction annotation #{} created delta on thread '{}'",
+                    annotation.id,
+                    thread.thread_id
+                );
             } else {
                 tracing::info!("[annotation] correction annotation #{} on node '{}' — no matching thread found, skipping delta",
                     annotation.id, annotation.node_id);
@@ -1330,39 +1588,91 @@ async fn process_annotation_hook(
 
         AnnotationType::Observation | AnnotationType::Idea => {
             // Observations and ideas flag the thread for review
-            tracing::info!("[annotation] {} annotation #{} on node '{}' — logged for FAQ processing",
-                annotation.annotation_type.as_str(), annotation.id, annotation.node_id);
+            tracing::info!(
+                "[annotation] {} annotation #{} on node '{}' — logged for FAQ processing",
+                annotation.annotation_type.as_str(),
+                annotation.id,
+                annotation.node_id
+            );
         }
 
         AnnotationType::Question => {
             // Questions get processed by the FAQ system (separate workstream)
-            tracing::info!("[annotation] question annotation #{} on node '{}' — logged for FAQ processing",
-                annotation.id, annotation.node_id);
+            tracing::info!(
+                "[annotation] question annotation #{} on node '{}' — logged for FAQ processing",
+                annotation.id,
+                annotation.node_id
+            );
         }
 
         AnnotationType::Friction => {
             // Friction is logged but doesn't trigger deltas
-            tracing::info!("[annotation] friction annotation #{} on node '{}' — logged",
-                annotation.id, annotation.node_id);
+            tracing::info!(
+                "[annotation] friction annotation #{} on node '{}' — logged",
+                annotation.id,
+                annotation.node_id
+            );
+        }
+
+        AnnotationType::Era => {
+            // ERA annotations mark project phase boundaries on vine nodes
+            tracing::info!(
+                "[annotation] ERA annotation #{} on node '{}' — vine intelligence",
+                annotation.id,
+                annotation.node_id
+            );
+        }
+
+        AnnotationType::Transition => {
+            // Transition annotations classify phase shifts between ERAs
+            tracing::info!(
+                "[annotation] transition annotation #{} on node '{}' — vine intelligence",
+                annotation.id,
+                annotation.node_id
+            );
+        }
+
+        AnnotationType::HealthCheck => {
+            // Health check results from vine integrity pass
+            tracing::info!(
+                "[annotation] health_check annotation #{} on node '{}' — vine integrity",
+                annotation.id,
+                annotation.node_id
+            );
+        }
+
+        AnnotationType::Directory => {
+            // Sub-apex directory wiring for vine navigation
+            tracing::info!(
+                "[annotation] directory annotation #{} on node '{}' — vine directory",
+                annotation.id,
+                annotation.node_id
+            );
         }
     }
 
     // FAQ processing — for any annotation with question_context
     if annotation.question_context.is_some() {
-        match faq::process_annotation(
-            reader, writer, slug, annotation, api_key, model
-        ).await {
+        match faq::process_annotation(reader, writer, slug, annotation, api_key, model).await {
             Ok(Some(faq_node)) => {
                 tracing::info!(
                     "[annotation] FAQ processed: annotation #{} → FAQ '{}'",
-                    annotation.id, faq_node.id
+                    annotation.id,
+                    faq_node.id
                 );
             }
             Ok(None) => {
-                tracing::debug!("[annotation] no FAQ generated for annotation #{}", annotation.id);
+                tracing::debug!(
+                    "[annotation] no FAQ generated for annotation #{}",
+                    annotation.id
+                );
             }
             Err(e) => {
-                tracing::warn!("[annotation] FAQ processing failed for annotation #{}: {}", annotation.id, e);
+                tracing::warn!(
+                    "[annotation] FAQ processing failed for annotation #{}: {}",
+                    annotation.id,
+                    e
+                );
             }
         }
     }
@@ -1397,7 +1707,10 @@ async fn handle_edges(
     let conn = state.reader.lock().await;
     match webbing::get_active_edges(&conn, &slug_name, 0.1) {
         Ok(edges) => Ok(json_ok(&edges)),
-        Err(e) => Ok(json_error(warp::http::StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
     }
 }
 
@@ -1411,7 +1724,10 @@ async fn handle_meta_run(
         match slug::get_slug(&conn, &slug_name) {
             Ok(Some(_)) => {}
             Ok(None) => {
-                return Ok(json_error(warp::http::StatusCode::NOT_FOUND, "Slug not found"));
+                return Ok(json_error(
+                    warp::http::StatusCode::NOT_FOUND,
+                    "Slug not found",
+                ));
             }
             Err(e) => {
                 return Ok(json_error(
@@ -1451,7 +1767,10 @@ async fn handle_meta_read(
     let conn = state.reader.lock().await;
     match meta::get_meta_nodes(&conn, &slug_name) {
         Ok(nodes) => Ok(json_ok(&nodes)),
-        Err(e) => Ok(json_error(warp::http::StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
     }
 }
 
@@ -1464,7 +1783,10 @@ async fn handle_list_faq(
     let conn = state.reader.lock().await;
     match db::get_faq_nodes(&conn, &slug_name) {
         Ok(faqs) => Ok(json_ok(&faqs)),
-        Err(e) => Ok(json_error(warp::http::StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
     }
 }
 
@@ -1478,10 +1800,22 @@ async fn handle_match_faq(
     let model = config.primary_model.clone();
     drop(config);
 
-    match faq::match_faq(&state.reader, &state.writer, &slug_name, &params.q, &api_key, &model).await {
+    match faq::match_faq(
+        &state.reader,
+        &state.writer,
+        &slug_name,
+        &params.q,
+        &api_key,
+        &model,
+    )
+    .await
+    {
         Ok(Some(faq_node)) => Ok(json_ok(&faq_node)),
         Ok(None) => Ok(json_ok(&serde_json::json!(null))),
-        Err(e) => Ok(json_error(warp::http::StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
     }
 }
 
@@ -1498,7 +1832,10 @@ async fn handle_faq_directory(
 
     match faq::get_faq_directory(&state.reader, &state.writer, &slug_name, &api_key, &model).await {
         Ok(directory) => Ok(json_ok(&directory)),
-        Err(e) => Ok(json_error(warp::http::StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
     }
 }
 
@@ -1514,7 +1851,10 @@ async fn handle_faq_category_drill(
             if msg.contains("not found") {
                 Ok(json_error(warp::http::StatusCode::NOT_FOUND, &msg))
             } else {
-                Ok(json_error(warp::http::StatusCode::INTERNAL_SERVER_ERROR, &msg))
+                Ok(json_error(
+                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    &msg,
+                ))
             }
         }
     }
@@ -1575,7 +1915,10 @@ async fn handle_auto_update_config_post(
 
     if let Some(d) = body.debounce_minutes {
         if d < 1 {
-            return Ok(json_error(warp::http::StatusCode::BAD_REQUEST, "debounce_minutes must be >= 1"));
+            return Ok(json_error(
+                warp::http::StatusCode::BAD_REQUEST,
+                "debounce_minutes must be >= 1",
+            ));
         }
         sets.push(format!("debounce_minutes = ?{}", params.len() + 1));
         params.push(Box::new(d));
@@ -1586,7 +1929,10 @@ async fn handle_auto_update_config_post(
     }
     if let Some(r) = body.runaway_threshold {
         if r <= 0.0 || r > 1.0 {
-            return Ok(json_error(warp::http::StatusCode::BAD_REQUEST, "runaway_threshold must be > 0.0 and <= 1.0"));
+            return Ok(json_error(
+                warp::http::StatusCode::BAD_REQUEST,
+                "runaway_threshold must be > 0.0 and <= 1.0",
+            ));
         }
         sets.push(format!("runaway_threshold = ?{}", params.len() + 1));
         params.push(Box::new(r));
@@ -1597,7 +1943,10 @@ async fn handle_auto_update_config_post(
     }
 
     if sets.is_empty() {
-        return Ok(json_error(warp::http::StatusCode::BAD_REQUEST, "No fields to update"));
+        return Ok(json_error(
+            warp::http::StatusCode::BAD_REQUEST,
+            "No fields to update",
+        ));
     }
 
     let slug_idx = params.len() + 1;
@@ -1621,7 +1970,10 @@ async fn handle_auto_update_config_post(
                 None => Ok(json_ok(&serde_json::json!({"status": "updated"}))),
             }
         }
-        Err(e) => Ok(json_error(warp::http::StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
     }
 }
 
@@ -1652,7 +2004,9 @@ async fn handle_auto_update_freeze(
         watcher.pause();
     }
 
-    Ok(json_ok(&serde_json::json!({"status": "frozen", "slug": slug_name})))
+    Ok(json_ok(
+        &serde_json::json!({"status": "frozen", "slug": slug_name}),
+    ))
 }
 
 /// POST /pyramid/:slug/auto-update/unfreeze
@@ -1676,7 +2030,9 @@ async fn handle_auto_update_unfreeze(
     drop(engines);
 
     // Resume file watcher (repopulates caches from DB)
-    let db_path = state.data_dir.as_ref()
+    let db_path = state
+        .data_dir
+        .as_ref()
         .expect("data_dir not set")
         .join("pyramid.db")
         .to_string_lossy()
@@ -1712,15 +2068,14 @@ async fn handle_auto_update_unfreeze(
 /// Rescan all tracked files for a slug, comparing current hashes against stored hashes.
 /// Writes `file_change` mutations for any differences. Returns count of mutations written.
 fn hash_rescan(conn: &Connection, slug: &str) -> i64 {
-    use sha2::{Digest, Sha256};
     use hex;
+    use sha2::{Digest, Sha256};
 
-    let mut stmt = match conn.prepare(
-        "SELECT file_path, hash FROM pyramid_file_hashes WHERE slug = ?1"
-    ) {
-        Ok(s) => s,
-        Err(_) => return 0,
-    };
+    let mut stmt =
+        match conn.prepare("SELECT file_path, hash FROM pyramid_file_hashes WHERE slug = ?1") {
+            Ok(s) => s,
+            Err(_) => return 0,
+        };
 
     let rows: Vec<(String, String)> = stmt
         .query_map(rusqlite::params![slug], |row| {
@@ -1770,9 +2125,9 @@ fn hash_rescan(conn: &Connection, slug: &str) -> i64 {
 /// Force a full L0 sweep by enqueueing one pending mutation for every tracked file
 /// that is not already waiting in the WAL.
 pub fn enqueue_full_l0_sweep(conn: &Connection, slug: &str) -> (i64, i64, i64) {
-    let mut stmt = match conn.prepare(
-        "SELECT file_path FROM pyramid_file_hashes WHERE slug = ?1 ORDER BY file_path ASC"
-    ) {
+    let mut stmt = match conn
+        .prepare("SELECT file_path FROM pyramid_file_hashes WHERE slug = ?1 ORDER BY file_path ASC")
+    {
         Ok(stmt) => stmt,
         Err(_) => return (0, 0, 0),
     };
@@ -1805,7 +2160,11 @@ pub fn enqueue_full_l0_sweep(conn: &Connection, slug: &str) -> (i64, i64, i64) {
         }
 
         let exists_on_disk = std::path::Path::new(file_path).exists();
-        let mutation_type = if exists_on_disk { "file_change" } else { "deleted_file" };
+        let mutation_type = if exists_on_disk {
+            "file_change"
+        } else {
+            "deleted_file"
+        };
         let detail = if exists_on_disk {
             "Forced full L0 sweep"
         } else {
@@ -1832,7 +2191,9 @@ async fn handle_breaker_resume(
     let mut engines = state.stale_engines.lock().await;
     if let Some(engine) = engines.get_mut(&slug_name) {
         engine.resume_breaker();
-        Ok(json_ok(&serde_json::json!({"status": "resumed", "slug": slug_name})))
+        Ok(json_ok(
+            &serde_json::json!({"status": "resumed", "slug": slug_name}),
+        ))
     } else {
         // No engine in memory — update DB directly
         let conn = state.writer.lock().await;
@@ -1840,7 +2201,9 @@ async fn handle_breaker_resume(
             "UPDATE pyramid_auto_update_config SET breaker_tripped = 0, breaker_tripped_at = NULL WHERE slug = ?1",
             rusqlite::params![slug_name],
         );
-        Ok(json_ok(&serde_json::json!({"status": "resumed", "slug": slug_name, "note": "No active engine, breaker cleared in DB"})))
+        Ok(json_ok(
+            &serde_json::json!({"status": "resumed", "slug": slug_name, "note": "No active engine, breaker cleared in DB"}),
+        ))
     }
 }
 
@@ -1856,10 +2219,16 @@ async fn handle_breaker_build_new(
         match slug::get_slug(&conn, &slug_name) {
             Ok(Some(info)) => info,
             Ok(None) => {
-                return Ok(json_error(warp::http::StatusCode::NOT_FOUND, "Slug not found"));
+                return Ok(json_error(
+                    warp::http::StatusCode::NOT_FOUND,
+                    "Slug not found",
+                ));
             }
             Err(e) => {
-                return Ok(json_error(warp::http::StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()));
+                return Ok(json_error(
+                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    &e.to_string(),
+                ));
             }
         }
     };
@@ -1885,10 +2254,18 @@ async fn handle_breaker_build_new(
 
     {
         let conn = state.writer.lock().await;
-        match slug::create_slug(&conn, &new_slug, &slug_info.content_type, &slug_info.source_path) {
+        match slug::create_slug(
+            &conn,
+            &new_slug,
+            &slug_info.content_type,
+            &slug_info.source_path,
+        ) {
             Ok(_) => {}
             Err(e) => {
-                return Ok(json_error(warp::http::StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()));
+                return Ok(json_error(
+                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    &e.to_string(),
+                ));
             }
         }
         // Create auto-update config for the new slug with defaults
@@ -1972,9 +2349,19 @@ async fn handle_stale_log(
     let conn = state.reader.lock().await;
 
     // Bug 3 fix: Delegate to db::get_stale_log instead of duplicating the query inline.
-    match db::get_stale_log(&conn, &slug_name, params.layer, params.stale.as_deref(), limit, offset) {
+    match db::get_stale_log(
+        &conn,
+        &slug_name,
+        params.layer,
+        params.stale.as_deref(),
+        limit,
+        offset,
+    ) {
         Ok(rows) => Ok(json_ok(&rows)),
-        Err(e) => Ok(json_error(warp::http::StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
     }
 }
 
@@ -2001,7 +2388,8 @@ async fn handle_cost(
         .query_row(
             &format!(
                 "SELECT COALESCE(SUM(estimated_cost), 0.0), COUNT(*) FROM pyramid_cost_log
-                 WHERE slug = ?1 {}", window_clause
+                 WHERE slug = ?1 {}",
+                window_clause
             ),
             rusqlite::params![slug_name],
             |row| Ok((row.get(0)?, row.get(1)?)),
@@ -2010,11 +2398,14 @@ async fn handle_cost(
 
     // By source (manual vs auto_stale)
     let by_source = {
-        let mut stmt = conn.prepare(&format!(
-            "SELECT COALESCE(source, 'manual'), COALESCE(SUM(estimated_cost), 0.0), COUNT(*)
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT COALESCE(source, 'manual'), COALESCE(SUM(estimated_cost), 0.0), COUNT(*)
              FROM pyramid_cost_log WHERE slug = ?1 {}
-             GROUP BY COALESCE(source, 'manual')", window_clause
-        )).unwrap();
+             GROUP BY COALESCE(source, 'manual')",
+                window_clause
+            ))
+            .unwrap();
         let rows: Vec<serde_json::Value> = stmt
             .query_map(rusqlite::params![slug_name], |row| {
                 Ok(serde_json::json!({
@@ -2030,11 +2421,13 @@ async fn handle_cost(
 
     // By check_type
     let by_check_type = {
-        let mut stmt = conn.prepare(&format!(
+        let mut stmt = conn
+            .prepare(&format!(
             "SELECT COALESCE(check_type, 'unknown'), COALESCE(SUM(estimated_cost), 0.0), COUNT(*)
              FROM pyramid_cost_log WHERE slug = ?1 {}
              GROUP BY COALESCE(check_type, 'unknown')", window_clause
-        )).unwrap();
+        ))
+            .unwrap();
         let rows: Vec<serde_json::Value> = stmt
             .query_map(rusqlite::params![slug_name], |row| {
                 Ok(serde_json::json!({
@@ -2050,11 +2443,14 @@ async fn handle_cost(
 
     // By layer
     let by_layer = {
-        let mut stmt = conn.prepare(&format!(
-            "SELECT COALESCE(layer, -1), COALESCE(SUM(estimated_cost), 0.0), COUNT(*)
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT COALESCE(layer, -1), COALESCE(SUM(estimated_cost), 0.0), COUNT(*)
              FROM pyramid_cost_log WHERE slug = ?1 {}
-             GROUP BY COALESCE(layer, -1)", window_clause
-        )).unwrap();
+             GROUP BY COALESCE(layer, -1)",
+                window_clause
+            ))
+            .unwrap();
         let rows: Vec<serde_json::Value> = stmt
             .query_map(rusqlite::params![slug_name], |row| {
                 Ok(serde_json::json!({
@@ -2070,12 +2466,15 @@ async fn handle_cost(
 
     // Recent calls (last 20)
     let recent_calls = {
-        let mut stmt = conn.prepare(&format!(
-            "SELECT id, operation, model, input_tokens, output_tokens, estimated_cost,
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT id, operation, model, input_tokens, output_tokens, estimated_cost,
                     COALESCE(source, 'manual'), layer, check_type, created_at
              FROM pyramid_cost_log WHERE slug = ?1 {}
-             ORDER BY created_at DESC LIMIT 20", window_clause
-        )).unwrap();
+             ORDER BY created_at DESC LIMIT 20",
+                window_clause
+            ))
+            .unwrap();
         let rows: Vec<serde_json::Value> = stmt
             .query_map(rusqlite::params![slug_name], |row| {
                 Ok(serde_json::json!({
@@ -2135,26 +2534,29 @@ async fn handle_auto_update_l0_sweep(
         })
     };
 
-    let dispatch_status = if let Some((db_path, api_key, model, semaphore, phase_arc, detail_arc, summary_arc)) = engine_data {
-        for layer in 0..=3 {
-            let _ = stale_engine::drain_and_dispatch(
-                &slug_name,
-                layer,
-                0,
-                &db_path,
-                semaphore.clone(),
-                &api_key,
-                &model,
-                phase_arc.clone(),
-                detail_arc.clone(),
-                summary_arc.clone(),
-            )
-            .await;
-        }
-        "completed"
-    } else {
-        "enqueued_only"
-    };
+    let dispatch_status =
+        if let Some((db_path, api_key, model, semaphore, phase_arc, detail_arc, summary_arc)) =
+            engine_data
+        {
+            for layer in 0..=3 {
+                let _ = stale_engine::drain_and_dispatch(
+                    &slug_name,
+                    layer,
+                    0,
+                    &db_path,
+                    semaphore.clone(),
+                    &api_key,
+                    &model,
+                    phase_arc.clone(),
+                    detail_arc.clone(),
+                    summary_arc.clone(),
+                )
+                .await;
+            }
+            "completed"
+        } else {
+            "enqueued_only"
+        };
 
     Ok(json_ok(&serde_json::json!({
         "status": dispatch_status,
@@ -2163,4 +2565,287 @@ async fn handle_auto_update_l0_sweep(
         "enqueued": enqueued,
         "already_pending": already_pending,
     })))
+}
+
+// ── Vine Conversation System handlers ────────────────────────────────────────
+
+async fn handle_vine_build(
+    state: Arc<PyramidState>,
+    body: VineBuildBody,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let vine_slug = slug::slugify(&body.vine_slug);
+    if let Err(e) = slug::validate_slug(&vine_slug) {
+        return Ok(json_error(
+            warp::http::StatusCode::BAD_REQUEST,
+            &format!("Invalid vine slug: {}", e),
+        ));
+    }
+    let jsonl_dirs: Vec<PathBuf> = body.jsonl_dirs.iter().map(PathBuf::from).collect();
+
+    if jsonl_dirs.is_empty() {
+        return Ok(json_error(
+            warp::http::StatusCode::BAD_REQUEST,
+            "jsonl_dirs must not be empty",
+        ));
+    }
+
+    // Validate all directories exist
+    for dir in &jsonl_dirs {
+        if !dir.is_dir() {
+            return Ok(json_error(
+                warp::http::StatusCode::BAD_REQUEST,
+                &format!("Directory does not exist: {}", dir.display()),
+            ));
+        }
+    }
+
+    // Check if vine_slug already exists — if so, check it's a vine type
+    {
+        let conn = state.reader.lock().await;
+        if let Ok(Some(existing)) = slug::get_slug(&conn, &vine_slug) {
+            if existing.content_type != ContentType::Vine {
+                return Ok(json_error(
+                    warp::http::StatusCode::CONFLICT,
+                    &format!(
+                        "Slug '{}' exists but is not a vine (type: {:?})",
+                        vine_slug, existing.content_type
+                    ),
+                ));
+            }
+        }
+    }
+
+    // Check for concurrent vine build on this slug
+    {
+        let builds = state.vine_builds.lock().await;
+        if let Some(handle) = builds.get(&vine_slug) {
+            if handle.status == "running" {
+                return Ok(json_error(
+                    warp::http::StatusCode::CONFLICT,
+                    &format!("A vine build is already running for '{}'", vine_slug),
+                ));
+            }
+        }
+    }
+
+    // Spawn build in background with its own cancellation token (NOT the global active_build)
+    let cancel = tokio_util::sync::CancellationToken::new();
+
+    // Register the vine build
+    {
+        let mut builds = state.vine_builds.lock().await;
+        builds.insert(
+            vine_slug.clone(),
+            super::VineBuildHandle {
+                cancel: cancel.clone(),
+                status: "running".to_string(),
+                error: None,
+            },
+        );
+    }
+
+    let state_clone = state.clone();
+    let slug_clone = vine_slug.clone();
+    let cancel_clone = cancel.clone();
+
+    tokio::spawn(async move {
+        let (final_status, error_msg) =
+            match vine::build_vine(&state_clone, &slug_clone, &jsonl_dirs, &cancel_clone).await {
+                Ok(apex_id) => {
+                    tracing::info!("Vine build complete for '{}': apex={}", slug_clone, apex_id);
+                    ("complete".to_string(), None)
+                }
+                Err(e) => {
+                    let msg = format!("{:#}", e);
+                    tracing::error!("Vine build failed for '{}': {}", slug_clone, msg);
+                    ("failed".to_string(), Some(msg))
+                }
+            };
+        // Update status when build finishes
+        let mut builds = state_clone.vine_builds.lock().await;
+        if let Some(handle) = builds.get_mut(&slug_clone) {
+            handle.status = final_status;
+            handle.error = error_msg;
+        }
+    });
+
+    Ok(json_ok(&serde_json::json!({
+        "status": "started",
+        "vine_slug": vine_slug,
+        "jsonl_dirs": body.jsonl_dirs,
+    })))
+}
+
+async fn handle_vine_bunches(
+    slug_name: String,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let conn = state.reader.lock().await;
+    match db::list_vine_bunches(&conn, &slug_name) {
+        Ok(bunches) => Ok(json_ok(&bunches)),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
+    }
+}
+
+async fn handle_vine_eras(
+    slug_name: String,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let conn = state.reader.lock().await;
+    match db::get_annotations_by_type(&conn, &slug_name, "era") {
+        Ok(annotations) => Ok(json_ok(&annotations)),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
+    }
+}
+
+async fn handle_vine_decisions(
+    slug_name: String,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let conn = state.reader.lock().await;
+    match db::get_faq_nodes_by_prefix(&conn, &slug_name, "FAQ-vine-decision-") {
+        Ok(faqs) => Ok(json_ok(&faqs)),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
+    }
+}
+
+async fn handle_vine_entities(
+    slug_name: String,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let conn = state.reader.lock().await;
+    match db::get_faq_nodes_by_prefix(&conn, &slug_name, "FAQ-vine-entity-") {
+        Ok(faqs) => Ok(json_ok(&faqs)),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
+    }
+}
+
+async fn handle_vine_threads(
+    slug_name: String,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let conn = state.reader.lock().await;
+    let threads = db::get_threads(&conn, &slug_name);
+    let edges = webbing::get_active_edges(&conn, &slug_name, 0.1);
+    match (threads, edges) {
+        (Ok(t), Ok(e)) => Ok(json_ok(&serde_json::json!({
+            "threads": t,
+            "web_edges": e,
+        }))),
+        (Err(e), _) | (_, Err(e)) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
+    }
+}
+
+async fn handle_vine_drill(
+    slug_name: String,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let conn = state.reader.lock().await;
+    // Read Directory annotations on sub-apex nodes and return as navigation structure
+    let directory_annotations = db::get_annotations_by_type(&conn, &slug_name, "directory");
+    match directory_annotations {
+        Ok(dirs) => {
+            // Build navigation structure from directory annotations
+            let mut nav: Vec<serde_json::Value> = Vec::new();
+            for ann in &dirs {
+                // Parse the content as JSON if possible (directory annotations store structured data)
+                let content_val: serde_json::Value = serde_json::from_str(&ann.content)
+                    .unwrap_or_else(|_| serde_json::Value::String(ann.content.clone()));
+                nav.push(serde_json::json!({
+                    "node_id": ann.node_id,
+                    "content": content_val,
+                    "author": ann.author,
+                    "created_at": ann.created_at,
+                }));
+            }
+            Ok(json_ok(&serde_json::json!({
+                "vine_slug": slug_name,
+                "directory_count": nav.len(),
+                "directories": nav,
+            })))
+        }
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
+    }
+}
+
+async fn handle_vine_rebuild_upper(
+    slug_name: String,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let state_clone = state.clone();
+    let slug_clone = slug_name.clone();
+
+    tokio::spawn(async move {
+        match vine::force_rebuild_vine_upper(&state_clone, &slug_clone, &cancel).await {
+            Ok(apex_id) => {
+                tracing::info!(
+                    "Vine upper rebuild complete for '{}': apex={}",
+                    slug_clone,
+                    apex_id
+                );
+            }
+            Err(e) => {
+                tracing::error!("Vine upper rebuild failed for '{}': {}", slug_clone, e);
+            }
+        }
+    });
+
+    Ok(json_ok(&serde_json::json!({
+        "status": "started",
+        "vine_slug": slug_name,
+        "operation": "rebuild-upper",
+    })))
+}
+
+async fn handle_vine_integrity(
+    slug_name: String,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    match vine::run_integrity_check(&state, &slug_name).await {
+        Ok(summary) => Ok(json_ok(&serde_json::json!({
+            "vine_slug": slug_name,
+            "summary": summary,
+        }))),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
+    }
+}
+
+async fn handle_vine_build_status(
+    slug_name: String,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let builds = state.vine_builds.lock().await;
+    match builds.get(&slug_name) {
+        Some(handle) => Ok(json_ok(&serde_json::json!({
+            "vine_slug": slug_name,
+            "status": handle.status,
+            "error": handle.error,
+        }))),
+        None => Ok(json_ok(&serde_json::json!({
+            "vine_slug": slug_name,
+            "status": "not_found",
+        }))),
+    }
 }

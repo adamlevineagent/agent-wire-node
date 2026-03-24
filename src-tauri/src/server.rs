@@ -1,18 +1,18 @@
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use warp::Filter;
 use warp::Reply;
-use serde::{Serialize, Deserialize};
 
-use crate::credits::CreditTracker;
 use crate::auth::AuthState;
-use crate::sync::SyncState;
-use crate::tunnel;
+use crate::credits::CreditTracker;
+use crate::partner;
 use crate::pyramid;
 use crate::pyramid::stale_engine::PyramidStaleEngine;
 use crate::pyramid::types::AutoUpdateConfig;
 use crate::pyramid::watcher::PyramidFileWatcher;
-use crate::partner;
+use crate::sync::SyncState;
+use crate::tunnel;
 
 /// HTTP server state
 #[derive(Clone)]
@@ -66,11 +66,13 @@ pub async fn init_stale_engines(pyramid_state: &Arc<pyramid::PyramidState>) {
     // WAL cleanup: delete processed mutations older than 30 days
     {
         let conn = pyramid_state.writer.lock().await;
-        let deleted_processed = conn.execute(
-            "DELETE FROM pyramid_pending_mutations
+        let deleted_processed = conn
+            .execute(
+                "DELETE FROM pyramid_pending_mutations
              WHERE processed = 1 AND detected_at < datetime('now', '-30 days')",
-            [],
-        ).unwrap_or(0);
+                [],
+            )
+            .unwrap_or(0);
 
         let deleted_runaway = conn.execute(
             "DELETE FROM pyramid_pending_mutations
@@ -81,7 +83,8 @@ pub async fn init_stale_engines(pyramid_state: &Arc<pyramid::PyramidState>) {
         if deleted_processed > 0 || deleted_runaway > 0 {
             tracing::info!(
                 "WAL cleanup: removed {} processed and {} runaway mutations older than 30 days",
-                deleted_processed, deleted_runaway
+                deleted_processed,
+                deleted_runaway
             );
         }
     }
@@ -107,7 +110,7 @@ pub async fn init_stale_engines(pyramid_state: &Arc<pyramid::PyramidState>) {
         let mut stmt = match conn.prepare(
             "SELECT slug, auto_update, debounce_minutes, min_changed_files,
                     runaway_threshold, breaker_tripped, breaker_tripped_at, frozen, frozen_at
-             FROM pyramid_auto_update_config WHERE auto_update = 1"
+             FROM pyramid_auto_update_config WHERE auto_update = 1",
         ) {
             Ok(s) => s,
             Err(e) => {
@@ -149,14 +152,15 @@ pub async fn init_stale_engines(pyramid_state: &Arc<pyramid::PyramidState>) {
 
         // Frozen pyramids: skip entirely
         if config.frozen {
-            tracing::info!("Pyramid '{}' is frozen — skipping engine and watcher on startup", slug);
+            tracing::info!(
+                "Pyramid '{}' is frozen — skipping engine and watcher on startup",
+                slug
+            );
             continue;
         }
 
         // Create the engine
-        let mut engine = PyramidStaleEngine::new(
-            &slug, config.clone(), &db_path, &api_key, &model,
-        );
+        let mut engine = PyramidStaleEngine::new(&slug, config.clone(), &db_path, &api_key, &model);
 
         // Breaker-tripped: create engine in tripped state, log warning, no watcher
         if config.breaker_tripped {
@@ -184,7 +188,9 @@ pub async fn init_stale_engines(pyramid_state: &Arc<pyramid::PyramidState>) {
                 if count > 0 {
                     tracing::info!(
                         "Pyramid '{}' layer {} has {} unprocessed WAL entries — starting timer",
-                        slug, layer, count
+                        slug,
+                        layer,
+                        count
                     );
                     engine.notify_mutation(layer);
                 }
@@ -201,10 +207,8 @@ pub async fn init_stale_engines(pyramid_state: &Arc<pyramid::PyramidState>) {
             let conn = pyramid_state.reader.lock().await;
             // Get source paths from slug info
             match pyramid::slug::get_slug(&conn, &slug) {
-                Ok(Some(info)) => {
-                    serde_json::from_str(&info.source_path)
-                        .unwrap_or_else(|_| vec![info.source_path.clone()])
-                }
+                Ok(Some(info)) => serde_json::from_str(&info.source_path)
+                    .unwrap_or_else(|_| vec![info.source_path.clone()]),
                 _ => Vec::new(),
             }
         };
@@ -284,25 +288,28 @@ pub async fn start_server(
     let cors = warp::cors()
         .allow_any_origin()
         .allow_methods(vec!["GET", "POST", "DELETE", "OPTIONS"])
-        .allow_headers(vec!["Content-Type", "Range", "Authorization", "Access-Control-Request-Private-Network"]);
+        .allow_headers(vec![
+            "Content-Type",
+            "Range",
+            "Authorization",
+            "Access-Control-Request-Private-Network",
+        ]);
 
     // GET /health
     let health = {
         let state = state.clone();
-        warp::path("health")
-            .and(warp::get())
-            .and_then(move || {
-                let state = state.clone();
-                async move {
-                    let count = count_cached_documents(&state.cache_dir).await;
-                    let resp = HealthResponse {
-                        status: "online".to_string(),
-                        version: env!("CARGO_PKG_VERSION").to_string(),
-                        documents_cached: count,
-                    };
-                    Ok::<_, warp::Rejection>(warp::reply::json(&resp))
-                }
-            })
+        warp::path("health").and(warp::get()).and_then(move || {
+            let state = state.clone();
+            async move {
+                let count = count_cached_documents(&state.cache_dir).await;
+                let resp = HealthResponse {
+                    status: "online".to_string(),
+                    version: env!("CARGO_PKG_VERSION").to_string(),
+                    documents_cached: count,
+                };
+                Ok::<_, warp::Rejection>(warp::reply::json(&resp))
+            }
+        })
     };
 
     // Query parameter for token fallback (?token=JWT)
@@ -500,7 +507,12 @@ pub async fn start_server(
                     let allowed = match origin.as_deref() {
                         None => true, // No origin header = same-origin or non-browser client
                         Some(o) if o.starts_with("https://newsbleach.com") => true,
-                        Some(o) if o.starts_with("http://localhost") || o.starts_with("http://127.0.0.1") => true,
+                        Some(o)
+                            if o.starts_with("http://localhost")
+                                || o.starts_with("http://127.0.0.1") =>
+                        {
+                            true
+                        }
                         Some(o) if o == "tauri://localhost" => true,
                         Some(o) => {
                             tracing::warn!("Auth complete rejected from origin: {}", o);
@@ -509,7 +521,9 @@ pub async fn start_server(
                     };
 
                     if !allowed {
-                        return Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({"error": "forbidden"})));
+                        return Ok::<_, warp::Rejection>(warp::reply::json(
+                            &serde_json::json!({"error": "forbidden"}),
+                        ));
                     }
 
                     tracing::info!("Auth callback received - user_id={:?}", body.user_id);
@@ -522,7 +536,9 @@ pub async fn start_server(
                     // Preserve api_token and node_id from previous registration
 
                     tracing::info!("Auth state updated via magic link callback");
-                    Ok::<_, warp::Rejection>(warp::reply::json(&serde_json::json!({"status": "ok"})))
+                    Ok::<_, warp::Rejection>(warp::reply::json(
+                        &serde_json::json!({"status": "ok"}),
+                    ))
                 }
             })
     };
@@ -530,16 +546,14 @@ pub async fn start_server(
     // GET /stats — node stats for dashboard
     let stats = {
         let state = state.clone();
-        warp::path("stats")
-            .and(warp::get())
-            .and_then(move || {
-                let state = state.clone();
-                async move {
-                    let cr = state.credits.read().await;
-                    let dashboard = cr.dashboard_stats();
-                    Ok::<_, warp::Rejection>(warp::reply::json(&dashboard))
-                }
-            })
+        warp::path("stats").and(warp::get()).and_then(move || {
+            let state = state.clone();
+            async move {
+                let cr = state.credits.read().await;
+                let dashboard = cr.dashboard_stats();
+                Ok::<_, warp::Rejection>(warp::reply::json(&dashboard))
+            }
+        })
     };
 
     // GET /tunnel-status — expose internal tunnel connection state
@@ -570,17 +584,19 @@ pub async fn start_server(
     };
 
     // Explicit OPTIONS preflight handler
-    let preflight = warp::options()
-        .map(|| {
-            warp::http::Response::builder()
-                .status(204)
-                .header("Access-Control-Allow-Origin", "*")
-                .header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
-                .header("Access-Control-Allow-Headers", "Content-Type, Range, Authorization")
-                .header("Access-Control-Allow-Private-Network", "true")
-                .body("")
-                .unwrap()
-        });
+    let preflight = warp::options().map(|| {
+        warp::http::Response::builder()
+            .status(204)
+            .header("Access-Control-Allow-Origin", "*")
+            .header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+            .header(
+                "Access-Control-Allow-Headers",
+                "Content-Type, Range, Authorization",
+            )
+            .header("Access-Control-Allow-Private-Network", "true")
+            .body("")
+            .unwrap()
+    });
 
     // Pyramid Knowledge Engine routes
     let pyramid_routes = pyramid::routes::pyramid_routes(state.pyramid.clone());
@@ -591,7 +607,12 @@ pub async fn start_server(
     let routes = preflight
         .or(pyramid_routes)
         .or(partner_routes)
-        .or(auth_callback.or(auth_complete).or(health).or(tunnel_debug).or(documents).or(stats))
+        .or(auth_callback
+            .or(auth_complete)
+            .or(health)
+            .or(tunnel_debug)
+            .or(documents)
+            .or(stats))
         .with(cors);
 
     tracing::info!("Wire Node HTTP server starting on 127.0.0.1:{}", port);
@@ -689,12 +710,20 @@ const AUTH_CALLBACK_HTML: &str = r#"<!DOCTYPE html>
 </html>"#;
 
 /// Find a cached document body file by document ID (search all corpus subdirs)
-async fn find_cached_document(cache_dir: &std::path::Path, document_id: &str) -> Option<std::path::PathBuf> {
+async fn find_cached_document(
+    cache_dir: &std::path::Path,
+    document_id: &str,
+) -> Option<std::path::PathBuf> {
     let target_filename = format!("{}.body", document_id);
 
     if let Ok(mut entries) = tokio::fs::read_dir(cache_dir).await {
         while let Ok(Some(entry)) = entries.next_entry().await {
-            if entry.file_type().await.map(|ft| ft.is_dir()).unwrap_or(false) {
+            if entry
+                .file_type()
+                .await
+                .map(|ft| ft.is_dir())
+                .unwrap_or(false)
+            {
                 let candidate = entry.path().join(&target_filename);
                 if candidate.exists() {
                     return Some(candidate);
@@ -710,7 +739,12 @@ async fn count_cached_documents(cache_dir: &std::path::Path) -> usize {
     let mut count = 0;
     if let Ok(mut entries) = tokio::fs::read_dir(cache_dir).await {
         while let Ok(Some(entry)) = entries.next_entry().await {
-            if entry.file_type().await.map(|ft| ft.is_dir()).unwrap_or(false) {
+            if entry
+                .file_type()
+                .await
+                .map(|ft| ft.is_dir())
+                .unwrap_or(false)
+            {
                 if let Ok(mut sub_entries) = tokio::fs::read_dir(entry.path()).await {
                     while let Ok(Some(sub_entry)) = sub_entries.next_entry().await {
                         if let Some(name) = sub_entry.file_name().to_str() {
@@ -730,7 +764,9 @@ async fn count_cached_documents(cache_dir: &std::path::Path) -> usize {
 fn parse_range(range: &str, file_size: usize) -> Option<(usize, usize)> {
     let range = range.strip_prefix("bytes=")?;
     let parts: Vec<&str> = range.split('-').collect();
-    if parts.len() != 2 { return None; }
+    if parts.len() != 2 {
+        return None;
+    }
 
     let start: usize = parts[0].parse().ok()?;
     let end: usize = if parts[1].is_empty() {
@@ -748,7 +784,7 @@ fn parse_range(range: &str, file_size: usize) -> Option<(usize, usize)> {
 
 /// Verify a JWT using Ed25519 (EdDSA) public key
 fn verify_jwt(token: &str, public_key_pem: &str) -> Result<DocumentClaims, String> {
-    use jsonwebtoken::{decode, DecodingKey, Validation, Algorithm};
+    use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
 
     let decoding_key = DecodingKey::from_ed_pem(public_key_pem.as_bytes())
         .map_err(|e| format!("Invalid public key: {}", e))?;
