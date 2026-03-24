@@ -58,7 +58,7 @@ steps:
   # Step type saved as "code_extract".
   - name: l0_code_extract
     primitive: extract
-    instruction: "prompts/code/code_extract.md"
+    instruction: "$prompts/code/code_extract.md"
     for_each: chunks
     node_id_pattern: "C-L0-{index:03}"
     depth: 0
@@ -73,7 +73,7 @@ steps:
   # Same node ID pattern as l0_code_extract; the runtime selects based on chunk type.
   - name: l0_config_extract
     primitive: extract
-    instruction: "prompts/code/config_extract.md"
+    instruction: "$prompts/code/config_extract.md"
     when: "chunk.type == 'config'"
     for_each: chunks
     node_id_pattern: "C-L0-{index:03}"
@@ -109,7 +109,7 @@ steps:
   # Step type saved as "synth" at depth 1.
   - name: l1_code_group_synthesis
     primitive: synthesize
-    instruction: "prompts/code/code_group.md"
+    instruction: "$prompts/code/code_group.md"
     for_each: clusters
     node_id_pattern: "C-L1-{index:03}"
     depth: 1
@@ -131,9 +131,9 @@ steps:
   # Step type saved as "thread_cluster" at depth 1.
   - name: l2_thread_clustering
     primitive: classify
-    instruction: "prompts/conversation/thread_cluster.md"
+    instruction: "$prompts/conversation/thread_cluster.md"
     batch_threshold: 30000
-    merge_instruction: "prompts/conversation/merge.md"
+    merge_instruction: "$prompts/conversation/merge.md"
     depth: 1
     save_as: thread_assignments
     model: "qwen/qwen3.5-flash-02-23"
@@ -147,7 +147,7 @@ steps:
   # Step type saved as "synth" at depth 2.
   - name: l2_thread_narrative
     primitive: synthesize
-    instruction: "prompts/conversation/thread_narrative.md"
+    instruction: "$prompts/conversation/thread_narrative.md"
     for_each: thread_assignments
     node_id_pattern: "L2-{index:03}"
     depth: 2
@@ -166,7 +166,7 @@ steps:
   # Continues until single apex node remains.
   - name: upper_layer_synthesis
     primitive: synthesize
-    instruction: "prompts/conversation/distill.md"
+    instruction: "$prompts/conversation/distill.md"
     recursive_pair: true
     depth: 2
     node_id_pattern: "L{depth}-{index:03}"
