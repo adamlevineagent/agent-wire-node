@@ -1147,6 +1147,12 @@ async fn execute_recursive_pair(
             send_progress(progress_tx, *done, total).await;
         }
 
+        // Flush: wait for the async writer to commit all pending nodes at
+        // target_depth before we read them back in the next iteration.
+        // Without this, the DB read may see fewer nodes than were just created,
+        // causing premature apex declaration.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
         depth = target_depth;
     }
 }
