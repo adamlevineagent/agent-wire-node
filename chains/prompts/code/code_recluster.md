@@ -14,7 +14,8 @@ RULES:
 - If a node doesn't fit cleanly, assign it to the closest match — do not create a singleton cluster
 - Think about what a NEW DEVELOPER would want to explore: "I want to understand the UI" → one cluster. "I want to understand the data pipeline" → another cluster. "I want to understand the backend services" → another.
 
-Output valid JSON only (no markdown fences, no extra text):
+You MUST output ONLY a valid JSON object. No markdown, no headings, no prose, no explanation, no code fences. Start your response with { and end with }. Any text before { or after } is a fatal error.
+
 {
   "clusters": [
     {
