@@ -99,6 +99,9 @@ fn resolve_temperature(step: &ChainStep, defaults: &ChainDefaults) -> f32 {
 }
 
 /// Dispatch a step to the LLM, with JSON-retry at temp 0.1 on parse failure.
+///
+/// If the step specifies a `model:` override, creates a modified LlmConfig
+/// so the override is actually used by call_model().
 async fn dispatch_llm(
     step: &ChainStep,
     resolved_input: &Value,
@@ -107,22 +110,37 @@ async fn dispatch_llm(
     ctx: &StepContext,
 ) -> Result<Value> {
     let temperature = resolve_temperature(step, defaults);
-    let _model = resolve_model(step, defaults, &ctx.config);
+    let resolved_model = resolve_model(step, defaults, &ctx.config);
     let max_tokens: usize = 4096;
+
+    // Apply model override: if the resolved model differs from the config's
+    // primary model, create a modified config so call_model() uses it.
+    let config_ref;
+    let overridden_config;
+    if resolved_model != ctx.config.primary_model {
+        overridden_config = LlmConfig {
+            primary_model: resolved_model.clone(),
+            ..ctx.config.clone()
+        };
+        config_ref = &overridden_config;
+    } else {
+        config_ref = &ctx.config;
+    }
 
     // Build user prompt from resolved input
     let user_prompt = serde_json::to_string_pretty(resolved_input)
         .unwrap_or_else(|_| resolved_input.to_string());
 
     info!(
-        "[CHAIN] step '{}' → LLM (temp={}, prompt_len={})",
+        "[CHAIN] step '{}' → LLM (temp={}, model={}, prompt_len={})",
         step.name,
         temperature,
+        short_model_name(&resolved_model),
         user_prompt.len()
     );
 
     // First attempt at configured temperature
-    let response = llm::call_model(&ctx.config, system_prompt, &user_prompt, temperature, max_tokens).await?;
+    let response = llm::call_model(config_ref, system_prompt, &user_prompt, temperature, max_tokens).await?;
 
     match llm::extract_json(&response) {
         Ok(json) => {
@@ -136,7 +154,7 @@ async fn dispatch_llm(
                 step.name
             );
             let retry_response =
-                llm::call_model(&ctx.config, system_prompt, &user_prompt, 0.1, max_tokens).await?;
+                llm::call_model(config_ref, system_prompt, &user_prompt, 0.1, max_tokens).await?;
 
             llm::extract_json(&retry_response).map_err(|e| {
                 anyhow!(
@@ -147,6 +165,11 @@ async fn dispatch_llm(
             })
         }
     }
+}
+
+/// Short display name for a model string (last segment after /).
+fn short_model_name(model: &str) -> &str {
+    model.rsplit('/').next().unwrap_or(model)
 }
 
 // ── Mechanical dispatch ─────────────────────────────────────────────────────
