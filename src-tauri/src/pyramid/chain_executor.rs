@@ -1369,17 +1369,36 @@ async fn execute_recursive_cluster(
             }
         };
 
-        // Parse cluster assignments
+        // Parse cluster assignments — try "clusters" key first, fall back to "groups"
         let clusters = cluster_assignments
             .get("clusters")
+            .or_else(|| cluster_assignments.get("groups"))
             .and_then(|v| v.as_array())
             .cloned()
             .unwrap_or_default();
 
         if clusters.is_empty() {
-            warn!("[CHAIN] [{}] clustering returned 0 clusters, aborting", step.name);
-            return Ok((String::new(), failures + 1));
+            let keys: Vec<&String> = cluster_assignments.as_object().map(|o| o.keys().collect()).unwrap_or_default();
+            warn!("[CHAIN] [{}] cluster JSON keys: {:?}, looking for 'clusters'", step.name, keys);
         }
+
+        // If clustering returned 0 clusters (LLM returned wrong key or empty array),
+        // fall back to positional groups of 3 instead of aborting
+        let clusters = if clusters.is_empty() {
+            warn!("[CHAIN] [{}] clustering returned 0 clusters, falling back to positional groups of 3", step.name);
+            let mut fallback: Vec<serde_json::Value> = Vec::new();
+            for (i, chunk) in current_nodes.chunks(3).enumerate() {
+                let ids: Vec<String> = chunk.iter().map(|n| n.id.clone()).collect();
+                fallback.push(serde_json::json!({
+                    "name": format!("Group {}", i + 1),
+                    "description": "Positional fallback group",
+                    "node_ids": ids,
+                }));
+            }
+            fallback
+        } else {
+            clusters
+        };
 
         info!(
             "[CHAIN] [{}] clustering produced {} clusters",
