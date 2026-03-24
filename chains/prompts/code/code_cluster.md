@@ -8,7 +8,7 @@ RULES:
 - Files that import from each other or share types/APIs belong together
 - Configuration files (package.json, tsconfig, Cargo.toml) go with the system they configure
 - Test files go with the module they test
-- Target exactly 8 threads for codebases under 150 files. For larger codebases (150+), use 12 or 16. These powers-of-two-friendly counts ensure balanced pairing in upper layers.
+- 8-14 threads total. Prefer even numbers (8, 10, 12) for balanced pairing in upper layers.
 - SPLIT large systems: if a thread would contain more than 20 files, break it into meaningful sub-threads (e.g., "Pyramid Build Pipeline" + "Pyramid Query & Persistence" instead of one giant "Pyramid Engine" thread)
 - NO catch-all threads: do NOT create threads like "Utilities", "Miscellaneous", or "Other". Every file belongs to a real subsystem. Small helper files go with the system they support.
 - Thread names should be concrete and recognizable: "Chain Execution Engine", not "Module Group 3"
