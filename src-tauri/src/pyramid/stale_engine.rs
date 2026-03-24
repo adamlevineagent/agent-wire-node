@@ -15,11 +15,12 @@ use chrono::Utc;
 use rusqlite::Connection;
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
-use tracing::{info, warn, error};
+use tracing::{debug, info, warn, error};
 use uuid::Uuid;
 
 use super::stale_helpers;
 use super::stale_helpers_upper;
+use super::faq;
 use super::types::{
     AutoUpdateConfig, ConnectionCheckResult, PendingMutation, StaleCheckResult,
 };
@@ -57,6 +58,15 @@ pub struct PyramidStaleEngine {
     pub db_path: String,
     pub api_key: String,
     pub model: String,
+    poll_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Current lifecycle phase: "idle", "debounce", "evaluating", "cascading", "done_stale", "done_clean"
+    pub current_phase: Arc<std::sync::Mutex<String>>,
+    /// Detail text for the current phase, e.g. "batch 2 of 3 at L0"
+    pub phase_detail: Arc<std::sync::Mutex<String>>,
+    /// ISO timestamp when the debounce timer will fire (None when not in debounce)
+    pub timer_fires_at: Arc<std::sync::Mutex<Option<String>>>,
+    /// Summary of the last completed run, e.g. "updated 3 understandings"
+    pub last_result_summary: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl PyramidStaleEngine {
@@ -87,7 +97,139 @@ impl PyramidStaleEngine {
             db_path: db_path.to_string(),
             api_key: api_key.to_string(),
             model: model.to_string(),
+            poll_handle: None,
+            current_phase: Arc::new(std::sync::Mutex::new("idle".to_string())),
+            phase_detail: Arc::new(std::sync::Mutex::new(String::new())),
+            timer_fires_at: Arc::new(std::sync::Mutex::new(None)),
+            last_result_summary: Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    /// Start a background poll loop that checks the WAL every 60 seconds.
+    /// This is the belt-and-suspenders fallback: even if the watcher can't
+    /// signal the engine directly, pending mutations will be picked up.
+    pub fn start_poll_loop(&mut self) {
+        // Cancel any existing poll loop
+        if let Some(handle) = self.poll_handle.take() {
+            handle.abort();
+        }
+
+        let slug = self.slug.clone();
+        let db_path = self.db_path.clone();
+        let _debounce = self.layers.get(&0).map(|t| t.debounce).unwrap_or(Duration::from_secs(300));
+        let semaphore = self.concurrent_helpers.clone();
+        let min_changed_files = self.config.min_changed_files;
+        let api_key = self.api_key.clone();
+        let model = self.model.clone();
+        let phase_arc = self.current_phase.clone();
+        let detail_arc = self.phase_detail.clone();
+        let summary_arc = self.last_result_summary.clone();
+        let timer_fires_arc = self.timer_fires_at.clone();
+
+        let handle = tokio::spawn(async move {
+            loop {
+                // Sleep 60 seconds between polls
+                tokio::time::sleep(Duration::from_secs(60)).await;
+
+                // Check each layer for unprocessed mutations
+                let pending_by_layer: Vec<(i32, i64)> = match tokio::task::spawn_blocking({
+                    let db_path = db_path.clone();
+                    let slug = slug.clone();
+                    move || {
+                        let conn = match Connection::open(&db_path) {
+                            Ok(c) => c,
+                            Err(_) => return vec![],
+                        };
+                        let mut results = vec![];
+                        for layer in 0..=3 {
+                            let count: i64 = conn
+                                .query_row(
+                                    "SELECT COUNT(*) FROM pyramid_pending_mutations
+                                     WHERE processed = 0 AND slug = ?1 AND layer = ?2",
+                                    rusqlite::params![slug, layer],
+                                    |row| row.get(0),
+                                )
+                                .unwrap_or(0);
+                            if count > 0 {
+                                results.push((layer, count));
+                            }
+                        }
+                        results
+                    }
+                }).await {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+
+                // For each layer with pending mutations, fire drain_and_dispatch directly
+                for (layer, count) in pending_by_layer {
+                    info!(
+                        slug = %slug,
+                        layer,
+                        count,
+                        "Poll loop found pending mutations, dispatching"
+                    );
+
+                    // Wait for the configured debounce before dispatching
+                    // (the mutations may still be accumulating).
+                    let debounce_secs = _debounce.as_secs();
+                    {
+                        let mut phase = phase_arc.lock().unwrap();
+                        *phase = "debounce".to_string();
+                    }
+                    {
+                        let mut tfa = timer_fires_arc.lock().unwrap();
+                        *tfa = Some((Utc::now() + chrono::Duration::seconds(debounce_secs as i64)).to_rfc3339());
+                    }
+
+                    tokio::time::sleep(_debounce).await;
+
+                    {
+                        let mut tfa = timer_fires_arc.lock().unwrap();
+                        *tfa = None;
+                    }
+
+                    if let Err(e) = drain_and_dispatch(
+                        &slug,
+                        layer,
+                        min_changed_files,
+                        &db_path,
+                        semaphore.clone(),
+                        &api_key,
+                        &model,
+                        phase_arc.clone(),
+                        detail_arc.clone(),
+                        summary_arc.clone(),
+                    ).await {
+                        error!(slug = %slug, layer, error = %e, "Poll-triggered drain failed");
+                    }
+                }
+
+                // Check if breaker was tripped during dispatch (M1 fix)
+                let breaker_tripped_in_db = {
+                    let db = db_path.clone();
+                    let s = slug.clone();
+                    tokio::task::spawn_blocking(move || -> bool {
+                        if let Ok(conn) = Connection::open(&db) {
+                            conn.query_row(
+                                "SELECT breaker_tripped FROM pyramid_auto_update_config WHERE slug = ?1",
+                                rusqlite::params![s],
+                                |row| row.get::<_, i32>(0),
+                            ).unwrap_or(0) != 0
+                        } else {
+                            false
+                        }
+                    }).await.unwrap_or(false)
+                };
+                if breaker_tripped_in_db {
+                    warn!(slug = %slug, "Breaker tripped in DB — poll loop exiting");
+                    break;
+                }
+            }
+        });
+
+        self.poll_handle = Some(handle);
+        info!(slug = %self.slug, "WAL poll loop started (60s interval)");
     }
 
     /// Called when a mutation is written to WAL for this slug.
@@ -105,6 +247,18 @@ impl PyramidStaleEngine {
 
         if let Some(timer) = self.layers.get_mut(&layer) {
             timer.has_pending = true;
+
+            // Update phase tracking
+            {
+                let mut phase = self.current_phase.lock().unwrap();
+                *phase = "debounce".to_string();
+            }
+            {
+                let fires_at = Utc::now() + chrono::Duration::from_std(timer.debounce).unwrap_or(chrono::Duration::seconds(300));
+                let mut tfa = self.timer_fires_at.lock().unwrap();
+                *tfa = Some(fires_at.to_rfc3339());
+            }
+
             self.start_timer(layer);
         } else {
             warn!(
@@ -135,10 +289,24 @@ impl PyramidStaleEngine {
         let min_changed_files = self.config.min_changed_files;
         let api_key = self.api_key.clone();
         let model = self.model.clone();
+        let phase_arc = self.current_phase.clone();
+        let detail_arc = self.phase_detail.clone();
+        let tfa_arc = self.timer_fires_at.clone();
+        let summary_arc = self.last_result_summary.clone();
+
+        // Update timer_fires_at
+        {
+            let fires_at = Utc::now() + chrono::Duration::from_std(debounce).unwrap_or(chrono::Duration::seconds(300));
+            let mut tfa = tfa_arc.lock().unwrap();
+            *tfa = Some(fires_at.to_rfc3339());
+        }
 
         let handle = tokio::spawn(async move {
             tokio::time::sleep(debounce).await;
             info!(slug = %slug, layer, "Debounce timer fired, draining WAL");
+
+            // Clear timer_fires_at since debounce has expired
+            { let mut tfa = tfa_arc.lock().unwrap(); *tfa = None; }
 
             if let Err(e) = drain_and_dispatch(
                 &slug,
@@ -148,6 +316,9 @@ impl PyramidStaleEngine {
                 semaphore,
                 &api_key,
                 &model,
+                phase_arc,
+                detail_arc,
+                summary_arc,
             )
             .await
             {
@@ -218,6 +389,22 @@ impl PyramidStaleEngine {
         }
     }
 
+    /// Run a specific layer immediately, skipping the debounce timer.
+    /// Used by the "Run Now" button to flush pending mutations on demand.
+    pub async fn run_layer_now(&self, layer: i32) {
+        let slug = self.slug.clone();
+        let db_path = self.db_path.clone();
+        let api_key = self.api_key.clone();
+        let model = self.model.clone();
+        let semaphore = self.concurrent_helpers.clone();
+
+        // min_changed_files = 0 to force run regardless of threshold
+        let _ = drain_and_dispatch(
+            &slug, layer, 0, &db_path, semaphore, &api_key, &model,
+            self.current_phase.clone(), self.phase_detail.clone(), self.last_result_summary.clone(),
+        ).await;
+    }
+
     /// Freeze the engine: cancel timers, mark all WAL entries processed.
     pub fn freeze(&mut self) {
         info!(slug = %self.slug, "Freezing stale engine");
@@ -247,6 +434,13 @@ impl PyramidStaleEngine {
         }
     }
 
+    /// Abort the poll loop task to prevent orphan background tasks when replacing an engine.
+    pub fn abort_poll_loop(&mut self) {
+        if let Some(handle) = self.poll_handle.take() {
+            handle.abort();
+        }
+    }
+
     /// Unfreeze the engine. Hash rescan will be triggered by Phase 7 startup.
     pub fn unfreeze(&mut self) {
         info!(slug = %self.slug, "Unfreezing stale engine");
@@ -268,7 +462,7 @@ impl PyramidStaleEngine {
 /// Core drain function. Reads unprocessed mutations from WAL, batches them,
 /// and dispatches helpers. This is a free async function (not a method) so it
 /// can be called from spawned tasks without Send issues around `&Connection`.
-async fn drain_and_dispatch(
+pub async fn drain_and_dispatch(
     slug: &str,
     layer: i32,
     min_changed_files: i32,
@@ -276,11 +470,29 @@ async fn drain_and_dispatch(
     semaphore: Arc<Semaphore>,
     api_key: &str,
     model: &str,
+    phase_arc: Arc<std::sync::Mutex<String>>,
+    detail_arc: Arc<std::sync::Mutex<String>>,
+    summary_arc: Arc<std::sync::Mutex<Option<String>>>,
 ) -> Result<()> {
     let slug_owned = slug.to_string();
     let db_owned = db_path.to_string();
     let api_key_owned = api_key.to_string();
     let model_owned = model.to_string();
+
+    // Set phase to evaluating at entry; record start time for minimum display duration
+    let phase_started_at = std::time::Instant::now();
+    {
+        let mut phase = phase_arc.lock().unwrap();
+        *phase = if layer > 0 { "cascading".to_string() } else { "evaluating".to_string() };
+    }
+    {
+        let mut detail = detail_arc.lock().unwrap();
+        *detail = if layer > 0 {
+            format!("climbing to L{}", layer)
+        } else {
+            format!("L{}: draining WAL", layer)
+        };
+    }
 
     // Check runaway threshold before processing — trip breaker if exceeded
     {
@@ -365,8 +577,55 @@ async fn drain_and_dispatch(
 
     if mutations.is_empty() {
         info!(slug = %slug_owned, layer, "No pending mutations to drain (or below threshold)");
+        // Set phase to done_clean briefly, then revert to idle after 10s
+        {
+            let mut phase = phase_arc.lock().unwrap();
+            *phase = "done_clean".to_string();
+        }
+        {
+            let mut summary = summary_arc.lock().unwrap();
+            *summary = Some("found nothing actionable".to_string());
+        }
+        let pa = phase_arc.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            let mut phase = pa.lock().unwrap();
+            if *phase == "done_clean" || *phase == "done_stale" {
+                *phase = "idle".to_string();
+            }
+        });
         return Ok(());
     }
+
+    // Update detail with mutation count
+    {
+        let mut detail = detail_arc.lock().unwrap();
+        *detail = format!("L{}: {} files", layer, mutations.len());
+    }
+
+    // Dedup by (target_ref, mutation_type) — keep latest (highest id) to avoid
+    // double-firing when the file watcher writes duplicate WAL entries.
+    let mutations = {
+        let pre_dedup = mutations.len();
+        let mut seen: HashMap<(String, String), usize> = HashMap::new();
+        for (i, m) in mutations.iter().enumerate() {
+            let key = (m.target_ref.clone(), m.mutation_type.clone());
+            seen.insert(key, i); // last one wins (highest id due to ORDER BY id ASC)
+        }
+        let mut deduped_indices: Vec<usize> = seen.into_values().collect();
+        deduped_indices.sort();
+        let deduped: Vec<PendingMutation> = deduped_indices.into_iter().map(|i| mutations[i].clone()).collect();
+        if deduped.len() < pre_dedup {
+            info!(
+                slug = %slug_owned,
+                layer,
+                before = pre_dedup,
+                after = deduped.len(),
+                "Deduplicated WAL mutations by (target_ref, mutation_type)"
+            );
+        }
+        deduped
+    };
 
     let batch_id = mutations
         .first()
@@ -389,6 +648,7 @@ async fn drain_and_dispatch(
     let mut confirmed_stales: Vec<PendingMutation> = Vec::new();
     let mut edge_stales: Vec<PendingMutation> = Vec::new();
     let mut node_stales: Vec<PendingMutation> = Vec::new();
+    let mut faq_category_stales: Vec<PendingMutation> = Vec::new();
 
     for m in mutations {
         match m.mutation_type.as_str() {
@@ -399,6 +659,7 @@ async fn drain_and_dispatch(
             "confirmed_stale" => confirmed_stales.push(m),
             "edge_stale" => edge_stales.push(m),
             "node_stale" => node_stales.push(m),
+            "faq_category_stale" => faq_category_stales.push(m),
             other => {
                 warn!(slug = %slug_owned, mutation_type = other, "Unknown mutation type, treating as node_stale");
                 node_stales.push(m);
@@ -414,6 +675,13 @@ async fn drain_and_dispatch(
     let confirmed_batches = batch_items(confirmed_stales, BATCH_CAP_NODES);
     let edge_batches = batch_items(edge_stales, BATCH_CAP_CONNECTIONS);
     let node_batches = batch_items(node_stales, BATCH_CAP_NODES);
+
+    let total_batches = file_batches.len() + new_file_batches.len() + deleted_batches.len()
+        + rename_batches.len() + confirmed_batches.len() + edge_batches.len() + node_batches.len();
+    {
+        let mut detail = detail_arc.lock().unwrap();
+        *detail = format!("L{}: {} batches to process", layer, total_batches);
+    }
 
     let mut handles: Vec<JoinHandle<()>> = Vec::new();
 
@@ -433,6 +701,45 @@ async fn drain_and_dispatch(
                     Vec::new()
                 }
             };
+            // For stale L0 results, resolve file path to node IDs and execute
+            // supersession so nodes get updated before propagating to L1.
+            let mut results = results;
+            for result in &mut results {
+                if result.stale {
+                    // result.target_id is a file path for L0 file_change mutations.
+                    // Resolve it to node IDs via pyramid_file_hashes.
+                    let db_resolve = db.clone();
+                    let s_resolve = s.clone();
+                    let target = result.target_id.clone();
+                    let node_ids: Vec<String> = tokio::task::spawn_blocking(move || {
+                        let conn = match Connection::open(&db_resolve) {
+                            Ok(c) => c,
+                            Err(_) => return Vec::new(),
+                        };
+                        let node_ids_json: String = conn.query_row(
+                            "SELECT node_ids FROM pyramid_file_hashes WHERE slug = ?1 AND file_path = ?2",
+                            rusqlite::params![s_resolve, target],
+                            |row| row.get(0),
+                        ).unwrap_or_else(|_| "[]".to_string());
+                        serde_json::from_str(&node_ids_json).unwrap_or_default()
+                    }).await.unwrap_or_default();
+
+                    if node_ids.is_empty() {
+                        warn!(slug = %s, target = %result.target_id, "No node IDs found for file path — skipping supersession");
+                        continue;
+                    }
+
+                    for node_id in &node_ids {
+                        if let Err(e) = stale_helpers_upper::execute_supersession(
+                            node_id, &db, &s, &key, &mdl,
+                        ).await {
+                            error!(slug = %s, target = %result.target_id, node_id = %node_id, error = %e, "execute_supersession (L0 file_change) failed");
+                        } else {
+                            result.reason = format!("{} (node {} superseded)", result.reason, node_id);
+                        }
+                    }
+                }
+            }
             let _ = tokio::task::spawn_blocking(move || {
                 if let Ok(conn) = Connection::open(&db) {
                     let _ = log_stale_results(&conn, &s, &bid, layer, &results);
@@ -486,12 +793,17 @@ async fn drain_and_dispatch(
                 }
             };
             // For confirmed stale results, execute supersession
-            for result in &results {
+            let mut results = results;
+            for result in &mut results {
                 if result.stale {
                     if let Err(e) = stale_helpers_upper::execute_supersession(
                         &result.target_id, &db, &s, &key, &mdl,
                     ).await {
                         error!(slug = %s, target = %result.target_id, error = %e, "execute_supersession failed");
+                    } else {
+                        // Bug 4 fix: Update reason to reflect supersession so propagated
+                        // mutations reference post-supersession state, not pre-supersession content.
+                        result.reason = format!("{} (node superseded)", result.reason);
                     }
                 }
             }
@@ -584,6 +896,58 @@ async fn drain_and_dispatch(
         }
     }
 
+    // ── FAQ category stale: re-distill affected categories ──────────────────
+    if !faq_category_stales.is_empty() {
+        let db = db_owned.clone();
+        let s = slug_owned.clone();
+        let key = api_key_owned.clone();
+        let mdl = model_owned.clone();
+        let permit = semaphore.clone().acquire_owned().await?;
+        handles.push(tokio::spawn(async move {
+            // Collect unique category IDs from the mutations
+            let _category_ids: Vec<String> = faq_category_stales
+                .iter()
+                .map(|m| m.target_ref.clone())
+                .collect::<std::collections::HashSet<_>>()
+                .into_iter()
+                .collect();
+
+            // Re-run category meta-pass for the slug (re-distills all categories)
+            // Use a single DB connection for both read and write (L3 fix)
+            let conn = match Connection::open(&db) {
+                Ok(c) => c,
+                Err(e) => {
+                    error!(slug = %s, error = %e, "Failed to open DB for faq_category_stale");
+                    drop(permit);
+                    return;
+                }
+            };
+            let shared_conn = Arc::new(tokio::sync::Mutex::new(conn));
+            let reader = shared_conn.clone();
+            let writer = shared_conn;
+
+            // Load FAQs
+            let faqs = {
+                let conn = reader.lock().await;
+                match super::db::get_faq_nodes(&conn, &s) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        error!(slug = %s, error = %e, "Failed to load FAQs for category re-distillation");
+                        drop(permit);
+                        return;
+                    }
+                }
+            };
+
+            if let Err(e) = faq::run_faq_category_meta_pass(&reader, &writer, &s, &faqs, &key, &mdl).await {
+                warn!(slug = %s, error = %e, "FAQ category meta-pass failed during stale dispatch");
+            } else {
+                info!(slug = %s, "FAQ category meta-pass completed via stale dispatch");
+            }
+            drop(permit);
+        }));
+    }
+
     for handle in handles {
         let _ = handle.await;
     }
@@ -594,6 +958,55 @@ async fn drain_and_dispatch(
         batch_id = %batch_id,
         "All helpers completed for batch"
     );
+
+    // Ensure the evaluating/cascading phase is visible for at least 3 seconds
+    // so the frontend poll (10s interval) can catch it.
+    let min_display = Duration::from_secs(3);
+    let elapsed = phase_started_at.elapsed();
+    if elapsed < min_display {
+        tokio::time::sleep(min_display - elapsed).await;
+    }
+
+    // Determine outcome by checking stale log for this batch
+    let stale_count = {
+        let db = db_owned.clone();
+        let s = slug_owned.clone();
+        let bid = batch_id.clone();
+        tokio::task::spawn_blocking(move || -> i64 {
+            if let Ok(conn) = Connection::open(&db) {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM pyramid_stale_check_log
+                     WHERE slug = ?1 AND batch_id = ?2 AND stale = 1",
+                    rusqlite::params![s, bid],
+                    |row| row.get(0),
+                ).unwrap_or(0)
+            } else {
+                0
+            }
+        }).await.unwrap_or(0)
+    };
+
+    if stale_count > 0 {
+        let mut phase = phase_arc.lock().unwrap();
+        *phase = "done_stale".to_string();
+        let mut summary = summary_arc.lock().unwrap();
+        *summary = Some(format!("updated {} understanding{}", stale_count, if stale_count != 1 { "s" } else { "" }));
+    } else {
+        let mut phase = phase_arc.lock().unwrap();
+        *phase = "done_clean".to_string();
+        let mut summary = summary_arc.lock().unwrap();
+        *summary = Some("found nothing actionable".to_string());
+    }
+
+    // Revert to idle after 10 seconds
+    let pa = phase_arc.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        let mut phase = pa.lock().unwrap();
+        if *phase == "done_clean" || *phase == "done_stale" {
+            *phase = "idle".to_string();
+        }
+    });
 
     Ok(())
 }
@@ -705,46 +1118,93 @@ fn propagate_confirmed_stales(
     let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
     let next_layer = (layer + 1).min(3);
 
+    // Don't propagate from the apex layer back to itself
+    if next_layer == layer {
+        info!(
+            slug = %slug,
+            layer,
+            "Skipping propagation: already at apex layer"
+        );
+        return Ok(());
+    }
+
     for result in results {
         if !result.stale {
+            debug!(
+                slug = %slug,
+                target = %result.target_id,
+                layer,
+                "Skipping propagation for non-stale result"
+            );
             continue;
         }
 
-        info!(
-            slug = %slug,
-            target = %result.target_id,
-            layer,
-            next_layer,
-            "Propagating confirmed stale to layer {}",
-            next_layer
-        );
+        // Bug 1 fix: Use cascade_depth from the StaleCheckResult directly instead of
+        // a DB lookup that would fail because propagated mutations lack batch_id.
+        let new_depth = result.cascade_depth + 1;
 
-        // Look up the original mutation's cascade_depth from the WAL by target_ref and batch_id
-        let original_depth: i32 = conn
-            .query_row(
-                "SELECT cascade_depth FROM pyramid_pending_mutations
-                 WHERE slug = ?1 AND target_ref = ?2 AND batch_id = ?3
-                 ORDER BY id DESC LIMIT 1",
-                rusqlite::params![slug, result.target_id, result.batch_id],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
-        let new_depth = original_depth + 1;
-
-        conn.execute(
-            "INSERT INTO pyramid_pending_mutations
-             (slug, layer, mutation_type, target_ref, detail, cascade_depth, detected_at, processed)
-             VALUES (?1, ?2, 'confirmed_stale', ?3, ?4, ?5, ?6, 0)",
-            rusqlite::params![
+        // Resolve the propagation target: we need the PARENT node, not the current node.
+        // For L0, target_id is a file path — resolve via pyramid_file_hashes.
+        // For L1+, target_id is a node ID — look up its parent directly.
+        let propagation_targets = if layer == 0 {
+            let targets = stale_helpers_upper::resolve_parent_targets_for_file(conn, slug, &result.target_id)?;
+            if targets.is_empty() {
+                warn!(
+                    slug = %slug,
+                    target = %result.target_id,
+                    "L0 stale file has no live parent thread target — skipping propagation"
+                );
+                continue;
+            }
+            targets
+        } else {
+            let targets = stale_helpers_upper::resolve_parent_targets_for_node_ids(
+                conn,
                 slug,
+                std::slice::from_ref(&result.target_id),
+            )?;
+            if targets.is_empty() {
+                warn!(
+                    slug = %slug,
+                    target = %result.target_id,
+                    layer,
+                    "Node has no live parent thread target — skipping propagation to L{}",
+                    next_layer
+                );
+                continue;
+            }
+            targets
+        };
+
+        for propagation_target in propagation_targets {
+            info!(
+                slug = %slug,
+                target = %propagation_target,
+                layer,
                 next_layer,
-                result.target_id,
-                result.reason,
-                new_depth,
-                now,
-            ],
-        )
-        .context("Failed to propagate confirmed stale mutation")?;
+                cascade_depth = new_depth,
+                "Propagating confirmed stale to layer {}",
+                next_layer
+            );
+
+            // Note (Bug 8): notify_mutation cannot be called from within spawn_blocking
+            // because the engine is not accessible here. Propagated mutations are picked
+            // up by the 60s poll loop — this is accepted latency.
+            conn.execute(
+                "INSERT INTO pyramid_pending_mutations
+                 (slug, layer, mutation_type, target_ref, detail, cascade_depth, detected_at, processed)
+                 VALUES (?1, ?2, 'confirmed_stale', ?3, ?4, ?5, ?6, 0)",
+                rusqlite::params![
+                    slug,
+                    next_layer,
+                    propagation_target,
+                    result.reason,
+                    new_depth,
+                    now,
+                ],
+            )
+            .context("Failed to propagate confirmed stale mutation")?;
+        }
     }
 
     Ok(())
@@ -779,6 +1239,7 @@ async fn dispatch_node_stale_check(batch: Vec<PendingMutation>) -> Vec<StaleChec
             checked_at: now.clone(),
             cost_tokens: None,
             cost_usd: None,
+            cascade_depth: m.cascade_depth,
         })
         .collect()
 }
@@ -838,6 +1299,7 @@ async fn dispatch_edge_stale_check(batch: Vec<PendingMutation>) -> Vec<StaleChec
             checked_at: now.clone(),
             cost_tokens: None,
             cost_usd: None,
+            cascade_depth: m.cascade_depth,
         })
         .collect()
 }

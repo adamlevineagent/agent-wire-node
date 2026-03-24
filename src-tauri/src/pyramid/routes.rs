@@ -22,6 +22,7 @@ use super::delta;
 use super::webbing;
 use super::meta;
 use super::faq;
+use super::stale_engine;
 use crate::http_utils::{ct_eq, Unauthorized, json_error, json_ok};
 
 // ── Auth middleware ──────────────────────────────────────────────────
@@ -417,6 +418,27 @@ pub fn pyramid_routes(
         .and(warp::query::<FaqMatchQuery>())
         .and_then(handle_match_faq));
 
+    // GET /pyramid/:slug/faq/directory — FAQ directory (flat or hierarchical)
+    let faq_directory = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("faq"))
+        .and(warp::path("directory"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_faq_directory));
+
+    // GET /pyramid/:slug/faq/category/:id — drill into a FAQ category
+    let faq_category_drill = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("faq"))
+        .and(warp::path("category"))
+        .and(warp::path::param::<String>())
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_faq_category_drill));
+
     // DELETE /pyramid/:slug
     let delete_slug_route = route!(prefix
         .and(warp::path::param::<String>())
@@ -467,6 +489,16 @@ pub fn pyramid_routes(
         .and(warp::post())
         .and(with_auth_state(state.clone()))
         .and_then(handle_auto_update_unfreeze));
+
+    // POST /pyramid/:slug/auto-update/l0-sweep
+    let auto_update_l0_sweep = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("auto-update"))
+        .and(warp::path("l0-sweep"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_auto_update_l0_sweep));
 
     // POST /pyramid/:slug/auto-update/breaker/resume
     let breaker_resume = route!(prefix
@@ -537,11 +569,13 @@ pub fn pyramid_routes(
     let r11 = edges.or(usage).unify().boxed();
     let r12 = meta_run.or(meta_read).unify().boxed();
     let r13 = faq_match.or(faq_list).unify().boxed();
+    let r19 = faq_directory.or(faq_category_drill).unify().boxed();
     // Phase 5 & 6 routes
     let r14 = auto_update_config_get.or(auto_update_config_post).unify().boxed();
     let r15 = auto_update_freeze.or(auto_update_unfreeze).unify().boxed();
     let r16 = breaker_resume.or(breaker_build_new).unify().boxed();
     let r17 = auto_update_status.or(stale_log).unify().boxed();
+    let r20 = auto_update_l0_sweep;
     let r18 = cost;
 
     // Combine the groups (each is BoxedFilter<(Response,)>)
@@ -554,16 +588,18 @@ pub fn pyramid_routes(
     let g7 = r13.or(r14).unify().boxed();
     let g8 = r15.or(r16).unify().boxed();
     let g9 = r17.or(r18).unify().boxed();
+    let g10 = r19.or(r20).unify().boxed();
 
     let h1 = g1.or(g2).unify().boxed();
     let h2 = g3.or(g4).unify().boxed();
     let h3 = g5.or(g6).unify().boxed();
     let h4 = g7.or(g8).unify().boxed();
+    let h5 = g9.or(g10).unify().boxed();
 
     let top = h1.or(h2).unify().boxed();
     let top2 = top.or(h3).unify().boxed();
     let top3 = top2.or(h4).unify().boxed();
-    top3.or(g9).unify().boxed()
+    top3.or(h5).unify().boxed()
 }
 
 // ── Route handlers ──────────────────────────────────────────────────
@@ -1044,9 +1080,9 @@ async fn handle_ingest(
         for path_str in &paths {
             let path = std::path::Path::new(path_str);
             match content_type {
-                ContentType::Code => { ingest::ingest_code(&conn, &slug_clone, path)?; }
+                ContentType::Code => { let _ = ingest::ingest_code(&conn, &slug_clone, path)?; }
                 ContentType::Conversation => { ingest::ingest_conversation(&conn, &slug_clone, path)?; }
-                ContentType::Document => { ingest::ingest_docs(&conn, &slug_clone, path)?; }
+                ContentType::Document => { let _ = ingest::ingest_docs(&conn, &slug_clone, path)?; }
             }
         }
         Ok::<String, anyhow::Error>(slug_clone)
@@ -1449,6 +1485,41 @@ async fn handle_match_faq(
     }
 }
 
+// ── FAQ Directory route handlers ─────────────────────────────────────
+
+async fn handle_faq_directory(
+    slug_name: String,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let config = state.config.read().await;
+    let api_key = config.api_key.clone();
+    let model = config.primary_model.clone();
+    drop(config);
+
+    match faq::get_faq_directory(&state.reader, &state.writer, &slug_name, &api_key, &model).await {
+        Ok(directory) => Ok(json_ok(&directory)),
+        Err(e) => Ok(json_error(warp::http::StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())),
+    }
+}
+
+async fn handle_faq_category_drill(
+    slug_name: String,
+    category_id: String,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    match faq::drill_faq_category(&state.reader, &slug_name, &category_id).await {
+        Ok(entry) => Ok(json_ok(&entry)),
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("not found") {
+                Ok(json_error(warp::http::StatusCode::NOT_FOUND, &msg))
+            } else {
+                Ok(json_error(warp::http::StatusCode::INTERNAL_SERVER_ERROR, &msg))
+            }
+        }
+    }
+}
+
 // ── Phase 5: Breaker & Freeze route handlers ────────────────────────
 
 /// Helper: load AutoUpdateConfig from DB for a given slug.
@@ -1604,10 +1675,15 @@ async fn handle_auto_update_unfreeze(
     }
     drop(engines);
 
-    // Resume file watcher
+    // Resume file watcher (repopulates caches from DB)
+    let db_path = state.data_dir.as_ref()
+        .expect("data_dir not set")
+        .join("pyramid.db")
+        .to_string_lossy()
+        .to_string();
     let mut watchers = state.file_watchers.lock().await;
     if let Some(watcher) = watchers.get_mut(&slug_name) {
-        watcher.resume();
+        watcher.resume(&db_path);
     }
     drop(watchers);
 
@@ -1689,6 +1765,63 @@ fn hash_rescan(conn: &Connection, slug: &str) -> i64 {
     }
 
     count
+}
+
+/// Force a full L0 sweep by enqueueing one pending mutation for every tracked file
+/// that is not already waiting in the WAL.
+pub fn enqueue_full_l0_sweep(conn: &Connection, slug: &str) -> (i64, i64, i64) {
+    let mut stmt = match conn.prepare(
+        "SELECT file_path FROM pyramid_file_hashes WHERE slug = ?1 ORDER BY file_path ASC"
+    ) {
+        Ok(stmt) => stmt,
+        Err(_) => return (0, 0, 0),
+    };
+
+    let file_paths: Vec<String> = stmt
+        .query_map(rusqlite::params![slug], |row| row.get::<_, String>(0))
+        .ok()
+        .map(|iter| iter.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default();
+
+    let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let mut enqueued = 0i64;
+    let mut already_pending = 0i64;
+
+    for file_path in &file_paths {
+        let pending_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pyramid_pending_mutations
+                 WHERE slug = ?1 AND layer = 0 AND processed = 0
+                   AND target_ref = ?2
+                   AND mutation_type IN ('file_change', 'deleted_file')",
+                rusqlite::params![slug, file_path],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+
+        if pending_count > 0 {
+            already_pending += 1;
+            continue;
+        }
+
+        let exists_on_disk = std::path::Path::new(file_path).exists();
+        let mutation_type = if exists_on_disk { "file_change" } else { "deleted_file" };
+        let detail = if exists_on_disk {
+            "Forced full L0 sweep"
+        } else {
+            "Forced full L0 sweep (file missing)"
+        };
+
+        let _ = conn.execute(
+            "INSERT INTO pyramid_pending_mutations
+             (slug, layer, mutation_type, target_ref, detail, cascade_depth, detected_at, processed)
+             VALUES (?1, 0, ?2, ?3, ?4, 0, ?5, 0)",
+            rusqlite::params![slug, mutation_type, file_path, detail, now],
+        );
+        enqueued += 1;
+    }
+
+    (file_paths.len() as i64, enqueued, already_pending)
 }
 
 /// POST /pyramid/:slug/auto-update/breaker/resume
@@ -1838,56 +1971,11 @@ async fn handle_stale_log(
     let offset = params.offset.unwrap_or(0);
     let conn = state.reader.lock().await;
 
-    let mut sql = String::from(
-        "SELECT id, slug, batch_id, layer, target_id, stale, reason,
-                checker_index, checker_batch_size, checked_at, cost_tokens, cost_usd
-         FROM pyramid_stale_check_log WHERE slug = ?1"
-    );
-    let mut param_vals: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-    param_vals.push(Box::new(slug_name.clone()));
-
-    if let Some(layer) = params.layer {
-        param_vals.push(Box::new(layer));
-        sql.push_str(&format!(" AND layer = ?{}", param_vals.len()));
+    // Bug 3 fix: Delegate to db::get_stale_log instead of duplicating the query inline.
+    match db::get_stale_log(&conn, &slug_name, params.layer, params.stale.as_deref(), limit, offset) {
+        Ok(rows) => Ok(json_ok(&rows)),
+        Err(e) => Ok(json_error(warp::http::StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())),
     }
-    if let Some(ref stale_str) = params.stale {
-        let stale_val: i32 = if stale_str == "yes" { 1 } else { 0 };
-        param_vals.push(Box::new(stale_val));
-        sql.push_str(&format!(" AND stale = ?{}", param_vals.len()));
-    }
-
-    param_vals.push(Box::new(limit));
-    sql.push_str(&format!(" ORDER BY checked_at DESC LIMIT ?{}", param_vals.len()));
-    param_vals.push(Box::new(offset));
-    sql.push_str(&format!(" OFFSET ?{}", param_vals.len()));
-
-    let param_refs: Vec<&dyn rusqlite::types::ToSql> = param_vals.iter().map(|p| p.as_ref()).collect();
-    let mut stmt = match conn.prepare(&sql) {
-        Ok(s) => s,
-        Err(e) => return Ok(json_error(warp::http::StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())),
-    };
-
-    let rows: Vec<serde_json::Value> = stmt
-        .query_map(param_refs.as_slice(), |row| {
-            Ok(serde_json::json!({
-                "id": row.get::<_, i64>(0)?,
-                "slug": row.get::<_, String>(1)?,
-                "batch_id": row.get::<_, String>(2)?,
-                "layer": row.get::<_, i32>(3)?,
-                "target_id": row.get::<_, String>(4)?,
-                "stale": row.get::<_, String>(5)?,
-                "reason": row.get::<_, String>(6)?,
-                "checker_index": row.get::<_, i32>(7)?,
-                "checker_batch_size": row.get::<_, i32>(8)?,
-                "checked_at": row.get::<_, String>(9)?,
-                "cost_tokens": row.get::<_, Option<i64>>(10)?,
-                "cost_usd": row.get::<_, Option<f64>>(11)?,
-            }))
-        })
-        .map(|iter| iter.filter_map(|r| r.ok()).collect())
-        .unwrap_or_default();
-
-    Ok(json_ok(&rows))
 }
 
 // ── Phase 6: Cost Observatory route handler ─────────────────────────
@@ -1912,7 +2000,7 @@ async fn handle_cost(
     let (total_spend, total_calls): (f64, i64) = conn
         .query_row(
             &format!(
-                "SELECT COALESCE(SUM(cost_usd), 0.0), COUNT(*) FROM pyramid_cost_log
+                "SELECT COALESCE(SUM(estimated_cost), 0.0), COUNT(*) FROM pyramid_cost_log
                  WHERE slug = ?1 {}", window_clause
             ),
             rusqlite::params![slug_name],
@@ -1923,7 +2011,7 @@ async fn handle_cost(
     // By source (manual vs auto_stale)
     let by_source = {
         let mut stmt = conn.prepare(&format!(
-            "SELECT COALESCE(source, 'manual'), COALESCE(SUM(cost_usd), 0.0), COUNT(*)
+            "SELECT COALESCE(source, 'manual'), COALESCE(SUM(estimated_cost), 0.0), COUNT(*)
              FROM pyramid_cost_log WHERE slug = ?1 {}
              GROUP BY COALESCE(source, 'manual')", window_clause
         )).unwrap();
@@ -1943,7 +2031,7 @@ async fn handle_cost(
     // By check_type
     let by_check_type = {
         let mut stmt = conn.prepare(&format!(
-            "SELECT COALESCE(check_type, 'unknown'), COALESCE(SUM(cost_usd), 0.0), COUNT(*)
+            "SELECT COALESCE(check_type, 'unknown'), COALESCE(SUM(estimated_cost), 0.0), COUNT(*)
              FROM pyramid_cost_log WHERE slug = ?1 {}
              GROUP BY COALESCE(check_type, 'unknown')", window_clause
         )).unwrap();
@@ -1963,7 +2051,7 @@ async fn handle_cost(
     // By layer
     let by_layer = {
         let mut stmt = conn.prepare(&format!(
-            "SELECT COALESCE(layer, -1), COALESCE(SUM(cost_usd), 0.0), COUNT(*)
+            "SELECT COALESCE(layer, -1), COALESCE(SUM(estimated_cost), 0.0), COUNT(*)
              FROM pyramid_cost_log WHERE slug = ?1 {}
              GROUP BY COALESCE(layer, -1)", window_clause
         )).unwrap();
@@ -1983,7 +2071,7 @@ async fn handle_cost(
     // Recent calls (last 20)
     let recent_calls = {
         let mut stmt = conn.prepare(&format!(
-            "SELECT id, operation, model, input_tokens, output_tokens, cost_usd,
+            "SELECT id, operation, model, input_tokens, output_tokens, estimated_cost,
                     COALESCE(source, 'manual'), layer, check_type, created_at
              FROM pyramid_cost_log WHERE slug = ?1 {}
              ORDER BY created_at DESC LIMIT 20", window_clause
@@ -2019,3 +2107,60 @@ async fn handle_cost(
     })))
 }
 
+/// POST /pyramid/:slug/auto-update/l0-sweep
+///
+/// Enqueue every tracked L0 file for a fresh stale check, then immediately
+/// drain layers 0..=3 so the full cascade runs without waiting for the poll loop.
+async fn handle_auto_update_l0_sweep(
+    slug_name: String,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let (tracked_files, enqueued, already_pending) = {
+        let conn = state.writer.lock().await;
+        enqueue_full_l0_sweep(&conn, &slug_name)
+    };
+
+    let engine_data = {
+        let engines = state.stale_engines.lock().await;
+        engines.get(&slug_name).map(|engine| {
+            (
+                engine.db_path.clone(),
+                engine.api_key.clone(),
+                engine.model.clone(),
+                engine.concurrent_helpers.clone(),
+                engine.current_phase.clone(),
+                engine.phase_detail.clone(),
+                engine.last_result_summary.clone(),
+            )
+        })
+    };
+
+    let dispatch_status = if let Some((db_path, api_key, model, semaphore, phase_arc, detail_arc, summary_arc)) = engine_data {
+        for layer in 0..=3 {
+            let _ = stale_engine::drain_and_dispatch(
+                &slug_name,
+                layer,
+                0,
+                &db_path,
+                semaphore.clone(),
+                &api_key,
+                &model,
+                phase_arc.clone(),
+                detail_arc.clone(),
+                summary_arc.clone(),
+            )
+            .await;
+        }
+        "completed"
+    } else {
+        "enqueued_only"
+    };
+
+    Ok(json_ok(&serde_json::json!({
+        "status": dispatch_status,
+        "slug": slug_name,
+        "tracked_files": tracked_files,
+        "enqueued": enqueued,
+        "already_pending": already_pending,
+    })))
+}

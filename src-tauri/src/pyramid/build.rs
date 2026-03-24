@@ -24,6 +24,7 @@ use tracing::{info, warn};
 
 use super::db;
 use super::llm::{call_model, extract_json, LlmConfig};
+use super::naming::headline_from_analysis;
 use super::types::*;
 
 // ── UTF-8 safe slicing helpers (delegated to shared utils) ──────────────────
@@ -134,6 +135,7 @@ RULES:
 
 Output valid JSON only (no markdown fences, no extra text):
 {
+  "headline": "2-6 word chunk name that helps a human recognize this chunk later",
   "distilled": "The definitive dense record of this chunk. Everything important, nothing wasted. A reader learns everything the chunk contained.",
   "corrections": [{"wrong": "...", "right": "...", "who": "..."}],
   "decisions": [{"decided": "...", "rejected": "...", "why": "..."}],
@@ -159,9 +161,11 @@ For each topic:
 - entities: the specific named things in this topic
 - corrections: wrong/right/who for things that changed within this topic
 - decisions: what was decided and why, within this topic
+- headline: a 2-6 word label for the parent node itself. Concrete and human-friendly. No "This node..."
 
 Output valid JSON only:
 {
+  "headline": "2-6 word node label",
   "orientation": "1-2 sentences: what this node covers. Which children to drill for which topics.",
   "topics": [
     {
@@ -220,9 +224,11 @@ For each sub-topic:
 - entities: specific named things from the CURRENT state
 - corrections: wrong/right/who for things that changed, with source node
 - decisions: what was decided and why, with source node (prefer late decisions)
+- headline: a 2-6 word label for the thread node itself. Concrete and human-friendly. No "This thread..."
 
 Output valid JSON only:
 {
+  "headline": "2-6 word thread label",
   "orientation": "1-2 sentences: what this thread covers. Which source nodes to drill for which sub-topics.",
   "source_nodes": ["L1-000", "L1-003"],
   "topics": [
@@ -252,6 +258,7 @@ Be concrete. Use the actual names from the code. Do not abstract or generalize. 
 
 Output valid JSON only:
 {
+  "headline": "2-6 word file label",
   "purpose": "1-2 sentences: what this file does in the system",
   "line_count": 0,
   "exports": [{"name": "...", "type": "function|struct|interface|type|const|enum", "signature": "..."}],
@@ -272,6 +279,7 @@ pub const CONFIG_EXTRACT_PROMPT: &str = r#"You are analyzing a configuration fil
 
 Output valid JSON only:
 {
+  "headline": "2-6 word config label",
   "purpose": "What this config file controls",
   "app_identity": {"name": "...", "version": "...", "description": "..."},
   "dependencies": [{"name": "...", "version": "...", "role": "1-3 words: what it does"}],
@@ -298,9 +306,11 @@ For each topic:
 - depends_on: external services or other modules this depends on
 - patterns: structural observations about how the code works (error handling style, state access pattern, async patterns)
 - discrepancies: any inconsistencies between files (e.g., frontend removed a feature but backend still exposes the endpoint)
+- headline: a 2-6 word label for this grouped node. Concrete and recognizable. No "This module..."
 
 Output valid JSON only:
 {
+  "headline": "2-6 word module label",
   "orientation": "1-2 sentences: what this module does. Which files to read for which aspects.",
   "topics": [
     {
@@ -332,6 +342,7 @@ For each document, identify:
 
 Output valid JSON only:
 {
+  "headline": "2-6 word document label",
   "purpose": "chapter draft / character sheet / worldbuilding / outline / research",
   "summary": "2-4 sentence description of this document's content",
   "characters": [{"name": "...", "role": "...", "arc": "what happens to them here"}],
@@ -355,9 +366,11 @@ For each topic:
 - characters: Characters involved
 - plot_status: Where this thread stands (setup / developing / climax / resolved / open)
 - connections: How this thread connects to other parts of the story
+- headline: a 2-6 word label for this grouped node. Concrete and reader-friendly.
 
 Output valid JSON only:
 {
+  "headline": "2-6 word story arc label",
   "orientation": "1-2 sentences: what this cluster covers and which documents to read for which threads.",
   "topics": [
     {
@@ -512,6 +525,7 @@ fn node_from_analysis(
         slug: slug.to_string(),
         depth,
         chunk_index,
+        headline: headline_from_analysis(analysis, id),
         distilled,
         topics,
         corrections,
@@ -1673,7 +1687,7 @@ async fn build_threads_layer(
                 topic_inventory.push(serde_json::json!({
                     "source_node": node.id,
                     "topic_index": 0,
-                    "name": safe_slice_end(&node.distilled, 60),
+                    "name": node.headline,
                     "entities": [],
                 }));
             } else {
@@ -1756,7 +1770,7 @@ async fn build_threads_layer(
                             vec![serde_json::json!({
                                 "source_node": node.id,
                                 "topic_index": 0,
-                                "topic_name": safe_slice_end(&node.distilled, 60),
+                                "topic_name": node.headline,
                             })]
                         } else {
                             node.topics.iter().enumerate().map(|(ti, t)| {
@@ -1890,7 +1904,7 @@ async fn build_threads_layer(
                         assigned_topics.push(topic_val);
                     } else {
                         assigned_topics.push(serde_json::json!({
-                            "name": safe_slice_end(&l1_node.distilled, 60),
+                            "name": l1_node.headline,
                             "current": l1_node.distilled,
                             "entities": [],
                             "corrections": l1_node.corrections,
@@ -2127,9 +2141,14 @@ async fn build_upper_layers(
 /// Build a JSON payload from a node, preferring topics if available.
 fn child_payload_json(node: &PyramidNode) -> Value {
     if !node.topics.is_empty() {
-        serde_json::to_value(&node.topics).unwrap_or(serde_json::json!([]))
+        serde_json::json!({
+            "headline": node.headline,
+            "distilled": node.distilled,
+            "topics": node.topics,
+        })
     } else {
         serde_json::json!({
+            "headline": node.headline,
             "distilled": node.distilled,
             "corrections": node.corrections,
             "decisions": node.decisions,

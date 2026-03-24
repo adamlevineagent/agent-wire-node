@@ -20,6 +20,7 @@ use crate::pyramid::db;
 use crate::pyramid::types::*;
 use crate::pyramid::llm;
 use crate::pyramid::config_helper::config_for_model;
+use crate::pyramid::naming::{clean_headline, headline_for_node};
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -362,16 +363,10 @@ Output JSON only:
             Ok(affected) => {
                 if !affected.is_empty() {
                     info!("[delta] staleness propagated to {} nodes: {:?}", affected.len(), affected);
-                    // Write confirmed_stale WAL entries for each affected node
-                    let w = writer.lock().await;
-                    let now = chrono::Utc::now().to_rfc3339();
-                    for node_id in &affected {
-                        let _ = w.execute(
-                            "INSERT INTO pyramid_pending_mutations (slug, layer, mutation_type, target_ref, detail, cascade_depth, detected_at, processed) VALUES (?1, ?2, 'confirmed_stale', ?3, ?4, 0, ?5, 0)",
-                            rusqlite::params![slug, 1, node_id, format!("Staleness propagated from {}", canonical_id), now],
-                        );
-                    }
-                    info!("[delta] Wrote {} confirmed_stale WAL entries for affected nodes", affected.len());
+                    // Note: Do NOT write confirmed_stale WAL entries here.
+                    // DADBEAR handles upward propagation through its own per-layer timer system.
+                    // Writing WAL entries from create_delta caused false L1 firings
+                    // (every delta creation triggered L1 checks even when content didn't change).
                 }
             }
             Err(e) => {
@@ -583,6 +578,7 @@ pub async fn collapse_thread(
 
     // 4. Build canonical JSON for the prompt
     let canonical_json = serde_json::json!({
+        "headline": canonical_node.headline,
         "distilled": canonical_node.distilled,
         "topics": canonical_node.topics,
         "corrections": canonical_node.corrections,
@@ -610,6 +606,7 @@ Deduplicate corrections and decisions -- keep only the latest version if correct
 
 Output valid JSON matching this schema:
 {{
+  "headline": "2-6 word canonical label",
   "distilled": "Complete understanding incorporating all changes",
   "topics": [{{"name": "topic", "current": "state", "entities": ["entity"], "corrections": [{{"wrong": "was", "right": "is", "who": "delta-chain-collapse"}}], "decisions": [{{"decided": "what", "why": "reason", "rejected": "alternatives"}}]}}],
   "corrections": [{{"wrong": "was", "right": "is", "who": "delta-chain-collapse"}}],
@@ -629,6 +626,12 @@ Output valid JSON matching this schema:
     let parsed = llm::extract_json(&raw)?;
 
     // 5. Parse response into PyramidNode fields
+    let headline = parsed
+        .get("headline")
+        .and_then(|v| v.as_str())
+        .and_then(clean_headline)
+        .unwrap_or_else(|| headline_for_node(&canonical_node, None));
+
     let distilled = parsed
         .get("distilled")
         .and_then(|v| v.as_str())
@@ -676,6 +679,7 @@ Output valid JSON matching this schema:
         slug: slug.to_string(),
         depth: canonical_node.depth,
         chunk_index: canonical_node.chunk_index,
+        headline,
         distilled,
         topics,
         corrections,
@@ -741,8 +745,8 @@ Output valid JSON matching this schema:
 
         // 9. Update thread
         tx.execute(
-            "UPDATE pyramid_threads SET current_canonical_id = ?1, delta_count = 0, updated_at = ?2 WHERE slug = ?3 AND thread_id = ?4",
-            rusqlite::params![new_node_id, now_ts(), slug, thread_id],
+            "UPDATE pyramid_threads SET current_canonical_id = ?1, thread_name = ?2, delta_count = 0, updated_at = ?3 WHERE slug = ?4 AND thread_id = ?5",
+            rusqlite::params![new_node_id, new_node.headline, now_ts(), slug, thread_id],
         )?;
 
         // 10. Clear distillation
@@ -792,16 +796,9 @@ Output valid JSON matching this schema:
             Ok(affected) => {
                 if !affected.is_empty() {
                     info!("[delta] collapse staleness propagated to {} nodes: {:?}", affected.len(), affected);
-                    // Write confirmed_stale WAL entries for each affected node
-                    let w = writer.lock().await;
-                    let now = chrono::Utc::now().to_rfc3339();
-                    for node_id in &affected {
-                        let _ = w.execute(
-                            "INSERT INTO pyramid_pending_mutations (slug, layer, mutation_type, target_ref, detail, cascade_depth, detected_at, processed) VALUES (?1, ?2, 'confirmed_stale', ?3, ?4, 0, ?5, 0)",
-                            rusqlite::params![slug, 1, node_id, format!("Staleness propagated from {}", new_node_id), now],
-                        );
-                    }
-                    info!("[delta] Wrote {} confirmed_stale WAL entries for affected nodes", affected.len());
+                    // Note: Do NOT write confirmed_stale WAL entries here.
+                    // DADBEAR handles upward propagation through its own per-layer timer system.
+                    // Writing WAL entries from collapse_thread caused false L1 firings.
                 }
             }
             Err(e) => {

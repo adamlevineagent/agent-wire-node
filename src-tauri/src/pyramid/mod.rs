@@ -16,6 +16,7 @@ pub mod ingest;
 pub mod build;
 pub mod query;
 pub mod llm;
+pub mod naming;
 pub mod slug;
 pub mod routes;
 pub mod delta;

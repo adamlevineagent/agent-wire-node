@@ -8,9 +8,12 @@ use chrono::Utc;
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use tokio::sync::mpsc;
 
+use super::db as pyramid_db;
 use super::types::AutoUpdateConfig;
 
 // ── Recent Remove tracker for rename-candidate detection ─────────────────────
@@ -29,6 +32,15 @@ pub struct PyramidFileWatcher {
     watcher: Option<RecommendedWatcher>,
     source_paths: Vec<String>,
     paused_flag: Arc<Mutex<bool>>,
+    /// In-memory cache of all file paths tracked in pyramid_file_hashes for this slug.
+    tracked_paths: Arc<Mutex<HashSet<String>>>,
+    /// Extensions that were ingested during the build (e.g. [".rs", ".ts"]).
+    ingested_extensions: Arc<Mutex<Vec<String>>>,
+    /// Config filenames that were ingested (e.g. ["Cargo.toml", "package.json"]).
+    ingested_config_files: Arc<Mutex<Vec<String>>>,
+    /// Channel to notify stale engines when mutations are written to the WAL.
+    /// Sends (slug, layer) so the receiver can call engine.notify_mutation(layer).
+    mutation_sender: Option<mpsc::UnboundedSender<(String, i32)>>,
 }
 
 impl PyramidFileWatcher {
@@ -39,16 +51,69 @@ impl PyramidFileWatcher {
             watcher: None,
             source_paths,
             paused_flag: Arc::new(Mutex::new(false)),
+            tracked_paths: Arc::new(Mutex::new(HashSet::new())),
+            ingested_extensions: Arc::new(Mutex::new(Vec::new())),
+            ingested_config_files: Arc::new(Mutex::new(Vec::new())),
+            mutation_sender: None,
         }
+    }
+
+    /// Set the mutation sender channel. After write_mutation(), sends (slug, layer)
+    /// so the stale engine can be notified of new mutations without polling.
+    pub fn set_mutation_sender(&mut self, sender: mpsc::UnboundedSender<(String, i32)>) {
+        self.mutation_sender = Some(sender);
+    }
+
+    /// Populate caches from the database. Called on start() and resume().
+    fn populate_caches(&self, db_path: &str) -> Result<()> {
+        let conn = Connection::open(db_path)
+            .with_context(|| format!("Failed to open DB for cache population: {}", db_path))?;
+
+        // Load tracked paths
+        let paths = pyramid_db::get_tracked_paths(&conn, &self.slug)?;
+        if let Ok(mut cache) = self.tracked_paths.lock() {
+            *cache = paths;
+        }
+
+        // Load ingested extensions
+        let extensions = pyramid_db::get_ingested_extensions(&conn, &self.slug)?;
+        if let Ok(mut cache) = self.ingested_extensions.lock() {
+            *cache = extensions;
+        }
+
+        // Load ingested config files from pyramid_file_hashes: filenames without extensions
+        // that match known config file patterns
+        let config_fnames = pyramid_db::get_ingested_config_files(&conn, &self.slug)?;
+        if let Ok(mut cache) = self.ingested_config_files.lock() {
+            *cache = config_fnames;
+        }
+
+        tracing::info!(
+            "Watcher caches populated for slug='{}': {} tracked paths, {} extensions, {} config files",
+            self.slug,
+            self.tracked_paths.lock().map(|c| c.len()).unwrap_or(0),
+            self.ingested_extensions.lock().map(|c| c.len()).unwrap_or(0),
+            self.ingested_config_files.lock().map(|c| c.len()).unwrap_or(0),
+        );
+
+        Ok(())
     }
 
     /// Start watching all source paths for file changes.
     ///
-    /// Events open a new database connection each time (no long-lived connection held).
+    /// Populates in-memory caches from DB on start. Event handlers use caches for reads;
+    /// a single DB connection is opened per event batch for writes only.
     pub fn start(&mut self, db_path: &str) -> Result<()> {
+        // Populate caches from DB before starting
+        self.populate_caches(db_path)?;
+
         let slug = self.slug.clone();
         let db_path = db_path.to_string();
         let paused_clone = Arc::clone(&self.paused_flag);
+        let tracked_paths_clone = Arc::clone(&self.tracked_paths);
+        let ingested_extensions_clone = Arc::clone(&self.ingested_extensions);
+        let ingested_config_files_clone = Arc::clone(&self.ingested_config_files);
+        let mutation_sender_clone = self.mutation_sender.clone();
         // Shared recent-removes tracker for rename-candidate detection
         let recent_removes: Arc<Mutex<Vec<RecentRemove>>> =
             Arc::new(Mutex::new(Vec::new()));
@@ -78,6 +143,10 @@ impl PyramidFileWatcher {
                 &slug,
                 &db_path,
                 &recent_removes_clone,
+                &tracked_paths_clone,
+                &ingested_extensions_clone,
+                &ingested_config_files_clone,
+                &mutation_sender_clone,
             ) {
                 tracing::warn!("Error handling file event: {}", e);
             }
@@ -115,17 +184,26 @@ impl PyramidFileWatcher {
     }
 
     /// Resume the watcher — events are processed again.
-    pub fn resume(&mut self) {
+    /// Repopulates caches from DB to pick up any changes made while paused.
+    pub fn resume(&mut self, db_path: &str) {
+        if let Err(e) = self.populate_caches(db_path) {
+            tracing::warn!("Failed to repopulate watcher caches on resume for slug='{}': {}", self.slug, e);
+        }
         *self.paused_flag.lock().unwrap() = false;
     }
 }
 
 // ── Event handling with rename-candidate tracking ────────────────────────────
 
-/// Wrapper that tracks recent removes for rename-candidate detection.
-/// Check if a path is tracked (exists in pyramid_file_hashes) or is a plausible
-/// new source file. Filters out build artifacts, node_modules, .git, tmp files, etc.
-fn is_trackable_path(path: &str, slug: &str, db_path: &str) -> bool {
+/// Check if a path is tracked (exists in cached tracked_paths) or is a plausible
+/// new source file matching ingested extensions/config files.
+/// Uses ONLY in-memory caches — ZERO database connections per event.
+fn is_trackable_path(
+    path: &str,
+    tracked_paths: &Arc<Mutex<HashSet<String>>>,
+    ingested_extensions: &Arc<Mutex<Vec<String>>>,
+    ingested_config_files: &Arc<Mutex<Vec<String>>>,
+) -> bool {
     // Fast reject: skip obvious non-source paths
     let skip_patterns = [
         "/target/", "/node_modules/", "/.git/", "/dist/", "/.next/",
@@ -137,26 +215,38 @@ fn is_trackable_path(path: &str, slug: &str, db_path: &str) -> bool {
         }
     }
 
-    // Check if this file is already tracked
-    if let Ok(conn) = Connection::open(db_path) {
-        let tracked: bool = conn
-            .query_row(
-                "SELECT COUNT(*) > 0 FROM pyramid_file_hashes WHERE slug = ?1 AND file_path = ?2",
-                rusqlite::params![slug, path],
-                |row| row.get(0),
-            )
-            .unwrap_or(false);
-        if tracked {
+    // Check if this file is already tracked in the cache
+    if let Ok(cache) = tracked_paths.lock() {
+        if cache.contains(path) {
             return true;
         }
     }
 
-    // For untracked files, only allow common source extensions (potential new files)
-    let source_extensions = [
-        ".rs", ".ts", ".tsx", ".js", ".jsx", ".py", ".go", ".toml", ".json",
-        ".yaml", ".yml", ".md", ".html", ".css", ".sql",
-    ];
-    source_extensions.iter().any(|ext| path.ends_with(ext))
+    // For untracked files: check if the extension matches ingested extensions
+    let file_ext = Path::new(path)
+        .extension()
+        .map(|e| format!(".{}", e.to_string_lossy().to_lowercase()))
+        .unwrap_or_default();
+
+    if let Ok(exts) = ingested_extensions.lock() {
+        if exts.iter().any(|ext| ext == &file_ext) {
+            return true;
+        }
+    }
+
+    // Check if filename matches ingested config files (e.g. "Cargo.toml")
+    let filename = Path::new(path)
+        .file_name()
+        .map(|f| f.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    if let Ok(configs) = ingested_config_files.lock() {
+        if configs.iter().any(|cf| cf == &filename) {
+            return true;
+        }
+    }
+
+    false
 }
 
 fn handle_event_with_rename_tracking(
@@ -164,6 +254,10 @@ fn handle_event_with_rename_tracking(
     slug: &str,
     db_path: &str,
     recent_removes: &Arc<Mutex<Vec<RecentRemove>>>,
+    tracked_paths: &Arc<Mutex<HashSet<String>>>,
+    ingested_extensions: &Arc<Mutex<Vec<String>>>,
+    ingested_config_files: &Arc<Mutex<Vec<String>>>,
+    mutation_sender: &Option<mpsc::UnboundedSender<(String, i32)>>,
 ) -> Result<()> {
     let now = Utc::now();
 
@@ -172,14 +266,22 @@ fn handle_event_with_rename_tracking(
         removes.retain(|r| (now - r.timestamp).num_seconds() < 3);
     }
 
-    for path in &event.paths {
-        let path_str = path.to_string_lossy().to_string();
+    // Collect trackable paths first (uses caches only, no DB)
+    let trackable_paths: Vec<String> = event
+        .paths
+        .iter()
+        .map(|p| p.to_string_lossy().to_string())
+        .filter(|p| is_trackable_path(p, tracked_paths, ingested_extensions, ingested_config_files))
+        .collect();
 
-        // Filter: only process tracked files or plausible source files
-        if !is_trackable_path(&path_str, slug, db_path) {
-            continue;
-        }
+    if trackable_paths.is_empty() {
+        return Ok(());
+    }
 
+    // Open ONE connection for all write operations in this event
+    let conn = open_conn(db_path)?;
+
+    for path_str in &trackable_paths {
         match &event.kind {
             EventKind::Remove(_) => {
                 // Track the remove for potential rename-candidate pairing
@@ -190,11 +292,11 @@ fn handle_event_with_rename_tracking(
                     });
                 }
                 // Also handle as a normal remove event
-                handle_remove_event(slug, db_path, &path_str)?;
+                handle_remove_event_conn(&conn, slug, path_str, tracked_paths)?;
             }
             EventKind::Create(_) => {
                 // Check if this Create pairs with a recent Remove (rename candidate)
-                let rename_pair = find_rename_candidate(recent_removes, &path_str, now);
+                let rename_pair = find_rename_candidate(recent_removes, path_str, now);
 
                 if let Some(old_path) = rename_pair {
                     // Write a rename_candidate mutation
@@ -204,26 +306,30 @@ fn handle_event_with_rename_tracking(
                     })
                     .to_string();
 
-                    let conn = open_conn(db_path)?;
                     // Fan-out to all pyramids tracking this file
                     let slugs = get_watched_slugs_for_path(&conn, &old_path)?;
                     for s in &slugs {
-                        write_mutation(&conn, s, 0, "rename_candidate", &path_str, Some(&detail))?;
+                        write_mutation(&conn, s, 0, "rename_candidate", path_str, Some(&detail))?;
                         if check_runaway_for_slug(&conn, s)? {
                             tracing::warn!("Runaway threshold tripped for slug='{}'", s);
                         }
                     }
                     // Also write for the current slug if not already covered
                     if !slugs.contains(&slug.to_string()) {
-                        write_mutation(&conn, slug, 0, "rename_candidate", &path_str, Some(&detail))?;
+                        write_mutation(&conn, slug, 0, "rename_candidate", path_str, Some(&detail))?;
+                    }
+                    // Update tracked_paths cache for rename
+                    if let Ok(mut cache) = tracked_paths.lock() {
+                        cache.remove(&old_path);
+                        cache.insert(path_str.clone());
                     }
                 } else {
                     // Normal create event
-                    handle_create_event(slug, db_path, &path_str)?;
+                    handle_create_event_conn(&conn, slug, path_str, tracked_paths)?;
                 }
             }
             EventKind::Modify(_) => {
-                handle_modify_event(slug, db_path, &path_str)?;
+                handle_modify_event_conn(&conn, slug, path_str)?;
             }
             // Rename is not emitted on macOS (FSEvents reports Remove+Create),
             // but handle it if the platform does emit it.
@@ -234,6 +340,13 @@ fn handle_event_with_rename_tracking(
                 // Access, Any, etc. — ignore
             }
         }
+    }
+
+    // Notify the stale engine that mutations were written for layer 0.
+    // This bridges the gap between the file watcher and the stale engine
+    // so mutations are processed immediately instead of waiting for the poll loop.
+    if let Some(sender) = mutation_sender {
+        let _ = sender.send((slug.to_string(), 0));
     }
 
     Ok(())
@@ -302,18 +415,16 @@ fn filenames_similar(a: &str, b: &str) -> bool {
     shared * 2 >= shorter // at least 50% overlap
 }
 
-// ── Individual event handlers ────────────────────────────────────────────────
+// ── Individual event handlers (using shared connection) ──────────────────────
 
-fn handle_modify_event(slug: &str, db_path: &str, path: &str) -> Result<()> {
+fn handle_modify_event_conn(conn: &Connection, slug: &str, path: &str) -> Result<()> {
     let hash = match compute_file_hash(path) {
         Ok(h) => h,
         Err(_) => return Ok(()), // file may have been deleted between event and read
     };
 
-    let conn = open_conn(db_path)?;
-
     // Fan-out: find all slugs tracking this file
-    let slugs = get_watched_slugs_for_path(&conn, path)?;
+    let slugs = get_watched_slugs_for_path(conn, path)?;
     let all_slugs = ensure_slug_included(&slugs, slug);
 
     for s in &all_slugs {
@@ -333,8 +444,8 @@ fn handle_modify_event(slug: &str, db_path: &str, path: &str) -> Result<()> {
         }
 
         // Hash differs — write file_change mutation
-        write_mutation(&conn, s, 0, "file_change", path, Some(&hash))?;
-        if check_runaway_for_slug(&conn, s)? {
+        write_mutation(conn, s, 0, "file_change", path, Some(&hash))?;
+        if check_runaway_for_slug(conn, s)? {
             tracing::warn!("Runaway threshold tripped for slug='{}'", s);
         }
     }
@@ -342,11 +453,14 @@ fn handle_modify_event(slug: &str, db_path: &str, path: &str) -> Result<()> {
     Ok(())
 }
 
-fn handle_create_event(slug: &str, db_path: &str, path: &str) -> Result<()> {
-    let conn = open_conn(db_path)?;
-
+fn handle_create_event_conn(
+    conn: &Connection,
+    slug: &str,
+    path: &str,
+    tracked_paths: &Arc<Mutex<HashSet<String>>>,
+) -> Result<()> {
     // Fan-out to all slugs that may track this path
-    let slugs = get_watched_slugs_for_path(&conn, path)?;
+    let slugs = get_watched_slugs_for_path(conn, path)?;
     let all_slugs = ensure_slug_included(&slugs, slug);
 
     for s in &all_slugs {
@@ -361,21 +475,29 @@ fn handle_create_event(slug: &str, db_path: &str, path: &str) -> Result<()> {
             > 0;
 
         if !exists {
-            write_mutation(&conn, s, 0, "new_file", path, None)?;
-            if check_runaway_for_slug(&conn, s)? {
+            write_mutation(conn, s, 0, "new_file", path, None)?;
+            if check_runaway_for_slug(conn, s)? {
                 tracing::warn!("Runaway threshold tripped for slug='{}'", s);
             }
         }
     }
 
+    // Update tracked_paths cache with the new file
+    if let Ok(mut cache) = tracked_paths.lock() {
+        cache.insert(path.to_string());
+    }
+
     Ok(())
 }
 
-fn handle_remove_event(slug: &str, db_path: &str, path: &str) -> Result<()> {
-    let conn = open_conn(db_path)?;
-
+fn handle_remove_event_conn(
+    conn: &Connection,
+    slug: &str,
+    path: &str,
+    tracked_paths: &Arc<Mutex<HashSet<String>>>,
+) -> Result<()> {
     // Fan-out
-    let slugs = get_watched_slugs_for_path(&conn, path)?;
+    let slugs = get_watched_slugs_for_path(conn, path)?;
     let all_slugs = ensure_slug_included(&slugs, slug);
 
     for s in &all_slugs {
@@ -390,11 +512,16 @@ fn handle_remove_event(slug: &str, db_path: &str, path: &str) -> Result<()> {
             > 0;
 
         if exists {
-            write_mutation(&conn, s, 0, "deleted_file", path, None)?;
-            if check_runaway_for_slug(&conn, s)? {
+            write_mutation(conn, s, 0, "deleted_file", path, None)?;
+            if check_runaway_for_slug(conn, s)? {
                 tracing::warn!("Runaway threshold tripped for slug='{}'", s);
             }
         }
+    }
+
+    // Update tracked_paths cache — remove the deleted file
+    if let Ok(mut cache) = tracked_paths.lock() {
+        cache.remove(path);
     }
 
     Ok(())
@@ -414,7 +541,7 @@ pub fn compute_file_hash(path: &str) -> Result<String> {
 
 /// Check whether the runaway threshold has been exceeded for a slug.
 ///
-/// Returns true if the ratio of unprocessed mutations (excluding new_file and deleted_file)
+/// Returns true if the ratio of distinct L0 file targets waiting in the WAL
 /// to total tracked files exceeds the configured runaway_threshold.
 pub fn check_runaway(conn: &Connection, slug: &str, config: &AutoUpdateConfig) -> bool {
     // Count total files tracked for this slug
@@ -430,11 +557,14 @@ pub fn check_runaway(conn: &Connection, slug: &str, config: &AutoUpdateConfig) -
         return false; // pyramid just created, no baseline
     }
 
-    // Count unprocessed mutations excluding new_file and deleted_file
+    // Count distinct pending L0 file targets excluding new_file and deleted_file.
+    // This matches the operator-facing meaning of the threshold: "what share of
+    // tracked files is currently pending?" Duplicate watcher rows should not
+    // inflate the breaker ratio.
     let mutation_count: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM pyramid_pending_mutations
-             WHERE slug = ?1 AND processed = 0
+            "SELECT COUNT(DISTINCT target_ref) FROM pyramid_pending_mutations
+             WHERE slug = ?1 AND layer = 0 AND processed = 0
              AND mutation_type NOT IN ('new_file', 'deleted_file')",
             rusqlite::params![slug],
             |row| row.get(0),
@@ -442,7 +572,9 @@ pub fn check_runaway(conn: &Connection, slug: &str, config: &AutoUpdateConfig) -
         .unwrap_or(0);
 
     let ratio = mutation_count as f64 / total_files as f64;
-    ratio >= config.runaway_threshold
+    // Treat the threshold as inclusive. At 100%, operators are explicitly
+    // allowing a full-slug sweep to proceed.
+    ratio > config.runaway_threshold
 }
 
 /// Write a pending mutation to the WAL. Returns the inserted row ID.

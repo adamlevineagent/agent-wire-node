@@ -1,4 +1,6 @@
 // pyramid/types.rs — Data model structs for the Knowledge Pyramid engine
+// DADBEAR: Detect, Accumulate, Debounce, Batch, Evaluate, Act, Recurse
+// v0.2.0 — Live stale detection, FAQ generalization, cost observatory
 //
 // Types: SlugInfo, ContentType, PyramidNode, Topic, Correction, Decision, Term,
 //        TreeNode, DrillResult, SearchHit, EntityEntry, BuildStatus, BuildProgress,
@@ -52,6 +54,7 @@ pub struct PyramidNode {
     pub slug: String,
     pub depth: i64,
     pub chunk_index: Option<i64>,
+    pub headline: String,
     pub distilled: String,
     pub topics: Vec<Topic>,
     pub corrections: Vec<Correction>,
@@ -99,7 +102,10 @@ pub struct Term {
 pub struct TreeNode {
     pub id: String,
     pub depth: i64,
+    pub headline: String,
     pub distilled: String,
+    pub thread_id: Option<String>,
+    pub source_path: Option<String>,
     pub children: Vec<TreeNode>,
 }
 
@@ -350,6 +356,38 @@ impl AnnotationType {
     }
 }
 
+// ── FAQ Category / Directory Types ────────────────────────────────────────────
+
+/// A FAQ category — grouping of related FAQ nodes with a distilled summary.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FaqCategory {
+    pub id: String,
+    pub slug: String,
+    pub name: String,
+    pub distilled_summary: String,
+    pub faq_ids: Vec<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// The FAQ directory — flat or hierarchical depending on FAQ count.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FaqDirectory {
+    pub slug: String,
+    pub mode: String, // "flat" or "hierarchical"
+    pub total_faqs: i64,
+    pub categories: Vec<FaqCategoryEntry>,
+    pub uncategorized: Vec<FaqNode>, // FAQs not in any category, or ALL faqs in flat mode
+}
+
+/// A single category entry in the directory (with optional children on drill).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FaqCategoryEntry {
+    pub category: FaqCategory,
+    pub faq_count: i64,
+    pub children: Option<Vec<FaqNode>>, // populated on drill
+}
+
 // ── v4.2 Auto-Update & Stale-Check Types ─────────────────────────────────────
 
 /// WAL entry for crash recovery of pending mutations.
@@ -396,6 +434,9 @@ pub struct StaleCheckResult {
     pub checked_at: String,
     pub cost_tokens: Option<i64>,
     pub cost_usd: Option<f64>,
+    /// Cascade depth from the source mutation, used for propagation tracking.
+    /// Populated from the PendingMutation that triggered this check.
+    pub cascade_depth: i32,
 }
 
 /// Result of a connection carryforward check.

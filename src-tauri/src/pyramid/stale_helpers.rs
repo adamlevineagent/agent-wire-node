@@ -17,6 +17,8 @@ use uuid::Uuid;
 
 use super::config_helper::{config_for_model, estimate_cost};
 use super::llm::{call_model_with_usage, extract_json};
+use super::naming::{headline_from_path, tombstone_headline};
+use super::stale_helpers_upper::resolve_parent_targets_for_node_ids;
 use super::types::{
     FileStaleResult, PendingMutation, RenameResult, StaleCheckResult,
 };
@@ -84,6 +86,27 @@ fn compute_hash(content: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(content);
     hex::encode(hasher.finalize())
+}
+
+fn enqueue_parent_confirmed_stales(
+    conn: &Connection,
+    slug: &str,
+    source_node_ids: &[String],
+    detail: &str,
+    now: &str,
+) -> Result<usize> {
+    let parent_targets = resolve_parent_targets_for_node_ids(conn, slug, source_node_ids)?;
+
+    for target in &parent_targets {
+        conn.execute(
+            "INSERT INTO pyramid_pending_mutations
+             (slug, layer, mutation_type, target_ref, detail, cascade_depth, detected_at, processed)
+             VALUES (?1, 1, 'confirmed_stale', ?2, ?3, 0, ?4, 0)",
+            rusqlite::params![slug, target, detail, now],
+        )?;
+    }
+
+    Ok(parent_targets.len())
 }
 
 // ── dispatch_file_stale_check ────────────────────────────────────────────────
@@ -219,6 +242,7 @@ pub async fn dispatch_file_stale_check(
                 checked_at: now.clone(),
                 cost_tokens: None,
                 cost_usd: None,
+                cascade_depth: m.cascade_depth,
             })
             .collect());
     }
@@ -323,6 +347,7 @@ Output JSON only. Array of objects, one per file:
             checked_at: now.clone(),
             cost_tokens: Some(total_tokens),
             cost_usd: Some(cost_usd),
+            cascade_depth: m.cascade_depth,
         });
     }
 
@@ -389,14 +414,15 @@ pub async fn dispatch_new_file_ingest(
                 file_path,
                 distilled_lines.join("\n")
             );
+            let headline = headline_from_path(file_path).unwrap_or_else(|| "New File".to_string());
 
             // Insert node into pyramid_nodes
             conn.execute(
                 "INSERT OR REPLACE INTO pyramid_nodes
-                 (id, slug, depth, chunk_index, distilled, topics, corrections, decisions,
+                 (id, slug, depth, chunk_index, headline, distilled, topics, corrections, decisions,
                   terms, dead_ends, self_prompt, children, parent_id, build_version, created_at)
-                 VALUES (?1, ?2, 0, NULL, ?3, '[]', '[]', '[]', '[]', '[]', '', '[]', NULL, 1, ?4)",
-                rusqlite::params![node_id, slug_c, distilled, now],
+                 VALUES (?1, ?2, 0, NULL, ?3, ?4, '[]', '[]', '[]', '[]', '[]', '', '[]', NULL, 1, ?5)",
+                rusqlite::params![node_id, slug_c, headline, distilled, now],
             )
             .with_context(|| format!("Failed to insert L0 node for {}", file_path))?;
 
@@ -410,16 +436,20 @@ pub async fn dispatch_new_file_ingest(
             )
             .with_context(|| format!("Failed to update file_hashes for {}", file_path))?;
 
-            // Write confirmed_stale mutation to WAL for L1 layer
-            conn.execute(
-                "INSERT INTO pyramid_pending_mutations
-                 (slug, layer, mutation_type, target_ref, detail, cascade_depth, detected_at, processed)
-                 VALUES (?1, 1, 'confirmed_stale', ?2, 'New file ingested', 0, ?3, 0)",
-                rusqlite::params![slug_c, node_id, now],
+            let parent_count = enqueue_parent_confirmed_stales(
+                &conn,
+                &slug_c,
+                std::slice::from_ref(&node_id),
+                "New file ingested",
+                &now,
             )
             .with_context(|| {
                 format!("Failed to write L1 confirmed_stale for {}", file_path)
             })?;
+
+            if parent_count == 0 {
+                info!(file = %file_path, node_id = %node_id, "New file ingested without an existing parent thread target");
+            }
 
             info!(file = %file_path, node_id = %node_id, "New file ingested into pyramid");
         }
@@ -499,16 +529,17 @@ pub async fn dispatch_tombstone(
                 "File deleted: {}. Previously contained: {}",
                 file_path, first_line
             );
+            let tombstone_headline = tombstone_headline(file_path);
 
             // Create tombstone node
             let tombstone_id = format!("TOMB-{}", Uuid::new_v4());
 
             conn.execute(
                 "INSERT INTO pyramid_nodes
-                 (id, slug, depth, chunk_index, distilled, topics, corrections, decisions,
+                 (id, slug, depth, chunk_index, headline, distilled, topics, corrections, decisions,
                   terms, dead_ends, self_prompt, children, parent_id, build_version, created_at)
-                 VALUES (?1, ?2, 0, NULL, ?3, '[]', '[]', '[]', '[]', '[]', '', '[]', NULL, 1, ?4)",
-                rusqlite::params![tombstone_id, slug_c, tombstone_content, now],
+                 VALUES (?1, ?2, 0, NULL, ?3, ?4, '[]', '[]', '[]', '[]', '[]', '', '[]', NULL, 1, ?5)",
+                rusqlite::params![tombstone_id, slug_c, tombstone_headline, tombstone_content, now],
             )
             .with_context(|| format!("Failed to create tombstone node for {}", file_path))?;
 
@@ -542,13 +573,17 @@ pub async fn dispatch_tombstone(
                 rusqlite::params![slug_c, file_path],
             )?;
 
-            // Write confirmed_stale mutation to WAL for L1 layer
-            conn.execute(
-                "INSERT INTO pyramid_pending_mutations
-                 (slug, layer, mutation_type, target_ref, detail, cascade_depth, detected_at, processed)
-                 VALUES (?1, 1, 'confirmed_stale', ?2, ?3, 0, ?4, 0)",
-                rusqlite::params![slug_c, tombstone_id, tombstone_content, now],
+            let parent_count = enqueue_parent_confirmed_stales(
+                &conn,
+                &slug_c,
+                &node_ids,
+                &tombstone_content,
+                &now,
             )?;
+
+            if parent_count == 0 {
+                info!(file = %file_path, tombstone = %tombstone_id, "Tombstone created without an existing parent thread target");
+            }
 
             info!(file = %file_path, tombstone = %tombstone_id, "File tombstoned");
         }
@@ -781,13 +816,17 @@ Output JSON only:
                     rusqlite::params![new_path_c, new_node_id, now, slug_c, old_node_id],
                 )?;
 
-                // Write confirmed_stale for L1
-                conn.execute(
-                    "INSERT INTO pyramid_pending_mutations
-                     (slug, layer, mutation_type, target_ref, detail, cascade_depth, detected_at, processed)
-                     VALUES (?1, 1, 'confirmed_stale', ?2, ?3, 0, ?4, 0)",
-                    rusqlite::params![slug_c, new_node_id, rename_note, now],
+                let parent_count = enqueue_parent_confirmed_stales(
+                    &conn,
+                    &slug_c,
+                    &old_node_ids,
+                    &rename_note,
+                    &now,
                 )?;
+
+                if parent_count == 0 {
+                    info!(old_path = %old_path_c, new_path = %new_path_c, "Rename completed without an existing parent thread target");
+                }
 
                 info!(
                     old_path = %old_path_c,
@@ -819,15 +858,16 @@ Output JSON only:
                     "File deleted: {}. Previously contained: {}",
                     old_path_c, first_line
                 );
+                let tombstone_headline = tombstone_headline(&old_path_c);
 
                 let tombstone_id = format!("TOMB-{}", Uuid::new_v4());
 
                 conn.execute(
                     "INSERT INTO pyramid_nodes
-                     (id, slug, depth, chunk_index, distilled, topics, corrections, decisions,
+                     (id, slug, depth, chunk_index, headline, distilled, topics, corrections, decisions,
                       terms, dead_ends, self_prompt, children, parent_id, build_version, created_at)
-                     VALUES (?1, ?2, 0, NULL, ?3, '[]', '[]', '[]', '[]', '[]', '', '[]', NULL, 1, ?4)",
-                    rusqlite::params![tombstone_id, slug_c, tombstone_content, now],
+                     VALUES (?1, ?2, 0, NULL, ?3, ?4, '[]', '[]', '[]', '[]', '[]', '', '[]', NULL, 1, ?5)",
+                    rusqlite::params![tombstone_id, slug_c, tombstone_headline, tombstone_content, now],
                 )?;
 
                 for oid in &old_node_ids {
@@ -848,12 +888,17 @@ Output JSON only:
                     rusqlite::params![slug_c, old_path_c],
                 )?;
 
-                conn.execute(
-                    "INSERT INTO pyramid_pending_mutations
-                     (slug, layer, mutation_type, target_ref, detail, cascade_depth, detected_at, processed)
-                     VALUES (?1, 1, 'confirmed_stale', ?2, ?3, 0, ?4, 0)",
-                    rusqlite::params![slug_c, tombstone_id, tombstone_content, now],
+                let parent_count = enqueue_parent_confirmed_stales(
+                    &conn,
+                    &slug_c,
+                    &old_node_ids,
+                    &tombstone_content,
+                    &now,
                 )?;
+
+                if parent_count == 0 {
+                    info!(old_path = %old_path_c, tombstone = %tombstone_id, "Rename-false tombstone created without an existing parent thread target");
+                }
             }
 
             // Ingest the new file
@@ -885,12 +930,17 @@ Output JSON only:
                     rusqlite::params![slug_c, new_path_c, hash, node_ids_json, now],
                 )?;
 
-                conn.execute(
-                    "INSERT INTO pyramid_pending_mutations
-                     (slug, layer, mutation_type, target_ref, detail, cascade_depth, detected_at, processed)
-                     VALUES (?1, 1, 'confirmed_stale', ?2, 'New file ingested (from rename-false)', 0, ?3, 0)",
-                    rusqlite::params![slug_c, new_node_id, now],
+                let parent_count = enqueue_parent_confirmed_stales(
+                    &conn,
+                    &slug_c,
+                    std::slice::from_ref(&new_node_id),
+                    "New file ingested (from rename-false)",
+                    &now,
                 )?;
+
+                if parent_count == 0 {
+                    info!(new_path = %new_path_c, node_id = %new_node_id, "Rename-false new file ingested without an existing parent thread target");
+                }
             }
         }
 

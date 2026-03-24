@@ -138,17 +138,19 @@ pub async fn init_stale_engines(pyramid_state: &Arc<pyramid::PyramidState>) {
         return;
     }
 
+    // Create a mutation notification channel: watcher -> stale engine bridge
+    let (mutation_tx, mut mutation_rx) = tokio::sync::mpsc::unbounded_channel::<(String, i32)>();
+
     let mut engines = pyramid_state.stale_engines.lock().await;
     let mut watchers = pyramid_state.file_watchers.lock().await;
 
     for config in configs {
         let slug = config.slug.clone();
 
-        if config.breaker_tripped {
-            tracing::warn!(
-                "Pyramid '{}' has breaker tripped — starting in breaker state (UI notification is frontend concern)",
-                slug
-            );
+        // Frozen pyramids: skip entirely
+        if config.frozen {
+            tracing::info!("Pyramid '{}' is frozen — skipping engine and watcher on startup", slug);
+            continue;
         }
 
         // Create the engine
@@ -156,9 +158,12 @@ pub async fn init_stale_engines(pyramid_state: &Arc<pyramid::PyramidState>) {
             &slug, config.clone(), &db_path, &api_key, &model,
         );
 
-        // Skip frozen pyramids — engine exists but timers don't start
-        if config.frozen {
-            tracing::info!("Pyramid '{}' is frozen — engine created but no timers started", slug);
+        // Breaker-tripped: create engine in tripped state, log warning, no watcher
+        if config.breaker_tripped {
+            tracing::warn!(
+                "Pyramid '{}' has breaker tripped — engine created in tripped state, no watcher started",
+                slug
+            );
             engines.insert(slug.clone(), engine);
             continue;
         }
@@ -186,6 +191,9 @@ pub async fn init_stale_engines(pyramid_state: &Arc<pyramid::PyramidState>) {
             }
         }
 
+        // Start the WAL poll loop (belt-and-suspenders for timer re-arm)
+        engine.start_poll_loop();
+
         engines.insert(slug.clone(), engine);
 
         // Create and start file watcher
@@ -203,6 +211,7 @@ pub async fn init_stale_engines(pyramid_state: &Arc<pyramid::PyramidState>) {
 
         if !source_paths.is_empty() {
             let mut watcher = PyramidFileWatcher::new(&slug, source_paths);
+            watcher.set_mutation_sender(mutation_tx.clone());
             match watcher.start(&db_path) {
                 Ok(()) => {
                     tracing::info!("File watcher started for pyramid '{}'", slug);
@@ -220,6 +229,21 @@ pub async fn init_stale_engines(pyramid_state: &Arc<pyramid::PyramidState>) {
         engines.len(),
         watchers.len()
     );
+
+    // Drop locks before spawning receiver
+    drop(engines);
+    drop(watchers);
+
+    // Spawn a receiver task that bridges watcher mutations to stale engines
+    let ps = pyramid_state.clone();
+    tokio::spawn(async move {
+        while let Some((slug, layer)) = mutation_rx.recv().await {
+            let mut engines = ps.stale_engines.lock().await;
+            if let Some(engine) = engines.get_mut(&slug) {
+                engine.notify_mutation(layer);
+            }
+        }
+    });
 }
 
 /// Start the HTTP server on the given port

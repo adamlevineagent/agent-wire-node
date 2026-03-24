@@ -2121,6 +2121,7 @@ async fn get_logs(state: tauri::State<'_, SharedState>) -> Result<Vec<String>, S
 use wire_node_lib::pyramid::types::*;
 use wire_node_lib::pyramid::query as pyramid_query;
 use wire_node_lib::pyramid::db as pyramid_db;
+use wire_node_lib::pyramid::faq as pyramid_faq;
 
 #[tauri::command]
 async fn pyramid_list_slugs(
@@ -2184,6 +2185,294 @@ async fn pyramid_search(
     pyramid_query::search(&conn, &slug, &term).map_err(|e| e.to_string())
 }
 
+/// Post-build seeding: populate auto_update_config, file_hashes, and start engine + watcher.
+/// Called after a successful pyramid build to auto-enable DADBEAR.
+async fn post_build_seed(
+    pyramid_state: &std::sync::Arc<wire_node_lib::pyramid::PyramidState>,
+    slug: &str,
+    content_type: &ContentType,
+) -> Result<(), String> {
+    let db_path = pyramid_state.data_dir.as_ref()
+        .expect("data_dir not set")
+        .join("pyramid.db")
+        .to_string_lossy()
+        .to_string();
+
+    // Get slug info for source paths
+    let source_paths: Vec<String> = {
+        let conn = pyramid_state.reader.lock().await;
+        match wire_node_lib::pyramid::slug::get_slug(&conn, slug) {
+            Ok(Some(info)) => {
+                serde_json::from_str(&info.source_path)
+                    .unwrap_or_else(|_| vec![info.source_path.clone()])
+            }
+            _ => Vec::new(),
+        }
+    };
+
+    // Determine extensions and config files based on content type, and hash files
+    let (extensions_json, config_files_json) = match content_type {
+        ContentType::Code => {
+            // Re-walk the source dirs to compute hashes and collect extensions
+            let db_path_clone = db_path.clone();
+            let slug_owned = slug.to_string();
+            let source_paths_clone = source_paths.clone();
+            tokio::task::spawn_blocking(move || {
+                let conn = rusqlite::Connection::open(&db_path_clone).map_err(|e| e.to_string())?;
+                let code_exts: Vec<String> = wire_node_lib::pyramid::ingest::code_extensions()
+                    .into_iter().map(|e| e.to_string()).collect();
+                let config_fnames: Vec<String> = wire_node_lib::pyramid::ingest::config_files()
+                    .into_iter().map(|e| e.to_string()).collect();
+
+                // Hash each tracked file
+                for path_str in &source_paths_clone {
+                    let dir = std::path::Path::new(path_str);
+                    if !dir.is_dir() { continue; }
+                    hash_source_files(&conn, &slug_owned, dir, &code_exts, &config_fnames)?;
+                }
+
+                let exts_json = serde_json::to_string(&code_exts).unwrap_or("[]".to_string());
+                let configs_json = serde_json::to_string(&config_fnames).unwrap_or("[]".to_string());
+                Ok::<(String, String), String>((exts_json, configs_json))
+            }).await.map_err(|e| format!("Spawn blocking failed: {e}"))??
+        }
+        ContentType::Document => {
+            let db_path_clone = db_path.clone();
+            let slug_owned = slug.to_string();
+            let source_paths_clone = source_paths.clone();
+            tokio::task::spawn_blocking(move || {
+                let conn = rusqlite::Connection::open(&db_path_clone).map_err(|e| e.to_string())?;
+                let doc_exts: Vec<String> = wire_node_lib::pyramid::ingest::doc_extensions()
+                    .into_iter().map(|e| e.to_string()).collect();
+
+                for path_str in &source_paths_clone {
+                    let dir = std::path::Path::new(path_str);
+                    if !dir.is_dir() { continue; }
+                    hash_source_files(&conn, &slug_owned, dir, &doc_exts, &[])?;
+                }
+
+                let exts_json = serde_json::to_string(&doc_exts).unwrap_or("[]".to_string());
+                Ok::<(String, String), String>((exts_json, "[]".to_string()))
+            }).await.map_err(|e| format!("Spawn blocking failed: {e}"))??
+        }
+        ContentType::Conversation => {
+            // Conversations don't use file watching
+            ("[]".to_string(), "[]".to_string())
+        }
+    };
+
+    // Insert auto_update_config defaults
+    {
+        let conn = pyramid_state.writer.lock().await;
+        wire_node_lib::pyramid::db::insert_auto_update_config_defaults(
+            &conn, slug, &extensions_json, &config_files_json,
+        ).map_err(|e| e.to_string())?;
+    }
+
+    // Backfill node_ids in pyramid_file_hashes
+    {
+        let db_path_clone = db_path.clone();
+        let slug_owned = slug.to_string();
+        let ct = content_type.clone();
+        tokio::task::spawn_blocking(move || {
+            if matches!(ct, ContentType::Conversation) {
+                return Ok::<(), String>(()); // skip for conversations
+            }
+            let conn = rusqlite::Connection::open(&db_path_clone).map_err(|e| e.to_string())?;
+            backfill_node_ids(&conn, &slug_owned).map_err(|e| e.to_string())
+        }).await.map_err(|e| format!("Spawn blocking failed: {e}"))??;
+    }
+
+    tracing::info!("Post-build seeding complete for slug='{}'", slug);
+
+    // Skip engine + watcher for conversations (no file watching)
+    if matches!(content_type, ContentType::Conversation) {
+        return Ok(());
+    }
+
+    // Start stale engine + file watcher
+    let (api_key, model) = {
+        let cfg = pyramid_state.config.read().await;
+        (cfg.api_key.clone(), cfg.primary_model.clone())
+    };
+
+    let config = {
+        let conn = pyramid_state.reader.lock().await;
+        conn.query_row(
+            "SELECT slug, auto_update, debounce_minutes, min_changed_files,
+                    runaway_threshold, breaker_tripped, breaker_tripped_at, frozen, frozen_at
+             FROM pyramid_auto_update_config WHERE slug = ?1",
+            rusqlite::params![slug],
+            |row| {
+                Ok(wire_node_lib::pyramid::types::AutoUpdateConfig {
+                    slug: row.get(0)?,
+                    auto_update: row.get::<_, i32>(1)? != 0,
+                    debounce_minutes: row.get(2)?,
+                    min_changed_files: row.get(3)?,
+                    runaway_threshold: row.get(4)?,
+                    breaker_tripped: row.get::<_, i32>(5)? != 0,
+                    breaker_tripped_at: row.get(6)?,
+                    frozen: row.get::<_, i32>(7)? != 0,
+                    frozen_at: row.get(8)?,
+                })
+            },
+        ).map_err(|e| e.to_string())?
+    };
+
+    let mut engine = wire_node_lib::pyramid::stale_engine::PyramidStaleEngine::new(
+        slug, config, &db_path, &api_key, &model,
+    );
+    engine.start_poll_loop();
+
+    let mut engines = pyramid_state.stale_engines.lock().await;
+    // Abort old engine's poll loop to prevent orphan tasks (M5 fix)
+    if let Some(old_engine) = engines.get_mut(slug) {
+        old_engine.abort_poll_loop();
+    }
+    engines.insert(slug.to_string(), engine);
+    drop(engines);
+
+    if !source_paths.is_empty() {
+        let mut watcher = wire_node_lib::pyramid::watcher::PyramidFileWatcher::new(slug, source_paths);
+
+        // Create mutation channel and wire it to the stale engine
+        let (mutation_tx, mut mutation_rx) = tokio::sync::mpsc::unbounded_channel::<(String, i32)>();
+        watcher.set_mutation_sender(mutation_tx);
+
+        // Spawn receiver task to bridge watcher -> engine notifications
+        let ps = pyramid_state.clone();
+        tokio::spawn(async move {
+            while let Some((slug, layer)) = mutation_rx.recv().await {
+                let mut engines = ps.stale_engines.lock().await;
+                if let Some(engine) = engines.get_mut(&slug) {
+                    engine.notify_mutation(layer);
+                }
+            }
+        });
+
+        match watcher.start(&db_path) {
+            Ok(()) => {
+                tracing::info!("Post-build: file watcher started for '{}'", slug);
+                let mut watchers = pyramid_state.file_watchers.lock().await;
+                watchers.insert(slug.to_string(), watcher);
+            }
+            Err(e) => {
+                tracing::warn!("Post-build: failed to start file watcher for '{}': {}", slug, e);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Hash source files in a directory and write to pyramid_file_hashes.
+fn hash_source_files(
+    conn: &rusqlite::Connection,
+    slug: &str,
+    dir: &std::path::Path,
+    extensions: &[String],
+    config_filenames: &[String],
+) -> Result<(), String> {
+    use sha2::{Digest, Sha256};
+
+    fn walk_and_hash(
+        conn: &rusqlite::Connection,
+        slug: &str,
+        base: &std::path::Path,
+        current: &std::path::Path,
+        extensions: &[String],
+        config_filenames: &[String],
+    ) -> Result<(), String> {
+        let entries = std::fs::read_dir(current).map_err(|e| e.to_string())?;
+        let skip_dirs = [".git", "node_modules", "target", "dist", "build", ".next", "__pycache__", ".cache"];
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+
+            if name_str.starts_with('.') && path.is_dir() {
+                continue;
+            }
+
+            if path.is_dir() {
+                if !skip_dirs.contains(&name_str.as_ref()) {
+                    walk_and_hash(conn, slug, base, &path, extensions, config_filenames)?;
+                }
+                continue;
+            }
+
+            let fname = name_str.to_string();
+            let ext = path.extension()
+                .map(|e| format!(".{}", e.to_string_lossy().to_lowercase()))
+                .unwrap_or_default();
+
+            let is_code = extensions.iter().any(|e| e == &ext);
+            let is_config = config_filenames.iter().any(|cf| cf == &fname);
+
+            if !is_code && !is_config {
+                continue;
+            }
+
+            let bytes = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+
+            let mut hasher = Sha256::new();
+            hasher.update(&bytes);
+            let hash = hex::encode(hasher.finalize());
+
+            let abs_path = path.to_string_lossy().to_string();
+            wire_node_lib::pyramid::db::upsert_file_hash(conn, slug, &abs_path, &hash, 1, "[]")
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
+    walk_and_hash(conn, slug, dir, dir, extensions, config_filenames)
+}
+
+/// Backfill node_ids in pyramid_file_hashes using L0 node ordering.
+/// L0 node IDs are zero-padded (e.g. C-L0-003), so lexicographic ORDER BY preserves chunk order.
+fn backfill_node_ids(conn: &rusqlite::Connection, slug: &str) -> Result<(), String> {
+    // Get all L0 nodes in order
+    let mut stmt = conn.prepare(
+        "SELECT id FROM live_pyramid_nodes WHERE slug = ?1 AND depth = 0 ORDER BY id ASC"
+    ).map_err(|e| e.to_string())?;
+    let node_ids: Vec<String> = stmt.query_map(rusqlite::params![slug], |row| row.get::<_, String>(0))
+        .map_err(|e| e.to_string())?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    // Get all file hashes in order (by file_path for deterministic mapping)
+    let mut file_stmt = conn.prepare(
+        "SELECT file_path FROM pyramid_file_hashes WHERE slug = ?1 ORDER BY file_path ASC"
+    ).map_err(|e| e.to_string())?;
+    let file_paths: Vec<String> = file_stmt.query_map(rusqlite::params![slug], |row| row.get::<_, String>(0))
+        .map_err(|e| e.to_string())?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    // Map: each file gets one chunk, so chunk_index i -> node_ids[i]
+    // Since 1 file = 1 chunk for code/doc pyramids, the mapping is straightforward
+    for (i, file_path) in file_paths.iter().enumerate() {
+        if i < node_ids.len() {
+            let node_ids_json = serde_json::to_string(&[&node_ids[i]]).unwrap_or("[]".to_string());
+            conn.execute(
+                "UPDATE pyramid_file_hashes SET node_ids = ?1 WHERE slug = ?2 AND file_path = ?3",
+                rusqlite::params![node_ids_json, slug, file_path],
+            ).map_err(|e| e.to_string())?;
+        }
+    }
+
+    tracing::info!(
+        "Backfilled node_ids for slug='{}': {} files, {} L0 nodes",
+        slug, file_paths.len(), node_ids.len()
+    );
+    Ok(())
+}
+
 #[tauri::command]
 async fn pyramid_build(
     state: tauri::State<'_, SharedState>,
@@ -2237,6 +2526,7 @@ async fn pyramid_build(
     let writer = state.pyramid.writer.clone();
     let config = state.pyramid.config.clone();
     let build_status = status.clone();
+    let pyramid_state = state.pyramid.clone(); // Arc<PyramidState> for post-build seeding
 
     tokio::spawn(async move {
         let start = std::time::Instant::now();
@@ -2386,6 +2676,20 @@ async fn pyramid_build(
             s.elapsed_seconds = start.elapsed().as_secs_f64();
         }
 
+        // ── Post-build seeding: auto_update_config, file_hashes, engine + watcher ──
+        // Only seed if build succeeded (not cancelled, not failed)
+        {
+            let status_check = build_status.read().await;
+            let should_seed = matches!(status_check.status.as_str(), "complete" | "complete_with_errors");
+            drop(status_check);
+
+            if should_seed {
+                if let Err(e) = post_build_seed(&pyramid_state, &slug, &content_type).await {
+                    tracing::error!("Post-build seeding failed for '{}': {}", slug, e);
+                }
+            }
+        }
+
     });
 
     let s = status.read().await;
@@ -2441,9 +2745,9 @@ async fn pyramid_ingest(
         for path_str in &paths {
             let path = std::path::Path::new(path_str);
             match content_type {
-                ContentType::Code => { wire_node_lib::pyramid::ingest::ingest_code(&conn, &slug_clone, path).map_err(|e| e.to_string())?; }
+                ContentType::Code => { let _ = wire_node_lib::pyramid::ingest::ingest_code(&conn, &slug_clone, path).map_err(|e| e.to_string())?; }
                 ContentType::Conversation => { wire_node_lib::pyramid::ingest::ingest_conversation(&conn, &slug_clone, path).map_err(|e| e.to_string())?; }
-                ContentType::Document => { wire_node_lib::pyramid::ingest::ingest_docs(&conn, &slug_clone, path).map_err(|e| e.to_string())?; }
+                ContentType::Document => { let _ = wire_node_lib::pyramid::ingest::ingest_docs(&conn, &slug_clone, path).map_err(|e| e.to_string())?; }
             }
         }
         Ok::<(), String>(())
@@ -2533,6 +2837,11 @@ fn get_home_dir() -> Result<String, String> {
 }
 
 #[tauri::command]
+fn get_app_version() -> String {
+    env!("CARGO_PKG_VERSION").to_string()
+}
+
+#[tauri::command]
 async fn pyramid_build_cancel(
     state: tauri::State<'_, SharedState>,
 ) -> Result<(), String> {
@@ -2543,6 +2852,450 @@ async fn pyramid_build_cancel(
     } else {
         Err("No active build to cancel".to_string())
     }
+}
+
+// --- DADBEAR IPC Commands ---------------------------------------------------
+
+#[tauri::command]
+async fn pyramid_auto_update_config_get(
+    state: tauri::State<'_, SharedState>,
+    slug: String,
+) -> Result<serde_json::Value, String> {
+    let conn = state.pyramid.reader.lock().await;
+    match pyramid_db::get_auto_update_config(&conn, &slug) {
+        Some(config) => serde_json::to_value(&config).map_err(|e| e.to_string()),
+        None => Err(format!("No auto-update config for slug '{}'", slug)),
+    }
+}
+
+#[tauri::command]
+async fn pyramid_auto_update_config_set(
+    state: tauri::State<'_, SharedState>,
+    slug: String,
+    debounce_minutes: Option<i32>,
+    min_changed_files: Option<i32>,
+    runaway_threshold: Option<f64>,
+    auto_update: Option<bool>,
+) -> Result<serde_json::Value, String> {
+    let (result, should_resume_breaker) = {
+        let conn = state.pyramid.writer.lock().await;
+        let mut should_resume_breaker = false;
+
+        let mut sets: Vec<String> = Vec::new();
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+        if let Some(d) = debounce_minutes {
+            if d < 1 { return Err("debounce_minutes must be >= 1".to_string()); }
+            sets.push(format!("debounce_minutes = ?{}", params.len() + 1));
+            params.push(Box::new(d));
+        }
+        if let Some(m) = min_changed_files {
+            sets.push(format!("min_changed_files = ?{}", params.len() + 1));
+            params.push(Box::new(m));
+        }
+        if let Some(r) = runaway_threshold {
+            if r <= 0.0 || r > 1.0 { return Err("runaway_threshold must be > 0.0 and <= 1.0".to_string()); }
+            sets.push(format!("runaway_threshold = ?{}", params.len() + 1));
+            params.push(Box::new(r));
+        }
+        if let Some(a) = auto_update {
+            sets.push(format!("auto_update = ?{}", params.len() + 1));
+            params.push(Box::new(if a { 1i32 } else { 0i32 }));
+        }
+
+        if sets.is_empty() {
+            return Err("No fields to update".to_string());
+        }
+
+        let slug_idx = params.len() + 1;
+        params.push(Box::new(slug.clone()));
+        let sql = format!(
+            "UPDATE pyramid_auto_update_config SET {} WHERE slug = ?{}",
+            sets.join(", "), slug_idx
+        );
+
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        let result = match conn.execute(&sql, param_refs.as_slice()) {
+            Ok(0) => Err(format!("No auto-update config for slug '{}'", slug)),
+            Ok(_) => {
+                match pyramid_db::get_auto_update_config(&conn, &slug) {
+                    Some(config) => {
+                        if config.breaker_tripped && !wire_node_lib::pyramid::watcher::check_runaway(&conn, &slug, &config) {
+                            let _ = conn.execute(
+                                "UPDATE pyramid_auto_update_config
+                                 SET breaker_tripped = 0, breaker_tripped_at = NULL
+                                 WHERE slug = ?1",
+                                rusqlite::params![slug],
+                            );
+                            should_resume_breaker = true;
+                        }
+
+                        let refreshed = pyramid_db::get_auto_update_config(&conn, &slug).unwrap_or(config);
+                        serde_json::to_value(&refreshed).map_err(|e| e.to_string())
+                    }
+                    None => Ok(serde_json::json!({"status": "updated"})),
+                }
+            }
+            Err(e) => Err(e.to_string()),
+        };
+
+        (result, should_resume_breaker)
+    };
+
+    if should_resume_breaker {
+        let mut engines = state.pyramid.stale_engines.lock().await;
+        if let Some(engine) = engines.get_mut(&slug) {
+            engine.resume_breaker();
+        }
+    }
+
+    result
+}
+
+#[tauri::command]
+async fn pyramid_auto_update_freeze(
+    state: tauri::State<'_, SharedState>,
+    slug: String,
+) -> Result<serde_json::Value, String> {
+    let mut engines = state.pyramid.stale_engines.lock().await;
+    if let Some(engine) = engines.get_mut(&slug) {
+        engine.freeze();
+    } else {
+        let conn = state.pyramid.writer.lock().await;
+        let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let _ = conn.execute(
+            "UPDATE pyramid_auto_update_config SET frozen = 1, frozen_at = ?1 WHERE slug = ?2",
+            rusqlite::params![now, slug],
+        );
+        let _ = conn.execute(
+            "UPDATE pyramid_pending_mutations SET processed = 1 WHERE processed = 0 AND slug = ?1",
+            rusqlite::params![slug],
+        );
+    }
+    let mut watchers = state.pyramid.file_watchers.lock().await;
+    if let Some(watcher) = watchers.get_mut(&slug) {
+        watcher.pause();
+    }
+    Ok(serde_json::json!({"status": "frozen", "slug": slug}))
+}
+
+#[tauri::command]
+async fn pyramid_auto_update_unfreeze(
+    state: tauri::State<'_, SharedState>,
+    slug: String,
+) -> Result<serde_json::Value, String> {
+    let mut engines = state.pyramid.stale_engines.lock().await;
+    if let Some(engine) = engines.get_mut(&slug) {
+        engine.unfreeze();
+    } else {
+        let conn = state.pyramid.writer.lock().await;
+        let _ = conn.execute(
+            "UPDATE pyramid_auto_update_config SET frozen = 0, frozen_at = NULL WHERE slug = ?1",
+            rusqlite::params![slug],
+        );
+    }
+    drop(engines);
+
+    let db_path = state.pyramid.data_dir.as_ref()
+        .expect("data_dir not set")
+        .join("pyramid.db")
+        .to_string_lossy()
+        .to_string();
+    let mut watchers = state.pyramid.file_watchers.lock().await;
+    if let Some(watcher) = watchers.get_mut(&slug) {
+        watcher.resume(&db_path);
+    }
+
+    Ok(serde_json::json!({"status": "unfrozen", "slug": slug}))
+}
+
+#[tauri::command]
+async fn pyramid_auto_update_status(
+    state: tauri::State<'_, SharedState>,
+    slug: String,
+) -> Result<serde_json::Value, String> {
+    let conn = state.pyramid.reader.lock().await;
+    match pyramid_db::get_auto_update_status(&conn, &slug).map_err(|e| e.to_string())? {
+        Some(mut status) => {
+            // Enrich with phase tracking fields from the live engine
+            let engines = state.pyramid.stale_engines.lock().await;
+            if let Some(engine) = engines.get(&slug) {
+                let phase = engine.current_phase.lock().unwrap().clone();
+                let phase_detail = engine.phase_detail.lock().unwrap().clone();
+                let timer_fires_at = engine.timer_fires_at.lock().unwrap().clone();
+                let last_result_summary = engine.last_result_summary.lock().unwrap().clone();
+                status["phase"] = serde_json::json!(phase);
+                status["phase_detail"] = serde_json::json!(phase_detail);
+                status["timer_fires_at"] = serde_json::json!(timer_fires_at);
+                status["last_result_summary"] = serde_json::json!(last_result_summary);
+            } else {
+                status["phase"] = serde_json::json!("idle");
+                status["phase_detail"] = serde_json::json!(null);
+                status["timer_fires_at"] = serde_json::json!(null);
+                status["last_result_summary"] = serde_json::json!(null);
+            }
+            Ok(status)
+        },
+        None => Err(format!("No auto-update config for slug '{}'", slug)),
+    }
+}
+
+#[tauri::command]
+async fn pyramid_stale_log(
+    state: tauri::State<'_, SharedState>,
+    slug: String,
+    limit: Option<i64>,
+    layer: Option<i32>,
+    stale_only: Option<bool>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let conn = state.pyramid.reader.lock().await;
+    // Three-state filter: Some(true) = stale only, Some(false) = not-stale only, None = all
+    let stale_filter = match stale_only {
+        Some(true) => Some("yes"),
+        Some(false) => Some("no"),
+        None => None,
+    };
+    pyramid_db::get_stale_log(&conn, &slug, layer, stale_filter, limit.unwrap_or(100), 0)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn pyramid_cost_summary(
+    state: tauri::State<'_, SharedState>,
+    slug: String,
+    window: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let conn = state.pyramid.reader.lock().await;
+    pyramid_db::get_cost_summary(&conn, &slug, window.as_deref())
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn pyramid_breaker_resume(
+    state: tauri::State<'_, SharedState>,
+    slug: String,
+) -> Result<serde_json::Value, String> {
+    let mut engines = state.pyramid.stale_engines.lock().await;
+    if let Some(engine) = engines.get_mut(&slug) {
+        engine.resume_breaker();
+        Ok(serde_json::json!({"status": "resumed", "slug": slug}))
+    } else {
+        let conn = state.pyramid.writer.lock().await;
+        let _ = conn.execute(
+            "UPDATE pyramid_auto_update_config SET breaker_tripped = 0, breaker_tripped_at = NULL WHERE slug = ?1",
+            rusqlite::params![slug],
+        );
+        Ok(serde_json::json!({"status": "resumed", "slug": slug, "note": "No active engine, breaker cleared in DB"}))
+    }
+}
+
+#[tauri::command]
+async fn pyramid_auto_update_run_now(
+    state: tauri::State<'_, SharedState>,
+    slug: String,
+) -> Result<serde_json::Value, String> {
+    // Extract what we need from the engine while briefly holding the lock, then release
+    let (db_path, api_key, model, semaphore, phase_arc, detail_arc, summary_arc) = {
+        let engines = state.pyramid.stale_engines.lock().await;
+        let engine = engines.get(&slug).ok_or("No active stale engine for this pyramid")?;
+        (
+            engine.db_path.clone(),
+            engine.api_key.clone(),
+            engine.model.clone(),
+            engine.concurrent_helpers.clone(),
+            engine.current_phase.clone(),
+            engine.phase_detail.clone(),
+            engine.last_result_summary.clone(),
+        )
+    };
+    // Lock released here — no mutex held across LLM calls
+
+    // Drain and dispatch each layer sequentially: L0 → L1 → L2 → L3
+    for layer in 0..=3 {
+        let _ = wire_node_lib::pyramid::stale_engine::drain_and_dispatch(
+            &slug, layer, 0, &db_path, semaphore.clone(), &api_key, &model,
+            phase_arc.clone(), detail_arc.clone(), summary_arc.clone(),
+        ).await;
+    }
+    Ok(serde_json::json!({"status": "completed", "slug": slug}))
+}
+
+#[tauri::command]
+async fn pyramid_auto_update_l0_sweep(
+    state: tauri::State<'_, SharedState>,
+    slug: String,
+) -> Result<serde_json::Value, String> {
+    let (tracked_files, enqueued, already_pending) = {
+        let conn = state.pyramid.writer.lock().await;
+        wire_node_lib::pyramid::routes::enqueue_full_l0_sweep(&conn, &slug)
+    };
+
+    let (db_path, api_key, model, semaphore, phase_arc, detail_arc, summary_arc) = {
+        let engines = state.pyramid.stale_engines.lock().await;
+        let engine = engines.get(&slug).ok_or("No active stale engine for this pyramid")?;
+        (
+            engine.db_path.clone(),
+            engine.api_key.clone(),
+            engine.model.clone(),
+            engine.concurrent_helpers.clone(),
+            engine.current_phase.clone(),
+            engine.phase_detail.clone(),
+            engine.last_result_summary.clone(),
+        )
+    };
+
+    for layer in 0..=3 {
+        let _ = wire_node_lib::pyramid::stale_engine::drain_and_dispatch(
+            &slug,
+            layer,
+            0,
+            &db_path,
+            semaphore.clone(),
+            &api_key,
+            &model,
+            phase_arc.clone(),
+            detail_arc.clone(),
+            summary_arc.clone(),
+        )
+        .await;
+    }
+
+    Ok(serde_json::json!({
+        "status": "completed",
+        "slug": slug,
+        "tracked_files": tracked_files,
+        "enqueued": enqueued,
+        "already_pending": already_pending,
+    }))
+}
+
+#[tauri::command]
+async fn pyramid_breaker_archive_and_rebuild(
+    state: tauri::State<'_, SharedState>,
+    slug: String,
+) -> Result<serde_json::Value, String> {
+    // Get old slug info
+    let slug_info = {
+        let conn = state.pyramid.reader.lock().await;
+        wire_node_lib::pyramid::slug::get_slug(&conn, &slug)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("Slug '{}' not found", slug))?
+    };
+
+    // Freeze old pyramid, remove engine and watcher
+    {
+        let mut engines = state.pyramid.stale_engines.lock().await;
+        if let Some(engine) = engines.get_mut(&slug) {
+            engine.freeze();
+        }
+        let mut watchers = state.pyramid.file_watchers.lock().await;
+        if let Some(watcher) = watchers.get_mut(&slug) {
+            watcher.stop();
+        }
+        watchers.remove(&slug);
+        engines.remove(&slug);
+    }
+
+    // Create new slug with date suffix
+    let date_suffix = chrono::Utc::now().format("%Y%m%d").to_string();
+    let new_slug = format!("{}-{}", slug, date_suffix);
+
+    {
+        let conn = state.pyramid.writer.lock().await;
+        wire_node_lib::pyramid::slug::create_slug(&conn, &new_slug, &slug_info.content_type, &slug_info.source_path)
+            .map_err(|e| e.to_string())?;
+        let _ = conn.execute(
+            "INSERT OR IGNORE INTO pyramid_auto_update_config (slug) VALUES (?1)",
+            rusqlite::params![new_slug],
+        );
+    }
+
+    Ok(serde_json::json!({
+        "status": "created",
+        "old_slug": slug,
+        "new_slug": new_slug,
+        "note": "Old pyramid archived. Call pyramid_build(new_slug) to start full build.",
+    }))
+}
+
+// --- Annotations IPC Commands -------------------------------------------------
+
+#[tauri::command]
+async fn pyramid_annotations_recent(
+    state: tauri::State<'_, SharedState>,
+    slug: String,
+    limit: Option<i64>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let conn = state.pyramid.reader.lock().await;
+    let lim = limit.unwrap_or(10);
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, slug, node_id, annotation_type, content, question_context, author, created_at
+             FROM pyramid_annotations WHERE slug = ?1
+             ORDER BY created_at DESC LIMIT ?2",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(rusqlite::params![slug, lim], |row| {
+            Ok(serde_json::json!({
+                "id": row.get::<_, i64>(0)?,
+                "slug": row.get::<_, String>(1)?,
+                "node_id": row.get::<_, String>(2)?,
+                "annotation_type": row.get::<_, String>(3)?,
+                "content": row.get::<_, String>(4)?,
+                "question_context": row.get::<_, Option<String>>(5)?,
+                "author": row.get::<_, String>(6)?,
+                "created_at": row.get::<_, String>(7)?,
+            }))
+        })
+        .map_err(|e| e.to_string())?;
+    let mut results = Vec::new();
+    for row in rows {
+        results.push(row.map_err(|e| e.to_string())?);
+    }
+    Ok(results)
+}
+
+// --- FAQ Directory IPC Commands -----------------------------------------------
+
+#[tauri::command]
+async fn pyramid_faq_directory(
+    state: tauri::State<'_, SharedState>,
+    slug: String,
+) -> Result<serde_json::Value, String> {
+    let config = state.pyramid.config.read().await;
+    let api_key = config.api_key.clone();
+    let model = config.primary_model.clone();
+    drop(config);
+
+    let directory = pyramid_faq::get_faq_directory(
+        &state.pyramid.reader,
+        &state.pyramid.writer,
+        &slug,
+        &api_key,
+        &model,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    serde_json::to_value(&directory).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn pyramid_faq_category_drill(
+    state: tauri::State<'_, SharedState>,
+    slug: String,
+    category_id: String,
+) -> Result<serde_json::Value, String> {
+    let entry = pyramid_faq::drill_faq_category(
+        &state.pyramid.reader,
+        &slug,
+        &category_id,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    serde_json::to_value(&entry).map_err(|e| e.to_string())
 }
 
 // --- App Setup --------------------------------------------------------------
@@ -3267,6 +4020,14 @@ fn main() {
                 }
             });
 
+            // --- Initialize stale engines for auto-update (Phase 7) ---
+            let stale_init_state = state.clone();
+            tauri::async_runtime::spawn(async move {
+                // Small delay to let DB initialize
+                tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+                server::init_stale_engines(&stale_init_state.pyramid).await;
+            });
+
             // --- Background auto-update check (every 6 hours) ---
             let update_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
@@ -3355,6 +4116,21 @@ fn main() {
             pyramid_create_slug,
             pyramid_delete_slug,
             pyramid_get_config,
+            get_app_version,
+            pyramid_auto_update_config_get,
+            pyramid_auto_update_config_set,
+            pyramid_auto_update_freeze,
+            pyramid_auto_update_unfreeze,
+            pyramid_auto_update_status,
+            pyramid_stale_log,
+            pyramid_cost_summary,
+            pyramid_breaker_resume,
+            pyramid_auto_update_run_now,
+            pyramid_auto_update_l0_sweep,
+            pyramid_breaker_archive_and_rebuild,
+            pyramid_annotations_recent,
+            pyramid_faq_directory,
+            pyramid_faq_category_drill,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Wire Node");

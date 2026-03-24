@@ -1,7 +1,9 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { AddWorkspace } from './AddWorkspace';
 import { BuildProgress } from './BuildProgress';
+import { DADBEARPanel } from './DADBEARPanel';
+import { FAQDirectory } from './FAQDirectory';
 
 interface SlugInfo {
     slug: string;
@@ -20,7 +22,12 @@ interface BuildStatus {
     elapsed_seconds: number;
 }
 
-type View = 'list' | 'add' | 'building';
+interface DadbearStatus {
+    frozen: boolean;
+    breaker_tripped: boolean;
+}
+
+type View = 'list' | 'add' | 'building' | 'dadbear' | 'faq';
 
 export function PyramidDashboard() {
     const [slugs, setSlugs] = useState<SlugInfo[]>([]);
@@ -30,12 +37,30 @@ export function PyramidDashboard() {
     const [buildingSlug, setBuildingSlug] = useState<string | null>(null);
     const [deletingSlug, setDeletingSlug] = useState<string | null>(null);
     const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
+    const [selectedSlug, setSelectedSlug] = useState<string | null>(null);
+    const [dadbearStatuses, setDadbearStatuses] = useState<Record<string, DadbearStatus>>({});
+
+    const fetchDadbearStatuses = useCallback(async (slugList: SlugInfo[]) => {
+        const statuses: Record<string, DadbearStatus> = {};
+        for (const s of slugList) {
+            try {
+                const config = await invoke<{ frozen: boolean; breaker_tripped: boolean }>(
+                    'pyramid_auto_update_config_get', { slug: s.slug }
+                );
+                statuses[s.slug] = { frozen: config.frozen, breaker_tripped: config.breaker_tripped };
+            } catch {
+                // No auto-update config for this slug — skip
+            }
+        }
+        setDadbearStatuses(statuses);
+    }, []);
 
     const fetchSlugs = useCallback(async () => {
         try {
             const data = await invoke<SlugInfo[]>('pyramid_list_slugs');
             setSlugs(data);
             setError(null);
+            fetchDadbearStatuses(data);
         } catch (err) {
             setError(String(err));
         } finally {
@@ -107,8 +132,89 @@ export function PyramidDashboard() {
         }
     };
 
+    // Agent Onboarding card state
+    const [onboardingOpen, setOnboardingOpen] = useState(false);
+    const [onboardingCopied, setOnboardingCopied] = useState(false);
+    const onboardingCopyTimeout = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+    const generateOnboardingText = () => {
+        const slugList = slugs.map(s => `- ${s.slug} (${s.content_type}, ${s.node_count} nodes)`).join('\n');
+        return `# Knowledge Pyramid Access
+
+You have access to a Knowledge Pyramid system running on localhost:8765. Use the pyramid CLI to explore and contribute.
+
+## Available Pyramids
+${slugList}
+
+## Query Commands
+\`\`\`bash
+# Search for a topic
+node "/Users/adamlevine/AI Project Files/agent-wire-node/mcp-server/dist/cli.js" search <SLUG> "your query"
+
+# Get the apex (top-level summary)
+node "/Users/adamlevine/AI Project Files/agent-wire-node/mcp-server/dist/cli.js" apex <SLUG>
+
+# Drill into a specific node
+node "/Users/adamlevine/AI Project Files/agent-wire-node/mcp-server/dist/cli.js" drill <SLUG> <NODE_ID>
+
+# Match a question to FAQ
+node "/Users/adamlevine/AI Project Files/agent-wire-node/mcp-server/dist/cli.js" faq <SLUG> "your question"
+
+# Check system health
+node "/Users/adamlevine/AI Project Files/agent-wire-node/mcp-server/dist/cli.js" health
+\`\`\`
+
+## Contributing Back
+When you learn something generalizable, annotate it:
+\`\`\`bash
+node "/Users/adamlevine/AI Project Files/agent-wire-node/mcp-server/dist/cli.js" annotate <SLUG> <NODE_ID> "Your finding here. Include specific details.\\n\\nGeneralized understanding: The mechanism-level knowledge that would help future agents." --question "What question does this answer?" --author "your-agent-name" --type observation
+\`\`\`
+
+Always include the "Generalized understanding:" section — this triggers FAQ generalization so future agents benefit from your work.
+
+## Annotation Types
+- observation: General finding or documentation
+- correction: Something is wrong or outdated
+- question: Unanswered question for future investigation
+- friction: Something that was harder than it should be
+- idea: Improvement suggestion`;
+    };
+
+    const handleCopyOnboarding = () => {
+        navigator.clipboard.writeText(generateOnboardingText()).then(() => {
+            setOnboardingCopied(true);
+            if (onboardingCopyTimeout.current) clearTimeout(onboardingCopyTimeout.current);
+            onboardingCopyTimeout.current = setTimeout(() => setOnboardingCopied(false), 2000);
+        });
+    };
+
     if (view === 'add') {
         return <AddWorkspace onComplete={handleAddComplete} onCancel={() => setView('list')} />;
+    }
+
+    if (view === 'dadbear' && selectedSlug) {
+        return (
+            <DADBEARPanel
+                slug={selectedSlug}
+                onBack={() => {
+                    setSelectedSlug(null);
+                    setView('list');
+                    fetchSlugs();
+                }}
+            />
+        );
+    }
+
+    if (view === 'faq' && selectedSlug) {
+        return (
+            <FAQDirectory
+                slug={selectedSlug}
+                onBack={() => {
+                    setSelectedSlug(null);
+                    setView('list');
+                }}
+            />
+        );
     }
 
     if (view === 'building' && buildingSlug) {
@@ -139,6 +245,28 @@ export function PyramidDashboard() {
                     <button className="workspace-error-dismiss" onClick={() => setError(null)}>
                         Dismiss
                     </button>
+                </div>
+            )}
+
+            {!loading && slugs.length > 0 && (
+                <div className="agent-onboarding-card">
+                    <div className="agent-onboarding-header" onClick={() => setOnboardingOpen(!onboardingOpen)}>
+                        <h3>Agent Onboarding Instructions</h3>
+                        <div className="agent-onboarding-header-actions">
+                            <button
+                                className={`copy-btn${onboardingCopied ? ' copied' : ''}`}
+                                onClick={(e) => { e.stopPropagation(); handleCopyOnboarding(); }}
+                            >
+                                {onboardingCopied ? 'Copied!' : 'Copy to Clipboard'}
+                            </button>
+                            <span className="agent-onboarding-toggle">{onboardingOpen ? '\u25B2' : '\u25BC'}</span>
+                        </div>
+                    </div>
+                    {onboardingOpen && (
+                        <div className="agent-onboarding-content">
+                            <pre>{generateOnboardingText()}</pre>
+                        </div>
+                    )}
                 </div>
             )}
 
@@ -190,7 +318,11 @@ export function PyramidDashboard() {
                             </div>
 
                             <div className="pyramid-card-status">
-                                {s.node_count > 0 ? (
+                                {dadbearStatuses[s.slug]?.frozen ? (
+                                    <span className="pyramid-status-indicator frozen">Frozen — DADBEAR is hibernating</span>
+                                ) : dadbearStatuses[s.slug]?.breaker_tripped ? (
+                                    <span className="pyramid-status-indicator breaker-tripped">DADBEAR needs your attention</span>
+                                ) : s.node_count > 0 ? (
                                     <span className="pyramid-status-indicator idle">Ready</span>
                                 ) : (
                                     <span className="pyramid-status-indicator needs-build">Needs Build</span>
@@ -204,6 +336,22 @@ export function PyramidDashboard() {
                                     disabled={s.node_count === 0}
                                 >
                                     Open in Vibesmithy
+                                </button>
+                                <button
+                                    className={`pyramid-card-dadbear-btn${dadbearStatuses[s.slug]?.frozen ? ' dadbear-attention-frozen' : ''}${dadbearStatuses[s.slug]?.breaker_tripped ? ' dadbear-attention-tripped' : ''}`}
+                                    onClick={() => { setSelectedSlug(s.slug); setView('dadbear'); }}
+                                    title="DADBEAR Auto-Update Panel"
+                                    disabled={s.node_count === 0}
+                                >
+                                    &#x1F43B;
+                                </button>
+                                <button
+                                    className="pyramid-card-faq-btn"
+                                    onClick={() => { setSelectedSlug(s.slug); setView('faq'); }}
+                                    title="FAQ Directory"
+                                    disabled={s.node_count === 0}
+                                >
+                                    &#x1F4D6;
                                 </button>
                                 <button
                                     className="btn btn-small btn-secondary"

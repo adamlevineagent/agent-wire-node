@@ -156,6 +156,43 @@ pub fn get_tree(conn: &Connection, slug: &str) -> Result<Vec<TreeNode>> {
         return Ok(Vec::new());
     }
 
+    let mut source_path_by_node_id: HashMap<String, String> = HashMap::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT file_path, node_ids FROM pyramid_file_hashes WHERE slug = ?1 ORDER BY file_path",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![slug], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+
+        for row in rows {
+            let Ok((file_path, node_ids_json)) = row else {
+                continue;
+            };
+            let node_ids: Vec<String> = serde_json::from_str(&node_ids_json).unwrap_or_default();
+            for node_id in node_ids {
+                source_path_by_node_id.entry(node_id).or_insert_with(|| file_path.clone());
+            }
+        }
+    }
+
+    let mut thread_id_by_canonical_id: HashMap<String, String> = HashMap::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT thread_id, current_canonical_id FROM pyramid_threads WHERE slug = ?1",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![slug], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+
+        for row in rows {
+            let Ok((thread_id, canonical_id)) = row else {
+                continue;
+            };
+            thread_id_by_canonical_id.insert(canonical_id, thread_id);
+        }
+    }
+
     // Index by ID for O(1) lookup
     let node_map: HashMap<&str, &PyramidNode> = nodes.iter().map(|n| (n.id.as_str(), n)).collect();
 
@@ -168,6 +205,8 @@ pub fn get_tree(conn: &Connection, slug: &str) -> Result<Vec<TreeNode>> {
     fn build_tree_node(
         node: &PyramidNode,
         node_map: &HashMap<&str, &PyramidNode>,
+        thread_id_by_canonical_id: &HashMap<String, String>,
+        source_path_by_node_id: &HashMap<String, String>,
     ) -> TreeNode {
         let children = node
             .children
@@ -175,21 +214,24 @@ pub fn get_tree(conn: &Connection, slug: &str) -> Result<Vec<TreeNode>> {
             .filter_map(|child_id| {
                 node_map
                     .get(child_id.as_str())
-                    .map(|child| build_tree_node(child, node_map))
+                    .map(|child| build_tree_node(child, node_map, thread_id_by_canonical_id, source_path_by_node_id))
             })
             .collect();
 
         TreeNode {
             id: node.id.clone(),
             depth: node.depth,
+            headline: node.headline.clone(),
             distilled: node.distilled.clone(),
+            thread_id: thread_id_by_canonical_id.get(&node.id).cloned(),
+            source_path: source_path_by_node_id.get(&node.id).cloned(),
             children,
         }
     }
 
     let trees = apex_nodes
         .into_iter()
-        .map(|apex| build_tree_node(apex, &node_map))
+        .map(|apex| build_tree_node(apex, &node_map, &thread_id_by_canonical_id, &source_path_by_node_id))
         .collect();
 
     Ok(trees)
@@ -220,41 +262,100 @@ pub fn drill(conn: &Connection, slug: &str, node_id: &str) -> Result<Option<Dril
 /// Searches in distilled text, topics JSON, and corrections JSON.
 /// Returns results ordered by depth descending (most synthesized first).
 pub fn search(conn: &Connection, slug: &str, term: &str) -> Result<Vec<SearchHit>> {
-    let pattern = format!("%{}%", term.to_lowercase());
+    // Split query into individual words for AND-matching.
+    // Each word must appear in at least one searchable field.
+    // This allows "stale engine" to match nodes where "stale" is in distilled
+    // and "engine" is in topics, rather than requiring the exact phrase.
+    let words: Vec<String> = term
+        .to_lowercase()
+        .split_whitespace()
+        .filter(|w| w.len() > 1) // skip single-char noise
+        .map(|w| w.to_string())
+        .collect();
 
-    let mut stmt = conn.prepare(
-        "SELECT id, depth, distilled, topics, corrections FROM live_pyramid_nodes \
-         WHERE slug = ? AND (\
-             LOWER(distilled) LIKE ? \
-             OR LOWER(topics) LIKE ? \
-             OR LOWER(corrections) LIKE ? \
-             OR LOWER(terms) LIKE ?\
-         ) ORDER BY depth DESC",
-    )?;
+    if words.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Build dynamic WHERE clause: each word must match at least one field
+    let mut conditions = Vec::new();
+    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+    params.push(Box::new(slug.to_string()));
+
+    for word in &words {
+        let pattern = format!("%{}%", word);
+        let idx = params.len();
+        conditions.push(format!(
+            "(LOWER(distilled) LIKE ?{p1} OR LOWER(topics) LIKE ?{p2} OR LOWER(corrections) LIKE ?{p3} OR LOWER(terms) LIKE ?{p4} OR LOWER(entities) LIKE ?{p5})",
+            p1 = idx + 1, p2 = idx + 2, p3 = idx + 3, p4 = idx + 4, p5 = idx + 5
+        ));
+        // Same pattern for all 5 fields
+        for _ in 0..5 {
+            params.push(Box::new(pattern.clone()));
+        }
+    }
+
+    let sql = format!(
+        "SELECT id, depth, distilled, topics, corrections, terms, entities FROM live_pyramid_nodes \
+         WHERE slug = ?1 AND {} ORDER BY depth DESC",
+        conditions.join(" AND ")
+    );
+
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+    let mut stmt = conn.prepare(&sql)?;
 
     let hits: Vec<SearchHit> = stmt
-        .query_map(rusqlite::params![slug, &pattern, &pattern, &pattern, &pattern], |row| {
+        .query_map(param_refs.as_slice(), |row| {
             let id: String = row.get("id")?;
             let depth: i64 = row.get("depth")?;
             let distilled: String = row.get("distilled")?;
+            let topics: String = row.get::<_, String>("topics").unwrap_or_default();
+            let terms_str: String = row.get::<_, String>("terms").unwrap_or_default();
+            let entities: String = row.get::<_, String>("entities").unwrap_or_default();
 
-            // Find snippet around the match
-            let term_lower = term.to_lowercase();
-            let distilled_lower = distilled.to_lowercase();
-            let snippet = if let Some(idx) = distilled_lower.find(&term_lower) {
-                let mut start = idx.saturating_sub(40);
-                while start > 0 && !distilled.is_char_boundary(start) { start -= 1; }
-                let mut end = (idx + term.len() + 40).min(distilled.len());
-                while end < distilled.len() && !distilled.is_char_boundary(end) { end += 1; }
-                format!("...{}...", &distilled[start..end])
+            // Combine all searchable text for snippet extraction and scoring
+            let all_text = format!("{} {} {} {}", distilled, topics, terms_str, entities);
+            let all_lower = all_text.to_lowercase();
+
+            // Count how many query words appear and find first match for snippet
+            let mut word_hits = 0;
+            let mut first_match_idx: Option<usize> = None;
+            for word in &words {
+                if all_lower.contains(word.as_str()) {
+                    word_hits += 1;
+                    if first_match_idx.is_none() {
+                        if let Some(idx) = all_lower.find(word.as_str()) {
+                            first_match_idx = Some(idx);
+                        }
+                    }
+                }
+            }
+
+            // Build snippet around first match
+            let snippet = if let Some(_idx) = first_match_idx {
+                let source = &distilled; // prefer distilled for snippet
+                let source_lower = source.to_lowercase();
+                if let Some(sidx) = source_lower.find(&words[0]) {
+                    let mut start = sidx.saturating_sub(50);
+                    while start > 0 && !source.is_char_boundary(start) { start -= 1; }
+                    let mut end = (sidx + words[0].len() + 80).min(source.len());
+                    while end < source.len() && !source.is_char_boundary(end) { end += 1; }
+                    format!("...{}...", &source[start..end])
+                } else {
+                    let mut end = distilled.len().min(120);
+                    while end < distilled.len() && !distilled.is_char_boundary(end) { end += 1; }
+                    distilled[..end].to_string()
+                }
             } else {
-                let mut end = distilled.len().min(80);
+                let mut end = distilled.len().min(120);
                 while end < distilled.len() && !distilled.is_char_boundary(end) { end += 1; }
                 distilled[..end].to_string()
             };
 
-            // Simple relevance: higher depth = more synthesized = higher score
-            let score = depth as f64 + 1.0;
+            // Score: word coverage * depth bonus
+            // More words matched = higher score. Higher depth = more synthesized.
+            let coverage = word_hits as f64 / words.len() as f64;
+            let score = coverage * (depth as f64 + 1.0) * 10.0;
 
             Ok(SearchHit {
                 node_id: id,
@@ -266,7 +367,11 @@ pub fn search(conn: &Connection, slug: &str, term: &str) -> Result<Vec<SearchHit
         .filter_map(|r| match r { Ok(v) => Some(v), Err(e) => { warn!("Skipping row: {e}"); None } })
         .collect();
 
-    Ok(hits)
+    // Sort by score descending (best matches first)
+    let mut sorted = hits;
+    sorted.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+
+    Ok(sorted)
 }
 
 /// Entity index — all entities that appear in 2+ nodes, with their locations.

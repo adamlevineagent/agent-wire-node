@@ -226,6 +226,7 @@ async fn save_meta_node(
         slug: slug.to_string(),
         depth: -1,
         chunk_index: None,
+        headline: title.to_string(),
         distilled: content.to_string(),
         topics: vec![Topic {
             name: title.to_string(),

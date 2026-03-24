@@ -8200,3 +8200,1291 @@ body {
     align-items: center;
     gap: 12px;
 }
+
+/* ═══════════════════════════════════════════════════════════════════
+   Version Badge — Sidebar bottom
+   ═══════════════════════════════════════════════════════════════════ */
+
+.version-badge {
+    padding: 6px 14px;
+    font-size: 10px;
+    font-weight: 500;
+    color: var(--text-muted);
+    text-align: center;
+    letter-spacing: 0.5px;
+    border-top: 1px solid var(--glass-border);
+    user-select: none;
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   DADBEAR Panel — Auto-Update Control Dashboard
+   ═══════════════════════════════════════════════════════════════════ */
+
+.dadbear-panel {
+    padding: 20px;
+    height: 100%;
+    overflow-y: auto;
+}
+
+.dadbear-panel-header {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 24px;
+}
+
+.dadbear-panel-header h2 {
+    font-size: 20px;
+    font-weight: 600;
+    color: var(--text-primary);
+    flex: 1;
+}
+
+.dadbear-back-btn {
+    background: var(--glass);
+    border: 1px solid var(--glass-border);
+    color: var(--text-secondary);
+    padding: 6px 12px;
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+    font-family: inherit;
+    font-size: 12px;
+    transition: background var(--transition), color var(--transition);
+}
+
+.dadbear-back-btn:hover {
+    background: rgba(255, 255, 255, 0.08);
+    color: var(--text-primary);
+}
+
+.dadbear-slug-label {
+    font-size: 13px;
+    color: var(--text-secondary);
+    font-weight: 500;
+    padding: 4px 10px;
+    background: var(--glass);
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--glass-border);
+}
+
+.dadbear-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+    margin-bottom: 16px;
+}
+
+.dadbear-grid-full {
+    grid-column: 1 / -1;
+}
+
+/* ── Config Section ─────────────────────────────────────────────── */
+
+.dadbear-config-section {
+    background: var(--bg-card);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-md);
+    padding: 16px;
+    backdrop-filter: blur(12px);
+}
+
+.dadbear-config-section h3 {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-primary);
+    margin-bottom: 14px;
+}
+
+.dadbear-field {
+    margin-bottom: 12px;
+}
+
+.dadbear-field label {
+    display: block;
+    font-size: 11px;
+    font-weight: 500;
+    color: var(--text-secondary);
+    margin-bottom: 4px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+.dadbear-field-value {
+    font-size: 13px;
+    color: var(--text-primary);
+    font-weight: 600;
+}
+
+/* ── Toggle Switch ──────────────────────────────────────────────── */
+
+.dadbear-toggle {
+    position: relative;
+    display: inline-block;
+    width: 40px;
+    height: 22px;
+    cursor: pointer;
+}
+
+.dadbear-toggle input {
+    opacity: 0;
+    width: 0;
+    height: 0;
+}
+
+.dadbear-toggle-track {
+    position: absolute;
+    inset: 0;
+    background: var(--glass);
+    border: 1px solid var(--glass-border);
+    border-radius: 11px;
+    transition: background var(--transition);
+}
+
+.dadbear-toggle input:checked + .dadbear-toggle-track {
+    background: rgba(34, 211, 238, 0.3);
+    border-color: var(--accent-cyan);
+}
+
+.dadbear-toggle-thumb {
+    position: absolute;
+    top: 3px;
+    left: 3px;
+    width: 16px;
+    height: 16px;
+    background: var(--text-secondary);
+    border-radius: 50%;
+    transition: transform var(--transition), background var(--transition);
+}
+
+.dadbear-toggle input:checked ~ .dadbear-toggle-thumb {
+    transform: translateX(18px);
+    background: var(--accent-cyan);
+}
+
+/* ── Slider ─────────────────────────────────────────────────────── */
+
+.dadbear-slider {
+    width: 100%;
+    height: 4px;
+    border-radius: 2px;
+    background: var(--glass);
+    outline: none;
+    -webkit-appearance: none;
+    appearance: none;
+    cursor: pointer;
+}
+
+.dadbear-slider::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    background: var(--accent-cyan);
+    cursor: pointer;
+    border: 2px solid var(--bg-surface);
+    box-shadow: 0 0 6px rgba(34, 211, 238, 0.4);
+}
+
+.dadbear-slider::-moz-range-thumb {
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    background: var(--accent-cyan);
+    cursor: pointer;
+    border: 2px solid var(--bg-surface);
+    box-shadow: 0 0 6px rgba(34, 211, 238, 0.4);
+}
+
+.dadbear-save-btn {
+    background: var(--accent-cyan);
+    color: #000;
+    border: none;
+    padding: 8px 16px;
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+    font-family: inherit;
+    font-size: 12px;
+    font-weight: 600;
+    transition: opacity var(--transition);
+    margin-top: 8px;
+}
+
+.dadbear-save-btn:hover {
+    opacity: 0.85;
+}
+
+.dadbear-save-btn:disabled {
+    opacity: 0.4;
+    cursor: default;
+}
+
+/* ── Status Section ─────────────────────────────────────────────── */
+
+.dadbear-status-section {
+    background: var(--bg-card);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-md);
+    padding: 16px;
+    backdrop-filter: blur(12px);
+    display: flex;
+    flex-direction: column;
+}
+
+.dadbear-status-section h3 {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-primary);
+    margin-bottom: 14px;
+}
+
+.dadbear-status-text {
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--accent-cyan);
+    margin-bottom: 12px;
+}
+
+.dadbear-status-text.dadbear-status-snowcave {
+    color: #f87171;
+}
+
+.dadbear-status-text.dadbear-status-tripped {
+    color: var(--accent-warm);
+}
+
+.dadbear-status-text.dadbear-status-hibernating {
+    color: var(--text-muted);
+}
+
+.dadbear-status-text.dadbear-status-counting {
+    color: var(--accent-cyan);
+    animation: dadbear-pulse 2s ease-in-out infinite;
+}
+
+.dadbear-status-text.dadbear-status-sniffing {
+    color: var(--accent-cyan);
+}
+
+.dadbear-status-text.dadbear-status-climbing {
+    color: var(--accent-purple, #a78bfa);
+}
+
+.dadbear-status-text.dadbear-status-updated {
+    color: var(--accent-green);
+    animation: dadbear-glow 1.5s ease-out forwards;
+}
+
+@keyframes dadbear-pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.55; }
+}
+
+@keyframes dadbear-glow {
+    0% { text-shadow: 0 0 8px rgba(64, 208, 128, 0.6); }
+    100% { text-shadow: none; }
+}
+
+/* ── Vertical Bar Chart ─────────────────────────────────────────── */
+
+.dadbear-bar-chart {
+    display: flex;
+    justify-content: space-around;
+    align-items: flex-end;
+    flex: 1;
+    min-height: 120px;
+    padding: 0 16px;
+    gap: 16px;
+}
+
+.dadbear-bar-column {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    flex: 1;
+    height: 100%;
+    justify-content: flex-end;
+}
+
+.dadbear-bar-fill {
+    width: 100%;
+    max-width: 48px;
+    background: var(--accent-cyan);
+    border-radius: var(--radius-sm) var(--radius-sm) 0 0;
+    transition: height 0.3s ease;
+    min-height: 2px;
+}
+
+.dadbear-bar-label {
+    margin-top: 4px;
+    font-size: 11px;
+    color: var(--text-muted);
+}
+
+.dadbear-bar-count {
+    font-size: 13px;
+    color: var(--text-primary);
+    font-weight: 600;
+}
+
+/* ── Status Footer (last check + controls pushed to bottom) ────── */
+
+.dadbear-status-footer {
+    margin-top: auto;
+}
+
+.dadbear-last-check {
+    font-size: 11px;
+    color: var(--text-muted);
+}
+
+/* ── Control Buttons ────────────────────────────────────────────── */
+
+.dadbear-controls {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin-top: 12px;
+}
+
+.dadbear-freeze-btn {
+    padding: 6px 14px;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--glass-border);
+    font-family: inherit;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background var(--transition), color var(--transition), border-color var(--transition);
+}
+
+.dadbear-freeze-btn.active {
+    background: rgba(34, 211, 238, 0.1);
+    color: var(--accent-cyan);
+    border-color: var(--accent-cyan);
+}
+
+.dadbear-freeze-btn.frozen {
+    background: rgba(248, 113, 113, 0.1);
+    color: #f87171;
+    border-color: #f87171;
+}
+
+.dadbear-freeze-btn:hover {
+    opacity: 0.85;
+}
+
+.dadbear-breaker-indicator {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 14px;
+    border-radius: var(--radius-sm);
+    font-size: 12px;
+    font-weight: 600;
+    border: 1px solid var(--glass-border);
+}
+
+.dadbear-breaker-indicator.ok {
+    color: var(--accent-green);
+    border-color: rgba(64, 208, 128, 0.3);
+}
+
+.dadbear-breaker-indicator.tripped {
+    color: var(--accent-warm);
+    border-color: rgba(240, 192, 64, 0.3);
+}
+
+.dadbear-breaker-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+}
+
+.dadbear-breaker-dot.ok {
+    background: var(--accent-green);
+    box-shadow: 0 0 6px var(--accent-green);
+}
+
+.dadbear-breaker-dot.tripped {
+    background: var(--accent-warm);
+    box-shadow: 0 0 6px var(--accent-warm);
+    animation: pulse-dot 1.5s ease-in-out infinite;
+}
+
+.dadbear-action-btn {
+    padding: 6px 14px;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--glass-border);
+    background: var(--glass);
+    color: var(--text-secondary);
+    font-family: inherit;
+    font-size: 12px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background var(--transition), color var(--transition);
+}
+
+.dadbear-action-btn:hover {
+    background: rgba(255, 255, 255, 0.08);
+    color: var(--text-primary);
+}
+
+.dadbear-action-btn.danger {
+    color: var(--accent-warm);
+    border-color: rgba(240, 192, 64, 0.3);
+}
+
+.dadbear-action-btn.danger:hover {
+    background: rgba(240, 192, 64, 0.1);
+}
+
+.dadbear-action-btn.run-now {
+    color: var(--accent-cyan);
+    border-color: rgba(34, 211, 238, 0.4);
+    font-weight: 600;
+}
+
+.dadbear-action-btn.run-now:hover {
+    background: rgba(34, 211, 238, 0.15);
+    box-shadow: 0 0 12px rgba(34, 211, 238, 0.2);
+}
+
+.dadbear-action-btn.l0-sweep {
+    color: var(--accent-green);
+    border-color: rgba(64, 208, 128, 0.4);
+    font-weight: 600;
+}
+
+.dadbear-action-btn.l0-sweep:hover {
+    background: rgba(64, 208, 128, 0.14);
+    box-shadow: 0 0 12px rgba(64, 208, 128, 0.18);
+}
+
+/* ── Frozen/Breaker state on workspace cards ──────────────────── */
+
+.pyramid-status-indicator.frozen {
+    color: #7dd3fc;
+    font-style: italic;
+}
+
+.pyramid-status-indicator.breaker-tripped {
+    color: var(--accent-warm);
+    font-weight: 600;
+    animation: dadbear-pulse 2s ease-in-out infinite;
+}
+
+.pyramid-card-dadbear-btn.dadbear-attention-frozen {
+    background: rgba(125, 211, 252, 0.15);
+    border-color: rgba(125, 211, 252, 0.4);
+    box-shadow: 0 0 8px rgba(125, 211, 252, 0.2);
+}
+
+.pyramid-card-dadbear-btn.dadbear-attention-tripped {
+    background: rgba(240, 192, 64, 0.15);
+    border-color: rgba(240, 192, 64, 0.5);
+    box-shadow: 0 0 12px rgba(240, 192, 64, 0.3);
+    animation: dadbear-pulse 2s ease-in-out infinite;
+}
+
+/* ── Stale Log Section ──────────────────────────────────────────── */
+
+.dadbear-log-section {
+    background: var(--bg-card);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-md);
+    padding: 16px;
+    backdrop-filter: blur(12px);
+}
+
+.dadbear-log-section h3 {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-primary);
+    margin-bottom: 10px;
+}
+
+.dadbear-log-filters {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 10px;
+}
+
+.dadbear-log-filters select {
+    background: var(--bg-surface);
+    border: 1px solid var(--glass-border);
+    color: var(--text-secondary);
+    padding: 4px 8px;
+    border-radius: var(--radius-sm);
+    font-family: inherit;
+    font-size: 11px;
+    cursor: pointer;
+}
+
+.stale-log-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 11px;
+    max-height: 300px;
+    overflow-y: auto;
+    display: block;
+}
+
+.stale-log-table thead {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+}
+
+.stale-log-table th {
+    text-align: left;
+    padding: 6px 8px;
+    background: var(--bg-surface);
+    color: var(--text-muted);
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    font-size: 10px;
+    border-bottom: 1px solid var(--glass-border);
+}
+
+.stale-log-table td {
+    padding: 6px 8px;
+    color: var(--text-secondary);
+    border-bottom: 1px solid rgba(255, 255, 255, 0.03);
+}
+
+.stale-log-table tbody tr:nth-child(even) {
+    background: rgba(255, 255, 255, 0.02);
+}
+
+.stale-log-table tbody tr:hover {
+    background: rgba(255, 255, 255, 0.04);
+}
+
+.stale-badge {
+    display: inline-block;
+    padding: 1px 6px;
+    border-radius: 4px;
+    font-size: 10px;
+    font-weight: 600;
+}
+
+.stale-badge.stale-yes {
+    background: rgba(248, 113, 113, 0.15);
+    color: #f87171;
+}
+
+.stale-badge.stale-no {
+    background: rgba(64, 208, 128, 0.15);
+    color: var(--accent-green);
+}
+
+/* ── Cost Section ───────────────────────────────────────────────── */
+
+.dadbear-cost-section {
+    background: var(--bg-card);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-md);
+    padding: 16px;
+    backdrop-filter: blur(12px);
+}
+
+.dadbear-cost-section h3 {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-primary);
+    margin-bottom: 14px;
+}
+
+.dadbear-cost-total {
+    font-size: 28px;
+    font-weight: 700;
+    color: var(--accent-cyan);
+    margin-bottom: 4px;
+}
+
+.dadbear-cost-calls {
+    font-size: 12px;
+    color: var(--text-muted);
+    margin-bottom: 16px;
+}
+
+.dadbear-cost-breakdown {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.dadbear-cost-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 12px;
+}
+
+.dadbear-cost-row-label {
+    color: var(--text-secondary);
+}
+
+.dadbear-cost-row-value {
+    color: var(--text-primary);
+    font-weight: 600;
+}
+
+.dadbear-cost-window {
+    display: flex;
+    gap: 4px;
+    margin-bottom: 12px;
+}
+
+.dadbear-cost-window button {
+    background: var(--glass);
+    border: 1px solid var(--glass-border);
+    color: var(--text-muted);
+    padding: 3px 8px;
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+    font-family: inherit;
+    font-size: 10px;
+    font-weight: 600;
+    transition: background var(--transition), color var(--transition);
+}
+
+.dadbear-cost-window button.active {
+    background: rgba(34, 211, 238, 0.1);
+    color: var(--accent-cyan);
+    border-color: var(--accent-cyan);
+}
+
+.dadbear-cost-window button:hover {
+    background: rgba(255, 255, 255, 0.06);
+    color: var(--text-secondary);
+}
+
+/* ── Bear Icon Button on Workspace Card ─────────────────────────── */
+
+.pyramid-card-dadbear-btn {
+    background: transparent;
+    border: 1px solid var(--glass-border);
+    color: var(--text-muted);
+    padding: 4px 8px;
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+    font-size: 14px;
+    transition: background var(--transition), color var(--transition), border-color var(--transition);
+    line-height: 1;
+}
+
+.pyramid-card-dadbear-btn:hover {
+    background: rgba(34, 211, 238, 0.08);
+    color: var(--accent-cyan);
+    border-color: var(--accent-cyan);
+}
+
+.pyramid-card-dadbear-btn:disabled {
+    opacity: 0.3;
+    cursor: default;
+}
+
+/* ── FAQ Button on workspace cards ──────────────────────────────── */
+
+.pyramid-card-faq-btn {
+    background: transparent;
+    border: 1px solid var(--glass-border);
+    color: var(--text-muted);
+    padding: 4px 8px;
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+    font-size: 14px;
+    transition: background var(--transition), color var(--transition), border-color var(--transition);
+    line-height: 1;
+}
+
+.pyramid-card-faq-btn:hover {
+    background: rgba(34, 211, 238, 0.08);
+    color: var(--accent-cyan);
+    border-color: var(--accent-cyan);
+}
+
+.pyramid-card-faq-btn:disabled {
+    opacity: 0.3;
+    cursor: default;
+}
+
+/* ── FAQ Directory ─────────────────────────────────────────────── */
+
+.faq-directory {
+    padding: 20px;
+    max-width: 900px;
+    margin: 0 auto;
+}
+
+.faq-directory-header {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    margin-bottom: 20px;
+}
+
+.faq-directory-header h2 {
+    margin: 0;
+    font-size: 18px;
+    color: var(--text-primary);
+}
+
+.faq-directory-meta {
+    font-size: 12px;
+    color: var(--text-muted);
+}
+
+.faq-search {
+    margin-bottom: 20px;
+}
+
+.faq-search-input {
+    width: 100%;
+    padding: 10px 14px;
+    background: var(--bg-card);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-md);
+    color: var(--text-primary);
+    font-size: 13px;
+    outline: none;
+    transition: border-color var(--transition);
+}
+
+.faq-search-input:focus {
+    border-color: var(--accent-cyan);
+}
+
+.faq-search-input::placeholder {
+    color: var(--text-muted);
+}
+
+/* Category cards */
+.faq-categories {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    margin-bottom: 24px;
+}
+
+.faq-category-card {
+    background: var(--bg-card);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-md);
+    overflow: hidden;
+    backdrop-filter: blur(var(--glass));
+    transition: border-color var(--transition);
+}
+
+.faq-category-card:hover {
+    border-color: rgba(34, 211, 238, 0.3);
+}
+
+.faq-category-card-header {
+    padding: 16px;
+    cursor: pointer;
+    user-select: none;
+}
+
+.faq-category-card-title {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 8px;
+}
+
+.faq-category-card-title h3 {
+    margin: 0;
+    font-size: 15px;
+    color: var(--text-primary);
+    font-weight: 600;
+}
+
+.faq-category-expand {
+    font-size: 10px;
+    color: var(--accent-cyan);
+    width: 14px;
+    flex-shrink: 0;
+}
+
+.faq-category-count {
+    font-size: 11px;
+    color: var(--text-muted);
+    background: rgba(34, 211, 238, 0.08);
+    padding: 2px 8px;
+    border-radius: 10px;
+    margin-left: auto;
+}
+
+.faq-category-summary {
+    margin: 0;
+    font-size: 13px;
+    color: var(--text-secondary);
+    line-height: 1.5;
+    padding-left: 22px;
+}
+
+.faq-category-children {
+    border-top: 1px solid var(--glass-border);
+    padding: 8px 16px 16px;
+}
+
+/* Section title (for uncategorized in hierarchical mode) */
+.faq-section-title {
+    font-size: 13px;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin: 20px 0 12px;
+    font-weight: 600;
+}
+
+/* FAQ entries (flat list) */
+.faq-flat-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.faq-entry {
+    background: var(--bg-card);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-sm);
+    overflow: hidden;
+    transition: border-color var(--transition);
+}
+
+.faq-entry:hover {
+    border-color: rgba(34, 211, 238, 0.2);
+}
+
+.faq-entry-expanded {
+    border-color: rgba(34, 211, 238, 0.3);
+}
+
+.faq-entry-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 14px;
+    cursor: pointer;
+    user-select: none;
+}
+
+.faq-entry-expand {
+    font-size: 9px;
+    color: var(--accent-cyan);
+    width: 12px;
+    flex-shrink: 0;
+}
+
+.faq-entry-question {
+    font-size: 13px;
+    color: var(--text-primary);
+    flex: 1;
+    line-height: 1.4;
+}
+
+.faq-entry-hits {
+    font-size: 11px;
+    color: var(--text-muted);
+    flex-shrink: 0;
+}
+
+.faq-entry-body {
+    padding: 0 14px 14px 34px;
+}
+
+.faq-entry-answer {
+    font-size: 13px;
+    color: var(--text-secondary);
+    line-height: 1.6;
+    white-space: pre-wrap;
+    margin-bottom: 10px;
+}
+
+.faq-entry-triggers,
+.faq-entry-sources {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 6px;
+}
+
+.faq-entry-label {
+    font-size: 11px;
+    color: var(--text-muted);
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+}
+
+.faq-trigger-tag {
+    font-size: 11px;
+    background: rgba(34, 211, 238, 0.08);
+    color: var(--accent-cyan);
+    padding: 2px 8px;
+    border-radius: 10px;
+    border: 1px solid rgba(34, 211, 238, 0.15);
+}
+
+.faq-source-tag {
+    font-size: 11px;
+    background: rgba(139, 92, 246, 0.08);
+    color: var(--accent-purple, #a78bfa);
+    padding: 2px 8px;
+    border-radius: 10px;
+    border: 1px solid rgba(139, 92, 246, 0.15);
+    font-family: var(--font-mono, monospace);
+}
+
+.faq-empty {
+    text-align: center;
+    padding: 40px;
+    color: var(--text-muted);
+    font-size: 13px;
+}
+
+/* ── Loading Spinner ────────────────────────────────────────────── */
+
+.dadbear-loading {
+    text-align: center;
+    padding: 40px;
+    color: var(--text-muted);
+    font-size: 13px;
+}
+
+/* ── Knowledge Contributions ───────────────────────────────────── */
+
+.dadbear-contributions {
+    background: var(--glass-bg);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-md, 8px);
+    padding: 16px;
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+}
+
+.dadbear-contributions h3 {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-primary);
+    margin-bottom: 12px;
+}
+
+.contribution-stats {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-bottom: 14px;
+}
+
+.contribution-stat-row {
+    font-size: 12px;
+    color: var(--text-secondary);
+}
+
+.contribution-recent {
+    border-top: 1px solid var(--glass-border);
+    padding-top: 10px;
+}
+
+.contribution-recent-label {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-muted);
+    margin-bottom: 6px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+
+.contribution-item {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    padding: 4px 0;
+    font-size: 12px;
+    color: var(--text-secondary);
+}
+
+.contribution-author-badge {
+    display: inline-block;
+    font-size: 10px;
+    font-weight: 600;
+    font-family: var(--font-mono, monospace);
+    background: rgba(139, 92, 246, 0.1);
+    color: var(--accent-purple, #a78bfa);
+    padding: 1px 6px;
+    border-radius: 8px;
+    border: 1px solid rgba(139, 92, 246, 0.2);
+    white-space: nowrap;
+    flex-shrink: 0;
+}
+
+.contribution-content {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text-muted);
+    font-size: 11px;
+}
+
+.contribution-empty {
+    text-align: center;
+    padding: 20px;
+    color: var(--text-muted);
+    font-size: 12px;
+}
+
+/* ── DADBEAR UX Overhaul ────────────────────────────────────────────── */
+
+.dadbear-acronym {
+    display: flex;
+    gap: 8px;
+    justify-content: center;
+    margin-top: 2px;
+}
+
+.dadbear-acronym-step {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 2px;
+}
+
+.dadbear-acronym-letter {
+    font-size: 13px;
+    font-weight: 600;
+    transition: color 0.5s ease, text-shadow 0.5s ease;
+    letter-spacing: 0.5px;
+}
+
+.dadbear-acronym-count {
+    font-size: 10px;
+    color: var(--text-muted);
+    font-variant-numeric: tabular-nums;
+    min-width: 16px;
+    text-align: center;
+}
+
+.dadbear-countdown {
+    font-family: 'SF Mono', monospace;
+    font-size: 24px;
+    color: var(--accent-cyan);
+    font-weight: 300;
+    letter-spacing: 2px;
+}
+
+.dadbear-countdown-reset {
+    color: var(--accent-warm);
+    font-size: 11px;
+    animation: dadbear-flash 2s ease-out forwards;
+}
+
+@keyframes dadbear-flash {
+    0% { opacity: 1; }
+    70% { opacity: 1; }
+    100% { opacity: 0; }
+}
+
+.dadbear-layer-label {
+    font-size: 11px;
+    color: var(--text-secondary);
+    min-width: 80px;
+}
+
+.dadbear-layer-count {
+    font-size: 11px;
+    color: var(--text-muted);
+    min-width: 40px;
+    text-align: right;
+}
+
+.dadbear-phase-detail {
+    font-size: 12px;
+    color: var(--text-secondary);
+    margin-top: 4px;
+    font-style: italic;
+}
+
+/* (old horizontal bar styles removed — replaced by vertical bar chart) */
+
+/* ─── Agent Onboarding / Instructions Cards ──────────────────────── */
+
+.agent-onboarding-card {
+    background: var(--bg-card);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-md);
+    padding: 16px 20px;
+    backdrop-filter: blur(12px);
+    transition: all var(--transition);
+    margin-bottom: 16px;
+}
+
+.agent-onboarding-card:hover {
+    border-color: rgba(255, 255, 255, 0.12);
+}
+
+.agent-onboarding-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    cursor: pointer;
+}
+
+.agent-onboarding-header h3 {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.agent-onboarding-header-actions {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+
+.agent-onboarding-toggle {
+    color: var(--text-muted);
+    font-size: 12px;
+    user-select: none;
+}
+
+.agent-onboarding-content {
+    margin-top: 12px;
+}
+
+.agent-onboarding-content pre {
+    background: var(--bg-deep);
+    padding: 12px;
+    border-radius: var(--radius-sm);
+    overflow-x: auto;
+    font-size: 12px;
+    line-height: 1.5;
+    color: var(--text-secondary);
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+.copy-btn {
+    background: transparent;
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-sm);
+    color: var(--text-secondary);
+    font-size: 12px;
+    padding: 4px 12px;
+    cursor: pointer;
+    transition: all var(--transition);
+}
+
+.copy-btn:hover {
+    border-color: var(--accent-cyan);
+    color: var(--accent-cyan);
+}
+
+.copy-btn.copied {
+    color: var(--accent-green);
+    border-color: var(--accent-green);
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   Pyramid Visualization
+   ═══════════════════════════════════════════════════════════════════ */
+
+.pyramid-viz-container {
+    position: relative;
+    min-height: 400px;
+    height: 400px;
+    border-radius: 12px;
+    overflow: visible; /* tooltips can escape */
+}
+
+.pyramid-viz-inner {
+    position: relative;
+    width: 100%;
+    height: 100%;
+    min-height: 400px;
+    background: var(--bg-card, rgba(14, 21, 37, 0.6));
+    backdrop-filter: blur(8px);
+    border: 1px solid var(--glass-border, rgba(255, 255, 255, 0.06));
+    border-radius: 12px;
+    overflow: hidden; /* clips canvas to rounded corners */
+}
+
+.pyramid-viz-canvas {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    cursor: crosshair;
+}
+
+.pyramid-viz-tooltip {
+    position: absolute;
+    pointer-events: none;
+    padding: 8px 12px;
+    background: rgba(14, 21, 37, 0.95);
+    backdrop-filter: blur(12px);
+    border: 1px solid var(--glass-border);
+    border-radius: 8px;
+    color: var(--text-primary);
+    font-size: 12px;
+    max-width: 280px;
+    z-index: 10;
+    transition: opacity 0.15s ease;
+}
+
+.pyramid-viz-popover {
+    position: absolute;
+    padding: 16px;
+    background: var(--bg-surface);
+    backdrop-filter: blur(20px);
+    border: 1px solid var(--glass-border);
+    border-radius: 12px;
+    color: var(--text-primary);
+    font-size: 13px;
+    max-width: 400px;
+    max-height: 300px;
+    overflow-y: auto;
+    z-index: 20;
+    box-shadow: var(--shadow-glow);
+}
+
+.pyramid-viz-popover-close {
+    position: absolute;
+    top: 8px;
+    right: 8px;
+    background: none;
+    border: none;
+    color: var(--text-muted);
+    cursor: pointer;
+    font-size: 16px;
+}
+
+.pyramid-viz-popover-close:hover {
+    color: var(--text-primary);
+}
+
+.pyramid-viz-empty {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 250px;
+    color: var(--text-muted);
+    font-size: 14px;
+}
+
+.pyramid-viz-layer-label {
+    position: absolute;
+    left: 8px;
+    color: var(--text-muted);
+    font-size: 10px;
+    font-family: monospace;
+    opacity: 0.4;
+    pointer-events: none;
+}

@@ -4,6 +4,9 @@
 // Phase 4b: Real LLM-powered implementations replacing the Phase 3 placeholders
 // in stale_engine.rs for node stale-checks, connection checks, and edge checks.
 
+use std::collections::BTreeSet;
+use std::fs;
+
 use anyhow::{Context, Result};
 use chrono::Utc;
 use rusqlite::Connection;
@@ -12,10 +15,236 @@ use uuid::Uuid;
 
 use super::config_helper::{config_for_model, estimate_cost};
 use super::llm::{call_model_with_usage, extract_json};
+use super::naming::{clean_headline, headline_for_node};
 use super::stale_engine::batch_items;
 use super::types::{
     ConnectionCheckResult, ConnectionResult, NodeStaleResult, PendingMutation, StaleCheckResult,
 };
+
+#[derive(Debug, Clone)]
+struct ThreadTarget {
+    thread_id: String,
+    canonical_node_id: String,
+    depth: i32,
+}
+
+fn lookup_thread_target_by_canonical(
+    conn: &Connection,
+    slug: &str,
+    node_id: &str,
+) -> Result<Option<ThreadTarget>> {
+    Ok(conn.query_row(
+        "SELECT thread_id, current_canonical_id, depth FROM pyramid_threads
+         WHERE slug = ?1 AND current_canonical_id = ?2",
+        rusqlite::params![slug, node_id],
+        |row| {
+            Ok(ThreadTarget {
+                thread_id: row.get(0)?,
+                canonical_node_id: row.get(1)?,
+                depth: row.get(2)?,
+            })
+        },
+    )
+    .ok())
+}
+
+fn lookup_thread_target_by_thread_id(
+    conn: &Connection,
+    slug: &str,
+    node_id: &str,
+) -> Result<Option<ThreadTarget>> {
+    Ok(conn.query_row(
+        "SELECT thread_id, current_canonical_id, depth FROM pyramid_threads
+         WHERE slug = ?1 AND thread_id = ?2",
+        rusqlite::params![slug, node_id],
+        |row| {
+            Ok(ThreadTarget {
+                thread_id: row.get(0)?,
+                canonical_node_id: row.get(1)?,
+                depth: row.get(2)?,
+            })
+        },
+    )
+    .ok())
+}
+
+fn summarize_for_thread_name(text: &str, max_chars: usize) -> String {
+    let cleaned: String = text.chars().filter(|c| !c.is_control()).collect();
+    let summary: String = cleaned.chars().take(max_chars).collect();
+    if summary.is_empty() {
+        "Untitled".to_string()
+    } else if cleaned.chars().count() > max_chars {
+        format!("{summary}...")
+    } else {
+        summary
+    }
+}
+
+fn excerpt(text: &str, max_chars: usize) -> String {
+    text.chars().take(max_chars).collect()
+}
+
+fn can_self_heal_thread(node_id: &str, depth: i32) -> bool {
+    if depth == 1 {
+        node_id.starts_with("C-L1-")
+    } else if depth >= 2 {
+        node_id.starts_with(&format!("L{depth}-"))
+    } else {
+        false
+    }
+}
+
+fn ensure_thread_target(
+    conn: &Connection,
+    slug: &str,
+    node_id: &str,
+) -> Result<Option<ThreadTarget>> {
+    if let Some(thread_target) = lookup_thread_target_by_canonical(conn, slug, node_id)? {
+        return Ok(Some(thread_target));
+    }
+
+    if let Some(thread_target) = lookup_thread_target_by_thread_id(conn, slug, node_id)? {
+        return Ok(Some(thread_target));
+    }
+
+    let mut cursor = node_id.to_string();
+    for _ in 0..16 {
+        let next_id: Option<String> = conn
+            .query_row(
+                "SELECT superseded_by FROM pyramid_nodes
+                 WHERE slug = ?1 AND id = ?2 AND superseded_by IS NOT NULL",
+                rusqlite::params![slug, cursor],
+                |row| row.get(0),
+            )
+            .ok()
+            .flatten();
+
+        let Some(next_id) = next_id else {
+            break;
+        };
+
+        if next_id == cursor {
+            break;
+        }
+
+        if let Some(thread_target) = lookup_thread_target_by_canonical(conn, slug, &next_id)? {
+            return Ok(Some(thread_target));
+        }
+
+        if let Some(thread_target) = lookup_thread_target_by_thread_id(conn, slug, &next_id)? {
+            return Ok(Some(thread_target));
+        }
+
+        cursor = next_id;
+    }
+
+    let node_row: Option<(i32, String, Option<String>, String)> = conn
+        .query_row(
+            "SELECT depth,
+                    headline,
+                    json_extract(topics, '$[0].name'),
+                    distilled
+             FROM pyramid_nodes
+             WHERE slug = ?1 AND id = ?2",
+            rusqlite::params![slug, node_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .ok();
+
+    let Some((depth, headline, topic_name, distilled)) = node_row else {
+        return Ok(None);
+    };
+
+    if !can_self_heal_thread(node_id, depth) {
+        return Ok(None);
+    }
+
+    let thread_name = clean_headline(&headline)
+        .or_else(|| topic_name.filter(|name| !name.trim().is_empty()))
+        .unwrap_or_else(|| summarize_for_thread_name(&distilled, 60));
+
+    conn.execute(
+        "INSERT OR IGNORE INTO pyramid_threads
+         (slug, thread_id, thread_name, current_canonical_id, depth, delta_count, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, 0, datetime('now'), datetime('now'))",
+        rusqlite::params![slug, node_id, thread_name, node_id, depth],
+    )?;
+
+    conn.execute(
+        "INSERT OR IGNORE INTO pyramid_distillations
+         (slug, thread_id, content, delta_count, updated_at)
+         VALUES (?1, ?2, '', 0, datetime('now'))",
+        rusqlite::params![slug, node_id],
+    )?;
+
+    Ok(Some(ThreadTarget {
+        thread_id: node_id.to_string(),
+        canonical_node_id: node_id.to_string(),
+        depth,
+    }))
+}
+
+pub(crate) fn resolve_stale_target_for_node(
+    conn: &Connection,
+    slug: &str,
+    node_id: &str,
+) -> Result<Option<String>> {
+    Ok(ensure_thread_target(conn, slug, node_id)?.map(|target| target.thread_id))
+}
+
+pub(crate) fn resolve_parent_targets_for_node_ids(
+    conn: &Connection,
+    slug: &str,
+    node_ids: &[String],
+) -> Result<Vec<String>> {
+    let mut targets = BTreeSet::new();
+
+    for node_id in node_ids {
+        let parent_id: Option<String> = conn
+            .query_row(
+                "SELECT parent_id FROM pyramid_nodes
+                 WHERE slug = ?1 AND id = ?2 AND parent_id IS NOT NULL",
+                rusqlite::params![slug, node_id],
+                |row| row.get(0),
+            )
+            .ok()
+            .flatten();
+
+        let Some(parent_id) = parent_id else {
+            continue;
+        };
+
+        if let Some(target) = resolve_stale_target_for_node(conn, slug, &parent_id)? {
+            targets.insert(target);
+        } else {
+            warn!(slug = %slug, node_id = %node_id, parent_id = %parent_id, "Parent node does not map to a live thread target");
+        }
+    }
+
+    Ok(targets.into_iter().collect())
+}
+
+pub(crate) fn resolve_parent_targets_for_file(
+    conn: &Connection,
+    slug: &str,
+    file_path: &str,
+) -> Result<Vec<String>> {
+    let node_ids_json: Option<String> = conn
+        .query_row(
+            "SELECT node_ids FROM pyramid_file_hashes
+             WHERE slug = ?1 AND file_path = ?2",
+            rusqlite::params![slug, file_path],
+            |row| row.get(0),
+        )
+        .ok();
+
+    let Some(node_ids_json) = node_ids_json else {
+        return Ok(Vec::new());
+    };
+
+    let node_ids: Vec<String> = serde_json::from_str(&node_ids_json).unwrap_or_default();
+    resolve_parent_targets_for_node_ids(conn, slug, &node_ids)
+}
 
 // ── 1. Node Stale-Check (Template 2) ─────────────────────────────────────────
 
@@ -41,15 +270,33 @@ pub async fn dispatch_node_stale_check(
     let node_ids: Vec<String> = batch.iter().map(|m| m.target_ref.clone()).collect();
     let slugs: Vec<String> = batch.iter().map(|m| m.slug.clone()).collect();
 
-    let node_data = tokio::task::spawn_blocking(move || -> Result<Vec<(String, String, String, i32)>> {
+    #[derive(Debug, Clone)]
+    struct PromptNode {
+        source_index: usize,
+        node_id: String,
+        distilled: String,
+        delta_content: String,
+        depth: i32,
+    }
+
+    #[derive(Debug, Clone)]
+    struct SkippedNode {
+        source_index: usize,
+        node_id: String,
+        reason: String,
+    }
+
+    let (node_data, skipped_nodes) = tokio::task::spawn_blocking(move || -> Result<(Vec<PromptNode>, Vec<SkippedNode>)> {
         let conn = Connection::open(&db).context("Failed to open DB for node stale-check")?;
         let mut results = Vec::new();
+        let mut skipped = Vec::new();
+        let mut covered_threads = BTreeSet::new();
 
         for (i, node_id) in node_ids.iter().enumerate() {
             let slug = &slugs[i];
 
-            // Get node distillation and depth
-            let (distilled, depth): (String, i32) = conn
+            let thread_target = ensure_thread_target(&conn, slug, node_id)?;
+            let fallback_node: (String, i32) = conn
                 .query_row(
                     "SELECT distilled, depth FROM pyramid_nodes WHERE id = ?1 AND slug = ?2",
                     rusqlite::params![node_id, slug],
@@ -57,46 +304,95 @@ pub async fn dispatch_node_stale_check(
                 )
                 .unwrap_or_else(|_| (String::new(), 0));
 
-            // Get the thread_id for this node, then fetch recent deltas
-            let thread_id: Option<String> = conn
+            let Some(thread_target) = thread_target else {
+                skipped.push(SkippedNode {
+                    source_index: i,
+                    node_id: node_id.clone(),
+                    reason: "Skipped stale check: target does not map to a live thread in this pyramid.".to_string(),
+                });
+                continue;
+            };
+
+            if !covered_threads.insert(thread_target.thread_id.clone()) {
+                skipped.push(SkippedNode {
+                    source_index: i,
+                    node_id: node_id.clone(),
+                    reason: format!(
+                        "Skipped duplicate stale check: target resolves to live thread {} already covered in this batch.",
+                        thread_target.thread_id
+                    ),
+                });
+                continue;
+            }
+
+            let (distilled, depth): (String, i32) = conn
                 .query_row(
-                    "SELECT thread_id FROM pyramid_threads
-                     WHERE slug = ?1 AND current_canonical_id = ?2",
-                    rusqlite::params![slug, node_id],
-                    |row| row.get(0),
+                    "SELECT distilled, depth FROM pyramid_nodes WHERE id = ?1 AND slug = ?2",
+                    rusqlite::params![thread_target.canonical_node_id, slug],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
                 )
-                .ok();
+                .unwrap_or((fallback_node.0, thread_target.depth));
 
             let mut delta_content = String::new();
-            if let Some(ref tid) = thread_id {
-                let mut stmt = conn
-                    .prepare(
-                        "SELECT content FROM pyramid_deltas
-                         WHERE slug = ?1 AND thread_id = ?2
-                         ORDER BY sequence DESC LIMIT 10",
-                    )
-                    .unwrap();
-                let rows = stmt
-                    .query_map(rusqlite::params![slug, tid], |row| {
-                        row.get::<_, String>(0)
-                    })
-                    .unwrap();
-                for row in rows {
-                    if let Ok(content) = row {
-                        if !delta_content.is_empty() {
-                            delta_content.push_str("\n\n");
-                        }
-                        delta_content.push_str(&content);
+            let mut stmt = conn
+                .prepare(
+                    "SELECT content FROM pyramid_deltas
+                     WHERE slug = ?1 AND thread_id = ?2
+                     ORDER BY sequence DESC LIMIT 10",
+                )
+                .unwrap();
+            let rows = stmt
+                .query_map(rusqlite::params![slug, thread_target.thread_id], |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap();
+            for row in rows {
+                if let Ok(content) = row {
+                    if !delta_content.is_empty() {
+                        delta_content.push_str("\n\n");
                     }
+                    delta_content.push_str(&content);
                 }
             }
 
-            results.push((node_id.clone(), distilled, delta_content, depth));
+            results.push(PromptNode {
+                source_index: i,
+                node_id: node_id.clone(),
+                distilled,
+                delta_content,
+                depth,
+            });
         }
 
-        Ok(results)
+        Ok((results, skipped))
     })
     .await??;
+
+    if node_data.is_empty() {
+        let results: Vec<StaleCheckResult> = skipped_nodes
+            .into_iter()
+            .map(|skipped| {
+                let m = &batch[skipped.source_index];
+                StaleCheckResult {
+                    id: 0,
+                    slug: m.slug.clone(),
+                    batch_id: m.batch_id.clone().unwrap_or_default(),
+                    layer: m.layer,
+                    target_id: skipped.node_id,
+                    stale: false,
+                    reason: skipped.reason,
+                    checker_index: skipped.source_index as i32,
+                    checker_batch_size: batch_size,
+                    checked_at: now.clone(),
+                    cost_tokens: None,
+                    cost_usd: None,
+                    cascade_depth: m.cascade_depth,
+                }
+            })
+            .collect();
+
+        return Ok(results);
+    }
 
     // Build Template 2 prompt
     let system_prompt = "You are evaluating whether changes to lower-level knowledge nodes require \
@@ -114,18 +410,18 @@ pub async fn dispatch_node_stale_check(
         When in doubt, choose true.\n\n---\n\n",
     );
 
-    for (i, (node_id, distilled, delta_content, depth)) in node_data.iter().enumerate() {
+    for (i, node) in node_data.iter().enumerate() {
         user_prompt.push_str(&format!(
             "NODE {} of {}: {}\nLayer: L{}\n\nCurrent distillation:\n{}\n\nDelta(s):\n{}\n\n---\n\n",
             i + 1,
-            batch_size,
-            node_id,
-            depth,
-            distilled,
-            if delta_content.is_empty() {
+            node_data.len(),
+            node.node_id,
+            node.depth,
+            node.distilled,
+            if node.delta_content.is_empty() {
                 "(no deltas found)"
             } else {
-                delta_content
+                &node.delta_content
             }
         ));
     }
@@ -166,11 +462,16 @@ pub async fn dispatch_node_stale_check(
         .context("Failed to parse NodeStaleResult array from LLM response")?;
 
     // Convert to StaleCheckResult
-    let results: Vec<StaleCheckResult> = node_results
+    let mut results: Vec<StaleCheckResult> = node_results
         .iter()
         .enumerate()
         .map(|(i, nr)| {
-            let m = batch.iter().find(|m| m.target_ref == nr.node_id).unwrap_or(&batch[i]);
+            let source_index = node_data
+                .iter()
+                .find(|node| node.node_id == nr.node_id)
+                .map(|node| node.source_index)
+                .unwrap_or(i.min(batch.len().saturating_sub(1)));
+            let m = &batch[source_index];
             StaleCheckResult {
                 id: 0,
                 slug: m.slug.clone(),
@@ -184,9 +485,29 @@ pub async fn dispatch_node_stale_check(
                 checked_at: now.clone(),
                 cost_tokens: Some(usage.prompt_tokens + usage.completion_tokens),
                 cost_usd: Some(estimate_cost(&usage)),
+                cascade_depth: m.cascade_depth,
             }
         })
         .collect();
+
+    results.extend(skipped_nodes.into_iter().map(|skipped| {
+        let m = &batch[skipped.source_index];
+        StaleCheckResult {
+            id: 0,
+            slug: m.slug.clone(),
+            batch_id: m.batch_id.clone().unwrap_or_default(),
+            layer: m.layer,
+            target_id: skipped.node_id,
+            stale: false,
+            reason: skipped.reason,
+            checker_index: skipped.source_index as i32,
+            checker_batch_size: batch_size,
+            checked_at: now.clone(),
+            cost_tokens: None,
+            cost_usd: None,
+            cascade_depth: m.cascade_depth,
+        }
+    }));
 
     info!(
         count = results.len(),
@@ -716,6 +1037,7 @@ pub async fn dispatch_edge_stale_check(
                     checked_at: now.clone(),
                     cost_tokens: None,
                     cost_usd: None,
+                    cascade_depth: mutation.cascade_depth,
                 });
                 continue;
             }
@@ -869,6 +1191,7 @@ pub async fn dispatch_edge_stale_check(
             checked_at: now.clone(),
             cost_tokens: Some(usage.prompt_tokens + usage.completion_tokens),
             cost_usd: Some(estimate_cost(&usage)),
+            cascade_depth: mutation.cascade_depth,
         });
     }
 
@@ -906,12 +1229,16 @@ pub async fn execute_supersession(
 
     #[derive(Debug, Clone)]
     struct NodeData {
+        headline: String,
         distilled: String,
         depth: i64,
         parent_id: Option<String>,
         children: Vec<String>,
-        thread_id: Option<String>,
+        self_thread_id: Option<String>,
+        parent_thread_id: Option<String>,
         delta_content: String,
+        source_file_path: Option<String>,
+        source_snapshot: Option<String>,
         topics: String,
         corrections: String,
         decisions: String,
@@ -927,10 +1254,10 @@ pub async fn execute_supersession(
         move || -> Result<NodeData> {
             let conn = Connection::open(&db).context("Failed to open DB for supersession")?;
 
-            let (distilled, depth, parent_id, children_json, topics, corrections, decisions, terms, dead_ends, self_prompt): (
-                String, i64, Option<String>, String, String, String, String, String, String, String,
+            let (headline, distilled, depth, parent_id, children_json, topics, corrections, decisions, terms, dead_ends, self_prompt): (
+                String, String, i64, Option<String>, String, String, String, String, String, String, String,
             ) = conn.query_row(
-                "SELECT distilled, depth, parent_id, children, topics, corrections, decisions, terms, dead_ends, self_prompt
+                "SELECT headline, distilled, depth, parent_id, children, topics, corrections, decisions, terms, dead_ends, self_prompt
                  FROM pyramid_nodes WHERE id = ?1 AND slug = ?2",
                 rusqlite::params![nid, s],
                 |row| {
@@ -938,13 +1265,14 @@ pub async fn execute_supersession(
                         row.get(0)?,
                         row.get(1)?,
                         row.get(2)?,
-                        row.get::<_, Option<String>>(3)?.unwrap_or_else(|| "[]".to_string()),
+                        row.get(3)?,
                         row.get::<_, Option<String>>(4)?.unwrap_or_else(|| "[]".to_string()),
                         row.get::<_, Option<String>>(5)?.unwrap_or_else(|| "[]".to_string()),
                         row.get::<_, Option<String>>(6)?.unwrap_or_else(|| "[]".to_string()),
                         row.get::<_, Option<String>>(7)?.unwrap_or_else(|| "[]".to_string()),
                         row.get::<_, Option<String>>(8)?.unwrap_or_else(|| "[]".to_string()),
-                        row.get::<_, Option<String>>(9)?.unwrap_or_default(),
+                        row.get::<_, Option<String>>(9)?.unwrap_or_else(|| "[]".to_string()),
+                        row.get::<_, Option<String>>(10)?.unwrap_or_default(),
                     ))
                 },
             )?;
@@ -952,18 +1280,16 @@ pub async fn execute_supersession(
             let children: Vec<String> = serde_json::from_str(&children_json).unwrap_or_default();
 
             // Get thread_id
-            let thread_id: Option<String> = conn
-                .query_row(
-                    "SELECT thread_id FROM pyramid_threads
-                     WHERE slug = ?1 AND current_canonical_id = ?2",
-                    rusqlite::params![s, nid],
-                    |row| row.get(0),
-                )
-                .ok();
+            let self_thread_id = resolve_stale_target_for_node(&conn, &s, &nid)?;
+            let parent_thread_id = parent_id
+                .as_deref()
+                .map(|pid| resolve_stale_target_for_node(&conn, &s, pid))
+                .transpose()?
+                .flatten();
 
             // Gather deltas
             let mut delta_content = String::new();
-            if let Some(ref tid) = thread_id {
+            if let Some(ref tid) = self_thread_id {
                 let mut stmt = conn.prepare(
                     "SELECT content FROM pyramid_deltas
                      WHERE slug = ?1 AND thread_id = ?2
@@ -982,13 +1308,41 @@ pub async fn execute_supersession(
                 }
             }
 
+            let source_file_path: Option<String> = if depth == 0 {
+                conn.query_row(
+                    "SELECT file_path FROM pyramid_file_hashes pfh
+                     WHERE pfh.slug = ?1
+                       AND EXISTS (
+                           SELECT 1 FROM json_each(pfh.node_ids)
+                           WHERE value = ?2
+                       )
+                     LIMIT 1",
+                    rusqlite::params![s, nid],
+                    |row| row.get(0),
+                )
+                .ok()
+            } else {
+                None
+            };
+
+            let source_snapshot = source_file_path.as_ref().and_then(|path| {
+                fs::read_to_string(path).ok().map(|content| {
+                    let line_excerpt = content.lines().take(400).collect::<Vec<_>>().join("\n");
+                    line_excerpt.chars().take(20_000).collect::<String>()
+                })
+            });
+
             Ok(NodeData {
+                headline,
                 distilled,
                 depth,
                 parent_id,
                 children,
-                thread_id,
+                self_thread_id,
+                parent_thread_id,
                 delta_content,
+                source_file_path,
+                source_snapshot,
                 topics,
                 corrections,
                 decisions,
@@ -1000,28 +1354,93 @@ pub async fn execute_supersession(
     })
     .await??;
 
-    // Generate updated distillation via LLM
-    let system_prompt = "You are updating a knowledge pyramid node distillation to incorporate \
-        new information from deltas. Produce an updated distillation that integrates the delta \
-        information. Output the updated distillation text only, no JSON wrapping.";
+    // Generate updated headline + distillation via LLM
+    let system_prompt = "You are updating a knowledge pyramid node after new information arrived. \
+        Produce JSON only with a short human-friendly headline and the updated distillation.";
 
-    let user_prompt = format!(
-        "Current distillation (Layer L{}):\n{}\n\n\
-        New delta(s) to incorporate:\n{}\n\n\
-        Write the updated distillation that incorporates these changes. \
-        Keep the same style and level of detail as the original.",
-        node_data.depth,
-        node_data.distilled,
-        if node_data.delta_content.is_empty() {
-            "(no deltas)".to_string()
-        } else {
-            node_data.delta_content.clone()
-        }
-    );
+    let user_prompt = if node_data.depth == 0 {
+        let source_label = node_data
+            .source_file_path
+            .as_deref()
+            .unwrap_or("(unknown source file)");
+        let source_snapshot = node_data
+            .source_snapshot
+            .clone()
+            .unwrap_or_else(|| "(source snapshot unavailable)".to_string());
+
+        format!(
+            "Current headline (Layer L0):\n{}\n\n\
+            Current distillation (Layer L0):\n{}\n\n\
+            Current source file:\n{}\n\n\
+            Current source content snapshot:\n{}\n\n\
+            Rewrite the node so it accurately reflects the current file. \
+            Return JSON only:\n\
+            {{\"headline\":\"2-6 word file or module label\",\"distilled\":\"updated distillation\"}}\n\
+            Keep the same style and level of detail as the original, but prefer the source file over the old distillation. \
+            The headline must be concrete and human-friendly. No 'This file...' or 'This node...'.",
+            node_data.headline,
+            node_data.distilled,
+            source_label,
+            source_snapshot,
+        )
+    } else {
+        format!(
+            "Current headline (Layer L{}):\n{}\n\n\
+            Current distillation (Layer L{}):\n{}\n\n\
+            New delta(s) to incorporate:\n{}\n\n\
+            Write the updated node that incorporates these changes. \
+            Return JSON only:\n\
+            {{\"headline\":\"2-6 word node label\",\"distilled\":\"updated distillation\"}}\n\
+            Keep the same style and level of detail as the original. \
+            The headline must be concrete and human-friendly. No 'This node...'.",
+            node_data.depth,
+            node_data.headline,
+            node_data.depth,
+            node_data.distilled,
+            if node_data.delta_content.is_empty() {
+                "(no deltas)".to_string()
+            } else {
+                node_data.delta_content.clone()
+            }
+        )
+    };
 
     let config = config_for_model(api_key, model);
-    let (new_distillation, supersession_usage) =
+    let (supersession_response, supersession_usage) =
         call_model_with_usage(&config, system_prompt, &user_prompt, 0.2, 4096).await?;
+    let supersession_json = extract_json(&supersession_response).ok();
+    let new_headline = supersession_json
+        .as_ref()
+        .and_then(|json| json.get("headline"))
+        .and_then(|value| value.as_str())
+        .and_then(clean_headline)
+        .unwrap_or_else(|| headline_for_node(
+            &super::types::PyramidNode {
+                id: nid.clone(),
+                slug: s.clone(),
+                depth: node_data.depth,
+                chunk_index: None,
+                headline: node_data.headline.clone(),
+                distilled: node_data.distilled.clone(),
+                topics: serde_json::from_str(&node_data.topics).unwrap_or_default(),
+                corrections: serde_json::from_str(&node_data.corrections).unwrap_or_default(),
+                decisions: serde_json::from_str(&node_data.decisions).unwrap_or_default(),
+                terms: serde_json::from_str(&node_data.terms).unwrap_or_default(),
+                dead_ends: serde_json::from_str(&node_data.dead_ends).unwrap_or_default(),
+                self_prompt: node_data.self_prompt.clone(),
+                children: node_data.children.clone(),
+                parent_id: node_data.parent_id.clone(),
+                superseded_by: None,
+                created_at: String::new(),
+            },
+            node_data.source_file_path.as_deref(),
+        ));
+    let new_distillation = supersession_json
+        .as_ref()
+        .and_then(|json| json.get("distilled"))
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| supersession_response.trim().to_string());
 
     // Log cost to pyramid_cost_log
     {
@@ -1048,6 +1467,7 @@ pub async fn execute_supersession(
     let nid = node_id.to_string();
     let new_nid = new_node_id.clone();
     let nd = node_data.clone();
+    let new_head = new_headline.clone();
     let new_dist = new_distillation.clone();
 
     tokio::task::spawn_blocking(move || -> Result<()> {
@@ -1057,13 +1477,14 @@ pub async fn execute_supersession(
         // Insert new node
         conn.execute(
             "INSERT INTO pyramid_nodes
-             (id, slug, depth, distilled, topics, corrections, decisions, terms,
+             (id, slug, depth, headline, distilled, topics, corrections, decisions, terms,
               dead_ends, self_prompt, children, parent_id, build_version, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 1, ?13)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 1, ?14)",
             rusqlite::params![
                 new_nid,
                 s,
                 nd.depth,
+                new_head,
                 new_dist,
                 nd.topics,
                 nd.corrections,
@@ -1118,17 +1539,60 @@ pub async fn execute_supersession(
         }
 
         // Update thread canonical ID
-        if let Some(ref tid) = nd.thread_id {
+        if let Some(ref tid) = nd.self_thread_id {
             conn.execute(
-                "UPDATE pyramid_threads SET current_canonical_id = ?1, updated_at = ?2
-                 WHERE slug = ?3 AND thread_id = ?4",
-                rusqlite::params![new_nid, now_str, s, tid],
+                "UPDATE pyramid_threads SET current_canonical_id = ?1, thread_name = ?2, updated_at = ?3
+                 WHERE slug = ?4 AND thread_id = ?5",
+                rusqlite::params![new_nid, new_head, now_str, s, tid],
+            )?;
+        }
+
+        if let Some(ref tid) = nd.parent_thread_id {
+            // Record the child supersession on the parent thread so the next layer
+            // evaluates the updated child information instead of seeing an empty delta set.
+            let next_seq: i64 = conn.query_row(
+                "SELECT COALESCE(MAX(sequence), 0) + 1 FROM pyramid_deltas
+                 WHERE slug = ?1 AND thread_id = ?2",
+                rusqlite::params![s, tid],
+                |row| row.get(0),
+            ).unwrap_or(1);
+
+            let delta_summary = format!(
+                "Child node {} superseded by {}.\n\nPrevious child distillation:\n{}\n\nUpdated child distillation:\n{}",
+                nid,
+                new_nid,
+                excerpt(&nd.distilled, 400),
+                excerpt(&new_dist, 400),
+            );
+
+            conn.execute(
+                "INSERT INTO pyramid_deltas
+                 (slug, thread_id, sequence, content, relevance, source_node_id, flag, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                rusqlite::params![
+                    s,
+                    tid,
+                    next_seq,
+                    delta_summary,
+                    "high",
+                    nid,
+                    Option::<String>::None,
+                    now_str,
+                ],
+            )?;
+
+            conn.execute(
+                "UPDATE pyramid_threads
+                 SET delta_count = delta_count + 1, updated_at = ?1
+                 WHERE slug = ?2 AND thread_id = ?3",
+                rusqlite::params![now_str, s, tid],
             )?;
         }
 
         // Write confirmed_stale mutations for: parent layer (layer+1) and all edges
         let next_layer = (nd.depth as i32 + 1).min(3);
-        if let Some(ref pid) = nd.parent_id {
+        let propagation_targets = resolve_parent_targets_for_node_ids(&conn, &s, std::slice::from_ref(&nid))?;
+        for target in propagation_targets {
             conn.execute(
                 "INSERT INTO pyramid_pending_mutations
                  (slug, layer, mutation_type, target_ref, detail, cascade_depth, detected_at, processed)
@@ -1136,7 +1600,7 @@ pub async fn execute_supersession(
                 rusqlite::params![
                     s,
                     next_layer,
-                    pid,
+                    target,
                     format!("Child node {} superseded by {}", nid, new_nid),
                     now_str,
                 ],
@@ -1144,7 +1608,7 @@ pub async fn execute_supersession(
         }
 
         // Write edge_stale mutations for all edges touching this node's thread
-        if let Some(ref tid) = nd.thread_id {
+        if let Some(ref tid) = nd.self_thread_id {
             let mut stmt = conn.prepare(
                 "SELECT id FROM pyramid_web_edges
                  WHERE slug = ?1 AND (thread_a_id = ?2 OR thread_b_id = ?2)",

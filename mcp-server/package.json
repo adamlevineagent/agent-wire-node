@@ -1,0 +1,21 @@
+{
+  "name": "wire-node-pyramid-mcp",
+  "version": "0.2.0",
+  "description": "MCP server for Wire Node pyramid queries",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "pyramid-cli": "dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "@types/node": "^22.0.0"
+  }
+}

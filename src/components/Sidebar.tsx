@@ -1,3 +1,5 @@
+import { useState, useEffect } from 'react';
+import { invoke } from '@tauri-apps/api/core';
 import { useAppContext, Mode } from '../contexts/AppContext';
 
 interface ModeItem {
@@ -9,6 +11,11 @@ interface ModeItem {
 
 export function Sidebar() {
     const { state, setMode } = useAppContext();
+    const [appVersion, setAppVersion] = useState<string>('');
+
+    useEffect(() => {
+        invoke<string>('get_app_version').then(setAppVersion).catch(() => {});
+    }, []);
 
     // TODO: Pending requests endpoint requires agent auth (requireWireScope), not operator auth.
     // Re-enable once an operator-compatible pending requests endpoint exists.
@@ -92,6 +99,10 @@ export function Sidebar() {
                      'Offline'}
                 </span>
             </div>
+
+            {appVersion && (
+                <div className="version-badge">v{appVersion}</div>
+            )}
         </nav>
     );
 }

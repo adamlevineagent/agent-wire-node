@@ -7,11 +7,42 @@
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use super::db;
 use super::types::ContentType;
+
+/// Metadata about files ingested during a build, used for post-build seeding.
+#[derive(Debug, Clone)]
+pub struct IngestFileInfo {
+    /// Absolute path to the file
+    pub abs_path: String,
+    /// SHA-256 hash of the file
+    pub hash: String,
+    /// The chunk_index this file was assigned (1 file = 1 chunk for code/doc)
+    pub chunk_index: i64,
+}
+
+/// Result of an ingestion that includes extension/config metadata for seeding.
+#[derive(Debug, Clone)]
+pub struct IngestResult {
+    pub slug: String,
+    /// Extensions that were ingested (e.g. [".rs", ".ts"])
+    pub ingested_extensions: Vec<String>,
+    /// Config filenames that were ingested (e.g. ["Cargo.toml"])
+    pub ingested_config_files: Vec<String>,
+    /// Per-file hash information
+    pub file_infos: Vec<IngestFileInfo>,
+}
+
+/// Compute SHA-256 hash of file content bytes.
+fn sha256_hex(data: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    hex::encode(hasher.finalize())
+}
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -37,7 +68,7 @@ fn skip_dirs() -> HashSet<&'static str> {
 }
 
 /// File extensions recognized as source code.
-fn code_extensions() -> HashSet<&'static str> {
+pub fn code_extensions() -> HashSet<&'static str> {
     [
         ".rs", ".ts", ".tsx", ".js", ".jsx", ".py", ".go", ".java", ".swift", ".kt",
     ]
@@ -46,7 +77,7 @@ fn code_extensions() -> HashSet<&'static str> {
 }
 
 /// Filenames recognized as config files.
-fn config_files() -> HashSet<&'static str> {
+pub fn config_files() -> HashSet<&'static str> {
     [
         "package.json",
         "Cargo.toml",
@@ -62,7 +93,7 @@ fn config_files() -> HashSet<&'static str> {
 }
 
 /// Document file extensions for doc ingestion.
-fn doc_extensions() -> HashSet<&'static str> {
+pub fn doc_extensions() -> HashSet<&'static str> {
     [".txt", ".md"].into_iter().collect()
 }
 
@@ -410,8 +441,9 @@ pub fn ingest_continuation(
 /// - Walks the directory recursively, skipping SKIP_DIRS and hidden files
 /// - Collects files matching CODE_EXTENSIONS or CONFIG_FILES
 /// - Each file = 1 chunk, formatted with metadata header
-/// - Returns the slug name
-pub fn ingest_code(conn: &Connection, slug: &str, dir_path: &Path) -> Result<String> {
+/// - Computes SHA-256 per file for file hash tracking
+/// - Returns IngestResult with slug name, extensions, config files, and file hash info
+pub fn ingest_code(conn: &Connection, slug: &str, dir_path: &Path) -> Result<IngestResult> {
     let path_str = dir_path.to_string_lossy().to_string();
 
     // Check if slug exists — create if not, otherwise append chunks
@@ -430,11 +462,16 @@ pub fn ingest_code(conn: &Connection, slug: &str, dir_path: &Path) -> Result<Str
 
     // Filter to code + config files
     struct FileEntry {
+        abs_path_str: String,
         rel_path: String,
         content: String,
+        raw_bytes: Vec<u8>,
         language: &'static str,
         file_type: &'static str,
         lines: usize,
+        is_config: bool,
+        ext: String,
+        filename: String,
     }
 
     let mut files: Vec<FileEntry> = Vec::new();
@@ -462,15 +499,14 @@ pub fn ingest_code(conn: &Connection, slug: &str, dir_path: &Path) -> Result<Str
             continue;
         }
 
-        let content = match std::fs::read_to_string(abs_path) {
-            Ok(c) => c,
-            Err(_) => {
-                // Try reading with lossy UTF-8 (matching Python's errors='replace')
-                match std::fs::read(abs_path) {
-                    Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
-                    Err(_) => continue,
-                }
-            }
+        let raw_bytes = match std::fs::read(abs_path) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+
+        let content = match std::str::from_utf8(&raw_bytes) {
+            Ok(s) => s.to_string(),
+            Err(_) => String::from_utf8_lossy(&raw_bytes).to_string(),
         };
 
         if content.trim().is_empty() {
@@ -482,11 +518,16 @@ pub fn ingest_code(conn: &Connection, slug: &str, dir_path: &Path) -> Result<Str
         let line_count = content.matches('\n').count() + 1;
 
         files.push(FileEntry {
+            abs_path_str: abs_path.to_string_lossy().to_string(),
             rel_path: rel_path.to_string_lossy().to_string(),
             content,
+            raw_bytes,
             language,
             file_type,
             lines: line_count,
+            is_config,
+            ext: ext.clone(),
+            filename: fname,
         });
     }
 
@@ -497,6 +538,17 @@ pub fn ingest_code(conn: &Connection, slug: &str, dir_path: &Path) -> Result<Str
         dir_path.display(),
         files.len()
     );
+
+    // Collect unique extensions and config filenames
+    let mut collected_extensions: HashSet<String> = HashSet::new();
+    let mut collected_config_files: HashSet<String> = HashSet::new();
+    for f in &files {
+        if f.is_config {
+            collected_config_files.insert(f.filename.clone());
+        } else {
+            collected_extensions.insert(f.ext.clone());
+        }
+    }
 
     // Create batch for this path
     let metadata = serde_json::json!({
@@ -509,7 +561,8 @@ pub fn ingest_code(conn: &Connection, slug: &str, dir_path: &Path) -> Result<Str
 
     tracing::info!("Code metadata: {}", metadata);
 
-    // Create chunks — 1 file = 1 chunk
+    // Create chunks — 1 file = 1 chunk, and collect file hash info
+    let mut file_infos: Vec<IngestFileInfo> = Vec::new();
     for (i, f) in files.iter().enumerate() {
         let chunk_content = format!(
             "## FILE: {}\n## LANGUAGE: {}\n## TYPE: {}\n## LINES: {}\n\n{}",
@@ -517,21 +570,36 @@ pub fn ingest_code(conn: &Connection, slug: &str, dir_path: &Path) -> Result<Str
         );
         let chunk_index = chunk_offset + i as i64;
         db::insert_chunk(conn, slug, batch_id, chunk_index, &chunk_content)?;
+
+        // Compute SHA-256 hash of raw file bytes
+        let hash = sha256_hex(&f.raw_bytes);
+        file_infos.push(IngestFileInfo {
+            abs_path: f.abs_path_str.clone(),
+            hash,
+            chunk_index,
+        });
     }
 
     tracing::info!(
         "Slug '{slug}': {} chunks saved (1 file = 1 chunk, offset {chunk_offset})",
         files.len()
     );
-    Ok(slug.to_string())
+
+    Ok(IngestResult {
+        slug: slug.to_string(),
+        ingested_extensions: collected_extensions.into_iter().collect(),
+        ingested_config_files: collected_config_files.into_iter().collect(),
+        file_infos,
+    })
 }
 
 /// Ingest a directory of documents (.txt, .md) into the pyramid database.
 ///
 /// - Walks the directory, skipping hidden dirs/files
 /// - Each document = 1 chunk, formatted as `## DOCUMENT: <rel_path>\n\n<content>`
-/// - Returns the slug name
-pub fn ingest_docs(conn: &Connection, slug: &str, dir_path: &Path) -> Result<String> {
+/// - Computes SHA-256 per file for file hash tracking
+/// - Returns IngestResult with slug name, extensions, and file hash info
+pub fn ingest_docs(conn: &Connection, slug: &str, dir_path: &Path) -> Result<IngestResult> {
     let path_str = dir_path.to_string_lossy().to_string();
 
     // Check if slug exists — create if not, otherwise append chunks
@@ -548,7 +616,15 @@ pub fn ingest_docs(conn: &Connection, slug: &str, dir_path: &Path) -> Result<Str
     let all_files = walk_dir(dir_path, &empty_skip, true);
 
     // Filter to document files
-    let mut doc_contents: Vec<(String, String)> = Vec::new();
+    struct DocEntry {
+        abs_path_str: String,
+        rel_path: String,
+        content: String,
+        raw_bytes: Vec<u8>,
+        ext: String,
+    }
+
+    let mut doc_entries: Vec<DocEntry> = Vec::new();
 
     for (abs_path, rel_path) in &all_files {
         let ext = abs_path
@@ -560,53 +636,79 @@ pub fn ingest_docs(conn: &Connection, slug: &str, dir_path: &Path) -> Result<Str
             continue;
         }
 
-        let content = match std::fs::read_to_string(abs_path) {
-            Ok(c) => c,
-            Err(_) => {
-                match std::fs::read(abs_path) {
-                    Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
-                    Err(_) => continue,
-                }
-            }
+        let raw_bytes = match std::fs::read(abs_path) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+
+        let content = match std::str::from_utf8(&raw_bytes) {
+            Ok(s) => s.to_string(),
+            Err(_) => String::from_utf8_lossy(&raw_bytes).to_string(),
         };
 
         if content.trim().is_empty() {
             continue;
         }
 
-        doc_contents.push((rel_path.to_string_lossy().to_string(), content));
+        doc_entries.push(DocEntry {
+            abs_path_str: abs_path.to_string_lossy().to_string(),
+            rel_path: rel_path.to_string_lossy().to_string(),
+            content,
+            raw_bytes,
+            ext,
+        });
     }
 
-    if doc_contents.is_empty() {
+    if doc_entries.is_empty() {
         anyhow::bail!("No documents found in {}", dir_path.display());
     }
 
-    let total_lines: usize = doc_contents
+    let total_lines: usize = doc_entries
         .iter()
-        .map(|(_, c)| c.matches('\n').count() + 1)
+        .map(|d| d.content.matches('\n').count() + 1)
         .sum();
     tracing::info!(
         "Ingesting documents from {}: {} files ({total_lines} lines), chunk_offset={chunk_offset}",
         dir_path.display(),
-        doc_contents.len()
+        doc_entries.len()
     );
+
+    // Collect unique extensions
+    let mut collected_extensions: HashSet<String> = HashSet::new();
+    for d in &doc_entries {
+        collected_extensions.insert(d.ext.clone());
+    }
 
     // Create batch for this path
     let batch_type = if chunk_offset == 0 { "initial" } else { "additional" };
     let batch_id = db::create_batch(conn, slug, batch_type, &path_str, chunk_offset)?;
 
-    // Each document = 1 chunk
-    for (i, (rel_path, content)) in doc_contents.iter().enumerate() {
-        let chunk_content = format!("## DOCUMENT: {rel_path}\n\n{content}");
+    // Each document = 1 chunk, collect file hash info
+    let mut file_infos: Vec<IngestFileInfo> = Vec::new();
+    for (i, d) in doc_entries.iter().enumerate() {
+        let chunk_content = format!("## DOCUMENT: {}\n\n{}", d.rel_path, d.content);
         let chunk_index = chunk_offset + i as i64;
         db::insert_chunk(conn, slug, batch_id, chunk_index, &chunk_content)?;
+
+        let hash = sha256_hex(&d.raw_bytes);
+        file_infos.push(IngestFileInfo {
+            abs_path: d.abs_path_str.clone(),
+            hash,
+            chunk_index,
+        });
     }
 
     tracing::info!(
         "Slug '{slug}': {} documents saved (offset {chunk_offset})",
-        doc_contents.len()
+        doc_entries.len()
     );
-    Ok(slug.to_string())
+
+    Ok(IngestResult {
+        slug: slug.to_string(),
+        ingested_extensions: collected_extensions.into_iter().collect(),
+        ingested_config_files: Vec::new(), // docs have no config files
+        file_infos,
+    })
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────

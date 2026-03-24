@@ -14,7 +14,9 @@ use uuid::Uuid;
 
 use super::db;
 use super::llm::LlmConfig;
-use super::types::{FaqNode, PyramidAnnotation};
+use super::config_helper::{config_for_model, estimate_cost};
+use super::llm::{call_model_with_usage, extract_json};
+use super::types::{FaqNode, FaqCategory, FaqDirectory, FaqCategoryEntry, PyramidAnnotation};
 
 /// Called after every annotation is saved.
 ///
@@ -406,4 +408,233 @@ async fn create_new_faq(
 
     info!("[faq] created new FAQ {} for slug '{}'", faq.id, slug);
     Ok(faq)
+}
+
+// ── FAQ Directory / Category Engine ──────────────────────────────────────────
+
+/// Threshold: below this count, directory returns flat mode.
+const FAQ_CATEGORY_THRESHOLD: usize = 20;
+
+/// Get the FAQ directory for a slug.
+///
+/// Takes BOTH reader AND writer because the meta-pass creates categories.
+/// If count < FAQ_CATEGORY_THRESHOLD: returns flat mode with all FAQs.
+/// If >= threshold: loads or creates categories via meta-pass.
+/// Falls back to flat mode on any LLM failure.
+pub async fn get_faq_directory(
+    reader: &Arc<Mutex<Connection>>,
+    writer: &Arc<Mutex<Connection>>,
+    slug: &str,
+    api_key: &str,
+    model: &str,
+) -> Result<FaqDirectory> {
+    let all_faqs = {
+        let conn = reader.lock().await;
+        db::get_faq_nodes(&conn, slug)?
+    };
+
+    let total_faqs = all_faqs.len() as i64;
+
+    // Below threshold: flat mode
+    if all_faqs.len() < FAQ_CATEGORY_THRESHOLD {
+        return Ok(FaqDirectory {
+            slug: slug.to_string(),
+            mode: "flat".to_string(),
+            total_faqs,
+            categories: Vec::new(),
+            uncategorized: all_faqs,
+        });
+    }
+
+    // Above threshold: try to load existing categories
+    let existing_categories = {
+        let conn = reader.lock().await;
+        db::get_faq_categories(&conn, slug)?
+    };
+
+    let categories = if existing_categories.is_empty() {
+        // No categories exist — run meta-pass
+        match run_faq_category_meta_pass(reader, writer, slug, &all_faqs, api_key, model).await {
+            Ok(cats) => cats,
+            Err(e) => {
+                warn!("[faq] category meta-pass failed for '{}': {}, falling back to flat mode", slug, e);
+                return Ok(FaqDirectory {
+                    slug: slug.to_string(),
+                    mode: "flat".to_string(),
+                    total_faqs,
+                    categories: Vec::new(),
+                    uncategorized: all_faqs,
+                });
+            }
+        }
+    } else {
+        existing_categories
+    };
+
+    // Build category entries
+    let mut categorized_faq_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut entries: Vec<FaqCategoryEntry> = Vec::new();
+
+    for cat in categories {
+        let faq_count = cat.faq_ids.len() as i64;
+        for fid in &cat.faq_ids {
+            categorized_faq_ids.insert(fid.clone());
+        }
+        entries.push(FaqCategoryEntry {
+            category: cat,
+            faq_count,
+            children: None, // not populated on directory view — use drill
+        });
+    }
+
+    // Collect uncategorized FAQs
+    let uncategorized: Vec<FaqNode> = all_faqs
+        .into_iter()
+        .filter(|f| !categorized_faq_ids.contains(&f.id))
+        .collect();
+
+    Ok(FaqDirectory {
+        slug: slug.to_string(),
+        mode: "hierarchical".to_string(),
+        total_faqs,
+        categories: entries,
+        uncategorized,
+    })
+}
+
+/// Run the LLM meta-pass to cluster FAQs into 3-7 categories with distilled summaries.
+///
+/// Creates category rows in the DB. On malformed LLM response, returns error
+/// (caller falls back to flat mode).
+pub async fn run_faq_category_meta_pass(
+    _reader: &Arc<Mutex<Connection>>,
+    writer: &Arc<Mutex<Connection>>,
+    slug: &str,
+    faqs: &[FaqNode],
+    api_key: &str,
+    model: &str,
+) -> Result<Vec<FaqCategory>> {
+    let faq_list: String = faqs
+        .iter()
+        .map(|f| format!("- [{}] Q: {} | A: {}", f.id, f.question, &f.answer[..f.answer.len().min(200)]))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let system_prompt = r#"You are a knowledge categorization engine. Given a list of FAQ entries, group them into 3-7 logical categories. Each category should have:
+- name: a short descriptive name (2-5 words)
+- faq_ids: array of FAQ IDs that belong to this category
+- summary: a distilled paragraph that captures the mechanism-level knowledge of this group, so that ~50% of queries can be answered from the summary alone without drilling into individual FAQs
+
+Return ONLY valid JSON: an array of objects with fields "name", "faq_ids", and "summary". No explanation."#;
+
+    let user_prompt = format!(
+        "Categorize these {} FAQ entries:\n\n{}",
+        faqs.len(),
+        faq_list
+    );
+
+    let config = config_for_model(api_key, model);
+    let (response, usage) = call_model_with_usage(&config, system_prompt, &user_prompt, 0.3, 4096).await?;
+
+    // Log cost
+    let cost = estimate_cost(&usage);
+    {
+        let conn = writer.lock().await;
+        let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let _ = conn.execute(
+            "INSERT INTO pyramid_cost_log (slug, operation, model, input_tokens, output_tokens, estimated_cost, source, layer, check_type, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'auto-stale', 0, 'faq_category', ?7)",
+            rusqlite::params![slug, "faq_category_meta_pass", model, usage.prompt_tokens, usage.completion_tokens, cost, now],
+        );
+    }
+
+    // Parse the LLM response
+    let json_val = extract_json(&response)?;
+    let categories_raw: Vec<serde_json::Value> = json_val
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("LLM returned non-array for FAQ categories"))?
+        .clone();
+
+    if categories_raw.is_empty() || categories_raw.len() > 10 {
+        anyhow::bail!(
+            "LLM returned {} categories (expected 3-7)",
+            categories_raw.len()
+        );
+    }
+
+    let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let mut result: Vec<FaqCategory> = Vec::new();
+
+    // Delete old categories before inserting new ones
+    {
+        let conn = writer.lock().await;
+        db::delete_faq_categories(&conn, slug)?;
+    }
+
+    for raw in categories_raw {
+        let name = raw.get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Uncategorized")
+            .to_string();
+
+        let summary = raw.get("summary")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        let faq_ids: Vec<String> = raw.get("faq_ids")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+            .unwrap_or_default();
+
+        let cat = FaqCategory {
+            id: format!("FAQCAT-{}", uuid::Uuid::new_v4()),
+            slug: slug.to_string(),
+            name,
+            distilled_summary: summary,
+            faq_ids,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        };
+
+        {
+            let conn = writer.lock().await;
+            db::save_faq_category(&conn, &cat)?;
+        }
+
+        result.push(cat);
+    }
+
+    info!("[faq] created {} categories for slug '{}'", result.len(), slug);
+    Ok(result)
+}
+
+/// Drill into a specific FAQ category — load the category and its child FAQs.
+pub async fn drill_faq_category(
+    reader: &Arc<Mutex<Connection>>,
+    slug: &str,
+    category_id: &str,
+) -> Result<FaqCategoryEntry> {
+    let conn = reader.lock().await;
+
+    let cat = db::get_faq_category(&conn, category_id)?
+        .ok_or_else(|| anyhow::anyhow!("FAQ category '{}' not found", category_id))?;
+
+    if cat.slug != slug {
+        anyhow::bail!("Category '{}' does not belong to slug '{}'", category_id, slug);
+    }
+
+    // Load child FAQs by their IDs
+    let all_faqs = db::get_faq_nodes(&conn, slug)?;
+    let children: Vec<FaqNode> = all_faqs
+        .into_iter()
+        .filter(|f| cat.faq_ids.contains(&f.id))
+        .collect();
+
+    let faq_count = children.len() as i64;
+
+    Ok(FaqCategoryEntry {
+        category: cat,
+        faq_count,
+        children: Some(children),
+    })
 }

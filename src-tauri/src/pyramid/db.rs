@@ -6,7 +6,9 @@
 
 use anyhow::{Context, Result};
 use rusqlite::Connection;
+use std::collections::HashMap;
 
+use super::naming::{headline_for_node, clean_headline};
 use super::types::*;
 
 // ── Database Opening ─────────────────────────────────────────────────────────
@@ -57,6 +59,7 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
             slug TEXT NOT NULL REFERENCES pyramid_slugs(slug) ON DELETE CASCADE,
             depth INTEGER NOT NULL,
             chunk_index INTEGER,
+            headline TEXT NOT NULL DEFAULT '',
             distilled TEXT NOT NULL DEFAULT '',
             topics TEXT,
             corrections TEXT,
@@ -106,6 +109,10 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
     // Migration-safe column addition (ignore error if column already exists)
     let _ = conn.execute(
         "ALTER TABLE pyramid_nodes ADD COLUMN superseded_by TEXT DEFAULT NULL",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE pyramid_nodes ADD COLUMN headline TEXT NOT NULL DEFAULT ''",
         [],
     );
 
@@ -242,6 +249,22 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
         ",
     )?;
 
+    // ── FAQ category table ────────────────────────────────────────────────────
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS pyramid_faq_categories (
+            id TEXT PRIMARY KEY,
+            slug TEXT NOT NULL REFERENCES pyramid_slugs(slug) ON DELETE CASCADE,
+            name TEXT NOT NULL,
+            distilled_summary TEXT NOT NULL DEFAULT '',
+            faq_ids TEXT NOT NULL DEFAULT '[]',
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_faq_cat_slug ON pyramid_faq_categories(slug);
+        ",
+    )?;
+
     // ── Usage log table ──────────────────────────────────────────────────────
     conn.execute_batch(
         "
@@ -354,6 +377,14 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
         "ALTER TABLE pyramid_faq_nodes ADD COLUMN match_triggers TEXT DEFAULT '[]'",
         [],
     );
+    let _ = conn.execute(
+        "ALTER TABLE pyramid_auto_update_config ADD COLUMN ingested_extensions TEXT DEFAULT '[]'",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE pyramid_auto_update_config ADD COLUMN ingested_config_files TEXT DEFAULT '[]'",
+        [],
+    );
 
     // ── Compensating DELETE triggers for FK CASCADE on existing DBs ──
     // (SQLite cannot ALTER FK constraints, so these triggers handle cascading
@@ -385,6 +416,8 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
         END;
         ",
     );
+
+    backfill_missing_headlines(conn)?;
 
     // Migrate existing L2+ nodes into threads
     migrate_existing_threads(conn)?;
@@ -571,6 +604,52 @@ fn parse_json_vec<T: serde::de::DeserializeOwned>(json: &str) -> Vec<T> {
     serde_json::from_str(json).unwrap_or_default()
 }
 
+fn load_source_paths_by_node_id(conn: &Connection) -> Result<HashMap<String, String>> {
+    let mut stmt = conn.prepare(
+        "SELECT file_path, node_ids FROM pyramid_file_hashes ORDER BY file_path",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+
+    let mut source_path_by_node_id = HashMap::new();
+    for row in rows {
+        let (file_path, node_ids_json) = row?;
+        let node_ids: Vec<String> = serde_json::from_str(&node_ids_json).unwrap_or_default();
+        for node_id in node_ids {
+            source_path_by_node_id
+                .entry(node_id)
+                .or_insert_with(|| file_path.clone());
+        }
+    }
+
+    Ok(source_path_by_node_id)
+}
+
+fn backfill_missing_headlines(conn: &Connection) -> Result<()> {
+    let source_path_by_node_id = load_source_paths_by_node_id(conn)?;
+    let sql = format!(
+        "SELECT {NODE_SELECT_COLS} FROM pyramid_nodes
+         WHERE headline IS NULL OR TRIM(headline) = ''"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([], node_from_row)?;
+
+    for row in rows {
+        let node = row?;
+        let headline = headline_for_node(
+            &node,
+            source_path_by_node_id.get(&node.id).map(|path| path.as_str()),
+        );
+        conn.execute(
+            "UPDATE pyramid_nodes SET headline = ?1 WHERE slug = ?2 AND id = ?3",
+            rusqlite::params![headline, node.slug, node.id],
+        )?;
+    }
+
+    Ok(())
+}
+
 /// Build a PyramidNode from a rusqlite Row using named column access.
 ///
 /// Uses named columns for robustness against schema column reordering.
@@ -588,6 +667,7 @@ pub fn node_from_row(row: &rusqlite::Row) -> rusqlite::Result<PyramidNode> {
         slug: row.get("slug")?,
         depth: row.get("depth")?,
         chunk_index: row.get("chunk_index").ok(),
+        headline: row.get::<_, String>("headline").unwrap_or_default(),
         distilled: row.get("distilled")?,
         topics: parse_json_vec(&topics_json),
         corrections: parse_json_vec(&corrections_json),
@@ -605,7 +685,7 @@ pub fn node_from_row(row: &rusqlite::Row) -> rusqlite::Result<PyramidNode> {
 }
 
 const NODE_SELECT_COLS: &str =
-    "id, slug, depth, chunk_index, distilled, topics, corrections, decisions, \
+    "id, slug, depth, chunk_index, headline, distilled, topics, corrections, decisions, \
      terms, dead_ends, self_prompt, children, parent_id, superseded_by, created_at";
 
 /// Save (upsert) a PyramidNode. Serializes all Vec fields to JSON strings.
@@ -627,15 +707,18 @@ pub fn save_node(
     let terms = serde_json::to_string(&node.terms)?;
     let dead_ends = serde_json::to_string(&node.dead_ends)?;
     let children = serde_json::to_string(&node.children)?;
+    let headline = clean_headline(&node.headline)
+        .unwrap_or_else(|| headline_for_node(node, None));
 
     conn.execute(
         "INSERT INTO pyramid_nodes
-            (id, slug, depth, chunk_index, distilled, topics, corrections, decisions,
+            (id, slug, depth, chunk_index, headline, distilled, topics, corrections, decisions,
              terms, dead_ends, self_prompt, children, parent_id, superseded_by)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
          ON CONFLICT(slug, id) DO UPDATE SET
             depth = excluded.depth,
             chunk_index = excluded.chunk_index,
+            headline = excluded.headline,
             distilled = excluded.distilled,
             topics = excluded.topics,
             corrections = excluded.corrections,
@@ -652,6 +735,7 @@ pub fn save_node(
             node.slug,
             node.depth,
             node.chunk_index,
+            headline,
             node.distilled,
             topics,
             corrections,
@@ -817,23 +901,23 @@ pub fn delete_steps(conn: &Connection, slug: &str, step_type: &str) -> Result<()
 
 // ── Thread Migration ─────────────────────────────────────────────────────────
 
-/// Migrate existing L2+ nodes into pyramid_threads entries.
-/// Safe to call multiple times — skips if threads already exist.
+/// Backfill missing thread/distillation rows for live L1+ canonical nodes.
+/// Safe to call multiple times — only inserts rows that are still missing.
 pub fn migrate_existing_threads(conn: &Connection) -> Result<()> {
-    let count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM pyramid_threads", [], |r| r.get(0))
-        .unwrap_or(0);
-
-    if count > 0 {
-        return Ok(()); // Already migrated
-    }
-
     conn.execute_batch(
         "
         INSERT OR IGNORE INTO pyramid_threads (slug, thread_id, thread_name, current_canonical_id, depth)
-        SELECT slug, id, COALESCE(json_extract(topics, '$[0].name'), 'Untitled-' || id), id, depth
-        FROM pyramid_nodes
-        WHERE depth >= 2 AND build_version > 0;
+        SELECT pn.slug, pn.id, COALESCE(NULLIF(TRIM(pn.headline), ''), json_extract(pn.topics, '$[0].name'), 'Untitled-' || pn.id), pn.id, pn.depth
+        FROM pyramid_nodes pn
+        WHERE pn.depth >= 1
+          AND pn.build_version > 0
+          AND pn.superseded_by IS NULL
+          AND NOT EXISTS (
+              SELECT 1
+              FROM pyramid_threads pt
+              WHERE pt.slug = pn.slug
+                AND pt.current_canonical_id = pn.id
+          );
 
         INSERT OR IGNORE INTO pyramid_distillations (slug, thread_id, content, delta_count)
         SELECT slug, thread_id, '', 0
@@ -1489,6 +1573,90 @@ pub fn delete_faq_node(conn: &Connection, id: &str) -> Result<()> {
     Ok(())
 }
 
+// ── FAQ Category CRUD ────────────────────────────────────────────────────────
+
+use super::types::FaqCategory;
+
+/// Save (upsert) a FAQ category.
+pub fn save_faq_category(conn: &Connection, cat: &FaqCategory) -> Result<()> {
+    let faq_ids_json = serde_json::to_string(&cat.faq_ids).unwrap_or_else(|_| "[]".to_string());
+    conn.execute(
+        "INSERT INTO pyramid_faq_categories (id, slug, name, distilled_summary, faq_ids, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(id) DO UPDATE SET
+            name = excluded.name,
+            distilled_summary = excluded.distilled_summary,
+            faq_ids = excluded.faq_ids,
+            updated_at = excluded.updated_at",
+        rusqlite::params![
+            cat.id, cat.slug, cat.name, cat.distilled_summary, faq_ids_json,
+            cat.created_at, cat.updated_at
+        ],
+    )?;
+    Ok(())
+}
+
+/// Get all FAQ categories for a slug.
+pub fn get_faq_categories(conn: &Connection, slug: &str) -> Result<Vec<FaqCategory>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, slug, name, distilled_summary, faq_ids, created_at, updated_at
+         FROM pyramid_faq_categories WHERE slug = ?1 ORDER BY name ASC",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![slug], |row| {
+        let faq_ids_str: String = row.get(4)?;
+        let faq_ids: Vec<String> = serde_json::from_str(&faq_ids_str).unwrap_or_default();
+        Ok(FaqCategory {
+            id: row.get(0)?,
+            slug: row.get(1)?,
+            name: row.get(2)?,
+            distilled_summary: row.get(3)?,
+            faq_ids,
+            created_at: row.get(5)?,
+            updated_at: row.get(6)?,
+        })
+    })?;
+    let mut result = Vec::new();
+    for r in rows {
+        result.push(r?);
+    }
+    Ok(result)
+}
+
+/// Get a single FAQ category by id.
+pub fn get_faq_category(conn: &Connection, id: &str) -> Result<Option<FaqCategory>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, slug, name, distilled_summary, faq_ids, created_at, updated_at
+         FROM pyramid_faq_categories WHERE id = ?1",
+    )?;
+    let mut rows = stmt.query_map(rusqlite::params![id], |row| {
+        let faq_ids_str: String = row.get(4)?;
+        let faq_ids: Vec<String> = serde_json::from_str(&faq_ids_str).unwrap_or_default();
+        Ok(FaqCategory {
+            id: row.get(0)?,
+            slug: row.get(1)?,
+            name: row.get(2)?,
+            distilled_summary: row.get(3)?,
+            faq_ids,
+            created_at: row.get(5)?,
+            updated_at: row.get(6)?,
+        })
+    })?;
+    match rows.next() {
+        Some(Ok(cat)) => Ok(Some(cat)),
+        Some(Err(e)) => Err(e.into()),
+        None => Ok(None),
+    }
+}
+
+/// Delete all FAQ categories for a slug (used before regenerating).
+pub fn delete_faq_categories(conn: &Connection, slug: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM pyramid_faq_categories WHERE slug = ?1",
+        rusqlite::params![slug],
+    )?;
+    Ok(())
+}
+
 // ── Usage Log CRUD ───────────────────────────────────────────────────────────
 
 /// Insert a usage log entry. Returns the auto-generated id.
@@ -1574,6 +1742,331 @@ pub fn get_most_accessed_nodes(conn: &Connection, slug: &str, limit: i64) -> Res
     Ok(nodes)
 }
 
+// ── Watcher Cache Helpers ─────────────────────────────────────────────────────
+
+/// Get all tracked file paths for a slug from pyramid_file_hashes.
+pub fn get_tracked_paths(conn: &Connection, slug: &str) -> Result<std::collections::HashSet<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT file_path FROM pyramid_file_hashes WHERE slug = ?1",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![slug], |row| row.get::<_, String>(0))?;
+    let mut paths = std::collections::HashSet::new();
+    for row in rows {
+        if let Ok(p) = row {
+            paths.insert(p);
+        }
+    }
+    Ok(paths)
+}
+
+/// Get ingested extensions for a slug from pyramid_auto_update_config.
+/// Returns empty Vec if no config exists or column is missing.
+pub fn get_ingested_extensions(conn: &Connection, slug: &str) -> Result<Vec<String>> {
+    let json_str: String = conn
+        .query_row(
+            "SELECT ingested_extensions FROM pyramid_auto_update_config WHERE slug = ?1",
+            rusqlite::params![slug],
+            |row| row.get(0),
+        )
+        .unwrap_or_else(|_| "[]".to_string());
+    let exts: Vec<String> = serde_json::from_str(&json_str).unwrap_or_default();
+    Ok(exts)
+}
+
+/// Get ingested config filenames for a slug from pyramid_auto_update_config.
+/// Returns empty Vec if no config exists or column is missing.
+pub fn get_ingested_config_files(conn: &Connection, slug: &str) -> Result<Vec<String>> {
+    let json_str: String = conn
+        .query_row(
+            "SELECT ingested_config_files FROM pyramid_auto_update_config WHERE slug = ?1",
+            rusqlite::params![slug],
+            |row| row.get(0),
+        )
+        .unwrap_or_else(|_| "[]".to_string());
+    let configs: Vec<String> = serde_json::from_str(&json_str).unwrap_or_default();
+    Ok(configs)
+}
+
+// ── Build Pipeline Seeding Helpers ───────────────────────────────────────────
+
+/// Insert default auto_update_config for a slug with ingested extensions and config files.
+/// Uses INSERT OR IGNORE so it won't overwrite an existing config.
+pub fn insert_auto_update_config_defaults(
+    conn: &Connection,
+    slug: &str,
+    extensions_json: &str,
+    config_files_json: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO pyramid_auto_update_config
+         (slug, auto_update, debounce_minutes, min_changed_files, runaway_threshold,
+          breaker_tripped, frozen, ingested_extensions, ingested_config_files)
+         VALUES (?1, 1, 5, 1, 0.5, 0, 0, ?2, ?3)",
+        rusqlite::params![slug, extensions_json, config_files_json],
+    )?;
+    Ok(())
+}
+
+/// Upsert a file hash into pyramid_file_hashes.
+pub fn upsert_file_hash(
+    conn: &Connection,
+    slug: &str,
+    file_path: &str,
+    hash: &str,
+    chunk_count: i32,
+    node_ids_json: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO pyramid_file_hashes (slug, file_path, hash, chunk_count, node_ids, last_ingested_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'))
+         ON CONFLICT(slug, file_path) DO UPDATE SET
+            hash = excluded.hash,
+            chunk_count = excluded.chunk_count,
+            node_ids = excluded.node_ids,
+            last_ingested_at = excluded.last_ingested_at",
+        rusqlite::params![slug, file_path, hash, chunk_count, node_ids_json],
+    )?;
+    Ok(())
+}
+
+// ── Shared Query Functions (used by both HTTP routes and Tauri IPC commands) ──
+
+/// Load auto-update config for a slug. Returns None if not found.
+pub fn get_auto_update_config(conn: &Connection, slug: &str) -> Option<super::types::AutoUpdateConfig> {
+    conn.query_row(
+        "SELECT slug, auto_update, debounce_minutes, min_changed_files,
+                runaway_threshold, breaker_tripped, breaker_tripped_at, frozen, frozen_at
+         FROM pyramid_auto_update_config WHERE slug = ?1",
+        rusqlite::params![slug],
+        |row| {
+            Ok(super::types::AutoUpdateConfig {
+                slug: row.get(0)?,
+                auto_update: row.get::<_, i32>(1)? != 0,
+                debounce_minutes: row.get(2)?,
+                min_changed_files: row.get(3)?,
+                runaway_threshold: row.get(4)?,
+                breaker_tripped: row.get::<_, i32>(5)? != 0,
+                breaker_tripped_at: row.get(6)?,
+                frozen: row.get::<_, i32>(7)? != 0,
+                frozen_at: row.get(8)?,
+            })
+        },
+    )
+    .ok()
+}
+
+/// Get auto-update status for a slug (config + pending mutations + last check time).
+pub fn get_auto_update_status(conn: &Connection, slug: &str) -> Result<Option<serde_json::Value>> {
+    let config = match get_auto_update_config(conn, slug) {
+        Some(c) => c,
+        None => return Ok(None),
+    };
+
+    let mut pending_by_layer = std::collections::HashMap::new();
+    for layer in 0..=3 {
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pyramid_pending_mutations
+                 WHERE processed = 0 AND slug = ?1 AND layer = ?2",
+                rusqlite::params![slug, layer],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        pending_by_layer.insert(layer, count);
+    }
+
+    let last_check_at: Option<String> = conn
+        .query_row(
+            "SELECT MAX(checked_at) FROM pyramid_stale_check_log WHERE slug = ?1",
+            rusqlite::params![slug],
+            |row| row.get(0),
+        )
+        .ok()
+        .flatten();
+
+    Ok(Some(serde_json::json!({
+        "auto_update": config.auto_update,
+        "frozen": config.frozen,
+        "breaker_tripped": config.breaker_tripped,
+        "pending_mutations_by_layer": pending_by_layer,
+        "last_check_at": last_check_at,
+    })))
+}
+
+/// Query stale check log entries.
+pub fn get_stale_log(
+    conn: &Connection,
+    slug: &str,
+    layer: Option<i32>,
+    stale: Option<&str>,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<serde_json::Value>> {
+    let mut sql = String::from(
+        "SELECT id, slug, batch_id, layer, target_id, stale, reason,
+                checker_index, checker_batch_size, checked_at, cost_tokens, cost_usd
+         FROM pyramid_stale_check_log WHERE slug = ?1"
+    );
+    let mut param_vals: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+    param_vals.push(Box::new(slug.to_string()));
+
+    if let Some(layer_val) = layer {
+        param_vals.push(Box::new(layer_val));
+        sql.push_str(&format!(" AND layer = ?{}", param_vals.len()));
+    }
+    if let Some(stale_str) = stale {
+        let stale_val: i32 = if stale_str == "yes" || stale_str == "true" || stale_str == "1" { 1 } else { 0 };
+        param_vals.push(Box::new(stale_val));
+        sql.push_str(&format!(" AND stale = ?{}", param_vals.len()));
+    }
+
+    param_vals.push(Box::new(limit));
+    sql.push_str(&format!(" ORDER BY checked_at DESC LIMIT ?{}", param_vals.len()));
+    param_vals.push(Box::new(offset));
+    sql.push_str(&format!(" OFFSET ?{}", param_vals.len()));
+
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> = param_vals.iter().map(|p| p.as_ref()).collect();
+    let mut stmt = conn.prepare(&sql)?;
+
+    let rows: Vec<serde_json::Value> = stmt
+        .query_map(param_refs.as_slice(), |row| {
+            Ok(serde_json::json!({
+                "id": row.get::<_, i64>(0)?,
+                "slug": row.get::<_, String>(1)?,
+                "batch_id": row.get::<_, String>(2)?,
+                "layer": row.get::<_, i32>(3)?,
+                "target_id": row.get::<_, String>(4)?,
+                "stale": if row.get::<_, i32>(5)? == 1 { "yes" } else { "no" },
+                "reason": row.get::<_, String>(6)?,
+                "checker_index": row.get::<_, i32>(7)?,
+                "checker_batch_size": row.get::<_, i32>(8)?,
+                "checked_at": row.get::<_, String>(9)?,
+                "cost_tokens": row.get::<_, Option<i64>>(10)?,
+                "cost_usd": row.get::<_, Option<f64>>(11)?,
+            }))
+        })
+        .map(|iter| iter.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default();
+
+    Ok(rows)
+}
+
+/// Get cost summary for a slug within an optional time window.
+/// Note: The actual column in pyramid_cost_log is `estimated_cost`, not `cost_usd`.
+pub fn get_cost_summary(conn: &Connection, slug: &str, window: Option<&str>) -> Result<serde_json::Value> {
+    let window_clause = match window {
+        Some("24h") => "AND created_at >= datetime('now', '-1 day')",
+        Some("7d") => "AND created_at >= datetime('now', '-7 days')",
+        Some("30d") => "AND created_at >= datetime('now', '-30 days')",
+        _ => "",
+    };
+
+    let (total_spend, total_calls): (f64, i64) = conn
+        .query_row(
+            &format!(
+                "SELECT COALESCE(SUM(estimated_cost), 0.0), COUNT(*) FROM pyramid_cost_log
+                 WHERE slug = ?1 {}", window_clause
+            ),
+            rusqlite::params![slug],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap_or((0.0, 0));
+
+    let by_source = {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT COALESCE(source, 'manual'), COALESCE(SUM(estimated_cost), 0.0), COUNT(*)
+             FROM pyramid_cost_log WHERE slug = ?1 {}
+             GROUP BY COALESCE(source, 'manual')", window_clause
+        ))?;
+        let rows: Vec<serde_json::Value> = stmt
+            .query_map(rusqlite::params![slug], |row| {
+                Ok(serde_json::json!({
+                    "source": row.get::<_, String>(0)?,
+                    "spend": row.get::<_, f64>(1)?,
+                    "calls": row.get::<_, i64>(2)?,
+                }))
+            })
+            .map(|iter| iter.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default();
+        rows
+    };
+
+    let by_check_type = {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT COALESCE(check_type, 'unknown'), COALESCE(SUM(estimated_cost), 0.0), COUNT(*)
+             FROM pyramid_cost_log WHERE slug = ?1 {}
+             GROUP BY COALESCE(check_type, 'unknown')", window_clause
+        ))?;
+        let rows: Vec<serde_json::Value> = stmt
+            .query_map(rusqlite::params![slug], |row| {
+                Ok(serde_json::json!({
+                    "check_type": row.get::<_, String>(0)?,
+                    "spend": row.get::<_, f64>(1)?,
+                    "calls": row.get::<_, i64>(2)?,
+                }))
+            })
+            .map(|iter| iter.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default();
+        rows
+    };
+
+    let by_layer = {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT COALESCE(layer, -1), COALESCE(SUM(estimated_cost), 0.0), COUNT(*)
+             FROM pyramid_cost_log WHERE slug = ?1 {}
+             GROUP BY COALESCE(layer, -1)", window_clause
+        ))?;
+        let rows: Vec<serde_json::Value> = stmt
+            .query_map(rusqlite::params![slug], |row| {
+                Ok(serde_json::json!({
+                    "layer": row.get::<_, i32>(0)?,
+                    "spend": row.get::<_, f64>(1)?,
+                    "calls": row.get::<_, i64>(2)?,
+                }))
+            })
+            .map(|iter| iter.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default();
+        rows
+    };
+
+    let recent_calls = {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT id, operation, model, input_tokens, output_tokens, estimated_cost,
+                    COALESCE(source, 'manual'), layer, check_type, created_at
+             FROM pyramid_cost_log WHERE slug = ?1 {}
+             ORDER BY created_at DESC LIMIT 20", window_clause
+        ))?;
+        let rows: Vec<serde_json::Value> = stmt
+            .query_map(rusqlite::params![slug], |row| {
+                Ok(serde_json::json!({
+                    "id": row.get::<_, i64>(0)?,
+                    "operation": row.get::<_, String>(1)?,
+                    "model": row.get::<_, String>(2)?,
+                    "input_tokens": row.get::<_, i64>(3)?,
+                    "output_tokens": row.get::<_, i64>(4)?,
+                    "cost_usd": row.get::<_, f64>(5)?,
+                    "source": row.get::<_, String>(6)?,
+                    "layer": row.get::<_, Option<i32>>(7)?,
+                    "check_type": row.get::<_, Option<String>>(8)?,
+                    "created_at": row.get::<_, String>(9)?,
+                }))
+            })
+            .map(|iter| iter.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default();
+        rows
+    };
+
+    Ok(serde_json::json!({
+        "slug": slug,
+        "total_spend": total_spend,
+        "total_calls": total_calls,
+        "by_source": by_source,
+        "by_check_type": by_check_type,
+        "by_layer": by_layer,
+        "recent_calls": recent_calls,
+    }))
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1645,6 +2138,7 @@ mod tests {
             slug: "s".to_string(),
             depth: 0,
             chunk_index: Some(0),
+            headline: "Auth Node".to_string(),
             distilled: "Test distillation".to_string(),
             topics: vec![Topic {
                 name: "Auth".to_string(),
@@ -1694,6 +2188,7 @@ mod tests {
                 slug: "s".to_string(),
                 depth: 0,
                 chunk_index: Some(i),
+                headline: format!("Node {i}"),
                 distilled: format!("Node {i}"),
                 topics: vec![],
                 corrections: vec![],
@@ -1729,6 +2224,7 @@ mod tests {
                 slug: "s".to_string(),
                 depth,
                 chunk_index: None,
+                headline: format!("Depth {depth}"),
                 distilled: format!("Depth {depth}"),
                 topics: vec![],
                 corrections: vec![],
@@ -1788,6 +2284,7 @@ mod tests {
                 slug: "s".to_string(),
                 depth: 0,
                 chunk_index: Some(i),
+                headline: format!("Node {i}"),
                 distilled: String::new(),
                 topics: vec![],
                 corrections: vec![],
@@ -1807,6 +2304,7 @@ mod tests {
             slug: "s".to_string(),
             depth: 1,
             chunk_index: None,
+            headline: "Apex".to_string(),
             distilled: String::new(),
             topics: vec![],
             corrections: vec![],
@@ -1839,6 +2337,7 @@ mod tests {
             slug: "s".to_string(),
             depth: 0,
             chunk_index: Some(0),
+            headline: "Versioned Node".to_string(),
             distilled: "Version 1".to_string(),
             topics: vec![],
             corrections: vec![],
