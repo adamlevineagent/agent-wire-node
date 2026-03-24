@@ -11,8 +11,11 @@
 //   routes  — Warp HTTP route handlers
 
 pub mod build;
+pub mod chain_dispatch;
 pub mod chain_engine;
+pub mod chain_executor;
 pub mod chain_loader;
+pub mod chain_resolve;
 pub mod chain_registry;
 pub mod config_helper;
 pub mod db;
