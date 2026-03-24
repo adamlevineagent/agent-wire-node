@@ -1,20 +1,22 @@
-# Code Pipeline Chain Definition — Simplified
+# Code Pipeline Chain Definition — Semantic Grouping
 #
-# Pipeline sequence (mechanical steps removed — they are placeholders):
+# Pipeline:
 #   1. L0 code extraction (per-file LLM analysis)
-#   2. L1 adjacent pairing (pairs nearby L0 nodes via distill prompt)
-#   3. Upper layers (recursive adjacent pairing from L1 to apex)
+#   2. Thread clustering (LLM groups ALL L0 topics into 6-12 semantic threads)
+#   3. Thread narrative synthesis (per-thread LLM synthesis into L1 nodes)
+#   4. Upper layers (recursive adjacent pairing from L1 to apex)
+#
+# This produces meaningful semantic layers instead of blind 2:1 pairing.
 
 schema_version: 1
 id: code-default
 name: Code Pyramid
 description: >
-  Simplified code analysis pipeline: per-file LLM extraction, then
-  recursive adjacent pairing from L0 through to a single apex node.
-  Mechanical clustering steps are bypassed (they are unimplemented
-  placeholders in the chain dispatch).
+  Code analysis pipeline with semantic grouping: per-file extraction,
+  LLM-based thread clustering, per-thread narrative synthesis, then
+  recursive pairing to apex.
 content_type: code
-version: "1.1.0"
+version: "2.0.0"
 author: agent-wire
 
 defaults:
@@ -25,7 +27,6 @@ defaults:
 steps:
   # ── Step 1: L0 code extraction ────────────────────────────────────────
   # Per-file LLM analysis producing one node per source file.
-  # Node IDs: "C-L0-{index:03}"
   - name: l0_code_extract
     primitive: extract
     instruction: "$prompts/code/code_extract.md"
@@ -37,19 +38,42 @@ steps:
     temperature: 0.3
     on_error: skip
 
-  # ── Step 2: Upper layers (recursive pairing L0 → apex) ───────────────
-  # Starts at depth 0 (L0 code extract nodes). At each depth:
-  #   - Gets all nodes at current depth
-  #   - If <=1 node, that's the apex — done
-  #   - Otherwise pairs adjacent nodes, synthesizes with distill prompt
-  #   - Node IDs: "L{depth}-{pair_idx:03}"
-  #   - On LLM failure: retries up to 3 times, then carries left node forward
-  # Continues until single apex node remains.
+  # ── Step 2: Thread clustering ─────────────────────────────────────────
+  # Takes ALL L0 extraction topics and groups them into 6-12 semantic
+  # threads. Uses qwen (1M context) because the topic inventory can be
+  # very large for big codebases.
+  # Input: the full array of L0 step outputs.
+  # Output: JSON with "threads" array, each containing assignments.
+  - name: thread_clustering
+    primitive: classify
+    instruction: "$prompts/code/code_cluster.md"
+    input:
+      topics: $l0_code_extract
+    model: "qwen/qwen3.5-flash-02-23"
+    temperature: 0.3
+    on_error: skip
+
+  # ── Step 3: Thread narrative synthesis ─────────────────────────────────
+  # For each thread from clustering, synthesize the assigned L0 topics
+  # into a coherent narrative node.
+  - name: thread_narrative
+    primitive: synthesize
+    instruction: "$prompts/code/code_thread.md"
+    for_each: $thread_clustering.threads
+    node_id_pattern: "L1-{index:03}"
+    depth: 1
+    save_as: node
+    model_tier: mid
+    temperature: 0.3
+    on_error: skip
+
+  # ── Step 4: Upper layers (recursive pairing L1 → apex) ───────────────
+  # Recursive adjacent pairing from L1 thread nodes to single apex.
   - name: upper_layer_synthesis
     primitive: synthesize
     instruction: "$prompts/code/code_distill.md"
     recursive_pair: true
-    depth: 0
+    depth: 1
     save_as: node
     node_id_pattern: "L{depth}-{index:03}"
     model_tier: mid
