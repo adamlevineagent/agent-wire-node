@@ -59,7 +59,7 @@ steps:
   - name: l0_code_extract
     primitive: extract
     instruction: "$prompts/code/code_extract.md"
-    for_each: chunks
+    for_each: $chunks
     node_id_pattern: "C-L0-{index:03}"
     depth: 0
     model_tier: mid
@@ -75,7 +75,7 @@ steps:
     primitive: extract
     instruction: "$prompts/code/config_extract.md"
     when: "chunk.type == 'config'"
-    for_each: chunks
+    for_each: $chunks
     node_id_pattern: "C-L0-{index:03}"
     depth: 0
     model_tier: mid
@@ -110,7 +110,7 @@ steps:
   - name: l1_code_group_synthesis
     primitive: synthesize
     instruction: "$prompts/code/code_group.md"
-    for_each: clusters
+    for_each: $import_graph_clustering
     node_id_pattern: "C-L1-{index:03}"
     depth: 1
     input:
@@ -148,7 +148,7 @@ steps:
   - name: l2_thread_narrative
     primitive: synthesize
     instruction: "$prompts/conversation/thread_narrative.md"
-    for_each: thread_assignments
+    for_each: $l2_thread_clustering
     node_id_pattern: "L2-{index:03}"
     depth: 2
     model_tier: mid
