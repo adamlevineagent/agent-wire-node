@@ -11,6 +11,9 @@
 //   routes  — Warp HTTP route handlers
 
 pub mod build;
+pub mod chain_engine;
+pub mod chain_loader;
+pub mod chain_registry;
 pub mod config_helper;
 pub mod db;
 pub mod delta;
@@ -60,6 +63,8 @@ pub struct PyramidConfig {
     pub partner_model: String,
     #[serde(default = "default_collapse_model")]
     pub collapse_model: String,
+    #[serde(default)]
+    pub use_chain_engine: bool,
 }
 
 fn default_primary_model() -> String {
@@ -88,6 +93,7 @@ impl Default for PyramidConfig {
             fallback_model_2: default_fallback_2(),
             partner_model: default_partner_model(),
             collapse_model: default_collapse_model(),
+            use_chain_engine: false,
         }
     }
 }

@@ -449,6 +449,9 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
     // ── Migrate CHECK constraint to include 'vine' ────────────────────────────
     migrate_slugs_check_constraint(conn)?;
 
+    // ── Chain registry table ─────────────────────────────────────────────────
+    super::chain_registry::init_chain_tables(conn)?;
+
     Ok(())
 }
 
