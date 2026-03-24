@@ -455,13 +455,16 @@ pub async fn execute_chain_from(
         }
 
         // Skip steps below from_depth (layered rebuild)
+        // Only skip extract steps that produce nodes below from_depth.
+        // Never skip classify/synthesize steps — they read lower depths
+        // and produce assignments or nodes at/above from_depth.
         if from_depth > 0 {
             let step_depth = step.depth.unwrap_or(0);
-            // Skip forEach/single steps that produce nodes below from_depth
-            // But don't skip recursive_cluster/recursive_pair (they span multiple depths)
-            if step_depth < from_depth && !step.recursive_cluster && !step.recursive_pair {
+            let is_extract = step.primitive == "extract" || step.primitive == "compress" || step.primitive == "fuse";
+            let is_spanning = step.recursive_cluster || step.recursive_pair;
+            if step_depth < from_depth && is_extract && !is_spanning {
                 info!(
-                    "[CHAIN] step \"{}\" skipped (depth {} < from_depth {})",
+                    "[CHAIN] step \"{}\" skipped (extract at depth {} < from_depth {})",
                     step.name, step_depth, from_depth
                 );
                 continue;
@@ -472,11 +475,13 @@ pub async fn execute_chain_from(
         let saves_node = step.save_as.as_deref() == Some("node");
 
         info!(
-            "[CHAIN] step \"{}\" started ({}/{}, primitive: {})",
+            "[CHAIN] step \"{}\" started ({}/{}, primitive: {}, done={}/{})",
             step.name,
             step_idx + 1,
             chain.steps.len(),
             step.primitive,
+            done,
+            total,
         );
 
         let step_result = if step.mechanical {
@@ -1440,7 +1445,12 @@ async fn execute_recursive_cluster(
 
         if clusters.is_empty() {
             let keys: Vec<&String> = cluster_assignments.as_object().map(|o| o.keys().collect()).unwrap_or_default();
-            warn!("[CHAIN] [{}] cluster JSON keys: {:?}, looking for 'clusters'", step.name, keys);
+            let raw_preview: String = serde_json::to_string(&cluster_assignments)
+                .unwrap_or_default()
+                .chars()
+                .take(500)
+                .collect();
+            warn!("[CHAIN] [{}] clustering returned 0 clusters. Keys: {:?}. Raw JSON (first 500 chars): {}", step.name, keys, raw_preview);
         }
 
         // If clustering returned 0 clusters (LLM returned wrong key or empty array),

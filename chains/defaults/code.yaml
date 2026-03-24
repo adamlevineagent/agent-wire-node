@@ -51,7 +51,7 @@ steps:
       topics: $l0_code_extract
     model: "qwen/qwen3.5-flash-02-23"
     temperature: 0.3
-    on_error: skip
+    on_error: "retry(3)"
 
   # ── Step 3: Thread narrative synthesis ─────────────────────────────────
   # For each thread from clustering, synthesize the assigned L0 topics
@@ -65,7 +65,7 @@ steps:
     save_as: node
     model_tier: mid
     temperature: 0.3
-    on_error: skip
+    on_error: "retry(2)"
 
   # ── Step 4: Upper layers (recursive clustering L1 → apex) ────────────
   # Semantic re-clustering at each layer instead of blind 2:1 pairing.

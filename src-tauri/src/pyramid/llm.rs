@@ -96,6 +96,10 @@ async fn call_model_inner(
     let client = reqwest::Client::new();
     let url = "https://openrouter.ai/api/v1/chat/completions";
 
+    // Scale timeout with prompt size: base 120s, +60s per 100K chars, max 600s (10 min)
+    let prompt_chars = system_prompt.len() + user_prompt.len();
+    let timeout_secs = std::cmp::min(600, 120 + (prompt_chars / 100_000) as u64 * 60);
+
     for attempt in 0..5u32 {
         let mut body = serde_json::json!({
             "model": use_model,
@@ -116,7 +120,7 @@ async fn call_model_inner(
             .header("Content-Type", "application/json")
             .header("HTTP-Referer", "https://newsbleach.com")
             .header("X-Title", "Wire Pyramid Engine")
-            .timeout(std::time::Duration::from_secs(120))
+            .timeout(std::time::Duration::from_secs(timeout_secs))
             .json(&body)
             .send()
             .await;
@@ -125,11 +129,11 @@ async fn call_model_inner(
             Ok(r) => r,
             Err(e) => {
                 if attempt < 4 {
-                    info!("  request error, retry {}...", attempt + 1);
+                    info!("  request error (timeout={}s), retry {}...", timeout_secs, attempt + 1);
                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                     continue;
                 }
-                return Err(anyhow!("Request failed after 5 attempts: {}", e));
+                return Err(anyhow!("Request failed after 5 attempts (timeout={}s): {}", timeout_secs, e));
             }
         };
 
