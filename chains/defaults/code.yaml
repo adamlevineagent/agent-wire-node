@@ -1,24 +1,20 @@
-# Code Pipeline Chain Definition
-# Mirrors build_code() from src-tauri/src/pyramid/build.rs
+# Code Pipeline Chain Definition — Simplified
 #
-# Pipeline sequence:
-#   1. Mechanical metadata extraction (import graph, IPC bindings, spawns, strings, complexity)
-#   2. Concurrent L0 code extraction (per-file LLM analysis, config files get separate prompt)
-#   3. Import graph clustering (mechanical: BFS connected components, split clusters >8 files)
-#   4. Code group synthesis (per-cluster LLM synthesis with import graph + IPC map context)
-#   5. Thread clustering (LLM groups L1 topics into 6-12 threads; batched if >30k est. tokens)
-#   6. Thread narrative synthesis (per-thread LLM narrative with temporal authority ordering)
-#   7. Upper layers (recursive adjacent pairing from L2 to apex via DISTILL_PROMPT)
+# Pipeline sequence (mechanical steps removed — they are placeholders):
+#   1. L0 code extraction (per-file LLM analysis)
+#   2. L1 adjacent pairing (pairs nearby L0 nodes via distill prompt)
+#   3. Upper layers (recursive adjacent pairing from L1 to apex)
 
 schema_version: 1
 id: code-default
 name: Code Pyramid
 description: >
-  Full code analysis pipeline: mechanical metadata extraction, concurrent per-file
-  LLM extraction (with config file variant), import-graph clustering, code group
-  synthesis, thread clustering, thread narrative synthesis, and recursive pairing to apex.
+  Simplified code analysis pipeline: per-file LLM extraction, then
+  recursive adjacent pairing from L0 through to a single apex node.
+  Mechanical clustering steps are bypassed (they are unimplemented
+  placeholders in the chain dispatch).
 content_type: code
-version: "1.0.0"
+version: "1.1.0"
 author: agent-wire
 
 defaults:
@@ -27,35 +23,9 @@ defaults:
   on_error: "retry(2)"
 
 steps:
-  # ── Step 1: Mechanical metadata extraction ──────────────────────────────
-  # Rust: extract_import_graph(conn, slug, Some(&wtx))
-  # Parses all chunks to extract: import/export maps, IPC bindings (Tauri invoke <-> #[tauri::command]),
-  # spawn/timer counts, string literal resources (URLs, tables, storage buckets, file paths),
-  # and per-file complexity metrics (lines, functions, spawn_count).
-  # Saves as step_type "import_graph" with node_id "".
-  - name: mechanical_metadata
-    primitive: detect
-    mechanical: true
-    rust_function: extract_import_graph
-    input:
-      sources:
-        - import_graph
-        - ipc_bindings
-        - spawn_counts
-        - string_resources
-        - complexity_metrics
-    save_as: import_graph
-    depth: -1
-    node_id_pattern: ""
-    on_error: abort
-
-  # ── Step 2: Concurrent L0 code extraction ───────────────────────────────
-  # Rust: for ci in 0..num_chunks, spawns concurrent tasks (concurrency = min(num_chunks, 3))
-  # Node IDs: "C-L0-{ci:03}" (e.g., C-L0-000, C-L0-001, ...)
-  # Config detection: if chunk contains "## TYPE: config", uses CONFIG_EXTRACT_PROMPT;
-  #   otherwise uses CODE_EXTRACT_PROMPT.
-  # Non-config files get mechanical metadata appended: spawn counts, string resources, complexity.
-  # Step type saved as "code_extract".
+  # ── Step 1: L0 code extraction ────────────────────────────────────────
+  # Per-file LLM analysis producing one node per source file.
+  # Node IDs: "C-L0-{index:03}"
   - name: l0_code_extract
     primitive: extract
     instruction: "$prompts/code/code_extract.md"
@@ -67,94 +37,11 @@ steps:
     temperature: 0.3
     on_error: skip
 
-  # ── Step 2b: Config file extraction ────────────────────────────────────
-  # REMOVED: The `when` condition doesn't filter per-item (only per-step),
-  # causing all 112 chunks to be extracted twice. The code_extract prompt
-  # handles config files (package.json, tsconfig, etc.) adequately.
-  # If per-chunk filtering is needed, it requires runtime support for
-  # per-item `when` evaluation inside forEach loops.
-
-  # ── Step 3: Import graph clustering ─────────────────────────────────────
-  # Rust: cluster_by_imports(&import_graph)
-  # Algorithm: Build undirected adjacency from import graph (Rust use/mod + TS relative imports),
-  # then BFS to find connected components. Clusters >8 files are split into groups of 6.
-  # Pure mechanical — no LLM call.
-  - name: import_graph_clustering
-    primitive: classify
-    mechanical: true
-    rust_function: cluster_by_imports
-    input:
-      source: import_graph
-      algorithm: bfs_connected_components
-      max_cluster_size: 8
-      split_size: 6
-    save_as: clusters
-    on_error: abort
-
-  # ── Step 4: Code group synthesis ────────────────────────────────────────
-  # Rust: for each cluster, gathers child L0 nodes, builds user prompt with:
-  #   - FILES IN THIS CLUSTER (JSON array of file paths)
-  #   - IMPORT GRAPH (subset for cluster files)
-  #   - IPC BINDINGS (bindings touching cluster files)
-  #   - FILE EXTRACTIONS (L0 topics data)
-  # Node IDs: "C-L1-{ci_idx:03}"
-  # Step type saved as "synth" at depth 1.
-  - name: l1_code_group_synthesis
-    primitive: synthesize
-    instruction: "$prompts/code/code_group.md"
-    for_each: $import_graph_clustering
-    node_id_pattern: "C-L1-{index:03}"
-    depth: 1
-    save_as: node
-    input:
-      context:
-        - import_graph
-        - ipc_bindings
-        - child_topics
-    model_tier: mid
-    temperature: 0.3
-    on_error: skip
-
-  # ── Step 5: Thread clustering ───────────────────────────────────────────
-  # Rust: build_threads_layer() — shared between code and conversation pipelines.
-  # Builds topic inventory from all L1 nodes, then LLM groups into 6-12 threads.
-  # If estimated tokens >30,000: splits into batches, clusters each independently,
-  #   then merges via MERGE_PROMPT.
-  # If clustering fails: falls back to positional pairing of adjacent L1 nodes.
-  # Step type saved as "thread_cluster" at depth 1.
-  - name: l2_thread_clustering
-    primitive: classify
-    instruction: "$prompts/conversation/thread_cluster.md"
-    batch_threshold: 30000
-    merge_instruction: "$prompts/conversation/merge.md"
-    depth: 1
-    save_as: thread_assignments
-    model: "qwen/qwen3.5-flash-02-23"
-    temperature: 0.3
-    on_error: skip
-
-  # ── Step 6: Thread narrative synthesis ──────────────────────────────────
-  # Rust: for each thread, gathers assigned topics from L1 nodes, sorts chronologically,
-  #   marks late topics (>70% through) as "[LATE -- AUTHORITATIVE]", then synthesizes.
-  # Node IDs: "L2-{thread_idx:03}"
-  # Step type saved as "synth" at depth 2.
-  - name: l2_thread_narrative
-    primitive: synthesize
-    instruction: "$prompts/conversation/thread_narrative.md"
-    for_each: $l2_thread_clustering
-    node_id_pattern: "L2-{index:03}"
-    depth: 2
-    save_as: node
-    model_tier: mid
-    temperature: 0.3
-    on_error: skip
-
-  # ── Step 7: Upper layers (L3+ recursive pairing to apex) ───────────────
-  # Rust: build_upper_layers(db, writer_tx, llm_config, slug, 2, ...)
-  # Starts at depth 2 (L2 thread nodes). At each depth:
+  # ── Step 2: Upper layers (recursive pairing L0 → apex) ───────────────
+  # Starts at depth 0 (L0 code extract nodes). At each depth:
   #   - Gets all nodes at current depth
   #   - If <=1 node, that's the apex — done
-  #   - Otherwise pairs adjacent nodes, synthesizes with DISTILL_PROMPT
+  #   - Otherwise pairs adjacent nodes, synthesizes with distill prompt
   #   - Node IDs: "L{depth}-{pair_idx:03}"
   #   - On LLM failure: retries up to 3 times, then carries left node forward
   # Continues until single apex node remains.
@@ -162,7 +49,7 @@ steps:
     primitive: synthesize
     instruction: "$prompts/conversation/distill.md"
     recursive_pair: true
-    depth: 2
+    depth: 0
     save_as: node
     node_id_pattern: "L{depth}-{index:03}"
     model_tier: mid
