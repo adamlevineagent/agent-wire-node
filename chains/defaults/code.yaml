@@ -66,21 +66,12 @@ steps:
     temperature: 0.3
     on_error: skip
 
-  # ── Step 2b: Config file extraction (variant) ──────────────────────────
-  # Applied when chunk header contains "## TYPE: config".
-  # Uses CONFIG_EXTRACT_PROMPT instead of CODE_EXTRACT_PROMPT.
-  # No mechanical metadata appended.
-  # Same node ID pattern as l0_code_extract; the runtime selects based on chunk type.
-  - name: l0_config_extract
-    primitive: extract
-    instruction: "$prompts/code/config_extract.md"
-    when: "chunk.type == 'config'"
-    for_each: $chunks
-    node_id_pattern: "C-L0-{index:03}"
-    depth: 0
-    model_tier: mid
-    temperature: 0.3
-    on_error: skip
+  # ── Step 2b: Config file extraction ────────────────────────────────────
+  # REMOVED: The `when` condition doesn't filter per-item (only per-step),
+  # causing all 112 chunks to be extracted twice. The code_extract prompt
+  # handles config files (package.json, tsconfig, etc.) adequately.
+  # If per-chunk filtering is needed, it requires runtime support for
+  # per-item `when` evaluation inside forEach loops.
 
   # ── Step 3: Import graph clustering ─────────────────────────────────────
   # Rust: cluster_by_imports(&import_graph)
