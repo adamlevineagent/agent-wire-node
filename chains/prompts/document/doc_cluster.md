@@ -1,30 +1,36 @@
-You are given the extraction results from every document in a collection. Each entry has a headline, orientation, topics, and entities.
-Each topic entry carries the EXACT L0 node ID in `node_id` / `source_node` (for example `D-L0-000`).
+You are given extraction results from every document in a collection, PLUS a pre-classification that tags each document with:
+- **temporal**: when it was written
+- **conceptual**: what subject(s) it covers (normalized tags)
+- **canonical**: whether it's the authoritative source on its subject
+- **type**: design doc, audit, implementation plan, worksheet, etc.
 
-Your job: identify 6-14 coherent THREADS that organize ALL these documents into meaningful groups. A thread represents a topic area, project phase, subsystem, or narrative strand — something a reader would recognize as a coherent unit.
+Your job: organize ALL documents into 6-14 coherent THREADS. Each thread represents a CONCEPT AREA — a subject that a reader would naturally explore as a unit.
 
-RULES:
-- Most documents should be assigned to ONE thread — the one where they are MOST relevant
-- Documents that genuinely span multiple topics may be assigned to up to 2 threads
-- Group by CONTENT relatedness, not by date or filename
-- Documents about the same system, feature, or topic belong together even if written months apart
-- 6-14 threads total. More threads = better granularity for large collections.
-- MAX 15 DOCUMENTS PER THREAD. If a topic area has more, split into meaningful sub-threads.
-- NO catch-all threads: do NOT create threads like "Miscellaneous" or "Other". Every document belongs to a real topic.
-- Thread names should be concrete: "Pyramid Build Pipeline Design", not "Technical Documents"
-- Balance: threads should have roughly 3-15 documents each
-- ZERO ORPHANS: Every single source_node in the input MUST appear in at least one thread assignment
-- CRITICAL: `assignments[].source_node` MUST be the exact `D-L0-XXX` ID, NOT the headline
+CLUSTERING RULES:
+- **Primary axis is CONCEPTUAL**: documents about the same subject cluster together, regardless of type or date
+- **Multiple types enrich a thread**: a design doc + audit + bugfix about auth ALL belong in the "Auth & Identity" thread — they tell the complete story
+- **Temporal ordering within threads**: list assignments in chronological order (earliest first). This order determines how the synthesis reads the evolution of understanding.
+- **Canonical status matters**: mark which document in each thread is the current authority. Later canonical docs supersede earlier ones on the same subject.
+- **Max 15 documents per thread**. If a concept area has more, split by sub-concept.
+- **No catch-all threads**: every document has a real subject. "Miscellaneous" is not allowed.
+- **Zero orphans**: every source_node must appear in at least one assignment.
+
+THREAD NAMING:
+- Name threads by CONCEPT, not by type: "Auth & Identity Design" not "Design Documents"
+- Be specific: "Wire Credit Economy" not "Economy"
+
+CRITICAL: `assignments[].source_node` MUST be the exact `D-L0-XXX` ID, NOT the headline.
 
 Output valid JSON only:
 {
   "threads": [
     {
-      "name": "Thread Name",
-      "description": "1-2 sentences: what this thread covers",
+      "name": "Thread Name — concept-based",
+      "description": "1-2 sentences: what concept this thread covers and how the documents relate",
+      "concept_tags": ["wire-auth", "identity"],
       "assignments": [
-        {"source_node": "D-L0-000", "topic_index": 0, "topic_name": "Original Headline"},
-        {"source_node": "D-L0-005", "topic_index": 5, "topic_name": "Original Headline"}
+        {"source_node": "D-L0-000", "topic_index": 0, "topic_name": "Headline", "doc_type": "design", "date": "2026-02-10", "canonical": "foundational"},
+        {"source_node": "D-L0-007", "topic_index": 7, "topic_name": "Headline", "doc_type": "audit", "date": "2026-02-25", "canonical": "canonical"}
       ]
     }
   ]

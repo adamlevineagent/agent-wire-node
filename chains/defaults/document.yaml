@@ -1,25 +1,29 @@
-# Document Pipeline Chain Definition — Semantic Grouping
+# Document Pipeline Chain Definition — Four-Axis Semantic Grouping
+#
+# Documents are organized along four axes:
+#   1. TEMPORAL — when was it written, what came before/after
+#   2. CONCEPTUAL — what subject/domain does it cover
+#   3. CANONICAL — is this the authoritative source on its subject
+#   4. TYPE — design doc, audit, worksheet, strategy, etc.
 #
 # Pipeline:
-#   1. L0 document extraction (per-document LLM analysis)
-#   2. Thread clustering (LLM groups ALL L0 topics into semantic threads)
-#   3. Thread narrative synthesis (per-thread LLM synthesis into L1 nodes)
-#   4. L1 cross-layer webbing
-#   5. Upper layers (recursive clustering L1 → apex)
-#   6. L2 cross-layer webbing
-#
-# Handles any document type: technical docs, design docs, meeting notes,
-# research papers, creative writing, audit reports, etc.
+#   1. Pre-classify (LLM reads headers, tags all 4 axes)
+#   2. L0 document extraction (per-doc, type-aware)
+#   3. Subject clustering (LLM groups by concept, informed by all 4 axes)
+#   4. Thread synthesis (temporally-ordered, supersession-aware)
+#   5. L1 cross-layer webbing
+#   6. Upper layers (recursive clustering to apex)
+#   7. L2 cross-layer webbing
 
 schema_version: 1
 id: document-default
 name: Document Pyramid
 description: >
-  Document analysis pipeline with semantic grouping: per-document extraction,
-  LLM-based thread clustering, per-thread narrative synthesis, cross-layer
-  webbing, then recursive clustering to apex.
+  Four-axis document analysis: pre-classification (temporal, conceptual,
+  canonical, type), type-aware extraction, concept-based clustering,
+  temporally-ordered synthesis, cross-layer webbing, recursive clustering.
 content_type: document
-version: "2.0.0"
+version: "3.0.0"
 author: agent-wire
 
 defaults:
@@ -28,14 +32,81 @@ defaults:
   on_error: "retry(2)"
 
 steps:
-  # ── Step 1: L0 document extraction ──────────────────────────────────
-  # Per-document LLM analysis producing one node per document/chunk.
-  # Detects document type (technical, design, narrative, audit, etc.)
-  # and extracts accordingly.
+  # ── Step 1: Pre-classify ────────────────────────────────────────────
+  # Reads first ~20 lines of every document in one LLM call.
+  # Tags each document: temporal (date), conceptual (subject tags),
+  # canonical (authority status), type (design/audit/worksheet/etc).
+  # Produces a shared taxonomy of concept tags for consistent labeling.
+  # Output feeds into extraction (type-aware prompts) and clustering
+  # (concept + temporal signals).
+  - name: doc_classify
+    primitive: classify
+    instruction: "$prompts/document/doc_classify.md"
+    input:
+      headers: $chunks
+      header_lines: 20
+    response_schema:
+      type: object
+      properties:
+        documents:
+          type: array
+          items:
+            type: object
+            properties:
+              source_node:
+                type: string
+                description: "Exact D-L0-XXX chunk ID"
+              title:
+                type: string
+              temporal:
+                type: object
+                properties:
+                  date:
+                    type: string
+                  confidence:
+                    type: string
+                required: ["date", "confidence"]
+                additionalProperties: false
+              conceptual:
+                type: array
+                items:
+                  type: string
+                description: "1-3 normalized concept tags"
+              canonical:
+                type: string
+                description: "canonical | superseded | partial | foundational"
+              type:
+                type: string
+                description: "design | audit | implementation | strategy | report | reference | worksheet | meta"
+              supersedes:
+                type: string
+                description: "Source node ID this document replaces, or null"
+              superseded_by:
+                type: string
+                description: "Source node ID that replaces this document, or null"
+            required: ["source_node", "title", "temporal", "conceptual", "canonical", "type"]
+            additionalProperties: false
+        concept_taxonomy:
+          type: object
+          additionalProperties:
+            type: string
+          description: "Map of concept tag → 1-sentence description"
+      required: ["documents", "concept_taxonomy"]
+      additionalProperties: false
+    model: "qwen/qwen3.5-flash-02-23"
+    temperature: 0.2
+    on_error: "retry(3)"
+
+  # ── Step 2: L0 document extraction ──────────────────────────────────
+  # Per-document LLM analysis. The classification metadata from step 1
+  # is available as context so the extraction knows what TYPE of document
+  # it's reading and what to emphasize.
   - name: l0_doc_extract
     primitive: extract
     instruction: "$prompts/document/doc_extract.md"
     for_each: $chunks
+    context:
+      classification: $doc_classify
     node_id_pattern: "D-L0-{index:03}"
     depth: 0
     save_as: node
@@ -44,14 +115,16 @@ steps:
     temperature: 0.3
     on_error: "retry(3)"
 
-  # ── Step 2: Thread clustering ───────────────────────────────────────
-  # Groups ALL L0 document topics into 6-14 semantic threads.
-  # Uses qwen (1M context) because the topic inventory can be large.
+  # ── Step 3: Subject clustering ──────────────────────────────────────
+  # Groups documents by CONCEPT (primary axis), informed by all 4 axes.
+  # Documents about the same concept cluster together regardless of type.
+  # Within each cluster, temporal ordering determines read sequence.
   - name: thread_clustering
     primitive: classify
     instruction: "$prompts/document/doc_cluster.md"
     input:
       topics: $l0_doc_extract
+      classification: $doc_classify
     response_schema:
       type: object
       properties:
@@ -63,10 +136,14 @@ steps:
             properties:
               name:
                 type: string
-                description: "2-6 word thread label"
+                description: "2-6 word thread label based on concept"
               description:
                 type: string
-                description: "1-2 sentence description of what this thread covers"
+              concept_tags:
+                type: array
+                items:
+                  type: string
+                description: "Which concept tags this thread covers"
               assignments:
                 type: array
                 minItems: 1
@@ -75,11 +152,20 @@ steps:
                   properties:
                     source_node:
                       type: string
-                      description: "Exact D-L0-XXX node ID from input"
+                      description: "Exact D-L0-XXX node ID"
                     topic_index:
                       type: integer
                     topic_name:
                       type: string
+                    doc_type:
+                      type: string
+                      description: "Type from classification"
+                    date:
+                      type: string
+                      description: "Date from classification"
+                    canonical:
+                      type: string
+                      description: "Canonical status from classification"
                   required: ["source_node", "topic_index", "topic_name"]
                   additionalProperties: false
             required: ["name", "description", "assignments"]
@@ -90,13 +176,16 @@ steps:
     temperature: 0.3
     on_error: "retry(3)"
 
-  # ── Step 3: Thread narrative synthesis ───────────────────────────────
-  # For each thread, synthesize assigned documents into a rich L1 node.
-  # No structured output — free-form JSON produces richer content.
+  # ── Step 4: Thread synthesis ────────────────────────────────────────
+  # Per-thread synthesis with temporal ordering and supersession awareness.
+  # Documents within each thread are ordered by date. Later documents
+  # are more authoritative. Superseded content becomes corrections.
   - name: thread_narrative
     primitive: synthesize
     instruction: "$prompts/document/doc_thread.md"
     for_each: $thread_clustering.threads
+    context:
+      classification: $doc_classify
     node_id_pattern: "L1-{index:03}"
     depth: 1
     save_as: node
@@ -105,7 +194,7 @@ steps:
     temperature: 0.3
     on_error: "retry(2)"
 
-  # ── Step 4: L1 cross-layer webbing ──────────────────────────────────
+  # ── Step 5: L1 cross-layer webbing ──────────────────────────────────
   - name: l1_webbing
     primitive: web
     instruction: "$prompts/document/doc_web.md"
@@ -121,10 +210,8 @@ steps:
             properties:
               source:
                 type: string
-                description: "Exact sibling node ID (e.g., L1-000)"
               target:
                 type: string
-                description: "Exact sibling node ID (e.g., L1-003)"
               relationship:
                 type: string
               shared_resources:
@@ -143,7 +230,7 @@ steps:
     temperature: 0.2
     on_error: "skip"
 
-  # ── Step 5: Upper layers (recursive clustering L1 → apex) ──────────
+  # ── Step 6: Upper layers (recursive clustering → apex) ──────────────
   - name: upper_layer_synthesis
     primitive: synthesize
     instruction: "$prompts/document/doc_distill.md"
@@ -160,7 +247,7 @@ steps:
             properties:
               name:
                 type: string
-                description: "2-6 word cluster label — must be unique"
+                description: "2-6 word cluster label — unique and concrete"
               description:
                 type: string
               node_ids:
@@ -178,7 +265,7 @@ steps:
     temperature: 0.3
     on_error: "retry(3)"
 
-  # ── Step 6: L2 cross-layer webbing ──────────────────────────────────
+  # ── Step 7: L2 cross-layer webbing ──────────────────────────────────
   - name: l2_webbing
     primitive: web
     instruction: "$prompts/document/doc_web.md"
