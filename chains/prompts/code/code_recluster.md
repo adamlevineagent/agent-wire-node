@@ -9,6 +9,7 @@ RULES:
 - CRITICAL: Cluster names must be COMPLETELY DIFFERENT from each other AND from the child node headlines AND from the project name. Test: if you cover the names and read the descriptions, could you tell them apart? If not, rename them.
   - BAD: "Pyramid Knowledge Platform" + "Knowledge Pyramid Orchestration" (too similar)
   - GOOD: "Tauri Desktop UI Stack" + "Rust Backend & Data Layer" + "LLM Pipeline & Chain Execution" + "CLI, MCP & External Integrations" (each clearly distinct)
+- Before finalizing, compare the cluster names side by side. If two names share the same head noun or both read like "project overview", rename them into distinct architectural responsibilities.
 - Use architectural LAYER or RESPONSIBILITY framing, not product name repetition
 - Balance: each cluster should have at least 2 nodes
 - If a node doesn't fit cleanly, assign it to the closest match — do not create a singleton cluster

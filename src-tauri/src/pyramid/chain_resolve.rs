@@ -14,6 +14,7 @@ use std::collections::HashMap;
 // ── ChainContext ─────────────────────────────────────────────────────────
 
 /// Runtime context for resolving `$variable.path` references during chain execution.
+#[derive(Clone)]
 pub struct ChainContext {
     /// Step outputs keyed by step name.
     pub step_outputs: HashMap<String, Value>,
@@ -100,9 +101,12 @@ impl ChainContext {
                 .ok_or_else(|| anyhow::anyhow!("Unresolved reference: $item (no active forEach)"));
         }
         if path == "index" {
-            return self.current_index.map(|i| Value::Number(i.into())).ok_or_else(|| {
-                anyhow::anyhow!("Unresolved reference: $index (no active forEach)")
-            });
+            return self
+                .current_index
+                .map(|i| Value::Number(i.into()))
+                .ok_or_else(|| {
+                    anyhow::anyhow!("Unresolved reference: $index (no active forEach)")
+                });
         }
 
         // ── recursive_pair vars ─────────────────────────────────────
@@ -187,16 +191,13 @@ impl ChainContext {
         for segment in &segments {
             match segment {
                 PathSegment::Field(name) => {
-                    current = current
-                        .get(name.as_str())
-                        .cloned()
-                        .ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "Field \"{}\" not found in step \"{}\" output",
-                                name,
-                                step_name
-                            )
-                        })?;
+                    current = current.get(name.as_str()).cloned().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Field \"{}\" not found in step \"{}\" output",
+                            name,
+                            step_name
+                        )
+                    })?;
                 }
                 PathSegment::Index(idx) => {
                     let arr = current.as_array().ok_or_else(|| {
@@ -257,7 +258,8 @@ impl ChainContext {
                 Ok(Value::Object(resolved))
             }
             Value::Array(arr) => {
-                let resolved: Result<Vec<Value>> = arr.iter().map(|v| self.resolve_value(v)).collect();
+                let resolved: Result<Vec<Value>> =
+                    arr.iter().map(|v| self.resolve_value(v)).collect();
                 Ok(Value::Array(resolved?))
             }
             // Numbers, bools, null — pass through
@@ -470,11 +472,15 @@ mod tests {
     use serde_json::json;
 
     fn test_context() -> ChainContext {
-        let mut ctx = ChainContext::new("my-slug", "conversation", vec![
-            json!({"text": "chunk0"}),
-            json!({"text": "chunk1"}),
-            json!({"text": "chunk2"}),
-        ]);
+        let mut ctx = ChainContext::new(
+            "my-slug",
+            "conversation",
+            vec![
+                json!({"text": "chunk0"}),
+                json!({"text": "chunk1"}),
+                json!({"text": "chunk2"}),
+            ],
+        );
 
         // Add a step output
         ctx.step_outputs.insert(
@@ -492,8 +498,10 @@ mod tests {
             }),
         );
 
-        ctx.accumulators
-            .insert("running_context".to_string(), "accumulated so far".to_string());
+        ctx.accumulators.insert(
+            "running_context".to_string(),
+            "accumulated so far".to_string(),
+        );
 
         ctx
     }
@@ -740,7 +748,11 @@ mod tests {
         let result = resolve_prompt_template("{{missing_var}}", &input);
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("Unresolved prompt variable"), "got: {}", err_msg);
+        assert!(
+            err_msg.contains("Unresolved prompt variable"),
+            "got: {}",
+            err_msg
+        );
     }
 
     #[test]

@@ -74,12 +74,30 @@ pub async fn run_build_from(
     let use_chain = state.use_chain_engine.load(Ordering::Relaxed);
 
     if use_chain {
-        run_chain_build(state, slug_name, &content_type, from_depth, cancel, progress_tx).await
+        run_chain_build(
+            state,
+            slug_name,
+            &content_type,
+            from_depth,
+            cancel,
+            progress_tx,
+        )
+        .await
     } else {
         if from_depth > 0 {
-            return Err(anyhow!("from_depth is only supported with the chain engine (set use_chain_engine: true)"));
+            return Err(anyhow!(
+                "from_depth is only supported with the chain engine (set use_chain_engine: true)"
+            ));
         }
-        run_legacy_build(state, slug_name, &content_type, cancel, progress_tx, write_tx).await
+        run_legacy_build(
+            state,
+            slug_name,
+            &content_type,
+            cancel,
+            progress_tx,
+            write_tx,
+        )
+        .await
     }
 }
 
@@ -140,7 +158,8 @@ async fn run_chain_build(
         "starting chain engine build"
     );
 
-    chain_executor::execute_chain_from(state, &chain, slug_name, from_depth, cancel, progress_tx).await
+    chain_executor::execute_chain_from(state, &chain, slug_name, from_depth, cancel, progress_tx)
+        .await
 }
 
 /// Legacy path: dispatch to the old build_conversation/build_code/build_docs.
@@ -162,9 +181,7 @@ async fn run_legacy_build(
         None => {
             let (tx, mut rx) = mpsc::channel::<BuildProgress>(16);
             // Spawn a drain so the channel doesn't block
-            tokio::spawn(async move {
-                while rx.recv().await.is_some() {}
-            });
+            tokio::spawn(async move { while rx.recv().await.is_some() {} });
             owned_tx = tx;
             &owned_tx
         }
@@ -205,9 +222,7 @@ async fn run_legacy_build(
             .await?
         }
         ContentType::Vine => {
-            return Err(anyhow!(
-                "Vine builds use the vine-specific build endpoint"
-            ));
+            return Err(anyhow!("Vine builds use the vine-specific build endpoint"));
         }
     };
 

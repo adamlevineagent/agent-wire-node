@@ -48,7 +48,15 @@ pub async fn call_model(
     temperature: f32,
     max_tokens: usize,
 ) -> Result<String> {
-    call_model_inner(config, system_prompt, user_prompt, temperature, max_tokens, None).await
+    call_model_inner(
+        config,
+        system_prompt,
+        user_prompt,
+        temperature,
+        max_tokens,
+        None,
+    )
+    .await
 }
 
 /// Call OpenRouter with structured output enforcement via JSON schema.
@@ -69,7 +77,15 @@ pub async fn call_model_structured(
             "schema": response_schema
         }
     });
-    call_model_inner(config, system_prompt, user_prompt, temperature, max_tokens, Some(&response_format)).await
+    call_model_inner(
+        config,
+        system_prompt,
+        user_prompt,
+        temperature,
+        max_tokens,
+        Some(&response_format),
+    )
+    .await
 }
 
 async fn call_model_inner(
@@ -111,7 +127,9 @@ async fn call_model_inner(
             "max_tokens": max_tokens
         });
         if let Some(rf) = response_format {
-            body.as_object_mut().unwrap().insert("response_format".to_string(), rf.clone());
+            body.as_object_mut()
+                .unwrap()
+                .insert("response_format".to_string(), rf.clone());
         }
 
         let resp = client
@@ -129,11 +147,19 @@ async fn call_model_inner(
             Ok(r) => r,
             Err(e) => {
                 if attempt < 4 {
-                    info!("  request error (timeout={}s), retry {}...", timeout_secs, attempt + 1);
+                    info!(
+                        "  request error (timeout={}s), retry {}...",
+                        timeout_secs,
+                        attempt + 1
+                    );
                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                     continue;
                 }
-                return Err(anyhow!("Request failed after 5 attempts (timeout={}s): {}", timeout_secs, e));
+                return Err(anyhow!(
+                    "Request failed after 5 attempts (timeout={}s): {}",
+                    timeout_secs,
+                    e
+                ));
             }
         };
 

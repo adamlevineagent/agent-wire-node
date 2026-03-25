@@ -911,6 +911,50 @@ pub fn get_nodes_at_depth(conn: &Connection, slug: &str, depth: i64) -> Result<V
     Ok(nodes)
 }
 
+pub fn get_node_id_by_depth_and_chunk_index(
+    conn: &Connection,
+    slug: &str,
+    depth: i64,
+    chunk_index: i64,
+) -> Result<Option<String>> {
+    let result = conn.query_row(
+        "SELECT id FROM pyramid_nodes
+         WHERE slug = ?1 AND depth = ?2 AND chunk_index = ?3
+         ORDER BY build_version DESC, id ASC
+         LIMIT 1",
+        rusqlite::params![slug, depth, chunk_index],
+        |row| row.get::<_, String>(0),
+    );
+
+    match result {
+        Ok(id) => Ok(Some(id)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+pub fn get_node_id_by_depth_and_headline(
+    conn: &Connection,
+    slug: &str,
+    depth: i64,
+    headline: &str,
+) -> Result<Option<String>> {
+    let result = conn.query_row(
+        "SELECT id FROM pyramid_nodes
+         WHERE slug = ?1 AND depth = ?2 AND headline = ?3
+         ORDER BY build_version DESC, id ASC
+         LIMIT 1",
+        rusqlite::params![slug, depth, headline],
+        |row| row.get::<_, String>(0),
+    );
+
+    match result {
+        Ok(id) => Ok(Some(id)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// Count nodes at a given depth for a slug.
 pub fn count_nodes_at_depth(conn: &Connection, slug: &str, depth: i64) -> Result<i64> {
     let count: i64 = conn.query_row(
@@ -1011,6 +1055,33 @@ pub fn get_step_output(
     let result = stmt.query_row(rusqlite::params![slug, step_type, chunk_index], |row| {
         row.get::<_, Option<String>>(0)
     });
+
+    match result {
+        Ok(json) => Ok(json),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Get the output_json for one exact step record.
+pub fn get_step_output_exact(
+    conn: &Connection,
+    slug: &str,
+    step_type: &str,
+    chunk_index: i64,
+    depth: i64,
+    node_id: &str,
+) -> Result<Option<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT output_json FROM pyramid_pipeline_steps
+         WHERE slug = ?1 AND step_type = ?2 AND chunk_index = ?3 AND depth = ?4 AND node_id = ?5
+         LIMIT 1",
+    )?;
+
+    let result = stmt.query_row(
+        rusqlite::params![slug, step_type, chunk_index, depth, node_id],
+        |row| row.get::<_, Option<String>>(0),
+    );
 
     match result {
         Ok(json) => Ok(json),
@@ -1300,6 +1371,22 @@ pub fn save_web_edge(conn: &Connection, edge: &WebEdge) -> Result<i64> {
         ],
     )?;
     Ok(conn.last_insert_rowid())
+}
+
+/// Delete all web edges whose endpoints both belong to a given depth.
+pub fn delete_web_edges_for_depth(conn: &Connection, slug: &str, depth: i64) -> Result<usize> {
+    let deleted = conn.execute(
+        "DELETE FROM pyramid_web_edges
+         WHERE slug = ?1
+           AND thread_a_id IN (
+                SELECT thread_id FROM pyramid_threads WHERE slug = ?1 AND depth = ?2
+           )
+           AND thread_b_id IN (
+                SELECT thread_id FROM pyramid_threads WHERE slug = ?1 AND depth = ?2
+           )",
+        rusqlite::params![slug, depth],
+    )?;
+    Ok(deleted)
 }
 
 /// Get a single web edge between two threads (normalized order: a < b).
@@ -2477,6 +2564,61 @@ mod tests {
     }
 
     #[test]
+    fn test_lookup_node_id_by_chunk_index_and_headline() {
+        let conn = test_conn();
+        create_slug(&conn, "s", &ContentType::Code, "").unwrap();
+
+        let first = PyramidNode {
+            id: "C-L0-000".to_string(),
+            slug: "s".to_string(),
+            depth: 0,
+            chunk_index: Some(0),
+            headline: "MCP Server Package Config".to_string(),
+            distilled: String::new(),
+            topics: vec![],
+            corrections: vec![],
+            decisions: vec![],
+            terms: vec![],
+            dead_ends: vec![],
+            self_prompt: String::new(),
+            children: vec![],
+            parent_id: None,
+            superseded_by: None,
+            created_at: String::new(),
+        };
+        let second = PyramidNode {
+            id: "C-L0-001".to_string(),
+            slug: "s".to_string(),
+            depth: 0,
+            chunk_index: Some(1),
+            headline: "mod.rs".to_string(),
+            distilled: String::new(),
+            topics: vec![],
+            corrections: vec![],
+            decisions: vec![],
+            terms: vec![],
+            dead_ends: vec![],
+            self_prompt: String::new(),
+            children: vec![],
+            parent_id: None,
+            superseded_by: None,
+            created_at: String::new(),
+        };
+
+        save_node(&conn, &first, None).unwrap();
+        save_node(&conn, &second, None).unwrap();
+
+        assert_eq!(
+            get_node_id_by_depth_and_chunk_index(&conn, "s", 0, 1).unwrap(),
+            Some("C-L0-001".to_string())
+        );
+        assert_eq!(
+            get_node_id_by_depth_and_headline(&conn, "s", 0, "MCP Server Package Config").unwrap(),
+            Some("C-L0-000".to_string())
+        );
+    }
+
+    #[test]
     fn test_delete_nodes_above() {
         let conn = test_conn();
         create_slug(&conn, "s", &ContentType::Code, "").unwrap();
@@ -2555,6 +2697,47 @@ mod tests {
         // Delete steps
         delete_steps(&conn, "s", "extract").unwrap();
         assert!(!step_exists(&conn, "s", "extract", 0, 0, "").unwrap());
+    }
+
+    #[test]
+    fn test_get_step_output_exact_disambiguates_by_depth_and_node() {
+        let conn = test_conn();
+        create_slug(&conn, "s", &ContentType::Code, "").unwrap();
+
+        save_step(
+            &conn,
+            "s",
+            "synth",
+            -1,
+            2,
+            "L2-000",
+            r#"{"node":"L2-000"}"#,
+            "gpt-4",
+            1.0,
+        )
+        .unwrap();
+        save_step(
+            &conn,
+            "s",
+            "synth",
+            -1,
+            3,
+            "L3-000",
+            r#"{"node":"L3-000"}"#,
+            "gpt-4",
+            1.0,
+        )
+        .unwrap();
+
+        let l2 = get_step_output_exact(&conn, "s", "synth", -1, 2, "L2-000")
+            .unwrap()
+            .unwrap();
+        let l3 = get_step_output_exact(&conn, "s", "synth", -1, 3, "L3-000")
+            .unwrap()
+            .unwrap();
+
+        assert!(l2.contains("L2-000"));
+        assert!(l3.contains("L3-000"));
     }
 
     #[test]
@@ -2646,5 +2829,84 @@ mod tests {
 
         // Should still be 1 node, not 2
         assert_eq!(count_nodes_at_depth(&conn, "s", 0).unwrap(), 1);
+    }
+
+    #[test]
+    fn test_delete_web_edges_for_depth_only_clears_target_layer() {
+        let conn = test_conn();
+        create_slug(&conn, "s", &ContentType::Code, "").unwrap();
+
+        for (id, depth) in [("L1-000", 1), ("L1-001", 1), ("L2-000", 2), ("L2-001", 2)] {
+            let node = PyramidNode {
+                id: id.to_string(),
+                slug: "s".to_string(),
+                depth,
+                chunk_index: None,
+                headline: id.to_string(),
+                distilled: String::new(),
+                topics: vec![],
+                corrections: vec![],
+                decisions: vec![],
+                terms: vec![],
+                dead_ends: vec![],
+                self_prompt: String::new(),
+                children: vec![],
+                parent_id: None,
+                superseded_by: None,
+                created_at: String::new(),
+            };
+            save_node(&conn, &node, None).unwrap();
+
+            let thread = PyramidThread {
+                slug: "s".into(),
+                thread_id: id.to_string(),
+                thread_name: id.to_string(),
+                current_canonical_id: id.to_string(),
+                depth,
+                delta_count: 0,
+                created_at: "now".into(),
+                updated_at: "now".into(),
+            };
+            save_thread(&conn, &thread).unwrap();
+        }
+
+        save_web_edge(
+            &conn,
+            &WebEdge {
+                id: 0,
+                slug: "s".into(),
+                thread_a_id: "L1-000".into(),
+                thread_b_id: "L1-001".into(),
+                relationship: "L1 edge".into(),
+                relevance: 0.8,
+                delta_count: 0,
+                created_at: String::new(),
+                updated_at: String::new(),
+            },
+        )
+        .unwrap();
+        save_web_edge(
+            &conn,
+            &WebEdge {
+                id: 0,
+                slug: "s".into(),
+                thread_a_id: "L2-000".into(),
+                thread_b_id: "L2-001".into(),
+                relationship: "L2 edge".into(),
+                relevance: 0.9,
+                delta_count: 0,
+                created_at: String::new(),
+                updated_at: String::new(),
+            },
+        )
+        .unwrap();
+
+        let deleted = delete_web_edges_for_depth(&conn, "s", 1).unwrap();
+        assert_eq!(deleted, 1);
+
+        let remaining = get_web_edges(&conn, "s").unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].thread_a_id, "L2-000");
+        assert_eq!(remaining[0].thread_b_id, "L2-001");
     }
 }

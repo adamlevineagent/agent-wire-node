@@ -4,7 +4,9 @@
 #   1. L0 code extraction (per-file LLM analysis)
 #   2. Thread clustering (LLM groups ALL L0 topics into 6-12 semantic threads)
 #   3. Thread narrative synthesis (per-thread LLM synthesis into L1 nodes)
-#   4. Upper layers (recursive adjacent pairing from L1 to apex)
+#   4. L1 cross-layer webbing
+#   5. Upper layers (recursive adjacent pairing from L1 to apex)
+#   6. L2 cross-layer webbing
 #
 # This produces meaningful semantic layers instead of blind 2:1 pairing.
 
@@ -31,6 +33,7 @@ steps:
     primitive: extract
     instruction: "$prompts/code/code_extract.md"
     for_each: $chunks
+    concurrency: 8
     node_id_pattern: "C-L0-{index:03}"
     depth: 0
     save_as: node
@@ -96,6 +99,7 @@ steps:
     primitive: synthesize
     instruction: "$prompts/code/code_thread.md"
     for_each: $thread_clustering.threads
+    concurrency: 5
     # No response_schema — structured outputs constrain mercury-2 and cause
     # token clipping on large threads (49K+ tokens). Free-form JSON + retry
     # is more reliable and produces richer content.
@@ -106,7 +110,49 @@ steps:
     temperature: 0.3
     on_error: "retry(2)"
 
-  # ── Step 4: Upper layers (recursive clustering L1 → apex) ────────────
+  # ── Step 4: L1 cross-layer webbing ────────────────────────────────────
+  # Identify cross-cutting relationships between sibling L1 nodes so the
+  # UI can show "see also" edges across the tree.
+  - name: l1_webbing
+    primitive: web
+    instruction: "$prompts/code/code_web.md"
+    input:
+      nodes: $thread_narrative
+    response_schema:
+      type: object
+      properties:
+        edges:
+          type: array
+          items:
+            type: object
+            properties:
+              source:
+                type: string
+                description: "Exact sibling node ID from the input nodes array (for example L1-000). Never use the headline here."
+              target:
+                type: string
+                description: "Exact sibling node ID from the input nodes array (for example L1-003). Never use the headline here."
+              relationship:
+                type: string
+                description: "One concise sentence explaining the concrete connection"
+              shared_resources:
+                type: array
+                items:
+                  type: string
+              strength:
+                type: number
+                description: "0.0-1.0 relevance score for the connection"
+            required: ["source", "target", "relationship", "shared_resources", "strength"]
+            additionalProperties: false
+      required: ["edges"]
+      additionalProperties: false
+    depth: 1
+    save_as: web_edges
+    model_tier: mid
+    temperature: 0.2
+    on_error: "skip"
+
+  # ── Step 5: Upper layers (recursive clustering L1 → apex) ────────────
   # Semantic re-clustering at each layer instead of blind 2:1 pairing.
   # Each layer: LLM groups nodes into 3-5 clusters → synthesize each cluster.
   # Produces 2-3 upper layers instead of 4-5, with better semantic structure.
@@ -145,5 +191,43 @@ steps:
     model_tier: mid
     temperature: 0.3
     on_error: "retry(3)"
+
+  # ── Step 6: L2 cross-layer webbing ────────────────────────────────────
+  # Runs after upper-layer synthesis completes and refreshes the peer edges
+  # between architectural-domain nodes at depth 2.
+  - name: l2_webbing
+    primitive: web
+    instruction: "$prompts/code/code_web.md"
+    response_schema:
+      type: object
+      properties:
+        edges:
+          type: array
+          items:
+            type: object
+            properties:
+              source:
+                type: string
+                description: "Exact sibling node ID from depth 2 (for example L2-000). Never use the headline here."
+              target:
+                type: string
+                description: "Exact sibling node ID from depth 2 (for example L2-001). Never use the headline here."
+              relationship:
+                type: string
+              shared_resources:
+                type: array
+                items:
+                  type: string
+              strength:
+                type: number
+            required: ["source", "target", "relationship", "shared_resources", "strength"]
+            additionalProperties: false
+      required: ["edges"]
+      additionalProperties: false
+    depth: 2
+    save_as: web_edges
+    model_tier: mid
+    temperature: 0.2
+    on_error: "skip"
 
 post_build: []

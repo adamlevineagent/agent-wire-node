@@ -7,7 +7,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-use super::chain_engine::{ChainDefinition, ChainMetadata, validate_chain};
+use super::chain_engine::{validate_chain, ChainDefinition, ChainMetadata};
 
 /// Load a chain definition from a YAML file.
 ///
@@ -108,7 +108,11 @@ pub fn discover_chains(chains_dir: &Path) -> Result<Vec<ChainMetadata>> {
             let entry = entry?;
             let path = entry.path();
 
-            if path.extension().map(|e| e == "yaml" || e == "yml").unwrap_or(false) {
+            if path
+                .extension()
+                .map(|e| e == "yaml" || e == "yml")
+                .unwrap_or(false)
+            {
                 match load_chain_metadata(&path, *is_default) {
                     Ok(meta) => results.push(meta),
                     Err(e) => {

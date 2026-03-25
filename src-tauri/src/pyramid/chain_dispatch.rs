@@ -21,6 +21,7 @@ use super::types::{Correction, Decision, PyramidNode, Term, Topic};
 // ── Step context ────────────────────────────────────────────────────────────
 
 /// Context available to all chain steps during execution.
+#[derive(Clone)]
 pub struct StepContext {
     pub db_reader: Arc<Mutex<Connection>>,
     pub db_writer: Arc<Mutex<Connection>>,
@@ -49,10 +50,7 @@ pub async fn dispatch_step(
             .rust_function
             .as_deref()
             .ok_or_else(|| anyhow!("Mechanical step '{}' missing rust_function", step.name))?;
-        info!(
-            "[CHAIN] step '{}' → mechanical fn '{}'",
-            step.name, fn_name
-        );
+        info!("[CHAIN] step '{}' → mechanical fn '{}'", step.name, fn_name);
         dispatch_mechanical(fn_name, resolved_input, ctx)
     } else {
         dispatch_llm(step, resolved_input, system_prompt, defaults, ctx).await
@@ -128,8 +126,8 @@ async fn dispatch_llm(
     }
 
     // Build user prompt from resolved input
-    let user_prompt = serde_json::to_string_pretty(resolved_input)
-        .unwrap_or_else(|_| resolved_input.to_string());
+    let user_prompt =
+        serde_json::to_string_pretty(resolved_input).unwrap_or_else(|_| resolved_input.to_string());
 
     info!(
         "[CHAIN] step '{}' → LLM (temp={}, model={}, prompt_len={})",
@@ -142,18 +140,38 @@ async fn dispatch_llm(
     // If step has a response_schema, use structured outputs for guaranteed JSON
     if let Some(ref schema) = step.response_schema {
         let schema_name = step.name.replace('-', "_");
-        info!("[CHAIN] step '{}' → using structured output (schema: {})", step.name, schema_name);
+        info!(
+            "[CHAIN] step '{}' → using structured output (schema: {})",
+            step.name, schema_name
+        );
         let response = llm::call_model_structured(
-            config_ref, system_prompt, &user_prompt, temperature, max_tokens,
-            schema, &schema_name,
-        ).await?;
+            config_ref,
+            system_prompt,
+            &user_prompt,
+            temperature,
+            max_tokens,
+            schema,
+            &schema_name,
+        )
+        .await?;
         return llm::extract_json(&response).map_err(|e| {
-            anyhow!("Step '{}': structured output JSON parse failed: {}", step.name, e)
+            anyhow!(
+                "Step '{}': structured output JSON parse failed: {}",
+                step.name,
+                e
+            )
         });
     }
 
     // Standard path: call model, parse JSON, retry at temp 0.1 on failure
-    let response = llm::call_model(config_ref, system_prompt, &user_prompt, temperature, max_tokens).await?;
+    let response = llm::call_model(
+        config_ref,
+        system_prompt,
+        &user_prompt,
+        temperature,
+        max_tokens,
+    )
+    .await?;
 
     match llm::extract_json(&response) {
         Ok(json) => {
@@ -201,11 +219,7 @@ const MECHANICAL_FUNCTIONS: &[&str] = &[
 /// the generic `(input: &Value, ctx: &StepContext) -> Result<Value>` contract.
 /// The dispatch framework is established here; actual wiring happens in Phase 5
 /// when the chain executor replaces the hardcoded build pipeline.
-fn dispatch_mechanical(
-    function_name: &str,
-    input: &Value,
-    ctx: &StepContext,
-) -> Result<Value> {
+fn dispatch_mechanical(function_name: &str, input: &Value, ctx: &StepContext) -> Result<Value> {
     match function_name {
         "extract_import_graph" => {
             info!("[mechanical] extract_import_graph (placeholder)");
@@ -540,12 +554,8 @@ mod tests {
     #[test]
     fn test_dispatch_mechanical_unknown_fn() {
         let ctx = StepContext {
-            db_reader: Arc::new(Mutex::new(
-                Connection::open_in_memory().unwrap(),
-            )),
-            db_writer: Arc::new(Mutex::new(
-                Connection::open_in_memory().unwrap(),
-            )),
+            db_reader: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
+            db_writer: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
             slug: "test".into(),
             config: LlmConfig::default(),
         };
@@ -560,12 +570,8 @@ mod tests {
     #[test]
     fn test_dispatch_mechanical_known_fn() {
         let ctx = StepContext {
-            db_reader: Arc::new(Mutex::new(
-                Connection::open_in_memory().unwrap(),
-            )),
-            db_writer: Arc::new(Mutex::new(
-                Connection::open_in_memory().unwrap(),
-            )),
+            db_reader: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
+            db_writer: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
             slug: "test-slug".into(),
             config: LlmConfig::default(),
         };
@@ -627,12 +633,15 @@ mod tests {
             sequential: false,
             accumulate: None,
             for_each: None,
+            concurrency: 1,
             pair_adjacent: false,
             recursive_pair: false,
             recursive_cluster: false,
             cluster_instruction: None,
             cluster_model: None,
+            cluster_response_schema: None,
             target_clusters: None,
+            response_schema: None,
             batch_threshold: None,
             merge_instruction: None,
             when: None,
@@ -667,12 +676,15 @@ mod tests {
             sequential: false,
             accumulate: None,
             for_each: None,
+            concurrency: 1,
             pair_adjacent: false,
             recursive_pair: false,
             recursive_cluster: false,
             cluster_instruction: None,
             cluster_model: None,
+            cluster_response_schema: None,
             target_clusters: None,
+            response_schema: None,
             batch_threshold: None,
             merge_instruction: None,
             when: None,

@@ -11,6 +11,8 @@ HEADLINE RULES:
 - The headline must be DIFFERENT from any child headline. Never repeat "Pyramid Engine" if a child already uses it.
 - Make it specific to THIS level of abstraction. If children are "Tauri Frontend Core" and "Dashboard UI", the parent might be "Desktop Application Stack".
 - APEX headline MUST name the project and its purpose: "Wire Node: Knowledge Pyramid Desktop Platform" not "System Overview".
+- If the input includes `cluster_name`, treat that as the intended architectural lane for this parent and make the headline fit that lane.
+- If the input includes `sibling_clusters`, your headline MUST be clearly distinct from every sibling cluster name. Avoid repeating the project name or the phrase "Knowledge Pyramid" unless this is the apex.
 
 ORIENTATION — write like a senior architect's briefing document, not a summary:
 - APEX: First sentence answers "What is this project and what problem does it solve?" Then: architecture, data flows between subsystems, auth model, key tables, key endpoints, build/deploy process, and what to explore first. Be exhaustive.

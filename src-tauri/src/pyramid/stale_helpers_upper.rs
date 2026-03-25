@@ -88,7 +88,7 @@ fn excerpt(text: &str, max_chars: usize) -> String {
 
 fn can_self_heal_thread(node_id: &str, depth: i32) -> bool {
     if depth == 1 {
-        node_id.starts_with("C-L1-")
+        node_id.starts_with("C-L1-") || node_id.starts_with("L1-")
     } else if depth >= 2 {
         node_id.starts_with(&format!("L{depth}-"))
     } else {

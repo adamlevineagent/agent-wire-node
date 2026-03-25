@@ -42,6 +42,7 @@ pub const VALID_PRIMITIVES: &[&str] = &[
     "relate",
     "cross_reference",
     "map",
+    "web",
     // Meta
     "price",
     "metabolize",
@@ -62,6 +63,10 @@ fn default_temperature() -> f32 {
 
 fn default_on_error() -> String {
     "retry(2)".into()
+}
+
+fn default_concurrency() -> usize {
+    1
 }
 
 // ── Chain definition structs ─────────────────────────────────────────────
@@ -119,6 +124,8 @@ pub struct ChainStep {
     pub accumulate: Option<serde_json::Value>,
     #[serde(default)]
     pub for_each: Option<String>,
+    #[serde(default = "default_concurrency")]
+    pub concurrency: usize,
     #[serde(default)]
     pub pair_adjacent: bool,
     #[serde(default)]
@@ -256,10 +263,7 @@ pub fn validate_chain(def: &ChainDefinition) -> ValidationResult {
 
         // LLM steps (non-mechanical) must have instruction
         if !step.mechanical && step.instruction.is_none() {
-            errors.push(format!(
-                "{}: LLM step must specify instruction",
-                prefix
-            ));
+            errors.push(format!("{}: LLM step must specify instruction", prefix));
         }
 
         // on_error validation
@@ -268,10 +272,14 @@ pub fn validate_chain(def: &ChainDefinition) -> ValidationResult {
         }
 
         // recursive_pair, pair_adjacent, and recursive_cluster are mutually exclusive
-        let mode_count = [step.recursive_pair, step.pair_adjacent, step.recursive_cluster]
-            .iter()
-            .filter(|&&b| b)
-            .count();
+        let mode_count = [
+            step.recursive_pair,
+            step.pair_adjacent,
+            step.recursive_cluster,
+        ]
+        .iter()
+        .filter(|&&b| b)
+        .count();
         if mode_count > 1 {
             errors.push(format!(
                 "{}: recursive_pair, pair_adjacent, and recursive_cluster are mutually exclusive",
@@ -289,8 +297,17 @@ pub fn validate_chain(def: &ChainDefinition) -> ValidationResult {
 
         // sequential only valid with for_each
         if step.sequential && step.for_each.is_none() {
+            errors.push(format!("{}: sequential requires for_each", prefix));
+        }
+        if step.concurrency == 0 {
+            errors.push(format!("{}: concurrency must be >= 1", prefix));
+        }
+        if step.concurrency > 1 && step.for_each.is_none() {
+            errors.push(format!("{}: concurrency > 1 requires for_each", prefix));
+        }
+        if step.sequential && step.concurrency > 1 {
             errors.push(format!(
-                "{}: sequential requires for_each",
+                "{}: sequential steps cannot use concurrency > 1",
                 prefix
             ));
         }
@@ -321,20 +338,17 @@ fn validate_on_error(value: &str, field: &str, errors: &mut Vec<String>) {
         "abort" | "skip" | "carry_left" | "carry_up" => {}
         other => {
             // Check for retry(N)
-            if let Some(inner) = other.strip_prefix("retry(").and_then(|s| s.strip_suffix(')')) {
+            if let Some(inner) = other
+                .strip_prefix("retry(")
+                .and_then(|s| s.strip_suffix(')'))
+            {
                 match inner.parse::<u32>() {
                     Ok(n) if (1..=10).contains(&n) => {}
                     Ok(n) => {
-                        errors.push(format!(
-                            "{}: retry count must be 1-10, got {}",
-                            field, n
-                        ));
+                        errors.push(format!("{}: retry count must be 1-10, got {}", field, n));
                     }
                     Err(_) => {
-                        errors.push(format!(
-                            "{}: invalid retry expression \"{}\"",
-                            field, other
-                        ));
+                        errors.push(format!("{}: invalid retry expression \"{}\"", field, other));
                     }
                 }
             } else {
@@ -381,6 +395,7 @@ mod tests {
                 sequential: false,
                 accumulate: None,
                 for_each: None,
+                concurrency: 1,
                 pair_adjacent: false,
                 recursive_pair: false,
                 recursive_cluster: false,
@@ -432,7 +447,10 @@ mod tests {
         chain.steps.push(step);
         let result = validate_chain(&chain);
         assert!(!result.valid);
-        assert!(result.errors.iter().any(|e| e.contains("duplicate step name")));
+        assert!(result
+            .errors
+            .iter()
+            .any(|e| e.contains("duplicate step name")));
     }
 
     #[test]
@@ -477,7 +495,10 @@ mod tests {
         chain.steps[0].pair_adjacent = true;
         let result = validate_chain(&chain);
         assert!(!result.valid);
-        assert!(result.errors.iter().any(|e| e.contains("mutually exclusive")));
+        assert!(result
+            .errors
+            .iter()
+            .any(|e| e.contains("mutually exclusive")));
     }
 
     #[test]
@@ -486,6 +507,35 @@ mod tests {
         chain.steps[0].sequential = true;
         let result = validate_chain(&chain);
         assert!(!result.valid);
-        assert!(result.errors.iter().any(|e| e.contains("sequential requires for_each")));
+        assert!(result
+            .errors
+            .iter()
+            .any(|e| e.contains("sequential requires for_each")));
+    }
+
+    #[test]
+    fn concurrency_without_for_each_fails() {
+        let mut chain = minimal_chain();
+        chain.steps[0].concurrency = 4;
+        let result = validate_chain(&chain);
+        assert!(!result.valid);
+        assert!(result
+            .errors
+            .iter()
+            .any(|e| e.contains("concurrency > 1 requires for_each")));
+    }
+
+    #[test]
+    fn sequential_with_concurrency_fails() {
+        let mut chain = minimal_chain();
+        chain.steps[0].for_each = Some("$chunks".into());
+        chain.steps[0].sequential = true;
+        chain.steps[0].concurrency = 2;
+        let result = validate_chain(&chain);
+        assert!(!result.valid);
+        assert!(result
+            .errors
+            .iter()
+            .any(|e| e.contains("sequential steps cannot use concurrency > 1")));
     }
 }

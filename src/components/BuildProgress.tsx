@@ -99,14 +99,14 @@ export function BuildProgress({ slug, onComplete, onClose }: BuildProgressProps)
                     />
                 </div>
                 <div className="build-progress-stats">
-                    <span>{pct}% ({status?.progress.done || 0}/{status?.progress.total || 0} nodes)</span>
+                    <span>{pct}% ({status?.progress.done || 0}/{status?.progress.total || 0} estimated nodes)</span>
                     <span>Elapsed: {elapsed}</span>
                 </div>
             </div>
 
             {isComplete && status && (
                 <div className="build-complete-summary">
-                    Pyramid built! {status.progress.done} nodes processed.{status.failures > 0 ? ` (${status.failures} failures)` : ''}
+                    Pyramid built! {status.progress.done} nodes built.{status.failures > 0 ? ` (${status.failures} failures)` : ''}
                     <div className="build-complete-actions">
                         <button
                             className="btn btn-primary"

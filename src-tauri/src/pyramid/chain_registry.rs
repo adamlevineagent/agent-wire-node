@@ -36,9 +36,8 @@ pub fn assign_chain(
 
 /// Get the chain assignment for a slug. Returns (chain_id, chain_file) or None.
 pub fn get_assignment(conn: &Connection, slug: &str) -> Result<Option<(String, Option<String>)>> {
-    let mut stmt = conn.prepare(
-        "SELECT chain_id, chain_file FROM pyramid_chain_assignments WHERE slug = ?1",
-    )?;
+    let mut stmt =
+        conn.prepare("SELECT chain_id, chain_file FROM pyramid_chain_assignments WHERE slug = ?1")?;
     let result = stmt.query_row(rusqlite::params![slug], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
     });

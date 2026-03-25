@@ -3250,15 +3250,17 @@ async fn pyramid_vine_build(
 
     // Validate slug
     let vine_slug_clean = wire_node_lib::pyramid::slug::slugify(&vine_slug);
-    wire_node_lib::pyramid::slug::validate_slug(&vine_slug_clean)
-        .map_err(|e| e.to_string())?;
+    wire_node_lib::pyramid::slug::validate_slug(&vine_slug_clean).map_err(|e| e.to_string())?;
 
     // Check for concurrent vine build on same slug
     {
         let builds = state.pyramid.vine_builds.lock().await;
         if let Some(handle) = builds.get(&vine_slug_clean) {
             if handle.status == "running" {
-                return Err(format!("Vine build already running for '{}'", vine_slug_clean));
+                return Err(format!(
+                    "Vine build already running for '{}'",
+                    vine_slug_clean
+                ));
             }
         }
     }
@@ -3267,11 +3269,14 @@ async fn pyramid_vine_build(
     let cancel = tokio_util::sync::CancellationToken::new();
     {
         let mut builds = state.pyramid.vine_builds.lock().await;
-        builds.insert(vine_slug_clean.clone(), wire_node_lib::pyramid::VineBuildHandle {
-            cancel: cancel.clone(),
-            status: "running".to_string(),
-            error: None,
-        });
+        builds.insert(
+            vine_slug_clean.clone(),
+            wire_node_lib::pyramid::VineBuildHandle {
+                cancel: cancel.clone(),
+                status: "running".to_string(),
+                error: None,
+            },
+        );
     }
 
     let pyramid_state = Arc::new(wire_node_lib::pyramid::PyramidState {
@@ -3284,7 +3289,10 @@ async fn pyramid_vine_build(
         file_watchers: state.pyramid.file_watchers.clone(),
         vine_builds: state.pyramid.vine_builds.clone(),
         use_chain_engine: std::sync::atomic::AtomicBool::new(
-            state.pyramid.use_chain_engine.load(std::sync::atomic::Ordering::Relaxed),
+            state
+                .pyramid
+                .use_chain_engine
+                .load(std::sync::atomic::Ordering::Relaxed),
         ),
     });
 
@@ -3347,7 +3355,8 @@ async fn pyramid_vine_eras(
     slug: String,
 ) -> Result<serde_json::Value, String> {
     let conn = state.pyramid.reader.lock().await;
-    let eras = pyramid_db::get_annotations_by_type(&conn, &slug, "era").map_err(|e| e.to_string())?;
+    let eras =
+        pyramid_db::get_annotations_by_type(&conn, &slug, "era").map_err(|e| e.to_string())?;
     Ok(serde_json::to_value(&eras).map_err(|e| e.to_string())?)
 }
 
@@ -3357,7 +3366,8 @@ async fn pyramid_vine_decisions(
     slug: String,
 ) -> Result<serde_json::Value, String> {
     let conn = state.pyramid.reader.lock().await;
-    let faqs = pyramid_db::get_faq_nodes_by_prefix(&conn, &slug, "FAQ-vine-decision-").map_err(|e| e.to_string())?;
+    let faqs = pyramid_db::get_faq_nodes_by_prefix(&conn, &slug, "FAQ-vine-decision-")
+        .map_err(|e| e.to_string())?;
     Ok(serde_json::to_value(&faqs).map_err(|e| e.to_string())?)
 }
 
@@ -3367,7 +3377,8 @@ async fn pyramid_vine_entities(
     slug: String,
 ) -> Result<serde_json::Value, String> {
     let conn = state.pyramid.reader.lock().await;
-    let faqs = pyramid_db::get_faq_nodes_by_prefix(&conn, &slug, "FAQ-vine-entity-").map_err(|e| e.to_string())?;
+    let faqs = pyramid_db::get_faq_nodes_by_prefix(&conn, &slug, "FAQ-vine-entity-")
+        .map_err(|e| e.to_string())?;
     Ok(serde_json::to_value(&faqs).map_err(|e| e.to_string())?)
 }
 
@@ -3415,7 +3426,8 @@ async fn pyramid_vine_drill(
     slug: String,
 ) -> Result<serde_json::Value, String> {
     let conn = state.pyramid.reader.lock().await;
-    let annotations = pyramid_db::get_annotations_by_type(&conn, &slug, "directory").map_err(|e| e.to_string())?;
+    let annotations = pyramid_db::get_annotations_by_type(&conn, &slug, "directory")
+        .map_err(|e| e.to_string())?;
     Ok(serde_json::to_value(&annotations).map_err(|e| e.to_string())?)
 }
 
@@ -3446,11 +3458,16 @@ async fn pyramid_vine_integrity(
         file_watchers: state.pyramid.file_watchers.clone(),
         vine_builds: state.pyramid.vine_builds.clone(),
         use_chain_engine: std::sync::atomic::AtomicBool::new(
-            state.pyramid.use_chain_engine.load(std::sync::atomic::Ordering::Relaxed),
+            state
+                .pyramid
+                .use_chain_engine
+                .load(std::sync::atomic::Ordering::Relaxed),
         ),
     });
 
-    let summary = vine::run_integrity_check(&pyramid_state, &slug).await.map_err(|e| e.to_string())?;
+    let summary = vine::run_integrity_check(&pyramid_state, &slug)
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(serde_json::json!({
         "vine_slug": slug,
         "summary": summary,
@@ -3474,12 +3491,17 @@ async fn pyramid_vine_rebuild_upper(
         file_watchers: state.pyramid.file_watchers.clone(),
         vine_builds: state.pyramid.vine_builds.clone(),
         use_chain_engine: std::sync::atomic::AtomicBool::new(
-            state.pyramid.use_chain_engine.load(std::sync::atomic::Ordering::Relaxed),
+            state
+                .pyramid
+                .use_chain_engine
+                .load(std::sync::atomic::Ordering::Relaxed),
         ),
     });
 
     let cancel = tokio_util::sync::CancellationToken::new();
-    vine::force_rebuild_vine_upper(&pyramid_state, &slug, &cancel).await.map_err(|e| e.to_string())
+    vine::force_rebuild_vine_upper(&pyramid_state, &slug, &cancel)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 // --- DADBEAR IPC Commands ---------------------------------------------------
