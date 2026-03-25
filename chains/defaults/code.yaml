@@ -36,7 +36,7 @@ steps:
     save_as: node
     model_tier: mid
     temperature: 0.3
-    on_error: skip
+    on_error: "retry(3)"
 
   # ── Step 2: Thread clustering ─────────────────────────────────────────
   # Takes ALL L0 extraction topics and groups them into 6-12 semantic
@@ -49,6 +49,42 @@ steps:
     instruction: "$prompts/code/code_cluster.md"
     input:
       topics: $l0_code_extract
+    response_schema:
+      type: object
+      properties:
+        threads:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            properties:
+              name:
+                type: string
+                description: "2-6 word thread label"
+              description:
+                type: string
+                description: "1-2 sentence description of the subsystem"
+              assignments:
+                type: array
+                minItems: 1
+                items:
+                  type: object
+                  properties:
+                    source_node:
+                      type: string
+                      description: "Assigned L0 node ID copied EXACTLY from the input topic's node_id/source_node field (for example C-L0-005). Never put the headline text here."
+                    topic_index:
+                      type: integer
+                      description: "Index of the topic within the topic inventory"
+                    topic_name:
+                      type: string
+                      description: "Original headline or topic label"
+                  required: ["source_node", "topic_index", "topic_name"]
+                  additionalProperties: false
+            required: ["name", "description", "assignments"]
+            additionalProperties: false
+      required: ["threads"]
+      additionalProperties: false
     model: "qwen/qwen3.5-flash-02-23"
     temperature: 0.3
     on_error: "retry(3)"
@@ -60,6 +96,9 @@ steps:
     primitive: synthesize
     instruction: "$prompts/code/code_thread.md"
     for_each: $thread_clustering.threads
+    # No response_schema — structured outputs constrain mercury-2 and cause
+    # token clipping on large threads (49K+ tokens). Free-form JSON + retry
+    # is more reliable and produces richer content.
     node_id_pattern: "L1-{index:03}"
     depth: 1
     save_as: node
