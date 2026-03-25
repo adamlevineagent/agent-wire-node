@@ -1,165 +1,255 @@
-# Conversation pipeline chain definition
-# Exact sequencing from build_conversation() in build.rs
+# Conversation Pipeline Chain Definition — Maximal Design
 #
-# Pipeline: forward → reverse → combine → L1 pairing → thread clustering →
-#           thread narratives → upper layers (recursive pair to apex)
+# The forward/reverse/combine pattern is preserved — it's the best
+# compression strategy for sequential content.
+#
+# The KEY CHANGE: after L0 combine, we go directly to semantic thread
+# clustering instead of blind positional pairing. This groups topics
+# across chunks by subject, producing L1 nodes that are coherent
+# knowledge areas instead of arbitrary chunk pairs.
+#
+# Pipeline:
+#   1. Forward pass (sequential, context-accumulating)
+#   2. Reverse pass (sequential, backward annotation)
+#   3. Combine → L0 nodes (fuse forward + reverse)
+#   4. Thread clustering (LLM groups L0 topics by subject)
+#   5. Thread synthesis → L1 nodes (per-thread, temporally-ordered)
+#   6. L1 cross-layer webbing
+#   7. Upper layers (recursive clustering → apex)
+#   8. L2 cross-layer webbing
 
 schema_version: 1
-id: "conversation-default"
-name: "Conversation (Default)"
-description: "Standard conversation pyramid build pipeline — forward/reverse distillation, L0 combine, L1 positional pairing, L2 thread clustering + narratives, L3+ recursive pairing to apex."
-content_type: "conversation"
-version: "1.0.0"
-author: "wire-default"
+id: conversation-default
+name: Conversation Pyramid
+description: >
+  Conversation analysis with forward/reverse compression, semantic thread
+  clustering (replacing blind L1 pairing), temporally-ordered synthesis,
+  cross-layer webbing, and recursive clustering to apex.
+content_type: conversation
+version: "2.0.0"
+author: agent-wire
 
 defaults:
-  model_tier: "mid"
+  model_tier: mid
   temperature: 0.3
   on_error: "retry(2)"
 
 steps:
-  # ── Phase 1: Forward pass ──────────────────────────────────────────────
-  # forEach chunks (0..N), sequential with running_context accumulation.
-  # Saves step output only (no node). Step type: "forward".
-  # Input: running_context from prior chunks + raw chunk content.
-  # running_context init: "Beginning of conversation."
-  # running_context from field: "running_context"
-  # running_context accumulation: append with space, trim to 1200 chars from START when >1500.
-  - name: "forward_pass"
-    primitive: "compress"
+  # ── Step 1: Forward pass ────────────────────────────────────────────
+  # Sequential chronological compression with running context.
+  - name: forward_pass
+    primitive: compress
     instruction: "$prompts/conversation/forward.md"
-    for_each: "chunks"
+    for_each: $chunks
     sequential: true
     accumulate:
-      field: "running_context"
+      field: running_context
       init: "Beginning of conversation."
       max_chars: 1500
       trim_to: 1200
-      trim_side: "start"
+      trim_side: start
     input:
       user_template: "## RUNNING CONTEXT FROM PRIOR CHUNKS\n{running_context}\n\n## CHUNK {chunk_index}\n{chunk_content}"
-    save_as: "step_only"
+    save_as: step_only
     depth: -1
 
-  # ── Phase 2: Reverse pass ──────────────────────────────────────────────
-  # forEach chunks_reversed (N-1..0), sequential with running_context accumulation.
-  # Saves step output only (no node). Step type: "reverse".
-  # Input: running_context from future chunks + raw chunk content.
-  # running_context init: "End of conversation."
-  # running_context from field: "running_context"
-  # running_context accumulation: prepend with space, trim to 1200 chars from END when >1500.
-  - name: "reverse_pass"
-    primitive: "compress"
+  # ── Step 2: Reverse pass ────────────────────────────────────────────
+  # Sequential backward annotation — marks what mattered vs noise.
+  - name: reverse_pass
+    primitive: compress
     instruction: "$prompts/conversation/reverse.md"
-    for_each: "chunks_reversed"
+    for_each: $chunks_reversed
     sequential: true
     accumulate:
-      field: "running_context"
+      field: running_context
       init: "End of conversation."
       max_chars: 1500
       trim_to: 1200
-      trim_side: "end"
+      trim_side: end
     input:
       user_template: "## RUNNING CONTEXT FROM FUTURE CHUNKS\n{running_context}\n\n## CHUNK {chunk_index}\n{chunk_content}"
-    save_as: "step_only"
+    save_as: step_only
     depth: -1
 
-  # ── Phase 3: Combine forward + reverse → L0 nodes ─────────────────────
-  # forEach chunks (0..N), zips forward[i] + reverse[i] step outputs.
-  # Saves both step ("combine") and node. Node ID: "L0-{index:03}".
-  # Input: pretty-printed forward JSON as "STONE", reverse JSON as "WATER".
-  # Node depth: 0. chunk_index set. No children.
-  - name: "combine_l0"
-    primitive: "fuse"
+  # ── Step 3: Combine forward + reverse → L0 nodes ───────────────────
+  # Fuses forward (what was understood) + reverse (what mattered).
+  # Keeps what survived, drops dead ends, preserves corrections.
+  - name: combine_l0
+    primitive: fuse
     instruction: "$prompts/conversation/combine.md"
-    for_each: "chunks"
+    for_each: $chunks
     input:
       user_template: "## FORWARD (STONE)\n{forward_output_pretty}\n\n## REVERSE (WATER)\n{reverse_output_pretty}\n\nCombine into L0."
       zip_steps:
-        - "forward_pass"
-        - "reverse_pass"
-    save_as: "node"
+        - forward_pass
+        - reverse_pass
+    save_as: node
     node_id_pattern: "L0-{index:03}"
     depth: 0
 
-  # ── Phase 4: L1 positional pairing ────────────────────────────────────
-  # pair_adjacent L0 nodes into L1 nodes using DISTILL_PROMPT.
-  # Step type: "synth". Node ID: "L1-{index:03}".
-  # Input: left child as "SIBLING A (earlier)", right child as "SIBLING B (later)".
-  # Each child rendered via child_payload_json (headline + distilled + topics).
-  # On LLM failure: carry left node up (carry_left).
-  # Odd trailing node: carry up unchanged.
-  # Saves node with topics_json. Updates parent_id on children.
-  - name: "l1_pairing"
-    primitive: "synthesize"
-    instruction: "$prompts/conversation/distill.md"
-    pair_adjacent: true
+  # ── Step 4: Thread clustering ───────────────────────────────────────
+  # Groups ALL L0 topics by SUBJECT across chunks. A topic discussed in
+  # chunks 3, 7, and 12 becomes ONE thread. Replaces blind L1 pairing.
+  - name: thread_clustering
+    primitive: classify
+    instruction: "$prompts/conversation/conv_cluster.md"
     input:
-      source_depth: 0
-      user_template: "## SIBLING A (earlier)\n{left_payload_pretty}\n\n## SIBLING B (later)\n{right_payload_pretty}"
-    save_as: "node"
+      topics: $combine_l0
+    response_schema:
+      type: object
+      properties:
+        threads:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            properties:
+              name:
+                type: string
+                description: "2-6 word thread label"
+              description:
+                type: string
+              assignments:
+                type: array
+                minItems: 1
+                items:
+                  type: object
+                  properties:
+                    source_node:
+                      type: string
+                      description: "Exact L0-XXX node ID"
+                    topic_index:
+                      type: integer
+                    topic_name:
+                      type: string
+                  required: ["source_node", "topic_index", "topic_name"]
+                  additionalProperties: false
+            required: ["name", "description", "assignments"]
+            additionalProperties: false
+      required: ["threads"]
+      additionalProperties: false
+    model: "qwen/qwen3.5-flash-02-23"
+    temperature: 0.3
+    on_error: "retry(3)"
+
+  # ── Step 5: Thread synthesis → L1 nodes ─────────────────────────────
+  # Per-thread synthesis with strong temporal authority. Topics within
+  # each thread sorted by chunk order. Later topics override earlier.
+  # Corrections are first-class content.
+  - name: thread_narrative
+    primitive: synthesize
+    instruction: "$prompts/conversation/conv_thread.md"
+    for_each: $thread_clustering.threads
     node_id_pattern: "L1-{index:03}"
     depth: 1
-    on_error: "carry_left"
+    save_as: node
+    concurrency: 5
+    model_tier: mid
+    temperature: 0.3
+    on_error: "retry(2)"
 
-  # ── Phase 5: Thread clustering ─────────────────────────────────────────
-  # Single LLM call (or batched if est_tokens > 30k) to classify L1 topics
-  # into 6-12 threads. Step type: "thread_cluster".
-  # Input: flat JSON array of {source_node, topic_index, name, entities (top 6)}.
-  # If batched: each batch gets THREAD_CLUSTER_PROMPT, then results merged
-  # with MERGE_PROMPT into unified 8-15 threads.
-  # Saves step output only (no node).
-  # Orphaned L1 nodes get added to an "Other" catch-all thread.
-  - name: "thread_clustering"
-    primitive: "classify"
-    instruction: "$prompts/conversation/thread_cluster.md"
-    batch_threshold: 30000
-    merge_instruction: "$prompts/conversation/merge_batches.md"
+  # ── Step 6: L1 cross-layer webbing ──────────────────────────────────
+  - name: l1_webbing
+    primitive: web
+    instruction: "$prompts/conversation/conv_web.md"
     input:
-      source_depth: 1
-      format: "topic_inventory"
-    save_as: "step_only"
+      nodes: $thread_narrative
+    response_schema:
+      type: object
+      properties:
+        edges:
+          type: array
+          items:
+            type: object
+            properties:
+              source:
+                type: string
+              target:
+                type: string
+              relationship:
+                type: string
+              shared_resources:
+                type: array
+                items:
+                  type: string
+              strength:
+                type: number
+            required: ["source", "target", "relationship", "shared_resources", "strength"]
+            additionalProperties: false
+      required: ["edges"]
+      additionalProperties: false
     depth: 1
+    save_as: web_edges
+    model_tier: mid
+    temperature: 0.2
+    on_error: skip
 
-  # ── Phase 6: Thread narratives → L2 nodes ──────────────────────────────
-  # forEach threads from clustering output. Synthesizes each thread's
-  # assigned topics (gathered from L1 nodes) into an L2 node.
-  # Step type: "synth". Node ID: "L2-{index:03}".
-  # Topics sorted by source_node (chronological), with order numbers added.
-  # Late topics (>70% threshold) marked "[LATE — AUTHORITATIVE]".
-  # Input: thread name + chronologically ordered topics array.
-  # Children: list of contributing L1 node IDs.
-  # Saves node with topics_json. Updates parent_id on contributing L1 nodes.
-  - name: "thread_narratives"
-    primitive: "synthesize"
-    instruction: "$prompts/conversation/thread_narrative.md"
-    for_each: "threads"
-    input:
-      source_step: "thread_clustering"
-      user_template: "## THREAD: {thread_name}\n\n## TOPICS (chronological — higher order = later = more authoritative)\n{assigned_topics_pretty}"
-      late_authority_threshold: 0.7
-    save_as: "node"
-    node_id_pattern: "L2-{index:03}"
-    depth: 2
-
-  # ── Phase 7: Upper layers (L3+ recursive pairing to apex) ─────────────
-  # recursive_pair from depth 2 upward. Each layer pairs adjacent nodes
-  # using DISTILL_PROMPT until only 1 apex node remains.
-  # Node ID: "L{depth}-{index:03}".
-  # Same sibling A/B input format as L1 pairing.
-  # On LLM failure: retry 3 times with exponential backoff (2s, 4s, 8s),
-  # then carry left node up as fallback.
-  # Odd trailing node: carry up unchanged.
-  # Saves node with topics_json. Updates parent_id on children.
-  - name: "upper_layers"
-    primitive: "synthesize"
-    instruction: "$prompts/conversation/distill.md"
-    recursive_pair: true
-    input:
-      start_depth: 2
-      user_template: "## SIBLING A (earlier)\n{left_payload_pretty}\n\n## SIBLING B (later)\n{right_payload_pretty}"
-    save_as: "node"
+  # ── Step 7: Upper layers (recursive clustering → apex) ──────────────
+  - name: upper_layer_synthesis
+    primitive: synthesize
+    instruction: "$prompts/conversation/conv_distill.md"
+    recursive_cluster: true
+    cluster_instruction: "$prompts/conversation/conv_recluster.md"
+    cluster_model: "qwen/qwen3.5-flash-02-23"
+    cluster_response_schema:
+      type: object
+      properties:
+        clusters:
+          type: array
+          items:
+            type: object
+            properties:
+              name:
+                type: string
+              description:
+                type: string
+              node_ids:
+                type: array
+                items:
+                  type: string
+            required: ["name", "description", "node_ids"]
+            additionalProperties: false
+      required: ["clusters"]
+      additionalProperties: false
+    depth: 1
+    save_as: node
     node_id_pattern: "L{depth}-{index:03}"
-    on_error: "carry_left"
+    model_tier: mid
+    temperature: 0.3
+    on_error: "retry(3)"
+
+  # ── Step 8: L2 cross-layer webbing ──────────────────────────────────
+  - name: l2_webbing
+    primitive: web
+    instruction: "$prompts/conversation/conv_web.md"
+    response_schema:
+      type: object
+      properties:
+        edges:
+          type: array
+          items:
+            type: object
+            properties:
+              source:
+                type: string
+              target:
+                type: string
+              relationship:
+                type: string
+              shared_resources:
+                type: array
+                items:
+                  type: string
+              strength:
+                type: number
+            required: ["source", "target", "relationship", "shared_resources", "strength"]
+            additionalProperties: false
+      required: ["edges"]
+      additionalProperties: false
+    depth: 2
+    save_as: web_edges
+    model_tier: mid
+    temperature: 0.2
+    on_error: skip
 
 post_build: []
