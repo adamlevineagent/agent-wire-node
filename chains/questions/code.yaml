@@ -1,0 +1,86 @@
+# Code Question Pyramid
+# Designed for: source code repositories (Rust, TypeScript, Python, etc.)
+# Goal: A developer visits the apex + 4 nodes and understands 85%+ of the codebase
+
+type: code
+version: 3.0
+
+defaults:
+  model: inception/mercury-2
+  temperature: 0.3
+  retry: 2
+
+questions:
+
+  # ── Layer 0: What's in each file? ────────────────────────────────
+  - ask: "What does this file do, what does it export, what tables/endpoints/IPC channels does it touch, and how does it connect to the rest of the system?"
+    about: each file individually
+    creates: L0 nodes
+    prompt: prompts/code/extract.md
+    parallel: 8
+    retry: 3
+    variants:
+      config files: prompts/code/config_extract.md
+      frontend (.tsx, .jsx): prompts/code/frontend_extract.md
+
+  # ── Layer 0→1 bridge: What concepts exist? ───────────────────────
+  - ask: "Looking at all L0 topics together, what are the 8-15 distinct subsystems or conceptual areas in this codebase? A single file may belong to multiple areas."
+    about: all L0 topics at once
+    creates: L1 topic assignments
+    prompt: prompts/code/cluster.md
+    model: qwen/qwen3.5-flash-02-23
+    constraints:
+      min_groups: 8
+      max_groups: 18
+      max_items_per_group: 12
+    retry: 3
+
+  # ── Layer 0 webbing: What do files share? ────────────────────────
+  - ask: "What tables, endpoints, types, IPC channels, or auth mechanisms are shared between files?"
+    about: all L0 nodes at once
+    creates: web edges between L0 nodes
+    prompt: prompts/code/web.md
+    model: qwen/qwen3.5-flash-02-23
+    optional: true
+
+  # ── Layer 1: What is each subsystem? ─────────────────────────────
+  - ask: "Synthesize everything known about this subsystem into a comprehensive developer briefing — dense enough that a senior engineer understands it without drilling to individual files."
+    about: each L1 topic's assigned L0 nodes
+    creates: L1 nodes
+    context:
+      - L0 web edges
+    prompt: prompts/code/thread.md
+    parallel: 5
+    retry: 2
+
+  # ── Layer 1 webbing: What do subsystems share? ───────────────────
+  - ask: "What do these subsystems share — tables, APIs, auth flows, IPC channels, error patterns?"
+    about: all L1 nodes at once
+    creates: web edges between L1 nodes
+    prompt: prompts/code/web.md
+
+  # ── Layer 1→2 bridge: What are the architectural domains? ────────
+  - ask: "What are the 3-5 major architectural domains? Each domain should represent a genuinely distinct concern — not a relabeled subsystem."
+    about: all L1 nodes at once
+    creates: L2 nodes
+    context:
+      - L1 web edges
+      - sibling headlines
+    prompt: prompts/code/recluster.md
+    model: qwen/qwen3.5-flash-02-23
+    retry: 3
+
+  # ── Layer 2 webbing: What connects domains? ──────────────────────
+  - ask: "What connects these architectural domains — shared data stores, cross-domain API calls, common auth boundaries?"
+    about: all L2 nodes at once
+    creates: web edges between L2 nodes
+    prompt: prompts/code/web.md
+    optional: true
+
+  # ── Apex: What is this system? ───────────────────────────────────
+  - ask: "What is this system, what problem does it solve, and how do its architectural domains fit together?"
+    about: all top-level nodes at once
+    creates: apex
+    context:
+      - L2 web edges
+    prompt: prompts/code/distill.md

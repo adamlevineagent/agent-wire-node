@@ -1,0 +1,98 @@
+# Document Question Pyramid
+# Designed for: collections of design docs, specs, audits, strategy memos
+# Goal: A reader visits the apex + 4 nodes and understands the current state
+#        of the project/system across all documents, including what evolved
+
+type: document
+version: 3.0
+
+defaults:
+  model: inception/mercury-2
+  temperature: 0.3
+  retry: 2
+
+questions:
+
+  # ── Pre-classification: What kind of document is this? ───────────
+  - ask: "What type of document is this (design doc, audit, strategy memo, implementation plan, worksheet)? What subject does it cover? When was it written? Is it still the canonical source on its subject or has it been superseded?"
+    about: the first 20 lines of each file
+    creates: L0 classification tags
+    prompt: prompts/doc/classify.md
+    parallel: 8
+
+  # ── Layer 0: What does each document say? ────────────────────────
+  - ask: "What are the key claims, decisions, entities, and open questions in this document? When claims contradict other documents, note the contradiction — later documents are more authoritative."
+    about: each file individually
+    creates: L0 nodes
+    context:
+      - L0 classification tags
+    prompt: prompts/doc/extract.md
+    parallel: 8
+    retry: 3
+
+  # ── Layer 0→1 bridge: What topics exist across all docs? ─────────
+  - ask: "Looking at all L0 topics together — across all document types and dates — what are the 6-15 distinct conceptual topics? Group by SUBJECT, not by document. A single document may contribute to multiple topics. A narrow audit and a broad strategy doc might both feed the same topic."
+    about: all L0 topics at once
+    creates: L1 topic assignments
+    context:
+      - L0 classification tags
+    prompt: prompts/doc/cluster.md
+    model: qwen/qwen3.5-flash-02-23
+    constraints:
+      min_groups: 6
+      max_groups: 15
+      max_items_per_group: 15
+    retry: 3
+
+  # ── Layer 0 webbing: What do documents share? ────────────────────
+  - ask: "What entities, decisions, or claims appear in multiple documents? Where do documents agree, contradict, or extend each other?"
+    about: all L0 nodes at once
+    creates: web edges between L0 nodes
+    context:
+      - L0 classification tags
+    prompt: prompts/doc/web.md
+    model: qwen/qwen3.5-flash-02-23
+    optional: true
+
+  # ── Layer 1: What is the current state of each topic? ────────────
+  - ask: "Synthesize everything known about this topic across all contributing documents. Order by date — later documents are more authoritative. State the CURRENT truth, note what was superseded, note what's still unresolved. Include every specific entity, table, endpoint, and decision. A reader should understand this topic fully without drilling to individual documents."
+    about: each L1 topic's assigned L0 nodes
+    creates: L1 nodes
+    context:
+      - L0 web edges
+      - L0 classification tags
+    prompt: prompts/doc/thread.md
+    parallel: 5
+    retry: 2
+
+  # ── Layer 1 webbing: What connects topics? ───────────────────────
+  - ask: "What connects these topics — shared entities, dependencies, contradictions, or unresolved tensions between them?"
+    about: all L1 nodes at once
+    creates: web edges between L1 nodes
+    prompt: prompts/doc/web.md
+
+  # ── Layer 1→2 bridge: What are the major domains? ────────────────
+  - ask: "What are the 3-5 major domains these topics fall into? Each domain should represent a genuinely distinct area of concern — technical vs economic vs governance vs product."
+    about: all L1 nodes at once
+    creates: L2 nodes
+    context:
+      - L1 web edges
+      - sibling headlines
+    prompt: prompts/doc/recluster.md
+    model: qwen/qwen3.5-flash-02-23
+    retry: 3
+
+  # ── Layer 2 webbing ──────────────────────────────────────────────
+  - ask: "What are the cross-domain dependencies and tensions?"
+    about: all L2 nodes at once
+    creates: web edges between L2 nodes
+    prompt: prompts/doc/web.md
+    optional: true
+
+  # ── Apex ─────────────────────────────────────────────────────────
+  - ask: "What is this corpus about, what is the current state of the system it describes, what decisions are settled, and what is still evolving?"
+    about: all top-level nodes at once
+    creates: apex
+    context:
+      - L2 web edges
+    prompt: prompts/doc/distill.md
