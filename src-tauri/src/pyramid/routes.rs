@@ -45,6 +45,10 @@ fn with_auth_state(
                     None => return Err(warp::reject::custom(Unauthorized)),
                 };
 
+                // Auth token is set in pyramid_config.json (field: "auth_token")
+                // or via the desktop app's Settings → API Key flow which writes to the same file.
+                // Location: ~/Library/Application Support/wire-node/pyramid_config.json
+                // All HTTP API calls require: Authorization: Bearer <auth_token>
                 let auth_token = {
                     let config = state.config.read().await;
                     config.auth_token.clone()
@@ -100,10 +104,10 @@ struct VineBuildBody {
 #[derive(Deserialize)]
 struct ConfigBody {
     openrouter_api_key: Option<String>,
-    auth_token: Option<String>,
     primary_model: Option<String>,
     fallback_model_1: Option<String>,
     fallback_model_2: Option<String>,
+    use_ir_executor: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -754,8 +758,26 @@ async fn handle_create_slug(
     state: Arc<PyramidState>,
     body: CreateSlugBody,
 ) -> Result<warp::reply::Response, warp::Rejection> {
+    let normalized_source_path = match slug::normalize_and_validate_source_path(
+        &body.source_path,
+        &body.content_type,
+        state.data_dir.as_deref(),
+    ) {
+        Ok(path) => path,
+        Err(e) => {
+            return Ok(json_error(
+                warp::http::StatusCode::BAD_REQUEST,
+                &e.to_string(),
+            ));
+        }
+    };
     let conn = state.writer.lock().await;
-    match slug::create_slug(&conn, &body.slug, &body.content_type, &body.source_path) {
+    match slug::create_slug(
+        &conn,
+        &body.slug,
+        &body.content_type,
+        &normalized_source_path,
+    ) {
         Ok(info) => Ok(warp::reply::with_status(
             warp::reply::json(&info),
             warp::http::StatusCode::CREATED,
@@ -778,7 +800,7 @@ async fn handle_apex(
     agent_id: Option<String>,
 ) -> Result<warp::reply::Response, warp::Rejection> {
     let conn = state.reader.lock().await;
-    match query::get_apex(&conn, &slug_name) {
+    match query::get_apex_with_edges(&conn, &slug_name) {
         Ok(Some(node)) => {
             let response = json_ok(&node);
             log_query_usage(
@@ -786,7 +808,7 @@ async fn handle_apex(
                 slug_name,
                 "apex".to_string(),
                 "{}".to_string(),
-                vec![node.id.clone()],
+                vec![node.node.id.clone()],
                 agent_id,
             );
             Ok(response)
@@ -809,7 +831,7 @@ async fn handle_node(
     agent_id: Option<String>,
 ) -> Result<warp::reply::Response, warp::Rejection> {
     let conn = state.reader.lock().await;
-    match db::get_node(&conn, &slug_name, &node_id) {
+    match query::get_node_with_edges(&conn, &slug_name, &node_id) {
         Ok(Some(node)) => {
             let response = json_ok(&node);
             log_query_usage(
@@ -817,7 +839,7 @@ async fn handle_node(
                 slug_name,
                 "node".to_string(),
                 serde_json::json!({"node_id": node_id}).to_string(),
-                vec![node.id.clone()],
+                vec![node.node.id.clone()],
                 agent_id,
             );
             Ok(response)
@@ -1023,17 +1045,14 @@ async fn handle_build(
 
     {
         let mut active = state.active_build.write().await;
-        if let Some(ref handle) = *active {
+        if let Some(handle) = active.get(&slug_name) {
             let s = handle.status.read().await;
-            let is_terminal = matches!(
-                s.status.as_str(),
-                "complete" | "complete_with_errors" | "failed" | "cancelled"
-            );
+            let is_terminal = s.is_terminal();
             drop(s);
             if !handle.cancel.is_cancelled() && !is_terminal {
                 return Ok(json_error(
                     warp::http::StatusCode::CONFLICT,
-                    &format!("Build already running for slug '{}'", handle.slug),
+                    "Build already running for this slug",
                 ));
             }
         }
@@ -1043,7 +1062,7 @@ async fn handle_build(
             cancel: cancel.clone(),
             status: status.clone(),
         };
-        *active = Some(handle);
+        active.insert(slug_name.clone(), handle);
     }
 
     // Spawn the build task
@@ -1095,6 +1114,10 @@ async fn handle_build(
                                 ref parent_id,
                             } => db::update_parent(&conn, slug, node_id, parent_id),
                             WriteOp::UpdateStats { ref slug } => db::update_slug_stats(&conn, slug),
+                            WriteOp::Flush { done } => {
+                                let _ = done.send(());
+                                Ok(())
+                            }
                         }
                     };
                     if let Err(e) = result {
@@ -1183,11 +1206,9 @@ async fn handle_build_status(
     state: Arc<PyramidState>,
 ) -> Result<warp::reply::Response, warp::Rejection> {
     let active = state.active_build.read().await;
-    if let Some(ref handle) = *active {
-        if handle.slug == slug_name {
-            let s = handle.status.read().await;
-            return Ok(json_ok(&*s));
-        }
+    if let Some(handle) = active.get(&slug_name) {
+        let s = handle.status.read().await;
+        return Ok(json_ok(&*s));
     }
 
     // No active build — return idle status
@@ -1204,10 +1225,18 @@ async fn handle_build_cancel(
     slug_name: String,
     state: Arc<PyramidState>,
 ) -> Result<warp::reply::Response, warp::Rejection> {
-    let active = state.active_build.read().await;
-    if let Some(ref handle) = *active {
-        if handle.slug == slug_name && !handle.cancel.is_cancelled() {
-            handle.cancel.cancel();
+    let maybe_handle = {
+        let active = state.active_build.read().await;
+        active
+            .get(&slug_name)
+            .map(|handle| (handle.cancel.clone(), handle.status.clone()))
+    };
+
+    if let Some((cancel, status)) = maybe_handle {
+        let s = status.read().await;
+        if s.is_running() && !cancel.is_cancelled() {
+            drop(s);
+            cancel.cancel();
             return Ok(json_ok(&serde_json::json!({"status": "cancelling"})));
         }
     }
@@ -1247,15 +1276,25 @@ async fn handle_ingest(
     let slug_clone = slug_name.clone();
 
     // Parse source_path as JSON array, falling back to single-path for backward compat
-    let paths: Vec<String> =
-        serde_json::from_str(&source_path).unwrap_or_else(|_| vec![source_path.clone()]);
+    let paths = match slug::resolve_validated_source_paths(
+        &source_path,
+        &content_type,
+        state.data_dir.as_deref(),
+    ) {
+        Ok(paths) => paths,
+        Err(e) => {
+            return Ok(json_error(
+                warp::http::StatusCode::BAD_REQUEST,
+                &e.to_string(),
+            ));
+        }
+    };
 
     // Run synchronous ingest on a blocking thread
     let writer = state.writer.clone();
     let result = tokio::task::spawn_blocking(move || {
         let conn = writer.blocking_lock();
-        for path_str in &paths {
-            let path = std::path::Path::new(path_str);
+        for path in &paths {
             match content_type {
                 ContentType::Code => {
                     let _ = ingest::ingest_code(&conn, &slug_clone, path)?;
@@ -1308,9 +1347,6 @@ async fn handle_config(
     if let Some(ref key) = body.openrouter_api_key {
         config.api_key = key.clone();
     }
-    if let Some(ref token) = body.auth_token {
-        config.auth_token = token.clone();
-    }
     if let Some(ref model) = body.primary_model {
         config.primary_model = model.clone();
     }
@@ -1321,15 +1357,20 @@ async fn handle_config(
         config.fallback_model_2 = model.clone();
     }
 
+    if let Some(use_ir) = body.use_ir_executor {
+        state.use_ir_executor.store(use_ir, std::sync::atomic::Ordering::Relaxed);
+        tracing::info!("IR executor toggled to: {use_ir}");
+    }
+
     // Persist to config file if data_dir is set
     if let Some(ref data_dir) = state.data_dir {
         // Load existing config to preserve fields not managed by this endpoint
         let mut pyramid_config = super::PyramidConfig::load(data_dir);
         pyramid_config.openrouter_api_key = config.api_key.clone();
-        pyramid_config.auth_token = config.auth_token.clone();
         pyramid_config.primary_model = config.primary_model.clone();
         pyramid_config.fallback_model_1 = config.fallback_model_1.clone();
         pyramid_config.fallback_model_2 = config.fallback_model_2.clone();
+        pyramid_config.use_ir_executor = state.use_ir_executor.load(std::sync::atomic::Ordering::Relaxed);
         if let Err(e) = pyramid_config.save(data_dir) {
             tracing::error!("Failed to save pyramid config: {e}");
         }
@@ -1340,6 +1381,7 @@ async fn handle_config(
         "primary_model": config.primary_model,
         "fallback_model_1": config.fallback_model_1,
         "fallback_model_2": config.fallback_model_2,
+        "use_ir_executor": state.use_ir_executor.load(std::sync::atomic::Ordering::Relaxed),
     })))
 }
 
@@ -1350,8 +1392,9 @@ async fn handle_delete_slug(
     // Don't allow deleting a slug with an active build
     {
         let active = state.active_build.read().await;
-        if let Some(ref handle) = *active {
-            if handle.slug == slug_name && !handle.cancel.is_cancelled() {
+        if let Some(handle) = active.get(&slug_name) {
+            let s = handle.status.read().await;
+            if s.is_running() && !handle.cancel.is_cancelled() {
                 return Ok(json_error(
                     warp::http::StatusCode::CONFLICT,
                     "Cannot delete slug while build is running",
@@ -1361,8 +1404,15 @@ async fn handle_delete_slug(
     }
 
     let conn = state.writer.lock().await;
-    match slug::delete_slug(&conn, &slug_name) {
-        Ok(()) => Ok(json_ok(&serde_json::json!({"deleted": slug_name}))),
+    let result = slug::delete_slug(&conn, &slug_name);
+    drop(conn);
+
+    match result {
+        Ok(()) => {
+            let mut active = state.active_build.write().await;
+            active.remove(&slug_name);
+            Ok(json_ok(&serde_json::json!({"deleted": slug_name})))
+        }
         Err(e) => {
             let msg = e.to_string();
             if msg.contains("not found") {
@@ -2420,7 +2470,8 @@ async fn handle_cost(
         let mut stmt = conn
             .prepare(&format!(
                 "SELECT id, operation, model, input_tokens, output_tokens, estimated_cost,
-                    COALESCE(source, 'manual'), layer, check_type, created_at
+                    COALESCE(source, 'manual'), layer, check_type, created_at,
+                    chain_id, step_name, tier, latency_ms, generation_id, estimated_cost_usd
              FROM pyramid_cost_log WHERE slug = ?1 {}
              ORDER BY created_at DESC LIMIT 20",
                 window_clause
@@ -2439,6 +2490,12 @@ async fn handle_cost(
                     "layer": row.get::<_, Option<i32>>(7)?,
                     "check_type": row.get::<_, Option<String>>(8)?,
                     "created_at": row.get::<_, String>(9)?,
+                    "chain_id": row.get::<_, Option<String>>(10)?,
+                    "step_name": row.get::<_, Option<String>>(11)?,
+                    "tier": row.get::<_, Option<String>>(12)?,
+                    "latency_ms": row.get::<_, Option<i64>>(13)?,
+                    "generation_id": row.get::<_, Option<String>>(14)?,
+                    "estimated_cost_usd": row.get::<_, Option<f64>>(15)?,
                 }))
             })
             .map(|iter| iter.filter_map(|r| r.ok()).collect())

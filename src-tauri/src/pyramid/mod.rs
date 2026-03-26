@@ -19,19 +19,26 @@ pub mod chain_loader;
 pub mod chain_registry;
 pub mod chain_resolve;
 pub mod config_helper;
+pub mod converge_expand;
 pub mod db;
+pub mod defaults_adapter;
 pub mod delta;
+pub mod execution_plan;
+pub mod execution_state;
+pub mod expression;
 pub mod faq;
 pub mod ingest;
 pub mod llm;
 pub mod meta;
 pub mod naming;
+pub mod parity;
 pub mod query;
 pub mod routes;
 pub mod slug;
 pub mod stale_engine;
 pub mod stale_helpers;
 pub mod stale_helpers_upper;
+pub mod transform_runtime;
 pub mod types;
 pub mod vine;
 pub mod vine_prompts;
@@ -52,10 +59,23 @@ use self::types::BuildStatus;
 use self::watcher::PyramidFileWatcher;
 
 /// Persistent pyramid configuration stored in `pyramid_config.json`.
+///
+/// Location: `~/Library/Application Support/wire-node/pyramid_config.json`
+///
+/// Key fields:
+/// - `auth_token`: Bearer token required for ALL HTTP API calls.
+///   Set via the desktop app Settings → API Key, or manually in the JSON file.
+///   All requests must include header: `Authorization: Bearer <auth_token>`
+/// - `openrouter_api_key`: API key for LLM calls via OpenRouter.
+/// - `primary_model`: Default LLM model (default: `inception/mercury-2`).
+/// - `use_ir_executor`: Enable the IR-based chain executor (default: false).
+///   Toggle at runtime via: `POST /pyramid/config` with `{"use_ir_executor": true}`
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PyramidConfig {
     #[serde(default)]
     pub openrouter_api_key: String,
+    /// Bearer token for HTTP API auth. Required for all API calls.
+    /// Set in this config file or via the desktop app Settings → API Key.
     #[serde(default)]
     pub auth_token: String,
     #[serde(default = "default_primary_model")]
@@ -70,6 +90,8 @@ pub struct PyramidConfig {
     pub collapse_model: String,
     #[serde(default)]
     pub use_chain_engine: bool,
+    #[serde(default)]
+    pub use_ir_executor: bool,
 }
 
 fn default_primary_model() -> String {
@@ -99,6 +121,7 @@ impl Default for PyramidConfig {
             partner_model: default_partner_model(),
             collapse_model: default_collapse_model(),
             use_chain_engine: false,
+            use_ir_executor: false,
         }
     }
 }
@@ -154,8 +177,8 @@ pub struct PyramidState {
     pub writer: Arc<Mutex<Connection>>,
     /// LLM configuration (API key, model cascade).
     pub config: Arc<tokio::sync::RwLock<LlmConfig>>,
-    /// Currently active build, if any.
-    pub active_build: Arc<tokio::sync::RwLock<Option<BuildHandle>>>,
+    /// Active builds keyed by slug name.
+    pub active_build: Arc<tokio::sync::RwLock<HashMap<String, BuildHandle>>>,
     /// Data directory for persisting config files. None if not set.
     pub data_dir: Option<PathBuf>,
     /// Per-slug stale engines for auto-update (Phase 7). Keyed by slug name.
@@ -166,6 +189,9 @@ pub struct PyramidState {
     pub vine_builds: Arc<Mutex<HashMap<String, VineBuildHandle>>>,
     /// Whether to use the chain engine for builds (feature flag).
     pub use_chain_engine: AtomicBool,
+    /// Whether to use the IR executor path (compile chain → ExecutionPlan → execute_plan).
+    /// Takes precedence over use_chain_engine when true.
+    pub use_ir_executor: AtomicBool,
 }
 
 /// Handle to a running pyramid build.
