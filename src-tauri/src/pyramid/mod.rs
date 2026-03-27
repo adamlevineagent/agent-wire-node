@@ -18,11 +18,14 @@ pub mod chain_executor;
 pub mod chain_loader;
 pub mod chain_registry;
 pub mod chain_resolve;
+pub mod chain_resolver;
 pub mod config_helper;
 pub mod converge_expand;
+pub mod crystallization;
 pub mod db;
 pub mod defaults_adapter;
 pub mod delta;
+pub mod event_chain;
 pub mod execution_plan;
 pub mod execution_state;
 pub mod expression;
@@ -33,6 +36,10 @@ pub mod meta;
 pub mod naming;
 pub mod parity;
 pub mod query;
+pub mod question_compiler;
+pub mod question_decomposition;
+pub mod question_loader;
+pub mod question_yaml;
 pub mod routes;
 pub mod slug;
 pub mod stale_engine;
@@ -44,6 +51,8 @@ pub mod vine;
 pub mod vine_prompts;
 pub mod watcher;
 pub mod webbing;
+pub mod wire_import;
+pub mod wire_publish;
 
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -53,6 +62,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+use self::event_chain::LocalEventBus;
 use self::llm::LlmConfig;
 use self::stale_engine::PyramidStaleEngine;
 use self::types::BuildStatus;
@@ -192,6 +202,8 @@ pub struct PyramidState {
     /// Whether to use the IR executor path (compile chain → ExecutionPlan → execute_plan).
     /// Takes precedence over use_chain_engine when true.
     pub use_ir_executor: AtomicBool,
+    /// Local event bus for chain-triggered cascades (P3.2).
+    pub event_bus: Arc<LocalEventBus>,
 }
 
 /// Handle to a running pyramid build.

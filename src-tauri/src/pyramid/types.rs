@@ -119,6 +119,24 @@ pub struct TreeNode {
 pub struct DrillResult {
     pub node: PyramidNode,
     pub children: Vec<PyramidNode>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub web_edges: Vec<ConnectedWebEdge>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConnectedWebEdge {
+    pub connected_to: String,
+    pub connected_headline: String,
+    pub relationship: String,
+    pub strength: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeWithWebEdges {
+    #[serde(flatten)]
+    pub node: PyramidNode,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub web_edges: Vec<ConnectedWebEdge>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -147,6 +165,19 @@ pub struct BuildStatus {
     /// Number of nodes that failed during the build (LLM errors, timeouts, etc.)
     #[serde(default)]
     pub failures: i32,
+}
+
+impl BuildStatus {
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self.status.as_str(),
+            "complete" | "complete_with_errors" | "failed" | "cancelled"
+        )
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.status == "running"
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

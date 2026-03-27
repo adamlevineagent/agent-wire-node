@@ -620,7 +620,7 @@ Return ONLY valid JSON: an array of objects with fields "name", "faq_ids", and "
         let conn = writer.lock().await;
         let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
         let _ = conn.execute(
-            "INSERT INTO pyramid_cost_log (slug, operation, model, input_tokens, output_tokens, estimated_cost, source, layer, check_type, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'auto-stale', 0, 'faq_category', ?7)",
+            "INSERT INTO pyramid_cost_log (slug, operation, model, input_tokens, output_tokens, estimated_cost, source, layer, check_type, created_at, chain_id, step_name, tier, latency_ms, generation_id, estimated_cost_usd) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'auto-stale', 0, 'faq_category', ?7, NULL, NULL, NULL, NULL, NULL, NULL)",
             rusqlite::params![slug, "faq_category_meta_pass", model, usage.prompt_tokens, usage.completion_tokens, cost, now],
         );
     }

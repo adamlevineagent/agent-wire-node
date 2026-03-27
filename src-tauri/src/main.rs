@@ -2473,9 +2473,9 @@ async fn pyramid_list_slugs(state: tauri::State<'_, SharedState>) -> Result<Vec<
 async fn pyramid_apex(
     state: tauri::State<'_, SharedState>,
     slug: String,
-) -> Result<PyramidNode, String> {
+) -> Result<NodeWithWebEdges, String> {
     let conn = state.pyramid.reader.lock().await;
-    pyramid_query::get_apex(&conn, &slug)
+    pyramid_query::get_apex_with_edges(&conn, &slug)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "No apex node found".to_string())
 }
@@ -2485,9 +2485,9 @@ async fn pyramid_node(
     state: tauri::State<'_, SharedState>,
     slug: String,
     node_id: String,
-) -> Result<PyramidNode, String> {
+) -> Result<NodeWithWebEdges, String> {
     let conn = state.pyramid.reader.lock().await;
-    pyramid_db::get_node(&conn, &slug, &node_id)
+    pyramid_query::get_node_with_edges(&conn, &slug, &node_id)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "Node not found".to_string())
 }
@@ -2542,8 +2542,15 @@ async fn post_build_seed(
     let source_paths: Vec<String> = {
         let conn = pyramid_state.reader.lock().await;
         match wire_node_lib::pyramid::slug::get_slug(&conn, slug) {
-            Ok(Some(info)) => serde_json::from_str(&info.source_path)
-                .unwrap_or_else(|_| vec![info.source_path.clone()]),
+            Ok(Some(info)) => wire_node_lib::pyramid::slug::resolve_validated_source_paths(
+                &info.source_path,
+                &info.content_type,
+                pyramid_state.data_dir.as_deref(),
+            )
+            .unwrap_or_default()
+            .into_iter()
+            .map(|path| path.to_string_lossy().to_string())
+            .collect(),
             _ => Vec::new(),
         }
     };
@@ -2862,15 +2869,12 @@ async fn pyramid_build(
     // Check if a build is already running
     {
         let active = state.pyramid.active_build.read().await;
-        if let Some(ref handle) = *active {
+        if let Some(handle) = active.get(&slug) {
             let s = handle.status.read().await;
-            let is_terminal = matches!(
-                s.status.as_str(),
-                "complete" | "complete_with_errors" | "failed" | "cancelled"
-            );
+            let is_terminal = s.is_terminal();
             drop(s);
             if !handle.cancel.is_cancelled() && !is_terminal {
-                return Err(format!("Build already running for slug '{}'", handle.slug));
+                return Err("Build already running for this slug".to_string());
             }
         }
     }
@@ -2900,7 +2904,7 @@ async fn pyramid_build(
 
     {
         let mut active = state.pyramid.active_build.write().await;
-        *active = Some(handle);
+        active.insert(slug.clone(), handle);
     }
 
     let writer = state.pyramid.writer.clone();
@@ -2959,6 +2963,10 @@ async fn pyramid_build(
                             ),
                             wire_node_lib::pyramid::build::WriteOp::UpdateStats { ref slug } => {
                                 wire_node_lib::pyramid::db::update_slug_stats(&conn, slug)
+                            }
+                            wire_node_lib::pyramid::build::WriteOp::Flush { done } => {
+                                let _ = done.send(());
+                                Ok(())
                             }
                         }
                     };
@@ -3072,11 +3080,9 @@ async fn pyramid_build_status(
     slug: String,
 ) -> Result<BuildStatus, String> {
     let active = state.pyramid.active_build.read().await;
-    if let Some(ref handle) = *active {
-        if handle.slug == slug {
-            let s = handle.status.read().await;
-            return Ok(s.clone());
-        }
+    if let Some(handle) = active.get(&slug) {
+        let s = handle.status.read().await;
+        return Ok(s.clone());
     }
 
     Ok(BuildStatus {
@@ -3107,13 +3113,16 @@ async fn pyramid_ingest(
     let writer = state.pyramid.writer.clone();
 
     // Parse source_path as JSON array, falling back to single-path for backward compat
-    let paths: Vec<String> =
-        serde_json::from_str(&source_path).unwrap_or_else(|_| vec![source_path.clone()]);
+    let paths = wire_node_lib::pyramid::slug::resolve_validated_source_paths(
+        &source_path,
+        &content_type,
+        state.pyramid.data_dir.as_deref(),
+    )
+    .map_err(|e| e.to_string())?;
 
     tokio::task::spawn_blocking(move || {
         let conn = writer.blocking_lock();
-        for path_str in &paths {
-            let path = std::path::Path::new(path_str);
+        for path in &paths {
             match content_type {
                 ContentType::Code => {
                     let _ = wire_node_lib::pyramid::ingest::ingest_code(&conn, &slug_clone, path)
@@ -3186,8 +3195,14 @@ async fn pyramid_create_slug(
             content_type
         )
     })?;
+    let normalized_source_path = wire_node_lib::pyramid::slug::normalize_and_validate_source_path(
+        &source_path,
+        &ct,
+        state.pyramid.data_dir.as_deref(),
+    )
+    .map_err(|e| e.to_string())?;
     let conn = state.pyramid.writer.lock().await;
-    wire_node_lib::pyramid::slug::create_slug(&conn, &slug, &ct, &source_path)
+    wire_node_lib::pyramid::slug::create_slug(&conn, &slug, &ct, &normalized_source_path)
         .map_err(|e| e.to_string())
 }
 
@@ -3196,8 +3211,30 @@ async fn pyramid_delete_slug(
     state: tauri::State<'_, SharedState>,
     slug: String,
 ) -> Result<(), String> {
+    let maybe_handle = {
+        let active = state.pyramid.active_build.read().await;
+        active
+            .get(&slug)
+            .map(|handle| (handle.cancel.clone(), handle.status.clone()))
+    };
+
+    if let Some((cancel, status)) = maybe_handle {
+        let s = status.read().await;
+        if s.is_running() && !cancel.is_cancelled() {
+            return Err("Cannot delete slug while build is running".to_string());
+        }
+    }
+
     let conn = state.pyramid.writer.lock().await;
-    wire_node_lib::pyramid::slug::delete_slug(&conn, &slug).map_err(|e| e.to_string())
+    let result = wire_node_lib::pyramid::slug::delete_slug(&conn, &slug).map_err(|e| e.to_string());
+    drop(conn);
+
+    if result.is_ok() {
+        let mut active = state.pyramid.active_build.write().await;
+        active.remove(&slug);
+    }
+
+    result
 }
 
 #[tauri::command]
@@ -3228,13 +3265,29 @@ fn get_app_version() -> String {
 
 #[tauri::command]
 async fn pyramid_build_cancel(state: tauri::State<'_, SharedState>) -> Result<(), String> {
-    let active = state.pyramid.active_build.read().await;
-    if let Some(ref handle) = *active {
-        handle.cancel.cancel();
-        Ok(())
-    } else {
-        Err("No active build to cancel".to_string())
+    let handles = {
+        let active = state.pyramid.active_build.read().await;
+        active
+            .values()
+            .map(|handle| (handle.cancel.clone(), handle.status.clone()))
+            .collect::<Vec<_>>()
+    };
+
+    let mut cancelled_any = false;
+    for (cancel, status) in handles {
+        let s = status.read().await;
+        if s.is_running() && !cancel.is_cancelled() {
+            drop(s);
+            cancel.cancel();
+            cancelled_any = true;
+        }
     }
+
+    if !cancelled_any {
+        return Err("No active build to cancel".to_string());
+    }
+
+    Ok(())
 }
 
 #[tauri::command]
@@ -3294,6 +3347,13 @@ async fn pyramid_vine_build(
                 .use_chain_engine
                 .load(std::sync::atomic::Ordering::Relaxed),
         ),
+        use_ir_executor: std::sync::atomic::AtomicBool::new(
+            state
+                .pyramid
+                .use_ir_executor
+                .load(std::sync::atomic::Ordering::Relaxed),
+        ),
+        event_bus: state.pyramid.event_bus.clone(),
     });
 
     let slug_for_task = vine_slug_clean.clone();
@@ -3463,6 +3523,13 @@ async fn pyramid_vine_integrity(
                 .use_chain_engine
                 .load(std::sync::atomic::Ordering::Relaxed),
         ),
+        use_ir_executor: std::sync::atomic::AtomicBool::new(
+            state
+                .pyramid
+                .use_ir_executor
+                .load(std::sync::atomic::Ordering::Relaxed),
+        ),
+        event_bus: state.pyramid.event_bus.clone(),
     });
 
     let summary = vine::run_integrity_check(&pyramid_state, &slug)
@@ -3496,6 +3563,13 @@ async fn pyramid_vine_rebuild_upper(
                 .use_chain_engine
                 .load(std::sync::atomic::Ordering::Relaxed),
         ),
+        use_ir_executor: std::sync::atomic::AtomicBool::new(
+            state
+                .pyramid
+                .use_ir_executor
+                .load(std::sync::atomic::Ordering::Relaxed),
+        ),
+        event_bus: state.pyramid.event_bus.clone(),
     });
 
     let cancel = tokio_util::sync::CancellationToken::new();
@@ -4074,15 +4148,29 @@ fn main() {
         reader: Arc::new(tokio::sync::Mutex::new(pyramid_reader)),
         writer: Arc::new(tokio::sync::Mutex::new(pyramid_writer)),
         config: Arc::new(RwLock::new(pyramid_config.to_llm_config())),
-        active_build: Arc::new(RwLock::new(None)),
+        active_build: Arc::new(RwLock::new(std::collections::HashMap::new())),
         data_dir: Some(config.data_dir()),
         stale_engines: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         file_watchers: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         vine_builds: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         use_chain_engine: std::sync::atomic::AtomicBool::new(pyramid_config.use_chain_engine),
+        use_ir_executor: std::sync::atomic::AtomicBool::new(pyramid_config.use_ir_executor),
+        event_bus: Arc::new(wire_node_lib::pyramid::event_chain::LocalEventBus::new()),
     });
 
-    tracing::info!("Pyramid engine initialized at {:?}", pyramid_db_path);
+    // Load persisted event subscriptions into the in-memory event bus
+    {
+        let reader = pyramid_state.reader.blocking_lock();
+        if let Err(e) = pyramid_state.event_bus.load_from_db_sync(&reader) {
+            tracing::warn!("Failed to load event subscriptions from DB: {e}");
+        }
+    }
+
+    tracing::info!(
+        "Pyramid engine initialized at {:?}, ir_executor={}",
+        pyramid_db_path,
+        pyramid_config.use_ir_executor
+    );
 
     // Initialize partner (Dennis) state with its own pyramid reader and partner.db
     let partner_db_path = config.data_dir().join("partner.db");

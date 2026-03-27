@@ -7,6 +7,7 @@
 
 use anyhow::{anyhow, Result};
 use rusqlite::Connection;
+use std::path::{Path, PathBuf};
 
 use super::db;
 use super::types::*;
@@ -63,6 +64,138 @@ pub fn create_slug(
     }
 
     db::create_slug(conn, &normalized, content_type, source_path)
+}
+
+fn parse_source_paths(source_path: &str) -> Result<Vec<String>> {
+    let trimmed = source_path.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("source_path cannot be empty"));
+    }
+
+    if trimmed.starts_with('[') {
+        let parsed: Vec<String> = serde_json::from_str(trimmed)
+            .map_err(|e| anyhow!("Invalid source_path array JSON: {e}"))?;
+        if parsed.is_empty() {
+            return Err(anyhow!("source_path array cannot be empty"));
+        }
+        return Ok(parsed);
+    }
+
+    Ok(vec![trimmed.to_string()])
+}
+
+fn is_sensitive_source_path(path: &Path, data_dir: Option<&Path>) -> bool {
+    if let Some(data_dir) = data_dir {
+        if path.starts_with(data_dir) {
+            return true;
+        }
+    }
+
+    let sensitive_segments = [
+        ".ssh", ".aws", ".gnupg", ".config", "Library", "AppData", ".local",
+    ];
+
+    path.components().any(|component| {
+        let text = component.as_os_str().to_string_lossy();
+        sensitive_segments.iter().any(|segment| text == *segment)
+    })
+}
+
+fn allowed_source_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Ok(cwd) = std::env::current_dir() {
+        if let Ok(canonical) = cwd.canonicalize() {
+            roots.push(canonical);
+        }
+    }
+    if let Some(home) = dirs::home_dir() {
+        if let Ok(canonical) = home.canonicalize() {
+            roots.push(canonical);
+        }
+    }
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+pub fn resolve_validated_source_paths(
+    source_path: &str,
+    content_type: &ContentType,
+    data_dir: Option<&Path>,
+) -> Result<Vec<PathBuf>> {
+    let allowed_roots = allowed_source_roots();
+    if allowed_roots.is_empty() {
+        return Err(anyhow!("No allowed source roots are configured"));
+    }
+
+    let parsed_paths = parse_source_paths(source_path)?;
+    let mut validated = Vec::with_capacity(parsed_paths.len());
+
+    for raw_path in parsed_paths {
+        let candidate = PathBuf::from(raw_path.trim());
+        if candidate.as_os_str().is_empty() {
+            return Err(anyhow!("source_path entries cannot be empty"));
+        }
+        let canonical = candidate
+            .canonicalize()
+            .map_err(|e| anyhow!("Invalid source path '{}': {e}", candidate.display()))?;
+
+        if !allowed_roots.iter().any(|root| canonical.starts_with(root)) {
+            return Err(anyhow!(
+                "Source path '{}' is outside the allowed roots",
+                canonical.display()
+            ));
+        }
+        if is_sensitive_source_path(&canonical, data_dir) {
+            return Err(anyhow!(
+                "Source path '{}' points to a restricted location",
+                canonical.display()
+            ));
+        }
+
+        match content_type {
+            ContentType::Code | ContentType::Document | ContentType::Vine => {
+                if !canonical.is_dir() {
+                    return Err(anyhow!(
+                        "Source path '{}' must be a directory for {} slugs",
+                        canonical.display(),
+                        content_type.as_str()
+                    ));
+                }
+            }
+            ContentType::Conversation => {
+                if !canonical.is_file() {
+                    return Err(anyhow!(
+                        "Source path '{}' must be a file for conversation slugs",
+                        canonical.display()
+                    ));
+                }
+            }
+        }
+
+        validated.push(canonical);
+    }
+
+    Ok(validated)
+}
+
+pub fn normalize_and_validate_source_path(
+    source_path: &str,
+    content_type: &ContentType,
+    data_dir: Option<&Path>,
+) -> Result<String> {
+    let paths = resolve_validated_source_paths(source_path, content_type, data_dir)?;
+    let normalized: Vec<String> = paths
+        .iter()
+        .map(|path| path.to_string_lossy().to_string())
+        .collect();
+
+    if normalized.len() == 1 && !source_path.trim_start().starts_with('[') {
+        Ok(normalized[0].clone())
+    } else {
+        serde_json::to_string(&normalized)
+            .map_err(|e| anyhow!("Failed to serialize source paths: {e}"))
+    }
 }
 
 /// List all slugs.

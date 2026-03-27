@@ -193,6 +193,8 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
             FOREIGN KEY (slug, thread_a_id) REFERENCES pyramid_threads(slug, thread_id),
             FOREIGN KEY (slug, thread_b_id) REFERENCES pyramid_threads(slug, thread_id)
         );
+        CREATE INDEX IF NOT EXISTS idx_web_edges_slug_a ON pyramid_web_edges(slug, thread_a_id);
+        CREATE INDEX IF NOT EXISTS idx_web_edges_slug_b ON pyramid_web_edges(slug, thread_b_id);
 
         -- Web edge deltas
         CREATE TABLE IF NOT EXISTS pyramid_web_edge_deltas (
@@ -370,6 +372,23 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
         "ALTER TABLE pyramid_cost_log ADD COLUMN check_type TEXT",
         [],
     );
+
+    // ── P1.5 cost observatory columns (nullable, old rows stay valid) ──
+    let _ = conn.execute("ALTER TABLE pyramid_cost_log ADD COLUMN chain_id TEXT", []);
+    let _ = conn.execute("ALTER TABLE pyramid_cost_log ADD COLUMN step_name TEXT", []);
+    let _ = conn.execute("ALTER TABLE pyramid_cost_log ADD COLUMN tier TEXT", []);
+    let _ = conn.execute(
+        "ALTER TABLE pyramid_cost_log ADD COLUMN latency_ms INTEGER",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE pyramid_cost_log ADD COLUMN generation_id TEXT",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE pyramid_cost_log ADD COLUMN estimated_cost_usd REAL",
+        [],
+    );
     let _ = conn.execute(
         "ALTER TABLE pyramid_faq_nodes ADD COLUMN match_triggers TEXT DEFAULT '[]'",
         [],
@@ -451,6 +470,15 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
 
     // ── Chain registry table ─────────────────────────────────────────────────
     super::chain_registry::init_chain_tables(conn)?;
+
+    // ── Event bus tables (P3.2) ──────────────────────────────────────────────
+    super::event_chain::init_event_tables(conn)?;
+
+    // ── Wire import tables (P4.2) ────────────────────────────────────────────
+    super::wire_import::init_import_tables(conn)?;
+
+    // ── Wire publication ID mapping table (P4.3) ──────────────────────────────
+    super::wire_publish::init_id_map_table(conn)?;
 
     Ok(())
 }
@@ -2184,6 +2212,57 @@ pub fn get_stale_log(
     Ok(rows)
 }
 
+/// Insert a cost log entry with full P1.5 observatory columns.
+///
+/// All new columns are optional — pass `None` for fields not available in
+/// the current call context. This is the canonical write path for the chain
+/// executor and any future callers that have chain/step/tier metadata.
+pub fn insert_cost_log(
+    conn: &Connection,
+    slug: &str,
+    operation: &str,
+    model: &str,
+    input_tokens: i64,
+    output_tokens: i64,
+    estimated_cost: f64,
+    source: &str,
+    layer: Option<i32>,
+    check_type: Option<&str>,
+    chain_id: Option<&str>,
+    step_name: Option<&str>,
+    tier: Option<&str>,
+    latency_ms: Option<i64>,
+    generation_id: Option<&str>,
+    estimated_cost_usd: Option<f64>,
+) -> Result<()> {
+    let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    conn.execute(
+        "INSERT INTO pyramid_cost_log (slug, operation, model, input_tokens, output_tokens,
+         estimated_cost, source, layer, check_type, created_at,
+         chain_id, step_name, tier, latency_ms, generation_id, estimated_cost_usd)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+        rusqlite::params![
+            slug,
+            operation,
+            model,
+            input_tokens,
+            output_tokens,
+            estimated_cost,
+            source,
+            layer,
+            check_type,
+            now,
+            chain_id,
+            step_name,
+            tier,
+            latency_ms,
+            generation_id,
+            estimated_cost_usd,
+        ],
+    )?;
+    Ok(())
+}
+
 /// Get cost summary for a slug within an optional time window.
 /// Note: The actual column in pyramid_cost_log is `estimated_cost`, not `cost_usd`.
 pub fn get_cost_summary(
@@ -2273,7 +2352,8 @@ pub fn get_cost_summary(
     let recent_calls = {
         let mut stmt = conn.prepare(&format!(
             "SELECT id, operation, model, input_tokens, output_tokens, estimated_cost,
-                    COALESCE(source, 'manual'), layer, check_type, created_at
+                    COALESCE(source, 'manual'), layer, check_type, created_at,
+                    chain_id, step_name, tier, latency_ms, generation_id, estimated_cost_usd
              FROM pyramid_cost_log WHERE slug = ?1 {}
              ORDER BY created_at DESC LIMIT 20",
             window_clause
@@ -2291,6 +2371,12 @@ pub fn get_cost_summary(
                     "layer": row.get::<_, Option<i32>>(7)?,
                     "check_type": row.get::<_, Option<String>>(8)?,
                     "created_at": row.get::<_, String>(9)?,
+                    "chain_id": row.get::<_, Option<String>>(10)?,
+                    "step_name": row.get::<_, Option<String>>(11)?,
+                    "tier": row.get::<_, Option<String>>(12)?,
+                    "latency_ms": row.get::<_, Option<i64>>(13)?,
+                    "generation_id": row.get::<_, Option<String>>(14)?,
+                    "estimated_cost_usd": row.get::<_, Option<f64>>(15)?,
                 }))
             })
             .map(|iter| iter.filter_map(|r| r.ok()).collect())

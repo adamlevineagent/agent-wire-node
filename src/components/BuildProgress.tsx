@@ -33,12 +33,18 @@ export function BuildProgress({ slug, onComplete, onClose }: BuildProgressProps)
                         onComplete?.(s);
                         break;
                     }
+
+                    const isFinalizing =
+                        s.status === 'running' &&
+                        s.progress.total > 0 &&
+                        s.progress.done >= s.progress.total;
+                    await new Promise((r) => setTimeout(r, isFinalizing ? 500 : 2000));
+                    continue;
                 } catch (err) {
                     if (!active) break;
                     setError(String(err));
                     break;
                 }
-                await new Promise((r) => setTimeout(r, 2000));
             }
         };
 
@@ -66,13 +72,19 @@ export function BuildProgress({ slug, onComplete, onClose }: BuildProgressProps)
     const isFailed = status?.status === 'failed';
     const isCancelled = status?.status === 'cancelled';
     const isRunning = status?.status === 'running';
+    const isFinalizing =
+        isRunning &&
+        (status?.progress.total ?? 0) > 0 &&
+        (status?.progress.done ?? 0) >= (status?.progress.total ?? 0);
 
     return (
         <div className="build-progress-panel">
             <div className="build-progress-header">
                 <h3>Building Pyramid: {slug}</h3>
                 {isRunning && (
-                    <span className="build-status-badge running">Running</span>
+                    <span className="build-status-badge running">
+                        {isFinalizing ? 'Finalizing' : 'Running'}
+                    </span>
                 )}
                 {isComplete && (
                     <span className="build-status-badge complete">Complete</span>

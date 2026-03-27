@@ -73,6 +73,63 @@ fn collect_entities(node: &PyramidNode) -> Vec<(String, String)> {
     out
 }
 
+fn load_connected_web_edges(
+    conn: &Connection,
+    slug: &str,
+    canonical_node_id: &str,
+) -> Result<Vec<ConnectedWebEdge>> {
+    let mut stmt = conn.prepare(
+        "SELECT
+            other.current_canonical_id AS connected_to,
+            node.headline AS connected_headline,
+            edge.relationship,
+            edge.relevance
+         FROM pyramid_threads AS current
+         JOIN pyramid_web_edges AS edge
+           ON edge.slug = current.slug
+          AND (edge.thread_a_id = current.thread_id OR edge.thread_b_id = current.thread_id)
+         JOIN pyramid_threads AS other
+           ON other.slug = current.slug
+          AND other.thread_id = CASE
+                WHEN edge.thread_a_id = current.thread_id THEN edge.thread_b_id
+                ELSE edge.thread_a_id
+              END
+         JOIN live_pyramid_nodes AS node
+           ON node.slug = other.slug
+          AND node.id = other.current_canonical_id
+         WHERE current.slug = ?1
+           AND current.current_canonical_id = ?2
+         ORDER BY edge.relevance DESC, connected_to ASC",
+    )?;
+
+    let rows = stmt.query_map(rusqlite::params![slug, canonical_node_id], |row| {
+        Ok(ConnectedWebEdge {
+            connected_to: row.get(0)?,
+            connected_headline: row.get(1)?,
+            relationship: row.get(2)?,
+            strength: row.get(3)?,
+        })
+    })?;
+
+    let mut edges = Vec::new();
+    for row in rows {
+        edges.push(row?);
+    }
+    Ok(edges)
+}
+
+pub fn get_node_with_edges(
+    conn: &Connection,
+    slug: &str,
+    node_id: &str,
+) -> Result<Option<NodeWithWebEdges>> {
+    let Some(node) = db::get_node(conn, slug, node_id)? else {
+        return Ok(None);
+    };
+    let web_edges = load_connected_web_edges(conn, slug, &node.id)?;
+    Ok(Some(NodeWithWebEdges { node, web_edges }))
+}
+
 // ── Public query API ─────────────────────────────────────────────────
 
 /// Get the apex node (highest depth, single node at that depth).
@@ -136,6 +193,14 @@ pub fn get_apex(conn: &Connection, slug: &str) -> Result<Option<PyramidNode>> {
     }
 
     Ok(None)
+}
+
+pub fn get_apex_with_edges(conn: &Connection, slug: &str) -> Result<Option<NodeWithWebEdges>> {
+    let Some(node) = get_apex(conn, slug)? else {
+        return Ok(None);
+    };
+    let web_edges = load_connected_web_edges(conn, slug, &node.id)?;
+    Ok(Some(NodeWithWebEdges { node, web_edges }))
 }
 
 /// Get the full tree structure from the apex down.
@@ -272,7 +337,134 @@ pub fn drill(conn: &Connection, slug: &str, node_id: &str) -> Result<Option<Dril
     Ok(Some(DrillResult {
         node: parent,
         children,
+        web_edges: load_connected_web_edges(conn, slug, node_id)?,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pyramid::db;
+
+    fn seed_slug(conn: &Connection, slug: &str) {
+        conn.execute(
+            "INSERT INTO pyramid_slugs (slug, content_type, source_path) VALUES (?1, 'code', '')",
+            rusqlite::params![slug],
+        )
+        .unwrap();
+    }
+
+    fn test_node(slug: &str, id: &str, depth: i64, headline: &str) -> PyramidNode {
+        PyramidNode {
+            id: id.to_string(),
+            slug: slug.to_string(),
+            depth,
+            chunk_index: None,
+            headline: headline.to_string(),
+            distilled: format!("{headline} distilled"),
+            topics: vec![],
+            corrections: vec![],
+            decisions: vec![],
+            terms: vec![],
+            dead_ends: vec![],
+            self_prompt: String::new(),
+            children: vec![],
+            parent_id: None,
+            superseded_by: None,
+            created_at: "2025-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    fn test_thread(slug: &str, id: &str, headline: &str, depth: i64) -> PyramidThread {
+        PyramidThread {
+            slug: slug.to_string(),
+            thread_id: id.to_string(),
+            thread_name: headline.to_string(),
+            current_canonical_id: id.to_string(),
+            depth,
+            delta_count: 0,
+            created_at: "2025-01-01T00:00:00Z".to_string(),
+            updated_at: "2025-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_get_node_with_edges_returns_connected_edge_payload() {
+        let conn = Connection::open_in_memory().unwrap();
+        db::init_pyramid_db(&conn).unwrap();
+        seed_slug(&conn, "s");
+
+        let node_a = test_node("s", "L1-000", 1, "Alpha Thread");
+        let node_b = test_node("s", "L1-001", 1, "Beta Thread");
+        db::save_node(&conn, &node_a, None).unwrap();
+        db::save_node(&conn, &node_b, None).unwrap();
+        db::save_thread(&conn, &test_thread("s", "L1-000", "Alpha Thread", 1)).unwrap();
+        db::save_thread(&conn, &test_thread("s", "L1-001", "Beta Thread", 1)).unwrap();
+        db::save_web_edge(
+            &conn,
+            &WebEdge {
+                id: 0,
+                slug: "s".to_string(),
+                thread_a_id: "L1-000".to_string(),
+                thread_b_id: "L1-001".to_string(),
+                relationship: "Both read pyramid_nodes".to_string(),
+                relevance: 0.82,
+                delta_count: 0,
+                created_at: "2025-01-01T00:00:00Z".to_string(),
+                updated_at: "2025-01-01T00:00:00Z".to_string(),
+            },
+        )
+        .unwrap();
+
+        let result = get_node_with_edges(&conn, "s", "L1-000").unwrap().unwrap();
+        assert_eq!(result.node.id, "L1-000");
+        assert_eq!(result.web_edges.len(), 1);
+        assert_eq!(result.web_edges[0].connected_to, "L1-001");
+        assert_eq!(result.web_edges[0].connected_headline, "Beta Thread");
+        assert_eq!(result.web_edges[0].relationship, "Both read pyramid_nodes");
+        assert!((result.web_edges[0].strength - 0.82).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_drill_includes_web_edges_and_empty_when_no_thread() {
+        let conn = Connection::open_in_memory().unwrap();
+        db::init_pyramid_db(&conn).unwrap();
+        seed_slug(&conn, "s");
+
+        let parent = PyramidNode {
+            children: vec!["L0-000".to_string()],
+            ..test_node("s", "L1-000", 1, "Parent")
+        };
+        let child = test_node("s", "L0-000", 0, "Leaf");
+        let sibling = test_node("s", "L1-001", 1, "Sibling");
+        db::save_node(&conn, &parent, None).unwrap();
+        db::save_node(&conn, &child, None).unwrap();
+        db::save_node(&conn, &sibling, None).unwrap();
+        db::save_thread(&conn, &test_thread("s", "L1-000", "Parent", 1)).unwrap();
+        db::save_thread(&conn, &test_thread("s", "L1-001", "Sibling", 1)).unwrap();
+        db::save_web_edge(
+            &conn,
+            &WebEdge {
+                id: 0,
+                slug: "s".to_string(),
+                thread_a_id: "L1-000".to_string(),
+                thread_b_id: "L1-001".to_string(),
+                relationship: "Shared API".to_string(),
+                relevance: 0.7,
+                delta_count: 0,
+                created_at: "2025-01-01T00:00:00Z".to_string(),
+                updated_at: "2025-01-01T00:00:00Z".to_string(),
+            },
+        )
+        .unwrap();
+
+        let drilled = drill(&conn, "s", "L1-000").unwrap().unwrap();
+        assert_eq!(drilled.children.len(), 1);
+        assert_eq!(drilled.web_edges.len(), 1);
+
+        let leaf = get_node_with_edges(&conn, "s", "L0-000").unwrap().unwrap();
+        assert!(leaf.web_edges.is_empty());
+    }
 }
 
 /// Search across all nodes for a term (case-insensitive).

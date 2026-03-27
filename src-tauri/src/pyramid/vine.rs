@@ -75,6 +75,10 @@ fn spawn_write_drain(
                         ref parent_id,
                     } => db::update_parent(&conn, slug, node_id, parent_id),
                     build::WriteOp::UpdateStats { ref slug } => db::update_slug_stats(&conn, slug),
+                    build::WriteOp::Flush { done } => {
+                        let _ = done.send(());
+                        Ok(())
+                    }
                 }
             };
             if let Err(e) = result {

@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 
 interface VineBuildStatus {
-    status: 'running' | 'complete' | 'failed';
+    status: 'running' | 'complete' | 'failed' | 'not_found';
     error: string | null;
 }
 
@@ -38,7 +38,24 @@ export function VineBuildProgress({ slug, onComplete, onClose }: VineBuildProgre
                     try {
                         const bunchData: any = await invoke('pyramid_vine_bunches', { slug });
                         if (!active) break;
-                        setBunches(Array.isArray(bunchData) ? bunchData : bunchData?.bunches || []);
+                        const nextBunches = Array.isArray(bunchData) ? bunchData : bunchData?.bunches || [];
+                        setBunches(nextBunches);
+
+                        const completed = nextBunches.filter(
+                            (b: BunchStatus) => b.status === 'complete' || b.node_count > 0,
+                        ).length;
+                        const isFinalizing =
+                            status.status === 'running' &&
+                            nextBunches.length > 0 &&
+                            completed >= nextBunches.length;
+
+                        if (status.status === 'complete' || status.status === 'failed') {
+                            onComplete?.();
+                            break;
+                        }
+
+                        await new Promise((r) => setTimeout(r, isFinalizing ? 500 : 3000));
+                        continue;
                     } catch {
                         // Bunches endpoint may not be available yet
                     }
@@ -47,12 +64,14 @@ export function VineBuildProgress({ slug, onComplete, onClose }: VineBuildProgre
                         onComplete?.();
                         break;
                     }
+
+                    await new Promise((r) => setTimeout(r, 3000));
+                    continue;
                 } catch (err) {
                     if (!active) break;
                     setError(String(err));
                     break;
                 }
-                await new Promise((r) => setTimeout(r, 3000));
             }
         };
 
@@ -67,13 +86,16 @@ export function VineBuildProgress({ slug, onComplete, onClose }: VineBuildProgre
     const completedBunches = bunches.filter(b => b.status === 'complete' || b.node_count > 0).length;
     const totalBunches = bunches.length;
     const pct = totalBunches > 0 ? Math.round((completedBunches / totalBunches) * 100) : 0;
+    const isFinalizing = isRunning && totalBunches > 0 && completedBunches >= totalBunches;
 
     return (
         <div className="build-progress-panel">
             <div className="build-progress-header">
                 <h3>Building Vine: {slug}</h3>
                 {isRunning && (
-                    <span className="build-status-badge running">Running</span>
+                    <span className="build-status-badge running">
+                        {isFinalizing ? 'Finalizing' : 'Running'}
+                    </span>
                 )}
                 {isComplete && (
                     <span className="build-status-badge complete">Complete</span>

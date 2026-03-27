@@ -14,8 +14,11 @@ use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use super::chain_engine::{ChainDefaults, ChainStep};
-use super::llm::{self, LlmConfig};
+use super::execution_plan::{ModelRequirements, Step, StepOperation};
+use super::expression::ValueEnv;
+use super::llm::{self, LlmConfig, LlmResponse};
 use super::naming::headline_from_analysis;
+use super::transform_runtime;
 use super::types::{Correction, Decision, PyramidNode, Term, Topic};
 
 // ── Step context ────────────────────────────────────────────────────────────
@@ -109,15 +112,21 @@ async fn dispatch_llm(
 ) -> Result<Value> {
     let temperature = resolve_temperature(step, defaults);
     let resolved_model = resolve_model(step, defaults, &ctx.config);
+    let resolved_limit = resolve_context_limit(step, defaults, &ctx.config);
     let max_tokens: usize = 100_000;
 
     // Apply model override: if the resolved model differs from the config's
     // primary model, create a modified config so call_model() uses it.
+    // IMPORTANT: also override primary_context_limit so the cascade logic in
+    // call_model_unified compares against the *resolved* model's capacity.
     let config_ref;
     let overridden_config;
-    if resolved_model != ctx.config.primary_model {
+    if resolved_model != ctx.config.primary_model
+        || resolved_limit != ctx.config.primary_context_limit
+    {
         overridden_config = LlmConfig {
             primary_model: resolved_model.clone(),
+            primary_context_limit: resolved_limit,
             ..ctx.config.clone()
         };
         config_ref = &overridden_config;
@@ -496,10 +505,329 @@ pub fn generate_node_id(pattern: &str, index: usize, depth: Option<i64>) -> Stri
     result
 }
 
+// ── IR Dispatch Layer ────────────────────────────────────────────────────────
+//
+// New dispatch functions for the IR execution path (P1.4 Task B).
+// These read from `execution_plan::Step` + `ModelRequirements` instead of
+// `ChainStep` + `ChainDefaults`. The legacy functions above are untouched.
+
+/// Resolve the model string from IR `ModelRequirements` and config.
+///
+/// Priority:
+/// 1. `reqs.model` — direct model override on the step
+/// 2. `reqs.tier` — mapped through config tiers
+/// 3. Falls back to primary_model when tier is absent or unrecognized
+pub fn resolve_ir_model(reqs: &ModelRequirements, config: &LlmConfig) -> String {
+    // Direct model override takes highest precedence
+    if let Some(ref model) = reqs.model {
+        return model.clone();
+    }
+    // Map tier to actual model
+    let tier = reqs.tier.as_deref().unwrap_or("mid");
+    match tier {
+        "low" | "mid" => config.primary_model.clone(),
+        "high" => config.fallback_model_1.clone(),
+        "max" => config.fallback_model_2.clone(),
+        other => {
+            warn!(
+                "[IR] Unknown model_tier '{}', falling back to primary",
+                other
+            );
+            config.primary_model.clone()
+        }
+    }
+}
+
+/// Resolve the primary context limit (in estimated tokens) for an IR step's model.
+///
+/// When a step overrides the model via tier or direct model string, the context
+/// limit must match the resolved model — otherwise the cascade logic in
+/// `call_model_unified` compares input size against the *original* config's
+/// primary_context_limit and may incorrectly fall back to a model that ignores
+/// response_format/response_schema.
+fn resolve_ir_context_limit(reqs: &ModelRequirements, config: &LlmConfig) -> usize {
+    // Direct model override — we don't know the model's actual limit, so use a
+    // generous 1M (covers most large-context models on OpenRouter).
+    if reqs.model.is_some() {
+        return 1_000_000;
+    }
+    let tier = reqs.tier.as_deref().unwrap_or("mid");
+    match tier {
+        "low" | "mid" => config.primary_context_limit,
+        "high" => 1_000_000,
+        "max" => 2_000_000,
+        _ => config.primary_context_limit,
+    }
+}
+
+/// Resolve the primary context limit for a legacy chain step's model.
+///
+/// Same purpose as `resolve_ir_context_limit` but for the legacy `ChainStep` /
+/// `ChainDefaults` dispatch path.
+fn resolve_context_limit(step: &ChainStep, defaults: &ChainDefaults, config: &LlmConfig) -> usize {
+    // Direct model override on step or defaults
+    if step.model.is_some() {
+        return 1_000_000;
+    }
+    if step.model_tier.is_none() && defaults.model.is_some() {
+        return 1_000_000;
+    }
+    let tier = step
+        .model_tier
+        .as_deref()
+        .unwrap_or(defaults.model_tier.as_str());
+    match tier {
+        "low" | "mid" => config.primary_context_limit,
+        "high" => 1_000_000,
+        "max" => 2_000_000,
+        _ => config.primary_context_limit,
+    }
+}
+
+/// Resolve temperature from IR `ModelRequirements`, with a default of 0.3.
+fn resolve_ir_temperature(reqs: &ModelRequirements) -> f32 {
+    reqs.temperature.unwrap_or(0.3)
+}
+
+fn resolve_ir_max_tokens(step: &Step) -> usize {
+    let _ = step;
+    100_000
+}
+
+fn resolve_ir_llm_call_options(step: &Step) -> llm::LlmCallOptions {
+    let min_timeout_secs = if step.response_schema.is_some() {
+        match step.primitive.as_deref() {
+            Some("classify") => Some(420),
+            Some("web") => Some(240),
+            _ => Some(180),
+        }
+    } else {
+        None
+    };
+
+    llm::LlmCallOptions { min_timeout_secs }
+}
+
+/// Dispatch an IR Step to the appropriate execution path.
+///
+/// Routes based on `step.operation`:
+/// - `Llm` → `dispatch_ir_llm`
+/// - `Transform` → `transform_runtime::execute_transform`
+/// - `Mechanical` → `dispatch_ir_mechanical`
+/// - `Wire | Task | Game` → error (Phase 4)
+///
+/// For LLM steps, returns `(parsed_output, Some(LlmResponse))`.
+/// For non-LLM steps, returns `(output, None)`.
+pub async fn dispatch_ir_step(
+    step: &Step,
+    resolved_input: &Value,
+    system_prompt: &str,
+    ctx: &StepContext,
+) -> Result<(Value, Option<LlmResponse>)> {
+    match step.operation {
+        StepOperation::Llm => {
+            let (value, response) =
+                dispatch_ir_llm(step, resolved_input, system_prompt, ctx).await?;
+            Ok((value, Some(response)))
+        }
+        StepOperation::Transform => {
+            let spec = step.transform.as_ref().ok_or_else(|| {
+                anyhow!(
+                    "IR step '{}' is Transform but has no transform spec",
+                    step.id
+                )
+            })?;
+            info!("[IR] step '{}' → transform '{}'", step.id, spec.function);
+            let env = ValueEnv::new(resolved_input);
+            let resolved_args = transform_runtime::resolve_transform_args(&spec.args, &env)?;
+            let result =
+                transform_runtime::execute_transform_function(&spec.function, &resolved_args)?;
+            Ok((result, None))
+        }
+        StepOperation::Mechanical => {
+            let result = dispatch_ir_mechanical(step, resolved_input, ctx)?;
+            Ok((result, None))
+        }
+        StepOperation::Wire | StepOperation::Task | StepOperation::Game => Err(anyhow!(
+            "IR step '{}': operation {:?} not implemented in local executor (Phase 4)",
+            step.id,
+            step.operation
+        )),
+    }
+}
+
+/// Dispatch an IR LLM step: resolve model from ModelRequirements, call
+/// `call_model_unified`, parse JSON output, retry at temp 0.1 on parse failure.
+///
+/// Returns `(parsed_json, LlmResponse)` so the caller can log costs from the
+/// LlmResponse (usage, generation_id).
+pub async fn dispatch_ir_llm(
+    step: &Step,
+    resolved_input: &Value,
+    system_prompt: &str,
+    ctx: &StepContext,
+) -> Result<(Value, LlmResponse)> {
+    let temperature = resolve_ir_temperature(&step.model_requirements);
+    let resolved_model = resolve_ir_model(&step.model_requirements, &ctx.config);
+    let resolved_limit = resolve_ir_context_limit(&step.model_requirements, &ctx.config);
+    let max_tokens = resolve_ir_max_tokens(step);
+    let llm_options = resolve_ir_llm_call_options(step);
+
+    // Apply model override: if the resolved model differs from the config's
+    // primary model, create a modified config so call_model_unified uses it.
+    // IMPORTANT: also override primary_context_limit so the cascade logic in
+    // call_model_unified compares against the *resolved* model's capacity,
+    // not the original config's (which may be much smaller).
+    let config_ref;
+    let overridden_config;
+    if resolved_model != ctx.config.primary_model
+        || resolved_limit != ctx.config.primary_context_limit
+    {
+        overridden_config = LlmConfig {
+            primary_model: resolved_model.clone(),
+            primary_context_limit: resolved_limit,
+            ..ctx.config.clone()
+        };
+        config_ref = &overridden_config;
+    } else {
+        config_ref = &ctx.config;
+    }
+
+    let raw_input_len = serde_json::to_string(resolved_input)
+        .unwrap_or_default()
+        .len();
+    info!(
+        "[IR] step '{}' compact_inputs={}, raw_input_len={}",
+        step.id, step.compact_inputs, raw_input_len
+    );
+
+    // Build user prompt from resolved input
+    let user_prompt =
+        serde_json::to_string_pretty(resolved_input).unwrap_or_else(|_| resolved_input.to_string());
+
+    info!(
+        "[IR] step '{}' → LLM (temp={}, model={}, ctx_limit={}, prompt_len={}, max_tokens={}, timeout_floor={:?})",
+        step.id,
+        temperature,
+        short_model_name(&resolved_model),
+        resolved_limit,
+        user_prompt.len(),
+        max_tokens,
+        llm_options.min_timeout_secs
+    );
+
+    // If step has a response_schema, use structured outputs for guaranteed JSON
+    if let Some(ref schema) = step.response_schema {
+        let schema_name = step.id.replace('-', "_").replace('.', "_");
+        info!(
+            "[IR] step '{}' → using structured output (schema: {}, schema_type: {:?})",
+            step.id,
+            schema_name,
+            schema.get("type").and_then(|v| v.as_str()),
+        );
+        let response_format = serde_json::json!({
+            "type": "json_schema",
+            "json_schema": {
+                "name": schema_name,
+                "strict": true,
+                "schema": schema
+            }
+        });
+        let response = llm::call_model_unified_with_options(
+            config_ref,
+            system_prompt,
+            &user_prompt,
+            temperature,
+            max_tokens,
+            Some(&response_format),
+            llm_options,
+        )
+        .await?;
+        let parsed = llm::extract_json(&response.content).map_err(|e| {
+            anyhow!(
+                "IR step '{}': structured output JSON parse failed: {}",
+                step.id,
+                e
+            )
+        })?;
+        return Ok((parsed, response));
+    }
+
+    // No response_schema — standard path without structured output enforcement
+    info!(
+        "[IR] step '{}' → no response_schema, using standard JSON extraction",
+        step.id,
+    );
+
+    // Standard path: call model, parse JSON, retry at temp 0.1 on failure
+    let response = llm::call_model_unified_with_options(
+        config_ref,
+        system_prompt,
+        &user_prompt,
+        temperature,
+        max_tokens,
+        None,
+        llm_options,
+    )
+    .await?;
+
+    match llm::extract_json(&response.content) {
+        Ok(json) => {
+            info!("[IR] step '{}' → JSON parsed OK", step.id);
+            Ok((json, response))
+        }
+        Err(_first_err) => {
+            // JSON-retry guarantee: retry at temperature 0.1
+            info!(
+                "[IR] step '{}' → JSON parse failed, retrying at temp 0.1",
+                step.id
+            );
+            let retry_response = llm::call_model_unified_with_options(
+                config_ref,
+                system_prompt,
+                &user_prompt,
+                0.1,
+                max_tokens,
+                None,
+                llm_options,
+            )
+            .await?;
+
+            let parsed = llm::extract_json(&retry_response.content).map_err(|e| {
+                anyhow!(
+                    "IR step '{}': JSON parse failed after retry at temp 0.1: {}",
+                    step.id,
+                    e
+                )
+            })?;
+            Ok((parsed, retry_response))
+        }
+    }
+}
+
+/// Dispatch an IR mechanical step: look up `step.rust_function` in the registry.
+///
+/// Same registry as the legacy `dispatch_mechanical` but reads from IR types.
+pub fn dispatch_ir_mechanical(
+    step: &Step,
+    resolved_input: &Value,
+    ctx: &StepContext,
+) -> Result<Value> {
+    let fn_name = step
+        .rust_function
+        .as_deref()
+        .ok_or_else(|| anyhow!("IR mechanical step '{}' missing rust_function", step.id))?;
+    info!("[IR] step '{}' → mechanical fn '{}'", step.id, fn_name);
+    dispatch_mechanical(fn_name, resolved_input, ctx)
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
+    use super::super::execution_plan::{
+        ErrorPolicy, ModelRequirements, Step, StepOperation, TransformSpec,
+    };
     use super::*;
 
     #[test]
@@ -644,6 +972,10 @@ mod tests {
             response_schema: None,
             batch_threshold: None,
             merge_instruction: None,
+            instruction_map: None,
+            max_thread_size: None,
+            context: None,
+            compact_inputs: false,
             when: None,
             on_error: None,
             save_as: None,
@@ -687,6 +1019,10 @@ mod tests {
             response_schema: None,
             batch_threshold: None,
             merge_instruction: None,
+            instruction_map: None,
+            max_thread_size: None,
+            context: None,
+            compact_inputs: false,
             when: None,
             on_error: None,
             save_as: None,
@@ -717,5 +1053,308 @@ mod tests {
             resolve_model(&make_step("max"), &defaults, &config),
             config.fallback_model_2
         );
+    }
+
+    // ── IR dispatch tests ───────────────────────────────────────────────────
+
+    /// Helper to build a minimal IR Step for testing.
+    fn ir_step(id: &str, op: StepOperation) -> Step {
+        Step {
+            id: id.to_string(),
+            operation: op,
+            primitive: None,
+            depends_on: vec![],
+            iteration: None,
+            input: serde_json::json!({}),
+            instruction: Some("test prompt".to_string()),
+            instruction_map: None,
+            compact_inputs: false,
+            output_schema: None,
+            constraints: None,
+            error_policy: ErrorPolicy::Retry(2),
+            model_requirements: ModelRequirements::default(),
+            storage_directive: None,
+            cost_estimate: super::super::execution_plan::CostEstimate::default(),
+            action_id: None,
+            rust_function: None,
+            transform: None,
+            when: None,
+            context: vec![],
+            response_schema: None,
+            source_step_name: None,
+            converge_metadata: None,
+            metadata: None,
+            scope: None,
+        }
+    }
+
+    #[test]
+    fn test_resolve_ir_model_direct_override() {
+        let reqs = ModelRequirements {
+            tier: Some("low".into()),
+            model: Some("custom/my-model".into()),
+            temperature: None,
+        };
+        let config = LlmConfig::default();
+        // Direct model override wins over tier
+        assert_eq!(resolve_ir_model(&reqs, &config), "custom/my-model");
+    }
+
+    #[test]
+    fn test_resolve_ir_model_tier_mapping() {
+        let config = LlmConfig::default();
+
+        let make_reqs = |tier: &str| ModelRequirements {
+            tier: Some(tier.into()),
+            model: None,
+            temperature: None,
+        };
+
+        assert_eq!(
+            resolve_ir_model(&make_reqs("low"), &config),
+            config.primary_model
+        );
+        assert_eq!(
+            resolve_ir_model(&make_reqs("mid"), &config),
+            config.primary_model
+        );
+        assert_eq!(
+            resolve_ir_model(&make_reqs("high"), &config),
+            config.fallback_model_1
+        );
+        assert_eq!(
+            resolve_ir_model(&make_reqs("max"), &config),
+            config.fallback_model_2
+        );
+    }
+
+    #[test]
+    fn test_resolve_ir_model_default_tier() {
+        // When tier is None, defaults to "mid" → primary_model
+        let reqs = ModelRequirements::default();
+        let config = LlmConfig::default();
+        assert_eq!(resolve_ir_model(&reqs, &config), config.primary_model);
+    }
+
+    #[test]
+    fn test_resolve_ir_model_unknown_tier() {
+        let reqs = ModelRequirements {
+            tier: Some("ultra".into()),
+            model: None,
+            temperature: None,
+        };
+        let config = LlmConfig::default();
+        // Unknown tier falls back to primary
+        assert_eq!(resolve_ir_model(&reqs, &config), config.primary_model);
+    }
+
+    #[test]
+    fn test_resolve_ir_temperature_override() {
+        let reqs = ModelRequirements {
+            tier: None,
+            model: None,
+            temperature: Some(0.7),
+        };
+        assert_eq!(resolve_ir_temperature(&reqs), 0.7);
+    }
+
+    #[test]
+    fn test_resolve_ir_temperature_default() {
+        let reqs = ModelRequirements::default();
+        assert_eq!(resolve_ir_temperature(&reqs), 0.3);
+    }
+
+    #[test]
+    fn test_resolve_ir_timeout_floor_for_structured_classify() {
+        let mut step = ir_step("clustering", StepOperation::Llm);
+        step.primitive = Some("classify".to_string());
+        step.response_schema = Some(serde_json::json!({"type": "object"}));
+
+        assert_eq!(resolve_ir_max_tokens(&step), 100_000);
+        assert_eq!(
+            resolve_ir_llm_call_options(&step).min_timeout_secs,
+            Some(420)
+        );
+    }
+
+    #[test]
+    fn test_resolve_ir_llm_defaults_for_unstructured_steps() {
+        let step = ir_step("l1_synthesis", StepOperation::Llm);
+        assert_eq!(resolve_ir_max_tokens(&step), 100_000);
+        assert_eq!(resolve_ir_llm_call_options(&step).min_timeout_secs, None);
+    }
+
+    #[test]
+    fn test_dispatch_ir_mechanical_routes_correctly() {
+        let ctx = StepContext {
+            db_reader: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
+            db_writer: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
+            slug: "ir-test".into(),
+            config: LlmConfig::default(),
+        };
+        let mut step = ir_step("mech_step", StepOperation::Mechanical);
+        step.rust_function = Some("extract_import_graph".into());
+        let input = serde_json::json!({"files": ["lib.rs"]});
+        let result = dispatch_ir_mechanical(&step, &input, &ctx).unwrap();
+        assert_eq!(result["_mechanical"], "extract_import_graph");
+        assert_eq!(result["_status"], "placeholder");
+        assert_eq!(result["slug"], "ir-test");
+    }
+
+    #[test]
+    fn test_dispatch_ir_mechanical_missing_fn_name() {
+        let ctx = StepContext {
+            db_reader: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
+            db_writer: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
+            slug: "test".into(),
+            config: LlmConfig::default(),
+        };
+        let step = ir_step("no_fn", StepOperation::Mechanical);
+        // rust_function is None
+        let result = dispatch_ir_mechanical(&step, &serde_json::json!({}), &ctx);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("missing rust_function"));
+    }
+
+    #[test]
+    fn test_dispatch_ir_mechanical_unknown_fn() {
+        let ctx = StepContext {
+            db_reader: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
+            db_writer: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
+            slug: "test".into(),
+            config: LlmConfig::default(),
+        };
+        let mut step = ir_step("bad_fn", StepOperation::Mechanical);
+        step.rust_function = Some("nonexistent_fn".into());
+        let result = dispatch_ir_mechanical(&step, &serde_json::json!({}), &ctx);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Unknown mechanical function"));
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_ir_step_transform_routes() {
+        let ctx = StepContext {
+            db_reader: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
+            db_writer: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
+            slug: "test".into(),
+            config: LlmConfig::default(),
+        };
+        let mut step = ir_step("count_step", StepOperation::Transform);
+        step.transform = Some(TransformSpec {
+            function: "count".into(),
+            args: serde_json::json!({"collection": [1, 2, 3]}),
+        });
+        let (result, llm_resp) = dispatch_ir_step(&step, &serde_json::json!({}), "", &ctx)
+            .await
+            .unwrap();
+        assert_eq!(result, serde_json::json!(3));
+        assert!(llm_resp.is_none()); // transforms don't produce LlmResponse
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_ir_step_transform_resolves_args_against_input() {
+        let ctx = StepContext {
+            db_reader: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
+            db_writer: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
+            slug: "test".into(),
+            config: LlmConfig::default(),
+        };
+        let mut step = ir_step("coalesce_step", StepOperation::Transform);
+        step.transform = Some(TransformSpec {
+            function: "coalesce".into(),
+            args: serde_json::json!({
+                "values": ["$primary", "$fallback"]
+            }),
+        });
+        let input = serde_json::json!({
+            "primary": null,
+            "fallback": [1, 2, 3]
+        });
+        let (result, llm_resp) = dispatch_ir_step(&step, &input, "", &ctx).await.unwrap();
+        assert_eq!(result, serde_json::json!([1, 2, 3]));
+        assert!(llm_resp.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_ir_step_transform_missing_spec() {
+        let ctx = StepContext {
+            db_reader: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
+            db_writer: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
+            slug: "test".into(),
+            config: LlmConfig::default(),
+        };
+        let step = ir_step("bad_transform", StepOperation::Transform);
+        // transform is None
+        let result = dispatch_ir_step(&step, &serde_json::json!({}), "", &ctx).await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("no transform spec"));
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_ir_step_wire_not_implemented() {
+        let ctx = StepContext {
+            db_reader: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
+            db_writer: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
+            slug: "test".into(),
+            config: LlmConfig::default(),
+        };
+        let step = ir_step("wire_step", StepOperation::Wire);
+        let result = dispatch_ir_step(&step, &serde_json::json!({}), "", &ctx).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("not implemented"));
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_ir_step_task_not_implemented() {
+        let ctx = StepContext {
+            db_reader: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
+            db_writer: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
+            slug: "test".into(),
+            config: LlmConfig::default(),
+        };
+        let step = ir_step("task_step", StepOperation::Task);
+        let result = dispatch_ir_step(&step, &serde_json::json!({}), "", &ctx).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("not implemented"));
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_ir_step_game_not_implemented() {
+        let ctx = StepContext {
+            db_reader: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
+            db_writer: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
+            slug: "test".into(),
+            config: LlmConfig::default(),
+        };
+        let step = ir_step("game_step", StepOperation::Game);
+        let result = dispatch_ir_step(&step, &serde_json::json!({}), "", &ctx).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("not implemented"));
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_ir_step_mechanical_routes() {
+        let ctx = StepContext {
+            db_reader: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
+            db_writer: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
+            slug: "slug".into(),
+            config: LlmConfig::default(),
+        };
+        let mut step = ir_step("mech", StepOperation::Mechanical);
+        step.rust_function = Some("extract_mechanical_metadata".into());
+        let (result, llm_resp) = dispatch_ir_step(&step, &serde_json::json!({}), "", &ctx)
+            .await
+            .unwrap();
+        assert_eq!(result["_mechanical"], "extract_mechanical_metadata");
+        assert!(llm_resp.is_none()); // mechanical steps don't produce LlmResponse
     }
 }

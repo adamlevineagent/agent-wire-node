@@ -87,7 +87,9 @@ fn excerpt(text: &str, max_chars: usize) -> String {
 }
 
 fn can_self_heal_thread(node_id: &str, depth: i32) -> bool {
-    if depth == 1 {
+    if depth == 0 {
+        node_id.contains("-L0-") || node_id.starts_with("L0-")
+    } else if depth == 1 {
         node_id.starts_with("C-L1-") || node_id.starts_with("L1-")
     } else if depth >= 2 {
         node_id.starts_with(&format!("L{depth}-"))
@@ -452,7 +454,7 @@ pub async fn dispatch_node_stale_check(
             if let Ok(conn) = Connection::open(&db_cost) {
                 let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
                 let _ = conn.execute(
-                    "INSERT INTO pyramid_cost_log (slug, operation, model, input_tokens, output_tokens, estimated_cost, source, layer, check_type, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'auto-stale', ?7, ?8, ?9)",
+                    "INSERT INTO pyramid_cost_log (slug, operation, model, input_tokens, output_tokens, estimated_cost, source, layer, check_type, created_at, chain_id, step_name, tier, latency_ms, generation_id, estimated_cost_usd) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'auto-stale', ?7, ?8, ?9, NULL, NULL, NULL, NULL, NULL, NULL)",
                     rusqlite::params![slug_cost, "stale_check", model_cost, pt, ct, cost, lyr, "node_stale", now],
                 );
             }
@@ -749,7 +751,7 @@ pub async fn dispatch_connection_check(
                 if let Ok(conn) = Connection::open(&db_cost) {
                     let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
                     let _ = conn.execute(
-                        "INSERT INTO pyramid_cost_log (slug, operation, model, input_tokens, output_tokens, estimated_cost, source, layer, check_type, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'auto-stale', ?7, ?8, ?9)",
+                        "INSERT INTO pyramid_cost_log (slug, operation, model, input_tokens, output_tokens, estimated_cost, source, layer, check_type, created_at, chain_id, step_name, tier, latency_ms, generation_id, estimated_cost_usd) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'auto-stale', ?7, ?8, ?9, NULL, NULL, NULL, NULL, NULL, NULL)",
                         rusqlite::params![slug_cost, "stale_check", model_cost, pt, ct, cost, old_depth, "connection_check", now],
                     );
                 }
@@ -1086,7 +1088,7 @@ pub async fn dispatch_edge_stale_check(
                 if let Ok(conn) = Connection::open(&db_cost) {
                     let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
                     let _ = conn.execute(
-                        "INSERT INTO pyramid_cost_log (slug, operation, model, input_tokens, output_tokens, estimated_cost, source, layer, check_type, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'auto-stale', ?7, ?8, ?9)",
+                        "INSERT INTO pyramid_cost_log (slug, operation, model, input_tokens, output_tokens, estimated_cost, source, layer, check_type, created_at, chain_id, step_name, tier, latency_ms, generation_id, estimated_cost_usd) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'auto-stale', ?7, ?8, ?9, NULL, NULL, NULL, NULL, NULL, NULL)",
                         rusqlite::params![slug_cost, "stale_check", model_cost, pt, ct, cost, lyr, "edge_stale", now],
                     );
                 }
@@ -1462,7 +1464,7 @@ pub async fn execute_supersession(
             if let Ok(conn) = Connection::open(&db_cost) {
                 let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
                 let _ = conn.execute(
-                    "INSERT INTO pyramid_cost_log (slug, operation, model, input_tokens, output_tokens, estimated_cost, source, layer, check_type, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'auto-stale', ?7, ?8, ?9)",
+                    "INSERT INTO pyramid_cost_log (slug, operation, model, input_tokens, output_tokens, estimated_cost, source, layer, check_type, created_at, chain_id, step_name, tier, latency_ms, generation_id, estimated_cost_usd) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'auto-stale', ?7, ?8, ?9, NULL, NULL, NULL, NULL, NULL, NULL)",
                     rusqlite::params![slug_cost, "supersession", model_cost, pt, ct, cost, 0i32, "supersession", now],
                 );
             }

@@ -53,33 +53,38 @@ pub fn load_chain(yaml_path: &Path, chains_dir: &Path) -> Result<ChainDefinition
 /// `"{chains_dir}/prompts/conversation/forward.md"` and is replaced with
 /// the file content.
 fn resolve_prompt_refs(def: &mut ChainDefinition, chains_dir: &Path) -> Result<()> {
+    let resolve_prompt = |prompt_ref: &str, step_name: &str, field_name: &str| -> Result<String> {
+        if let Some(rel_path) = prompt_ref.strip_prefix("$prompts/") {
+            let prompt_path = chains_dir.join("prompts").join(rel_path);
+            return std::fs::read_to_string(&prompt_path).with_context(|| {
+                format!(
+                    "step \"{}\": failed to read {} prompt file {}",
+                    step_name,
+                    field_name,
+                    prompt_path.display()
+                )
+            });
+        }
+        Ok(prompt_ref.to_string())
+    };
+
     for step in &mut def.steps {
         if let Some(ref instruction) = step.instruction {
-            if let Some(rel_path) = instruction.strip_prefix("$prompts/") {
-                let prompt_path = chains_dir.join("prompts").join(rel_path);
-                let content = std::fs::read_to_string(&prompt_path).with_context(|| {
-                    format!(
-                        "step \"{}\": failed to read prompt file {}",
-                        step.name,
-                        prompt_path.display()
-                    )
-                })?;
-                step.instruction = Some(content);
-            }
+            step.instruction = Some(resolve_prompt(instruction, &step.name, "instruction")?);
         }
 
-        // Also resolve merge_instruction refs
+        if let Some(ref cluster_instruction) = step.cluster_instruction {
+            step.cluster_instruction =
+                Some(resolve_prompt(cluster_instruction, &step.name, "cluster")?);
+        }
+
         if let Some(ref merge_instr) = step.merge_instruction {
-            if let Some(rel_path) = merge_instr.strip_prefix("$prompts/") {
-                let prompt_path = chains_dir.join("prompts").join(rel_path);
-                let content = std::fs::read_to_string(&prompt_path).with_context(|| {
-                    format!(
-                        "step \"{}\": failed to read merge prompt file {}",
-                        step.name,
-                        prompt_path.display()
-                    )
-                })?;
-                step.merge_instruction = Some(content);
+            step.merge_instruction = Some(resolve_prompt(merge_instr, &step.name, "merge")?);
+        }
+
+        if let Some(instruction_map) = step.instruction_map.as_mut() {
+            for (key, value) in instruction_map.iter_mut() {
+                *value = resolve_prompt(value, &step.name, key)?;
             }
         }
     }

@@ -16,22 +16,21 @@ questions:
   - ask: "What does this file do, what does it export, what tables/endpoints/IPC channels does it touch, and how does it connect to the rest of the system?"
     about: each file individually
     creates: L0 nodes
-    prompt: prompts/code/extract.md
+    prompt: prompts/code/code_extract.md
     parallel: 8
     retry: 3
     variants:
       config files: prompts/code/config_extract.md
-      frontend (.tsx, .jsx): prompts/code/frontend_extract.md
+      frontend (.tsx, .jsx): prompts/code/code_extract_frontend.md
 
   # ── Layer 0→1 bridge: What concepts exist? ───────────────────────
-  - ask: "Looking at all L0 topics together, what are the 8-15 distinct subsystems or conceptual areas in this codebase? A single file may belong to multiple areas."
+  - ask: "Looking at all L0 topics together, what are the distinct subsystems or conceptual areas in this codebase? As many or as few as the material demands. A single file may belong to multiple areas."
     about: all L0 topics at once
     creates: L1 topic assignments
-    prompt: prompts/code/cluster.md
-    model: qwen/qwen3.5-flash-02-23
+    prompt: prompts/code/code_cluster.md
+    # Use default model (mercury-2). Only escalate to qwen for very large codebases
+    # where the compacted topic inventory exceeds 100K chars.
     constraints:
-      min_groups: 8
-      max_groups: 18
       max_items_per_group: 12
     retry: 3
 
@@ -39,8 +38,7 @@ questions:
   - ask: "What tables, endpoints, types, IPC channels, or auth mechanisms are shared between files?"
     about: all L0 nodes at once
     creates: web edges between L0 nodes
-    prompt: prompts/code/web.md
-    model: qwen/qwen3.5-flash-02-23
+    prompt: prompts/code/code_web.md
     optional: true
 
   # ── Layer 1: What is each subsystem? ─────────────────────────────
@@ -49,7 +47,7 @@ questions:
     creates: L1 nodes
     context:
       - L0 web edges
-    prompt: prompts/code/thread.md
+    prompt: prompts/code/code_thread.md
     parallel: 5
     retry: 2
 
@@ -57,7 +55,7 @@ questions:
   - ask: "What do these subsystems share — tables, APIs, auth flows, IPC channels, error patterns?"
     about: all L1 nodes at once
     creates: web edges between L1 nodes
-    prompt: prompts/code/web.md
+    prompt: prompts/code/code_web.md
 
   # ── Layer 1→2 bridge: What are the architectural domains? ────────
   - ask: "What are the 3-5 major architectural domains? Each domain should represent a genuinely distinct concern — not a relabeled subsystem."
@@ -66,15 +64,16 @@ questions:
     context:
       - L1 web edges
       - sibling headlines
-    prompt: prompts/code/recluster.md
-    model: qwen/qwen3.5-flash-02-23
+    prompt: prompts/code/code_distill.md
+    cluster_prompt: prompts/code/code_recluster.md
+    # Use default model for recluster — L1 summaries are compact enough for mercury-2
     retry: 3
 
   # ── Layer 2 webbing: What connects domains? ──────────────────────
   - ask: "What connects these architectural domains — shared data stores, cross-domain API calls, common auth boundaries?"
     about: all L2 nodes at once
     creates: web edges between L2 nodes
-    prompt: prompts/code/web.md
+    prompt: prompts/code/code_web.md
     optional: true
 
   # ── Apex: What is this system? ───────────────────────────────────
@@ -83,4 +82,4 @@ questions:
     creates: apex
     context:
       - L2 web edges
-    prompt: prompts/code/distill.md
+    prompt: prompts/code/code_distill.md

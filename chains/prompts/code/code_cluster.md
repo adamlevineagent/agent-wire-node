@@ -1,7 +1,9 @@
 You are given the extraction results from every source file in a codebase. Each entry has a headline, purpose, exports, key types, key functions, external resources, and other metadata.
 Each topic entry also carries the EXACT L0 node ID in `node_id` / `source_node` (for example `C-L0-000`).
 
-Your job: identify 8-14 coherent THREADS that organize ALL these files into meaningful groups. A thread represents a subsystem, feature area, or architectural layer — something a developer would recognize as "the auth system", "the build pipeline", "the UI components", "the database layer", etc.
+Your job: identify 10-18 coherent THREADS that organize ALL these files into meaningful groups. A thread represents a subsystem, feature area, or architectural layer — something a developer would recognize as "the auth system", "the build pipeline", "the UI components", "the database layer", etc.
+
+The input may include `file_level_connections`: concrete cross-file links discovered from L0 webbing. Use those as strong evidence when deciding what belongs together, especially when files share tables, endpoints, IPC channels, or types.
 
 RULES:
 - Most files should be assigned to ONE thread — the one where they are MOST relevant

@@ -23,6 +23,8 @@ use super::stale_engine;
 use super::types::*;
 use super::vine;
 use super::webbing;
+use super::wire_import;
+use super::wire_publish;
 use super::PyramidState;
 use crate::http_utils::{ct_eq, json_error, json_ok, Unauthorized};
 use std::path::PathBuf;
@@ -134,8 +136,78 @@ struct StaleLogQuery {
 }
 
 #[derive(Deserialize)]
+struct QuestionBuildBody {
+    question: String,
+    #[serde(default = "default_granularity")]
+    granularity: u32,
+    #[serde(default = "default_max_depth")]
+    max_depth: u32,
+    #[serde(default)]
+    from_depth: Option<i64>,
+}
+
+fn default_granularity() -> u32 {
+    3
+}
+fn default_max_depth() -> u32 {
+    3
+}
+
+#[cfg(test)]
+mod question_build_body_tests {
+    use super::QuestionBuildBody;
+
+    #[test]
+    fn question_build_body_defaults_without_from_depth() {
+        let body: QuestionBuildBody =
+            serde_json::from_str(r#"{"question":"What matters here?"}"#).unwrap();
+
+        assert_eq!(body.question, "What matters here?");
+        assert_eq!(body.granularity, 3);
+        assert_eq!(body.max_depth, 3);
+        assert_eq!(body.from_depth, None);
+    }
+
+    #[test]
+    fn question_build_body_accepts_from_depth() {
+        let body: QuestionBuildBody = serde_json::from_str(
+            r#"{"question":"What matters here?","granularity":2,"max_depth":4,"from_depth":1}"#,
+        )
+        .unwrap();
+
+        assert_eq!(body.granularity, 2);
+        assert_eq!(body.max_depth, 4);
+        assert_eq!(body.from_depth, Some(1));
+    }
+}
+
+#[derive(Deserialize)]
 struct CostQuery {
     window: Option<String>, // "24h", "7d", "30d"
+}
+
+#[derive(Deserialize)]
+struct ChainImportBody {
+    contribution_id: String,
+    /// "chain" or "question_set" — defaults to "chain"
+    import_type: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ChainImportResponse {
+    ok: bool,
+    contribution_id: String,
+    title: String,
+    content_type: Option<String>,
+    import_type: String,
+}
+
+// ── Phase 4.3: Publication boundary types ────────────────────────────
+
+#[derive(Deserialize)]
+struct PublishQuestionSetBody {
+    /// Optional human-readable description of the question set.
+    description: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -569,6 +641,28 @@ pub fn pyramid_routes(
         .and(warp::query::<CostQuery>())
         .and_then(handle_cost));
 
+    // ── P3.3: Crystallization chain pattern routes ────────────────────
+
+    // POST /pyramid/:slug/crystallize — manually trigger a delta check
+    let crystallize_trigger = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("crystallize"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(with_auth_state(state.clone()))
+        .and(warp::body::json())
+        .and_then(handle_crystallize_trigger));
+
+    // GET /pyramid/:slug/crystallize/status — show crystallization cascade status
+    let crystallize_status = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("crystallize"))
+        .and(warp::path("status"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_crystallize_status));
+
     // ── Vine Conversation System routes ─────────────────────────────
 
     // POST /pyramid/vine/build — must come BEFORE :slug param routes
@@ -672,10 +766,65 @@ pub fn pyramid_routes(
         .and(with_auth_state(state.clone()))
         .and_then(handle_vine_build_status));
 
+    // POST /pyramid/:slug/build/question — decomposed question build (P2.2)
+    let question_build = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("build"))
+        .and(warp::path("question"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(warp::query::<std::collections::HashMap<String, String>>())
+        .and(warp::body::json::<QuestionBuildBody>())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_question_build));
+
+    // POST /pyramid/:slug/build/preview — preview decomposition without building (P2.2)
+    let question_preview = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("build"))
+        .and(warp::path("preview"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(warp::body::json::<QuestionBuildBody>())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_question_preview));
+
+    // POST /pyramid/:slug/publish — publish pyramid to Wire (P4.3)
+    let publish_pyramid = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("publish"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_publish_pyramid));
+
+    // POST /pyramid/:slug/publish/question-set — publish question set to Wire (P4.3)
+    let publish_question_set = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("publish"))
+        .and(warp::path("question-set"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(warp::body::json::<PublishQuestionSetBody>())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_publish_question_set));
+
+    // POST /pyramid/chain/import — import a chain or question set from the Wire (P4.2)
+    let chain_import = route!(prefix
+        .and(warp::path("chain"))
+        .and(warp::path("import"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(warp::body::json::<ChainImportBody>())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_chain_import));
+
     // Combine routes. Box in groups to keep the nested Either type manageable.
     // Each .or().unify() flattens a pair, and .boxed() erases the type.
     let r1 = list_slugs.or(create_slug_route).unify().boxed();
     let r2 = build_status.or(build_cancel).unify().boxed();
+    // Question build/preview routes must come before generic build (more specific paths)
+    let r2a = question_build.or(question_preview).unify().boxed();
     let r3 = build.or(apex).unify().boxed();
     let r4 = node.or(tree).unify().boxed();
     let r5 = drill.or(search).unify().boxed();
@@ -698,6 +847,8 @@ pub fn pyramid_routes(
     let r17 = auto_update_status.or(stale_log).unify().boxed();
     let r20 = auto_update_l0_sweep;
     let r18 = cost;
+    // Crystallization routes (P3.3)
+    let r26 = crystallize_status.or(crystallize_trigger).unify().boxed();
     // Vine routes
     let r21 = vine_build.or(vine_bunches).unify().boxed();
     let r22 = vine_eras.or(vine_decisions).unify().boxed();
@@ -707,7 +858,8 @@ pub fn pyramid_routes(
 
     // Combine the groups (each is BoxedFilter<(Response,)>)
     let g1 = r1.or(r2).unify().boxed();
-    let g2 = r3.or(r4).unify().boxed();
+    let g1a = r2a.or(r3).unify().boxed();
+    let g2 = g1a.or(r4).unify().boxed();
     let g3 = r5.or(r6).unify().boxed();
     let g4 = r7.or(r8).unify().boxed();
     let g5 = r9.or(r10).unify().boxed();
@@ -718,7 +870,7 @@ pub fn pyramid_routes(
     let g10 = r19.or(r20).unify().boxed();
     let g11 = r21.or(r22).unify().boxed();
     let g12 = r23.or(r24).unify().boxed();
-    let g13 = r25;
+    let g13 = r25.or(r26).unify().boxed();
 
     let h1 = g1.or(g2).unify().boxed();
     let h2 = g3.or(g4).unify().boxed();
@@ -728,15 +880,23 @@ pub fn pyramid_routes(
     let h6 = g11.or(g12).unify().boxed();
     let h7 = g13;
 
-    // CRITICAL: Vine routes (h6, h7) with literal "vine" path segments MUST come
-    // BEFORE slug-parameterized routes, otherwise "vine" gets captured as a :slug param.
+    // Publication routes (P4.3) — slug-parameterized
+    let r27 = publish_pyramid.or(publish_question_set).unify().boxed();
+
+    // Chain import route (P4.2) — literal "chain" path must be before slug-parameterized routes
+    let h8 = chain_import;
+
+    // CRITICAL: Vine routes (h6, h7) and chain import (h8) with literal path segments MUST come
+    // BEFORE slug-parameterized routes, otherwise "vine"/"chain" gets captured as a :slug param.
     let top = h6.or(h7).unify().boxed(); // Vine routes first (literal paths)
+    let top = top.or(h8).unify().boxed(); // Chain import (literal paths)
     let top2 = top.or(h1).unify().boxed(); // Then everything else
     let top3 = top2.or(h2).unify().boxed();
     let top4 = top3.or(h3).unify().boxed();
     let top5 = top4.or(h4).unify().boxed();
     let top6 = top5.or(h5).unify().boxed();
-    top6
+    let top7 = top6.or(r27).unify().boxed(); // Publication routes (P4.3)
+    top7
 }
 
 // ── Route handlers ──────────────────────────────────────────────────
@@ -1358,7 +1518,9 @@ async fn handle_config(
     }
 
     if let Some(use_ir) = body.use_ir_executor {
-        state.use_ir_executor.store(use_ir, std::sync::atomic::Ordering::Relaxed);
+        state
+            .use_ir_executor
+            .store(use_ir, std::sync::atomic::Ordering::Relaxed);
         tracing::info!("IR executor toggled to: {use_ir}");
     }
 
@@ -1370,7 +1532,9 @@ async fn handle_config(
         pyramid_config.primary_model = config.primary_model.clone();
         pyramid_config.fallback_model_1 = config.fallback_model_1.clone();
         pyramid_config.fallback_model_2 = config.fallback_model_2.clone();
-        pyramid_config.use_ir_executor = state.use_ir_executor.load(std::sync::atomic::Ordering::Relaxed);
+        pyramid_config.use_ir_executor = state
+            .use_ir_executor
+            .load(std::sync::atomic::Ordering::Relaxed);
         if let Err(e) = pyramid_config.save(data_dir) {
             tracing::error!("Failed to save pyramid config: {e}");
         }
@@ -2855,5 +3019,604 @@ async fn handle_vine_build_status(
             "vine_slug": slug_name,
             "status": "not_found",
         }))),
+    }
+}
+
+// ── Question decomposition routes (P2.2) ─────────────────────────────────────
+
+/// POST /pyramid/:slug/build/question
+///
+/// Start a decomposed question build. Decomposes the apex question into sub-questions,
+/// compiles to IR, and executes through the standard executor.
+async fn handle_question_build(
+    slug_name: String,
+    query: std::collections::HashMap<String, String>,
+    body: QuestionBuildBody,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let from_depth = query
+        .get("from_depth")
+        .and_then(|s| s.parse().ok())
+        .or(body.from_depth)
+        .unwrap_or(0);
+
+    // Validate slug exists
+    {
+        let conn = state.reader.lock().await;
+        match slug::get_slug(&conn, &slug_name) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return Ok(json_error(
+                    warp::http::StatusCode::NOT_FOUND,
+                    "Slug not found",
+                ));
+            }
+            Err(e) => {
+                return Ok(json_error(
+                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    &e.to_string(),
+                ));
+            }
+        }
+    }
+
+    if body.question.trim().is_empty() {
+        return Ok(json_error(
+            warp::http::StatusCode::BAD_REQUEST,
+            "question cannot be empty",
+        ));
+    }
+
+    // Check for existing active build
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let status = Arc::new(tokio::sync::RwLock::new(BuildStatus {
+        slug: slug_name.clone(),
+        status: "running".to_string(),
+        progress: BuildProgress { done: 0, total: 0 },
+        elapsed_seconds: 0.0,
+        failures: 0,
+    }));
+
+    {
+        let mut active = state.active_build.write().await;
+        if let Some(handle) = active.get(&slug_name) {
+            let s = handle.status.read().await;
+            let is_terminal = s.is_terminal();
+            drop(s);
+            if !handle.cancel.is_cancelled() && !is_terminal {
+                return Ok(json_error(
+                    warp::http::StatusCode::CONFLICT,
+                    "Build already running for this slug",
+                ));
+            }
+        }
+
+        let handle = super::BuildHandle {
+            slug: slug_name.clone(),
+            cancel: cancel.clone(),
+            status: status.clone(),
+        };
+        active.insert(slug_name.clone(), handle);
+    }
+
+    // Spawn the build task
+    let build_state = state.clone();
+    let build_status = status.clone();
+    let question = body.question.clone();
+    let granularity = body.granularity;
+    let max_depth = body.max_depth;
+    let from_depth_for_build = from_depth;
+    let response_slug = slug_name.clone();
+
+    tokio::spawn(async move {
+        let start = std::time::Instant::now();
+
+        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel::<BuildProgress>(64);
+        let progress_status = build_status.clone();
+        let progress_start = start;
+        let progress_handle = tokio::spawn(async move {
+            while let Some(prog) = progress_rx.recv().await {
+                let mut s = progress_status.write().await;
+                s.progress = prog;
+                s.elapsed_seconds = progress_start.elapsed().as_secs_f64();
+            }
+        });
+
+        let result = super::build_runner::run_decomposed_build(
+            &build_state,
+            &slug_name,
+            &question,
+            granularity,
+            max_depth,
+            from_depth_for_build,
+            &cancel,
+            Some(progress_tx.clone()),
+        )
+        .await;
+
+        drop(progress_tx);
+        let _ = progress_handle.await;
+
+        // Update final status
+        {
+            let mut s = build_status.write().await;
+            if cancel.is_cancelled() {
+                s.status = "cancelled".to_string();
+            } else {
+                match result {
+                    Ok((_apex, failures)) => {
+                        s.status = "complete".to_string();
+                        s.failures = failures;
+                    }
+                    Err(e) => {
+                        s.status = format!("error: {}", e);
+                        s.failures = -1;
+                    }
+                }
+            }
+            s.elapsed_seconds = start.elapsed().as_secs_f64();
+        }
+    });
+
+    Ok(json_ok(&serde_json::json!({
+        "status": "started",
+        "slug": response_slug,
+        "build_type": "question_decomposition",
+        "question": body.question,
+        "granularity": body.granularity,
+        "max_depth": body.max_depth,
+        "from_depth": from_depth,
+    })))
+}
+
+/// POST /pyramid/:slug/build/preview
+///
+/// Preview what a decomposed question build would produce without actually building.
+/// Returns the question tree, estimated node counts, estimated LLM calls, and cost.
+async fn handle_question_preview(
+    slug_name: String,
+    body: QuestionBuildBody,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    // Validate slug exists
+    {
+        let conn = state.reader.lock().await;
+        match slug::get_slug(&conn, &slug_name) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return Ok(json_error(
+                    warp::http::StatusCode::NOT_FOUND,
+                    "Slug not found",
+                ));
+            }
+            Err(e) => {
+                return Ok(json_error(
+                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    &e.to_string(),
+                ));
+            }
+        }
+    }
+
+    if body.question.trim().is_empty() {
+        return Ok(json_error(
+            warp::http::StatusCode::BAD_REQUEST,
+            "question cannot be empty",
+        ));
+    }
+
+    match super::build_runner::preview_decomposed_build(
+        &state,
+        &slug_name,
+        &body.question,
+        body.granularity,
+        body.max_depth,
+    )
+    .await
+    {
+        Ok((tree, preview)) => Ok(json_ok(&serde_json::json!({
+            "slug": slug_name,
+            "question": body.question,
+            "preview": preview,
+            "question_tree": tree,
+        }))),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
+    }
+}
+
+// ── P3.3: Crystallization route handlers ────────────────────────────────
+
+/// Request body for POST /pyramid/:slug/crystallize
+#[derive(Debug, Deserialize)]
+struct CrystallizeTriggerBody {
+    /// List of L0 node IDs that changed (e.g., ["L0-001", "L0-005"]).
+    changed_node_ids: Vec<String>,
+}
+
+/// POST /pyramid/:slug/crystallize — manually trigger a delta check
+async fn handle_crystallize_trigger(
+    slug_name: String,
+    state: Arc<PyramidState>,
+    body: CrystallizeTriggerBody,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    use super::crystallization;
+
+    // Load config and build subscriptions while holding the lock, then release
+    let subscriptions = {
+        let conn = state.reader.lock().await;
+        let config = crystallization::load_config(&conn, &slug_name).unwrap_or_default();
+        crystallization::build_crystallization_subscriptions(&config)
+    };
+
+    // Register subscriptions in-memory only (no DB persistence from route handler)
+    for sub in subscriptions {
+        let _ = state.event_bus.subscribe_memory_only(sub).await;
+    }
+
+    // Emit StaleDetected event directly (avoids holding &Connection across awaits)
+    let event = super::event_chain::PyramidEvent::StaleDetected {
+        slug: slug_name.clone(),
+        node_ids: body.changed_node_ids.clone(),
+        layer: 0,
+    };
+    match state.event_bus.emit_memory_only(event).await {
+        Ok(invocation_ids) => Ok(json_ok(&serde_json::json!({
+            "slug": slug_name,
+            "triggered": true,
+            "changed_node_ids": body.changed_node_ids,
+            "invocation_ids": invocation_ids,
+        }))),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
+    }
+}
+
+/// GET /pyramid/:slug/crystallize/status — show crystallization cascade status
+async fn handle_crystallize_status(
+    slug_name: String,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    use super::crystallization;
+
+    let status = crystallization::get_crystallization_status(&state.event_bus, &slug_name).await;
+    Ok(json_ok(&status))
+}
+
+/// POST /pyramid/chain/import — import a chain or question set from the Wire (P4.2)
+async fn handle_chain_import(
+    body: ChainImportBody,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let import_type = body.import_type.as_deref().unwrap_or("chain");
+    let contribution_id = body.contribution_id.trim();
+
+    if contribution_id.is_empty() {
+        return Ok(json_error(
+            warp::http::StatusCode::BAD_REQUEST,
+            "contribution_id is required",
+        ));
+    }
+
+    // Read Wire config from pyramid config
+    let config = state.config.read().await;
+    let wire_url =
+        std::env::var("WIRE_URL").unwrap_or_else(|_| "https://api.callmeplayful.com".to_string());
+    let wire_auth = config.auth_token.clone();
+    drop(config);
+
+    if wire_auth.is_empty() {
+        return Ok(json_error(
+            warp::http::StatusCode::BAD_REQUEST,
+            "auth_token not configured — set via POST /pyramid/config",
+        ));
+    }
+
+    let client = wire_import::WireImportClient::new(wire_url, wire_auth, None);
+
+    match import_type {
+        "chain" => {
+            match client.fetch_chain(contribution_id).await {
+                Ok(chain) => {
+                    // Persist to SQLite (tables created at startup in init_pyramid_db)
+                    let writer = state.writer.lock().await;
+                    if let Err(e) = wire_import::save_imported_chain(&writer, &chain) {
+                        tracing::error!(error = %e, "failed to persist imported chain");
+                        return Ok(json_error(
+                            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                            &format!("failed to persist chain: {}", e),
+                        ));
+                    }
+                    drop(writer);
+
+                    let resp = ChainImportResponse {
+                        ok: true,
+                        contribution_id: chain.id,
+                        title: chain.title,
+                        content_type: chain.content_type,
+                        import_type: "chain".into(),
+                    };
+                    Ok(json_ok(&resp))
+                }
+                Err(e) => {
+                    let msg = format!("failed to import chain: {}", e);
+                    tracing::warn!(contribution_id, error = %e, "chain import failed");
+                    Ok(json_error(warp::http::StatusCode::BAD_GATEWAY, &msg))
+                }
+            }
+        }
+        "question_set" => {
+            match client.fetch_question_set(contribution_id).await {
+                Ok(qs) => {
+                    // Persist to SQLite (tables created at startup in init_pyramid_db)
+                    let writer = state.writer.lock().await;
+                    if let Err(e) = wire_import::save_imported_question_set(&writer, &qs) {
+                        tracing::error!(error = %e, "failed to persist imported question set");
+                        return Ok(json_error(
+                            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                            &format!("failed to persist question set: {}", e),
+                        ));
+                    }
+                    drop(writer);
+
+                    let resp = ChainImportResponse {
+                        ok: true,
+                        contribution_id: qs.id,
+                        title: qs.title,
+                        content_type: None,
+                        import_type: "question_set".into(),
+                    };
+                    Ok(json_ok(&resp))
+                }
+                Err(e) => {
+                    let msg = format!("failed to import question set: {}", e);
+                    tracing::warn!(contribution_id, error = %e, "question set import failed");
+                    Ok(json_error(warp::http::StatusCode::BAD_GATEWAY, &msg))
+                }
+            }
+        }
+        other => Ok(json_error(
+            warp::http::StatusCode::BAD_REQUEST,
+            &format!(
+                "invalid import_type '{}': expected 'chain' or 'question_set'",
+                other
+            ),
+        )),
+    }
+}
+
+// ── P4.3: Publication handlers ──────────────────────────────────────
+
+/// POST /pyramid/:slug/publish — publish all pyramid nodes to the Wire
+async fn handle_publish_pyramid(
+    slug_name: String,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    // Validate slug exists
+    {
+        let conn = state.reader.lock().await;
+        match db::get_slug(&conn, &slug_name) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return Ok(json_error(
+                    warp::http::StatusCode::NOT_FOUND,
+                    &format!("slug '{}' not found", slug_name),
+                ));
+            }
+            Err(e) => {
+                return Ok(json_error(
+                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    &e.to_string(),
+                ));
+            }
+        }
+    }
+
+    // Read Wire config
+    let config = state.config.read().await;
+    let wire_url =
+        std::env::var("WIRE_URL").unwrap_or_else(|_| "https://api.callmeplayful.com".to_string());
+    let wire_auth = config.auth_token.clone();
+    drop(config);
+
+    if wire_auth.is_empty() {
+        return Ok(json_error(
+            warp::http::StatusCode::BAD_REQUEST,
+            "auth_token not configured — set via POST /pyramid/config",
+        ));
+    }
+
+    let publisher = wire_publish::PyramidPublisher::new(wire_url, wire_auth);
+
+    // Phase 1: Load all nodes from DB (synchronous, scoped lock)
+    let nodes_by_depth = {
+        let conn = state.reader.lock().await;
+        let slug_info = match db::get_slug(&conn, &slug_name) {
+            Ok(Some(info)) => info,
+            Ok(None) => {
+                return Ok(json_error(
+                    warp::http::StatusCode::NOT_FOUND,
+                    &format!("slug '{}' not found", slug_name),
+                ));
+            }
+            Err(e) => {
+                return Ok(json_error(
+                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    &e.to_string(),
+                ));
+            }
+        };
+        let mut result = Vec::new();
+        for depth in 0..=slug_info.max_depth {
+            match db::get_nodes_at_depth(&conn, &slug_name, depth) {
+                Ok(nodes) => {
+                    if !nodes.is_empty() {
+                        result.push((depth, nodes));
+                    }
+                }
+                Err(e) => {
+                    return Ok(json_error(
+                        warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        &format!("failed to load nodes at depth {}: {}", depth, e),
+                    ));
+                }
+            }
+        }
+        result
+    };
+
+    if nodes_by_depth.is_empty() {
+        return Ok(json_error(
+            warp::http::StatusCode::BAD_REQUEST,
+            &format!("no nodes found for slug '{}'", slug_name),
+        ));
+    }
+
+    // Phase 2: Publish nodes via HTTP (async, no DB lock held)
+    match publisher.publish_pyramid(&slug_name, &nodes_by_depth).await {
+        Ok(result) => {
+            // Phase 3: Persist ID mappings (scoped write lock)
+            {
+                let writer = state.writer.lock().await;
+                if let Err(e) = wire_publish::init_id_map_table(&writer) {
+                    tracing::warn!(error = %e, "failed to init id_map table");
+                }
+                for mapping in &result.id_mappings {
+                    if let Err(e) = wire_publish::save_id_mapping(
+                        &writer,
+                        &slug_name,
+                        &mapping.local_id,
+                        &mapping.wire_uuid,
+                    ) {
+                        tracing::warn!(
+                            local_id = %mapping.local_id,
+                            error = %e,
+                            "failed to persist ID mapping"
+                        );
+                    }
+                }
+            }
+            tracing::info!(
+                slug = %slug_name,
+                node_count = result.node_count,
+                apex_uuid = ?result.apex_wire_uuid,
+                "pyramid published to Wire"
+            );
+            Ok(json_ok(&result))
+        }
+        Err(e) => {
+            let msg = format!("failed to publish pyramid: {}", e);
+            tracing::warn!(slug = %slug_name, error = %e, "publish failed");
+            Ok(json_error(warp::http::StatusCode::BAD_GATEWAY, &msg))
+        }
+    }
+}
+
+/// POST /pyramid/:slug/publish/question-set — publish a question set to the Wire
+async fn handle_publish_question_set(
+    slug_name: String,
+    body: PublishQuestionSetBody,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    // Validate slug exists and get its content type
+    let content_type = {
+        let conn = state.reader.lock().await;
+        match db::get_slug(&conn, &slug_name) {
+            Ok(Some(info)) => info.content_type,
+            Ok(None) => {
+                return Ok(json_error(
+                    warp::http::StatusCode::NOT_FOUND,
+                    &format!("slug '{}' not found", slug_name),
+                ));
+            }
+            Err(e) => {
+                return Ok(json_error(
+                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    &e.to_string(),
+                ));
+            }
+        }
+    };
+
+    // Load the question set YAML for this content type
+    let chains_dir = state
+        .data_dir
+        .as_ref()
+        .map(|d| d.join("chains"))
+        .unwrap_or_else(|| PathBuf::from("chains"));
+
+    let qs_path = chains_dir
+        .join("questions")
+        .join(format!("{}.yaml", content_type.as_str()));
+
+    let qs_yaml = match std::fs::read_to_string(&qs_path) {
+        Ok(yaml) => yaml,
+        Err(e) => {
+            return Ok(json_error(
+                warp::http::StatusCode::NOT_FOUND,
+                &format!(
+                    "question set not found for content type '{}': {}",
+                    content_type.as_str(),
+                    e
+                ),
+            ));
+        }
+    };
+
+    let question_set: super::question_yaml::QuestionSet = match serde_yaml::from_str(&qs_yaml) {
+        Ok(qs) => qs,
+        Err(e) => {
+            return Ok(json_error(
+                warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("failed to parse question set YAML: {}", e),
+            ));
+        }
+    };
+
+    // Read Wire config
+    let config = state.config.read().await;
+    let wire_url =
+        std::env::var("WIRE_URL").unwrap_or_else(|_| "https://api.callmeplayful.com".to_string());
+    let wire_auth = config.auth_token.clone();
+    drop(config);
+
+    if wire_auth.is_empty() {
+        return Ok(json_error(
+            warp::http::StatusCode::BAD_REQUEST,
+            "auth_token not configured — set via POST /pyramid/config",
+        ));
+    }
+
+    let publisher = wire_publish::PyramidPublisher::new(wire_url, wire_auth);
+    let description = body.description.unwrap_or_else(|| {
+        format!(
+            "Question set for {} content type ({} questions, v{})",
+            question_set.r#type,
+            question_set.questions.len(),
+            question_set.version,
+        )
+    });
+
+    match publisher
+        .publish_question_set(&question_set, &description)
+        .await
+    {
+        Ok(result) => {
+            tracing::info!(
+                slug = %slug_name,
+                wire_uuid = %result.wire_uuid,
+                "question set published to Wire"
+            );
+            Ok(json_ok(&result))
+        }
+        Err(e) => {
+            let msg = format!("failed to publish question set: {}", e);
+            tracing::warn!(slug = %slug_name, error = %e, "question set publish failed");
+            Ok(json_error(warp::http::StatusCode::BAD_GATEWAY, &msg))
+        }
     }
 }

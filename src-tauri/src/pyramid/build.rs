@@ -18,7 +18,7 @@ use regex::Regex;
 use rusqlite::Connection;
 use serde_json::Value;
 use std::sync::LazyLock;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
@@ -73,6 +73,9 @@ pub enum WriteOp {
     },
     UpdateStats {
         slug: String,
+    },
+    Flush {
+        done: oneshot::Sender<()>,
     },
 }
 
@@ -615,6 +618,16 @@ pub(crate) async fn send_update_parent(
     {
         warn!("Writer channel closed, UpdateParent dropped: {e}");
     }
+}
+
+/// Wait until all previously queued writer operations have been applied.
+pub(crate) async fn flush_writes(writer_tx: &mpsc::Sender<WriteOp>) {
+    let (tx, rx) = oneshot::channel();
+    if let Err(e) = writer_tx.send(WriteOp::Flush { done: tx }).await {
+        warn!("Writer channel closed, Flush dropped: {e}");
+        return;
+    }
+    let _ = rx.await;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

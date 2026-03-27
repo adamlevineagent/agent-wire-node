@@ -4,6 +4,7 @@
 // See docs/plans/action-chain-refactor-v3.md for full specification.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 // ── Wire primitives (28 + escape hatch) ──────────────────────────────────
 
@@ -69,6 +70,10 @@ fn default_concurrency() -> usize {
     1
 }
 
+fn default_compact_inputs() -> bool {
+    false
+}
+
 // ── Chain definition structs ─────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -105,6 +110,8 @@ pub struct ChainStep {
     #[serde(default)]
     pub instruction: Option<String>,
     #[serde(default)]
+    pub instruction_map: Option<HashMap<String, String>>,
+    #[serde(default)]
     pub mechanical: bool,
     #[serde(default)]
     pub rust_function: Option<String>,
@@ -126,6 +133,8 @@ pub struct ChainStep {
     pub for_each: Option<String>,
     #[serde(default = "default_concurrency")]
     pub concurrency: usize,
+    #[serde(default)]
+    pub max_thread_size: Option<usize>,
     #[serde(default)]
     pub pair_adjacent: bool,
     #[serde(default)]
@@ -156,6 +165,13 @@ pub struct ChainStep {
     pub node_id_pattern: Option<String>,
     #[serde(default)]
     pub depth: Option<i64>,
+    /// Per-item context injection: map of section-label → $step_ref.
+    /// Resolved at forEach dispatch time. Array refs are auto-indexed by $index.
+    /// Each entry appends a `## {LABEL} CONTEXT` section to the system prompt.
+    #[serde(default)]
+    pub context: Option<serde_json::Value>,
+    #[serde(default = "default_compact_inputs")]
+    pub compact_inputs: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -311,6 +327,17 @@ pub fn validate_chain(def: &ChainDefinition) -> ValidationResult {
                 prefix
             ));
         }
+        if step.accumulate.is_some() && step.concurrency > 1 {
+            errors.push(format!(
+                "{}: accumulate cannot be used with concurrency > 1",
+                prefix
+            ));
+        }
+        if let Some(max_thread_size) = step.max_thread_size {
+            if max_thread_size == 0 {
+                errors.push(format!("{}: max_thread_size must be >= 1", prefix));
+            }
+        }
 
         // model_tier warning
         if let Some(ref tier) = step.model_tier {
@@ -411,6 +438,10 @@ mod tests {
                 save_as: None,
                 node_id_pattern: None,
                 depth: None,
+                instruction_map: None,
+                max_thread_size: None,
+                context: None,
+                compact_inputs: false,
             }],
             post_build: vec![],
         }

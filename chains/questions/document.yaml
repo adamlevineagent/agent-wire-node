@@ -17,7 +17,7 @@ questions:
   - ask: "What type of document is this (design doc, audit, strategy memo, implementation plan, worksheet)? What subject does it cover? When was it written? Is it still the canonical source on its subject or has it been superseded?"
     about: the first 20 lines of each file
     creates: L0 classification tags
-    prompt: prompts/doc/classify.md
+    prompt: prompts/document/doc_classify.md
     parallel: 8
 
   # ── Layer 0: What does each document say? ────────────────────────
@@ -26,7 +26,7 @@ questions:
     creates: L0 nodes
     context:
       - L0 classification tags
-    prompt: prompts/doc/extract.md
+    prompt: prompts/document/doc_extract.md
     parallel: 8
     retry: 3
 
@@ -36,7 +36,7 @@ questions:
     creates: L1 topic assignments
     context:
       - L0 classification tags
-    prompt: prompts/doc/cluster.md
+    prompt: prompts/document/doc_cluster.md
     model: qwen/qwen3.5-flash-02-23
     constraints:
       min_groups: 6
@@ -50,7 +50,7 @@ questions:
     creates: web edges between L0 nodes
     context:
       - L0 classification tags
-    prompt: prompts/doc/web.md
+    prompt: prompts/document/doc_web.md
     model: qwen/qwen3.5-flash-02-23
     optional: true
 
@@ -61,7 +61,7 @@ questions:
     context:
       - L0 web edges
       - L0 classification tags
-    prompt: prompts/doc/thread.md
+    prompt: prompts/document/doc_thread.md
     parallel: 5
     retry: 2
 
@@ -69,7 +69,7 @@ questions:
   - ask: "What connects these topics — shared entities, dependencies, contradictions, or unresolved tensions between them?"
     about: all L1 nodes at once
     creates: web edges between L1 nodes
-    prompt: prompts/doc/web.md
+    prompt: prompts/document/doc_web.md
 
   # ── Layer 1→2 bridge: What are the major domains? ────────────────
   - ask: "What are the 3-5 major domains these topics fall into? Each domain should represent a genuinely distinct area of concern — technical vs economic vs governance vs product."
@@ -78,15 +78,16 @@ questions:
     context:
       - L1 web edges
       - sibling headlines
-    prompt: prompts/doc/recluster.md
-    model: qwen/qwen3.5-flash-02-23
+    prompt: prompts/document/doc_distill.md
+    cluster_prompt: prompts/document/doc_recluster.md
+    cluster_model: qwen/qwen3.5-flash-02-23
     retry: 3
 
   # ── Layer 2 webbing ──────────────────────────────────────────────
   - ask: "What are the cross-domain dependencies and tensions?"
     about: all L2 nodes at once
     creates: web edges between L2 nodes
-    prompt: prompts/doc/web.md
+    prompt: prompts/document/doc_web.md
     optional: true
 
   # ── Apex ─────────────────────────────────────────────────────────
@@ -95,4 +96,4 @@ questions:
     creates: apex
     context:
       - L2 web edges
-    prompt: prompts/doc/distill.md
+    prompt: prompts/document/doc_distill.md

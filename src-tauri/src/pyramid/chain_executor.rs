@@ -22,7 +22,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use super::build::{
-    child_payload_json, send_save_node, send_save_step, send_update_parent, WriteOp,
+    child_payload_json, flush_writes, send_save_node, send_save_step, send_update_parent, WriteOp,
 };
 use super::chain_dispatch::{self, build_node_from_output, generate_node_id, normalize_node_id};
 use super::chain_engine::{ChainDefinition, ChainStep};
@@ -31,6 +31,9 @@ use super::db;
 use super::stale_helpers_upper::resolve_stale_target_for_node;
 use super::types::{BuildProgress, PyramidNode, WebEdge};
 use super::PyramidState;
+
+const CODE_THREAD_SPLIT_PROMPT: &str =
+    include_str!("../../../chains/prompts/code/code_thread_split.md");
 
 // ── Error strategy ──────────────────────────────────────────────────────────
 
@@ -151,61 +154,96 @@ async fn cleanup_from_depth(
     .await?
 }
 
-fn cleanup_from_depth_sync(conn: &Connection, slug: &str, from_depth: i64) -> Result<()> {
-    conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
+/// Delete all nodes, steps, threads, web edges, deltas, and distillations
+/// at or above `from_depth` in a single transaction.  Used for layered rebuilds.
+pub fn cleanup_from_depth_sync(conn: &Connection, slug: &str, from_depth: i64) -> Result<()> {
+    conn.execute_batch("BEGIN IMMEDIATE;")?;
 
-    conn.execute(
-        "UPDATE pyramid_nodes SET parent_id = NULL WHERE slug = ?1 AND depth < ?2",
-        rusqlite::params![slug, from_depth],
-    )?;
-    conn.execute(
-        "DELETE FROM pyramid_annotations WHERE slug = ?1 AND node_id IN \
-         (SELECT id FROM pyramid_nodes WHERE slug = ?1 AND depth >= ?2)",
-        rusqlite::params![slug, from_depth],
-    )?;
-    conn.execute(
-        "DELETE FROM pyramid_threads WHERE slug = ?1 AND current_canonical_id IN \
-         (SELECT id FROM pyramid_nodes WHERE slug = ?1 AND depth >= ?2)",
-        rusqlite::params![slug, from_depth],
-    )
-    .ok();
-    conn.execute(
-        "DELETE FROM pyramid_web_edges WHERE slug = ?1 AND (thread_a_id NOT IN \
-         (SELECT thread_id FROM pyramid_threads WHERE slug = ?1) OR thread_b_id NOT IN \
-         (SELECT thread_id FROM pyramid_threads WHERE slug = ?1))",
-        rusqlite::params![slug],
-    )
-    .ok();
-    conn.execute(
-        "DELETE FROM pyramid_distillations WHERE slug = ?1 AND thread_id NOT IN \
-         (SELECT thread_id FROM pyramid_threads WHERE slug = ?1)",
-        rusqlite::params![slug],
-    )
-    .ok();
-    conn.execute(
-        "DELETE FROM pyramid_deltas WHERE slug = ?1 AND thread_id NOT IN \
-         (SELECT thread_id FROM pyramid_threads WHERE slug = ?1)",
-        rusqlite::params![slug],
-    )
-    .ok();
-    conn.execute(
-        "DELETE FROM pyramid_nodes WHERE slug = ?1 AND depth >= ?2",
-        rusqlite::params![slug, from_depth],
-    )?;
-    conn.execute(
-        "DELETE FROM pyramid_pipeline_steps WHERE slug = ?1 AND depth >= ?2",
-        rusqlite::params![slug, from_depth],
-    )?;
-
-    conn.execute_batch("PRAGMA foreign_keys = ON;")?;
-
-    if from_depth <= 1 {
+    let result = (|| -> Result<()> {
         conn.execute(
-            "DELETE FROM pyramid_pipeline_steps WHERE slug = ?1 AND step_type IN ('thread_cluster', 'thread_narrative', 'synth')",
+            "UPDATE pyramid_nodes SET parent_id = NULL WHERE slug = ?1 AND depth < ?2",
+            rusqlite::params![slug, from_depth],
+        )?;
+        if from_depth > 0 {
+            conn.execute(
+                "UPDATE pyramid_nodes SET children = '[]' WHERE slug = ?1 AND depth = ?2",
+                rusqlite::params![slug, from_depth - 1],
+            )?;
+        }
+        conn.execute(
+            "DELETE FROM pyramid_annotations WHERE slug = ?1 AND node_id IN \
+             (SELECT id FROM pyramid_nodes WHERE slug = ?1 AND depth >= ?2)",
+            rusqlite::params![slug, from_depth],
+        )?;
+        conn.execute(
+            "DELETE FROM pyramid_web_edges
+             WHERE slug = ?1
+               AND (
+                    thread_a_id IN (
+                        SELECT thread_id FROM pyramid_threads WHERE slug = ?1 AND depth >= ?2
+                    )
+                    OR thread_b_id IN (
+                        SELECT thread_id FROM pyramid_threads WHERE slug = ?1 AND depth >= ?2
+                    )
+               )",
+            rusqlite::params![slug, from_depth],
+        )?;
+        conn.execute(
+            "DELETE FROM pyramid_distillations
+             WHERE slug = ?1
+               AND thread_id IN (
+                    SELECT thread_id FROM pyramid_threads WHERE slug = ?1 AND depth >= ?2
+               )",
+            rusqlite::params![slug, from_depth],
+        )?;
+        conn.execute(
+            "DELETE FROM pyramid_deltas
+             WHERE slug = ?1
+               AND thread_id IN (
+                    SELECT thread_id FROM pyramid_threads WHERE slug = ?1 AND depth >= ?2
+               )",
+            rusqlite::params![slug, from_depth],
+        )?;
+        conn.execute(
+            "DELETE FROM pyramid_threads WHERE slug = ?1 AND depth >= ?2",
+            rusqlite::params![slug, from_depth],
+        )?;
+        conn.execute(
+            "DELETE FROM pyramid_nodes WHERE slug = ?1 AND depth >= ?2",
+            rusqlite::params![slug, from_depth],
+        )?;
+        conn.execute(
+            "DELETE FROM pyramid_pipeline_steps WHERE slug = ?1 AND depth >= ?2",
+            rusqlite::params![slug, from_depth],
+        )?;
+        conn.execute(
+            "DELETE FROM pyramid_pipeline_steps
+             WHERE slug = ?1
+               AND (
+                    step_type GLOB '*_r[0-9]*_classify'
+                    OR step_type GLOB '*_r[0-9]*_fallback'
+                    OR step_type GLOB '*_r[0-9]*_repair'
+                    OR step_type GLOB '*_shortcut'
+               )",
             rusqlite::params![slug],
         )?;
+
+        if from_depth <= 1 {
+            conn.execute(
+                "DELETE FROM pyramid_pipeline_steps WHERE slug = ?1 AND step_type IN ('thread_cluster', 'thread_narrative', 'synth', 'cluster_assignment')",
+                rusqlite::params![slug],
+            )?;
+        }
+
+        Ok(())
+    })();
+
+    if let Err(err) = result {
+        let _ = conn.execute_batch("ROLLBACK;");
+        return Err(err);
     }
 
+    conn.execute_batch("COMMIT;")?;
     Ok(())
 }
 
@@ -234,6 +272,40 @@ async fn load_prior_step_output(
     .await?;
 
     Ok(json_str.and_then(|s| serde_json::from_str::<Value>(&s).ok()))
+}
+
+async fn load_cluster_assignment_output(
+    reader: &Arc<Mutex<Connection>>,
+    slug: &str,
+    depth: i64,
+    node_id: &str,
+) -> Result<Option<Value>> {
+    load_prior_step_output(reader, slug, "cluster_assignment", -1, depth, node_id).await
+}
+
+async fn save_cluster_assignment_output(
+    writer_tx: &mpsc::Sender<WriteOp>,
+    slug: &str,
+    depth: i64,
+    node_id: &str,
+    output: &Value,
+    model: &str,
+) -> Result<()> {
+    let output_json = serde_json::to_string(output)?;
+    send_save_step(
+        writer_tx,
+        slug,
+        "cluster_assignment",
+        -1,
+        depth,
+        node_id,
+        &output_json,
+        model,
+        0.0,
+    )
+    .await;
+    flush_writes(writer_tx).await;
+    Ok(())
 }
 
 fn decorate_step_output(mut output: Value, node_id: &str, chunk_index: i64) -> Value {
@@ -713,6 +785,192 @@ async fn resolve_authoritative_child_ids_with_db(
     Ok(normalize_authoritative_child_ids(resolved_ids))
 }
 
+/// Strip `header_lines` from a resolved input map and truncate the `content`
+/// field of every chunk in every array value to the first N lines.
+///
+/// YAML usage: `input: { chunks: $chunks, header_lines: 20 }`
+/// The `header_lines` key is a resolver directive, not data — it is always
+/// removed before the input reaches the LLM.
+fn apply_header_lines(mut input: Value) -> Value {
+    let n = match input.get("header_lines").and_then(|v| v.as_u64()) {
+        Some(n) if n > 0 => n as usize,
+        _ => return input,
+    };
+    if let Some(obj) = input.as_object_mut() {
+        obj.remove("header_lines");
+        for val in obj.values_mut() {
+            if let Some(content) = val.as_str() {
+                let truncated = content.lines().take(n).collect::<Vec<_>>().join("\n");
+                *val = Value::String(truncated);
+                continue;
+            }
+            if let Some(arr) = val.as_array_mut() {
+                for item in arr.iter_mut() {
+                    if let Some(chunk_obj) = item.as_object_mut() {
+                        if let Some(Value::String(content)) = chunk_obj.get("content") {
+                            let truncated = content.lines().take(n).collect::<Vec<_>>().join("\n");
+                            chunk_obj.insert("content".to_string(), Value::String(truncated));
+                        }
+                    }
+                }
+            } else if let Some(chunk_obj) = val.as_object_mut() {
+                if let Some(Value::String(content)) = chunk_obj.get("content") {
+                    let truncated = content.lines().take(n).collect::<Vec<_>>().join("\n");
+                    chunk_obj.insert("content".to_string(), Value::String(truncated));
+                }
+            }
+        }
+    }
+    input
+}
+
+/// Resolve `step.context` entries and return them as appended system-prompt sections.
+///
+/// YAML usage:
+/// ```yaml
+/// context:
+///   classification: $doc_classify
+/// ```
+///
+/// Each entry is resolved from `ctx`. If the resolved value is a JSON array
+/// (e.g. the output of a prior forEach step), it is auto-indexed by
+/// `ctx.current_index` to extract the per-item value. The result is appended
+/// to the system prompt as:
+///
+/// ```
+/// ## CLASSIFICATION CONTEXT
+/// <serialized value>
+/// ```
+fn resolve_context_sections(context: &Value, ctx: &ChainContext) -> anyhow::Result<String> {
+    let mut sections = String::new();
+    let map = match context.as_object() {
+        Some(m) => m,
+        None => return Ok(sections),
+    };
+    for (key, ref_val) in map {
+        let ref_str = match ref_val.as_str() {
+            Some(s) => s,
+            None => continue,
+        };
+        let mut resolved = ctx.resolve_ref(ref_str)?;
+        // Auto-index arrays by current loop position
+        if resolved.is_array() {
+            if let Some(idx) = ctx.current_index {
+                resolved = resolved
+                    .as_array()
+                    .and_then(|arr| arr.get(idx))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+            }
+        }
+        let section_title = key.replace('_', " ").to_uppercase();
+        let content = match &resolved {
+            Value::String(s) => s.clone(),
+            other => serde_json::to_string_pretty(other).unwrap_or_default(),
+        };
+        sections.push_str(&format!("\n\n## {section_title} CONTEXT\n{content}"));
+    }
+    Ok(sections)
+}
+
+fn chunk_header_value(content: &str, prefix: &str) -> Option<String> {
+    content.lines().take(6).find_map(|line| {
+        line.strip_prefix(prefix)
+            .map(|value| value.trim().to_string())
+    })
+}
+
+fn is_probable_frontend_chunk(content: &str) -> bool {
+    let file_path = chunk_header_value(content, "## FILE: ")
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_default();
+    if file_path.is_empty() || file_path.contains("src-tauri") {
+        return false;
+    }
+
+    let extension = std::path::Path::new(file_path.split(" [").next().unwrap_or(&file_path))
+        .extension()
+        .map(|ext| format!(".{}", ext.to_string_lossy().to_ascii_lowercase()))
+        .unwrap_or_default();
+
+    matches!(extension.as_str(), ".tsx" | ".jsx")
+        || (matches!(extension.as_str(), ".ts" | ".js")
+            && [
+                "/src/",
+                "/components/",
+                "/pages/",
+                "/app/",
+                "/hooks/",
+                "/contexts/",
+                "/ui/",
+            ]
+            .iter()
+            .any(|segment| file_path.contains(segment)))
+}
+
+fn instruction_map_prompt(step: &ChainStep, resolved_input: &Value) -> Option<String> {
+    let instruction_map = step.instruction_map.as_ref()?;
+    let content = resolved_input
+        .get("content")
+        .and_then(|value| value.as_str())?;
+
+    let file_type =
+        chunk_header_value(content, "## TYPE: ").map(|value| value.to_ascii_lowercase());
+    let language =
+        chunk_header_value(content, "## LANGUAGE: ").map(|value| value.to_ascii_lowercase());
+    let extension = chunk_header_value(content, "## FILE: ").and_then(|value| {
+        std::path::Path::new(value.split(" [").next().unwrap_or(&value))
+            .extension()
+            .map(|ext| format!(".{}", ext.to_string_lossy().to_ascii_lowercase()))
+    });
+
+    file_type
+        .as_ref()
+        .and_then(|value| instruction_map.get(&format!("type:{value}")).cloned())
+        .or_else(|| {
+            language
+                .as_ref()
+                .and_then(|value| instruction_map.get(&format!("language:{value}")).cloned())
+        })
+        .or_else(|| {
+            extension
+                .as_ref()
+                .and_then(|value| instruction_map.get(&format!("extension:{value}")).cloned())
+        })
+        .or_else(|| {
+            if is_probable_frontend_chunk(content) {
+                instruction_map.get("type:frontend").cloned()
+            } else {
+                None
+            }
+        })
+}
+
+fn resolve_instruction(step: &ChainStep, resolved_input: &Value) -> String {
+    instruction_map_prompt(step, resolved_input)
+        .or_else(|| step.instruction.clone())
+        .unwrap_or_default()
+}
+
+fn build_system_prompt(
+    step: &ChainStep,
+    resolved_input: &Value,
+    ctx: &ChainContext,
+) -> anyhow::Result<String> {
+    let instruction = resolve_instruction(step, resolved_input);
+    let base_prompt = match resolve_prompt_template(&instruction, resolved_input) {
+        Ok(s) => s,
+        Err(_) => instruction,
+    };
+
+    if let Some(ref context_map) = step.context {
+        let suffix = resolve_context_sections(context_map, ctx)?;
+        Ok(format!("{base_prompt}{suffix}"))
+    } else {
+        Ok(base_prompt)
+    }
+}
+
 fn enrich_group_item_input(item: &Value, ctx: &ChainContext) -> Value {
     let source_nodes = resolve_authoritative_child_ids(item, ctx);
     if source_nodes.is_empty() {
@@ -911,6 +1169,237 @@ fn validate_step_output(step: &ChainStep, output: &Value) -> Result<()> {
     Ok(())
 }
 
+fn canonical_assignment_key(assignment: &Value) -> Option<String> {
+    let source_node = assignment
+        .get("source_node")
+        .or_else(|| assignment.get("node_id"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let topic_index = assignment
+        .get("topic_index")
+        .and_then(|value| value.as_i64())
+        .unwrap_or(-1);
+    Some(format!("{source_node}|{topic_index}"))
+}
+
+fn fallback_split_thread(thread: &Value, max_thread_size: usize) -> Vec<Value> {
+    let assignments = thread
+        .get("assignments")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let base_name = thread
+        .get("name")
+        .and_then(|value| value.as_str())
+        .unwrap_or("Thread");
+    let base_description = thread
+        .get("description")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+
+    assignments
+        .chunks(max_thread_size.max(1))
+        .enumerate()
+        .map(|(index, chunk)| {
+            serde_json::json!({
+                "name": format!("{base_name} Part {}", index + 1),
+                "description": format!("{base_description} Part {} of overflow split.", index + 1).trim().to_string(),
+                "assignments": chunk.to_vec(),
+            })
+        })
+        .collect()
+}
+
+fn validate_split_threads(
+    original_assignments: &[Value],
+    split_threads: &[Value],
+    max_thread_size: usize,
+) -> bool {
+    if split_threads.is_empty() {
+        return false;
+    }
+
+    let original_keys: HashSet<String> = original_assignments
+        .iter()
+        .filter_map(canonical_assignment_key)
+        .collect();
+    let mut split_keys = HashSet::new();
+
+    for thread in split_threads {
+        let Some(assignments) = thread.get("assignments").and_then(|value| value.as_array()) else {
+            return false;
+        };
+        if assignments.is_empty() || assignments.len() > max_thread_size {
+            return false;
+        }
+        for assignment in assignments {
+            let Some(key) = canonical_assignment_key(assignment) else {
+                return false;
+            };
+            if !original_keys.contains(&key) || !split_keys.insert(key) {
+                return false;
+            }
+        }
+    }
+
+    split_keys == original_keys
+}
+
+fn topic_preview_for_assignment(assignment: &Value, topics: &[Value]) -> Option<Value> {
+    let by_index = assignment
+        .get("topic_index")
+        .and_then(|value| value.as_u64())
+        .and_then(|index| topics.get(index as usize))
+        .cloned();
+    if by_index.is_some() {
+        return by_index;
+    }
+
+    let assignment_node_id = assignment
+        .get("source_node")
+        .or_else(|| assignment.get("node_id"))
+        .and_then(|value| value.as_str())
+        .and_then(candidate_node_id_from_str)?;
+
+    topics.iter().find_map(|topic| {
+        topic
+            .get("node_id")
+            .or_else(|| topic.get("source_node"))
+            .and_then(|value| value.as_str())
+            .and_then(candidate_node_id_from_str)
+            .filter(|topic_node_id| *topic_node_id == assignment_node_id)
+            .map(|_| topic.clone())
+    })
+}
+
+async fn enforce_max_thread_size(
+    step: &ChainStep,
+    output: Value,
+    resolved_input: &Value,
+    ctx: &ChainContext,
+    reader: &Arc<Mutex<Connection>>,
+    dispatch_ctx: &chain_dispatch::StepContext,
+    defaults: &super::chain_engine::ChainDefaults,
+    error_strategy: &ErrorStrategy,
+) -> Result<Value> {
+    let Some(max_thread_size) = step.max_thread_size else {
+        return Ok(output);
+    };
+    let Some(threads) = output.get("threads").and_then(|value| value.as_array()) else {
+        return Ok(output);
+    };
+    if threads.iter().all(|thread| {
+        thread
+            .get("assignments")
+            .and_then(|value| value.as_array())
+            .map(|assignments| assignments.len() <= max_thread_size)
+            .unwrap_or(true)
+    }) {
+        return Ok(output);
+    }
+
+    let topics = resolved_input
+        .get("topics")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let depth0_edges = load_same_depth_web_connections(reader, &ctx.slug, 0).await?;
+    let mut rebuilt_threads = Vec::new();
+
+    for thread in threads {
+        let assignments = thread
+            .get("assignments")
+            .and_then(|value| value.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        if assignments.len() <= max_thread_size {
+            rebuilt_threads.push(thread.clone());
+            continue;
+        }
+
+        let source_nodes: Vec<String> = assignments
+            .iter()
+            .filter_map(|assignment| {
+                assignment
+                    .get("source_node")
+                    .or_else(|| assignment.get("node_id"))
+                    .and_then(|value| value.as_str())
+                    .and_then(candidate_node_id_from_str)
+            })
+            .collect();
+        let topic_previews: Vec<Value> = assignments
+            .iter()
+            .filter_map(|assignment| topic_preview_for_assignment(assignment, &topics))
+            .collect();
+        let internal_connections = summarize_internal_connections(&depth0_edges, &source_nodes, 18);
+        let target_parts = ((assignments.len() + max_thread_size - 1) / max_thread_size).max(2);
+        let split_input = serde_json::json!({
+            "original_thread": thread,
+            "max_thread_size": max_thread_size,
+            "target_subthreads": target_parts,
+            "assignment_count": assignments.len(),
+            "topics": topic_previews,
+            "internal_file_connections": internal_connections,
+        });
+
+        let mut split_step = step.clone();
+        split_step.instruction = Some(CODE_THREAD_SPLIT_PROMPT.to_string());
+        let split_system_prompt = build_system_prompt(&split_step, &split_input, ctx)?;
+        let split_result = dispatch_with_retry(
+            &split_step,
+            &split_input,
+            &split_system_prompt,
+            defaults,
+            dispatch_ctx,
+            error_strategy,
+            &format!("{}-split-{}", step.name, rebuilt_threads.len()),
+        )
+        .await;
+
+        let split_threads = split_result.ok().and_then(|value| {
+            value
+                .get("threads")
+                .and_then(|threads| threads.as_array())
+                .cloned()
+        });
+
+        if let Some(split_threads) = split_threads.as_ref() {
+            if validate_split_threads(&assignments, split_threads, max_thread_size) {
+                info!(
+                    "[CHAIN] [{}] semantically split oversized thread '{}' into {} subthreads",
+                    step.name,
+                    thread
+                        .get("name")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("Unnamed"),
+                    split_threads.len()
+                );
+                rebuilt_threads.extend(split_threads.iter().cloned());
+                continue;
+            }
+        }
+
+        warn!(
+            "[CHAIN] [{}] falling back to deterministic overflow split for '{}' ({} assignments)",
+            step.name,
+            thread
+                .get("name")
+                .and_then(|value| value.as_str())
+                .unwrap_or("Unnamed"),
+            assignments.len()
+        );
+        rebuilt_threads.extend(fallback_split_thread(thread, max_thread_size));
+    }
+
+    let mut normalized = output;
+    if let Some(obj) = normalized.as_object_mut() {
+        obj.insert("threads".to_string(), Value::Array(rebuilt_threads));
+    }
+    Ok(normalized)
+}
+
 #[derive(Debug, Clone)]
 struct PendingWebEdge {
     source_node_id: String,
@@ -951,10 +1440,126 @@ fn collect_web_entities(node: &PyramidNode) -> Vec<String> {
     entities
 }
 
-fn build_webbing_input(nodes: &[PyramidNode], depth: i64, resolved_input: &Value) -> Value {
+#[derive(Debug, Clone, Default)]
+struct SupplementalWebNodeContext {
+    source_path: Option<String>,
+    entities: Vec<String>,
+}
+
+fn supplemental_web_context_by_key(
+    resolved_input: &Value,
+) -> HashMap<String, SupplementalWebNodeContext> {
+    let mut contexts = HashMap::new();
+    let items = resolved_input
+        .get("nodes")
+        .and_then(|value| value.as_array())
+        .or_else(|| resolved_input.as_array());
+
+    let Some(items) = items else {
+        return contexts;
+    };
+
+    for item in items {
+        let Some(obj) = item.as_object() else {
+            continue;
+        };
+
+        let mut ctx = SupplementalWebNodeContext::default();
+        ctx.source_path = obj
+            .get("source_path")
+            .or_else(|| obj.get("sourcePath"))
+            .or_else(|| obj.get("file_path"))
+            .or_else(|| obj.get("path"))
+            .and_then(|value| value.as_str())
+            .map(|value| value.to_string());
+
+        let mut entity_set = HashSet::new();
+        if let Some(entities) = obj.get("entities").and_then(|value| value.as_array()) {
+            for entity in entities.iter().filter_map(|value| value.as_str()) {
+                let trimmed = entity.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if entity_set.insert(trimmed.to_ascii_lowercase()) {
+                    ctx.entities.push(trimmed.to_string());
+                }
+            }
+        }
+        if let Some(topics) = obj.get("topics").and_then(|value| value.as_array()) {
+            for topic in topics {
+                if let Some(entities) = topic.get("entities").and_then(|value| value.as_array()) {
+                    for entity in entities.iter().filter_map(|value| value.as_str()) {
+                        let trimmed = entity.trim();
+                        if trimmed.is_empty() {
+                            continue;
+                        }
+                        if entity_set.insert(trimmed.to_ascii_lowercase()) {
+                            ctx.entities.push(trimmed.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut keys = Vec::new();
+        for key in ["node_id", "source_node", "id", "headline"] {
+            if let Some(value) = obj.get(key).and_then(|value| value.as_str()) {
+                let trimmed = value.trim();
+                if !trimmed.is_empty() {
+                    keys.push(trimmed.to_string());
+                }
+            }
+        }
+
+        for key in keys {
+            contexts.entry(key).or_insert_with(|| ctx.clone());
+        }
+    }
+
+    contexts
+}
+
+fn merge_web_entities(
+    node: &PyramidNode,
+    supplemental: Option<&SupplementalWebNodeContext>,
+    max_items: usize,
+) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut merged = Vec::new();
+
+    for entity in collect_web_entities(node).into_iter().chain(
+        supplemental
+            .into_iter()
+            .flat_map(|ctx| ctx.entities.iter().cloned()),
+    ) {
+        let trimmed = entity.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if seen.insert(trimmed.to_ascii_lowercase()) {
+            merged.push(trimmed.to_string());
+        }
+        if merged.len() >= max_items {
+            break;
+        }
+    }
+
+    merged
+}
+
+fn build_webbing_input(
+    nodes: &[PyramidNode],
+    depth: i64,
+    resolved_input: &Value,
+    compact_inputs: bool,
+) -> Value {
+    let supplemental = supplemental_web_context_by_key(resolved_input);
     let node_payloads: Vec<Value> = nodes
         .iter()
         .map(|node| {
+            let supplemental_ctx = supplemental
+                .get(&node.id)
+                .or_else(|| supplemental.get(&node.headline));
             let topic_payloads: Vec<Value> = node
                 .topics
                 .iter()
@@ -967,13 +1572,33 @@ fn build_webbing_input(nodes: &[PyramidNode], depth: i64, resolved_input: &Value
                 })
                 .collect();
 
-            serde_json::json!({
-                "node_id": node.id.clone(),
-                "headline": node.headline.clone(),
-                "orientation": truncate_for_webbing(&node.distilled, 1200),
-                "topics": topic_payloads,
-                "entities": collect_web_entities(node),
-            })
+            if compact_inputs {
+                let mut payload = serde_json::Map::new();
+                payload.insert("node_id".to_string(), Value::String(node.id.clone()));
+                payload.insert("headline".to_string(), Value::String(node.headline.clone()));
+                if let Some(source_path) = supplemental_ctx.and_then(|ctx| ctx.source_path.clone())
+                {
+                    payload.insert("source_path".to_string(), Value::String(source_path));
+                }
+                payload.insert(
+                    "entities".to_string(),
+                    Value::Array(
+                        merge_web_entities(node, supplemental_ctx, 16)
+                            .into_iter()
+                            .map(Value::String)
+                            .collect(),
+                    ),
+                );
+                Value::Object(payload)
+            } else {
+                serde_json::json!({
+                    "node_id": node.id.clone(),
+                    "headline": node.headline.clone(),
+                    "orientation": truncate_for_webbing(&node.distilled, 1200),
+                    "topics": topic_payloads,
+                    "entities": merge_web_entities(node, supplemental_ctx, 24),
+                })
+            }
         })
         .collect();
 
@@ -1032,6 +1657,229 @@ fn extract_explicit_web_node_ids(resolved_input: &Value) -> Vec<String> {
     node_ids
 }
 
+#[derive(Debug, Clone)]
+struct SameDepthWebConnection {
+    left_id: String,
+    left_headline: String,
+    right_id: String,
+    right_headline: String,
+    relationship: String,
+    relevance: f64,
+}
+
+fn connection_summary_line(connection: &SameDepthWebConnection) -> String {
+    format!(
+        "{} \"{}\" <-> {} \"{}\": {} ({:.2})",
+        connection.left_id,
+        connection.left_headline,
+        connection.right_id,
+        connection.right_headline,
+        connection.relationship.trim(),
+        connection.relevance
+    )
+}
+
+fn extract_node_ids_from_topic_inventory(value: &Value) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut node_ids = Vec::new();
+    let Some(topics) = value.get("topics").and_then(|topics| topics.as_array()) else {
+        return node_ids;
+    };
+
+    for topic in topics {
+        let candidate = topic
+            .get("node_id")
+            .or_else(|| topic.get("source_node"))
+            .or_else(|| topic.get("id"))
+            .and_then(|value| value.as_str())
+            .and_then(candidate_node_id_from_str);
+        if let Some(node_id) = candidate {
+            if seen.insert(node_id.clone()) {
+                node_ids.push(node_id);
+            }
+        }
+    }
+
+    node_ids
+}
+
+async fn load_same_depth_web_connections(
+    reader: &Arc<Mutex<Connection>>,
+    slug: &str,
+    depth: i64,
+) -> Result<Vec<SameDepthWebConnection>> {
+    let slug = slug.to_string();
+    db_read(reader, move |conn| {
+        let mut stmt = conn.prepare(
+            "SELECT
+                left_thread.current_canonical_id AS left_id,
+                left_node.headline AS left_headline,
+                right_thread.current_canonical_id AS right_id,
+                right_node.headline AS right_headline,
+                edge.relationship,
+                edge.relevance
+             FROM pyramid_web_edges AS edge
+             JOIN pyramid_threads AS left_thread
+               ON left_thread.slug = edge.slug
+              AND left_thread.thread_id = edge.thread_a_id
+             JOIN pyramid_threads AS right_thread
+               ON right_thread.slug = edge.slug
+              AND right_thread.thread_id = edge.thread_b_id
+             JOIN live_pyramid_nodes AS left_node
+               ON left_node.slug = left_thread.slug
+              AND left_node.id = left_thread.current_canonical_id
+             JOIN live_pyramid_nodes AS right_node
+               ON right_node.slug = right_thread.slug
+              AND right_node.id = right_thread.current_canonical_id
+             WHERE edge.slug = ?1
+               AND left_thread.depth = ?2
+               AND right_thread.depth = ?2
+             ORDER BY edge.relevance DESC, left_id ASC, right_id ASC",
+        )?;
+
+        let rows = stmt.query_map(rusqlite::params![slug, depth], |row| {
+            Ok(SameDepthWebConnection {
+                left_id: row.get(0)?,
+                left_headline: row.get(1)?,
+                right_id: row.get(2)?,
+                right_headline: row.get(3)?,
+                relationship: row.get(4)?,
+                relevance: row.get(5)?,
+            })
+        })?;
+
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
+    })
+    .await
+}
+
+fn summarize_internal_connections(
+    connections: &[SameDepthWebConnection],
+    node_ids: &[String],
+    limit: usize,
+) -> String {
+    let node_id_set: HashSet<&str> = node_ids.iter().map(|id| id.as_str()).collect();
+    connections
+        .iter()
+        .filter(|connection| {
+            node_id_set.contains(connection.left_id.as_str())
+                && node_id_set.contains(connection.right_id.as_str())
+        })
+        .take(limit)
+        .map(connection_summary_line)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn summarize_external_connections(
+    connections: &[SameDepthWebConnection],
+    node_ids: &[String],
+    limit: usize,
+) -> String {
+    let node_id_set: HashSet<&str> = node_ids.iter().map(|id| id.as_str()).collect();
+    connections
+        .iter()
+        .filter(|connection| {
+            let left_in = node_id_set.contains(connection.left_id.as_str());
+            let right_in = node_id_set.contains(connection.right_id.as_str());
+            left_in ^ right_in
+        })
+        .take(limit)
+        .map(connection_summary_line)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn insert_text_context(value: &mut Value, key: &str, text: String) {
+    if text.trim().is_empty() {
+        return;
+    }
+    let Some(obj) = value.as_object_mut() else {
+        return;
+    };
+    obj.entry(key.to_string()).or_insert(Value::String(text));
+}
+
+async fn enrich_single_step_input(
+    step: &ChainStep,
+    mut resolved_input: Value,
+    reader: &Arc<Mutex<Connection>>,
+    slug: &str,
+) -> Result<Value> {
+    if step.name == "thread_clustering" {
+        let topic_node_ids = extract_node_ids_from_topic_inventory(&resolved_input);
+        if !topic_node_ids.is_empty() {
+            let depth0_edges = load_same_depth_web_connections(reader, slug, 0).await?;
+            let summary = summarize_internal_connections(&depth0_edges, &topic_node_ids, 24);
+            insert_text_context(&mut resolved_input, "file_level_connections", summary);
+        }
+    }
+
+    Ok(resolved_input)
+}
+
+async fn enrich_for_each_step_input(
+    step: &ChainStep,
+    mut resolved_input: Value,
+    item: &Value,
+    ctx: &ChainContext,
+    reader: &Arc<Mutex<Connection>>,
+) -> Result<Value> {
+    if step.name == "thread_narrative" {
+        let child_ids = resolve_authoritative_child_ids_with_db(item, ctx, reader).await?;
+        if !child_ids.is_empty() {
+            let depth0_edges = load_same_depth_web_connections(reader, &ctx.slug, 0).await?;
+            let summary = summarize_external_connections(&depth0_edges, &child_ids, 18);
+            insert_text_context(&mut resolved_input, "cross_thread_connections", summary);
+        }
+    }
+
+    Ok(resolved_input)
+}
+
+async fn enrich_group_extra_input(
+    step: &ChainStep,
+    nodes: &[PyramidNode],
+    extra_input: Option<Value>,
+    reader: &Arc<Mutex<Connection>>,
+    slug: &str,
+) -> Result<Option<Value>> {
+    let mut merged = match extra_input {
+        Some(Value::Object(map)) => map,
+        Some(other) => {
+            let mut map = serde_json::Map::new();
+            map.insert("context".to_string(), other);
+            map
+        }
+        None => serde_json::Map::new(),
+    };
+
+    if step.name == "upper_layer_synthesis" {
+        let depth = nodes.first().map(|node| node.depth).unwrap_or(0);
+        let node_ids: Vec<String> = nodes.iter().map(|node| node.id.clone()).collect();
+        if !node_ids.is_empty() {
+            let sibling_edges = load_same_depth_web_connections(reader, slug, depth).await?;
+            let summary = summarize_external_connections(&sibling_edges, &node_ids, 12);
+            if !summary.trim().is_empty() {
+                merged.insert(
+                    "cross_subsystem_connections".to_string(),
+                    Value::String(summary),
+                );
+            }
+        }
+    }
+
+    if merged.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(Value::Object(merged)))
+    }
+}
+
 async fn load_nodes_for_webbing(
     reader: &Arc<Mutex<Connection>>,
     slug: &str,
@@ -1040,37 +1888,25 @@ async fn load_nodes_for_webbing(
 ) -> Result<Vec<PyramidNode>> {
     let expected_order = expected_ids.to_vec();
     let expected_set: HashSet<String> = expected_order.iter().cloned().collect();
-    let max_attempts = if expected_order.is_empty() { 1 } else { 5 };
+    let slug_owned = slug.to_string();
+    let mut nodes = db_read(reader, move |conn| {
+        db::get_nodes_at_depth(conn, &slug_owned, depth)
+    })
+    .await?;
 
-    for attempt in 0..max_attempts {
-        let slug_owned = slug.to_string();
-        let mut nodes = db_read(reader, move |conn| {
-            db::get_nodes_at_depth(conn, &slug_owned, depth)
-        })
-        .await?;
-
-        if !expected_set.is_empty() {
-            nodes.retain(|node| expected_set.contains(&node.id));
-
-            if nodes.len() >= expected_order.len() || attempt + 1 == max_attempts {
-                let mut by_id: HashMap<String, PyramidNode> = nodes
-                    .into_iter()
-                    .map(|node| (node.id.clone(), node))
-                    .collect();
-                let ordered = expected_order
-                    .iter()
-                    .filter_map(|node_id| by_id.remove(node_id))
-                    .collect();
-                return Ok(ordered);
-            }
-        } else {
-            return Ok(nodes);
-        }
-
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    if expected_set.is_empty() {
+        return Ok(nodes);
     }
 
-    Ok(Vec::new())
+    nodes.retain(|node| expected_set.contains(&node.id));
+    let mut by_id: HashMap<String, PyramidNode> = nodes
+        .into_iter()
+        .map(|node| (node.id.clone(), node))
+        .collect();
+    Ok(expected_order
+        .iter()
+        .filter_map(|node_id| by_id.remove(node_id))
+        .collect())
 }
 
 fn normalize_web_relationship(raw: &str, shared_resources: &[String]) -> String {
@@ -1251,51 +2087,65 @@ async fn persist_web_edges_for_depth(
             }
         }
 
-        db::delete_web_edges_for_depth(&conn, &slug_owned, depth)?;
+        conn.execute_batch("BEGIN IMMEDIATE;")?;
+        let save_result = (|| -> Result<usize> {
+            db::delete_web_edges_for_depth(&conn, &slug_owned, depth)?;
 
-        let mut saved = 0;
-        for edge in edges_owned {
-            let Some(thread_a_id) = node_to_thread.get(&edge.source_node_id).cloned() else {
-                warn!(
-                    "[CHAIN] web edge source node missing thread target: {}",
-                    edge.source_node_id
-                );
-                continue;
-            };
-            let Some(thread_b_id) = node_to_thread.get(&edge.target_node_id).cloned() else {
-                warn!(
-                    "[CHAIN] web edge target node missing thread target: {}",
-                    edge.target_node_id
-                );
-                continue;
-            };
+            let mut saved = 0;
+            for edge in edges_owned {
+                let Some(thread_a_id) = node_to_thread.get(&edge.source_node_id).cloned() else {
+                    warn!(
+                        "[CHAIN] web edge source node missing thread target: {}",
+                        edge.source_node_id
+                    );
+                    continue;
+                };
+                let Some(thread_b_id) = node_to_thread.get(&edge.target_node_id).cloned() else {
+                    warn!(
+                        "[CHAIN] web edge target node missing thread target: {}",
+                        edge.target_node_id
+                    );
+                    continue;
+                };
 
-            if thread_a_id == thread_b_id {
-                continue;
+                if thread_a_id == thread_b_id {
+                    continue;
+                }
+
+                let (thread_a_id, thread_b_id) = if thread_a_id < thread_b_id {
+                    (thread_a_id, thread_b_id)
+                } else {
+                    (thread_b_id, thread_a_id)
+                };
+
+                let edge_row = WebEdge {
+                    id: 0,
+                    slug: slug_owned.clone(),
+                    thread_a_id,
+                    thread_b_id,
+                    relationship: edge.relationship,
+                    relevance: edge.strength,
+                    delta_count: 0,
+                    created_at: String::new(),
+                    updated_at: String::new(),
+                };
+                db::save_web_edge(&conn, &edge_row)?;
+                saved += 1;
             }
 
-            let (thread_a_id, thread_b_id) = if thread_a_id < thread_b_id {
-                (thread_a_id, thread_b_id)
-            } else {
-                (thread_b_id, thread_a_id)
-            };
+            Ok(saved)
+        })();
 
-            let edge_row = WebEdge {
-                id: 0,
-                slug: slug_owned.clone(),
-                thread_a_id,
-                thread_b_id,
-                relationship: edge.relationship,
-                relevance: edge.strength,
-                delta_count: 0,
-                created_at: String::new(),
-                updated_at: String::new(),
-            };
-            db::save_web_edge(&conn, &edge_row)?;
-            saved += 1;
+        match save_result {
+            Ok(saved) => {
+                conn.execute_batch("COMMIT;")?;
+                Ok(saved)
+            }
+            Err(err) => {
+                let _ = conn.execute_batch("ROLLBACK;");
+                Err(err)
+            }
         }
-
-        Ok(saved)
     })
     .await?
 }
@@ -1343,6 +2193,10 @@ fn spawn_write_drain(
                         ref parent_id,
                     } => db::update_parent(&conn, slug, node_id, parent_id),
                     WriteOp::UpdateStats { ref slug } => db::update_slug_stats(&conn, slug),
+                    WriteOp::Flush { done } => {
+                        let _ = done.send(());
+                        Ok(())
+                    }
                 }
             };
             if let Err(e) = result {
@@ -1547,7 +2401,21 @@ async fn dispatch_with_retry(
         )
         .await
         {
-            Ok(v) => return Ok(v),
+            Ok(v) => match validate_step_output(step, &v) {
+                Ok(()) => return Ok(v),
+                Err(e) => {
+                    warn!(
+                        "  Dispatch attempt {}/{} validation failed for {fallback_key}: {e}",
+                        attempt + 1,
+                        max_attempts,
+                    );
+                    last_err = Some(e);
+                    if attempt + 1 < max_attempts {
+                        let delay = std::time::Duration::from_secs(2u64.pow(attempt + 1));
+                        tokio::time::sleep(delay).await;
+                    }
+                }
+            },
             Err(e) => {
                 warn!(
                     "  Dispatch attempt {}/{} failed for {fallback_key}: {e}",
@@ -1750,6 +2618,7 @@ pub async fn execute_chain_from(
                 &dispatch_ctx,
                 &chain.defaults,
                 &error_strategy,
+                &writer_tx,
                 &state.reader,
                 &state.writer,
             )
@@ -1916,6 +2785,11 @@ pub async fn execute_chain_from(
         .await?;
     }
 
+    if !cancel.is_cancelled() {
+        let final_total = total.max(done);
+        send_progress(&progress_tx, final_total, final_total).await;
+    }
+
     info!(
         "Chain '{}' complete for slug '{}': apex={}, failures={}",
         chain.name, slug, apex_node_id, total_failures
@@ -1990,7 +2864,6 @@ async fn execute_for_each(
         }
     }
 
-    let instruction = step.instruction.as_deref().unwrap_or("");
     let concurrency = step.concurrency.max(1);
 
     if !step.sequential && concurrency > 1 {
@@ -2002,7 +2875,6 @@ async fn execute_for_each(
             step,
             ctx,
             items,
-            instruction,
             dispatch_ctx,
             defaults,
             error_strategy,
@@ -2098,12 +2970,13 @@ async fn execute_for_each(
         } else {
             enrich_group_item_input(item, ctx)
         };
+        // Strip `header_lines` directive and truncate chunk content fields.
+        let resolved_input = apply_header_lines(resolved_input);
+        let resolved_input =
+            enrich_for_each_step_input(step, resolved_input, item, ctx, reader).await?;
 
         // Resolve prompt template
-        let system_prompt = match resolve_prompt_template(instruction, &resolved_input) {
-            Ok(s) => s,
-            Err(_) => instruction.to_string(), // Fallback: use raw instruction
-        };
+        let system_prompt = build_system_prompt(step, &resolved_input, ctx)?;
 
         // Dispatch with retry
         let fallback_key = format!("{}-{index}", step.name);
@@ -2267,7 +3140,6 @@ async fn execute_for_each_concurrent(
     step: &ChainStep,
     ctx: &mut ChainContext,
     items: Vec<Value>,
-    instruction: &str,
     dispatch_ctx: &chain_dispatch::StepContext,
     defaults: &super::chain_engine::ChainDefaults,
     error_strategy: &ErrorStrategy,
@@ -2358,10 +3230,10 @@ async fn execute_for_each_concurrent(
         } else {
             enrich_group_item_input(item, &item_ctx)
         };
-        let system_prompt = match resolve_prompt_template(instruction, &resolved_input) {
-            Ok(s) => s,
-            Err(_) => instruction.to_string(),
-        };
+        let resolved_input = apply_header_lines(resolved_input);
+        let resolved_input =
+            enrich_for_each_step_input(step, resolved_input, item, &item_ctx, reader).await?;
+        let system_prompt = build_system_prompt(step, &resolved_input, &item_ctx)?;
 
         pending.push(ForEachPendingWork {
             index,
@@ -2865,7 +3737,7 @@ async fn dispatch_pair(
     dispatch_ctx: &chain_dispatch::StepContext,
     defaults: &super::chain_engine::ChainDefaults,
     error_strategy: &ErrorStrategy,
-    instruction: &str,
+    _instruction: &str,
     left: &PyramidNode,
     right: &PyramidNode,
     node_id: &str,
@@ -2893,12 +3765,11 @@ async fn dispatch_pair(
             "right": right_payload,
         })
     };
+    let resolved_input = apply_header_lines(resolved_input);
+    let resolved_input =
+        enrich_single_step_input(step, resolved_input, &dispatch_ctx.db_reader, &ctx.slug).await?;
 
-    // Resolve prompt template
-    let system_prompt = match resolve_prompt_template(instruction, &resolved_input) {
-        Ok(s) => s,
-        Err(_) => instruction.to_string(),
-    };
+    let system_prompt = build_system_prompt(step, &resolved_input, ctx)?;
 
     let fallback_key = format!("{}-d{target_depth}-{pair_idx}", step.name);
     let t0 = Instant::now();
@@ -3147,7 +4018,7 @@ async fn execute_recursive_pair(
         // target_depth before we read them back in the next iteration.
         // Without this, the DB read may see fewer nodes than were just created,
         // causing premature apex declaration.
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        flush_writes(writer_tx).await;
 
         depth = target_depth;
     }
@@ -3312,7 +4183,7 @@ async fn execute_recursive_cluster(
             }
 
             // Flush writer
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            flush_writes(writer_tx).await;
 
             info!("[CHAIN] === APEX: {node_id} at depth {target_depth} ===");
             return Ok((node_id, failures));
@@ -3334,61 +4205,79 @@ async fn execute_recursive_cluster(
                 serde_json::json!({
                     "node_id": n.id,
                     "headline": n.headline,
-                    "orientation": if n.distilled.len() > 500 {
-                        format!("{}...", &n.distilled[..500])
-                    } else {
-                        n.distilled.clone()
-                    },
+                    "orientation": truncate_for_webbing(&n.distilled, 500),
                     "topics": topic_names,
                 })
             })
             .collect();
 
         let cluster_input_value = serde_json::json!(cluster_input);
+        let cluster_assignment_node_id = format!("CLUSTER-L{target_depth}");
 
         // Build a temporary step-like config for the clustering LLM call
         let cluster_model = step.cluster_model.clone().or_else(|| step.model.clone());
         let mut cluster_step = step.clone();
         cluster_step.model = cluster_model;
+        cluster_step.instruction = Some(cluster_instruction.to_string());
         // Use cluster_response_schema if available for structured output
         cluster_step.response_schema = step.cluster_response_schema.clone();
 
-        let cluster_system =
-            match resolve_prompt_template(cluster_instruction, &cluster_input_value) {
-                Ok(s) => s,
-                Err(_) => cluster_instruction.to_string(),
+        let cluster_assignments = if let Some(saved) = load_cluster_assignment_output(
+            reader,
+            &ctx.slug,
+            target_depth,
+            &cluster_assignment_node_id,
+        )
+        .await?
+        {
+            info!(
+                "[CHAIN] [{}] loaded saved cluster assignments for depth {}",
+                step.name, target_depth
+            );
+            saved
+        } else {
+            let cluster_system = build_system_prompt(&cluster_step, &cluster_input_value, ctx)?;
+            let cluster_result = dispatch_with_retry(
+                &cluster_step,
+                &cluster_input_value,
+                &cluster_system,
+                defaults,
+                dispatch_ctx,
+                &ErrorStrategy::Retry(3),
+                &format!("{}-cluster-d{target_depth}", step.name),
+            )
+            .await;
+
+            let output = match cluster_result {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(
+                        "[CHAIN] [{}] clustering FAILED at depth {}, falling back to positional groups of 3: {e}",
+                        step.name, depth
+                    );
+                    let mut fallback_clusters = Vec::new();
+                    for (i, chunk) in current_nodes.chunks(3).enumerate() {
+                        let ids: Vec<String> = chunk.iter().map(|n| n.id.clone()).collect();
+                        fallback_clusters.push(serde_json::json!({
+                            "name": format!("Group {}", i + 1),
+                            "description": "Positional fallback group",
+                            "node_ids": ids,
+                        }));
+                    }
+                    serde_json::json!({ "clusters": fallback_clusters })
+                }
             };
 
-        let cluster_result = dispatch_with_retry(
-            &cluster_step,
-            &cluster_input_value,
-            &cluster_system,
-            defaults,
-            dispatch_ctx,
-            &ErrorStrategy::Retry(3),
-            &format!("{}-cluster-d{target_depth}", step.name),
-        )
-        .await;
-
-        let cluster_assignments = match cluster_result {
-            Ok(v) => v,
-            Err(e) => {
-                warn!(
-                    "[CHAIN] [{}] clustering FAILED at depth {}, falling back to positional groups of 3: {e}",
-                    step.name, depth
-                );
-                // Fallback: chunk into groups of 3
-                let mut fallback_clusters = Vec::new();
-                for (i, chunk) in current_nodes.chunks(3).enumerate() {
-                    let ids: Vec<String> = chunk.iter().map(|n| n.id.clone()).collect();
-                    fallback_clusters.push(serde_json::json!({
-                        "name": format!("Group {}", i + 1),
-                        "description": "Positional fallback group",
-                        "node_ids": ids,
-                    }));
-                }
-                serde_json::json!({ "clusters": fallback_clusters })
-            }
+            save_cluster_assignment_output(
+                writer_tx,
+                &ctx.slug,
+                target_depth,
+                &cluster_assignment_node_id,
+                &output,
+                &dispatch_ctx.config.primary_model,
+            )
+            .await?;
+            output
         };
 
         // Parse cluster assignments — try "clusters" key first, fall back to "groups"
@@ -3629,7 +4518,7 @@ async fn execute_recursive_cluster(
         }
 
         // Flush writer before reading next layer
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        flush_writes(writer_tx).await;
 
         depth = target_depth;
     }
@@ -3643,7 +4532,7 @@ async fn dispatch_group(
     dispatch_ctx: &chain_dispatch::StepContext,
     defaults: &super::chain_engine::ChainDefaults,
     error_strategy: &ErrorStrategy,
-    instruction: &str,
+    _instruction: &str,
     nodes: &[PyramidNode],
     node_id: &str,
     target_depth: i64,
@@ -3652,6 +4541,10 @@ async fn dispatch_group(
     saves_node: bool,
     writer_tx: &mpsc::Sender<WriteOp>,
 ) -> Result<Value> {
+    let extra_input =
+        enrich_group_extra_input(step, nodes, extra_input, &dispatch_ctx.db_reader, &ctx.slug)
+            .await?;
+
     // Build input: array of child payloads with headers
     let mut sections = Vec::new();
     for (i, node) in nodes.iter().enumerate() {
@@ -3682,12 +4575,9 @@ async fn dispatch_group(
             }
         }
     }
-    let resolved_input = Value::Object(resolved_input_map);
+    let resolved_input = apply_header_lines(Value::Object(resolved_input_map));
 
-    let system_prompt = match resolve_prompt_template(instruction, &resolved_input) {
-        Ok(s) => s,
-        Err(_) => instruction.to_string(),
-    };
+    let system_prompt = build_system_prompt(step, &resolved_input, ctx)?;
 
     let fallback_key = format!("{}-d{target_depth}-g{group_idx}", step.name);
     let t0 = Instant::now();
@@ -3750,6 +4640,7 @@ async fn execute_web_step(
     dispatch_ctx: &chain_dispatch::StepContext,
     defaults: &super::chain_engine::ChainDefaults,
     error_strategy: &ErrorStrategy,
+    writer_tx: &mpsc::Sender<WriteOp>,
     reader: &Arc<Mutex<Connection>>,
     writer: &Arc<Mutex<Connection>>,
 ) -> Result<Value> {
@@ -3780,12 +4671,14 @@ async fn execute_web_step(
         return Ok(serde_json::json!({ "edges": [] }));
     }
 
-    let instruction = step.instruction.as_deref().unwrap_or("");
     let resolved_input = if let Some(ref input) = step.input {
         ctx.resolve_value(input)?
     } else {
         Value::Object(serde_json::Map::new())
     };
+    let resolved_input = apply_header_lines(resolved_input);
+
+    flush_writes(writer_tx).await;
 
     let explicit_node_ids = extract_explicit_web_node_ids(&resolved_input);
     let nodes = load_nodes_for_webbing(reader, &ctx.slug, depth, &explicit_node_ids).await?;
@@ -3800,11 +4693,8 @@ async fn execute_web_step(
     }
 
     let normalized_edges = if nodes.len() >= 2 {
-        let web_input = build_webbing_input(&nodes, depth, &resolved_input);
-        let system_prompt = match resolve_prompt_template(instruction, &web_input) {
-            Ok(s) => s,
-            Err(_) => instruction.to_string(),
-        };
+        let web_input = build_webbing_input(&nodes, depth, &resolved_input, step.compact_inputs);
+        let system_prompt = build_system_prompt(step, &web_input, ctx)?;
         let fallback_key = format!("{}-d{depth}", step.name);
         let analysis = dispatch_with_retry(
             step,
@@ -3816,14 +4706,10 @@ async fn execute_web_step(
             &fallback_key,
         )
         .await?;
-        validate_step_output(step, &analysis)?;
         parse_web_edges(&step.name, &analysis, &nodes)
     } else {
         Vec::new()
     };
-
-    let saved_edge_count =
-        persist_web_edges_for_depth(writer, &ctx.slug, depth, &normalized_edges).await?;
 
     let edges_json: Vec<Value> = normalized_edges
         .iter()
@@ -3840,7 +4726,7 @@ async fn execute_web_step(
         "edges": edges_json,
         "webbed_depth": depth,
         "node_count": nodes.len(),
-        "saved_edge_count": saved_edge_count,
+        "saved_edge_count": 0,
     });
 
     let output_json = serde_json::to_string(&output)?;
@@ -3849,6 +4735,8 @@ async fn execute_web_step(
     let save_synthetic_id = synthetic_id.clone();
     let save_model = dispatch_ctx.config.primary_model.clone();
     let writer = writer.clone();
+    let persist_writer = writer.clone();
+    let final_writer = persist_writer.clone();
     tokio::task::spawn_blocking(move || -> Result<()> {
         let conn = writer.blocking_lock();
         db::save_step(
@@ -3865,6 +4753,37 @@ async fn execute_web_step(
     })
     .await??;
 
+    let saved_edge_count =
+        persist_web_edges_for_depth(&persist_writer, &ctx.slug, depth, &normalized_edges).await?;
+
+    let final_output = serde_json::json!({
+        "edges": output.get("edges").cloned().unwrap_or_else(|| serde_json::json!([])),
+        "webbed_depth": depth,
+        "node_count": nodes.len(),
+        "saved_edge_count": saved_edge_count,
+    });
+    let final_output_json = serde_json::to_string(&final_output)?;
+    let save_slug = ctx.slug.clone();
+    let save_step_name = step.name.clone();
+    let save_synthetic_id = synthetic_id.clone();
+    let save_model = dispatch_ctx.config.primary_model.clone();
+    let writer = final_writer;
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let conn = writer.blocking_lock();
+        db::save_step(
+            &conn,
+            &save_slug,
+            &save_step_name,
+            -1,
+            depth,
+            &save_synthetic_id,
+            &final_output_json,
+            &save_model,
+            0.0,
+        )
+    })
+    .await??;
+
     info!(
         "[CHAIN] [{}] depth {} webbing complete ({} nodes, {} edges)",
         step.name,
@@ -3873,7 +4792,7 @@ async fn execute_web_step(
         saved_edge_count
     );
 
-    Ok(output)
+    Ok(final_output)
 }
 
 // ── Single step execution ───────────────────────────────────────────────────
@@ -3924,20 +4843,16 @@ async fn execute_single(
         warn!("[CHAIN] [{}] {node_id} -- stale, rebuilding", step.name);
     }
 
-    let instruction = step.instruction.as_deref().unwrap_or("");
-
     // Resolve step input
     let resolved_input = if let Some(ref input) = step.input {
         ctx.resolve_value(input)?
     } else {
         Value::Object(serde_json::Map::new())
     };
+    let resolved_input = apply_header_lines(resolved_input);
+    let resolved_input = enrich_single_step_input(step, resolved_input, reader, &ctx.slug).await?;
 
-    // Resolve prompt template
-    let system_prompt = match resolve_prompt_template(instruction, &resolved_input) {
-        Ok(s) => s,
-        Err(_) => instruction.to_string(),
-    };
+    let system_prompt = build_system_prompt(step, &resolved_input, ctx)?;
 
     let fallback_key = format!("{}-single", step.name);
     let t0 = Instant::now();
@@ -3953,6 +4868,17 @@ async fn execute_single(
     )
     .await?;
 
+    let analysis = enforce_max_thread_size(
+        step,
+        analysis,
+        &resolved_input,
+        ctx,
+        reader,
+        dispatch_ctx,
+        defaults,
+        error_strategy,
+    )
+    .await?;
     validate_step_output(step, &analysis)?;
     let elapsed = t0.elapsed().as_secs_f64();
     let decorated_output = decorate_step_output(analysis.clone(), &node_id, -1);
@@ -4011,6 +4937,2828 @@ async fn execute_mechanical(
     chain_dispatch::dispatch_step(step, &resolved_input, "", defaults, dispatch_ctx).await
 }
 
+// ══════════════════════════════════════════════════════════════════════════════
+// IR Execution Path — Task C of P1.4
+//
+// New `execute_plan` function that consumes an `ExecutionPlan` DAG produced by
+// the Defaults Adapter (P1.3). All legacy functions above are untouched.
+//
+// Uses:
+//   - ExecutionState from execution_state.rs (Task A) for all state management
+//   - dispatch_ir_step from chain_dispatch.rs (Task B) for all step dispatch
+//   - expression.rs for when guards and $ref resolution
+//   - transform_runtime.rs for Transform steps
+// ══════════════════════════════════════════════════════════════════════════════
+
+use super::execution_plan::{
+    ContextEntry, ErrorPolicy, ExecutionPlan, IterationMode, IterationShape, Step as IrStep,
+    StorageKind,
+};
+use super::execution_state::{ExecutionState, IrWriteOp, ResumeState as IrResumeState};
+use super::expression::{self, ValueEnv};
+
+// ── Topological sort ─────────────────────────────────────────────────────────
+
+/// Topological sort of IR steps by depends_on relationships.
+///
+/// Returns step indices in execution order.  The compiler pre-sorts steps,
+/// but this guarantees correctness even if the plan is reordered.
+///
+/// Returns an error if a cycle is detected (defense-in-depth; the plan
+/// validator also rejects cycles, but the sort should not silently drop steps).
+fn topological_sort_ir(steps: &[IrStep]) -> Result<Vec<usize>> {
+    let n = steps.len();
+    let id_to_idx: HashMap<&str, usize> = steps
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.id.as_str(), i))
+        .collect();
+
+    // Build in-degree counts and adjacency list
+    let mut in_degree = vec![0usize; n];
+    let mut dependents: Vec<Vec<usize>> = vec![vec![]; n];
+
+    for (i, step) in steps.iter().enumerate() {
+        for dep in &step.depends_on {
+            if let Some(&dep_idx) = id_to_idx.get(dep.as_str()) {
+                in_degree[i] += 1;
+                dependents[dep_idx].push(i);
+            }
+        }
+    }
+
+    // Kahn's algorithm
+    let mut queue: std::collections::VecDeque<usize> = in_degree
+        .iter()
+        .enumerate()
+        .filter(|(_, &deg)| deg == 0)
+        .map(|(i, _)| i)
+        .collect();
+
+    let mut order = Vec::with_capacity(n);
+    while let Some(idx) = queue.pop_front() {
+        order.push(idx);
+        for &dep_idx in &dependents[idx] {
+            in_degree[dep_idx] -= 1;
+            if in_degree[dep_idx] == 0 {
+                queue.push_back(dep_idx);
+            }
+        }
+    }
+
+    if order.len() < n {
+        let cycled: Vec<&str> = steps
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !order.contains(i))
+            .map(|(_, s)| s.id.as_str())
+            .collect();
+        return Err(anyhow!(
+            "IR plan contains a cycle involving steps: {}",
+            cycled.join(", ")
+        ));
+    }
+
+    Ok(order)
+}
+
+// ── When guard evaluation (IR path) ──────────────────────────────────────────
+
+/// Evaluate a `when` guard expression against the current execution state.
+///
+/// Uses the expression engine for full expression support (count(), comparisons,
+/// $ref resolution).  Falls back to simple truthiness checks for bare $refs.
+fn evaluate_when_ir(when: Option<&str>, state: &ExecutionState) -> bool {
+    let expr = match when {
+        Some(e) => e.trim(),
+        None => return true,
+    };
+
+    if expr.is_empty() {
+        return true;
+    }
+
+    // Build an expression environment from step_outputs + accumulators + special vars
+    let env_value = build_expression_env(state);
+    let env = ValueEnv::new(&env_value);
+
+    match expression::evaluate_expression(expr, &env) {
+        Ok(val) => value_is_truthy(&val),
+        Err(e) => {
+            // If expression evaluation fails, try simple ref check
+            if expr.starts_with('$') && !expr.contains(' ') {
+                let ref_name = &expr[1..];
+                if let Some(output) = state.step_outputs.get(ref_name) {
+                    return value_is_truthy(output);
+                }
+            }
+            warn!(
+                "[IR] when guard '{}' evaluation failed: {}, defaulting to false",
+                expr, e
+            );
+            false
+        }
+    }
+}
+
+/// Build a JSON Value environment for expression evaluation.
+///
+/// Merges step_outputs, accumulators, special variables ($chunks, $has_prior_build)
+/// into a single flat object that the ValueEnv can resolve symbols from.
+fn build_expression_env(state: &ExecutionState) -> Value {
+    let mut map = serde_json::Map::new();
+
+    // Step outputs
+    for (key, val) in &state.step_outputs {
+        map.insert(key.clone(), val.clone());
+    }
+
+    // Accumulators as string values
+    for (key, val) in &state.accumulators {
+        map.insert(key.clone(), Value::String(val.clone()));
+    }
+
+    // Special variables
+    map.insert("chunks".to_string(), Value::Array(state.chunks.clone()));
+    map.insert(
+        "has_prior_build".to_string(),
+        Value::Bool(state.has_prior_build),
+    );
+
+    // Current item/index for forEach
+    if let Some(ref item) = state.current_item {
+        map.insert("item".to_string(), item.clone());
+    }
+    if let Some(idx) = state.current_index {
+        map.insert(
+            "index".to_string(),
+            Value::Number(serde_json::Number::from(idx as u64)),
+        );
+    }
+
+    Value::Object(map)
+}
+
+fn ir_persisted_step_name(step: &IrStep) -> &str {
+    &step.id
+}
+
+fn is_ir_apex_step(step: &IrStep) -> bool {
+    step.id == "apex"
+        || step
+            .storage_directive
+            .as_ref()
+            .and_then(|sd| sd.node_id_pattern.as_deref())
+            .map(|pattern| pattern.eq_ignore_ascii_case("APEX"))
+            .unwrap_or(false)
+}
+
+fn update_ir_top_level_alias(
+    exec_state: &mut ExecutionState,
+    step: &IrStep,
+    output: &Value,
+    highest_non_apex_depth: &mut i64,
+) {
+    if output.is_null() || !ExecutionState::step_saves_node(step) {
+        return;
+    }
+
+    let depth = ExecutionState::step_depth(step);
+    if depth < 0 || is_ir_apex_step(step) || depth < *highest_non_apex_depth {
+        return;
+    }
+
+    if extract_node_ids_from_value(output).is_empty() {
+        return;
+    }
+
+    exec_state.store_step_output("top_level_nodes", output.clone());
+    exec_state.store_step_output(
+        "top_level_depth",
+        Value::Number(serde_json::Number::from(depth)),
+    );
+    *highest_non_apex_depth = depth;
+}
+
+fn build_chain_context_from_execution_state(state: &ExecutionState) -> ChainContext {
+    let mut ctx = ChainContext::new(&state.slug, &state.content_type, state.chunks.clone());
+    ctx.step_outputs = state.step_outputs.clone();
+    ctx.current_item = state.current_item.clone();
+    ctx.current_index = state.current_index;
+    ctx.accumulators = state.accumulators.clone();
+    ctx.has_prior_build = state.has_prior_build;
+    ctx
+}
+
+fn should_enrich_ir_group_input(item: &Value, resolved_input: &Value) -> bool {
+    let has_group_keys = |value: &Value| {
+        value.get("assignments").is_some()
+            || value.get("source_nodes").is_some()
+            || value.get("node_ids").is_some()
+    };
+
+    has_group_keys(item)
+        || has_group_keys(resolved_input)
+        || resolved_input
+            .get("thread")
+            .map(has_group_keys)
+            .unwrap_or(false)
+}
+
+fn enrich_ir_group_input(resolved_input: Value, item: &Value, ctx: &ChainContext) -> Value {
+    if !should_enrich_ir_group_input(item, &resolved_input) {
+        return resolved_input;
+    }
+
+    let enriched_item = enrich_group_item_input(item, ctx);
+    let Some(enriched_obj) = enriched_item.as_object() else {
+        return resolved_input;
+    };
+
+    match resolved_input {
+        Value::Object(mut map) => {
+            if map.contains_key("thread") {
+                map.insert("thread".to_string(), enriched_item.clone());
+            }
+
+            if let Some(source_nodes) = enriched_obj.get("source_nodes").cloned() {
+                map.insert("assigned_nodes".to_string(), source_nodes.clone());
+                map.insert("source_nodes".to_string(), source_nodes);
+            }
+            if let Some(source_count) = enriched_obj.get("source_count").cloned() {
+                map.insert("source_count".to_string(), source_count);
+            }
+            if let Some(assigned_items) = enriched_obj.get("assigned_items").cloned() {
+                map.insert("assigned_items".to_string(), assigned_items);
+            }
+            if let Some(source_analyses) = enriched_obj.get("source_analyses").cloned() {
+                map.insert("source_analyses".to_string(), source_analyses);
+            }
+
+            Value::Object(map)
+        }
+        _ => enriched_item,
+    }
+}
+
+async fn resolve_ir_authoritative_children(
+    item: Option<&Value>,
+    resolved_input: &Value,
+    ctx: &ChainContext,
+    reader: &Arc<Mutex<Connection>>,
+) -> Result<Vec<String>> {
+    if let Some(item) = item {
+        let extracted = resolve_authoritative_child_ids_with_db(item, ctx, reader).await?;
+        if !extracted.is_empty() {
+            return Ok(extracted);
+        }
+    }
+
+    let extracted = resolve_authoritative_child_ids_with_db(resolved_input, ctx, reader).await?;
+    if !extracted.is_empty() {
+        return Ok(extracted);
+    }
+
+    Ok(normalize_authoritative_child_ids(
+        extract_node_ids_from_value(resolved_input),
+    ))
+}
+
+async fn override_ir_node_children(
+    step: &IrStep,
+    node_id: &str,
+    node: &mut PyramidNode,
+    item: Option<&Value>,
+    resolved_input: &Value,
+    ctx: &ChainContext,
+    reader: &Arc<Mutex<Connection>>,
+) -> Result<()> {
+    let step_label = step.source_step_name.as_deref().unwrap_or(&step.id);
+    let authoritative_children =
+        resolve_ir_authoritative_children(item, resolved_input, ctx, reader).await?;
+
+    if !authoritative_children.is_empty() {
+        info!(
+            "[IR] [{}] {}: using {} authoritative child IDs (replacing {} LLM children)",
+            step_label,
+            node_id,
+            authoritative_children.len(),
+            node.children.len()
+        );
+        node.children = authoritative_children;
+        return Ok(());
+    }
+
+    let has_valid_children = !node.children.is_empty()
+        && node
+            .children
+            .iter()
+            .all(|child| child.contains("-L") || child.contains("-l"));
+    if has_valid_children {
+        return Ok(());
+    }
+
+    let item_keys = item
+        .and_then(Value::as_object)
+        .map(|obj| obj.keys().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    let resolved_keys = resolved_input
+        .as_object()
+        .map(|obj| obj.keys().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    warn!(
+        "[IR] [{}] {}: no authoritative children in item/resolved_input; item_keys={:?}; resolved_keys={:?}; LLM children invalid ({:?})",
+        step_label,
+        node_id,
+        item_keys,
+        resolved_keys,
+        node.children.iter().take(3).collect::<Vec<_>>()
+    );
+    node.children = Vec::new();
+    Ok(())
+}
+
+/// Check truthiness of a JSON value (matches legacy evaluate_when behavior).
+fn value_is_truthy(val: &Value) -> bool {
+    match val {
+        Value::Bool(b) => *b,
+        Value::Null => false,
+        Value::Number(n) => n.as_f64().map(|f| f != 0.0).unwrap_or(false),
+        Value::String(s) => !s.is_empty() && s != "false",
+        Value::Array(a) => !a.is_empty(),
+        Value::Object(o) => !o.is_empty(),
+    }
+}
+
+fn compact_ir_inventory_node_id(item: &serde_json::Map<String, Value>) -> Option<String> {
+    for key in ["node_id", "source_node", "sourceNode"] {
+        if let Some(raw) = item.get(key).and_then(|value| value.as_str()) {
+            let trimmed = raw.trim();
+            if !trimmed.is_empty() {
+                return Some(normalize_node_id(trimmed));
+            }
+        }
+    }
+
+    item.get("id")
+        .and_then(|value| value.as_str())
+        .and_then(candidate_node_id_from_str)
+}
+
+fn compact_ir_inventory_headline(item: &serde_json::Map<String, Value>) -> Option<String> {
+    for key in ["headline", "title", "name", "label"] {
+        if let Some(raw) = item.get(key).and_then(|value| value.as_str()) {
+            let trimmed = raw.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn compact_ir_topic_name(value: &Value) -> Option<String> {
+    match value {
+        Value::String(raw) => {
+            let trimmed = raw.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        }
+        Value::Object(map) => {
+            for key in ["name", "topic_name", "topicName", "headline", "label"] {
+                if let Some(raw) = map.get(key).and_then(|value| value.as_str()) {
+                    let trimmed = raw.trim();
+                    if !trimmed.is_empty() {
+                        return Some(trimmed.to_string());
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn compact_ir_topic_names(item: &serde_json::Map<String, Value>) -> Option<Vec<Value>> {
+    item.get("topics")
+        .and_then(|value| value.as_array())
+        .map(|topics| {
+            topics
+                .iter()
+                .filter_map(compact_ir_topic_name)
+                .map(Value::String)
+                .collect()
+        })
+}
+
+fn looks_like_ir_compactable_inventory_item(item: &Value) -> bool {
+    let Some(map) = item.as_object() else {
+        return false;
+    };
+
+    map.contains_key("topics")
+        || map.contains_key("headline")
+        || map.contains_key("node_id")
+        || map.contains_key("source_node")
+        || map.contains_key("sourceNode")
+        || map.contains_key("id")
+}
+
+fn compact_ir_inventory_item(item: Value) -> Value {
+    let Value::Object(map) = item else {
+        return item;
+    };
+
+    let mut compact = serde_json::Map::new();
+
+    if let Some(node_id) = compact_ir_inventory_node_id(&map) {
+        compact.insert("node_id".to_string(), Value::String(node_id));
+    }
+    if let Some(headline) = compact_ir_inventory_headline(&map) {
+        compact.insert("headline".to_string(), Value::String(headline));
+    }
+    if let Some(topic_names) = compact_ir_topic_names(&map) {
+        compact.insert("topics".to_string(), Value::Array(topic_names));
+    }
+
+    if compact.is_empty() {
+        Value::Object(map)
+    } else {
+        Value::Object(compact)
+    }
+}
+
+fn compact_ir_inventory_array(items: Vec<Value>) -> Value {
+    if !items.iter().any(looks_like_ir_compactable_inventory_item) {
+        return Value::Array(items);
+    }
+
+    Value::Array(items.into_iter().map(compact_ir_inventory_item).collect())
+}
+
+fn extract_ir_topic_inventory_entries(resolved_input: &Value) -> Vec<(String, usize, String)> {
+    resolved_input
+        .get("topics")
+        .and_then(Value::as_array)
+        .map(|topics| {
+            topics
+                .iter()
+                .enumerate()
+                .filter_map(|(index, topic)| {
+                    let map = topic.as_object()?;
+                    let node_id = compact_ir_inventory_node_id(map)?;
+                    let topic_name = compact_ir_inventory_headline(map).or_else(|| {
+                        compact_ir_topic_names(map).and_then(|names| {
+                            names
+                                .into_iter()
+                                .find_map(|value| value.as_str().map(str::to_string))
+                        })
+                    })?;
+                    Some((node_id, index, topic_name))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn repair_ir_thread_assignments(step: &IrStep, resolved_input: &Value, output: &mut Value) {
+    let topic_entries = extract_ir_topic_inventory_entries(resolved_input);
+    if topic_entries.is_empty() {
+        return;
+    }
+
+    let Some(threads) = output.get_mut("threads").and_then(Value::as_array_mut) else {
+        return;
+    };
+    if threads.is_empty() {
+        return;
+    }
+
+    let mut assigned_ids = HashSet::new();
+    for thread in threads.iter() {
+        let Some(assignments) = thread.get("assignments").and_then(Value::as_array) else {
+            continue;
+        };
+        for assignment in assignments {
+            if let Some(source_node) = assignment.get("source_node").and_then(Value::as_str) {
+                assigned_ids.insert(normalize_node_id(source_node));
+            }
+        }
+    }
+
+    let missing: Vec<(String, usize, String)> = topic_entries
+        .into_iter()
+        .filter(|(node_id, _, _)| !assigned_ids.contains(node_id))
+        .collect();
+    if missing.is_empty() {
+        return;
+    }
+
+    let missing_ids: Vec<String> = missing
+        .iter()
+        .map(|(node_id, _, _)| node_id.clone())
+        .collect();
+    warn!(
+        "[IR] step '{}' clustering missed {} nodes: {:?}",
+        step.id,
+        missing_ids.len(),
+        missing_ids
+    );
+
+    for (node_id, topic_index, topic_name) in missing {
+        if let Some((target_idx, _)) = threads.iter().enumerate().min_by_key(|(_, thread)| {
+            thread
+                .get("assignments")
+                .and_then(Value::as_array)
+                .map(|assignments| assignments.len())
+                .unwrap_or(usize::MAX)
+        }) {
+            if let Some(assignments) = threads[target_idx]
+                .get_mut("assignments")
+                .and_then(Value::as_array_mut)
+            {
+                assignments.push(serde_json::json!({
+                    "source_node": node_id,
+                    "topic_index": topic_index,
+                    "topic_name": topic_name,
+                }));
+            }
+        }
+    }
+
+    info!(
+        "[IR] step '{}' repaired clustering by reassigning missing nodes into existing threads",
+        step.id
+    );
+}
+
+fn step_uses_ir_legacy_group_children(step: &IrStep) -> bool {
+    matches!(step.primitive.as_deref(), Some("synthesize"))
+        && matches!(
+            step.iteration
+                .as_ref()
+                .and_then(|iteration| iteration.shape),
+            Some(IterationShape::ConvergeReduce)
+        )
+}
+
+fn collect_ir_group_source_nodes(
+    resolved_input: &Value,
+    current_item: &Value,
+    ctx: &ChainContext,
+) -> Vec<String> {
+    let mut ordered = Vec::new();
+    let mut seen = HashSet::new();
+
+    for key in ["source_nodes", "assigned_nodes", "cluster_node_ids"] {
+        if let Some(values) = resolved_input.get(key).and_then(Value::as_array) {
+            for value in values {
+                if let Some(raw) = value.as_str() {
+                    let normalized = normalize_node_id(raw);
+                    if seen.insert(normalized.clone()) {
+                        ordered.push(normalized);
+                    }
+                }
+            }
+        }
+    }
+
+    if ordered.is_empty() {
+        for child_id in resolve_authoritative_child_ids(current_item, ctx) {
+            let normalized = normalize_node_id(&child_id);
+            if seen.insert(normalized.clone()) {
+                ordered.push(normalized);
+            }
+        }
+    }
+
+    ordered
+}
+
+fn build_ir_group_analysis_lookup(resolved_input: &Value) -> HashMap<String, Value> {
+    let mut lookup = HashMap::new();
+
+    if let Some(nodes) = resolved_input.get("nodes").and_then(Value::as_array) {
+        for node in nodes {
+            let Some(map) = node.as_object() else {
+                continue;
+            };
+            let Some(node_id) = compact_ir_inventory_node_id(map) else {
+                continue;
+            };
+            lookup.entry(node_id).or_insert_with(|| node.clone());
+        }
+    }
+
+    if let Some(source_analyses) = resolved_input
+        .get("source_analyses")
+        .and_then(Value::as_array)
+    {
+        for entry in source_analyses {
+            let Some(map) = entry.as_object() else {
+                continue;
+            };
+            let Some(source_node) = map
+                .get("source_node")
+                .and_then(Value::as_str)
+                .map(normalize_node_id)
+            else {
+                continue;
+            };
+            let Some(analysis) = map.get("analysis") else {
+                continue;
+            };
+            lookup
+                .entry(source_node)
+                .or_insert_with(|| analysis.clone());
+        }
+    }
+
+    if let Some(assigned_items) = resolved_input
+        .get("assigned_items")
+        .and_then(Value::as_array)
+    {
+        for entry in assigned_items {
+            let Some(map) = entry.as_object() else {
+                continue;
+            };
+            let Some(source_node) = map
+                .get("source_node")
+                .and_then(Value::as_str)
+                .map(normalize_node_id)
+            else {
+                continue;
+            };
+            let Some(analysis) = map.get("analysis") else {
+                continue;
+            };
+            lookup
+                .entry(source_node)
+                .or_insert_with(|| analysis.clone());
+        }
+    }
+
+    lookup
+}
+
+fn build_ir_child_payload_from_analysis(
+    analysis: &Value,
+    source_node: &str,
+    slug: &str,
+) -> Option<(String, Value)> {
+    let node = build_node_from_output(analysis, source_node, slug, 0, None).ok()?;
+    let headline = node.headline.clone();
+    Some((headline, child_payload_json(&node)))
+}
+
+fn build_ir_sibling_cluster_inventory(resolved_input: &Value, current_item: &Value) -> Vec<Value> {
+    resolved_input
+        .get("clusters")
+        .and_then(Value::as_array)
+        .map(|clusters| {
+            clusters
+                .iter()
+                .filter(|cluster| *cluster != current_item)
+                .map(|cluster| {
+                    serde_json::json!({
+                        "name": cluster.get("name").and_then(Value::as_str).unwrap_or("Unnamed"),
+                        "description": cluster.get("description").and_then(Value::as_str).unwrap_or(""),
+                        "node_ids": cluster.get("node_ids").cloned().unwrap_or_else(|| serde_json::json!([])),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn apply_ir_group_children_shaping(
+    step: &IrStep,
+    resolved_input: Value,
+    current_item: &Value,
+    ctx: &ChainContext,
+) -> Value {
+    if !step_uses_ir_legacy_group_children(step) {
+        return resolved_input;
+    }
+
+    let pre_len = serde_json::to_string(&resolved_input)
+        .map(|json| json.len())
+        .unwrap_or_default();
+    let source_nodes = collect_ir_group_source_nodes(&resolved_input, current_item, ctx);
+    let analysis_lookup = build_ir_group_analysis_lookup(&resolved_input);
+
+    let mut sections = Vec::new();
+    let mut child_headlines = Vec::new();
+    for (idx, source_node) in source_nodes.iter().enumerate() {
+        let Some(analysis) = analysis_lookup.get(source_node) else {
+            continue;
+        };
+        let Some((headline, payload)) =
+            build_ir_child_payload_from_analysis(analysis, source_node, &ctx.slug)
+        else {
+            continue;
+        };
+        child_headlines.push(Value::String(headline.clone()));
+        sections.push(format!(
+            "## CHILD NODE {}: \"{}\"\n{}",
+            idx + 1,
+            headline,
+            serde_json::to_string_pretty(&payload).unwrap_or_else(|_| payload.to_string())
+        ));
+    }
+
+    if sections.is_empty() {
+        return resolved_input;
+    }
+
+    let mut shaped = serde_json::Map::new();
+    shaped.insert("children".to_string(), Value::String(sections.join("\n\n")));
+    shaped.insert(
+        "child_count".to_string(),
+        Value::Number(serde_json::Number::from(sections.len() as u64)),
+    );
+    if let Some(name) = current_item
+        .get("name")
+        .or_else(|| current_item.get("label"))
+        .or_else(|| current_item.get("headline"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        shaped.insert("cluster_name".to_string(), Value::String(name.to_string()));
+    }
+    if let Some(description) = current_item
+        .get("description")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        shaped.insert(
+            "cluster_description".to_string(),
+            Value::String(description.to_string()),
+        );
+    }
+    shaped.insert(
+        "cluster_node_ids".to_string(),
+        Value::Array(
+            source_nodes
+                .iter()
+                .cloned()
+                .map(Value::String)
+                .collect::<Vec<_>>(),
+        ),
+    );
+    if !child_headlines.is_empty() {
+        shaped.insert("child_headlines".to_string(), Value::Array(child_headlines));
+    }
+
+    let sibling_clusters = build_ir_sibling_cluster_inventory(&resolved_input, current_item);
+    if !sibling_clusters.is_empty() {
+        shaped.insert(
+            "sibling_clusters".to_string(),
+            Value::Array(sibling_clusters),
+        );
+    }
+
+    shaped.insert(
+        "headline_constraints".to_string(),
+        serde_json::json!({
+            "must_be_distinct_from_siblings": true,
+            "avoid_project_name_repetition": true,
+            "prefer_architectural_domain_naming": true
+        }),
+    );
+
+    let shaped = Value::Object(shaped);
+    let post_len = serde_json::to_string(&shaped)
+        .map(|json| json.len())
+        .unwrap_or_default();
+
+    info!(
+        "[IR] step '{}' legacy_children shaped payload {} -> {} chars",
+        step.id, pre_len, post_len
+    );
+
+    shaped
+}
+
+fn compact_ir_inventory_payload(resolved_input: Value) -> Value {
+    const INVENTORY_KEYS: [&str; 6] = [
+        "topics",
+        "nodes",
+        "assigned_items",
+        "assigned_nodes",
+        "source_nodes",
+        "source_analyses",
+    ];
+
+    match resolved_input {
+        Value::Array(items) => compact_ir_inventory_array(items),
+        Value::Object(mut map) => {
+            for key in INVENTORY_KEYS {
+                if let Some(value) = map.get_mut(key) {
+                    if let Value::Array(items) = value {
+                        *value = compact_ir_inventory_array(items.clone());
+                    }
+                }
+            }
+
+            if let Some(Value::Object(thread)) = map.get_mut("thread") {
+                for key in INVENTORY_KEYS {
+                    if let Some(value) = thread.get_mut(key) {
+                        if let Value::Array(items) = value {
+                            *value = compact_ir_inventory_array(items.clone());
+                        }
+                    }
+                }
+            }
+
+            Value::Object(map)
+        }
+        other => other,
+    }
+}
+
+fn apply_ir_input_shaping(step: &IrStep, resolved_input: Value) -> Value {
+    if !step.compact_inputs {
+        return resolved_input;
+    }
+
+    let pre_len = serde_json::to_string(&resolved_input)
+        .map(|json| json.len())
+        .unwrap_or_default();
+    let compacted = compact_ir_inventory_payload(resolved_input);
+    let post_len = serde_json::to_string(&compacted)
+        .map(|json| json.len())
+        .unwrap_or_default();
+
+    info!(
+        "[IR] step '{}' compact_inputs reduced payload {} -> {} chars",
+        step.id, pre_len, post_len
+    );
+
+    compacted
+}
+
+fn prepare_ir_resolved_input(
+    step: &IrStep,
+    resolved_input: Value,
+    current_item: Option<&Value>,
+    ctx: &ChainContext,
+) -> Value {
+    let enriched = match current_item {
+        Some(item) => enrich_ir_group_input(resolved_input, item, ctx),
+        None => resolved_input,
+    };
+
+    let grouped = match current_item {
+        Some(item) => apply_ir_group_children_shaping(step, enriched, item, ctx),
+        None => enriched,
+    };
+
+    apply_ir_input_shaping(step, grouped)
+}
+
+// ── Input resolution (IR path) ───────────────────────────────────────────────
+
+/// Resolve $ref expressions in a step's input JSON against the current state.
+///
+/// Walks the JSON tree and replaces string values that look like expressions
+/// with their resolved values from state.step_outputs.
+fn resolve_ir_inputs(input: &Value, state: &ExecutionState) -> Value {
+    let env_value = build_expression_env(state);
+    resolve_refs_in_value(input, &env_value)
+}
+
+/// Recursively resolve $ref expressions in a JSON value.
+fn resolve_refs_in_value(value: &Value, env: &Value) -> Value {
+    match value {
+        Value::String(s) => {
+            let trimmed = s.trim();
+            if trimmed.starts_with('$') {
+                // This is a reference expression — try to resolve it
+                let val_env = ValueEnv::new(env);
+                match expression::evaluate_expression(trimmed, &val_env) {
+                    Ok(resolved) => resolved,
+                    Err(_) => value.clone(),
+                }
+            } else {
+                value.clone()
+            }
+        }
+        Value::Object(map) => {
+            let mut out = serde_json::Map::new();
+            for (key, val) in map {
+                out.insert(key.clone(), resolve_refs_in_value(val, env));
+            }
+            Value::Object(out)
+        }
+        Value::Array(arr) => Value::Array(
+            arr.iter()
+                .map(|item| resolve_refs_in_value(item, env))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+// ── Instruction resolution (IR path) ─────────────────────────────────────────
+
+/// Resolve instruction for an IR step, handling instruction_map variant dispatch.
+///
+/// Uses the same header-extraction and priority logic as the legacy
+/// `instruction_map_prompt` function (lines 885-927).
+fn resolve_ir_instruction(step: &IrStep, resolved_input: &Value) -> String {
+    if let Some(ref map) = step.instruction_map {
+        if let Some(content) = resolved_input.get("content").and_then(|v| v.as_str()) {
+            let file_type =
+                chunk_header_value(content, "## TYPE: ").map(|v| v.to_ascii_lowercase());
+            let language =
+                chunk_header_value(content, "## LANGUAGE: ").map(|v| v.to_ascii_lowercase());
+            let extension = chunk_header_value(content, "## FILE: ").and_then(|v| {
+                std::path::Path::new(v.split(" [").next().unwrap_or(&v))
+                    .extension()
+                    .map(|ext| format!(".{}", ext.to_string_lossy().to_ascii_lowercase()))
+            });
+
+            let resolved = file_type
+                .as_ref()
+                .and_then(|v| map.get(&format!("type:{v}")).cloned())
+                .or_else(|| {
+                    language
+                        .as_ref()
+                        .and_then(|v| map.get(&format!("language:{v}")).cloned())
+                })
+                .or_else(|| {
+                    extension
+                        .as_ref()
+                        .and_then(|v| map.get(&format!("extension:{v}")).cloned())
+                })
+                .or_else(|| {
+                    if is_probable_frontend_chunk(content) {
+                        map.get("type:frontend").cloned()
+                    } else {
+                        None
+                    }
+                });
+
+            if let Some(instruction) = resolved {
+                return instruction;
+            }
+        }
+    }
+
+    step.instruction.clone().unwrap_or_default()
+}
+
+/// Build system prompt for an IR step.
+///
+/// Resolves instruction (with instruction_map variant dispatch), applies
+/// template resolution, and appends context entries.
+fn build_ir_system_prompt(step: &IrStep, resolved_input: &Value, state: &ExecutionState) -> String {
+    let instruction = resolve_ir_instruction(step, resolved_input);
+
+    // Apply template resolution ({{key}} → value from resolved_input)
+    let base_prompt =
+        match super::chain_resolve::resolve_prompt_template(&instruction, resolved_input) {
+            Ok(s) => s,
+            Err(_) => instruction,
+        };
+
+    // If this step was generated from a question decomposition, prepend the question
+    // as a framing directive. This makes the LLM answer the QUESTION instead of
+    // blindly following the generic prompt template.
+    let base_prompt = if let Some(ref metadata) = step.metadata {
+        if let Some(question) = metadata.get("question").and_then(|v| v.as_str()) {
+            if !question.is_empty() {
+                format!(
+                    "QUESTION YOU ARE ANSWERING: {}\n\n\
+                     Focus your answer on the question above. Only include information \
+                     that is relevant to answering it. Use the format instructions below \
+                     to structure your response, but do NOT exhaustively list every entity \
+                     or trace every data flow — only those that help answer the question.\n\n\
+                     ---\n\n{}",
+                    question, base_prompt
+                )
+            } else {
+                base_prompt
+            }
+        } else {
+            base_prompt
+        }
+    } else {
+        base_prompt
+    };
+
+    // Append context entries
+    if step.context.is_empty() {
+        return base_prompt;
+    }
+
+    let mut suffix = String::new();
+    let env_value = build_expression_env(state);
+
+    for entry in &step.context {
+        let resolved = if let Some(ref reference) = entry.reference {
+            let trimmed = reference.trim();
+            let expr = if trimmed.starts_with('$') {
+                trimmed.to_string()
+            } else {
+                format!("${trimmed}")
+            };
+            let val_env = ValueEnv::new(&env_value);
+            match expression::evaluate_expression(&expr, &val_env) {
+                Ok(val) => {
+                    // Auto-index: if result is array and we're in a forEach, extract element
+                    if let (Value::Array(arr), Some(idx)) = (&val, state.current_index) {
+                        if idx < arr.len() {
+                            Some(arr[idx].clone())
+                        } else {
+                            Some(val)
+                        }
+                    } else {
+                        Some(val)
+                    }
+                }
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+
+        if let Some(val) = resolved {
+            if !val.is_null() {
+                let formatted = match &val {
+                    Value::String(s) => s.clone(),
+                    other => serde_json::to_string_pretty(other).unwrap_or_default(),
+                };
+                if !formatted.is_empty() {
+                    suffix.push_str("\n\n---\n");
+                    suffix.push_str(&entry.label);
+                    suffix.push_str(":\n");
+                    suffix.push_str(&formatted);
+                }
+            }
+        }
+    }
+
+    format!("{base_prompt}{suffix}")
+}
+
+// ── Node ID generation for IR ─────────────────────────────────────────────────
+
+/// Generate a node ID from the step's storage_directive.node_id_pattern.
+fn generate_ir_node_id(step: &IrStep, index: usize) -> String {
+    let pattern = step
+        .storage_directive
+        .as_ref()
+        .and_then(|sd| sd.node_id_pattern.as_deref())
+        .unwrap_or("N-{index:03}");
+    let depth = step.storage_directive.as_ref().and_then(|sd| sd.depth);
+    chain_dispatch::generate_node_id(pattern, index, depth)
+}
+
+// ── Decorate step output (IR path) ──────────────────────────────────────────
+
+/// Inject node_id, source_node, and chunk_index into step output.
+///
+/// Matches decorate_step_output (lines 285-298) so downstream steps can
+/// reference these fields.
+fn decorate_ir_step_output(mut output: Value, node_id: &str, chunk_index: i64) -> Value {
+    if let Some(map) = output.as_object_mut() {
+        map.insert("node_id".to_string(), Value::String(node_id.to_string()));
+        map.insert(
+            "source_node".to_string(),
+            Value::String(node_id.to_string()),
+        );
+        map.insert(
+            "chunk_index".to_string(),
+            Value::Number(serde_json::Number::from(chunk_index)),
+        );
+    }
+    output
+}
+
+// ── IR dispatch with retry ──────────────────────────────────────────────────
+
+/// Dispatch an IR step with retry logic (exponential backoff).
+///
+/// Matches dispatch_with_retry (lines 2351-2408) but uses dispatch_ir_step.
+async fn dispatch_ir_with_retry(
+    step: &IrStep,
+    resolved_input: &Value,
+    system_prompt: &str,
+    dispatch_ctx: &chain_dispatch::StepContext,
+    error_policy: &ErrorPolicy,
+) -> Result<(Value, Option<super::llm::LlmResponse>)> {
+    let max_attempts = match error_policy {
+        ErrorPolicy::Retry(n) => *n,
+        _ => 1,
+    };
+
+    let mut last_err = None;
+    for attempt in 0..max_attempts {
+        match chain_dispatch::dispatch_ir_step(step, resolved_input, system_prompt, dispatch_ctx)
+            .await
+        {
+            Ok((val, llm_response)) => return Ok((val, llm_response)),
+            Err(e) => {
+                warn!(
+                    "[IR] dispatch attempt {}/{} failed for '{}': {e}",
+                    attempt + 1,
+                    max_attempts,
+                    step.id,
+                );
+                last_err = Some(e);
+                if attempt + 1 < max_attempts {
+                    let delay = std::time::Duration::from_secs(2u64.pow(attempt + 1));
+                    tokio::time::sleep(delay).await;
+                }
+            }
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| anyhow!("dispatch failed for IR step '{}'", step.id)))
+}
+
+// ── Core execution ──────────────────────────────────────────────────────────
+
+/// Execute an IR ExecutionPlan against a pyramid slug.
+///
+/// This is the main execution loop for the IR path (Task C of P1.4).
+/// It walks the DAG, dispatches steps via dispatch_ir_step, manages state
+/// via ExecutionState, and produces the same node tree as the legacy executor.
+///
+/// Returns `(apex_node_id, failure_count)`.
+pub async fn execute_plan(
+    state: &PyramidState,
+    plan: &ExecutionPlan,
+    slug: &str,
+    from_depth: i64,
+    cancel: &CancellationToken,
+    progress_tx: Option<mpsc::Sender<BuildProgress>>,
+) -> Result<(String, i32)> {
+    let llm_config = state.config.read().await.clone();
+
+    // ── 1. Load chunks ──────────────────────────────────────────────────
+    let slug_owned = slug.to_string();
+    let num_chunks = db_read(&state.reader, {
+        let s = slug_owned.clone();
+        move |conn| db::count_chunks(conn, &s)
+    })
+    .await?;
+
+    if num_chunks == 0 {
+        return Err(anyhow!("No chunks found for slug '{slug}'"));
+    }
+
+    let chunks: Vec<Value> = {
+        let mut items = Vec::new();
+        for i in 0..num_chunks {
+            let s = slug.to_string();
+            let content = db_read(&state.reader, move |conn| db::get_chunk(conn, &s, i))
+                .await?
+                .unwrap_or_default();
+            items.push(serde_json::json!({
+                "index": i,
+                "content": content,
+            }));
+        }
+        items
+    };
+
+    // ── 2. Check prior build ─────────────────────────────────────────────
+    let has_prior_build = db_read(&state.reader, {
+        let s = slug_owned.clone();
+        move |conn| {
+            let count = db::count_nodes_at_depth(conn, &s, 0)?;
+            Ok(count > 0)
+        }
+    })
+    .await?;
+
+    // ── 3. from_depth cleanup ────────────────────────────────────────────
+    if from_depth > 0 {
+        info!(
+            "[IR] Layered rebuild from depth {from_depth}: deleting nodes and steps at depth >= {from_depth}"
+        );
+        cleanup_from_depth(&state.writer, slug, from_depth).await?;
+    }
+
+    // ── 4. Initialize ExecutionState ─────────────────────────────────────
+    let (mut exec_state, drain_handle) = ExecutionState::new(
+        slug.to_string(),
+        plan.source_content_type
+            .clone()
+            .unwrap_or_else(|| "code".to_string()),
+        plan.source_chain_id.clone(),
+        chunks,
+        has_prior_build,
+        plan.total_estimated_nodes,
+        cancel.clone(),
+        progress_tx.clone(),
+        state.reader.clone(),
+        state.writer.clone(),
+    );
+
+    // ── 5. Build dispatch context ────────────────────────────────────────
+    let dispatch_ctx = chain_dispatch::StepContext {
+        db_reader: state.reader.clone(),
+        db_writer: state.writer.clone(),
+        slug: slug.to_string(),
+        config: llm_config.clone(),
+    };
+
+    exec_state.send_progress().await;
+
+    // ── 6. Topological sort ──────────────────────────────────────────────
+    let step_order = topological_sort_ir(&plan.steps)?;
+    let mut total_failures: i32 = 0;
+    let mut apex_node_id = String::new();
+    let mut highest_saved_depth: i64 = -1;
+    let mut highest_non_apex_depth: i64 = -1;
+
+    // ── 7. Execute each step ─────────────────────────────────────────────
+    for &step_idx in &step_order {
+        let step = &plan.steps[step_idx];
+
+        // 7a. Check cancellation
+        if exec_state.is_cancelled() {
+            info!("[IR] Execution cancelled at step '{}'", step.id);
+            break;
+        }
+
+        // 7b. Evaluate `when` guard
+        if !evaluate_when_ir(step.when.as_deref(), &exec_state) {
+            info!("[IR] Step '{}' skipped (when guard false)", step.id);
+            continue;
+        }
+
+        // 7c. from_depth skip
+        let step_depth = ExecutionState::step_depth(step);
+        let saves_node = ExecutionState::step_saves_node(step);
+        let is_extract = step
+            .primitive
+            .as_deref()
+            .map(|p| p == "extract" || p == "compress" || p == "fuse")
+            .unwrap_or(false);
+        let is_spanning = step
+            .iteration
+            .as_ref()
+            .and_then(|it| it.shape.as_ref())
+            .map(|s| {
+                matches!(
+                    s,
+                    IterationShape::RecursivePair | IterationShape::ConvergeReduce
+                )
+            })
+            .unwrap_or(false);
+
+        if from_depth > 0 && step_depth < from_depth && is_extract && !is_spanning {
+            info!(
+                "[IR] step '{}' skipped (extract at depth {} < from_depth {})",
+                step.id, step_depth, from_depth
+            );
+            // Hydrate output from DB for downstream refs
+            if let Some(hydrated) = hydrate_ir_step_output(step, &exec_state).await? {
+                if saves_node {
+                    let count = match &hydrated {
+                        Value::Array(items) => items.len() as i64,
+                        Value::Null => 0,
+                        _ => 1,
+                    };
+                    exec_state.done += count;
+                }
+                exec_state.store_step_output(&step.id, hydrated);
+                if let Some(output) = exec_state.get_step_output(&step.id).cloned() {
+                    update_ir_top_level_alias(
+                        &mut exec_state,
+                        step,
+                        &output,
+                        &mut highest_non_apex_depth,
+                    );
+                }
+                exec_state.total = (plan.total_estimated_nodes as i64).max(exec_state.done);
+                exec_state.send_progress().await;
+            }
+            continue;
+        }
+
+        info!(
+            "[IR] step '{}' started (primitive: {:?}, depth: {}, done={}/{})",
+            step.id, step.primitive, step_depth, exec_state.done, exec_state.total,
+        );
+
+        // 7d. Check for web edge path (Task D) before iteration dispatch
+        let step_path = classify_ir_step_path(step);
+        if step_path == IrStepExecutionPath::WebEdges {
+            let step_result = execute_ir_web_edges(step, &mut exec_state, &dispatch_ctx).await;
+            match step_result {
+                Ok(output) => {
+                    info!("[IR] web step '{}' complete", step.id);
+                    if !output.is_null() {
+                        exec_state.store_step_output(&step.id, output);
+                    }
+                }
+                Err(e) => match &step.error_policy {
+                    ErrorPolicy::Abort | ErrorPolicy::Retry(_) => {
+                        error!("[IR] web step '{}' FAILED (abort): {e}", step.id);
+                        drop(exec_state);
+                        let _ = drain_handle.await;
+                        return Err(anyhow!("IR plan aborted at web step '{}': {e}", step.id));
+                    }
+                    ErrorPolicy::Skip => {
+                        warn!("[IR] web step '{}' FAILED (skip): {e}", step.id);
+                    }
+                    _ => {
+                        warn!("[IR] web step '{}' FAILED: {e}", step.id);
+                        total_failures += 1;
+                    }
+                },
+            }
+            continue;
+        }
+
+        // 7e. Determine iteration mode and execute
+        let iteration_mode = step
+            .iteration
+            .as_ref()
+            .map(|it| it.mode)
+            .unwrap_or(IterationMode::Single);
+
+        let step_result = match iteration_mode {
+            IterationMode::Single => execute_ir_single(step, &mut exec_state, &dispatch_ctx).await,
+            IterationMode::Parallel => {
+                execute_ir_parallel_foreach(step, &mut exec_state, &dispatch_ctx, cancel).await
+            }
+            IterationMode::Sequential => {
+                execute_ir_sequential_foreach(step, &mut exec_state, &dispatch_ctx).await
+            }
+        };
+
+        // 7f. Handle result
+        match step_result {
+            Ok(output) => {
+                info!("[IR] step '{}' complete", step.id);
+                if !output.is_null() {
+                    exec_state.store_step_output(&step.id, output);
+                    if let Some(stored) = exec_state.get_step_output(&step.id).cloned() {
+                        update_ir_top_level_alias(
+                            &mut exec_state,
+                            step,
+                            &stored,
+                            &mut highest_non_apex_depth,
+                        );
+                    }
+                }
+                // Track highest depth for apex detection
+                if saves_node && step_depth > highest_saved_depth {
+                    highest_saved_depth = step_depth;
+                }
+            }
+            Err(e) => match &step.error_policy {
+                ErrorPolicy::Abort | ErrorPolicy::Retry(_) => {
+                    error!("[IR] step '{}' FAILED (abort): {e}", step.id);
+                    drop(exec_state);
+                    let _ = drain_handle.await;
+                    return Err(anyhow!("IR plan aborted at step '{}': {e}", step.id));
+                }
+                ErrorPolicy::Skip => {
+                    warn!("[IR] step '{}' FAILED (skip): {e}", step.id);
+                }
+                _ => {
+                    warn!("[IR] step '{}' FAILED: {e}", step.id);
+                    total_failures += 1;
+                }
+            },
+        }
+    }
+
+    // ── 8. Drop write drain, await completion ────────────────────────────
+    exec_state.send_update_stats().await;
+    let final_done = exec_state.done;
+    let final_total = exec_state.total;
+    drop(exec_state);
+    let _ = drain_handle.await;
+
+    // ── 9. Update slug stats ─────────────────────────────────────────────
+    {
+        let writer = state.writer.clone();
+        let slug_owned = slug.to_string();
+        let _ = tokio::task::spawn_blocking(move || {
+            let conn = writer.blocking_lock();
+            db::update_slug_stats(&conn, &slug_owned)
+        })
+        .await;
+    }
+
+    // ── 10. Find apex ────────────────────────────────────────────────────
+    if apex_node_id.is_empty() {
+        let slug_owned = slug.to_string();
+        apex_node_id = db_read(&state.reader, move |conn| {
+            let max_depth: i64 = conn
+                .query_row(
+                    "SELECT COALESCE(MAX(depth), 0) FROM pyramid_nodes WHERE slug = ?1",
+                    rusqlite::params![&slug_owned],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0);
+            let nodes = db::get_nodes_at_depth(conn, &slug_owned, max_depth)?;
+            Ok(nodes.first().map(|n| n.id.clone()).unwrap_or_default())
+        })
+        .await?;
+    }
+
+    if !cancel.is_cancelled() {
+        if let Some(ref tx) = progress_tx {
+            let completed = final_total.max(final_done);
+            let _ = tx
+                .send(BuildProgress {
+                    done: completed,
+                    total: completed,
+                })
+                .await;
+        }
+    }
+
+    info!(
+        "[IR] Plan complete for slug '{}': apex={}, failures={}",
+        slug, apex_node_id, total_failures
+    );
+
+    Ok((apex_node_id, total_failures))
+}
+
+// ── Single step execution (IR) ──────────────────────────────────────────────
+
+async fn execute_ir_single(
+    step: &IrStep,
+    exec_state: &mut ExecutionState,
+    dispatch_ctx: &chain_dispatch::StepContext,
+) -> Result<Value> {
+    let saves_node = ExecutionState::step_saves_node(step);
+    let depth = ExecutionState::step_depth(step);
+    let node_id = generate_ir_node_id(step, 0);
+    let chunk_index: i64 = 0;
+
+    // Check resume
+    let step_name = ir_persisted_step_name(step);
+    let resume = exec_state
+        .check_resume_state(step_name, chunk_index, depth, &node_id, saves_node)
+        .await?;
+
+    if resume == IrResumeState::Complete {
+        info!("[IR] step '{}' already complete (resume)", step.id);
+        if let Some(output_json) = exec_state
+            .load_step_output_exact(step_name, chunk_index, depth, &node_id)
+            .await?
+        {
+            let output: Value = serde_json::from_str(&output_json).unwrap_or(Value::Null);
+            return Ok(output);
+        }
+        return Ok(Value::Null);
+    }
+
+    // Resolve inputs (apply header_lines directive — see handoff section 9.9)
+    let resolved_input = apply_header_lines(resolve_ir_inputs(&step.input, exec_state));
+    let ctx_for_input = build_chain_context_from_execution_state(exec_state);
+    let resolved_input = prepare_ir_resolved_input(
+        step,
+        resolved_input,
+        exec_state.current_item.as_ref(),
+        &ctx_for_input,
+    );
+
+    // Build system prompt — use async context builder when step has loader-based context entries
+    let system_prompt = if step.context.iter().any(|c| c.loader.is_some()) {
+        build_ir_system_prompt_with_context(step, &resolved_input, exec_state).await
+    } else {
+        build_ir_system_prompt(step, &resolved_input, exec_state)
+    };
+
+    // Dispatch
+    let start = Instant::now();
+    let (mut output, llm_response) = dispatch_ir_with_retry(
+        step,
+        &resolved_input,
+        &system_prompt,
+        dispatch_ctx,
+        &step.error_policy,
+    )
+    .await?;
+    let elapsed = start.elapsed().as_secs_f64();
+
+    repair_ir_thread_assignments(step, &resolved_input, &mut output);
+
+    // Decorate output
+    output = decorate_ir_step_output(output, &node_id, chunk_index);
+
+    // Log cost
+    if let Some(ref response) = llm_response {
+        let model =
+            chain_dispatch::resolve_ir_model(&step.model_requirements, &dispatch_ctx.config);
+        let _ = exec_state
+            .log_cost(
+                step_name,
+                &model,
+                response.usage.prompt_tokens,
+                response.usage.completion_tokens,
+                0.0,
+                step.model_requirements.tier.as_deref(),
+                Some((elapsed * 1000.0) as i64),
+                response.generation_id.as_deref(),
+                None,
+            )
+            .await;
+    }
+
+    // Save step record
+    let output_json = serde_json::to_string(&output).unwrap_or_default();
+    let model = chain_dispatch::resolve_ir_model(&step.model_requirements, &dispatch_ctx.config);
+    exec_state
+        .send_save_step(
+            step_name,
+            chunk_index,
+            depth,
+            &node_id,
+            &output_json,
+            &model,
+            elapsed,
+        )
+        .await;
+
+    // Save node if storage_directive says so
+    if saves_node {
+        let mut node = chain_dispatch::build_node_from_output(
+            &output,
+            &node_id,
+            &exec_state.slug,
+            depth,
+            Some(chunk_index),
+        )?;
+        let ctx = build_chain_context_from_execution_state(exec_state);
+        override_ir_node_children(
+            step,
+            &node_id,
+            &mut node,
+            None,
+            &resolved_input,
+            &ctx,
+            &exec_state.reader,
+        )
+        .await?;
+
+        // Wire children
+        let children = node.children.clone();
+        exec_state.send_save_node(node, None).await;
+
+        for child_id in &children {
+            exec_state.send_update_parent(child_id, &node_id).await;
+        }
+
+        exec_state.report_progress().await;
+    }
+
+    Ok(output)
+}
+
+// ── Parallel forEach (IR) ───────────────────────────────────────────────────
+
+struct IrForEachOutcome {
+    index: usize,
+    #[allow(dead_code)]
+    node_id: String,
+    output: Result<Value>,
+}
+
+async fn execute_ir_parallel_foreach(
+    step: &IrStep,
+    exec_state: &mut ExecutionState,
+    dispatch_ctx: &chain_dispatch::StepContext,
+    cancel: &CancellationToken,
+) -> Result<Value> {
+    let saves_node = ExecutionState::step_saves_node(step);
+    let depth = ExecutionState::step_depth(step);
+    let step_name = ir_persisted_step_name(step);
+
+    // Resolve the collection to iterate over
+    let items = resolve_foreach_collection(step, exec_state)?;
+    if items.is_empty() {
+        return Ok(Value::Array(vec![]));
+    }
+
+    let concurrency = step
+        .iteration
+        .as_ref()
+        .and_then(|it| it.concurrency)
+        .unwrap_or(4);
+    let semaphore = Arc::new(Semaphore::new(concurrency));
+
+    let mut completed_outputs: Vec<Option<Value>> = vec![None; items.len()];
+    let mut handles: Vec<(usize, tokio::task::JoinHandle<IrForEachOutcome>)> = Vec::new();
+
+    for (i, item) in items.iter().enumerate() {
+        let node_id = generate_ir_node_id(step, i);
+        let chunk_index = item
+            .get("index")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(i as i64);
+
+        // Check resume
+        let resume = exec_state
+            .check_resume_state(step_name, chunk_index, depth, &node_id, saves_node)
+            .await?;
+
+        if resume == IrResumeState::Complete {
+            info!("[IR] forEach item {} already complete (resume)", i);
+            if let Some(output_json) = exec_state
+                .load_step_output_exact(step_name, chunk_index, depth, &node_id)
+                .await?
+            {
+                let output: Value = serde_json::from_str(&output_json).unwrap_or(Value::Null);
+                completed_outputs[i] = Some(output);
+                if saves_node {
+                    exec_state.report_progress().await;
+                }
+            }
+            continue;
+        }
+
+        // Build resolved input with $item and $index
+        let mut item_state_outputs = exec_state.step_outputs.clone();
+        item_state_outputs.insert("item".to_string(), item.clone());
+        item_state_outputs.insert(
+            "index".to_string(),
+            Value::Number(serde_json::Number::from(i as u64)),
+        );
+        // Build a temporary env for resolution
+        let mut env_map = serde_json::Map::new();
+        for (k, v) in &item_state_outputs {
+            env_map.insert(k.clone(), v.clone());
+        }
+        env_map.insert(
+            "chunks".to_string(),
+            Value::Array(exec_state.chunks.clone()),
+        );
+        env_map.insert(
+            "has_prior_build".to_string(),
+            Value::Bool(exec_state.has_prior_build),
+        );
+        let env_value = Value::Object(env_map);
+        let resolved_input = apply_header_lines(resolve_refs_in_value(&step.input, &env_value));
+        let mut ctx_for_input = build_chain_context_from_execution_state(exec_state);
+        ctx_for_input.current_item = Some(item.clone());
+        ctx_for_input.current_index = Some(i);
+        let resolved_input =
+            prepare_ir_resolved_input(step, resolved_input, Some(item), &ctx_for_input);
+
+        // Build system prompt with item context — resolve async context loaders before spawn
+        let system_prompt = if step.context.iter().any(|c| c.loader.is_some()) {
+            // Set current_index so sibling_cluster_context can exclude the right cluster
+            exec_state.current_index = Some(i);
+            exec_state.current_item = Some(item.clone());
+            let prompt =
+                build_ir_system_prompt_with_context(step, &resolved_input, exec_state).await;
+            exec_state.current_index = None;
+            exec_state.current_item = None;
+            prompt
+        } else {
+            let instruction = resolve_ir_instruction(step, &resolved_input);
+            match super::chain_resolve::resolve_prompt_template(&instruction, &resolved_input) {
+                Ok(s) => s,
+                Err(_) => instruction,
+            }
+        };
+
+        // Spawn task
+        let sem = semaphore.clone();
+        let cancel_clone = cancel.clone();
+        let step_clone = step.clone();
+        let ctx_clone = dispatch_ctx.clone();
+        let node_id_clone = node_id.clone();
+        let slug = exec_state.slug.clone();
+        let writer_tx = exec_state.writer_tx.clone();
+        let reader = exec_state.reader.clone();
+        let step_name_owned = step_name.to_string();
+        let model =
+            chain_dispatch::resolve_ir_model(&step.model_requirements, &dispatch_ctx.config);
+        let item_clone = item.clone();
+        let mut ctx_snapshot = build_chain_context_from_execution_state(exec_state);
+        ctx_snapshot.current_item = Some(item_clone.clone());
+        ctx_snapshot.current_index = Some(i);
+
+        let handle = tokio::spawn(async move {
+            let _permit = sem
+                .acquire_owned()
+                .await
+                .expect("forEach semaphore should remain open");
+            if cancel_clone.is_cancelled() {
+                return IrForEachOutcome {
+                    index: i,
+                    node_id: node_id_clone,
+                    output: Err(anyhow!("cancelled")),
+                };
+            }
+
+            let start = Instant::now();
+            let dispatch_result = chain_dispatch::dispatch_ir_step(
+                &step_clone,
+                &resolved_input,
+                &system_prompt,
+                &ctx_clone,
+            )
+            .await;
+            let elapsed = start.elapsed().as_secs_f64();
+
+            match dispatch_result {
+                Ok((mut output, _llm_response)) => {
+                    output = decorate_ir_step_output(output, &node_id_clone, chunk_index);
+
+                    // Save step record
+                    let output_json = serde_json::to_string(&output).unwrap_or_default();
+                    let _ = writer_tx
+                        .send(IrWriteOp::SaveStep {
+                            slug: slug.clone(),
+                            step_type: step_name_owned.clone(),
+                            chunk_index,
+                            depth,
+                            node_id: node_id_clone.clone(),
+                            output_json,
+                            model: model.clone(),
+                            elapsed,
+                        })
+                        .await;
+
+                    // Save node if needed
+                    if saves_node {
+                        if let Ok(mut node) = chain_dispatch::build_node_from_output(
+                            &output,
+                            &node_id_clone,
+                            &slug,
+                            depth,
+                            Some(chunk_index),
+                        ) {
+                            if let Err(e) = override_ir_node_children(
+                                &step_clone,
+                                &node_id_clone,
+                                &mut node,
+                                Some(&item_clone),
+                                &resolved_input,
+                                &ctx_snapshot,
+                                &reader,
+                            )
+                            .await
+                            {
+                                warn!(
+                                    "[IR] [{}] {}: failed to resolve authoritative children: {e}",
+                                    step_name_owned, node_id_clone,
+                                );
+                            }
+                            let children = node.children.clone();
+                            let _ = writer_tx
+                                .send(IrWriteOp::SaveNode {
+                                    node,
+                                    topics_json: None,
+                                })
+                                .await;
+                            for child_id in &children {
+                                let _ = writer_tx
+                                    .send(IrWriteOp::UpdateParent {
+                                        slug: slug.clone(),
+                                        node_id: child_id.clone(),
+                                        parent_id: node_id_clone.clone(),
+                                    })
+                                    .await;
+                            }
+                        }
+                    }
+
+                    IrForEachOutcome {
+                        index: i,
+                        node_id: node_id_clone,
+                        output: Ok(output),
+                    }
+                }
+                Err(e) => IrForEachOutcome {
+                    index: i,
+                    node_id: node_id_clone,
+                    output: Err(e),
+                },
+            }
+        });
+        handles.push((i, handle));
+    }
+
+    // Await ALL spawned tasks — every handle must resolve before we proceed.
+    // This guarantees that completed_outputs contains results for every item
+    // before dependent steps can reference this step's output.
+    for (spawn_index, handle) in handles {
+        let outcome = match handle.await {
+            Ok(outcome) => outcome,
+            Err(join_err) => {
+                // Task panicked or was cancelled — treat as a failed item
+                error!(
+                    "[IR] forEach item {} panicked or was aborted: {join_err}",
+                    spawn_index
+                );
+                IrForEachOutcome {
+                    index: spawn_index,
+                    node_id: String::new(),
+                    output: Err(anyhow!("forEach task panicked or was aborted: {join_err}")),
+                }
+            }
+        };
+        match outcome.output {
+            Ok(output) => {
+                completed_outputs[outcome.index] = Some(output);
+                if saves_node {
+                    exec_state.report_progress().await;
+                }
+            }
+            Err(e) => match &step.error_policy {
+                ErrorPolicy::Abort => {
+                    return Err(anyhow!(
+                        "IR forEach item {} failed (abort): {e}",
+                        outcome.index
+                    ));
+                }
+                ErrorPolicy::Skip => {
+                    warn!("[IR] forEach item {} failed (skip): {e}", outcome.index);
+                    completed_outputs[outcome.index] = Some(Value::Null);
+                }
+                _ => {
+                    warn!("[IR] forEach item {} failed: {e}", outcome.index);
+                    completed_outputs[outcome.index] = Some(Value::Null);
+                }
+            },
+        }
+    }
+
+    // Build output array
+    let outputs: Vec<Value> = completed_outputs
+        .into_iter()
+        .map(|o| o.unwrap_or(Value::Null))
+        .collect();
+
+    Ok(Value::Array(outputs))
+}
+
+// ── Sequential forEach (IR) ─────────────────────────────────────────────────
+
+async fn execute_ir_sequential_foreach(
+    step: &IrStep,
+    exec_state: &mut ExecutionState,
+    dispatch_ctx: &chain_dispatch::StepContext,
+) -> Result<Value> {
+    let saves_node = ExecutionState::step_saves_node(step);
+    let depth = ExecutionState::step_depth(step);
+    let step_name = ir_persisted_step_name(step);
+
+    // Seed accumulators
+    if let Some(ref acc_config) = step
+        .iteration
+        .as_ref()
+        .and_then(|it| it.accumulate.as_ref())
+    {
+        exec_state.seed_accumulators(acc_config);
+    }
+
+    // Resolve the collection to iterate over
+    let items = resolve_foreach_collection(step, exec_state)?;
+    let mut outputs = Vec::with_capacity(items.len());
+
+    for (i, item) in items.iter().enumerate() {
+        if exec_state.is_cancelled() {
+            info!("[IR] Sequential forEach cancelled at item {}", i);
+            break;
+        }
+
+        let node_id = generate_ir_node_id(step, i);
+        let chunk_index = item
+            .get("index")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(i as i64);
+
+        // Check resume
+        let resume = exec_state
+            .check_resume_state(step_name, chunk_index, depth, &node_id, saves_node)
+            .await?;
+
+        if resume == IrResumeState::Complete {
+            info!(
+                "[IR] sequential forEach item {} already complete (resume)",
+                i
+            );
+            if let Some(output_json) = exec_state
+                .load_step_output_exact(step_name, chunk_index, depth, &node_id)
+                .await?
+            {
+                let output: Value = serde_json::from_str(&output_json).unwrap_or(Value::Null);
+
+                // Update accumulators even for resumed items
+                if let Some(ref acc_config) = step
+                    .iteration
+                    .as_ref()
+                    .and_then(|it| it.accumulate.as_ref())
+                {
+                    exec_state.update_accumulators(&output, acc_config);
+                }
+
+                outputs.push(output);
+                if saves_node {
+                    exec_state.report_progress().await;
+                }
+            }
+            continue;
+        }
+
+        // Set current item/index for expression resolution
+        exec_state.current_item = Some(item.clone());
+        exec_state.current_index = Some(i);
+
+        // Resolve inputs with $item, $index, and accumulators in scope
+        // Apply header_lines directive (handoff section 9.9)
+        let resolved_input = apply_header_lines(resolve_ir_inputs(&step.input, exec_state));
+        let ctx_for_input = build_chain_context_from_execution_state(exec_state);
+        let resolved_input =
+            prepare_ir_resolved_input(step, resolved_input, Some(item), &ctx_for_input);
+
+        // Build system prompt — use async context builder when step has loader-based context entries
+        let system_prompt = if step.context.iter().any(|c| c.loader.is_some()) {
+            build_ir_system_prompt_with_context(step, &resolved_input, exec_state).await
+        } else {
+            build_ir_system_prompt(step, &resolved_input, exec_state)
+        };
+
+        // Dispatch
+        let start = Instant::now();
+        let dispatch_result = dispatch_ir_with_retry(
+            step,
+            &resolved_input,
+            &system_prompt,
+            dispatch_ctx,
+            &step.error_policy,
+        )
+        .await;
+        let elapsed = start.elapsed().as_secs_f64();
+
+        match dispatch_result {
+            Ok((mut output, llm_response)) => {
+                output = decorate_ir_step_output(output, &node_id, chunk_index);
+
+                // Log cost
+                if let Some(ref response) = llm_response {
+                    let model = chain_dispatch::resolve_ir_model(
+                        &step.model_requirements,
+                        &dispatch_ctx.config,
+                    );
+                    let _ = exec_state
+                        .log_cost(
+                            step_name,
+                            &model,
+                            response.usage.prompt_tokens,
+                            response.usage.completion_tokens,
+                            0.0,
+                            step.model_requirements.tier.as_deref(),
+                            Some((elapsed * 1000.0) as i64),
+                            response.generation_id.as_deref(),
+                            None,
+                        )
+                        .await;
+                }
+
+                // Save step record
+                let output_json = serde_json::to_string(&output).unwrap_or_default();
+                let model = chain_dispatch::resolve_ir_model(
+                    &step.model_requirements,
+                    &dispatch_ctx.config,
+                );
+                exec_state
+                    .send_save_step(
+                        step_name,
+                        chunk_index,
+                        depth,
+                        &node_id,
+                        &output_json,
+                        &model,
+                        elapsed,
+                    )
+                    .await;
+
+                // Save node if needed
+                if saves_node {
+                    let mut node = chain_dispatch::build_node_from_output(
+                        &output,
+                        &node_id,
+                        &exec_state.slug,
+                        depth,
+                        Some(chunk_index),
+                    )?;
+                    let ctx = build_chain_context_from_execution_state(exec_state);
+                    override_ir_node_children(
+                        step,
+                        &node_id,
+                        &mut node,
+                        Some(item),
+                        &resolved_input,
+                        &ctx,
+                        &exec_state.reader,
+                    )
+                    .await?;
+                    let children = node.children.clone();
+                    exec_state.send_save_node(node, None).await;
+                    for child_id in &children {
+                        exec_state.send_update_parent(child_id, &node_id).await;
+                    }
+                    exec_state.report_progress().await;
+                }
+
+                // Update accumulators
+                if let Some(ref acc_config) = step
+                    .iteration
+                    .as_ref()
+                    .and_then(|it| it.accumulate.as_ref())
+                {
+                    exec_state.update_accumulators(&output, acc_config);
+                }
+
+                outputs.push(output);
+            }
+            Err(e) => match &step.error_policy {
+                ErrorPolicy::Abort => {
+                    return Err(anyhow!(
+                        "IR sequential forEach item {} failed (abort): {e}",
+                        i
+                    ));
+                }
+                ErrorPolicy::Skip => {
+                    warn!("[IR] sequential forEach item {} failed (skip): {e}", i);
+                    outputs.push(Value::Null);
+                }
+                _ => {
+                    warn!("[IR] sequential forEach item {} failed: {e}", i);
+                    outputs.push(Value::Null);
+                }
+            },
+        }
+    }
+
+    // Clear forEach context
+    exec_state.current_item = None;
+    exec_state.current_index = None;
+
+    Ok(Value::Array(outputs))
+}
+
+// ── forEach collection resolution ───────────────────────────────────────────
+
+/// Resolve the collection to iterate over from the step's iteration.over expression.
+fn resolve_foreach_collection(step: &IrStep, state: &ExecutionState) -> Result<Vec<Value>> {
+    const IR_THREAD_INPUT_CHAR_BUDGET: usize = 90_000;
+
+    fn is_ir_thread_synthesis_step(step: &IrStep) -> bool {
+        if step.id == "l1_synthesis" {
+            return true;
+        }
+
+        step.metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("about"))
+            .and_then(Value::as_str)
+            .map(|about| about.contains("assigned L0 nodes"))
+            .unwrap_or(false)
+    }
+
+    fn estimate_ir_foreach_item_input_chars(
+        step: &IrStep,
+        item: &Value,
+        index: usize,
+        state: &ExecutionState,
+    ) -> usize {
+        let mut item_state_outputs = state.step_outputs.clone();
+        item_state_outputs.insert("item".to_string(), item.clone());
+        item_state_outputs.insert(
+            "index".to_string(),
+            Value::Number(serde_json::Number::from(index as u64)),
+        );
+
+        let mut env_map = serde_json::Map::new();
+        for (key, value) in &item_state_outputs {
+            env_map.insert(key.clone(), value.clone());
+        }
+        env_map.insert("chunks".to_string(), Value::Array(state.chunks.clone()));
+        env_map.insert(
+            "has_prior_build".to_string(),
+            Value::Bool(state.has_prior_build),
+        );
+
+        let env_value = Value::Object(env_map);
+        let resolved_input = apply_header_lines(resolve_refs_in_value(&step.input, &env_value));
+        let mut ctx = build_chain_context_from_execution_state(state);
+        ctx.current_item = Some(item.clone());
+        ctx.current_index = Some(index);
+        let prepared = prepare_ir_resolved_input(step, resolved_input, Some(item), &ctx);
+
+        serde_json::to_string(&prepared)
+            .map(|json| json.len())
+            .unwrap_or_default()
+    }
+
+    fn split_oversized_ir_thread_items(
+        step: &IrStep,
+        items: Vec<Value>,
+        state: &ExecutionState,
+    ) -> Vec<Value> {
+        if !is_ir_thread_synthesis_step(step) {
+            return items;
+        }
+
+        let mut split_items = Vec::new();
+
+        for (index, item) in items.into_iter().enumerate() {
+            let assignments = item
+                .get("assignments")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            if assignments.len() <= 1 {
+                split_items.push(item);
+                continue;
+            }
+
+            let input_chars = estimate_ir_foreach_item_input_chars(step, &item, index, state);
+            if input_chars <= IR_THREAD_INPUT_CHAR_BUDGET {
+                split_items.push(item);
+                continue;
+            }
+
+            let target_parts = ((input_chars + IR_THREAD_INPUT_CHAR_BUDGET - 1)
+                / IR_THREAD_INPUT_CHAR_BUDGET)
+                .max(2);
+            let max_assignments_per_part =
+                ((assignments.len() + target_parts - 1) / target_parts).max(1);
+            let thread_name = item
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("Unnamed");
+
+            info!(
+                "[IR] step '{}' batching oversized thread '{}' raw_input_len={} assignments={} -> {} parts (<= {} assignments)",
+                step.id,
+                thread_name,
+                input_chars,
+                assignments.len(),
+                target_parts,
+                max_assignments_per_part
+            );
+
+            split_items.extend(fallback_split_thread(&item, max_assignments_per_part));
+        }
+
+        split_items
+    }
+
+    let over_expr = step
+        .iteration
+        .as_ref()
+        .and_then(|it| it.over.as_deref())
+        .ok_or_else(|| anyhow!("IR step '{}' has forEach but no 'over' expression", step.id))?;
+
+    let env_value = build_expression_env(state);
+    let val_env = ValueEnv::new(&env_value);
+
+    let expr = if over_expr.starts_with('$') {
+        over_expr.to_string()
+    } else {
+        format!("${over_expr}")
+    };
+
+    let resolved = expression::evaluate_expression(&expr, &val_env).map_err(|e| {
+        anyhow!(
+            "IR step '{}': failed to resolve over='{}': {e}",
+            step.id,
+            over_expr
+        )
+    })?;
+
+    match resolved {
+        Value::Array(items) => Ok(split_oversized_ir_thread_items(step, items, state)),
+        Value::Null => Ok(vec![]),
+        other => Ok(vec![other]),
+    }
+}
+
+// ── from_depth output hydration (IR) ────────────────────────────────────────
+
+/// Load previously saved step outputs from the DB for skipped steps.
+///
+/// Used when from_depth > 0 to hydrate outputs for steps that produced
+/// nodes below from_depth (so downstream steps can reference them).
+async fn hydrate_ir_step_output(
+    step: &IrStep,
+    exec_state: &ExecutionState,
+) -> Result<Option<Value>> {
+    let step_name = ir_persisted_step_name(step);
+    let saves_node = ExecutionState::step_saves_node(step);
+
+    if !saves_node {
+        // Non-node steps: try to load a single output
+        if let Some(output_json) = exec_state.load_step_output_from_db(step_name, 0).await? {
+            let output: Value = serde_json::from_str(&output_json).unwrap_or(Value::Null);
+            return Ok(Some(output));
+        }
+        return Ok(None);
+    }
+
+    // For forEach steps that save nodes, collect all outputs
+    let is_foreach = step
+        .iteration
+        .as_ref()
+        .map(|it| it.mode != IterationMode::Single)
+        .unwrap_or(false);
+
+    if is_foreach {
+        let mut outputs = Vec::new();
+        // Try loading outputs for sequential chunk indices
+        for i in 0..exec_state.chunks.len() as i64 {
+            if let Some(output_json) = exec_state.load_step_output_from_db(step_name, i).await? {
+                let output: Value = serde_json::from_str(&output_json).unwrap_or(Value::Null);
+                outputs.push(output);
+            }
+        }
+        if outputs.is_empty() {
+            return Ok(None);
+        }
+        return Ok(Some(Value::Array(outputs)));
+    }
+
+    // Single step
+    if let Some(output_json) = exec_state.load_step_output_from_db(step_name, 0).await? {
+        let output: Value = serde_json::from_str(&output_json).unwrap_or(Value::Null);
+        return Ok(Some(output));
+    }
+
+    Ok(None)
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Task D: Web Edge Execution + Context Loaders + Converge Specialization
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ── Web edge step detection ──────────────────────────────────────────────────
+
+/// Returns true when the step's storage_directive indicates it saves web edges
+/// rather than nodes.
+fn ir_step_is_web_edges(step: &IrStep) -> bool {
+    step.storage_directive
+        .as_ref()
+        .map(|sd| sd.kind == StorageKind::WebEdges)
+        .unwrap_or(false)
+}
+
+// ── Web edge execution for IR steps ──────────────────────────────────────────
+
+/// Execute a web-edge step through the IR path.
+///
+/// Mirrors `execute_web_step` (lines 4611-4769) but operates on `IrStep` and
+/// `ExecutionState`.  The flow:
+///   1. Check resume
+///   2. Flush write drain (nodes must be committed before webbing reads them)
+///   3. Load nodes at the target depth from DB
+///   4. Build compact/full webbing input
+///   5. Dispatch via LLM
+///   6. Parse edges with `parse_web_edges`
+///   7. Persist via `persist_web_edges_for_depth`
+///   8. Save step record (directly, not through write drain — matches legacy)
+async fn execute_ir_web_edges(
+    step: &IrStep,
+    exec_state: &mut ExecutionState,
+    dispatch_ctx: &chain_dispatch::StepContext,
+) -> Result<Value> {
+    let depth = ExecutionState::step_depth(step);
+    let synthetic_id = format!("WEB-L{depth}");
+    let step_name = ir_persisted_step_name(step);
+
+    // 1. Resume check
+    let resume = exec_state
+        .check_resume_state(step_name, -1, depth, &synthetic_id, false)
+        .await?;
+
+    if resume == IrResumeState::Complete {
+        info!("[IR] web step '{}' already complete (resume)", step.id);
+        if let Some(output_json) = exec_state
+            .load_step_output_exact(step_name, -1, depth, &synthetic_id)
+            .await?
+        {
+            let output: Value = serde_json::from_str(&output_json).unwrap_or(Value::Null);
+            return Ok(output);
+        }
+        return Ok(serde_json::json!({ "edges": [] }));
+    }
+
+    // 2. Flush write drain — all prior nodes must be committed
+    exec_state.flush_writes().await;
+
+    // 3. Resolve inputs and extract explicit node IDs
+    let resolved_input = resolve_ir_inputs(&step.input, exec_state);
+    let explicit_node_ids = extract_explicit_web_node_ids(&resolved_input);
+
+    // 4. Load nodes at target depth
+    let nodes = load_nodes_for_webbing(
+        &exec_state.reader,
+        &exec_state.slug,
+        depth,
+        &explicit_node_ids,
+    )
+    .await?;
+
+    if explicit_node_ids.len() > 1 && nodes.len() < explicit_node_ids.len() {
+        return Err(anyhow!(
+            "IR web step '{}' expected {} node(s) at depth {}, but only {} were available",
+            step.id,
+            explicit_node_ids.len(),
+            depth,
+            nodes.len()
+        ));
+    }
+
+    // 5. Build webbing input, dispatch, and parse edges
+    let normalized_edges = if nodes.len() >= 2 {
+        let web_input = build_webbing_input(&nodes, depth, &resolved_input, step.compact_inputs);
+
+        // Build system prompt with async context entries resolved
+        let system_prompt = build_ir_system_prompt_with_context(step, &web_input, exec_state).await;
+
+        let start = Instant::now();
+        let (analysis, llm_resp) = dispatch_ir_with_retry(
+            step,
+            &web_input,
+            &system_prompt,
+            dispatch_ctx,
+            &step.error_policy,
+        )
+        .await?;
+        let elapsed = start.elapsed().as_secs_f64();
+
+        // Log cost
+        if let Some(ref response) = llm_resp {
+            let model =
+                chain_dispatch::resolve_ir_model(&step.model_requirements, &dispatch_ctx.config);
+            let _ = exec_state
+                .log_cost(
+                    step_name,
+                    &model,
+                    response.usage.prompt_tokens,
+                    response.usage.completion_tokens,
+                    0.0,
+                    step.model_requirements.tier.as_deref(),
+                    Some((elapsed * 1000.0) as i64),
+                    response.generation_id.as_deref(),
+                    None,
+                )
+                .await;
+        }
+
+        parse_web_edges(step_name, &analysis, &nodes)
+    } else {
+        Vec::new()
+    };
+
+    // 6. Build output JSON
+    let edges_json: Vec<Value> = normalized_edges
+        .iter()
+        .map(|edge| {
+            serde_json::json!({
+                "source": edge.source_node_id,
+                "target": edge.target_node_id,
+                "relationship": edge.relationship,
+                "strength": edge.strength,
+            })
+        })
+        .collect();
+
+    let output = serde_json::json!({
+        "edges": edges_json,
+        "webbed_depth": depth,
+        "node_count": nodes.len(),
+        "saved_edge_count": 0,
+    });
+
+    // 7. Save step record (directly, not through write drain)
+    let output_json = serde_json::to_string(&output)?;
+    let model = chain_dispatch::resolve_ir_model(&step.model_requirements, &dispatch_ctx.config);
+    {
+        let slug = exec_state.slug.clone();
+        let step_name_owned = step_name.to_string();
+        let synthetic_id_clone = synthetic_id.clone();
+        let model_clone = model.clone();
+        let output_json_clone = output_json.clone();
+        let writer = exec_state.writer.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let conn = writer.blocking_lock();
+            db::save_step(
+                &conn,
+                &slug,
+                &step_name_owned,
+                -1,
+                depth,
+                &synthetic_id_clone,
+                &output_json_clone,
+                &model_clone,
+                0.0,
+            )
+        })
+        .await??;
+    }
+
+    // 8. Persist web edges
+    let saved_edge_count = persist_web_edges_for_depth(
+        &exec_state.writer,
+        &exec_state.slug,
+        depth,
+        &normalized_edges,
+    )
+    .await?;
+
+    // 9. Update step record with final edge count
+    let final_output = serde_json::json!({
+        "edges": output.get("edges").cloned().unwrap_or_else(|| serde_json::json!([])),
+        "webbed_depth": depth,
+        "node_count": nodes.len(),
+        "saved_edge_count": saved_edge_count,
+    });
+    let final_output_json = serde_json::to_string(&final_output)?;
+    {
+        let slug = exec_state.slug.clone();
+        let step_name_owned = step_name.to_string();
+        let synthetic_id_clone = synthetic_id;
+        let model_clone = model;
+        let writer = exec_state.writer.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let conn = writer.blocking_lock();
+            db::save_step(
+                &conn,
+                &slug,
+                &step_name_owned,
+                -1,
+                depth,
+                &synthetic_id_clone,
+                &final_output_json,
+                &model_clone,
+                0.0,
+            )
+        })
+        .await??;
+    }
+
+    info!(
+        "[IR] web step '{}' depth {} complete ({} nodes, {} edges)",
+        step.id,
+        depth,
+        nodes.len(),
+        saved_edge_count
+    );
+
+    Ok(final_output)
+}
+
+// ── Context loader dispatch ──────────────────────────────────────────────────
+
+/// Resolve loader-based context entries for an IR step.
+///
+/// For entries with only `reference`: handled by `build_ir_system_prompt` (existing sync path).
+/// For entries with `loader`: dispatched to the appropriate async loader function.
+///
+/// Returns labeled text sections to append to the system prompt.
+async fn resolve_ir_context_entries(
+    step: &IrStep,
+    resolved_input: &Value,
+    exec_state: &ExecutionState,
+) -> Vec<(String, String)> {
+    let mut sections = Vec::new();
+
+    for entry in &step.context {
+        let loader = match &entry.loader {
+            Some(l) => l.as_str(),
+            None => continue, // reference-only entries are handled by build_ir_system_prompt
+        };
+
+        let result = match loader {
+            "web_edge_summary" => {
+                resolve_web_edge_summary_context(entry, step, resolved_input, exec_state).await
+            }
+            "sibling_cluster_context" => resolve_sibling_cluster_context(entry, exec_state).await,
+            unknown => {
+                warn!(
+                    "[IR] Unknown context loader '{}' on step '{}' — skipping",
+                    unknown, step.id
+                );
+                continue;
+            }
+        };
+
+        match result {
+            Ok(text) if !text.trim().is_empty() => {
+                sections.push((entry.label.clone(), text));
+            }
+            Ok(_) => {} // empty result, skip
+            Err(e) => {
+                warn!(
+                    "[IR] Context loader '{}' failed on step '{}': {e}",
+                    loader, step.id
+                );
+            }
+        }
+    }
+
+    sections
+}
+
+/// Load web edges from DB at the specified depth, filter by mode, summarize.
+///
+/// Params (from ContextEntry.params):
+///   - `depth`: i64 — which depth to load edges from (default: step depth)
+///   - `mode`: "internal" | "external" | "all" (default: "all")
+///   - `max_edges`: usize (default: 24)
+async fn resolve_web_edge_summary_context(
+    entry: &ContextEntry,
+    step: &IrStep,
+    resolved_input: &Value,
+    exec_state: &ExecutionState,
+) -> Result<String> {
+    let params = entry.params.as_ref().cloned().unwrap_or(Value::Null);
+
+    // Determine depth to load edges from
+    let edge_depth = params
+        .get("depth")
+        .and_then(|v| v.as_i64())
+        .unwrap_or_else(|| ExecutionState::step_depth(step));
+
+    // Determine mode
+    let mode = params.get("mode").and_then(|v| v.as_str()).unwrap_or("all");
+
+    let max_edges = params
+        .get("max_edges")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(24) as usize;
+
+    // Load connections from DB
+    let connections =
+        load_same_depth_web_connections(&exec_state.reader, &exec_state.slug, edge_depth).await?;
+
+    if connections.is_empty() {
+        return Ok(String::new());
+    }
+
+    // Resolve node IDs for filtering (if reference is set)
+    let node_ids: Vec<String> = if let Some(ref reference) = entry.reference {
+        let env_value = build_expression_env(exec_state);
+        let val_env = ValueEnv::new(&env_value);
+        let expr = if reference.starts_with('$') {
+            reference.clone()
+        } else {
+            format!("${reference}")
+        };
+        match expression::evaluate_expression(&expr, &val_env) {
+            Ok(Value::Array(arr)) => arr
+                .iter()
+                .filter_map(|v| {
+                    v.as_str().map(|s| s.to_string()).or_else(|| {
+                        v.get("node_id")
+                            .and_then(|n| n.as_str())
+                            .map(|s| s.to_string())
+                    })
+                })
+                .collect(),
+            Ok(val) => extract_node_ids_from_value(&val),
+            Err(_) => extract_node_ids_from_value(resolved_input),
+        }
+    } else {
+        extract_node_ids_from_value(resolved_input)
+    };
+
+    // Summarize based on mode
+    let summary = match mode {
+        "internal" => summarize_internal_connections(&connections, &node_ids, max_edges),
+        "external" => summarize_external_connections(&connections, &node_ids, max_edges),
+        _ => {
+            // "all" — return both internal and external
+            let internal = summarize_internal_connections(&connections, &node_ids, max_edges / 2);
+            let external = summarize_external_connections(&connections, &node_ids, max_edges / 2);
+            let mut combined = String::new();
+            if !internal.is_empty() {
+                combined.push_str("Internal connections:\n");
+                combined.push_str(&internal);
+            }
+            if !external.is_empty() {
+                if !combined.is_empty() {
+                    combined.push_str("\n\n");
+                }
+                combined.push_str("External connections:\n");
+                combined.push_str(&external);
+            }
+            combined
+        }
+    };
+
+    Ok(summary)
+}
+
+/// Extract node IDs from a Value in various shapes.
+fn extract_node_ids_from_value(val: &Value) -> Vec<String> {
+    let mut ids = Vec::new();
+    match val {
+        Value::Array(arr) => {
+            for item in arr {
+                if let Some(id) = item
+                    .as_str()
+                    .map(|s| s.to_string())
+                    .or_else(|| {
+                        item.get("node_id")
+                            .and_then(|n| n.as_str())
+                            .map(|s| s.to_string())
+                    })
+                    .or_else(|| {
+                        item.get("id")
+                            .and_then(|n| n.as_str())
+                            .map(|s| s.to_string())
+                    })
+                {
+                    ids.push(id);
+                }
+            }
+        }
+        Value::Object(map) => {
+            // Check for "topics" array (topic_inventory format)
+            if let Some(topics) = map.get("topics").and_then(|t| t.as_array()) {
+                for topic in topics {
+                    if let Some(id) = topic
+                        .get("node_id")
+                        .or_else(|| topic.get("source_node"))
+                        .or_else(|| topic.get("id"))
+                        .and_then(|v| v.as_str())
+                        .and_then(candidate_node_id_from_str)
+                    {
+                        ids.push(id);
+                    }
+                }
+            }
+            // Check for "nodes" array
+            if let Some(nodes) = map.get("nodes").and_then(|n| n.as_array()) {
+                for node in nodes {
+                    if let Some(id) = node
+                        .as_str()
+                        .and_then(candidate_node_id_from_str)
+                        .or_else(|| {
+                            node.get("node_id")
+                                .and_then(|n| n.as_str())
+                                .map(|s| s.to_string())
+                        })
+                        .or_else(|| {
+                            node.get("id")
+                                .and_then(|n| n.as_str())
+                                .map(|s| s.to_string())
+                        })
+                        .or_else(|| {
+                            node.get("source_node")
+                                .and_then(|n| n.as_str())
+                                .and_then(candidate_node_id_from_str)
+                        })
+                    {
+                        ids.push(id);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    ids
+}
+
+/// Resolve sibling cluster context for converge reduce steps.
+///
+/// When a reduce step processes one cluster, it needs to know what the other
+/// clusters contain so it can produce appropriately differentiated syntheses.
+async fn resolve_sibling_cluster_context(
+    entry: &ContextEntry,
+    exec_state: &ExecutionState,
+) -> Result<String> {
+    // The reference should point to the repair step's output (the full cluster list)
+    let clusters_val = if let Some(ref reference) = entry.reference {
+        let env_value = build_expression_env(exec_state);
+        let val_env = ValueEnv::new(&env_value);
+        let expr = if reference.starts_with('$') {
+            reference.clone()
+        } else {
+            format!("${reference}")
+        };
+        expression::evaluate_expression(&expr, &val_env).ok()
+    } else {
+        None
+    };
+
+    let Some(Value::Array(clusters)) = clusters_val else {
+        return Ok(String::new());
+    };
+
+    // If we're in a forEach iteration, identify the current cluster index
+    let current_idx = exec_state.current_index;
+
+    let mut summary = String::new();
+    for (i, cluster) in clusters.iter().enumerate() {
+        // Skip the current cluster (the one being synthesized)
+        if Some(i) == current_idx {
+            continue;
+        }
+
+        // Extract cluster headline/label
+        let label = cluster
+            .get("label")
+            .or_else(|| cluster.get("name"))
+            .or_else(|| cluster.get("headline"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("(unnamed cluster)");
+
+        // Extract assigned node count or node list
+        let node_count = cluster
+            .get("assignments")
+            .or_else(|| cluster.get("node_ids"))
+            .or_else(|| cluster.get("members"))
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.len())
+            .unwrap_or(0);
+
+        if !summary.is_empty() {
+            summary.push('\n');
+        }
+        summary.push_str(&format!(
+            "- Sibling cluster {}: \"{}\" ({} nodes)",
+            i, label, node_count
+        ));
+    }
+
+    Ok(summary)
+}
+
+/// Build system prompt for an IR step with async context loader resolution.
+///
+/// This is the async version of `build_ir_system_prompt` that resolves
+/// loader-based context entries (web_edge_summary, sibling_cluster_context)
+/// before appending them to the prompt.
+async fn build_ir_system_prompt_with_context(
+    step: &IrStep,
+    resolved_input: &Value,
+    exec_state: &ExecutionState,
+) -> String {
+    // Start with the synchronous base prompt
+    let base = build_ir_system_prompt(step, resolved_input, exec_state);
+
+    // Resolve async loader-based context entries
+    let loader_sections = resolve_ir_context_entries(step, resolved_input, exec_state).await;
+
+    if loader_sections.is_empty() {
+        return base;
+    }
+
+    let mut result = base;
+    for (label, text) in loader_sections {
+        result.push_str("\n\n---\n");
+        result.push_str(&label);
+        result.push_str(":\n");
+        result.push_str(&text);
+    }
+
+    result
+}
+
+// ── Step path classification ─────────────────────────────────────────────────
+
+/// Determine the execution path for an IR step.
+///
+///   - WebEdges → specialized web edge execution
+///   - Has loader-based context entries → use async context-aware prompt builder
+///   - Otherwise → standard execution path
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IrStepExecutionPath {
+    /// Standard execution through generic iteration handlers (Task C)
+    Standard,
+    /// Web edge execution (flush, load nodes, dispatch, parse, persist)
+    WebEdges,
+    /// Standard execution but with async context loader resolution
+    StandardWithAsyncContext,
+}
+
+fn classify_ir_step_path(step: &IrStep) -> IrStepExecutionPath {
+    if ir_step_is_web_edges(step) {
+        return IrStepExecutionPath::WebEdges;
+    }
+    if step.context.iter().any(|c| c.loader.is_some()) {
+        return IrStepExecutionPath::StandardWithAsyncContext;
+    }
+    IrStepExecutionPath::Standard
+}
+
+// ── End of IR execution path ─────────────────────────────────────────────────
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4043,6 +7791,10 @@ mod tests {
             response_schema: None,
             batch_threshold: None,
             merge_instruction: None,
+            instruction_map: None,
+            max_thread_size: None,
+            context: None,
+            compact_inputs: false,
             when: None,
             on_error: None,
             save_as: None,
@@ -4471,5 +8223,2099 @@ mod tests {
             &partial_current_nodes,
             &target_nodes
         ));
+    }
+
+    #[test]
+    fn test_apply_header_lines_truncates_strings_and_chunk_content() {
+        let input = json!({
+            "header_lines": 2,
+            "content": "a\nb\nc",
+            "chunks": [
+                { "content": "x\ny\nz" }
+            ]
+        });
+
+        let output = apply_header_lines(input);
+        assert_eq!(output.get("header_lines"), None);
+        assert_eq!(output.get("content").and_then(|v| v.as_str()), Some("a\nb"));
+        assert_eq!(
+            output["chunks"][0].get("content").and_then(|v| v.as_str()),
+            Some("x\ny")
+        );
+    }
+
+    #[test]
+    fn test_instruction_map_prompt_routes_frontend_and_config_chunks() {
+        let mut step = test_step("l0_code_extract");
+        step.instruction = Some("$prompts/code/code_extract.md".to_string());
+        step.instruction_map = Some(HashMap::from([
+            (
+                "type:config".to_string(),
+                "$prompts/code/config_extract.md".to_string(),
+            ),
+            (
+                "extension:.tsx".to_string(),
+                "$prompts/code/code_extract_frontend.md".to_string(),
+            ),
+            (
+                "type:frontend".to_string(),
+                "$prompts/code/code_extract_frontend.md".to_string(),
+            ),
+        ]));
+
+        let tsx_input = json!({
+            "content": "## FILE: src/components/AppShell.tsx\n## LANGUAGE: tsx\n## TYPE: source\n## LINES: 10\n\nexport function AppShell() {}"
+        });
+        let js_frontend_input = json!({
+            "content": "## FILE: src/hooks/useWidget.js\n## LANGUAGE: javascript\n## TYPE: source\n## LINES: 10\n\nexport function useWidget() {}"
+        });
+        let config_input = json!({
+            "content": "## FILE: package.json\n## LANGUAGE: json\n## TYPE: config\n## LINES: 10\n\n{}"
+        });
+
+        assert_eq!(
+            instruction_map_prompt(&step, &tsx_input).as_deref(),
+            Some("$prompts/code/code_extract_frontend.md")
+        );
+        assert_eq!(
+            instruction_map_prompt(&step, &js_frontend_input).as_deref(),
+            Some("$prompts/code/code_extract_frontend.md")
+        );
+        assert_eq!(
+            instruction_map_prompt(&step, &config_input).as_deref(),
+            Some("$prompts/code/config_extract.md")
+        );
+    }
+
+    #[test]
+    fn test_fallback_split_thread_respects_max_size() {
+        let thread = json!({
+            "name": "Pyramid Engine",
+            "description": "Build pipeline and query layer",
+            "assignments": [
+                {"source_node": "C-L0-000", "topic_index": 0, "topic_name": "A"},
+                {"source_node": "C-L0-001", "topic_index": 1, "topic_name": "B"},
+                {"source_node": "C-L0-002", "topic_index": 2, "topic_name": "C"}
+            ]
+        });
+
+        let split = fallback_split_thread(&thread, 2);
+        assert_eq!(split.len(), 2);
+        assert_eq!(split[0]["name"], "Pyramid Engine Part 1");
+        assert_eq!(split[0]["assignments"].as_array().unwrap().len(), 2);
+        assert_eq!(split[1]["assignments"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_validate_split_threads_rejects_missing_or_duplicate_assignments() {
+        let original = vec![
+            json!({"source_node": "C-L0-000", "topic_index": 0, "topic_name": "A"}),
+            json!({"source_node": "C-L0-001", "topic_index": 1, "topic_name": "B"}),
+        ];
+        let valid = vec![
+            json!({"name": "Part 1", "assignments": [original[0].clone()]}),
+            json!({"name": "Part 2", "assignments": [original[1].clone()]}),
+        ];
+        let invalid = vec![
+            json!({"name": "Part 1", "assignments": [original[0].clone(), original[0].clone()]}),
+        ];
+
+        assert!(validate_split_threads(&original, &valid, 1));
+        assert!(!validate_split_threads(&original, &invalid, 2));
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // IR Execution Path Tests (Task C of P1.4)
+    // ════════════════════════════════════════════════════════════════════════
+
+    use crate::pyramid::execution_plan::{
+        CostEstimate, IterationDirective, IterationMode, IterationShape, ModelRequirements,
+        Step as IrStep, StepOperation as IrStepOp, StorageDirective, StorageKind,
+    };
+    use crate::pyramid::execution_state::ExecutionState;
+
+    fn ir_test_step(id: &str) -> IrStep {
+        use crate::pyramid::execution_plan::ErrorPolicy as IrErrorPolicy;
+        IrStep {
+            id: id.to_string(),
+            operation: IrStepOp::Llm,
+            primitive: Some("extract".to_string()),
+            depends_on: vec![],
+            iteration: None,
+            input: json!({}),
+            instruction: Some("test prompt".to_string()),
+            instruction_map: None,
+            compact_inputs: false,
+            output_schema: None,
+            constraints: None,
+            error_policy: IrErrorPolicy::Retry(2),
+            model_requirements: ModelRequirements::default(),
+            storage_directive: None,
+            cost_estimate: CostEstimate::default(),
+            action_id: None,
+            rust_function: None,
+            transform: None,
+            when: None,
+            context: vec![],
+            response_schema: None,
+            source_step_name: None,
+            converge_metadata: None,
+            metadata: None,
+            scope: None,
+        }
+    }
+
+    // ── Topological sort tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_topological_sort_ir_linear() {
+        let a = ir_test_step("a");
+        let mut b = ir_test_step("b");
+        let mut c = ir_test_step("c");
+        b.depends_on = vec!["a".to_string()];
+        c.depends_on = vec!["b".to_string()];
+        let steps = vec![c, a, b]; // intentionally out of order
+
+        let order = topological_sort_ir(&steps).unwrap();
+        let ids: Vec<&str> = order.iter().map(|&i| steps[i].id.as_str()).collect();
+
+        // "a" must come before "b", "b" before "c"
+        let pos_a = ids.iter().position(|&x| x == "a").unwrap();
+        let pos_b = ids.iter().position(|&x| x == "b").unwrap();
+        let pos_c = ids.iter().position(|&x| x == "c").unwrap();
+        assert!(pos_a < pos_b);
+        assert!(pos_b < pos_c);
+    }
+
+    #[test]
+    fn test_topological_sort_ir_diamond() {
+        let a = ir_test_step("a");
+        let mut b = ir_test_step("b");
+        let mut c = ir_test_step("c");
+        let mut d = ir_test_step("d");
+        b.depends_on = vec!["a".to_string()];
+        c.depends_on = vec!["a".to_string()];
+        d.depends_on = vec!["b".to_string(), "c".to_string()];
+        let steps = vec![d, b, a, c]; // intentionally jumbled
+
+        let order = topological_sort_ir(&steps).unwrap();
+        let ids: Vec<&str> = order.iter().map(|&i| steps[i].id.as_str()).collect();
+
+        let pos_a = ids.iter().position(|&x| x == "a").unwrap();
+        let pos_b = ids.iter().position(|&x| x == "b").unwrap();
+        let pos_c = ids.iter().position(|&x| x == "c").unwrap();
+        let pos_d = ids.iter().position(|&x| x == "d").unwrap();
+        assert!(pos_a < pos_b);
+        assert!(pos_a < pos_c);
+        assert!(pos_b < pos_d);
+        assert!(pos_c < pos_d);
+    }
+
+    #[test]
+    fn test_topological_sort_ir_no_deps() {
+        let steps = vec![ir_test_step("x"), ir_test_step("y"), ir_test_step("z")];
+        let order = topological_sort_ir(&steps).unwrap();
+        // All steps should appear (no deps = any order is valid)
+        assert_eq!(order.len(), 3);
+    }
+
+    #[test]
+    fn test_topological_sort_ir_cycle_errors() {
+        let mut a = ir_test_step("a");
+        let mut b = ir_test_step("b");
+        a.depends_on = vec!["b".to_string()];
+        b.depends_on = vec!["a".to_string()];
+        let steps = vec![a, b];
+
+        let result = topological_sort_ir(&steps);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("cycle"),
+            "expected cycle error, got: {err_msg}"
+        );
+    }
+
+    // ── When guard evaluation tests ─────────────────────────────────────
+
+    #[test]
+    fn test_evaluate_when_ir_none_returns_true() {
+        let state = make_ir_test_state();
+        assert!(evaluate_when_ir(None, &state));
+    }
+
+    #[test]
+    fn test_evaluate_when_ir_empty_returns_true() {
+        let state = make_ir_test_state();
+        assert!(evaluate_when_ir(Some(""), &state));
+    }
+
+    #[test]
+    fn test_evaluate_when_ir_simple_ref_bool() {
+        let mut state = make_ir_test_state();
+        state.has_prior_build = true;
+        assert!(evaluate_when_ir(Some("$has_prior_build"), &state));
+
+        state.has_prior_build = false;
+        assert!(!evaluate_when_ir(Some("$has_prior_build"), &state));
+    }
+
+    #[test]
+    fn test_evaluate_when_ir_count_comparison() {
+        let mut state = make_ir_test_state();
+        state
+            .step_outputs
+            .insert("thread_syntheses".to_string(), json!([1, 2, 3]));
+        assert!(evaluate_when_ir(
+            Some("count($thread_syntheses) <= 4"),
+            &state
+        ));
+        assert!(!evaluate_when_ir(
+            Some("count($thread_syntheses) > 4"),
+            &state
+        ));
+    }
+
+    #[test]
+    fn test_evaluate_when_ir_missing_ref() {
+        let state = make_ir_test_state();
+        assert!(!evaluate_when_ir(Some("$nonexistent"), &state));
+    }
+
+    // ── Input resolution tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_resolve_ir_inputs_simple_ref() {
+        let mut state = make_ir_test_state();
+        state
+            .step_outputs
+            .insert("extract".to_string(), json!({"data": [1, 2, 3]}));
+        let input = json!({"items": "$extract.data"});
+        let resolved = resolve_ir_inputs(&input, &state);
+        assert_eq!(resolved["items"], json!([1, 2, 3]));
+    }
+
+    #[test]
+    fn test_resolve_ir_inputs_no_ref() {
+        let state = make_ir_test_state();
+        let input = json!({"static_key": "static_value"});
+        let resolved = resolve_ir_inputs(&input, &state);
+        assert_eq!(resolved["static_key"], "static_value");
+    }
+
+    #[test]
+    fn test_resolve_ir_inputs_nested() {
+        let mut state = make_ir_test_state();
+        state
+            .step_outputs
+            .insert("step_a".to_string(), json!({"count": 5}));
+        let input = json!({"nested": {"ref": "$step_a.count"}});
+        let resolved = resolve_ir_inputs(&input, &state);
+        assert_eq!(resolved["nested"]["ref"], 5);
+    }
+
+    #[test]
+    fn test_resolve_ir_inputs_chunks() {
+        let mut state = make_ir_test_state();
+        state.chunks = vec![json!({"index": 0, "content": "hello"})];
+        let input = json!({"data": "$chunks"});
+        let resolved = resolve_ir_inputs(&input, &state);
+        assert_eq!(resolved["data"], json!([{"index": 0, "content": "hello"}]));
+    }
+
+    // ── Truthiness tests ────────────────────────────────────────────────
+
+    #[test]
+    fn test_value_is_truthy() {
+        assert!(value_is_truthy(&json!(true)));
+        assert!(!value_is_truthy(&json!(false)));
+        assert!(!value_is_truthy(&json!(null)));
+        assert!(!value_is_truthy(&json!(0)));
+        assert!(value_is_truthy(&json!(1)));
+        assert!(value_is_truthy(&json!("hello")));
+        assert!(!value_is_truthy(&json!("")));
+        assert!(!value_is_truthy(&json!("false")));
+        assert!(value_is_truthy(&json!([1])));
+        assert!(!value_is_truthy(&json!([])));
+        assert!(value_is_truthy(&json!({"a": 1})));
+        assert!(!value_is_truthy(&json!({})));
+    }
+
+    // ── Node ID generation tests ────────────────────────────────────────
+
+    #[test]
+    fn test_generate_ir_node_id_basic() {
+        let mut step = ir_test_step("extract");
+        step.storage_directive = Some(StorageDirective {
+            kind: StorageKind::Node,
+            depth: Some(0),
+            node_id_pattern: Some("C-L0-{index:03}".to_string()),
+            target: None,
+        });
+        assert_eq!(generate_ir_node_id(&step, 5), "C-L0-005");
+        assert_eq!(generate_ir_node_id(&step, 42), "C-L0-042");
+    }
+
+    #[test]
+    fn test_generate_ir_node_id_with_depth() {
+        let mut step = ir_test_step("synth");
+        step.storage_directive = Some(StorageDirective {
+            kind: StorageKind::Node,
+            depth: Some(3),
+            node_id_pattern: Some("L{depth}-{index:03}".to_string()),
+            target: None,
+        });
+        assert_eq!(generate_ir_node_id(&step, 2), "L3-002");
+    }
+
+    #[test]
+    fn test_generate_ir_node_id_no_pattern_fallback() {
+        let step = ir_test_step("no_storage");
+        // No storage directive → uses fallback pattern
+        assert_eq!(generate_ir_node_id(&step, 0), "N-000");
+    }
+
+    // ── Decorate step output tests ──────────────────────────────────────
+
+    #[test]
+    fn test_decorate_ir_step_output() {
+        let output = json!({"headline": "Test"});
+        let decorated = decorate_ir_step_output(output, "C-L0-005", 5);
+        assert_eq!(decorated["node_id"], "C-L0-005");
+        assert_eq!(decorated["source_node"], "C-L0-005");
+        assert_eq!(decorated["chunk_index"], 5);
+        assert_eq!(decorated["headline"], "Test");
+    }
+
+    // ── forEach collection resolution tests ─────────────────────────────
+
+    #[test]
+    fn test_resolve_foreach_collection_chunks() {
+        let mut state = make_ir_test_state();
+        state.chunks = vec![
+            json!({"index": 0, "content": "a"}),
+            json!({"index": 1, "content": "b"}),
+        ];
+
+        let mut step = ir_test_step("extract");
+        step.iteration = Some(IterationDirective {
+            mode: IterationMode::Parallel,
+            over: Some("chunks".to_string()),
+            concurrency: Some(4),
+            accumulate: None,
+            shape: Some(IterationShape::ForEach),
+        });
+
+        let items = resolve_foreach_collection(&step, &state).unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["index"], 0);
+    }
+
+    #[test]
+    fn test_resolve_foreach_collection_step_output() {
+        let mut state = make_ir_test_state();
+        state.step_outputs.insert(
+            "cluster_output".to_string(),
+            json!([{"name": "group1"}, {"name": "group2"}]),
+        );
+
+        let mut step = ir_test_step("synthesize");
+        step.iteration = Some(IterationDirective {
+            mode: IterationMode::Parallel,
+            over: Some("cluster_output".to_string()),
+            concurrency: Some(4),
+            accumulate: None,
+            shape: Some(IterationShape::ForEach),
+        });
+
+        let items = resolve_foreach_collection(&step, &state).unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["name"], "group1");
+    }
+
+    // ── Instruction map resolution tests ────────────────────────────────
+
+    #[test]
+    fn test_resolve_ir_instruction_with_map() {
+        let mut step = ir_test_step("extract");
+        step.instruction = Some("default instruction".to_string());
+        step.instruction_map = Some({
+            let mut map = std::collections::HashMap::new();
+            map.insert(
+                "type:config".to_string(),
+                "config-specific instruction".to_string(),
+            );
+            map.insert(
+                "language:rust".to_string(),
+                "rust-specific instruction".to_string(),
+            );
+            map
+        });
+
+        // Content with TYPE header
+        let input = json!({"content": "## TYPE: config\nsome config content"});
+        assert_eq!(
+            resolve_ir_instruction(&step, &input),
+            "config-specific instruction"
+        );
+
+        // Content with LANGUAGE header
+        let input = json!({"content": "## LANGUAGE: Rust\nsome rust code"});
+        assert_eq!(
+            resolve_ir_instruction(&step, &input),
+            "rust-specific instruction"
+        );
+
+        // Content with no matching header → falls back to default
+        let input = json!({"content": "## TYPE: unknown\nsome content"});
+        assert_eq!(resolve_ir_instruction(&step, &input), "default instruction");
+    }
+
+    #[test]
+    fn test_resolve_ir_instruction_no_map() {
+        let mut step = ir_test_step("extract");
+        step.instruction = Some("the instruction".to_string());
+        step.instruction_map = None;
+
+        let input = json!({"content": "any content"});
+        assert_eq!(resolve_ir_instruction(&step, &input), "the instruction");
+    }
+
+    // ── Helper to build a test ExecutionState ───────────────────────────
+
+    fn make_ir_test_state() -> ExecutionState {
+        use std::sync::Arc;
+        use tokio::sync::{mpsc, Mutex};
+
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::pyramid::db::init_pyramid_db(&conn).unwrap();
+        let db = Arc::new(Mutex::new(conn));
+        let (tx, _rx) = mpsc::channel(16);
+        let cancel = tokio_util::sync::CancellationToken::new();
+
+        ExecutionState {
+            slug: "test-slug".to_string(),
+            content_type: "code".to_string(),
+            chain_id: None,
+            chunks: vec![],
+            step_outputs: std::collections::HashMap::new(),
+            accumulators: std::collections::HashMap::new(),
+            current_item: None,
+            current_index: None,
+            has_prior_build: false,
+            writer_tx: tx,
+            progress_tx: None,
+            done: 0,
+            total: 10,
+            cancel,
+            reader: db.clone(),
+            writer: db,
+        }
+    }
+
+    #[test]
+    fn test_ir_persisted_step_name_uses_unique_step_id() {
+        let mut step = ir_test_step("l2_synthesis_r0_repair");
+        step.source_step_name = Some("l2_synthesis".to_string());
+
+        assert_eq!(ir_persisted_step_name(&step), "l2_synthesis_r0_repair");
+    }
+
+    #[test]
+    fn test_update_ir_top_level_alias_tracks_highest_non_apex_layer() {
+        let mut state = make_ir_test_state();
+        let mut highest_non_apex_depth = -1;
+
+        let mut l1 = ir_test_step("l1_synthesis");
+        l1.storage_directive = Some(StorageDirective {
+            kind: StorageKind::Node,
+            depth: Some(1),
+            node_id_pattern: Some("L1-{index:03}".to_string()),
+            target: None,
+        });
+        let l1_output = json!([{"node_id": "L1-000", "headline": "Layer 1"}]);
+        update_ir_top_level_alias(&mut state, &l1, &l1_output, &mut highest_non_apex_depth);
+
+        assert_eq!(highest_non_apex_depth, 1);
+        assert_eq!(state.step_outputs.get("top_level_nodes"), Some(&l1_output));
+        assert_eq!(state.step_outputs.get("top_level_depth"), Some(&json!(1)));
+
+        let mut apex = ir_test_step("apex");
+        apex.storage_directive = Some(StorageDirective {
+            kind: StorageKind::Node,
+            depth: Some(3),
+            node_id_pattern: Some("APEX".to_string()),
+            target: None,
+        });
+        let apex_output = json!({"node_id": "APEX", "headline": "Apex"});
+        update_ir_top_level_alias(&mut state, &apex, &apex_output, &mut highest_non_apex_depth);
+
+        assert_eq!(highest_non_apex_depth, 1);
+        assert_eq!(state.step_outputs.get("top_level_nodes"), Some(&l1_output));
+
+        let mut l2 = ir_test_step("l2_synthesis_r0_reduce");
+        l2.storage_directive = Some(StorageDirective {
+            kind: StorageKind::Node,
+            depth: Some(2),
+            node_id_pattern: Some("L2-{index:03}".to_string()),
+            target: None,
+        });
+        let l2_output = json!([{"node_id": "L2-000", "headline": "Layer 2"}]);
+        update_ir_top_level_alias(&mut state, &l2, &l2_output, &mut highest_non_apex_depth);
+
+        assert_eq!(highest_non_apex_depth, 2);
+        assert_eq!(state.step_outputs.get("top_level_nodes"), Some(&l2_output));
+        assert_eq!(state.step_outputs.get("top_level_depth"), Some(&json!(2)));
+
+        let empty_reduce = json!([]);
+        update_ir_top_level_alias(&mut state, &l2, &empty_reduce, &mut highest_non_apex_depth);
+
+        assert_eq!(highest_non_apex_depth, 2);
+        assert_eq!(state.step_outputs.get("top_level_nodes"), Some(&l2_output));
+    }
+
+    #[test]
+    fn test_cleanup_from_depth_sync_deletes_thread_dependents_before_threads() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::pyramid::db::init_pyramid_db(&conn).unwrap();
+        crate::pyramid::db::create_slug(
+            &conn,
+            "cleanup-test",
+            &crate::pyramid::types::ContentType::Code,
+            "",
+        )
+        .unwrap();
+
+        let l0 = crate::pyramid::types::PyramidNode {
+            id: "L0-000".to_string(),
+            slug: "cleanup-test".to_string(),
+            depth: 0,
+            chunk_index: Some(0),
+            headline: "Leaf".to_string(),
+            distilled: "Leaf node".to_string(),
+            topics: vec![],
+            corrections: vec![],
+            decisions: vec![],
+            terms: vec![],
+            dead_ends: vec![],
+            self_prompt: String::new(),
+            children: vec!["L1-000".to_string()],
+            parent_id: Some("L1-000".to_string()),
+            superseded_by: None,
+            created_at: String::new(),
+        };
+        let l1 = crate::pyramid::types::PyramidNode {
+            id: "L1-000".to_string(),
+            slug: "cleanup-test".to_string(),
+            depth: 1,
+            chunk_index: None,
+            headline: "Thread Canonical".to_string(),
+            distilled: "Grouped node".to_string(),
+            topics: vec![],
+            corrections: vec![],
+            decisions: vec![],
+            terms: vec![],
+            dead_ends: vec![],
+            self_prompt: String::new(),
+            children: vec!["L0-000".to_string()],
+            parent_id: None,
+            superseded_by: None,
+            created_at: String::new(),
+        };
+
+        crate::pyramid::db::save_node(&conn, &l0, None).unwrap();
+        crate::pyramid::db::save_node(&conn, &l1, None).unwrap();
+
+        conn.execute(
+            "INSERT INTO pyramid_threads (slug, thread_id, thread_name, current_canonical_id, depth)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["cleanup-test", "T-001", "Core Thread", "L1-000", 1],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO pyramid_distillations (slug, thread_id, content)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params!["cleanup-test", "T-001", "Distilled thread content"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO pyramid_deltas (slug, thread_id, sequence, content)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params!["cleanup-test", "T-001", 1, "Delta content"],
+        )
+        .unwrap();
+        crate::pyramid::db::save_step(
+            &conn,
+            "cleanup-test",
+            "l2_synthesis_r0_classify",
+            -1,
+            0,
+            "L2-HELPER",
+            "{\"clusters\":[]}",
+            "qwen/qwen3.5-flash-02-23",
+            0.0,
+        )
+        .unwrap();
+        crate::pyramid::db::save_step(
+            &conn,
+            "cleanup-test",
+            "l2_synthesis_shortcut",
+            -1,
+            0,
+            "L2-SHORTCUT",
+            "{\"headline\":\"stale\"}",
+            "inception/mercury-2",
+            0.0,
+        )
+        .unwrap();
+
+        cleanup_from_depth_sync(&conn, "cleanup-test", 1).unwrap();
+
+        let remaining_threads: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pyramid_threads WHERE slug = ?1",
+                rusqlite::params!["cleanup-test"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let remaining_distillations: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pyramid_distillations WHERE slug = ?1",
+                rusqlite::params!["cleanup-test"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let remaining_deltas: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pyramid_deltas WHERE slug = ?1",
+                rusqlite::params!["cleanup-test"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let remaining_depth_one_nodes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pyramid_nodes WHERE slug = ?1 AND depth >= 1",
+                rusqlite::params!["cleanup-test"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let remaining_converge_helpers: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pyramid_pipeline_steps
+                 WHERE slug = ?1
+                   AND (
+                        step_type GLOB '*_r[0-9]*_classify'
+                        OR step_type GLOB '*_shortcut'
+                   )",
+                rusqlite::params!["cleanup-test"],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        let surviving_l0 = crate::pyramid::db::get_node(&conn, "cleanup-test", "L0-000")
+            .unwrap()
+            .expect("L0 node should survive from_depth=1 cleanup");
+
+        assert_eq!(remaining_threads, 0);
+        assert_eq!(remaining_distillations, 0);
+        assert_eq!(remaining_deltas, 0);
+        assert_eq!(remaining_depth_one_nodes, 0);
+        assert_eq!(remaining_converge_helpers, 0);
+        assert_eq!(surviving_l0.parent_id, None);
+        assert!(surviving_l0.children.is_empty());
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // Task D Tests: Web Edge Execution + Context Loaders + Converge
+    // ════════════════════════════════════════════════════════════════════════
+
+    use crate::pyramid::execution_plan::{ContextEntry, ConvergeMetadata, ConvergeRole};
+
+    // ── Web edge step detection ──────────────────────────────────────────
+
+    #[test]
+    fn test_ir_step_is_web_edges_true() {
+        let mut step = ir_test_step("web_step");
+        step.storage_directive = Some(StorageDirective {
+            kind: StorageKind::WebEdges,
+            depth: Some(0),
+            node_id_pattern: None,
+            target: None,
+        });
+        assert!(ir_step_is_web_edges(&step));
+    }
+
+    #[test]
+    fn test_ir_step_is_web_edges_false_for_node() {
+        let mut step = ir_test_step("node_step");
+        step.storage_directive = Some(StorageDirective {
+            kind: StorageKind::Node,
+            depth: Some(0),
+            node_id_pattern: Some("C-L0-{index:03}".to_string()),
+            target: None,
+        });
+        assert!(!ir_step_is_web_edges(&step));
+    }
+
+    #[test]
+    fn test_ir_step_is_web_edges_false_when_no_storage() {
+        let step = ir_test_step("plain_step");
+        assert!(!ir_step_is_web_edges(&step));
+    }
+
+    // ── Step path classification ─────────────────────────────────────────
+
+    #[test]
+    fn test_classify_ir_step_path_web_edges() {
+        let mut step = ir_test_step("web_step");
+        step.storage_directive = Some(StorageDirective {
+            kind: StorageKind::WebEdges,
+            depth: Some(0),
+            node_id_pattern: None,
+            target: None,
+        });
+        assert_eq!(classify_ir_step_path(&step), IrStepExecutionPath::WebEdges);
+    }
+
+    #[test]
+    fn test_classify_ir_step_path_standard() {
+        let step = ir_test_step("plain_step");
+        assert_eq!(classify_ir_step_path(&step), IrStepExecutionPath::Standard);
+    }
+
+    #[test]
+    fn test_classify_ir_step_path_async_context() {
+        let mut step = ir_test_step("context_step");
+        step.context = vec![ContextEntry {
+            label: "web_edges".to_string(),
+            reference: None,
+            loader: Some("web_edge_summary".to_string()),
+            params: None,
+        }];
+        assert_eq!(
+            classify_ir_step_path(&step),
+            IrStepExecutionPath::StandardWithAsyncContext
+        );
+    }
+
+    #[test]
+    fn test_classify_ir_step_path_reference_only_context_is_standard() {
+        let mut step = ir_test_step("ref_context_step");
+        step.context = vec![ContextEntry {
+            label: "some_data".to_string(),
+            reference: Some("$other_step".to_string()),
+            loader: None,
+            params: None,
+        }];
+        assert_eq!(classify_ir_step_path(&step), IrStepExecutionPath::Standard);
+    }
+
+    // ── Web edges take priority over StorageKind::Node ───────────────────
+
+    #[test]
+    fn test_web_edges_path_overrides_iteration_mode() {
+        let mut step = ir_test_step("web_with_iteration");
+        step.storage_directive = Some(StorageDirective {
+            kind: StorageKind::WebEdges,
+            depth: Some(1),
+            node_id_pattern: None,
+            target: None,
+        });
+        step.iteration = Some(IterationDirective {
+            mode: IterationMode::Parallel,
+            over: Some("$chunks".to_string()),
+            concurrency: Some(4),
+            accumulate: None,
+            shape: Some(IterationShape::ForEach),
+        });
+        // Web edges path should take priority even with forEach iteration
+        assert_eq!(classify_ir_step_path(&step), IrStepExecutionPath::WebEdges);
+    }
+
+    // ── Context loader dispatch ──────────────────────────────────────────
+
+    #[test]
+    fn test_extract_node_ids_from_value_array() {
+        let val = json!([
+            {"node_id": "C-L0-000", "headline": "First"},
+            {"node_id": "C-L0-001", "headline": "Second"},
+        ]);
+        let ids = extract_node_ids_from_value(&val);
+        assert_eq!(ids, vec!["C-L0-000", "C-L0-001"]);
+    }
+
+    #[test]
+    fn test_extract_node_ids_from_value_string_array() {
+        let val = json!(["C-L0-000", "C-L0-001"]);
+        let ids = extract_node_ids_from_value(&val);
+        assert_eq!(ids, vec!["C-L0-000", "C-L0-001"]);
+    }
+
+    #[test]
+    fn test_extract_node_ids_from_value_topics_format() {
+        let val = json!({
+            "topics": [
+                {"node_id": "C-L0-000", "name": "Topic A"},
+                {"source_node": "C-L0-001", "name": "Topic B"},
+            ]
+        });
+        let ids = extract_node_ids_from_value(&val);
+        assert_eq!(ids, vec!["C-L0-000", "C-L0-001"]);
+    }
+
+    #[test]
+    fn test_extract_node_ids_from_value_nodes_format() {
+        let val = json!({
+            "nodes": [
+                {"node_id": "C-L0-000"},
+                {"node_id": "C-L0-001"},
+            ]
+        });
+        let ids = extract_node_ids_from_value(&val);
+        assert_eq!(ids, vec!["C-L0-000", "C-L0-001"]);
+    }
+
+    #[test]
+    fn test_extract_node_ids_from_value_nodes_string_and_id_formats() {
+        let val = json!({
+            "nodes": [
+                "L1-000",
+                {"id": "L1-001"},
+                {"source_node": "L1-002"}
+            ]
+        });
+        let ids = extract_node_ids_from_value(&val);
+        assert_eq!(ids, vec!["L1-000", "L1-001", "L1-002"]);
+    }
+
+    #[test]
+    fn test_extract_node_ids_from_value_empty() {
+        let val = json!({});
+        let ids = extract_node_ids_from_value(&val);
+        assert!(ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_resolve_ir_authoritative_children_falls_back_to_resolved_input_nodes() {
+        let state = make_ir_test_state();
+        let ctx = build_chain_context_from_execution_state(&state);
+        let resolved_input = json!({
+            "nodes": [
+                {"node_id": "L1-000"},
+                {"id": "L1-001"}
+            ]
+        });
+
+        let children =
+            resolve_ir_authoritative_children(None, &resolved_input, &ctx, &state.reader)
+                .await
+                .unwrap();
+
+        assert_eq!(children, vec!["L1-000", "L1-001"]);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_ir_authoritative_children_prefers_item_assignments() {
+        let state = make_ir_test_state();
+        let mut ctx = build_chain_context_from_execution_state(&state);
+        ctx.current_item = Some(json!({
+            "assignments": [
+                {"source_node": "C-L0-000"},
+                {"source_node": "C-L0-001"}
+            ]
+        }));
+        let item = ctx.current_item.as_ref().unwrap().clone();
+        let resolved_input = json!({
+            "nodes": [
+                {"node_id": "WRONG-000"}
+            ]
+        });
+
+        let children =
+            resolve_ir_authoritative_children(Some(&item), &resolved_input, &ctx, &state.reader)
+                .await
+                .unwrap();
+
+        assert_eq!(children, vec!["C-L0-000", "C-L0-001"]);
+    }
+
+    #[test]
+    fn test_enrich_ir_group_input_merges_legacy_thread_fields() {
+        let mut state = make_ir_test_state();
+        state.step_outputs.insert(
+            "l0_extract".to_string(),
+            json!([
+                {
+                    "node_id": "C-L0-000",
+                    "headline": "Alpha",
+                    "orientation": "Alpha file",
+                    "topics": []
+                },
+                {
+                    "node_id": "C-L0-001",
+                    "headline": "Beta",
+                    "orientation": "Beta file",
+                    "topics": []
+                }
+            ]),
+        );
+
+        let item = json!({
+            "name": "Thread A",
+            "assignments": [
+                {"source_node": "C-L0-000"},
+                {"source_node": "C-L0-001"}
+            ]
+        });
+        let resolved_input = item.clone();
+        let ctx = build_chain_context_from_execution_state(&state);
+
+        let enriched = enrich_ir_group_input(resolved_input, &item, &ctx);
+
+        assert_eq!(
+            enriched
+                .get("source_nodes")
+                .and_then(Value::as_array)
+                .map(|arr| arr.len()),
+            Some(2)
+        );
+        assert_eq!(
+            enriched
+                .get("assigned_items")
+                .and_then(Value::as_array)
+                .map(|arr| arr.len()),
+            Some(2)
+        );
+        assert_eq!(
+            enriched
+                .get("source_analyses")
+                .and_then(Value::as_array)
+                .map(|arr| arr.len()),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn test_apply_ir_input_shaping_compacts_topic_inventory() {
+        let mut step = ir_test_step("clustering");
+        step.compact_inputs = true;
+
+        let resolved_input = json!({
+            "topics": [
+                {
+                    "node_id": "C-L0-5",
+                    "headline": "Auth Flow",
+                    "orientation": "A long explanation that should never reach clustering once compact_inputs is enabled.",
+                    "topics": [
+                        {
+                            "name": "Login handshake",
+                            "current": "very long topic narrative",
+                            "entities": ["session", "cookie"]
+                        },
+                        {
+                            "name": "Token refresh",
+                            "current": "another long topic narrative",
+                            "entities": ["jwt"]
+                        }
+                    ],
+                    "entities": ["AuthService"]
+                }
+            ],
+            "question": "What themes matter most?"
+        });
+
+        let compacted = apply_ir_input_shaping(&step, resolved_input);
+        let topics = compacted
+            .get("topics")
+            .and_then(Value::as_array)
+            .expect("topics array should remain present");
+        let first = topics
+            .first()
+            .and_then(Value::as_object)
+            .expect("first compact topic entry should be an object");
+
+        assert_eq!(first.get("node_id"), Some(&json!("C-L0-005")));
+        assert_eq!(first.get("headline"), Some(&json!("Auth Flow")));
+        assert_eq!(
+            first.get("topics"),
+            Some(&json!(["Login handshake", "Token refresh"]))
+        );
+        assert!(!first.contains_key("orientation"));
+        assert_eq!(
+            compacted.get("question"),
+            Some(&json!("What themes matter most?"))
+        );
+    }
+
+    #[test]
+    fn test_repair_ir_thread_assignments_reassigns_missing_topics() {
+        let step = ir_test_step("clustering");
+        let resolved_input = json!({
+            "topics": [
+                { "node_id": "L0-000", "headline": "Alpha" },
+                { "node_id": "L0-001", "headline": "Beta" },
+                { "node_id": "L0-002", "headline": "Gamma" }
+            ]
+        });
+        let mut output = json!({
+            "threads": [
+                {
+                    "name": "Thread A",
+                    "description": "desc",
+                    "assignments": [
+                        { "source_node": "L0-000", "topic_index": 0, "topic_name": "Alpha" }
+                    ]
+                },
+                {
+                    "name": "Thread B",
+                    "description": "desc",
+                    "assignments": [
+                        { "source_node": "L0-001", "topic_index": 1, "topic_name": "Beta" }
+                    ]
+                }
+            ]
+        });
+
+        repair_ir_thread_assignments(&step, &resolved_input, &mut output);
+
+        let threads = output
+            .get("threads")
+            .and_then(Value::as_array)
+            .expect("threads");
+        let assignments: Vec<String> = threads
+            .iter()
+            .flat_map(|thread| {
+                thread
+                    .get("assignments")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|assignment| {
+                        assignment
+                            .get("source_node")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    })
+            })
+            .collect();
+
+        assert!(assignments.contains(&"L0-002".to_string()));
+    }
+
+    #[test]
+    fn test_prepare_ir_resolved_input_shapes_converge_reduce_like_legacy_group() {
+        let mut step = ir_test_step("l2_synthesis_r0_reduce");
+        step.primitive = Some("synthesize".to_string());
+        step.iteration = Some(IterationDirective {
+            mode: IterationMode::Parallel,
+            over: Some("$clusters".to_string()),
+            concurrency: Some(5),
+            accumulate: None,
+            shape: Some(IterationShape::ConvergeReduce),
+        });
+
+        let current_item = json!({
+            "name": "Desktop Runtime",
+            "description": "Frontend shell and interaction layer",
+            "node_ids": ["L1-000", "L1-001"]
+        });
+        let resolved_input = json!({
+            "clusters": [
+                current_item.clone(),
+                {
+                    "name": "Backend Services",
+                    "description": "Rust services and persistence",
+                    "node_ids": ["L1-010", "L1-011"]
+                }
+            ],
+            "nodes": [
+                {
+                    "node_id": "L1-000",
+                    "headline": "Window Shell",
+                    "orientation": "Desktop entry points and command routing.",
+                    "topics": [
+                        { "name": "App boot" },
+                        { "name": "Window state" }
+                    ]
+                },
+                {
+                    "node_id": "L1-001",
+                    "headline": "Panel Views",
+                    "orientation": "Dashboard rendering and interactive panels.",
+                    "topics": [
+                        { "name": "Dashboard panels" }
+                    ]
+                }
+            ]
+        });
+
+        let state = make_ir_test_state();
+        let ctx = build_chain_context_from_execution_state(&state);
+        let prepared = prepare_ir_resolved_input(&step, resolved_input, Some(&current_item), &ctx);
+
+        assert!(prepared.get("nodes").is_none());
+        assert!(prepared.get("clusters").is_none());
+        assert_eq!(
+            prepared.get("cluster_name"),
+            Some(&json!("Desktop Runtime"))
+        );
+        assert_eq!(prepared.get("child_count"), Some(&json!(2)));
+        assert_eq!(
+            prepared.get("cluster_node_ids"),
+            Some(&json!(["L1-000", "L1-001"]))
+        );
+        let children = prepared
+            .get("children")
+            .and_then(Value::as_str)
+            .expect("children briefing should be present");
+        assert!(children.contains("## CHILD NODE 1: \"Window Shell\""));
+        assert!(children.contains("Desktop entry points and command routing."));
+        assert_eq!(
+            prepared.get("child_headlines"),
+            Some(&json!(["Window Shell", "Panel Views"]))
+        );
+        assert_eq!(
+            prepared.get("sibling_clusters"),
+            Some(&json!([
+                {
+                    "name": "Backend Services",
+                    "description": "Rust services and persistence",
+                    "node_ids": ["L1-010", "L1-011"]
+                }
+            ]))
+        );
+    }
+
+    #[test]
+    fn test_prepare_ir_resolved_input_preserves_non_compact_steps() {
+        let step = ir_test_step("l1_synthesis");
+        let input = json!({
+            "topics": [
+                {
+                    "node_id": "C-L0-000",
+                    "headline": "Alpha",
+                    "topics": [{"name": "Topic A"}]
+                }
+            ]
+        });
+        let ctx = ChainContext::new("slug", "code", vec![]);
+
+        let prepared = prepare_ir_resolved_input(&step, input.clone(), None, &ctx);
+
+        assert_eq!(prepared, input);
+    }
+
+    // ── Sibling cluster context ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_resolve_sibling_cluster_context_basic() {
+        let mut state = make_ir_test_state();
+
+        // Store cluster output in step_outputs
+        state.step_outputs.insert(
+            "uls_r0_repair".to_string(),
+            json!([
+                {
+                    "label": "Error Handling",
+                    "assignments": [{"source_node": "C-L0-000"}, {"source_node": "C-L0-001"}]
+                },
+                {
+                    "label": "Database Layer",
+                    "assignments": [{"source_node": "C-L0-002"}]
+                },
+                {
+                    "label": "API Routes",
+                    "assignments": [{"source_node": "C-L0-003"}, {"source_node": "C-L0-004"}, {"source_node": "C-L0-005"}]
+                },
+            ]),
+        );
+
+        // Set current_index to simulate being in cluster 1
+        state.current_index = Some(1);
+
+        let entry = ContextEntry {
+            label: "sibling_clusters".to_string(),
+            reference: Some("$uls_r0_repair".to_string()),
+            loader: Some("sibling_cluster_context".to_string()),
+            params: None,
+        };
+
+        let result = resolve_sibling_cluster_context(&entry, &state)
+            .await
+            .unwrap();
+
+        // Should contain clusters 0 and 2 but not cluster 1 (current)
+        assert!(result.contains("Error Handling"));
+        assert!(result.contains("API Routes"));
+        assert!(!result.contains("Database Layer"));
+        assert!(result.contains("2 nodes")); // Error Handling has 2
+        assert!(result.contains("3 nodes")); // API Routes has 3
+    }
+
+    #[tokio::test]
+    async fn test_resolve_sibling_cluster_context_no_reference() {
+        let state = make_ir_test_state();
+        let entry = ContextEntry {
+            label: "sibling_clusters".to_string(),
+            reference: None,
+            loader: Some("sibling_cluster_context".to_string()),
+            params: None,
+        };
+        let result = resolve_sibling_cluster_context(&entry, &state)
+            .await
+            .unwrap();
+        assert!(result.is_empty());
+    }
+
+    // ── Converge role handling (works through generic path) ──────────────
+
+    #[test]
+    fn test_converge_shortcut_step_has_when_guard() {
+        let mut step = ir_test_step("uls_shortcut");
+        step.when = Some("count($thread_syntheses) <= 4".to_string());
+        step.converge_metadata = Some(ConvergeMetadata {
+            converge_id: "uls".to_string(),
+            round: None,
+            role: ConvergeRole::Shortcut,
+            max_rounds: 6,
+            shortcut_at: 4,
+            classify_fallback: None,
+        });
+
+        // With 3 items, when guard should be true
+        let mut state = make_ir_test_state();
+        state
+            .step_outputs
+            .insert("thread_syntheses".to_string(), json!([1, 2, 3]));
+        assert!(evaluate_when_ir(step.when.as_deref(), &state));
+    }
+
+    #[test]
+    fn test_converge_shortcut_skipped_when_many_items() {
+        let mut step = ir_test_step("uls_shortcut");
+        step.when = Some("count($thread_syntheses) <= 4".to_string());
+        step.converge_metadata = Some(ConvergeMetadata {
+            converge_id: "uls".to_string(),
+            round: None,
+            role: ConvergeRole::Shortcut,
+            max_rounds: 6,
+            shortcut_at: 4,
+            classify_fallback: None,
+        });
+
+        // With 10 items, when guard should be false
+        let mut state = make_ir_test_state();
+        state.step_outputs.insert(
+            "thread_syntheses".to_string(),
+            json!([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]),
+        );
+        assert!(!evaluate_when_ir(step.when.as_deref(), &state));
+    }
+
+    #[test]
+    fn test_converge_classify_step_skipped_when_few_items() {
+        let mut step = ir_test_step("uls_r0_classify");
+        step.when = Some("count($thread_syntheses) > 4".to_string());
+
+        // With 3 items, classify guard should be false
+        let mut state = make_ir_test_state();
+        state
+            .step_outputs
+            .insert("thread_syntheses".to_string(), json!([1, 2, 3]));
+        assert!(!evaluate_when_ir(step.when.as_deref(), &state));
+    }
+
+    #[test]
+    fn test_converge_classify_runs_when_many_items() {
+        let mut step = ir_test_step("uls_r0_classify");
+        step.when = Some("count($thread_syntheses) > 4".to_string());
+
+        // With 10 items, classify guard should be true
+        let mut state = make_ir_test_state();
+        state.step_outputs.insert(
+            "thread_syntheses".to_string(),
+            json!([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]),
+        );
+        assert!(evaluate_when_ir(step.when.as_deref(), &state));
+    }
+
+    #[test]
+    fn test_converge_reduce_step_path_is_standard_with_async_context() {
+        let mut step = ir_test_step("uls_r0_reduce");
+        step.iteration = Some(IterationDirective {
+            mode: IterationMode::Parallel,
+            over: Some("$uls_r0_repair".to_string()),
+            concurrency: Some(5),
+            accumulate: None,
+            shape: Some(IterationShape::ConvergeReduce),
+        });
+        step.context = vec![ContextEntry {
+            label: "sibling_clusters".to_string(),
+            reference: Some("$uls_r0_repair".to_string()),
+            loader: Some("sibling_cluster_context".to_string()),
+            params: None,
+        }];
+        step.converge_metadata = Some(ConvergeMetadata {
+            converge_id: "uls".to_string(),
+            round: Some(0),
+            role: ConvergeRole::Reduce,
+            max_rounds: 6,
+            shortcut_at: 4,
+            classify_fallback: None,
+        });
+
+        // Reduce steps with loader context should use async path
+        assert_eq!(
+            classify_ir_step_path(&step),
+            IrStepExecutionPath::StandardWithAsyncContext
+        );
+    }
+
+    // ── Web edge summary context loader ──────────────────────────────────
+
+    #[tokio::test]
+    async fn test_resolve_web_edge_summary_context_empty_db() {
+        let state = make_ir_test_state();
+        let step = ir_test_step("thread_clustering");
+
+        let entry = ContextEntry {
+            label: "file_level_connections".to_string(),
+            reference: None,
+            loader: Some("web_edge_summary".to_string()),
+            params: Some(json!({"depth": 0, "mode": "internal", "max_edges": 24})),
+        };
+
+        let result = resolve_web_edge_summary_context(&entry, &step, &json!({}), &state)
+            .await
+            .unwrap();
+        assert!(result.is_empty());
+    }
+
+    // ── Context entry loader dispatch ────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_resolve_ir_context_entries_skips_reference_only() {
+        let state = make_ir_test_state();
+        let mut step = ir_test_step("some_step");
+        step.context = vec![ContextEntry {
+            label: "ref_only".to_string(),
+            reference: Some("$other_step".to_string()),
+            loader: None,
+            params: None,
+        }];
+
+        let sections = resolve_ir_context_entries(&step, &json!({}), &state).await;
+        // Reference-only entries are handled by build_ir_system_prompt, not the loader
+        assert!(sections.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_resolve_ir_context_entries_unknown_loader() {
+        let state = make_ir_test_state();
+        let mut step = ir_test_step("some_step");
+        step.context = vec![ContextEntry {
+            label: "unknown".to_string(),
+            reference: None,
+            loader: Some("nonexistent_loader".to_string()),
+            params: None,
+        }];
+
+        let sections = resolve_ir_context_entries(&step, &json!({}), &state).await;
+        // Unknown loaders are skipped with a warning
+        assert!(sections.is_empty());
+    }
+
+    // ── build_ir_system_prompt_with_context ──────────────────────────────
+
+    #[tokio::test]
+    async fn test_build_ir_system_prompt_with_context_no_loaders() {
+        let state = make_ir_test_state();
+        let mut step = ir_test_step("plain_step");
+        step.instruction = Some("Do something.".to_string());
+
+        let prompt = build_ir_system_prompt_with_context(&step, &json!({}), &state).await;
+        assert_eq!(prompt, "Do something.");
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // Task E: Integration Tests — End-to-end compile + execute verification
+    // ════════════════════════════════════════════════════════════════════════
+
+    use crate::pyramid::defaults_adapter;
+    use std::sync::atomic::AtomicBool;
+
+    fn make_test_defaults() -> ChainDefaults {
+        ChainDefaults {
+            model_tier: "mid".to_string(),
+            model: None,
+            temperature: 0.3,
+            on_error: "retry(2)".to_string(),
+        }
+    }
+
+    fn make_chain_step_for_integration(name: &str, primitive: &str) -> ChainStep {
+        ChainStep {
+            name: name.to_string(),
+            primitive: primitive.to_string(),
+            instruction: Some("Do the thing".to_string()),
+            instruction_map: None,
+            mechanical: false,
+            rust_function: None,
+            input: None,
+            output_schema: None,
+            model_tier: None,
+            model: None,
+            temperature: None,
+            sequential: false,
+            accumulate: None,
+            for_each: None,
+            concurrency: 1,
+            max_thread_size: None,
+            pair_adjacent: false,
+            recursive_pair: false,
+            recursive_cluster: false,
+            cluster_instruction: None,
+            cluster_model: None,
+            cluster_response_schema: None,
+            target_clusters: None,
+            response_schema: None,
+            batch_threshold: None,
+            merge_instruction: None,
+            when: None,
+            on_error: None,
+            save_as: None,
+            node_id_pattern: None,
+            depth: None,
+            context: None,
+            compact_inputs: false,
+        }
+    }
+
+    fn make_integration_code_chain() -> ChainDefinition {
+        ChainDefinition {
+            schema_version: 1,
+            id: "code-default".to_string(),
+            name: "Code Pyramid".to_string(),
+            description: "Code analysis pipeline".to_string(),
+            content_type: "code".to_string(),
+            version: "2.0.0".to_string(),
+            author: "test".to_string(),
+            defaults: make_test_defaults(),
+            steps: vec![
+                {
+                    let mut s = make_chain_step_for_integration("l0_code_extract", "extract");
+                    s.for_each = Some("$chunks".to_string());
+                    s.concurrency = 8;
+                    s.node_id_pattern = Some("C-L0-{index:03}".to_string());
+                    s.depth = Some(0);
+                    s.save_as = Some("node".to_string());
+                    s.instruction_map = Some({
+                        let mut m = HashMap::new();
+                        m.insert("type:config".to_string(), "Config extract".to_string());
+                        m.insert("extension:.tsx".to_string(), "Frontend extract".to_string());
+                        m
+                    });
+                    s.on_error = Some("retry(3)".to_string());
+                    s
+                },
+                {
+                    let mut s = make_chain_step_for_integration("l0_webbing", "web");
+                    s.input = Some(json!({ "nodes": "$l0_code_extract" }));
+                    s.depth = Some(0);
+                    s.save_as = Some("web_edges".to_string());
+                    s.compact_inputs = true;
+                    s.model = Some("qwen/qwen3.5-flash-02-23".to_string());
+                    s.on_error = Some("skip".to_string());
+                    s.response_schema = Some(json!({ "type": "object" }));
+                    s
+                },
+                {
+                    let mut s = make_chain_step_for_integration("thread_clustering", "classify");
+                    s.input = Some(json!({ "topics": "$l0_code_extract" }));
+                    s.model = Some("qwen/qwen3.5-flash-02-23".to_string());
+                    s.response_schema = Some(json!({ "type": "object" }));
+                    s.on_error = Some("retry(3)".to_string());
+                    s
+                },
+                {
+                    let mut s = make_chain_step_for_integration("thread_narrative", "synthesize");
+                    s.for_each = Some("$thread_clustering.threads".to_string());
+                    s.concurrency = 5;
+                    s.node_id_pattern = Some("L1-{index:03}".to_string());
+                    s.depth = Some(1);
+                    s.save_as = Some("node".to_string());
+                    s
+                },
+                {
+                    let mut s = make_chain_step_for_integration("l1_webbing", "web");
+                    s.input = Some(json!({ "nodes": "$thread_narrative" }));
+                    s.depth = Some(1);
+                    s.save_as = Some("web_edges".to_string());
+                    s.response_schema = Some(json!({ "type": "object" }));
+                    s.on_error = Some("skip".to_string());
+                    s
+                },
+                {
+                    let mut s =
+                        make_chain_step_for_integration("upper_layer_synthesis", "synthesize");
+                    s.recursive_cluster = true;
+                    s.cluster_instruction = Some("Group into clusters".to_string());
+                    s.cluster_model = Some("qwen/qwen3.5-flash-02-23".to_string());
+                    s.cluster_response_schema = Some(json!({ "type": "object" }));
+                    s.depth = Some(1);
+                    s.save_as = Some("node".to_string());
+                    s.node_id_pattern = Some("L{depth}-{index:03}".to_string());
+                    s.on_error = Some("retry(3)".to_string());
+                    s
+                },
+                {
+                    let mut s = make_chain_step_for_integration("l2_webbing", "web");
+                    s.depth = Some(2);
+                    s.save_as = Some("web_edges".to_string());
+                    s.response_schema = Some(json!({ "type": "object" }));
+                    s.on_error = Some("skip".to_string());
+                    s
+                },
+            ],
+            post_build: vec![],
+        }
+    }
+
+    fn make_integration_document_chain() -> ChainDefinition {
+        ChainDefinition {
+            schema_version: 1,
+            id: "document-default".to_string(),
+            name: "Document Pyramid".to_string(),
+            description: "Document analysis pipeline".to_string(),
+            content_type: "document".to_string(),
+            version: "3.0.0".to_string(),
+            author: "test".to_string(),
+            defaults: make_test_defaults(),
+            steps: vec![
+                {
+                    let mut s = make_chain_step_for_integration("doc_classify", "classify");
+                    s.input = Some(json!({ "headers": "$chunks", "header_lines": 20 }));
+                    s.model = Some("qwen/qwen3.5-flash-02-23".to_string());
+                    s.response_schema = Some(json!({ "type": "object" }));
+                    s.on_error = Some("retry(3)".to_string());
+                    s
+                },
+                {
+                    let mut s = make_chain_step_for_integration("l0_doc_extract", "extract");
+                    s.for_each = Some("$chunks".to_string());
+                    s.context = Some(json!({ "classification": "$doc_classify" }));
+                    s.concurrency = 8;
+                    s.node_id_pattern = Some("D-L0-{index:03}".to_string());
+                    s.depth = Some(0);
+                    s.save_as = Some("node".to_string());
+                    s.on_error = Some("retry(3)".to_string());
+                    s
+                },
+                {
+                    let mut s = make_chain_step_for_integration("thread_clustering", "classify");
+                    s.input = Some(
+                        json!({ "topics": "$l0_doc_extract", "classification": "$doc_classify" }),
+                    );
+                    s.model = Some("qwen/qwen3.5-flash-02-23".to_string());
+                    s.response_schema = Some(json!({ "type": "object" }));
+                    s.on_error = Some("retry(3)".to_string());
+                    s
+                },
+                {
+                    let mut s = make_chain_step_for_integration("thread_narrative", "synthesize");
+                    s.for_each = Some("$thread_clustering.threads".to_string());
+                    s.context = Some(json!({ "classification": "$doc_classify" }));
+                    s.concurrency = 5;
+                    s.node_id_pattern = Some("L1-{index:03}".to_string());
+                    s.depth = Some(1);
+                    s.save_as = Some("node".to_string());
+                    s
+                },
+                {
+                    let mut s = make_chain_step_for_integration("l1_webbing", "web");
+                    s.input = Some(json!({ "nodes": "$thread_narrative" }));
+                    s.depth = Some(1);
+                    s.save_as = Some("web_edges".to_string());
+                    s.response_schema = Some(json!({ "type": "object" }));
+                    s.on_error = Some("skip".to_string());
+                    s
+                },
+                {
+                    let mut s =
+                        make_chain_step_for_integration("upper_layer_synthesis", "synthesize");
+                    s.recursive_cluster = true;
+                    s.cluster_instruction = Some("Group into clusters".to_string());
+                    s.cluster_model = Some("qwen/qwen3.5-flash-02-23".to_string());
+                    s.cluster_response_schema = Some(json!({ "type": "object" }));
+                    s.depth = Some(1);
+                    s.save_as = Some("node".to_string());
+                    s.node_id_pattern = Some("L{depth}-{index:03}".to_string());
+                    s.on_error = Some("retry(3)".to_string());
+                    s
+                },
+                {
+                    let mut s = make_chain_step_for_integration("l2_webbing", "web");
+                    s.depth = Some(2);
+                    s.save_as = Some("web_edges".to_string());
+                    s.response_schema = Some(json!({ "type": "object" }));
+                    s.on_error = Some("skip".to_string());
+                    s
+                },
+            ],
+            post_build: vec![],
+        }
+    }
+
+    // ── Integration test 1: Code chain compile + validate + inspect ───────
+
+    #[test]
+    fn integration_code_chain_compile_and_validate() {
+        let chain = make_integration_code_chain();
+        let plan =
+            defaults_adapter::compile_defaults(&chain).expect("code chain should compile to IR");
+
+        plan.validate().expect("compiled code plan should be valid");
+
+        assert_eq!(plan.source_chain_id.as_deref(), Some("code-default"));
+        assert_eq!(plan.source_content_type.as_deref(), Some("code"));
+
+        // 6 straight-line steps + converge expansion (shortcut + rounds)
+        assert!(
+            plan.steps.len() >= 11,
+            "expected at least 11 steps after converge expansion, got {}",
+            plan.steps.len()
+        );
+
+        let step_ids: Vec<&str> = plan.steps.iter().map(|s| s.id.as_str()).collect();
+        assert!(step_ids.contains(&"l0_code_extract"));
+        assert!(step_ids.contains(&"l0_webbing"));
+        assert!(step_ids.contains(&"thread_clustering"));
+        assert!(step_ids.contains(&"thread_narrative"));
+        assert!(step_ids.contains(&"l1_webbing"));
+        assert!(step_ids.contains(&"l2_webbing"));
+        assert!(step_ids.contains(&"upper_layer_synthesis_shortcut"));
+        assert!(step_ids.contains(&"upper_layer_synthesis_r0_classify"));
+        assert!(step_ids.contains(&"upper_layer_synthesis_r0_reduce"));
+
+        // L0 extraction config
+        let l0 = plan
+            .steps
+            .iter()
+            .find(|s| s.id == "l0_code_extract")
+            .unwrap();
+        let iter = l0.iteration.as_ref().unwrap();
+        assert_eq!(iter.mode, IterationMode::Parallel);
+        assert_eq!(iter.concurrency, Some(8));
+        assert!(l0.instruction_map.is_some());
+
+        // Webbing steps have WebEdges storage
+        let l0_web = plan.steps.iter().find(|s| s.id == "l0_webbing").unwrap();
+        assert_eq!(
+            l0_web.storage_directive.as_ref().unwrap().kind,
+            StorageKind::WebEdges
+        );
+        assert!(l0_web.compact_inputs);
+
+        // DAG has no dangling deps
+        let all_ids: std::collections::HashSet<&str> =
+            plan.steps.iter().map(|s| s.id.as_str()).collect();
+        for step in &plan.steps {
+            for dep in &step.depends_on {
+                assert!(
+                    all_ids.contains(dep.as_str()),
+                    "dangling dep '{}' on '{}'",
+                    dep,
+                    step.id
+                );
+            }
+        }
+
+        assert!(plan.total_estimated_nodes > 0);
+        assert!(plan.total_estimated_cost.billable_calls > 0);
+    }
+
+    // ── Integration test 2: Document chain compile + validate + inspect ───
+
+    #[test]
+    fn integration_document_chain_compile_and_validate() {
+        let chain = make_integration_document_chain();
+        let plan = defaults_adapter::compile_defaults(&chain)
+            .expect("document chain should compile to IR");
+
+        plan.validate()
+            .expect("compiled document plan should be valid");
+
+        assert_eq!(plan.source_chain_id.as_deref(), Some("document-default"));
+        assert_eq!(plan.source_content_type.as_deref(), Some("document"));
+
+        assert!(
+            plan.steps.len() >= 11,
+            "expected >= 11 steps, got {}",
+            plan.steps.len()
+        );
+
+        let step_ids: Vec<&str> = plan.steps.iter().map(|s| s.id.as_str()).collect();
+        assert!(step_ids.contains(&"doc_classify"));
+        assert!(step_ids.contains(&"l0_doc_extract"));
+        assert!(step_ids.contains(&"thread_clustering"));
+        assert!(step_ids.contains(&"thread_narrative"));
+
+        // doc_classify is single execution
+        let classify = plan.steps.iter().find(|s| s.id == "doc_classify").unwrap();
+        assert!(
+            classify.iteration.is_none()
+                || classify.iteration.as_ref().unwrap().mode == IterationMode::Single
+        );
+
+        // l0_doc_extract has classification context
+        let l0 = plan
+            .steps
+            .iter()
+            .find(|s| s.id == "l0_doc_extract")
+            .unwrap();
+        assert!(l0.context.iter().any(|c| c.label == "classification"));
+
+        // thread_narrative has both contexts
+        let tn = plan
+            .steps
+            .iter()
+            .find(|s| s.id == "thread_narrative")
+            .unwrap();
+        assert!(tn.context.iter().any(|c| c.label == "classification"));
+        assert!(tn
+            .context
+            .iter()
+            .any(|c| c.label == "cross_thread_connections"));
+
+        // DAG integrity
+        let all_ids: std::collections::HashSet<&str> =
+            plan.steps.iter().map(|s| s.id.as_str()).collect();
+        for step in &plan.steps {
+            for dep in &step.depends_on {
+                assert!(
+                    all_ids.contains(dep.as_str()),
+                    "dangling dep '{}' on '{}'",
+                    dep,
+                    step.id
+                );
+            }
+        }
+    }
+
+    // ── Integration test 3: Code plan topological sort succeeds ──────────
+
+    #[test]
+    fn integration_code_plan_topological_sort_succeeds() {
+        let chain = make_integration_code_chain();
+        let plan = defaults_adapter::compile_defaults(&chain).unwrap();
+        let order = topological_sort_ir(&plan.steps)
+            .expect("topo sort should succeed on compiled code plan");
+        assert_eq!(order.len(), plan.steps.len());
+
+        let idx_of = |id: &str| -> usize {
+            order
+                .iter()
+                .position(|&i| plan.steps[i].id == id)
+                .unwrap_or_else(|| panic!("step '{}' not in topo order", id))
+        };
+        assert!(idx_of("l0_code_extract") < idx_of("l0_webbing"));
+        assert!(idx_of("l0_code_extract") < idx_of("thread_clustering"));
+        assert!(idx_of("thread_clustering") < idx_of("thread_narrative"));
+        assert!(idx_of("thread_narrative") < idx_of("l1_webbing"));
+    }
+
+    // ── Integration test 4: Document plan topological sort succeeds ──────
+
+    #[test]
+    fn integration_document_plan_topological_sort_succeeds() {
+        let chain = make_integration_document_chain();
+        let plan = defaults_adapter::compile_defaults(&chain).unwrap();
+        let order = topological_sort_ir(&plan.steps)
+            .expect("topo sort should succeed on compiled document plan");
+        assert_eq!(order.len(), plan.steps.len());
+
+        let idx_of = |id: &str| -> usize {
+            order
+                .iter()
+                .position(|&i| plan.steps[i].id == id)
+                .unwrap_or_else(|| panic!("step '{}' not in topo order", id))
+        };
+        assert!(idx_of("doc_classify") < idx_of("l0_doc_extract"));
+        assert!(idx_of("l0_doc_extract") < idx_of("thread_clustering"));
+    }
+
+    // ── Integration test 5: execute_plan fails cleanly with no slug ──────
+
+    #[tokio::test]
+    async fn integration_execute_plan_initializes_state() {
+        let db = {
+            let conn = rusqlite::Connection::open_in_memory().unwrap();
+            crate::pyramid::db::init_pyramid_db(&conn).unwrap();
+            Arc::new(Mutex::new(conn))
+        };
+        let config = crate::pyramid::llm::LlmConfig::default();
+        let pyramid_state = crate::pyramid::PyramidState {
+            reader: db.clone(),
+            writer: db.clone(),
+            config: Arc::new(tokio::sync::RwLock::new(config)),
+            active_build: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            data_dir: None,
+            stale_engines: Arc::new(Mutex::new(HashMap::new())),
+            file_watchers: Arc::new(Mutex::new(HashMap::new())),
+            vine_builds: Arc::new(Mutex::new(HashMap::new())),
+            use_chain_engine: AtomicBool::new(false),
+            use_ir_executor: AtomicBool::new(true),
+            event_bus: Arc::new(crate::pyramid::event_chain::LocalEventBus::new()),
+        };
+
+        let chain = make_integration_code_chain();
+        let plan = defaults_adapter::compile_defaults(&chain).unwrap();
+        let cancel = CancellationToken::new();
+
+        let result =
+            execute_plan(&pyramid_state, &plan, "nonexistent-slug", 0, &cancel, None).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("not found") || err.contains("No chunks") || err.contains("Slug"),
+            "expected slug/chunk error, got: {err}"
+        );
+    }
+
+    // ── Integration test 6: execute_plan with chunks reaches first step ──
+
+    #[tokio::test]
+    async fn integration_execute_plan_with_chunks_reaches_first_step() {
+        let db = {
+            let conn = rusqlite::Connection::open_in_memory().unwrap();
+            crate::pyramid::db::init_pyramid_db(&conn).unwrap();
+            Arc::new(Mutex::new(conn))
+        };
+
+        {
+            let conn = db.lock().await;
+            conn.execute(
+                "INSERT INTO pyramid_slugs (slug, content_type, source_path) VALUES (?1, ?2, ?3)",
+                rusqlite::params!["test-slug", "code", "/tmp/test"],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO pyramid_chunks (slug, chunk_index, content) VALUES (?1, ?2, ?3)",
+                rusqlite::params![
+                    "test-slug",
+                    0,
+                    "## FILE: main.rs\n## LANGUAGE: Rust\n## TYPE: source\n\nfn main() {}"
+                ],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO pyramid_chunks (slug, chunk_index, content) VALUES (?1, ?2, ?3)",
+                rusqlite::params![
+                    "test-slug",
+                    1,
+                    "## FILE: lib.rs\n## LANGUAGE: Rust\n## TYPE: source\n\npub fn hello() {}"
+                ],
+            )
+            .unwrap();
+        }
+
+        let config = crate::pyramid::llm::LlmConfig::default();
+        let pyramid_state = crate::pyramid::PyramidState {
+            reader: db.clone(),
+            writer: db.clone(),
+            config: Arc::new(tokio::sync::RwLock::new(config)),
+            active_build: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            data_dir: None,
+            stale_engines: Arc::new(Mutex::new(HashMap::new())),
+            file_watchers: Arc::new(Mutex::new(HashMap::new())),
+            vine_builds: Arc::new(Mutex::new(HashMap::new())),
+            use_chain_engine: AtomicBool::new(false),
+            use_ir_executor: AtomicBool::new(true),
+            event_bus: Arc::new(crate::pyramid::event_chain::LocalEventBus::new()),
+        };
+
+        let chain = make_integration_code_chain();
+        let plan = defaults_adapter::compile_defaults(&chain).unwrap();
+        let cancel = CancellationToken::new();
+        let (ptx, mut prx) = mpsc::channel::<BuildProgress>(64);
+
+        let result = execute_plan(&pyramid_state, &plan, "test-slug", 0, &cancel, Some(ptx)).await;
+
+        // Should have sent initial progress
+        let first_progress = prx.try_recv();
+        assert!(
+            first_progress.is_ok(),
+            "should have received initial progress"
+        );
+
+        // If error, should be LLM-related, not init-related
+        if let Err(e) = &result {
+            let msg = e.to_string();
+            assert!(
+                !msg.contains("No chunks"),
+                "should have loaded chunks: {msg}"
+            );
+            assert!(
+                !msg.contains("topological"),
+                "topo sort should succeed: {msg}"
+            );
+        }
+    }
+
+    // ── Integration test 7: Converge when guards are consistent ──────────
+
+    #[test]
+    fn integration_converge_when_guards_consistent() {
+        let chain = make_integration_code_chain();
+        let plan = defaults_adapter::compile_defaults(&chain).unwrap();
+
+        let converge_steps: Vec<_> = plan
+            .steps
+            .iter()
+            .filter(|s| s.converge_metadata.is_some())
+            .collect();
+        assert!(!converge_steps.is_empty());
+
+        // Shortcut has when guard
+        let shortcut = converge_steps
+            .iter()
+            .find(|s| {
+                s.converge_metadata.as_ref().unwrap().role
+                    == crate::pyramid::execution_plan::ConvergeRole::Shortcut
+            })
+            .expect("should have shortcut");
+        assert!(shortcut.when.is_some(), "shortcut needs when guard");
+
+        // All classify steps have when guards
+        for s in &converge_steps {
+            if s.converge_metadata.as_ref().unwrap().role
+                == crate::pyramid::execution_plan::ConvergeRole::Classify
+            {
+                assert!(s.when.is_some(), "classify '{}' needs when guard", s.id);
+            }
+        }
+    }
+
+    // ── Integration test 8: Build runner IR path flag wiring ─────────────
+
+    #[test]
+    fn integration_build_runner_ir_flag_exists() {
+        let db = {
+            let conn = rusqlite::Connection::open_in_memory().unwrap();
+            crate::pyramid::db::init_pyramid_db(&conn).unwrap();
+            Arc::new(Mutex::new(conn))
+        };
+        let config = crate::pyramid::llm::LlmConfig::default();
+        let pyramid_state = crate::pyramid::PyramidState {
+            reader: db.clone(),
+            writer: db.clone(),
+            config: Arc::new(tokio::sync::RwLock::new(config)),
+            active_build: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            data_dir: None,
+            stale_engines: Arc::new(Mutex::new(HashMap::new())),
+            file_watchers: Arc::new(Mutex::new(HashMap::new())),
+            vine_builds: Arc::new(Mutex::new(HashMap::new())),
+            use_chain_engine: AtomicBool::new(false),
+            use_ir_executor: AtomicBool::new(false),
+            event_bus: Arc::new(crate::pyramid::event_chain::LocalEventBus::new()),
+        };
+
+        assert!(!pyramid_state
+            .use_ir_executor
+            .load(std::sync::atomic::Ordering::Relaxed));
+        pyramid_state
+            .use_ir_executor
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(pyramid_state
+            .use_ir_executor
+            .load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    // ── Integration test 9: Pre-cancellation respected ───────────────────
+
+    #[tokio::test]
+    async fn integration_execute_plan_respects_pre_cancellation() {
+        let db = {
+            let conn = rusqlite::Connection::open_in_memory().unwrap();
+            crate::pyramid::db::init_pyramid_db(&conn).unwrap();
+            Arc::new(Mutex::new(conn))
+        };
+
+        {
+            let conn = db.lock().await;
+            conn.execute(
+                "INSERT INTO pyramid_slugs (slug, content_type, source_path) VALUES (?1, ?2, ?3)",
+                rusqlite::params!["cancel-test", "code", "/tmp/test"],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO pyramid_chunks (slug, chunk_index, content) VALUES (?1, ?2, ?3)",
+                rusqlite::params!["cancel-test", 0, "## FILE: main.rs\nfn main() {}"],
+            )
+            .unwrap();
+        }
+
+        let config = crate::pyramid::llm::LlmConfig::default();
+        let pyramid_state = crate::pyramid::PyramidState {
+            reader: db.clone(),
+            writer: db.clone(),
+            config: Arc::new(tokio::sync::RwLock::new(config)),
+            active_build: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            data_dir: None,
+            stale_engines: Arc::new(Mutex::new(HashMap::new())),
+            file_watchers: Arc::new(Mutex::new(HashMap::new())),
+            vine_builds: Arc::new(Mutex::new(HashMap::new())),
+            use_chain_engine: AtomicBool::new(false),
+            use_ir_executor: AtomicBool::new(true),
+            event_bus: Arc::new(crate::pyramid::event_chain::LocalEventBus::new()),
+        };
+
+        let chain = make_integration_code_chain();
+        let plan = defaults_adapter::compile_defaults(&chain).unwrap();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let result = execute_plan(&pyramid_state, &plan, "cancel-test", 0, &cancel, None).await;
+
+        match result {
+            Ok((_apex, failures)) => {
+                assert_eq!(failures, 0, "pre-cancelled should have 0 failures");
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.to_lowercase().contains("cancel"),
+                    "error should be cancellation-related, got: {msg}"
+                );
+            }
+        }
+    }
+
+    // ── Integration test 10: Step count breakdown ────────────────────────
+
+    #[test]
+    fn integration_code_plan_step_count_breakdown() {
+        let chain = make_integration_code_chain();
+        let plan = defaults_adapter::compile_defaults(&chain).unwrap();
+
+        let straight_line = plan
+            .steps
+            .iter()
+            .filter(|s| s.converge_metadata.is_none())
+            .count();
+        let converge = plan
+            .steps
+            .iter()
+            .filter(|s| s.converge_metadata.is_some())
+            .count();
+
+        assert_eq!(
+            straight_line, 6,
+            "expected 6 straight-line steps, got {straight_line}"
+        );
+        assert!(
+            converge >= 4,
+            "expected >= 4 converge steps, got {converge}"
+        );
     }
 }
