@@ -594,13 +594,16 @@ pub async fn run_decomposed_build(
     let l0_plan = {
         let mut filtered = patched_plan.clone();
         filtered.steps.retain(|step| {
-            step.storage_directive
-                .as_ref()
-                .and_then(|sd| sd.depth)
-                .map(|d| d == 0)
-                .unwrap_or(false)
-                // Also keep steps without storage directives (setup steps)
-                || step.storage_directive.is_none()
+            match &step.storage_directive {
+                None => true, // Keep setup steps without storage directives
+                Some(sd) => {
+                    // Exclude apex (depth 99 or APEX pattern) and all non-L0 steps
+                    if sd.node_id_pattern.as_deref() == Some("APEX") {
+                        return false;
+                    }
+                    sd.depth == Some(0)
+                }
+            }
         });
         // Strip dangling depends_on references (deps on removed non-L0 steps)
         let kept_ids: std::collections::HashSet<String> =
