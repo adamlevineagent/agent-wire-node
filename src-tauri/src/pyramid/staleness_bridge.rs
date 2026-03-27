@@ -112,13 +112,14 @@ pub fn run_staleness_check(
 ///
 /// This bridges DADBEAR's mutation format into the crystallization format.
 pub fn auto_detect_changed_files(conn: &Connection, slug: &str) -> Result<Vec<ChangedFile>> {
-    // pyramid_pending_mutations stores: slug, layer, node_id, file_path, mutation_type, ...
-    // We only care about file-level mutations (layer 0) that have a file_path.
+    // pyramid_pending_mutations columns: id, slug, layer, mutation_type, target_ref, detail,
+    // cascade_depth, detected_at, processed, batch_id.
+    // target_ref holds the file path for file-level mutations. Only process unprocessed entries.
     let mut stmt = conn.prepare(
-        "SELECT DISTINCT file_path, mutation_type
+        "SELECT DISTINCT target_ref, mutation_type
          FROM pyramid_pending_mutations
-         WHERE slug = ?1 AND file_path IS NOT NULL AND file_path != ''
-         ORDER BY created_at DESC",
+         WHERE slug = ?1 AND target_ref IS NOT NULL AND target_ref != '' AND processed = 0
+         ORDER BY detected_at DESC",
     )?;
 
     let rows = stmt.query_map(rusqlite::params![slug], |row| {

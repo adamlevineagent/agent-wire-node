@@ -588,6 +588,20 @@ pub async fn run_decomposed_build(
                 // Also keep steps without storage directives (setup steps)
                 || step.storage_directive.is_none()
         });
+        // Strip dangling depends_on references (deps on removed non-L0 steps)
+        let kept_ids: std::collections::HashSet<String> =
+            filtered.steps.iter().map(|s| s.id.clone()).collect();
+        for step in &mut filtered.steps {
+            let before = step.depends_on.len();
+            step.depends_on.retain(|dep| kept_ids.contains(dep));
+            if step.depends_on.len() < before {
+                warn!(
+                    step_id = %step.id,
+                    removed = before - step.depends_on.len(),
+                    "L0 filter: stripped dangling dependency references"
+                );
+            }
+        }
         filtered
     };
 
@@ -608,6 +622,21 @@ pub async fn run_decomposed_build(
         })
         .await
         .map_err(|e| anyhow!("Build start save panicked: {e}"))??;
+    }
+
+    // Clear stale evidence/gaps from prior builds before L0 extraction
+    {
+        let conn = state.writer.clone();
+        let slug_owned = slug_name.to_string();
+        tokio::task::spawn_blocking(move || {
+            let c = conn.blocking_lock();
+            db::clear_evidence_for_slug(&c, &slug_owned)?;
+            // Also clear old gaps
+            c.execute("DELETE FROM pyramid_gaps WHERE slug = ?1", rusqlite::params![&slug_owned])?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .map_err(|e| anyhow!("Evidence cleanup panicked: {e}"))??;
     }
 
     let (_, l0_count) = chain_executor::execute_plan(
@@ -640,12 +669,21 @@ pub async fn run_decomposed_build(
         "synthesis prompts generated — entering per-layer evidence loop"
     );
 
-    let mut total_nodes = l0_count;
+    let actual_l0_count = l0_nodes.len() as i32;
+    let mut total_nodes = actual_l0_count;
+    // Exclude layer 0 from estimate (L0 already counted via actual_l0_count from executor)
+    let estimated_total: i64 = layer_questions.iter()
+        .filter(|(&k, _)| k > 0)
+        .map(|(_, qs)| qs.len() as i64)
+        .sum::<i64>() + actual_l0_count as i64;
+    let mut layers_completed: i64 = 0;
+    let mut build_error: Option<String> = None;
 
     for layer in 1..=max_layer {
         // Check cancellation at each layer boundary
         if cancel.is_cancelled() {
             warn!(slug = slug_name, layer, "build cancelled during evidence loop");
+            build_error = Some(format!("Cancelled at layer {}", layer));
             break;
         }
 
@@ -679,7 +717,8 @@ pub async fn run_decomposed_build(
         {
             Ok(map) => map,
             Err(e) => {
-                warn!(slug = slug_name, layer, error = %e, "pre-mapping failed, skipping layer");
+                warn!(slug = slug_name, layer, error = %e, "pre-mapping failed, stopping at layer");
+                build_error = Some(format!("Pre-mapping failed at layer {}: {}", layer, e));
                 break;
             }
         };
@@ -697,7 +736,8 @@ pub async fn run_decomposed_build(
         {
             Ok(a) => a,
             Err(e) => {
-                warn!(slug = slug_name, layer, error = %e, "answer_questions failed, skipping layer");
+                warn!(slug = slug_name, layer, error = %e, "answer_questions failed, stopping at layer");
+                build_error = Some(format!("Answer failed at layer {}: {}", layer, e));
                 break;
             }
         };
@@ -713,22 +753,34 @@ pub async fn run_decomposed_build(
             let answered_owned = answered;
             tokio::task::spawn_blocking(move || {
                 let c = conn.blocking_lock();
-                for a in &answered_owned {
-                    db::save_node(&c, &a.node, None)?;
-                    for link in &a.evidence {
-                        db::save_evidence_link(&c, link)?;
+                // Wrap per-layer persistence in a transaction for atomicity
+                c.execute_batch("BEGIN")?;
+                let result = (|| -> anyhow::Result<()> {
+                    for a in &answered_owned {
+                        db::save_node(&c, &a.node, None)?;
+                        // Back-patch parent_id on child nodes so upward navigation works
+                        for child_id in &a.node.children {
+                            let _ = db::update_parent(&c, &slug_owned, child_id, &a.node.id);
+                        }
+                        for link in &a.evidence {
+                            db::save_evidence_link(&c, link)?;
+                        }
+                        // Save missing items as gap reports
+                        for missing_desc in &a.missing {
+                            let gap = types::GapReport {
+                                question_id: a.node.self_prompt.clone(),
+                                description: missing_desc.clone(),
+                                layer: a.node.depth as i64,
+                            };
+                            db::save_gap(&c, &slug_owned, &gap)?;
+                        }
                     }
-                    // Save missing items as gap reports
-                    for missing_desc in &a.missing {
-                        let gap = types::GapReport {
-                            question_id: a.node.self_prompt.clone(),
-                            description: missing_desc.clone(),
-                            layer: a.node.depth as i64,
-                        };
-                        db::save_gap(&c, &slug_owned, &gap)?;
-                    }
+                    Ok(())
+                })();
+                match result {
+                    Ok(()) => { c.execute_batch("COMMIT")?; Ok(()) }
+                    Err(e) => { let _ = c.execute_batch("ROLLBACK"); Err(e) }
                 }
-                Ok::<(), anyhow::Error>(())
             })
             .await
             .map_err(|e| anyhow!("Evidence save panicked: {e}"))??;
@@ -752,6 +804,7 @@ pub async fn run_decomposed_build(
         }
 
         total_nodes += layer_node_count;
+        layers_completed = layer;
 
         // Step e: Update build progress
         {
@@ -759,9 +812,10 @@ pub async fn run_decomposed_build(
             let slug_owned = slug_name.to_string();
             let bid = build_id.clone();
             let tn = total_nodes;
+            let al0 = actual_l0_count;
             tokio::task::spawn_blocking(move || {
                 let c = conn.blocking_lock();
-                local_store::update_build_progress(&c, &slug_owned, &bid, layer, l0_count as i64, tn as i64)?;
+                local_store::update_build_progress(&c, &slug_owned, &bid, layer, al0 as i64, tn as i64)?;
                 Ok::<(), anyhow::Error>(())
             })
             .await
@@ -772,7 +826,7 @@ pub async fn run_decomposed_build(
         if let Some(ref tx) = progress_tx {
             let _ = tx.send(BuildProgress {
                 done: total_nodes as i64,
-                total: (total_nodes as i64) + (max_layer - layer) as i64 * layer_node_count as i64,
+                total: estimated_total,
             }).await;
         }
 
@@ -785,28 +839,63 @@ pub async fn run_decomposed_build(
         );
     }
 
-    // Mark build complete
+    // Mark build complete or failed
     {
         let conn = state.writer.clone();
         let slug_owned = slug_name.to_string();
         let bid = build_id;
+        let err = build_error.clone();
+        let lc = layers_completed;
+        let ml = max_layer;
         tokio::task::spawn_blocking(move || {
             let c = conn.blocking_lock();
-            local_store::complete_build(&c, &slug_owned, &bid, None)?;
+            if let Some(error_msg) = err {
+                local_store::fail_build(&c, &slug_owned, &bid, &format!(
+                    "Stopped at layer {}/{}: {}", lc, ml, error_msg
+                ))?;
+            } else {
+                local_store::complete_build(&c, &slug_owned, &bid, None)?;
+            }
             Ok::<(), anyhow::Error>(())
         })
         .await
-        .map_err(|e| anyhow!("Build complete save panicked: {e}"))??;
+        .map_err(|e| anyhow!("Build status save panicked: {e}"))??;
     }
 
-    info!(
-        slug = slug_name,
-        total_nodes,
-        layers = max_layer,
-        "question pyramid build complete"
-    );
+    // Update slug stats so node_count/max_depth reflect evidence-answered nodes
+    {
+        let conn = state.writer.clone();
+        let slug_owned = slug_name.to_string();
+        tokio::task::spawn_blocking(move || {
+            let c = conn.blocking_lock();
+            let _ = db::update_slug_stats(&c, &slug_owned);
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .map_err(|e| anyhow!("Slug stats update panicked: {e}"))??;
+    }
 
-    Ok((slug_name.to_string(), total_nodes))
+    let failure_count = if build_error.is_some() { 1 } else { 0 };
+
+    if let Some(ref err) = build_error {
+        info!(
+            slug = slug_name,
+            total_nodes,
+            layers_completed,
+            max_layers = max_layer,
+            error = %err,
+            "question pyramid build PARTIAL (stopped early)"
+        );
+    } else {
+        info!(
+            slug = slug_name,
+            total_nodes,
+            layers = max_layer,
+            "question pyramid build complete"
+        );
+    }
+
+    Ok((slug_name.to_string(), failure_count))
 }
 
 /// Preview a decomposed question build — returns the question tree and cost estimates

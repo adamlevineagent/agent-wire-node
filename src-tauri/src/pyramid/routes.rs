@@ -3756,10 +3756,17 @@ async fn handle_check_staleness(
 
     let files_processed = changed_files.len();
 
-    // Run the staleness pipeline on the writer connection (it writes deltas + queue entries)
-    let conn = state.writer.lock().await;
-    match staleness_bridge::run_staleness_check(&conn, &slug_name, &changed_files, threshold) {
-        Ok((report, queued_items)) => {
+    // Run the staleness pipeline via spawn_blocking (writes deltas + queue entries)
+    let conn = state.writer.clone();
+    let slug_owned = slug_name.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let c = conn.blocking_lock();
+        staleness_bridge::run_staleness_check(&c, &slug_owned, &changed_files, threshold)
+    })
+    .await;
+
+    match result {
+        Ok(Ok((report, queued_items))) => {
             let response = staleness_bridge::CheckStalenessResponse {
                 source,
                 files_processed,
@@ -3768,11 +3775,18 @@ async fn handle_check_staleness(
             };
             Ok(json_ok(&response))
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             tracing::warn!(slug = %slug_name, error = %e, "staleness check failed");
             Ok(json_error(
                 warp::http::StatusCode::INTERNAL_SERVER_ERROR,
                 &format!("staleness check failed: {}", e),
+            ))
+        }
+        Err(e) => {
+            tracing::warn!(slug = %slug_name, error = %e, "staleness check panicked");
+            Ok(json_error(
+                warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("staleness check panicked: {}", e),
             ))
         }
     }
