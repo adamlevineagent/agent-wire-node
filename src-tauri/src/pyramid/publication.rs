@@ -96,23 +96,20 @@ fn build_l0_derived_from(
         .collect()
 }
 
-/// Generate a deterministic placeholder UUID (v5-style) from a local ID.
+/// Generate a deterministic placeholder UUID v5 from a local ID.
 ///
 /// The Wire validates source_item_id as UUID or handle-path format. For L0
 /// source document citations where we don't have a real Wire UUID, we produce
-/// a UUID-formatted string so it passes Wire validation.
+/// a real UUID v5 (SHA-1 based, stable across all Rust versions and platforms).
 /// TODO: Replace with real Wire UUIDs once source document registration is implemented.
 fn make_placeholder_uuid(local_id: &str) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    local_id.hash(&mut hasher);
-    let h = hasher.finish();
-    // Format as UUID-like string: 00000000-0000-5000-8000-XXXXXXXXXXXX
-    format!(
-        "00000000-0000-5000-8000-{:012x}",
-        h & 0xFFFF_FFFF_FFFF
-    )
+    use uuid::Uuid;
+    // Fixed namespace for Wire Node placeholder UUIDs (generated once, never changes).
+    // This is a v4 UUID used solely as a namespace for deterministic v5 generation.
+    const WIRE_NODE_NAMESPACE: Uuid =
+        Uuid::from_bytes([0x9b, 0x6a, 0xe3, 0x2f, 0x1c, 0x4d, 0x4a, 0x7e,
+                          0xb8, 0x52, 0xd3, 0xf1, 0xa0, 0xc9, 0x67, 0x2b]);
+    Uuid::new_v5(&WIRE_NODE_NAMESPACE, local_id.as_bytes()).to_string()
 }
 
 /// Build derived_from for L1+ node (cites published lower-layer nodes).
@@ -167,48 +164,38 @@ struct NodePublishData {
     derived_from: Vec<DerivedFromEntry>,
 }
 
-/// Publish all non-orphan nodes at a single layer.
+/// Result of synchronous data collection for a layer (Phase 1).
+/// Contains everything needed for the async publish phase, plus any
+/// skip/fail results accumulated during the DB read phase.
+struct LayerCollectResult {
+    nodes_to_publish: Vec<NodePublishData>,
+    skipped_already_published: Vec<String>,
+    skipped_orphans: Vec<String>,
+    failed: Vec<(String, String)>,
+}
+
+/// Phase 1 (SYNC): Collect all data needed to publish a layer from SQLite.
 ///
-/// All DB reads happen synchronously before the async publisher calls.
-/// On publish failure for individual nodes, the error is logged and the node
-/// is recorded in the failed list. Already-published nodes are skipped.
-pub async fn publish_layer(
-    publisher: &PyramidPublisher,
+/// This function does all DB reads synchronously and returns owned data.
+/// The `conn` reference does NOT escape this function — it is safe to drop
+/// the connection after this call and before entering the async publish phase.
+pub fn collect_layer_publish_data(
     conn: &rusqlite::Connection,
     slug: &str,
     layer: i64,
     node_ids: &[String],
     orphan_ids: &[String],
-) -> Result<LayerPublishResult> {
+    id_map: &HashMap<String, String>,
+) -> Result<LayerCollectResult> {
     let orphan_set: std::collections::HashSet<&str> =
         orphan_ids.iter().map(|s| s.as_str()).collect();
 
-    let mut result = LayerPublishResult {
-        layer,
-        published: Vec::new(),
+    let mut result = LayerCollectResult {
+        nodes_to_publish: Vec::new(),
         skipped_already_published: Vec::new(),
         skipped_orphans: Vec::new(),
         failed: Vec::new(),
     };
-
-    // ── Phase 1: Synchronous DB reads ────────────────────────────────────
-    // Gather all data we need before entering the async publish loop,
-    // because rusqlite::Connection is !Send.
-
-    // Build the current id_map from already-published entries.
-    // Maps local_id → wire_uuid (Issue 1: use Wire UUID, not fabricated handle-path)
-    let existing_mappings = db::get_all_id_mappings(conn, slug)
-        .context("publication: failed to load existing id mappings")?;
-    let mut id_map: HashMap<String, String> = existing_mappings
-        .into_iter()
-        .map(|m| {
-            // Prefer wire_uuid; fall back to wire_handle_path for legacy entries
-            let wire_ref = m.wire_uuid.clone().unwrap_or(m.wire_handle_path.clone());
-            (m.local_id, wire_ref)
-        })
-        .collect();
-
-    let mut nodes_to_publish: Vec<NodePublishData> = Vec::new();
 
     for node_id in node_ids {
         // Skip orphans
@@ -263,9 +250,9 @@ pub async fn publish_layer(
 
         // Build derived_from based on layer
         let mut derived_from = if layer == 0 {
-            build_l0_derived_from(&node, &evidence, &id_map)
+            build_l0_derived_from(&node, &evidence, id_map)
         } else {
-            build_upper_derived_from(&evidence, &id_map)
+            build_upper_derived_from(&evidence, id_map)
         };
 
         // Normalize weights to sum=1.0
@@ -293,22 +280,40 @@ pub async fn publish_layer(
             );
         }
 
-        nodes_to_publish.push(NodePublishData {
+        result.nodes_to_publish.push(NodePublishData {
             node,
             derived_from,
         });
     }
 
-    // ── Phase 2: Async publish loop ──────────────────────────────────────
+    Ok(result)
+}
 
-    for data in &nodes_to_publish {
+/// Phase 2 (ASYNC): Publish pre-collected node data to the Wire.
+///
+/// Takes ownership of data collected by `collect_layer_publish_data`.
+/// No `conn` reference — all DB reads happened in Phase 1.
+/// Returns the layer result with published mappings for the caller to persist.
+pub async fn publish_layer(
+    publisher: &PyramidPublisher,
+    slug: &str,
+    layer: i64,
+    collected: LayerCollectResult,
+) -> Result<LayerPublishResult> {
+    let mut result = LayerPublishResult {
+        layer,
+        published: Vec::new(),
+        skipped_already_published: collected.skipped_already_published,
+        skipped_orphans: collected.skipped_orphans,
+        failed: collected.failed,
+    };
+
+    for data in &collected.nodes_to_publish {
         match publisher
             .publish_pyramid_node(&data.node, &data.derived_from, None)
             .await
         {
             Ok((wire_uuid, wire_handle_path)) => {
-                // Use the real handle-path from the Wire response, falling back
-                // to UUID if the Wire didn't return one (older Wire versions)
                 let handle_path = wire_handle_path.unwrap_or_else(|| wire_uuid.clone());
 
                 let mapping = IdMapping {
@@ -318,23 +323,6 @@ pub async fn publish_layer(
                     published_at: chrono::Utc::now().to_rfc3339(),
                 };
 
-                // Issue 1: Store Wire UUID in id_map for derived_from lookups,
-                // not the fabricated handle-path
-                id_map.insert(data.node.id.clone(), wire_uuid.clone());
-
-                // Issue 2: Persist mapping immediately so a mid-layer crash
-                // doesn't lose already-published nodes
-                if let Err(e) = db::save_id_mapping_extended(conn, slug, &mapping) {
-                    tracing::error!(
-                        slug = slug,
-                        local_id = %mapping.local_id,
-                        error = %e,
-                        "failed to persist id mapping immediately — will retry at layer end"
-                    );
-                }
-
-                result.published.push(mapping);
-
                 tracing::info!(
                     slug = slug,
                     node_id = %data.node.id,
@@ -342,6 +330,8 @@ pub async fn publish_layer(
                     wire_uuid = %wire_uuid,
                     "published pyramid node to Wire"
                 );
+
+                result.published.push(mapping);
             }
             Err(e) => {
                 tracing::error!(
@@ -362,13 +352,17 @@ pub async fn publish_layer(
     Ok(result)
 }
 
-/// Orchestrate full bottom-up pyramid publication.
+/// Orchestrate full bottom-up pyramid publication (local-first architecture).
+///
+/// Pattern: SYNC phase collects all data from SQLite per layer, drops the conn
+/// reference, then ASYNC phase publishes to Wire. This avoids holding a
+/// `rusqlite::Connection` (which is `!Send`) across `.await` points.
 ///
 /// Iterates layers 0 → max_depth. Each layer MUST complete before the next
 /// starts because upper layers reference handle-paths from lower layers.
 ///
-/// On individual node failure: logs error, continues. The idempotency check
-/// means a retry will skip already-published nodes.
+/// Returns a `FullPublicationResult` with all mappings. The caller is
+/// responsible for persisting ID mappings back to SQLite (scoped write lock).
 pub async fn publish_pyramid_bottom_up(
     publisher: &PyramidPublisher,
     conn: &rusqlite::Connection,
@@ -385,6 +379,17 @@ pub async fn publish_pyramid_bottom_up(
     };
 
     let empty_orphans: Vec<String> = Vec::new();
+
+    // Build the id_map from already-published entries (once, then grow per layer).
+    let existing_mappings = db::get_all_id_mappings(conn, slug)
+        .context("publication: failed to load existing id mappings")?;
+    let mut id_map: HashMap<String, String> = existing_mappings
+        .into_iter()
+        .map(|m| {
+            let wire_ref = m.wire_uuid.clone().unwrap_or(m.wire_handle_path.clone());
+            (m.local_id, wire_ref)
+        })
+        .collect();
 
     for layer in 0..=max_depth {
         tracing::info!(
@@ -411,18 +416,16 @@ pub async fn publish_pyramid_bottom_up(
 
         let orphans = orphans_by_layer.get(&layer).unwrap_or(&empty_orphans);
 
-        let layer_result = publish_layer(publisher, conn, slug, layer, &node_ids, orphans).await?;
+        // Phase 1 (SYNC): collect all data from SQLite — conn ref is scoped here
+        let collected = collect_layer_publish_data(conn, slug, layer, &node_ids, orphans, &id_map)?;
 
-        // Mappings are already persisted inside publish_layer (Issue 2 fix).
-        // This secondary pass is a safety net — the upsert is idempotent.
+        // Phase 2 (ASYNC): publish to Wire — no conn reference held
+        let layer_result = publish_layer(publisher, slug, layer, collected).await?;
+
+        // Update id_map with newly published mappings for next layer's derived_from
         for mapping in &layer_result.published {
-            if let Err(e) = db::save_id_mapping_extended(conn, slug, mapping) {
-                tracing::error!(
-                    slug = slug,
-                    local_id = %mapping.local_id,
-                    error = %e,
-                    "failed to persist id mapping in safety-net pass"
-                );
+            if let Some(ref wire_uuid) = mapping.wire_uuid {
+                id_map.insert(mapping.local_id.clone(), wire_uuid.clone());
             }
         }
 
@@ -452,6 +455,34 @@ pub async fn publish_pyramid_bottom_up(
     );
 
     Ok(full_result)
+}
+
+// ─── Corpus Registration ─────────────────────────────────────────────────────
+
+/// Register a source document with the Wire as a corpus document.
+///
+/// Calls `POST /api/v1/wire/corpora/{slug}/documents` on the Wire server.
+/// Returns the Wire-assigned corpus document UUID.
+///
+/// STUB: For now returns a deterministic placeholder UUID derived from the
+/// file path. The actual Wire endpoint exists but client wiring is deferred.
+/// When fully wired, this will make an HTTP call and return the real UUID.
+pub async fn register_corpus_document(
+    slug: &str,
+    file_path: &str,
+    content_hash: &str,
+    _publisher: &PyramidPublisher,
+) -> Result<String> {
+    // TODO: Wire the actual HTTP call:
+    //   POST {wire_url}/api/v1/wire/corpora/{slug}/documents
+    //   body: { "file_path": file_path, "content_hash": content_hash }
+    //   response: { "document_id": "<uuid>" }
+    //
+    // For now, return a deterministic placeholder UUID so publication can
+    // proceed without a live Wire connection. The placeholder is stable
+    // (same input always produces the same UUID) so re-publication is safe.
+    let composite_key = format!("{}:{}:{}", slug, file_path, content_hash);
+    Ok(make_placeholder_uuid(&composite_key))
 }
 
 /// Build a PublicationManifest for a single layer (used for logging/reporting).
@@ -641,9 +672,10 @@ mod tests {
     #[test]
     fn test_make_placeholder_uuid_format() {
         let uuid = make_placeholder_uuid("C-L0-003");
-        // Should be UUID-formatted: 00000000-0000-5000-8000-XXXXXXXXXXXX
-        assert!(uuid.starts_with("00000000-0000-5000-8000-"));
-        assert_eq!(uuid.len(), 36); // standard UUID length
+        // Should be a valid UUID v5 (36 chars, version nibble = 5, variant bits correct)
+        assert_eq!(uuid.len(), 36, "standard UUID length");
+        let parsed = uuid::Uuid::parse_str(&uuid).expect("should be a valid UUID");
+        assert_eq!(parsed.get_version_num(), 5, "should be UUID v5");
     }
 
     #[test]
@@ -651,6 +683,29 @@ mod tests {
         let a = make_placeholder_uuid("same-input");
         let b = make_placeholder_uuid("same-input");
         assert_eq!(a, b, "placeholder UUID should be deterministic");
+    }
+
+    #[test]
+    fn test_make_placeholder_uuid_stable_across_versions() {
+        // Pin known outputs so any accidental change to the namespace or
+        // algorithm is caught immediately. UUID v5 is SHA-1 based and stable
+        // across all Rust versions and platforms.
+        assert_eq!(
+            make_placeholder_uuid("C-L0-003"),
+            "e74baebc-cabc-5ec8-b9bb-86e16cb1b663",
+            "output must not change across builds"
+        );
+        assert_eq!(
+            make_placeholder_uuid("same-input"),
+            "822de58f-e0c1-535f-b5aa-8c69c550800b",
+            "output must not change across builds"
+        );
+        // Different inputs produce different UUIDs
+        assert_ne!(
+            make_placeholder_uuid("C-L0-003"),
+            make_placeholder_uuid("C-L0-004"),
+            "different inputs must produce different UUIDs"
+        );
     }
 
     #[test]

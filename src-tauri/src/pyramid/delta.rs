@@ -5,7 +5,7 @@
 //   create_delta           — create an incremental diff against current understanding
 //   rewrite_distillation   — rewrite cumulative distillation incorporating a new delta
 //   collapse_thread        — collapse accumulated deltas into a new canonical node
-//   propagate_staleness    — propagate change signals upward through the pyramid
+//   propagate_staleness_parent_chain — propagate change signals upward through the pyramid (legacy parent-chain model)
 //   check_collapse_needed  — determine if a thread needs collapsing
 
 use rusqlite::Connection;
@@ -392,7 +392,7 @@ Output JSON only:
     {
         let conn = reader.lock().await;
         let mut visited = HashSet::new();
-        match propagate_staleness(
+        match propagate_staleness_parent_chain(
             &conn,
             slug,
             &canonical_id,
@@ -851,7 +851,7 @@ Output valid JSON matching this schema:
     {
         let conn = reader.lock().await;
         let mut visited = HashSet::new();
-        match propagate_staleness(
+        match propagate_staleness_parent_chain(
             &conn,
             slug,
             &new_node_id,
@@ -906,7 +906,7 @@ fn strip_version(node_id: &str) -> &str {
 /// Returns a list of affected (stale) node IDs — the parent chain above the
 /// changed node. The caller decides what to do with these (log, write WAL
 /// entries, etc.).
-pub fn propagate_staleness(
+pub fn propagate_staleness_parent_chain(
     conn: &Connection,
     slug: &str,
     changed_node_id: &str,
@@ -945,7 +945,7 @@ pub fn propagate_staleness(
             affected.push(pid.clone());
             // Recurse upward
             let mut upstream =
-                propagate_staleness(conn, slug, &pid, changed_depth + 1, visited, max_depth)?;
+                propagate_staleness_parent_chain(conn, slug, &pid, changed_depth + 1, visited, max_depth)?;
             affected.append(&mut upstream);
         }
     }

@@ -70,6 +70,10 @@ pub struct QuestionTree {
 /// A single node in the question tree.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuestionNode {
+    /// Stable deterministic ID: `q-{sha256_hex_first_12}`.
+    /// NOT produced by the LLM — assigned after deserialization via `assign_question_ids`.
+    #[serde(default)]
+    pub id: String,
     /// The natural language question.
     pub question: String,
     /// Scope declaration — what this question is about.
@@ -101,6 +105,91 @@ pub struct DecompositionPreview {
     pub tree_summary: String,
     /// Estimated depth of the resulting pyramid.
     pub estimated_pyramid_depth: u32,
+}
+
+// ── Stable ID Assignment ──────────────────────────────────────────────────────
+
+/// Assign deterministic IDs to every node in the question tree.
+///
+/// ID format: `q-{sha256_hex_first_12}` where the hash input is
+/// `"{question}|{about}|{depth}"`. Depth is 0 for leaves, increasing toward
+/// the root (i.e. the root/apex gets the highest depth value).
+///
+/// Two passes: first compute max_depth, then assign IDs with correct depths.
+pub fn assign_question_ids(tree: &mut QuestionTree) {
+    let max_depth = compute_max_depth(&tree.apex);
+    assign_ids_recursive(&mut tree.apex, max_depth, 0);
+}
+
+/// Compute the max depth of the tree (number of edges from root to deepest leaf).
+fn compute_max_depth(node: &QuestionNode) -> u32 {
+    if node.children.is_empty() {
+        return 0;
+    }
+    node.children
+        .iter()
+        .map(|c| 1 + compute_max_depth(c))
+        .max()
+        .unwrap_or(0)
+}
+
+/// Recursively assign IDs. `max_depth` is the tree height, `current_level` is
+/// how far from the root (0 = root). The node's depth = max_depth - current_level
+/// (so leaves = 0, root = max_depth).
+fn assign_ids_recursive(node: &mut QuestionNode, max_depth: u32, current_level: u32) {
+    let depth = max_depth.saturating_sub(current_level);
+    node.id = make_question_id(&node.question, &node.about, depth);
+    for child in &mut node.children {
+        assign_ids_recursive(child, max_depth, current_level + 1);
+    }
+}
+
+/// Build a deterministic question ID from question text, about, and depth.
+fn make_question_id(question: &str, about: &str, depth: u32) -> String {
+    use sha2::{Sha256, Digest};
+    let input = format!("{}|{}|{}", question, about, depth);
+    let hash = Sha256::digest(input.as_bytes());
+    let hex_str = hex::encode(hash);
+    format!("q-{}", &hex_str[..12])
+}
+
+// ── Layer Question Extraction ─────────────────────────────────────────────────
+
+/// Extract per-layer question sets from a question tree.
+///
+/// Leaves are layer 0 (L0). Their parents are layer 1. Root/apex is the highest
+/// layer. Returns a HashMap<layer, Vec<LayerQuestion>>.
+///
+/// Requires `assign_question_ids` to have been called first (IDs must be populated).
+pub fn extract_layer_questions(
+    tree: &QuestionTree,
+) -> std::collections::HashMap<i64, Vec<super::types::LayerQuestion>> {
+    let max_depth = compute_max_depth(&tree.apex);
+    let mut result: std::collections::HashMap<i64, Vec<super::types::LayerQuestion>> =
+        std::collections::HashMap::new();
+    collect_layer_questions(&tree.apex, max_depth, 0, &mut result);
+    result
+}
+
+fn collect_layer_questions(
+    node: &QuestionNode,
+    max_depth: u32,
+    current_level: u32,
+    result: &mut std::collections::HashMap<i64, Vec<super::types::LayerQuestion>>,
+) {
+    let depth = max_depth.saturating_sub(current_level) as i64;
+
+    result.entry(depth).or_default().push(super::types::LayerQuestion {
+        question_id: node.id.clone(),
+        question_text: node.question.clone(),
+        layer: depth,
+        about: node.about.clone(),
+        creates: node.creates.clone(),
+    });
+
+    for child in &node.children {
+        collect_layer_questions(child, max_depth, current_level + 1, result);
+    }
 }
 
 // ── Decomposition ─────────────────────────────────────────────────────────────
@@ -164,6 +253,7 @@ pub async fn decompose_question(
     }
 
     let apex_node = QuestionNode {
+        id: String::new(),
         question: config.apex_question.clone(),
         about: "all top-level nodes at once".to_string(),
         creates: "apex".to_string(),
@@ -173,11 +263,16 @@ pub async fn decompose_question(
         is_leaf: false,
     };
 
-    Ok(QuestionTree {
+    let mut tree = QuestionTree {
         apex: apex_node,
         content_type: config.content_type.clone(),
         config: config.clone(),
-    })
+    };
+
+    // Assign stable deterministic IDs to all question nodes
+    assign_question_ids(&mut tree);
+
+    Ok(tree)
 }
 
 /// Recursively build a subtree for a decomposed question.
@@ -196,6 +291,7 @@ async fn build_subtree(
     // Terminal conditions: marked as leaf, or depth exceeded
     if raw.is_leaf || current_depth >= max_depth {
         return Ok(QuestionNode {
+            id: String::new(),
             question: raw.question.clone(),
             about: "each file individually".to_string(),
             creates: "L0 nodes".to_string(),
@@ -208,6 +304,7 @@ async fn build_subtree(
     // Only decompose further if granularity warrants it
     if granularity <= 2 && current_depth >= 2 {
         return Ok(QuestionNode {
+            id: String::new(),
             question: raw.question.clone(),
             about: "each file individually".to_string(),
             creates: "L0 nodes".to_string(),
@@ -233,6 +330,7 @@ async fn build_subtree(
     if sub_questions.is_empty() {
         // If the LLM returned no sub-questions, treat as leaf
         return Ok(QuestionNode {
+            id: String::new(),
             question: raw.question.clone(),
             about: "each file individually".to_string(),
             creates: "L0 nodes".to_string(),
@@ -261,6 +359,7 @@ async fn build_subtree(
     let (about, creates) = scope_for_depth(current_depth);
 
     Ok(QuestionNode {
+        id: String::new(),
         question: raw.question.clone(),
         about,
         creates,
@@ -1093,6 +1192,7 @@ mod tests {
 
     fn make_leaf(question: &str) -> QuestionNode {
         QuestionNode {
+            id: String::new(),
             question: question.to_string(),
             about: "each file individually".to_string(),
             creates: "L0 nodes".to_string(),
@@ -1104,6 +1204,7 @@ mod tests {
 
     fn make_branch(question: &str, children: Vec<QuestionNode>) -> QuestionNode {
         QuestionNode {
+            id: String::new(),
             question: question.to_string(),
             about: "all L1 nodes at once".to_string(),
             creates: "L1 nodes".to_string(),
@@ -1116,6 +1217,7 @@ mod tests {
     fn make_tree(apex_children: Vec<QuestionNode>) -> QuestionTree {
         QuestionTree {
             apex: QuestionNode {
+                id: String::new(),
                 question: "What should I know about this codebase?".to_string(),
                 about: "all top-level nodes at once".to_string(),
                 creates: "apex".to_string(),

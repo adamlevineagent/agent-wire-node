@@ -22,6 +22,7 @@ use super::meta;
 use super::query;
 use super::slug;
 use super::stale_engine;
+use super::staleness_bridge;
 use super::types::*;
 use super::vine;
 use super::webbing;
@@ -832,6 +833,16 @@ pub fn pyramid_routes(
         .and(with_auth_state(state.clone()))
         .and_then(handle_publish_question_set));
 
+    // POST /pyramid/:slug/check-staleness — run crystallization staleness pipeline (WS-E)
+    let check_staleness = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("check-staleness"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(with_auth_state(state.clone()))
+        .and(warp::body::json::<staleness_bridge::CheckStalenessRequest>())
+        .and_then(handle_check_staleness));
+
     // POST /pyramid/chain/import — import a chain or question set from the Wire (P4.2)
     let chain_import = route!(prefix
         .and(warp::path("chain"))
@@ -924,7 +935,9 @@ pub fn pyramid_routes(
     let top5 = top4.or(h4).unify().boxed();
     let top6 = top5.or(h5).unify().boxed();
     let top7 = top6.or(r27).unify().boxed(); // Publication routes (P4.3)
-    top7
+    let r28 = check_staleness; // Staleness bridge route (WS-E)
+    let top8 = top7.or(r28).unify().boxed();
+    top8
 }
 
 // ── Route handlers ──────────────────────────────────────────────────
@@ -3701,6 +3714,66 @@ async fn handle_publish_question_set(
             let msg = format!("failed to publish question set: {}", e);
             tracing::warn!(slug = %slug_name, error = %e, "question set publish failed");
             Ok(json_error(warp::http::StatusCode::BAD_GATEWAY, &msg))
+        }
+    }
+}
+
+// ── WS-E: Staleness bridge handler ──────────────────────────────────
+
+async fn handle_check_staleness(
+    slug_name: String,
+    state: Arc<PyramidState>,
+    body: staleness_bridge::CheckStalenessRequest,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let threshold = body
+        .threshold
+        .unwrap_or(super::staleness::DEFAULT_STALENESS_THRESHOLD);
+
+    // Determine changed files: explicit body or auto-detect from pending mutations
+    let (changed_files, source) = {
+        let explicit = body
+            .files
+            .as_ref()
+            .filter(|f| !f.is_empty())
+            .map(|f| staleness_bridge::entries_to_changed_files(f));
+
+        if let Some(files) = explicit {
+            (files, "explicit".to_string())
+        } else {
+            // Auto-detect from DADBEAR's pending mutations table
+            let conn = state.reader.lock().await;
+            match staleness_bridge::auto_detect_changed_files(&conn, &slug_name) {
+                Ok(files) => (files, "auto_detect_pending_mutations".to_string()),
+                Err(e) => {
+                    return Ok(json_error(
+                        warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        &format!("failed to auto-detect changed files: {}", e),
+                    ));
+                }
+            }
+        }
+    };
+
+    let files_processed = changed_files.len();
+
+    // Run the staleness pipeline on the writer connection (it writes deltas + queue entries)
+    let conn = state.writer.lock().await;
+    match staleness_bridge::run_staleness_check(&conn, &slug_name, &changed_files, threshold) {
+        Ok((report, queued_items)) => {
+            let response = staleness_bridge::CheckStalenessResponse {
+                source,
+                files_processed,
+                report,
+                queued_items,
+            };
+            Ok(json_ok(&response))
+        }
+        Err(e) => {
+            tracing::warn!(slug = %slug_name, error = %e, "staleness check failed");
+            Ok(json_error(
+                warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("staleness check failed: {}", e),
+            ))
         }
     }
 }

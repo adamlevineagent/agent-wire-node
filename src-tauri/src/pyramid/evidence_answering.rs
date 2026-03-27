@@ -15,16 +15,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
-use rusqlite::Connection;
 use serde::Deserialize;
 use tokio::sync::Semaphore;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use super::db;
 use super::llm::{self, LlmConfig};
 use super::types::{
-    AnsweredNode, CandidateMap, EvidenceLink, EvidenceVerdict, GapReport, LayerQuestion,
+    AnsweredNode, CandidateMap, EvidenceLink, EvidenceVerdict, LayerQuestion,
     PyramidNode,
 };
 
@@ -32,6 +30,32 @@ use super::types::{
 
 /// Max concurrency for parallel question answering.
 const ANSWER_CONCURRENCY: usize = 5;
+
+/// Maximum character budget for the L0 summary string.
+const L0_SUMMARY_BUDGET: usize = 100_000;
+
+/// Maximum character budget for the pre-mapping prompt before switching modes.
+const PRE_MAP_PROMPT_BUDGET: usize = 80_000;
+
+// ── L0 Summary Helper ────────────────────────────────────────────────────────
+
+/// Build a summary string from L0 nodes for use in synthesis prompt generation.
+///
+/// Concatenates each node's headline + distilled text (truncated to ~200 chars
+/// per node). Total budget: ~100K chars. If it exceeds that, truncates from the end.
+pub fn build_l0_summary(nodes: &[PyramidNode]) -> String {
+    let mut summary = String::new();
+    for node in nodes {
+        let distilled_trunc: String = node.distilled.chars().take(200).collect();
+        let entry = format!("- {}: {}\n", node.headline, distilled_trunc);
+        if summary.len() + entry.len() > L0_SUMMARY_BUDGET {
+            summary.push_str("... (truncated)\n");
+            break;
+        }
+        summary.push_str(&entry);
+    }
+    summary
+}
 
 // ── Step 3.1: Horizontal Pre-Mapping ─────────────────────────────────────────
 
@@ -75,8 +99,8 @@ pub async fn pre_map_layer(
         .collect::<Vec<_>>()
         .join("\n");
 
-    // ── Build node listing (headline + distilled only, not full content) ─
-    let nodes_text = lower_layer_nodes
+    // ── Build node listing with token budget guard ────────────────────
+    let mut nodes_text = lower_layer_nodes
         .iter()
         .map(|n| {
             format!(
@@ -88,6 +112,49 @@ pub async fn pre_map_layer(
         })
         .collect::<Vec<_>>()
         .join("\n");
+
+    // Token budget guard: if combined prompt exceeds budget, switch to headlines-only
+    let combined_len = questions_text.len() + nodes_text.len();
+    if combined_len > PRE_MAP_PROMPT_BUDGET {
+        warn!(
+            combined_len,
+            budget = PRE_MAP_PROMPT_BUDGET,
+            "Pre-mapping prompt exceeds budget, switching to headlines-only mode"
+        );
+        nodes_text = lower_layer_nodes
+            .iter()
+            .map(|n| {
+                format!(
+                    "  - id: \"{}\"\n    headline: \"{}\"",
+                    n.id,
+                    n.headline.chars().take(200).collect::<String>()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // If STILL too large after headlines-only, truncate node list
+        if questions_text.len() + nodes_text.len() > PRE_MAP_PROMPT_BUDGET {
+            let max_nodes = (PRE_MAP_PROMPT_BUDGET - questions_text.len()) / 220; // ~220 chars per headline entry
+            warn!(
+                total_nodes = lower_layer_nodes.len(),
+                max_nodes,
+                "Pre-mapping still too large, truncating node list"
+            );
+            nodes_text = lower_layer_nodes
+                .iter()
+                .take(max_nodes)
+                .map(|n| {
+                    format!(
+                        "  - id: \"{}\"\n    headline: \"{}\"",
+                        n.id,
+                        n.headline.chars().take(200).collect::<String>()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+        }
+    }
 
     // ── Prompts ─────────────────────────────────────────────────────────
     let system_prompt = r#"You are mapping questions to candidate evidence nodes. Your job is to determine which nodes from the layer below MIGHT contain relevant evidence for each question.
@@ -182,6 +249,8 @@ struct PreMapResponse {
 ///   6. Save the answered node to pyramid_nodes
 ///
 /// Returns the answered nodes with their evidence links and any MISSING reports.
+/// The caller is responsible for persisting results to the database (e.g. via
+/// spawn_blocking), which solves the `&Connection` / `!Send` problem.
 ///
 /// Parallel, 5x concurrency via tokio::sync::Semaphore.
 pub async fn answer_questions(
@@ -190,7 +259,6 @@ pub async fn answer_questions(
     all_nodes: &[PyramidNode],
     synthesis_prompt: Option<&str>,
     llm_config: &LlmConfig,
-    conn: &Connection,
     slug: &str,
 ) -> Result<Vec<AnsweredNode>> {
     if questions.is_empty() {
@@ -250,9 +318,7 @@ pub async fn answer_questions(
         handles.push(handle);
     }
 
-    // Collect results — all DB writes happen here sequentially (not in spawned tasks)
-    // because rusqlite::Connection is !Send. The parallel LLM work is done; now we
-    // persist results synchronously using the borrowed connection.
+    // Collect results — NO DB writes here. The caller persists via spawn_blocking.
     let mut answered_nodes = Vec::new();
     let mut total_evidence = 0usize;
     let mut total_missing = 0usize;
@@ -261,41 +327,6 @@ pub async fn answer_questions(
         let result = handle.await.map_err(|e| anyhow!("Answer task panicked: {}", e))?;
         match result {
             Ok(answered) => {
-                // Save evidence links to DB (synchronous, no mutex needed)
-                for link in &answered.evidence {
-                    if let Err(e) = db::save_evidence_link(conn, link) {
-                        warn!(
-                            source = %link.source_node_id,
-                            target = %link.target_node_id,
-                            "Failed to save evidence link: {}",
-                            e
-                        );
-                    }
-                }
-                // Save the answered node to pyramid_nodes
-                if let Err(e) = db::save_node(conn, &answered.node, None) {
-                    warn!(
-                        node_id = %answered.node.id,
-                        "Failed to save answered node: {}",
-                        e
-                    );
-                }
-                // Save MISSING evidence as gap reports
-                for desc in &answered.missing {
-                    let gap = GapReport {
-                        question_id: answered.node.self_prompt.clone(),
-                        description: desc.clone(),
-                        layer: answered.node.depth,
-                    };
-                    if let Err(e) = db::save_gap(conn, &slug, &gap) {
-                        warn!(
-                            node_id = %answered.node.id,
-                            "Failed to save gap report: {}",
-                            e
-                        );
-                    }
-                }
-
                 total_evidence += answered.evidence.len();
                 total_missing += answered.missing.len();
                 answered_nodes.push(answered);

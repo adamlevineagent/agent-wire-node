@@ -96,7 +96,8 @@ pub fn compile_question_set(qs: &QuestionSet, _chains_dir: &Path) -> Result<Exec
         }
     }
 
-    assign_apex_storage_depth(&mut all_steps, apex_depth_for_question_set(qs));
+    let apex_depth = apex_depth_for_compiled_steps(&all_steps);
+    assign_apex_storage_depth(&mut all_steps, apex_depth);
 
     // Rewrite dependencies: replace references to converge step IDs with their
     // terminal step IDs so the DAG has no dangling references.
@@ -183,10 +184,22 @@ fn source_depth_for_scope(scope: &str) -> Option<i64> {
     }
 }
 
-fn apex_depth_for_question_set(qs: &QuestionSet) -> i64 {
-    qs.questions
+/// Scan ALL compiled steps (including converge-expanded) for the real max
+/// non-apex depth, then return max + 1.  The old implementation only checked
+/// the original QuestionSet `creates` strings, which missed depths introduced
+/// by converge expansion rounds.
+fn apex_depth_for_compiled_steps(steps: &[Step]) -> i64 {
+    steps
         .iter()
-        .filter_map(|q| conceptual_depth_for_creates(&q.creates))
+        .filter_map(|s| {
+            let sd = s.storage_directive.as_ref()?;
+            // Skip the apex placeholder itself (depth 99) so we don't
+            // perpetuate the sentinel value.
+            if is_apex_storage(sd) {
+                return None;
+            }
+            sd.depth
+        })
         .max()
         .unwrap_or(0)
         + 1
@@ -1264,7 +1277,11 @@ mod tests {
             .as_ref()
             .expect("apex should have storage");
         assert_eq!(sd.kind, StorageKind::Node);
-        assert_eq!(sd.depth, Some(3));
+        // Apex depth must be max-compiled-step-depth + 1, accounting for
+        // converge-expanded rounds (not just the conceptual L2 layer).
+        // With 8 converge rounds starting at depth 2, max round depth = 9,
+        // so apex = 10.
+        assert_eq!(sd.depth, Some(10));
     }
 
     #[test]

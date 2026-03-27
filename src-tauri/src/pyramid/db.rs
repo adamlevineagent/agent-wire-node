@@ -557,6 +557,24 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
             UNIQUE(slug, question_id)
         );
         CREATE INDEX IF NOT EXISTS idx_staleness_queue_slug ON pyramid_staleness_queue(slug, priority DESC);
+
+        -- Build metadata
+        CREATE TABLE IF NOT EXISTS pyramid_builds (
+            slug TEXT NOT NULL,
+            build_id TEXT NOT NULL,
+            question TEXT NOT NULL,
+            started_at TEXT NOT NULL DEFAULT (datetime('now')),
+            completed_at TEXT,
+            status TEXT NOT NULL DEFAULT 'running',
+            layers_completed INTEGER DEFAULT 0,
+            total_layers INTEGER DEFAULT 0,
+            l0_node_count INTEGER DEFAULT 0,
+            total_node_count INTEGER DEFAULT 0,
+            quality_score REAL,
+            error_message TEXT,
+            PRIMARY KEY (slug, build_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_builds_slug ON pyramid_builds(slug);
         ",
     )?;
 

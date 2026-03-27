@@ -12,24 +12,27 @@ use std::sync::atomic::Ordering;
 use anyhow::{anyhow, Result};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::info;
+use tracing::{info, warn};
 
 use super::build::{self, WriteOp};
 use super::chain_executor;
 use super::chain_loader;
 use super::chain_registry;
 use super::characterize;
-use super::types::CharacterizationResult;
-use super::defaults_adapter;
+use super::db;
+use super::evidence_answering;
 use super::extraction_schema;
 use super::ingest;
+use super::local_store;
 use super::question_compiler;
 use super::question_decomposition::{
     self, DecompositionConfig, DecompositionPreview, QuestionTree,
 };
 use super::question_loader;
+use super::reconciliation;
 use super::slug;
-use super::types::{BuildProgress, ContentType};
+use super::types::{self, BuildProgress, CharacterizationResult, ContentType};
+use super::defaults_adapter;
 use super::PyramidState;
 
 /// Unified build runner — dispatches to the chain engine or legacy build
@@ -571,8 +574,239 @@ pub async fn run_decomposed_build(
         info!(slug = slug_name, chunks = chunk_count, "ingestion complete");
     }
 
-    // ── 9. Execute through the IR executor ───────────────────────────────
-    chain_executor::execute_plan(state, &patched_plan, slug_name, from_depth, cancel, progress_tx).await
+    // ── 9. Filter plan to L0-only steps and execute ────────────────────
+    // Under the evidence pipeline, the IR executor only handles L0 extraction.
+    // Upper layers (L1+) are built by the evidence-weighted answering loop below.
+    let l0_plan = {
+        let mut filtered = patched_plan.clone();
+        filtered.steps.retain(|step| {
+            step.storage_directive
+                .as_ref()
+                .and_then(|sd| sd.depth)
+                .map(|d| d == 0)
+                .unwrap_or(false)
+                // Also keep steps without storage directives (setup steps)
+                || step.storage_directive.is_none()
+        });
+        filtered
+    };
+
+    // Record build start
+    let build_id = format!("qb-{}", uuid::Uuid::new_v4());
+    let layer_questions = question_decomposition::extract_layer_questions(&tree);
+    let max_layer = layer_questions.keys().copied().max().unwrap_or(0);
+    {
+        let conn = state.writer.clone();
+        let slug_owned = slug_name.to_string();
+        let bid = build_id.clone();
+        let q = apex_question.to_string();
+        let ml = max_layer;
+        tokio::task::spawn_blocking(move || {
+            let c = conn.blocking_lock();
+            local_store::save_build_start(&c, &slug_owned, &bid, &q, ml)?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .map_err(|e| anyhow!("Build start save panicked: {e}"))??;
+    }
+
+    let (_, l0_count) = chain_executor::execute_plan(
+        state, &l0_plan, slug_name, from_depth, cancel, progress_tx.clone(),
+    )
+    .await?;
+
+    info!(slug = slug_name, l0_nodes = l0_count, "L0 extraction complete — starting evidence loop");
+
+    // ── 10. Evidence-weighted upper layer loop ───────────────────────────
+    // Load L0 nodes and generate synthesis prompts
+    let l0_nodes = {
+        let conn = state.reader.lock().await;
+        db::get_nodes_at_depth(&conn, slug_name, 0)?
+    };
+
+    let l0_summary = evidence_answering::build_l0_summary(&l0_nodes);
+
+    let synth_prompts = extraction_schema::generate_synthesis_prompts(
+        &tree,
+        &l0_summary,
+        &ext_schema,
+        &llm_config,
+    )
+    .await?;
+
+    info!(
+        slug = slug_name,
+        answering_prompt_len = synth_prompts.answering_prompt.len(),
+        "synthesis prompts generated — entering per-layer evidence loop"
+    );
+
+    let mut total_nodes = l0_count;
+
+    for layer in 1..=max_layer {
+        // Check cancellation at each layer boundary
+        if cancel.is_cancelled() {
+            warn!(slug = slug_name, layer, "build cancelled during evidence loop");
+            break;
+        }
+
+        let layer_qs = match layer_questions.get(&layer) {
+            Some(qs) => qs.clone(),
+            None => {
+                info!(slug = slug_name, layer, "no questions at layer, skipping");
+                continue;
+            }
+        };
+
+        // Load lower-layer nodes
+        let lower_nodes = {
+            let conn = state.reader.lock().await;
+            db::get_nodes_at_depth(&conn, slug_name, layer - 1)?
+        };
+
+        info!(
+            slug = slug_name,
+            layer,
+            questions = layer_qs.len(),
+            lower_nodes = lower_nodes.len(),
+            "starting evidence answering for layer"
+        );
+
+        // Step a: Pre-map questions to candidate evidence nodes
+        let candidate_map = match evidence_answering::pre_map_layer(
+            &layer_qs, &lower_nodes, &llm_config,
+        )
+        .await
+        {
+            Ok(map) => map,
+            Err(e) => {
+                warn!(slug = slug_name, layer, error = %e, "pre-mapping failed, skipping layer");
+                break;
+            }
+        };
+
+        // Step b: Answer questions with evidence (NO DB writes — returns results only)
+        let answered = match evidence_answering::answer_questions(
+            &layer_qs,
+            &candidate_map,
+            &lower_nodes,
+            Some(&synth_prompts.answering_prompt),
+            &llm_config,
+            slug_name,
+        )
+        .await
+        {
+            Ok(a) => a,
+            Err(e) => {
+                warn!(slug = slug_name, layer, error = %e, "answer_questions failed, skipping layer");
+                break;
+            }
+        };
+
+        let answered_ids: Vec<String> = answered.iter().map(|a| a.node.id.clone()).collect();
+        let lower_ids: Vec<String> = lower_nodes.iter().map(|n| n.id.clone()).collect();
+        let layer_node_count = answered.len() as i32;
+
+        // Step c: Persist answered nodes + evidence links + gaps in spawn_blocking
+        {
+            let conn = state.writer.clone();
+            let slug_owned = slug_name.to_string();
+            let answered_owned = answered;
+            tokio::task::spawn_blocking(move || {
+                let c = conn.blocking_lock();
+                for a in &answered_owned {
+                    db::save_node(&c, &a.node, None)?;
+                    for link in &a.evidence {
+                        db::save_evidence_link(&c, link)?;
+                    }
+                    // Save missing items as gap reports
+                    for missing_desc in &a.missing {
+                        let gap = types::GapReport {
+                            question_id: a.node.self_prompt.clone(),
+                            description: missing_desc.clone(),
+                            layer: a.node.depth as i64,
+                        };
+                        db::save_gap(&c, &slug_owned, &gap)?;
+                    }
+                }
+                Ok::<(), anyhow::Error>(())
+            })
+            .await
+            .map_err(|e| anyhow!("Evidence save panicked: {e}"))??;
+        }
+
+        // Step d: Reconcile layer in spawn_blocking
+        {
+            let conn = state.writer.clone();
+            let slug_owned = slug_name.to_string();
+            let aids = answered_ids;
+            let lids = lower_ids;
+            tokio::task::spawn_blocking(move || {
+                let c = conn.blocking_lock();
+                let _result = reconciliation::reconcile_layer(
+                    &c, &slug_owned, layer, &aids, &lids,
+                )?;
+                Ok::<(), anyhow::Error>(())
+            })
+            .await
+            .map_err(|e| anyhow!("Reconciliation panicked: {e}"))??;
+        }
+
+        total_nodes += layer_node_count;
+
+        // Step e: Update build progress
+        {
+            let conn = state.writer.clone();
+            let slug_owned = slug_name.to_string();
+            let bid = build_id.clone();
+            let tn = total_nodes;
+            tokio::task::spawn_blocking(move || {
+                let c = conn.blocking_lock();
+                local_store::update_build_progress(&c, &slug_owned, &bid, layer, l0_count as i64, tn as i64)?;
+                Ok::<(), anyhow::Error>(())
+            })
+            .await
+            .map_err(|e| anyhow!("Progress update panicked: {e}"))??;
+        }
+
+        // Step f: Send progress update if channel available
+        if let Some(ref tx) = progress_tx {
+            let _ = tx.send(BuildProgress {
+                done: total_nodes as i64,
+                total: (total_nodes as i64) + (max_layer - layer) as i64 * layer_node_count as i64,
+            }).await;
+        }
+
+        info!(
+            slug = slug_name,
+            layer,
+            nodes_created = layer_node_count,
+            total_nodes,
+            "layer complete"
+        );
+    }
+
+    // Mark build complete
+    {
+        let conn = state.writer.clone();
+        let slug_owned = slug_name.to_string();
+        let bid = build_id;
+        tokio::task::spawn_blocking(move || {
+            let c = conn.blocking_lock();
+            local_store::complete_build(&c, &slug_owned, &bid, None)?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .map_err(|e| anyhow!("Build complete save panicked: {e}"))??;
+    }
+
+    info!(
+        slug = slug_name,
+        total_nodes,
+        layers = max_layer,
+        "question pyramid build complete"
+    );
+
+    Ok((slug_name.to_string(), total_nodes))
 }
 
 /// Preview a decomposed question build — returns the question tree and cost estimates
