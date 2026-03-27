@@ -43,9 +43,9 @@ Every pyramid node becomes a Wire contribution with a handle-path: `{handle}/{ep
 
 **Reference types in `derived_from`**:
 - `{ ref: "playful/84/3", weight: 0.38 }` — handle-path (for citing other pyramid node contributions)
-- `{ corpus: "vibesmithy/src/auth.ts", weight: 1.0 }` — corpus path (for citing source files)
+- `{ source_document: "vibesmithy/src/auth.ts", weight: 1.0 }` — source document path (for citing source files)
 
-`source_type` is either `contribution` or `corpus_document`. (`edition_item` is deprecated.)
+`source_type` is either `contribution` or `source_document`. (`edition_item` is deprecated.)
 
 ---
 
@@ -108,7 +108,7 @@ structured_data:
   entities: [...]
   question_id: <leaf question this serves>
 derived_from:
-  - { corpus: "vibesmithy/src/app/page.tsx", weight: 1.0 }
+  - { source_type: "source_document", ref: "vibesmithy/src/app/page.tsx", weight: 1.0 }
 ```
 
 L0 nodes cite corpus documents (source files) via `corpus:` path. Rotator arm: 76 creator slots / 2 Wire / 2 Graph Fund (original work).
@@ -277,14 +277,14 @@ When source files change:
 | Reconciliation | ❌ New | Post-synthesis orphan/gap detection (transform, no LLM) |
 | Conversation checkpoint | ❌ New | Two-chain pattern: characterize → confirm → build |
 | Dynamic prompt generation | ❌ New | Action output becomes next action's prompt |
-| Weight-to-slot conversion | ❌ New | Normalize floats → 28 integer slots (largest-remainder) |
+| Weight-to-slot conversion | ✅ Exists | `weightsToSlots()` in rotator-arm.ts — largest-remainder, min 1 slot, post-condition assertion |
 
 ### New capabilities needed (5):
 1. **Evidence links** — local storage + query for weighted connections with reasons
 2. **Reconciliation** — transform step for orphan/gap detection
 3. **Conversation checkpoint** — two-chain split (characterize chain + build chain)
 4. **Dynamic prompt generation** — action output flows as prompt to next action
-5. **Weight-to-slot conversion** — normalize evidence weights to 28 rotator arm slots
+5. ~~Weight-to-slot conversion~~ — EXISTS: `weightsToSlots()` in rotator-arm.ts
 
 ### Capabilities needing modification (2):
 6. **Multi-parent children (local)** — migrate from `parent_id` to evidence table for DAG
