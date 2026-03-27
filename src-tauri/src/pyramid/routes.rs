@@ -12,6 +12,8 @@ use warp::Filter;
 use warp::Reply;
 
 use super::build::WriteOp;
+use super::characterize;
+use super::types::CharacterizationResult;
 use super::db;
 use super::delta;
 use super::faq;
@@ -144,6 +146,17 @@ struct QuestionBuildBody {
     max_depth: u32,
     #[serde(default)]
     from_depth: Option<i64>,
+    /// Optional pre-computed characterization. If provided, the build skips
+    /// automatic characterization and uses this directly.
+    #[serde(default)]
+    characterization: Option<CharacterizationResult>,
+}
+
+#[derive(Deserialize)]
+struct CharacterizeBody {
+    question: String,
+    #[serde(default)]
+    source_path: Option<String>,
 }
 
 fn default_granularity() -> u32 {
@@ -789,6 +802,16 @@ pub fn pyramid_routes(
         .and(with_auth_state(state.clone()))
         .and_then(handle_question_preview));
 
+    // POST /pyramid/:slug/characterize — characterize source material before build (P1.1)
+    let characterize_route = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("characterize"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(warp::body::json::<CharacterizeBody>())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_characterize));
+
     // POST /pyramid/:slug/publish — publish pyramid to Wire (P4.3)
     let publish_pyramid = route!(prefix
         .and(warp::path::param::<String>())
@@ -823,8 +846,13 @@ pub fn pyramid_routes(
     // Each .or().unify() flattens a pair, and .boxed() erases the type.
     let r1 = list_slugs.or(create_slug_route).unify().boxed();
     let r2 = build_status.or(build_cancel).unify().boxed();
-    // Question build/preview routes must come before generic build (more specific paths)
-    let r2a = question_build.or(question_preview).unify().boxed();
+    // Question build/preview/characterize routes must come before generic build (more specific paths)
+    let r2a = question_build
+        .or(question_preview)
+        .unify()
+        .or(characterize_route)
+        .unify()
+        .boxed();
     let r3 = build.or(apex).unify().boxed();
     let r4 = node.or(tree).unify().boxed();
     let r5 = drill.or(search).unify().boxed();
@@ -3022,6 +3050,59 @@ async fn handle_vine_build_status(
     }
 }
 
+// ── Characterization route (P1.1) ─────────────────────────────────────────────
+
+/// POST /pyramid/:slug/characterize
+///
+/// Characterize source material before building a knowledge pyramid.
+/// Returns a CharacterizationResult that the caller can review/modify
+/// before passing into the question build endpoint.
+async fn handle_characterize(
+    slug_name: String,
+    body: CharacterizeBody,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    // Validate slug exists and get source_path
+    let source_path = {
+        let conn = state.reader.lock().await;
+        match slug::get_slug(&conn, &slug_name) {
+            Ok(Some(s)) => {
+                // Use provided source_path or fall back to slug's source_path
+                body.source_path.unwrap_or(s.source_path)
+            }
+            Ok(None) => {
+                return Ok(json_error(
+                    warp::http::StatusCode::NOT_FOUND,
+                    "Slug not found",
+                ));
+            }
+            Err(e) => {
+                return Ok(json_error(
+                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    &e.to_string(),
+                ));
+            }
+        }
+    };
+
+    if body.question.trim().is_empty() {
+        return Ok(json_error(
+            warp::http::StatusCode::BAD_REQUEST,
+            "question cannot be empty",
+        ));
+    }
+
+    let llm_config = state.config.read().await.clone();
+
+    match characterize::characterize(&source_path, &body.question, &llm_config).await {
+        Ok(result) => Ok(json_ok(&result)),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Characterization failed: {}", e),
+        )),
+    }
+}
+
 // ── Question decomposition routes (P2.2) ─────────────────────────────────────
 
 /// POST /pyramid/:slug/build/question
@@ -3106,6 +3187,7 @@ async fn handle_question_build(
     let granularity = body.granularity;
     let max_depth = body.max_depth;
     let from_depth_for_build = from_depth;
+    let characterization = body.characterization.clone();
     let response_slug = slug_name.clone();
 
     tokio::spawn(async move {
@@ -3129,6 +3211,7 @@ async fn handle_question_build(
             granularity,
             max_depth,
             from_depth_for_build,
+            characterization,
             &cancel,
             Some(progress_tx.clone()),
         )
@@ -3486,11 +3569,12 @@ async fn handle_publish_pyramid(
                     tracing::warn!(error = %e, "failed to init id_map table");
                 }
                 for mapping in &result.id_mappings {
+                    let uuid = mapping.wire_uuid.as_deref().unwrap_or(&mapping.wire_handle_path);
                     if let Err(e) = wire_publish::save_id_mapping(
                         &writer,
                         &slug_name,
                         &mapping.local_id,
-                        &mapping.wire_uuid,
+                        uuid,
                     ) {
                         tracing::warn!(
                             local_id = %mapping.local_id,

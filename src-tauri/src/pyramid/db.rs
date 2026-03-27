@@ -480,6 +480,101 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
     // ── Wire publication ID mapping table (P4.3) ──────────────────────────────
     super::wire_publish::init_id_map_table(conn)?;
 
+    // ── Phase 1: Question Pyramid Evidence System tables ─────────────────────
+
+    conn.execute_batch(
+        "
+        -- Many-to-many weighted evidence links between nodes
+        CREATE TABLE IF NOT EXISTS pyramid_evidence (
+            slug TEXT NOT NULL,
+            source_node_id TEXT NOT NULL,
+            target_node_id TEXT NOT NULL,
+            verdict TEXT NOT NULL CHECK(verdict IN ('KEEP', 'DISCONNECT', 'MISSING')),
+            weight REAL,
+            reason TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (slug, source_node_id, target_node_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_evidence_target ON pyramid_evidence(slug, target_node_id);
+        CREATE INDEX IF NOT EXISTS idx_evidence_source ON pyramid_evidence(slug, source_node_id);
+
+        -- Question decomposition tree per slug (stored as JSON blob)
+        CREATE TABLE IF NOT EXISTS pyramid_question_tree (
+            slug TEXT PRIMARY KEY,
+            tree TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        -- Missing evidence gap reports
+        CREATE TABLE IF NOT EXISTS pyramid_gaps (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            slug TEXT NOT NULL,
+            question_id TEXT NOT NULL,
+            description TEXT NOT NULL,
+            layer INTEGER NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(slug, question_id, description)
+        );
+        CREATE INDEX IF NOT EXISTS idx_gaps_slug ON pyramid_gaps(slug);
+        CREATE INDEX IF NOT EXISTS idx_gaps_question ON pyramid_gaps(slug, question_id);
+
+        -- Per-file change log for crystallization (NOT thread-level pyramid_deltas)
+        CREATE TABLE IF NOT EXISTS pyramid_source_deltas (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            slug TEXT NOT NULL,
+            file_path TEXT NOT NULL,
+            change_type TEXT NOT NULL,
+            diff_summary TEXT,
+            processed INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_source_deltas_unprocessed ON pyramid_source_deltas(slug, processed);
+
+        -- Belief correction audit trail
+        CREATE TABLE IF NOT EXISTS pyramid_supersessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            slug TEXT NOT NULL,
+            node_id TEXT NOT NULL,
+            superseded_claim TEXT NOT NULL,
+            corrected_to TEXT NOT NULL,
+            source_node TEXT,
+            channel TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_supersessions_slug ON pyramid_supersessions(slug);
+        CREATE INDEX IF NOT EXISTS idx_supersessions_node ON pyramid_supersessions(slug, node_id);
+
+        -- Pending re-answer work items
+        CREATE TABLE IF NOT EXISTS pyramid_staleness_queue (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            slug TEXT NOT NULL,
+            question_id TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            channel TEXT NOT NULL,
+            priority REAL NOT NULL DEFAULT 0.0,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(slug, question_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_staleness_queue_slug ON pyramid_staleness_queue(slug, priority DESC);
+        ",
+    )?;
+
+    // Migrate pyramid_id_map: add wire_handle_path column if missing
+    let _ = conn.execute(
+        "ALTER TABLE pyramid_id_map ADD COLUMN wire_handle_path TEXT DEFAULT ''",
+        [],
+    );
+
+    // Migrate pyramid_staleness_queue: add UNIQUE(slug, question_id) if missing
+    migrate_staleness_queue_unique(conn)?;
+
+    // Migrate pyramid_gaps: add UNIQUE(slug, question_id, description) and question index if missing
+    migrate_gaps_unique(conn)?;
+
+    // Backfill pyramid_evidence from existing pyramid_nodes.children arrays
+    backfill_evidence_from_children(conn)?;
+
     Ok(())
 }
 
@@ -2501,6 +2596,590 @@ pub fn get_faq_nodes_by_prefix(
 
     let faqs: Vec<FaqNode> = rows.filter_map(|r| r.ok()).collect();
     Ok(faqs)
+}
+
+// ── Evidence System CRUD (Phase 1) ────────────────────────────────────────────
+
+/// Save an evidence link (upsert on slug + source + target).
+pub fn save_evidence_link(conn: &Connection, link: &EvidenceLink) -> Result<()> {
+    conn.execute(
+        "INSERT INTO pyramid_evidence (slug, source_node_id, target_node_id, verdict, weight, reason)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(slug, source_node_id, target_node_id) DO UPDATE SET
+           verdict = excluded.verdict,
+           weight = excluded.weight,
+           reason = excluded.reason",
+        rusqlite::params![
+            link.slug,
+            link.source_node_id,
+            link.target_node_id,
+            link.verdict.as_str(),
+            link.weight,
+            link.reason,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Get all evidence links pointing at a target node (i.e. its supporting evidence).
+pub fn get_evidence_for_target(
+    conn: &Connection,
+    slug: &str,
+    target_node_id: &str,
+) -> Result<Vec<EvidenceLink>> {
+    let mut stmt = conn.prepare(
+        "SELECT slug, source_node_id, target_node_id, verdict, weight, reason
+         FROM pyramid_evidence WHERE slug = ?1 AND target_node_id = ?2",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![slug, target_node_id], evidence_from_row)?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
+/// Get all evidence links from a source node (i.e. what it supports).
+pub fn get_evidence_for_source(
+    conn: &Connection,
+    slug: &str,
+    source_node_id: &str,
+) -> Result<Vec<EvidenceLink>> {
+    let mut stmt = conn.prepare(
+        "SELECT slug, source_node_id, target_node_id, verdict, weight, reason
+         FROM pyramid_evidence WHERE slug = ?1 AND source_node_id = ?2",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![slug, source_node_id], evidence_from_row)?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
+/// Get only KEEP evidence links for a target node.
+pub fn get_keep_evidence_for_target(
+    conn: &Connection,
+    slug: &str,
+    target_node_id: &str,
+) -> Result<Vec<EvidenceLink>> {
+    let mut stmt = conn.prepare(
+        "SELECT slug, source_node_id, target_node_id, verdict, weight, reason
+         FROM pyramid_evidence WHERE slug = ?1 AND target_node_id = ?2 AND verdict = 'KEEP'",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![slug, target_node_id], evidence_from_row)?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
+/// Delete all evidence links for a slug.
+pub fn clear_evidence_for_slug(conn: &Connection, slug: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM pyramid_evidence WHERE slug = ?1",
+        rusqlite::params![slug],
+    )?;
+    Ok(())
+}
+
+fn evidence_from_row(row: &rusqlite::Row) -> rusqlite::Result<EvidenceLink> {
+    let verdict_str: String = row.get(3)?;
+    Ok(EvidenceLink {
+        slug: row.get(0)?,
+        source_node_id: row.get(1)?,
+        target_node_id: row.get(2)?,
+        verdict: EvidenceVerdict::from_str(&verdict_str),
+        weight: row.get(4)?,
+        reason: row.get(5)?,
+    })
+}
+
+// ── Question Tree CRUD ───────────────────────────────────────────────────────
+
+/// Save (upsert) a question decomposition tree for a slug.
+pub fn save_question_tree(
+    conn: &Connection,
+    slug: &str,
+    tree: &serde_json::Value,
+) -> Result<()> {
+    let json_str = serde_json::to_string(tree)?;
+    conn.execute(
+        "INSERT INTO pyramid_question_tree (slug, tree)
+         VALUES (?1, ?2)
+         ON CONFLICT(slug) DO UPDATE SET
+           tree = excluded.tree,
+           updated_at = datetime('now')",
+        rusqlite::params![slug, json_str],
+    )?;
+    Ok(())
+}
+
+/// Get the question tree for a slug.
+pub fn get_question_tree(
+    conn: &Connection,
+    slug: &str,
+) -> Result<Option<serde_json::Value>> {
+    let mut stmt = conn.prepare(
+        "SELECT tree FROM pyramid_question_tree WHERE slug = ?1",
+    )?;
+    let result = stmt.query_row(rusqlite::params![slug], |row| {
+        let json_str: String = row.get(0)?;
+        Ok(json_str)
+    });
+    match result {
+        Ok(json_str) => {
+            let val: serde_json::Value = serde_json::from_str(&json_str)?;
+            Ok(Some(val))
+        }
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+// ── Gap Reports CRUD ─────────────────────────────────────────────────────────
+
+/// Save a gap report for a slug.
+/// Deduplicates on (slug, question_id, description) — upserts layer on re-runs.
+pub fn save_gap(conn: &Connection, slug: &str, gap: &GapReport) -> Result<()> {
+    conn.execute(
+        "INSERT INTO pyramid_gaps (slug, question_id, description, layer)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(slug, question_id, description) DO UPDATE SET layer = excluded.layer",
+        rusqlite::params![slug, gap.question_id, gap.description, gap.layer],
+    )?;
+    Ok(())
+}
+
+/// Get all gap reports for a slug.
+pub fn get_gaps_for_slug(conn: &Connection, slug: &str) -> Result<Vec<GapReport>> {
+    let mut stmt = conn.prepare(
+        "SELECT question_id, description, layer FROM pyramid_gaps WHERE slug = ?1 ORDER BY id ASC",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![slug], |row| {
+        Ok(GapReport {
+            question_id: row.get(0)?,
+            description: row.get(1)?,
+            layer: row.get(2)?,
+        })
+    })?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
+// ── ID Map Extensions (wire_handle_path) ─────────────────────────────────────
+
+/// Save an ID mapping with wire_handle_path (extends existing pyramid_id_map).
+pub fn save_id_mapping_extended(
+    conn: &Connection,
+    slug: &str,
+    mapping: &IdMapping,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO pyramid_id_map (slug, local_id, wire_uuid, wire_handle_path, published_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(slug, local_id) DO UPDATE SET
+           wire_uuid = excluded.wire_uuid,
+           wire_handle_path = excluded.wire_handle_path,
+           published_at = excluded.published_at",
+        rusqlite::params![
+            slug,
+            mapping.local_id,
+            mapping.wire_uuid.as_deref().unwrap_or(""),
+            mapping.wire_handle_path,
+            mapping.published_at,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Save an ID mapping — contract-matching alias for `save_id_mapping_extended`.
+pub fn save_id_mapping(conn: &Connection, slug: &str, mapping: &IdMapping) -> Result<()> {
+    save_id_mapping_extended(conn, slug, mapping)
+}
+
+/// Get the wire handle-path for a local node ID.
+pub fn get_wire_handle_path(
+    conn: &Connection,
+    slug: &str,
+    local_id: &str,
+) -> Result<Option<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT wire_handle_path FROM pyramid_id_map WHERE slug = ?1 AND local_id = ?2",
+    )?;
+    let result = stmt.query_row(rusqlite::params![slug, local_id], |row| {
+        row.get::<_, String>(0)
+    });
+    match result {
+        Ok(path) if path.is_empty() => Ok(None),
+        Ok(path) => Ok(Some(path)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Get all ID mappings for a slug as IdMapping structs.
+pub fn get_all_id_mappings(conn: &Connection, slug: &str) -> Result<Vec<IdMapping>> {
+    let mut stmt = conn.prepare(
+        "SELECT local_id, wire_handle_path, wire_uuid, published_at
+         FROM pyramid_id_map WHERE slug = ?1 ORDER BY local_id",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![slug], |row| {
+        let wire_uuid: String = row.get(2)?;
+        Ok(IdMapping {
+            local_id: row.get(0)?,
+            wire_handle_path: row.get(1)?,
+            wire_uuid: if wire_uuid.is_empty() { None } else { Some(wire_uuid) },
+            published_at: row.get(3)?,
+        })
+    })?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
+/// Check if a local node has been published to Wire.
+pub fn is_already_published(conn: &Connection, slug: &str, local_id: &str) -> Result<bool> {
+    let result = conn.prepare(
+        "SELECT 1 FROM pyramid_id_map WHERE slug = ?1 AND local_id = ?2 LIMIT 1",
+    );
+    match result {
+        Ok(mut stmt) => {
+            let exists = stmt
+                .query_row(rusqlite::params![slug, local_id], |_row| Ok(()))
+                .is_ok();
+            Ok(exists)
+        }
+        Err(e) => {
+            // Gracefully handle "no such table" — table may not be created yet
+            let msg = e.to_string();
+            if msg.contains("no such table") {
+                tracing::debug!(
+                    slug = slug,
+                    local_id = local_id,
+                    "pyramid_id_map table not found, treating as not-yet-published"
+                );
+                Ok(false)
+            } else {
+                Err(e.into())
+            }
+        }
+    }
+}
+
+// ── Source Deltas CRUD (file-level, NOT thread-level) ────────────────────────
+
+/// Save a file-level source delta.
+pub fn save_source_delta(
+    conn: &Connection,
+    slug: &str,
+    file_path: &str,
+    change_type: &str,
+    diff_summary: Option<&str>,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO pyramid_source_deltas (slug, file_path, change_type, diff_summary)
+         VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![slug, file_path, change_type, diff_summary],
+    )?;
+    Ok(())
+}
+
+/// Get all unprocessed source deltas for a slug.
+pub fn get_unprocessed_source_deltas(
+    conn: &Connection,
+    slug: &str,
+) -> Result<Vec<SourceDelta>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, slug, file_path, change_type, diff_summary, processed, created_at
+         FROM pyramid_source_deltas WHERE slug = ?1 AND processed = 0 ORDER BY id ASC",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![slug], |row| {
+        Ok(SourceDelta {
+            id: row.get(0)?,
+            slug: row.get(1)?,
+            file_path: row.get(2)?,
+            change_type: row.get(3)?,
+            diff_summary: row.get(4)?,
+            processed: row.get::<_, i64>(5)? != 0,
+            created_at: row.get(6)?,
+        })
+    })?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
+/// Mark a source delta as processed.
+pub fn mark_source_delta_processed(conn: &Connection, id: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE pyramid_source_deltas SET processed = 1 WHERE id = ?1",
+        rusqlite::params![id],
+    )?;
+    Ok(())
+}
+
+// ── Supersessions CRUD ───────────────────────────────────────────────────────
+
+/// Record a belief correction (supersession).
+pub fn save_supersession(
+    conn: &Connection,
+    slug: &str,
+    node_id: &str,
+    superseded_claim: &str,
+    corrected_to: &str,
+    source_node: Option<&str>,
+    channel: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO pyramid_supersessions (slug, node_id, superseded_claim, corrected_to, source_node, channel)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![slug, node_id, superseded_claim, corrected_to, source_node, channel],
+    )?;
+    Ok(())
+}
+
+// ── Staleness Queue CRUD ─────────────────────────────────────────────────────
+
+/// Enqueue a question for re-answering due to staleness.
+/// Deduplicates on (slug, question_id) — keeps the highest priority and latest channel.
+pub fn enqueue_staleness(
+    conn: &Connection,
+    slug: &str,
+    question_id: &str,
+    reason: &str,
+    channel: &str,
+    priority: f64,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO pyramid_staleness_queue (slug, question_id, reason, channel, priority)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(slug, question_id) DO UPDATE SET
+           priority = MAX(priority, excluded.priority),
+           channel = excluded.channel,
+           reason = excluded.reason",
+        rusqlite::params![slug, question_id, reason, channel, priority],
+    )?;
+    Ok(())
+}
+
+/// Dequeue the highest-priority staleness items for a slug.
+/// Returns up to `limit` items, deleting them from the queue.
+/// SELECT + DELETE are wrapped in a transaction to prevent TOCTOU races.
+pub fn dequeue_staleness(
+    conn: &Connection,
+    slug: &str,
+    limit: u32,
+) -> Result<Vec<StalenessItem>> {
+    // Use IMMEDIATE transaction to prevent concurrent readers from seeing the
+    // same rows before we delete them.
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+
+    let result = (|| -> Result<Vec<StalenessItem>> {
+        let mut stmt = conn.prepare(
+            "SELECT id, slug, question_id, reason, channel, priority, created_at
+             FROM pyramid_staleness_queue WHERE slug = ?1
+             ORDER BY priority DESC, id ASC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![slug, limit], |row| {
+            Ok(StalenessItem {
+                id: row.get(0)?,
+                slug: row.get(1)?,
+                question_id: row.get(2)?,
+                reason: row.get(3)?,
+                channel: row.get(4)?,
+                priority: row.get(5)?,
+                created_at: row.get(6)?,
+            })
+        })?;
+        let items: Vec<StalenessItem> = rows.filter_map(|r| r.ok()).collect();
+
+        // Delete the dequeued items using parameterized placeholders
+        if !items.is_empty() {
+            let ids: Vec<i64> = items.iter().map(|i| i.id).collect();
+            let placeholders: String = (1..=ids.len())
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            conn.execute(
+                &format!("DELETE FROM pyramid_staleness_queue WHERE id IN ({placeholders})"),
+                rusqlite::params_from_iter(ids.iter()),
+            )?;
+        }
+
+        Ok(items)
+    })();
+
+    match &result {
+        Ok(_) => conn.execute_batch("COMMIT")?,
+        Err(_) => { let _ = conn.execute_batch("ROLLBACK"); }
+    }
+
+    result
+}
+
+// ── Table Migrations ─────────────────────────────────────────────────────────
+
+/// Migrate `pyramid_staleness_queue` to add UNIQUE(slug, question_id) if missing.
+/// Idempotent: skips if the constraint already exists.
+fn migrate_staleness_queue_unique(conn: &Connection) -> Result<()> {
+    let table_sql: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='pyramid_staleness_queue'",
+            [],
+            |row| row.get(0),
+        )
+        .ok();
+
+    let needs_migration = match &table_sql {
+        Some(sql) => !sql.contains("UNIQUE"),
+        None => false, // Table doesn't exist yet (will be created fresh above)
+    };
+
+    if !needs_migration {
+        return Ok(());
+    }
+
+    tracing::info!("Migrating pyramid_staleness_queue to add UNIQUE(slug, question_id)...");
+    conn.execute_batch("PRAGMA foreign_keys=OFF;")?;
+    let result = conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS pyramid_staleness_queue_new (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            slug TEXT NOT NULL,
+            question_id TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            channel TEXT NOT NULL,
+            priority REAL NOT NULL DEFAULT 0.0,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(slug, question_id)
+        );
+        INSERT OR REPLACE INTO pyramid_staleness_queue_new (id, slug, question_id, reason, channel, priority, created_at)
+            SELECT id, slug, question_id, reason, channel, MAX(priority), created_at
+            FROM pyramid_staleness_queue GROUP BY slug, question_id;
+        DROP TABLE pyramid_staleness_queue;
+        ALTER TABLE pyramid_staleness_queue_new RENAME TO pyramid_staleness_queue;
+        CREATE INDEX IF NOT EXISTS idx_staleness_queue_slug ON pyramid_staleness_queue(slug, priority DESC);
+        ",
+    );
+    conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+    result?;
+    Ok(())
+}
+
+/// Migrate `pyramid_gaps` to add UNIQUE(slug, question_id, description) and question index.
+/// Idempotent: skips if the constraint already exists.
+fn migrate_gaps_unique(conn: &Connection) -> Result<()> {
+    let table_sql: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='pyramid_gaps'",
+            [],
+            |row| row.get(0),
+        )
+        .ok();
+
+    let needs_migration = match &table_sql {
+        Some(sql) => !sql.contains("UNIQUE"),
+        None => false, // Table doesn't exist yet
+    };
+
+    if !needs_migration {
+        // Still ensure the question index exists even if UNIQUE is already there
+        let _ = conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_gaps_question ON pyramid_gaps(slug, question_id);"
+        );
+        return Ok(());
+    }
+
+    tracing::info!("Migrating pyramid_gaps to add UNIQUE(slug, question_id, description)...");
+    conn.execute_batch("PRAGMA foreign_keys=OFF;")?;
+    let result = conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS pyramid_gaps_new (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            slug TEXT NOT NULL,
+            question_id TEXT NOT NULL,
+            description TEXT NOT NULL,
+            layer INTEGER NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(slug, question_id, description)
+        );
+        INSERT OR REPLACE INTO pyramid_gaps_new (id, slug, question_id, description, layer, created_at)
+            SELECT id, slug, question_id, description, layer, created_at
+            FROM pyramid_gaps GROUP BY slug, question_id, description;
+        DROP TABLE pyramid_gaps;
+        ALTER TABLE pyramid_gaps_new RENAME TO pyramid_gaps;
+        CREATE INDEX IF NOT EXISTS idx_gaps_slug ON pyramid_gaps(slug);
+        CREATE INDEX IF NOT EXISTS idx_gaps_question ON pyramid_gaps(slug, question_id);
+        ",
+    );
+    conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+    result?;
+    Ok(())
+}
+
+// ── Evidence Backfill ────────────────────────────────────────────────────────
+
+/// Migrate existing `pyramid_nodes.children` JSON arrays into `pyramid_evidence` rows.
+/// Only runs if pyramid_evidence is empty but pyramid_nodes has children.
+/// Creates evidence links with verdict=KEEP, weight=1.0, reason="legacy backfill".
+fn backfill_evidence_from_children(conn: &Connection) -> Result<()> {
+    // Check if pyramid_evidence already has data
+    let evidence_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pyramid_evidence",
+        [],
+        |row| row.get(0),
+    )?;
+    if evidence_count > 0 {
+        return Ok(());
+    }
+
+    // Check if any nodes have children
+    let nodes_with_children: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pyramid_nodes WHERE children IS NOT NULL AND children != '[]' AND children != ''",
+        [],
+        |row| row.get(0),
+    )?;
+    if nodes_with_children == 0 {
+        return Ok(());
+    }
+
+    tracing::info!(
+        "Backfilling pyramid_evidence from {} nodes with children...",
+        nodes_with_children
+    );
+
+    // Collect all rows first so we can release the borrow on conn before the transaction
+    let node_rows: Vec<(String, String, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT slug, id, children FROM pyramid_nodes WHERE children IS NOT NULL AND children != '[]' AND children != ''",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        rows.filter_map(|r| r.ok()).collect()
+    };
+
+    // Wrap all inserts in a transaction to avoid partial backfill state on crash
+    conn.execute_batch("BEGIN")?;
+    let result = (|| -> Result<u64> {
+        let mut count = 0u64;
+        for (slug, parent_id, children_json) in &node_rows {
+            let children: Vec<String> = match serde_json::from_str(children_json) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            for child_id in &children {
+                let _ = conn.execute(
+                    "INSERT OR IGNORE INTO pyramid_evidence (slug, source_node_id, target_node_id, verdict, weight, reason)
+                     VALUES (?1, ?2, ?3, 'KEEP', 1.0, 'legacy backfill')",
+                    rusqlite::params![slug, child_id, parent_id],
+                );
+                count += 1;
+            }
+        }
+        Ok(count)
+    })();
+
+    match &result {
+        Ok(_) => conn.execute_batch("COMMIT")?,
+        Err(_) => { let _ = conn.execute_batch("ROLLBACK"); }
+    }
+
+    let count = result?;
+    if count > 0 {
+        tracing::info!("Backfilled {} evidence links from existing children.", count);
+    }
+
+    Ok(())
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────

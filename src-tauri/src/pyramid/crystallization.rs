@@ -13,9 +13,12 @@
 
 use anyhow::Result;
 use chrono::Utc;
+use dashmap::DashMap;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 use tracing::info;
 
 use super::event_chain::{EventSubscription, LocalEventBus, PyramidEvent};
@@ -23,6 +26,76 @@ use super::execution_plan::{
     CostEstimate, ErrorPolicy, ExecutionPlan, ModelRequirements, Step, StepOperation,
     StorageDirective, StorageKind,
 };
+
+// ── Per-Node Locking ─────────────────────────────────────────────────────────
+
+/// Per-node mutex map to prevent concurrent delta processing on the same node.
+///
+/// DashMap provides lock-free concurrent access to the map itself, while each
+/// node gets its own tokio::sync::Mutex to serialize delta processing.
+/// This prevents concurrent deltas from dropping corrections on the same node.
+#[derive(Debug, Clone)]
+pub struct NodeLockMap {
+    locks: Arc<DashMap<String, Arc<Mutex<()>>>>,
+}
+
+impl NodeLockMap {
+    /// Create a new empty lock map.
+    pub fn new() -> Self {
+        Self {
+            locks: Arc::new(DashMap::new()),
+        }
+    }
+
+    /// Acquire the lock for a given node_id. Returns a guard that releases
+    /// the lock when dropped.
+    ///
+    /// If no lock exists for this node_id yet, one is created atomically.
+    pub async fn acquire(&self, node_id: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let mutex = self
+            .locks
+            .entry(node_id.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
+        mutex.lock_owned().await
+    }
+
+    /// Remove the lock entry for a node that is no longer active.
+    /// Only call this when you're certain no one holds or will request the lock.
+    pub fn remove(&self, node_id: &str) {
+        self.locks.remove(node_id);
+    }
+
+    /// Number of tracked nodes (for diagnostics).
+    pub fn len(&self) -> usize {
+        self.locks.len()
+    }
+
+    /// Whether the map is empty.
+    pub fn is_empty(&self) -> bool {
+        self.locks.is_empty()
+    }
+
+    /// Evict stale entries from the lock map.
+    ///
+    /// Removes entries where the `Arc<Mutex<()>>` strong count is 1, meaning
+    /// only the map itself holds a reference and no active task is using or
+    /// waiting on the lock. This is safe to call periodically (e.g. after a
+    /// build completes) to prevent unbounded growth of the map over time.
+    ///
+    /// Returns the number of entries removed.
+    pub fn cleanup(&self) -> usize {
+        let before = self.locks.len();
+        self.locks.retain(|_key, mutex| Arc::strong_count(mutex) > 1);
+        before - self.locks.len()
+    }
+}
+
+impl Default for NodeLockMap {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 // ── Configuration ────────────────────────────────────────────────────────────
 
@@ -917,9 +990,37 @@ pub async fn trigger_delta_check(
     changed_node_ids: &[String],
     conn: Option<&Connection>,
 ) -> Result<Vec<String>> {
+    trigger_delta_check_with_locks(bus, slug, changed_node_ids, conn, None).await
+}
+
+/// Like `trigger_delta_check` but acquires per-node locks before emitting events.
+///
+/// When `node_locks` is provided, each node's lock is acquired before its delta
+/// event is emitted, preventing concurrent delta processing from dropping corrections.
+/// Locks are released after the event emission (the downstream handler should
+/// also use `NodeLockMap` for end-to-end protection).
+pub async fn trigger_delta_check_with_locks(
+    bus: &LocalEventBus,
+    slug: &str,
+    changed_node_ids: &[String],
+    conn: Option<&Connection>,
+    node_locks: Option<&NodeLockMap>,
+) -> Result<Vec<String>> {
     if changed_node_ids.is_empty() {
         return Ok(vec![]);
     }
+
+    // Acquire per-node locks if a lock map is provided.
+    // This serializes concurrent deltas targeting the same node.
+    let _guards = if let Some(locks) = node_locks {
+        let mut guards = Vec::with_capacity(changed_node_ids.len());
+        for node_id in changed_node_ids {
+            guards.push(locks.acquire(node_id).await);
+        }
+        Some(guards)
+    } else {
+        None
+    };
 
     let event = PyramidEvent::StaleDetected {
         slug: slug.to_string(),
@@ -936,6 +1037,7 @@ pub async fn trigger_delta_check(
         "triggered crystallization delta check"
     );
 
+    // Guards are dropped here, releasing per-node locks
     Ok(invocations)
 }
 

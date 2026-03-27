@@ -18,7 +18,11 @@ use super::build::{self, WriteOp};
 use super::chain_executor;
 use super::chain_loader;
 use super::chain_registry;
+use super::characterize;
+use super::types::CharacterizationResult;
 use super::defaults_adapter;
+use super::extraction_schema;
+use super::ingest;
 use super::question_compiler;
 use super::question_decomposition::{
     self, DecompositionConfig, DecompositionPreview, QuestionTree,
@@ -376,6 +380,10 @@ pub async fn run_question_build(
 ///
 /// This is the P2.2 entry point. The caller provides a natural language question,
 /// and the system decomposes it into sub-questions that shape the pyramid topology.
+///
+/// If `characterization` is Some, the provided characterization is used (user confirmed
+/// or overrode the initial characterization). If None, characterize() is called
+/// automatically before decomposition proceeds.
 pub async fn run_decomposed_build(
     state: &PyramidState,
     slug_name: &str,
@@ -383,6 +391,7 @@ pub async fn run_decomposed_build(
     granularity: u32,
     max_depth: u32,
     from_depth: i64,
+    characterization: Option<CharacterizationResult>,
     cancel: &CancellationToken,
     progress_tx: Option<mpsc::Sender<BuildProgress>>,
 ) -> Result<(String, i32)> {
@@ -395,6 +404,24 @@ pub async fn run_decomposed_build(
     };
 
     let ct_str = content_type.as_str();
+
+    // ── 1b. Characterize if not provided ─────────────────────────────────
+    let llm_config = state.config.read().await.clone();
+
+    let characterization_result = match characterization {
+        Some(c) => {
+            info!(
+                slug = slug_name,
+                material_profile = %c.material_profile,
+                "using provided characterization"
+            );
+            c
+        }
+        None => {
+            info!(slug = slug_name, "running automatic characterization");
+            characterize::characterize(&source_path, apex_question, &llm_config).await?
+        }
+    };
 
     // ── 2. Resolve chains directory ──────────────────────────────────────
     let chains_dir = state
@@ -415,8 +442,6 @@ pub async fn run_decomposed_build(
         folder_map,
     };
 
-    let llm_config = state.config.read().await.clone();
-
     info!(
         slug = slug_name,
         apex = apex_question,
@@ -427,6 +452,29 @@ pub async fn run_decomposed_build(
     );
 
     let tree = question_decomposition::decompose_question(&config, &llm_config).await?;
+
+    // ── 4b. Generate extraction schema from leaf questions ────────────────
+    // This is the critical quality lever (Step 1.3): makes L0 extraction
+    // question-shaped instead of generic. The extraction prompt tells L0
+    // exactly what to look for based on the decomposed questions.
+    let leaf_questions = extraction_schema::collect_leaf_questions(&tree);
+    let leaf_refs: Vec<_> = leaf_questions.into_iter().cloned().collect();
+
+    let ext_schema = extraction_schema::generate_extraction_schema(
+        &leaf_refs,
+        &characterization_result.material_profile,
+        &characterization_result.audience,
+        &characterization_result.tone,
+        &llm_config,
+    )
+    .await?;
+
+    info!(
+        slug = slug_name,
+        topic_fields = ext_schema.topic_schema.len(),
+        extraction_prompt_len = ext_schema.extraction_prompt.len(),
+        "extraction schema generated — L0 will use question-shaped prompts"
+    );
 
     // ── 5. Convert tree to QuestionSet ───────────────────────────────────
     let qs = question_decomposition::question_tree_to_question_set(&tree, ct_str, &chains_dir)?;
@@ -443,8 +491,88 @@ pub async fn run_decomposed_build(
         "starting decomposed question build"
     );
 
-    // ── 7. Execute through the same IR executor ──────────────────────────
-    chain_executor::execute_plan(state, &plan, slug_name, from_depth, cancel, progress_tx).await
+    // ── 7. Patch L0 extraction steps with question-shaped prompt ────────
+    // Instead of modifying the executor, we patch the plan's L0 steps
+    // to use the dynamically generated extraction prompt. This makes L0
+    // extraction question-shaped without changing execute_plan()'s signature.
+    //
+    // CRITICAL: We must also clear instruction_map because the executor's
+    // resolve_ir_instruction() checks instruction_map FIRST. If it finds a
+    // match, it ignores step.instruction entirely. Clearing the map forces
+    // the executor to fall through to step.instruction (our question-shaped prompt).
+    //
+    // ── Heuristic coupling note ──
+    // L0 steps are identified by `storage_directive.depth == Some(0)` combined
+    // with `step.instruction.is_some()`. This coupling exists because we need
+    // to patch L0 extraction steps *outside* chain_executor.rs — the executor
+    // is a general-purpose engine that knows nothing about question-shaped
+    // pyramids. Rather than threading a question-mode flag through the executor's
+    // API (which would leak pyramid-specific concerns into the chain layer),
+    // we intercept the IR plan here in the build runner and rewrite the L0
+    // instructions before the executor ever sees them. The depth+instruction
+    // predicate is sufficient because only L0 extraction steps carry both a
+    // depth-0 storage directive and an instruction body.
+    let mut patched_plan = plan;
+    let extraction_instruction = ext_schema.extraction_prompt.clone();
+    for step in &mut patched_plan.steps {
+        if let Some(ref sd) = step.storage_directive {
+            if sd.depth == Some(0) {
+                step.instruction = Some(extraction_instruction.clone());
+                step.instruction_map = None; // Force question-shaped prompt over file-type dispatch
+            }
+        }
+    }
+
+    info!(
+        slug = slug_name,
+        patched_l0_steps = patched_plan.steps.iter()
+            .filter(|s| s.storage_directive.as_ref().map(|sd| sd.depth == Some(0)).unwrap_or(false))
+            .count(),
+        "patched L0 steps with question-shaped extraction prompt"
+    );
+
+    // ── 8. Ingest source files into chunks (required before executor) ────
+    // The IR executor reads chunks from SQLite. For a fresh slug or changed
+    // source files, we need to ingest first. This is the same ingestion that
+    // the /pyramid/:slug/ingest endpoint and the legacy build path perform.
+    {
+        let slug_info = {
+            let conn = state.reader.lock().await;
+            slug::get_slug(&conn, slug_name)?
+                .ok_or_else(|| anyhow!("Slug '{}' not found", slug_name))?
+        };
+        let paths = slug::resolve_validated_source_paths(
+            &slug_info.source_path,
+            &slug_info.content_type,
+            state.data_dir.as_deref(),
+        )?;
+        let writer = state.writer.clone();
+        let slug_owned = slug_name.to_string();
+        let ct = slug_info.content_type;
+        tokio::task::spawn_blocking(move || {
+            let conn = writer.blocking_lock();
+            for path in &paths {
+                match ct {
+                    ContentType::Code => { ingest::ingest_code(&conn, &slug_owned, path)?; }
+                    ContentType::Conversation => { ingest::ingest_conversation(&conn, &slug_owned, path)?; }
+                    ContentType::Document => { ingest::ingest_docs(&conn, &slug_owned, path)?; }
+                    ContentType::Vine => { return Err(anyhow!("Vine builds use a separate pipeline")); }
+                }
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .map_err(|e| anyhow!("Ingest task panicked: {e}"))??;
+
+        let chunk_count = {
+            let conn = state.reader.lock().await;
+            super::db::count_chunks(&conn, slug_name)?
+        };
+        info!(slug = slug_name, chunks = chunk_count, "ingestion complete");
+    }
+
+    // ── 9. Execute through the IR executor ───────────────────────────────
+    chain_executor::execute_plan(state, &patched_plan, slug_name, from_depth, cancel, progress_tx).await
 }
 
 /// Preview a decomposed question build — returns the question tree and cost estimates

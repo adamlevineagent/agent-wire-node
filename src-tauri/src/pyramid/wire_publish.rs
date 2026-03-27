@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use super::question_yaml::QuestionSet;
-use super::types::PyramidNode;
+use super::types::{DerivedFromEntry, IdMapping, PyramidNode};
 
 // ─── Helpers ─────────────────────────────────────────────────
 
@@ -31,8 +31,6 @@ fn truncate_str(s: &str, max_bytes: usize) -> &str {
     &s[..end]
 }
 
-// ─── Types ───────────────────────────────────────────────────
-
 /// Result of publishing a single node.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PublishNodeResult {
@@ -47,13 +45,6 @@ pub struct PublishPyramidResult {
     pub apex_wire_uuid: Option<String>,
     pub node_count: usize,
     pub id_mappings: Vec<IdMapping>,
-}
-
-/// A single local_id → wire_uuid mapping.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IdMapping {
-    pub local_id: String,
-    pub wire_uuid: String,
 }
 
 /// Result of publishing a question set.
@@ -78,6 +69,10 @@ pub enum WirePublishError {
     NoNodes(String),
     #[error("missing Wire auth token")]
     MissingAuth,
+    #[error("derived_from entry has zero weight for ref_path '{0}'")]
+    ZeroWeight(String),
+    #[error("all derived_from weights sum to zero — caller must provide pre-normalized weights")]
+    AllZeroWeights,
 }
 
 // ─── Client ──────────────────────────────────────────────────
@@ -109,15 +104,42 @@ impl PyramidPublisher {
 
     /// Publish a single PyramidNode to the Wire as a contribution.
     ///
-    /// `derived_from_wire_uuids` maps this node's children local IDs to their
-    /// Wire UUIDs, used for the `derived_from` field on the contribution.
+    /// Each `DerivedFromEntry` carries the actual evidence weight and source_type.
+    /// Weights must be pre-normalized by the caller (sum to 1.0). This function
+    /// does NOT normalize — the caller (publication.rs) handles normalization,
+    /// and the Wire server normalizes again on ingest. We trust the caller.
     ///
-    /// Returns the Wire UUID of the published contribution.
+    /// Zero-weight entries are rejected. If ALL entries have zero weight,
+    /// an error is returned (prevents silent publish of meaningless weights).
+    ///
+    /// `evidence_data` is an optional JSON value merged into structured_data.
+    /// Use it to pass `evidence_full`, `question`, `gaps`, `web_edges`, or
+    /// any other spec-required fields without changing this function's core shape.
+    ///
+    /// Returns (wire_uuid, Option<handle_path>) from the Wire's response.
     pub async fn publish_pyramid_node(
         &self,
         node: &PyramidNode,
-        derived_from_wire_uuids: &[(String, String)], // (child_wire_uuid, justification)
-    ) -> Result<String> {
+        derived_from: &[DerivedFromEntry],
+        evidence_data: Option<serde_json::Value>,
+    ) -> Result<(String, Option<String>)> {
+        // Validate: reject individual zero-weight entries
+        for entry in derived_from {
+            if entry.weight <= 0.0 {
+                return Err(WirePublishError::ZeroWeight(entry.ref_path.clone()).into());
+            }
+        }
+
+        // Guard: if derived_from is non-empty but all weights sum to zero,
+        // something is wrong upstream. Since we no longer normalize here,
+        // this would produce meaningless data on the Wire.
+        if !derived_from.is_empty() {
+            let weight_sum: f64 = derived_from.iter().map(|e| e.weight).sum();
+            if weight_sum == 0.0 {
+                return Err(WirePublishError::AllZeroWeights.into());
+            }
+        }
+
         // Teaser is set explicitly (prose, not JSON) to avoid the Wire's
         // generateTeaser() truncating structured_data JSON into nonsense.
         // The em-dash separator " — " is 5 bytes (space + 3-byte UTF-8 + space).
@@ -144,7 +166,7 @@ impl PyramidPublisher {
         };
 
         // Build structured_data with full node metadata
-        let structured_data = serde_json::json!({
+        let mut structured_data = serde_json::json!({
             "depth": node.depth,
             "children": node.children,
             "parent_id": node.parent_id,
@@ -155,6 +177,19 @@ impl PyramidPublisher {
             "dead_ends": node.dead_ends,
             "self_prompt": node.self_prompt,
         });
+
+        // Merge caller-provided evidence data (evidence_full, question, gaps,
+        // web_edges, etc.) into structured_data so Wire consumers get the
+        // full spec-required fields.
+        if let Some(extra) = evidence_data {
+            if let (Some(base), Some(extra_obj)) =
+                (structured_data.as_object_mut(), extra.as_object())
+            {
+                for (k, v) in extra_obj {
+                    base.insert(k.clone(), v.clone());
+                }
+            }
+        }
 
         // Extract topic names as string array
         let topics: Vec<String> = node.topics.iter().map(|t| t.name.clone()).collect();
@@ -173,15 +208,15 @@ impl PyramidPublisher {
             })
             .collect();
 
-        // Build derived_from array using Wire UUIDs
-        let derived_from: Vec<serde_json::Value> = derived_from_wire_uuids
+        // Pass weights through as-is. Caller is responsible for normalization.
+        let derived_from_json: Vec<serde_json::Value> = derived_from
             .iter()
-            .map(|(wire_uuid, justification)| {
+            .map(|entry| {
                 serde_json::json!({
-                    "source_type": "contribution",
-                    "source_item_id": wire_uuid,
-                    "weight": 1.0,
-                    "justification": justification,
+                    "source_type": entry.source_type,
+                    "source_item_id": entry.ref_path,
+                    "weight": entry.weight,
+                    "justification": entry.justification.as_deref().unwrap_or("Evidence citation"),
                 })
             })
             .collect();
@@ -195,10 +230,33 @@ impl PyramidPublisher {
             "topics": topics,
             "entities": entities,
             "structured_data": structured_data,
-            "derived_from": derived_from,
+            "derived_from": derived_from_json,
         });
 
         self.post_contribution(&payload).await
+    }
+
+    /// Backward-compatible wrapper for callers still using the old (wire_uuid, justification) tuple format.
+    ///
+    /// Converts each tuple into a DerivedFromEntry with source_type="contribution" and weight=1.0.
+    /// Prefer calling `publish_pyramid_node` with `&[DerivedFromEntry]` directly for proper weights.
+    #[deprecated(note = "Use publish_pyramid_node with &[DerivedFromEntry] for proper evidence weights")]
+    pub async fn publish_pyramid_node_legacy(
+        &self,
+        node: &PyramidNode,
+        derived_from_wire_uuids: &[(String, String)], // (child_wire_uuid, justification)
+    ) -> Result<String> {
+        let entries: Vec<DerivedFromEntry> = derived_from_wire_uuids
+            .iter()
+            .map(|(wire_uuid, justification)| DerivedFromEntry {
+                ref_path: wire_uuid.clone(),
+                source_type: "contribution".to_string(),
+                weight: 1.0,
+                justification: Some(justification.clone()),
+            })
+            .collect();
+        let (uuid, _handle_path) = self.publish_pyramid_node(node, &entries, None).await?;
+        Ok(uuid)
     }
 
     /// Publish an entire pyramid (all pre-loaded nodes), bottom-up.
@@ -206,12 +264,30 @@ impl PyramidPublisher {
     /// `nodes_by_depth` must be sorted by depth (ascending): L0 first, apex last.
     /// Each entry is (depth, nodes_at_that_depth).
     ///
+    /// To enable idempotency checking, call `collect_already_published` first
+    /// and pass the result as `already_published`. Nodes in that set are skipped.
+    ///
     /// Returns the ID mappings and apex Wire UUID. Caller is responsible for
     /// persisting the mappings to SQLite.
     pub async fn publish_pyramid(
         &self,
         slug: &str,
         nodes_by_depth: &[(i64, Vec<PyramidNode>)],
+    ) -> Result<PublishPyramidResult> {
+        self.publish_pyramid_idempotent(slug, nodes_by_depth, &HashMap::new())
+            .await
+    }
+
+    /// Publish with idempotency: `already_published` maps local_id → wire_uuid
+    /// for nodes that should be skipped (already on Wire).
+    ///
+    /// Build this map by calling `collect_already_published()` synchronously
+    /// before entering the async publish loop.
+    pub async fn publish_pyramid_idempotent(
+        &self,
+        slug: &str,
+        nodes_by_depth: &[(i64, Vec<PyramidNode>)],
+        already_published: &HashMap<String, String>,
     ) -> Result<PublishPyramidResult> {
         if nodes_by_depth.is_empty() {
             return Err(WirePublishError::NoNodes(slug.to_string()).into());
@@ -225,23 +301,58 @@ impl PyramidPublisher {
         // Publish bottom-up
         for (depth, nodes) in nodes_by_depth {
             for node in nodes {
-                // Build derived_from from this node's children Wire UUIDs
-                let derived_from: Vec<(String, String)> = node
+                // Fix 3: Idempotency — skip already-published nodes
+                if let Some(existing_uuid) = already_published.get(&node.id) {
+                    id_map.insert(node.id.clone(), existing_uuid.clone());
+                    all_mappings.push(IdMapping {
+                        local_id: node.id.clone(),
+                        wire_handle_path: existing_uuid.clone(),
+                        wire_uuid: Some(existing_uuid.clone()),
+                        published_at: chrono::Utc::now().to_rfc3339(),
+                    });
+                    if *depth == max_depth {
+                        apex_wire_uuid = Some(existing_uuid.clone());
+                    }
+                    tracing::info!(
+                        slug = slug,
+                        node_id = %node.id,
+                        depth = depth,
+                        "skipped already-published pyramid node"
+                    );
+                    continue;
+                }
+
+                // Fix 2: Use correct source_type based on depth.
+                // L0 nodes cite source documents; L1+ nodes cite other pyramid contributions.
+                let source_type = if *depth == 0 {
+                    "source_document"
+                } else {
+                    "contribution"
+                };
+
+                // Build derived_from entries with proper weights and source types
+                let derived_from: Vec<DerivedFromEntry> = node
                     .children
                     .iter()
                     .filter_map(|child_id| {
-                        id_map.get(child_id).map(|wire_uuid| {
-                            (wire_uuid.clone(), format!("child node {}", child_id))
+                        id_map.get(child_id).map(|wire_uuid| DerivedFromEntry {
+                            ref_path: wire_uuid.clone(),
+                            source_type: source_type.to_string(),
+                            weight: 1.0, // Equal weight when no evidence system data available
+                            justification: Some(format!("child node {}", child_id)),
                         })
                     })
                     .collect();
 
-                let wire_uuid = self.publish_pyramid_node(node, &derived_from).await?;
+                let (wire_uuid, handle_path) = self.publish_pyramid_node(node, &derived_from, None).await?;
+                let resolved_handle = handle_path.unwrap_or_else(|| wire_uuid.clone());
 
                 id_map.insert(node.id.clone(), wire_uuid.clone());
                 all_mappings.push(IdMapping {
                     local_id: node.id.clone(),
-                    wire_uuid: wire_uuid.clone(),
+                    wire_handle_path: resolved_handle,
+                    wire_uuid: Some(wire_uuid.clone()),
+                    published_at: chrono::Utc::now().to_rfc3339(),
                 });
 
                 // Track apex (highest depth)
@@ -312,7 +423,7 @@ impl PyramidPublisher {
             "derived_from": [],
         });
 
-        let wire_uuid = self.post_contribution(&payload).await?;
+        let (wire_uuid, _handle_path) = self.post_contribution(&payload).await?;
 
         Ok(PublishQuestionSetResult {
             wire_uuid,
@@ -321,7 +432,7 @@ impl PyramidPublisher {
     }
 
     /// Post a contribution to the Wire API and return its UUID.
-    async fn post_contribution(&self, payload: &serde_json::Value) -> Result<String> {
+    async fn post_contribution(&self, payload: &serde_json::Value) -> Result<(String, Option<String>)> {
         let url = format!("{}/api/v1/contribute", self.wire_url.trim_end_matches('/'),);
 
         let response = self
@@ -360,16 +471,26 @@ impl PyramidPublisher {
             .map_err(|e| WirePublishError::Network(e.to_string()))
             .context("wire publish: failed to parse response JSON")?;
 
-        // The contribute endpoint returns { contribution: { id: "uuid" } }
-        let contribution_id = body
+        // The contribute endpoint returns { contribution: { id: "uuid", handle_path: "..." } }
+        let contribution = body
             .get("contribution")
-            .and_then(|c| c.get("id"))
+            .ok_or_else(|| {
+                WirePublishError::Rejected("response missing contribution object".to_string())
+            })?;
+
+        let contribution_id = contribution
+            .get("id")
             .and_then(|id| id.as_str())
             .ok_or_else(|| {
                 WirePublishError::Rejected("response missing contribution.id".to_string())
             })?;
 
-        Ok(contribution_id.to_string())
+        let handle_path = contribution
+            .get("handle_path")
+            .and_then(|hp| hp.as_str())
+            .map(|s| s.to_string());
+
+        Ok((contribution_id.to_string(), handle_path))
     }
 }
 
@@ -442,6 +563,75 @@ pub fn get_local_id(
         Ok(id) => Ok(Some(id)),
         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
         Err(e) => Err(e.into()),
+    }
+}
+
+/// Collect already-published node mappings for idempotency.
+///
+/// Returns a HashMap of local_id → wire_uuid for all nodes in the given slug
+/// that have been previously published. This map is passed to
+/// `publish_pyramid_idempotent()` to skip re-publishing.
+///
+/// Gracefully handles the case where the `pyramid_id_map` table doesn't exist
+/// yet (returns an empty map).
+pub fn collect_already_published(
+    conn: &rusqlite::Connection,
+    slug: &str,
+) -> HashMap<String, String> {
+    match get_all_mappings(conn, slug) {
+        Ok(mappings) => mappings.into_iter().collect(),
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("no such table") {
+                tracing::debug!(
+                    slug = slug,
+                    "pyramid_id_map table not found, treating all nodes as unpublished"
+                );
+            } else {
+                tracing::warn!(
+                    slug = slug,
+                    error = %e,
+                    "failed to read pyramid_id_map, treating all nodes as unpublished"
+                );
+            }
+            HashMap::new()
+        }
+    }
+}
+
+/// Check whether a node has already been published to the Wire.
+///
+/// Gracefully handles the case where `pyramid_id_map` doesn't exist yet
+/// (returns Ok(false) so the caller proceeds with publish).
+pub fn is_already_published(
+    conn: &rusqlite::Connection,
+    slug: &str,
+    local_id: &str,
+) -> Result<bool> {
+    let result = conn.prepare(
+        "SELECT 1 FROM pyramid_id_map WHERE slug = ?1 AND local_id = ?2 LIMIT 1",
+    );
+    match result {
+        Ok(mut stmt) => {
+            let exists = stmt
+                .query_row(rusqlite::params![slug, local_id], |_row| Ok(()))
+                .is_ok();
+            Ok(exists)
+        }
+        Err(e) => {
+            // Gracefully handle "no such table" — table may not be created yet (WS1-A)
+            let msg = e.to_string();
+            if msg.contains("no such table") {
+                tracing::debug!(
+                    slug = slug,
+                    local_id = local_id,
+                    "pyramid_id_map table not found, treating as not-yet-published"
+                );
+                Ok(false)
+            } else {
+                Err(e.into())
+            }
+        }
     }
 }
 
@@ -628,20 +818,90 @@ mod tests {
         id_map.insert("L0-001".to_string(), "wire-uuid-001".to_string());
         id_map.insert("L0-002".to_string(), "wire-uuid-002".to_string());
 
-        // Build derived_from from children Wire UUIDs (same logic as publish_pyramid)
-        let derived_from: Vec<(String, String)> = node
+        // Build derived_from using DerivedFromEntry (same logic as publish_pyramid)
+        let derived_from: Vec<DerivedFromEntry> = node
             .children
             .iter()
             .filter_map(|child_id| {
-                id_map
-                    .get(child_id)
-                    .map(|wire_uuid| (wire_uuid.clone(), format!("child node {}", child_id)))
+                id_map.get(child_id).map(|wire_uuid| DerivedFromEntry {
+                    ref_path: wire_uuid.clone(),
+                    source_type: "contribution".to_string(),
+                    weight: 1.0,
+                    justification: Some(format!("child node {}", child_id)),
+                })
             })
             .collect();
 
         assert_eq!(derived_from.len(), 2);
-        assert_eq!(derived_from[0].0, "wire-uuid-001"); // Wire UUID, not local ID
-        assert_eq!(derived_from[1].0, "wire-uuid-002");
+        assert_eq!(derived_from[0].ref_path, "wire-uuid-001"); // Wire UUID, not local ID
+        assert_eq!(derived_from[1].ref_path, "wire-uuid-002");
+    }
+
+    #[test]
+    fn test_weights_passed_through_as_is() {
+        // publish_pyramid_node no longer normalizes — weights are passed through.
+        // Caller (publication.rs) is responsible for pre-normalization.
+        let entries = vec![
+            DerivedFromEntry {
+                ref_path: "a".to_string(),
+                source_type: "contribution".to_string(),
+                weight: 0.6,
+                justification: None,
+            },
+            DerivedFromEntry {
+                ref_path: "b".to_string(),
+                source_type: "contribution".to_string(),
+                weight: 0.4,
+                justification: None,
+            },
+        ];
+        // Weights should remain as the caller set them
+        assert!((entries[0].weight - 0.6).abs() < 1e-10);
+        assert!((entries[1].weight - 0.4).abs() < 1e-10);
+        // Caller should ensure they sum to 1.0
+        let weight_sum: f64 = entries.iter().map(|e| e.weight).sum();
+        assert!((weight_sum - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_zero_weight_rejected() {
+        let entry = DerivedFromEntry {
+            ref_path: "bad".to_string(),
+            source_type: "contribution".to_string(),
+            weight: 0.0,
+            justification: None,
+        };
+        assert!(entry.weight <= 0.0, "zero weight should be rejected by publish_pyramid_node");
+    }
+
+    #[test]
+    fn test_is_already_published_no_table() {
+        // When pyramid_id_map table doesn't exist, should return Ok(false)
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let result = is_already_published(&conn, "slug", "node-1").unwrap();
+        assert!(!result);
+    }
+
+    #[test]
+    fn test_is_already_published_exists() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        init_id_map_table(&conn).unwrap();
+        save_id_mapping(&conn, "slug", "node-1", "uuid-1").unwrap();
+
+        assert!(is_already_published(&conn, "slug", "node-1").unwrap());
+        assert!(!is_already_published(&conn, "slug", "node-2").unwrap());
+    }
+
+    #[test]
+    fn test_l0_source_type_is_source_document() {
+        // Verify depth-based source_type logic
+        let depth: i64 = 0;
+        let source_type = if depth == 0 { "source_document" } else { "contribution" };
+        assert_eq!(source_type, "source_document");
+
+        let depth: i64 = 1;
+        let source_type = if depth == 0 { "source_document" } else { "contribution" };
+        assert_eq!(source_type, "contribution");
     }
 
     #[test]

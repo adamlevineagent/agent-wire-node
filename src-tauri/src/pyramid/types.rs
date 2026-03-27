@@ -7,6 +7,7 @@
 //        PyramidBatch, PendingMutation, AutoUpdateConfig, StaleCheckResult, etc.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SlugInfo {
@@ -611,4 +612,242 @@ pub struct BunchDiscovery {
     pub first_ts: String,
     pub last_ts: String,
     pub message_count: i64,
+}
+
+// ── Evidence System Types (Phase 1 — Question Pyramid) ────────────────────────
+
+/// Verdict for an evidence link between two pyramid nodes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum EvidenceVerdict {
+    Keep,
+    Disconnect,
+    Missing,
+}
+
+impl EvidenceVerdict {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            EvidenceVerdict::Keep => "KEEP",
+            EvidenceVerdict::Disconnect => "DISCONNECT",
+            EvidenceVerdict::Missing => "MISSING",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "KEEP" => EvidenceVerdict::Keep,
+            "DISCONNECT" => EvidenceVerdict::Disconnect,
+            "MISSING" => EvidenceVerdict::Missing,
+            other => {
+                tracing::warn!("Unknown evidence verdict: '{other}', defaulting to Keep");
+                EvidenceVerdict::Keep
+            }
+        }
+    }
+}
+
+/// A weighted evidence link between a source node (evidence provider) and a
+/// target node (question answerer).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvidenceLink {
+    pub slug: String,
+    pub source_node_id: String,   // child node (evidence provider)
+    pub target_node_id: String,   // parent node (question answerer)
+    pub verdict: EvidenceVerdict,
+    pub weight: Option<f64>,      // 0.0-1.0, None for DISCONNECT/MISSING
+    pub reason: Option<String>,
+}
+
+// ── Evidence Answering Types (Phase 1, Steps 3.1–3.2) ─────────────────────────
+
+/// A question for a specific layer of the pyramid, produced by the question compiler.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LayerQuestion {
+    pub question_id: String,
+    pub question_text: String,
+    pub layer: i64,
+    /// What this question is about (e.g., "trust boundaries", "error handling").
+    pub about: String,
+    /// What answering this question creates (e.g., "a synthesized view of auth flow").
+    pub creates: String,
+}
+
+/// Result of the horizontal pre-mapping step: question_id → candidate node IDs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CandidateMap {
+    pub mappings: HashMap<String, Vec<String>>,
+}
+
+/// A question that has been answered with evidence verdicts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnsweredNode {
+    /// The pyramid node created from answering the question.
+    pub node: PyramidNode,
+    /// Evidence links (KEEP/DISCONNECT verdicts) from the answering step.
+    pub evidence: Vec<EvidenceLink>,
+    /// Descriptions of missing evidence the LLM wished it had.
+    pub missing: Vec<String>,
+}
+
+// ── Characterization ──────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CharacterizationResult {
+    pub material_profile: String,
+    pub interpreted_question: String,
+    pub audience: String,
+    pub tone: String,
+}
+
+// ── Reconciliation ────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReconciliationResult {
+    pub orphans: Vec<String>,              // node IDs never referenced
+    pub gaps: Vec<GapReport>,              // MISSING evidence reports
+    pub central_nodes: Vec<String>,        // high-citation nodes
+    pub weight_map: HashMap<String, f64>,  // node_id → aggregate weight
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GapReport {
+    pub question_id: String,
+    pub description: String,
+    pub layer: i64,
+}
+
+// ── Publication ───────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PublicationManifest {
+    pub slug: String,
+    pub layer: i64,
+    pub nodes_to_publish: Vec<String>,  // non-orphan node IDs
+    pub skipped_orphans: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdMapping {
+    pub local_id: String,
+    pub wire_handle_path: String,
+    pub wire_uuid: Option<String>,
+    pub published_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DerivedFromEntry {
+    pub ref_path: String,           // handle-path or corpus path
+    pub source_type: String,        // "contribution" or "source_document"
+    pub weight: f64,                // 0.0-1.0
+    pub justification: Option<String>,
+}
+
+// ── Extraction Schema (Phase 1, Step 1.3 — Dynamic Prompt Generation) ─────────
+
+/// Dynamic extraction schema generated from leaf questions BEFORE L0 extraction.
+/// This is the critical quality lever — makes extraction question-shaped instead of generic.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExtractionSchema {
+    /// Question-shaped extraction prompt: tells L0 exactly what to look for in each source file.
+    /// NOT "list every function" — specifically what the downstream questions need.
+    pub extraction_prompt: String,
+    /// Topic fields that each extracted node should contain. Varies by question domain.
+    pub topic_schema: Vec<TopicField>,
+    /// Orientation guidance: how detailed, what tone, what to emphasize.
+    pub orientation_guidance: String,
+}
+
+/// A field in the dynamic topic schema.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TopicField {
+    /// Machine-friendly name (e.g., "trust_boundaries", "user_features").
+    pub name: String,
+    /// Human-readable description of what this field captures.
+    pub description: String,
+    /// Whether this field must be present in every extracted node.
+    pub required: bool,
+}
+
+/// Per-layer synthesis prompts generated AFTER L0 extraction, BEFORE L1 answering.
+/// References actual extracted evidence so synthesis is grounded.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SynthesisPrompts {
+    /// Prompt for the pre-mapping step (organizing L0 nodes under questions).
+    pub pre_mapping_prompt: String,
+    /// Prompt for the answering step (synthesizing L0 evidence into L1 answers).
+    pub answering_prompt: String,
+    /// Prompt for web edge discovery between answered questions.
+    pub web_edge_prompt: String,
+}
+
+// ── Source Delta (file-level, NOT thread-level) ───────────────────────────────
+
+/// A file-level source delta for crystallization tracking.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SourceDelta {
+    pub id: i64,
+    pub slug: String,
+    pub file_path: String,
+    pub change_type: String,
+    pub diff_summary: Option<String>,
+    pub processed: bool,
+    pub created_at: String,
+}
+
+// ── Staleness Queue ───────────────────────────────────────────────────────────
+
+/// An item in the staleness re-answer queue.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StalenessItem {
+    pub id: i64,
+    pub slug: String,
+    pub question_id: String,
+    pub reason: String,
+    pub channel: String,
+    pub priority: f64,
+    pub created_at: String,
+}
+
+// ── Belief Supersession Types (Channel B) ─────────────────────────────────────
+
+/// A contradiction detected by LLM analysis when source content changes.
+/// Represents a specific claim in the pyramid that is now false.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Contradiction {
+    /// The claim in the existing pyramid extraction that is now false.
+    pub superseded_claim: String,
+    /// What the source now says instead.
+    pub corrected_to: String,
+    /// LLM confidence that this is a genuine contradiction (0.0-1.0).
+    pub confidence: f64,
+    /// The L0 node ID that contained the superseded claim.
+    pub source_node_id: String,
+}
+
+/// Trace of all pyramid nodes affected by one or more contradictions.
+/// Unlike Channel A (staleness), this trace does NOT attenuate through layers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupersessionTrace {
+    /// The contradictions that triggered this trace.
+    pub contradictions: Vec<Contradiction>,
+    /// Every node in the pyramid affected by these contradictions.
+    pub affected_nodes: Vec<AffectedNode>,
+    /// Total count of affected nodes (convenience field).
+    pub total_nodes_affected: usize,
+    /// The deepest layer reached during the trace.
+    pub max_depth_reached: i64,
+}
+
+/// A single pyramid node affected by a belief supersession.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AffectedNode {
+    /// The pyramid node ID that contains the superseded claim.
+    pub node_id: String,
+    /// How many layers above the source L0 node this is.
+    pub depth: i64,
+    /// The specific superseded claim text found in this node.
+    pub contains_claim: String,
+    /// Trace path from the source node to this node: [L0-id, L1-id, ...].
+    pub path_from_source: Vec<String>,
 }
