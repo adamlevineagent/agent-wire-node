@@ -724,6 +724,7 @@ mod tests {
                 {
                     let mut s = make_chain_step("thread_clustering", "classify");
                     s.input = Some(json!({ "topics": "$l0_code_extract" }));
+                    s.compact_inputs = true; // Use headlines+topics only, not full distilled
                     s.model = Some("qwen/qwen3.5-flash-02-23".to_string());
                     s.response_schema = Some(json!({ "type": "object" }));
                     s.on_error = Some("retry(3)".to_string());
@@ -814,6 +815,7 @@ mod tests {
                     s.input = Some(
                         json!({ "topics": "$l0_doc_extract", "classification": "$doc_classify" }),
                     );
+                    s.compact_inputs = true; // Use headlines+topics only, not full distilled
                     s.model = Some("qwen/qwen3.5-flash-02-23".to_string());
                     s.response_schema = Some(json!({ "type": "object" }));
                     s.on_error = Some("retry(3)".to_string());

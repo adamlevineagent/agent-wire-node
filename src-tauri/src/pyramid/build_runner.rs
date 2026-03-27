@@ -12,7 +12,7 @@ use std::sync::atomic::Ordering;
 use anyhow::{anyhow, Result};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use super::build::{self, WriteOp};
 use super::chain_executor;
@@ -426,15 +426,45 @@ pub async fn run_decomposed_build(
         }
     };
 
-    // ── 2. Resolve chains directory ──────────────────────────────────────
-    let chains_dir = state
-        .data_dir
-        .as_ref()
-        .ok_or_else(|| anyhow!("data_dir not set on PyramidState"))?
-        .join("chains");
+    // ── 3. Ensure base pyramid exists (overlay architecture) ──────────────
+    // Question pyramids are OVERLAYS on an existing mechanical pyramid.
+    // The base pyramid's L0 nodes are the canonical extraction — comprehensive,
+    // question-independent. If no L0 nodes exist, we need to build the base first.
+    let base_l0_nodes = {
+        let conn = state.reader.lock().await;
+        db::get_nodes_at_depth(&conn, slug_name, 0)?
+    };
 
-    // ── 3. Build folder map from source path for LLM context ─────────────
-    let folder_map = question_decomposition::build_folder_map(&source_path);
+    if base_l0_nodes.is_empty() {
+        info!(slug = slug_name, "no base L0 nodes found — running mechanical build first");
+        // Run the mechanical build to create the base pyramid
+        let (write_tx, _write_rx) = tokio::sync::mpsc::channel::<WriteOp>(512);
+        run_build(state, slug_name, cancel, progress_tx.clone(), &write_tx).await?;
+
+        // Reload L0 nodes after mechanical build
+        let conn = state.reader.lock().await;
+        let fresh_l0 = db::get_nodes_at_depth(&conn, slug_name, 0)?;
+        info!(slug = slug_name, l0_count = fresh_l0.len(), "base pyramid built — L0 nodes available");
+        drop(conn);
+    } else {
+        info!(slug = slug_name, l0_count = base_l0_nodes.len(), "base pyramid exists — using as overlay base");
+    }
+
+    // Build decomposition context from base pyramid L0 summaries (not folder map)
+    // This gives the decomposer actual content knowledge, not just file names
+    let base_l0_for_context = {
+        let conn = state.reader.lock().await;
+        db::get_nodes_at_depth(&conn, slug_name, 0)?
+    };
+    let l0_context = base_l0_for_context.iter()
+        .map(|n| format!("- {}: {} — {}", n.id, n.headline,
+            if n.distilled.len() > 200 { &n.distilled[..200] } else { &n.distilled }))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let decomp_context = format!(
+        "Source material ({} extracted summaries from the base knowledge pyramid):\n{}",
+        base_l0_for_context.len(), l0_context
+    );
 
     // ── 4. Decompose the apex question into a question tree ──────────────
     let config = DecompositionConfig {
@@ -442,7 +472,7 @@ pub async fn run_decomposed_build(
         content_type: ct_str.to_string(),
         granularity,
         max_depth,
-        folder_map,
+        folder_map: Some(decomp_context), // Pass L0 summaries instead of folder listing
     };
 
     info!(
@@ -454,9 +484,31 @@ pub async fn run_decomposed_build(
         "starting question decomposition"
     );
 
-    let tree = question_decomposition::decompose_question(&config, &llm_config).await?;
+    // Check for existing partial tree (resume support)
+    let existing_node_count = {
+        let conn = state.reader.lock().await;
+        db::count_question_nodes(&conn, slug_name).unwrap_or(0)
+    };
+    if existing_node_count > 0 {
+        info!(
+            slug = slug_name,
+            existing_nodes = existing_node_count,
+            "found existing question nodes — will resume decomposition"
+        );
+    }
 
-    // Persist question tree so it survives crashes and can be inspected post-build
+    let mut tree = question_decomposition::decompose_question_incremental(
+        &config,
+        &llm_config,
+        state.writer.clone(),
+        slug_name,
+    )
+    .await?;
+
+    // Attach the audience from characterization so it flows through all downstream prompts
+    tree.audience = Some(characterization_result.audience.clone());
+
+    // Also persist as the legacy JSON blob for backward compat
     {
         let tree_json = serde_json::to_value(&tree)?;
         let conn = state.writer.clone();
@@ -493,134 +545,16 @@ pub async fn run_decomposed_build(
         "extraction schema generated — L0 will use question-shaped prompts"
     );
 
-    // ── 5. Convert tree to QuestionSet ───────────────────────────────────
-    let qs = question_decomposition::question_tree_to_question_set(&tree, ct_str, &chains_dir)?;
-
-    // ── 6. Compile to ExecutionPlan ──────────────────────────────────────
-    let plan = question_compiler::compile_question_set(&qs, &chains_dir)?;
-
-    info!(
-        slug = slug_name,
-        content_type = ct_str,
-        ir_steps = plan.steps.len(),
-        estimated_nodes = plan.total_estimated_nodes,
-        from_depth = from_depth,
-        "starting decomposed question build"
-    );
-
-    // ── 7. Patch L0 extraction steps with question-shaped prompt ────────
-    // Instead of modifying the executor, we patch the plan's L0 steps
-    // to use the dynamically generated extraction prompt. This makes L0
-    // extraction question-shaped without changing execute_plan()'s signature.
+    // ── 5. Overlay architecture: skip L0 extraction, go straight to evidence loop ──
+    // The base pyramid's L0 nodes ARE the canonical extraction.
+    // The question pyramid is an OVERLAY — it creates answer layers (L1+) on top
+    // of the existing base, without re-extracting source material.
     //
-    // CRITICAL: We must also clear instruction_map because the executor's
-    // resolve_ir_instruction() checks instruction_map FIRST. If it finds a
-    // match, it ignores step.instruction entirely. Clearing the map forces
-    // the executor to fall through to step.instruction (our question-shaped prompt).
-    //
-    // ── Heuristic coupling note ──
-    // L0 steps are identified by `storage_directive.depth == Some(0)` combined
-    // with `step.instruction.is_some()`. This coupling exists because we need
-    // to patch L0 extraction steps *outside* chain_executor.rs — the executor
-    // is a general-purpose engine that knows nothing about question-shaped
-    // pyramids. Rather than threading a question-mode flag through the executor's
-    // API (which would leak pyramid-specific concerns into the chain layer),
-    // we intercept the IR plan here in the build runner and rewrite the L0
-    // instructions before the executor ever sees them. The depth+instruction
-    // predicate is sufficient because only L0 extraction steps carry both a
-    // depth-0 storage directive and an instruction body.
-    let mut patched_plan = plan;
-    let extraction_instruction = ext_schema.extraction_prompt.clone();
-    for step in &mut patched_plan.steps {
-        if let Some(ref sd) = step.storage_directive {
-            if sd.depth == Some(0) {
-                step.instruction = Some(extraction_instruction.clone());
-                step.instruction_map = None; // Force question-shaped prompt over file-type dispatch
-            }
-        }
-    }
-
-    info!(
-        slug = slug_name,
-        patched_l0_steps = patched_plan.steps.iter()
-            .filter(|s| s.storage_directive.as_ref().map(|sd| sd.depth == Some(0)).unwrap_or(false))
-            .count(),
-        "patched L0 steps with question-shaped extraction prompt"
-    );
-
-    // ── 8. Ingest source files into chunks (required before executor) ────
-    // The IR executor reads chunks from SQLite. For a fresh slug or changed
-    // source files, we need to ingest first. This is the same ingestion that
-    // the /pyramid/:slug/ingest endpoint and the legacy build path perform.
-    {
-        let slug_info = {
-            let conn = state.reader.lock().await;
-            slug::get_slug(&conn, slug_name)?
-                .ok_or_else(|| anyhow!("Slug '{}' not found", slug_name))?
-        };
-        let paths = slug::resolve_validated_source_paths(
-            &slug_info.source_path,
-            &slug_info.content_type,
-            state.data_dir.as_deref(),
-        )?;
-        let writer = state.writer.clone();
-        let slug_owned = slug_name.to_string();
-        let ct = slug_info.content_type;
-        tokio::task::spawn_blocking(move || {
-            let conn = writer.blocking_lock();
-            for path in &paths {
-                match ct {
-                    ContentType::Code => { ingest::ingest_code(&conn, &slug_owned, path)?; }
-                    ContentType::Conversation => { ingest::ingest_conversation(&conn, &slug_owned, path)?; }
-                    ContentType::Document => { ingest::ingest_docs(&conn, &slug_owned, path)?; }
-                    ContentType::Vine => { return Err(anyhow!("Vine builds use a separate pipeline")); }
-                }
-            }
-            Ok::<(), anyhow::Error>(())
-        })
-        .await
-        .map_err(|e| anyhow!("Ingest task panicked: {e}"))??;
-
-        let chunk_count = {
-            let conn = state.reader.lock().await;
-            super::db::count_chunks(&conn, slug_name)?
-        };
-        info!(slug = slug_name, chunks = chunk_count, "ingestion complete");
-    }
-
-    // ── 9. Filter plan to L0-only steps and execute ────────────────────
-    // Under the evidence pipeline, the IR executor only handles L0 extraction.
-    // Upper layers (L1+) are built by the evidence-weighted answering loop below.
-    let l0_plan = {
-        let mut filtered = patched_plan.clone();
-        filtered.steps.retain(|step| {
-            match &step.storage_directive {
-                None => true, // Keep setup steps without storage directives
-                Some(sd) => {
-                    // Exclude apex (depth 99 or APEX pattern) and all non-L0 steps
-                    if sd.node_id_pattern.as_deref() == Some("APEX") {
-                        return false;
-                    }
-                    sd.depth == Some(0)
-                }
-            }
-        });
-        // Strip dangling depends_on references (deps on removed non-L0 steps)
-        let kept_ids: std::collections::HashSet<String> =
-            filtered.steps.iter().map(|s| s.id.clone()).collect();
-        for step in &mut filtered.steps {
-            let before = step.depends_on.len();
-            step.depends_on.retain(|dep| kept_ids.contains(dep));
-            if step.depends_on.len() < before {
-                warn!(
-                    step_id = %step.id,
-                    removed = before - step.depends_on.len(),
-                    "L0 filter: stripped dangling dependency references"
-                );
-            }
-        }
-        filtered
-    };
+    // This means:
+    // - No IR executor call needed (no L0 extraction, no plan compilation)
+    // - No chunk ingestion needed (base pyramid already did this)
+    // - Second question on same corpus = instant (no re-extraction)
+    // - The evidence loop reads base L0 directly
 
     // Record build start
     let build_id = format!("qb-{}", uuid::Uuid::new_v4());
@@ -631,7 +565,7 @@ pub async fn run_decomposed_build(
         let slug_owned = slug_name.to_string();
         let bid = build_id.clone();
         let q = apex_question.to_string();
-        let ml = max_layer + 1; // total_layers = max_layer_index + 1 (L0 through Lmax)
+        let ml = max_layer + 1;
         tokio::task::spawn_blocking(move || {
             let c = conn.blocking_lock();
             local_store::save_build_start(&c, &slug_owned, &bid, &q, ml)?;
@@ -641,51 +575,22 @@ pub async fn run_decomposed_build(
         .map_err(|e| anyhow!("Build start save panicked: {e}"))??;
     }
 
-    // Clean up prior build artifacts and run L0 extraction (or skip if from_depth > 0)
-    if from_depth == 0 {
-        // Full rebuild: clear ALL evidence, gaps, and upper-layer nodes
+    // Clean up any prior overlay nodes (L1+) but keep base L0
+    {
         let conn = state.writer.clone();
         let slug_owned = slug_name.to_string();
         tokio::task::spawn_blocking(move || {
             let c = conn.blocking_lock();
             db::clear_evidence_for_slug(&c, &slug_owned)?;
             c.execute("DELETE FROM pyramid_gaps WHERE slug = ?1", rusqlite::params![&slug_owned])?;
-            db::delete_nodes_above(&c, &slug_owned, -1)?; // Delete ALL nodes (depth > -1 = all)
+            db::delete_nodes_above(&c, &slug_owned, 0)?; // Delete L1+ overlay, keep base L0
             Ok::<(), anyhow::Error>(())
         })
         .await
-        .map_err(|e| anyhow!("Evidence cleanup panicked: {e}"))??;
-
-        let _ = chain_executor::execute_plan(
-            state, &l0_plan, slug_name, from_depth, cancel, progress_tx.clone(),
-        )
-        .await?;
-    } else {
-        // Partial rebuild: clear only evidence/gaps/nodes at from_depth and above
-        // IMPORTANT: Scope evidence clearing to affected layers only — preserve L0 evidence
-        let fd = from_depth;
-        let conn = state.writer.clone();
-        let slug_owned = slug_name.to_string();
-        tokio::task::spawn_blocking(move || {
-            let c = conn.blocking_lock();
-            // Only clear evidence for nodes at or above from_depth
-            c.execute(
-                "DELETE FROM pyramid_evidence WHERE slug = ?1 AND target_node_id IN \
-                 (SELECT id FROM pyramid_nodes WHERE slug = ?1 AND depth >= ?2)",
-                rusqlite::params![&slug_owned, fd],
-            )?;
-            c.execute("DELETE FROM pyramid_gaps WHERE slug = ?1 AND layer >= ?2",
-                rusqlite::params![&slug_owned, fd])?;
-            db::delete_nodes_above(&c, &slug_owned, fd - 1)?;
-            Ok::<(), anyhow::Error>(())
-        })
-        .await
-        .map_err(|e| anyhow!("Partial cleanup panicked: {e}"))??;
-
-        info!(slug = slug_name, from_depth, "skipping L0 extraction (reusing existing L0 nodes)");
+        .map_err(|e| anyhow!("Overlay cleanup panicked: {e}"))??;
     }
 
-    info!(slug = slug_name, "L0 phase complete — starting evidence loop");
+    info!(slug = slug_name, "overlay mode — using base pyramid L0, starting evidence loop");
 
     // ── 10. Evidence-weighted upper layer loop ───────────────────────────
     // Load L0 nodes and generate synthesis prompts
@@ -693,16 +598,25 @@ pub async fn run_decomposed_build(
         let conn = state.reader.lock().await;
         db::get_nodes_at_depth(&conn, slug_name, 0)?
     };
+    info!(slug = slug_name, l0_count = l0_nodes.len(), "loaded L0 nodes for evidence loop");
 
     let l0_summary = evidence_answering::build_l0_summary(&l0_nodes);
+    info!(slug = slug_name, summary_len = l0_summary.len(), "built L0 summary");
 
-    let synth_prompts = extraction_schema::generate_synthesis_prompts(
+    let synth_prompts = match extraction_schema::generate_synthesis_prompts(
         &tree,
         &l0_summary,
         &ext_schema,
+        tree.audience.as_deref(),
         &llm_config,
     )
-    .await?;
+    .await {
+        Ok(p) => p,
+        Err(e) => {
+            error!(slug = slug_name, error = %e, "generate_synthesis_prompts failed");
+            return Err(e);
+        }
+    };
 
     info!(
         slug = slug_name,
@@ -771,6 +685,7 @@ pub async fn run_decomposed_build(
             &candidate_map,
             &lower_nodes,
             Some(&synth_prompts.answering_prompt),
+            tree.audience.as_deref(),
             &llm_config,
             slug_name,
         )

@@ -82,18 +82,29 @@ Respond in JSON with exactly these fields:
 
 The topic_schema should have 3-8 fields that are specific to this question domain. Generic fields like "summary" or "key_points" are NOT useful. Fields should map to what the questions need.
 
+CRITICAL — AUDIENCE-AWARE EXTRACTION:
+The extraction prompt you generate MUST shape the output for the target audience specified below. If the audience is non-technical (e.g., "a smart high school graduate"), the extraction directives should instruct the extractor to:
+- Describe WHAT each thing does and WHY it matters to a user, not just its technical implementation
+- Avoid jargon — use plain language explanations
+- Focus on purpose, behavior, and user-facing value over internal mechanics
+- When technical terms are unavoidable, include brief plain-language definitions
+
+If the audience IS technical, the extraction can use appropriate technical vocabulary freely.
+
 Return ONLY the JSON object, no other text."#;
 
     let user_prompt = format!(
         r#"Material: {material_profile}
-Audience: {audience}
+Target audience: {audience}
 Tone: {tone}
 
 The pyramid needs to answer these leaf-level questions (each will be answered by synthesizing extracted evidence from source files):
 
 {leaf_list}
 
-Design an extraction schema that will make the L0 extraction pass capture exactly what these questions need. Remember: question-shaped, not generic."#,
+Design an extraction schema that will make the L0 extraction pass capture exactly what these questions need. Remember: question-shaped, not generic.
+
+The extraction prompt you produce will be used to describe source files. Those descriptions must be written FOR the target audience above. If the audience is non-technical, the extraction prompt must explicitly instruct: "Write descriptions that {audience} would understand. Explain WHY each feature matters to a user, not just WHAT it does technically. Avoid developer jargon — use plain language.""#,
     );
 
     // ── 3. Call LLM using the "max" tier ─────────────────────────────────
@@ -153,13 +164,26 @@ pub async fn generate_synthesis_prompts(
     question_tree: &QuestionTree,
     l0_results_summary: &str,
     extraction_schema: &ExtractionSchema,
+    audience: Option<&str>,
     llm_config: &LlmConfig,
 ) -> Result<SynthesisPrompts> {
     // ── 1. Build tree summary for context ────────────────────────────────
     let tree_summary = format_tree_for_prompt(&question_tree.apex, 0);
 
     // ── 2. Construct prompts ─────────────────────────────────────────────
-    let system_prompt = r#"You are designing synthesis prompts for a knowledge pyramid builder. The L0 extraction pass has already completed — you know what evidence was actually extracted. Now you must produce prompts for the synthesis layers that will combine this evidence into answers.
+    let audience_instruction = match audience {
+        Some(aud) if !aud.is_empty() => format!(
+            r#"
+
+CRITICAL — AUDIENCE-AWARE SYNTHESIS:
+The target audience is: {aud}
+All three prompts you generate MUST instruct the synthesizer to write for this audience. If the audience is non-technical, the answering_prompt must explicitly say: "Synthesize for {aud}. Translate technical evidence into plain-language explanations. Explain WHY things matter, not just WHAT they do. Avoid jargon." The pre_mapping and web_edge prompts should also reference the audience context."#
+        ),
+        _ => String::new(),
+    };
+
+    let system_prompt = format!(
+        r#"You are designing synthesis prompts for a knowledge pyramid builder. The L0 extraction pass has already completed — you know what evidence was actually extracted. Now you must produce prompts for the synthesis layers that will combine this evidence into answers.
 
 There are three prompts needed:
 
@@ -168,22 +192,29 @@ There are three prompts needed:
 2. answering_prompt: Instructions for synthesizing L0 evidence into L1 answers. Must reference the actual evidence domains that were extracted, not hypothetical ones.
 
 3. web_edge_prompt: Instructions for discovering connections between answered questions. What cross-cutting themes or dependencies exist?
+{audience_instruction}
 
 Respond in JSON with exactly these fields:
-{
+{{
   "pre_mapping_prompt": "...",
   "answering_prompt": "...",
   "web_edge_prompt": "..."
-}
+}}
 
 Each prompt should be 2-4 sentences. Be specific to the actual content, not generic.
 
-Return ONLY the JSON object, no other text."#;
+Return ONLY the JSON object, no other text."#
+    );
+
+    let audience_line = match audience {
+        Some(aud) if !aud.is_empty() => format!("\nTarget audience: {aud}\n"),
+        _ => String::new(),
+    };
 
     let user_prompt = format!(
         r#"Question tree:
 {tree_summary}
-
+{audience_line}
 Extraction schema used:
 {extraction_prompt}
 
@@ -192,7 +223,7 @@ Topic fields extracted: {topic_fields}
 Summary of what L0 extraction actually found:
 {l0_results_summary}
 
-Design synthesis prompts that will combine this extracted evidence into answers for the question tree above."#,
+Design synthesis prompts that will combine this extracted evidence into answers for the question tree above. The synthesized answers must be written for the target audience."#,
         extraction_prompt = extraction_schema.extraction_prompt,
         topic_fields = extraction_schema
             .topic_schema
@@ -214,7 +245,7 @@ Design synthesis prompts that will combine this extracted evidence into answers 
 
         let response = llm::call_model_unified(
             &synth_config,
-            system_prompt,
+            &system_prompt,
             &user_prompt,
             temp,
             max_tokens,
@@ -373,6 +404,7 @@ mod tests {
 
     fn make_leaf(question: &str, hint: &str) -> QuestionNode {
         QuestionNode {
+            id: String::new(),
             question: question.to_string(),
             about: "each file individually".to_string(),
             creates: "L0 nodes".to_string(),
@@ -384,6 +416,7 @@ mod tests {
 
     fn make_parent(question: &str, children: Vec<QuestionNode>) -> QuestionNode {
         QuestionNode {
+            id: String::new(),
             question: question.to_string(),
             about: "all sub-answers".to_string(),
             creates: "L1 nodes".to_string(),
@@ -407,6 +440,7 @@ mod tests {
             ),
             content_type: "code".to_string(),
             config: DecompositionConfig::default(),
+            audience: None,
         };
 
         let leaves = collect_leaf_questions(&tree);
@@ -435,6 +469,7 @@ mod tests {
             ),
             content_type: "code".to_string(),
             config: DecompositionConfig::default(),
+            audience: None,
         };
 
         let leaves = collect_leaf_questions(&tree);

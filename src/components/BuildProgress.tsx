@@ -54,11 +54,11 @@ export function BuildProgress({ slug, onComplete, onClose }: BuildProgressProps)
 
     const handleCancel = useCallback(async () => {
         try {
-            await invoke('pyramid_build_cancel');
+            await invoke('pyramid_build_cancel', { slug });
         } catch (err) {
             console.error('Cancel failed:', err);
         }
-    }, []);
+    }, [slug]);
 
     const pct = status?.progress.total
         ? Math.round((status.progress.done / status.progress.total) * 100)

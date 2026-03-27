@@ -506,6 +506,24 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
             updated_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
 
+        -- Individual question decomposition nodes for incremental/resumable builds
+        CREATE TABLE IF NOT EXISTS pyramid_question_nodes (
+            slug TEXT NOT NULL,
+            question_id TEXT NOT NULL,
+            parent_id TEXT,
+            depth INTEGER NOT NULL,
+            question TEXT NOT NULL,
+            about TEXT NOT NULL DEFAULT '',
+            creates TEXT NOT NULL DEFAULT '',
+            prompt_hint TEXT NOT NULL DEFAULT '',
+            is_leaf INTEGER NOT NULL DEFAULT 0,
+            children_json TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY(slug, question_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_question_nodes_parent ON pyramid_question_nodes(slug, parent_id);
+        CREATE INDEX IF NOT EXISTS idx_question_nodes_depth ON pyramid_question_nodes(slug, depth);
+
         -- Missing evidence gap reports
         CREATE TABLE IF NOT EXISTS pyramid_gaps (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -858,6 +876,20 @@ pub fn count_chunks(conn: &Connection, slug: &str) -> Result<i64> {
     Ok(count)
 }
 
+/// Delete all chunks for a slug. Used before re-ingestion to prevent duplicates.
+pub fn clear_chunks(conn: &Connection, slug: &str) -> Result<i64> {
+    let deleted = conn.execute(
+        "DELETE FROM pyramid_chunks WHERE slug = ?1",
+        rusqlite::params![slug],
+    )?;
+    // Also reset batch chunk_counts so they don't drift
+    conn.execute(
+        "UPDATE pyramid_batches SET chunk_count = 0 WHERE slug = ?1",
+        rusqlite::params![slug],
+    )?;
+    Ok(deleted as i64)
+}
+
 // ── Node CRUD ────────────────────────────────────────────────────────────────
 
 /// Parse a JSON string into a Vec<T>, returning an empty vec on null/empty/error.
@@ -1027,6 +1059,22 @@ pub fn get_node(conn: &Connection, slug: &str, node_id: &str) -> Result<Option<P
 
     let result = stmt.query_row(rusqlite::params![slug, node_id], node_from_row);
 
+    match result {
+        Ok(node) => Ok(Some(node)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Lightweight node fetch — only the columns needed for drill child display.
+/// Skips heavy JSON columns (topics, corrections, decisions, terms, dead_ends).
+pub fn get_node_summary(conn: &Connection, slug: &str, node_id: &str) -> Result<Option<PyramidNode>> {
+    let sql = "SELECT id, slug, depth, chunk_index, headline, distilled, \
+               '[]' as topics, '[]' as corrections, '[]' as decisions, \
+               '[]' as terms, '[]' as dead_ends, self_prompt, children, parent_id, superseded_by, created_at \
+               FROM pyramid_nodes WHERE slug = ?1 AND id = ?2";
+    let mut stmt = conn.prepare(sql)?;
+    let result = stmt.query_row(rusqlite::params![slug, node_id], node_from_row);
     match result {
         Ok(node) => Ok(Some(node)),
         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
@@ -2744,6 +2792,218 @@ pub fn get_question_tree(
     }
 }
 
+// ── Question Node CRUD (incremental decomposition) ──────────────────────────
+
+/// Save (upsert) a single question decomposition node.
+///
+/// Used by the incremental decomposition flow: each node is persisted
+/// immediately after the LLM returns its children, so progress survives
+/// crashes and restarts.
+pub fn save_question_node(
+    conn: &Connection,
+    slug: &str,
+    node: &super::question_decomposition::QuestionNode,
+    parent_id: Option<&str>,
+    depth: u32,
+) -> Result<()> {
+    let children_json = if node.children.is_empty() {
+        None
+    } else {
+        let ids: Vec<&str> = node.children.iter().map(|c| c.id.as_str()).collect();
+        Some(serde_json::to_string(&ids)?)
+    };
+
+    conn.execute(
+        "INSERT INTO pyramid_question_nodes (slug, question_id, parent_id, depth, question, about, creates, prompt_hint, is_leaf, children_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+         ON CONFLICT(slug, question_id) DO UPDATE SET
+           parent_id = excluded.parent_id,
+           depth = excluded.depth,
+           question = excluded.question,
+           about = excluded.about,
+           creates = excluded.creates,
+           prompt_hint = excluded.prompt_hint,
+           is_leaf = excluded.is_leaf,
+           children_json = excluded.children_json",
+        rusqlite::params![
+            slug,
+            node.id,
+            parent_id,
+            depth,
+            node.question,
+            node.about,
+            node.creates,
+            node.prompt_hint,
+            node.is_leaf as i32,
+            children_json,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Load all question nodes for a slug and reconstruct the QuestionTree.
+///
+/// Returns None if no nodes exist for this slug. Reconstructs the tree
+/// by assembling parent→child relationships from the flat node rows.
+pub fn load_question_nodes_as_tree(
+    conn: &Connection,
+    slug: &str,
+) -> Result<Option<Vec<QuestionNodeRow>>> {
+    let mut stmt = conn.prepare(
+        "SELECT question_id, parent_id, depth, question, about, creates, prompt_hint, is_leaf, children_json
+         FROM pyramid_question_nodes
+         WHERE slug = ?1
+         ORDER BY depth ASC",
+    )?;
+    let rows: Vec<QuestionNodeRow> = stmt
+        .query_map(rusqlite::params![slug], |row| {
+            Ok(QuestionNodeRow {
+                question_id: row.get(0)?,
+                parent_id: row.get(1)?,
+                depth: row.get(2)?,
+                question: row.get(3)?,
+                about: row.get(4)?,
+                creates: row.get(5)?,
+                prompt_hint: row.get(6)?,
+                is_leaf: row.get::<_, i32>(7)? != 0,
+                children_json: row.get(8)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    if rows.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(rows))
+    }
+}
+
+/// A flat row from the pyramid_question_nodes table.
+#[derive(Debug, Clone)]
+pub struct QuestionNodeRow {
+    pub question_id: String,
+    pub parent_id: Option<String>,
+    pub depth: u32,
+    pub question: String,
+    pub about: String,
+    pub creates: String,
+    pub prompt_hint: String,
+    pub is_leaf: bool,
+    pub children_json: Option<String>,
+}
+
+/// Get nodes that are branch nodes (is_leaf = 0) but haven't been decomposed yet
+/// (children_json IS NULL). These are the nodes that need further LLM decomposition.
+pub fn get_undecomposed_nodes(
+    conn: &Connection,
+    slug: &str,
+) -> Result<Vec<QuestionNodeRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT question_id, parent_id, depth, question, about, creates, prompt_hint, is_leaf, children_json
+         FROM pyramid_question_nodes
+         WHERE slug = ?1 AND is_leaf = 0 AND children_json IS NULL
+         ORDER BY depth ASC",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![slug], |row| {
+            Ok(QuestionNodeRow {
+                question_id: row.get(0)?,
+                parent_id: row.get(1)?,
+                depth: row.get(2)?,
+                question: row.get(3)?,
+                about: row.get(4)?,
+                creates: row.get(5)?,
+                prompt_hint: row.get(6)?,
+                is_leaf: row.get::<_, i32>(7)? != 0,
+                children_json: row.get(8)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Count total question nodes for a slug.
+pub fn count_question_nodes(conn: &Connection, slug: &str) -> Result<i64> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pyramid_question_nodes WHERE slug = ?1",
+        rusqlite::params![slug],
+        |row| row.get(0),
+    )?;
+    Ok(count)
+}
+
+/// Delete all question nodes for a slug (used when starting a fresh decomposition).
+pub fn clear_question_nodes(conn: &Connection, slug: &str) -> Result<i64> {
+    let deleted = conn.execute(
+        "DELETE FROM pyramid_question_nodes WHERE slug = ?1",
+        rusqlite::params![slug],
+    )?;
+    Ok(deleted as i64)
+}
+
+/// Reconstruct a QuestionTree from the flat node rows stored in pyramid_question_nodes.
+///
+/// Rebuilds the tree by finding the root (no parent_id) and recursively
+/// attaching children based on children_json ordering.
+pub fn reconstruct_question_tree(
+    rows: &[QuestionNodeRow],
+    config: &super::question_decomposition::DecompositionConfig,
+) -> Result<super::question_decomposition::QuestionTree> {
+    use super::question_decomposition::{QuestionNode, QuestionTree};
+
+    if rows.is_empty() {
+        return Err(anyhow::anyhow!("no nodes to reconstruct tree from"));
+    }
+
+    // Build a map: question_id → row
+    let row_map: HashMap<String, &QuestionNodeRow> = rows
+        .iter()
+        .map(|r| (r.question_id.clone(), r))
+        .collect();
+
+    // Find the root (no parent_id)
+    let root_row = rows
+        .iter()
+        .find(|r| r.parent_id.is_none())
+        .ok_or_else(|| anyhow::anyhow!("no root node found (all nodes have parent_id)"))?;
+
+    fn build_node(
+        row: &QuestionNodeRow,
+        row_map: &HashMap<String, &QuestionNodeRow>,
+    ) -> QuestionNode {
+        let children = match &row.children_json {
+            Some(json_str) => {
+                let child_ids: Vec<String> = serde_json::from_str(json_str).unwrap_or_default();
+                child_ids
+                    .iter()
+                    .filter_map(|id| row_map.get(id.as_str()))
+                    .map(|child_row| build_node(child_row, row_map))
+                    .collect()
+            }
+            None => vec![],
+        };
+
+        QuestionNode {
+            id: row.question_id.clone(),
+            question: row.question.clone(),
+            about: row.about.clone(),
+            creates: row.creates.clone(),
+            prompt_hint: row.prompt_hint.clone(),
+            children,
+            is_leaf: row.is_leaf,
+        }
+    }
+
+    let apex = build_node(root_row, &row_map);
+
+    Ok(QuestionTree {
+        apex,
+        content_type: config.content_type.clone(),
+        config: config.clone(),
+        audience: None,
+    })
+}
+
 // ── Gap Reports CRUD ─────────────────────────────────────────────────────────
 
 /// Save a gap report for a slug.
@@ -2764,6 +3024,21 @@ pub fn get_gaps_for_slug(conn: &Connection, slug: &str) -> Result<Vec<GapReport>
         "SELECT question_id, description, layer FROM pyramid_gaps WHERE slug = ?1 ORDER BY id ASC",
     )?;
     let rows = stmt.query_map(rusqlite::params![slug], |row| {
+        Ok(GapReport {
+            question_id: row.get(0)?,
+            description: row.get(1)?,
+            layer: row.get(2)?,
+        })
+    })?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
+/// Get gap reports for a specific question node within a slug.
+pub fn get_gaps_for_question(conn: &Connection, slug: &str, question_id: &str) -> Result<Vec<GapReport>> {
+    let mut stmt = conn.prepare(
+        "SELECT question_id, description, layer FROM pyramid_gaps WHERE slug = ?1 AND question_id = ?2 ORDER BY id ASC",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![slug, question_id], |row| {
         Ok(GapReport {
             question_id: row.get(0)?,
             description: row.get(1)?,
@@ -3198,6 +3473,105 @@ fn backfill_evidence_from_children(conn: &Connection) -> Result<()> {
     }
 
     Ok(())
+}
+
+// ── Canonical L0 Helpers ─────────────────────────────────────────────────────
+
+/// Check if canonical L0 exists for a slug (any node matching C-L0-% pattern).
+pub fn has_canonical_l0(conn: &Connection, slug: &str) -> Result<bool> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pyramid_nodes WHERE slug = ?1 AND id LIKE 'C-L0-%'",
+        rusqlite::params![slug],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
+/// Get all canonical L0 nodes for a slug.
+pub fn get_canonical_l0_nodes(conn: &Connection, slug: &str) -> Result<Vec<PyramidNode>> {
+    let sql = format!(
+        "SELECT {NODE_SELECT_COLS} FROM pyramid_nodes
+         WHERE slug = ?1 AND id LIKE 'C-L0-%'
+         ORDER BY id ASC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params![slug], node_from_row)?;
+    let mut nodes = Vec::new();
+    for row in rows {
+        nodes.push(row?);
+    }
+    Ok(nodes)
+}
+
+/// Build a summary of canonical L0 for decomposition context.
+/// Returns: Vec of (node_id, headline, distilled_truncated_to_300_chars).
+pub fn get_canonical_l0_summaries(
+    conn: &Connection,
+    slug: &str,
+) -> Result<Vec<(String, String, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, headline, distilled FROM pyramid_nodes
+         WHERE slug = ?1 AND id LIKE 'C-L0-%'
+         ORDER BY id ASC",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![slug], |row| {
+        let id: String = row.get(0)?;
+        let headline: String = row.get(1)?;
+        let distilled: String = row.get(2)?;
+        Ok((id, headline, distilled))
+    })?;
+    let mut summaries = Vec::new();
+    for row in rows {
+        let (id, headline, distilled) = row?;
+        // Truncate distilled to 300 chars
+        let truncated = if distilled.len() > 300 {
+            let mut end = 300;
+            // Don't break in the middle of a UTF-8 character
+            while !distilled.is_char_boundary(end) && end > 0 {
+                end -= 1;
+            }
+            format!("{}...", &distilled[..end])
+        } else {
+            distilled
+        };
+        summaries.push((id, headline, truncated));
+    }
+    Ok(summaries)
+}
+
+/// Delete only canonical L0 nodes (for re-extraction when source files change).
+pub fn clear_canonical_l0(conn: &Connection, slug: &str) -> Result<usize> {
+    let deleted = conn.execute(
+        "DELETE FROM pyramid_nodes WHERE slug = ?1 AND id LIKE 'C-L0-%'",
+        rusqlite::params![slug],
+    )?;
+    Ok(deleted)
+}
+
+/// Delete only question L0 nodes (for rebuild with different question).
+pub fn clear_question_l0(conn: &Connection, slug: &str) -> Result<usize> {
+    let deleted = conn.execute(
+        "DELETE FROM pyramid_nodes WHERE slug = ?1 AND id LIKE 'L0-%' AND id NOT LIKE 'C-L0-%'",
+        rusqlite::params![slug],
+    )?;
+    Ok(deleted)
+}
+
+/// Load all chunk contents for a slug, ordered by chunk_index.
+/// Returns Vec of (chunk_index, content).
+pub fn get_all_chunks(conn: &Connection, slug: &str) -> Result<Vec<(i64, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT chunk_index, content FROM pyramid_chunks
+         WHERE slug = ?1 ORDER BY chunk_index ASC",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![slug], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut chunks = Vec::new();
+    for row in rows {
+        chunks.push(row?);
+    }
+    Ok(chunks)
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────

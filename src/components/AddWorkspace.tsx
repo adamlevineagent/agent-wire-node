@@ -4,6 +4,8 @@ import { open } from '@tauri-apps/plugin-dialog';
 import { BuildProgress } from './BuildProgress';
 import { VineBuildProgress } from './VineBuildProgress';
 
+const NOOP = () => {};
+
 interface AddWorkspaceProps {
     onComplete: () => void;
     onCancel: () => void;
@@ -654,14 +656,14 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
             {step === 'building' && contentType === 'vine' && (
                 <VineBuildProgress
                     slug={slug}
-                    onComplete={() => {}}
+                    onComplete={NOOP}
                     onClose={onComplete}
                 />
             )}
             {step === 'building' && contentType !== 'vine' && (
                 <BuildProgress
                     slug={slug}
-                    onComplete={() => {}}
+                    onComplete={NOOP}
                     onClose={onComplete}
                 />
             )}

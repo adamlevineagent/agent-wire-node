@@ -2900,6 +2900,7 @@ async fn pyramid_build(
         slug: slug.clone(),
         cancel: cancel.clone(),
         status: status.clone(),
+        started_at: std::time::Instant::now(),
     };
 
     {
@@ -3081,8 +3082,12 @@ async fn pyramid_build_status(
 ) -> Result<BuildStatus, String> {
     let active = state.pyramid.active_build.read().await;
     if let Some(handle) = active.get(&slug) {
-        let s = handle.status.read().await;
-        return Ok(s.clone());
+        let mut s = handle.status.read().await.clone();
+        // Compute elapsed live instead of using the cached (possibly stale) value
+        if s.status == "running" {
+            s.elapsed_seconds = handle.started_at.elapsed().as_secs_f64();
+        }
+        return Ok(s);
     }
 
     Ok(BuildStatus {
@@ -3264,30 +3269,20 @@ fn get_app_version() -> String {
 }
 
 #[tauri::command]
-async fn pyramid_build_cancel(state: tauri::State<'_, SharedState>) -> Result<(), String> {
-    let handles = {
-        let active = state.pyramid.active_build.read().await;
-        active
-            .values()
-            .map(|handle| (handle.cancel.clone(), handle.status.clone()))
-            .collect::<Vec<_>>()
-    };
-
-    let mut cancelled_any = false;
-    for (cancel, status) in handles {
-        let s = status.read().await;
-        if s.is_running() && !cancel.is_cancelled() {
+async fn pyramid_build_cancel(
+    state: tauri::State<'_, SharedState>,
+    slug: String,
+) -> Result<(), String> {
+    let active = state.pyramid.active_build.read().await;
+    if let Some(handle) = active.get(&slug) {
+        let s = handle.status.read().await;
+        if s.is_running() && !handle.cancel.is_cancelled() {
             drop(s);
-            cancel.cancel();
-            cancelled_any = true;
+            handle.cancel.cancel();
+            return Ok(());
         }
     }
-
-    if !cancelled_any {
-        return Err("No active build to cancel".to_string());
-    }
-
-    Ok(())
+    Err("No active build to cancel".to_string())
 }
 
 #[tauri::command]

@@ -258,6 +258,7 @@ pub async fn answer_questions(
     candidate_map: &CandidateMap,
     all_nodes: &[PyramidNode],
     synthesis_prompt: Option<&str>,
+    audience: Option<&str>,
     llm_config: &LlmConfig,
     slug: &str,
 ) -> Result<Vec<AnsweredNode>> {
@@ -273,6 +274,7 @@ pub async fn answer_questions(
     let llm_config = Arc::new(llm_config.clone());
     let slug = slug.to_string();
     let synthesis_prompt = synthesis_prompt.map(|s| s.to_string());
+    let audience = audience.map(|s| s.to_string());
 
     // Prepare per-question work items
     let work_items: Vec<AnswerWorkItem> = questions
@@ -304,6 +306,7 @@ pub async fn answer_questions(
         let llm_config = llm_config.clone();
         let slug = slug.clone();
         let synthesis_prompt = synthesis_prompt.clone();
+        let audience = audience.clone();
 
         let handle = tokio::spawn(async move {
             let _permit = semaphore
@@ -311,7 +314,7 @@ pub async fn answer_questions(
                 .await
                 .expect("answer semaphore should remain open");
 
-            answer_single_question(&work.question, &work.candidate_nodes, synthesis_prompt.as_deref(), &llm_config, &slug)
+            answer_single_question(&work.question, &work.candidate_nodes, synthesis_prompt.as_deref(), audience.as_deref(), &llm_config, &slug)
                 .await
         });
 
@@ -365,6 +368,7 @@ async fn answer_single_question(
     question: &LayerQuestion,
     candidate_nodes: &[PyramidNode],
     synthesis_prompt: Option<&str>,
+    audience: Option<&str>,
     llm_config: &LlmConfig,
     slug: &str,
 ) -> Result<AnsweredNode> {
@@ -396,6 +400,13 @@ async fn answer_single_question(
     // ── Prompts ─────────────────────────────────────────────────────────
     let extra_guidance = synthesis_prompt.unwrap_or("");
 
+    let audience_guidance = match audience {
+        Some(aud) if !aud.is_empty() => format!(
+            "\nAUDIENCE: Your answer is for {aud}. Write the headline and distilled synthesis so that {aud} would understand it. Translate technical evidence into plain-language explanations of user value. Avoid jargon — explain WHY things matter, not just WHAT they do technically. When technical terms are unavoidable, include a brief plain-language definition.\n"
+        ),
+        _ => String::new(),
+    };
+
     let system_prompt = format!(
         r#"You are answering a knowledge pyramid question using candidate evidence from the layer below.
 
@@ -405,7 +416,7 @@ For each candidate node, you MUST report a verdict:
 - MISSING(description) — describe evidence you wish you had but don't.
 
 Then synthesize your answer to the question using ONLY the KEEP evidence.
-
+{audience_guidance}
 {extra_guidance}
 
 Respond with ONLY a JSON object:

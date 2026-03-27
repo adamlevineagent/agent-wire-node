@@ -843,6 +843,15 @@ pub fn pyramid_routes(
         .and(warp::body::json::<staleness_bridge::CheckStalenessRequest>())
         .and_then(handle_check_staleness));
 
+    // GET /pyramid/:slug/question-tree — current decomposition tree state (may be partial)
+    let question_tree_route = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("question-tree"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_question_tree));
+
     // POST /pyramid/chain/import — import a chain or question set from the Wire (P4.2)
     let chain_import = route!(prefix
         .and(warp::path("chain"))
@@ -936,8 +945,10 @@ pub fn pyramid_routes(
     let top6 = top5.or(h5).unify().boxed();
     let top7 = top6.or(r27).unify().boxed(); // Publication routes (P4.3)
     let r28 = check_staleness; // Staleness bridge route (WS-E)
+    let r29 = question_tree_route; // Question tree progress route
     let top8 = top7.or(r28).unify().boxed();
-    top8
+    let top9 = top8.or(r29).unify().boxed();
+    top9
 }
 
 // ── Route handlers ──────────────────────────────────────────────────
@@ -1262,6 +1273,7 @@ async fn handle_build(
             slug: slug_name.clone(),
             cancel: cancel.clone(),
             status: status.clone(),
+            started_at: std::time::Instant::now(),
         };
         active.insert(slug_name.clone(), handle);
     }
@@ -1408,8 +1420,12 @@ async fn handle_build_status(
 ) -> Result<warp::reply::Response, warp::Rejection> {
     let active = state.active_build.read().await;
     if let Some(handle) = active.get(&slug_name) {
-        let s = handle.status.read().await;
-        return Ok(json_ok(&*s));
+        let mut s = handle.status.read().await.clone();
+        // Compute elapsed live for running builds (same fix as Tauri command path)
+        if s.status == "running" {
+            s.elapsed_seconds = handle.started_at.elapsed().as_secs_f64();
+        }
+        return Ok(json_ok(&s));
     }
 
     // No active build — return idle status
@@ -1495,6 +1511,14 @@ async fn handle_ingest(
     let writer = state.writer.clone();
     let result = tokio::task::spawn_blocking(move || {
         let conn = writer.blocking_lock();
+        // Clear existing chunks before re-ingesting to prevent duplicates.
+        // Without this, repeated ingest calls append duplicate copies of the
+        // same source files, causing the build's forEach over $chunks to
+        // produce duplicate L0 nodes.
+        let cleared = super::db::clear_chunks(&conn, &slug_clone)?;
+        if cleared > 0 {
+            tracing::info!(slug = %slug_clone, cleared, "cleared stale chunks before re-ingest");
+        }
         for path in &paths {
             match content_type {
                 ContentType::Code => {
@@ -3189,6 +3213,7 @@ async fn handle_question_build(
             slug: slug_name.clone(),
             cancel: cancel.clone(),
             status: status.clone(),
+            started_at: std::time::Instant::now(),
         };
         active.insert(slug_name.clone(), handle);
     }
@@ -3321,6 +3346,93 @@ async fn handle_question_preview(
             "preview": preview,
             "question_tree": tree,
         }))),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
+    }
+}
+
+// ── Question Tree Progress ──────────────────────────────────────────────
+
+/// GET /pyramid/:slug/question-tree
+///
+/// Returns the current question decomposition tree state for a slug.
+/// Works even during an active decomposition — returns whatever nodes
+/// have been persisted so far (partial tree). Useful for showing
+/// decomposition progress in real time.
+async fn handle_question_tree(
+    slug_name: String,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    // First try the incremental node-based table
+    let node_result = {
+        let conn = state.reader.lock().await;
+        db::load_question_nodes_as_tree(&conn, &slug_name)
+    };
+
+    match node_result {
+        Ok(Some(rows)) => {
+            let total_nodes = rows.len();
+            let undecomposed: Vec<_> = rows
+                .iter()
+                .filter(|r| !r.is_leaf && r.children_json.is_none())
+                .collect();
+            let leaf_count = rows.iter().filter(|r| r.is_leaf).count();
+            let is_complete = undecomposed.is_empty();
+
+            // Build a lightweight representation of each node
+            let nodes_json: Vec<serde_json::Value> = rows
+                .iter()
+                .map(|r| {
+                    serde_json::json!({
+                        "question_id": r.question_id,
+                        "parent_id": r.parent_id,
+                        "depth": r.depth,
+                        "question": r.question,
+                        "about": r.about,
+                        "creates": r.creates,
+                        "is_leaf": r.is_leaf,
+                        "has_children": r.children_json.is_some(),
+                    })
+                })
+                .collect();
+
+            Ok(json_ok(&serde_json::json!({
+                "slug": slug_name,
+                "source": "nodes",
+                "total_nodes": total_nodes,
+                "leaf_nodes": leaf_count,
+                "undecomposed_nodes": undecomposed.len(),
+                "is_complete": is_complete,
+                "nodes": nodes_json,
+            })))
+        }
+        Ok(None) => {
+            // Fall back to the legacy JSON blob table
+            let tree_result = {
+                let conn = state.reader.lock().await;
+                db::get_question_tree(&conn, &slug_name)
+            };
+            match tree_result {
+                Ok(Some(tree_json)) => Ok(json_ok(&serde_json::json!({
+                    "slug": slug_name,
+                    "source": "legacy_blob",
+                    "question_tree": tree_json,
+                }))),
+                Ok(None) => Ok(json_ok(&serde_json::json!({
+                    "slug": slug_name,
+                    "source": "none",
+                    "total_nodes": 0,
+                    "is_complete": false,
+                    "nodes": [],
+                }))),
+                Err(e) => Ok(json_error(
+                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    &e.to_string(),
+                )),
+            }
+        }
         Err(e) => Ok(json_error(
             warp::http::StatusCode::INTERNAL_SERVER_ERROR,
             &e.to_string(),

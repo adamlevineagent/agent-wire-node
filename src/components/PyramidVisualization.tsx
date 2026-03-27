@@ -34,19 +34,72 @@ interface AutoUpdateStatus {
   last_result_summary: string | null;
 }
 
+interface EvidenceLink {
+  slug: string;
+  source_node_id: string;
+  target_node_id: string;
+  verdict: "KEEP" | "DISCONNECT" | "MISSING";
+  weight: number | null;
+  reason: string | null;
+}
+
+interface GapReport {
+  question_id: string;
+  description: string;
+  layer: number;
+}
+
+interface QuestionContext {
+  parent_question: string | null;
+  sibling_questions: string[];
+}
+
 interface DrillResult {
   node: {
     id: string;
+    slug: string;
     depth: number;
+    chunk_index: number | null;
     headline: string;
     distilled: string;
+    self_prompt: string;
+    children: string[];
+    parent_id: string | null;
+    superseded_by: string | null;
+    created_at: string;
+    topics: Array<{name: string; current: string; entities: string[]; corrections: any[]; decisions: any[]}>;
+    corrections: any[];
+    decisions: any[];
+    terms: any[];
+    dead_ends: string[];
   };
   children: Array<{
     id: string;
+    slug: string;
     depth: number;
     headline: string;
     distilled: string;
+    self_prompt: string;
+    chunk_index: number | null;
+    children: string[];
+    parent_id: string | null;
+    superseded_by: string | null;
+    created_at: string;
+    topics: Array<{name: string; current: string; entities: string[]; corrections: any[]; decisions: any[]}>;
+    corrections: any[];
+    decisions: any[];
+    terms: any[];
+    dead_ends: string[];
   }>;
+  web_edges?: Array<{
+    connected_to: string;
+    connected_headline: string;
+    relationship: string;
+    strength: number;
+  }>;
+  evidence?: Array<EvidenceLink>;
+  gaps?: Array<GapReport>;
+  question_context?: QuestionContext | null;
 }
 
 // ── Props ─────────────────────────────────────────────────────────────
@@ -506,19 +559,39 @@ export function PyramidVisualization({ slug, staleLog, status }: PyramidVisualiz
       const child = stateNodes.find((n) => n.id === childId);
       if (child) {
         setPopoverNode(child);
-        setDrillData(null);
-        setDrillLoading(true);
-        invoke<DrillResult>('pyramid_drill', { slug, nodeId: childId })
-          .then((data) => {
-            setDrillData(data);
-            setDrillLoading(false);
-          })
-          .catch(() => {
-            setDrillLoading(false);
+      } else {
+        // Node not in layout tree (e.g. superseded) — create synthetic node
+        // using current popover position so drill data still displays
+        const currentPos = popoverNode;
+        if (currentPos) {
+          setPopoverNode({
+            id: childId,
+            depth: (currentPos.depth ?? 0) + 1,
+            headline: '',
+            distilled: '',
+            threadId: null,
+            sourcePath: null,
+            parentId: currentPos.id,
+            childIds: [],
+            x: currentPos.x,
+            y: currentPos.y,
+            radius: currentPos.radius,
+            state: NodeState.STABLE,
           });
+        }
       }
+      setDrillData(null);
+      setDrillLoading(true);
+      invoke<DrillResult>('pyramid_drill', { slug, nodeId: childId })
+        .then((data) => {
+          setDrillData(data);
+          setDrillLoading(false);
+        })
+        .catch(() => {
+          setDrillLoading(false);
+        });
     },
-    [stateNodes, slug],
+    [stateNodes, slug, popoverNode],
   );
 
   // ── Stale history for popover ───────────────────────────────────────
@@ -541,12 +614,12 @@ export function PyramidVisualization({ slug, staleLog, status }: PyramidVisualiz
     let left = popoverNode.x + popoverNode.radius + 16;
     let top = popoverNode.y - 60;
 
-    // Keep within bounds
-    if (left + 400 > width) {
-      left = popoverNode.x - popoverNode.radius - 416;
+    // Keep within bounds (popover is 460px wide via CSS)
+    if (left + 460 > width) {
+      left = popoverNode.x - popoverNode.radius - 476;
     }
+    if (left < 8) left = 8;
     if (top < 8) top = 8;
-    if (top + 300 > height) top = height - 308;
 
     return { left, top };
   }, [popoverNode, width, height]);
@@ -643,7 +716,21 @@ export function PyramidVisualization({ slug, staleLog, status }: PyramidVisualiz
               x
             </button>
 
-            <div style={{ fontWeight: 600, marginBottom: 8, paddingRight: 20 }}>
+            {/* THE QUESTION (self_prompt) */}
+            {drillData?.node.self_prompt?.trim() && (
+              <div style={{
+                fontStyle: 'italic',
+                fontSize: 14,
+                color: 'var(--accent-cyan)',
+                marginBottom: 12,
+                paddingRight: 20,
+                lineHeight: 1.4,
+              }}>
+                {drillData.node.self_prompt}
+              </div>
+            )}
+
+            <div style={{ fontWeight: 600, marginBottom: 14, paddingRight: 20, fontSize: 15 }}>
               {nodeTitle(popoverNode)}
               <span style={{ opacity: 0.4, marginLeft: 8, fontWeight: 400, fontSize: 11 }}>
                 L{popoverNode.depth}
@@ -673,18 +760,64 @@ export function PyramidVisualization({ slug, staleLog, status }: PyramidVisualiz
                 : drillData?.node.distilled ?? popoverNode.distilled}
             </div>
 
+            {/* Evidence */}
+            {drillData?.evidence && drillData.evidence.length > 0 && (
+              <div style={{ marginBottom: 12 }}>
+                <div style={{
+                  fontSize: 11, opacity: 0.5, marginBottom: 4, marginTop: 12,
+                  textTransform: 'uppercase', letterSpacing: '0.5px',
+                }}>
+                  Evidence
+                </div>
+                {drillData.evidence.map((ev, i) => {
+                  const verdictIcon = ev.verdict === 'KEEP' ? '\u2713' : ev.verdict === 'DISCONNECT' ? '\u2717' : '?';
+                  const verdictColor = ev.verdict === 'KEEP'
+                    ? 'var(--accent-green)'
+                    : ev.verdict === 'DISCONNECT'
+                      ? '#e87040'
+                      : '#e8c840';
+                  const sourceHeadline = drillData.children.find(c => c.id === ev.source_node_id)?.headline
+                    ?? (drillData.node.id === ev.source_node_id ? drillData.node.headline : null)
+                    ?? ev.source_node_id;
+                  return (
+                    <div key={`ev-${i}`} style={{ fontSize: 12, padding: '3px 0', display: 'flex', gap: 6, alignItems: 'baseline' }}>
+                      <span style={{ color: verdictColor, fontWeight: 600, flexShrink: 0 }}>{verdictIcon}</span>
+                      <span style={{ opacity: 0.6, flexShrink: 0 }}>
+                        {ev.verdict.toUpperCase()}{ev.weight != null ? ` (${ev.weight.toFixed(1)})` : ''}
+                      </span>
+                      <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                        {sourceHeadline}{ev.reason ? ` \u2014 ${ev.reason}` : ''}
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+
+            {/* Gaps */}
+            {drillData?.gaps && drillData.gaps.length > 0 && (
+              <div style={{ marginBottom: 12 }}>
+                <div style={{
+                  fontSize: 11, opacity: 0.5, marginBottom: 4, marginTop: 12,
+                  textTransform: 'uppercase', letterSpacing: '0.5px',
+                }}>
+                  Gaps
+                </div>
+                {drillData.gaps.map((gap, i) => (
+                  <div key={`gap-${i}`} style={{ fontSize: 12, padding: '2px 0', opacity: 0.8, color: '#e8c840' }}>
+                    {'\u26A0'} {gap.description}
+                  </div>
+                ))}
+              </div>
+            )}
+
             {/* Children */}
             {drillData && drillData.children.length > 0 && (
               <div style={{ marginBottom: 12 }}>
-                <div
-                  style={{
-                    fontSize: 11,
-                    opacity: 0.5,
-                    marginBottom: 4,
-                    textTransform: 'uppercase',
-                    letterSpacing: '0.5px',
-                  }}
-                >
+                <div style={{
+                  fontSize: 11, opacity: 0.5, marginBottom: 4, marginTop: 12,
+                  textTransform: 'uppercase', letterSpacing: '0.5px',
+                }}>
                   Children
                 </div>
                 {drillData.children.map((child) => (
@@ -714,26 +847,59 @@ export function PyramidVisualization({ slug, staleLog, status }: PyramidVisualiz
               </div>
             )}
 
+            {/* Question Tree Context */}
+            {drillData?.question_context && (
+              drillData.question_context.parent_question ||
+              drillData.question_context.sibling_questions.length > 0
+            ) && (
+              <div style={{ marginBottom: 12 }}>
+                <div style={{
+                  fontSize: 11, opacity: 0.5, marginBottom: 4, marginTop: 12,
+                  textTransform: 'uppercase', letterSpacing: '0.5px',
+                }}>
+                  Question Tree
+                </div>
+                {drillData.question_context.parent_question && (
+                  <div style={{ fontSize: 11, opacity: 0.6, padding: '2px 0' }}>
+                    Parent: {drillData.question_context.parent_question}
+                  </div>
+                )}
+                {drillData.question_context.sibling_questions.length > 0 && (
+                  <div style={{ fontSize: 11, opacity: 0.6, padding: '2px 0' }}>
+                    Siblings: {drillData.question_context.sibling_questions.join(', ')}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Web Edges (Related) */}
+            {drillData?.web_edges && drillData.web_edges.length > 0 && (
+              <div style={{ marginBottom: 12 }}>
+                <div style={{
+                  fontSize: 11, opacity: 0.5, marginBottom: 4, marginTop: 12,
+                  textTransform: 'uppercase', letterSpacing: '0.5px',
+                }}>
+                  Related
+                </div>
+                {drillData.web_edges.map((edge, i) => (
+                  <div key={`edge-${i}`} style={{ fontSize: 12, padding: '2px 0', opacity: 0.7 }}>
+                    {'\u2194'} {edge.connected_headline} ({edge.strength.toFixed(1)})
+                  </div>
+                ))}
+              </div>
+            )}
+
             {/* Stale history */}
             {popoverStaleHistory.length > 0 && (
               <div>
-                <div
-                  style={{
-                    fontSize: 11,
-                    opacity: 0.5,
-                    marginBottom: 4,
-                    textTransform: 'uppercase',
-                    letterSpacing: '0.5px',
-                  }}
-                >
+                <div style={{
+                  fontSize: 11, opacity: 0.5, marginBottom: 4, marginTop: 12,
+                  textTransform: 'uppercase', letterSpacing: '0.5px',
+                }}>
                   Stale History
                 </div>
                 {popoverStaleHistory.map((entry) => {
-                  const isStale =
-                    entry.stale === 'yes' ||
-                    entry.stale === 'Yes' ||
-                    entry.stale === '1' ||
-                    entry.stale === 'true';
+                  const isStale = isStaleValue(entry.stale);
                   return (
                     <div
                       key={entry.id}
@@ -748,8 +914,8 @@ export function PyramidVisualization({ slug, staleLog, status }: PyramidVisualiz
                       <span
                         style={{
                           color: isStale
-                            ? 'var(--accent-green)'
-                            : 'var(--accent-cyan)',
+                            ? '#e87040'
+                            : 'var(--accent-green)',
                           fontWeight: 500,
                         }}
                       >

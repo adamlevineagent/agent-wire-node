@@ -163,13 +163,14 @@ pub async fn call_model_unified_with_options(
     response_format: Option<&serde_json::Value>,
     options: LlmCallOptions,
 ) -> Result<LlmResponse> {
-    let est_total = (system_prompt.len() + user_prompt.len()) / 4 + max_tokens;
+    // Model selection based on INPUT size only — max_tokens (output budget) is
+    // irrelevant to whether the prompt fits in the model's context window.
+    let est_input_tokens = (system_prompt.len() + user_prompt.len()) / 4;
 
-    // Pick initial model based on estimated token usage
-    let mut use_model = if est_total > config.fallback_1_context_limit {
+    let mut use_model = if est_input_tokens > config.fallback_1_context_limit {
         info!("[fallback->{}]", short_name(&config.fallback_model_2));
         config.fallback_model_2.clone()
-    } else if est_total > config.primary_context_limit {
+    } else if est_input_tokens > config.primary_context_limit {
         info!("[fallback->{}]", short_name(&config.fallback_model_1));
         config.fallback_model_1.clone()
     } else {

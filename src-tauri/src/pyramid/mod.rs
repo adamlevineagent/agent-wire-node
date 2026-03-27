@@ -12,6 +12,7 @@
 
 pub mod build;
 pub mod build_runner;
+pub mod canonical_l0;
 pub mod characterize;
 pub mod chain_dispatch;
 pub mod chain_engine;
@@ -43,6 +44,7 @@ pub mod query;
 pub mod question_compiler;
 pub mod reconciliation;
 pub mod question_decomposition;
+pub mod question_l0;
 pub mod question_loader;
 pub mod question_yaml;
 pub mod routes;
@@ -223,4 +225,6 @@ pub struct BuildHandle {
     pub cancel: tokio_util::sync::CancellationToken,
     /// Live status (progress, elapsed time, etc.)
     pub status: Arc<tokio::sync::RwLock<BuildStatus>>,
+    /// When the build started — used to compute elapsed time live.
+    pub started_at: std::time::Instant,
 }

@@ -320,7 +320,8 @@ pub fn get_tree(conn: &Connection, slug: &str) -> Result<Vec<TreeNode>> {
     Ok(trees)
 }
 
-/// Drill into a node — returns the node plus its direct children.
+/// Drill into a node — returns the node plus its direct children,
+/// evidence links, gaps, and question tree context.
 pub fn drill(conn: &Connection, slug: &str, node_id: &str) -> Result<Option<DrillResult>> {
     let parent = match db::get_node(conn, slug, node_id)? {
         Some(n) => n,
@@ -329,16 +330,84 @@ pub fn drill(conn: &Connection, slug: &str, node_id: &str) -> Result<Option<Dril
 
     let mut children = Vec::new();
     for child_id in &parent.children {
-        if let Some(child) = db::get_node(conn, slug, child_id)? {
+        if let Some(child) = db::get_node_summary(conn, slug, child_id)? {
             children.push(child);
         }
     }
+
+    let evidence = db::get_evidence_for_target(conn, slug, node_id)?;
+
+    let gaps = db::get_gaps_for_question(conn, slug, node_id)?;
+
+    let question_context = db::get_question_tree(conn, slug)?
+        .and_then(|tree_json| find_question_context(&tree_json, node_id));
 
     Ok(Some(DrillResult {
         node: parent,
         children,
         web_edges: load_connected_web_edges(conn, slug, node_id)?,
+        evidence,
+        gaps,
+        question_context,
     }))
+}
+
+/// Walk a question tree JSON to find `node_id` and return its parent question + siblings.
+fn find_question_context(
+    tree_json: &serde_json::Value,
+    node_id: &str,
+) -> Option<QuestionContext> {
+    find_in_tree(&tree_json["apex"], node_id, None)
+}
+
+/// Recursive helper: searches the question tree for `target_id`.
+/// `parent_question` is the question text of the caller's node (None at root).
+fn find_in_tree(
+    node: &serde_json::Value,
+    target_id: &str,
+    parent_question: Option<&str>,
+) -> Option<QuestionContext> {
+    let current_id = node["id"].as_str().unwrap_or("");
+
+    // If the current node IS the target, return context only if there's a parent.
+    // Apex nodes (no parent, no siblings) return None so the frontend skips the section.
+    if current_id == target_id {
+        return match parent_question {
+            Some(pq) => Some(QuestionContext {
+                parent_question: Some(pq.to_string()),
+                sibling_questions: Vec::new(),
+            }),
+            None => None,
+        };
+    }
+
+    if let Some(kids) = node["children"].as_array() {
+        let this_question = node["question"].as_str().unwrap_or("");
+
+        // Check if target is a direct child — then we can compute siblings.
+        for child in kids {
+            if child["id"].as_str() == Some(target_id) {
+                let siblings: Vec<String> = kids
+                    .iter()
+                    .filter(|k| k["id"].as_str() != Some(target_id))
+                    .filter_map(|k| k["question"].as_str().map(String::from))
+                    .collect();
+                return Some(QuestionContext {
+                    parent_question: Some(this_question.to_string()),
+                    sibling_questions: siblings,
+                });
+            }
+        }
+
+        // Recurse into children.
+        for child in kids {
+            if let Some(ctx) = find_in_tree(child, target_id, Some(this_question)) {
+                return Some(ctx);
+            }
+        }
+    }
+
+    None
 }
 
 #[cfg(test)]

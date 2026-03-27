@@ -9454,9 +9454,10 @@ body {
     border-radius: 12px;
     color: var(--text-primary);
     font-size: 13px;
-    max-width: 400px;
-    max-height: 300px;
+    width: 460px;
+    max-height: 70vh;
     overflow-y: auto;
+    word-wrap: break-word;
     z-index: 20;
     box-shadow: var(--shadow-glow);
 }

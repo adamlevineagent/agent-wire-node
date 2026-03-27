@@ -122,6 +122,18 @@ pub struct DrillResult {
     pub children: Vec<PyramidNode>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub web_edges: Vec<ConnectedWebEdge>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<EvidenceLink>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gaps: Vec<GapReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question_context: Option<QuestionContext>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuestionContext {
+    pub parent_question: Option<String>,
+    pub sibling_questions: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

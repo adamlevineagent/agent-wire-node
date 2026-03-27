@@ -13,12 +13,16 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::sync::Mutex;
 use tracing::{info, warn};
 
+use super::db;
 use super::llm::{self, LlmConfig};
 use super::question_yaml::{Question, QuestionDefaults, QuestionSet};
 
@@ -65,6 +69,12 @@ pub struct QuestionTree {
     pub content_type: String,
     /// Config used to produce this tree.
     pub config: DecompositionConfig,
+    /// Target audience for the pyramid output. Extracted from the characterization
+    /// phase so it can flow into extraction, synthesis, and answering prompts.
+    /// When set, all LLM prompts will be shaped for this audience (e.g. "a smart
+    /// high school graduate, not a developer") instead of defaulting to technical jargon.
+    #[serde(default)]
+    pub audience: Option<String>,
 }
 
 /// A single node in the question tree.
@@ -238,9 +248,16 @@ pub async fn decompose_question(
 
     // Build children recursively (bounded by max_depth)
     let mut children = Vec::new();
-    for sq in sub_questions {
+    for (i, sq) in sub_questions.iter().enumerate() {
+        info!(
+            branch = i + 1,
+            total = sub_questions.len(),
+            question = %sq.question,
+            is_leaf = sq.is_leaf,
+            "decomposing L1 branch"
+        );
         let child = build_subtree(
-            &sq,
+            sq,
             &config.content_type,
             config.folder_map.as_deref(),
             granularity,
@@ -249,6 +266,13 @@ pub async fn decompose_question(
             llm_config,
         )
         .await?;
+        let node_count = count_tree_nodes(&child);
+        info!(
+            branch = i + 1,
+            question = %sq.question,
+            nodes = node_count,
+            "L1 branch complete"
+        );
         children.push(child);
     }
 
@@ -267,12 +291,369 @@ pub async fn decompose_question(
         apex: apex_node,
         content_type: config.content_type.clone(),
         config: config.clone(),
+        audience: None, // Set by build_runner from characterization result
     };
 
     // Assign stable deterministic IDs to all question nodes
     assign_question_ids(&mut tree);
 
     Ok(tree)
+}
+
+// ── Incremental Decomposition ────────────────────────────────────────────────
+
+/// Decompose an apex question incrementally, persisting each node to the DB
+/// as it comes back from the LLM.
+///
+/// If a partial tree already exists in the DB (from a previous killed run),
+/// it resumes from where it left off — only decomposing branch nodes that
+/// don't have children yet.
+///
+/// Returns the fully assembled QuestionTree.
+pub async fn decompose_question_incremental(
+    config: &DecompositionConfig,
+    llm_config: &LlmConfig,
+    writer: Arc<Mutex<Connection>>,
+    slug: &str,
+) -> Result<QuestionTree> {
+    if config.apex_question.trim().is_empty() {
+        return Err(anyhow!("apex_question cannot be empty"));
+    }
+    if config.max_depth == 0 {
+        return Err(anyhow!("max_depth must be at least 1"));
+    }
+
+    let granularity = config.granularity.clamp(1, 5);
+    let (min_subs, max_subs) = granularity_to_range(granularity);
+
+    // Check for existing partial tree
+    let existing_count = {
+        let conn = writer.lock().await;
+        db::count_question_nodes(&conn, slug)?
+    };
+
+    if existing_count > 0 {
+        // Resume path: check if there are undecomposed branch nodes
+        let undecomposed = {
+            let conn = writer.lock().await;
+            db::get_undecomposed_nodes(&conn, slug)?
+        };
+
+        if undecomposed.is_empty() {
+            // Tree is complete — reconstruct and return
+            info!(
+                slug = slug,
+                existing_nodes = existing_count,
+                "question tree already fully decomposed, reconstructing"
+            );
+            let rows = {
+                let conn = writer.lock().await;
+                db::load_question_nodes_as_tree(&conn, slug)?
+                    .ok_or_else(|| anyhow!("no nodes found despite count > 0"))?
+            };
+            return db::reconstruct_question_tree(&rows, config);
+        }
+
+        info!(
+            slug = slug,
+            existing_nodes = existing_count,
+            undecomposed = undecomposed.len(),
+            "resuming decomposition from existing partial tree"
+        );
+
+        // Decompose each undecomposed branch node
+        for node_row in &undecomposed {
+            let raw = RawDecomposedQuestion {
+                question: node_row.question.clone(),
+                prompt_hint: node_row.prompt_hint.clone(),
+                is_leaf: false,
+            };
+
+            // Determine current_depth from the node's depth in the tree
+            // node_row.depth is the tree depth (root=max, leaves=0), we need
+            // the distance from root for decomposition depth
+            let current_depth = node_row.depth;
+
+            info!(
+                slug = slug,
+                question_id = %node_row.question_id,
+                depth = current_depth,
+                question = %node_row.question,
+                "resuming decomposition for unfinished node"
+            );
+
+            build_subtree_incremental(
+                &raw,
+                &config.content_type,
+                config.folder_map.as_deref(),
+                granularity,
+                config.max_depth,
+                current_depth,
+                llm_config,
+                writer.clone(),
+                slug,
+                Some(&node_row.question_id),
+            )
+            .await?;
+        }
+
+        // Reconstruct the full tree
+        let rows = {
+            let conn = writer.lock().await;
+            db::load_question_nodes_as_tree(&conn, slug)?
+                .ok_or_else(|| anyhow!("no nodes found after resume decomposition"))?
+        };
+        return db::reconstruct_question_tree(&rows, config);
+    }
+
+    // Fresh decomposition — no existing nodes
+    info!(
+        apex = %config.apex_question,
+        content_type = %config.content_type,
+        granularity = granularity,
+        max_depth = config.max_depth,
+        slug = slug,
+        "starting incremental question decomposition"
+    );
+
+    // First call: apex → L1 sub-questions
+    let sub_questions = call_decomposition_llm(
+        &config.apex_question,
+        &config.content_type,
+        config.folder_map.as_deref(),
+        min_subs,
+        max_subs,
+        1,
+        llm_config,
+    )
+    .await?;
+
+    // Build apex node (we'll save it after we know its children)
+    let mut apex_children = Vec::new();
+
+    for (i, sq) in sub_questions.iter().enumerate() {
+        info!(
+            branch = i + 1,
+            total = sub_questions.len(),
+            question = %sq.question,
+            is_leaf = sq.is_leaf,
+            slug = slug,
+            "decomposing L1 branch (incremental)"
+        );
+        let child = build_subtree_incremental(
+            sq,
+            &config.content_type,
+            config.folder_map.as_deref(),
+            granularity,
+            config.max_depth,
+            2,
+            llm_config,
+            writer.clone(),
+            slug,
+            None, // parent_id set after apex node gets its ID
+        )
+        .await?;
+        let node_count = count_tree_nodes(&child);
+        info!(
+            branch = i + 1,
+            question = %sq.question,
+            nodes = node_count,
+            slug = slug,
+            "L1 branch complete (incremental)"
+        );
+        apex_children.push(child);
+    }
+
+    // ── Horizontal review: merge overlaps + depth-check L1 siblings ────
+    let (merged, leafed) = horizontal_review_siblings(&mut apex_children, llm_config).await?;
+    if merged > 0 || leafed > 0 {
+        info!(
+            merged = merged,
+            marked_as_leaf = leafed,
+            remaining = apex_children.len(),
+            slug = slug,
+            "horizontal review: merged overlaps and checked depth"
+        );
+    }
+
+    let apex_node = QuestionNode {
+        id: String::new(),
+        question: config.apex_question.clone(),
+        about: "all top-level nodes at once".to_string(),
+        creates: "apex".to_string(),
+        prompt_hint: "Synthesize all sub-answers into a comprehensive answer to the apex question."
+            .to_string(),
+        children: apex_children,
+        is_leaf: false,
+    };
+
+    let mut tree = QuestionTree {
+        apex: apex_node,
+        content_type: config.content_type.clone(),
+        config: config.clone(),
+        audience: None,
+    };
+
+    // Assign stable deterministic IDs to all nodes
+    assign_question_ids(&mut tree);
+
+    // Now persist ALL nodes to the DB with correct IDs
+    save_tree_nodes_to_db(&tree.apex, None, 0, slug, &writer).await?;
+
+    let total_nodes = {
+        let conn = writer.lock().await;
+        db::count_question_nodes(&conn, slug)?
+    };
+    info!(
+        slug = slug,
+        total_nodes = total_nodes,
+        "incremental decomposition complete — all nodes persisted"
+    );
+
+    Ok(tree)
+}
+
+/// Recursively save all nodes in a tree to the DB.
+async fn save_tree_nodes_to_db(
+    node: &QuestionNode,
+    parent_id: Option<&str>,
+    depth: u32,
+    slug: &str,
+    writer: &Arc<Mutex<Connection>>,
+) -> Result<()> {
+    {
+        let conn = writer.lock().await;
+        db::save_question_node(&conn, slug, node, parent_id, depth)?;
+    }
+
+    let node_id = node.id.clone();
+    for child in &node.children {
+        Box::pin(save_tree_nodes_to_db(
+            child,
+            Some(&node_id),
+            depth + 1,
+            slug,
+            writer,
+        ))
+        .await?;
+    }
+
+    Ok(())
+}
+
+/// Incrementally build a subtree, persisting each node as it's created.
+///
+/// Similar to `build_subtree` but saves nodes to DB after each LLM call.
+/// For resumed builds, `existing_parent_id` lets us update the parent's
+/// children_json once we know the child IDs.
+async fn build_subtree_incremental(
+    raw: &RawDecomposedQuestion,
+    content_type: &str,
+    folder_map: Option<&str>,
+    granularity: u32,
+    max_depth: u32,
+    current_depth: u32,
+    llm_config: &LlmConfig,
+    writer: Arc<Mutex<Connection>>,
+    slug: &str,
+    _existing_parent_id: Option<&str>,
+) -> Result<QuestionNode> {
+    // Terminal conditions: marked as leaf, or depth exceeded
+    if raw.is_leaf || current_depth >= max_depth {
+        let node = QuestionNode {
+            id: String::new(), // Will be assigned later by assign_question_ids
+            question: raw.question.clone(),
+            about: "each file individually".to_string(),
+            creates: "L0 nodes".to_string(),
+            prompt_hint: raw.prompt_hint.clone(),
+            children: vec![],
+            is_leaf: true,
+        };
+        return Ok(node);
+    }
+
+    // The LLM decides whether to decompose further — it can return an empty
+    // array if the question is already specific enough. No forced minimums.
+
+    let (min_subs, max_subs) = granularity_to_range(granularity);
+
+    info!(
+        depth = current_depth,
+        question = %raw.question,
+        slug = slug,
+        "decomposing sub-question (incremental)"
+    );
+    let sub_questions = call_decomposition_llm(
+        &raw.question,
+        content_type,
+        folder_map,
+        min_subs,
+        max_subs,
+        current_depth,
+        llm_config,
+    )
+    .await?;
+
+    info!(
+        depth = current_depth,
+        question = %raw.question,
+        sub_count = sub_questions.len(),
+        slug = slug,
+        "sub-questions returned (incremental)"
+    );
+
+    if sub_questions.is_empty() {
+        let node = QuestionNode {
+            id: String::new(),
+            question: raw.question.clone(),
+            about: "each file individually".to_string(),
+            creates: "L0 nodes".to_string(),
+            prompt_hint: raw.prompt_hint.clone(),
+            children: vec![],
+            is_leaf: true,
+        };
+        return Ok(node);
+    }
+
+    let mut children = Vec::new();
+    for sq in sub_questions {
+        let child = Box::pin(build_subtree_incremental(
+            &sq,
+            content_type,
+            folder_map,
+            granularity,
+            max_depth,
+            current_depth + 1,
+            llm_config,
+            writer.clone(),
+            slug,
+            None,
+        ))
+        .await?;
+        children.push(child);
+    }
+
+    let (about, creates) = scope_for_depth(current_depth);
+
+    let node = QuestionNode {
+        id: String::new(),
+        question: raw.question.clone(),
+        about,
+        creates,
+        prompt_hint: raw.prompt_hint.clone(),
+        children,
+        is_leaf: false,
+    };
+
+    info!(
+        slug = slug,
+        depth = current_depth,
+        children_count = node.children.len(),
+        question = %raw.question,
+        "decomposed question node (incremental)"
+    );
+
+    Ok(node)
 }
 
 /// Recursively build a subtree for a decomposed question.
@@ -316,6 +697,11 @@ async fn build_subtree(
 
     let (min_subs, max_subs) = granularity_to_range(granularity);
 
+    info!(
+        depth = current_depth,
+        question = %raw.question,
+        "decomposing sub-question"
+    );
     let sub_questions = call_decomposition_llm(
         &raw.question,
         content_type,
@@ -326,6 +712,12 @@ async fn build_subtree(
         llm_config,
     )
     .await?;
+    info!(
+        depth = current_depth,
+        question = %raw.question,
+        sub_count = sub_questions.len(),
+        "sub-questions returned"
+    );
 
     if sub_questions.is_empty() {
         // If the LLM returned no sub-questions, treat as leaf
@@ -386,47 +778,55 @@ async fn call_decomposition_llm(
     parent_question: &str,
     content_type: &str,
     folder_map: Option<&str>,
-    min_subs: u32,
-    max_subs: u32,
+    _min_subs: u32,
+    _max_subs: u32,
     depth: u32,
     llm_config: &LlmConfig,
 ) -> Result<Vec<RawDecomposedQuestion>> {
     let folder_context = folder_map.unwrap_or("(no folder map provided)");
 
     let system_prompt = format!(
-        r#"You are a knowledge architect. You decompose questions into sub-questions that together fully answer the parent question.
+        r#"You are decomposing a question into sub-questions to build a knowledge pyramid.
 
-Rules:
-- Produce {min_subs} to {max_subs} sub-questions.
-- Each sub-question should be specific and non-overlapping with siblings.
-- Mark a sub-question as is_leaf: true if it can be answered by examining individual source files directly.
-- Mark a sub-question as is_leaf: false if it requires synthesizing information across multiple sources or sub-answers.
-- The prompt_hint should describe what the LLM should focus on when answering this sub-question.
-- Sub-questions should collectively cover the parent question with no significant gaps.
-- For "{content_type}" content, focus on aspects relevant to that content type.
+WHAT YOU ARE DOING:
+You are helping build a layered understanding of a topic. The source material is "{content_type}" content. The original question will be answered by synthesizing answers to your sub-questions. Your sub-questions will either be answered directly from source material (leaves) or further decomposed by another instance of you (branches).
+
+HOW TO THINK ABOUT IT:
+- Ask yourself: "What are the genuinely distinct facets of this question that require separate investigation?"
+- Each sub-question should cover territory that NO other sibling covers
+- If a question can be answered by reading source files directly, it is a leaf — do not decompose further
+- If a question requires combining insights from multiple sources, it is a branch
+- Prefer FEWER, more focused questions over many overlapping ones
+- It is completely fine to produce just 1 or 2 sub-questions if that is what the question needs
+- It is also fine to say this question is already specific enough and return zero sub-questions (empty array)
+- The goal is the MINIMUM decomposition needed to fully answer the parent question — no more
+
+WHAT TO AVOID:
+- Do NOT pad with extra questions just to fill a quota — there is no quota
+- Do NOT create questions that overlap significantly with each other
+- Do NOT create questions that rephrase the parent in slightly different words
+- Do NOT decompose a question that is already answerable from source material
+
+You are at decomposition depth {depth}. Deeper depth means the questions should be MORE specific and MORE likely to be leaves.
 
 Respond with a JSON array of objects, each with:
   "question": string,
-  "prompt_hint": string,
+  "prompt_hint": string (what to focus on when answering),
   "is_leaf": boolean
 
-Return ONLY the JSON array, no other text."#,
+Return ONLY the JSON array. An empty array [] is valid if the parent question needs no decomposition."#,
     );
 
     let user_prompt = format!(
         r#"Parent question: "{parent_question}"
-Content type: {content_type}
-Current decomposition depth: {depth}
-Source material context:
+
+Source material:
 {folder_context}
 
-Decompose this question into {min_subs}-{max_subs} sub-questions."#,
+What are the genuinely distinct sub-questions needed to answer this? Only create sub-questions that cover unique territory."#,
     );
 
-    // Use the "max" tier model for decomposition (High Intelligence)
-    // Override the primary model to force the frontier model for decomposition,
-    // since call_model_unified auto-selects based on context limits and would
-    // pick the cheap primary model for these small prompts.
+    // Use the "max" tier model for decomposition (needs reasoning quality)
     let mut decomp_config = llm_config.clone();
     decomp_config.primary_model = llm_config.fallback_model_2.clone();
 
@@ -1063,14 +1463,170 @@ fn format_tree_summary(node: &QuestionNode, indent: usize) -> String {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /// Map granularity (1-5) to a (min, max) range for sub-question count.
+fn count_tree_nodes(node: &QuestionNode) -> usize {
+    1 + node.children.iter().map(count_tree_nodes).sum::<usize>()
+}
+
+/// Horizontal review: after decomposing siblings, the LLM reviews all of them
+/// together to (1) merge overlapping questions and (2) decide which are already
+/// specific enough to be leaves (stopping further decomposition).
+///
+/// This is the key intelligence gate — instead of blindly recursing into every
+/// branch, we ask "given the full picture at this level, are we done?"
+///
+/// Returns (merges_applied, newly_marked_leaves).
+async fn horizontal_review_siblings(
+    siblings: &mut Vec<QuestionNode>,
+    llm_config: &LlmConfig,
+) -> Result<(usize, usize)> {
+    if siblings.len() <= 1 {
+        return Ok((0, 0));
+    }
+
+    let questions_list: Vec<String> = siblings
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let leaf_status = if s.is_leaf { " [LEAF]" } else { " [BRANCH]" };
+            format!("  [{}]{} {}", i, leaf_status, s.question)
+        })
+        .collect();
+    let questions_text = questions_list.join("\n");
+
+    let system_prompt = r#"You are reviewing a set of sibling questions that together answer a parent question. You have two jobs:
+
+JOB 1 — MERGE OVERLAPS:
+Identify pairs of questions that cover essentially the same territory. For each merge:
+- "keep": index of the question to keep
+- "remove": index to merge into it
+- "merged_question": the combined question text
+
+JOB 2 — DEPTH CHECK:
+For each remaining question currently marked [BRANCH], decide: is this question specific enough to be answered directly from source material? If YES, mark it as a leaf (stopping further decomposition).
+
+Think about it this way: further decomposition is only valuable if the question is genuinely too broad to answer from source files. If a skilled reader could answer it by looking at the relevant files, it's a leaf.
+
+Respond with a JSON object:
+{
+  "merges": [{"keep": N, "remove": N, "merged_question": "..."}],
+  "mark_as_leaf": [N, N, ...]
+}
+
+Both arrays can be empty. Be conservative with merges but aggressive with marking leaves — prefer fewer, deeper questions over a sprawling shallow tree.
+
+Return ONLY the JSON object."#;
+
+    let user_prompt = format!(
+        "Review these sibling sub-questions:\n\n{questions_text}\n\n\
+         Which should be merged? Which branches are specific enough to be leaves?"
+    );
+
+    let mut review_config = llm_config.clone();
+    review_config.primary_model = llm_config.fallback_model_2.clone();
+
+    let response = llm::call_model_unified(
+        &review_config,
+        system_prompt,
+        &user_prompt,
+        0.1,
+        2048,
+        None,
+    )
+    .await?;
+
+    let review: serde_json::Value = match llm::extract_json(&response.content) {
+        Ok(v) => v,
+        Err(_) => return Ok((0, 0)),
+    };
+
+    // ── Apply merges ────────────────────────────────────────────────────
+    let merges = review
+        .get("merges")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let mut removed_indices: Vec<usize> = Vec::new();
+    for merge in &merges {
+        let keep_idx = merge.get("keep").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let remove_idx = merge.get("remove").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let merged_q = merge
+            .get("merged_question")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        if keep_idx >= siblings.len() || remove_idx >= siblings.len() || keep_idx == remove_idx {
+            continue;
+        }
+        if removed_indices.contains(&remove_idx) || removed_indices.contains(&keep_idx) {
+            continue;
+        }
+
+        if !merged_q.is_empty() {
+            siblings[keep_idx].question = merged_q.to_string();
+        }
+
+        let removed_children: Vec<QuestionNode> = siblings[remove_idx].children.drain(..).collect();
+        siblings[keep_idx].children.extend(removed_children);
+
+        info!(
+            keep = keep_idx,
+            remove = remove_idx,
+            merged = merged_q,
+            "horizontal review: merging overlapping siblings"
+        );
+        removed_indices.push(remove_idx);
+    }
+
+    removed_indices.sort_unstable();
+    removed_indices.reverse();
+    for idx in &removed_indices {
+        siblings.remove(*idx);
+    }
+    let merge_count = removed_indices.len();
+
+    // ── Apply leaf marks ────────────────────────────────────────────────
+    let leaf_indices: Vec<usize> = review
+        .get("mark_as_leaf")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_u64().map(|n| n as usize))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut leaf_count = 0;
+    for &idx in &leaf_indices {
+        // Indices may have shifted due to merges — adjust
+        // Only mark if index is still valid and not already a leaf
+        if idx < siblings.len() && !siblings[idx].is_leaf {
+            siblings[idx].is_leaf = true;
+            siblings[idx].children.clear();
+            siblings[idx].about = "each file individually".to_string();
+            siblings[idx].creates = "L0 nodes".to_string();
+            info!(
+                idx = idx,
+                question = %siblings[idx].question,
+                "horizontal review: marking as leaf — specific enough for direct answering"
+            );
+            leaf_count += 1;
+        }
+    }
+
+    Ok((merge_count, leaf_count))
+}
+
 fn granularity_to_range(granularity: u32) -> (u32, u32) {
+    // These are hints passed to the LLM but the prompt no longer forces them.
+    // The LLM decides how many sub-questions are genuinely needed.
     match granularity {
-        1 => (2, 4),
-        2 => (3, 5),
-        3 => (3, 6),
-        4 => (4, 7),
-        5 => (5, 8),
-        _ => (3, 6),
+        1 => (2, 3),
+        2 => (3, 4),
+        3 => (3, 4),
+        4 => (4, 5),
+        5 => (5, 6),
+        _ => (3, 4),
     }
 }
 
@@ -1233,6 +1789,7 @@ mod tests {
                 max_depth: 3,
                 folder_map: None,
             },
+            audience: None,
         }
     }
 
@@ -1493,6 +2050,7 @@ That should cover it."#;
     fn tree_to_question_set_empty_tree_fails() {
         let tree = QuestionTree {
             apex: QuestionNode {
+                id: String::new(),
                 question: "Empty apex".to_string(),
                 about: "all top-level nodes at once".to_string(),
                 creates: "apex".to_string(),
@@ -1502,6 +2060,7 @@ That should cover it."#;
             },
             content_type: "code".to_string(),
             config: DecompositionConfig::default(),
+            audience: None,
         };
 
         let temp_dir = std::env::temp_dir();
