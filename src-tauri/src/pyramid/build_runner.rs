@@ -456,6 +456,20 @@ pub async fn run_decomposed_build(
 
     let tree = question_decomposition::decompose_question(&config, &llm_config).await?;
 
+    // Persist question tree so it survives crashes and can be inspected post-build
+    {
+        let tree_json = serde_json::to_value(&tree)?;
+        let conn = state.writer.clone();
+        let slug_owned = slug_name.to_string();
+        tokio::task::spawn_blocking(move || {
+            let c = conn.blocking_lock();
+            db::save_question_tree(&c, &slug_owned, &tree_json)?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .map_err(|e| anyhow!("Question tree save panicked: {e}"))??;
+    }
+
     // ── 4b. Generate extraction schema from leaf questions ────────────────
     // This is the critical quality lever (Step 1.3): makes L0 extraction
     // question-shaped instead of generic. The extraction prompt tells L0
@@ -614,7 +628,7 @@ pub async fn run_decomposed_build(
         let slug_owned = slug_name.to_string();
         let bid = build_id.clone();
         let q = apex_question.to_string();
-        let ml = max_layer;
+        let ml = max_layer + 1; // total_layers = max_layer_index + 1 (L0 through Lmax)
         tokio::task::spawn_blocking(move || {
             let c = conn.blocking_lock();
             local_store::save_build_start(&c, &slug_owned, &bid, &q, ml)?;
@@ -624,27 +638,45 @@ pub async fn run_decomposed_build(
         .map_err(|e| anyhow!("Build start save panicked: {e}"))??;
     }
 
-    // Clear stale evidence/gaps from prior builds before L0 extraction
-    {
+    // Clean up prior build artifacts and run L0 extraction (or skip if from_depth > 0)
+    if from_depth == 0 {
+        // Full rebuild: clear ALL evidence, gaps, and upper-layer nodes
         let conn = state.writer.clone();
         let slug_owned = slug_name.to_string();
         tokio::task::spawn_blocking(move || {
             let c = conn.blocking_lock();
             db::clear_evidence_for_slug(&c, &slug_owned)?;
-            // Also clear old gaps
             c.execute("DELETE FROM pyramid_gaps WHERE slug = ?1", rusqlite::params![&slug_owned])?;
+            db::delete_nodes_above(&c, &slug_owned, -1)?; // Delete ALL nodes (depth > -1 = all)
             Ok::<(), anyhow::Error>(())
         })
         .await
         .map_err(|e| anyhow!("Evidence cleanup panicked: {e}"))??;
+
+        let _ = chain_executor::execute_plan(
+            state, &l0_plan, slug_name, from_depth, cancel, progress_tx.clone(),
+        )
+        .await?;
+    } else {
+        // Partial rebuild: clear only evidence/gaps/nodes at from_depth and above
+        let fd = from_depth;
+        let conn = state.writer.clone();
+        let slug_owned = slug_name.to_string();
+        tokio::task::spawn_blocking(move || {
+            let c = conn.blocking_lock();
+            db::clear_evidence_for_slug(&c, &slug_owned)?;
+            c.execute("DELETE FROM pyramid_gaps WHERE slug = ?1 AND layer >= ?2",
+                rusqlite::params![&slug_owned, fd])?;
+            db::delete_nodes_above(&c, &slug_owned, fd - 1)?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .map_err(|e| anyhow!("Partial cleanup panicked: {e}"))??;
+
+        info!(slug = slug_name, from_depth, "skipping L0 extraction (reusing existing L0 nodes)");
     }
 
-    let (_, l0_count) = chain_executor::execute_plan(
-        state, &l0_plan, slug_name, from_depth, cancel, progress_tx.clone(),
-    )
-    .await?;
-
-    info!(slug = slug_name, l0_nodes = l0_count, "L0 extraction complete — starting evidence loop");
+    info!(slug = slug_name, "L0 phase complete — starting evidence loop");
 
     // ── 10. Evidence-weighted upper layer loop ───────────────────────────
     // Load L0 nodes and generate synthesis prompts
@@ -679,7 +711,8 @@ pub async fn run_decomposed_build(
     let mut layers_completed: i64 = 0;
     let mut build_error: Option<String> = None;
 
-    for layer in 1..=max_layer {
+    let evidence_start_layer = std::cmp::max(1, from_depth);
+    for layer in evidence_start_layer..=max_layer {
         // Check cancellation at each layer boundary
         if cancel.is_cancelled() {
             warn!(slug = slug_name, layer, "build cancelled during evidence loop");

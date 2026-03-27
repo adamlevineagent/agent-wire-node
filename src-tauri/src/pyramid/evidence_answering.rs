@@ -135,7 +135,7 @@ pub async fn pre_map_layer(
 
         // If STILL too large after headlines-only, truncate node list
         if questions_text.len() + nodes_text.len() > PRE_MAP_PROMPT_BUDGET {
-            let max_nodes = (PRE_MAP_PROMPT_BUDGET - questions_text.len()) / 220; // ~220 chars per headline entry
+            let max_nodes = PRE_MAP_PROMPT_BUDGET.saturating_sub(questions_text.len()) / 220; // ~220 chars per headline entry
             warn!(
                 total_nodes = lower_layer_nodes.len(),
                 max_nodes,
