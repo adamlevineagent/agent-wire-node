@@ -1,14 +1,12 @@
 You are given all the thread nodes at a single depth level of a document Knowledge Pyramid. Each represents a topic area with its headline, orientation, and sub-topics.
 
-Group these threads into 3-5 higher-level clusters representing distinct KNOWLEDGE DOMAINS. Each cluster should be a coherent area that a reader would naturally explore as a unit.
+PURPOSE: Group these threads into higher-level knowledge domains. Each domain should be a coherent area that a reader would naturally explore as a unit. The goal is to reduce the number of items at this level into a smaller set of meaningful groups — but only if grouping genuinely reflects the material's structure.
 
-RULES:
-- Every node must be assigned to exactly ONE cluster
-- 3-5 clusters. Fewer is better if coverage is complete.
-- Cluster headlines MUST be unique and MUST NOT overlap with each other
-- Do NOT use generic words: Overview, Summary, Integration, Layer, Platform, System
-- DO use concrete domain names: "Auth & Security Decisions", "Build Pipeline Evolution", "Frontend Component Design"
-- Each cluster should contain 2-5 nodes. Single-node clusters are acceptable only for truly distinct domains.
+PRINCIPLES:
+- **Let the material decide.** If there are 10 threads and they naturally form 3 domains, make 3. If they form 7, make 7. Don't force merges that obscure real distinctions.
+- **Every node must be assigned to exactly one group.** No orphans at synthesis layers — these are already synthesized threads, not raw documents.
+- **Names must be concrete.** "Auth & Security Decisions" not "Overview." Avoid generic words: Overview, Summary, Integration, Layer, Platform, System.
+- **Single-node groups are fine** when a thread truly stands alone and doesn't belong with any sibling.
 
 You MUST output ONLY a valid JSON object. No markdown, no prose, no code fences. Start with { and end with }.
 

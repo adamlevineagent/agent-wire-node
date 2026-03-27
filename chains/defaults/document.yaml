@@ -157,19 +157,15 @@ steps:
                       type: integer
                     topic_name:
                       type: string
-                    doc_type:
-                      type: string
-                      description: "Type from classification"
-                    date:
-                      type: string
-                      description: "Date from classification"
-                    canonical:
-                      type: string
-                      description: "Canonical status from classification"
                   required: ["source_node", "topic_index", "topic_name"]
                   additionalProperties: false
             required: ["name", "description", "assignments"]
             additionalProperties: false
+        unassigned:
+          type: array
+          items:
+            type: string
+          description: "D-L0-XXX IDs of documents that do not fit any coherent thread"
       required: ["threads"]
       additionalProperties: false
     model: "qwen/qwen3.5-flash-02-23"
