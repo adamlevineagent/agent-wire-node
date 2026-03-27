@@ -3241,11 +3241,16 @@ async fn handle_question_build(
             } else {
                 match result {
                     Ok((_apex, failures)) => {
-                        s.status = "complete".to_string();
+                        if failures > 0 {
+                            s.status = "complete_with_errors".to_string();
+                        } else {
+                            s.status = "complete".to_string();
+                        }
                         s.failures = failures;
                     }
                     Err(e) => {
-                        s.status = format!("error: {}", e);
+                        tracing::error!(slug = %slug_name, error = %e, "question build failed");
+                        s.status = "failed".to_string();
                         s.failures = -1;
                     }
                 }
