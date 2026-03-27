@@ -1,21 +1,20 @@
-You are reading sibling nodes from a document Knowledge Pyramid. Each node represents a topic area synthesized from multiple documents. Organize everything into coherent TOPICS.
+You are reading sibling nodes from a document Knowledge Pyramid. Each node represents a topic area synthesized from multiple documents. Your job is to synthesize them into a higher-level understanding.
 
-A topic is a bundle: a named subject grouping all related findings, decisions, and open items. Everything known about that subject belongs in that bundle.
+PURPOSE: A reader at this level wants to understand the big picture — how these topic areas relate, what the key themes are, and what matters most. Each topic you create should be a coherent bundle of related findings, decisions, and open items.
 
-LATER SIBLINGS ARE MORE CURRENT. When they contradict earlier siblings, the later one is the current truth.
+PRINCIPLES:
+- LATER SIBLINGS ARE MORE CURRENT. When they contradict earlier siblings, the later one is current truth.
+- Merge topics that cover the same domain. If two children discuss the same subject, that is ONE topic.
+- Let the material determine how many topics you need. A reader should scan your topic names and immediately know which thread to pull for what they care about.
 
-Your job: understand all children and decide what 3-6 coherent topics organize everything here. A reader should scan your topic names and immediately know which thread to pull for what they care about.
-
-Merge topics that cover the same domain. If both children discuss the same subject, that is ONE topic.
-
-HEADLINE RULES:
-- Your headline must describe this node's UNIQUE CONTENT — what distinguishes it from siblings
-- Do NOT use generic words: Overview, Summary, Integration, Layer, Platform, System, Architecture
-- DO use concrete nouns: "Auth & Token Design", "Build Pipeline Decisions", "Bug Triage Results"
+HEADLINE:
+- Must describe this node's UNIQUE CONTENT — what distinguishes it from siblings
+- Use concrete nouns: "Auth & Token Design", "Build Pipeline Decisions", "Bug Triage Results"
+- Avoid generic words: Overview, Summary, Integration, Layer, Platform, System, Architecture
 
 For each topic:
 - name: clear, descriptive
-- current: 3-5 sentences. What the CURRENT STATE is — latest findings, final decisions, resolved status. Dense with specifics.
+- current: What the CURRENT STATE is — latest findings, final decisions, resolved status. Dense with specifics.
 - entities: every specific name, system, person, metric, document referenced
 - corrections: what changed (wrong → right, with source)
 - decisions: what was decided and why
@@ -23,7 +22,7 @@ For each topic:
 Output valid JSON only:
 {
   "headline": "2-6 word label — concrete, no generic words",
-  "orientation": "3-5 sentences: what this node covers, which children to drill for which topics, and what the key takeaway is.",
+  "orientation": "What this node covers, which children to drill for which topics, and what the key takeaway is.",
   "topics": [
     {
       "name": "Topic Name",

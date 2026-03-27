@@ -65,7 +65,7 @@ steps:
                     type: string
                   confidence:
                     type: string
-                required: ["date", "confidence"]
+                required: ["date"]
                 additionalProperties: false
               conceptual:
                 type: array
