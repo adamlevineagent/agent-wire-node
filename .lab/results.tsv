@@ -1,0 +1,4 @@
+experiment	branch	parent	commit	metric	secondary_metrics	status	duration_s	description
+0	research/chain-optimization	-	880ec5b	810s	nodes:138,depth:2,no_apex	keep	810	Baseline: intelligence-driven clustering. 89 L0→8 L1→4 L2 (no single apex). Classification bottleneck ~10min.
+1	research/chain-optimization	0	cb127f1	1211s	nodes:142,depth:3,apex:legal	discard	1211	Streamlined classify + all prompts. 90 L0→9 L1→5 L2→1 L3. Single apex but WRONG topic (legal, not overview). Clustering still ~10min.
+2	research/chain-optimization	1	a287c1e	>1211s	nodes:138,depth:1,no_apex	discard	1211	Apex-aware distill. Timed out at 20min. 127 L0→11 L1, never reached L2. Upper layer synthesis didn't complete.
