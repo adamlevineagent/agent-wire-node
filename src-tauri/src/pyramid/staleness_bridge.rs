@@ -142,10 +142,18 @@ pub fn auto_detect_changed_files(conn: &Connection, slug: &str) -> Result<Vec<Ch
         });
     }
 
+    // Mark consumed mutations as processed to prevent re-processing
+    if !changed_files.is_empty() {
+        conn.execute(
+            "UPDATE pyramid_pending_mutations SET processed = 1 WHERE slug = ?1 AND processed = 0",
+            rusqlite::params![slug],
+        )?;
+    }
+
     info!(
         slug,
         count = changed_files.len(),
-        "Auto-detected changed files from pending mutations"
+        "Auto-detected changed files from pending mutations (marked as processed)"
     );
 
     Ok(changed_files)

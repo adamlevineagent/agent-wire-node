@@ -659,12 +659,18 @@ pub async fn run_decomposed_build(
         .await?;
     } else {
         // Partial rebuild: clear only evidence/gaps/nodes at from_depth and above
+        // IMPORTANT: Scope evidence clearing to affected layers only — preserve L0 evidence
         let fd = from_depth;
         let conn = state.writer.clone();
         let slug_owned = slug_name.to_string();
         tokio::task::spawn_blocking(move || {
             let c = conn.blocking_lock();
-            db::clear_evidence_for_slug(&c, &slug_owned)?;
+            // Only clear evidence for nodes at or above from_depth
+            c.execute(
+                "DELETE FROM pyramid_evidence WHERE slug = ?1 AND target_node_id IN \
+                 (SELECT id FROM pyramid_nodes WHERE slug = ?1 AND depth >= ?2)",
+                rusqlite::params![&slug_owned, fd],
+            )?;
             c.execute("DELETE FROM pyramid_gaps WHERE slug = ?1 AND layer >= ?2",
                 rusqlite::params![&slug_owned, fd])?;
             db::delete_nodes_above(&c, &slug_owned, fd - 1)?;
