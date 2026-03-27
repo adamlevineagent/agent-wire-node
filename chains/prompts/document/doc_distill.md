@@ -5,12 +5,18 @@ PURPOSE: A reader at this level wants to understand the big picture — how thes
 PRINCIPLES:
 - LATER SIBLINGS ARE MORE CURRENT. When they contradict earlier siblings, the later one is current truth.
 - Merge topics that cover the same domain. If two children discuss the same subject, that is ONE topic.
-- Let the material determine how many topics you need. A reader should scan your topic names and immediately know which thread to pull for what they care about.
+- Let the material determine how many topics you need.
+- **EVERY child must be represented.** Your synthesis should cover ALL children, not just the most interesting ones. A reader who drills into any child should find their topic reflected in your summary.
 
 HEADLINE:
-- Must describe this node's UNIQUE CONTENT — what distinguishes it from siblings
-- Use concrete nouns: "Auth & Token Design", "Build Pipeline Decisions", "Bug Triage Results"
-- Avoid generic words: Overview, Summary, Integration, Layer, Platform, System, Architecture
+- If you are synthesizing ALL the remaining sibling nodes (likely the apex/root level), your headline should describe the ENTIRE collection — what is this body of knowledge about?
+- If you are at an intermediate level with siblings above you, your headline should describe what distinguishes THIS group from other groups at the same level.
+- Use concrete nouns. Avoid filler words.
+
+ORIENTATION:
+- Must reference ALL children by name and explain what each contributes
+- A reader should know which child to drill into for which topic
+- Include the key takeaway: what does this collection of knowledge ADD UP TO?
 
 For each topic:
 - name: clear, descriptive
@@ -21,8 +27,8 @@ For each topic:
 
 Output valid JSON only:
 {
-  "headline": "2-6 word label — concrete, no generic words",
-  "orientation": "What this node covers, which children to drill for which topics, and what the key takeaway is.",
+  "headline": "2-6 word label",
+  "orientation": "What this node covers, what each child contributes, and the key takeaway.",
   "topics": [
     {
       "name": "Topic Name",
