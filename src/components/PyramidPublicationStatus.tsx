@@ -207,6 +207,85 @@ export function PyramidPublicationStatus() {
         }
     }, [accessTierDraft, fetchAccessTier]);
 
+    // ─── WS-ONLINE-G: Absorption config management ─────────────────────────────
+
+    const fetchAbsorptionConfig = useCallback(async (slug: string) => {
+        try {
+            const data = await invoke<AbsorptionConfig>("pyramid_get_absorption_config", { slug });
+            setAbsorptionConfigs(prev => ({ ...prev, [slug]: data }));
+            return data;
+        } catch (err) {
+            console.error("Failed to fetch absorption config for", slug, err);
+            return null;
+        }
+    }, []);
+
+    const handleExpandAbsorption = useCallback(async (slug: string) => {
+        if (expandedAbsorptionSlug === slug) {
+            setExpandedAbsorptionSlug(null);
+            return;
+        }
+        const data = await fetchAbsorptionConfig(slug);
+        if (data) {
+            setAbsorptionDraft({
+                mode: data.mode,
+                chainId: data.chain_id || "",
+                rateLimit: String(data.rate_limit_per_operator),
+                dailyCap: String(data.daily_spend_cap),
+            });
+        }
+        setExpandedAbsorptionSlug(slug);
+    }, [expandedAbsorptionSlug, fetchAbsorptionConfig]);
+
+    const handleSaveAbsorption = useCallback(async (slug: string) => {
+        setSavingAbsorption(true);
+        try {
+            const rateLimit = absorptionDraft.rateLimit.trim() === ""
+                ? null
+                : parseInt(absorptionDraft.rateLimit, 10);
+            const dailyCap = absorptionDraft.dailyCap.trim() === ""
+                ? null
+                : parseInt(absorptionDraft.dailyCap, 10);
+
+            if (rateLimit !== null && isNaN(rateLimit)) {
+                setLastPublishResult(prev => ({
+                    ...prev,
+                    [slug]: { success: false, message: "Rate limit must be a number" },
+                }));
+                return;
+            }
+            if (dailyCap !== null && isNaN(dailyCap)) {
+                setLastPublishResult(prev => ({
+                    ...prev,
+                    [slug]: { success: false, message: "Daily cap must be a number" },
+                }));
+                return;
+            }
+
+            await invoke("pyramid_set_absorption_mode", {
+                slug,
+                mode: absorptionDraft.mode,
+                chain_id: absorptionDraft.chainId.trim() || null,
+                rate_limit: rateLimit,
+                daily_cap: dailyCap,
+            });
+
+            await fetchAbsorptionConfig(slug);
+            setLastPublishResult(prev => ({
+                ...prev,
+                [slug]: { success: true, message: `Absorption mode set to ${absorptionDraft.mode}` },
+            }));
+        } catch (err) {
+            console.error("Failed to save absorption config:", err);
+            setLastPublishResult(prev => ({
+                ...prev,
+                [slug]: { success: false, message: String(err) },
+            }));
+        } finally {
+            setSavingAbsorption(false);
+        }
+    }, [absorptionDraft, fetchAbsorptionConfig]);
+
     // ─── WS-ONLINE-D: Pinning actions ─────────────────────────────────────────
 
     const [unpinningSlug, setUnpinningSlug] = useState<string | null>(null);
@@ -572,6 +651,93 @@ export function PyramidPublicationStatus() {
                                                 disabled={savingAccessTier}
                                             >
                                                 {savingAccessTier ? "Saving..." : "Save Access Tier"}
+                                            </button>
+                                        </div>
+                                    )}
+                                </div>
+                            )}
+
+                            {/* WS-ONLINE-G: Absorption Mode Controls */}
+                            {!p.pinned && (
+                                <div className="pyramid-access-tier-section">
+                                    <button
+                                        className="pyramid-access-tier-toggle"
+                                        onClick={() => handleExpandAbsorption(p.slug)}
+                                        title="Configure how incoming webs are absorbed"
+                                    >
+                                        Absorption: {absorptionConfigs[p.slug]?.mode || "open"}
+                                        <span className="pyramid-access-tier-chevron">
+                                            {expandedAbsorptionSlug === p.slug ? "\u25B4" : "\u25BE"}
+                                        </span>
+                                    </button>
+
+                                    {expandedAbsorptionSlug === p.slug && (
+                                        <div className="pyramid-access-tier-panel">
+                                            <div className="pyramid-access-tier-field">
+                                                <label>Mode</label>
+                                                <select
+                                                    value={absorptionDraft.mode}
+                                                    onChange={(e) => setAbsorptionDraft(prev => ({
+                                                        ...prev,
+                                                        mode: e.target.value as AbsorptionMode,
+                                                    }))}
+                                                >
+                                                    <option value="open">Open (questioner owns web)</option>
+                                                    <option value="absorb-all">Absorb All (owner funds)</option>
+                                                    <option value="absorb-selective">Absorb Selective (chain evaluates)</option>
+                                                </select>
+                                            </div>
+
+                                            {absorptionDraft.mode === "absorb-selective" && (
+                                                <div className="pyramid-access-tier-field">
+                                                    <label>Action Chain ID</label>
+                                                    <input
+                                                        type="text"
+                                                        value={absorptionDraft.chainId}
+                                                        onChange={(e) => setAbsorptionDraft(prev => ({
+                                                            ...prev,
+                                                            chainId: e.target.value,
+                                                        }))}
+                                                        placeholder="chain-id for evaluation"
+                                                    />
+                                                </div>
+                                            )}
+
+                                            {absorptionDraft.mode === "absorb-all" && (
+                                                <>
+                                                    <div className="pyramid-access-tier-field">
+                                                        <label>Rate Limit (builds/hour per operator)</label>
+                                                        <input
+                                                            type="text"
+                                                            value={absorptionDraft.rateLimit}
+                                                            onChange={(e) => setAbsorptionDraft(prev => ({
+                                                                ...prev,
+                                                                rateLimit: e.target.value,
+                                                            }))}
+                                                            placeholder="3"
+                                                        />
+                                                    </div>
+                                                    <div className="pyramid-access-tier-field">
+                                                        <label>Daily Spend Cap (credits/day)</label>
+                                                        <input
+                                                            type="text"
+                                                            value={absorptionDraft.dailyCap}
+                                                            onChange={(e) => setAbsorptionDraft(prev => ({
+                                                                ...prev,
+                                                                dailyCap: e.target.value,
+                                                            }))}
+                                                            placeholder="100"
+                                                        />
+                                                    </div>
+                                                </>
+                                            )}
+
+                                            <button
+                                                className="folder-publish-btn"
+                                                onClick={() => handleSaveAbsorption(p.slug)}
+                                                disabled={savingAbsorption}
+                                            >
+                                                {savingAbsorption ? "Saving..." : "Save Absorption Config"}
                                             </button>
                                         </div>
                                     )}
