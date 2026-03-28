@@ -3604,6 +3604,18 @@ async fn pyramid_characterize(
     }
 }
 
+/// Run dual-executor parity test on a code or document slug.
+#[tauri::command]
+async fn pyramid_parity_run(
+    state: tauri::State<'_, SharedState>,
+    slug: String,
+) -> Result<serde_json::Value, String> {
+    let report = wire_node_lib::pyramid::parity::run_parity_test(&state.pyramid, &slug)
+        .await
+        .map_err(|e| e.to_string())?;
+    serde_json::to_value(&report).map_err(|e| e.to_string())
+}
+
 /// IPC equivalent of POST /pyramid/:slug/meta — run all meta passes.
 #[tauri::command]
 async fn pyramid_meta_run(
@@ -5749,6 +5761,7 @@ fn main() {
             pyramid_question_build,
             pyramid_question_preview,
             pyramid_characterize,
+            pyramid_parity_run,
             pyramid_meta_run,
             pyramid_crystallize,
             pyramid_publish,
