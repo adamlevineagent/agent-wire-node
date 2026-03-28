@@ -3489,6 +3489,90 @@ async fn pyramid_set_access_tier(
     Ok(())
 }
 
+/// Set the absorption mode for a pyramid slug (WS-ONLINE-G).
+///
+/// Mutations are IPC-only (S1 security model). Sets the absorption mode and optional
+/// chain ID, plus rate limit and daily spend cap for absorb-all mode.
+#[tauri::command]
+async fn pyramid_set_absorption_mode(
+    state: tauri::State<'_, SharedState>,
+    slug: String,
+    mode: String,
+    chain_id: Option<String>,
+    rate_limit: Option<u32>,
+    daily_cap: Option<u64>,
+) -> Result<(), String> {
+    // Validate mode value
+    match mode.as_str() {
+        "open" | "absorb-all" | "absorb-selective" => {}
+        _ => return Err(format!(
+            "Invalid absorption mode '{}'. Must be one of: open, absorb-all, absorb-selective",
+            mode
+        )),
+    }
+
+    // For absorb-selective, chain_id is required
+    if mode == "absorb-selective" && chain_id.is_none() {
+        return Err("absorb-selective mode requires a chain_id".to_string());
+    }
+
+    // Save absorption mode to DB
+    let conn = state.pyramid.writer.lock().await;
+    pyramid_db::set_absorption_mode(&conn, &slug, &mode, chain_id.as_deref())
+        .map_err(|e| e.to_string())?;
+    drop(conn);
+
+    // Save rate limit config to pyramid_config.json if provided
+    if rate_limit.is_some() || daily_cap.is_some() {
+        let data_dir = state.pyramid.data_dir.as_ref()
+            .ok_or_else(|| "data_dir not set".to_string())?;
+        let mut cfg = wire_node_lib::pyramid::PyramidConfig::load(data_dir);
+        if let Some(rl) = rate_limit {
+            cfg.absorption_rate_limit_per_operator = rl;
+        }
+        if let Some(dc) = daily_cap {
+            cfg.absorption_daily_spend_cap = dc;
+        }
+        cfg.save(data_dir).map_err(|e| e.to_string())?;
+    }
+
+    tracing::info!(
+        slug = %slug,
+        mode = %mode,
+        chain_id = ?chain_id,
+        rate_limit = ?rate_limit,
+        daily_cap = ?daily_cap,
+        "Absorption mode updated via IPC"
+    );
+
+    Ok(())
+}
+
+/// Get the absorption config for a pyramid slug (WS-ONLINE-G).
+#[tauri::command]
+async fn pyramid_get_absorption_config(
+    state: tauri::State<'_, SharedState>,
+    slug: String,
+) -> Result<serde_json::Value, String> {
+    let conn = state.pyramid.reader.lock().await;
+    let (mode, chain_id) = pyramid_db::get_absorption_mode(&conn, &slug)
+        .map_err(|e| e.to_string())?;
+
+    let (rate_limit, daily_cap) = if let Some(ref data_dir) = state.pyramid.data_dir {
+        let cfg = wire_node_lib::pyramid::PyramidConfig::load(data_dir);
+        (cfg.absorption_rate_limit_per_operator, cfg.absorption_daily_spend_cap)
+    } else {
+        (3u32, 100u64)
+    };
+
+    Ok(serde_json::json!({
+        "mode": mode,
+        "chain_id": chain_id,
+        "rate_limit_per_operator": rate_limit,
+        "daily_spend_cap": daily_cap,
+    }))
+}
+
 /// Get the access tier and cached emergent price for a pyramid slug (WS-ONLINE-E).
 #[tauri::command]
 async fn pyramid_get_access_tier(
@@ -5999,6 +6083,8 @@ fn main() {
             pyramid_archive_slug,
             pyramid_set_access_tier,
             pyramid_get_access_tier,
+            pyramid_set_absorption_mode,
+            pyramid_get_absorption_config,
             pyramid_question_build,
             pyramid_question_preview,
             pyramid_characterize,

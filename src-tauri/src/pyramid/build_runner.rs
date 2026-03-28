@@ -39,6 +39,93 @@ use super::PyramidState;
 
 use std::collections::HashMap;
 
+// ── WS-ONLINE-G: Absorption build rate limiting ─────────────────────
+
+/// Check whether an external operator is allowed to trigger an absorb-all build
+/// on this slug. Enforces per-operator hourly rate limit and daily spend cap.
+///
+/// Returns `Ok(())` if allowed, or `Err` with a 429-style message if rate limited.
+///
+/// `estimated_cost` is the estimated credit cost of the build (0 if unknown).
+pub async fn check_absorption_rate_limit(
+    state: &PyramidState,
+    slug_name: &str,
+    operator_id: &str,
+    estimated_cost: u64,
+) -> Result<()> {
+    // Check absorption mode
+    let mode = {
+        let conn = state.reader.lock().await;
+        let (mode, _chain_id) = db::get_absorption_mode(&conn, slug_name)?;
+        mode
+    };
+
+    if mode != "absorb-all" {
+        // Not absorb-all — no rate limiting needed (open = requester pays, selective = chain decides)
+        return Ok(());
+    }
+
+    // Read rate limits from config
+    let (max_per_hour, daily_cap) = if let Some(ref data_dir) = state.data_dir {
+        let cfg = super::PyramidConfig::load(data_dir);
+        (cfg.absorption_rate_limit_per_operator, cfg.absorption_daily_spend_cap)
+    } else {
+        (3u32, 100u64)
+    };
+
+    // Per-operator hourly rate limit
+    {
+        let mut limiter = state.absorption_build_rate_limiter.lock().await;
+        let now = std::time::Instant::now();
+        let entry = limiter.entry(operator_id.to_string()).or_insert((0, now));
+        let elapsed = now.duration_since(entry.1);
+
+        if elapsed > std::time::Duration::from_secs(3600) {
+            // Window expired, reset
+            *entry = (1, now);
+        } else if entry.0 >= max_per_hour {
+            let retry_after = 3600 - elapsed.as_secs();
+            return Err(anyhow!(
+                "429: absorption build rate limit exceeded for operator '{}' on slug '{}'. \
+                 Limit: {} builds/hour. Retry after {}s",
+                operator_id, slug_name, max_per_hour, retry_after
+            ));
+        } else {
+            entry.0 += 1;
+        }
+    }
+
+    // Daily spend cap
+    {
+        let mut spend = state.absorption_daily_spend.lock().await;
+        let now = std::time::Instant::now();
+        let elapsed = now.duration_since(spend.1);
+
+        if elapsed > std::time::Duration::from_secs(86400) {
+            // Day expired, reset
+            *spend = (estimated_cost, now);
+        } else if spend.0 + estimated_cost > daily_cap {
+            let retry_after = 86400 - elapsed.as_secs();
+            return Err(anyhow!(
+                "429: absorption daily spend cap exceeded for slug '{}'. \
+                 Cap: {} credits/day, spent: {}. Retry after {}s",
+                slug_name, daily_cap, spend.0, retry_after
+            ));
+        } else {
+            spend.0 += estimated_cost;
+        }
+    }
+
+    info!(
+        slug = slug_name,
+        operator_id = operator_id,
+        estimated_cost = estimated_cost,
+        "Absorption build rate check passed"
+    );
+
+    Ok(())
+}
+
 /// Unified build runner — dispatches to the chain engine or legacy build
 /// pipeline based on the `use_chain_engine` feature flag.
 ///

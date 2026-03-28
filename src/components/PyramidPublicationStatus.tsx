@@ -17,12 +17,20 @@ interface PyramidPublicationInfo {
 
 type PublishingState = "idle" | "publishing";
 type AccessTier = "public" | "circle-scoped" | "priced" | "embargoed";
+type AbsorptionMode = "open" | "absorb-all" | "absorb-selective";
 
 interface AccessTierInfo {
     access_tier: AccessTier;
     access_price: number | null;
     allowed_circles: string[] | null;
     cached_emergent_price: number | null;
+}
+
+interface AbsorptionConfig {
+    mode: AbsorptionMode;
+    chain_id: string | null;
+    rate_limit_per_operator: number;
+    daily_spend_cap: number;
 }
 
 // ─── Component ───────────────────────────────────────────────────────────────
@@ -44,6 +52,17 @@ export function PyramidPublicationStatus() {
         circles: string;
     }>({ tier: "public", price: "", circles: "" });
     const [savingAccessTier, setSavingAccessTier] = useState(false);
+
+    // ─── WS-ONLINE-G: Absorption Config State ───────────────────────────────
+    const [absorptionConfigs, setAbsorptionConfigs] = useState<Record<string, AbsorptionConfig>>({});
+    const [expandedAbsorptionSlug, setExpandedAbsorptionSlug] = useState<string | null>(null);
+    const [absorptionDraft, setAbsorptionDraft] = useState<{
+        mode: AbsorptionMode;
+        chainId: string;
+        rateLimit: string;
+        dailyCap: string;
+    }>({ mode: "open", chainId: "", rateLimit: "3", dailyCap: "100" });
+    const [savingAbsorption, setSavingAbsorption] = useState(false);
 
     // ─── Fetch publication status ────────────────────────────────────────────
 

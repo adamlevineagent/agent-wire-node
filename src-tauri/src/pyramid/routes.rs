@@ -1865,7 +1865,20 @@ pub fn pyramid_routes(
     let top12 = top11.or(composed_route).unify().boxed(); // Composed view route (WS8-H)
     let top13 = top12.or(export_route).unify().boxed(); // WS-ONLINE-D: Export endpoint for pinning
     let top14 = top13.or(query_cost).unify().boxed(); // WS-ONLINE-H: Cost preview for nano-transactions
-    top14
+
+    // WS-ONLINE-G: GET /pyramid/:slug/absorption-config — read-only, Wire JWT accessible.
+    // Returns the absorption mode, chain ID, and rate limit config so remote agents
+    // can discover how this pyramid handles incoming webs.
+    let absorption_config = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("absorption-config"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(with_slug_read_auth(state.clone(), jwt_public_key.clone()))
+        .and_then(handle_absorption_config));
+
+    let top15 = top14.or(absorption_config).unify().boxed(); // WS-ONLINE-G: Absorption config
+    top15
 }
 
 // ── Route handlers ──────────────────────────────────────────────────
@@ -5510,4 +5523,61 @@ async fn handle_remote_query(
             }
         }
     }
+}
+
+// ── WS-ONLINE-G: Absorption config handler ──────────────────────────
+
+async fn handle_absorption_config(
+    slug_name: String,
+    (state, auth_source): (Arc<PyramidState>, AuthSource),
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let conn = state.reader.lock().await;
+
+    // Access tier enforcement — embargoed pyramids should not expose config
+    if let Err(response) = enforce_access_tier(&conn, &slug_name, &auth_source) {
+        return Ok(response);
+    }
+
+    // Verify slug exists
+    match db::get_slug(&conn, &slug_name) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return Ok(json_error(
+                warp::http::StatusCode::NOT_FOUND,
+                &format!("slug '{}' not found", slug_name),
+            ));
+        }
+        Err(e) => {
+            return Ok(json_error(
+                warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                &e.to_string(),
+            ));
+        }
+    }
+
+    // Read absorption mode from DB
+    let (mode, chain_id) = match db::get_absorption_mode(&conn, &slug_name) {
+        Ok(val) => val,
+        Err(e) => {
+            return Ok(json_error(
+                warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("failed to read absorption config: {}", e),
+            ));
+        }
+    };
+
+    // Read rate limit config from pyramid_config.json
+    let (rate_limit, daily_cap) = if let Some(ref data_dir) = state.data_dir {
+        let cfg = super::PyramidConfig::load(data_dir);
+        (cfg.absorption_rate_limit_per_operator, cfg.absorption_daily_spend_cap)
+    } else {
+        (3u32, 100u64) // defaults
+    };
+
+    Ok(json_ok(&serde_json::json!({
+        "mode": mode,
+        "chain_id": chain_id,
+        "rate_limit_per_operator": rate_limit,
+        "daily_spend_cap": daily_cap,
+    })))
 }
