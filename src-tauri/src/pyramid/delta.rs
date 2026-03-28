@@ -22,17 +22,7 @@ use crate::pyramid::llm;
 use crate::pyramid::naming::{clean_headline, headline_for_node};
 use crate::pyramid::types::*;
 
-// ── Constants (loaded from OperationalConfig) ─────────────────────────────────
-
-use super::{Tier2Config, Tier3Config};
-
-fn collapse_threshold() -> i64 { Tier3Config::default().collapse_threshold }
-fn distillation_token_budget() -> usize { Tier2Config::default().distillation_token_budget }
-fn distillation_early_collapse() -> usize { Tier2Config::default().distillation_early_collapse }
-#[allow(dead_code)]
-fn staleness_debounce_secs() -> u64 { Tier3Config::default().staleness_debounce_secs }
-fn max_propagation_depth() -> i64 { Tier3Config::default().max_propagation_depth }
-fn self_check_window() -> i64 { Tier3Config::default().self_check_window }
+use super::OperationalConfig;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -179,7 +169,7 @@ fn truncate_for_name(text: &str, max_len: usize) -> String {
 /// Steps:
 /// 1. Load the thread's current canonical node (distilled text)
 /// 2. Load the cumulative distillation
-/// 3. Load the last self_check_window() deltas
+/// 3. Load the last ops.tier3.self_check_window deltas
 /// 4. Call LLM with delta prompt
 /// 5. Parse response
 /// 6. Save delta with transaction-wrapped sequence assignment
@@ -195,6 +185,7 @@ pub async fn create_delta(
     source_node_id: Option<&str>,
     api_key: &str,
     model: &str,
+    ops: &OperationalConfig,
 ) -> anyhow::Result<Delta> {
     // 1. Load canonical node
     let (canonical_distilled, canonical_id) = {
@@ -220,8 +211,8 @@ pub async fn create_delta(
     let recent_deltas = {
         let conn = reader.lock().await;
         let all = db::get_deltas(&conn, slug, thread_id, None)?;
-        let start = if all.len() > self_check_window() as usize {
-            all.len() - self_check_window() as usize
+        let start = if all.len() > ops.tier3.self_check_window as usize {
+            all.len() - ops.tier3.self_check_window as usize
         } else {
             0
         };
@@ -358,7 +349,7 @@ Output JSON only:
 
     // 7. Rewrite distillation
     let web_edge_notes =
-        rewrite_distillation(reader, writer, slug, thread_id, &delta, api_key, model).await?;
+        rewrite_distillation(reader, writer, slug, thread_id, &delta, api_key, model, ops).await?;
 
     // 7b. Process web edge notes (cross-thread connections)
     if let Some(notes) = web_edge_notes {
@@ -376,7 +367,7 @@ Output JSON only:
     // 8. Check if collapse needed
     let needs_collapse = {
         let conn = reader.lock().await;
-        check_collapse_needed(&conn, slug, thread_id)?
+        check_collapse_needed(&conn, slug, thread_id, ops)?
     };
 
     if needs_collapse {
@@ -399,7 +390,7 @@ Output JSON only:
             &canonical_id,
             1,
             &mut visited,
-            max_propagation_depth(),
+            ops.tier3.max_propagation_depth,
         ) {
             Ok(affected) => {
                 if !affected.is_empty() {
@@ -435,6 +426,7 @@ pub async fn rewrite_distillation(
     delta: &Delta,
     api_key: &str,
     model: &str,
+    ops: &OperationalConfig,
 ) -> anyhow::Result<Option<Vec<WebEdgeNote>>> {
     // 1. Load current distillation
     let current_distillation = {
@@ -495,7 +487,7 @@ Output JSON only:
         } else {
             thread_names_list
         },
-        budget = distillation_token_budget(),
+        budget = ops.tier2.distillation_token_budget,
     );
 
     let cfg = config_for_model(api_key, model);
@@ -565,11 +557,11 @@ Output JSON only:
     );
 
     // 6. Check early collapse condition
-    if estimate_tokens(&new_distillation) > distillation_early_collapse() {
+    if estimate_tokens(&new_distillation) > ops.tier2.distillation_early_collapse {
         warn!(
             "[delta] distillation exceeds early collapse threshold ({} > {}), collapse recommended",
             estimate_tokens(&new_distillation),
-            distillation_early_collapse()
+            ops.tier2.distillation_early_collapse
         );
     }
 
@@ -589,6 +581,7 @@ pub async fn collapse_thread(
     thread_id: &str,
     api_key: &str,
     collapse_model: &str,
+    ops: &OperationalConfig,
 ) -> anyhow::Result<String> {
     let start = Instant::now();
 
@@ -861,7 +854,7 @@ Output valid JSON matching this schema:
             &new_node_id,
             1,
             &mut visited,
-            max_propagation_depth(),
+            ops.tier3.max_propagation_depth,
         ) {
             Ok(affected) => {
                 if !affected.is_empty() {
@@ -964,6 +957,7 @@ pub fn check_collapse_needed(
     conn: &Connection,
     slug: &str,
     thread_id: &str,
+    ops: &OperationalConfig,
 ) -> anyhow::Result<bool> {
     // Check delta_count from thread
     let delta_count: i64 = conn
@@ -974,7 +968,7 @@ pub fn check_collapse_needed(
         )
         .unwrap_or(0);
 
-    if delta_count >= collapse_threshold() {
+    if delta_count >= ops.tier3.collapse_threshold {
         return Ok(true);
     }
 
@@ -987,7 +981,7 @@ pub fn check_collapse_needed(
         )
         .unwrap_or_default();
 
-    if estimate_tokens(&distillation_content) > distillation_early_collapse() {
+    if estimate_tokens(&distillation_content) > ops.tier2.distillation_early_collapse {
         return Ok(true);
     }
 
@@ -1060,15 +1054,17 @@ mod tests {
         };
         db::save_thread(&conn, &thread).unwrap();
 
+        let ops = OperationalConfig::default();
+
         // Should not need collapse initially
-        assert!(!check_collapse_needed(&conn, "test", "t1").unwrap());
+        assert!(!check_collapse_needed(&conn, "test", "t1", &ops).unwrap());
 
         // Bump delta_count past threshold
         conn.execute(
             "UPDATE pyramid_threads SET delta_count = ?1 WHERE slug = 'test' AND thread_id = 't1'",
-            rusqlite::params![collapse_threshold()],
+            rusqlite::params![ops.tier3.collapse_threshold],
         )
         .unwrap();
-        assert!(check_collapse_needed(&conn, "test", "t1").unwrap());
+        assert!(check_collapse_needed(&conn, "test", "t1", &ops).unwrap());
     }
 }

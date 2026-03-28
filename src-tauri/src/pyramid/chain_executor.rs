@@ -10088,6 +10088,8 @@ mod tests {
             use_chain_engine: AtomicBool::new(false),
             use_ir_executor: AtomicBool::new(true),
             event_bus: Arc::new(crate::pyramid::event_chain::LocalEventBus::new()),
+            operational: Arc::new(crate::pyramid::OperationalConfig::default()),
+            chains_dir: std::path::PathBuf::from("chains"),
         };
 
         let chain = make_integration_code_chain();
@@ -10154,6 +10156,8 @@ mod tests {
             use_chain_engine: AtomicBool::new(false),
             use_ir_executor: AtomicBool::new(true),
             event_bus: Arc::new(crate::pyramid::event_chain::LocalEventBus::new()),
+            operational: Arc::new(crate::pyramid::OperationalConfig::default()),
+            chains_dir: std::path::PathBuf::from("chains"),
         };
 
         let chain = make_integration_code_chain();
@@ -10240,6 +10244,8 @@ mod tests {
             use_chain_engine: AtomicBool::new(false),
             use_ir_executor: AtomicBool::new(false),
             event_bus: Arc::new(crate::pyramid::event_chain::LocalEventBus::new()),
+            operational: Arc::new(crate::pyramid::OperationalConfig::default()),
+            chains_dir: std::path::PathBuf::from("chains"),
         };
 
         assert!(!pyramid_state
@@ -10290,6 +10296,8 @@ mod tests {
             use_chain_engine: AtomicBool::new(false),
             use_ir_executor: AtomicBool::new(true),
             event_bus: Arc::new(crate::pyramid::event_chain::LocalEventBus::new()),
+            operational: Arc::new(crate::pyramid::OperationalConfig::default()),
+            chains_dir: std::path::PathBuf::from("chains"),
         };
 
         let chain = make_integration_code_chain();

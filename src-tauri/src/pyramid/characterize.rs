@@ -18,6 +18,7 @@ use tracing::info;
 use super::llm::{self, LlmConfig};
 use super::question_decomposition;
 use super::types::CharacterizationResult;
+use super::Tier1Config;
 
 // ── Public API ───────────────────────────────────────────────────────────────
 
@@ -34,8 +35,9 @@ pub async fn characterize(
     source_path: &str,
     apex_question: &str,
     llm_config: &LlmConfig,
+    tier1: &Tier1Config,
 ) -> Result<CharacterizationResult> {
-    characterize_with_fallback(source_path, apex_question, llm_config, None).await
+    characterize_with_fallback(source_path, apex_question, llm_config, None, tier1).await
 }
 
 /// Characterize source material with an optional L0 summary fallback.
@@ -49,6 +51,7 @@ pub async fn characterize_with_fallback(
     apex_question: &str,
     llm_config: &LlmConfig,
     l0_fallback: Option<&str>,
+    tier1: &Tier1Config,
 ) -> Result<CharacterizationResult> {
     // ── 1. Build folder map from source path for LLM context ─────────────
     let folder_map = question_decomposition::build_folder_map(source_path);
@@ -101,8 +104,8 @@ Analyze this material and produce the characterization."#,
     // Model selection is controlled by YAML chain definitions, not Rust overrides.
     // See Inviolable #4: "YAML is the single source of truth for model selection."
 
-    let temperature = 0.3;
-    let max_tokens: usize = 2048;
+    let temperature = tier1.characterize_temperature;
+    let max_tokens = tier1.characterize_max_tokens;
 
     // Try up to 2 times on parse failure (same pattern as decomposition)
     for attempt in 0..2u32 {

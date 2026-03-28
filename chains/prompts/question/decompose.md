@@ -10,12 +10,11 @@ BEFORE YOU OUTPUT ANYTHING, do this mental exercise:
 
 THE GOLDEN RULE: If you find yourself listing the same features, components, or capabilities in multiple imagined answers, your questions aren't different enough. Go back to step 1.
 
-LEAF vs BRANCH at depth {{depth}}:
-- Depth 1: ALL sub-questions must be branches (is_leaf: false). Period.
-- Depth 2: Most should be branches unless truly narrow.
-- Depth 3+: Most should be leaves.
+LEAF vs BRANCH: For each sub-question, decide based on the question's complexity. If the question can be answered directly from source material, make it a leaf. If it needs further decomposition to be answerable, make it a branch.
 
-OUTPUT: 2-3 sub-questions. Not more. Fewer is better if they're truly distinct.
+Produce the MINIMUM number of sub-questions needed to fully answer the parent question. If 1 suffices, use 1. If 5 are genuinely needed, use 5. Do not pad and do not artificially limit.
+
+{{audience_block}}
 
 Respond with a JSON array of objects, each with:
   "question": string,

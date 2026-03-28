@@ -478,12 +478,10 @@ async fn create_new_faq(
 
 // ── FAQ Directory / Category Engine ──────────────────────────────────────────
 
-fn faq_category_threshold() -> usize { super::Tier2Config::default().faq_category_threshold }
-
 /// Get the FAQ directory for a slug.
 ///
 /// Takes BOTH reader AND writer because the meta-pass creates categories.
-/// If count < faq_category_threshold(): returns flat mode with all FAQs.
+/// If count < faq_category_threshold: returns flat mode with all FAQs.
 /// If >= threshold: loads or creates categories via meta-pass.
 /// Falls back to flat mode on any LLM failure.
 pub async fn get_faq_directory(
@@ -492,6 +490,7 @@ pub async fn get_faq_directory(
     slug: &str,
     api_key: &str,
     model: &str,
+    tier2: &super::Tier2Config,
 ) -> Result<FaqDirectory> {
     let all_faqs = {
         let conn = reader.lock().await;
@@ -501,7 +500,7 @@ pub async fn get_faq_directory(
     let total_faqs = all_faqs.len() as i64;
 
     // Below threshold: flat mode
-    if all_faqs.len() < faq_category_threshold() {
+    if all_faqs.len() < tier2.faq_category_threshold {
         return Ok(FaqDirectory {
             slug: slug.to_string(),
             mode: "flat".to_string(),

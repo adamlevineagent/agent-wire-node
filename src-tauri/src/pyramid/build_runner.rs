@@ -88,8 +88,8 @@ pub async fn run_build_from(
     // Question slugs route through run_decomposed_build, loading nodes from
     // referenced slugs instead of from their own source path.
     if content_type == ContentType::Question {
-        // Retrieve the stored apex question from the question tree
-        let apex_question = {
+        // Retrieve the stored apex question and config from the question tree
+        let (apex_question, stored_granularity, stored_max_depth) = {
             let conn = state.reader.lock().await;
             let tree_json = db::get_question_tree(&conn, slug_name)?
                 .ok_or_else(|| anyhow!(
@@ -99,15 +99,19 @@ pub async fn run_build_from(
                 ))?;
             let tree: question_decomposition::QuestionTree =
                 serde_json::from_value(tree_json)?;
-            tree.config.apex_question.clone()
+            (
+                tree.config.apex_question.clone(),
+                tree.config.granularity,
+                tree.config.max_depth,
+            )
         };
 
         return Box::pin(run_decomposed_build(
             state,
             slug_name,
             &apex_question,
-            3,  // default granularity
-            4,  // default max_depth
+            stored_granularity,
+            stored_max_depth,
             from_depth,
             None, // re-characterize from cross-slug nodes
             cancel,
@@ -237,12 +241,8 @@ async fn run_chain_build(
         }
     };
 
-    // Resolve chain file path from the chains directory
-    let chains_dir = state
-        .data_dir
-        .as_ref()
-        .ok_or_else(|| anyhow!("data_dir not set on PyramidState"))?
-        .join("chains");
+    // Use the pre-resolved chains directory from state
+    let chains_dir = state.chains_dir.clone();
 
     // Discover all chain files and find the one matching our chain_id
     let all_chains = chain_loader::discover_chains(&chains_dir)?;
@@ -298,12 +298,8 @@ async fn run_ir_build(
         }
     };
 
-    // Resolve chain file path from the chains directory
-    let chains_dir = state
-        .data_dir
-        .as_ref()
-        .ok_or_else(|| anyhow!("data_dir not set on PyramidState"))?
-        .join("chains");
+    // Use the pre-resolved chains directory from state
+    let chains_dir = state.chains_dir.clone();
 
     // Discover all chain files and find the one matching our chain_id
     let all_chains = chain_loader::discover_chains(&chains_dir)?;
@@ -428,11 +424,7 @@ pub async fn run_question_build(
     let ct_str = content_type.as_str();
 
     // ── 2. Resolve chains directory ──────────────────────────────────────
-    let chains_dir = state
-        .data_dir
-        .as_ref()
-        .ok_or_else(|| anyhow!("data_dir not set on PyramidState"))?
-        .join("chains");
+    let chains_dir = state.chains_dir.clone();
 
     // ── 3. Discover and load the question set for this content type ──────
     let question_sets = question_loader::discover_question_sets(&chains_dir)?;
@@ -609,6 +601,7 @@ pub async fn run_decomposed_build(
                 apex_question,
                 &llm_config,
                 l0_fallback.as_deref(),
+                &state.operational.tier1,
             ).await?
         }
     };
@@ -731,7 +724,7 @@ pub async fn run_decomposed_build(
 
     // ── 4. Decompose the apex question into a question tree ──────────────
     // 11-G/H: Pass chains_dir so decomposition prompts load from .md files
-    let decomp_chains_dir = state.data_dir.as_ref().map(|d| d.join("chains"));
+    let decomp_chains_dir = Some(state.chains_dir.clone());
     let config = DecompositionConfig {
         apex_question: enhanced_question.clone(),
         content_type: ct_str.to_string(),
@@ -739,6 +732,7 @@ pub async fn run_decomposed_build(
         max_depth,
         folder_map: Some(decomp_context), // Pass L0 summaries instead of folder listing
         chains_dir: decomp_chains_dir,
+        audience: Some(characterization_result.audience.clone()),
     };
 
     info!(
@@ -814,6 +808,8 @@ pub async fn run_decomposed_build(
             &llm_config,
             state.writer.clone(),
             slug_name,
+            &state.operational.tier1,
+            &state.operational.tier2,
         )
         .await?
     };
@@ -848,6 +844,7 @@ pub async fn run_decomposed_build(
         &characterization_result.audience,
         &characterization_result.tone,
         &llm_config,
+        &state.operational.tier1,
     )
     .await?;
 
@@ -914,7 +911,7 @@ pub async fn run_decomposed_build(
             let conn = state.writer.clone();
             let slug_owned = slug_name.to_string();
             let overlay_build_id = build_id.clone();
-            let depth_threshold = max_overlay_depth - 1;
+            let depth_threshold = max_overlay_depth;
             tokio::task::spawn_blocking(move || {
                 let c = conn.blocking_lock();
                 // Only supersede at the apex depth of the existing overlay
@@ -967,6 +964,7 @@ pub async fn run_decomposed_build(
         &ext_schema,
         tree.audience.as_deref(),
         &llm_config,
+        &state.operational.tier1,
     )
     .await {
         Ok(p) => p,
@@ -1040,7 +1038,7 @@ pub async fn run_decomposed_build(
 
         // Step a: Pre-map questions to candidate evidence nodes
         let candidate_map = match evidence_answering::pre_map_layer(
-            &layer_qs, &lower_nodes, &llm_config, &state.operational,
+            &layer_qs, &lower_nodes, &llm_config, &state.operational, tree.audience.as_deref(),
         )
         .await
         {
@@ -1322,11 +1320,12 @@ pub async fn preview_decomposed_build(
         granularity,
         max_depth,
         folder_map: decomp_context,
-        chains_dir: state.data_dir.as_ref().map(|d| d.join("chains")),
+        chains_dir: Some(state.chains_dir.clone()),
+        audience: None,
     };
 
     let llm_config = state.config.read().await.clone();
-    let tree = question_decomposition::decompose_question(&config, &llm_config).await?;
+    let tree = question_decomposition::decompose_question(&config, &llm_config, &state.operational.tier1, &state.operational.tier2).await?;
 
     // ── 4. Preview ───────────────────────────────────────────────────────
     let preview = question_decomposition::preview_decomposition(&tree);

@@ -27,6 +27,7 @@ pub async fn crystallize(
     slug: &str,
     api_key: &str,
     collapse_model: &str,
+    ops: &crate::pyramid::OperationalConfig,
 ) -> anyhow::Result<CrystalResult> {
     let mut collapses = 0;
 
@@ -38,7 +39,7 @@ pub async fn crystallize(
     for thread in &threads {
         let needs_collapse = {
             let conn = reader.lock().await;
-            delta::check_collapse_needed(&conn, slug, &thread.thread_id)?
+            delta::check_collapse_needed(&conn, slug, &thread.thread_id, ops)?
         };
 
         if needs_collapse {
@@ -53,6 +54,7 @@ pub async fn crystallize(
                 &thread.thread_id,
                 api_key,
                 collapse_model,
+                ops,
             )
             .await
             {
@@ -81,6 +83,7 @@ pub async fn crystallize(
         let slug = slug.to_string();
         let api_key = api_key.to_string();
         let collapse_model = collapse_model.to_string();
+        let tier3 = ops.tier3.clone();
         tokio::spawn(async move {
             match webbing::check_and_collapse_edges(
                 &reader,
@@ -88,6 +91,7 @@ pub async fn crystallize(
                 &slug,
                 &api_key,
                 &collapse_model,
+                &tier3,
             )
             .await
             {

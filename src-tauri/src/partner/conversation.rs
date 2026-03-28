@@ -602,6 +602,7 @@ pub async fn handle_message(
                 let warm_in_progress = state.warm_in_progress.clone();
                 let slug_for_cleanup = slug.clone();
 
+                let ops = state.pyramid.operational.clone();
                 tokio::spawn(async move {
                     let result = super::warm::warm_pass(
                         new_messages,
@@ -611,6 +612,7 @@ pub async fn handle_message(
                         &api_key,
                         &model,
                         &collapse_model,
+                        &ops,
                     )
                     .await;
 

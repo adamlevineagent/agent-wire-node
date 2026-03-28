@@ -65,6 +65,7 @@ pub async fn pre_map_layer(
     lower_layer_nodes: &[PyramidNode],
     llm_config: &LlmConfig,
     ops: &OperationalConfig,
+    audience: Option<&str>,
 ) -> Result<CandidateMap> {
     if questions.is_empty() {
         return Ok(CandidateMap {
@@ -150,20 +151,29 @@ pub async fn pre_map_layer(
     }
 
     // ── Prompts ─────────────────────────────────────────────────────────
-    let system_prompt = r#"You are mapping questions to candidate evidence nodes. Your job is to determine which nodes from the layer below MIGHT contain relevant evidence for each question.
+    let audience_hint = match audience {
+        Some(aud) if !aud.is_empty() => format!(
+            "\nThe questioner is {aud}. When assigning candidates, prioritize evidence describing user-facing behavior over internal implementation details.\n"
+        ),
+        _ => String::new(),
+    };
 
+    let system_prompt = format!(
+        r#"You are mapping questions to candidate evidence nodes. Your job is to determine which nodes from the layer below MIGHT contain relevant evidence for each question.
+{audience_hint}
 IMPORTANT: Over-include rather than miss. If a node MIGHT be relevant, include it. The next step will prune irrelevant candidates — a false positive here costs little, but a miss loses evidence permanently.
 
 Respond with ONLY a JSON object in this exact format:
-{
-  "mappings": {
+{{
+  "mappings": {{
     "question_id_1": ["node_id_a", "node_id_b"],
     "question_id_2": ["node_id_c"],
     ...
-  }
-}
+  }}
+}}
 
-Every question_id from the input MUST appear as a key in the mappings, even if its candidate list is empty."#;
+Every question_id from the input MUST appear as a key in the mappings, even if its candidate list is empty."#
+    );
 
     let user_prompt = format!(
         "QUESTIONS for this layer:\n{}\n\nNODES from the layer below (candidate evidence):\n{}\n\nFor each question, identify which nodes likely contain relevant evidence. Include uncertain matches.",
@@ -173,7 +183,7 @@ Every question_id from the input MUST appear as a key in the mappings, even if i
     // ── LLM call (primary model — fast classification) ──────
     let response = llm::call_model_unified(
         llm_config,
-        system_prompt,
+        &system_prompt,
         &user_prompt,
         ops.tier1.pre_map_temperature,
         ops.tier1.pre_map_max_tokens,
@@ -437,13 +447,13 @@ async fn answer_single_question(
 
     let audience_guidance = match audience {
         Some(aud) if !aud.is_empty() => format!(
-            "\nAUDIENCE: Your answer is for {aud}. Write the headline and distilled synthesis so that {aud} would understand it. Translate technical evidence into plain-language explanations of user value. Avoid jargon — explain WHY things matter, not just WHAT they do technically. When technical terms are unavoidable, include a brief plain-language definition.\n"
+            "You are writing for {aud}. ALL technical terms from the evidence MUST be translated to plain language.\nThe reader should NEVER encounter framework names, file names, function names, API terms, or programming concepts unless they specifically asked about development.\nExtract the USER-FACING MEANING from technical evidence and express THAT.\n\n"
         ),
         _ => String::new(),
     };
 
     let system_prompt = format!(
-        r#"You are answering a knowledge pyramid question using candidate evidence from the layer below.
+        r#"{audience_guidance}You are answering a knowledge pyramid question using candidate evidence from the layer below.
 
 For each candidate node, you MUST report a verdict:
 - KEEP(weight, reason) — this evidence is relevant. Weight 0.0-1.0 indicates how central it is.
@@ -451,7 +461,10 @@ For each candidate node, you MUST report a verdict:
 - MISSING(description) — describe evidence you wish you had but don't.
 
 Then synthesize your answer to the question using ONLY the KEEP evidence.
-{audience_guidance}
+
+Focus your synthesis on your STRONGEST evidence — the nodes that most directly answer the question.
+You do not need to mention every KEEP node. A focused answer drawing from your best sources is better than a sprawling answer trying to mention everything.
+
 {extra_guidance}
 
 Respond with ONLY a JSON object:

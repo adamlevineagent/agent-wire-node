@@ -3382,6 +3382,7 @@ async fn pyramid_vine_build(
         ),
         event_bus: state.pyramid.event_bus.clone(),
         operational: state.pyramid.operational.clone(),
+        chains_dir: state.pyramid.chains_dir.clone(),
     });
 
     let slug_for_task = vine_slug_clean.clone();
@@ -3559,6 +3560,7 @@ async fn pyramid_vine_integrity(
         ),
         event_bus: state.pyramid.event_bus.clone(),
         operational: state.pyramid.operational.clone(),
+        chains_dir: state.pyramid.chains_dir.clone(),
     });
 
     let summary = vine::run_integrity_check(&pyramid_state, &slug)
@@ -3600,6 +3602,7 @@ async fn pyramid_vine_rebuild_upper(
         ),
         event_bus: state.pyramid.event_bus.clone(),
         operational: state.pyramid.operational.clone(),
+        chains_dir: state.pyramid.chains_dir.clone(),
     });
 
     let cancel = tokio_util::sync::CancellationToken::new();
@@ -4059,6 +4062,7 @@ async fn pyramid_faq_directory(
         &slug,
         &api_key,
         &model,
+        &state.pyramid.operational.tier2,
     )
     .await
     .map_err(|e| e.to_string())?;
@@ -4170,8 +4174,23 @@ fn main() {
         !pyramid_config.openrouter_api_key.is_empty()
     );
 
-    // Ensure default chain YAML files exist on disk
+    // Resolve chains directory: in dev mode, use the source tree so prompt .md
+    // files are read live; in release mode, use the data_dir copy.
+    #[cfg(debug_assertions)]
+    let chains_dir = {
+        let src = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../chains");
+        if src.exists() {
+            src.canonicalize().unwrap_or(src)
+        } else {
+            config.data_dir().join("chains")
+        }
+    };
+    #[cfg(not(debug_assertions))]
     let chains_dir = config.data_dir().join("chains");
+
+    tracing::info!("chains_dir resolved to {:?}", chains_dir);
+
+    // Ensure default chain YAML files exist on disk (needed for release-mode bootstrapping)
     if let Err(e) = wire_node_lib::pyramid::chain_loader::ensure_default_chains(&chains_dir) {
         tracing::warn!("Failed to write default chain files: {e}");
     }
@@ -4189,6 +4208,7 @@ fn main() {
         use_ir_executor: std::sync::atomic::AtomicBool::new(pyramid_config.use_ir_executor),
         event_bus: Arc::new(wire_node_lib::pyramid::event_chain::LocalEventBus::new()),
         operational: Arc::new(pyramid_config.operational.clone()),
+        chains_dir: chains_dir.clone(),
     });
 
     // Load persisted event subscriptions into the in-memory event bus

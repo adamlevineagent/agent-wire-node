@@ -19,6 +19,7 @@ use tracing::{info, warn};
 use super::llm::{self, LlmConfig};
 use super::question_decomposition::{QuestionNode, QuestionTree};
 use super::types::{ExtractionSchema, SynthesisPrompts, TopicField};
+use super::Tier1Config;
 
 // ── Public API ───────────────────────────────────────────────────────────────
 
@@ -40,6 +41,7 @@ pub async fn generate_extraction_schema(
     audience: &str,
     tone: &str,
     llm_config: &LlmConfig,
+    tier1: &Tier1Config,
 ) -> Result<ExtractionSchema> {
     if leaf_questions.is_empty() {
         anyhow::bail!("No leaf questions provided — cannot generate extraction schema");
@@ -110,8 +112,8 @@ The extraction prompt you produce will be used to describe source files. Those d
     // ── 3. Call LLM ─────────────────────────────────────────────────────
     // Model selection is controlled by YAML chain definitions, not Rust overrides.
 
-    let temperature = 0.3;
-    let max_tokens: usize = 4096;
+    let temperature = tier1.extraction_schema_temperature;
+    let max_tokens = tier1.extraction_schema_max_tokens;
 
     for attempt in 0..2u32 {
         let temp = if attempt == 0 { temperature } else { 0.1 };
@@ -165,6 +167,7 @@ pub async fn generate_synthesis_prompts(
     extraction_schema: &ExtractionSchema,
     audience: Option<&str>,
     llm_config: &LlmConfig,
+    tier1: &Tier1Config,
 ) -> Result<SynthesisPrompts> {
     // ── 1. Build tree summary for context ────────────────────────────────
     let tree_summary = format_tree_for_prompt(&question_tree.apex, 0);
@@ -235,8 +238,8 @@ Design synthesis prompts that will combine this extracted evidence into answers 
     // ── 3. Call LLM ─────────────────────────────────────────────────────
     // Model selection is controlled by YAML chain definitions, not Rust overrides.
 
-    let temperature = 0.3;
-    let max_tokens: usize = 2048;
+    let temperature = tier1.extraction_schema_temperature;
+    let max_tokens = tier1.synthesis_prompts_max_tokens;
 
     for attempt in 0..2u32 {
         let temp = if attempt == 0 { temperature } else { 0.1 };

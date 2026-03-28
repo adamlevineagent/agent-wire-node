@@ -115,6 +115,7 @@ pub async fn warm_pass(
     api_key: &str,
     model: &str,
     collapse_model: &str,
+    ops: &crate::pyramid::OperationalConfig,
 ) -> anyhow::Result<WarmPassResult> {
     if conversation_chunk.is_empty() {
         return Ok(WarmPassResult {
@@ -157,7 +158,7 @@ pub async fn warm_pass(
 
     // Create a delta
     let delta = delta::create_delta(
-        reader, writer, slug, &thread_id, &combined, None, api_key, model,
+        reader, writer, slug, &thread_id, &combined, None, api_key, model, ops,
     )
     .await?;
 
@@ -186,8 +187,9 @@ pub async fn warm_pass(
         let slug = slug.to_string();
         let api_key = api_key.to_string();
         let collapse_model = collapse_model.to_string();
+        let ops_clone = ops.clone();
         tokio::spawn(async move {
-            match crystal::crystallize(&reader, &writer, &slug, &api_key, &collapse_model).await {
+            match crystal::crystallize(&reader, &writer, &slug, &api_key, &collapse_model, &ops_clone).await {
                 Ok(result) => {
                     if result.collapses > 0 {
                         info!(

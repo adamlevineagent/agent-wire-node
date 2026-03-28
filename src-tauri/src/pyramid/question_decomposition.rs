@@ -49,6 +49,9 @@ pub struct DecompositionConfig {
     /// `chains/prompts/question/decompose.md` and `horizontal_review.md`.
     #[serde(skip)]
     pub chains_dir: Option<std::path::PathBuf>,
+    /// WS13-A: Audience string flows into every LLM call in the pipeline.
+    /// When present, decomposition prompts use the audience's vocabulary and perspective.
+    pub audience: Option<String>,
 }
 
 /// 11-Q: Replace `{{variable}}` template placeholders in a prompt string.
@@ -71,6 +74,7 @@ impl Default for DecompositionConfig {
             max_depth: 3,
             folder_map: None,
             chains_dir: None,
+            audience: None,
         }
     }
 }
@@ -436,6 +440,8 @@ fn collect_existing_questions(node: &QuestionNode, out: &mut Vec<(String, String
 pub async fn decompose_question(
     config: &DecompositionConfig,
     llm_config: &LlmConfig,
+    tier1: &super::Tier1Config,
+    tier2: &super::Tier2Config,
 ) -> Result<QuestionTree> {
     if config.apex_question.trim().is_empty() {
         return Err(anyhow!("apex_question cannot be empty"));
@@ -445,7 +451,7 @@ pub async fn decompose_question(
     }
 
     let granularity = config.granularity.clamp(1, 5);
-    let (min_subs, max_subs) = granularity_to_range(granularity);
+    let (min_subs, max_subs) = granularity_to_range(granularity, tier2);
 
     info!(
         apex = %config.apex_question,
@@ -465,6 +471,8 @@ pub async fn decompose_question(
         1, // depth 1
         llm_config,
         config.chains_dir.as_deref(),
+        config.audience.as_deref(),
+        tier1,
     )
     .await?;
 
@@ -487,6 +495,9 @@ pub async fn decompose_question(
             2, // current depth (apex was 0, first decomposition was 1)
             llm_config,
             config.chains_dir.as_deref(),
+            config.audience.as_deref(),
+            tier1,
+            tier2,
         )
         .await?;
         let node_count = count_tree_nodes(&child);
@@ -538,6 +549,8 @@ pub async fn decompose_question_incremental(
     llm_config: &LlmConfig,
     writer: Arc<Mutex<Connection>>,
     slug: &str,
+    tier1: &super::Tier1Config,
+    tier2: &super::Tier2Config,
 ) -> Result<QuestionTree> {
     if config.apex_question.trim().is_empty() {
         return Err(anyhow!("apex_question cannot be empty"));
@@ -547,7 +560,7 @@ pub async fn decompose_question_incremental(
     }
 
     let granularity = config.granularity.clamp(1, 5);
-    let (min_subs, max_subs) = granularity_to_range(granularity);
+    let (min_subs, max_subs) = granularity_to_range(granularity, tier2);
 
     // Check for existing partial tree
     let existing_count = {
@@ -617,6 +630,9 @@ pub async fn decompose_question_incremental(
                 slug,
                 Some(&node_row.question_id),
                 config.chains_dir.as_deref(),
+                config.audience.as_deref(),
+                tier1,
+                tier2,
             )
             .await?;
         }
@@ -650,6 +666,8 @@ pub async fn decompose_question_incremental(
         1,
         llm_config,
         config.chains_dir.as_deref(),
+        config.audience.as_deref(),
+        tier1,
     )
     .await?;
 
@@ -677,6 +695,9 @@ pub async fn decompose_question_incremental(
             slug,
             None, // parent_id set after apex node gets its ID
             config.chains_dir.as_deref(),
+            config.audience.as_deref(),
+            tier1,
+            tier2,
         )
         .await?;
         let node_count = count_tree_nodes(&child);
@@ -808,6 +829,9 @@ async fn build_subtree_incremental(
     slug: &str,
     _existing_parent_id: Option<&str>,
     chains_dir: Option<&std::path::Path>,
+    audience: Option<&str>,
+    tier1: &super::Tier1Config,
+    tier2: &super::Tier2Config,
 ) -> Result<QuestionNode> {
     // Terminal conditions: marked as leaf, or depth exceeded
     if raw.is_leaf || current_depth >= max_depth {
@@ -826,7 +850,7 @@ async fn build_subtree_incremental(
     // The LLM decides whether to decompose further — it can return an empty
     // array if the question is already specific enough. No forced minimums.
 
-    let (min_subs, max_subs) = granularity_to_range(granularity);
+    let (min_subs, max_subs) = granularity_to_range(granularity, tier2);
 
     info!(
         depth = current_depth,
@@ -843,6 +867,8 @@ async fn build_subtree_incremental(
         current_depth,
         llm_config,
         chains_dir,
+        audience,
+        tier1,
     )
     .await?;
 
@@ -881,6 +907,9 @@ async fn build_subtree_incremental(
             slug,
             None,
             chains_dir,
+            audience,
+            tier1,
+            tier2,
         ))
         .await?;
         children.push(child);
@@ -922,6 +951,9 @@ async fn build_subtree(
     current_depth: u32,
     llm_config: &LlmConfig,
     chains_dir: Option<&std::path::Path>,
+    audience: Option<&str>,
+    tier1: &super::Tier1Config,
+    tier2: &super::Tier2Config,
 ) -> Result<QuestionNode> {
     // Terminal conditions: marked as leaf, or depth exceeded
     if raw.is_leaf || current_depth >= max_depth {
@@ -949,7 +981,7 @@ async fn build_subtree(
         });
     }
 
-    let (min_subs, max_subs) = granularity_to_range(granularity);
+    let (min_subs, max_subs) = granularity_to_range(granularity, tier2);
 
     info!(
         depth = current_depth,
@@ -965,6 +997,8 @@ async fn build_subtree(
         current_depth,
         llm_config,
         chains_dir,
+        audience,
+        tier1,
     )
     .await?;
     info!(
@@ -998,6 +1032,9 @@ async fn build_subtree(
             current_depth + 1,
             llm_config,
             chains_dir,
+            audience,
+            tier1,
+            tier2,
         ))
         .await?;
         children.push(child);
@@ -1041,10 +1078,18 @@ async fn call_decomposition_llm(
     depth: u32,
     llm_config: &LlmConfig,
     chains_dir: Option<&std::path::Path>,
+    audience: Option<&str>,
+    tier1: &super::Tier1Config,
 ) -> Result<Vec<RawDecomposedQuestion>> {
     let folder_context = folder_map.unwrap_or("(no folder map provided)");
 
     let depth_str = depth.to_string();
+    let audience_str = audience.unwrap_or("");
+    let audience_block = if audience_str.is_empty() {
+        String::new()
+    } else {
+        format!("AUDIENCE: The person asking this question is {audience_str}. Decompose into sub-questions they would naturally ask, using their vocabulary and perspective.")
+    };
     let system_prompt = match chains_dir
         .map(|d| d.join("prompts/question/decompose.md"))
         .and_then(|p| std::fs::read_to_string(&p).ok())
@@ -1052,6 +1097,7 @@ async fn call_decomposition_llm(
         Some(template) => render_prompt_template(&template, &[
             ("content_type", content_type),
             ("depth", &depth_str),
+            ("audience_block", &audience_block),
         ]),
         None => {
             warn!("decompose.md not found — using inline fallback");
@@ -1079,12 +1125,19 @@ WHAT TO AVOID:
 
 You are at decomposition depth {depth}. Deeper depth means the questions should be MORE specific and MORE likely to be leaves.
 
+{audience_hint}
+
 Respond with a JSON array of objects, each with:
   "question": string,
   "prompt_hint": string (what to focus on when answering),
   "is_leaf": boolean
 
 Return ONLY the JSON array. An empty array [] is valid if the parent question needs no decomposition."#,
+                audience_hint = if audience_str.is_empty() {
+                    String::new()
+                } else {
+                    format!("The person asking this question is {audience_str}. Decompose into sub-questions they would naturally ask, using their vocabulary and perspective.")
+                },
             )
         }
     };
@@ -1101,8 +1154,8 @@ What are the genuinely distinct sub-questions needed to answer this? Only create
     // Model selection is controlled by YAML chain definitions, not Rust overrides.
     // See Inviolable #4: "YAML is the single source of truth for model selection."
 
-    let temperature = 0.3;
-    let max_tokens: usize = 4096;
+    let temperature = tier1.decomposition_temperature;
+    let max_tokens = tier1.decomposition_max_tokens;
 
     // Try up to 2 times on parse failure
     for attempt in 0..2u32 {
@@ -1897,11 +1950,11 @@ Return ONLY the JSON object."#.to_string()
     Ok((merge_count, leaf_count))
 }
 
-fn granularity_to_range(granularity: u32) -> (u32, u32) {
+fn granularity_to_range(granularity: u32, tier2: &super::Tier2Config) -> (u32, u32) {
     // These are hints passed to the LLM but the prompt no longer forces them.
     // The LLM decides how many sub-questions are genuinely needed.
     // Values loaded from OperationalConfig.tier2.granularity_ranges.
-    let ranges = super::Tier2Config::default().granularity_ranges;
+    let ranges = &tier2.granularity_ranges;
     let idx = granularity as usize;
     if idx < ranges.len() {
         ranges[idx]
@@ -2448,8 +2501,9 @@ That should cover it."#;
 
     #[test]
     fn granularity_affects_range() {
-        let (min1, max1) = granularity_to_range(1);
-        let (min5, max5) = granularity_to_range(5);
+        let tier2 = super::Tier2Config::default();
+        let (min1, max1) = granularity_to_range(1, &tier2);
+        let (min5, max5) = granularity_to_range(5, &tier2);
         assert!(min5 > min1);
         assert!(max5 > max1);
     }

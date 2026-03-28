@@ -419,6 +419,11 @@ pub struct PyramidState {
     pub event_bus: Arc<LocalEventBus>,
     /// Operational config (tiered constants). Loaded once at startup from pyramid_config.json.
     pub operational: Arc<OperationalConfig>,
+    /// Directory containing chain YAML files, prompts, and question sets.
+    /// In dev mode (debug_assertions), points to the source tree `../chains` directory
+    /// so prompt .md files are read live without copying. In release mode, falls back
+    /// to `{data_dir}/chains`.
+    pub chains_dir: PathBuf,
 }
 
 /// Handle to a running pyramid build.

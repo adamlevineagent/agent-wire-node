@@ -1940,6 +1940,7 @@ async fn handle_annotate(
     let api_key = { state.config.read().await.api_key.clone() };
     let model = { state.config.read().await.primary_model.clone() };
     let slug_clone = saved.slug.clone();
+    let ops_clone = state.operational.clone();
 
     tokio::spawn(async move {
         if let Err(e) = process_annotation_hook(
@@ -1949,6 +1950,7 @@ async fn handle_annotate(
             &annotation_clone,
             &api_key,
             &model,
+            &ops_clone,
         )
         .await
         {
@@ -1972,6 +1974,7 @@ async fn process_annotation_hook(
     annotation: &PyramidAnnotation,
     api_key: &str,
     model: &str,
+    ops: &super::OperationalConfig,
 ) -> anyhow::Result<()> {
     match annotation.annotation_type {
         AnnotationType::Correction => {
@@ -2001,6 +2004,7 @@ async fn process_annotation_hook(
                     Some(&annotation.node_id),
                     api_key,
                     model,
+                    ops,
                 )
                 .await?;
 
@@ -2259,7 +2263,7 @@ async fn handle_faq_directory(
     let model = config.primary_model.clone();
     drop(config);
 
-    match faq::get_faq_directory(&state.reader, &state.writer, &slug_name, &api_key, &model).await {
+    match faq::get_faq_directory(&state.reader, &state.writer, &slug_name, &api_key, &model, &state.operational.tier2).await {
         Ok(directory) => Ok(json_ok(&directory)),
         Err(e) => Ok(json_error(
             warp::http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -3331,7 +3335,7 @@ async fn handle_characterize(
 
     let llm_config = state.config.read().await.clone();
 
-    match characterize::characterize(&source_path, &body.question, &llm_config).await {
+    match characterize::characterize(&source_path, &body.question, &llm_config, &state.operational.tier1).await {
         Ok(result) => Ok(json_ok(&result)),
         Err(e) => Ok(json_error(
             warp::http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -4009,11 +4013,7 @@ async fn handle_publish_question_set(
     };
 
     // Load the question set YAML for this content type
-    let chains_dir = state
-        .data_dir
-        .as_ref()
-        .map(|d| d.join("chains"))
-        .unwrap_or_else(|| PathBuf::from("chains"));
+    let chains_dir = state.chains_dir.clone();
 
     let qs_path = chains_dir
         .join("questions")
