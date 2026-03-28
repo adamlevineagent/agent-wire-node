@@ -13,11 +13,13 @@
 //
 // Uses the "max" tier model (frontier) because prompt generation is judgment work.
 
+use std::path::Path;
+
 use anyhow::Result;
 use tracing::{info, warn};
 
 use super::llm::{self, LlmConfig};
-use super::question_decomposition::{QuestionNode, QuestionTree};
+use super::question_decomposition::{render_prompt_template, QuestionNode, QuestionTree};
 use super::types::{ExtractionSchema, SynthesisPrompts, TopicField};
 use super::Tier1Config;
 
@@ -42,6 +44,7 @@ pub async fn generate_extraction_schema(
     tone: &str,
     llm_config: &LlmConfig,
     tier1: &Tier1Config,
+    chains_dir: Option<&Path>,
 ) -> Result<ExtractionSchema> {
     if leaf_questions.is_empty() {
         anyhow::bail!("No leaf questions provided — cannot generate extraction schema");
@@ -63,7 +66,14 @@ pub async fn generate_extraction_schema(
         .join("\n");
 
     // ── 2. Construct prompts ─────────────────────────────────────────────
-    let system_prompt = r#"You are designing an extraction schema for a knowledge pyramid builder. Given a set of questions that the pyramid needs to answer, you must produce a focused extraction prompt that tells the system EXACTLY what to look for in each source file.
+    let system_prompt = match chains_dir
+        .map(|d| d.join("prompts/question/extraction_schema.md"))
+        .and_then(|p| std::fs::read_to_string(&p).ok())
+    {
+        Some(template) => template,
+        None => {
+            warn!("extraction_schema.md not found — using inline fallback");
+            r#"You are designing an extraction schema for a knowledge pyramid builder. Given a set of questions that the pyramid needs to answer, you must produce a focused extraction prompt that tells the system EXACTLY what to look for in each source file.
 
 CRITICAL PRINCIPLE: The extraction prompt must be QUESTION-SHAPED. Do NOT produce generic instructions like "list all functions" or "summarize the file". Instead, produce specific extraction directives that target what the downstream questions actually need.
 
@@ -93,7 +103,9 @@ The extraction prompt you generate MUST shape the output for the target audience
 
 If the audience IS technical, the extraction can use appropriate technical vocabulary freely.
 
-Return ONLY the JSON object, no other text."#;
+Return ONLY the JSON object, no other text."#.to_string()
+        }
+    };
 
     let user_prompt = format!(
         r#"Material: {material_profile}
@@ -120,7 +132,7 @@ The extraction prompt you produce will be used to describe source files. Those d
 
         let response = llm::call_model_unified(
             llm_config,
-            system_prompt,
+            &system_prompt,
             &user_prompt,
             temp,
             max_tokens,
@@ -168,6 +180,7 @@ pub async fn generate_synthesis_prompts(
     audience: Option<&str>,
     llm_config: &LlmConfig,
     tier1: &Tier1Config,
+    chains_dir: Option<&Path>,
 ) -> Result<SynthesisPrompts> {
     // ── 1. Build tree summary for context ────────────────────────────────
     let tree_summary = format_tree_for_prompt(&question_tree.apex, 0);
@@ -184,8 +197,17 @@ All three prompts you generate MUST instruct the synthesizer to write for this a
         _ => String::new(),
     };
 
-    let system_prompt = format!(
-        r#"You are designing synthesis prompts for a knowledge pyramid builder. The L0 extraction pass has already completed — you know what evidence was actually extracted. Now you must produce prompts for the synthesis layers that will combine this evidence into answers.
+    let system_prompt = match chains_dir
+        .map(|d| d.join("prompts/question/synthesis_prompt.md"))
+        .and_then(|p| std::fs::read_to_string(&p).ok())
+    {
+        Some(template) => render_prompt_template(&template, &[
+            ("audience_instruction", &audience_instruction),
+        ]),
+        None => {
+            warn!("synthesis_prompt.md not found — using inline fallback");
+            format!(
+                r#"You are designing synthesis prompts for a knowledge pyramid builder. The L0 extraction pass has already completed — you know what evidence was actually extracted. Now you must produce prompts for the synthesis layers that will combine this evidence into answers.
 
 There are three prompts needed:
 
@@ -206,7 +228,9 @@ Respond in JSON with exactly these fields:
 Each prompt should be 2-4 sentences. Be specific to the actual content, not generic.
 
 Return ONLY the JSON object, no other text."#
-    );
+            )
+        }
+    };
 
     let audience_line = match audience {
         Some(aud) if !aud.is_empty() => format!("\nTarget audience: {aud}\n"),

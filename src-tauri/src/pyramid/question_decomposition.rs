@@ -247,6 +247,7 @@ pub async fn decompose_question_delta(
     llm_config: &LlmConfig,
     existing_tree: &QuestionTree,
     existing_answers: &[super::types::PyramidNode],
+    chains_dir: Option<&std::path::Path>,
 ) -> Result<DeltaDecompositionResult> {
     if config.apex_question.trim().is_empty() {
         return Err(anyhow!("apex_question cannot be empty"));
@@ -271,8 +272,18 @@ pub async fn decompose_question_delta(
         .join("\n");
 
     // Ask the LLM to decompose the new question, given what already exists
-    let system_prompt = format!(
-        r#"You are a question architect for knowledge pyramids. A knowledge pyramid already exists with answered questions. A NEW apex question is being asked about the SAME source material.
+    let system_prompt = match chains_dir
+        .map(|d| d.join("prompts/question/decompose_delta.md"))
+        .and_then(|p| std::fs::read_to_string(&p).ok())
+    {
+        Some(template) => render_prompt_template(&template, &[
+            ("existing_questions", &existing_q_context),
+            ("existing_answers", &existing_context),
+        ]),
+        None => {
+            warn!("decompose_delta.md not found — using inline fallback");
+            format!(
+                r#"You are a question architect for knowledge pyramids. A knowledge pyramid already exists with answered questions. A NEW apex question is being asked about the SAME source material.
 
 Your job: decompose the new question into sub-questions, but REUSE existing answered questions where they overlap.
 
@@ -297,7 +308,9 @@ Respond in JSON:
 }}
 
 Return ONLY the JSON object."#
-    );
+            )
+        }
+    };
 
     let user_prompt = format!(
         "New apex question: \"{}\"\n\nContent type: {}\n\n{}",

@@ -2478,6 +2478,10 @@ struct PyramidPublicationInfo {
     last_published_build_id: Option<String>,
     current_build_id: Option<String>,
     last_built_at: Option<String>,
+    /// WS-ONLINE-D: Whether this pyramid is pinned from a remote source.
+    pinned: bool,
+    /// WS-ONLINE-D: Source tunnel URL if pinned.
+    source_tunnel_url: Option<String>,
 }
 
 #[tauri::command]
@@ -2494,6 +2498,12 @@ async fn pyramid_get_publication_status(
         let unpublished = pyramid_db::count_unpublished_nodes(&conn, &s.slug).unwrap_or(0);
         let last_pub = pyramid_db::get_last_published_build_id(&conn, &s.slug).unwrap_or(None);
         let current = pyramid_db::get_current_build_id(&conn, &s.slug).unwrap_or(None);
+        let pinned = pyramid_db::is_pinned(&conn, &s.slug).unwrap_or(false);
+        let source_tunnel_url = if pinned {
+            pyramid_db::get_source_tunnel_url(&conn, &s.slug).unwrap_or(None)
+        } else {
+            None
+        };
         result.push(PyramidPublicationInfo {
             slug: s.slug,
             node_count: s.node_count,
@@ -2501,6 +2511,8 @@ async fn pyramid_get_publication_status(
             last_published_build_id: last_pub,
             current_build_id: current,
             last_built_at: s.last_built_at,
+            pinned,
+            source_tunnel_url,
         });
     }
     Ok(result)
@@ -3633,6 +3645,7 @@ async fn pyramid_characterize(
         &question,
         &llm_config,
         &state.pyramid.operational.tier1,
+        Some(&state.pyramid.chains_dir),
     )
     .await
     {
@@ -4035,6 +4048,83 @@ async fn pyramid_chain_import(
             other
         )),
     }
+}
+
+/// WS-ONLINE-D: Pin a remote pyramid — pulls full export and stores locally.
+#[tauri::command]
+async fn pyramid_pin_remote(
+    state: tauri::State<'_, SharedState>,
+    tunnel_url: String,
+    slug: String,
+) -> Result<serde_json::Value, String> {
+    use wire_node_lib::pyramid::wire_import::RemotePyramidClient;
+
+    let tunnel_url = tunnel_url.trim().to_string();
+    let slug = slug.trim().to_string();
+
+    if tunnel_url.is_empty() {
+        return Err("tunnel_url is required".to_string());
+    }
+    if slug.is_empty() {
+        return Err("slug is required".to_string());
+    }
+
+    // Get Wire auth token for authenticating with the remote node
+    let config = state.pyramid.config.read().await;
+    let wire_auth = config.auth_token.clone();
+    drop(config);
+
+    if wire_auth.is_empty() {
+        return Err("auth_token not configured".to_string());
+    }
+
+    let wire_server_url =
+        std::env::var("WIRE_URL").unwrap_or_else(|_| "https://api.callmeplayful.com".to_string());
+
+    // Pull remote pyramid export
+    let client = RemotePyramidClient::new(tunnel_url.clone(), wire_auth, wire_server_url);
+    let nodes = client
+        .pull_remote_pyramid(&slug)
+        .await
+        .map_err(|e| format!("failed to pull remote pyramid: {}", e))?;
+
+    let node_count = nodes.len();
+
+    // Insert into local SQLite
+    let writer = state.pyramid.writer.lock().await;
+    wire_node_lib::pyramid::slug::pin_remote_pyramid(&writer, &slug, &tunnel_url, &nodes)
+        .map_err(|e| format!("failed to pin pyramid: {}", e))?;
+    drop(writer);
+
+    Ok(serde_json::json!({
+        "ok": true,
+        "slug": slug,
+        "tunnel_url": tunnel_url,
+        "node_count": node_count,
+    }))
+}
+
+/// WS-ONLINE-D: Unpin a pyramid — clears pinned flag but never deletes node data (Pillar 1).
+#[tauri::command]
+async fn pyramid_unpin(
+    state: tauri::State<'_, SharedState>,
+    slug: String,
+) -> Result<serde_json::Value, String> {
+    let slug = slug.trim().to_string();
+    if slug.is_empty() {
+        return Err("slug is required".to_string());
+    }
+
+    let writer = state.pyramid.writer.lock().await;
+    wire_node_lib::pyramid::slug::unpin_pyramid(&writer, &slug)
+        .map_err(|e| format!("failed to unpin pyramid: {}", e))?;
+    drop(writer);
+
+    Ok(serde_json::json!({
+        "ok": true,
+        "slug": slug,
+        "message": "unpinned (node data preserved)"
+    }))
 }
 
 /// IPC equivalent of POST /partner/message — send message, get response + brain state.
@@ -5842,6 +5932,9 @@ fn main() {
             pyramid_publish_question_set,
             pyramid_check_staleness,
             pyramid_chain_import,
+            // WS-ONLINE-D: Pinning commands
+            pyramid_pin_remote,
+            pyramid_unpin,
             partner_send_message,
             partner_session_new,
         ])

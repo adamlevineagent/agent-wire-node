@@ -606,6 +606,7 @@ pub async fn run_decomposed_build(
                 &llm_config,
                 l0_fallback.as_deref(),
                 &state.operational.tier1,
+                Some(&state.chains_dir),
             ).await?
         }
     };
@@ -778,6 +779,7 @@ pub async fn run_decomposed_build(
             &llm_config,
             &existing_tree,
             &existing_answers,
+            Some(&state.chains_dir),
         )
         .await?;
 
@@ -849,6 +851,7 @@ pub async fn run_decomposed_build(
         &characterization_result.tone,
         &llm_config,
         &state.operational.tier1,
+        Some(&state.chains_dir),
     )
     .await?;
 
@@ -969,6 +972,7 @@ pub async fn run_decomposed_build(
         tree.audience.as_deref(),
         &llm_config,
         &state.operational.tier1,
+        Some(&state.chains_dir),
     )
     .await {
         Ok(p) => p,

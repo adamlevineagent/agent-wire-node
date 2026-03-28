@@ -11,9 +11,11 @@
 // Uses the "max" tier model (fallback_model_2 / frontier) because
 // characterization is a judgment call, not extraction.
 
+use std::path::Path;
+
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tracing::{info, warn};
 
 use super::llm::{self, LlmConfig};
 use super::question_decomposition;
@@ -36,8 +38,9 @@ pub async fn characterize(
     apex_question: &str,
     llm_config: &LlmConfig,
     tier1: &Tier1Config,
+    chains_dir: Option<&Path>,
 ) -> Result<CharacterizationResult> {
-    characterize_with_fallback(source_path, apex_question, llm_config, None, tier1).await
+    characterize_with_fallback(source_path, apex_question, llm_config, None, tier1, chains_dir).await
 }
 
 /// Characterize source material with an optional L0 summary fallback.
@@ -52,6 +55,7 @@ pub async fn characterize_with_fallback(
     llm_config: &LlmConfig,
     l0_fallback: Option<&str>,
     tier1: &Tier1Config,
+    chains_dir: Option<&Path>,
 ) -> Result<CharacterizationResult> {
     // ── 1. Build folder map from source path for LLM context ─────────────
     let folder_map = question_decomposition::build_folder_map(source_path);
@@ -74,7 +78,14 @@ pub async fn characterize_with_fallback(
     let folder_context = folder_context.as_str();
 
     // ── 2. Construct prompts ─────────────────────────────────────────────
-    let system_prompt = r#"You are analyzing a folder of source material to prepare for building a knowledge pyramid. Given the user's question and the folder contents below, determine:
+    let system_prompt = match chains_dir
+        .map(|d| d.join("prompts/question/characterize.md"))
+        .and_then(|p| std::fs::read_to_string(&p).ok())
+    {
+        Some(template) => template,
+        None => {
+            warn!("characterize.md not found — using inline fallback");
+            r#"You are analyzing a folder of source material to prepare for building a knowledge pyramid. Given the user's question and the folder contents below, determine:
 
 1) What kind of material this is (code repo, design docs, mixed, conversation logs, etc.)
 2) What the user is really asking (restate in precise terms)
@@ -89,7 +100,9 @@ Respond in JSON with exactly these fields:
   "tone": "what tone to use (technical, conversational, executive, etc.)"
 }
 
-Return ONLY the JSON object, no other text."#;
+Return ONLY the JSON object, no other text."#.to_string()
+        }
+    };
 
     let user_prompt = format!(
         r#"User's question: "{apex_question}"
@@ -113,7 +126,7 @@ Analyze this material and produce the characterization."#,
 
         let response = llm::call_model_unified(
             llm_config,
-            system_prompt,
+            &system_prompt,
             &user_prompt,
             temp,
             max_tokens,

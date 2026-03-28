@@ -41,8 +41,12 @@ pub enum AuthSource {
     /// Authenticated via local auth_token — desktop app, free access.
     Local,
     /// Authenticated via Wire JWT — remote agent, billable.
-    /// Contains the operator_id from the JWT for rate limiting and billing.
-    WireJwt { operator_id: String },
+    /// Contains the operator_id from the JWT for rate limiting and billing,
+    /// and optional circle_id for circle-scoped access tier checking (WS-ONLINE-E).
+    WireJwt {
+        operator_id: String,
+        circle_id: Option<String>,
+    },
 }
 
 /// Validate bearer token and pass state through. LOCAL-ONLY auth — rejects Wire JWTs.
@@ -156,7 +160,8 @@ fn with_dual_auth(
                                 }
                             }
 
-                            return Ok((state, AuthSource::WireJwt { operator_id }));
+                            let circle_id = claims.circle_id;
+                            return Ok((state, AuthSource::WireJwt { operator_id, circle_id }));
                         }
                         Err(e) => {
                             tracing::warn!("Wire JWT validation failed: {}", e);
@@ -178,8 +183,8 @@ impl warp::reject::Reject for RateLimited {}
 
 /// REMOTE-SAFE read-only auth filter that drops AuthSource from output.
 /// Accepts either local auth_token or Wire JWT, but passes only PyramidState
-/// to the handler. Use this for read-only GET endpoints that don't yet need
-/// billing info. WS-ONLINE-H will upgrade these to use AuthSource for nano-tx.
+/// to the handler. Use this for non-slug read-only GET endpoints (e.g. list_slugs)
+/// that don't need access tier checking.
 fn with_read_auth(
     state: Arc<PyramidState>,
     jwt_public_key: Arc<tokio::sync::RwLock<String>>,
@@ -188,7 +193,7 @@ fn with_read_auth(
         |(state, auth_source): (Arc<PyramidState>, AuthSource)| async move {
             match &auth_source {
                 AuthSource::Local => {}
-                AuthSource::WireJwt { operator_id } => {
+                AuthSource::WireJwt { operator_id, .. } => {
                     tracing::debug!(
                         operator_id = %operator_id,
                         "Remote pyramid query via Wire JWT"
@@ -198,6 +203,121 @@ fn with_read_auth(
             Ok::<_, warp::Rejection>(state)
         },
     )
+}
+
+/// REMOTE-SAFE read-only auth filter that preserves AuthSource (WS-ONLINE-E).
+///
+/// Like `with_read_auth` but returns `(Arc<PyramidState>, AuthSource)` so that
+/// slug-parameterized handlers can enforce access tier restrictions via
+/// `enforce_access_tier`.
+fn with_slug_read_auth(
+    state: Arc<PyramidState>,
+    jwt_public_key: Arc<tokio::sync::RwLock<String>>,
+) -> impl Filter<Extract = ((Arc<PyramidState>, AuthSource),), Error = warp::Rejection> + Clone {
+    with_dual_auth(state, jwt_public_key)
+}
+
+// ── Access Tier Enforcement (WS-ONLINE-E) ───────────────────────────
+
+/// Access tier rejection: circle-scoped slug, caller is not a member.
+#[derive(Debug)]
+pub struct AccessDeniedCircle;
+impl warp::reject::Reject for AccessDeniedCircle {}
+
+/// Access tier rejection: embargoed slug, no remote access.
+#[derive(Debug)]
+pub struct AccessEmbargoed;
+impl warp::reject::Reject for AccessEmbargoed {}
+
+/// Enforce access tier restrictions for a Wire JWT request (WS-ONLINE-E).
+///
+/// - `public`: allow (stamp only, no access price)
+/// - `circle-scoped`: extract circle_id from JWT, check against allowed_circles
+/// - `priced`: allow (cost preview shows price, payment handled in WS-ONLINE-H)
+/// - `embargoed`: reject all Wire JWT requests with 451
+///
+/// Local auth (desktop app) always passes — access tiers only restrict remote agents.
+/// Returns `Ok(())` if access is allowed, or an error `warp::reply::Response` to return.
+fn enforce_access_tier(
+    conn: &rusqlite::Connection,
+    slug: &str,
+    auth_source: &AuthSource,
+) -> Result<(), warp::reply::Response> {
+    // Local auth always bypasses access tier checks
+    let (operator_id, circle_id) = match auth_source {
+        AuthSource::Local => return Ok(()),
+        AuthSource::WireJwt {
+            operator_id,
+            circle_id,
+        } => (operator_id, circle_id),
+    };
+
+    let (tier, _price, allowed_circles) = db::get_access_tier(conn, slug).unwrap_or((
+        "public".to_string(),
+        None,
+        None,
+    ));
+
+    match tier.as_str() {
+        "public" => Ok(()),
+        "priced" => Ok(()), // Payment enforcement in WS-ONLINE-H
+        "circle-scoped" => {
+            let caller_circle = match circle_id {
+                Some(c) if !c.is_empty() => c.as_str(),
+                _ => {
+                    tracing::warn!(
+                        operator_id = %operator_id,
+                        slug = %slug,
+                        "Circle-scoped pyramid access denied: no circle_id in JWT"
+                    );
+                    return Err(json_error(
+                        warp::http::StatusCode::FORBIDDEN,
+                        "Access denied: this pyramid is circle-scoped and your JWT does not include a circle_id",
+                    ));
+                }
+            };
+
+            // Parse allowed_circles as JSON array
+            let circles: Vec<String> = allowed_circles
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or_default();
+
+            if circles.iter().any(|c| c == caller_circle) {
+                Ok(())
+            } else {
+                tracing::warn!(
+                    operator_id = %operator_id,
+                    slug = %slug,
+                    circle_id = %caller_circle,
+                    "Circle-scoped pyramid access denied: circle not in allowed_circles"
+                );
+                Err(json_error(
+                    warp::http::StatusCode::FORBIDDEN,
+                    "Access denied: your circle is not authorized for this pyramid",
+                ))
+            }
+        }
+        "embargoed" => {
+            tracing::info!(
+                operator_id = %operator_id,
+                slug = %slug,
+                "Embargoed pyramid access denied"
+            );
+            Err(warp::http::Response::builder()
+                .status(451)
+                .header("content-type", "application/json")
+                .body(
+                    serde_json::json!({
+                        "error": "This pyramid is embargoed and not available for remote access"
+                    })
+                    .to_string(),
+                )
+                .unwrap()
+                .into_response())
+        }
+        _ => Ok(()), // Unknown tier = allow (fail open for forward compat)
+    }
 }
 
 // ── Request body types ──────────────────────────────────────────────
@@ -457,7 +577,7 @@ pub fn pyramid_routes(
         .and(warp::path("status"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(with_read_auth(state.clone(), jwt_public_key.clone()))
+        .and(with_slug_read_auth(state.clone(), jwt_public_key.clone()))
         .and_then(handle_build_status));
 
     // MOVED TO IPC: see main.rs — pyramid_build_cancel command
@@ -515,44 +635,44 @@ pub fn pyramid_routes(
         .map(|r: warp::reply::Response| r)
         .boxed();
 
-    // REMOTE-SAFE: GET /pyramid/:slug/apex — read-only, dual auth
+    // REMOTE-SAFE: GET /pyramid/:slug/apex — read-only, dual auth + access tier (WS-ONLINE-E)
     let apex = route!(prefix
         .and(warp::path::param::<String>())
         .and(warp::path("apex"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(with_read_auth(state.clone(), jwt_public_key.clone()))
+        .and(with_slug_read_auth(state.clone(), jwt_public_key.clone()))
         .and(with_agent_id())
         .and_then(handle_apex));
 
-    // REMOTE-SAFE: GET /pyramid/:slug/node/:id — read-only, dual auth
+    // REMOTE-SAFE: GET /pyramid/:slug/node/:id — read-only, dual auth + access tier (WS-ONLINE-E)
     let node = route!(prefix
         .and(warp::path::param::<String>())
         .and(warp::path("node"))
         .and(warp::path::param::<String>())
         .and(warp::path::end())
         .and(warp::get())
-        .and(with_read_auth(state.clone(), jwt_public_key.clone()))
+        .and(with_slug_read_auth(state.clone(), jwt_public_key.clone()))
         .and(with_agent_id())
         .and_then(handle_node));
 
-    // REMOTE-SAFE: GET /pyramid/:slug/tree — read-only, dual auth
+    // REMOTE-SAFE: GET /pyramid/:slug/tree — read-only, dual auth + access tier (WS-ONLINE-E)
     let tree = route!(prefix
         .and(warp::path::param::<String>())
         .and(warp::path("tree"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(with_read_auth(state.clone(), jwt_public_key.clone()))
+        .and(with_slug_read_auth(state.clone(), jwt_public_key.clone()))
         .and_then(handle_tree));
 
-    // REMOTE-SAFE: GET /pyramid/:slug/drill/:id — read-only, dual auth
+    // REMOTE-SAFE: GET /pyramid/:slug/drill/:id — read-only, dual auth + access tier (WS-ONLINE-E)
     let drill = route!(prefix
         .and(warp::path::param::<String>())
         .and(warp::path("drill"))
         .and(warp::path::param::<String>())
         .and(warp::path::end())
         .and(warp::get())
-        .and(with_read_auth(state.clone(), jwt_public_key.clone()))
+        .and(with_slug_read_auth(state.clone(), jwt_public_key.clone()))
         .and(with_agent_id())
         .and_then(handle_drill));
 
@@ -562,45 +682,45 @@ pub fn pyramid_routes(
         .and(warp::path("search"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(with_read_auth(state.clone(), jwt_public_key.clone()))
+        .and(with_slug_read_auth(state.clone(), jwt_public_key.clone()))
         .and(warp::query::<SearchQuery>())
         .and(with_agent_id())
         .and_then(handle_search));
 
-    // REMOTE-SAFE: GET /pyramid/:slug/entities — read-only, dual auth
+    // REMOTE-SAFE: GET /pyramid/:slug/entities — read-only, dual auth + access tier (WS-ONLINE-E)
     let entities = route!(prefix
         .and(warp::path::param::<String>())
         .and(warp::path("entities"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(with_read_auth(state.clone(), jwt_public_key.clone()))
+        .and(with_slug_read_auth(state.clone(), jwt_public_key.clone()))
         .and_then(handle_entities));
 
-    // REMOTE-SAFE: GET /pyramid/:slug/resolved — read-only, dual auth
+    // REMOTE-SAFE: GET /pyramid/:slug/resolved — read-only, dual auth + access tier (WS-ONLINE-E)
     let resolved = route!(prefix
         .and(warp::path::param::<String>())
         .and(warp::path("resolved"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(with_read_auth(state.clone(), jwt_public_key.clone()))
+        .and(with_slug_read_auth(state.clone(), jwt_public_key.clone()))
         .and_then(handle_resolved));
 
-    // REMOTE-SAFE: GET /pyramid/:slug/corrections — read-only, dual auth
+    // REMOTE-SAFE: GET /pyramid/:slug/corrections — read-only, dual auth + access tier (WS-ONLINE-E)
     let corrections = route!(prefix
         .and(warp::path::param::<String>())
         .and(warp::path("corrections"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(with_read_auth(state.clone(), jwt_public_key.clone()))
+        .and(with_slug_read_auth(state.clone(), jwt_public_key.clone()))
         .and_then(handle_corrections));
 
-    // REMOTE-SAFE: GET /pyramid/:slug/terms — read-only, dual auth
+    // REMOTE-SAFE: GET /pyramid/:slug/terms — read-only, dual auth + access tier (WS-ONLINE-E)
     let terms = route!(prefix
         .and(warp::path::param::<String>())
         .and(warp::path("terms"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(with_read_auth(state.clone(), jwt_public_key.clone()))
+        .and(with_slug_read_auth(state.clone(), jwt_public_key.clone()))
         .and_then(handle_terms));
 
     // MOVED TO IPC: see main.rs — pyramid_ingest command
@@ -661,7 +781,7 @@ pub fn pyramid_routes(
         .and(warp::path("threads"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(with_read_auth(state.clone(), jwt_public_key.clone()))
+        .and(with_slug_read_auth(state.clone(), jwt_public_key.clone()))
         .and_then(handle_threads));
 
     // LOCAL-ONLY: POST /pyramid/:slug/annotate — mutation, local auth only
@@ -1439,6 +1559,21 @@ pub fn pyramid_routes(
         .and(with_read_auth(state.clone(), jwt_public_key.clone()))
         .and_then(handle_composed_view));
 
+    // WS-ONLINE-D: GET /pyramid/:slug/export — full node export for pinning.
+    // Gated behind Wire JWT auth (with_dual_auth). Has its own stricter rate limit
+    // (5/minute per operator) enforced in the handler, separate from query rate limit.
+    let export_rate_limiter: Arc<Mutex<std::collections::HashMap<String, (u64, std::time::Instant)>>> =
+        Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let export_rl = export_rate_limiter.clone();
+    let export_route = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("export"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(with_dual_auth(state.clone(), jwt_public_key.clone()))
+        .and(warp::any().map(move || export_rl.clone()))
+        .and_then(handle_export));
+
     // REMOTE-SAFE: GET /pyramid/:slug/question-tree — read-only, dual auth
     let question_tree_route = route!(prefix
         .and(warp::path::param::<String>())
@@ -1566,7 +1701,8 @@ pub fn pyramid_routes(
     let top10 = top9.or(r30).unify().boxed();
     let top11 = top10.or(r31).unify().boxed(); // Archive, purge, references routes (WS8-B)
     let top12 = top11.or(composed_route).unify().boxed(); // Composed view route (WS8-H)
-    top12
+    let top13 = top12.or(export_route).unify().boxed(); // WS-ONLINE-D: Export endpoint for pinning
+    top13
 }
 
 // ── Route handlers ──────────────────────────────────────────────────
@@ -1694,10 +1830,14 @@ async fn handle_create_slug(
 
 async fn handle_apex(
     slug_name: String,
-    state: Arc<PyramidState>,
+    (state, auth_source): (Arc<PyramidState>, AuthSource),
     agent_id: Option<String>,
 ) -> Result<warp::reply::Response, warp::Rejection> {
     let conn = state.reader.lock().await;
+    // WS-ONLINE-E: Access tier enforcement for remote queries
+    if let Err(response) = enforce_access_tier(&conn, &slug_name, &auth_source) {
+        return Ok(response);
+    }
     match query::get_apex_with_edges(&conn, &slug_name) {
         Ok(Some(node)) => {
             let response = json_ok(&node);
@@ -1725,10 +1865,14 @@ async fn handle_apex(
 async fn handle_node(
     slug_name: String,
     node_id: String,
-    state: Arc<PyramidState>,
+    (state, auth_source): (Arc<PyramidState>, AuthSource),
     agent_id: Option<String>,
 ) -> Result<warp::reply::Response, warp::Rejection> {
     let conn = state.reader.lock().await;
+    // WS-ONLINE-E: Access tier enforcement for remote queries
+    if let Err(response) = enforce_access_tier(&conn, &slug_name, &auth_source) {
+        return Ok(response);
+    }
     match query::get_node_with_edges(&conn, &slug_name, &node_id) {
         Ok(Some(node)) => {
             let response = json_ok(&node);
@@ -1755,9 +1899,13 @@ async fn handle_node(
 
 async fn handle_tree(
     slug_name: String,
-    state: Arc<PyramidState>,
+    (state, auth_source): (Arc<PyramidState>, AuthSource),
 ) -> Result<warp::reply::Response, warp::Rejection> {
     let conn = state.reader.lock().await;
+    // WS-ONLINE-E: Access tier enforcement for remote queries
+    if let Err(response) = enforce_access_tier(&conn, &slug_name, &auth_source) {
+        return Ok(response);
+    }
     match query::get_tree(&conn, &slug_name) {
         Ok(tree) => Ok(json_ok(&tree)),
         Err(e) => Ok(json_error(
@@ -1770,10 +1918,14 @@ async fn handle_tree(
 async fn handle_drill(
     slug_name: String,
     node_id: String,
-    state: Arc<PyramidState>,
+    (state, auth_source): (Arc<PyramidState>, AuthSource),
     agent_id: Option<String>,
 ) -> Result<warp::reply::Response, warp::Rejection> {
     let conn = state.reader.lock().await;
+    // WS-ONLINE-E: Access tier enforcement for remote queries
+    if let Err(response) = enforce_access_tier(&conn, &slug_name, &auth_source) {
+        return Ok(response);
+    }
     match query::drill(&conn, &slug_name, &node_id) {
         Ok(Some(result)) => {
             let response = json_ok(&result);
@@ -1804,11 +1956,15 @@ async fn handle_drill(
 
 async fn handle_search(
     slug_name: String,
-    state: Arc<PyramidState>,
+    (state, auth_source): (Arc<PyramidState>, AuthSource),
     params: SearchQuery,
     agent_id: Option<String>,
 ) -> Result<warp::reply::Response, warp::Rejection> {
     let conn = state.reader.lock().await;
+    // WS-ONLINE-E: Access tier enforcement for remote queries
+    if let Err(response) = enforce_access_tier(&conn, &slug_name, &auth_source) {
+        return Ok(response);
+    }
     match query::search(&conn, &slug_name, &params.q) {
         Ok(hits) => {
             let response = json_ok(&hits);
@@ -1848,9 +2004,13 @@ async fn handle_usage(
 
 async fn handle_entities(
     slug_name: String,
-    state: Arc<PyramidState>,
+    (state, auth_source): (Arc<PyramidState>, AuthSource),
 ) -> Result<warp::reply::Response, warp::Rejection> {
     let conn = state.reader.lock().await;
+    // WS-ONLINE-E: Access tier enforcement for remote queries
+    if let Err(response) = enforce_access_tier(&conn, &slug_name, &auth_source) {
+        return Ok(response);
+    }
     match query::entities(&conn, &slug_name) {
         Ok(entries) => Ok(json_ok(&entries)),
         Err(e) => Ok(json_error(
@@ -1862,9 +2022,13 @@ async fn handle_entities(
 
 async fn handle_resolved(
     slug_name: String,
-    state: Arc<PyramidState>,
+    (state, auth_source): (Arc<PyramidState>, AuthSource),
 ) -> Result<warp::reply::Response, warp::Rejection> {
     let conn = state.reader.lock().await;
+    // WS-ONLINE-E: Access tier enforcement for remote queries
+    if let Err(response) = enforce_access_tier(&conn, &slug_name, &auth_source) {
+        return Ok(response);
+    }
     match query::resolved(&conn, &slug_name) {
         Ok(entries) => Ok(json_ok(&entries)),
         Err(e) => Ok(json_error(
@@ -1876,9 +2040,13 @@ async fn handle_resolved(
 
 async fn handle_corrections(
     slug_name: String,
-    state: Arc<PyramidState>,
+    (state, auth_source): (Arc<PyramidState>, AuthSource),
 ) -> Result<warp::reply::Response, warp::Rejection> {
     let conn = state.reader.lock().await;
+    // WS-ONLINE-E: Access tier enforcement for remote queries
+    if let Err(response) = enforce_access_tier(&conn, &slug_name, &auth_source) {
+        return Ok(response);
+    }
     match query::corrections(&conn, &slug_name) {
         Ok(entries) => Ok(json_ok(&entries)),
         Err(e) => Ok(json_error(
@@ -1890,9 +2058,13 @@ async fn handle_corrections(
 
 async fn handle_terms(
     slug_name: String,
-    state: Arc<PyramidState>,
+    (state, auth_source): (Arc<PyramidState>, AuthSource),
 ) -> Result<warp::reply::Response, warp::Rejection> {
     let conn = state.reader.lock().await;
+    // WS-ONLINE-E: Access tier enforcement for remote queries
+    if let Err(response) = enforce_access_tier(&conn, &slug_name, &auth_source) {
+        return Ok(response);
+    }
     match query::terms(&conn, &slug_name) {
         Ok(entries) => Ok(json_ok(&entries)),
         Err(e) => Ok(json_error(
@@ -2102,8 +2274,15 @@ async fn handle_build(
 
 async fn handle_build_status(
     slug_name: String,
-    state: Arc<PyramidState>,
+    (state, auth_source): (Arc<PyramidState>, AuthSource),
 ) -> Result<warp::reply::Response, warp::Rejection> {
+    // WS-ONLINE-E: Access tier enforcement for remote queries
+    {
+        let conn = state.reader.lock().await;
+        if let Err(response) = enforce_access_tier(&conn, &slug_name, &auth_source) {
+            return Ok(response);
+        }
+    }
     let active = state.active_build.read().await;
     if let Some(handle) = active.get(&slug_name) {
         let mut s = handle.status.read().await.clone();
@@ -2430,9 +2609,13 @@ async fn handle_composed_view(
 
 async fn handle_threads(
     slug_name: String,
-    state: Arc<PyramidState>,
+    (state, auth_source): (Arc<PyramidState>, AuthSource),
 ) -> Result<warp::reply::Response, warp::Rejection> {
     let conn = state.reader.lock().await;
+    // WS-ONLINE-E: Access tier enforcement for remote queries
+    if let Err(response) = enforce_access_tier(&conn, &slug_name, &auth_source) {
+        return Ok(response);
+    }
     match db::get_threads(&conn, &slug_name) {
         Ok(threads) => Ok(json_ok(&threads)),
         Err(e) => Ok(json_error(
@@ -3908,7 +4091,7 @@ async fn handle_characterize(
 
     let llm_config = state.config.read().await.clone();
 
-    match characterize::characterize(&source_path, &body.question, &llm_config, &state.operational.tier1).await {
+    match characterize::characterize(&source_path, &body.question, &llm_config, &state.operational.tier1, Some(&state.chains_dir)).await {
         Ok(result) => Ok(json_ok(&result)),
         Err(e) => Ok(json_error(
             warp::http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -4785,5 +4968,84 @@ async fn handle_check_staleness(
                 &format!("staleness check panicked: {}", e),
             ))
         }
+    }
+}
+
+// ── WS-ONLINE-D: Export handler ──────────────────────────────────────────────
+
+/// GET /pyramid/:slug/export — returns all live nodes for the slug as a JSON array.
+/// Gated behind Wire JWT auth (with_dual_auth). Rate limited to 5/minute per operator.
+async fn handle_export(
+    slug: String,
+    (state, auth_source): (Arc<PyramidState>, AuthSource),
+    export_rate_limiter: Arc<Mutex<std::collections::HashMap<String, (u64, std::time::Instant)>>>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    // Export rate limiting: 5/minute per operator for Wire JWT, unlimited for local
+    let operator_id = match &auth_source {
+        AuthSource::Local => None,
+        AuthSource::WireJwt { operator_id, .. } => Some(operator_id.clone()),
+    };
+
+    if let Some(ref op_id) = operator_id {
+        let mut limiter = export_rate_limiter.lock().await;
+        let now = std::time::Instant::now();
+        let entry = limiter
+            .entry(op_id.clone())
+            .or_insert((0u64, now));
+
+        // Reset window if more than 60s elapsed
+        if now.duration_since(entry.1).as_secs() >= 60 {
+            entry.0 = 0;
+            entry.1 = now;
+        }
+
+        entry.0 += 1;
+        if entry.0 > 5 {
+            tracing::warn!(
+                operator_id = %op_id,
+                "Export rate limit exceeded (5/min)"
+            );
+            return Err(warp::reject::custom(RateLimited));
+        }
+    }
+
+    let conn = state.reader.lock().await;
+
+    // Verify slug exists
+    match db::get_slug(&conn, &slug) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return Ok(json_error(
+                warp::http::StatusCode::NOT_FOUND,
+                &format!("slug '{}' not found", slug),
+            ));
+        }
+        Err(e) => {
+            return Ok(json_error(
+                warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                &e.to_string(),
+            ));
+        }
+    }
+
+    // Get all live nodes for export
+    match db::get_all_nodes_for_export(&conn, &slug) {
+        Ok(nodes) => {
+            tracing::info!(
+                slug = %slug,
+                node_count = nodes.len(),
+                auth = ?auth_source,
+                "pyramid export served"
+            );
+            Ok(json_ok(&serde_json::json!({
+                "slug": slug,
+                "nodes": nodes,
+                "node_count": nodes.len(),
+            })))
+        }
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("export failed: {}", e),
+        )),
     }
 }
