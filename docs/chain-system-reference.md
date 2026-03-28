@@ -559,7 +559,7 @@ enhance_question                     Expand user's short question (max 30 words)
 decompose                           Break into sub-questions (leaf/branch tree)
     |
     v
-horizontal_review                    Merge overlaps, convert branches to leaves
+horizontal_review                    Merge overlapping sibling questions
     |
     v
 [IR executor for L0]                Standard extraction runs against source material
@@ -597,6 +597,7 @@ The question pyramid uses a different flow than mechanical chains. Instead of YA
 
 **Template variables:**
 - `{{content_type}}` -- "code" or "document"
+- `{{depth}}` -- Current decomposition depth (1 = first level below apex)
 - `{{audience_block}}` -- Audience description paragraph (or empty)
 
 **Output:** JSON array of `{ question, prompt_hint, is_leaf }` objects.
@@ -609,11 +610,11 @@ The question pyramid uses a different flow than mechanical chains. Instead of YA
 
 ### `horizontal_review.md`
 
-**Purpose:** Post-processing pass that merges overlapping sibling questions and converts branches to leaves when possible.
+**Purpose:** Post-processing pass that merges overlapping sibling questions. Does NOT convert branches to leaves — the `mark_as_leaf` array is forced empty by the current prompt.
 
 **Template variables:** None (receives question list as user prompt).
 
-**Output:** JSON object with `merges` array and `mark_as_leaf` array.
+**Output:** JSON object with `merges` array and `mark_as_leaf` array (always empty).
 
 ### `pre_map.md`
 
@@ -685,7 +686,7 @@ The question pyramid uses a different flow than mechanical chains. Instead of YA
 | File | Used By | Variables |
 |------|---------|-----------|
 | `enhance_question.md` | `question_decomposition.rs` | (none) |
-| `decompose.md` | `question_decomposition.rs` | `{{content_type}}`, `{{audience_block}}` |
+| `decompose.md` | `question_decomposition.rs` | `{{content_type}}`, `{{depth}}`, `{{audience_block}}` |
 | `horizontal_review.md` | `question_decomposition.rs` | (none) |
 | `pre_map.md` | `evidence_answering.rs` | `{{audience_block}}`, `{{content_type_block}}` |
 | `answer.md` | `evidence_answering.rs` | `{{audience_block}}`, `{{synthesis_prompt}}`, `{{content_type_block}}` |

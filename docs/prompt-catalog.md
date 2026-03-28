@@ -30,7 +30,7 @@ These shape how understanding webs are built on top of mechanical pyramids.
 ### `question/horizontal_review.md`
 **Purpose:** Reviews sibling questions for overlap and decides which branches are specific enough to be leaves.
 **Template variables:** None (siblings passed as user prompt).
-**Key behavior:** Two jobs: (1) merge overlapping sibling questions, (2) for each remaining branch, decide if it's specific enough to answer directly — if so, mark as leaf. Returns JSON with `merged`, `mark_as_leaf`, and `keep_as_branch` arrays.
+**Key behavior:** One job: merge overlapping sibling questions. The `mark_as_leaf` array is forced empty — the decomposition step decides leaf vs branch, and horizontal review must not override that. Returns JSON with `merges` and `mark_as_leaf` (always empty) arrays.
 **Called from:** `question_decomposition.rs::horizontal_review_siblings` — runs once per depth level after all siblings are decomposed.
 
 ### `question/pre_map.md`
