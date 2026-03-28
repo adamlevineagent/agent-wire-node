@@ -284,14 +284,23 @@ pub async fn start_server(
     // Phase 7: Initialize stale engines for auto-update pyramids
     init_stale_engines(&state.pyramid).await;
 
-    // CORS headers for browser access
+    // S2: CORS tightening — restrict to known origins instead of allow_any_origin.
+    // These are Tauri's default dev port and common localhost variants.
+    // TODO: make configurable via PyramidConfig (editable only via Tauri IPC per S1).
+    const CORS_ALLOWED_ORIGINS: &[&str] = &[
+        "http://localhost:1420",
+        "http://127.0.0.1:1420",
+        "https://localhost:1420",
+        "tauri://localhost",
+    ];
     let cors = warp::cors()
-        .allow_any_origin()
-        .allow_methods(vec!["GET", "POST", "DELETE", "OPTIONS"])
+        .allow_origins(CORS_ALLOWED_ORIGINS.iter().copied())
+        .allow_methods(vec!["GET", "POST", "OPTIONS"])
         .allow_headers(vec![
             "Content-Type",
             "Range",
             "Authorization",
+            "X-Payment-Token",
             "Access-Control-Request-Private-Network",
         ]);
 
@@ -427,13 +436,14 @@ pub async fn start_server(
                                     if let Some(range) = range_header {
                                         if let Some((start, end)) = parse_range(&range, file_size) {
                                             let slice = data[start..=end].to_vec();
+                                            // S2: Removed hardcoded Access-Control-Allow-Origin: *
+                                            // CORS is handled by the warp::cors() middleware with the allowlist.
                                             let resp = warp::http::Response::builder()
                                                 .status(206)
                                                 .header("Content-Type", "application/octet-stream")
                                                 .header("Content-Length", slice.len().to_string())
                                                 .header("Content-Range", format!("bytes {}-{}/{}", start, end, file_size))
                                                 .header("Accept-Ranges", "bytes")
-                                                .header("Access-Control-Allow-Origin", "*")
                                                 .header("X-Served-By", "wire-node")
                                                 .body(slice)
                                                 .unwrap();
@@ -442,12 +452,13 @@ pub async fn start_server(
                                     }
 
                                     // Full response
+                                    // S2: Removed hardcoded Access-Control-Allow-Origin: *
+                                    // CORS is handled by the warp::cors() middleware with the allowlist.
                                     let resp = warp::http::Response::builder()
                                         .status(200)
                                         .header("Content-Type", "application/octet-stream")
                                         .header("Content-Length", file_size.to_string())
                                         .header("Accept-Ranges", "bytes")
-                                        .header("Access-Control-Allow-Origin", "*")
                                         .header("X-Served-By", "wire-node")
                                         .body(data)
                                         .unwrap();
@@ -484,7 +495,11 @@ pub async fn start_server(
                 .unwrap()
         });
 
+    // MOVED TO IPC: see main.rs — auth_complete_ipc command
     // POST /auth/complete — receives tokens from the callback page
+    // NOTE: This endpoint is retained but only for the magic-link callback HTML page
+    // which runs in a browser tab and cannot use Tauri IPC. The origin check
+    // restricts it to trusted origins only.
     #[derive(Deserialize)]
     struct AuthCompleteRequest {
         access_token: String,
@@ -498,6 +513,7 @@ pub async fn start_server(
         warp::path!("auth" / "complete")
             .and(warp::post())
             .and(warp::header::optional::<String>("origin"))
+            .and(warp::body::content_length_limit(1_048_576)) // S4: 1MB body size limit
             .and(warp::body::json())
             .and_then(move |origin: Option<String>, body: AuthCompleteRequest| {
                 let state = state.clone();
@@ -584,19 +600,32 @@ pub async fn start_server(
     };
 
     // Explicit OPTIONS preflight handler
-    let preflight = warp::options().map(|| {
-        warp::http::Response::builder()
-            .status(204)
-            .header("Access-Control-Allow-Origin", "*")
-            .header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
-            .header(
-                "Access-Control-Allow-Headers",
-                "Content-Type, Range, Authorization",
-            )
-            .header("Access-Control-Allow-Private-Network", "true")
-            .body("")
-            .unwrap()
-    });
+    // S2: Use the same origin allowlist as the CORS middleware.
+    // Warp's cors() middleware handles preflight for standard CORS, but the
+    // Access-Control-Request-Private-Network header needs an explicit handler
+    // for Private Network Access (PNA) preflight. We still set the allowed
+    // origin from the allowlist rather than hardcoding *.
+    let preflight = warp::options()
+        .and(warp::header::optional::<String>("origin"))
+        .map(|origin: Option<String>| {
+            let mut builder = warp::http::Response::builder()
+                .status(204)
+                .header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+                .header(
+                    "Access-Control-Allow-Headers",
+                    "Content-Type, Range, Authorization, X-Payment-Token",
+                )
+                .header("Access-Control-Allow-Private-Network", "true");
+
+            // Only echo back origin if it's in our allowlist
+            if let Some(ref o) = origin {
+                if CORS_ALLOWED_ORIGINS.iter().any(|allowed| *allowed == o.as_str()) {
+                    builder = builder.header("Access-Control-Allow-Origin", o.as_str());
+                }
+            }
+
+            builder.body("").unwrap()
+        });
 
     // Pyramid Knowledge Engine routes
     let pyramid_routes = pyramid::routes::pyramid_routes(state.pyramid.clone());

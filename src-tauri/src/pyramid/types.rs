@@ -325,6 +325,7 @@ pub struct WebEdge {
     pub relationship: String,
     pub relevance: f64,
     pub delta_count: i64,
+    pub build_id: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }

@@ -2131,6 +2131,7 @@ async fn persist_web_edges_for_depth(
                     relationship: edge.relationship,
                     relevance: edge.strength,
                     delta_count: 0,
+                    build_id: None,
                     created_at: String::new(),
                     updated_at: String::new(),
                 };

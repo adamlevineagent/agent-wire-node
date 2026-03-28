@@ -2397,6 +2397,7 @@ async fn map_vine_thread_continuity(
                     relationship: format!("Co-occur in {} sessions", shared.len()),
                     relevance: shared.len() as f64 / bunches.len().max(1) as f64,
                     delta_count: 0,
+                    build_id: None,
                     created_at: now.clone(),
                     updated_at: now.clone(),
                 };

@@ -74,15 +74,32 @@ pub fn partner_routes(
         };
     }
 
+    // MOVED TO IPC: see main.rs — partner_session_new command
     // POST /partner/session/new (must be before /partner/session/:id)
-    let new_session = route!(prefix
+    // let new_session = route!(prefix
+    //     .and(warp::path("session"))
+    //     .and(warp::path("new"))
+    //     .and(warp::path::end())
+    //     .and(warp::post())
+    //     .and(with_auth_state(state.clone()))
+    //     .and(warp::body::json())
+    //     .and_then(handle_new_session));
+    let new_session = prefix
         .and(warp::path("session"))
         .and(warp::path("new"))
         .and(warp::path::end())
         .and(warp::post())
-        .and(with_auth_state(state.clone()))
-        .and(warp::body::json())
-        .and_then(handle_new_session));
+        .and_then(|| async {
+            Ok::<warp::reply::Response, warp::Rejection>(
+                warp::http::Response::builder()
+                    .status(410)
+                    .header("Content-Type", "application/json")
+                    .body(r#"{"error":"moved to IPC","command":"partner_session_new"}"#.into())
+                    .unwrap(),
+            )
+        })
+        .map(|r: warp::reply::Response| r)
+        .boxed();
 
     // GET /partner/session/:id
     let get_session = route!(prefix
@@ -93,14 +110,30 @@ pub fn partner_routes(
         .and(with_auth_state(state.clone()))
         .and_then(handle_get_session));
 
+    // MOVED TO IPC: see main.rs — partner_send_message command
     // POST /partner/message
-    let send_message = route!(prefix
+    // let send_message = route!(prefix
+    //     .and(warp::path("message"))
+    //     .and(warp::path::end())
+    //     .and(warp::post())
+    //     .and(with_auth_state(state.clone()))
+    //     .and(warp::body::json())
+    //     .and_then(handle_send_message));
+    let send_message = prefix
         .and(warp::path("message"))
         .and(warp::path::end())
         .and(warp::post())
-        .and(with_auth_state(state.clone()))
-        .and(warp::body::json())
-        .and_then(handle_send_message));
+        .and_then(|| async {
+            Ok::<warp::reply::Response, warp::Rejection>(
+                warp::http::Response::builder()
+                    .status(410)
+                    .header("Content-Type", "application/json")
+                    .body(r#"{"error":"moved to IPC","command":"partner_send_message"}"#.into())
+                    .unwrap(),
+            )
+        })
+        .map(|r: warp::reply::Response| r)
+        .boxed();
 
     // GET /partner/brain/:session_id
     let get_brain = route!(prefix

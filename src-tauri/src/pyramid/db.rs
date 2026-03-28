@@ -728,6 +728,122 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
         "CREATE INDEX IF NOT EXISTS idx_evidence_build ON pyramid_evidence(slug, build_id);",
     );
 
+    // ── Schema Prep Migration for Wire Online push ──────────────────────────
+    migrate_online_push_columns(conn)?;
+
+    Ok(())
+}
+
+/// Wire Online Push — Schema Prep Migration.
+///
+/// Adds all columns needed by WS-ONLINE-A through WS-ONLINE-G to `pyramid_slugs`,
+/// adds build_id/archived_at to `pyramid_web_edges`, creates `pyramid_remote_web_edges`,
+/// and backfills web edge build_ids. Idempotent: uses ALTER TABLE with error suppression
+/// and CREATE TABLE/INDEX IF NOT EXISTS.
+fn migrate_online_push_columns(conn: &Connection) -> Result<()> {
+    // ── pyramid_slugs: publication tracking (WS-ONLINE-A) ──
+    let _ = conn.execute(
+        "ALTER TABLE pyramid_slugs ADD COLUMN last_published_build_id TEXT DEFAULT NULL",
+        [],
+    );
+
+    // ── pyramid_slugs: pinning (WS-ONLINE-D) ──
+    let _ = conn.execute(
+        "ALTER TABLE pyramid_slugs ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE pyramid_slugs ADD COLUMN source_tunnel_url TEXT DEFAULT NULL",
+        [],
+    );
+
+    // ── pyramid_slugs: access tiers (WS-ONLINE-E) ──
+    let _ = conn.execute(
+        "ALTER TABLE pyramid_slugs ADD COLUMN access_tier TEXT NOT NULL DEFAULT 'public'",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE pyramid_slugs ADD COLUMN access_price INTEGER DEFAULT NULL",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE pyramid_slugs ADD COLUMN allowed_circles TEXT DEFAULT NULL",
+        [],
+    );
+
+    // ── pyramid_slugs: discovery metadata tracking (WS-ONLINE-B) ──
+    let _ = conn.execute(
+        "ALTER TABLE pyramid_slugs ADD COLUMN metadata_contribution_id TEXT DEFAULT NULL",
+        [],
+    );
+
+    // ── pyramid_slugs: absorption config (WS-ONLINE-G) ──
+    let _ = conn.execute(
+        "ALTER TABLE pyramid_slugs ADD COLUMN absorption_mode TEXT NOT NULL DEFAULT 'open'",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE pyramid_slugs ADD COLUMN absorption_chain_id TEXT DEFAULT NULL",
+        [],
+    );
+
+    // ── pyramid_slugs: emergent pricing cache (WS-ONLINE-E) ──
+    let _ = conn.execute(
+        "ALTER TABLE pyramid_slugs ADD COLUMN cached_emergent_price INTEGER DEFAULT NULL",
+        [],
+    );
+
+    // ── pyramid_web_edges: build_id scoping (WS-ONLINE-S3) ──
+    let _ = conn.execute(
+        "ALTER TABLE pyramid_web_edges ADD COLUMN build_id TEXT DEFAULT NULL",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE pyramid_web_edges ADD COLUMN archived_at TEXT DEFAULT NULL",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE pyramid_web_edges ADD COLUMN last_confirmed_at TEXT DEFAULT NULL",
+        [],
+    );
+
+    // ── pyramid_web_edge_deltas: build_id scoping (WS-ONLINE-S3) ──
+    let _ = conn.execute(
+        "ALTER TABLE pyramid_web_edge_deltas ADD COLUMN build_id TEXT DEFAULT NULL",
+        [],
+    );
+
+    // ── pyramid_remote_web_edges table (WS-ONLINE-F) ──
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS pyramid_remote_web_edges (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            slug TEXT NOT NULL,
+            local_thread_id TEXT NOT NULL,
+            remote_handle_path TEXT NOT NULL,
+            remote_tunnel_url TEXT NOT NULL,
+            relationship TEXT NOT NULL DEFAULT '',
+            relevance REAL NOT NULL DEFAULT 1.0,
+            delta_count INTEGER NOT NULL DEFAULT 0,
+            build_id TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(slug, local_thread_id, remote_handle_path, build_id),
+            FOREIGN KEY (slug, local_thread_id) REFERENCES pyramid_threads(slug, thread_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_remote_web_edges_slug ON pyramid_remote_web_edges(slug);
+        ",
+    )?;
+
+    // ── Backfill: set build_id on existing web edges from latest node build_id ──
+    let _ = conn.execute(
+        "UPDATE pyramid_web_edges SET build_id = (
+            SELECT MAX(build_id) FROM pyramid_nodes
+            WHERE pyramid_nodes.slug = pyramid_web_edges.slug
+        ) WHERE build_id IS NULL",
+        [],
+    );
+
     Ok(())
 }
 
@@ -2066,11 +2182,11 @@ pub fn save_delta(conn: &Connection, delta: &Delta) -> Result<i64> {
 
 // ── Web Edge CRUD ────────────────────────────────────────────────────────────
 
-/// Get all web edges for a slug.
+/// Get all active (non-archived) web edges for a slug.
 pub fn get_web_edges(conn: &Connection, slug: &str) -> Result<Vec<WebEdge>> {
     let mut stmt = conn.prepare(
-        "SELECT id, slug, thread_a_id, thread_b_id, relationship, relevance, delta_count, created_at, updated_at
-         FROM pyramid_web_edges WHERE slug = ?1 ORDER BY relevance DESC",
+        "SELECT id, slug, thread_a_id, thread_b_id, relationship, relevance, delta_count, build_id, created_at, updated_at
+         FROM pyramid_web_edges WHERE slug = ?1 AND archived_at IS NULL ORDER BY relevance DESC",
     )?;
 
     let rows = stmt.query_map(rusqlite::params![slug], |row| {
@@ -2082,8 +2198,9 @@ pub fn get_web_edges(conn: &Connection, slug: &str) -> Result<Vec<WebEdge>> {
             relationship: row.get(4)?,
             relevance: row.get(5)?,
             delta_count: row.get(6)?,
-            created_at: row.get(7)?,
-            updated_at: row.get(8)?,
+            build_id: row.get(7)?,
+            created_at: row.get(8)?,
+            updated_at: row.get(9)?,
         })
     })?;
 
@@ -2095,14 +2212,18 @@ pub fn get_web_edges(conn: &Connection, slug: &str) -> Result<Vec<WebEdge>> {
 }
 
 /// Save (upsert) a web edge. Returns the row ID.
+/// Writes build_id and last_confirmed_at for contribution-model scoping.
 pub fn save_web_edge(conn: &Connection, edge: &WebEdge) -> Result<i64> {
     conn.execute(
-        "INSERT INTO pyramid_web_edges (slug, thread_a_id, thread_b_id, relationship, relevance, delta_count, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'))
+        "INSERT INTO pyramid_web_edges (slug, thread_a_id, thread_b_id, relationship, relevance, delta_count, build_id, last_confirmed_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, datetime('now'), datetime('now'))
          ON CONFLICT(slug, thread_a_id, thread_b_id) DO UPDATE SET
             relationship = excluded.relationship,
             relevance = excluded.relevance,
             delta_count = excluded.delta_count,
+            build_id = excluded.build_id,
+            last_confirmed_at = datetime('now'),
+            archived_at = NULL,
             updated_at = excluded.updated_at",
         rusqlite::params![
             edge.slug,
@@ -2111,28 +2232,25 @@ pub fn save_web_edge(conn: &Connection, edge: &WebEdge) -> Result<i64> {
             edge.relationship,
             edge.relevance,
             edge.delta_count,
+            edge.build_id,
         ],
     )?;
     Ok(conn.last_insert_rowid())
 }
 
-/// Delete all web edges whose endpoints both belong to a given depth.
-pub fn delete_web_edges_for_depth(conn: &Connection, slug: &str, depth: i64) -> Result<usize> {
-    let deleted = conn.execute(
-        "DELETE FROM pyramid_web_edges
-         WHERE slug = ?1
-           AND thread_a_id IN (
-                SELECT thread_id FROM pyramid_threads WHERE slug = ?1 AND depth = ?2
-           )
-           AND thread_b_id IN (
-                SELECT thread_id FROM pyramid_threads WHERE slug = ?1 AND depth = ?2
-           )",
-        rusqlite::params![slug, depth],
-    )?;
-    Ok(deleted)
+/// No-op: web edges are now scoped by build_id (WS-ONLINE-S3).
+///
+/// Previously this deleted all web edges for a given depth before re-inserting.
+/// With the contribution model, new edges are upserted with the current build_id
+/// via `save_web_edge`. Old edges with stale build_ids persist as historical
+/// records and are eventually archived by `decay_web_edges`.
+///
+/// Retained with original signature to avoid breaking callers during transition.
+pub fn delete_web_edges_for_depth(_conn: &Connection, _slug: &str, _depth: i64) -> Result<usize> {
+    Ok(0)
 }
 
-/// Get a single web edge between two threads (normalized order: a < b).
+/// Get a single active (non-archived) web edge between two threads (normalized order: a < b).
 pub fn get_web_edge_between(
     conn: &Connection,
     slug: &str,
@@ -2140,8 +2258,8 @@ pub fn get_web_edge_between(
     thread_b_id: &str,
 ) -> Result<Option<WebEdge>> {
     let mut stmt = conn.prepare(
-        "SELECT id, slug, thread_a_id, thread_b_id, relationship, relevance, delta_count, created_at, updated_at
-         FROM pyramid_web_edges WHERE slug = ?1 AND thread_a_id = ?2 AND thread_b_id = ?3",
+        "SELECT id, slug, thread_a_id, thread_b_id, relationship, relevance, delta_count, build_id, created_at, updated_at
+         FROM pyramid_web_edges WHERE slug = ?1 AND thread_a_id = ?2 AND thread_b_id = ?3 AND archived_at IS NULL",
     )?;
 
     let mut rows = stmt.query_map(rusqlite::params![slug, thread_a_id, thread_b_id], |row| {
@@ -2153,8 +2271,9 @@ pub fn get_web_edge_between(
             relationship: row.get(4)?,
             relevance: row.get(5)?,
             delta_count: row.get(6)?,
-            created_at: row.get(7)?,
-            updated_at: row.get(8)?,
+            build_id: row.get(7)?,
+            created_at: row.get(8)?,
+            updated_at: row.get(9)?,
         })
     })?;
 
@@ -2197,13 +2316,15 @@ pub fn get_web_edge_deltas(conn: &Connection, edge_id: i64) -> Result<Vec<WebEdg
     Ok(deltas)
 }
 
-/// Delete web edge deltas by edge ID. Returns the number of deleted rows.
-pub fn delete_web_edge_deltas(conn: &Connection, edge_id: i64) -> Result<usize> {
-    let count = conn.execute(
-        "DELETE FROM pyramid_web_edge_deltas WHERE edge_id = ?1",
-        rusqlite::params![edge_id],
-    )?;
-    Ok(count)
+/// No-op: web edge deltas are now scoped by build_id (WS-ONLINE-S3).
+///
+/// Previously this deleted all deltas for an edge after collapse absorbed them.
+/// With the contribution model, deltas persist as historical records. The
+/// edge's `delta_count` is reset to 0 by `update_web_edge` during collapse,
+/// which is sufficient for collapse-threshold tracking. Retained with original
+/// signature to avoid breaking callers.
+pub fn delete_web_edge_deltas(_conn: &Connection, _edge_id: i64) -> Result<usize> {
+    Ok(0)
 }
 
 /// Update a web edge's relationship, relevance, and delta_count.
@@ -2221,10 +2342,10 @@ pub fn update_web_edge(
     Ok(())
 }
 
-/// Get a web edge by its ID.
+/// Get a web edge by its ID (includes archived edges — used by collapse logic).
 pub fn get_web_edge(conn: &Connection, edge_id: i64) -> Result<Option<WebEdge>> {
     let mut stmt = conn.prepare(
-        "SELECT id, slug, thread_a_id, thread_b_id, relationship, relevance, delta_count, created_at, updated_at
+        "SELECT id, slug, thread_a_id, thread_b_id, relationship, relevance, delta_count, build_id, created_at, updated_at
          FROM pyramid_web_edges WHERE id = ?1",
     )?;
 
@@ -2237,8 +2358,9 @@ pub fn get_web_edge(conn: &Connection, edge_id: i64) -> Result<Option<WebEdge>> 
             relationship: row.get(4)?,
             relevance: row.get(5)?,
             delta_count: row.get(6)?,
-            created_at: row.get(7)?,
-            updated_at: row.get(8)?,
+            build_id: row.get(7)?,
+            created_at: row.get(8)?,
+            updated_at: row.get(9)?,
         })
     })?;
 
@@ -2249,28 +2371,36 @@ pub fn get_web_edge(conn: &Connection, edge_id: i64) -> Result<Option<WebEdge>> 
     }
 }
 
-/// Decay all web edges for a slug by reducing relevance. Returns count of decayed edges.
+/// Decay all active web edges for a slug by reducing relevance. Returns count of archived edges.
+///
+/// Edges that drop below 0.1 relevance are archived (not deleted) by setting `archived_at`.
+/// The `last_confirmed_at` guard prevents valid edges on quiet pyramids from decaying to
+/// zero: edges confirmed within the last 7 days are exempt from archival even if their
+/// relevance has decayed below the threshold.
 pub fn decay_web_edges(conn: &Connection, slug: &str, decay_rate: f64) -> Result<usize> {
-    // Reduce relevance
+    // Reduce relevance on all active (non-archived) edges
     conn.execute(
-        "UPDATE pyramid_web_edges SET relevance = relevance - ?1, updated_at = datetime('now') WHERE slug = ?2",
+        "UPDATE pyramid_web_edges SET relevance = relevance - ?1, updated_at = datetime('now')
+         WHERE slug = ?2 AND archived_at IS NULL",
         rusqlite::params![decay_rate, slug],
     )?;
 
-    // Delete edges that dropped below threshold
-    let archived = conn.execute(
-        "DELETE FROM pyramid_web_edges WHERE slug = ?1 AND relevance < 0.1",
+    // Archive edges that dropped below threshold AND haven't been confirmed recently
+    let archived_count = conn.execute(
+        "UPDATE pyramid_web_edges SET archived_at = datetime('now')
+         WHERE slug = ?1 AND archived_at IS NULL AND relevance < 0.1
+           AND (last_confirmed_at IS NULL OR last_confirmed_at < datetime('now', '-7 days'))",
         rusqlite::params![slug],
     )?;
 
-    Ok(archived)
+    Ok(archived_count)
 }
 
-/// Get active web edges above a minimum relevance threshold.
+/// Get active (non-archived) web edges above a minimum relevance threshold.
 pub fn get_active_edges(conn: &Connection, slug: &str, min_relevance: f64) -> Result<Vec<WebEdge>> {
     let mut stmt = conn.prepare(
-        "SELECT id, slug, thread_a_id, thread_b_id, relationship, relevance, delta_count, created_at, updated_at
-         FROM pyramid_web_edges WHERE slug = ?1 AND relevance >= ?2 ORDER BY relevance DESC",
+        "SELECT id, slug, thread_a_id, thread_b_id, relationship, relevance, delta_count, build_id, created_at, updated_at
+         FROM pyramid_web_edges WHERE slug = ?1 AND relevance >= ?2 AND archived_at IS NULL ORDER BY relevance DESC",
     )?;
 
     let rows = stmt.query_map(rusqlite::params![slug, min_relevance], |row| {
@@ -2282,8 +2412,9 @@ pub fn get_active_edges(conn: &Connection, slug: &str, min_relevance: f64) -> Re
             relationship: row.get(4)?,
             relevance: row.get(5)?,
             delta_count: row.get(6)?,
-            created_at: row.get(7)?,
-            updated_at: row.get(8)?,
+            build_id: row.get(7)?,
+            created_at: row.get(8)?,
+            updated_at: row.get(9)?,
         })
     })?;
 
@@ -4796,8 +4927,11 @@ mod tests {
         assert_eq!(count_nodes_at_depth(&conn, "s", 0).unwrap(), 1);
     }
 
+    /// WS-ONLINE-S3: delete_web_edges_for_depth is now a no-op (build_id scoping).
+    /// This test verifies edges are preserved and that save_web_edge writes
+    /// build_id + last_confirmed_at, and that decay archives instead of deleting.
     #[test]
-    fn test_delete_web_edges_for_depth_only_clears_target_layer() {
+    fn test_web_edge_build_id_scoping_and_archival() {
         let conn = test_conn();
         create_slug(&conn, "s", &ContentType::Code, "").unwrap();
 
@@ -4818,6 +4952,7 @@ mod tests {
                 children: vec![],
                 parent_id: None,
                 superseded_by: None,
+                build_id: None,
                 created_at: String::new(),
             };
             save_node(&conn, &node, None).unwrap();
@@ -4835,6 +4970,7 @@ mod tests {
             save_thread(&conn, &thread).unwrap();
         }
 
+        // Save edges with build_id
         save_web_edge(
             &conn,
             &WebEdge {
@@ -4845,6 +4981,7 @@ mod tests {
                 relationship: "L1 edge".into(),
                 relevance: 0.8,
                 delta_count: 0,
+                build_id: Some("build-1".into()),
                 created_at: String::new(),
                 updated_at: String::new(),
             },
@@ -4860,19 +4997,109 @@ mod tests {
                 relationship: "L2 edge".into(),
                 relevance: 0.9,
                 delta_count: 0,
+                build_id: Some("build-1".into()),
                 created_at: String::new(),
                 updated_at: String::new(),
             },
         )
         .unwrap();
 
+        // delete_web_edges_for_depth is now a no-op — edges preserved
         let deleted = delete_web_edges_for_depth(&conn, "s", 1).unwrap();
-        assert_eq!(deleted, 1);
+        assert_eq!(deleted, 0);
 
-        let remaining = get_web_edges(&conn, "s").unwrap();
-        assert_eq!(remaining.len(), 1);
-        assert_eq!(remaining[0].thread_a_id, "L2-000");
-        assert_eq!(remaining[0].thread_b_id, "L2-001");
+        let all_edges = get_web_edges(&conn, "s").unwrap();
+        assert_eq!(all_edges.len(), 2); // Both edges still present
+
+        // Verify build_id was written
+        assert_eq!(all_edges[0].build_id, Some("build-1".into()));
+
+        // Verify last_confirmed_at was set (non-NULL)
+        let has_confirmed: bool = conn
+            .query_row(
+                "SELECT last_confirmed_at IS NOT NULL FROM pyramid_web_edges WHERE slug = 's' LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(has_confirmed);
+
+        // Upsert with new build_id updates the edge
+        save_web_edge(
+            &conn,
+            &WebEdge {
+                id: 0,
+                slug: "s".into(),
+                thread_a_id: "L1-000".into(),
+                thread_b_id: "L1-001".into(),
+                relationship: "L1 edge updated".into(),
+                relevance: 0.05, // Below threshold
+                delta_count: 0,
+                build_id: Some("build-2".into()),
+                created_at: String::new(),
+                updated_at: String::new(),
+            },
+        )
+        .unwrap();
+
+        // Verify build_id updated
+        let edge = get_web_edge_between(&conn, "s", "L1-000", "L1-001")
+            .unwrap()
+            .unwrap();
+        assert_eq!(edge.build_id, Some("build-2".into()));
+        assert_eq!(edge.relationship, "L1 edge updated");
+
+        // Decay: edge at 0.05 is below 0.1 but last_confirmed_at is recent (just saved)
+        // so the 7-day guard should protect it
+        let archived = decay_web_edges(&conn, "s", 0.0).unwrap(); // decay_rate 0 to not change relevance
+        assert_eq!(archived, 0); // Protected by last_confirmed_at guard
+
+        // Backdate last_confirmed_at to bypass the guard
+        conn.execute(
+            "UPDATE pyramid_web_edges SET last_confirmed_at = datetime('now', '-8 days')
+             WHERE slug = 's' AND thread_a_id = 'L1-000'",
+            [],
+        )
+        .unwrap();
+
+        // Now decay should archive the low-relevance edge
+        let archived = decay_web_edges(&conn, "s", 0.0).unwrap();
+        assert_eq!(archived, 1);
+
+        // Archived edge excluded from get_web_edges
+        let active = get_web_edges(&conn, "s").unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].thread_a_id, "L2-000");
+
+        // Archived edge excluded from get_web_edge_between
+        let gone = get_web_edge_between(&conn, "s", "L1-000", "L1-001").unwrap();
+        assert!(gone.is_none());
+
+        // But get_web_edge by ID still returns it (for collapse logic)
+        let by_id = get_web_edge(&conn, edge.id).unwrap();
+        assert!(by_id.is_some());
+
+        // Re-saving an archived edge un-archives it (archived_at = NULL on upsert)
+        save_web_edge(
+            &conn,
+            &WebEdge {
+                id: 0,
+                slug: "s".into(),
+                thread_a_id: "L1-000".into(),
+                thread_b_id: "L1-001".into(),
+                relationship: "L1 edge revived".into(),
+                relevance: 0.9,
+                delta_count: 0,
+                build_id: Some("build-3".into()),
+                created_at: String::new(),
+                updated_at: String::new(),
+            },
+        )
+        .unwrap();
+
+        let revived = get_web_edge_between(&conn, "s", "L1-000", "L1-001").unwrap();
+        assert!(revived.is_some());
+        assert_eq!(revived.unwrap().relationship, "L1 edge revived");
     }
 
     /// 11-J: Verify same-slug and cross-slug evidence can coexist with the same bare node ID.

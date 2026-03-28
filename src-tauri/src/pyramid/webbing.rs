@@ -101,6 +101,7 @@ pub async fn process_web_edge_notes(
                     relationship: note.relationship.clone(),
                     relevance: 1.0,
                     delta_count: 0,
+                    build_id: None,
                     created_at: now_ts(),
                     updated_at: now_ts(),
                 };
@@ -262,11 +263,11 @@ pub async fn check_and_collapse_edges(
     // After collapse cycle, decay all edges
     {
         let conn = writer.lock().await;
-        let archived = db::decay_web_edges(&conn, slug, tier3.edge_decay_rate)?;
-        if archived > 0 {
+        let archived_count = db::decay_web_edges(&conn, slug, tier3.edge_decay_rate)?;
+        if archived_count > 0 {
             info!(
                 "[webbing] archived {} stale edges (relevance < {})",
-                archived, tier3.edge_min_relevance
+                archived_count, tier3.edge_min_relevance
             );
         }
     }
@@ -276,10 +277,11 @@ pub async fn check_and_collapse_edges(
 
 // ── decay_web_edges (module-level wrapper) ───────────────────────────────────
 
-/// Reduces relevance of stale edges. Wrapper around db::decay_web_edges.
+/// Reduces relevance of stale edges and archives those below threshold.
+/// Wrapper around db::decay_web_edges.
 pub fn decay_web_edges(conn: &Connection, slug: &str, decay_rate: f64) -> anyhow::Result<usize> {
-    let archived = db::decay_web_edges(conn, slug, decay_rate)?;
-    Ok(archived)
+    let archived_count = db::decay_web_edges(conn, slug, decay_rate)?;
+    Ok(archived_count)
 }
 
 // ── get_active_edges (module-level wrapper) ──────────────────────────────────
@@ -374,6 +376,7 @@ mod tests {
             relationship: "test relationship".into(),
             relevance: 0.20,
             delta_count: 0,
+            build_id: None,
             created_at: now_ts(),
             updated_at: now_ts(),
         };
@@ -382,18 +385,27 @@ mod tests {
         let cfg = Tier3Config::default();
 
         // First decay: 0.20 - 0.05 = 0.15, still >= 0.1, not archived
-        let archived = decay_web_edges(&conn, "test", cfg.edge_decay_rate).unwrap();
-        assert_eq!(archived, 0);
+        let archived_count = decay_web_edges(&conn, "test", cfg.edge_decay_rate).unwrap();
+        assert_eq!(archived_count, 0);
 
         // Second decay: 0.15 - 0.05 = 0.10, still >= 0.1 (exact in float), not archived
-        let archived = decay_web_edges(&conn, "test", cfg.edge_decay_rate).unwrap();
-        assert_eq!(archived, 0);
+        let archived_count = decay_web_edges(&conn, "test", cfg.edge_decay_rate).unwrap();
+        assert_eq!(archived_count, 0);
 
         // Third decay: 0.10 - 0.05 = 0.05, below 0.1, should be archived
-        let archived = decay_web_edges(&conn, "test", cfg.edge_decay_rate).unwrap();
-        assert_eq!(archived, 1);
+        // (last_confirmed_at is set by save_web_edge, but the guard allows archival
+        //  because the edge was just created — the 7-day window hasn't passed, BUT
+        //  the edge was confirmed at creation time so it IS within 7 days.
+        //  We need to make last_confirmed_at old for the test to work.)
+        // Backdate last_confirmed_at so the guard doesn't protect it
+        conn.execute(
+            "UPDATE pyramid_web_edges SET last_confirmed_at = datetime('now', '-8 days') WHERE slug = 'test'",
+            [],
+        ).unwrap();
+        let archived_count = decay_web_edges(&conn, "test", cfg.edge_decay_rate).unwrap();
+        assert_eq!(archived_count, 1);
 
-        // No edges should remain
+        // No active edges should remain (archived edge still exists in DB)
         let edges = get_active_edges(&conn, "test", cfg.edge_min_relevance).unwrap();
         assert!(edges.is_empty());
     }
@@ -450,6 +462,7 @@ mod tests {
             relationship: "initial".into(),
             relevance: 1.0,
             delta_count: 0,
+            build_id: None,
             created_at: now_ts(),
             updated_at: now_ts(),
         };
@@ -477,11 +490,12 @@ mod tests {
         assert_eq!(deltas[0].content, "first change");
         assert_eq!(deltas[1].content, "second change");
 
-        // Delete deltas
-        let deleted = db::delete_web_edge_deltas(&conn, edge_id).unwrap();
-        assert_eq!(deleted, 2);
+        // delete_web_edge_deltas is now a no-op (WS-ONLINE-S3: deltas persist as history)
+        let archived = db::delete_web_edge_deltas(&conn, edge_id).unwrap();
+        assert_eq!(archived, 0); // No-op returns 0
 
+        // Deltas still exist in the database (contribution model: no deletion)
         let deltas = db::get_web_edge_deltas(&conn, edge_id).unwrap();
-        assert!(deltas.is_empty());
+        assert_eq!(deltas.len(), 2);
     }
 }

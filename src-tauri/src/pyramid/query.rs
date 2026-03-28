@@ -88,6 +88,7 @@ fn load_connected_web_edges(
          JOIN pyramid_web_edges AS edge
            ON edge.slug = current.slug
           AND (edge.thread_a_id = current.thread_id OR edge.thread_b_id = current.thread_id)
+          AND edge.archived_at IS NULL
          JOIN pyramid_threads AS other
            ON other.slug = current.slug
           AND other.thread_id = CASE
@@ -566,6 +567,7 @@ mod tests {
                 relationship: "Both read pyramid_nodes".to_string(),
                 relevance: 0.82,
                 delta_count: 0,
+                build_id: None,
                 created_at: "2025-01-01T00:00:00Z".to_string(),
                 updated_at: "2025-01-01T00:00:00Z".to_string(),
             },
@@ -608,6 +610,7 @@ mod tests {
                 relationship: "Shared API".to_string(),
                 relevance: 0.7,
                 delta_count: 0,
+                build_id: None,
                 created_at: "2025-01-01T00:00:00Z".to_string(),
                 updated_at: "2025-01-01T00:00:00Z".to_string(),
             },

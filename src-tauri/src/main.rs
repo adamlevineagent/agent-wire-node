@@ -3203,21 +3203,54 @@ async fn pyramid_ingest(
 #[tauri::command]
 async fn pyramid_set_config(
     state: tauri::State<'_, SharedState>,
-    api_key: String,
-    auth_token: String,
+    api_key: Option<String>,
+    auth_token: Option<String>,
+    primary_model: Option<String>,
+    fallback_model_1: Option<String>,
+    fallback_model_2: Option<String>,
+    use_ir_executor: Option<bool>,
 ) -> Result<(), String> {
     // Update in-memory LLM config
     {
         let mut config = state.pyramid.config.write().await;
-        config.api_key = api_key.clone();
-        config.auth_token = auth_token.clone();
+        if let Some(ref key) = api_key {
+            config.api_key = key.clone();
+        }
+        if let Some(ref token) = auth_token {
+            config.auth_token = token.clone();
+        }
+        if let Some(ref model) = primary_model {
+            config.primary_model = model.clone();
+        }
+        if let Some(ref model) = fallback_model_1 {
+            config.fallback_model_1 = model.clone();
+        }
+        if let Some(ref model) = fallback_model_2 {
+            config.fallback_model_2 = model.clone();
+        }
+    }
+
+    if let Some(use_ir) = use_ir_executor {
+        state
+            .pyramid
+            .use_ir_executor
+            .store(use_ir, std::sync::atomic::Ordering::Relaxed);
+        tracing::info!("IR executor toggled to: {use_ir}");
     }
 
     // Persist to disk
     if let Some(ref data_dir) = state.pyramid.data_dir {
         let mut pyramid_config = wire_node_lib::pyramid::PyramidConfig::load(data_dir);
-        pyramid_config.openrouter_api_key = api_key;
-        pyramid_config.auth_token = auth_token;
+        let config = state.pyramid.config.read().await;
+        pyramid_config.openrouter_api_key = config.api_key.clone();
+        pyramid_config.auth_token = config.auth_token.clone();
+        pyramid_config.primary_model = config.primary_model.clone();
+        pyramid_config.fallback_model_1 = config.fallback_model_1.clone();
+        pyramid_config.fallback_model_2 = config.fallback_model_2.clone();
+        pyramid_config.use_ir_executor = state
+            .pyramid
+            .use_ir_executor
+            .load(std::sync::atomic::Ordering::Relaxed);
         pyramid_config.save(data_dir).map_err(|e| e.to_string())?;
     }
 
@@ -3272,6 +3305,741 @@ async fn pyramid_delete_slug(
     drop(conn);
 
     result
+}
+
+// --- S1: IPC-only mutation commands (moved from HTTP) -------------------------
+
+/// IPC equivalent of POST /auth/complete — updates auth state from the frontend.
+/// The HTTP endpoint is retained only for the magic-link callback browser page.
+#[tauri::command]
+async fn auth_complete_ipc(
+    state: tauri::State<'_, SharedState>,
+    access_token: String,
+    refresh_token: Option<String>,
+    user_id: Option<String>,
+    email: Option<String>,
+) -> Result<(), String> {
+    tracing::info!("Auth complete via IPC - user_id={:?}", user_id);
+
+    let mut auth = state.auth.write().await;
+    auth.access_token = Some(access_token);
+    auth.refresh_token = refresh_token;
+    auth.user_id = user_id;
+    auth.email = email;
+    // Preserve api_token and node_id from previous registration
+
+    tracing::info!("Auth state updated via IPC");
+    Ok(())
+}
+
+/// IPC equivalent of DELETE /pyramid/:slug/purge — CASCADE DELETE of a slug.
+#[tauri::command]
+async fn pyramid_purge_slug(
+    state: tauri::State<'_, SharedState>,
+    slug: String,
+) -> Result<(), String> {
+    // Don't allow purging a slug with an active build
+    let maybe_handle = {
+        let active = state.pyramid.active_build.read().await;
+        active
+            .get(&slug)
+            .map(|handle| (handle.cancel.clone(), handle.status.clone()))
+    };
+
+    if let Some((cancel, status)) = maybe_handle {
+        let s = status.read().await;
+        if s.is_running() && !cancel.is_cancelled() {
+            return Err("Cannot purge slug while build is running".to_string());
+        }
+    }
+
+    let conn = state.pyramid.writer.lock().await;
+    let result = wire_node_lib::pyramid::slug::purge_slug(&conn, &slug).map_err(|e| e.to_string());
+    drop(conn);
+
+    if result.is_ok() {
+        let mut active = state.pyramid.active_build.write().await;
+        active.remove(&slug);
+    }
+
+    result
+}
+
+/// IPC equivalent of POST /pyramid/:slug/archive — archive a slug (state mutation).
+#[tauri::command]
+async fn pyramid_archive_slug(
+    state: tauri::State<'_, SharedState>,
+    slug: String,
+) -> Result<(), String> {
+    // Don't allow archiving a slug with an active build
+    let maybe_handle = {
+        let active = state.pyramid.active_build.read().await;
+        active
+            .get(&slug)
+            .map(|handle| (handle.cancel.clone(), handle.status.clone()))
+    };
+
+    if let Some((cancel, status)) = maybe_handle {
+        let s = status.read().await;
+        if s.is_running() && !cancel.is_cancelled() {
+            return Err("Cannot archive slug while build is running".to_string());
+        }
+    }
+
+    let conn = state.pyramid.writer.lock().await;
+    let result = wire_node_lib::pyramid::slug::archive_slug(&conn, &slug).map_err(|e| e.to_string());
+    drop(conn);
+
+    result
+}
+
+/// IPC equivalent of POST /pyramid/:slug/build/question — decomposed question build.
+#[tauri::command]
+async fn pyramid_question_build(
+    state: tauri::State<'_, SharedState>,
+    slug: String,
+    question: String,
+    granularity: Option<u32>,
+    max_depth: Option<u32>,
+    from_depth: Option<i64>,
+    characterization: Option<wire_node_lib::pyramid::types::CharacterizationResult>,
+) -> Result<serde_json::Value, String> {
+    let granularity = granularity.unwrap_or(3);
+    let max_depth = max_depth.unwrap_or(3);
+    let from_depth = from_depth.unwrap_or(0);
+
+    if question.trim().is_empty() {
+        return Err("question cannot be empty".to_string());
+    }
+
+    // Validate slug exists
+    {
+        let conn = state.pyramid.reader.lock().await;
+        wire_node_lib::pyramid::slug::get_slug(&conn, &slug)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("Slug '{}' not found", slug))?;
+    }
+
+    // Check for existing active build
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let status = Arc::new(tokio::sync::RwLock::new(BuildStatus {
+        slug: slug.clone(),
+        status: "running".to_string(),
+        progress: BuildProgress { done: 0, total: 0 },
+        elapsed_seconds: 0.0,
+        failures: 0,
+    }));
+
+    {
+        let mut active = state.pyramid.active_build.write().await;
+        if let Some(handle) = active.get(&slug) {
+            let s = handle.status.read().await;
+            let is_terminal = s.is_terminal();
+            drop(s);
+            if !handle.cancel.is_cancelled() && !is_terminal {
+                return Err("Build already running for this slug".to_string());
+            }
+        }
+
+        let handle = wire_node_lib::pyramid::BuildHandle {
+            slug: slug.clone(),
+            cancel: cancel.clone(),
+            status: status.clone(),
+            started_at: std::time::Instant::now(),
+        };
+        active.insert(slug.clone(), handle);
+    }
+
+    // Spawn the build task
+    let pyramid_state = state.pyramid.clone();
+    let build_status = status.clone();
+    let build_question = question.clone();
+    let build_slug = slug.clone();
+
+    tokio::spawn(async move {
+        let start = std::time::Instant::now();
+
+        let (progress_tx, mut progress_rx) =
+            tokio::sync::mpsc::channel::<BuildProgress>(64);
+        let progress_status = build_status.clone();
+        let progress_start = start;
+        let progress_handle = tokio::spawn(async move {
+            while let Some(prog) = progress_rx.recv().await {
+                let mut s = progress_status.write().await;
+                s.progress = prog;
+                s.elapsed_seconds = progress_start.elapsed().as_secs_f64();
+            }
+        });
+
+        let result = wire_node_lib::pyramid::build_runner::run_decomposed_build(
+            &pyramid_state,
+            &build_slug,
+            &build_question,
+            granularity,
+            max_depth,
+            from_depth,
+            characterization,
+            &cancel,
+            Some(progress_tx.clone()),
+        )
+        .await;
+
+        drop(progress_tx);
+        let _ = progress_handle.await;
+
+        // Update final status
+        {
+            let mut s = build_status.write().await;
+            if cancel.is_cancelled() {
+                s.status = "cancelled".to_string();
+            } else {
+                match result {
+                    Ok((_apex, failures)) => {
+                        if failures > 0 {
+                            s.status = "complete_with_errors".to_string();
+                        } else {
+                            s.status = "complete".to_string();
+                        }
+                        s.failures = failures;
+                    }
+                    Err(e) => {
+                        tracing::error!(slug = %build_slug, error = %e, "question build failed");
+                        s.status = "failed".to_string();
+                        s.failures = -1;
+                    }
+                }
+            }
+            s.elapsed_seconds = start.elapsed().as_secs_f64();
+        }
+    });
+
+    Ok(serde_json::json!({
+        "status": "started",
+        "slug": slug,
+        "build_type": "question_decomposition",
+        "question": question,
+        "granularity": granularity,
+        "max_depth": max_depth,
+        "from_depth": from_depth,
+    }))
+}
+
+/// IPC equivalent of POST /pyramid/:slug/build/preview — preview decomposition.
+#[tauri::command]
+async fn pyramid_question_preview(
+    state: tauri::State<'_, SharedState>,
+    slug: String,
+    question: String,
+    granularity: Option<u32>,
+    max_depth: Option<u32>,
+) -> Result<serde_json::Value, String> {
+    let granularity = granularity.unwrap_or(3);
+    let max_depth = max_depth.unwrap_or(3);
+
+    if question.trim().is_empty() {
+        return Err("question cannot be empty".to_string());
+    }
+
+    // Validate slug exists
+    {
+        let conn = state.pyramid.reader.lock().await;
+        wire_node_lib::pyramid::slug::get_slug(&conn, &slug)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("Slug '{}' not found", slug))?;
+    }
+
+    match wire_node_lib::pyramid::build_runner::preview_decomposed_build(
+        &state.pyramid,
+        &slug,
+        &question,
+        granularity,
+        max_depth,
+    )
+    .await
+    {
+        Ok((tree, preview)) => Ok(serde_json::json!({
+            "slug": slug,
+            "question": question,
+            "preview": preview,
+            "question_tree": tree,
+        })),
+        Err(e) => Err(format!("Preview failed: {}", e)),
+    }
+}
+
+/// IPC equivalent of POST /pyramid/:slug/characterize — characterize source material.
+#[tauri::command]
+async fn pyramid_characterize(
+    state: tauri::State<'_, SharedState>,
+    slug: String,
+    question: String,
+    source_path: Option<String>,
+) -> Result<serde_json::Value, String> {
+    if question.trim().is_empty() {
+        return Err("question cannot be empty".to_string());
+    }
+
+    // Validate slug exists and get source_path
+    let resolved_source_path = {
+        let conn = state.pyramid.reader.lock().await;
+        match wire_node_lib::pyramid::slug::get_slug(&conn, &slug) {
+            Ok(Some(s)) => source_path.unwrap_or(s.source_path),
+            Ok(None) => return Err(format!("Slug '{}' not found", slug)),
+            Err(e) => return Err(e.to_string()),
+        }
+    };
+
+    let llm_config = state.pyramid.config.read().await.clone();
+
+    match wire_node_lib::pyramid::characterize::characterize(
+        &resolved_source_path,
+        &question,
+        &llm_config,
+        &state.pyramid.operational.tier1,
+    )
+    .await
+    {
+        Ok(result) => serde_json::to_value(&result).map_err(|e| e.to_string()),
+        Err(e) => Err(format!("Characterization failed: {}", e)),
+    }
+}
+
+/// IPC equivalent of POST /pyramid/:slug/meta — run all meta passes.
+#[tauri::command]
+async fn pyramid_meta_run(
+    state: tauri::State<'_, SharedState>,
+    slug: String,
+) -> Result<serde_json::Value, String> {
+    // Verify slug exists
+    {
+        let conn = state.pyramid.reader.lock().await;
+        wire_node_lib::pyramid::slug::get_slug(&conn, &slug)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("Slug '{}' not found", slug))?;
+    }
+
+    // Get LLM config
+    let (api_key, model) = {
+        let config = state.pyramid.config.read().await;
+        (config.api_key.clone(), config.primary_model.clone())
+    };
+
+    let reader = state.pyramid.reader.clone();
+    let writer = state.pyramid.writer.clone();
+
+    match wire_node_lib::pyramid::meta::run_all_meta_passes(&reader, &writer, &slug, &api_key, &model).await {
+        Ok(quickstart) => Ok(serde_json::json!({
+            "slug": slug,
+            "status": "complete",
+            "quickstart": quickstart,
+        })),
+        Err(e) => Err(format!("Meta run failed: {}", e)),
+    }
+}
+
+/// IPC equivalent of POST /pyramid/:slug/crystallize — manually trigger a delta check.
+#[tauri::command]
+async fn pyramid_crystallize(
+    state: tauri::State<'_, SharedState>,
+    slug: String,
+    changed_node_ids: Vec<String>,
+) -> Result<serde_json::Value, String> {
+    use wire_node_lib::pyramid::crystallization;
+    use wire_node_lib::pyramid::event_chain::PyramidEvent;
+
+    // Load config and build subscriptions while holding the lock, then release
+    let subscriptions = {
+        let conn = state.pyramid.reader.lock().await;
+        let config = crystallization::load_config(&conn, &slug).unwrap_or_default();
+        crystallization::build_crystallization_subscriptions(&config)
+    };
+
+    // Register subscriptions in-memory only
+    for sub in subscriptions {
+        let _ = state.pyramid.event_bus.subscribe_memory_only(sub).await;
+    }
+
+    // Emit StaleDetected event
+    let event = PyramidEvent::StaleDetected {
+        slug: slug.clone(),
+        node_ids: changed_node_ids.clone(),
+        layer: 0,
+    };
+    match state.pyramid.event_bus.emit_memory_only(event).await {
+        Ok(invocation_ids) => Ok(serde_json::json!({
+            "slug": slug,
+            "triggered": true,
+            "changed_node_ids": changed_node_ids,
+            "invocation_ids": invocation_ids,
+        })),
+        Err(e) => Err(format!("Crystallize trigger failed: {}", e)),
+    }
+}
+
+/// IPC equivalent of POST /pyramid/:slug/publish — publish pyramid to Wire.
+#[tauri::command]
+async fn pyramid_publish(
+    state: tauri::State<'_, SharedState>,
+    slug: String,
+) -> Result<serde_json::Value, String> {
+    use wire_node_lib::pyramid::wire_publish;
+
+    // Validate slug exists
+    {
+        let conn = state.pyramid.reader.lock().await;
+        pyramid_db::get_slug(&conn, &slug)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("slug '{}' not found", slug))?;
+    }
+
+    // Read Wire config
+    let config = state.pyramid.config.read().await;
+    let wire_url =
+        std::env::var("WIRE_URL").unwrap_or_else(|_| "https://api.callmeplayful.com".to_string());
+    let wire_auth = config.auth_token.clone();
+    drop(config);
+
+    if wire_auth.is_empty() {
+        return Err("auth_token not configured".to_string());
+    }
+
+    let publisher = wire_publish::PyramidPublisher::new(wire_url, wire_auth);
+
+    // Phase 1: Load all nodes + evidence weights from DB
+    let (nodes_by_depth, evidence_weights) = {
+        let conn = state.pyramid.reader.lock().await;
+        let slug_info = pyramid_db::get_slug(&conn, &slug)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("slug '{}' not found", slug))?;
+
+        let mut result = Vec::new();
+        for depth in 0..=slug_info.max_depth {
+            let nodes = pyramid_db::get_nodes_at_depth(&conn, &slug, depth)
+                .map_err(|e| format!("failed to load nodes at depth {}: {}", depth, e))?;
+            if !nodes.is_empty() {
+                result.push((depth, nodes));
+            }
+        }
+
+        let mut ev_weights: std::collections::HashMap<String, std::collections::HashMap<String, f64>> =
+            std::collections::HashMap::new();
+        for (_depth, nodes) in &result {
+            for node in nodes {
+                if let Ok(links) = pyramid_db::get_keep_evidence_for_target(&conn, &slug, &node.id) {
+                    if !links.is_empty() {
+                        let mut child_weights = std::collections::HashMap::new();
+                        for link in links {
+                            if let Some(w) = link.weight {
+                                child_weights.insert(link.source_node_id, w);
+                            }
+                        }
+                        if !child_weights.is_empty() {
+                            ev_weights.insert(node.id.clone(), child_weights);
+                        }
+                    }
+                }
+            }
+        }
+
+        (result, ev_weights)
+    };
+
+    if nodes_by_depth.is_empty() {
+        return Err(format!("no nodes found for slug '{}'", slug));
+    }
+
+    // Phase 2: Publish nodes via HTTP
+    match publisher.publish_pyramid_idempotent(&slug, &nodes_by_depth, &std::collections::HashMap::new(), &evidence_weights).await {
+        Ok(result) => {
+            // Phase 3: Persist ID mappings
+            {
+                let writer = state.pyramid.writer.lock().await;
+                if let Err(e) = wire_publish::init_id_map_table(&writer) {
+                    tracing::warn!(error = %e, "failed to init id_map table");
+                }
+                for mapping in &result.id_mappings {
+                    let uuid = mapping.wire_uuid.as_deref().unwrap_or(&mapping.wire_handle_path);
+                    if let Err(e) = wire_publish::save_id_mapping(
+                        &writer,
+                        &slug,
+                        &mapping.local_id,
+                        uuid,
+                    ) {
+                        tracing::warn!(
+                            local_id = %mapping.local_id,
+                            error = %e,
+                            "failed to persist ID mapping"
+                        );
+                    }
+                }
+            }
+            tracing::info!(
+                slug = %slug,
+                node_count = result.node_count,
+                apex_uuid = ?result.apex_wire_uuid,
+                "pyramid published to Wire"
+            );
+            serde_json::to_value(&result).map_err(|e| e.to_string())
+        }
+        Err(e) => {
+            tracing::warn!(slug = %slug, error = %e, "publish failed");
+            Err(format!("failed to publish pyramid: {}", e))
+        }
+    }
+}
+
+/// IPC equivalent of POST /pyramid/:slug/publish/question-set — publish question set to Wire.
+#[tauri::command]
+async fn pyramid_publish_question_set(
+    state: tauri::State<'_, SharedState>,
+    slug: String,
+    description: Option<String>,
+) -> Result<serde_json::Value, String> {
+    use wire_node_lib::pyramid::wire_publish;
+
+    // Validate slug exists and get its content type
+    let content_type = {
+        let conn = state.pyramid.reader.lock().await;
+        let info = pyramid_db::get_slug(&conn, &slug)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("slug '{}' not found", slug))?;
+        info.content_type
+    };
+
+    // Load the question set YAML for this content type
+    let chains_dir = state.pyramid.chains_dir.clone();
+    let qs_path = chains_dir
+        .join("questions")
+        .join(format!("{}.yaml", content_type.as_str()));
+
+    let qs_yaml = std::fs::read_to_string(&qs_path)
+        .map_err(|e| format!("question set not found for content type '{}': {}", content_type.as_str(), e))?;
+
+    let question_set: wire_node_lib::pyramid::question_yaml::QuestionSet =
+        serde_yaml::from_str(&qs_yaml)
+            .map_err(|e| format!("failed to parse question set YAML: {}", e))?;
+
+    // Read Wire config
+    let config = state.pyramid.config.read().await;
+    let wire_url =
+        std::env::var("WIRE_URL").unwrap_or_else(|_| "https://api.callmeplayful.com".to_string());
+    let wire_auth = config.auth_token.clone();
+    drop(config);
+
+    if wire_auth.is_empty() {
+        return Err("auth_token not configured".to_string());
+    }
+
+    let publisher = wire_publish::PyramidPublisher::new(wire_url, wire_auth);
+    let desc = description.unwrap_or_else(|| {
+        format!(
+            "Question set for {} content type ({} questions, v{})",
+            question_set.r#type,
+            question_set.questions.len(),
+            question_set.version,
+        )
+    });
+
+    match publisher.publish_question_set(&question_set, &desc).await {
+        Ok(result) => {
+            tracing::info!(
+                slug = %slug,
+                wire_uuid = %result.wire_uuid,
+                "question set published to Wire"
+            );
+            serde_json::to_value(&result).map_err(|e| e.to_string())
+        }
+        Err(e) => {
+            tracing::warn!(slug = %slug, error = %e, "question set publish failed");
+            Err(format!("failed to publish question set: {}", e))
+        }
+    }
+}
+
+/// IPC equivalent of POST /pyramid/:slug/check-staleness — run crystallization staleness pipeline.
+#[tauri::command]
+async fn pyramid_check_staleness(
+    state: tauri::State<'_, SharedState>,
+    slug: String,
+    files: Option<Vec<wire_node_lib::pyramid::staleness_bridge::FileChangeEntry>>,
+    threshold: Option<f64>,
+) -> Result<serde_json::Value, String> {
+    use wire_node_lib::pyramid::staleness_bridge;
+
+    let threshold = threshold.unwrap_or(state.pyramid.operational.tier2.staleness_threshold);
+
+    // Determine changed files: explicit or auto-detect
+    let (changed_files, source) = {
+        let explicit = files
+            .as_ref()
+            .filter(|f| !f.is_empty())
+            .map(|f| staleness_bridge::entries_to_changed_files(f));
+
+        if let Some(files) = explicit {
+            (files, "explicit".to_string())
+        } else {
+            let conn = state.pyramid.reader.lock().await;
+            let files = staleness_bridge::auto_detect_changed_files(&conn, &slug)
+                .map_err(|e| format!("failed to auto-detect changed files: {}", e))?;
+            (files, "auto_detect_pending_mutations".to_string())
+        }
+    };
+
+    let files_processed = changed_files.len();
+
+    // Run the staleness pipeline via spawn_blocking
+    let conn = state.pyramid.writer.clone();
+    let slug_owned = slug.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let c = conn.blocking_lock();
+        staleness_bridge::run_staleness_check(&c, &slug_owned, &changed_files, threshold)
+    })
+    .await;
+
+    match result {
+        Ok(Ok((report, queued_items))) => {
+            let response = staleness_bridge::CheckStalenessResponse {
+                source,
+                files_processed,
+                report,
+                queued_items,
+            };
+            serde_json::to_value(&response).map_err(|e| e.to_string())
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(slug = %slug, error = %e, "staleness check failed");
+            Err(format!("staleness check failed: {}", e))
+        }
+        Err(e) => {
+            tracing::warn!(slug = %slug, error = %e, "staleness check panicked");
+            Err(format!("staleness check panicked: {}", e))
+        }
+    }
+}
+
+/// IPC equivalent of POST /pyramid/chain/import — import a chain or question set from the Wire.
+#[tauri::command]
+async fn pyramid_chain_import(
+    state: tauri::State<'_, SharedState>,
+    contribution_id: String,
+    import_type: Option<String>,
+) -> Result<serde_json::Value, String> {
+    use wire_node_lib::pyramid::wire_import;
+
+    let import_type = import_type.as_deref().unwrap_or("chain");
+    let contribution_id = contribution_id.trim();
+
+    if contribution_id.is_empty() {
+        return Err("contribution_id is required".to_string());
+    }
+
+    // Read Wire config from pyramid config
+    let config = state.pyramid.config.read().await;
+    let wire_url =
+        std::env::var("WIRE_URL").unwrap_or_else(|_| "https://api.callmeplayful.com".to_string());
+    let wire_auth = config.auth_token.clone();
+    drop(config);
+
+    if wire_auth.is_empty() {
+        return Err("auth_token not configured".to_string());
+    }
+
+    let client = wire_import::WireImportClient::new(wire_url, wire_auth, None);
+
+    match import_type {
+        "chain" => {
+            let chain = client.fetch_chain(contribution_id).await
+                .map_err(|e| format!("failed to import chain: {}", e))?;
+
+            let writer = state.pyramid.writer.lock().await;
+            wire_import::save_imported_chain(&writer, &chain)
+                .map_err(|e| format!("failed to persist chain: {}", e))?;
+            drop(writer);
+
+            Ok(serde_json::json!({
+                "ok": true,
+                "contribution_id": chain.id,
+                "title": chain.title,
+                "content_type": chain.content_type,
+                "import_type": "chain",
+            }))
+        }
+        "question_set" => {
+            let qs = client.fetch_question_set(contribution_id).await
+                .map_err(|e| format!("failed to import question set: {}", e))?;
+
+            let writer = state.pyramid.writer.lock().await;
+            wire_import::save_imported_question_set(&writer, &qs)
+                .map_err(|e| format!("failed to persist question set: {}", e))?;
+            drop(writer);
+
+            Ok(serde_json::json!({
+                "ok": true,
+                "contribution_id": qs.id,
+                "title": qs.title,
+                "content_type": null,
+                "import_type": "question_set",
+            }))
+        }
+        other => Err(format!(
+            "invalid import_type '{}': expected 'chain' or 'question_set'",
+            other
+        )),
+    }
+}
+
+/// IPC equivalent of POST /partner/message — send message, get response + brain state.
+#[tauri::command]
+async fn partner_send_message(
+    state: tauri::State<'_, SharedState>,
+    session_id: String,
+    message: String,
+) -> Result<serde_json::Value, String> {
+    match wire_node_lib::partner::conversation::handle_message(&state.partner, &session_id, &message).await {
+        Ok(response) => serde_json::to_value(&response).map_err(|e| e.to_string()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// IPC equivalent of POST /partner/session/new — create a new session.
+#[tauri::command]
+async fn partner_session_new(
+    state: tauri::State<'_, SharedState>,
+    slug: Option<String>,
+    is_lobby: Option<bool>,
+) -> Result<serde_json::Value, String> {
+    let is_lobby = is_lobby.unwrap_or(slug.is_none());
+    let session_id = uuid::Uuid::new_v4().to_string();
+    let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+
+    let session = wire_node_lib::partner::Session {
+        id: session_id.clone(),
+        slug,
+        is_lobby,
+        conversation_buffer: Vec::new(),
+        session_topics: Vec::new(),
+        hydrated_node_ids: Vec::new(),
+        lifted_results: Vec::new(),
+        dennis_state: wire_node_lib::partner::DennisState::Idle,
+        warm_cursor: 0,
+        created_at: now.clone(),
+        last_active_at: now,
+    };
+
+    // Save to DB
+    {
+        let db = state.partner.partner_db.lock().await;
+        wire_node_lib::partner::save_session(&db, &session)
+            .map_err(|e| e.to_string())?;
+    }
+
+    // Add to in-memory cache
+    {
+        let mut sessions = state.partner.sessions.lock().await;
+        sessions.insert(session_id.clone(), session.clone());
+    }
+
+    serde_json::to_value(&session).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -4974,6 +5742,21 @@ fn main() {
             pyramid_annotations_recent,
             pyramid_faq_directory,
             pyramid_faq_category_drill,
+            // S1: IPC-only mutation commands (moved from HTTP)
+            auth_complete_ipc,
+            pyramid_purge_slug,
+            pyramid_archive_slug,
+            pyramid_question_build,
+            pyramid_question_preview,
+            pyramid_characterize,
+            pyramid_meta_run,
+            pyramid_crystallize,
+            pyramid_publish,
+            pyramid_publish_question_set,
+            pyramid_check_staleness,
+            pyramid_chain_import,
+            partner_send_message,
+            partner_session_new,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Wire Node");
