@@ -35,7 +35,18 @@ use std::path::PathBuf;
 
 // ── Auth middleware ──────────────────────────────────────────────────
 
-/// Validate bearer token and pass state through. Returns PyramidState on success.
+/// Auth source for a request — either local (free, no billing) or remote Wire JWT (billable).
+#[derive(Debug, Clone)]
+pub enum AuthSource {
+    /// Authenticated via local auth_token — desktop app, free access.
+    Local,
+    /// Authenticated via Wire JWT — remote agent, billable.
+    /// Contains the operator_id from the JWT for rate limiting and billing.
+    WireJwt { operator_id: String },
+}
+
+/// Validate bearer token and pass state through. LOCAL-ONLY auth — rejects Wire JWTs.
+/// Used for mutation endpoints and endpoints that should never be remotely accessible.
 fn with_auth_state(
     state: Arc<PyramidState>,
 ) -> impl Filter<Extract = (Arc<PyramidState>,), Error = warp::Rejection> + Clone {
@@ -66,6 +77,127 @@ fn with_auth_state(
                 Ok(state)
             },
         )
+}
+
+/// REMOTE-SAFE: Dual auth filter for read-only endpoints (WS-ONLINE-C).
+///
+/// Accepts EITHER:
+/// - Local auth_token (short, no dots) → AuthSource::Local (free, no billing)
+/// - Wire JWT (longer, contains dots) → AuthSource::WireJwt (billable, rate limited)
+///
+/// Rate limiting: 100 queries per minute per operator_id for Wire JWT auth.
+fn with_dual_auth(
+    state: Arc<PyramidState>,
+    jwt_public_key: Arc<tokio::sync::RwLock<String>>,
+) -> impl Filter<Extract = ((Arc<PyramidState>, AuthSource),), Error = warp::Rejection> + Clone {
+    warp::header::optional::<String>("authorization")
+        .and(warp::any().map(move || state.clone()))
+        .and(warp::any().map(move || jwt_public_key.clone()))
+        .and_then(
+            |auth_header: Option<String>,
+             state: Arc<PyramidState>,
+             jwt_pk: Arc<tokio::sync::RwLock<String>>| async move {
+                let token = match auth_header {
+                    Some(h) => match h.strip_prefix("Bearer ") {
+                        Some(t) => t.to_string(),
+                        None => return Err(warp::reject::custom(Unauthorized)),
+                    },
+                    None => return Err(warp::reject::custom(Unauthorized)),
+                };
+
+                // Heuristic: local auth tokens are short and don't contain dots.
+                // Wire JWTs are base64-encoded with header.payload.signature (two dots).
+                let dot_count = token.matches('.').count();
+
+                // Try local auth first
+                let auth_token = {
+                    let config = state.config.read().await;
+                    config.auth_token.clone()
+                };
+                if !auth_token.is_empty() && ct_eq(&token, &auth_token) {
+                    return Ok((state, AuthSource::Local));
+                }
+
+                // If it looks like a JWT (has dots), try Wire JWT validation
+                if dot_count == 2 {
+                    let pubkey_str = jwt_pk.read().await;
+                    if pubkey_str.is_empty() {
+                        tracing::warn!("Wire JWT presented but no public key configured");
+                        return Err(warp::reject::custom(Unauthorized));
+                    }
+
+                    match crate::server::verify_pyramid_query_jwt(&token, &pubkey_str) {
+                        Ok(claims) => {
+                            let operator_id = claims
+                                .operator_id
+                                .unwrap_or_default();
+
+                            // Rate limiting: 100 queries per minute per operator
+                            {
+                                let mut limiter = state.remote_query_rate_limiter.lock().await;
+                                let now = std::time::Instant::now();
+                                let entry = limiter
+                                    .entry(operator_id.clone())
+                                    .or_insert((0u64, now));
+
+                                // Reset window if more than 60s elapsed
+                                if now.duration_since(entry.1).as_secs() >= 60 {
+                                    entry.0 = 0;
+                                    entry.1 = now;
+                                }
+
+                                entry.0 += 1;
+                                if entry.0 > 100 {
+                                    tracing::warn!(
+                                        operator_id = %operator_id,
+                                        "Rate limit exceeded for remote pyramid query"
+                                    );
+                                    return Err(warp::reject::custom(RateLimited));
+                                }
+                            }
+
+                            return Ok((state, AuthSource::WireJwt { operator_id }));
+                        }
+                        Err(e) => {
+                            tracing::warn!("Wire JWT validation failed: {}", e);
+                            return Err(warp::reject::custom(Unauthorized));
+                        }
+                    }
+                }
+
+                // Neither local nor valid JWT
+                Err(warp::reject::custom(Unauthorized))
+            },
+        )
+}
+
+/// Rate limit rejection type for Wire JWT queries (WS-ONLINE-C).
+#[derive(Debug)]
+pub struct RateLimited;
+impl warp::reject::Reject for RateLimited {}
+
+/// REMOTE-SAFE read-only auth filter that drops AuthSource from output.
+/// Accepts either local auth_token or Wire JWT, but passes only PyramidState
+/// to the handler. Use this for read-only GET endpoints that don't yet need
+/// billing info. WS-ONLINE-H will upgrade these to use AuthSource for nano-tx.
+fn with_read_auth(
+    state: Arc<PyramidState>,
+    jwt_public_key: Arc<tokio::sync::RwLock<String>>,
+) -> impl Filter<Extract = (Arc<PyramidState>,), Error = warp::Rejection> + Clone {
+    with_dual_auth(state, jwt_public_key).and_then(
+        |(state, auth_source): (Arc<PyramidState>, AuthSource)| async move {
+            match &auth_source {
+                AuthSource::Local => {}
+                AuthSource::WireJwt { operator_id } => {
+                    tracing::debug!(
+                        operator_id = %operator_id,
+                        "Remote pyramid query via Wire JWT"
+                    );
+                }
+            }
+            Ok::<_, warp::Rejection>(state)
+        },
+    )
 }
 
 // ── Request body types ──────────────────────────────────────────────
@@ -274,6 +406,7 @@ fn log_query_usage(
 
 pub fn pyramid_routes(
     state: Arc<PyramidState>,
+    jwt_public_key: Arc<tokio::sync::RwLock<String>>,
 ) -> warp::filters::BoxedFilter<(warp::reply::Response,)> {
     let prefix = warp::path("pyramid");
 
@@ -284,12 +417,12 @@ pub fn pyramid_routes(
         };
     }
 
-    // GET /pyramid/slugs
+    // REMOTE-SAFE: GET /pyramid/slugs — read-only, dual auth
     let list_slugs = route!(prefix
         .and(warp::path("slugs"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(with_auth_state(state.clone()))
+        .and(with_read_auth(state.clone(), jwt_public_key.clone()))
         .and_then(handle_list_slugs));
 
     // MOVED TO IPC: see main.rs — pyramid_create_slug command
@@ -317,14 +450,14 @@ pub fn pyramid_routes(
         .map(|r: warp::reply::Response| r)
         .boxed();
 
-    // GET /pyramid/:slug/build/status (must be before /pyramid/:slug/build)
+    // REMOTE-SAFE: GET /pyramid/:slug/build/status (must be before /pyramid/:slug/build)
     let build_status = route!(prefix
         .and(warp::path::param::<String>())
         .and(warp::path("build"))
         .and(warp::path("status"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(with_auth_state(state.clone()))
+        .and(with_read_auth(state.clone(), jwt_public_key.clone()))
         .and_then(handle_build_status));
 
     // MOVED TO IPC: see main.rs — pyramid_build_cancel command
@@ -382,92 +515,92 @@ pub fn pyramid_routes(
         .map(|r: warp::reply::Response| r)
         .boxed();
 
-    // GET /pyramid/:slug/apex
+    // REMOTE-SAFE: GET /pyramid/:slug/apex — read-only, dual auth
     let apex = route!(prefix
         .and(warp::path::param::<String>())
         .and(warp::path("apex"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(with_auth_state(state.clone()))
+        .and(with_read_auth(state.clone(), jwt_public_key.clone()))
         .and(with_agent_id())
         .and_then(handle_apex));
 
-    // GET /pyramid/:slug/node/:id
+    // REMOTE-SAFE: GET /pyramid/:slug/node/:id — read-only, dual auth
     let node = route!(prefix
         .and(warp::path::param::<String>())
         .and(warp::path("node"))
         .and(warp::path::param::<String>())
         .and(warp::path::end())
         .and(warp::get())
-        .and(with_auth_state(state.clone()))
+        .and(with_read_auth(state.clone(), jwt_public_key.clone()))
         .and(with_agent_id())
         .and_then(handle_node));
 
-    // GET /pyramid/:slug/tree
+    // REMOTE-SAFE: GET /pyramid/:slug/tree — read-only, dual auth
     let tree = route!(prefix
         .and(warp::path::param::<String>())
         .and(warp::path("tree"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(with_auth_state(state.clone()))
+        .and(with_read_auth(state.clone(), jwt_public_key.clone()))
         .and_then(handle_tree));
 
-    // GET /pyramid/:slug/drill/:id
+    // REMOTE-SAFE: GET /pyramid/:slug/drill/:id — read-only, dual auth
     let drill = route!(prefix
         .and(warp::path::param::<String>())
         .and(warp::path("drill"))
         .and(warp::path::param::<String>())
         .and(warp::path::end())
         .and(warp::get())
-        .and(with_auth_state(state.clone()))
+        .and(with_read_auth(state.clone(), jwt_public_key.clone()))
         .and(with_agent_id())
         .and_then(handle_drill));
 
-    // GET /pyramid/:slug/search?q=term
+    // REMOTE-SAFE: GET /pyramid/:slug/search?q=term — read-only, dual auth
     let search = route!(prefix
         .and(warp::path::param::<String>())
         .and(warp::path("search"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(with_auth_state(state.clone()))
+        .and(with_read_auth(state.clone(), jwt_public_key.clone()))
         .and(warp::query::<SearchQuery>())
         .and(with_agent_id())
         .and_then(handle_search));
 
-    // GET /pyramid/:slug/entities
+    // REMOTE-SAFE: GET /pyramid/:slug/entities — read-only, dual auth
     let entities = route!(prefix
         .and(warp::path::param::<String>())
         .and(warp::path("entities"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(with_auth_state(state.clone()))
+        .and(with_read_auth(state.clone(), jwt_public_key.clone()))
         .and_then(handle_entities));
 
-    // GET /pyramid/:slug/resolved
+    // REMOTE-SAFE: GET /pyramid/:slug/resolved — read-only, dual auth
     let resolved = route!(prefix
         .and(warp::path::param::<String>())
         .and(warp::path("resolved"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(with_auth_state(state.clone()))
+        .and(with_read_auth(state.clone(), jwt_public_key.clone()))
         .and_then(handle_resolved));
 
-    // GET /pyramid/:slug/corrections
+    // REMOTE-SAFE: GET /pyramid/:slug/corrections — read-only, dual auth
     let corrections = route!(prefix
         .and(warp::path::param::<String>())
         .and(warp::path("corrections"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(with_auth_state(state.clone()))
+        .and(with_read_auth(state.clone(), jwt_public_key.clone()))
         .and_then(handle_corrections));
 
-    // GET /pyramid/:slug/terms
+    // REMOTE-SAFE: GET /pyramid/:slug/terms — read-only, dual auth
     let terms = route!(prefix
         .and(warp::path::param::<String>())
         .and(warp::path("terms"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(with_auth_state(state.clone()))
+        .and(with_read_auth(state.clone(), jwt_public_key.clone()))
         .and_then(handle_terms));
 
     // MOVED TO IPC: see main.rs — pyramid_ingest command
@@ -522,16 +655,16 @@ pub fn pyramid_routes(
         .map(|r: warp::reply::Response| r)
         .boxed();
 
-    // GET /pyramid/:slug/threads
+    // REMOTE-SAFE: GET /pyramid/:slug/threads — read-only, dual auth
     let threads = route!(prefix
         .and(warp::path::param::<String>())
         .and(warp::path("threads"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(with_auth_state(state.clone()))
+        .and(with_read_auth(state.clone(), jwt_public_key.clone()))
         .and_then(handle_threads));
 
-    // POST /pyramid/:slug/annotate
+    // LOCAL-ONLY: POST /pyramid/:slug/annotate — mutation, local auth only
     let annotate = route!(prefix
         .and(warp::path::param::<String>())
         .and(warp::path("annotate"))
@@ -542,23 +675,23 @@ pub fn pyramid_routes(
         .and(warp::body::json())
         .and_then(handle_annotate));
 
-    // GET /pyramid/:slug/annotations?node_id=...
+    // REMOTE-SAFE: GET /pyramid/:slug/annotations?node_id=... — read-only, dual auth
     let annotations = route!(prefix
         .and(warp::path::param::<String>())
         .and(warp::path("annotations"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(with_auth_state(state.clone()))
+        .and(with_read_auth(state.clone(), jwt_public_key.clone()))
         .and(warp::query::<AnnotationsQuery>())
         .and_then(handle_annotations));
 
-    // GET /pyramid/:slug/edges
+    // REMOTE-SAFE: GET /pyramid/:slug/edges — read-only, dual auth
     let edges = route!(prefix
         .and(warp::path::param::<String>())
         .and(warp::path("edges"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(with_auth_state(state.clone()))
+        .and(with_read_auth(state.clone(), jwt_public_key.clone()))
         .and_then(handle_edges));
 
     // MOVED TO IPC: see main.rs — pyramid_meta_run command
@@ -587,56 +720,56 @@ pub fn pyramid_routes(
         .map(|r: warp::reply::Response| r)
         .boxed();
 
-    // GET /pyramid/:slug/meta (read meta nodes)
+    // REMOTE-SAFE: GET /pyramid/:slug/meta (read meta nodes) — read-only, dual auth
     let meta_read = route!(prefix
         .and(warp::path::param::<String>())
         .and(warp::path("meta"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(with_auth_state(state.clone()))
+        .and(with_read_auth(state.clone(), jwt_public_key.clone()))
         .and_then(handle_meta_read));
 
-    // GET /pyramid/:slug/usage?limit=100
+    // REMOTE-SAFE: GET /pyramid/:slug/usage?limit=100 — read-only, dual auth
     let usage = route!(prefix
         .and(warp::path::param::<String>())
         .and(warp::path("usage"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(with_auth_state(state.clone()))
+        .and(with_read_auth(state.clone(), jwt_public_key.clone()))
         .and(warp::query::<UsageQuery>())
         .and_then(handle_usage));
 
-    // GET /pyramid/:slug/faq — list all FAQ nodes for the slug
+    // REMOTE-SAFE: GET /pyramid/:slug/faq — read-only, dual auth
     let faq_list = route!(prefix
         .and(warp::path::param::<String>())
         .and(warp::path("faq"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(with_auth_state(state.clone()))
+        .and(with_read_auth(state.clone(), jwt_public_key.clone()))
         .and_then(handle_list_faq));
 
-    // GET /pyramid/:slug/faq/match?q=<question> — find best matching FAQ
+    // REMOTE-SAFE: GET /pyramid/:slug/faq/match?q=<question> — read-only, dual auth
     let faq_match = route!(prefix
         .and(warp::path::param::<String>())
         .and(warp::path("faq"))
         .and(warp::path("match"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(with_auth_state(state.clone()))
+        .and(with_read_auth(state.clone(), jwt_public_key.clone()))
         .and(warp::query::<FaqMatchQuery>())
         .and_then(handle_match_faq));
 
-    // GET /pyramid/:slug/faq/directory — FAQ directory (flat or hierarchical)
+    // REMOTE-SAFE: GET /pyramid/:slug/faq/directory — read-only, dual auth
     let faq_directory = route!(prefix
         .and(warp::path::param::<String>())
         .and(warp::path("faq"))
         .and(warp::path("directory"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(with_auth_state(state.clone()))
+        .and(with_read_auth(state.clone(), jwt_public_key.clone()))
         .and_then(handle_faq_directory));
 
-    // GET /pyramid/:slug/faq/category/:id — drill into a FAQ category
+    // REMOTE-SAFE: GET /pyramid/:slug/faq/category/:id — read-only, dual auth
     let faq_category_drill = route!(prefix
         .and(warp::path::param::<String>())
         .and(warp::path("faq"))
@@ -644,7 +777,7 @@ pub fn pyramid_routes(
         .and(warp::path::param::<String>())
         .and(warp::path::end())
         .and(warp::get())
-        .and(with_auth_state(state.clone()))
+        .and(with_read_auth(state.clone(), jwt_public_key.clone()))
         .and_then(handle_faq_category_drill));
 
     // MOVED TO IPC: see main.rs — pyramid_archive_slug command
@@ -699,25 +832,25 @@ pub fn pyramid_routes(
         .map(|r: warp::reply::Response| r)
         .boxed();
 
-    // GET /pyramid/:slug/references
+    // REMOTE-SAFE: GET /pyramid/:slug/references — read-only, dual auth
     let slug_references_route = route!(prefix
         .and(warp::path::param::<String>())
         .and(warp::path("references"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(with_auth_state(state.clone()))
+        .and(with_read_auth(state.clone(), jwt_public_key.clone()))
         .and_then(handle_slug_references));
 
     // ── Phase 5: Breaker & Freeze routes ────────────────────────────
 
-    // GET /pyramid/:slug/auto-update/config
+    // REMOTE-SAFE: GET /pyramid/:slug/auto-update/config — read-only, dual auth
     let auto_update_config_get = route!(prefix
         .and(warp::path::param::<String>())
         .and(warp::path("auto-update"))
         .and(warp::path("config"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(with_auth_state(state.clone()))
+        .and(with_read_auth(state.clone(), jwt_public_key.clone()))
         .and_then(handle_auto_update_config_get));
 
     // MOVED TO IPC: see main.rs — pyramid_auto_update_config_set command
@@ -893,35 +1026,35 @@ pub fn pyramid_routes(
         .map(|r: warp::reply::Response| r)
         .boxed();
 
-    // GET /pyramid/:slug/auto-update/status
+    // REMOTE-SAFE: GET /pyramid/:slug/auto-update/status — read-only, dual auth
     let auto_update_status = route!(prefix
         .and(warp::path::param::<String>())
         .and(warp::path("auto-update"))
         .and(warp::path("status"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(with_auth_state(state.clone()))
+        .and(with_read_auth(state.clone(), jwt_public_key.clone()))
         .and_then(handle_auto_update_status));
 
-    // GET /pyramid/:slug/stale-log
+    // REMOTE-SAFE: GET /pyramid/:slug/stale-log — read-only, dual auth
     let stale_log = route!(prefix
         .and(warp::path::param::<String>())
         .and(warp::path("stale-log"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(with_auth_state(state.clone()))
+        .and(with_read_auth(state.clone(), jwt_public_key.clone()))
         .and(warp::query::<StaleLogQuery>())
         .and_then(handle_stale_log));
 
     // ── Phase 6: Cost Observatory route ─────────────────────────────
 
-    // GET /pyramid/:slug/cost
+    // REMOTE-SAFE: GET /pyramid/:slug/cost — read-only, dual auth
     let cost = route!(prefix
         .and(warp::path::param::<String>())
         .and(warp::path("cost"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(with_auth_state(state.clone()))
+        .and(with_read_auth(state.clone(), jwt_public_key.clone()))
         .and(warp::query::<CostQuery>())
         .and_then(handle_cost));
 
@@ -954,14 +1087,14 @@ pub fn pyramid_routes(
         .map(|r: warp::reply::Response| r)
         .boxed();
 
-    // GET /pyramid/:slug/crystallize/status — show crystallization cascade status
+    // REMOTE-SAFE: GET /pyramid/:slug/crystallize/status — read-only, dual auth
     let crystallize_status = route!(prefix
         .and(warp::path::param::<String>())
         .and(warp::path("crystallize"))
         .and(warp::path("status"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(with_auth_state(state.clone()))
+        .and(with_read_auth(state.clone(), jwt_public_key.clone()))
         .and_then(handle_crystallize_status));
 
     // ── Vine Conversation System routes ─────────────────────────────
@@ -993,64 +1126,64 @@ pub fn pyramid_routes(
         .map(|r: warp::reply::Response| r)
         .boxed();
 
-    // GET /pyramid/:slug/vine/bunches
+    // REMOTE-SAFE: GET /pyramid/:slug/vine/bunches — read-only, dual auth
     let vine_bunches = route!(prefix
         .and(warp::path::param::<String>())
         .and(warp::path("vine"))
         .and(warp::path("bunches"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(with_auth_state(state.clone()))
+        .and(with_read_auth(state.clone(), jwt_public_key.clone()))
         .and_then(handle_vine_bunches));
 
-    // GET /pyramid/:slug/vine/eras
+    // REMOTE-SAFE: GET /pyramid/:slug/vine/eras — read-only, dual auth
     let vine_eras = route!(prefix
         .and(warp::path::param::<String>())
         .and(warp::path("vine"))
         .and(warp::path("eras"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(with_auth_state(state.clone()))
+        .and(with_read_auth(state.clone(), jwt_public_key.clone()))
         .and_then(handle_vine_eras));
 
-    // GET /pyramid/:slug/vine/decisions
+    // REMOTE-SAFE: GET /pyramid/:slug/vine/decisions — read-only, dual auth
     let vine_decisions = route!(prefix
         .and(warp::path::param::<String>())
         .and(warp::path("vine"))
         .and(warp::path("decisions"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(with_auth_state(state.clone()))
+        .and(with_read_auth(state.clone(), jwt_public_key.clone()))
         .and_then(handle_vine_decisions));
 
-    // GET /pyramid/:slug/vine/entities
+    // REMOTE-SAFE: GET /pyramid/:slug/vine/entities — read-only, dual auth
     let vine_entities = route!(prefix
         .and(warp::path::param::<String>())
         .and(warp::path("vine"))
         .and(warp::path("entities"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(with_auth_state(state.clone()))
+        .and(with_read_auth(state.clone(), jwt_public_key.clone()))
         .and_then(handle_vine_entities));
 
-    // GET /pyramid/:slug/vine/threads
+    // REMOTE-SAFE: GET /pyramid/:slug/vine/threads — read-only, dual auth
     let vine_threads = route!(prefix
         .and(warp::path::param::<String>())
         .and(warp::path("vine"))
         .and(warp::path("threads"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(with_auth_state(state.clone()))
+        .and(with_read_auth(state.clone(), jwt_public_key.clone()))
         .and_then(handle_vine_threads));
 
-    // GET /pyramid/:slug/vine/drill
+    // REMOTE-SAFE: GET /pyramid/:slug/vine/drill — read-only, dual auth
     let vine_drill = route!(prefix
         .and(warp::path::param::<String>())
         .and(warp::path("vine"))
         .and(warp::path("drill"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(with_auth_state(state.clone()))
+        .and(with_read_auth(state.clone(), jwt_public_key.clone()))
         .and_then(handle_vine_drill));
 
     // MOVED TO IPC: see main.rs — pyramid_vine_rebuild_upper command
@@ -1109,7 +1242,7 @@ pub fn pyramid_routes(
         .map(|r: warp::reply::Response| r)
         .boxed();
 
-    // GET /pyramid/:slug/vine/build/status
+    // REMOTE-SAFE: GET /pyramid/:slug/vine/build/status — read-only, dual auth
     let vine_build_status = route!(prefix
         .and(warp::path::param::<String>())
         .and(warp::path("vine"))
@@ -1117,7 +1250,7 @@ pub fn pyramid_routes(
         .and(warp::path("status"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(with_auth_state(state.clone()))
+        .and(with_read_auth(state.clone(), jwt_public_key.clone()))
         .and_then(handle_vine_build_status));
 
     // MOVED TO IPC: see main.rs — pyramid_question_build command
@@ -1288,31 +1421,31 @@ pub fn pyramid_routes(
         .map(|r: warp::reply::Response| r)
         .boxed();
 
-    // GET /pyramid/:slug/question-overlays — list question overlay builds for a slug
+    // REMOTE-SAFE: GET /pyramid/:slug/question-overlays — read-only, dual auth
     let question_overlays_route = route!(prefix
         .and(warp::path::param::<String>())
         .and(warp::path("question-overlays"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(with_auth_state(state.clone()))
+        .and(with_read_auth(state.clone(), jwt_public_key.clone()))
         .and_then(handle_question_overlays));
 
-    // GET /pyramid/:slug/composed — composed view across slug + referenced slugs (WS8-H)
+    // REMOTE-SAFE: GET /pyramid/:slug/composed — read-only, dual auth
     let composed_route = route!(prefix
         .and(warp::path::param::<String>())
         .and(warp::path("composed"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(with_auth_state(state.clone()))
+        .and(with_read_auth(state.clone(), jwt_public_key.clone()))
         .and_then(handle_composed_view));
 
-    // GET /pyramid/:slug/question-tree — current decomposition tree state (may be partial)
+    // REMOTE-SAFE: GET /pyramid/:slug/question-tree — read-only, dual auth
     let question_tree_route = route!(prefix
         .and(warp::path::param::<String>())
         .and(warp::path("question-tree"))
         .and(warp::path::end())
         .and(warp::get())
-        .and(with_auth_state(state.clone()))
+        .and(with_read_auth(state.clone(), jwt_public_key.clone()))
         .and_then(handle_question_tree));
 
     // MOVED TO IPC: see main.rs — pyramid_chain_import command

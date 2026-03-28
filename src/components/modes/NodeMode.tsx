@@ -5,8 +5,9 @@ import { SyncStatus } from '../SyncStatus';
 import { MarketView } from '../MarketView';
 import { LogViewer } from '../LogViewer';
 import { PyramidPublicationStatus } from '../PyramidPublicationStatus';
+import { RemoteConnectionStatus } from '../RemoteConnectionStatus';
 
-type NodeTab = 'sync' | 'market' | 'pyramids' | 'logs';
+type NodeTab = 'sync' | 'market' | 'pyramids' | 'remote' | 'logs';
 
 export function NodeMode() {
     const { state } = useAppContext();
@@ -25,6 +26,10 @@ export function NodeMode() {
     }, []);
 
     const folderCount = state.syncState ? Object.keys(state.syncState.linked_folders).length : 0;
+
+    // Extract tunnel info from state if available
+    const tunnelUrl = state.tunnelStatus?.tunnel_url ?? null;
+    const tunnelConnected = state.tunnelStatus?.status === "Connected";
 
     return (
         <div className="mode-container">
@@ -49,6 +54,12 @@ export function NodeMode() {
                     Pyramids
                 </button>
                 <button
+                    className={`node-tab ${activeTab === 'remote' ? 'node-tab-active' : ''}`}
+                    onClick={() => setActiveTab('remote')}
+                >
+                    Remote
+                </button>
+                <button
                     className={`node-tab ${activeTab === 'logs' ? 'node-tab-active' : ''}`}
                     onClick={() => setActiveTab('logs')}
                 >
@@ -67,6 +78,12 @@ export function NodeMode() {
                 )}
                 {activeTab === 'market' && <MarketView />}
                 {activeTab === 'pyramids' && <PyramidPublicationStatus />}
+                {activeTab === 'remote' && (
+                    <RemoteConnectionStatus
+                        tunnelUrl={tunnelUrl}
+                        tunnelConnected={tunnelConnected}
+                    />
+                )}
                 {activeTab === 'logs' && <LogViewer />}
             </div>
         </div>

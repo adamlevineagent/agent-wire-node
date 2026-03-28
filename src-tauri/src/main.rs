@@ -4200,6 +4200,7 @@ async fn pyramid_vine_build(
         event_bus: state.pyramid.event_bus.clone(),
         operational: state.pyramid.operational.clone(),
         chains_dir: state.pyramid.chains_dir.clone(),
+        remote_query_rate_limiter: state.pyramid.remote_query_rate_limiter.clone(),
     });
 
     let slug_for_task = vine_slug_clean.clone();
@@ -4378,6 +4379,7 @@ async fn pyramid_vine_integrity(
         event_bus: state.pyramid.event_bus.clone(),
         operational: state.pyramid.operational.clone(),
         chains_dir: state.pyramid.chains_dir.clone(),
+        remote_query_rate_limiter: state.pyramid.remote_query_rate_limiter.clone(),
     });
 
     let summary = vine::run_integrity_check(&pyramid_state, &slug)
@@ -4420,6 +4422,7 @@ async fn pyramid_vine_rebuild_upper(
         event_bus: state.pyramid.event_bus.clone(),
         operational: state.pyramid.operational.clone(),
         chains_dir: state.pyramid.chains_dir.clone(),
+        remote_query_rate_limiter: state.pyramid.remote_query_rate_limiter.clone(),
     });
 
     let cancel = tokio_util::sync::CancellationToken::new();
@@ -5026,6 +5029,7 @@ fn main() {
         event_bus: Arc::new(wire_node_lib::pyramid::event_chain::LocalEventBus::new()),
         operational: Arc::new(pyramid_config.operational.clone()),
         chains_dir: chains_dir.clone(),
+        remote_query_rate_limiter: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
     });
 
     // Load persisted event subscriptions into the in-memory event bus

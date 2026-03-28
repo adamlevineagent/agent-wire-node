@@ -425,6 +425,10 @@ pub struct PyramidState {
     /// so prompt .md files are read live without copying. In release mode, falls back
     /// to `{data_dir}/chains`.
     pub chains_dir: PathBuf,
+    /// Rate limiter for remote pyramid queries (WS-ONLINE-C).
+    /// Maps operator_id → (query_count, window_start).
+    /// 100 queries per minute per operator.
+    pub remote_query_rate_limiter: Arc<Mutex<HashMap<String, (u64, std::time::Instant)>>>,
 }
 
 /// Handle to a running pyramid build.

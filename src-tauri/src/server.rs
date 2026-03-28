@@ -35,6 +35,32 @@ pub struct HealthResponse {
     pub documents_cached: usize,
 }
 
+/// JWT claims for pyramid query access tokens (WS-ONLINE-C)
+///
+/// Issued by the Wire server for remote pyramid querying.
+///   aud → "pyramid-query", sub → operator_id, slug → target pyramid,
+///   query_type → "apex"|"drill"|"search"|"export"|"entities"
+#[derive(Debug, Deserialize)]
+pub struct PyramidQueryClaims {
+    /// Audience — must be "pyramid-query"
+    pub aud: Option<String>,
+    /// Operator ID of the querying agent (JWT standard `sub`)
+    #[serde(alias = "sub")]
+    pub operator_id: Option<String>,
+    /// Target pyramid slug
+    pub slug: Option<String>,
+    /// Query type: "apex", "drill", "search", "export", "entities"
+    pub query_type: Option<String>,
+    /// Expiration (standard JWT — validated by jsonwebtoken crate)
+    #[allow(dead_code)]
+    pub exp: Option<u64>,
+    /// Issuer — should be "wire"
+    #[allow(dead_code)]
+    pub iss: Option<String>,
+    /// JWT ID — for deduplication / logging
+    pub jti: Option<String>,
+}
+
 /// JWT claims for document access tokens
 ///
 /// The server-side JWT uses standard claims:
@@ -627,8 +653,11 @@ pub async fn start_server(
             builder.body("").unwrap()
         });
 
-    // Pyramid Knowledge Engine routes
-    let pyramid_routes = pyramid::routes::pyramid_routes(state.pyramid.clone());
+    // Pyramid Knowledge Engine routes (WS-ONLINE-C: pass jwt_public_key for Wire JWT auth)
+    let pyramid_routes = pyramid::routes::pyramid_routes(
+        state.pyramid.clone(),
+        state.jwt_public_key.clone(),
+    );
 
     // Partner (Dennis) routes
     let partner_routes = partner::routes::partner_routes(state.partner.clone());
@@ -811,7 +840,7 @@ fn parse_range(range: &str, file_size: usize) -> Option<(usize, usize)> {
     }
 }
 
-/// Verify a JWT using Ed25519 (EdDSA) public key
+/// Verify a JWT using Ed25519 (EdDSA) public key — document access tokens
 fn verify_jwt(token: &str, public_key_pem: &str) -> Result<DocumentClaims, String> {
     use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
 
@@ -825,6 +854,36 @@ fn verify_jwt(token: &str, public_key_pem: &str) -> Result<DocumentClaims, Strin
 
     let token_data = decode::<DocumentClaims>(token, &decoding_key, &validation)
         .map_err(|e| format!("JWT decode failed: {}", e))?;
+
+    Ok(token_data.claims)
+}
+
+/// Verify a pyramid query JWT using Ed25519 (EdDSA) public key (WS-ONLINE-C).
+///
+/// Validates the `aud` claim is "pyramid-query" and extracts operator_id, slug, query_type.
+pub fn verify_pyramid_query_jwt(
+    token: &str,
+    public_key_pem: &str,
+) -> Result<PyramidQueryClaims, String> {
+    use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
+
+    let decoding_key = DecodingKey::from_ed_pem(public_key_pem.as_bytes())
+        .map_err(|e| format!("Invalid public key: {}", e))?;
+
+    let mut validation = Validation::new(Algorithm::EdDSA);
+    validation.validate_exp = true;
+    validation.set_required_spec_claims(&["exp"]);
+    // Validate audience is "pyramid-query"
+    validation.set_audience(&["pyramid-query"]);
+
+    let token_data = decode::<PyramidQueryClaims>(token, &decoding_key, &validation)
+        .map_err(|e| format!("Pyramid query JWT decode failed: {}", e))?;
+
+    // Verify required fields
+    let claims = &token_data.claims;
+    if claims.operator_id.as_deref().unwrap_or("").is_empty() {
+        return Err("Missing operator_id (sub) in pyramid query JWT".into());
+    }
 
     Ok(token_data.claims)
 }

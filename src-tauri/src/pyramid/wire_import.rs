@@ -586,6 +586,275 @@ impl WireImportClient {
     }
 }
 
+// ─── Remote Pyramid Client (WS-ONLINE-C) ─────────────────────
+
+/// Response from a remote pyramid apex query.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteApexResponse {
+    pub slug: String,
+    pub node: serde_json::Value,
+}
+
+/// Response from a remote pyramid drill query.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteDrillResponse {
+    pub slug: String,
+    pub node: serde_json::Value,
+    pub children: Vec<serde_json::Value>,
+}
+
+/// Response from a remote pyramid search query.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteSearchResponse {
+    pub slug: String,
+    pub results: Vec<serde_json::Value>,
+}
+
+/// Response from a remote pyramid export query.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteExportResponse {
+    pub slug: String,
+    pub nodes: Vec<serde_json::Value>,
+}
+
+/// HTTP client for querying remote pyramids via tunnel URLs (WS-ONLINE-C).
+///
+/// Each method will eventually integrate payment flow (WS-ONLINE-H),
+/// but for now just does authenticated requests with Wire JWT.
+pub struct RemotePyramidClient {
+    /// The remote node's tunnel URL (e.g., "https://abcd1234.tunnel.wire.example.com")
+    pub tunnel_url: String,
+    /// Wire JWT for authenticating with the remote node
+    pub wire_jwt: String,
+    /// Wire server URL for obtaining tokens (used in WS-ONLINE-H payment flow)
+    pub wire_server_url: String,
+    /// HTTP client
+    client: reqwest::Client,
+}
+
+impl RemotePyramidClient {
+    /// Create a new remote pyramid client.
+    pub fn new(tunnel_url: String, wire_jwt: String, wire_server_url: String) -> Self {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .expect("failed to build HTTP client for RemotePyramidClient");
+
+        Self {
+            tunnel_url,
+            wire_jwt,
+            wire_server_url,
+            client,
+        }
+    }
+
+    /// Update the Wire JWT (e.g., after token refresh).
+    pub fn set_jwt(&mut self, jwt: String) {
+        self.wire_jwt = jwt;
+    }
+
+    /// GET /pyramid/{slug}/apex — fetch the apex node of a remote pyramid.
+    pub async fn remote_apex(&self, slug: &str) -> Result<RemoteApexResponse> {
+        let url = format!(
+            "{}/pyramid/{}/apex",
+            self.tunnel_url.trim_end_matches('/'),
+            slug
+        );
+
+        let response = self
+            .client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", self.wire_jwt))
+            .send()
+            .await
+            .map_err(|e| {
+                if e.is_timeout() {
+                    WireImportError::Timeout(Duration::from_secs(30))
+                } else {
+                    WireImportError::Network(e.to_string())
+                }
+            })
+            .context("remote pyramid: apex request failed")?;
+
+        self.check_response_status(&response)?;
+
+        let body: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|e| WireImportError::InvalidResponse(e.to_string()))
+            .context("remote pyramid: failed to parse apex response")?;
+
+        Ok(RemoteApexResponse {
+            slug: slug.to_string(),
+            node: body,
+        })
+    }
+
+    /// GET /pyramid/{slug}/drill/{node_id} — drill into a specific node.
+    pub async fn remote_drill(&self, slug: &str, node_id: &str) -> Result<RemoteDrillResponse> {
+        let url = format!(
+            "{}/pyramid/{}/drill/{}",
+            self.tunnel_url.trim_end_matches('/'),
+            slug,
+            node_id
+        );
+
+        let response = self
+            .client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", self.wire_jwt))
+            .send()
+            .await
+            .map_err(|e| {
+                if e.is_timeout() {
+                    WireImportError::Timeout(Duration::from_secs(30))
+                } else {
+                    WireImportError::Network(e.to_string())
+                }
+            })
+            .context("remote pyramid: drill request failed")?;
+
+        self.check_response_status(&response)?;
+
+        let body: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|e| WireImportError::InvalidResponse(e.to_string()))
+            .context("remote pyramid: failed to parse drill response")?;
+
+        Ok(RemoteDrillResponse {
+            slug: slug.to_string(),
+            node: body.get("node").cloned().unwrap_or(serde_json::Value::Null),
+            children: body
+                .get("children")
+                .and_then(|c| c.as_array())
+                .cloned()
+                .unwrap_or_default(),
+        })
+    }
+
+    /// GET /pyramid/{slug}/search?q={query} — search a remote pyramid.
+    pub async fn remote_search(
+        &self,
+        slug: &str,
+        query: &str,
+    ) -> Result<RemoteSearchResponse> {
+        let url = format!(
+            "{}/pyramid/{}/search?q={}",
+            self.tunnel_url.trim_end_matches('/'),
+            slug,
+            urlencoding::encode(query)
+        );
+
+        let response = self
+            .client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", self.wire_jwt))
+            .send()
+            .await
+            .map_err(|e| {
+                if e.is_timeout() {
+                    WireImportError::Timeout(Duration::from_secs(30))
+                } else {
+                    WireImportError::Network(e.to_string())
+                }
+            })
+            .context("remote pyramid: search request failed")?;
+
+        self.check_response_status(&response)?;
+
+        let body: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|e| WireImportError::InvalidResponse(e.to_string()))
+            .context("remote pyramid: failed to parse search response")?;
+
+        let results = body
+            .get("results")
+            .and_then(|r| r.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        Ok(RemoteSearchResponse {
+            slug: slug.to_string(),
+            results,
+        })
+    }
+
+    /// GET /pyramid/{slug}/export — export all nodes from a remote pyramid.
+    ///
+    /// This is a heavier operation; rate limiting applies on the serving node.
+    pub async fn remote_export(&self, slug: &str) -> Result<RemoteExportResponse> {
+        let url = format!(
+            "{}/pyramid/{}/export",
+            self.tunnel_url.trim_end_matches('/'),
+            slug
+        );
+
+        let response = self
+            .client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", self.wire_jwt))
+            .send()
+            .await
+            .map_err(|e| {
+                if e.is_timeout() {
+                    WireImportError::Timeout(Duration::from_secs(30))
+                } else {
+                    WireImportError::Network(e.to_string())
+                }
+            })
+            .context("remote pyramid: export request failed")?;
+
+        self.check_response_status(&response)?;
+
+        let body: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|e| WireImportError::InvalidResponse(e.to_string()))
+            .context("remote pyramid: failed to parse export response")?;
+
+        let nodes = body
+            .get("nodes")
+            .and_then(|n| n.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        Ok(RemoteExportResponse {
+            slug: slug.to_string(),
+            nodes,
+        })
+    }
+
+    /// Check HTTP response status and return appropriate error.
+    fn check_response_status(&self, response: &reqwest::Response) -> Result<()> {
+        let status = response.status();
+        if status.is_success() {
+            return Ok(());
+        }
+
+        match status {
+            reqwest::StatusCode::NOT_FOUND => {
+                Err(WireImportError::NotFound("remote pyramid or slug not found".into()).into())
+            }
+            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => {
+                Err(WireImportError::AuthFailed(format!("status {}", status)).into())
+            }
+            reqwest::StatusCode::TOO_MANY_REQUESTS => {
+                Err(WireImportError::RateLimited {
+                    retry_after_secs: 60,
+                }
+                .into())
+            }
+            _ => Err(WireImportError::Network(format!(
+                "remote pyramid returned status {}",
+                status
+            ))
+            .into()),
+        }
+    }
+}
+
 // ─── SQLite persistence for imported chains ──────────────────
 
 /// Initialize the imported chains table in SQLite.
