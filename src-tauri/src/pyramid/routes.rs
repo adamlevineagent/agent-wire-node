@@ -219,16 +219,6 @@ fn with_slug_read_auth(
 
 // ── Access Tier Enforcement (WS-ONLINE-E) ───────────────────────────
 
-/// Access tier rejection: circle-scoped slug, caller is not a member.
-#[derive(Debug)]
-pub struct AccessDeniedCircle;
-impl warp::reject::Reject for AccessDeniedCircle {}
-
-/// Access tier rejection: embargoed slug, no remote access.
-#[derive(Debug)]
-pub struct AccessEmbargoed;
-impl warp::reject::Reject for AccessEmbargoed {}
-
 /// Enforce access tier restrictions for a Wire JWT request (WS-ONLINE-E).
 ///
 /// - `public`: allow (stamp only, no access price)

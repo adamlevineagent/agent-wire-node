@@ -472,6 +472,92 @@ export function PyramidPublicationStatus() {
                                     </span>
                                 </div>
                             )}
+
+                            {/* WS-ONLINE-E: Access Tier Controls */}
+                            {!p.pinned && (
+                                <div className="pyramid-access-tier-section">
+                                    <button
+                                        className="pyramid-access-tier-toggle"
+                                        onClick={() => handleExpandAccessTier(p.slug)}
+                                        title="Configure access tier for remote queries"
+                                    >
+                                        Access: {accessTiers[p.slug]?.access_tier || "public"}
+                                        {accessTiers[p.slug]?.cached_emergent_price != null && accessTiers[p.slug]?.access_tier === "priced" && (
+                                            <span className="pyramid-emergent-price">
+                                                {" "}({accessTiers[p.slug]?.access_price ?? accessTiers[p.slug]?.cached_emergent_price} credits)
+                                            </span>
+                                        )}
+                                        <span className="pyramid-access-tier-chevron">
+                                            {expandedAccessSlug === p.slug ? "\u25B4" : "\u25BE"}
+                                        </span>
+                                    </button>
+
+                                    {expandedAccessSlug === p.slug && (
+                                        <div className="pyramid-access-tier-panel">
+                                            <div className="pyramid-access-tier-field">
+                                                <label>Tier</label>
+                                                <select
+                                                    value={accessTierDraft.tier}
+                                                    onChange={(e) => setAccessTierDraft(prev => ({
+                                                        ...prev,
+                                                        tier: e.target.value as AccessTier,
+                                                    }))}
+                                                >
+                                                    <option value="public">Public</option>
+                                                    <option value="circle-scoped">Circle-Scoped</option>
+                                                    <option value="priced">Priced</option>
+                                                    <option value="embargoed">Embargoed</option>
+                                                </select>
+                                            </div>
+
+                                            {accessTierDraft.tier === "circle-scoped" && (
+                                                <div className="pyramid-access-tier-field">
+                                                    <label>Allowed Circles (JSON array)</label>
+                                                    <input
+                                                        type="text"
+                                                        value={accessTierDraft.circles}
+                                                        onChange={(e) => setAccessTierDraft(prev => ({
+                                                            ...prev,
+                                                            circles: e.target.value,
+                                                        }))}
+                                                        placeholder='["circle-uuid-1","circle-uuid-2"]'
+                                                    />
+                                                </div>
+                                            )}
+
+                                            {accessTierDraft.tier === "priced" && (
+                                                <div className="pyramid-access-tier-field">
+                                                    <label>
+                                                        Price Override (credits)
+                                                        {accessTiers[p.slug]?.cached_emergent_price != null && (
+                                                            <span className="pyramid-emergent-hint">
+                                                                {" "}Emergent: {accessTiers[p.slug]?.cached_emergent_price}
+                                                            </span>
+                                                        )}
+                                                    </label>
+                                                    <input
+                                                        type="text"
+                                                        value={accessTierDraft.price}
+                                                        onChange={(e) => setAccessTierDraft(prev => ({
+                                                            ...prev,
+                                                            price: e.target.value,
+                                                        }))}
+                                                        placeholder="blank = use emergent price"
+                                                    />
+                                                </div>
+                                            )}
+
+                                            <button
+                                                className="folder-publish-btn"
+                                                onClick={() => handleSaveAccessTier(p.slug)}
+                                                disabled={savingAccessTier}
+                                            >
+                                                {savingAccessTier ? "Saving..." : "Save Access Tier"}
+                                            </button>
+                                        </div>
+                                    )}
+                                </div>
+                            )}
                         </div>
                     );
                 })}
