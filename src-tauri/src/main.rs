@@ -2469,6 +2469,43 @@ async fn pyramid_list_slugs(state: tauri::State<'_, SharedState>) -> Result<Vec<
     wire_node_lib::pyramid::slug::list_slugs(&conn).map_err(|e| e.to_string())
 }
 
+/// Per-slug publication status for the frontend Pyramids tab.
+#[derive(serde::Serialize)]
+struct PyramidPublicationInfo {
+    slug: String,
+    node_count: i64,
+    unpublished_count: i64,
+    last_published_build_id: Option<String>,
+    current_build_id: Option<String>,
+    last_built_at: Option<String>,
+}
+
+#[tauri::command]
+async fn pyramid_get_publication_status(
+    state: tauri::State<'_, SharedState>,
+) -> Result<Vec<PyramidPublicationInfo>, String> {
+    let conn = state.pyramid.reader.lock().await;
+    let slugs = wire_node_lib::pyramid::slug::list_slugs(&conn).map_err(|e| e.to_string())?;
+    let mut result = Vec::new();
+    for s in slugs {
+        if s.archived_at.is_some() {
+            continue;
+        }
+        let unpublished = pyramid_db::count_unpublished_nodes(&conn, &s.slug).unwrap_or(0);
+        let last_pub = pyramid_db::get_last_published_build_id(&conn, &s.slug).unwrap_or(None);
+        let current = pyramid_db::get_current_build_id(&conn, &s.slug).unwrap_or(None);
+        result.push(PyramidPublicationInfo {
+            slug: s.slug,
+            node_count: s.node_count,
+            unpublished_count: unpublished,
+            last_published_build_id: last_pub,
+            current_build_id: current,
+            last_built_at: s.last_built_at,
+        });
+    }
+    Ok(result)
+}
+
 #[tauri::command]
 async fn pyramid_apex(
     state: tauri::State<'_, SharedState>,
@@ -5215,6 +5252,7 @@ fn main() {
             // Ticks every 60s checking for unpublished pyramid builds.
             // If a linked pyramid has a new completed build, auto-publishes to Wire.
             let sync_pyramid_state = state.pyramid.clone();
+            let sync_tunnel_state = state.tunnel_state.clone();
             let pyramid_sync_state = std::sync::Arc::new(
                 tokio::sync::Mutex::new(
                     wire_node_lib::pyramid::sync::PyramidSyncState::new()
@@ -5228,9 +5266,15 @@ fn main() {
                 let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
                 loop {
                     interval.tick().await;
+                    // Read current tunnel URL for metadata publication (WS-ONLINE-B)
+                    let tunnel_url = {
+                        let ts = sync_tunnel_state.read().await;
+                        ts.tunnel_url.clone()
+                    };
                     wire_node_lib::pyramid::sync::pyramid_sync_tick(
                         &sync_pyramid_state,
                         &pyramid_sync_state_shared,
+                        tunnel_url,
                     )
                     .await;
                 }
@@ -5737,6 +5781,7 @@ fn main() {
             operator_api_call,
             get_home_dir,
             pyramid_list_slugs,
+            pyramid_get_publication_status,
             pyramid_apex,
             pyramid_node,
             pyramid_tree,

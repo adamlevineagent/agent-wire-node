@@ -506,6 +506,142 @@ impl PyramidPublisher {
 
         Ok((contribution_id.to_string(), handle_path))
     }
+
+    /// Publish (or re-publish) pyramid discovery metadata as a Wire contribution.
+    ///
+    /// Creates a `type: "pyramid_metadata"` contribution whose body is the apex
+    /// node's distilled text and whose structured_data carries all discovery
+    /// fields (slug, node_count, tunnel_url, access_tier, etc.).
+    ///
+    /// If `supersedes_uuid` is provided, the old metadata contribution is
+    /// superseded via the Wire supersession endpoint after the new one is created.
+    ///
+    /// Returns the new metadata contribution's wire_uuid.
+    pub async fn publish_pyramid_metadata(
+        &self,
+        metadata: &PyramidMetadata,
+        supersedes_uuid: Option<&str>,
+    ) -> Result<String> {
+        let title = format!("Pyramid: {}", metadata.pyramid_slug);
+
+        let teaser = if metadata.apex_headline.len() > 200 {
+            truncate_str(&metadata.apex_headline, 200).to_string()
+        } else {
+            metadata.apex_headline.clone()
+        };
+
+        let structured_data = serde_json::json!({
+            "pyramid_slug": metadata.pyramid_slug,
+            "node_count": metadata.node_count,
+            "max_depth": metadata.max_depth,
+            "content_type": metadata.content_type,
+            "quality_score": metadata.quality_score,
+            "tunnel_url": metadata.tunnel_url,
+            "api_base": format!("/pyramid/{}", metadata.pyramid_slug),
+            "apex_headline": metadata.apex_headline,
+            "topics": metadata.topics,
+            "last_build_at": metadata.last_build_at,
+            "access_tier": metadata.access_tier,
+            "access_price": metadata.access_price,
+            "absorption_mode": metadata.absorption_mode,
+        });
+
+        let payload = serde_json::json!({
+            "type": "pyramid_metadata",
+            "contribution_type": "mechanical",
+            "title": title,
+            "teaser": teaser,
+            "body": metadata.apex_body,
+            "topics": metadata.topics,
+            "entities": [],
+            "structured_data": structured_data,
+            "derived_from": [],
+        });
+
+        let (new_uuid, _handle_path) = self.post_contribution(&payload).await?;
+
+        // Supersede the old metadata contribution if one existed
+        if let Some(old_uuid) = supersedes_uuid {
+            if let Err(e) = self.supersede_contribution(old_uuid, &new_uuid).await {
+                // Log but don't fail — the new metadata is published, supersession
+                // is best-effort (the old one remains visible but not harmful).
+                tracing::warn!(
+                    old_uuid = old_uuid,
+                    new_uuid = %new_uuid,
+                    error = %e,
+                    "failed to supersede old pyramid metadata contribution"
+                );
+            }
+        }
+
+        Ok(new_uuid)
+    }
+
+    /// Call the Wire supersession endpoint to mark an old contribution as
+    /// superseded by a new one.
+    ///
+    /// POST /api/v1/wire/contributions/{old_id}/supersede
+    /// Body: { "new_contribution_id": "..." }
+    async fn supersede_contribution(
+        &self,
+        old_contribution_id: &str,
+        new_contribution_id: &str,
+    ) -> Result<()> {
+        let url = format!(
+            "{}/api/v1/wire/contributions/{}/supersede",
+            self.wire_url.trim_end_matches('/'),
+            old_contribution_id,
+        );
+
+        let body = serde_json::json!({
+            "new_contribution_id": new_contribution_id,
+        });
+
+        let response = self
+            .client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.auth_token))
+            .json(&body)
+            .send()
+            .await
+            .context("supersede_contribution: request failed")?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let text = response.text().await.unwrap_or_default();
+            return Err(WirePublishError::Rejected(format!(
+                "supersession failed ({}): {}",
+                status,
+                text.chars().take(500).collect::<String>()
+            ))
+            .into());
+        }
+
+        tracing::info!(
+            old_id = old_contribution_id,
+            new_id = new_contribution_id,
+            "superseded old contribution"
+        );
+        Ok(())
+    }
+}
+
+/// All fields needed to publish a pyramid_metadata contribution.
+#[derive(Debug, Clone)]
+pub struct PyramidMetadata {
+    pub pyramid_slug: String,
+    pub node_count: i64,
+    pub max_depth: i64,
+    pub content_type: String,
+    pub quality_score: f64,
+    pub tunnel_url: Option<String>,
+    pub apex_headline: String,
+    pub apex_body: String,
+    pub topics: Vec<String>,
+    pub last_build_at: Option<String>,
+    pub access_tier: String,
+    pub access_price: Option<i64>,
+    pub absorption_mode: String,
 }
 
 // ─── SQLite ID Mapping ───────────────────────────────────────

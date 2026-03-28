@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use super::db;
+use super::publication;
 use super::wire_publish::{self, PyramidPublisher};
 use super::PyramidState;
 
@@ -93,9 +94,13 @@ struct SyncPublishData {
 ///    then publishes to Wire (async).
 ///
 /// This function is designed to be called from a `tokio::time::interval` loop.
+///
+/// `tunnel_url` is the current Cloudflare tunnel URL, if connected. Passed
+/// through to discovery metadata publication (WS-ONLINE-B).
 pub async fn pyramid_sync_tick(
     pyramid_state: &PyramidState,
     sync_state: &Arc<Mutex<PyramidSyncState>>,
+    tunnel_url: Option<String>,
 ) {
     let links: Vec<PyramidPublicationLink> = {
         let state = sync_state.lock().await;
@@ -310,6 +315,13 @@ pub async fn pyramid_sync_tick(
                     );
                 }
 
+                // WS-ONLINE-B: Collect metadata while we hold the writer lock
+                let metadata_data = publication::collect_metadata_publish_data(
+                    &writer,
+                    &data.slug,
+                    tunnel_url.clone(),
+                );
+
                 tracing::info!(
                     slug = %data.slug,
                     node_count = result.node_count,
@@ -317,7 +329,59 @@ pub async fn pyramid_sync_tick(
                     apex_uuid = ?result.apex_wire_uuid,
                     "pyramid_sync_tick: publication complete"
                 );
-                // writer dropped here
+                // writer dropped here — must drop before .await for !Send safety
+                drop(writer);
+
+                // WS-ONLINE-B: Publish discovery metadata (async, no DB lock held)
+                match metadata_data {
+                    Ok(Some(md)) => {
+                        match publisher
+                            .publish_pyramid_metadata(&md.metadata, md.supersedes_uuid.as_deref())
+                            .await
+                        {
+                            Ok(new_uuid) => {
+                                // Re-acquire writer to persist the new metadata UUID
+                                let writer = pyramid_state.writer.lock().await;
+                                if let Err(e) = db::set_slug_metadata_contribution_id(
+                                    &writer,
+                                    &data.slug,
+                                    &new_uuid,
+                                ) {
+                                    tracing::warn!(
+                                        slug = %data.slug,
+                                        error = %e,
+                                        "pyramid_sync_tick: failed to persist metadata UUID"
+                                    );
+                                }
+                                tracing::info!(
+                                    slug = %data.slug,
+                                    metadata_uuid = %new_uuid,
+                                    "pyramid_sync_tick: metadata published"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    slug = %data.slug,
+                                    error = %e,
+                                    "pyramid_sync_tick: metadata publish failed (non-fatal)"
+                                );
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        tracing::debug!(
+                            slug = %data.slug,
+                            "pyramid_sync_tick: no metadata to publish"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            slug = %data.slug,
+                            error = %e,
+                            "pyramid_sync_tick: failed to collect metadata (non-fatal)"
+                        );
+                    }
+                }
             }
             Err(e) => {
                 tracing::error!(

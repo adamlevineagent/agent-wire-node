@@ -4122,6 +4122,60 @@ pub fn get_current_build_id(conn: &Connection, slug: &str) -> Result<Option<Stri
     }
 }
 
+/// Get the metadata contribution UUID for a slug (WS-ONLINE-B discovery).
+///
+/// Returns the Wire UUID of the most recently published `pyramid_metadata`
+/// contribution for this slug, or None if never published.
+pub fn get_slug_metadata_contribution_id(conn: &Connection, slug: &str) -> Result<Option<String>> {
+    let result = conn.query_row(
+        "SELECT metadata_contribution_id FROM pyramid_slugs WHERE slug = ?1",
+        rusqlite::params![slug],
+        |row| row.get::<_, Option<String>>(0),
+    );
+    match result {
+        Ok(val) => Ok(val),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Read the access tier, access price, and absorption mode for a slug.
+///
+/// These columns were added by the WS-ONLINE prep migration and default to
+/// 'public', NULL, and 'open' respectively.
+pub fn get_slug_online_fields(
+    conn: &Connection,
+    slug: &str,
+) -> Result<(String, Option<i64>, String)> {
+    let result = conn.query_row(
+        "SELECT access_tier, access_price, absorption_mode FROM pyramid_slugs WHERE slug = ?1",
+        rusqlite::params![slug],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<i64>>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        },
+    );
+    match result {
+        Ok(val) => Ok(val),
+        Err(rusqlite::Error::QueryReturnedNoRows) => {
+            Ok(("public".to_string(), None, "open".to_string()))
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Store the metadata contribution UUID for a slug after publishing discovery metadata.
+pub fn set_slug_metadata_contribution_id(conn: &Connection, slug: &str, uuid: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE pyramid_slugs SET metadata_contribution_id = ?1 WHERE slug = ?2",
+        rusqlite::params![uuid, slug],
+    )?;
+    Ok(())
+}
+
 /// Count nodes that exist in the pyramid but have not yet been published to Wire.
 ///
 /// Returns the number of nodes in the slug that do NOT have a corresponding

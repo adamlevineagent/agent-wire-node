@@ -526,6 +526,74 @@ pub async fn publish_pyramid_bottom_up(
     Ok(full_result)
 }
 
+// ─── Discovery Metadata (WS-ONLINE-B) ────────────────────────────────────────
+
+/// Data needed to publish pyramid discovery metadata, collected synchronously
+/// from SQLite before the async publish call.
+pub struct MetadataPublishData {
+    pub metadata: super::wire_publish::PyramidMetadata,
+    pub supersedes_uuid: Option<String>,
+}
+
+/// Phase 1 (SYNC): Collect all data needed to publish discovery metadata.
+///
+/// Reads slug info, apex node, access tier, and existing metadata UUID from
+/// SQLite. The `conn` reference does NOT escape this function.
+///
+/// `tunnel_url` is passed in because it lives in the app's TunnelState, which
+/// is not accessible from the publication context.
+pub fn collect_metadata_publish_data(
+    conn: &rusqlite::Connection,
+    slug: &str,
+    tunnel_url: Option<String>,
+) -> Result<Option<MetadataPublishData>> {
+    // Load slug info
+    let slug_info = match db::get_slug(conn, slug)? {
+        Some(info) => info,
+        None => return Ok(None),
+    };
+
+    // Load apex node (highest depth)
+    let apex_nodes = db::get_nodes_at_depth(conn, slug, slug_info.max_depth)?;
+    let apex = match apex_nodes.first() {
+        Some(n) => n,
+        None => {
+            tracing::warn!(slug = slug, "no apex node found for metadata publish");
+            return Ok(None);
+        }
+    };
+
+    // Load access tier, price, absorption mode
+    let (access_tier, access_price, absorption_mode) = db::get_slug_online_fields(conn, slug)?;
+
+    // Load existing metadata contribution UUID for supersession
+    let supersedes_uuid = db::get_slug_metadata_contribution_id(conn, slug)?;
+
+    // Collect topics from the apex node
+    let topics: Vec<String> = apex.topics.iter().map(|t| t.name.clone()).collect();
+
+    let metadata = super::wire_publish::PyramidMetadata {
+        pyramid_slug: slug.to_string(),
+        node_count: slug_info.node_count,
+        max_depth: slug_info.max_depth,
+        content_type: slug_info.content_type.as_str().to_string(),
+        quality_score: 0.0, // placeholder for now
+        tunnel_url,
+        apex_headline: apex.headline.clone(),
+        apex_body: apex.distilled.clone(),
+        topics,
+        last_build_at: slug_info.last_built_at.clone(),
+        access_tier,
+        access_price,
+        absorption_mode,
+    };
+
+    Ok(Some(MetadataPublishData {
+        metadata,
+        supersedes_uuid,
+    }))
+}
+
 // ─── Corpus Registration ─────────────────────────────────────────────────────
 
 /// Register a source document with the Wire as a corpus document.

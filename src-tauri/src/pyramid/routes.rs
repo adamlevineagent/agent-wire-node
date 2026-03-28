@@ -16,6 +16,7 @@ use super::characterize;
 use super::types::CharacterizationResult;
 use super::db;
 use super::delta;
+use super::publication;
 use super::faq;
 use super::ingest;
 use super::meta;
@@ -4415,6 +4416,60 @@ async fn handle_publish_pyramid(
                 apex_uuid = ?result.apex_wire_uuid,
                 "pyramid published to Wire"
             );
+
+            // WS-ONLINE-B: Publish discovery metadata after node publication.
+            // tunnel_url is None here — the sync timer will supersede with the
+            // real tunnel URL on the next tick once a tunnel is connected.
+            let metadata_data = {
+                let writer = state.writer.lock().await;
+                publication::collect_metadata_publish_data(&writer, &slug_name, None)
+            };
+            // writer dropped — safe to .await
+            match metadata_data {
+                Ok(Some(md)) => {
+                    match publisher
+                        .publish_pyramid_metadata(&md.metadata, md.supersedes_uuid.as_deref())
+                        .await
+                    {
+                        Ok(new_uuid) => {
+                            // Re-acquire writer to persist UUID
+                            let writer = state.writer.lock().await;
+                            if let Err(e) = db::set_slug_metadata_contribution_id(
+                                &writer,
+                                &slug_name,
+                                &new_uuid,
+                            ) {
+                                tracing::warn!(
+                                    slug = %slug_name,
+                                    error = %e,
+                                    "failed to persist metadata UUID"
+                                );
+                            }
+                            tracing::info!(
+                                slug = %slug_name,
+                                metadata_uuid = %new_uuid,
+                                "discovery metadata published"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                slug = %slug_name,
+                                error = %e,
+                                "discovery metadata publish failed (non-fatal)"
+                            );
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        slug = %slug_name,
+                        error = %e,
+                        "failed to collect discovery metadata (non-fatal)"
+                    );
+                }
+            }
+
             Ok(json_ok(&result))
         }
         Err(e) => {

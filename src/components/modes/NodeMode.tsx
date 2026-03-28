@@ -4,8 +4,9 @@ import { useAppContext } from '../../contexts/AppContext';
 import { SyncStatus } from '../SyncStatus';
 import { MarketView } from '../MarketView';
 import { LogViewer } from '../LogViewer';
+import { PyramidPublicationStatus } from '../PyramidPublicationStatus';
 
-type NodeTab = 'sync' | 'market' | 'logs';
+type NodeTab = 'sync' | 'market' | 'pyramids' | 'logs';
 
 export function NodeMode() {
     const { state } = useAppContext();
@@ -42,6 +43,12 @@ export function NodeMode() {
                     Market
                 </button>
                 <button
+                    className={`node-tab ${activeTab === 'pyramids' ? 'node-tab-active' : ''}`}
+                    onClick={() => setActiveTab('pyramids')}
+                >
+                    Pyramids
+                </button>
+                <button
                     className={`node-tab ${activeTab === 'logs' ? 'node-tab-active' : ''}`}
                     onClick={() => setActiveTab('logs')}
                 >
@@ -59,6 +66,7 @@ export function NodeMode() {
                     />
                 )}
                 {activeTab === 'market' && <MarketView />}
+                {activeTab === 'pyramids' && <PyramidPublicationStatus />}
                 {activeTab === 'logs' && <LogViewer />}
             </div>
         </div>
