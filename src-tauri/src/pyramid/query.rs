@@ -119,6 +119,48 @@ fn load_connected_web_edges(
     Ok(edges)
 }
 
+/// WS-ONLINE-F: Load remote web edges for a node's thread.
+///
+/// Looks up the thread for the given canonical node ID, then loads all remote
+/// web edges for that thread. Returns an empty vec on any error (non-fatal).
+fn load_remote_web_edges(
+    conn: &Connection,
+    slug: &str,
+    canonical_node_id: &str,
+) -> Vec<ConnectedRemoteWebEdge> {
+    // Find the thread for this canonical node
+    let thread_id: Option<String> = conn
+        .query_row(
+            "SELECT thread_id FROM pyramid_threads WHERE slug = ?1 AND current_canonical_id = ?2",
+            rusqlite::params![slug, canonical_node_id],
+            |row| row.get(0),
+        )
+        .ok();
+
+    let Some(tid) = thread_id else {
+        return Vec::new();
+    };
+
+    match db::get_remote_web_edges_for_thread(conn, slug, &tid) {
+        Ok(edges) => edges
+            .into_iter()
+            .map(|e| {
+                let remote_slug = HandlePath::parse(&e.remote_handle_path)
+                    .map(|h| h.slug)
+                    .unwrap_or_else(|| e.remote_handle_path.clone());
+                ConnectedRemoteWebEdge {
+                    remote_handle_path: e.remote_handle_path,
+                    remote_slug,
+                    relationship: e.relationship,
+                    relevance: e.relevance,
+                    build_id: e.build_id,
+                }
+            })
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
 pub fn get_node_with_edges(
     conn: &Connection,
     slug: &str,
@@ -429,10 +471,14 @@ pub fn drill(conn: &Connection, slug: &str, node_id: &str) -> Result<Option<Dril
     let question_context = db::get_question_tree(conn, slug)?
         .and_then(|tree_json| find_question_context(&tree_json, node_id));
 
+    // WS-ONLINE-F: Load remote web edges for this node's thread
+    let remote_web_edges = load_remote_web_edges(conn, slug, node_id);
+
     Ok(Some(DrillResult {
         node: parent,
         children,
         web_edges: load_connected_web_edges(conn, slug, node_id)?,
+        remote_web_edges,
         evidence,
         gaps,
         question_context,

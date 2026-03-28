@@ -445,6 +445,42 @@ impl PyramidPublisher {
         })
     }
 
+    /// Publish a gap report to the Wire (WS-ONLINE-F).
+    ///
+    /// Gap reports are demand signals: they tell the owner of the referenced
+    /// pyramid that a node is missing or incomplete. Published as a
+    /// `type: "gap_report"` contribution with the remote handle-path in
+    /// structured_data.
+    pub async fn publish_gap_report(
+        &self,
+        slug: &str,
+        remote_handle_path: &str,
+        gap_description: &str,
+    ) -> Result<(String, Option<String>)> {
+        let title = format!("Gap: {} on {}", gap_description.chars().take(60).collect::<String>(), remote_handle_path);
+        let teaser = truncate_str(gap_description, 200).to_string();
+
+        let structured_data = serde_json::json!({
+            "source_slug": slug,
+            "remote_handle_path": remote_handle_path,
+            "gap_type": "missing_content",
+        });
+
+        let payload = serde_json::json!({
+            "type": "gap_report",
+            "contribution_type": "mechanical",
+            "title": title,
+            "teaser": teaser,
+            "body": gap_description,
+            "topics": [],
+            "entities": [],
+            "structured_data": structured_data,
+            "derived_from": [],
+        });
+
+        self.post_contribution(&payload).await
+    }
+
     /// Post a contribution to the Wire API and return its UUID.
     async fn post_contribution(&self, payload: &serde_json::Value) -> Result<(String, Option<String>)> {
         let url = format!("{}/api/v1/contribute", self.wire_url.trim_end_matches('/'),);

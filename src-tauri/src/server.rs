@@ -659,6 +659,7 @@ pub async fn start_server(
     let pyramid_routes = pyramid::routes::pyramid_routes(
         state.pyramid.clone(),
         state.jwt_public_key.clone(),
+        state.node_id.clone(), // WS-ONLINE-H: serving_node_id for cost preview
     );
 
     // Partner (Dennis) routes
@@ -856,6 +857,102 @@ fn verify_jwt(token: &str, public_key_pem: &str) -> Result<DocumentClaims, Strin
 
     let token_data = decode::<DocumentClaims>(token, &decoding_key, &validation)
         .map_err(|e| format!("JWT decode failed: {}", e))?;
+
+    Ok(token_data.claims)
+}
+
+/// JWT claims for Wire-signed payment tokens (WS-ONLINE-H).
+///
+/// Issued by the Wire server via `POST /api/v1/wire/payment-intent`.
+/// The serving node validates these before executing a paid query, then
+/// redeems the token via `POST /api/v1/wire/payment-redeem` to collect payment.
+///
+///   aud → "payment"
+///   serving_node_operator_id → must match this node's operator_id
+///   contribution_handle_path → the contribution being paid for
+///   stamp_amount → flat p2p fee (always 1)
+///   access_amount → UFF-routed access price (0 for public pyramids)
+///   total_amount → stamp + access
+///   nonce → single-use UUID (prevents replay)
+///   exp → expiration (60s TTL)
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PaymentTokenClaims {
+    /// Audience — must be "payment"
+    pub aud: Option<String>,
+    /// Operator ID of the serving node (must match this node)
+    pub serving_node_operator_id: Option<String>,
+    /// Handle-path of the contribution being paid for
+    pub contribution_handle_path: Option<String>,
+    /// Stamp amount (flat 1-credit p2p fee)
+    #[serde(default)]
+    pub stamp_amount: u64,
+    /// Access price amount (UFF-routed, 0 for public pyramids)
+    #[serde(default)]
+    pub access_amount: u64,
+    /// Total amount (stamp + access)
+    #[serde(default)]
+    pub total_amount: u64,
+    /// Single-use nonce (UUID v4) — prevents replay
+    pub nonce: Option<String>,
+    /// Expiration (standard JWT exp claim)
+    #[allow(dead_code)]
+    pub exp: Option<u64>,
+}
+
+/// Verify a Wire-signed payment token using Ed25519 (EdDSA) public key (WS-ONLINE-H).
+///
+/// Validates the `aud` claim is "payment", checks required fields, and verifies
+/// that `serving_node_operator_id` matches the expected node operator ID.
+/// The Wire server's public key (same key used for pyramid-query JWTs) is used
+/// for validation — payment tokens are Wire-signed, never self-signed.
+pub fn verify_payment_token(
+    token: &str,
+    public_key_pem: &str,
+    expected_operator_id: &str,
+) -> Result<PaymentTokenClaims, String> {
+    use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
+
+    let decoding_key = DecodingKey::from_ed_pem(public_key_pem.as_bytes())
+        .map_err(|e| format!("Invalid public key for payment token: {}", e))?;
+
+    let mut validation = Validation::new(Algorithm::EdDSA);
+    validation.validate_exp = true;
+    validation.set_required_spec_claims(&["exp"]);
+    // Validate audience is "payment"
+    validation.set_audience(&["payment"]);
+
+    let token_data = decode::<PaymentTokenClaims>(token, &decoding_key, &validation)
+        .map_err(|e| format!("Payment token JWT decode failed: {}", e))?;
+
+    let claims = &token_data.claims;
+
+    // Verify serving_node_operator_id matches this node
+    let serving_id = claims
+        .serving_node_operator_id
+        .as_deref()
+        .unwrap_or("");
+    if serving_id.is_empty() {
+        return Err("Missing serving_node_operator_id in payment token".into());
+    }
+    if serving_id != expected_operator_id {
+        return Err(format!(
+            "Payment token serving_node_operator_id mismatch: expected '{}', got '{}'",
+            expected_operator_id, serving_id
+        ));
+    }
+
+    // Verify nonce is present
+    if claims.nonce.as_deref().unwrap_or("").is_empty() {
+        return Err("Missing nonce in payment token".into());
+    }
+
+    // Verify total_amount is consistent
+    if claims.total_amount != claims.stamp_amount + claims.access_amount {
+        return Err(format!(
+            "Payment token amount mismatch: total {} != stamp {} + access {}",
+            claims.total_amount, claims.stamp_amount, claims.access_amount
+        ));
+    }
 
     Ok(token_data.claims)
 }

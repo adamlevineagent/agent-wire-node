@@ -33,6 +33,14 @@ pub struct CreditTracker {
     #[serde(default)]
     pub unique_corpora_hosted: u64,
 
+    // WS-ONLINE-H: Pyramid nano-transaction counters
+    /// Total remote pyramid queries served (all time, persisted)
+    #[serde(default)]
+    pub pyramid_queries_served: u64,
+    /// Total stamps earned from serving pyramid queries (all time, persisted)
+    #[serde(default)]
+    pub pyramid_stamps_earned: u64,
+
     // Batched serve log — accumulated between reports, flushed every 60s
     #[serde(skip)]
     pub pending_serve_log: Vec<ServeLogEntry>,
@@ -41,6 +49,9 @@ pub struct CreditTracker {
     pub delta_documents_served: u64,
     #[serde(skip)]
     pub delta_bytes_served: u64,
+    // WS-ONLINE-H: Pending pyramid transaction log entries
+    #[serde(skip)]
+    pub pending_pyramid_tx_log: Vec<PyramidTxLogEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,6 +75,28 @@ pub struct ServeLogEntry {
     pub document_id: String,
     pub token_id: String,
     pub consumer_operator_id: String,
+    pub served_at: String,
+}
+
+/// Entry for pyramid transaction logging (WS-ONLINE-H).
+///
+/// Logged each time a remote pyramid query is served and a payment token
+/// is successfully redeemed (or queued for retry).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PyramidTxLogEntry {
+    /// Wire transaction ID (from payment-redeem response, or "pending" if not yet redeemed)
+    pub tx_id: String,
+    /// Querier's operator ID
+    pub querier_operator_id: String,
+    /// Pyramid slug queried
+    pub slug: String,
+    /// Query type: "apex", "drill", "search", "export"
+    pub query_type: String,
+    /// Stamp amount earned (always 1)
+    pub stamp_amount: u64,
+    /// Access amount earned (0 for public)
+    pub access_amount: u64,
+    /// When this transaction occurred
     pub served_at: String,
 }
 
@@ -381,6 +414,9 @@ impl CreditTracker {
             bytes_hosted: persisted.bytes_hosted,
             retention_challenges_passed: persisted.retention_challenges_passed,
             unique_corpora_hosted: persisted.unique_corpora_hosted,
+            // WS-ONLINE-H: Pyramid transaction counters (persisted)
+            pyramid_queries_served: persisted.pyramid_queries_served,
+            pyramid_stamps_earned: persisted.pyramid_stamps_earned,
             // Reset session-specific fields
             session_documents_served: 0,
             session_bytes_served: 0,
@@ -392,6 +428,7 @@ impl CreditTracker {
             pending_serve_log: Vec::new(),
             delta_documents_served: 0,
             delta_bytes_served: 0,
+            pending_pyramid_tx_log: Vec::new(),
             server_credit_balance: 0.0,
         }
     }
@@ -401,6 +438,45 @@ impl CreditTracker {
         if let Ok(json) = serde_json::to_string_pretty(self) {
             let _ = std::fs::write(path, json);
         }
+    }
+
+    /// Record a pyramid query transaction (WS-ONLINE-H).
+    ///
+    /// Called when a remote pyramid query is served. Increments the pyramid
+    /// query and stamp counters, and logs the transaction for batched reporting.
+    pub fn log_pyramid_tx(
+        &mut self,
+        tx_id: &str,
+        querier_operator_id: &str,
+        slug: &str,
+        query_type: &str,
+        stamp_amount: u64,
+        access_amount: u64,
+    ) {
+        self.pyramid_queries_served += 1;
+        self.pyramid_stamps_earned += stamp_amount;
+
+        self.pending_pyramid_tx_log.push(PyramidTxLogEntry {
+            tx_id: tx_id.to_string(),
+            querier_operator_id: querier_operator_id.to_string(),
+            slug: slug.to_string(),
+            query_type: query_type.to_string(),
+            stamp_amount,
+            access_amount,
+            served_at: Utc::now().to_rfc3339(),
+        });
+
+        tracing::debug!(
+            tx_id = %tx_id,
+            querier = %querier_operator_id,
+            slug = %slug,
+            query_type = %query_type,
+            stamp = %stamp_amount,
+            access = %access_amount,
+            total_queries = %self.pyramid_queries_served,
+            total_stamps = %self.pyramid_stamps_earned,
+            "pyramid transaction logged"
+        );
     }
 
     /// Record a document serve event

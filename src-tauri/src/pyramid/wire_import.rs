@@ -617,6 +617,21 @@ pub struct RemoteExportResponse {
     pub nodes: Vec<serde_json::Value>,
 }
 
+/// Cost preview response from a remote serving node (WS-ONLINE-H).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteCostPreview {
+    /// Stamp fee (always 1 credit)
+    pub stamp: u64,
+    /// Access price (0 for public pyramids)
+    pub access_price: i64,
+    /// Total cost (stamp + access_price)
+    pub total: i64,
+    /// Pyramid slug
+    pub slug: String,
+    /// Serving node's operator ID (needed for payment-intent)
+    pub serving_node_id: String,
+}
+
 /// HTTP client for querying remote pyramids via tunnel URLs (WS-ONLINE-C).
 ///
 /// Each method will eventually integrate payment flow (WS-ONLINE-H),
@@ -852,6 +867,125 @@ impl RemotePyramidClient {
             ))
             .into()),
         }
+    }
+}
+
+// ─── WS-ONLINE-H: Cost preview and payment integration ──────
+
+impl RemotePyramidClient {
+    /// GET /pyramid/{slug}/query-cost — fetch cost preview from a remote serving node.
+    ///
+    /// Returns the stamp (1 credit), access_price, and total cost for querying
+    /// this pyramid. The caller uses this to decide whether to proceed and to
+    /// call POST /api/v1/wire/payment-intent on the Wire server.
+    pub async fn query_cost(
+        &self,
+        slug: &str,
+        query_type: &str,
+        node_id: Option<&str>,
+    ) -> Result<RemoteCostPreview> {
+        let mut url = format!(
+            "{}/pyramid/{}/query-cost?query_type={}",
+            self.tunnel_url.trim_end_matches('/'),
+            slug,
+            urlencoding::encode(query_type)
+        );
+        if let Some(nid) = node_id {
+            url.push_str(&format!("&node_id={}", urlencoding::encode(nid)));
+        }
+
+        let response = self
+            .client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", self.wire_jwt))
+            .send()
+            .await
+            .map_err(|e| {
+                if e.is_timeout() {
+                    WireImportError::Timeout(Duration::from_secs(30))
+                } else {
+                    WireImportError::Network(e.to_string())
+                }
+            })
+            .context("remote pyramid: query-cost request failed")?;
+
+        self.check_response_status(&response)?;
+
+        let preview: RemoteCostPreview = response
+            .json()
+            .await
+            .map_err(|e| WireImportError::InvalidResponse(e.to_string()))
+            .context("remote pyramid: failed to parse query-cost response")?;
+
+        tracing::debug!(
+            slug = %slug,
+            stamp = %preview.stamp,
+            access_price = %preview.access_price,
+            total = %preview.total,
+            serving_node = %preview.serving_node_id,
+            "received cost preview from remote node"
+        );
+
+        Ok(preview)
+    }
+
+    /// Fetch apex with cost preview (WS-ONLINE-H).
+    ///
+    /// Calls query-cost first, then fetches the apex. Returns both the apex
+    /// response and the cost preview so the caller can decide about payment.
+    ///
+    /// TODO(WS-ONLINE-H): When Wire server payment-intent endpoint exists,
+    /// this method should: (1) call query_cost, (2) call payment-intent on
+    /// the Wire server to get a payment_token, (3) include the payment_token
+    /// as X-Payment-Token header on the apex request.
+    pub async fn remote_apex_with_cost(
+        &self,
+        slug: &str,
+    ) -> Result<(RemoteApexResponse, RemoteCostPreview)> {
+        let cost = self.query_cost(slug, "apex", None).await?;
+        let apex = self.remote_apex(slug).await?;
+        Ok((apex, cost))
+    }
+
+    /// Fetch drill with cost preview (WS-ONLINE-H).
+    ///
+    /// TODO(WS-ONLINE-H): Integrate payment-intent/token flow when Wire server ready.
+    pub async fn remote_drill_with_cost(
+        &self,
+        slug: &str,
+        node_id: &str,
+    ) -> Result<(RemoteDrillResponse, RemoteCostPreview)> {
+        let cost = self.query_cost(slug, "drill", Some(node_id)).await?;
+        let drill = self.remote_drill(slug, node_id).await?;
+        Ok((drill, cost))
+    }
+
+    /// Fetch search with cost preview (WS-ONLINE-H).
+    ///
+    /// TODO(WS-ONLINE-H): Integrate payment-intent/token flow when Wire server ready.
+    pub async fn remote_search_with_cost(
+        &self,
+        slug: &str,
+        query: &str,
+    ) -> Result<(RemoteSearchResponse, RemoteCostPreview)> {
+        let cost = self.query_cost(slug, "search", None).await?;
+        let search = self.remote_search(slug, query).await?;
+        Ok((search, cost))
+    }
+
+    /// Fetch export with cost preview (WS-ONLINE-H).
+    ///
+    /// Note: Export queries may take longer than 60s payment token TTL.
+    /// Per WS-ONLINE-H design, payment should be redeemed BEFORE executing
+    /// the export (payment collected upfront). This method fetches cost first;
+    /// the actual payment-intent + redeem-before-execute flow is a TODO.
+    pub async fn remote_export_with_cost(
+        &self,
+        slug: &str,
+    ) -> Result<(RemoteExportResponse, RemoteCostPreview)> {
+        let cost = self.query_cost(slug, "export", None).await?;
+        let export = self.remote_export(slug).await?;
+        Ok((export, cost))
     }
 }
 

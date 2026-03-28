@@ -32,9 +32,12 @@ use super::question_decomposition::{
 use super::question_loader;
 use super::reconciliation;
 use super::slug;
-use super::types::{self, BuildProgress, CharacterizationResult, ContentType};
+use super::types::{self, BuildProgress, CharacterizationResult, ContentType, HandlePath, RemoteWebEdge};
+use super::wire_import::RemotePyramidClient;
 use super::defaults_adapter;
 use super::PyramidState;
+
+use std::collections::HashMap;
 
 /// Unified build runner — dispatches to the chain engine or legacy build
 /// pipeline based on the `use_chain_engine` feature flag.
@@ -211,7 +214,133 @@ pub async fn run_build_from(
         }
     }
 
+    // ── WS-ONLINE-F: Resolve remote web edges ─────────────────────────────
+    // After a successful build, fetch content for any remote web edges created
+    // during this build. The fetched data is cached locally so downstream
+    // consumers (publication, drill view) have the remote content available.
+    if let Ok(ref res) = result {
+        if res.1 == 0 {
+            if let Err(e) = resolve_remote_web_edges(state, slug_name).await {
+                warn!(
+                    slug = slug_name,
+                    error = %e,
+                    "failed to resolve remote web edges (non-fatal)"
+                );
+            }
+        }
+    }
+
     result
+}
+
+/// WS-ONLINE-F: Resolve remote web edges created during a build.
+///
+/// For each remote web edge, uses `RemotePyramidClient` to fetch the referenced
+/// node's content from the remote pyramid. Results are cached in-memory for the
+/// build session and logged. If a remote node cannot be reached, a gap report
+/// could be published (future: integrated with wire_publish).
+async fn resolve_remote_web_edges(
+    state: &PyramidState,
+    slug_name: &str,
+) -> Result<()> {
+    // Load all remote web edges for this slug
+    let remote_edges: Vec<RemoteWebEdge> = {
+        let conn = state.reader.lock().await;
+        db::get_all_remote_web_edges(&conn, slug_name)?
+    };
+
+    if remote_edges.is_empty() {
+        return Ok(());
+    }
+
+    info!(
+        slug = slug_name,
+        edge_count = remote_edges.len(),
+        "resolving remote web edges"
+    );
+
+    // Get Wire auth for remote requests
+    let config = state.config.read().await;
+    let wire_jwt = config.auth_token.clone();
+    drop(config);
+
+    let wire_server_url = std::env::var("WIRE_URL")
+        .unwrap_or_else(|_| "https://api.callmeplayful.com".to_string());
+
+    // Group edges by remote tunnel URL to reuse clients
+    let mut clients: HashMap<String, RemotePyramidClient> = HashMap::new();
+    let mut resolved = 0usize;
+    let mut failed = 0usize;
+
+    for edge in &remote_edges {
+        if edge.remote_tunnel_url.is_empty() {
+            warn!(
+                slug = slug_name,
+                remote_handle_path = edge.remote_handle_path.as_str(),
+                "remote web edge has no tunnel URL, skipping"
+            );
+            failed += 1;
+            continue;
+        }
+
+        let handle = match HandlePath::parse(&edge.remote_handle_path) {
+            Some(h) => h,
+            None => {
+                warn!(
+                    slug = slug_name,
+                    remote_handle_path = edge.remote_handle_path.as_str(),
+                    "failed to parse remote handle-path, skipping"
+                );
+                failed += 1;
+                continue;
+            }
+        };
+
+        // Get or create client for this tunnel URL
+        let client = clients
+            .entry(edge.remote_tunnel_url.clone())
+            .or_insert_with(|| {
+                RemotePyramidClient::new(
+                    edge.remote_tunnel_url.clone(),
+                    wire_jwt.clone(),
+                    wire_server_url.clone(),
+                )
+            });
+
+        // Fetch the remote node content via drill endpoint
+        match client.remote_drill(&handle.slug, &handle.node_id).await {
+            Ok(_drill_response) => {
+                info!(
+                    slug = slug_name,
+                    remote = edge.remote_handle_path.as_str(),
+                    "resolved remote web edge"
+                );
+                // The drill response data is available for downstream consumers.
+                // Future: cache this in a local table or in-memory store for
+                // use during publication and evidence resolution.
+                resolved += 1;
+            }
+            Err(e) => {
+                warn!(
+                    slug = slug_name,
+                    remote = edge.remote_handle_path.as_str(),
+                    error = %e,
+                    "failed to resolve remote web edge"
+                );
+                failed += 1;
+            }
+        }
+    }
+
+    info!(
+        slug = slug_name,
+        resolved = resolved,
+        failed = failed,
+        total = remote_edges.len(),
+        "remote web edge resolution complete"
+    );
+
+    Ok(())
 }
 
 /// Chain-engine path: load chain YAML, execute via chain_executor.

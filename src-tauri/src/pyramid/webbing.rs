@@ -30,10 +30,13 @@ fn now_ts() -> String {
 /// Processes web edge notes emitted by `rewrite_distillation`.
 ///
 /// For each note:
-/// 1. Normalizes edge direction (thread_a_id < thread_b_id alphabetically)
-/// 2. Looks up existing edge between the two threads
-/// 3. If edge exists: creates a WebEdgeDelta, increments delta_count, boosts relevance
-/// 4. If edge doesn't exist: creates a new WebEdge with the relationship
+/// 1. Check if the thread_id is a three-segment Wire handle-path (slug/depth/node-id).
+///    If so and the slug differs from the local slug, create a remote edge in
+///    `pyramid_remote_web_edges` instead of a local one.
+/// 2. For local edges: normalizes edge direction (thread_a_id < thread_b_id alphabetically)
+/// 3. Looks up existing edge between the two threads
+/// 4. If edge exists: creates a WebEdgeDelta, increments delta_count, boosts relevance
+/// 5. If edge doesn't exist: creates a new WebEdge with the relationship
 pub async fn process_web_edge_notes(
     reader: &Arc<Mutex<Connection>>,
     writer: &Arc<Mutex<Connection>>,
@@ -41,11 +44,66 @@ pub async fn process_web_edge_notes(
     source_thread_id: &str,
     notes: &[WebEdgeNote],
 ) -> anyhow::Result<()> {
+    process_web_edge_notes_with_build(reader, writer, slug, source_thread_id, notes, None).await
+}
+
+/// Extended version of `process_web_edge_notes` that accepts a build_id for
+/// scoping remote web edges (WS-ONLINE-F).
+pub async fn process_web_edge_notes_with_build(
+    reader: &Arc<Mutex<Connection>>,
+    writer: &Arc<Mutex<Connection>>,
+    slug: &str,
+    source_thread_id: &str,
+    notes: &[WebEdgeNote],
+    build_id: Option<&str>,
+) -> anyhow::Result<()> {
     for note in notes {
         // Skip self-references
         if note.thread_id == source_thread_id {
             continue;
         }
+
+        // WS-ONLINE-F: Check if the thread_id is a remote handle-path (slug/depth/node-id)
+        if let Some(handle) = HandlePath::parse(&note.thread_id) {
+            if handle.is_remote(slug) {
+                // Remote reference — store in pyramid_remote_web_edges
+                let bid = build_id.unwrap_or("unknown");
+
+                // Look up tunnel URL for the remote slug (if we have it pinned)
+                let tunnel_url = {
+                    let conn = reader.lock().await;
+                    db::get_slug_tunnel_url(&conn, &handle.slug)?
+                        .unwrap_or_default()
+                };
+
+                let edge = RemoteWebEdge {
+                    id: 0,
+                    slug: slug.to_string(),
+                    local_thread_id: source_thread_id.to_string(),
+                    remote_handle_path: note.thread_id.clone(),
+                    remote_tunnel_url: tunnel_url,
+                    relationship: note.relationship.clone(),
+                    relevance: 1.0,
+                    delta_count: 0,
+                    build_id: bid.to_string(),
+                    created_at: now_ts(),
+                    updated_at: now_ts(),
+                };
+
+                {
+                    let conn = writer.lock().await;
+                    db::save_remote_web_edge(&conn, &edge)?;
+                }
+
+                info!(
+                    "[webbing] created remote edge {} -> {} (remote: {}): {}",
+                    source_thread_id, note.thread_id, handle.slug, note.relationship
+                );
+                continue;
+            }
+        }
+
+        // Local edge — existing logic
 
         // 1. Normalize edge direction: ensure thread_a_id < thread_b_id
         let (thread_a, thread_b) = if source_thread_id < note.thread_id.as_str() {

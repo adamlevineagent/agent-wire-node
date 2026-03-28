@@ -100,6 +100,13 @@ interface DrillResult {
     relationship: string;
     strength: number;
   }>;
+  remote_web_edges?: Array<{
+    remote_handle_path: string;
+    remote_slug: string;
+    relationship: string;
+    relevance: number;
+    build_id: string;
+  }>;
   evidence?: Array<EvidenceLink>;
   gaps?: Array<GapReport>;
   question_context?: QuestionContext | null;
@@ -988,6 +995,39 @@ export function PyramidVisualization({ slug, contentType, referencingSlugs, stal
                 {drillData.web_edges.map((edge, i) => (
                   <div key={`edge-${i}`} style={{ fontSize: 12, padding: '2px 0', opacity: 0.7 }}>
                     {'\u2194'} {edge.connected_headline} ({edge.strength.toFixed(1)})
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {/* Remote Web Edges (WS-ONLINE-F) */}
+            {drillData?.remote_web_edges && drillData.remote_web_edges.length > 0 && (
+              <div style={{ marginBottom: 12 }}>
+                <div style={{
+                  fontSize: 11, opacity: 0.5, marginBottom: 4, marginTop: 12,
+                  textTransform: 'uppercase', letterSpacing: '0.5px',
+                }}>
+                  Remote Connections
+                </div>
+                {drillData.remote_web_edges.map((edge, i) => (
+                  <div key={`remote-edge-${i}`} style={{
+                    fontSize: 12, padding: '4px 6px', opacity: 0.8,
+                    display: 'flex', alignItems: 'center', gap: 6,
+                  }}>
+                    <span style={{
+                      fontSize: 9, padding: '1px 4px', borderRadius: 3,
+                      background: 'rgba(100, 180, 255, 0.15)',
+                      color: 'rgba(100, 180, 255, 0.9)',
+                      fontWeight: 600, textTransform: 'uppercase',
+                    }}>
+                      remote
+                    </span>
+                    <span style={{ opacity: 0.7 }}>
+                      {edge.remote_slug}
+                    </span>
+                    <span style={{ opacity: 0.5, fontSize: 11 }}>
+                      {edge.relationship} ({edge.relevance.toFixed(1)})
+                    </span>
                   </div>
                 ))}
               </div>

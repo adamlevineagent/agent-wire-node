@@ -485,6 +485,91 @@ fn with_agent_id() -> impl Filter<Extract = (Option<String>,), Error = warp::Rej
     warp::header::optional::<String>("x-agent-id")
 }
 
+// ── Payment token header filter (WS-ONLINE-H) ──────────────────────
+
+fn with_payment_token(
+) -> impl Filter<Extract = (Option<String>,), Error = warp::Rejection> + Clone {
+    warp::header::optional::<String>("x-payment-token")
+}
+
+// ── Payment token validation helper (WS-ONLINE-H) ──────────────────
+//
+// Called by billable query handlers after access tier enforcement passes.
+// For now, logs the payment token but does NOT enforce (returns Ok even on failure).
+// Full enforcement (reject queries without valid payment token) will be enabled
+// when the Wire server payment-intent/redeem endpoints are live.
+
+/// Validate an X-Payment-Token header if present (WS-ONLINE-H).
+///
+/// For Wire JWT authenticated requests, checks whether the request includes
+/// a payment token and logs validation results. Does NOT enforce — queries
+/// proceed regardless of payment token validity. The returned `Option<String>`
+/// contains the nonce from a valid token (for future redeem calls).
+///
+/// ### WS-ONLINE-H ENFORCEMENT POINT ###
+/// When the Wire server payment-intent/redeem endpoints are live, change this
+/// function to return `Err(response)` on missing/invalid payment tokens for
+/// priced pyramids. At that point:
+/// 1. Require valid payment token for all priced pyramid queries
+/// 2. After query execution, call POST /api/v1/wire/payment-redeem with the token
+/// 3. On redeem failure, store in pyramid_unredeemed_tokens for retry
+async fn validate_payment_token(
+    payment_token_header: &Option<String>,
+    auth_source: &AuthSource,
+    jwt_public_key: &tokio::sync::RwLock<String>,
+    node_id: &tokio::sync::RwLock<String>,
+) -> Option<crate::server::PaymentTokenClaims> {
+    // Only relevant for Wire JWT authenticated requests
+    let operator_id = match auth_source {
+        AuthSource::Local => return None,
+        AuthSource::WireJwt { operator_id, .. } => operator_id,
+    };
+
+    let token = match payment_token_header {
+        Some(t) if !t.is_empty() => t,
+        _ => {
+            // No payment token present — this is fine for now (not enforced yet)
+            tracing::trace!(
+                operator_id = %operator_id,
+                "No X-Payment-Token header (WS-ONLINE-H: not yet enforced)"
+            );
+            return None;
+        }
+    };
+
+    let pubkey = jwt_public_key.read().await;
+    if pubkey.is_empty() {
+        tracing::warn!("Payment token present but no Wire public key configured");
+        return None;
+    }
+
+    let my_node_id = node_id.read().await;
+
+    match crate::server::verify_payment_token(token, &pubkey, &my_node_id) {
+        Ok(claims) => {
+            tracing::info!(
+                operator_id = %operator_id,
+                nonce = ?claims.nonce,
+                total_amount = %claims.total_amount,
+                stamp = %claims.stamp_amount,
+                access = %claims.access_amount,
+                "Valid payment token received (WS-ONLINE-H)"
+            );
+            Some(claims)
+        }
+        Err(e) => {
+            tracing::warn!(
+                operator_id = %operator_id,
+                error = %e,
+                "Invalid payment token (WS-ONLINE-H: not enforced, logging only)"
+            );
+            // ### WS-ONLINE-H ENFORCEMENT POINT ###
+            // When enforcing, return an error response here instead of None
+            None
+        }
+    }
+}
+
 // ── Usage logging helper (non-blocking) ─────────────────────────────
 
 fn log_query_usage(
@@ -514,9 +599,61 @@ fn log_query_usage(
 
 // ── Route definitions ───────────────────────────────────────────────
 
+/// Query parameters for the cost preview endpoint (WS-ONLINE-H).
+#[derive(Deserialize)]
+struct QueryCostParams {
+    /// Query type: "apex", "drill", "search", "export"
+    query_type: Option<String>,
+    /// Node ID (required for drill queries, used for handle-path resolution)
+    node_id: Option<String>,
+}
+
+/// Response from the cost preview endpoint (WS-ONLINE-H).
+#[derive(Serialize)]
+struct QueryCostResponse {
+    /// Stamp fee (always 1 credit, flat p2p to serving node)
+    stamp: u64,
+    /// Access price (UFF-routed, 0 for public pyramids)
+    access_price: i64,
+    /// Total cost (stamp + access_price)
+    total: i64,
+    /// Pyramid slug
+    slug: String,
+    /// Serving node's operator ID (needed for payment-intent call)
+    serving_node_id: String,
+}
+
+/// WS-ONLINE-V: Request body for POST /pyramid/remote-query proxy endpoint.
+/// Vibesmithy sends this to the local node, which forwards the query to a remote pyramid.
+#[derive(Deserialize)]
+struct RemoteQueryBody {
+    /// The remote pyramid's tunnel URL
+    tunnel_url: String,
+    /// Pyramid slug to query on the remote node
+    slug: String,
+    /// Action: "apex", "drill", "search", "entities", "export"
+    action: String,
+    /// Action-specific parameters (e.g., node_id for drill, q for search)
+    #[serde(default)]
+    params: std::collections::HashMap<String, String>,
+}
+
+/// WS-ONLINE-V: Payment required response for priced pyramids (402).
+#[derive(Serialize)]
+struct RemotePaymentRequired {
+    stamp: u64,
+    access_price: i64,
+    total: i64,
+    slug: String,
+    serving_node_id: String,
+}
+
 pub fn pyramid_routes(
     state: Arc<PyramidState>,
     jwt_public_key: Arc<tokio::sync::RwLock<String>>,
+    /// Node operator ID for cost preview responses (WS-ONLINE-H).
+    /// This is the node's identity on the Wire — used as `serving_node_id`.
+    node_id: Arc<tokio::sync::RwLock<String>>,
 ) -> warp::filters::BoxedFilter<(warp::reply::Response,)> {
     let prefix = warp::path("pyramid");
 
@@ -1549,6 +1686,20 @@ pub fn pyramid_routes(
         .and(with_read_auth(state.clone(), jwt_public_key.clone()))
         .and_then(handle_composed_view));
 
+    // WS-ONLINE-H: GET /pyramid/:slug/query-cost — cost preview for nano-transactions.
+    // Returns stamp (1) + access_price (from emergent or explicit pricing) + total.
+    // Gated behind Wire JWT auth (with_dual_auth) — only remote agents need cost info.
+    let node_id_for_cost = node_id.clone();
+    let query_cost = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("query-cost"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(with_slug_read_auth(state.clone(), jwt_public_key.clone()))
+        .and(warp::query::<QueryCostParams>())
+        .and(warp::any().map(move || node_id_for_cost.clone()))
+        .and_then(handle_query_cost));
+
     // WS-ONLINE-D: GET /pyramid/:slug/export — full node export for pinning.
     // Gated behind Wire JWT auth (with_dual_auth). Has its own stricter rate limit
     // (5/minute per operator) enforced in the handler, separate from query rate limit.
@@ -1599,6 +1750,24 @@ pub fn pyramid_routes(
         })
         .map(|r: warp::reply::Response| r)
         .boxed();
+
+    // LOCAL-ONLY: POST /pyramid/remote-query — Vibesmithy proxy for remote pyramid queries.
+    // Authenticated via local auth_token ONLY (never Wire JWT — this is the local node proxying).
+    // Rate limited: 60 queries/minute per tunnel_url to prevent accidental credit drain.
+    let remote_query_rl: Arc<Mutex<std::collections::HashMap<String, (u64, std::time::Instant)>>> =
+        Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let remote_query_rl_clone = remote_query_rl.clone();
+    let remote_query_state = state.clone();
+    let remote_query_route = route!(prefix
+        .and(warp::path("remote-query"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(warp::body::content_length_limit(1_048_576))
+        .and(with_auth_state(remote_query_state))
+        .and(warp::body::json::<RemoteQueryBody>())
+        .and(warp::header::optional::<String>("x-confirm-payment"))
+        .and(warp::any().map(move || remote_query_rl_clone.clone()))
+        .and_then(handle_remote_query));
 
     // Combine routes. Box in groups to keep the nested Either type manageable.
     // Each .or().unify() flattens a pair, and .boxed() erases the type.
@@ -1673,10 +1842,12 @@ pub fn pyramid_routes(
     // Chain import route (P4.2) — literal "chain" path must be before slug-parameterized routes
     let h8 = chain_import;
 
-    // CRITICAL: Vine routes (h6, h7) and chain import (h8) with literal path segments MUST come
-    // BEFORE slug-parameterized routes, otherwise "vine"/"chain" gets captured as a :slug param.
+    // CRITICAL: Vine routes (h6, h7), chain import (h8), and remote-query with literal path segments
+    // MUST come BEFORE slug-parameterized routes, otherwise "vine"/"chain"/"remote-query" gets
+    // captured as a :slug param.
     let top = h6.or(h7).unify().boxed(); // Vine routes first (literal paths)
     let top = top.or(h8).unify().boxed(); // Chain import (literal paths)
+    let top = top.or(remote_query_route).unify().boxed(); // WS-ONLINE-V: Remote query proxy (literal path)
     let top2 = top.or(h1).unify().boxed(); // Then everything else
     let top3 = top2.or(h2).unify().boxed();
     let top4 = top3.or(h3).unify().boxed();
@@ -1692,7 +1863,8 @@ pub fn pyramid_routes(
     let top11 = top10.or(r31).unify().boxed(); // Archive, purge, references routes (WS8-B)
     let top12 = top11.or(composed_route).unify().boxed(); // Composed view route (WS8-H)
     let top13 = top12.or(export_route).unify().boxed(); // WS-ONLINE-D: Export endpoint for pinning
-    top13
+    let top14 = top13.or(query_cost).unify().boxed(); // WS-ONLINE-H: Cost preview for nano-transactions
+    top14
 }
 
 // ── Route handlers ──────────────────────────────────────────────────
@@ -5037,5 +5209,301 @@ async fn handle_export(
             warp::http::StatusCode::INTERNAL_SERVER_ERROR,
             &format!("export failed: {}", e),
         )),
+    }
+}
+
+// ── WS-ONLINE-H: Cost preview handler ───────────────────────────────
+
+async fn handle_query_cost(
+    slug_name: String,
+    (state, auth_source): (Arc<PyramidState>, AuthSource),
+    params: QueryCostParams,
+    node_id: Arc<tokio::sync::RwLock<String>>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let conn = state.reader.lock().await;
+
+    // WS-ONLINE-E: Access tier enforcement — embargoed pyramids should not expose cost
+    if let Err(response) = enforce_access_tier(&conn, &slug_name, &auth_source) {
+        return Ok(response);
+    }
+
+    // Verify slug exists
+    match db::get_slug(&conn, &slug_name) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return Ok(json_error(
+                warp::http::StatusCode::NOT_FOUND,
+                &format!("slug '{}' not found", slug_name),
+            ));
+        }
+        Err(e) => {
+            return Ok(json_error(
+                warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                &e.to_string(),
+            ));
+        }
+    }
+
+    // Determine access price: explicit override first, then cached emergent price, then 0
+    let (tier, explicit_price, _circles) = db::get_access_tier(&conn, &slug_name).unwrap_or((
+        "public".to_string(),
+        None,
+        None,
+    ));
+
+    let access_price: i64 = match tier.as_str() {
+        "public" => 0, // Public pyramids: stamp only, no access fee
+        "priced" => {
+            // Explicit price override takes precedence, otherwise use cached emergent price
+            if let Some(p) = explicit_price {
+                p
+            } else {
+                db::get_cached_emergent_price(&conn, &slug_name)
+                    .unwrap_or(None)
+                    .unwrap_or(0)
+            }
+        }
+        // Circle-scoped: no access fee (access is gated by membership, not price)
+        "circle-scoped" => 0,
+        // Embargoed: shouldn't reach here (blocked above), but return 0
+        _ => 0,
+    };
+
+    let stamp: u64 = 1; // Flat 1-credit p2p fee, always
+    let total = stamp as i64 + access_price;
+
+    let serving_node_id = node_id.read().await.clone();
+
+    let response = QueryCostResponse {
+        stamp,
+        access_price,
+        total,
+        slug: slug_name.clone(),
+        serving_node_id,
+    };
+
+    tracing::debug!(
+        slug = %slug_name,
+        stamp = %stamp,
+        access_price = %access_price,
+        total = %total,
+        query_type = ?params.query_type,
+        auth = ?auth_source,
+        "query-cost preview served"
+    );
+
+    Ok(json_ok(&response))
+}
+
+// ── WS-ONLINE-V: Remote query proxy handler ──────────────────────────────────
+
+/// POST /pyramid/remote-query — Proxy endpoint for Vibesmithy to query remote pyramids.
+///
+/// Vibesmithy ALWAYS talks to the local node only. For remote pyramids, Vibesmithy
+/// sends the tunnel URL + slug + action here, and the local node forwards the request
+/// using its own Wire JWT. The Wire JWT never reaches the browser.
+///
+/// Rate limited: 60 queries/minute per tunnel_url to prevent accidental credit drain.
+///
+/// Payment flow (WS-ONLINE-H):
+/// 1. Check remote pyramid cost via GET {tunnel_url}/pyramid/{slug}/query-cost
+/// 2. If priced and no X-Confirm-Payment header: return 402 with cost details
+/// 3. If confirmed (or public): call Wire payment-intent, forward query with payment token
+/// 4. Return result to Vibesmithy
+async fn handle_remote_query(
+    state: Arc<PyramidState>,
+    body: RemoteQueryBody,
+    confirm_payment: Option<String>,
+    rate_limiter: Arc<Mutex<std::collections::HashMap<String, (u64, std::time::Instant)>>>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    // Validate action
+    let valid_actions = ["apex", "drill", "search", "entities", "export"];
+    if !valid_actions.contains(&body.action.as_str()) {
+        return Ok(json_error(
+            warp::http::StatusCode::BAD_REQUEST,
+            &format!("Invalid action '{}'. Must be one of: {:?}", body.action, valid_actions),
+        ));
+    }
+
+    // Validate tunnel URL (basic sanitization)
+    if !body.tunnel_url.starts_with("http://") && !body.tunnel_url.starts_with("https://") {
+        return Ok(json_error(
+            warp::http::StatusCode::BAD_REQUEST,
+            "tunnel_url must start with http:// or https://",
+        ));
+    }
+
+    // Rate limiting: 60 queries/minute per tunnel_url
+    {
+        let mut limiter = rate_limiter.lock().await;
+        let now = std::time::Instant::now();
+        let entry = limiter
+            .entry(body.tunnel_url.clone())
+            .or_insert((0u64, now));
+
+        if now.duration_since(entry.1).as_secs() >= 60 {
+            entry.0 = 0;
+            entry.1 = now;
+        }
+
+        entry.0 += 1;
+        if entry.0 > 60 {
+            return Ok(json_error(
+                warp::http::StatusCode::TOO_MANY_REQUESTS,
+                "Remote query rate limit exceeded (60/minute per tunnel). Wait before retrying.",
+            ));
+        }
+    }
+
+    // Get Wire JWT for authenticating with the remote node
+    let wire_jwt = {
+        let config = state.config.read().await;
+        config.wire_jwt.clone().unwrap_or_default()
+    };
+    let wire_server_url = std::env::var("WIRE_URL")
+        .unwrap_or_else(|_| "https://api.callmeplayful.com".to_string());
+
+    if wire_jwt.is_empty() {
+        return Ok(json_error(
+            warp::http::StatusCode::UNAUTHORIZED,
+            "Wire JWT not configured on this node. Complete Wire authentication in the desktop app first.",
+        ));
+    }
+
+    // Build the RemotePyramidClient
+    let client = wire_import::RemotePyramidClient::new(
+        body.tunnel_url.clone(),
+        wire_jwt.clone(),
+        wire_server_url.clone(),
+    );
+
+    // Step 1: Check cost (for priced pyramids)
+    // For now, attempt the query directly. If the remote node returns 402,
+    // we propagate it back. Full payment-intent flow depends on WS-ONLINE-H.
+    let has_payment_confirmation = confirm_payment
+        .as_ref()
+        .map(|v| v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
+    // Step 2: Forward the query based on action type
+    let result: Result<serde_json::Value, String> = match body.action.as_str() {
+        "apex" => {
+            match client.remote_apex(&body.slug).await {
+                Ok(resp) => serde_json::to_value(&resp).map_err(|e| e.to_string()),
+                Err(e) => Err(e.to_string()),
+            }
+        }
+        "drill" => {
+            let node_id = body.params.get("node_id").cloned().unwrap_or_default();
+            if node_id.is_empty() {
+                return Ok(json_error(
+                    warp::http::StatusCode::BAD_REQUEST,
+                    "params.node_id required for drill action",
+                ));
+            }
+            match client.remote_drill(&body.slug, &node_id).await {
+                Ok(resp) => serde_json::to_value(&resp).map_err(|e| e.to_string()),
+                Err(e) => Err(e.to_string()),
+            }
+        }
+        "search" => {
+            let q = body.params.get("q").cloned().unwrap_or_default();
+            if q.is_empty() {
+                return Ok(json_error(
+                    warp::http::StatusCode::BAD_REQUEST,
+                    "params.q required for search action",
+                ));
+            }
+            match client.remote_search(&body.slug, &q, Some(20)).await {
+                Ok(resp) => serde_json::to_value(&resp).map_err(|e| e.to_string()),
+                Err(e) => Err(e.to_string()),
+            }
+        }
+        "entities" => {
+            // RemotePyramidClient doesn't have a remote_entities method yet.
+            // Use a direct HTTP call via the client's tunnel URL for now.
+            let url = format!(
+                "{}/pyramid/{}/entities",
+                body.tunnel_url.trim_end_matches('/'),
+                urlencoding::encode(&body.slug),
+            );
+            let http_client = reqwest::Client::new();
+            match http_client
+                .get(&url)
+                .header("Authorization", format!("Bearer {}", wire_jwt))
+                .timeout(std::time::Duration::from_secs(30))
+                .send()
+                .await
+            {
+                Ok(resp) => {
+                    if resp.status().is_success() {
+                        match resp.json::<serde_json::Value>().await {
+                            Ok(val) => Ok(val),
+                            Err(e) => Err(format!("Failed to parse entities response: {}", e)),
+                        }
+                    } else {
+                        let status = resp.status().as_u16();
+                        let body_text = resp.text().await.unwrap_or_default();
+                        Err(format!("Remote returned {}: {}", status, body_text))
+                    }
+                }
+                Err(e) => Err(format!("Tunnel unreachable: {}", e)),
+            }
+        }
+        "export" => {
+            match client.remote_export(&body.slug).await {
+                Ok(resp) => serde_json::to_value(&resp).map_err(|e| e.to_string()),
+                Err(e) => Err(e.to_string()),
+            }
+        }
+        _ => unreachable!(), // Already validated above
+    };
+
+    match result {
+        Ok(value) => Ok(json_ok(&value)),
+        Err(err_msg) => {
+            // Check for specific error codes in the error message
+            if err_msg.contains("402") || err_msg.contains("Payment Required") {
+                // Priced pyramid — return 402 with details
+                // In the full WS-ONLINE-H flow, we'd parse the cost from the response.
+                // For now, return a generic 402 that Vibesmithy can handle.
+                let payment_info = RemotePaymentRequired {
+                    stamp: 1,
+                    access_price: 0, // Will be populated from query-cost once H lands
+                    total: 1,
+                    slug: body.slug.clone(),
+                    serving_node_id: String::new(), // Will be populated from query-cost
+                };
+                Ok(warp::http::Response::builder()
+                    .status(402)
+                    .header("Content-Type", "application/json")
+                    .body(serde_json::to_string(&payment_info).unwrap_or_default().into())
+                    .unwrap())
+            } else if err_msg.contains("403") || err_msg.contains("Forbidden") {
+                Ok(json_error(warp::http::StatusCode::FORBIDDEN, &err_msg))
+            } else if err_msg.contains("451") {
+                Ok(json_error(
+                    warp::http::StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS,
+                    &err_msg,
+                ))
+            } else if err_msg.contains("unreachable") || err_msg.contains("connect") || err_msg.contains("timeout") {
+                Ok(json_error(warp::http::StatusCode::BAD_GATEWAY, &format!(
+                    "Tunnel unreachable: {}. If you have a pinned copy, it will be used as fallback.",
+                    err_msg,
+                )))
+            } else {
+                tracing::warn!(
+                    tunnel_url = %body.tunnel_url,
+                    slug = %body.slug,
+                    action = %body.action,
+                    error = %err_msg,
+                    "Remote query proxy failed"
+                );
+                Ok(json_error(
+                    warp::http::StatusCode::BAD_GATEWAY,
+                    &format!("Remote query failed: {}", err_msg),
+                ))
+            }
+        }
     }
 }

@@ -844,6 +844,38 @@ fn migrate_online_push_columns(conn: &Connection) -> Result<()> {
         [],
     );
 
+    // ── pyramid_unredeemed_tokens: payment retry queue (WS-ONLINE-H) ──
+    //
+    // When a serving node executes a query but fails to redeem the payment
+    // token (e.g., Wire server unavailable), the token is stored here for
+    // retry with exponential backoff (up to 5 attempts). Tokens auto-expire
+    // after TTL (60s) — the Wire server is the authority on expiration.
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS pyramid_unredeemed_tokens (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            nonce TEXT NOT NULL UNIQUE,
+            payment_token TEXT NOT NULL,
+            querier_operator_id TEXT NOT NULL,
+            slug TEXT NOT NULL,
+            query_type TEXT NOT NULL,
+            stamp_amount INTEGER NOT NULL DEFAULT 1,
+            access_amount INTEGER NOT NULL DEFAULT 0,
+            total_amount INTEGER NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            expires_at TEXT NOT NULL,
+            retry_count INTEGER NOT NULL DEFAULT 0,
+            last_retry_at TEXT DEFAULT NULL,
+            redeemed_at TEXT DEFAULT NULL,
+            status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'redeemed', 'expired', 'failed'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_unredeemed_tokens_status
+            ON pyramid_unredeemed_tokens(status) WHERE status = 'pending';
+        CREATE INDEX IF NOT EXISTS idx_unredeemed_tokens_expires
+            ON pyramid_unredeemed_tokens(expires_at) WHERE status = 'pending';
+        ",
+    )?;
+
     Ok(())
 }
 
@@ -2415,6 +2447,145 @@ pub fn get_active_edges(conn: &Connection, slug: &str, min_relevance: f64) -> Re
             build_id: row.get(7)?,
             created_at: row.get(8)?,
             updated_at: row.get(9)?,
+        })
+    })?;
+
+    let mut edges = Vec::new();
+    for row in rows {
+        edges.push(row?);
+    }
+    Ok(edges)
+}
+
+// ── Remote Web Edge CRUD (WS-ONLINE-F) ──────────────────────────────────────
+
+/// Save (upsert) a remote web edge. Returns the row ID.
+///
+/// Remote web edges reference nodes on other pyramids via Wire handle-paths.
+/// Scoped by build_id — each build writes its own edges.
+pub fn save_remote_web_edge(conn: &Connection, edge: &RemoteWebEdge) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO pyramid_remote_web_edges (slug, local_thread_id, remote_handle_path, remote_tunnel_url, relationship, relevance, delta_count, build_id, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, datetime('now'))
+         ON CONFLICT(slug, local_thread_id, remote_handle_path, build_id) DO UPDATE SET
+            remote_tunnel_url = excluded.remote_tunnel_url,
+            relationship = excluded.relationship,
+            relevance = excluded.relevance,
+            delta_count = excluded.delta_count,
+            updated_at = datetime('now')",
+        rusqlite::params![
+            edge.slug,
+            edge.local_thread_id,
+            edge.remote_handle_path,
+            edge.remote_tunnel_url,
+            edge.relationship,
+            edge.relevance,
+            edge.delta_count,
+            edge.build_id,
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// Get remote web edges for a specific slug and build_id.
+pub fn get_remote_web_edges(conn: &Connection, slug: &str, build_id: &str) -> Result<Vec<RemoteWebEdge>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, slug, local_thread_id, remote_handle_path, remote_tunnel_url, relationship, relevance, delta_count, build_id, created_at, updated_at
+         FROM pyramid_remote_web_edges WHERE slug = ?1 AND build_id = ?2 ORDER BY relevance DESC",
+    )?;
+
+    let rows = stmt.query_map(rusqlite::params![slug, build_id], |row| {
+        Ok(RemoteWebEdge {
+            id: row.get(0)?,
+            slug: row.get(1)?,
+            local_thread_id: row.get(2)?,
+            remote_handle_path: row.get(3)?,
+            remote_tunnel_url: row.get(4)?,
+            relationship: row.get(5)?,
+            relevance: row.get(6)?,
+            delta_count: row.get(7)?,
+            build_id: row.get(8)?,
+            created_at: row.get(9)?,
+            updated_at: row.get(10)?,
+        })
+    })?;
+
+    let mut edges = Vec::new();
+    for row in rows {
+        edges.push(row?);
+    }
+    Ok(edges)
+}
+
+/// Get all remote web edges for a slug across all builds (for display).
+pub fn get_all_remote_web_edges(conn: &Connection, slug: &str) -> Result<Vec<RemoteWebEdge>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, slug, local_thread_id, remote_handle_path, remote_tunnel_url, relationship, relevance, delta_count, build_id, created_at, updated_at
+         FROM pyramid_remote_web_edges WHERE slug = ?1 ORDER BY build_id DESC, relevance DESC",
+    )?;
+
+    let rows = stmt.query_map(rusqlite::params![slug], |row| {
+        Ok(RemoteWebEdge {
+            id: row.get(0)?,
+            slug: row.get(1)?,
+            local_thread_id: row.get(2)?,
+            remote_handle_path: row.get(3)?,
+            remote_tunnel_url: row.get(4)?,
+            relationship: row.get(5)?,
+            relevance: row.get(6)?,
+            delta_count: row.get(7)?,
+            build_id: row.get(8)?,
+            created_at: row.get(9)?,
+            updated_at: row.get(10)?,
+        })
+    })?;
+
+    let mut edges = Vec::new();
+    for row in rows {
+        edges.push(row?);
+    }
+    Ok(edges)
+}
+
+/// Get the tunnel URL for a pinned slug (if any).
+pub fn get_slug_tunnel_url(conn: &Connection, slug: &str) -> Result<Option<String>> {
+    let result = conn.query_row(
+        "SELECT source_tunnel_url FROM pyramid_slugs WHERE slug = ?1",
+        rusqlite::params![slug],
+        |row| row.get::<_, Option<String>>(0),
+    );
+
+    match result {
+        Ok(url) => Ok(url),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Get remote web edges for a specific local thread.
+pub fn get_remote_web_edges_for_thread(
+    conn: &Connection,
+    slug: &str,
+    local_thread_id: &str,
+) -> Result<Vec<RemoteWebEdge>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, slug, local_thread_id, remote_handle_path, remote_tunnel_url, relationship, relevance, delta_count, build_id, created_at, updated_at
+         FROM pyramid_remote_web_edges WHERE slug = ?1 AND local_thread_id = ?2 ORDER BY relevance DESC",
+    )?;
+
+    let rows = stmt.query_map(rusqlite::params![slug, local_thread_id], |row| {
+        Ok(RemoteWebEdge {
+            id: row.get(0)?,
+            slug: row.get(1)?,
+            local_thread_id: row.get(2)?,
+            remote_handle_path: row.get(3)?,
+            remote_tunnel_url: row.get(4)?,
+            relationship: row.get(5)?,
+            relevance: row.get(6)?,
+            delta_count: row.get(7)?,
+            build_id: row.get(8)?,
+            created_at: row.get(9)?,
+            updated_at: row.get(10)?,
         })
     })?;
 
@@ -4849,6 +5020,155 @@ pub fn list_pinned_pyramids(conn: &Connection) -> Result<Vec<(String, String)>> 
 /// Returns all non-superseded nodes for a slug, ordered by depth then chunk_index.
 pub fn get_all_nodes_for_export(conn: &Connection, slug: &str) -> Result<Vec<PyramidNode>> {
     get_all_live_nodes(conn, slug)
+}
+
+// ── WS-ONLINE-H: Unredeemed token CRUD ──────────────────────────────────────
+
+/// An unredeemed payment token awaiting retry (WS-ONLINE-H).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnredeemedToken {
+    pub id: i64,
+    pub nonce: String,
+    pub payment_token: String,
+    pub querier_operator_id: String,
+    pub slug: String,
+    pub query_type: String,
+    pub stamp_amount: i64,
+    pub access_amount: i64,
+    pub total_amount: i64,
+    pub created_at: String,
+    pub expires_at: String,
+    pub retry_count: i64,
+    pub last_retry_at: Option<String>,
+    pub redeemed_at: Option<String>,
+    pub status: String,
+}
+
+/// Insert an unredeemed payment token for retry (WS-ONLINE-H).
+///
+/// Called when a serving node executes a query but the POST /api/v1/wire/payment-redeem
+/// call fails (Wire server unavailable, network error, etc.). The token is stored for
+/// retry with exponential backoff.
+pub fn insert_unredeemed_token(
+    conn: &Connection,
+    nonce: &str,
+    payment_token: &str,
+    querier_operator_id: &str,
+    slug: &str,
+    query_type: &str,
+    stamp_amount: i64,
+    access_amount: i64,
+    total_amount: i64,
+    expires_at: &str,
+) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO pyramid_unredeemed_tokens
+            (nonce, payment_token, querier_operator_id, slug, query_type,
+             stamp_amount, access_amount, total_amount, expires_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        rusqlite::params![
+            nonce,
+            payment_token,
+            querier_operator_id,
+            slug,
+            query_type,
+            stamp_amount,
+            access_amount,
+            total_amount,
+            expires_at,
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// Get all unredeemed tokens that are still pending and have not expired.
+///
+/// Returns tokens ordered by created_at (oldest first) for FIFO retry.
+/// Filters to status='pending' and retry_count < 5 (max retries).
+pub fn get_unredeemed_tokens(conn: &Connection) -> Result<Vec<UnredeemedToken>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, nonce, payment_token, querier_operator_id, slug, query_type,
+                stamp_amount, access_amount, total_amount, created_at, expires_at,
+                retry_count, last_retry_at, redeemed_at, status
+         FROM pyramid_unredeemed_tokens
+         WHERE status = 'pending' AND retry_count < 5
+         ORDER BY created_at ASC",
+    )?;
+
+    let tokens = stmt
+        .query_map([], |row| {
+            Ok(UnredeemedToken {
+                id: row.get(0)?,
+                nonce: row.get(1)?,
+                payment_token: row.get(2)?,
+                querier_operator_id: row.get(3)?,
+                slug: row.get(4)?,
+                query_type: row.get(5)?,
+                stamp_amount: row.get(6)?,
+                access_amount: row.get(7)?,
+                total_amount: row.get(8)?,
+                created_at: row.get(9)?,
+                expires_at: row.get(10)?,
+                retry_count: row.get(11)?,
+                last_retry_at: row.get(12)?,
+                redeemed_at: row.get(13)?,
+                status: row.get(14)?,
+            })
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    Ok(tokens)
+}
+
+/// Mark an unredeemed token as redeemed (WS-ONLINE-H).
+///
+/// Called after a successful POST /api/v1/wire/payment-redeem response.
+pub fn mark_redeemed(conn: &Connection, nonce: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE pyramid_unredeemed_tokens
+         SET status = 'redeemed', redeemed_at = datetime('now')
+         WHERE nonce = ?1 AND status = 'pending'",
+        rusqlite::params![nonce],
+    )?;
+    Ok(())
+}
+
+/// Increment the retry count for an unredeemed token (WS-ONLINE-H).
+///
+/// Called after a failed redeem attempt. If retry_count reaches 5, the token
+/// is automatically marked as 'failed'.
+pub fn increment_unredeemed_retry(conn: &Connection, nonce: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE pyramid_unredeemed_tokens
+         SET retry_count = retry_count + 1, last_retry_at = datetime('now')
+         WHERE nonce = ?1 AND status = 'pending'",
+        rusqlite::params![nonce],
+    )?;
+
+    // Auto-fail after 5 retries
+    conn.execute(
+        "UPDATE pyramid_unredeemed_tokens
+         SET status = 'failed'
+         WHERE nonce = ?1 AND retry_count >= 5 AND status = 'pending'",
+        rusqlite::params![nonce],
+    )?;
+
+    Ok(())
+}
+
+/// Expire unredeemed tokens past their TTL (WS-ONLINE-H).
+///
+/// Should be called periodically (e.g., every 30 seconds) to clean up tokens
+/// whose TTL has passed. Credits auto-unlock on the Wire server after TTL expiry.
+pub fn expire_unredeemed_tokens(conn: &Connection) -> Result<usize> {
+    let expired = conn.execute(
+        "UPDATE pyramid_unredeemed_tokens
+         SET status = 'expired'
+         WHERE status = 'pending' AND expires_at < datetime('now')",
+        [],
+    )?;
+    Ok(expired)
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────

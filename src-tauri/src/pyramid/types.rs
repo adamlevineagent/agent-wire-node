@@ -136,6 +136,8 @@ pub struct DrillResult {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub web_edges: Vec<ConnectedWebEdge>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remote_web_edges: Vec<ConnectedRemoteWebEdge>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence: Vec<EvidenceLink>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub gaps: Vec<GapReport>,
@@ -155,6 +157,16 @@ pub struct ConnectedWebEdge {
     pub connected_headline: String,
     pub relationship: String,
     pub strength: f64,
+}
+
+/// A remote web edge for display in the drill view (WS-ONLINE-F).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConnectedRemoteWebEdge {
+    pub remote_handle_path: String,
+    pub remote_slug: String,
+    pub relationship: String,
+    pub relevance: f64,
+    pub build_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -344,6 +356,56 @@ pub struct WebEdgeDelta {
 pub struct WebEdgeNote {
     pub thread_id: String,
     pub relationship: String,
+}
+
+/// A remote web edge referencing a node on another pyramid (WS-ONLINE-F).
+///
+/// Unlike local `WebEdge` which uses FK-constrained thread IDs, remote edges
+/// store a Wire handle-path (`slug/depth/node-id`) pointing to a node on
+/// another node's pyramid. The tunnel URL is stored so the build runner can
+/// resolve the reference.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteWebEdge {
+    pub id: i64,
+    pub slug: String,
+    pub local_thread_id: String,
+    pub remote_handle_path: String,
+    pub remote_tunnel_url: String,
+    pub relationship: String,
+    pub relevance: f64,
+    pub delta_count: i64,
+    pub build_id: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Parsed components of a three-segment Wire handle-path (`slug/depth/node-id`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct HandlePath {
+    pub slug: String,
+    pub depth: String,
+    pub node_id: String,
+}
+
+impl HandlePath {
+    /// Parse a three-segment handle-path. Returns None if not exactly three segments.
+    pub fn parse(s: &str) -> Option<Self> {
+        let parts: Vec<&str> = s.splitn(3, '/').collect();
+        if parts.len() == 3 && !parts[0].is_empty() && !parts[1].is_empty() && !parts[2].is_empty() {
+            Some(HandlePath {
+                slug: parts[0].to_string(),
+                depth: parts[1].to_string(),
+                node_id: parts[2].to_string(),
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Returns true if this handle-path references a remote pyramid (different slug).
+    pub fn is_remote(&self, local_slug: &str) -> bool {
+        self.slug != local_slug
+    }
 }
 
 /// A usage log entry tracking pyramid read queries.
