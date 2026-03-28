@@ -5211,6 +5211,31 @@ fn main() {
                 ).await;
             });
 
+            // --- Pyramid Sync Timer (WS-ONLINE-A) ---
+            // Ticks every 60s checking for unpublished pyramid builds.
+            // If a linked pyramid has a new completed build, auto-publishes to Wire.
+            let sync_pyramid_state = state.pyramid.clone();
+            let pyramid_sync_state = std::sync::Arc::new(
+                tokio::sync::Mutex::new(
+                    wire_node_lib::pyramid::sync::PyramidSyncState::new()
+                )
+            );
+            let pyramid_sync_state_shared = pyramid_sync_state.clone();
+            tauri::async_runtime::spawn(async move {
+                // Wait for startup to complete before starting sync timer
+                tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+
+                let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
+                loop {
+                    interval.tick().await;
+                    wire_node_lib::pyramid::sync::pyramid_sync_tick(
+                        &sync_pyramid_state,
+                        &pyramid_sync_state_shared,
+                    )
+                    .await;
+                }
+            });
+
             // --- Startup: refresh token, register node, start tunnel ---
             let startup_state = state.clone();
             let startup_config = config.clone();

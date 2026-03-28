@@ -380,6 +380,9 @@ pub async fn publish_layer(
 /// Iterates layers 0 → max_depth. Each layer MUST complete before the next
 /// starts because upper layers reference handle-paths from lower layers.
 ///
+/// After successful publication, writes `build_id` to `last_published_build_id`
+/// on the slug so the sync timer knows this build has been published.
+///
 /// Returns a `FullPublicationResult` with all mappings. The caller is
 /// responsible for persisting ID mappings back to SQLite (scoped write lock).
 pub async fn publish_pyramid_bottom_up(
@@ -499,6 +502,27 @@ pub async fn publish_pyramid_bottom_up(
         "full pyramid publication complete"
     );
 
+    // After successful publication, record the build_id so the sync timer
+    // knows this build has been published and won't re-trigger.
+    if full_result.total_published > 0 || full_result.total_skipped > 0 {
+        if let Ok(Some(build_id)) = db::get_current_build_id(conn, slug) {
+            if let Err(e) = db::set_last_published_build_id(conn, slug, &build_id) {
+                tracing::warn!(
+                    slug = slug,
+                    build_id = %build_id,
+                    error = %e,
+                    "failed to update last_published_build_id after publication"
+                );
+            } else {
+                tracing::info!(
+                    slug = slug,
+                    build_id = %build_id,
+                    "updated last_published_build_id"
+                );
+            }
+        }
+    }
+
     Ok(full_result)
 }
 
@@ -509,25 +533,109 @@ pub async fn publish_pyramid_bottom_up(
 /// Calls `POST /api/v1/wire/corpora/{slug}/documents` on the Wire server.
 /// Returns the Wire-assigned corpus document UUID.
 ///
-/// STUB: For now returns a deterministic placeholder UUID derived from the
-/// file path. The actual Wire endpoint exists but client wiring is deferred.
-/// When fully wired, this will make an HTTP call and return the real UUID.
+/// Falls back to a deterministic placeholder UUID if the HTTP call fails,
+/// so publication can proceed without a live Wire connection.
 pub async fn register_corpus_document(
     slug: &str,
     file_path: &str,
     content_hash: &str,
-    _publisher: &PyramidPublisher,
+    publisher: &PyramidPublisher,
 ) -> Result<String> {
-    // TODO: Wire the actual HTTP call:
-    //   POST {wire_url}/api/v1/wire/corpora/{slug}/documents
-    //   body: { "file_path": file_path, "content_hash": content_hash }
-    //   response: { "document_id": "<uuid>" }
-    //
-    // For now, return a deterministic placeholder UUID so publication can
-    // proceed without a live Wire connection. The placeholder is stable
-    // (same input always produces the same UUID) so re-publication is safe.
-    let composite_key = format!("{}:{}:{}", slug, file_path, content_hash);
-    Ok(make_placeholder_uuid(&composite_key))
+    let url = format!(
+        "{}/api/v1/wire/corpora/{}/documents",
+        publisher.wire_url.trim_end_matches('/'),
+        slug
+    );
+
+    // Derive a title from the file path (filename without extension)
+    let title = std::path::Path::new(file_path)
+        .file_stem()
+        .map(|s| s.to_string_lossy().replace('-', " ").replace('_', " "))
+        .unwrap_or_else(|| file_path.to_string().into());
+
+    // Infer format from extension
+    let format = match std::path::Path::new(file_path)
+        .extension()
+        .and_then(|e| e.to_str())
+    {
+        Some("md" | "markdown") => "text/markdown",
+        Some("html" | "htm") => "text/html",
+        Some("pdf") => "application/pdf",
+        _ => "text/plain",
+    };
+
+    let body = serde_json::json!({
+        "title": title,
+        "format": format,
+        "source_path": file_path,
+        "content_hash": content_hash,
+    });
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .context("register_corpus_document: failed to build HTTP client")?;
+
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", publisher.auth_token))
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await;
+
+    match resp {
+        Ok(response) if response.status().is_success() => {
+            #[derive(serde::Deserialize)]
+            struct CorpusDocResponse {
+                id: String,
+            }
+            match response.json::<CorpusDocResponse>().await {
+                Ok(parsed) => {
+                    tracing::info!(
+                        slug = slug,
+                        file_path = file_path,
+                        wire_uuid = %parsed.id,
+                        "registered corpus document on Wire"
+                    );
+                    Ok(parsed.id)
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        slug = slug,
+                        file_path = file_path,
+                        error = %e,
+                        "failed to parse corpus doc response, falling back to placeholder UUID"
+                    );
+                    let composite_key = format!("{}:{}:{}", slug, file_path, content_hash);
+                    Ok(make_placeholder_uuid(&composite_key))
+                }
+            }
+        }
+        Ok(response) => {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            tracing::warn!(
+                slug = slug,
+                file_path = file_path,
+                status = %status,
+                body = %text.chars().take(200).collect::<String>(),
+                "corpus document registration failed, falling back to placeholder UUID"
+            );
+            let composite_key = format!("{}:{}:{}", slug, file_path, content_hash);
+            Ok(make_placeholder_uuid(&composite_key))
+        }
+        Err(e) => {
+            tracing::warn!(
+                slug = slug,
+                file_path = file_path,
+                error = %e,
+                "corpus document registration network error, falling back to placeholder UUID"
+            );
+            let composite_key = format!("{}:{}:{}", slug, file_path, content_hash);
+            Ok(make_placeholder_uuid(&composite_key))
+        }
+    }
 }
 
 /// Build a PublicationManifest for a single layer (used for logging/reporting).

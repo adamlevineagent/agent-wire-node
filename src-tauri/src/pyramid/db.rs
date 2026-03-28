@@ -4078,6 +4078,85 @@ pub fn is_already_published(conn: &Connection, slug: &str, local_id: &str) -> Re
     }
 }
 
+// ── Publication Tracking ─────────────────────────────────────────────────────
+
+/// Get the last published build_id for a slug.
+///
+/// Returns None if the slug has never been published (column is NULL).
+pub fn get_last_published_build_id(conn: &Connection, slug: &str) -> Result<Option<String>> {
+    let result = conn.query_row(
+        "SELECT last_published_build_id FROM pyramid_slugs WHERE slug = ?1",
+        rusqlite::params![slug],
+        |row| row.get::<_, Option<String>>(0),
+    );
+    match result {
+        Ok(val) => Ok(val),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Set the last published build_id for a slug after successful publication.
+pub fn set_last_published_build_id(conn: &Connection, slug: &str, build_id: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE pyramid_slugs SET last_published_build_id = ?1 WHERE slug = ?2",
+        rusqlite::params![build_id, slug],
+    )?;
+    Ok(())
+}
+
+/// Get the current (latest) build_id for a slug from pyramid_nodes.
+///
+/// Returns the MAX(build_id) across all nodes in the slug, or None if no
+/// nodes exist or all build_ids are NULL.
+pub fn get_current_build_id(conn: &Connection, slug: &str) -> Result<Option<String>> {
+    let result = conn.query_row(
+        "SELECT MAX(build_id) FROM pyramid_nodes WHERE slug = ?1",
+        rusqlite::params![slug],
+        |row| row.get::<_, Option<String>>(0),
+    );
+    match result {
+        Ok(val) => Ok(val),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Count nodes that exist in the pyramid but have not yet been published to Wire.
+///
+/// Returns the number of nodes in the slug that do NOT have a corresponding
+/// entry in pyramid_id_map.
+pub fn count_unpublished_nodes(conn: &Connection, slug: &str) -> Result<i64> {
+    let result = conn.query_row(
+        "SELECT COUNT(*) FROM pyramid_nodes n
+         WHERE n.slug = ?1
+         AND NOT EXISTS (
+             SELECT 1 FROM pyramid_id_map m
+             WHERE m.slug = n.slug AND m.local_id = n.id
+         )",
+        rusqlite::params![slug],
+        |row| row.get::<_, i64>(0),
+    );
+    match result {
+        Ok(count) => Ok(count),
+        Err(e) => {
+            // Gracefully handle "no such table" — pyramid_id_map may not exist yet
+            let msg = e.to_string();
+            if msg.contains("no such table") {
+                // If id_map doesn't exist, all nodes are unpublished
+                let total: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM pyramid_nodes WHERE slug = ?1",
+                    rusqlite::params![slug],
+                    |row| row.get(0),
+                )?;
+                Ok(total)
+            } else {
+                Err(e.into())
+            }
+        }
+    }
+}
+
 // ── Source Deltas CRUD (file-level, NOT thread-level) ────────────────────────
 
 /// Save a file-level source delta.

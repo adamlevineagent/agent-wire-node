@@ -52,6 +52,7 @@ pub mod staleness;
 pub mod staleness_bridge;
 pub mod stale_helpers_upper;
 pub mod supersession;
+pub mod sync;
 pub mod local_store;
 pub mod transform_runtime;
 pub mod types;
