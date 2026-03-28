@@ -20,20 +20,17 @@ use super::db;
 use super::llm::{self, LlmConfig};
 use super::types::{AffectedNode, Contradiction, EvidenceVerdict, PyramidNode, SupersessionTrace};
 
-// ── Constants ────────────────────────────────────────────────────────────────
+// ── Constants (loaded from OperationalConfig) ─────────────────────────────────
 
-/// Minimum confidence threshold for a contradiction to proceed to tracing.
-const CONTRADICTION_CONFIDENCE_THRESHOLD: f64 = 0.8;
+use super::Tier3Config;
+
+fn contradiction_confidence_threshold() -> f64 { Tier3Config::default().contradiction_confidence_threshold }
 
 /// Channel identifier for staleness queue entries created by supersession.
 const CHANNEL_BELIEF_SUPERSESSION: &str = "belief_supersession";
 
-/// Priority for supersession-triggered re-answer queue items (maximum).
-const SUPERSESSION_PRIORITY: f64 = 1.0;
-
-/// Maximum trace depth to prevent runaway in degenerate graph topologies.
-/// Channel B does NOT attenuate, but we still cap at a sane limit.
-const MAX_TRACE_DEPTH: i64 = 50;
+fn supersession_priority() -> f64 { Tier3Config::default().supersession_priority }
+fn max_trace_depth() -> i64 { Tier3Config::default().max_trace_depth }
 
 // ── LLM Response Types ───────────────────────────────────────────────────────
 
@@ -148,7 +145,7 @@ pub async fn detect_contradictions(
     let contradictions: Vec<Contradiction> = parsed
         .contradictions
         .into_iter()
-        .filter(|c| c.confidence >= CONTRADICTION_CONFIDENCE_THRESHOLD)
+        .filter(|c| c.confidence >= contradiction_confidence_threshold())
         .map(|c| Contradiction {
             superseded_claim: c.superseded_claim,
             corrected_to: c.corrected_to,
@@ -207,10 +204,10 @@ pub fn trace_supersession(
 
         while let Some((current_node_id, depth, path)) = queue.pop_front() {
             // Depth safety cap
-            if depth > MAX_TRACE_DEPTH {
+            if depth > max_trace_depth() {
                 warn!(
                     "[supersession] Trace depth exceeded {} for node {}, stopping this branch",
-                    MAX_TRACE_DEPTH, current_node_id
+                    max_trace_depth(), current_node_id
                 );
                 continue;
             }
@@ -422,7 +419,7 @@ pub fn record_supersession(
             &affected.node_id,
             &reason,
             CHANNEL_BELIEF_SUPERSESSION,
-            SUPERSESSION_PRIORITY,
+            supersession_priority(),
         )?;
         enqueued += 1;
     }
@@ -475,6 +472,7 @@ mod tests {
             children: vec![],
             parent_id: None,
             superseded_by: None,
+            build_id: None,
             created_at: "2026-01-01T00:00:00Z".to_string(),
         }
     }
@@ -573,7 +571,7 @@ mod tests {
     #[test]
     fn test_contradiction_confidence_threshold() {
         // Verify the threshold constant is set correctly
-        assert_eq!(CONTRADICTION_CONFIDENCE_THRESHOLD, 0.8);
+        assert_eq!(contradiction_confidence_threshold(), 0.8);
     }
 
     #[test]

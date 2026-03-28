@@ -12,7 +12,6 @@
 
 pub mod build;
 pub mod build_runner;
-pub mod canonical_l0;
 pub mod characterize;
 pub mod chain_dispatch;
 pub mod chain_engine;
@@ -20,7 +19,6 @@ pub mod chain_executor;
 pub mod chain_loader;
 pub mod chain_registry;
 pub mod chain_resolve;
-pub mod chain_resolver;
 pub mod config_helper;
 pub mod converge_expand;
 pub mod crystallization;
@@ -44,7 +42,6 @@ pub mod query;
 pub mod question_compiler;
 pub mod reconciliation;
 pub mod question_decomposition;
-pub mod question_l0;
 pub mod question_loader;
 pub mod question_yaml;
 pub mod routes;
@@ -113,6 +110,10 @@ pub struct PyramidConfig {
     pub use_chain_engine: bool,
     #[serde(default)]
     pub use_ir_executor: bool,
+    /// Operational constants organized by tier. All fields have sensible defaults
+    /// matching the original hardcoded values, so existing configs are backward compatible.
+    #[serde(default)]
+    pub operational: OperationalConfig,
 }
 
 fn default_primary_model() -> String {
@@ -131,6 +132,201 @@ fn default_collapse_model() -> String {
     "x-ai/grok-4.20-beta".into()
 }
 
+// ── Operational Config (Tiered) ─────────────────────────────────────────────
+//
+// All operational constants externalized from Rust source. Organized into tiers
+// so operators know the blast radius of changes:
+//   Tier 1 (Operator): model selection, concurrency, temperature, max_tokens, retries, pricing
+//   Tier 2 (Tunable): staleness threshold, token budgets, timeouts, chunking, headline limits
+//   Tier 3 (Expert): delta collapse, webbing, supersession, staleness propagation, stale batching
+
+/// Tier 1 — Operator-level config. Safe to change for different workloads.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Tier1Config {
+    // Context limits
+    pub primary_context_limit: usize,
+    pub fallback_1_context_limit: usize,
+    pub high_tier_context_limit: usize,
+    pub max_tier_context_limit: usize,
+    // Concurrency
+    pub answer_concurrency: usize,
+    pub stale_max_concurrent_helpers: usize,
+    // max_tokens
+    pub decomposition_max_tokens: usize,
+    pub characterize_max_tokens: usize,
+    pub extraction_schema_max_tokens: usize,
+    pub synthesis_prompts_max_tokens: usize,
+    pub pre_map_max_tokens: usize,
+    pub answer_max_tokens: usize,
+    pub ir_max_tokens: usize,
+    // Temperature
+    pub decomposition_temperature: f32,
+    pub characterize_temperature: f32,
+    pub extraction_schema_temperature: f32,
+    pub pre_map_temperature: f32,
+    pub answer_temperature: f32,
+    pub default_ir_temperature: f32,
+    // Retries
+    pub llm_max_retries: u32,
+    // Pricing (per-million tokens)
+    pub default_input_price_per_million: f64,
+    pub default_output_price_per_million: f64,
+    // Timeouts (structured response minimum timeouts in seconds)
+    pub classify_min_timeout_secs: u64,
+    pub web_min_timeout_secs: u64,
+    pub default_structured_min_timeout_secs: u64,
+}
+
+impl Default for Tier1Config {
+    fn default() -> Self {
+        Self {
+            primary_context_limit: 120_000,
+            fallback_1_context_limit: 900_000,
+            high_tier_context_limit: 1_000_000,
+            max_tier_context_limit: 2_000_000,
+            answer_concurrency: 5,
+            stale_max_concurrent_helpers: 3,
+            decomposition_max_tokens: 4096,
+            characterize_max_tokens: 2048,
+            extraction_schema_max_tokens: 4096,
+            synthesis_prompts_max_tokens: 2048,
+            pre_map_max_tokens: 4096,
+            answer_max_tokens: 4096,
+            ir_max_tokens: 100_000,
+            decomposition_temperature: 0.3,
+            characterize_temperature: 0.3,
+            extraction_schema_temperature: 0.3,
+            pre_map_temperature: 0.2,
+            answer_temperature: 0.3,
+            default_ir_temperature: 0.3,
+            llm_max_retries: 5,
+            default_input_price_per_million: 0.19,
+            default_output_price_per_million: 0.75,
+            classify_min_timeout_secs: 420,
+            web_min_timeout_secs: 240,
+            default_structured_min_timeout_secs: 180,
+        }
+    }
+}
+
+/// Tier 2 — Tunable config. Affects quality/performance tradeoffs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Tier2Config {
+    pub staleness_threshold: f64,
+    pub l0_summary_budget: usize,
+    pub pre_map_prompt_budget: usize,
+    pub ir_thread_input_char_budget: usize,
+    pub distillation_token_budget: usize,
+    pub distillation_early_collapse: usize,
+    pub llm_base_timeout_secs: u64,
+    pub llm_max_timeout_secs: u64,
+    pub chunk_target_lines: usize,
+    pub max_headline_chars: usize,
+    pub max_headline_words: usize,
+    pub teaser_max_chars: usize,
+    pub granularity_ranges: Vec<(u32, u32)>,
+    pub faq_category_threshold: usize,
+}
+
+impl Default for Tier2Config {
+    fn default() -> Self {
+        Self {
+            staleness_threshold: 0.3,
+            l0_summary_budget: 100_000,
+            pre_map_prompt_budget: 80_000,
+            ir_thread_input_char_budget: 90_000,
+            distillation_token_budget: 800,
+            distillation_early_collapse: 1200,
+            llm_base_timeout_secs: 120,
+            llm_max_timeout_secs: 600,
+            chunk_target_lines: 100,
+            max_headline_chars: 72,
+            max_headline_words: 8,
+            teaser_max_chars: 200,
+            // Index = granularity (1-5), value = (min, max) hint range
+            // Index 0 = default fallback
+            granularity_ranges: vec![
+                (3, 4), // granularity 0 / default
+                (2, 3), // granularity 1
+                (3, 4), // granularity 2
+                (3, 4), // granularity 3
+                (4, 5), // granularity 4
+                (5, 6), // granularity 5
+            ],
+            faq_category_threshold: 20,
+        }
+    }
+}
+
+/// Tier 3 — Expert config. Affects crystallization, webbing, supersession internals.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Tier3Config {
+    // Delta / collapse
+    pub collapse_threshold: i64,
+    pub max_propagation_depth: i64,
+    pub self_check_window: i64,
+    // Webbing
+    pub web_edge_collapse_threshold: i64,
+    pub max_edges_per_thread: usize,
+    pub edge_decay_rate: f64,
+    pub edge_min_relevance: f64,
+    // Supersession
+    pub contradiction_confidence_threshold: f64,
+    pub supersession_priority: f64,
+    pub max_trace_depth: i64,
+    // Staleness propagation
+    pub staleness_max_propagation_depth: i64,
+    pub staleness_debounce_secs: u64,
+    // Stale batching
+    pub batch_cap_nodes: usize,
+    pub batch_cap_connections: usize,
+    pub batch_cap_renames: usize,
+}
+
+impl Default for Tier3Config {
+    fn default() -> Self {
+        Self {
+            collapse_threshold: 50,
+            max_propagation_depth: 10,
+            self_check_window: 5,
+            web_edge_collapse_threshold: 20,
+            max_edges_per_thread: 10,
+            edge_decay_rate: 0.05,
+            edge_min_relevance: 0.1,
+            contradiction_confidence_threshold: 0.8,
+            supersession_priority: 1.0,
+            max_trace_depth: 50,
+            staleness_max_propagation_depth: 20,
+            staleness_debounce_secs: 10,
+            batch_cap_nodes: 5,
+            batch_cap_connections: 20,
+            batch_cap_renames: 1,
+        }
+    }
+}
+
+/// All operational constants, organized by tier.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OperationalConfig {
+    pub tier1: Tier1Config,
+    pub tier2: Tier2Config,
+    pub tier3: Tier3Config,
+}
+
+impl Default for OperationalConfig {
+    fn default() -> Self {
+        Self {
+            tier1: Tier1Config::default(),
+            tier2: Tier2Config::default(),
+            tier3: Tier3Config::default(),
+        }
+    }
+}
+
 impl Default for PyramidConfig {
     fn default() -> Self {
         Self {
@@ -143,6 +339,7 @@ impl Default for PyramidConfig {
             collapse_model: default_collapse_model(),
             use_chain_engine: false,
             use_ir_executor: false,
+            operational: OperationalConfig::default(),
         }
     }
 }
@@ -170,13 +367,18 @@ impl PyramidConfig {
 
     /// Convert to an LlmConfig for use with the build pipeline.
     pub fn to_llm_config(&self) -> LlmConfig {
-        let mut cfg = LlmConfig::default();
-        cfg.api_key = self.openrouter_api_key.clone();
-        cfg.auth_token = self.auth_token.clone();
-        cfg.primary_model = self.primary_model.clone();
-        cfg.fallback_model_1 = self.fallback_model_1.clone();
-        cfg.fallback_model_2 = self.fallback_model_2.clone();
-        cfg
+        LlmConfig {
+            api_key: self.openrouter_api_key.clone(),
+            auth_token: self.auth_token.clone(),
+            primary_model: self.primary_model.clone(),
+            fallback_model_1: self.fallback_model_1.clone(),
+            fallback_model_2: self.fallback_model_2.clone(),
+            primary_context_limit: self.operational.tier1.primary_context_limit,
+            fallback_1_context_limit: self.operational.tier1.fallback_1_context_limit,
+            max_retries: self.operational.tier1.llm_max_retries,
+            base_timeout_secs: self.operational.tier2.llm_base_timeout_secs,
+            max_timeout_secs: self.operational.tier2.llm_max_timeout_secs,
+        }
     }
 }
 
@@ -215,6 +417,8 @@ pub struct PyramidState {
     pub use_ir_executor: AtomicBool,
     /// Local event bus for chain-triggered cascades (P3.2).
     pub event_bus: Arc<LocalEventBus>,
+    /// Operational config (tiered constants). Loaded once at startup from pyramid_config.json.
+    pub operational: Arc<OperationalConfig>,
 }
 
 /// Handle to a running pyramid build.

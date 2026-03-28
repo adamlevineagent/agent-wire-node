@@ -44,6 +44,22 @@ pub struct DecompositionConfig {
     /// Helps the LLM produce relevant sub-questions. Could be a directory listing,
     /// file count summary, or key filenames.
     pub folder_map: Option<String>,
+    /// 11-G/H/Q: Path to the chains directory for loading .md prompts.
+    /// When set, decomposition and horizontal review prompts are loaded from
+    /// `chains/prompts/question/decompose.md` and `horizontal_review.md`.
+    #[serde(skip)]
+    pub chains_dir: Option<std::path::PathBuf>,
+}
+
+/// 11-Q: Replace `{{variable}}` template placeholders in a prompt string.
+/// Uses double-brace convention to avoid conflicts with single-brace format strings.
+pub fn render_prompt_template(template: &str, vars: &[(&str, &str)]) -> String {
+    let mut result = template.to_string();
+    for (key, value) in vars {
+        let placeholder = format!("{{{{{}}}}}", key); // produces {{key}}
+        result = result.replace(&placeholder, value);
+    }
+    result
 }
 
 impl Default for DecompositionConfig {
@@ -54,6 +70,7 @@ impl Default for DecompositionConfig {
             granularity: 3,
             max_depth: 3,
             folder_map: None,
+            chains_dir: None,
         }
     }
 }
@@ -202,6 +219,210 @@ fn collect_layer_questions(
     }
 }
 
+// ── Delta Decomposition ───────────────────────────────────────────────────────
+
+/// Result of delta decomposition: which questions are new vs reused.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeltaDecompositionResult {
+    /// The full question tree for the new apex (includes both new and reused questions).
+    pub tree: QuestionTree,
+    /// IDs of questions from existing overlays that can be reused (their answer nodes
+    /// are still valid for the new apex).
+    pub reused_question_ids: Vec<String>,
+    /// New questions that need evidence answering.
+    pub new_questions: Vec<super::types::LayerQuestion>,
+}
+
+/// Delta decomposition: given existing overlay answers, determine what NEW questions
+/// the new apex question needs vs what can be reused from existing answers.
+///
+/// This is the key to making second+ questions on the same pyramid fast: shared
+/// sub-questions reuse existing answer nodes without re-running the LLM.
+pub async fn decompose_question_delta(
+    config: &DecompositionConfig,
+    llm_config: &LlmConfig,
+    existing_tree: &QuestionTree,
+    existing_answers: &[super::types::PyramidNode],
+) -> Result<DeltaDecompositionResult> {
+    if config.apex_question.trim().is_empty() {
+        return Err(anyhow!("apex_question cannot be empty"));
+    }
+
+    // Build context about existing answers for the LLM
+    let existing_context = existing_answers.iter()
+        .map(|n| {
+            let summary: String = n.distilled.chars().take(200).collect();
+            format!("- [{}] {}: {}", n.id, n.headline, summary)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // Collect existing question texts for reuse detection
+    let mut existing_questions: Vec<(String, String)> = Vec::new(); // (question_id, question_text)
+    collect_existing_questions(&existing_tree.apex, &mut existing_questions);
+
+    let existing_q_context = existing_questions.iter()
+        .map(|(id, q)| format!("- [{}] {}", id, q))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // Ask the LLM to decompose the new question, given what already exists
+    let system_prompt = format!(
+        r#"You are a question architect for knowledge pyramids. A knowledge pyramid already exists with answered questions. A NEW apex question is being asked about the SAME source material.
+
+Your job: decompose the new question into sub-questions, but REUSE existing answered questions where they overlap.
+
+EXISTING ANSWERED QUESTIONS:
+{existing_q_context}
+
+EXISTING ANSWER SUMMARIES:
+{existing_context}
+
+For the new apex question, produce sub-questions. For each sub-question, indicate whether it can be answered by an existing question (reuse) or needs fresh evidence gathering (new).
+
+Respond in JSON:
+{{
+  "sub_questions": [
+    {{
+      "question": "the sub-question text",
+      "reuse_id": "existing question ID if this reuses an existing answer, or null if new",
+      "prompt_hint": "hint for how to answer this question",
+      "is_leaf": true/false
+    }}
+  ]
+}}
+
+Return ONLY the JSON object."#
+    );
+
+    let user_prompt = format!(
+        "New apex question: \"{}\"\n\nContent type: {}\n\n{}",
+        config.apex_question,
+        config.content_type,
+        config.folder_map.as_deref().unwrap_or("(no additional context)")
+    );
+
+    let response = llm::call_model_unified(
+        llm_config,
+        &system_prompt,
+        &user_prompt,
+        0.3,
+        4096,
+        None,
+    )
+    .await?;
+
+    let json_value = llm::extract_json(&response.content)?;
+
+    // Parse the response
+    #[derive(Deserialize)]
+    struct DeltaSubQuestion {
+        question: String,
+        reuse_id: Option<String>,
+        prompt_hint: String,
+        is_leaf: bool,
+    }
+    #[derive(Deserialize)]
+    struct DeltaResponse {
+        sub_questions: Vec<DeltaSubQuestion>,
+    }
+
+    let delta_resp: DeltaResponse = serde_json::from_value(json_value)
+        .map_err(|e| anyhow!("Failed to parse delta decomposition response: {}", e))?;
+
+    let mut reused_question_ids = Vec::new();
+    let mut children = Vec::new();
+
+    let existing_q_map: std::collections::HashMap<&str, &str> = existing_questions
+        .iter()
+        .map(|(id, q)| (id.as_str(), q.as_str()))
+        .collect();
+
+    for sq in &delta_resp.sub_questions {
+        if let Some(ref reuse_id) = sq.reuse_id {
+            if existing_q_map.contains_key(reuse_id.as_str()) {
+                reused_question_ids.push(reuse_id.clone());
+                // Create a placeholder node that references the existing answer
+                children.push(QuestionNode {
+                    id: reuse_id.clone(),
+                    question: sq.question.clone(),
+                    about: "reused from existing overlay".to_string(),
+                    creates: "reused answer".to_string(),
+                    prompt_hint: sq.prompt_hint.clone(),
+                    children: vec![],
+                    is_leaf: true,
+                });
+                continue;
+            }
+        }
+        // New question — will need evidence answering
+        children.push(QuestionNode {
+            id: String::new(),
+            question: sq.question.clone(),
+            about: "each file individually".to_string(),
+            creates: "L0 nodes".to_string(),
+            prompt_hint: sq.prompt_hint.clone(),
+            children: vec![],
+            is_leaf: sq.is_leaf,
+        });
+    }
+
+    let apex_node = QuestionNode {
+        id: String::new(),
+        question: config.apex_question.clone(),
+        about: "all top-level nodes at once".to_string(),
+        creates: "apex".to_string(),
+        prompt_hint: "Synthesize all sub-answers into a comprehensive answer to the apex question."
+            .to_string(),
+        children,
+        is_leaf: false,
+    };
+
+    let mut tree = QuestionTree {
+        apex: apex_node,
+        content_type: config.content_type.clone(),
+        config: config.clone(),
+        audience: existing_tree.audience.clone(),
+    };
+
+    assign_question_ids(&mut tree);
+
+    // Extract new questions (those NOT in reused set)
+    let all_layer_qs = extract_layer_questions(&tree);
+    let reused_set: std::collections::HashSet<&str> = reused_question_ids.iter().map(|s| s.as_str()).collect();
+
+    let new_questions: Vec<super::types::LayerQuestion> = all_layer_qs
+        .into_iter()
+        .flat_map(|(_, qs)| qs)
+        .filter(|q| !reused_set.contains(q.question_id.as_str()))
+        .filter(|q| q.layer < tree.apex.children.len() as i64) // exclude apex itself from evidence loop
+        .collect();
+
+    info!(
+        apex = %config.apex_question,
+        total_sub_questions = delta_resp.sub_questions.len(),
+        reused = reused_question_ids.len(),
+        new = new_questions.len(),
+        "delta decomposition complete"
+    );
+
+    Ok(DeltaDecompositionResult {
+        tree,
+        reused_question_ids,
+        new_questions,
+    })
+}
+
+/// Collect all (question_id, question_text) pairs from a question tree.
+fn collect_existing_questions(node: &QuestionNode, out: &mut Vec<(String, String)>) {
+    if !node.id.is_empty() {
+        out.push((node.id.clone(), node.question.clone()));
+    }
+    for child in &node.children {
+        collect_existing_questions(child, out);
+    }
+}
+
 // ── Decomposition ─────────────────────────────────────────────────────────────
 
 /// Decompose an apex question into a question tree via LLM calls.
@@ -243,6 +464,7 @@ pub async fn decompose_question(
         max_subs,
         1, // depth 1
         llm_config,
+        config.chains_dir.as_deref(),
     )
     .await?;
 
@@ -264,6 +486,7 @@ pub async fn decompose_question(
             config.max_depth,
             2, // current depth (apex was 0, first decomposition was 1)
             llm_config,
+            config.chains_dir.as_deref(),
         )
         .await?;
         let node_count = count_tree_nodes(&child);
@@ -393,6 +616,7 @@ pub async fn decompose_question_incremental(
                 writer.clone(),
                 slug,
                 Some(&node_row.question_id),
+                config.chains_dir.as_deref(),
             )
             .await?;
         }
@@ -425,6 +649,7 @@ pub async fn decompose_question_incremental(
         max_subs,
         1,
         llm_config,
+        config.chains_dir.as_deref(),
     )
     .await?;
 
@@ -451,6 +676,7 @@ pub async fn decompose_question_incremental(
             writer.clone(),
             slug,
             None, // parent_id set after apex node gets its ID
+            config.chains_dir.as_deref(),
         )
         .await?;
         let node_count = count_tree_nodes(&child);
@@ -465,7 +691,7 @@ pub async fn decompose_question_incremental(
     }
 
     // ── Horizontal review: merge overlaps + depth-check L1 siblings ────
-    let (merged, leafed) = horizontal_review_siblings(&mut apex_children, llm_config).await?;
+    let (merged, leafed) = horizontal_review_siblings(&mut apex_children, llm_config, config.chains_dir.as_deref()).await?;
     if merged > 0 || leafed > 0 {
         info!(
             merged = merged,
@@ -513,7 +739,23 @@ pub async fn decompose_question_incremental(
     Ok(tree)
 }
 
-/// Recursively save all nodes in a tree to the DB.
+/// Collect all nodes from the tree into a flat vec of (node_clone, parent_id, depth).
+fn collect_tree_nodes(
+    node: &QuestionNode,
+    parent_id: Option<String>,
+    depth: u32,
+    out: &mut Vec<(QuestionNode, Option<String>, u32)>,
+) {
+    out.push((node.clone(), parent_id, depth));
+    for child in &node.children {
+        collect_tree_nodes(child, Some(node.id.clone()), depth + 1, out);
+    }
+}
+
+/// Save all nodes in a tree to the DB in a single blocking transaction.
+/// Collects all nodes in-memory first, then acquires the lock once and writes
+/// them all inside a transaction — avoids per-node async lock round-trips that
+/// caused backpressure hangs.
 async fn save_tree_nodes_to_db(
     node: &QuestionNode,
     parent_id: Option<&str>,
@@ -521,22 +763,30 @@ async fn save_tree_nodes_to_db(
     slug: &str,
     writer: &Arc<Mutex<Connection>>,
 ) -> Result<()> {
-    {
-        let conn = writer.lock().await;
-        db::save_question_node(&conn, slug, node, parent_id, depth)?;
-    }
+    let mut all_nodes = Vec::new();
+    collect_tree_nodes(node, parent_id.map(|s| s.to_string()), depth, &mut all_nodes);
 
-    let node_id = node.id.clone();
-    for child in &node.children {
-        Box::pin(save_tree_nodes_to_db(
-            child,
-            Some(&node_id),
-            depth + 1,
-            slug,
-            writer,
-        ))
-        .await?;
-    }
+    let node_count = all_nodes.len();
+    info!(nodes = node_count, slug = slug, "save_tree_nodes_to_db: batching all nodes in single transaction");
+
+    let conn = writer.clone();
+    let slug_owned = slug.to_string();
+    tokio::task::spawn_blocking(move || {
+        let c = conn.blocking_lock();
+        c.execute_batch("BEGIN")?;
+        let result = (|| -> anyhow::Result<()> {
+            for (ref n, ref pid, d) in &all_nodes {
+                db::save_question_node(&c, &slug_owned, n, pid.as_deref(), *d)?;
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => { c.execute_batch("COMMIT")?; Ok(()) }
+            Err(e) => { let _ = c.execute_batch("ROLLBACK"); Err(e) }
+        }
+    })
+    .await
+    .map_err(|e| anyhow!("save_tree_nodes_to_db panicked: {e}"))??;
 
     Ok(())
 }
@@ -557,6 +807,7 @@ async fn build_subtree_incremental(
     writer: Arc<Mutex<Connection>>,
     slug: &str,
     _existing_parent_id: Option<&str>,
+    chains_dir: Option<&std::path::Path>,
 ) -> Result<QuestionNode> {
     // Terminal conditions: marked as leaf, or depth exceeded
     if raw.is_leaf || current_depth >= max_depth {
@@ -591,6 +842,7 @@ async fn build_subtree_incremental(
         max_subs,
         current_depth,
         llm_config,
+        chains_dir,
     )
     .await?;
 
@@ -628,6 +880,7 @@ async fn build_subtree_incremental(
             writer.clone(),
             slug,
             None,
+            chains_dir,
         ))
         .await?;
         children.push(child);
@@ -668,6 +921,7 @@ async fn build_subtree(
     max_depth: u32,
     current_depth: u32,
     llm_config: &LlmConfig,
+    chains_dir: Option<&std::path::Path>,
 ) -> Result<QuestionNode> {
     // Terminal conditions: marked as leaf, or depth exceeded
     if raw.is_leaf || current_depth >= max_depth {
@@ -710,6 +964,7 @@ async fn build_subtree(
         max_subs,
         current_depth,
         llm_config,
+        chains_dir,
     )
     .await?;
     info!(
@@ -742,6 +997,7 @@ async fn build_subtree(
             max_depth,
             current_depth + 1,
             llm_config,
+            chains_dir,
         ))
         .await?;
         children.push(child);
@@ -774,6 +1030,8 @@ struct RawDecomposedQuestion {
 /// Call the LLM to decompose a question into sub-questions.
 ///
 /// Uses the "max" tier (High Intelligence) because decomposition is judgment work.
+/// 11-G: Loads system prompt from chains/prompts/question/decompose.md when chains_dir is set.
+/// 11-Q: Uses {{variable}} template substitution for content_type and depth.
 async fn call_decomposition_llm(
     parent_question: &str,
     content_type: &str,
@@ -782,11 +1040,23 @@ async fn call_decomposition_llm(
     _max_subs: u32,
     depth: u32,
     llm_config: &LlmConfig,
+    chains_dir: Option<&std::path::Path>,
 ) -> Result<Vec<RawDecomposedQuestion>> {
     let folder_context = folder_map.unwrap_or("(no folder map provided)");
 
-    let system_prompt = format!(
-        r#"You are decomposing a question into sub-questions to build a knowledge pyramid.
+    let depth_str = depth.to_string();
+    let system_prompt = match chains_dir
+        .map(|d| d.join("prompts/question/decompose.md"))
+        .and_then(|p| std::fs::read_to_string(&p).ok())
+    {
+        Some(template) => render_prompt_template(&template, &[
+            ("content_type", content_type),
+            ("depth", &depth_str),
+        ]),
+        None => {
+            warn!("decompose.md not found — using inline fallback");
+            format!(
+                r#"You are decomposing a question into sub-questions to build a knowledge pyramid.
 
 WHAT YOU ARE DOING:
 You are helping build a layered understanding of a topic. The source material is "{content_type}" content. The original question will be answered by synthesizing answers to your sub-questions. Your sub-questions will either be answered directly from source material (leaves) or further decomposed by another instance of you (branches).
@@ -815,7 +1085,9 @@ Respond with a JSON array of objects, each with:
   "is_leaf": boolean
 
 Return ONLY the JSON array. An empty array [] is valid if the parent question needs no decomposition."#,
-    );
+            )
+        }
+    };
 
     let user_prompt = format!(
         r#"Parent question: "{parent_question}"
@@ -826,9 +1098,8 @@ Source material:
 What are the genuinely distinct sub-questions needed to answer this? Only create sub-questions that cover unique territory."#,
     );
 
-    // Use the "max" tier model for decomposition (needs reasoning quality)
-    let mut decomp_config = llm_config.clone();
-    decomp_config.primary_model = llm_config.fallback_model_2.clone();
+    // Model selection is controlled by YAML chain definitions, not Rust overrides.
+    // See Inviolable #4: "YAML is the single source of truth for model selection."
 
     let temperature = 0.3;
     let max_tokens: usize = 4096;
@@ -838,7 +1109,7 @@ What are the genuinely distinct sub-questions needed to answer this? Only create
         let temp = if attempt == 0 { temperature } else { 0.1 };
 
         let response = llm::call_model_unified(
-            &decomp_config,
+            llm_config,
             &system_prompt,
             &user_prompt,
             temp,
@@ -1475,9 +1746,11 @@ fn count_tree_nodes(node: &QuestionNode) -> usize {
 /// branch, we ask "given the full picture at this level, are we done?"
 ///
 /// Returns (merges_applied, newly_marked_leaves).
+/// 11-H: Loads system prompt from chains/prompts/question/horizontal_review.md when available.
 async fn horizontal_review_siblings(
     siblings: &mut Vec<QuestionNode>,
     llm_config: &LlmConfig,
+    chains_dir: Option<&std::path::Path>,
 ) -> Result<(usize, usize)> {
     if siblings.len() <= 1 {
         return Ok((0, 0));
@@ -1493,7 +1766,15 @@ async fn horizontal_review_siblings(
         .collect();
     let questions_text = questions_list.join("\n");
 
-    let system_prompt = r#"You are reviewing a set of sibling questions that together answer a parent question. You have two jobs:
+    // 11-H: Load horizontal review prompt from .md file, fall back to inline
+    let system_prompt = match chains_dir
+        .map(|d| d.join("prompts/question/horizontal_review.md"))
+        .and_then(|p| std::fs::read_to_string(&p).ok())
+    {
+        Some(loaded) => loaded,
+        None => {
+            warn!("horizontal_review.md not found — using inline fallback");
+            r#"You are reviewing a set of sibling questions that together answer a parent question. You have two jobs:
 
 JOB 1 — MERGE OVERLAPS:
 Identify pairs of questions that cover essentially the same territory. For each merge:
@@ -1514,19 +1795,18 @@ Respond with a JSON object:
 
 Both arrays can be empty. Be conservative with merges but aggressive with marking leaves — prefer fewer, deeper questions over a sprawling shallow tree.
 
-Return ONLY the JSON object."#;
+Return ONLY the JSON object."#.to_string()
+        }
+    };
 
     let user_prompt = format!(
         "Review these sibling sub-questions:\n\n{questions_text}\n\n\
          Which should be merged? Which branches are specific enough to be leaves?"
     );
 
-    let mut review_config = llm_config.clone();
-    review_config.primary_model = llm_config.fallback_model_2.clone();
-
     let response = llm::call_model_unified(
-        &review_config,
-        system_prompt,
+        llm_config,
+        &system_prompt,
         &user_prompt,
         0.1,
         2048,
@@ -1620,13 +1900,13 @@ Return ONLY the JSON object."#;
 fn granularity_to_range(granularity: u32) -> (u32, u32) {
     // These are hints passed to the LLM but the prompt no longer forces them.
     // The LLM decides how many sub-questions are genuinely needed.
-    match granularity {
-        1 => (2, 3),
-        2 => (3, 4),
-        3 => (3, 4),
-        4 => (4, 5),
-        5 => (5, 6),
-        _ => (3, 4),
+    // Values loaded from OperationalConfig.tier2.granularity_ranges.
+    let ranges = super::Tier2Config::default().granularity_ranges;
+    let idx = granularity as usize;
+    if idx < ranges.len() {
+        ranges[idx]
+    } else {
+        ranges[0] // default fallback
     }
 }
 
@@ -1639,7 +1919,10 @@ fn scope_for_depth(depth: u32) -> (String, String) {
             "each L1 thread's assigned L0 nodes".to_string(),
             "L1 nodes".to_string(),
         ),
-        _ => ("all L1 nodes at once".to_string(), "L2 nodes".to_string()),
+        _ => (
+            format!("all L{} nodes", depth - 1),
+            format!("L{} nodes", depth),
+        ),
     }
 }
 
@@ -1788,6 +2071,7 @@ mod tests {
                 granularity: 3,
                 max_depth: 3,
                 folder_map: None,
+                chains_dir: None,
             },
             audience: None,
         }
@@ -2181,6 +2465,7 @@ That should cover it."#;
             granularity: 3,
             max_depth: 1,
             folder_map: None,
+            chains_dir: None,
         };
         // Can't test the async decompose directly without LLM, but we can test
         // that build_subtree respects depth limits via the terminal condition.
@@ -2202,6 +2487,7 @@ That should cover it."#;
             1, // max_depth
             1, // current_depth == max_depth
             &llm_config,
+            None,
         ));
         let node = result.unwrap();
         assert!(node.is_leaf);
@@ -2227,8 +2513,23 @@ That should cover it."#;
 
     #[test]
     fn scope_for_depth_l2() {
-        let (_about, creates) = scope_for_depth(2);
+        let (about, creates) = scope_for_depth(2);
         assert_eq!(creates, "L2 nodes");
+        assert_eq!(about, "all L1 nodes");
+    }
+
+    #[test]
+    fn scope_for_depth_l3() {
+        let (about, creates) = scope_for_depth(3);
+        assert_eq!(creates, "L3 nodes");
+        assert_eq!(about, "all L2 nodes");
+    }
+
+    #[test]
+    fn scope_for_depth_l4() {
+        let (about, creates) = scope_for_depth(4);
+        assert_eq!(creates, "L4 nodes");
+        assert_eq!(about, "all L3 nodes");
     }
 
     // ── Tree summary formatting ───────────────────────────────────────────

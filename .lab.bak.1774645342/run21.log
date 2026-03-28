@@ -1,0 +1,34 @@
+[0] Syncing chain files...
+  L0 nodes: 112
+{"error":"No active build for this slug"}[1] Building from depth 1...
+  Build: {"slug":"opt-017","status":"running","progress":{"done":0,"total":0},"elapsed_seconds":0.0,"failures":0}
+[2] Polling...
+  [1/226] running (1s, failures: 0)
+  [1/226] running (6s, failures: 0)
+  [1/226] running (11s, failures: 0)
+  [1/226] running (16s, failures: 0)
+  [1/226] running (21s, failures: 0)
+  [5/226] running (27s, failures: 0)
+  [8/226] running (32s, failures: 0)
+  [11/226] running (37s, failures: 0)
+  [11/226] running (42s, failures: 0)
+  [11/226] running (47s, failures: 0)
+  [11/226] running (52s, failures: 0)
+  [11/226] running (57s, failures: 0)
+  [11/226] running (62s, failures: 0)
+  [11/226] running (67s, failures: 0)
+  [11/226] running (72s, failures: 0)
+  [12/226] running (78s, failures: 0)
+  [13/226] running (83s, failures: 0)
+  [14/226] running (88s, failures: 0)
+Build complete in 93s (failures: 0)
+
+=== Apex Check ===
+APEX: VALID
+
+=== Structure ===
+0|112
+1|10
+2|3
+3|1
+Max depth: 3 | Total: 126 | Duration: 93s

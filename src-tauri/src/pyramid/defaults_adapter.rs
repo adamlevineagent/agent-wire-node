@@ -569,8 +569,8 @@ fn compile_context_entries(step: &ChainStep, _content_type: &str) -> Vec<Context
     // them into prompts, replacing the `if step.name == "..."` checks.
 
     match step.name.as_str() {
-        "thread_clustering" => {
-            // Legacy: loads depth-0 web edges, summarizes internal connections
+        "thread_clustering" | "doc_concept_areas" => {
+            // Loads depth-0 web edges, summarizes internal connections
             // for the topic inventory being clustered.
             entries.push(ContextEntry {
                 label: "file_level_connections".to_string(),
@@ -784,14 +784,25 @@ mod tests {
             name: "Document Pyramid".to_string(),
             description: "Document analysis pipeline".to_string(),
             content_type: "document".to_string(),
-            version: "3.0.0".to_string(),
+            version: "4.0.0".to_string(),
             author: "test".to_string(),
             defaults: make_defaults(),
             steps: vec![
-                // Step 1: Pre-classify
+                // Step 1a: Per-doc classification (parallel)
                 {
-                    let mut s = make_chain_step("doc_classify", "classify");
-                    s.input = Some(json!({ "headers": "$chunks", "header_lines": 20 }));
+                    let mut s = make_chain_step("doc_classify_perdoc", "classify");
+                    s.for_each = Some("$chunks".to_string());
+                    s.input = Some(json!({ "doc": "$item", "header_lines": 20 }));
+                    s.concurrency = 8;
+                    s.model = Some("qwen/qwen3.5-flash-02-23".to_string());
+                    s.response_schema = Some(json!({ "type": "object" }));
+                    s.on_error = Some("retry(3)".to_string());
+                    s
+                },
+                // Step 1b: Taxonomy normalization (single call)
+                {
+                    let mut s = make_chain_step("doc_taxonomy", "classify");
+                    s.input = Some(json!({ "per_doc_classifications": "$doc_classify_perdoc" }));
                     s.model = Some("qwen/qwen3.5-flash-02-23".to_string());
                     s.response_schema = Some(json!({ "type": "object" }));
                     s.on_error = Some("retry(3)".to_string());
@@ -801,7 +812,7 @@ mod tests {
                 {
                     let mut s = make_chain_step("l0_doc_extract", "extract");
                     s.for_each = Some("$chunks".to_string());
-                    s.context = Some(json!({ "classification": "$doc_classify" }));
+                    s.context = Some(json!({ "classification": "$doc_taxonomy" }));
                     s.concurrency = 8;
                     s.node_id_pattern = Some("D-L0-{index:03}".to_string());
                     s.depth = Some(0);
@@ -809,13 +820,27 @@ mod tests {
                     s.on_error = Some("retry(3)".to_string());
                     s
                 },
-                // Step 3: Subject clustering
+                // Step 3a: Concept area identification (single call)
                 {
-                    let mut s = make_chain_step("thread_clustering", "classify");
+                    let mut s = make_chain_step("doc_concept_areas", "classify");
                     s.input = Some(
-                        json!({ "topics": "$l0_doc_extract", "classification": "$doc_classify" }),
+                        json!({ "topics": "$l0_doc_extract", "classification": "$doc_taxonomy" }),
                     );
-                    s.compact_inputs = true; // Use headlines+topics only, not full distilled
+                    s.compact_inputs = true;
+                    s.model = Some("qwen/qwen3.5-flash-02-23".to_string());
+                    s.response_schema = Some(json!({ "type": "object" }));
+                    s.on_error = Some("retry(3)".to_string());
+                    s
+                },
+                // Step 3b: Per-doc thread assignment (parallel)
+                {
+                    let mut s = make_chain_step("doc_assign", "classify");
+                    s.for_each = Some("$l0_doc_extract".to_string());
+                    s.context = Some(json!({
+                        "threads": "$doc_concept_areas",
+                        "classification": "$doc_taxonomy"
+                    }));
+                    s.concurrency = 8;
                     s.model = Some("qwen/qwen3.5-flash-02-23".to_string());
                     s.response_schema = Some(json!({ "type": "object" }));
                     s.on_error = Some("retry(3)".to_string());
@@ -824,8 +849,11 @@ mod tests {
                 // Step 4: Thread synthesis
                 {
                     let mut s = make_chain_step("thread_narrative", "synthesize");
-                    s.for_each = Some("$thread_clustering.threads".to_string());
-                    s.context = Some(json!({ "classification": "$doc_classify" }));
+                    s.for_each = Some("$doc_concept_areas.threads".to_string());
+                    s.context = Some(json!({
+                        "classification": "$doc_taxonomy",
+                        "assignments": "$doc_assign"
+                    }));
                     s.concurrency = 5;
                     s.node_id_pattern = Some("L1-{index:03}".to_string());
                     s.depth = Some(1);
@@ -1164,7 +1192,7 @@ mod tests {
         let chain = make_document_chain();
         let plan = compile_defaults(&chain).unwrap();
 
-        // l0_doc_extract should have classification context from doc_classify
+        // l0_doc_extract should have classification context from doc_taxonomy
         let extract = plan
             .steps
             .iter()

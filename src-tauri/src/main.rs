@@ -2514,6 +2514,16 @@ async fn pyramid_drill(
 }
 
 #[tauri::command]
+async fn pyramid_list_question_overlays(
+    state: tauri::State<'_, SharedState>,
+    slug: String,
+) -> Result<Vec<wire_node_lib::pyramid::db::QuestionOverlayInfo>, String> {
+    let conn = state.pyramid.reader.lock().await;
+    wire_node_lib::pyramid::db::list_question_overlays(&conn, &slug)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 async fn pyramid_search(
     state: tauri::State<'_, SharedState>,
     slug: String,
@@ -2521,6 +2531,30 @@ async fn pyramid_search(
 ) -> Result<Vec<SearchHit>, String> {
     let conn = state.pyramid.reader.lock().await;
     pyramid_query::search(&conn, &slug, &term).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn pyramid_get_references(
+    state: tauri::State<'_, SharedState>,
+    slug: String,
+) -> Result<serde_json::Value, String> {
+    let conn = state.pyramid.reader.lock().await;
+    let references = pyramid_db::get_slug_references(&conn, &slug).map_err(|e| e.to_string())?;
+    let referrers = pyramid_db::get_slug_referrers(&conn, &slug).map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({
+        "references": references,
+        "referrers": referrers,
+    }))
+}
+
+#[tauri::command]
+async fn pyramid_get_composed_view(
+    state: tauri::State<'_, SharedState>,
+    slug: String,
+) -> Result<serde_json::Value, String> {
+    let conn = state.pyramid.reader.lock().await;
+    let view = pyramid_query::get_composed_view(&conn, &slug).map_err(|e| e.to_string())?;
+    serde_json::to_value(&view).map_err(|e| e.to_string())
 }
 
 /// Post-build seeding: populate auto_update_config, file_hashes, and start engine + watcher.
@@ -2615,8 +2649,8 @@ async fn post_build_seed(
             .await
             .map_err(|e| format!("Spawn blocking failed: {e}"))??
         }
-        ContentType::Conversation | ContentType::Vine => {
-            // Conversations and vines don't use file watching
+        ContentType::Conversation | ContentType::Vine | ContentType::Question => {
+            // Conversations, vines, and question pyramids don't use file watching
             ("[]".to_string(), "[]".to_string())
         }
     };
@@ -2687,7 +2721,7 @@ async fn post_build_seed(
     };
 
     let mut engine = wire_node_lib::pyramid::stale_engine::PyramidStaleEngine::new(
-        slug, config, &db_path, &api_key, &model,
+        slug, config, &db_path, &api_key, &model, pyramid_state.operational.as_ref().clone(),
     );
     engine.start_poll_loop();
 
@@ -3144,6 +3178,9 @@ async fn pyramid_ingest(
                 ContentType::Vine => {
                     return Err("Use vine-specific build endpoint for vine ingestion".to_string());
                 }
+                ContentType::Question => {
+                    return Err("Question pyramids do not support direct ingestion".to_string());
+                }
             }
         }
         Ok::<(), String>(())
@@ -3231,13 +3268,8 @@ async fn pyramid_delete_slug(
     }
 
     let conn = state.pyramid.writer.lock().await;
-    let result = wire_node_lib::pyramid::slug::delete_slug(&conn, &slug).map_err(|e| e.to_string());
+    let result = wire_node_lib::pyramid::slug::archive_slug(&conn, &slug).map_err(|e| e.to_string());
     drop(conn);
-
-    if result.is_ok() {
-        let mut active = state.pyramid.active_build.write().await;
-        active.remove(&slug);
-    }
 
     result
 }
@@ -3349,6 +3381,7 @@ async fn pyramid_vine_build(
                 .load(std::sync::atomic::Ordering::Relaxed),
         ),
         event_bus: state.pyramid.event_bus.clone(),
+        operational: state.pyramid.operational.clone(),
     });
 
     let slug_for_task = vine_slug_clean.clone();
@@ -3525,6 +3558,7 @@ async fn pyramid_vine_integrity(
                 .load(std::sync::atomic::Ordering::Relaxed),
         ),
         event_bus: state.pyramid.event_bus.clone(),
+        operational: state.pyramid.operational.clone(),
     });
 
     let summary = vine::run_integrity_check(&pyramid_state, &slug)
@@ -3565,6 +3599,7 @@ async fn pyramid_vine_rebuild_upper(
                 .load(std::sync::atomic::Ordering::Relaxed),
         ),
         event_bus: state.pyramid.event_bus.clone(),
+        operational: state.pyramid.operational.clone(),
     });
 
     let cancel = tokio_util::sync::CancellationToken::new();
@@ -3855,6 +3890,7 @@ async fn pyramid_auto_update_run_now(
             phase_arc.clone(),
             detail_arc.clone(),
             summary_arc.clone(),
+            &state.pyramid.operational,
         )
         .await;
     }
@@ -3899,6 +3935,7 @@ async fn pyramid_auto_update_l0_sweep(
             phase_arc.clone(),
             detail_arc.clone(),
             summary_arc.clone(),
+            &state.pyramid.operational,
         )
         .await;
     }
@@ -4151,6 +4188,7 @@ fn main() {
         use_chain_engine: std::sync::atomic::AtomicBool::new(pyramid_config.use_chain_engine),
         use_ir_executor: std::sync::atomic::AtomicBool::new(pyramid_config.use_ir_executor),
         event_bus: Arc::new(wire_node_lib::pyramid::event_chain::LocalEventBus::new()),
+        operational: Arc::new(pyramid_config.operational.clone()),
     });
 
     // Load persisted event subscriptions into the in-memory event bus
@@ -4878,7 +4916,10 @@ fn main() {
             pyramid_node,
             pyramid_tree,
             pyramid_drill,
+            pyramid_list_question_overlays,
             pyramid_search,
+            pyramid_get_references,
+            pyramid_get_composed_view,
             pyramid_build,
             pyramid_build_status,
             pyramid_build_cancel,

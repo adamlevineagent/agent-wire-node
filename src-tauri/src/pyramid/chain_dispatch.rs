@@ -20,6 +20,7 @@ use super::llm::{self, LlmConfig, LlmResponse};
 use super::naming::headline_from_analysis;
 use super::transform_runtime;
 use super::types::{Correction, Decision, PyramidNode, Term, Topic};
+use super::{OperationalConfig, Tier1Config};
 
 // ── Step context ────────────────────────────────────────────────────────────
 
@@ -30,6 +31,10 @@ pub struct StepContext {
     pub db_writer: Arc<Mutex<Connection>>,
     pub slug: String,
     pub config: LlmConfig,
+    /// Tier 1 operational config for context limits, timeouts, etc.
+    pub tier1: Tier1Config,
+    /// Full operational config for tier 2/3 values needed during dispatch.
+    pub ops: OperationalConfig,
 }
 
 // ── Top-level dispatcher ────────────────────────────────────────────────────
@@ -112,8 +117,8 @@ async fn dispatch_llm(
 ) -> Result<Value> {
     let temperature = resolve_temperature(step, defaults);
     let resolved_model = resolve_model(step, defaults, &ctx.config);
-    let resolved_limit = resolve_context_limit(step, defaults, &ctx.config);
-    let max_tokens: usize = 100_000;
+    let resolved_limit = resolve_context_limit(step, defaults, &ctx.config, &ctx.tier1);
+    let max_tokens: usize = ctx.tier1.ir_max_tokens;
 
     // Apply model override: if the resolved model differs from the config's
     // primary model, create a modified config so call_model() uses it.
@@ -432,6 +437,7 @@ pub fn build_node_from_output(
             .unwrap_or_default(),
         parent_id: None,
         superseded_by: None,
+            build_id: None,
         created_at: String::new(),
     })
 }
@@ -545,17 +551,17 @@ pub fn resolve_ir_model(reqs: &ModelRequirements, config: &LlmConfig) -> String 
 /// `call_model_unified` compares input size against the *original* config's
 /// primary_context_limit and may incorrectly fall back to a model that ignores
 /// response_format/response_schema.
-fn resolve_ir_context_limit(reqs: &ModelRequirements, config: &LlmConfig) -> usize {
+fn resolve_ir_context_limit(reqs: &ModelRequirements, config: &LlmConfig, tier1: &Tier1Config) -> usize {
     // Direct model override — we don't know the model's actual limit, so use a
-    // generous 1M (covers most large-context models on OpenRouter).
+    // generous value (covers most large-context models on OpenRouter).
     if reqs.model.is_some() {
-        return 1_000_000;
+        return tier1.high_tier_context_limit;
     }
     let tier = reqs.tier.as_deref().unwrap_or("mid");
     match tier {
         "low" | "mid" => config.primary_context_limit,
-        "high" => 1_000_000,
-        "max" => 2_000_000,
+        "high" => tier1.high_tier_context_limit,
+        "max" => tier1.max_tier_context_limit,
         _ => config.primary_context_limit,
     }
 }
@@ -564,13 +570,13 @@ fn resolve_ir_context_limit(reqs: &ModelRequirements, config: &LlmConfig) -> usi
 ///
 /// Same purpose as `resolve_ir_context_limit` but for the legacy `ChainStep` /
 /// `ChainDefaults` dispatch path.
-fn resolve_context_limit(step: &ChainStep, defaults: &ChainDefaults, config: &LlmConfig) -> usize {
+fn resolve_context_limit(step: &ChainStep, defaults: &ChainDefaults, config: &LlmConfig, tier1: &Tier1Config) -> usize {
     // Direct model override on step or defaults
     if step.model.is_some() {
-        return 1_000_000;
+        return tier1.high_tier_context_limit;
     }
     if step.model_tier.is_none() && defaults.model.is_some() {
-        return 1_000_000;
+        return tier1.high_tier_context_limit;
     }
     let tier = step
         .model_tier
@@ -578,28 +584,28 @@ fn resolve_context_limit(step: &ChainStep, defaults: &ChainDefaults, config: &Ll
         .unwrap_or(defaults.model_tier.as_str());
     match tier {
         "low" | "mid" => config.primary_context_limit,
-        "high" => 1_000_000,
-        "max" => 2_000_000,
+        "high" => tier1.high_tier_context_limit,
+        "max" => tier1.max_tier_context_limit,
         _ => config.primary_context_limit,
     }
 }
 
-/// Resolve temperature from IR `ModelRequirements`, with a default of 0.3.
-fn resolve_ir_temperature(reqs: &ModelRequirements) -> f32 {
-    reqs.temperature.unwrap_or(0.3)
+/// Resolve temperature from IR `ModelRequirements`, with a configurable default.
+fn resolve_ir_temperature(reqs: &ModelRequirements, tier1: &Tier1Config) -> f32 {
+    reqs.temperature.unwrap_or(tier1.default_ir_temperature)
 }
 
-fn resolve_ir_max_tokens(step: &Step) -> usize {
+fn resolve_ir_max_tokens(step: &Step, tier1: &Tier1Config) -> usize {
     let _ = step;
-    100_000
+    tier1.ir_max_tokens
 }
 
-fn resolve_ir_llm_call_options(step: &Step) -> llm::LlmCallOptions {
+fn resolve_ir_llm_call_options(step: &Step, tier1: &Tier1Config) -> llm::LlmCallOptions {
     let min_timeout_secs = if step.response_schema.is_some() {
         match step.primitive.as_deref() {
-            Some("classify") => Some(420),
-            Some("web") => Some(240),
-            _ => Some(180),
+            Some("classify") => Some(tier1.classify_min_timeout_secs),
+            Some("web") => Some(tier1.web_min_timeout_secs),
+            _ => Some(tier1.default_structured_min_timeout_secs),
         }
     } else {
         None
@@ -667,11 +673,11 @@ pub async fn dispatch_ir_llm(
     system_prompt: &str,
     ctx: &StepContext,
 ) -> Result<(Value, LlmResponse)> {
-    let temperature = resolve_ir_temperature(&step.model_requirements);
+    let temperature = resolve_ir_temperature(&step.model_requirements, &ctx.tier1);
     let resolved_model = resolve_ir_model(&step.model_requirements, &ctx.config);
-    let resolved_limit = resolve_ir_context_limit(&step.model_requirements, &ctx.config);
-    let max_tokens = resolve_ir_max_tokens(step);
-    let llm_options = resolve_ir_llm_call_options(step);
+    let resolved_limit = resolve_ir_context_limit(&step.model_requirements, &ctx.config, &ctx.tier1);
+    let max_tokens = resolve_ir_max_tokens(step, &ctx.tier1);
+    let llm_options = resolve_ir_llm_call_options(step, &ctx.tier1);
 
     // Apply model override: if the resolved model differs from the config's
     // primary model, create a modified config so call_model_unified uses it.
@@ -886,6 +892,8 @@ mod tests {
             db_writer: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
             slug: "test".into(),
             config: LlmConfig::default(),
+            tier1: Tier1Config::default(),
+            ops: OperationalConfig::default(),
         };
         let result = dispatch_mechanical("nonexistent", &serde_json::json!({}), &ctx);
         assert!(result.is_err());
@@ -902,6 +910,8 @@ mod tests {
             db_writer: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
             slug: "test-slug".into(),
             config: LlmConfig::default(),
+            tier1: Tier1Config::default(),
+            ops: OperationalConfig::default(),
         };
         let input = serde_json::json!({"files": ["main.rs"]});
         let result = dispatch_mechanical("extract_import_graph", &input, &ctx).unwrap();
@@ -1155,33 +1165,37 @@ mod tests {
             model: None,
             temperature: Some(0.7),
         };
-        assert_eq!(resolve_ir_temperature(&reqs), 0.7);
+        let tier1 = Tier1Config::default();
+        assert_eq!(resolve_ir_temperature(&reqs, &tier1), 0.7);
     }
 
     #[test]
     fn test_resolve_ir_temperature_default() {
         let reqs = ModelRequirements::default();
-        assert_eq!(resolve_ir_temperature(&reqs), 0.3);
+        let tier1 = Tier1Config::default();
+        assert_eq!(resolve_ir_temperature(&reqs, &tier1), 0.3);
     }
 
     #[test]
     fn test_resolve_ir_timeout_floor_for_structured_classify() {
+        let tier1 = Tier1Config::default();
         let mut step = ir_step("clustering", StepOperation::Llm);
         step.primitive = Some("classify".to_string());
         step.response_schema = Some(serde_json::json!({"type": "object"}));
 
-        assert_eq!(resolve_ir_max_tokens(&step), 100_000);
+        assert_eq!(resolve_ir_max_tokens(&step, &tier1), tier1.ir_max_tokens);
         assert_eq!(
-            resolve_ir_llm_call_options(&step).min_timeout_secs,
-            Some(420)
+            resolve_ir_llm_call_options(&step, &tier1).min_timeout_secs,
+            Some(tier1.classify_min_timeout_secs)
         );
     }
 
     #[test]
     fn test_resolve_ir_llm_defaults_for_unstructured_steps() {
+        let tier1 = Tier1Config::default();
         let step = ir_step("l1_synthesis", StepOperation::Llm);
-        assert_eq!(resolve_ir_max_tokens(&step), 100_000);
-        assert_eq!(resolve_ir_llm_call_options(&step).min_timeout_secs, None);
+        assert_eq!(resolve_ir_max_tokens(&step, &tier1), tier1.ir_max_tokens);
+        assert_eq!(resolve_ir_llm_call_options(&step, &tier1).min_timeout_secs, None);
     }
 
     #[test]
@@ -1191,6 +1205,8 @@ mod tests {
             db_writer: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
             slug: "ir-test".into(),
             config: LlmConfig::default(),
+            tier1: Tier1Config::default(),
+            ops: OperationalConfig::default(),
         };
         let mut step = ir_step("mech_step", StepOperation::Mechanical);
         step.rust_function = Some("extract_import_graph".into());
@@ -1208,6 +1224,8 @@ mod tests {
             db_writer: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
             slug: "test".into(),
             config: LlmConfig::default(),
+            tier1: Tier1Config::default(),
+            ops: OperationalConfig::default(),
         };
         let step = ir_step("no_fn", StepOperation::Mechanical);
         // rust_function is None
@@ -1226,6 +1244,8 @@ mod tests {
             db_writer: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
             slug: "test".into(),
             config: LlmConfig::default(),
+            tier1: Tier1Config::default(),
+            ops: OperationalConfig::default(),
         };
         let mut step = ir_step("bad_fn", StepOperation::Mechanical);
         step.rust_function = Some("nonexistent_fn".into());
@@ -1244,6 +1264,8 @@ mod tests {
             db_writer: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
             slug: "test".into(),
             config: LlmConfig::default(),
+            tier1: Tier1Config::default(),
+            ops: OperationalConfig::default(),
         };
         let mut step = ir_step("count_step", StepOperation::Transform);
         step.transform = Some(TransformSpec {
@@ -1264,6 +1286,8 @@ mod tests {
             db_writer: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
             slug: "test".into(),
             config: LlmConfig::default(),
+            tier1: Tier1Config::default(),
+            ops: OperationalConfig::default(),
         };
         let mut step = ir_step("coalesce_step", StepOperation::Transform);
         step.transform = Some(TransformSpec {
@@ -1288,6 +1312,8 @@ mod tests {
             db_writer: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
             slug: "test".into(),
             config: LlmConfig::default(),
+            tier1: Tier1Config::default(),
+            ops: OperationalConfig::default(),
         };
         let step = ir_step("bad_transform", StepOperation::Transform);
         // transform is None
@@ -1306,6 +1332,8 @@ mod tests {
             db_writer: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
             slug: "test".into(),
             config: LlmConfig::default(),
+            tier1: Tier1Config::default(),
+            ops: OperationalConfig::default(),
         };
         let step = ir_step("wire_step", StepOperation::Wire);
         let result = dispatch_ir_step(&step, &serde_json::json!({}), "", &ctx).await;
@@ -1320,6 +1348,8 @@ mod tests {
             db_writer: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
             slug: "test".into(),
             config: LlmConfig::default(),
+            tier1: Tier1Config::default(),
+            ops: OperationalConfig::default(),
         };
         let step = ir_step("task_step", StepOperation::Task);
         let result = dispatch_ir_step(&step, &serde_json::json!({}), "", &ctx).await;
@@ -1334,6 +1364,8 @@ mod tests {
             db_writer: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
             slug: "test".into(),
             config: LlmConfig::default(),
+            tier1: Tier1Config::default(),
+            ops: OperationalConfig::default(),
         };
         let step = ir_step("game_step", StepOperation::Game);
         let result = dispatch_ir_step(&step, &serde_json::json!({}), "", &ctx).await;

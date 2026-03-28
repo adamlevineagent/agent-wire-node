@@ -1,8 +1,13 @@
-You are reading sibling nodes from a knowledge pyramid. Each describes a subsystem or domain. Create a parent node that synthesizes them.
+You are synthesizing sibling nodes from a knowledge pyramid into a parent node. Each child describes a part of the system. Your job is to create a synthesis that helps someone UNDERSTAND the whole — not just catalog what's there.
 
-ORIENTATION: Write a briefing appropriate to the merge level:
-- If merging 2-3 nodes into a domain: 6-10 sentences covering what this domain does, how the subsystems connect, and key shared resources
-- If creating the apex (final merge): 10-15 sentences covering the whole system — what it is, what problem it solves, how the major areas relate, and what a newcomer should explore first
+HUMAN-INTEREST FRAMING (default lens):
+The reader wants to know what this system area does for real people or agents, what problem it solves, and what they'd experience using it. The synthesis should feel like a briefing that answers "why should I care about this?" before "how does it work?" If the area is purely internal plumbing, say so — then explain what it makes possible.
+
+When an `{audience}` variable is provided, shape the framing for that audience. When no audience is specified, write for a curious reader who is technically literate but wants significance before mechanics.
+
+ORIENTATION: Write for someone curious about this system, not someone implementing it.
+- If merging 2-3 nodes into a domain: 6-10 sentences explaining what this area of the system does, why it exists, how the parts work together, and what someone would experience when using it
+- If creating the apex (final merge): 10-15 sentences covering what this whole system IS, what problem it solves, why someone would care about it, how the major pieces fit together, and what makes it distinctive
 
 Then organize into 3-6 TOPICS. Each covers one coherent theme across the children.
 
@@ -10,24 +15,26 @@ HEADLINE RULES:
 - Must be DIFFERENT from any child headline
 - If input includes `cluster_name`, make the headline fit that lane
 - If input includes `sibling_clusters`, be clearly distinct from every sibling
-- APEX headline must name the project and its purpose
+- APEX headline must name the project and describe its value proposition
 - Avoid generic patterns: "System Overview", "Platform Overview", "Architecture"
 
 CONTENT RULES:
-- Be concrete: name functions, tables, endpoints, env vars
-- Preserve the MOST IMPORTANT details from children — the ones a developer would need
-- Do NOT list every entity from every child. Curate: keep the 10-20 most important across all children
-- Focus on HOW subsystems connect, not just what each one does independently
+- Lead with PURPOSE, then specifics. "This area handles how users earn and spend credits" not "This area implements the credit transaction pipeline"
+- Explain HOW subsystems connect in terms of what that means for users/participants
+- When children describe technical components, translate to what those components ENABLE
+- Preserve the MOST IMPORTANT details — the ones that help someone understand what this does and why
+- Do NOT list every entity from every child. Curate: keep the 10-20 most meaningful
 - When children contradict, the later/higher-numbered child is more authoritative
+- Only use technical language when the audience specifically needs implementation details
 
 Output valid JSON only:
 {
-  "headline": "2-6 word label — specific and unique",
+  "headline": "2-6 word label — describes what this does, not how",
   "orientation": "Briefing at appropriate density for this merge level",
   "topics": [
     {
       "name": "Topic Name",
-      "current": "3-6 sentences covering this theme across the merged subsystems",
+      "current": "3-6 sentences covering this theme in terms of purpose and value",
       "entities": ["curated list of most important named things"],
       "corrections": [],
       "decisions": []

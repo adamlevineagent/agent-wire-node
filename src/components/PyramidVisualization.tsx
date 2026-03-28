@@ -4,6 +4,8 @@ import { useCanvasSetup } from './pyramid-viz/useCanvasSetup';
 import { usePyramidLayout } from './pyramid-viz/usePyramidLayout';
 import type { TreeNode, FlatNode, LayoutNode, LayoutEdge } from './pyramid-viz/types';
 import { NodeState } from './pyramid-viz/types';
+import { OverlaySelector } from './OverlaySelector';
+import { ComposedView } from './pyramid-viz/ComposedView';
 
 // ── Shared type imports (mirrors DADBEARPanel's definitions) ──────────
 
@@ -41,6 +43,7 @@ interface EvidenceLink {
   verdict: "KEEP" | "DISCONNECT" | "MISSING";
   weight: number | null;
   reason: string | null;
+  live?: boolean;
 }
 
 interface GapReport {
@@ -104,10 +107,30 @@ interface DrillResult {
 
 // ── Props ─────────────────────────────────────────────────────────────
 
+type VizMode = 'pyramid' | 'composed';
+
 interface PyramidVisualizationProps {
   slug: string;
+  contentType?: string;
+  referencingSlugs?: string[];
   staleLog: StaleLogEntry[];
   status: AutoUpdateStatus | null;
+  onNavigateToSlug?: (slug: string, nodeId: string) => void;
+}
+
+// ── Cross-slug helpers ────────────────────────────────────────────────
+
+/** Parse a handle-path child ID like "other-slug/0/L0-003" into parts */
+function parseCrossSlugId(childId: string): { isExternal: boolean; slug: string; depth: string; nodeId: string } | null {
+  if (!childId.includes('/')) return null;
+  const parts = childId.split('/');
+  if (parts.length < 3) return null;
+  return {
+    isExternal: true,
+    slug: parts[0],
+    depth: parts[1],
+    nodeId: parts.slice(2).join('/'),
+  };
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────
@@ -261,7 +284,15 @@ const LABEL_COLOR = 'rgba(255, 255, 255, 0.2)';
 
 // ── Component ─────────────────────────────────────────────────────────
 
-export function PyramidVisualization({ slug, staleLog, status }: PyramidVisualizationProps) {
+export function PyramidVisualization({ slug, contentType, referencingSlugs, staleLog, status, onNavigateToSlug }: PyramidVisualizationProps) {
+  const isQuestion = contentType === 'question';
+  const [vizMode, setVizMode] = useState<VizMode>(isQuestion ? 'composed' : 'pyramid');
+
+  // Reset mode when slug/contentType changes
+  useEffect(() => {
+    setVizMode(contentType === 'question' ? 'composed' : 'pyramid');
+  }, [slug, contentType]);
+
   // State
   const [treeData, setTreeData] = useState<TreeNode[]>([]);
   const [loading, setLoading] = useState(true);
@@ -270,6 +301,20 @@ export function PyramidVisualization({ slug, staleLog, status }: PyramidVisualiz
   const [popoverNode, setPopoverNode] = useState<LayoutNode | null>(null);
   const [drillData, setDrillData] = useState<DrillResult | null>(null);
   const [drillLoading, setDrillLoading] = useState(false);
+
+  // Overlay state: tracks which question overlay build_ids are toggled on
+  const [activeOverlays, setActiveOverlays] = useState<Set<string>>(new Set());
+  const handleToggleOverlay = useCallback((buildId: string) => {
+    setActiveOverlays(prev => {
+      const next = new Set(prev);
+      if (next.has(buildId)) {
+        next.delete(buildId);
+      } else {
+        next.add(buildId);
+      }
+      return next;
+    });
+  }, []);
 
   // Refs
   const containerRef = useRef<HTMLDivElement>(null);
@@ -626,6 +671,26 @@ export function PyramidVisualization({ slug, staleLog, status }: PyramidVisualiz
 
   // ── Render ──────────────────────────────────────────────────────────
 
+  // ── Composed view drill handler ────────────────────────────────────
+  const handleComposedDrill = useCallback((nodeId: string, nodeSlug: string) => {
+    if (nodeSlug !== slug && onNavigateToSlug) {
+      onNavigateToSlug(nodeSlug, nodeId);
+    } else {
+      // Drill into node — switch to pyramid view and trigger popover
+      setVizMode('pyramid');
+      // Find the node in layout and open popover
+      const layoutNode = stateNodes.find(n => n.id === nodeId);
+      if (layoutNode) {
+        setPopoverNode(layoutNode);
+        setDrillData(null);
+        setDrillLoading(true);
+        invoke<DrillResult>('pyramid_drill', { slug, nodeId })
+          .then((data) => { setDrillData(data); setDrillLoading(false); })
+          .catch(() => { setDrillLoading(false); });
+      }
+    }
+  }, [slug, onNavigateToSlug, stateNodes]);
+
   if (loading && treeData.length === 0) {
     return (
       <div className="pyramid-viz-container">
@@ -638,6 +703,34 @@ export function PyramidVisualization({ slug, staleLog, status }: PyramidVisualiz
 
   return (
     <div className="pyramid-viz-container">
+      {/* View toggle for question slugs */}
+      {isQuestion && (
+        <div className="composed-view-toggle-bar">
+          <button
+            className={`composed-view-toggle-btn${vizMode === 'composed' ? ' active' : ''}`}
+            onClick={() => setVizMode('composed')}
+          >
+            Composed View
+          </button>
+          <button
+            className={`composed-view-toggle-btn${vizMode === 'pyramid' ? ' active' : ''}`}
+            onClick={() => setVizMode('pyramid')}
+          >
+            Pyramid View
+          </button>
+        </div>
+      )}
+
+      {vizMode === 'composed' && isQuestion ? (
+        <ComposedView slug={slug} onDrill={handleComposedDrill} />
+      ) : (
+        <>
+      <OverlaySelector
+        slug={slug}
+        activeOverlays={activeOverlays}
+        onToggleOverlay={handleToggleOverlay}
+        referencingSlugs={referencingSlugs}
+      />
       <div className="pyramid-viz-inner" ref={containerRef}>
         <canvas
           ref={canvasRef}
@@ -770,6 +863,7 @@ export function PyramidVisualization({ slug, staleLog, status }: PyramidVisualiz
                   Evidence
                 </div>
                 {drillData.evidence.map((ev, i) => {
+                  const isSuperseded = ev.live === false;
                   const verdictIcon = ev.verdict === 'KEEP' ? '\u2713' : ev.verdict === 'DISCONNECT' ? '\u2717' : '?';
                   const verdictColor = ev.verdict === 'KEEP'
                     ? 'var(--accent-green)'
@@ -780,11 +874,17 @@ export function PyramidVisualization({ slug, staleLog, status }: PyramidVisualiz
                     ?? (drillData.node.id === ev.source_node_id ? drillData.node.headline : null)
                     ?? ev.source_node_id;
                   return (
-                    <div key={`ev-${i}`} style={{ fontSize: 12, padding: '3px 0', display: 'flex', gap: 6, alignItems: 'baseline' }}>
-                      <span style={{ color: verdictColor, fontWeight: 600, flexShrink: 0 }}>{verdictIcon}</span>
-                      <span style={{ opacity: 0.6, flexShrink: 0 }}>
+                    <div
+                      key={`ev-${i}`}
+                      className={`evidence-row${isSuperseded ? ' evidence-superseded' : ''}`}
+                    >
+                      <span style={{ color: isSuperseded ? undefined : verdictColor, fontWeight: 600, flexShrink: 0 }}>{verdictIcon}</span>
+                      <span style={{ flexShrink: 0 }}>
                         {ev.verdict.toUpperCase()}{ev.weight != null ? ` (${ev.weight.toFixed(1)})` : ''}
                       </span>
+                      {isSuperseded && (
+                        <span className="evidence-superseded-badge">superseded</span>
+                      )}
                       <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                         {sourceHeadline}{ev.reason ? ` \u2014 ${ev.reason}` : ''}
                       </span>
@@ -820,30 +920,34 @@ export function PyramidVisualization({ slug, staleLog, status }: PyramidVisualiz
                 }}>
                   Children
                 </div>
-                {drillData.children.map((child) => (
-                  <div
-                    key={child.id}
-                    style={{
-                      fontSize: 12,
-                      cursor: 'pointer',
-                      padding: '2px 0',
-                      opacity: 0.7,
-                    }}
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      handlePopoverChildClick(child.id);
-                    }}
-                    onMouseEnter={(e) => {
-                      (e.target as HTMLElement).style.opacity = '1';
-                    }}
-                    onMouseLeave={(e) => {
-                      (e.target as HTMLElement).style.opacity = '0.7';
-                    }}
-                  >
-                    {(child.headline?.trim() ? child.headline : child.id)}: {child.distilled.slice(0, 60)}
-                    {child.distilled.length > 60 ? '...' : ''}
-                  </div>
-                ))}
+                {drillData.children.map((child) => {
+                  const crossSlug = parseCrossSlugId(child.id);
+                  return (
+                    <div
+                      key={child.id}
+                      className="drill-child-row"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        if (crossSlug && onNavigateToSlug) {
+                          onNavigateToSlug(crossSlug.slug, crossSlug.nodeId);
+                        } else {
+                          handlePopoverChildClick(child.id);
+                        }
+                      }}
+                    >
+                      {crossSlug && (
+                        <span className="cross-slug-badge" title={`From ${crossSlug.slug} at depth ${crossSlug.depth}`}>
+                          {crossSlug.slug}
+                          <span className="cross-slug-depth">L{crossSlug.depth}</span>
+                        </span>
+                      )}
+                      <span className="drill-child-text">
+                        {(child.headline?.trim() ? child.headline : child.id)}: {child.distilled.slice(0, 60)}
+                        {child.distilled.length > 60 ? '...' : ''}
+                      </span>
+                    </div>
+                  );
+                })}
               </div>
             )}
 
@@ -938,6 +1042,8 @@ export function PyramidVisualization({ slug, staleLog, status }: PyramidVisualiz
           </div>
         )}
       </div>
+        </>
+      )}
     </div>
   );
 }

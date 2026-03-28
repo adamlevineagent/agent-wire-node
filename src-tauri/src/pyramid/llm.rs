@@ -38,6 +38,12 @@ pub struct LlmConfig {
     pub fallback_model_2: String,
     pub primary_context_limit: usize,
     pub fallback_1_context_limit: usize,
+    /// Max retry attempts for LLM calls (loaded from Tier1Config).
+    pub max_retries: u32,
+    /// Base timeout in seconds for LLM calls (loaded from Tier2Config).
+    pub base_timeout_secs: u64,
+    /// Maximum timeout in seconds for LLM calls (loaded from Tier2Config).
+    pub max_timeout_secs: u64,
 }
 
 impl Default for LlmConfig {
@@ -50,6 +56,9 @@ impl Default for LlmConfig {
             fallback_model_2: "x-ai/grok-4.20-beta".into(),
             primary_context_limit: 120_000,
             fallback_1_context_limit: 900_000,
+            max_retries: 5,
+            base_timeout_secs: 120,
+            max_timeout_secs: 600,
         }
     }
 }
@@ -66,8 +75,8 @@ fn short_name(model: &str) -> &str {
     model.rsplit('/').next().unwrap_or(model)
 }
 
-fn compute_timeout(prompt_chars: usize, options: LlmCallOptions) -> std::time::Duration {
-    let derived_secs = std::cmp::min(600, 120 + (prompt_chars / 100_000) as u64 * 60);
+fn compute_timeout(prompt_chars: usize, options: LlmCallOptions, base_secs: u64, max_secs: u64) -> std::time::Duration {
+    let derived_secs = std::cmp::min(max_secs, base_secs + (prompt_chars / 100_000) as u64 * 60);
     let timeout_secs = options.min_timeout_secs.unwrap_or(0).max(derived_secs);
     std::time::Duration::from_secs(timeout_secs)
 }
@@ -180,11 +189,11 @@ pub async fn call_model_unified_with_options(
     let client = reqwest::Client::new();
     let url = "https://openrouter.ai/api/v1/chat/completions";
 
-    // Scale timeout with prompt size: base 120s, +60s per 100K chars, max 600s (10 min)
+    // Scale timeout with prompt size: base + 60s per 100K chars, capped at max
     let prompt_chars = system_prompt.len() + user_prompt.len();
-    let timeout = compute_timeout(prompt_chars, options);
+    let timeout = compute_timeout(prompt_chars, options, config.base_timeout_secs, config.max_timeout_secs);
 
-    for attempt in 0..5u32 {
+    for attempt in 0..config.max_retries {
         let mut body = serde_json::json!({
             "model": use_model,
             "messages": [

@@ -114,19 +114,31 @@ fn make_placeholder_uuid(local_id: &str) -> String {
 
 /// Build derived_from for L1+ node (cites published lower-layer nodes).
 ///
-/// Looks up each evidence source_node_id in the id_map to get Wire handle-paths.
-/// Sources without a handle-path are logged and skipped (the lower-layer node
+/// Looks up each evidence source_node_id in the per-slug id_maps to get Wire UUIDs.
+/// For cross-slug handle-paths (e.g. "other-slug/0/node-id"), parses the slug
+/// and bare node_id to look up in the correct slug's id_map.
+/// Sources without a mapping are logged and skipped (the lower-layer node
 /// may have been an orphan or failed to publish).
 fn build_upper_derived_from(
     evidence: &[EvidenceLink],
-    id_map: &HashMap<String, String>, // local_id → wire_uuid
+    id_maps: &HashMap<String, HashMap<String, String>>, // slug → (local_id → wire_uuid)
+    current_slug: &str,
 ) -> Vec<DerivedFromEntry> {
     let mut entries = Vec::new();
     for e in evidence {
-        match id_map.get(&e.source_node_id) {
-            Some(wire_uuid) => {
+        // Try to resolve the source_node_id via handle-path parsing first
+        let wire_uuid = if let Some((ref_slug, _depth, bare_id)) = db::parse_handle_path(&e.source_node_id) {
+            // Cross-slug handle-path: look up in the referenced slug's id_map
+            id_maps.get(ref_slug).and_then(|m| m.get(bare_id))
+        } else {
+            // Same-slug bare node_id: look up in current slug's id_map
+            id_maps.get(current_slug).and_then(|m| m.get(&e.source_node_id))
+        };
+
+        match wire_uuid {
+            Some(uuid) => {
                 entries.push(DerivedFromEntry {
-                    ref_path: wire_uuid.clone(),
+                    ref_path: uuid.clone(),
                     source_type: "contribution".to_string(),
                     weight: e.weight.unwrap_or(1.0),
                     justification: Some(e.reason.clone().unwrap_or_else(|| "Evidence-based citation".to_string())),
@@ -135,7 +147,8 @@ fn build_upper_derived_from(
             None => {
                 tracing::warn!(
                     source_node_id = %e.source_node_id,
-                    "skipping derived_from entry: lower-layer node not in id_map (orphan or unpublished)"
+                    current_slug = current_slug,
+                    "skipping derived_from entry: lower-layer node not in id_maps (orphan or unpublished)"
                 );
             }
         }
@@ -185,7 +198,7 @@ pub fn collect_layer_publish_data(
     layer: i64,
     node_ids: &[String],
     orphan_ids: &[String],
-    id_map: &HashMap<String, String>,
+    id_maps: &HashMap<String, HashMap<String, String>>,
 ) -> Result<LayerCollectResult> {
     let orphan_set: std::collections::HashSet<&str> =
         orphan_ids.iter().map(|s| s.as_str()).collect();
@@ -244,15 +257,21 @@ pub fn collect_layer_publish_data(
             }
         };
 
-        // Load KEEP evidence
-        let evidence = db::get_keep_evidence_for_target(conn, slug, node_id)
+        // Load KEEP evidence (cross-slug aware)
+        let evidence = db::get_keep_evidence_for_target_cross(conn, slug, node_id)
             .context("publication: failed to load evidence")?;
+
+        // Build a flat id_map for L0 (only needs current slug's mappings)
+        let flat_id_map: HashMap<String, String> = id_maps
+            .get(slug)
+            .cloned()
+            .unwrap_or_default();
 
         // Build derived_from based on layer
         let mut derived_from = if layer == 0 {
-            build_l0_derived_from(&node, &evidence, id_map)
+            build_l0_derived_from(&node, &evidence, &flat_id_map)
         } else {
-            build_upper_derived_from(&evidence, id_map)
+            build_upper_derived_from(&evidence, id_maps, slug)
         };
 
         // Normalize weights to sum=1.0
@@ -380,16 +399,39 @@ pub async fn publish_pyramid_bottom_up(
 
     let empty_orphans: Vec<String> = Vec::new();
 
-    // Build the id_map from already-published entries (once, then grow per layer).
+    // Build per-slug id_maps from already-published entries.
+    // Load current slug's mappings first, then all referenced slugs.
+    let mut id_maps: HashMap<String, HashMap<String, String>> = HashMap::new();
+
+    // Current slug
     let existing_mappings = db::get_all_id_mappings(conn, slug)
         .context("publication: failed to load existing id mappings")?;
-    let mut id_map: HashMap<String, String> = existing_mappings
+    let current_slug_map: HashMap<String, String> = existing_mappings
         .into_iter()
         .map(|m| {
             let wire_ref = m.wire_uuid.clone().unwrap_or(m.wire_handle_path.clone());
             (m.local_id, wire_ref)
         })
         .collect();
+    id_maps.insert(slug.to_string(), current_slug_map);
+
+    // Referenced slugs (cross-slug evidence needs their id_maps)
+    let referenced_slugs = db::get_slug_references(conn, slug)
+        .unwrap_or_default();
+    for ref_slug in &referenced_slugs {
+        let ref_mappings = db::get_all_id_mappings(conn, ref_slug)
+            .unwrap_or_default();
+        let ref_map: HashMap<String, String> = ref_mappings
+            .into_iter()
+            .map(|m| {
+                let wire_ref = m.wire_uuid.clone().unwrap_or(m.wire_handle_path.clone());
+                (m.local_id, wire_ref)
+            })
+            .collect();
+        if !ref_map.is_empty() {
+            id_maps.insert(ref_slug.clone(), ref_map);
+        }
+    }
 
     for layer in 0..=max_depth {
         tracing::info!(
@@ -417,15 +459,18 @@ pub async fn publish_pyramid_bottom_up(
         let orphans = orphans_by_layer.get(&layer).unwrap_or(&empty_orphans);
 
         // Phase 1 (SYNC): collect all data from SQLite — conn ref is scoped here
-        let collected = collect_layer_publish_data(conn, slug, layer, &node_ids, orphans, &id_map)?;
+        let collected = collect_layer_publish_data(conn, slug, layer, &node_ids, orphans, &id_maps)?;
 
         // Phase 2 (ASYNC): publish to Wire — no conn reference held
         let layer_result = publish_layer(publisher, slug, layer, collected).await?;
 
-        // Update id_map with newly published mappings for next layer's derived_from
+        // Update id_maps with newly published mappings for next layer's derived_from
         for mapping in &layer_result.published {
             if let Some(ref wire_uuid) = mapping.wire_uuid {
-                id_map.insert(mapping.local_id.clone(), wire_uuid.clone());
+                id_maps
+                    .entry(slug.to_string())
+                    .or_default()
+                    .insert(mapping.local_id.clone(), wire_uuid.clone());
             }
         }
 
@@ -524,6 +569,8 @@ mod tests {
             verdict: EvidenceVerdict::Keep,
             weight: Some(weight),
             reason: Some(format!("evidence from {}", source_id)),
+            build_id: None,
+            live: Some(true),
         }
     }
 
@@ -551,6 +598,7 @@ mod tests {
             children: vec![],
             parent_id: None,
             superseded_by: None,
+            build_id: None,
             created_at: "2026-03-26T00:00:00Z".to_string(),
         }
     }
@@ -614,6 +662,8 @@ mod tests {
             verdict: EvidenceVerdict::Keep,
             weight: Some(1.0),
             reason: None, // Issue 4: None reason
+            build_id: None,
+            live: Some(true),
         }];
         let id_map = HashMap::new();
 
@@ -628,25 +678,44 @@ mod tests {
         let evidence = vec![
             make_evidence("L0-001", "L1-001", 0.6),
             make_evidence("L0-002", "L1-001", 0.4),
-            make_evidence("L0-orphan", "L1-001", 0.1), // not in id_map
+            make_evidence("L0-orphan", "L1-001", 0.1), // not in id_maps
         ];
 
-        let mut id_map = HashMap::new();
-        // Issue 1: id_map now stores wire_uuid, not handle-path
-        id_map.insert(
-            "L0-001".to_string(),
-            "uuid-for-L0-001".to_string(),
-        );
-        id_map.insert(
-            "L0-002".to_string(),
-            "uuid-for-L0-002".to_string(),
-        );
+        let mut slug_map = HashMap::new();
+        slug_map.insert("L0-001".to_string(), "uuid-for-L0-001".to_string());
+        slug_map.insert("L0-002".to_string(), "uuid-for-L0-002".to_string());
+        let mut id_maps = HashMap::new();
+        id_maps.insert("test".to_string(), slug_map);
 
-        let entries = build_upper_derived_from(&evidence, &id_map);
+        let entries = build_upper_derived_from(&evidence, &id_maps, "test");
         assert_eq!(entries.len(), 2); // orphan source skipped
         assert_eq!(entries[0].source_type, "contribution");
         assert_eq!(entries[0].ref_path, "uuid-for-L0-001");
         assert_eq!(entries[1].ref_path, "uuid-for-L0-002");
+    }
+
+    #[test]
+    fn test_build_upper_derived_from_cross_slug() {
+        // Evidence with cross-slug handle-path source_node_id
+        let evidence = vec![
+            make_evidence("L0-001", "L1-001", 0.5),               // same-slug bare id
+            make_evidence("other-slug/0/L0-X01", "L1-001", 0.3),  // cross-slug handle-path
+            make_evidence("missing-slug/0/L0-Y01", "L1-001", 0.2), // cross-slug, no mapping
+        ];
+
+        let mut current_map = HashMap::new();
+        current_map.insert("L0-001".to_string(), "uuid-current-001".to_string());
+        let mut other_map = HashMap::new();
+        other_map.insert("L0-X01".to_string(), "uuid-other-X01".to_string());
+
+        let mut id_maps = HashMap::new();
+        id_maps.insert("test".to_string(), current_map);
+        id_maps.insert("other-slug".to_string(), other_map);
+
+        let entries = build_upper_derived_from(&evidence, &id_maps, "test");
+        assert_eq!(entries.len(), 2); // missing-slug ref skipped
+        assert_eq!(entries[0].ref_path, "uuid-current-001");
+        assert_eq!(entries[1].ref_path, "uuid-other-X01");
     }
 
     #[test]
@@ -658,12 +727,16 @@ mod tests {
             verdict: EvidenceVerdict::Keep,
             weight: Some(1.0),
             reason: None, // Issue 4: None reason
+            build_id: None,
+            live: Some(true),
         }];
 
-        let mut id_map = HashMap::new();
-        id_map.insert("L0-001".to_string(), "uuid-for-L0-001".to_string());
+        let mut slug_map = HashMap::new();
+        slug_map.insert("L0-001".to_string(), "uuid-for-L0-001".to_string());
+        let mut id_maps = HashMap::new();
+        id_maps.insert("test".to_string(), slug_map);
 
-        let entries = build_upper_derived_from(&evidence, &id_map);
+        let entries = build_upper_derived_from(&evidence, &id_maps, "test");
         assert_eq!(entries.len(), 1);
         // Issue 4: justification defaults to non-empty string
         assert_eq!(entries[0].justification, Some("Evidence-based citation".to_string()));

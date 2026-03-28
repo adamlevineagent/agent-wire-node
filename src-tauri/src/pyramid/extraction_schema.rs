@@ -107,9 +107,8 @@ Design an extraction schema that will make the L0 extraction pass capture exactl
 The extraction prompt you produce will be used to describe source files. Those descriptions must be written FOR the target audience above. If the audience is non-technical, the extraction prompt must explicitly instruct: "Write descriptions that {audience} would understand. Explain WHY each feature matters to a user, not just WHAT it does technically. Avoid developer jargon — use plain language.""#,
     );
 
-    // ── 3. Call LLM using the "max" tier ─────────────────────────────────
-    let mut schema_config = llm_config.clone();
-    schema_config.primary_model = llm_config.fallback_model_2.clone();
+    // ── 3. Call LLM ─────────────────────────────────────────────────────
+    // Model selection is controlled by YAML chain definitions, not Rust overrides.
 
     let temperature = 0.3;
     let max_tokens: usize = 4096;
@@ -118,7 +117,7 @@ The extraction prompt you produce will be used to describe source files. Those d
         let temp = if attempt == 0 { temperature } else { 0.1 };
 
         let response = llm::call_model_unified(
-            &schema_config,
+            llm_config,
             system_prompt,
             &user_prompt,
             temp,
@@ -233,9 +232,8 @@ Design synthesis prompts that will combine this extracted evidence into answers 
             .join(", "),
     );
 
-    // ── 3. Call LLM using the "max" tier ─────────────────────────────────
-    let mut synth_config = llm_config.clone();
-    synth_config.primary_model = llm_config.fallback_model_2.clone();
+    // ── 3. Call LLM ─────────────────────────────────────────────────────
+    // Model selection is controlled by YAML chain definitions, not Rust overrides.
 
     let temperature = 0.3;
     let max_tokens: usize = 2048;
@@ -244,7 +242,7 @@ Design synthesis prompts that will combine this extracted evidence into answers 
         let temp = if attempt == 0 { temperature } else { 0.1 };
 
         let response = llm::call_model_unified(
-            &synth_config,
+            llm_config,
             &system_prompt,
             &user_prompt,
             temp,

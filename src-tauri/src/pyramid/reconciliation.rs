@@ -10,7 +10,7 @@ use anyhow::Result;
 use rusqlite::Connection;
 
 use super::db;
-use super::types::{EvidenceLink, EvidenceVerdict, GapReport, ReconciliationResult};
+use super::types::{EvidenceLink, EvidenceVerdict, ReconciliationResult};
 
 /// Reconcile a layer after evidence-weighted answering.
 ///
@@ -22,25 +22,24 @@ use super::types::{EvidenceLink, EvidenceVerdict, GapReport, ReconciliationResul
 pub fn reconcile_layer(
     conn: &Connection,
     slug: &str,
-    layer: i64,
+    _layer: i64,
     answered_node_ids: &[String],
     lower_layer_node_ids: &[String],
 ) -> Result<ReconciliationResult> {
     // (a) Load all evidence links for answered nodes at this layer
     let mut all_evidence: Vec<EvidenceLink> = Vec::new();
     for target_id in answered_node_ids {
-        let links = db::get_evidence_for_target(conn, slug, target_id)?;
+        let links = db::get_evidence_for_target_cross(conn, slug, target_id)?;
         all_evidence.extend(links);
     }
 
     // (c) Orphan detection
     let orphans = find_orphans(lower_layer_node_ids, &all_evidence);
 
-    // (d) Gap reports — evidence links with verdict=MISSING
-    let gaps = extract_gaps(&all_evidence, layer);
-    for gap in &gaps {
-        db::save_gap(conn, slug, gap)?;
-    }
+    // (d) Gaps: MISSING verdicts are saved directly by build_runner during
+    // evidence answering, not extracted here. Keep an empty vec for the result
+    // struct (callers may inspect it).
+    let gaps = Vec::new();
 
     // (e) Central nodes
     let central_nodes = find_central_nodes(&all_evidence);
@@ -62,10 +61,15 @@ pub fn find_orphans(
     lower_layer_node_ids: &[String],
     evidence_links: &[EvidenceLink],
 ) -> Vec<String> {
-    // Collect all source_node_ids that appear in ANY evidence link
+    // 11-L: Parse handle-paths before comparison — extract bare node_id
+    // for cross-slug references so they match lower_layer_node_ids.
     let referenced: HashSet<&str> = evidence_links
         .iter()
-        .map(|e| e.source_node_id.as_str())
+        .map(|e| {
+            super::db::parse_handle_path(&e.source_node_id)
+                .map(|(_, _, bare)| bare)
+                .unwrap_or(e.source_node_id.as_str())
+        })
         .collect();
 
     lower_layer_node_ids
@@ -81,14 +85,18 @@ pub fn find_orphans(
 /// at least 3 different target (question) nodes, with an average weight
 /// exceeding 0.5. These represent cross-cutting concerns.
 pub fn find_central_nodes(evidence_links: &[EvidenceLink]) -> Vec<String> {
-    // Group KEEP links by source_node_id → list of (target_node_id, weight)
-    let mut source_citations: HashMap<&str, Vec<(&str, f64)>> = HashMap::new();
+    // 11-U: Normalize handle-path keys — strip slug/depth prefix when grouping
+    // so cross-slug and same-slug references to the same node are counted together.
+    let mut source_citations: HashMap<String, Vec<(&str, f64)>> = HashMap::new();
 
     for link in evidence_links {
         if link.verdict == EvidenceVerdict::Keep {
             let weight = link.weight.unwrap_or(0.0);
+            let key = super::db::parse_handle_path(&link.source_node_id)
+                .map(|(_, _, bare)| bare.to_string())
+                .unwrap_or_else(|| link.source_node_id.clone());
             source_citations
-                .entry(link.source_node_id.as_str())
+                .entry(key)
                 .or_default()
                 .push((link.target_node_id.as_str(), weight));
         }
@@ -123,8 +131,12 @@ pub fn build_weight_map(evidence_links: &[EvidenceLink]) -> HashMap<String, f64>
     for link in evidence_links {
         if link.verdict == EvidenceVerdict::Keep {
             let weight = link.weight.unwrap_or(0.0);
+            // 11-U: Normalize handle-path keys for consistent grouping
+            let key = super::db::parse_handle_path(&link.source_node_id)
+                .map(|(_, _, bare)| bare.to_string())
+                .unwrap_or_else(|| link.source_node_id.clone());
             *weights
-                .entry(link.source_node_id.clone())
+                .entry(key)
                 .or_insert(0.0) += weight;
         }
     }
@@ -132,21 +144,6 @@ pub fn build_weight_map(evidence_links: &[EvidenceLink]) -> HashMap<String, f64>
     weights
 }
 
-/// Extract gap reports from MISSING evidence links.
-fn extract_gaps(evidence_links: &[EvidenceLink], layer: i64) -> Vec<GapReport> {
-    evidence_links
-        .iter()
-        .filter(|link| link.verdict == EvidenceVerdict::Missing)
-        .map(|link| GapReport {
-            question_id: link.target_node_id.clone(),
-            description: link
-                .reason
-                .clone()
-                .unwrap_or_else(|| "Missing evidence (no reason provided)".to_string()),
-            layer,
-        })
-        .collect()
-}
 
 // ── Tests ────────────────────────────────────────────────────────────────────
 
@@ -168,6 +165,8 @@ mod tests {
             verdict,
             weight,
             reason: reason.map(|s| s.to_string()),
+            build_id: None,
+            live: Some(true),
         }
     }
 
@@ -352,57 +351,4 @@ mod tests {
         assert!(wm.is_empty());
     }
 
-    // ── extract_gaps tests ───────────────────────────────────────────────
-
-    #[test]
-    fn test_extract_gaps_basic() {
-        let evidence = vec![
-            make_link(
-                "a",
-                "q1",
-                EvidenceVerdict::Missing,
-                None,
-                Some("need performance data"),
-            ),
-            make_link("b", "q1", EvidenceVerdict::Keep, Some(0.8), None),
-            make_link(
-                "c",
-                "q2",
-                EvidenceVerdict::Missing,
-                None,
-                Some("missing auth details"),
-            ),
-        ];
-
-        let gaps = extract_gaps(&evidence, 2);
-        assert_eq!(gaps.len(), 2);
-        assert_eq!(gaps[0].question_id, "q1");
-        assert_eq!(gaps[0].description, "need performance data");
-        assert_eq!(gaps[0].layer, 2);
-        assert_eq!(gaps[1].question_id, "q2");
-        assert_eq!(gaps[1].description, "missing auth details");
-    }
-
-    #[test]
-    fn test_extract_gaps_no_reason_gets_default() {
-        let evidence = vec![make_link("a", "q1", EvidenceVerdict::Missing, None, None)];
-
-        let gaps = extract_gaps(&evidence, 1);
-        assert_eq!(gaps.len(), 1);
-        assert_eq!(
-            gaps[0].description,
-            "Missing evidence (no reason provided)"
-        );
-    }
-
-    #[test]
-    fn test_extract_gaps_none_when_no_missing() {
-        let evidence = vec![
-            make_link("a", "q1", EvidenceVerdict::Keep, Some(0.8), None),
-            make_link("b", "q1", EvidenceVerdict::Disconnect, None, None),
-        ];
-
-        let gaps = extract_gaps(&evidence, 1);
-        assert!(gaps.is_empty());
-    }
 }

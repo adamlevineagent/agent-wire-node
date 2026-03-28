@@ -66,7 +66,8 @@ impl PyramidFileWatcher {
 
     /// Populate caches from the database. Called on start() and resume().
     fn populate_caches(&self, db_path: &str) -> Result<()> {
-        let conn = Connection::open(db_path)
+        // 11-C: Use open_pyramid_connection for proper WAL, FK, and busy_timeout pragmas
+        let conn = pyramid_db::open_pyramid_connection(std::path::Path::new(db_path))
             .with_context(|| format!("Failed to open DB for cache population: {}", db_path))?;
 
         // Load tracked paths
@@ -649,13 +650,9 @@ pub fn get_watched_slugs_for_path(conn: &Connection, path: &str) -> Result<Vec<S
 // ── Private helpers ──────────────────────────────────────────────────────────
 
 /// Open a new database connection (short-lived, per the design spec).
+/// 11-C: Use open_pyramid_connection for consistent pragmas (WAL, FK, busy_timeout).
 fn open_conn(db_path: &str) -> Result<Connection> {
-    let conn =
-        Connection::open(db_path).with_context(|| format!("Failed to open DB at {}", db_path))?;
-    // Ensure WAL mode for concurrent reads
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
-        .ok();
-    Ok(conn)
+    pyramid_db::open_pyramid_connection(std::path::Path::new(db_path))
 }
 
 /// Load the AutoUpdateConfig for a slug, returning a default if not found.

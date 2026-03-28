@@ -494,17 +494,17 @@ impl ExecutionState {
 
     // ── Cleanup (from_depth rebuild) ──────────────────────────────────
 
-    /// Delete all nodes, steps, threads, web edges, deltas, and distillations
-    /// at and above `from_depth` in a single transaction.
+    /// Supersede nodes and scope execution tables at and above `from_depth`.
     ///
     /// Wraps `chain_executor::cleanup_from_depth_sync` (now public) so that
     /// both the legacy and IR execution paths share the same cleanup logic.
     pub async fn cleanup_from_depth(&self, from_depth: i64) -> Result<()> {
         let slug = self.slug.clone();
+        let build_id = format!("rebuild-{}", uuid::Uuid::new_v4());
         let db = self.writer.clone();
         tokio::task::spawn_blocking(move || {
             let conn = db.blocking_lock();
-            super::chain_executor::cleanup_from_depth_sync(&conn, &slug, from_depth)
+            super::chain_executor::cleanup_from_depth_sync(&conn, &slug, from_depth, &build_id)
         })
         .await?
     }

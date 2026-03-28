@@ -23,6 +23,7 @@ use super::db;
 use super::evidence_answering;
 use super::extraction_schema;
 use super::ingest;
+use super::llm;
 use super::local_store;
 use super::question_compiler;
 use super::question_decomposition::{
@@ -83,11 +84,43 @@ pub async fn run_build_from(
         ));
     }
 
+    // ── Question slug dispatch ──────────────────────────────────────────
+    // Question slugs route through run_decomposed_build, loading nodes from
+    // referenced slugs instead of from their own source path.
+    if content_type == ContentType::Question {
+        // Retrieve the stored apex question from the question tree
+        let apex_question = {
+            let conn = state.reader.lock().await;
+            let tree_json = db::get_question_tree(&conn, slug_name)?
+                .ok_or_else(|| anyhow!(
+                    "Question slug '{}' has no stored question tree. \
+                     Use the question build endpoint to set the initial question.",
+                    slug_name
+                ))?;
+            let tree: question_decomposition::QuestionTree =
+                serde_json::from_value(tree_json)?;
+            tree.config.apex_question.clone()
+        };
+
+        return Box::pin(run_decomposed_build(
+            state,
+            slug_name,
+            &apex_question,
+            3,  // default granularity
+            4,  // default max_depth
+            from_depth,
+            None, // re-characterize from cross-slug nodes
+            cancel,
+            progress_tx,
+        ))
+        .await;
+    }
+
     // ── 2. Check feature flags ───────────────────────────────────────────
     let use_ir = state.use_ir_executor.load(Ordering::Relaxed);
     let use_chain = state.use_chain_engine.load(Ordering::Relaxed);
 
-    if use_ir {
+    let result = if use_ir {
         // IR executor path: compile chain to ExecutionPlan, execute via execute_plan
         run_ir_build(
             state,
@@ -123,7 +156,58 @@ pub async fn run_build_from(
             write_tx,
         )
         .await
+    };
+
+    // ── WS8-F: Notify cross-slug referrers on successful build ──────────
+    // After a base slug rebuild completes, any slug that references this one
+    // may have stale evidence. Insert confirmed_stale mutations so those
+    // slugs pick up the changes on their next stale-engine cycle.
+    if let Ok(ref res) = result {
+        if res.1 == 0 {
+            // Build succeeded with zero failures — notify referrers
+            let writer = state.writer.clone();
+            let slug_owned = slug_name.to_string();
+            let notify_result = tokio::task::spawn_blocking(move || {
+                let conn = writer.blocking_lock();
+                let referrers = db::get_slug_referrers(&conn, &slug_owned)?;
+                if referrers.is_empty() {
+                    return Ok::<usize, anyhow::Error>(0);
+                }
+                let now = chrono::Utc::now().to_rfc3339();
+                let detail = serde_json::json!({
+                    "reason": "base_slug_rebuilt",
+                    "source_slug": slug_owned,
+                }).to_string();
+                let mut notified = 0usize;
+                for referrer in &referrers {
+                    conn.execute(
+                        "INSERT INTO pyramid_pending_mutations
+                         (slug, layer, mutation_type, target_ref, detail, cascade_depth, detected_at, processed)
+                         VALUES (?1, 0, 'confirmed_stale', ?2, ?3, 0, ?4, 0)",
+                        rusqlite::params![referrer, &slug_owned, &detail, &now],
+                    )?;
+                    notified += 1;
+                }
+                info!(
+                    source_slug = slug_owned.as_str(),
+                    referrer_count = notified,
+                    "notified cross-slug referrers of base rebuild"
+                );
+                Ok(notified)
+            })
+            .await;
+
+            if let Err(e) = notify_result {
+                warn!(
+                    slug = slug_name,
+                    error = %e,
+                    "failed to notify cross-slug referrers (non-fatal)"
+                );
+            }
+        }
     }
+
+    result
 }
 
 /// Chain-engine path: load chain YAML, execute via chain_executor.
@@ -313,6 +397,9 @@ async fn run_legacy_build(
         ContentType::Vine => {
             return Err(anyhow!("Vine builds use the vine-specific build endpoint"));
         }
+        ContentType::Question => {
+            return Err(anyhow!("Question builds use the question-driven build endpoint"));
+        }
     };
 
     Ok(("legacy".to_string(), failures))
@@ -408,7 +495,77 @@ pub async fn run_decomposed_build(
 
     let ct_str = content_type.as_str();
 
-    // ── 1b. Characterize if not provided ─────────────────────────────────
+    // ── 1a. Check for cross-slug references ─────────────────────────────
+    // Question slugs may reference other slugs. When references exist, we load
+    // nodes from ALL referenced slugs instead of looking at our own source_path.
+    let referenced_slugs = {
+        let conn = state.reader.lock().await;
+        db::get_slug_references(&conn, slug_name)?
+    };
+    let is_cross_slug = !referenced_slugs.is_empty();
+
+    // ── 1b. Cross-slug node loading ──────────────────────────────────────
+    // For cross-slug builds: load nodes from referenced slugs.
+    // - Mechanical (base) slugs: load L0 nodes
+    // - Question slugs in references: load ALL live nodes (answers become source material)
+    let cross_slug_nodes: Option<Vec<types::PyramidNode>> = if is_cross_slug {
+        let conn = state.reader.lock().await;
+        let mut all_nodes = Vec::new();
+
+        for ref_slug in &referenced_slugs {
+            let ref_info = slug::get_slug(&conn, ref_slug)?;
+            match ref_info {
+                Some(info) if info.content_type == ContentType::Question => {
+                    // Question slug: load ALL live nodes (answers are source material)
+                    let nodes = db::get_all_live_nodes(&conn, ref_slug)?;
+                    info!(
+                        slug = slug_name,
+                        ref_slug = ref_slug,
+                        node_count = nodes.len(),
+                        "loaded all live nodes from referenced question slug"
+                    );
+                    all_nodes.extend(nodes);
+                }
+                Some(_) => {
+                    // Mechanical (base) slug: load L0 only
+                    let nodes = db::get_nodes_at_depth(&conn, ref_slug, 0)?;
+                    info!(
+                        slug = slug_name,
+                        ref_slug = ref_slug,
+                        l0_count = nodes.len(),
+                        "loaded L0 nodes from referenced base slug"
+                    );
+                    all_nodes.extend(nodes);
+                }
+                None => {
+                    warn!(
+                        slug = slug_name,
+                        ref_slug = ref_slug,
+                        "referenced slug not found, skipping"
+                    );
+                }
+            }
+        }
+
+        if all_nodes.is_empty() {
+            return Err(anyhow!(
+                "Build your base pyramid first. Referenced slugs {:?} have no nodes.",
+                referenced_slugs
+            ));
+        }
+
+        info!(
+            slug = slug_name,
+            total_cross_slug_nodes = all_nodes.len(),
+            referenced_slugs = ?referenced_slugs,
+            "cross-slug nodes loaded"
+        );
+        Some(all_nodes)
+    } else {
+        None
+    };
+
+    // ── 1c. Characterize if not provided ─────────────────────────────────
     let llm_config = state.config.read().await.clone();
 
     let characterization_result = match characterization {
@@ -422,88 +579,244 @@ pub async fn run_decomposed_build(
         }
         None => {
             info!(slug = slug_name, "running automatic characterization");
-            characterize::characterize(&source_path, apex_question, &llm_config).await?
+            // Build L0 summary fallback — from cross-slug nodes or own L0
+            let l0_fallback = if let Some(ref cs_nodes) = cross_slug_nodes {
+                // Cross-slug: characterize from loaded cross-slug nodes
+                Some(cs_nodes.iter()
+                    .map(|n| {
+                        let summary: String = n.distilled.chars().take(200).collect();
+                        format!("- {}: {}", n.headline, summary)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"))
+            } else {
+                let conn = state.reader.lock().await;
+                let existing_l0 = db::get_nodes_at_depth(&conn, slug_name, 0).unwrap_or_default();
+                if existing_l0.is_empty() {
+                    None
+                } else {
+                    Some(existing_l0.iter()
+                        .map(|n| {
+                            let summary: String = n.distilled.chars().take(200).collect();
+                            format!("- {}: {}", n.headline, summary)
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n"))
+                }
+            };
+            characterize::characterize_with_fallback(
+                &source_path,
+                apex_question,
+                &llm_config,
+                l0_fallback.as_deref(),
+            ).await?
         }
     };
 
-    // ── 3. Ensure base pyramid exists (overlay architecture) ──────────────
-    // Question pyramids are OVERLAYS on an existing mechanical pyramid.
-    // The base pyramid's L0 nodes are the canonical extraction — comprehensive,
-    // question-independent. If no L0 nodes exist, we need to build the base first.
-    let base_l0_nodes = {
-        let conn = state.reader.lock().await;
-        db::get_nodes_at_depth(&conn, slug_name, 0)?
-    };
-
-    if base_l0_nodes.is_empty() {
-        info!(slug = slug_name, "no base L0 nodes found — running mechanical build first");
-        // Run the mechanical build to create the base pyramid
-        let (write_tx, _write_rx) = tokio::sync::mpsc::channel::<WriteOp>(512);
-        run_build(state, slug_name, cancel, progress_tx.clone(), &write_tx).await?;
-
-        // Reload L0 nodes after mechanical build
-        let conn = state.reader.lock().await;
-        let fresh_l0 = db::get_nodes_at_depth(&conn, slug_name, 0)?;
-        info!(slug = slug_name, l0_count = fresh_l0.len(), "base pyramid built — L0 nodes available");
-        drop(conn);
+    // ── 3. Ensure base nodes exist ──────────────────────────────────────
+    if is_cross_slug {
+        // Cross-slug path: nodes already loaded above. No mechanical build fallback.
+        info!(
+            slug = slug_name,
+            cross_slug_node_count = cross_slug_nodes.as_ref().map(|n| n.len()).unwrap_or(0),
+            "cross-slug mode — skipping mechanical build, using referenced slug nodes"
+        );
     } else {
-        info!(slug = slug_name, l0_count = base_l0_nodes.len(), "base pyramid exists — using as overlay base");
+        // Single-slug overlay architecture: question pyramids are OVERLAYS on an
+        // existing mechanical pyramid. If no L0 nodes exist, build the base first.
+        let base_l0_nodes = {
+            let conn = state.reader.lock().await;
+            db::get_nodes_at_depth(&conn, slug_name, 0)?
+        };
+
+        if base_l0_nodes.is_empty() {
+            info!(slug = slug_name, "no base L0 nodes found — running mechanical build first");
+            let (write_tx, mut write_rx) = tokio::sync::mpsc::channel::<WriteOp>(512);
+            let drain_handle = tokio::spawn(async move {
+                while write_rx.recv().await.is_some() {}
+            });
+            run_build(state, slug_name, cancel, progress_tx.clone(), &write_tx).await?;
+            drop(write_tx);
+            let _ = drain_handle.await;
+
+            let conn = state.reader.lock().await;
+            let fresh_l0 = db::get_nodes_at_depth(&conn, slug_name, 0)?;
+            info!(slug = slug_name, l0_count = fresh_l0.len(), "base pyramid built — L0 nodes available");
+            drop(conn);
+        } else {
+            info!(slug = slug_name, l0_count = base_l0_nodes.len(), "base pyramid exists — using as overlay base");
+        }
     }
 
-    // Build decomposition context from base pyramid L0 summaries (not folder map)
-    // This gives the decomposer actual content knowledge, not just file names
-    let base_l0_for_context = {
+    // Build decomposition context from base nodes (cross-slug or own L0)
+    let base_l0_for_context = if let Some(ref cs_nodes) = cross_slug_nodes {
+        cs_nodes.clone()
+    } else {
         let conn = state.reader.lock().await;
         db::get_nodes_at_depth(&conn, slug_name, 0)?
     };
     let l0_context = base_l0_for_context.iter()
-        .map(|n| format!("- {}: {} — {}", n.id, n.headline,
-            if n.distilled.len() > 200 { &n.distilled[..200] } else { &n.distilled }))
+        .map(|n| {
+            let summary: String = n.distilled.chars().take(200).collect();
+            format!("- {}: {} — {}", n.id, n.headline, summary)
+        })
         .collect::<Vec<_>>()
         .join("\n");
     let decomp_context = format!(
-        "Source material ({} extracted summaries from the base knowledge pyramid):\n{}",
-        base_l0_for_context.len(), l0_context
+        "Source material ({} extracted summaries from {}):\n{}",
+        base_l0_for_context.len(),
+        if is_cross_slug { "referenced slugs" } else { "the base knowledge pyramid" },
+        l0_context
     );
 
+    // ── 3b. Enhance the apex question ─────────────────────────────────────
+    // Before decomposition, expand the user's short question into a comprehensive
+    // apex question that captures what they're actually asking. This helps the
+    // decomposer produce better sub-questions.
+    let enhanced_question = {
+        // Load the enhancement prompt from the contribution file (chains/prompts/question/)
+        // Per Pillar #2: the prompt itself is a contribution, not hardcoded Rust.
+        let enhance_system_prompt = {
+            let prompt_path = state.data_dir.as_ref()
+                .map(|d| d.join("chains/prompts/question/enhance_question.md"))
+                .unwrap_or_else(|| std::path::PathBuf::from("chains/prompts/question/enhance_question.md"));
+            match std::fs::read_to_string(&prompt_path) {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!(slug = slug_name, path = %prompt_path.display(), error = %e,
+                        "could not load enhance_question.md — using inline fallback");
+                    "You expand brief questions into comprehensive apex questions for knowledge pyramids. Default to non-technical human-interest framing unless the user specifically asks about technical details.".to_string()
+                }
+            }
+        };
+
+        let enhance_user_prompt = format!(
+            "Original question: \"{apex_question}\"\n\n\
+             Source material: {count} extracted summaries. Sample headlines:\n{sample}\n\n\
+             Audience: {audience}\n\n\
+             Expand this into a comprehensive apex question.",
+            apex_question = apex_question,
+            count = base_l0_for_context.len(),
+            sample = base_l0_for_context.iter().take(10)
+                .map(|n| format!("- {}", n.headline))
+                .collect::<Vec<_>>().join("\n"),
+            audience = if characterization_result.audience.is_empty() { "a curious, intelligent non-developer" } else { &characterization_result.audience },
+        );
+
+        let response = llm::call_model_unified(
+            &llm_config,
+            &enhance_system_prompt,
+            &enhance_user_prompt,
+            0.3,
+            1024,
+            None,
+        ).await;
+
+        match response {
+            Ok(r) => {
+                let enhanced = r.content.trim().trim_matches('"').to_string();
+                info!(
+                    original = %apex_question,
+                    enhanced = %enhanced,
+                    "question enhancement complete"
+                );
+                enhanced
+            }
+            Err(e) => {
+                warn!(slug = slug_name, error = %e, "prompt enhancement failed — using original question");
+                apex_question.to_string()
+            }
+        }
+    };
+
     // ── 4. Decompose the apex question into a question tree ──────────────
+    // 11-G/H: Pass chains_dir so decomposition prompts load from .md files
+    let decomp_chains_dir = state.data_dir.as_ref().map(|d| d.join("chains"));
     let config = DecompositionConfig {
-        apex_question: apex_question.to_string(),
+        apex_question: enhanced_question.clone(),
         content_type: ct_str.to_string(),
         granularity,
         max_depth,
         folder_map: Some(decomp_context), // Pass L0 summaries instead of folder listing
+        chains_dir: decomp_chains_dir,
     };
 
     info!(
         slug = slug_name,
-        apex = apex_question,
+        apex = %enhanced_question,
         granularity = granularity,
         max_depth = max_depth,
         from_depth = from_depth,
         "starting question decomposition"
     );
 
-    // Check for existing partial tree (resume support)
-    let existing_node_count = {
+    // Check for existing question overlay BEFORE decomposition to decide delta vs fresh path
+    let pre_decomp_overlay_check = {
         let conn = state.reader.lock().await;
-        db::count_question_nodes(&conn, slug_name).unwrap_or(0)
+        db::has_existing_question_overlay(&conn, slug_name)?
     };
-    if existing_node_count > 0 {
+
+    // Delta decomposition result (populated only if delta path)
+    // reused_question_ids: question IDs from decomposition that map to existing answers
+    // (used to skip these questions in the evidence loop)
+    let mut reused_question_ids_for_skip: Vec<String> = Vec::new();
+
+    let mut tree = if pre_decomp_overlay_check {
+        // Delta path: load existing tree and overlay answers for context
+        info!(slug = slug_name, "delta decomposition — existing overlay detected");
+        let existing_tree = {
+            let conn = state.reader.lock().await;
+            let tree_json = db::get_question_tree(&conn, slug_name)?
+                .ok_or_else(|| anyhow!("existing overlay but no question tree found"))?;
+            serde_json::from_value::<question_decomposition::QuestionTree>(tree_json)?
+        };
+        let existing_answers = {
+            let conn = state.reader.lock().await;
+            db::get_existing_overlay_answers(&conn, slug_name)?
+        };
+
+        let delta_result = question_decomposition::decompose_question_delta(
+            &config,
+            &llm_config,
+            &existing_tree,
+            &existing_answers,
+        )
+        .await?;
+
+        // Track reused question IDs to skip in evidence loop
+        reused_question_ids_for_skip = delta_result.reused_question_ids.clone();
+
         info!(
             slug = slug_name,
-            existing_nodes = existing_node_count,
-            "found existing question nodes — will resume decomposition"
+            reused_questions = delta_result.reused_question_ids.len(),
+            new_questions = delta_result.new_questions.len(),
+            "delta decomposition complete"
         );
-    }
 
-    let mut tree = question_decomposition::decompose_question_incremental(
-        &config,
-        &llm_config,
-        state.writer.clone(),
-        slug_name,
-    )
-    .await?;
+        delta_result.tree
+    } else {
+        // Fresh path: full decomposition
+        // Check for existing partial tree (resume support)
+        let existing_node_count = {
+            let conn = state.reader.lock().await;
+            db::count_question_nodes(&conn, slug_name).unwrap_or(0)
+        };
+        if existing_node_count > 0 {
+            info!(
+                slug = slug_name,
+                existing_nodes = existing_node_count,
+                "found existing question nodes — will resume decomposition"
+            );
+        }
+
+        question_decomposition::decompose_question_incremental(
+            &config,
+            &llm_config,
+            state.writer.clone(),
+            slug_name,
+        )
+        .await?
+    };
 
     // Attach the audience from characterization so it flows through all downstream prompts
     tree.audience = Some(characterization_result.audience.clone());
@@ -561,46 +874,91 @@ pub async fn run_decomposed_build(
     let layer_questions = question_decomposition::extract_layer_questions(&tree);
     let max_layer = layer_questions.keys().copied().max().unwrap_or(0);
     {
+        info!(slug = slug_name, build_id = %build_id, "acquiring writer lock: save_build_start");
         let conn = state.writer.clone();
         let slug_owned = slug_name.to_string();
         let bid = build_id.clone();
-        let q = apex_question.to_string();
+        // 11-X: enhanced_question goes in `question` column, apex_question (user's original) in `original_question`
+        let q = enhanced_question.clone();
+        let orig_q = apex_question.to_string();
         let ml = max_layer + 1;
         tokio::task::spawn_blocking(move || {
             let c = conn.blocking_lock();
-            local_store::save_build_start(&c, &slug_owned, &bid, &q, ml)?;
+            local_store::save_build_start(&c, &slug_owned, &bid, &q, ml, Some(&orig_q))?;
             Ok::<(), anyhow::Error>(())
         })
         .await
         .map_err(|e| anyhow!("Build start save panicked: {e}"))??;
+        info!(slug = slug_name, "writer lock released: save_build_start");
     }
 
-    // Clean up any prior overlay nodes (L1+) but keep base L0
-    {
+    // ── Overlay cleanup: delta vs fresh path ────────────────────────────
+    // pre_decomp_overlay_check was set before decomposition.
+    // Delta path: only supersede existing overlay apex nodes (shared answers preserved).
+    // Fresh path: supersede all L1+ overlay nodes.
+    let existing_overlay_answers = if pre_decomp_overlay_check {
+        let conn = state.reader.lock().await;
+        db::get_existing_overlay_answers(&conn, slug_name)?
+    } else {
+        Vec::new()
+    };
+
+    if pre_decomp_overlay_check {
+        // Delta path: only supersede existing overlay apex nodes (highest depth overlay nodes).
+        // Shared answer nodes at lower depths are preserved for reuse.
+        let max_overlay_depth = existing_overlay_answers.iter()
+            .map(|n| n.depth)
+            .max()
+            .unwrap_or(0);
+        if max_overlay_depth > 0 {
+            let conn = state.writer.clone();
+            let slug_owned = slug_name.to_string();
+            let overlay_build_id = build_id.clone();
+            let depth_threshold = max_overlay_depth - 1;
+            tokio::task::spawn_blocking(move || {
+                let c = conn.blocking_lock();
+                // Only supersede at the apex depth of the existing overlay
+                c.execute(
+                    "UPDATE pyramid_nodes SET superseded_by = ?3
+                     WHERE slug = ?1 AND depth >= ?2 AND build_id LIKE 'qb-%' AND superseded_by IS NULL",
+                    rusqlite::params![slug_owned, depth_threshold, overlay_build_id],
+                )?;
+                Ok::<(), anyhow::Error>(())
+            })
+            .await
+            .map_err(|e| anyhow!("Delta overlay cleanup panicked: {e}"))??;
+        }
+        info!(slug = slug_name, "delta path — old apex superseded, shared answers preserved");
+    } else {
+        // Fresh path: supersede all prior overlay nodes (L1+) but keep base L0.
+        // Evidence and gaps are retained — live_pyramid_evidence view filters by live nodes.
         let conn = state.writer.clone();
         let slug_owned = slug_name.to_string();
+        let overlay_build_id = build_id.clone();
         tokio::task::spawn_blocking(move || {
             let c = conn.blocking_lock();
-            db::clear_evidence_for_slug(&c, &slug_owned)?;
-            c.execute("DELETE FROM pyramid_gaps WHERE slug = ?1", rusqlite::params![&slug_owned])?;
-            db::delete_nodes_above(&c, &slug_owned, 0)?; // Delete L1+ overlay, keep base L0
+            db::supersede_nodes_above(&c, &slug_owned, 0, &overlay_build_id)?;
             Ok::<(), anyhow::Error>(())
         })
         .await
         .map_err(|e| anyhow!("Overlay cleanup panicked: {e}"))??;
+        info!(slug = slug_name, "fresh path — all prior L1+ nodes superseded");
     }
 
     info!(slug = slug_name, "overlay mode — using base pyramid L0, starting evidence loop");
 
     // ── 10. Evidence-weighted upper layer loop ───────────────────────────
-    // Load L0 nodes and generate synthesis prompts
-    let l0_nodes = {
+    // Load L0 nodes for evidence loop: cross-slug nodes or own L0
+    let l0_nodes = if let Some(cs_nodes) = cross_slug_nodes {
+        info!(slug = slug_name, l0_count = cs_nodes.len(), "using cross-slug nodes as L0 for evidence loop");
+        cs_nodes
+    } else {
         let conn = state.reader.lock().await;
         db::get_nodes_at_depth(&conn, slug_name, 0)?
     };
     info!(slug = slug_name, l0_count = l0_nodes.len(), "loaded L0 nodes for evidence loop");
 
-    let l0_summary = evidence_answering::build_l0_summary(&l0_nodes);
+    let l0_summary = evidence_answering::build_l0_summary(&l0_nodes, &state.operational);
     info!(slug = slug_name, summary_len = l0_summary.len(), "built L0 summary");
 
     let synth_prompts = match extraction_schema::generate_synthesis_prompts(
@@ -643,7 +1001,7 @@ pub async fn run_decomposed_build(
             break;
         }
 
-        let layer_qs = match layer_questions.get(&layer) {
+        let layer_qs_raw = match layer_questions.get(&layer) {
             Some(qs) => qs.clone(),
             None => {
                 info!(slug = slug_name, layer, "no questions at layer, skipping");
@@ -651,8 +1009,23 @@ pub async fn run_decomposed_build(
             }
         };
 
-        // Load lower-layer nodes
-        let lower_nodes = {
+        // Filter out reused questions (delta path) — their answers already exist
+        let reused_set: std::collections::HashSet<&str> = reused_question_ids_for_skip.iter().map(|s| s.as_str()).collect();
+        let layer_qs: Vec<_> = layer_qs_raw.into_iter()
+            .filter(|q| !reused_set.contains(q.question_id.as_str()))
+            .collect();
+
+        if layer_qs.is_empty() {
+            info!(slug = slug_name, layer, "all questions at layer reused from existing overlay, skipping");
+            continue;
+        }
+
+        // Load lower-layer nodes.
+        // For cross-slug builds at layer 1, the "L0" nodes live in referenced slugs,
+        // not under our own slug. Use the pre-loaded l0_nodes in that case.
+        let lower_nodes = if is_cross_slug && layer == 1 {
+            l0_nodes.clone()
+        } else {
             let conn = state.reader.lock().await;
             db::get_nodes_at_depth(&conn, slug_name, layer - 1)?
         };
@@ -667,7 +1040,7 @@ pub async fn run_decomposed_build(
 
         // Step a: Pre-map questions to candidate evidence nodes
         let candidate_map = match evidence_answering::pre_map_layer(
-            &layer_qs, &lower_nodes, &llm_config,
+            &layer_qs, &lower_nodes, &llm_config, &state.operational,
         )
         .await
         {
@@ -680,7 +1053,7 @@ pub async fn run_decomposed_build(
         };
 
         // Step b: Answer questions with evidence (NO DB writes — returns results only)
-        let answered = match evidence_answering::answer_questions(
+        let batch_result = match evidence_answering::answer_questions(
             &layer_qs,
             &candidate_map,
             &lower_nodes,
@@ -688,6 +1061,8 @@ pub async fn run_decomposed_build(
             tree.audience.as_deref(),
             &llm_config,
             slug_name,
+            slug_name, // answer_slug — same as slug for single-pyramid builds
+            &state.operational,
         )
         .await
         {
@@ -699,15 +1074,35 @@ pub async fn run_decomposed_build(
             }
         };
 
+        let mut answered = batch_result.answered;
+        let failed = batch_result.failed;
+
+        // Stamp build_id on each answered node so they belong to this overlay
+        for a in &mut answered {
+            a.node.build_id = Some(build_id.clone());
+        }
+
         let answered_ids: Vec<String> = answered.iter().map(|a| a.node.id.clone()).collect();
         let lower_ids: Vec<String> = lower_nodes.iter().map(|n| n.id.clone()).collect();
         let layer_node_count = answered.len() as i32;
 
+        if !failed.is_empty() {
+            warn!(
+                slug = slug_name,
+                layer,
+                failed_count = failed.len(),
+                "some questions failed — recording as gap reports"
+            );
+        }
+
         // Step c: Persist answered nodes + evidence links + gaps in spawn_blocking
         {
+            info!(slug = slug_name, layer, nodes = layer_node_count, "acquiring writer lock: evidence persist");
             let conn = state.writer.clone();
             let slug_owned = slug_name.to_string();
+            let bid_for_gaps = build_id.clone();
             let answered_owned = answered;
+            let failed_owned = failed;
             tokio::task::spawn_blocking(move || {
                 let c = conn.blocking_lock();
                 // Wrap per-layer persistence in a transaction for atomicity
@@ -716,21 +1111,39 @@ pub async fn run_decomposed_build(
                     for a in &answered_owned {
                         db::save_node(&c, &a.node, None)?;
                         // Back-patch parent_id on child nodes so upward navigation works
+                        // 11-AG: Skip handle-path children — they live in other slugs,
+                        // parent_id is not meaningful cross-slug
                         for child_id in &a.node.children {
+                            if child_id.contains('/') {
+                                continue; // cross-slug reference, skip
+                            }
                             let _ = db::update_parent(&c, &slug_owned, child_id, &a.node.id);
                         }
                         for link in &a.evidence {
                             db::save_evidence_link(&c, link)?;
                         }
                         // Save missing items as gap reports
+                        // 11-W: Use node ID (not question text) so drill() can look up gaps by node_id
                         for missing_desc in &a.missing {
                             let gap = types::GapReport {
-                                question_id: a.node.self_prompt.clone(),
+                                question_id: a.node.id.clone(),
                                 description: missing_desc.clone(),
                                 layer: a.node.depth as i64,
                             };
-                            db::save_gap(&c, &slug_owned, &gap)?;
+                            db::save_gap(&c, &slug_owned, &gap, Some(&bid_for_gaps))?;
                         }
+                    }
+                    // Save gap reports for questions that failed entirely
+                    for fq in &failed_owned {
+                        let gap = types::GapReport {
+                            question_id: fq.question_id.clone(),
+                            description: format!(
+                                "Question failed during evidence answering: {}. Error: {}",
+                                fq.question_text, fq.error
+                            ),
+                            layer: fq.layer,
+                        };
+                        db::save_gap(&c, &slug_owned, &gap, Some(&bid_for_gaps))?;
                     }
                     Ok(())
                 })();
@@ -745,6 +1158,7 @@ pub async fn run_decomposed_build(
 
         // Step d: Reconcile layer in spawn_blocking
         {
+            info!(slug = slug_name, layer, "acquiring writer lock: reconcile_layer");
             let conn = state.writer.clone();
             let slug_owned = slug_name.to_string();
             let aids = answered_ids;
@@ -877,8 +1291,29 @@ pub async fn preview_decomposed_build(
 
     let ct_str = content_type.as_str();
 
-    // ── 2. Build folder map ──────────────────────────────────────────────
-    let folder_map = question_decomposition::build_folder_map(&source_path);
+    // ── 2. Build context from L0 summaries (aligned with actual build path) ──
+    // The actual build uses L0 summaries, not folder_map. Align preview to
+    // use the same context source so decomposition matches the real build.
+    let decomp_context = {
+        let conn = state.reader.lock().await;
+        let base_l0 = db::get_nodes_at_depth(&conn, slug_name, 0)?;
+        if base_l0.is_empty() {
+            // No base pyramid yet — fall back to folder map
+            question_decomposition::build_folder_map(&source_path)
+        } else {
+            let l0_context = base_l0.iter()
+                .map(|n| {
+                    let summary: String = n.distilled.chars().take(200).collect();
+                    format!("- {}: {} — {}", n.id, n.headline, summary)
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            Some(format!(
+                "Source material ({} extracted summaries from the base knowledge pyramid):\n{}",
+                base_l0.len(), l0_context
+            ))
+        }
+    };
 
     // ── 3. Decompose ─────────────────────────────────────────────────────
     let config = DecompositionConfig {
@@ -886,7 +1321,8 @@ pub async fn preview_decomposed_build(
         content_type: ct_str.to_string(),
         granularity,
         max_depth,
-        folder_map,
+        folder_map: decomp_context,
+        chains_dir: state.data_dir.as_ref().map(|d| d.join("chains")),
     };
 
     let llm_config = state.config.read().await.clone();

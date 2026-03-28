@@ -46,7 +46,7 @@ fn sha256_hex(data: &[u8]) -> String {
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-const CHUNK_TARGET_LINES: usize = 100;
+fn chunk_target_lines() -> usize { super::Tier2Config::default().chunk_target_lines }
 
 /// Directories to skip during code/doc ingestion.
 fn skip_dirs() -> HashSet<&'static str> {
@@ -245,8 +245,8 @@ fn chunk_transcript(transcript: &str) -> Vec<String> {
     let mut current_chunk: Vec<&str> = Vec::new();
     let mut current_count: usize = 0;
 
-    let soft_threshold = (CHUNK_TARGET_LINES as f64 * 0.7) as usize;
-    let hard_limit = (CHUNK_TARGET_LINES as f64 * 1.3) as usize;
+    let soft_threshold = (chunk_target_lines() as f64 * 0.7) as usize;
+    let hard_limit = (chunk_target_lines() as f64 * 1.3) as usize;
 
     for line in &lines {
         current_chunk.push(line);

@@ -1,0 +1,31 @@
+[0] Syncing chain files...
+  L0 nodes: 112
+{"error":"No active build for this slug"}[1] Building from depth 1...
+  Build: {"slug":"opt-017","status":"running","progress":{"done":0,"total":0},"elapsed_seconds":0.0,"failures":0}
+[2] Polling...
+  [0/0] running (1s, failures: 0)
+  [112/125] running (6s, failures: 0)
+  [112/125] running (11s, failures: 0)
+  [112/125] running (16s, failures: 0)
+  [112/125] running (21s, failures: 0)
+  [112/125] running (26s, failures: 0)
+  [112/125] running (31s, failures: 0)
+  [112/125] running (36s, failures: 0)
+  [112/125] running (42s, failures: 0)
+  [112/125] running (47s, failures: 0)
+  [112/125] running (52s, failures: 0)
+  [113/125] running (57s, failures: 0)
+  [113/125] running (62s, failures: 0)
+  [113/125] running (67s, failures: 0)
+  [113/125] running (72s, failures: 0)
+  [113/125] running (77s, failures: 0)
+  [114/125] running (82s, failures: 0)
+  [114/125] running (88s, failures: 0)
+  [114/125] running (93s, failures: 0)
+  [114/125] running (98s, failures: 0)
+  [114/125] running (103s, failures: 0)
+Build finished in 108s
+
+=== Apex Check ===
+APEX: INVALID
+Raw: APEX_FAILED

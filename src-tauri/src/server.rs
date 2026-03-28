@@ -160,7 +160,7 @@ pub async fn init_stale_engines(pyramid_state: &Arc<pyramid::PyramidState>) {
         }
 
         // Create the engine
-        let mut engine = PyramidStaleEngine::new(&slug, config.clone(), &db_path, &api_key, &model);
+        let mut engine = PyramidStaleEngine::new(&slug, config.clone(), &db_path, &api_key, &model, pyramid_state.operational.as_ref().clone());
 
         // Breaker-tripped: create engine in tripped state, log warning, no watcher
         if config.breaker_tripped {

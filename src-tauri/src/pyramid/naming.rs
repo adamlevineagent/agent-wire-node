@@ -3,9 +3,10 @@ use std::path::Path;
 use serde_json::Value;
 
 use super::types::{PyramidNode, Topic};
+use super::Tier2Config;
 
-const MAX_HEADLINE_CHARS: usize = 72;
-const MAX_HEADLINE_WORDS: usize = 8;
+fn max_headline_chars() -> usize { Tier2Config::default().max_headline_chars }
+fn max_headline_words() -> usize { Tier2Config::default().max_headline_words }
 
 pub fn clean_headline(raw: &str) -> Option<String> {
     let collapsed = raw
@@ -65,17 +66,17 @@ pub fn clean_headline(raw: &str) -> Option<String> {
     }
 
     let words = first_segment.split_whitespace().collect::<Vec<_>>();
-    let shortened = if words.len() > MAX_HEADLINE_WORDS {
-        words[..MAX_HEADLINE_WORDS].join(" ")
+    let shortened = if words.len() > max_headline_words() {
+        words[..max_headline_words()].join(" ")
     } else {
         first_segment.to_string()
     };
 
     let char_count = shortened.chars().count();
-    let final_text = if char_count > MAX_HEADLINE_CHARS {
+    let final_text = if char_count > max_headline_chars() {
         shortened
             .chars()
-            .take(MAX_HEADLINE_CHARS)
+            .take(max_headline_chars())
             .collect::<String>()
     } else {
         shortened

@@ -123,7 +123,7 @@ pub fn get_node_with_edges(
     slug: &str,
     node_id: &str,
 ) -> Result<Option<NodeWithWebEdges>> {
-    let Some(node) = db::get_node(conn, slug, node_id)? else {
+    let Some(node) = db::get_live_node(conn, slug, node_id)? else {
         return Ok(None);
     };
     let web_edges = load_connected_web_edges(conn, slug, &node.id)?;
@@ -132,13 +132,51 @@ pub fn get_node_with_edges(
 
 // ── Public query API ─────────────────────────────────────────────────
 
-/// Get the apex node (highest depth, single node at that depth).
+/// Get the mechanical apex node (highest depth, build_id IS NULL or NOT a question overlay).
 /// If multiple nodes exist at the max depth (e.g. cancelled build), logs a warning
 /// and falls back one level to find the completed apex.
 pub fn get_apex(conn: &Connection, slug: &str) -> Result<Option<PyramidNode>> {
-    // Find max depth
+    // For question slugs, all nodes are question nodes — no filter needed.
+    // For mechanical slugs, filter out overlay nodes (build_id LIKE 'qb-%').
+    let content_type: Option<String> = conn
+        .query_row(
+            "SELECT content_type FROM pyramid_slugs WHERE slug = ?1",
+            rusqlite::params![slug],
+            |row| row.get(0),
+        )
+        .optional()
+        .unwrap_or(None);
+
+    if content_type.as_deref() == Some("question") {
+        // Question slug: return the highest-depth node, no filter
+        get_apex_filtered(conn, slug, "")
+    } else {
+        // Mechanical slug: exclude overlay nodes
+        get_apex_filtered(conn, slug, "AND (build_id IS NULL OR build_id = '' OR build_id NOT LIKE 'qb-%')")
+    }
+}
+
+/// Get the apex node for a specific build_id (question overlay).
+/// Filters to nodes belonging to that build_id and returns the highest-depth one.
+pub fn get_apex_for_build(conn: &Connection, slug: &str, build_id: &str) -> Result<Option<PyramidNode>> {
+    let result = conn
+        .prepare(
+            "SELECT * FROM live_pyramid_nodes WHERE slug = ?1 AND build_id = ?2
+             ORDER BY depth DESC LIMIT 1"
+        )?
+        .query_row(rusqlite::params![slug, build_id], row_to_node)
+        .optional()
+        .context("Failed to query overlay apex node")?;
+    Ok(result)
+}
+
+/// Internal: get apex with an additional SQL filter clause.
+fn get_apex_filtered(conn: &Connection, slug: &str, filter: &str) -> Result<Option<PyramidNode>> {
+    // Find max depth with filter
     let max_depth: Option<i64> = conn
-        .prepare("SELECT MAX(depth) FROM live_pyramid_nodes WHERE slug = ?")?
+        .prepare(&format!(
+            "SELECT MAX(depth) FROM live_pyramid_nodes WHERE slug = ? {filter}"
+        ))?
         .query_row(rusqlite::params![slug], |row| row.get(0))
         .optional()
         .context("Failed to query max depth")?
@@ -151,12 +189,16 @@ pub fn get_apex(conn: &Connection, slug: &str) -> Result<Option<PyramidNode>> {
 
     // Count nodes at max depth
     let count: i64 = conn
-        .prepare("SELECT COUNT(*) FROM live_pyramid_nodes WHERE slug = ? AND depth = ?")?
+        .prepare(&format!(
+            "SELECT COUNT(*) FROM live_pyramid_nodes WHERE slug = ? AND depth = ? {filter}"
+        ))?
         .query_row(rusqlite::params![slug, max_depth], |row| row.get(0))?;
 
     if count == 1 {
         let node = conn
-            .prepare("SELECT * FROM live_pyramid_nodes WHERE slug = ? AND depth = ?")?
+            .prepare(&format!(
+                "SELECT * FROM live_pyramid_nodes WHERE slug = ? AND depth = ? {filter}"
+            ))?
             .query_row(rusqlite::params![slug, max_depth], row_to_node)
             .optional()
             .context("Failed to query apex node")?;
@@ -168,7 +210,9 @@ pub fn get_apex(conn: &Connection, slug: &str) -> Result<Option<PyramidNode>> {
     if count > 1 {
         for d in (0..max_depth).rev() {
             let d_count: i64 = conn
-                .prepare("SELECT COUNT(*) FROM live_pyramid_nodes WHERE slug = ? AND depth = ?")?
+                .prepare(&format!(
+                    "SELECT COUNT(*) FROM live_pyramid_nodes WHERE slug = ? AND depth = ? {filter}"
+                ))?
                 .query_row(rusqlite::params![slug, d], |row| row.get(0))?;
 
             if d_count == 1 {
@@ -177,7 +221,9 @@ pub fn get_apex(conn: &Connection, slug: &str) -> Result<Option<PyramidNode>> {
                     count, max_depth, slug, d
                 );
                 let node = conn
-                    .prepare("SELECT * FROM live_pyramid_nodes WHERE slug = ? AND depth = ?")?
+                    .prepare(&format!(
+                        "SELECT * FROM live_pyramid_nodes WHERE slug = ? AND depth = ? {filter}"
+                    ))?
                     .query_row(rusqlite::params![slug, d], row_to_node)
                     .optional()
                     .context("Failed to query apex node at lower depth")?;
@@ -275,7 +321,9 @@ pub fn get_tree(conn: &Connection, slug: &str) -> Result<Vec<TreeNode>> {
 
     fn build_tree_node(
         node: &PyramidNode,
+        source_slug: Option<String>,
         node_map: &HashMap<&str, &PyramidNode>,
+        conn: &Connection,
         thread_id_by_canonical_id: &HashMap<String, String>,
         source_path_by_node_id: &HashMap<String, String>,
     ) -> TreeNode {
@@ -283,14 +331,34 @@ pub fn get_tree(conn: &Connection, slug: &str) -> Result<Vec<TreeNode>> {
             .children
             .iter()
             .filter_map(|child_id| {
-                node_map.get(child_id.as_str()).map(|child| {
-                    build_tree_node(
-                        child,
-                        node_map,
-                        thread_id_by_canonical_id,
-                        source_path_by_node_id,
-                    )
-                })
+                if let Some((ref_slug, _depth, ref_node_id)) = db::parse_handle_path(child_id) {
+                    // Cross-slug child: load summary from the referenced slug
+                    match db::get_node_summary(conn, ref_slug, ref_node_id) {
+                        Ok(Some(child_node)) => Some(TreeNode {
+                            id: child_node.id.clone(),
+                            depth: child_node.depth,
+                            headline: child_node.headline.clone(),
+                            distilled: child_node.distilled.clone(),
+                            thread_id: None,
+                            source_path: None,
+                            source_slug: Some(ref_slug.to_string()),
+                            children: vec![], // Don't recurse into foreign slugs
+                        }),
+                        _ => None,
+                    }
+                } else {
+                    // Same-slug child: existing lookup
+                    node_map.get(child_id.as_str()).map(|child| {
+                        build_tree_node(
+                            child,
+                            None,
+                            node_map,
+                            conn,
+                            thread_id_by_canonical_id,
+                            source_path_by_node_id,
+                        )
+                    })
+                }
             })
             .collect();
 
@@ -301,6 +369,7 @@ pub fn get_tree(conn: &Connection, slug: &str) -> Result<Vec<TreeNode>> {
             distilled: node.distilled.clone(),
             thread_id: thread_id_by_canonical_id.get(&node.id).cloned(),
             source_path: source_path_by_node_id.get(&node.id).cloned(),
+            source_slug: source_slug,
             children,
         }
     }
@@ -310,7 +379,9 @@ pub fn get_tree(conn: &Connection, slug: &str) -> Result<Vec<TreeNode>> {
         .map(|apex| {
             build_tree_node(
                 apex,
+                None,
                 &node_map,
+                conn,
                 &thread_id_by_canonical_id,
                 &source_path_by_node_id,
             )
@@ -322,20 +393,35 @@ pub fn get_tree(conn: &Connection, slug: &str) -> Result<Vec<TreeNode>> {
 
 /// Drill into a node — returns the node plus its direct children,
 /// evidence links, gaps, and question tree context.
+///
+/// Cross-slug support: children that are handle-paths (e.g. "other-slug/0/node-id")
+/// are loaded from the referenced slug via `db::get_node_summary`.
 pub fn drill(conn: &Connection, slug: &str, node_id: &str) -> Result<Option<DrillResult>> {
-    let parent = match db::get_node(conn, slug, node_id)? {
+    let parent = match db::get_live_node(conn, slug, node_id)? {
         Some(n) => n,
         None => return Ok(None),
     };
 
+    // Children use raw get_node_summary (not live view) so the UI can badge
+    // superseded children and show links to their successors.
+    // Cross-slug handle-path children are resolved to their source slug.
     let mut children = Vec::new();
     for child_id in &parent.children {
-        if let Some(child) = db::get_node_summary(conn, slug, child_id)? {
-            children.push(child);
+        if let Some((ref_slug, _depth, ref_node_id)) = db::parse_handle_path(child_id) {
+            // Cross-slug child: load from the referenced slug
+            if let Some(child) = db::get_node_summary(conn, ref_slug, ref_node_id)? {
+                children.push(child);
+            }
+        } else {
+            // Same-slug child: existing behavior
+            if let Some(child) = db::get_node_summary(conn, slug, child_id)? {
+                children.push(child);
+            }
         }
     }
 
-    let evidence = db::get_evidence_for_target(conn, slug, node_id)?;
+    // Use cross-slug evidence loader (returns evidence with live flags)
+    let evidence = db::get_evidence_for_target_cross(conn, slug, node_id)?;
 
     let gaps = db::get_gaps_for_question(conn, slug, node_id)?;
 
@@ -440,6 +526,7 @@ mod tests {
             children: vec![],
             parent_id: None,
             superseded_by: None,
+            build_id: None,
             created_at: "2025-01-01T00:00:00Z".to_string(),
         }
     }
@@ -540,6 +627,9 @@ mod tests {
 ///
 /// Searches in distilled text, topics JSON, and corrections JSON.
 /// Returns results ordered by depth descending (most synthesized first).
+///
+/// Cross-slug support: when the slug has references, searches across all
+/// referenced slugs + self in a single query. Results are tagged with source_slug.
 pub fn search(conn: &Connection, slug: &str, term: &str) -> Result<Vec<SearchHit>> {
     // Split query into individual words for AND-matching.
     // Each word must appear in at least one searchable field.
@@ -556,27 +646,46 @@ pub fn search(conn: &Connection, slug: &str, term: &str) -> Result<Vec<SearchHit
         return Ok(Vec::new());
     }
 
-    // Build dynamic WHERE clause: each word must match at least one field
-    let mut conditions = Vec::new();
-    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-    params.push(Box::new(slug.to_string()));
+    // Gather all slugs to search: self + referenced slugs
+    let referenced = db::get_slug_references(conn, slug)?;
+    let all_slugs: Vec<String> = {
+        let mut s = vec![slug.to_string()];
+        s.extend(referenced);
+        s
+    };
 
+    // Build dynamic WHERE clause: slug IN (...) + each word must match at least one field
+    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+    // Build slug IN clause
+    let slug_placeholders: Vec<String> = all_slugs
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            params.push(Box::new(s.clone()));
+            format!("?{}", i + 1)
+        })
+        .collect();
+    let slug_in_clause = format!("slug IN ({})", slug_placeholders.join(", "));
+
+    let mut conditions = Vec::new();
     for word in &words {
         let pattern = format!("%{}%", word);
         let idx = params.len();
-        // Search distilled, topics (which includes entity names), corrections, and terms
+        // 11-Y: Search headline, distilled, topics (which includes entity names), corrections, and terms
         conditions.push(format!(
-            "(LOWER(distilled) LIKE ?{p1} OR LOWER(topics) LIKE ?{p2} OR LOWER(corrections) LIKE ?{p3} OR LOWER(terms) LIKE ?{p4})",
-            p1 = idx + 1, p2 = idx + 2, p3 = idx + 3, p4 = idx + 4
+            "(LOWER(headline) LIKE ?{p1} OR LOWER(distilled) LIKE ?{p2} OR LOWER(topics) LIKE ?{p3} OR LOWER(corrections) LIKE ?{p4} OR LOWER(terms) LIKE ?{p5})",
+            p1 = idx + 1, p2 = idx + 2, p3 = idx + 3, p4 = idx + 4, p5 = idx + 5
         ));
-        for _ in 0..4 {
+        for _ in 0..5 {
             params.push(Box::new(pattern.clone()));
         }
     }
 
     let sql = format!(
-        "SELECT id, depth, headline, distilled, topics, corrections, terms FROM live_pyramid_nodes \
-         WHERE slug = ?1 AND {} ORDER BY depth DESC",
+        "SELECT id, slug, depth, headline, distilled, topics, corrections, terms FROM live_pyramid_nodes \
+         WHERE {} AND {} ORDER BY depth DESC",
+        slug_in_clause,
         conditions.join(" AND ")
     );
 
@@ -586,6 +695,7 @@ pub fn search(conn: &Connection, slug: &str, term: &str) -> Result<Vec<SearchHit
     let hits: Vec<SearchHit> = stmt
         .query_map(param_refs.as_slice(), |row| {
             let id: String = row.get("id")?;
+            let hit_slug: String = row.get("slug")?;
             let depth: i64 = row.get("depth")?;
             let headline: String = row.get::<_, String>("headline").unwrap_or_default();
             let distilled: String = row.get("distilled")?;
@@ -645,11 +755,15 @@ pub fn search(conn: &Connection, slug: &str, term: &str) -> Result<Vec<SearchHit
             let coverage = word_hits as f64 / words.len() as f64;
             let score = coverage * (depth as f64 + 1.0) * 10.0;
 
+            // Tag with source_slug if it came from a different slug
+            let source_slug_tag = if hit_slug != slug { Some(hit_slug) } else { None };
+
             Ok(SearchHit {
                 node_id: id,
                 depth,
                 snippet,
                 score,
+                source_slug: source_slug_tag,
             })
         })?
         .filter_map(|r| match r {
@@ -670,6 +784,166 @@ pub fn search(conn: &Connection, slug: &str, term: &str) -> Result<Vec<SearchHit
     });
 
     Ok(sorted)
+}
+
+/// Composed view: load all live nodes from the slug + all referenced slugs,
+/// build edges from evidence links and children arrays.
+/// Returns the full cross-slug graph for visualization.
+pub fn get_composed_view(conn: &Connection, slug: &str) -> Result<ComposedView> {
+    // Gather all slugs: self + referenced
+    let referenced = db::get_slug_references(conn, slug)?;
+    let all_slugs: Vec<String> = {
+        let mut s = vec![slug.to_string()];
+        s.extend(referenced);
+        s
+    };
+
+    let mut composed_nodes: Vec<ComposedNode> = Vec::new();
+    let mut composed_edges: Vec<ComposedEdge> = Vec::new();
+    let mut node_ids_seen: HashSet<String> = HashSet::new();
+
+    for s in &all_slugs {
+        // Load all live nodes for this slug
+        let mut stmt = conn.prepare(
+            "SELECT id, slug, depth, headline, distilled, build_id FROM live_pyramid_nodes WHERE slug = ?1 ORDER BY depth, id",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![s], |row| {
+            let id: String = row.get(0)?;
+            let node_slug: String = row.get(1)?;
+            let depth: i64 = row.get(2)?;
+            let headline: String = row.get(3)?;
+            let distilled: String = row.get(4)?;
+            let build_id: Option<String> = row.get(5)?;
+            let node_type = if build_id.as_deref().map_or(false, |b| b.starts_with("qb-")) {
+                "answer".to_string()
+            } else {
+                "mechanical".to_string()
+            };
+            Ok(ComposedNode {
+                id,
+                slug: node_slug,
+                depth,
+                headline,
+                distilled,
+                node_type,
+            })
+        })?;
+
+        for row in rows {
+            if let Ok(node) = row {
+                node_ids_seen.insert(node.id.clone());
+                composed_nodes.push(node);
+            }
+        }
+
+        // Load children arrays to build child edges
+        let mut children_stmt = conn.prepare(
+            "SELECT id, children FROM live_pyramid_nodes WHERE slug = ?1",
+        )?;
+        let child_rows = children_stmt.query_map(rusqlite::params![s], |row| {
+            let id: String = row.get(0)?;
+            let children_json: String = row.get(1)?;
+            Ok((id, children_json))
+        })?;
+
+        for row in child_rows {
+            if let Ok((parent_id, children_json)) = row {
+                let children: Vec<String> = serde_json::from_str(&children_json).unwrap_or_default();
+                for child_id in children {
+                    composed_edges.push(ComposedEdge {
+                        source_id: parent_id.clone(),
+                        target_id: child_id,
+                        weight: 1.0,
+                        edge_type: "child".to_string(),
+                        live: true,
+                    });
+                }
+            }
+        }
+
+        // Load evidence edges
+        let mut ev_stmt = conn.prepare(
+            "SELECT source_node_id, target_node_id, weight, verdict FROM pyramid_evidence WHERE slug = ?1",
+        )?;
+        let ev_rows = ev_stmt.query_map(rusqlite::params![s], |row| {
+            let source_id: String = row.get(0)?;
+            let target_id: String = row.get(1)?;
+            let weight: Option<f64> = row.get(2)?;
+            let verdict: String = row.get(3)?;
+            Ok((source_id, target_id, weight, verdict))
+        })?;
+
+        for row in ev_rows {
+            if let Ok((source_id, target_id, weight, verdict)) = row {
+                if verdict == "DISCONNECT" {
+                    continue;
+                }
+                // Determine liveness: check if the source node is superseded
+                let live = if let Some((_ref_slug, _depth, ref_node_id)) = db::parse_handle_path(&source_id) {
+                    // Cross-slug source: check if the node is still live
+                    node_ids_seen.contains(ref_node_id)
+                } else {
+                    node_ids_seen.contains(&source_id)
+                };
+                composed_edges.push(ComposedEdge {
+                    source_id,
+                    target_id,
+                    weight: weight.unwrap_or(0.5),
+                    edge_type: "evidence".to_string(),
+                    live,
+                });
+            }
+        }
+
+        // Load web edges
+        let mut web_stmt = conn.prepare(
+            "SELECT e.thread_a_id, e.thread_b_id, e.relevance \
+             FROM pyramid_web_edges e WHERE e.slug = ?1",
+        )?;
+        let web_rows = web_stmt.query_map(rusqlite::params![s], |row| {
+            let thread_a: String = row.get(0)?;
+            let thread_b: String = row.get(1)?;
+            let relevance: f64 = row.get(2)?;
+            Ok((thread_a, thread_b, relevance))
+        })?;
+
+        // Resolve thread IDs to canonical node IDs for web edges
+        let mut thread_to_canonical: HashMap<String, String> = HashMap::new();
+        let mut t_stmt = conn.prepare(
+            "SELECT thread_id, current_canonical_id FROM pyramid_threads WHERE slug = ?1",
+        )?;
+        let t_rows = t_stmt.query_map(rusqlite::params![s], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in t_rows {
+            if let Ok((tid, cid)) = row {
+                thread_to_canonical.insert(tid, cid);
+            }
+        }
+
+        for row in web_rows {
+            if let Ok((thread_a, thread_b, relevance)) = row {
+                if let (Some(node_a), Some(node_b)) = (
+                    thread_to_canonical.get(&thread_a),
+                    thread_to_canonical.get(&thread_b),
+                ) {
+                    composed_edges.push(ComposedEdge {
+                        source_id: node_a.clone(),
+                        target_id: node_b.clone(),
+                        weight: relevance,
+                        edge_type: "web".to_string(),
+                        live: true,
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(ComposedView {
+        nodes: composed_nodes,
+        edges: composed_edges,
+        slugs: all_slugs,
+    })
 }
 
 /// Entity index — all entities that appear in 2+ nodes, with their locations.

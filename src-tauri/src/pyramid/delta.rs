@@ -22,16 +22,17 @@ use crate::pyramid::llm;
 use crate::pyramid::naming::{clean_headline, headline_for_node};
 use crate::pyramid::types::*;
 
-// ── Constants ────────────────────────────────────────────────────────────────
+// ── Constants (loaded from OperationalConfig) ─────────────────────────────────
 
-const COLLAPSE_THRESHOLD: i64 = 50;
-const DISTILLATION_TOKEN_BUDGET: usize = 800;
-const DISTILLATION_EARLY_COLLAPSE: usize = 1200;
-/// Reserved for future debounce logic in the warm pass.
+use super::{Tier2Config, Tier3Config};
+
+fn collapse_threshold() -> i64 { Tier3Config::default().collapse_threshold }
+fn distillation_token_budget() -> usize { Tier2Config::default().distillation_token_budget }
+fn distillation_early_collapse() -> usize { Tier2Config::default().distillation_early_collapse }
 #[allow(dead_code)]
-const STALENESS_DEBOUNCE_SECS: u64 = 10;
-const MAX_PROPAGATION_DEPTH: i64 = 10;
-const SELF_CHECK_WINDOW: i64 = 5;
+fn staleness_debounce_secs() -> u64 { Tier3Config::default().staleness_debounce_secs }
+fn max_propagation_depth() -> i64 { Tier3Config::default().max_propagation_depth }
+fn self_check_window() -> i64 { Tier3Config::default().self_check_window }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -178,7 +179,7 @@ fn truncate_for_name(text: &str, max_len: usize) -> String {
 /// Steps:
 /// 1. Load the thread's current canonical node (distilled text)
 /// 2. Load the cumulative distillation
-/// 3. Load the last SELF_CHECK_WINDOW deltas
+/// 3. Load the last self_check_window() deltas
 /// 4. Call LLM with delta prompt
 /// 5. Parse response
 /// 6. Save delta with transaction-wrapped sequence assignment
@@ -219,8 +220,8 @@ pub async fn create_delta(
     let recent_deltas = {
         let conn = reader.lock().await;
         let all = db::get_deltas(&conn, slug, thread_id, None)?;
-        let start = if all.len() > SELF_CHECK_WINDOW as usize {
-            all.len() - SELF_CHECK_WINDOW as usize
+        let start = if all.len() > self_check_window() as usize {
+            all.len() - self_check_window() as usize
         } else {
             0
         };
@@ -398,7 +399,7 @@ Output JSON only:
             &canonical_id,
             1,
             &mut visited,
-            MAX_PROPAGATION_DEPTH,
+            max_propagation_depth(),
         ) {
             Ok(affected) => {
                 if !affected.is_empty() {
@@ -494,7 +495,7 @@ Output JSON only:
         } else {
             thread_names_list
         },
-        budget = DISTILLATION_TOKEN_BUDGET,
+        budget = distillation_token_budget(),
     );
 
     let cfg = config_for_model(api_key, model);
@@ -564,11 +565,11 @@ Output JSON only:
     );
 
     // 6. Check early collapse condition
-    if estimate_tokens(&new_distillation) > DISTILLATION_EARLY_COLLAPSE {
+    if estimate_tokens(&new_distillation) > distillation_early_collapse() {
         warn!(
             "[delta] distillation exceeds early collapse threshold ({} > {}), collapse recommended",
             estimate_tokens(&new_distillation),
-            DISTILLATION_EARLY_COLLAPSE
+            distillation_early_collapse()
         );
     }
 
@@ -749,6 +750,7 @@ Output valid JSON matching this schema:
         children: canonical_node.children.clone(),
         parent_id: canonical_node.parent_id.clone(),
         superseded_by: None,
+            build_id: None,
         created_at: now_ts(),
     };
 
@@ -832,11 +834,13 @@ Output valid JSON matching this schema:
         };
         db::save_collapse_event(&tx, &event)?;
 
-        // Delete only the absorbed deltas (those with sequence <= max absorbed)
+        // Scope absorbed deltas by build_id (retained as history, not deleted)
         let max_absorbed_seq = all_deltas.last().map(|d| d.sequence).unwrap_or(0);
+        let collapse_build_id = format!("collapse-{}", new_node_id);
         tx.execute(
-            "DELETE FROM pyramid_deltas WHERE slug = ?1 AND thread_id = ?2 AND sequence <= ?3",
-            rusqlite::params![slug, thread_id, max_absorbed_seq],
+            "UPDATE pyramid_deltas SET build_id = ?4
+             WHERE slug = ?1 AND thread_id = ?2 AND sequence <= ?3 AND build_id IS NULL",
+            rusqlite::params![slug, thread_id, max_absorbed_seq, collapse_build_id],
         )?;
 
         tx.commit()?;
@@ -857,7 +861,7 @@ Output valid JSON matching this schema:
             &new_node_id,
             1,
             &mut visited,
-            MAX_PROPAGATION_DEPTH,
+            max_propagation_depth(),
         ) {
             Ok(affected) => {
                 if !affected.is_empty() {
@@ -970,7 +974,7 @@ pub fn check_collapse_needed(
         )
         .unwrap_or(0);
 
-    if delta_count >= COLLAPSE_THRESHOLD {
+    if delta_count >= collapse_threshold() {
         return Ok(true);
     }
 
@@ -983,7 +987,7 @@ pub fn check_collapse_needed(
         )
         .unwrap_or_default();
 
-    if estimate_tokens(&distillation_content) > DISTILLATION_EARLY_COLLAPSE {
+    if estimate_tokens(&distillation_content) > distillation_early_collapse() {
         return Ok(true);
     }
 
@@ -1062,7 +1066,7 @@ mod tests {
         // Bump delta_count past threshold
         conn.execute(
             "UPDATE pyramid_threads SET delta_count = ?1 WHERE slug = 'test' AND thread_id = 't1'",
-            rusqlite::params![COLLAPSE_THRESHOLD],
+            rusqlite::params![collapse_threshold()],
         )
         .unwrap();
         assert!(check_collapse_needed(&conn, "test", "t1").unwrap());

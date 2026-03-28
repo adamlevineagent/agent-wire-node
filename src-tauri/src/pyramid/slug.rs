@@ -123,6 +123,11 @@ pub fn resolve_validated_source_paths(
     content_type: &ContentType,
     data_dir: Option<&Path>,
 ) -> Result<Vec<PathBuf>> {
+    // Question pyramids derive from other pyramids, not filesystem paths.
+    if matches!(content_type, ContentType::Question) {
+        return Ok(vec![]);
+    }
+
     let allowed_roots = allowed_source_roots();
     if allowed_roots.is_empty() {
         return Err(anyhow!("No allowed source roots are configured"));
@@ -171,6 +176,10 @@ pub fn resolve_validated_source_paths(
                     ));
                 }
             }
+            ContentType::Question => {
+                // Question pyramids derive from other pyramids, not filesystem paths.
+                // Source path validation is a no-op.
+            }
         }
 
         validated.push(canonical);
@@ -184,6 +193,11 @@ pub fn normalize_and_validate_source_path(
     content_type: &ContentType,
     data_dir: Option<&Path>,
 ) -> Result<String> {
+    // Question pyramids derive from other pyramids, not filesystem paths.
+    if matches!(content_type, ContentType::Question) {
+        return Ok(String::new());
+    }
+
     let paths = resolve_validated_source_paths(source_path, content_type, data_dir)?;
     let normalized: Vec<String> = paths
         .iter()
@@ -203,12 +217,20 @@ pub fn list_slugs(conn: &Connection) -> Result<Vec<SlugInfo>> {
     db::list_slugs(conn)
 }
 
-/// Delete a slug and all associated data. Verifies the slug exists first.
-pub fn delete_slug(conn: &Connection, slug: &str) -> Result<()> {
+/// Archive a slug (soft-delete). Sets `archived_at` timestamp. Verifies the slug exists first.
+pub fn archive_slug(conn: &Connection, slug: &str) -> Result<()> {
     if db::get_slug(conn, slug)?.is_none() {
         return Err(anyhow!("Slug '{}' not found", slug));
     }
-    db::delete_slug(conn, slug)
+    db::archive_slug(conn, slug)
+}
+
+/// Admin-only hard delete of a slug and all associated data. Verifies the slug exists first.
+pub fn purge_slug(conn: &Connection, slug: &str) -> Result<()> {
+    if db::get_slug(conn, slug)?.is_none() {
+        return Err(anyhow!("Slug '{}' not found", slug));
+    }
+    db::purge_slug(conn, slug)
 }
 
 /// Get a single slug by name.
@@ -251,11 +273,21 @@ mod tests {
     }
 
     #[test]
-    fn test_delete_checks_existence() {
+    fn test_archive_checks_existence() {
         let conn = Connection::open_in_memory().unwrap();
         db::init_pyramid_db(&conn).unwrap();
 
-        let result = delete_slug(&conn, "nonexistent");
+        let result = archive_slug(&conn, "nonexistent");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("not found"));
+    }
+
+    #[test]
+    fn test_purge_checks_existence() {
+        let conn = Connection::open_in_memory().unwrap();
+        db::init_pyramid_db(&conn).unwrap();
+
+        let result = purge_slug(&conn, "nonexistent");
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("not found"));
     }

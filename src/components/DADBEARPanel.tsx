@@ -84,7 +84,10 @@ interface ContributionsData {
 
 interface DADBEARPanelProps {
     slug: string;
+    contentType?: string;
+    referencingSlugs?: string[];
     onBack: () => void;
+    onNavigateToSlug?: (slug: string, nodeId: string) => void;
 }
 
 interface L0SweepResult {
@@ -95,7 +98,7 @@ interface L0SweepResult {
     already_pending: number;
 }
 
-export function DADBEARPanel({ slug, onBack }: DADBEARPanelProps) {
+export function DADBEARPanel({ slug, contentType, referencingSlugs, onBack, onNavigateToSlug }: DADBEARPanelProps) {
     // Config state
     const [config, setConfig] = useState<AutoUpdateConfig | null>(null);
     const [editDebounce, setEditDebounce] = useState(5);
@@ -749,8 +752,11 @@ Last check: ${lastCheckStr}
                 <div className="dadbear-grid-full">
                     <PyramidVisualization
                         slug={slug}
+                        contentType={contentType}
+                        referencingSlugs={referencingSlugs}
                         staleLog={staleLog}
                         status={status}
+                        onNavigateToSlug={onNavigateToSlug}
                     />
                 </div>
 

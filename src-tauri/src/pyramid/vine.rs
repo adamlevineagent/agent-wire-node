@@ -464,6 +464,7 @@ pub fn assemble_vine_l0(
             children: Vec::new(),
             parent_id: None,
             superseded_by: None,
+            build_id: None,
             created_at: String::new(), // db fills this
         };
 
@@ -501,6 +502,7 @@ pub fn assemble_vine_l0(
                     children: Vec::new(),
                     parent_id: None,
                     superseded_by: None,
+            build_id: None,
                     created_at: String::new(),
                 };
 
@@ -566,6 +568,9 @@ pub async fn run_build_pipeline(
         }
         ContentType::Vine => Err(anyhow!(
             "Vine build uses vine-specific pipeline, not run_build_pipeline"
+        )),
+        ContentType::Question => Err(anyhow!(
+            "Question build uses question-driven pipeline, not run_build_pipeline"
         )),
     };
 
@@ -761,34 +766,25 @@ pub fn cleanup_building_bunches(conn: &Connection, vine_slug: &str) -> Result<i6
     let count = building.len() as i64;
     for bunch_slug in &building {
         info!("Cleaning up partial build for bunch '{bunch_slug}'");
-        // Delete pyramid data WITHOUT deleting the slug itself (preserves vine_bunches FK)
+        // Supersede all nodes (partial builds are still contributions)
+        let cleanup_build_id = format!("vine-cleanup-{}", uuid::Uuid::new_v4());
+        db::supersede_all_nodes(conn, bunch_slug, &cleanup_build_id)?;
+        // Scope execution tables by build_id (old records retained as history)
         conn.execute(
-            "DELETE FROM pyramid_nodes WHERE slug = ?1",
-            rusqlite::params![bunch_slug],
+            "UPDATE pyramid_pipeline_steps SET build_id = ?2 WHERE slug = ?1 AND build_id IS NULL",
+            rusqlite::params![bunch_slug, &cleanup_build_id],
         )?;
         conn.execute(
-            "DELETE FROM pyramid_chunks WHERE slug = ?1",
-            rusqlite::params![bunch_slug],
+            "UPDATE pyramid_threads SET build_id = ?2 WHERE slug = ?1 AND build_id IS NULL",
+            rusqlite::params![bunch_slug, &cleanup_build_id],
         )?;
         conn.execute(
-            "DELETE FROM pyramid_pipeline_steps WHERE slug = ?1",
-            rusqlite::params![bunch_slug],
+            "UPDATE pyramid_deltas SET build_id = ?2 WHERE slug = ?1 AND build_id IS NULL",
+            rusqlite::params![bunch_slug, &cleanup_build_id],
         )?;
         conn.execute(
-            "DELETE FROM pyramid_batches WHERE slug = ?1",
-            rusqlite::params![bunch_slug],
-        )?;
-        conn.execute(
-            "DELETE FROM pyramid_threads WHERE slug = ?1",
-            rusqlite::params![bunch_slug],
-        )?;
-        conn.execute(
-            "DELETE FROM pyramid_deltas WHERE slug = ?1",
-            rusqlite::params![bunch_slug],
-        )?;
-        conn.execute(
-            "DELETE FROM pyramid_distillations WHERE slug = ?1",
-            rusqlite::params![bunch_slug],
+            "UPDATE pyramid_distillations SET build_id = ?2 WHERE slug = ?1 AND build_id IS NULL",
+            rusqlite::params![bunch_slug, &cleanup_build_id],
         )?;
         // Reset slug stats
         conn.execute(
@@ -1687,12 +1683,15 @@ pub async fn run_intelligence_passes(
     cancel: &CancellationToken,
 ) -> Result<()> {
     // Idempotency: clear all vine-intelligence contributions before re-run.
-    // Annotations use INSERT (not upsert), so duplicates accumulate without cleanup.
-    // FAQ and web edges use ON CONFLICT DO UPDATE so they're naturally idempotent.
+    // 11-B: Use INSERT OR REPLACE pattern via unique constraint.
+    // Until the annotation schema gets a UNIQUE(slug, node_id, annotation_type, author) constraint,
+    // we scope the cleanup to specific annotation types produced by vine-intelligence.
+    // This is tightly scoped (not a blanket DELETE) and only affects machine-generated annotations.
     {
         let conn = state.writer.lock().await;
         conn.execute(
-            "DELETE FROM pyramid_annotations WHERE slug = ?1 AND author = 'vine-intelligence'",
+            "DELETE FROM pyramid_annotations WHERE slug = ?1 AND author = 'vine-intelligence' \
+             AND annotation_type IN ('era', 'transition', 'health_check', 'directory', 'observation')",
             rusqlite::params![vine_slug],
         )?;
         info!("Cleared previous vine-intelligence annotations for '{vine_slug}'");
@@ -2752,16 +2751,19 @@ pub async fn notify_vine_of_bunch_change(
     bunch.penultimate_node_ids = pen_ids;
     bunch.metadata = Some(new_metadata);
 
-    // Step: Delete existing vine L0 nodes for this bunch and reassemble
+    // Step: Supersede existing vine L0 nodes for this bunch and reassemble
     {
         let conn = state.writer.lock().await;
 
-        // Delete L0 nodes whose headline starts with "Session {bunch_index}:" or "Session {bunch_index} /"
+        // Supersede L0 nodes whose headline starts with "Session {bunch_index}:" or "Session {bunch_index} /"
         let prefix_colon = format!("Session {}:", bunch.bunch_index);
         let prefix_slash = format!("Session {} /", bunch.bunch_index);
-        conn.execute(
-            "DELETE FROM pyramid_nodes WHERE slug = ?1 AND depth = 0 AND (headline LIKE ?2 OR headline LIKE ?3)",
-            rusqlite::params![vine_slug, format!("{}%", prefix_colon), format!("{}%", prefix_slash)],
+        let reassembly_build_id = format!("vine-reassembly-{}", uuid::Uuid::new_v4());
+        db::supersede_nodes_by_headline_pattern(
+            &conn, vine_slug, 0,
+            &format!("{}%", prefix_colon),
+            &format!("{}%", prefix_slash),
+            &reassembly_build_id,
         )?;
 
         // Re-read the apex from the bunch pyramid (already extracted above, reuse it)
@@ -2774,7 +2776,7 @@ pub async fn notify_vine_of_bunch_change(
 
         // Determine the next available chunk_index for vine L0 nodes
         let max_chunk: i64 = conn.query_row(
-            "SELECT COALESCE(MAX(chunk_index), -1) FROM pyramid_nodes WHERE slug = ?1 AND depth = 0",
+            "SELECT COALESCE(MAX(chunk_index), -1) FROM live_pyramid_nodes WHERE slug = ?1 AND depth = 0",
             rusqlite::params![vine_slug],
             |row| row.get(0),
         )?;
@@ -2819,6 +2821,7 @@ pub async fn notify_vine_of_bunch_change(
             children: Vec::new(),
             parent_id: None,
             superseded_by: None,
+            build_id: None,
             created_at: String::new(),
         };
         db::save_node(
@@ -2854,6 +2857,7 @@ pub async fn notify_vine_of_bunch_change(
                     children: Vec::new(),
                     parent_id: None,
                     superseded_by: None,
+            build_id: None,
                     created_at: String::new(),
                 };
                 db::save_node(
@@ -3102,16 +3106,18 @@ pub async fn force_rebuild_vine_upper(
         }
     }
 
-    // Step 1-2: Delete L2+ nodes and pipeline steps
+    // Step 1-2: Supersede L2+ nodes and scope pipeline steps
     {
         let conn = state.writer.lock().await;
-        let nodes_deleted = db::delete_nodes_above(&conn, vine_slug, 1)?;
-        let steps_deleted = db::delete_steps_above_depth(&conn, vine_slug, 1)?;
-        info!("Cleared {nodes_deleted} nodes and {steps_deleted} steps above L1");
+        let rebuild_build_id = format!("vine-rebuild-{}", uuid::Uuid::new_v4());
+        let nodes_superseded = db::supersede_nodes_above(&conn, vine_slug, 1, &rebuild_build_id)?;
+        // 11-A: Scope step deletion by build_id (None = legacy steps without build_id)
+        let steps_deleted = db::delete_steps_above_depth(&conn, vine_slug, 1, None)?;
+        info!("Superseded {nodes_superseded} nodes and cleared {steps_deleted} steps above L1");
 
-        // Clear stale parent_ids on L1 nodes left behind after L2+ deletion
+        // Clear stale parent_ids on live L1 nodes left behind after L2+ supersession
         conn.execute(
-            "UPDATE pyramid_nodes SET parent_id = NULL WHERE slug = ?1 AND depth = 1",
+            "UPDATE pyramid_nodes SET parent_id = NULL WHERE slug = ?1 AND depth = 1 AND superseded_by IS NULL",
             rusqlite::params![vine_slug],
         )?;
     }
@@ -3139,7 +3145,8 @@ pub async fn force_rebuild_vine_upper(
     };
     let l0_to_bunch = rebuild_l0_to_bunch_map(state, vine_slug, &bunches).await?;
 
-    // Clear vine-intelligence annotations (ERA/transition will be regenerated)
+    // 11-B: Scoped cleanup of machine-generated annotations before regeneration.
+    // Tightly scoped to specific annotation_type + author — not a blanket DELETE.
     {
         let conn = state.writer.lock().await;
         conn.execute(
@@ -3294,7 +3301,7 @@ pub async fn run_integrity_check(state: &PyramidState, vine_slug: &str) -> Resul
 
         let conn = state.writer.lock().await;
 
-        // Delete previous health check annotation (prevent accumulation)
+        // 11-B: Scoped cleanup of previous health_check annotation before regeneration
         conn.execute(
             "DELETE FROM pyramid_annotations WHERE slug = ?1 AND annotation_type = 'health_check' AND author = 'vine-intelligence'",
             rusqlite::params![vine_slug],
@@ -3401,7 +3408,7 @@ pub async fn wire_sub_apex_directory(state: &PyramidState, vine_slug: &str) -> R
     {
         let conn = state.writer.lock().await;
 
-        // Delete old directory annotations
+        // 11-B: Scoped cleanup of old directory annotations before regeneration
         conn.execute(
             "DELETE FROM pyramid_annotations WHERE slug = ?1 AND annotation_type = 'directory' AND author = 'vine-intelligence'",
             rusqlite::params![vine_slug],

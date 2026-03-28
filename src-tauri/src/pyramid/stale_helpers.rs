@@ -7,6 +7,8 @@
 //   - dispatch_tombstone: Tombstone deleted files
 //   - dispatch_rename_check: LLM-powered rename detection
 
+use std::path::Path;
+
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use rusqlite::Connection;
@@ -141,7 +143,7 @@ pub async fn dispatch_file_stale_check(
 
     let prompt_sections: Vec<(String, String, String, String)> =
         tokio::task::spawn_blocking(move || -> Result<Vec<(String, String, String, String)>> {
-            let conn = Connection::open(&db).context("Failed to open DB for file stale check")?;
+            let conn = super::db::open_pyramid_connection(Path::new(&db)).context("Failed to open DB for file stale check")?;
             let mut sections = Vec::new();
 
             for m in &batch_c {
@@ -294,7 +296,7 @@ Output JSON only. Array of objects, one per file:
         let ct = usage.completion_tokens;
         let cost = cost_usd;
         let _ = tokio::task::spawn_blocking(move || {
-            if let Ok(conn) = Connection::open(&db_cost) {
+            if let Ok(conn) = super::db::open_pyramid_connection(Path::new(&db_cost)) {
                 let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
                 let _ = conn.execute(
                     "INSERT INTO pyramid_cost_log (slug, operation, model, input_tokens, output_tokens, estimated_cost, source, layer, check_type, created_at, chain_id, step_name, tier, latency_ms, generation_id, estimated_cost_usd) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'auto-stale', ?7, ?8, ?9, NULL, NULL, NULL, NULL, NULL, NULL)",
@@ -373,7 +375,7 @@ pub async fn dispatch_new_file_ingest(batch: Vec<PendingMutation>, db_path: &str
     let slug_c = slug.clone();
 
     tokio::task::spawn_blocking(move || -> Result<()> {
-        let conn = Connection::open(&db)
+        let conn = super::db::open_pyramid_connection(Path::new(&db))
             .context("Failed to open DB for new file ingest")?;
         let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
 
@@ -477,7 +479,7 @@ pub async fn dispatch_tombstone(batch: Vec<PendingMutation>, db_path: &str) -> R
     let slug_c = slug.clone();
 
     tokio::task::spawn_blocking(move || -> Result<()> {
-        let conn = Connection::open(&db)
+        let conn = super::db::open_pyramid_connection(Path::new(&db))
             .context("Failed to open DB for tombstoning")?;
         let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
 
@@ -629,7 +631,7 @@ pub async fn dispatch_rename_check(
 
     let (old_distilled, new_content_head) =
         tokio::task::spawn_blocking(move || -> Result<(String, String)> {
-            let conn = Connection::open(&db).context("Failed to open DB for rename check")?;
+            let conn = super::db::open_pyramid_connection(Path::new(&db)).context("Failed to open DB for rename check")?;
 
             // Look up old node content
             let node_ids = get_file_node_ids(&conn, &slug_c, &old_path_c).unwrap_or_default();
@@ -694,7 +696,7 @@ Output JSON only:
         let ct = usage.completion_tokens;
         let cost = cost_usd;
         let _ = tokio::task::spawn_blocking(move || {
-            if let Ok(conn) = Connection::open(&db_cost) {
+            if let Ok(conn) = super::db::open_pyramid_connection(Path::new(&db_cost)) {
                 let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
                 let _ = conn.execute(
                     "INSERT INTO pyramid_cost_log (slug, operation, model, input_tokens, output_tokens, estimated_cost, source, layer, check_type, created_at, chain_id, step_name, tier, latency_ms, generation_id, estimated_cost_usd) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'auto-stale', ?7, ?8, ?9, NULL, NULL, NULL, NULL, NULL, NULL)",
@@ -725,7 +727,7 @@ Output JSON only:
     let new_path_c = new_path.clone();
 
     tokio::task::spawn_blocking(move || -> Result<()> {
-        let conn = Connection::open(&db)
+        let conn = super::db::open_pyramid_connection(Path::new(&db))
             .context("Failed to open DB for rename post-processing")?;
         let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
 

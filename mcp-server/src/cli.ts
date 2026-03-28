@@ -18,6 +18,12 @@
  *   annotations <slug> [node_id]    List annotations (optionally for a specific node)
  *   annotate <slug> <node_id> <content>  Add annotation
  *
+ * Question Pyramid Commands:
+ *   create-question-slug <name> --ref <slug1> [--ref <slug2>]  Create question slug
+ *   question-build <slug> "<question>" [--granularity N] [--max-depth N]  Build question pyramid
+ *   references <slug>                     Show references and referrers
+ *   composed <slug>                       Get composed view across referenced slugs
+ *
  * Vine Commands:
  *   vine-build <slug> <dir1> [dir2...]   Build vine from JSONL directories
  *   vine-bunches <slug>                  List all bunches with metadata
@@ -266,6 +272,59 @@ async function run(): Promise<void> {
       break;
     }
 
+    // ── Question Pyramid commands (WS8-H) ─────────────────────────────
+
+    case "create-question-slug": {
+      const name = requireArg(1, "name");
+      // Collect all --ref flags: parseArgs only captures the last --ref,
+      // so we manually gather all of them from rawArgs.
+      const refs: string[] = [];
+      for (let ri = 0; ri < rawArgs.length; ri++) {
+        if (rawArgs[ri] === "--ref" && ri + 1 < rawArgs.length) {
+          refs.push(rawArgs[ri + 1]);
+          ri++;
+        }
+      }
+      if (refs.length === 0) {
+        process.stderr.write("Error: at least one --ref <slug> is required\n");
+        process.exit(1);
+      }
+      output(await pf("/pyramid/slugs", {
+        method: "POST",
+        body: {
+          slug: name,
+          content_type: "question",
+          referenced_slugs: refs,
+        },
+      }));
+      break;
+    }
+
+    case "question-build": {
+      const slug = requireArg(1, "slug");
+      const question = requireArg(2, "question");
+      const body: Record<string, unknown> = { question };
+      if (flags.granularity) body.granularity = parseInt(flags.granularity, 10);
+      if (flags["max-depth"]) body.max_depth = parseInt(flags["max-depth"], 10);
+      output(await pf(`/pyramid/${enc(slug)}/build/question`, {
+        method: "POST",
+        body,
+      }));
+      break;
+    }
+
+    case "references": {
+      const slug = requireArg(1, "slug");
+      output(await pf(`/pyramid/${enc(slug)}/references`));
+      break;
+    }
+
+    case "composed": {
+      const slug = requireArg(1, "slug");
+      output(await pf(`/pyramid/${enc(slug)}/composed`));
+      break;
+    }
+
     // ── Vine Conversation System commands ─────────────────────────────
 
     case "vine-build": {
@@ -352,6 +411,12 @@ Commands:
   faq-dir <slug>                  FAQ directory (flat or hierarchical)
   annotations <slug> [node_id]    List annotations (optionally for a specific node)
   annotate <slug> <node_id> <content>  Add annotation
+
+Question Pyramid Commands:
+  create-question-slug <name> --ref <slug1> [--ref <slug2>]  Create question slug with references
+  question-build <slug> "<question>" [--granularity N] [--max-depth N]  Build question pyramid
+  references <slug>                     Show what a slug references and who references it
+  composed <slug>                       Get composed view across slug + referenced slugs
 
 Vine Commands:
   vine-build <slug> <dir1> [dir2...]   Build vine from JSONL directories

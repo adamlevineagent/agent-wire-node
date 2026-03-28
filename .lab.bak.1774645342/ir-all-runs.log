@@ -1,0 +1,523 @@
+2026-03-26T16:32:11.403952Z  INFO wire_node_lib::pyramid::chain_executor: [IR] step 'l0_extract' started (primitive: Some("extract"), depth: 0, done=0/54)
+2026-03-26T16:32:11.408531Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=636)
+2026-03-26T16:32:11.408611Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:32:11.410955Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=14803)
+2026-03-26T16:32:11.411033Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:32:11.413357Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=9397)
+2026-03-26T16:32:11.413429Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:32:11.416118Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=9394)
+2026-03-26T16:32:11.416181Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:32:11.418537Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=4739)
+2026-03-26T16:32:11.418601Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:32:11.419893Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=641)
+2026-03-26T16:32:11.419949Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:32:11.422164Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=835)
+2026-03-26T16:32:11.422561Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:32:11.425979Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=8859)
+2026-03-26T16:32:11.426038Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:32:13.769473Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:32:14.231925Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:32:14.390172Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:32:15.108510Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=4296)
+2026-03-26T16:32:15.108575Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:32:15.204564Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:32:15.677942Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:32:15.727332Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:32:16.309934Z  WARN wire_node_lib::pyramid::chain_executor: [IR] [l0_extract] L0-000: no authoritative children in item/resolved_input; item_keys=["content", "index"]; resolved_keys=["content", "index"]; LLM children invalid ([])
+2026-03-26T16:32:16.310156Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=198)
+2026-03-26T16:32:16.310216Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:32:17.341667Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=5432)
+2026-03-26T16:32:17.341703Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:32:17.713013Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:32:17.773326Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=30522)
+2026-03-26T16:32:17.773343Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:32:17.786830Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:32:18.281667Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=8088)
+2026-03-26T16:32:18.281681Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:32:18.498364Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:32:19.083311Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=6174)
+2026-03-26T16:32:19.083356Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:32:19.907511Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parsed OK
+2026-03-26T16:32:19.907620Z  WARN wire_node_lib::pyramid::chain_executor: [IR] [l0_extract] L0-010: no authoritative children in item/resolved_input; item_keys=["content", "index"]; resolved_keys=["content", "index"]; LLM children invalid ([])
+2026-03-26T16:32:19.907852Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=14828)
+2026-03-26T16:32:19.907907Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:32:19.982080Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=44536)
+2026-03-26T16:32:19.982107Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:32:20.615797Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 1 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: Below is a **concise, question‑by‑question extraction** that is **directly supported by the contents of `mcp‑server/src/cli.ts`** (the only source you supplied).  
+2026-03-26T16:32:20.615857Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=6867)
+2026-03-26T16:32:20.615894Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:32:21.674520Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 2 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: **File overview – `mcp-server/src/index‑tester‑mark‑this‑stale.ts`**  
+2026-03-26T16:32:21.674654Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 3 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: **File:** `mcp-server/src/index.ts` (TypeScript – entry‑point for the **MCP (Model‑Context‑Protocol) server**)
+2026-03-26T16:32:21.674662Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=4345)
+2026-03-26T16:32:21.674715Z ERROR wire_node_lib::pyramid::chain_executor: [IR] forEach item 4 panicked or was aborted: task 506 panicked with message "byte index 200 is not a char boundary; it is inside '‑' (bytes 198..201) of `**File:** `mcp-server/src/lib.ts`  \n**Language:** TypeScript (Node.js)  \n\n---\n\n## 1. High‑level purpose of the file  \n\n- **Shared utilities** for the *Wire‑Node* “pyramid” MCP (Multi‑Chain‑Processor) server and its CLI.  \n- Provides three core `[...]"
+2026-03-26T16:32:21.674752Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:32:21.674768Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 4 failed: forEach task panicked or was aborted: task 506 panicked with message "byte index 200 is not a char boundary; it is inside '‑' (bytes 198..201) of `**File:** `mcp-server/src/lib.ts`  \n**Language:** TypeScript (Node.js)  \n\n---\n\n## 1. High‑level purpose of the file  \n\n- **Shared utilities** for the *Wire‑Node* “pyramid” MCP (Multi‑Chain‑Processor) server and its CLI.  \n- Provides three core `[...]"
+2026-03-26T16:32:21.674808Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 5 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: **What the `mcp‑server/tsconfig.json` tells us about the project**
+2026-03-26T16:32:21.674835Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 6 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: **Extracted information from `package.json` (frontend‑focused configuration)**  
+2026-03-26T16:32:21.674862Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 7 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: **File:** `scripts/backfill-source-paths.ts`  
+2026-03-26T16:32:22.460902Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:32:22.934638Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:32:23.373298Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 8 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: ## 1. What the `src/App.tsx` file does and how it fits into the overall frontend architecture  
+2026-03-26T16:32:23.373321Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 9 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: **File:** `src/assets.d.ts`  
+2026-03-26T16:32:23.373329Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=11697)
+2026-03-26T16:32:23.373345Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:32:23.606969Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:32:24.296780Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:32:24.556659Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:32:25.773914Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=19221)
+2026-03-26T16:32:25.773992Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:32:26.375085Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=9519)
+2026-03-26T16:32:26.375153Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:32:26.570152Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:32:26.935902Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:32:27.281680Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=2815)
+2026-03-26T16:32:27.281720Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:32:28.017918Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=12776)
+2026-03-26T16:32:28.017955Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:32:28.031790Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:32:28.592703Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=7455)
+2026-03-26T16:32:28.592734Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:32:28.984726Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:32:30.335506Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:32:30.667919Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:32:31.446636Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:32:31.751521Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 11 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: Below is a **focused extraction** of everything that can be learned from the **`src/components/AddWorkspace.tsx`** file.  
+2026-03-26T16:32:31.751571Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=17094)
+2026-03-26T16:32:31.751610Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:32:31.751582Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 12 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: **File:** `src/components/AppShell.tsx`  
+2026-03-26T16:32:31.751700Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 13 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: **What can be learned from `src/components/BuildProgress.tsx`**
+2026-03-26T16:32:31.751775Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 14 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: **File:** `src/components/CommandCenter.tsx`  
+2026-03-26T16:32:32.083780Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=1506)
+2026-03-26T16:32:32.083799Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:32:32.166088Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:32:32.340196Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=16563)
+2026-03-26T16:32:32.340218Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:32:33.148884Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=26153)
+2026-03-26T16:32:33.148919Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:32:34.376409Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=5253)
+2026-03-26T16:32:34.376482Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:32:34.536591Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:32:35.129261Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=8010)
+2026-03-26T16:32:35.129324Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:32:35.241421Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:32:35.379591Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:32:35.794534Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=25996)
+2026-03-26T16:32:35.794587Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:32:36.760797Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:32:37.115727Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 15 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: Below is a **focused extraction** from **`src/components/DADBEARPanel.tsx`** that answers each of the requested questions as far as the file itself can tell us.  
+2026-03-26T16:32:37.115843Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=11267)
+2026-03-26T16:32:37.115852Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 16 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: ### Dashboard.tsx – What the file does and how it fits into the overall UI
+2026-03-26T16:32:37.115872Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:32:37.115900Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 17 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: **File:** `src/components/DiffViewer.tsx`  
+2026-03-26T16:32:37.115930Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 18 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: Below is a focused extraction of everything that can be inferred from **`src/components/FAQDirectory.tsx`** and how it fits into the broader project.  
+2026-03-26T16:32:37.115956Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 19 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: **What can be learned from `src/components/FolderLink.tsx` about the questions‑node project?**  
+2026-03-26T16:32:37.115981Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 20 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: **File:** `src/components/ImpactStats.tsx`  
+2026-03-26T16:32:37.116017Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 21 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: **`src/components/LogViewer.tsx` – Overview & Key Details**
+2026-03-26T16:32:37.116044Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 22 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: **File:** `src/components/LoginScreen.tsx`  
+2026-03-26T16:32:37.116069Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 23 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: **`MarketView.tsx` – Overview & Key Details**
+2026-03-26T16:32:37.214976Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=4641)
+2026-03-26T16:32:37.215016Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:32:37.879056Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=28238)
+2026-03-26T16:32:37.879125Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:32:38.381553Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:32:39.109475Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=9025)
+2026-03-26T16:32:39.109556Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:32:39.281077Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:32:39.459969Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:32:40.001887Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 24 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: **File:** `src/components/Messages.tsx`  
+2026-03-26T16:32:40.001983Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 25 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: **File:** `src/components/ModeRouter.tsx`  
+2026-03-26T16:32:40.001929Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=7591)
+2026-03-26T16:32:40.002159Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 26 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: ### `OnboardingWizard.tsx` – Overview & Key Points  
+2026-03-26T16:32:40.002234Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:32:40.480516Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:32:41.536987Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=7503)
+2026-03-26T16:32:41.537010Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:32:42.273582Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:32:42.417329Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parsed OK
+2026-03-26T16:32:42.417539Z  WARN wire_node_lib::pyramid::chain_executor: [IR] [l0_extract] L0-033: no authoritative children in item/resolved_input; item_keys=["content", "index"]; resolved_keys=["content", "index"]; LLM children invalid ([])
+2026-03-26T16:32:42.418002Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=10484)
+2026-03-26T16:32:42.418385Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:32:43.345463Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=22352)
+2026-03-26T16:32:43.345485Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:32:44.110320Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parsed OK
+2026-03-26T16:32:44.110403Z  WARN wire_node_lib::pyramid::chain_executor: [IR] [l0_extract] L0-036: no authoritative children in item/resolved_input; item_keys=["content", "index"]; resolved_keys=["content", "index"]; LLM children invalid ([])
+2026-03-26T16:32:44.110588Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=16280)
+2026-03-26T16:32:44.110609Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:32:44.455750Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:32:45.423563Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=13716)
+2026-03-26T16:32:45.423645Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:32:45.513657Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=1891)
+2026-03-26T16:32:45.513755Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:32:45.561843Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:32:45.640153Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:32:46.991051Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:32:47.107246Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 27 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: **1. Overall purpose of the *agent‑wire‑node* project (as reflected in the dashboard)**  
+2026-03-26T16:32:47.107384Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 28 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: **File:** `src/components/PyramidFirstRun.tsx`  
+2026-03-26T16:32:47.107475Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 29 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: Below is a concise synthesis of what can be gleaned **only** from the `src/components/PyramidSettings.tsx` file you supplied.  
+2026-03-26T16:32:47.107568Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=18658)
+2026-03-26T16:32:47.107672Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:32:47.624151Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:32:48.007824Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:32:48.049153Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:32:48.139980Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=10728)
+2026-03-26T16:32:48.140056Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:32:49.583146Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 30 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: **The “pyramid” concept in *agent‑wire‑node***  
+2026-03-26T16:32:49.583265Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 31 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: **What can be learned from `src/components/Settings.tsx`**  
+2026-03-26T16:32:49.583310Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=17122)
+2026-03-26T16:32:49.583424Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:32:49.583338Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 32 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: Below is a concise extraction of everything that can be learned about the **frontend UI layer** from the **`src/components/Sidebar.tsx`** file.  
+2026-03-26T16:32:49.583632Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 34 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: **File:** `src/components/TunnelStatus.tsx`  
+2026-03-26T16:32:49.583704Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 35 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: **File:** `src/components/VersionHistory.tsx`  
+2026-03-26T16:32:50.219436Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=2492)
+2026-03-26T16:32:50.219575Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:32:50.534551Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 37 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: **VineDrillDown.tsx – What it does and how it implements the “vine” concept**
+2026-03-26T16:32:50.534703Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=1992)
+2026-03-26T16:32:50.534721Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:32:50.733925Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=561)
+2026-03-26T16:32:50.734053Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:32:50.850543Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=553)
+2026-03-26T16:32:50.850372Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 38 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: **VineIntelligence — what the file does and how it fits into the “vine” concept**
+2026-03-26T16:32:50.850642Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:32:50.850751Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 39 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: **`VineViewer.tsx` – High‑level Overview**
+2026-03-26T16:32:51.408774Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 40 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: **File:** `src/components/modes/ActivityMode.tsx`  
+2026-03-26T16:32:51.409023Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 41 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: **File:** `src/components/modes/AgentsMode.tsx` (TypeScript, 49 lines)  
+2026-03-26T16:32:51.409145Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=556)
+2026-03-26T16:32:51.409221Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:32:51.459065Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:32:52.467634Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:32:52.831114Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:32:52.931515Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:32:52.950543Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:32:53.341716Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:32:53.984476Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:32:54.429532Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=1462)
+2026-03-26T16:32:54.429624Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:32:55.036060Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 42 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: **File:** `src/components/modes/ComposeMode.tsx`  
+2026-03-26T16:32:55.036125Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=2392)
+2026-03-26T16:32:55.036264Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:32:55.409998Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 43 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: **DashboardMode.tsx – High‑level overview**
+2026-03-26T16:32:55.410054Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=4071)
+2026-03-26T16:32:55.410204Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:32:55.571802Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:32:55.749251Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=6347)
+2026-03-26T16:32:55.749367Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:32:55.981573Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:32:56.326477Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=20057)
+2026-03-26T16:32:56.326618Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:32:56.986182Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 44 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: Below is a concise extraction of everything that can be **directly inferred from the `src/components/modes/IdentityMode.tsx` file** and how it relates to the broader set of questions you listed.  
+2026-03-26T16:32:56.986226Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=8444)
+2026-03-26T16:32:56.986315Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:32:57.188028Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 45 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: **File:** `src/components/modes/NodeMode.tsx` (TypeScript React component)
+2026-03-26T16:32:57.188107Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=9420)
+2026-03-26T16:32:57.188127Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 46 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: ### `PyramidsMode` – What it does & how it works
+2026-03-26T16:32:57.188182Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:32:57.398482Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:32:57.557246Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=19850)
+2026-03-26T16:32:57.557325Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:32:58.092266Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:32:58.164685Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parsed OK
+2026-03-26T16:32:58.164932Z  WARN wire_node_lib::pyramid::chain_executor: [IR] [l0_extract] L0-053: no authoritative children in item/resolved_input; item_keys=["content", "index"]; resolved_keys=["content", "index"]; LLM children invalid ([])
+2026-03-26T16:32:58.165435Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=7368)
+2026-03-26T16:32:58.165498Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:32:59.238483Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 47 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: **Summary of what can be learned from `src/components/modes/SearchMode.tsx`**
+2026-03-26T16:32:59.238586Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 48 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: ### Quick Overview of the File  
+2026-03-26T16:32:59.238517Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=388)
+2026-03-26T16:32:59.238730Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:32:59.238669Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 49 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: **File:** `src/components/modes/WarroomMode.tsx`  
+2026-03-26T16:32:59.238864Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 50 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: **Key Data Models & Types (src/components/pyramid‑viz/types.ts)**  
+2026-03-26T16:32:59.334594Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 51 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: **File:** `src/components/pyramid-viz/useCanvasSetup.ts`  
+2026-03-26T16:32:59.334675Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=1736)
+2026-03-26T16:32:59.334796Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:33:00.119350Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:33:00.300709Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:33:00.369011Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:33:00.476498Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 52 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: ### `usePyramidLayout` – What it does and how it works  
+2026-03-26T16:33:00.476533Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=156)
+2026-03-26T16:33:00.476694Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:33:00.498936Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:33:00.617200Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:33:02.491191Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=16873)
+2026-03-26T16:33:02.491245Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:33:02.873820Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=22400)
+2026-03-26T16:33:02.873897Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:33:03.511860Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=1428)
+2026-03-26T16:33:03.511946Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:33:03.748570Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 54 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: **Component Overview – `CorpusDetail` (src/components/stewardship/CorpusDetail.tsx)**  
+2026-03-26T16:33:03.748644Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=3959)
+2026-03-26T16:33:03.748758Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:33:03.748690Z ERROR wire_node_lib::pyramid::chain_executor: [IR] forEach item 55 panicked or was aborted: task 613 panicked with message "byte index 200 is not a char boundary; it is inside '‑' (bytes 198..201) of `**File:** `src/components/stewardship/CorpusHealthDashboard.tsx`  \n**Language:** TypeScript (React)\n\n---\n\n## 1.\u{202f}What the component does – high‑level purpose\n`CorpusHealthDashboard` is a **read‑only dashboard** that visualises a variety of health‑`[...]"
+2026-03-26T16:33:03.748917Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 55 failed: forEach task panicked or was aborted: task 613 panicked with message "byte index 200 is not a char boundary; it is inside '‑' (bytes 198..201) of `**File:** `src/components/stewardship/CorpusHealthDashboard.tsx`  \n**Language:** TypeScript (React)\n\n---\n\n## 1.\u{202f}What the component does – high‑level purpose\n`CorpusHealthDashboard` is a **read‑only dashboard** that visualises a variety of health‑`[...]"
+2026-03-26T16:33:04.166220Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 56 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: **Component Overview – `CurationQueue` (src/components/stewardship/CurationQueue.tsx)**  
+2026-03-26T16:33:04.166924Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=203151)
+2026-03-26T16:33:04.167001Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:33:04.553981Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=8930)
+2026-03-26T16:33:04.554078Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:33:06.173651Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:33:06.977925Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=10622)
+2026-03-26T16:33:06.978023Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:33:06.983640Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:33:08.599957Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:33:08.692557Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:33:09.444876Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=19014)
+2026-03-26T16:33:09.444978Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:33:10.219816Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:33:10.343907Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:33:10.949341Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=27778)
+2026-03-26T16:33:10.949441Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:33:11.003002Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=3496)
+2026-03-26T16:33:11.003101Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:33:11.545205Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 57 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: **File:** `src/components/stewardship/DocumentDetail.tsx`  
+2026-03-26T16:33:11.545340Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 58 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: **File:** `src/contexts/AppContext.tsx`  
+2026-03-26T16:33:11.545265Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=12525)
+2026-03-26T16:33:11.545510Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:33:11.545427Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 59 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: **File:** `src/main.tsx` (TypeScript – entry point for the React UI)
+2026-03-26T16:33:11.545640Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 60 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: **Backend‑side snapshot – what the `src‑tauri/Cargo.toml` tells us**
+2026-03-26T16:33:11.545703Z ERROR wire_node_lib::pyramid::chain_executor: [IR] forEach item 61 panicked or was aborted: task 625 panicked with message "byte index 200 is not a char boundary; it is inside '‑' (bytes 199..202) of `**Relevant extraction from `src‑tauri/build.rs`**\n\n| Aspect | What the file tells us |\n|--------|------------------------|\n| **Backend framework** | The project uses **Tauri** as its native desktop‑app framework. The `build.rs` script is a tiny build`[...]"
+2026-03-26T16:33:11.545760Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 61 failed: forEach task panicked or was aborted: task 625 panicked with message "byte index 200 is not a char boundary; it is inside '‑' (bytes 199..202) of `**Relevant extraction from `src‑tauri/build.rs`**\n\n| Aspect | What the file tells us |\n|--------|------------------------|\n| **Backend framework** | The project uses **Tauri** as its native desktop‑app framework. The `build.rs` script is a tiny build`[...]"
+2026-03-26T16:33:11.545813Z ERROR wire_node_lib::pyramid::chain_executor: [IR] forEach item 62 panicked or was aborted: task 627 panicked with message "byte index 200 is not a char boundary; it is inside '”' (bytes 198..201) of `**Note:** The only source material provided is **`src‑tauri/src/auth.rs`** (a Rust module that implements authentication, node registration, heartbeat and deep‑link handling for the “Wire node”).  All answers are therefore limited to what can be in`[...]"
+2026-03-26T16:33:11.545865Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 62 failed: forEach task panicked or was aborted: task 627 panicked with message "byte index 200 is not a char boundary; it is inside '”' (bytes 198..201) of `**Note:** The only source material provided is **`src‑tauri/src/auth.rs`** (a Rust module that implements authentication, node registration, heartbeat and deep‑link handling for the “Wire node”).  All answers are therefore limited to what can be in`[...]"
+2026-03-26T16:33:11.545909Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 63 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: Below is a **targeted extraction** from **`src‑tauri/src/credits.rs`** together with a brief note on what can (and cannot) be answered from this single file.  
+2026-03-26T16:33:11.545953Z ERROR wire_node_lib::pyramid::chain_executor: [IR] forEach item 64 panicked or was aborted: task 631 panicked with message "byte index 200 is not a char boundary; it is inside '‑' (bytes 199..202) of `**Note:** The only source material provided is `src-tauri/src/http_utils.rs`, a small Rust module that supplies shared HTTP utilities for Warp route handlers. Consequently, most of the requested high‑level architectural and UI questions cannot be answere`[...]"
+2026-03-26T16:33:11.545999Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 64 failed: forEach task panicked or was aborted: task 631 panicked with message "byte index 200 is not a char boundary; it is inside '‑' (bytes 199..202) of `**Note:** The only source material provided is `src-tauri/src/http_utils.rs`, a small Rust module that supplies shared HTTP utilities for Warp route handlers. Consequently, most of the requested high‑level architectural and UI questions cannot be answere`[...]"
+2026-03-26T16:33:12.356822Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=9949)
+2026-03-26T16:33:12.356952Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:33:14.448626Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:33:14.587500Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 65 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: Below is a **concise extraction** of everything that can be inferred from the supplied source file **`src‑tauri/src/lib.rs`** (the Rust backend library of the *wire‑node* project).  
+2026-03-26T16:33:14.587561Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=9664)
+2026-03-26T16:33:14.587583Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:33:14.710851Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:33:14.733483Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:33:14.923610Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=128488)
+2026-03-26T16:33:14.923684Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:33:17.373383Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:33:18.518016Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=18339)
+2026-03-26T16:33:18.518112Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:33:18.671634Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:33:19.526923Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=48895)
+2026-03-26T16:33:19.526987Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:33:20.046539Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=18435)
+2026-03-26T16:33:20.046581Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:33:22.141808Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=330993)
+2026-03-26T16:33:22.141885Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:33:23.452208Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=9141)
+2026-03-26T16:33:23.452547Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:33:25.091947Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:33:25.191407Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:33:26.576006Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:33:27.774260Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:33:30.205118Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:33:32.762135Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=3152)
+2026-03-26T16:33:32.762205Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:33:34.590964Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=29659)
+2026-03-26T16:33:34.591242Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:33:35.161927Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=22132)
+2026-03-26T16:33:35.162026Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:33:35.473463Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=1388)
+2026-03-26T16:33:35.473545Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:33:36.922492Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:33:38.422157Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:33:38.554100Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:33:39.368359Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:33:40.367822Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=26335)
+2026-03-26T16:33:40.367879Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:33:40.431352Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=63634)
+2026-03-26T16:33:40.431383Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:33:41.253247Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=114212)
+2026-03-26T16:33:41.253319Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:33:42.181724Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=54113)
+2026-03-26T16:33:42.181757Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:33:45.009644Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=38809)
+2026-03-26T16:33:45.009688Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:33:45.662440Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:33:47.908929Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:33:49.141023Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:33:49.645076Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:33:50.328864Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:33:52.474652Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=32217)
+2026-03-26T16:33:52.474768Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:33:53.835035Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:33:57.074924Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=25785)
+2026-03-26T16:33:57.075023Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:33:57.353425Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:34:00.436506Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=39766)
+2026-03-26T16:34:00.436560Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:34:00.566033Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:34:03.646704Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:34:03.887917Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=28878)
+2026-03-26T16:34:03.888003Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:34:05.516098Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=26812)
+2026-03-26T16:34:05.516202Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:34:06.041124Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=28084)
+2026-03-26T16:34:06.041217Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:34:07.530016Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:34:07.859266Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=19366)
+2026-03-26T16:34:07.859289Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:34:09.821889Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:34:10.056876Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:34:10.515487Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=9536)
+2026-03-26T16:34:10.515548Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:34:12.600342Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:34:13.669191Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:34:14.961189Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:34:16.920071Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=7987)
+2026-03-26T16:34:16.920149Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:34:17.739592Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=7048)
+2026-03-26T16:34:17.739634Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:34:18.607755Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=73739)
+2026-03-26T16:34:18.607890Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:34:19.503951Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=35915)
+2026-03-26T16:34:19.504020Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:34:22.026894Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=54512)
+2026-03-26T16:34:22.026975Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:34:22.304521Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:34:22.415343Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:34:25.794356Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:34:26.476913Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=45301)
+2026-03-26T16:34:26.476992Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:34:26.933288Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=33763)
+2026-03-26T16:34:26.933405Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:34:27.095716Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:34:30.822510Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:34:31.494399Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 66 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: Based on the provided source file (`src-tauri/src/main.rs`), here is the extraction of information relevant to your questions. Please note that this file contains the **Rust backend logic** for a Taur
+2026-03-26T16:34:31.494512Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=13628)
+2026-03-26T16:34:31.494533Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 67 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: **What can be extracted from `src‑tauri/src/market.rs`**  
+2026-03-26T16:34:31.494709Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 68 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: Below is a **target‑focused extraction** from **`src‑tauri/src/messaging.rs`**.  
+2026-03-26T16:34:31.494619Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:34:31.494805Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 69 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: **File : src‑tauri/src/partner/context.rs – What it tells us about the “agent‑wire‑node” project**
+2026-03-26T16:34:31.495060Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 70 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: **1. Overall purpose of the *agent‑wire‑node* project (as inferred from `src‑tauri/src/partner/conversation.rs`)**  
+2026-03-26T16:34:31.495141Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 71 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: **File:** `src-tauri/src/partner/crystal.rs`  
+2026-03-26T16:34:31.495223Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 72 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: Below is a concise extraction of **all** the information that can be gathered from the file **`src‑tauri/src/partner/mod.rs`**.  
+2026-03-26T16:34:31.495284Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 73 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: **File `src‑tauri/src/partner/routes.rs` – What it tells us about the backend**
+2026-03-26T16:34:31.495342Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 74 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: Below is a **concise, question‑by‑question extraction** that only uses the content of **`src-tauri/src/partner/warm.rs`** (the file you supplied).  
+2026-03-26T16:34:31.495407Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 75 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: Based on the provided source file (`src-tauri/src/pyramid/build.rs`), here is the extraction of relevant information regarding the project's architecture, purpose, and implementation details.
+2026-03-26T16:34:31.495460Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 76 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: Below is a **compact extraction of everything this file tells us** about the *agent‑wire‑node* code‑base.  
+2026-03-26T16:34:31.495509Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 77 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: Below is a **concise, point‑by‑point synthesis** of everything that can be gleaned from the **`src‑tauri/src/pyramid/chain_dispatch.rs`** file and the surrounding test suite.  
+2026-03-26T16:34:31.495573Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 78 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: Below is a **focused extraction** from **`src‑tauri/src/pyramid/chain_engine.rs`** that answers each of the listed questions as far as the file permits.  
+2026-03-26T16:34:33.016446Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:34:38.372213Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=126704)
+2026-03-26T16:34:38.372293Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:34:39.882576Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:34:40.387385Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=8668)
+2026-03-26T16:34:40.387439Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:34:42.017220Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:34:43.707723Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=55907)
+2026-03-26T16:34:43.707799Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:34:46.295483Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=38979)
+2026-03-26T16:34:46.295593Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:34:48.579376Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:34:51.505772Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 79 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: Based on the provided source file (`src-tauri/src/pyramid/chain_executor.rs`), here is the extracted information relevant to your questions.
+2026-03-26T16:34:51.505934Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 80 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: **What the `src‑tauri/src/pyramid/chain_loader.rs` file tells us**
+2026-03-26T16:34:51.506024Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 81 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: **Key take‑aways from `src‑tauri/src/pyramid/chain_registry.rs`**
+2026-03-26T16:34:51.506043Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=68044)
+2026-03-26T16:34:51.506127Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 82 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: **File examined:** `src-tauri/src/pyramid/chain_resolve.rs` (Rust – 790 lines)  
+2026-03-26T16:34:51.506192Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:34:51.506279Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 83 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: **File examined:** `src-tauri/src/pyramid/chain_resolver.rs` (Rust implementation of a two‑tier chain‑resolution system)
+2026-03-26T16:34:51.506444Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 84 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: ### File Overview  
+2026-03-26T16:34:51.506515Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 85 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: Below is a **focused extraction** from the source file **`src‑tauri/src/pyramid/converge_expand.rs`** that is relevant to the many questions you listed.  
+2026-03-26T16:34:51.507104Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 86 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: **What the provided file tells us**
+2026-03-26T16:34:52.736659Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=24168)
+2026-03-26T16:34:52.736833Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:34:52.812507Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=19097)
+2026-03-26T16:34:52.812695Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:34:55.474326Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:34:56.388077Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=130335)
+2026-03-26T16:34:56.388179Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:34:59.388658Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:34:59.712795Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:35:01.532387Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 87 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: Based on the provided source file (`src-tauri/src/pyramid/db.rs`), here is the extraction of information relevant to your questions. Please note that this file is a **backend Rust database module** fo
+2026-03-26T16:35:01.532484Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=4941)
+2026-03-26T16:35:01.532555Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 88 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: Below is a **focused synthesis** that pulls every piece of information that can be gleaned from the only source file you supplied – `src‑tauri/src/pyramid/defaults_adapter.rs`.  Where the reques
+2026-03-26T16:35:01.532570Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:35:01.532675Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 89 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: Below is a **single‑source synthesis** built from the only file you supplied – `src‑tauri/src/pyramid/delta.rs`.  Wherever the original request asks for information that lives in other parts of 
+2026-03-26T16:35:01.532962Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 90 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: **File:** `src-tauri/src/pyramid/event_chain.rs`  
+2026-03-26T16:35:01.533041Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 91 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: ## What the `execution_plan.rs` file does and why it matters to the project  
+2026-03-26T16:35:01.533107Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 92 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: **File:** `src‑tauri/src/pyramid/execution_state.rs`  
+2026-03-26T16:35:01.533196Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 93 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: ### `src‑tauri/src/pyramid/expression.rs` – What it is and why it exists  
+2026-03-26T16:35:01.533276Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 94 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: Below is a **targeted extraction** from **`src‑tauri/src/pyramid/faq.rs`** that directly answers each of the bullet‑point questions you listed.  
+2026-03-26T16:35:01.533349Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 95 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: Below is a **focused extraction** of everything that can be learned from the **`src‑tauri/src/pyramid/ingest.rs`** file (820 lines of Rust code).  
+2026-03-26T16:35:01.533409Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 96 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: **File:** `src‑tauri/src/pyramid/llm.rs`  
+2026-03-26T16:35:01.533464Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 97 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: **File:** `src-tauri/src/pyramid/meta.rs`  
+2026-03-26T16:35:01.533514Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 98 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: Below is a **complete synthesis of everything that can be inferred from the `src‑tauri/src/pyramid/mod.rs` file** (the only source you supplied).  
+2026-03-26T16:35:01.533558Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 99 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: ## 1. What the file `src‑tauri/src/pyramid/naming.rs` does – a concise overview  
+2026-03-26T16:35:04.627796Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:35:04.818064Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:35:04.895324Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=26501)
+2026-03-26T16:35:04.895421Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:35:05.399496Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:35:07.170394Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=18045)
+2026-03-26T16:35:07.170461Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:35:08.374339Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=36591)
+2026-03-26T16:35:08.374417Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:35:09.543163Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=25985)
+2026-03-26T16:35:09.543241Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:35:10.935940Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:35:10.967157Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=10273)
+2026-03-26T16:35:10.967244Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:35:14.121676Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:35:14.608394Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:35:14.634908Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:35:17.579610Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:35:17.819947Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=32799)
+2026-03-26T16:35:17.820219Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:35:18.114206Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:35:18.526689Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=35390)
+2026-03-26T16:35:18.526708Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:35:18.711587Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=13202)
+2026-03-26T16:35:18.711665Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:35:19.465526Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=894)
+2026-03-26T16:35:19.465621Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:35:21.272695Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:35:23.239917Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:35:23.485953Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=21751)
+2026-03-26T16:35:23.486043Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:35:23.586854Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:35:25.068637Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:35:26.383414Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=1572)
+2026-03-26T16:35:26.383497Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:35:26.979367Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=821)
+2026-03-26T16:35:26.979420Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:35:28.158428Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:35:28.389331Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → LLM (temp=0.3, model=mercury-2, ctx_limit=120000, prompt_len=624)
+2026-03-26T16:35:28.389474Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → no response_schema, using standard JSON extraction
+2026-03-26T16:35:29.756209Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:35:29.837518Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:35:30.978556Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:35:32.684354Z  WARN wire_node_lib::pyramid::chain_executor: [IR] [l0_extract] L0-127: no authoritative children in item/resolved_input; item_keys=["content", "index"]; resolved_keys=["content", "index"]; LLM children invalid ([])
+2026-03-26T16:35:41.421589Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'l0_extract' → JSON parse failed, retrying at temp 0.1
+2026-03-26T16:35:42.700863Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 100 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: Based on the provided source file (`src-tauri/src/pyramid/parity.rs`), here is the extraction of information relevant to your questions. Please note that this file is a backend Rust module; informatio
+2026-03-26T16:35:42.701097Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 101 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: Below is a concise, **file‑only** extraction that answers every bullet you listed as far as the content of **`src‑tauri/src/pyramid/query.rs`** permits.  
+2026-03-26T16:35:42.701325Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 102 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: Below is a **concise, point‑by‑point synthesis** of what the `src‑tauri/src/pyramid/question_compiler.rs` file tells us about the **agent‑wire‑node** project.  
+2026-03-26T16:35:42.701408Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 103 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: Below is a **focused extraction** from **`src‑tauri/src/pyramid/question_decomposition.rs`** that directly answers the questions you asked.  
+2026-03-26T16:35:42.701477Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 104 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: Below is a **focused synthesis** of everything that can be learned from the single source file you supplied – `src‑tauri/src/pyramid/question_loader.rs`.  
+2026-03-26T16:35:42.701531Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 105 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: Below is a **focused synthesis** that draws **only** on the content of `src‑tauri/src/pyramid/question_yaml.rs`.  
+2026-03-26T16:36:02.816412Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 106 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: </think>
+2026-03-26T16:36:02.816521Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 107 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: Below is a concise “knowledge‑extraction” focused on the **`src‑tauri/src/pyramid/slug.rs`** source file you supplied.  
+2026-03-26T16:36:02.816680Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 108 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: **What the file tells us about the *agent‑wire‑node* project**
+2026-03-26T16:36:02.816734Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 109 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: Below is a **concise extraction** of everything that can be inferred from the single source file you supplied – **`src‑tauri/src/pyramid/stale_helpers.rs`** – and how it maps to the many questio
+2026-03-26T16:36:02.816775Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 110 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: ## 1. Overall purpose of the **agent‑wire‑node** project (as inferred from the code)
+2026-03-26T16:36:02.816819Z ERROR wire_node_lib::pyramid::chain_executor: [IR] forEach item 111 panicked or was aborted: task 733 panicked with message "byte index 200 is not a char boundary; it is inside '‑' (bytes 198..201) of `**File:** `src‑tauri/src/pyramid/transform_runtime.rs`  \n**Language:** Rust  \n**Purpose:** Implements the *runtime* for the “pyramid” data‑processing DSL used throughout the\u{202f}**agent‑wire‑node** project. It receives a **`TransformSpec`** (a JS`[...]"
+2026-03-26T16:36:02.816865Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 111 failed: forEach task panicked or was aborted: task 733 panicked with message "byte index 200 is not a char boundary; it is inside '‑' (bytes 198..201) of `**File:** `src‑tauri/src/pyramid/transform_runtime.rs`  \n**Language:** Rust  \n**Purpose:** Implements the *runtime* for the “pyramid” data‑processing DSL used throughout the\u{202f}**agent‑wire‑node** project. It receives a **`TransformSpec`** (a JS`[...]"
+2026-03-26T16:36:02.816903Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 112 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: **The “pyramid” in the *agent‑wire‑node* codebase is the core knowledge‑representation engine** – a hierarchical, multi‑modal graph that stores, distills and evolves the system’s und
+2026-03-26T16:36:21.708398Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 113 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: Based on the provided source file (`src-tauri/src/pyramid/vine.rs`), here is the extraction of information relevant to your questions. Please note that this file is a Rust backend implementation file;
+2026-03-26T16:36:21.708938Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 114 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: **Summary of what can be answered from `src‑tauri/src/pyramid/vine_prompts.rs`**  
+2026-03-26T16:36:21.709062Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 115 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: Below is a **focused synthesis** of what the **`src‑tauri/src/pyramid/watcher.rs`** file tells us about the *agent‑wire‑node* code‑base.  
+2026-03-26T16:36:21.709243Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 116 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: Below is a concise extraction of **everything** that can be learned from the file you supplied (`src‑tauri/src/pyramid/webbing.rs`).  
+2026-03-26T16:36:21.709307Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 117 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: Below is a **focused synthesis** that extracts everything the `src‑tauri/src/pyramid/wire_import.rs` file tells us about the *agent‑wire‑node* code‑base.  
+2026-03-26T16:36:21.709371Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 118 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: **File examined:** `src-tauri/src/pyramid/wire_publish.rs` (Rust – 698 lines)
+2026-03-26T16:36:21.709421Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 119 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: **What the `src‑tauri/src/retention.rs` file tells us about the project**
+2026-03-26T16:36:21.709899Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 120 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: Below is a **self‑contained synthesis** that pulls every piece of information that can be inferred from **`src‑tauri/src/server.rs`**.  
+2026-03-26T16:36:21.709963Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 121 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: **File `src‑tauri/src/sync.rs` – What it is and why it matters**
+2026-03-26T16:36:21.710012Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 122 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: Below is a **targeted extraction** from **`src‑tauri/src/tunnel.rs`** (the only source file supplied) that answers each of the requested items as far as the file can provide.  
+2026-03-26T16:36:21.710057Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 123 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: **What can be learned from `src‑tauri/src/utils.rs`**
+2026-03-26T16:36:21.710101Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 124 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: **What I can answer with the file you supplied**
+2026-03-26T16:36:21.710168Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 125 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: **Extracted information from `src‑tauri/tauri.conf.json`**
+2026-03-26T16:36:21.710207Z  WARN wire_node_lib::pyramid::chain_executor: [IR] forEach item 126 failed: IR step 'l0_extract': JSON parse failed after retry at temp 0.1: No JSON found in: **tsconfig.json – Overview**
+2026-03-26T16:36:21.710653Z  INFO wire_node_lib::pyramid::chain_executor: [IR] step 'l0_extract' complete
+2026-03-26T16:36:21.710710Z  INFO wire_node_lib::pyramid::chain_executor: [IR] step 'clustering' started (primitive: Some("classify"), depth: 1, done=6/54)
+2026-03-26T16:36:21.716491Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'clustering' → LLM (temp=0.3, model=qwen3.5-flash-02-23, ctx_limit=1000000, prompt_len=1444)
+2026-03-26T16:36:21.716575Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'clustering' → using structured output (schema: clustering, schema_type: Some("object"))
+2026-03-26T16:36:29.694521Z  WARN wire_node_lib::pyramid::chain_executor: [IR] dispatch attempt 1/2 failed for 'clustering': Model returned null content after 5 attempts
+2026-03-26T16:36:31.695798Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'clustering' → LLM (temp=0.3, model=qwen3.5-flash-02-23, ctx_limit=1000000, prompt_len=1444)
+2026-03-26T16:36:31.695942Z  INFO wire_node_lib::pyramid::chain_dispatch: [IR] step 'clustering' → using structured output (schema: clustering, schema_type: Some("object"))
+2026-03-26T16:36:39.422420Z  WARN wire_node_lib::pyramid::chain_executor: [IR] dispatch attempt 2/2 failed for 'clustering': Model returned null content after 5 attempts
+2026-03-26T16:36:39.422646Z ERROR wire_node_lib::pyramid::chain_executor: [IR] step 'clustering' FAILED (abort): Model returned null content after 5 attempts

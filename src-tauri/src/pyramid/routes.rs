@@ -73,7 +73,10 @@ fn with_auth_state(
 struct CreateSlugBody {
     slug: String,
     content_type: ContentType,
+    #[serde(default)]
     source_path: String,
+    #[serde(default)]
+    referenced_slugs: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -540,13 +543,32 @@ pub fn pyramid_routes(
         .and(with_auth_state(state.clone()))
         .and_then(handle_faq_category_drill));
 
-    // DELETE /pyramid/:slug
-    let delete_slug_route = route!(prefix
+    // POST /pyramid/:slug/archive
+    let archive_slug_route = route!(prefix
         .and(warp::path::param::<String>())
+        .and(warp::path("archive"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_archive_slug));
+
+    // DELETE /pyramid/:slug/purge
+    let purge_slug_route = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("purge"))
         .and(warp::path::end())
         .and(warp::delete())
         .and(with_auth_state(state.clone()))
-        .and_then(handle_delete_slug));
+        .and_then(handle_purge_slug));
+
+    // GET /pyramid/:slug/references
+    let slug_references_route = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("references"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_slug_references));
 
     // ── Phase 5: Breaker & Freeze routes ────────────────────────────
 
@@ -843,6 +865,24 @@ pub fn pyramid_routes(
         .and(warp::body::json::<staleness_bridge::CheckStalenessRequest>())
         .and_then(handle_check_staleness));
 
+    // GET /pyramid/:slug/question-overlays — list question overlay builds for a slug
+    let question_overlays_route = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("question-overlays"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_question_overlays));
+
+    // GET /pyramid/:slug/composed — composed view across slug + referenced slugs (WS8-H)
+    let composed_route = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("composed"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_composed_view));
+
     // GET /pyramid/:slug/question-tree — current decomposition tree state (may be partial)
     let question_tree_route = route!(prefix
         .and(warp::path::param::<String>())
@@ -879,7 +919,8 @@ pub fn pyramid_routes(
     let r6 = entities.or(resolved).unify().boxed();
     let r7 = corrections.or(terms).unify().boxed();
     let r8 = ingest_route.or(config_route).unify().boxed();
-    let r9 = threads.or(delete_slug_route).unify().boxed();
+    let r9 = threads.or(archive_slug_route).unify().boxed();
+    let r31 = purge_slug_route.or(slug_references_route).unify().boxed();
     let r10 = annotate.or(annotations).unify().boxed();
     let r11 = edges.or(usage).unify().boxed();
     let r12 = meta_run.or(meta_read).unify().boxed();
@@ -946,9 +987,13 @@ pub fn pyramid_routes(
     let top7 = top6.or(r27).unify().boxed(); // Publication routes (P4.3)
     let r28 = check_staleness; // Staleness bridge route (WS-E)
     let r29 = question_tree_route; // Question tree progress route
+    let r30 = question_overlays_route; // Question overlay listing (WS4)
     let top8 = top7.or(r28).unify().boxed();
     let top9 = top8.or(r29).unify().boxed();
-    top9
+    let top10 = top9.or(r30).unify().boxed();
+    let top11 = top10.or(r31).unify().boxed(); // Archive, purge, references routes (WS8-B)
+    let top12 = top11.or(composed_route).unify().boxed(); // Composed view route (WS8-H)
+    top12
 }
 
 // ── Route handlers ──────────────────────────────────────────────────
@@ -970,6 +1015,23 @@ async fn handle_create_slug(
     state: Arc<PyramidState>,
     body: CreateSlugBody,
 ) -> Result<warp::reply::Response, warp::Rejection> {
+    let is_question = body.content_type == ContentType::Question;
+
+    // For question slugs: validate referenced_slugs
+    let refs = if is_question {
+        match &body.referenced_slugs {
+            Some(refs) if !refs.is_empty() => refs.clone(),
+            _ => {
+                return Ok(json_error(
+                    warp::http::StatusCode::BAD_REQUEST,
+                    "Question slugs require referenced_slugs",
+                ));
+            }
+        }
+    } else {
+        vec![]
+    };
+
     let normalized_source_path = match slug::normalize_and_validate_source_path(
         &body.source_path,
         &body.content_type,
@@ -983,18 +1045,69 @@ async fn handle_create_slug(
             ));
         }
     };
+
     let conn = state.writer.lock().await;
+
+    // For question slugs: validate all referenced slugs exist and check for archived ones
+    let mut archived_warnings: Vec<String> = vec![];
+    if is_question {
+        for ref_slug in &refs {
+            match db::get_slug(&conn, ref_slug) {
+                Ok(Some(info)) => {
+                    if info.archived_at.is_some() {
+                        archived_warnings.push(format!(
+                            "Referenced slug '{}' is archived",
+                            ref_slug
+                        ));
+                    }
+                }
+                Ok(None) => {
+                    return Ok(json_error(
+                        warp::http::StatusCode::BAD_REQUEST,
+                        &format!("Referenced slug '{}' does not exist", ref_slug),
+                    ));
+                }
+                Err(e) => {
+                    return Ok(json_error(
+                        warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        &e.to_string(),
+                    ));
+                }
+            }
+        }
+    }
+
     match slug::create_slug(
         &conn,
         &body.slug,
         &body.content_type,
         &normalized_source_path,
     ) {
-        Ok(info) => Ok(warp::reply::with_status(
-            warp::reply::json(&info),
-            warp::http::StatusCode::CREATED,
-        )
-        .into_response()),
+        Ok(info) => {
+            // Save slug references for question slugs
+            if is_question {
+                if let Err(e) = db::save_slug_references(&conn, &info.slug, &refs) {
+                    return Ok(json_error(
+                        warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        &format!("Slug created but failed to save references: {}", e),
+                    ));
+                }
+            }
+
+            if archived_warnings.is_empty() {
+                Ok(warp::reply::with_status(
+                    warp::reply::json(&info),
+                    warp::http::StatusCode::CREATED,
+                )
+                .into_response())
+            } else {
+                // Return 200 with warning instead of 201
+                Ok(json_ok(&serde_json::json!({
+                    "slug": info,
+                    "warnings": archived_warnings,
+                })))
+            }
+        }
         Err(e) => {
             let msg = e.to_string();
             if msg.contains("already exists") {
@@ -1535,6 +1648,11 @@ async fn handle_ingest(
                         "Use POST /pyramid/vine/build for vine ingestion"
                     ));
                 }
+                ContentType::Question => {
+                    return Err(anyhow::anyhow!(
+                        "Question pyramids do not support direct ingestion"
+                    ));
+                }
             }
         }
         Ok::<String, anyhow::Error>(slug_clone)
@@ -1614,11 +1732,11 @@ async fn handle_config(
     })))
 }
 
-async fn handle_delete_slug(
+async fn handle_archive_slug(
     slug_name: String,
     state: Arc<PyramidState>,
 ) -> Result<warp::reply::Response, warp::Rejection> {
-    // Don't allow deleting a slug with an active build
+    // Don't allow archiving a slug with an active build
     {
         let active = state.active_build.read().await;
         if let Some(handle) = active.get(&slug_name) {
@@ -1626,21 +1744,59 @@ async fn handle_delete_slug(
             if s.is_running() && !handle.cancel.is_cancelled() {
                 return Ok(json_error(
                     warp::http::StatusCode::CONFLICT,
-                    "Cannot delete slug while build is running",
+                    "Cannot archive slug while build is running",
                 ));
             }
         }
     }
 
     let conn = state.writer.lock().await;
-    let result = slug::delete_slug(&conn, &slug_name);
+    let result = slug::archive_slug(&conn, &slug_name);
+    drop(conn);
+
+    match result {
+        Ok(()) => Ok(json_ok(&serde_json::json!({"archived": slug_name}))),
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("not found") {
+                Ok(json_error(warp::http::StatusCode::NOT_FOUND, &msg))
+            } else {
+                Ok(json_error(
+                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    &msg,
+                ))
+            }
+        }
+    }
+}
+
+async fn handle_purge_slug(
+    slug_name: String,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    // Don't allow purging a slug with an active build
+    {
+        let active = state.active_build.read().await;
+        if let Some(handle) = active.get(&slug_name) {
+            let s = handle.status.read().await;
+            if s.is_running() && !handle.cancel.is_cancelled() {
+                return Ok(json_error(
+                    warp::http::StatusCode::CONFLICT,
+                    "Cannot purge slug while build is running",
+                ));
+            }
+        }
+    }
+
+    let conn = state.writer.lock().await;
+    let result = slug::purge_slug(&conn, &slug_name);
     drop(conn);
 
     match result {
         Ok(()) => {
             let mut active = state.active_build.write().await;
             active.remove(&slug_name);
-            Ok(json_ok(&serde_json::json!({"deleted": slug_name})))
+            Ok(json_ok(&serde_json::json!({"purged": slug_name})))
         }
         Err(e) => {
             let msg = e.to_string();
@@ -1653,6 +1809,49 @@ async fn handle_delete_slug(
                 ))
             }
         }
+    }
+}
+
+async fn handle_slug_references(
+    slug_name: String,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let conn = state.reader.lock().await;
+    let references = match db::get_slug_references(&conn, &slug_name) {
+        Ok(r) => r,
+        Err(e) => {
+            return Ok(json_error(
+                warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                &e.to_string(),
+            ));
+        }
+    };
+    let referrers = match db::get_slug_referrers(&conn, &slug_name) {
+        Ok(r) => r,
+        Err(e) => {
+            return Ok(json_error(
+                warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                &e.to_string(),
+            ));
+        }
+    };
+    Ok(json_ok(&serde_json::json!({
+        "references": references,
+        "referrers": referrers,
+    })))
+}
+
+async fn handle_composed_view(
+    slug_name: String,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let conn = state.reader.lock().await;
+    match query::get_composed_view(&conn, &slug_name) {
+        Ok(view) => Ok(json_ok(&view)),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
     }
 }
 
@@ -2787,6 +2986,7 @@ async fn handle_auto_update_l0_sweep(
                     phase_arc.clone(),
                     detail_arc.clone(),
                     summary_arc.clone(),
+                    &state.operational,
                 )
                 .await;
             }
@@ -3440,6 +3640,34 @@ async fn handle_question_tree(
     }
 }
 
+// ── WS4: Question Overlay Listing ────────────────────────────────────────
+
+/// GET /pyramid/:slug/question-overlays
+///
+/// Returns all question overlay builds for a slug. Each entry includes the
+/// build_id, apex question, status, and creation timestamp. Used by the
+/// frontend overlay selector (WS7).
+async fn handle_question_overlays(
+    slug_name: String,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let result = {
+        let conn = state.reader.lock().await;
+        db::list_question_overlays(&conn, &slug_name)
+    };
+
+    match result {
+        Ok(overlays) => Ok(json_ok(&serde_json::json!({
+            "slug": slug_name,
+            "overlays": overlays,
+        }))),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
+    }
+}
+
 // ── P3.3: Crystallization route handlers ────────────────────────────────
 
 /// Request body for POST /pyramid/:slug/crystallize
@@ -3645,8 +3873,8 @@ async fn handle_publish_pyramid(
 
     let publisher = wire_publish::PyramidPublisher::new(wire_url, wire_auth);
 
-    // Phase 1: Load all nodes from DB (synchronous, scoped lock)
-    let nodes_by_depth = {
+    // Phase 1: Load all nodes + evidence weights from DB (synchronous, scoped lock)
+    let (nodes_by_depth, evidence_weights) = {
         let conn = state.reader.lock().await;
         let slug_info = match db::get_slug(&conn, &slug_name) {
             Ok(Some(info)) => info,
@@ -3679,7 +3907,31 @@ async fn handle_publish_pyramid(
                 }
             }
         }
-        result
+
+        // Build evidence weight map: target_node_id -> (source_node_id -> weight)
+        // Uses KEEP evidence links so published contributions carry real weights
+        // instead of flat 1.0.
+        let mut ev_weights: std::collections::HashMap<String, std::collections::HashMap<String, f64>> =
+            std::collections::HashMap::new();
+        for (_depth, nodes) in &result {
+            for node in nodes {
+                if let Ok(links) = db::get_keep_evidence_for_target(&conn, &slug_name, &node.id) {
+                    if !links.is_empty() {
+                        let mut child_weights = std::collections::HashMap::new();
+                        for link in links {
+                            if let Some(w) = link.weight {
+                                child_weights.insert(link.source_node_id, w);
+                            }
+                        }
+                        if !child_weights.is_empty() {
+                            ev_weights.insert(node.id.clone(), child_weights);
+                        }
+                    }
+                }
+            }
+        }
+
+        (result, ev_weights)
     };
 
     if nodes_by_depth.is_empty() {
@@ -3690,7 +3942,7 @@ async fn handle_publish_pyramid(
     }
 
     // Phase 2: Publish nodes via HTTP (async, no DB lock held)
-    match publisher.publish_pyramid(&slug_name, &nodes_by_depth).await {
+    match publisher.publish_pyramid_idempotent(&slug_name, &nodes_by_depth, &std::collections::HashMap::new(), &evidence_weights).await {
         Ok(result) => {
             // Phase 3: Persist ID mappings (scoped write lock)
             {
@@ -3844,7 +4096,7 @@ async fn handle_check_staleness(
 ) -> Result<warp::reply::Response, warp::Rejection> {
     let threshold = body
         .threshold
-        .unwrap_or(super::staleness::DEFAULT_STALENESS_THRESHOLD);
+        .unwrap_or(state.operational.tier2.staleness_threshold);
 
     // Determine changed files: explicit body or auto-detect from pending mutations
     let (changed_files, source) = {

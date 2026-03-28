@@ -141,10 +141,10 @@ server.tool(
 // 5. pyramid_drill
 server.tool(
   "pyramid_drill",
-  "Drill into a specific pyramid node and retrieve it along with its immediate children. Use node IDs from search or apex results.",
+  "Drill into a specific pyramid node and retrieve it along with its immediate children. Use node IDs from search or apex results. For question slugs, node IDs may use cross-slug handle-path format (e.g. 'source-slug:L1-003').",
   {
     slug: z.string().describe("Pyramid slug identifier"),
-    node_id: z.string().describe("Node ID to drill into (e.g. L2-000, L1-003, L0-012)"),
+    node_id: z.string().describe("Node ID to drill into (e.g. L2-000, L1-003, L0-012, or cross-slug: source-slug:L1-003)"),
   },
   async ({ slug, node_id }) => {
     const resp = await pyramidFetch(
@@ -241,6 +241,95 @@ server.tool(
     const resp = await pyramidFetch(
       `/pyramid/${encodeURIComponent(slug)}/annotate`,
       { method: "POST", body }
+    );
+    return toToolResult(resp);
+  }
+);
+
+// 9. pyramid_create_question_slug
+server.tool(
+  "pyramid_create_question_slug",
+  "Create a new question pyramid slug that references one or more existing source pyramids. The question slug composes knowledge across its referenced slugs.",
+  {
+    slug: z.string().describe("Name for the new question slug"),
+    referenced_slugs: z
+      .array(z.string())
+      .min(1)
+      .describe("Array of existing pyramid slugs to reference (at least one required)"),
+  },
+  async ({ slug, referenced_slugs }) => {
+    const resp = await pyramidFetch("/pyramid/slugs", {
+      method: "POST",
+      body: {
+        slug,
+        content_type: "question",
+        referenced_slugs,
+      },
+    });
+    return toToolResult(resp);
+  }
+);
+
+// 10. pyramid_question_build
+server.tool(
+  "pyramid_question_build",
+  "Trigger a question build on a question slug. Decomposes the question into sub-questions and builds answer nodes across referenced source pyramids.",
+  {
+    slug: z.string().describe("Question pyramid slug identifier"),
+    question: z.string().describe("The question to decompose and answer"),
+    granularity: z
+      .number()
+      .int()
+      .min(1)
+      .max(10)
+      .optional()
+      .describe("Number of sub-questions per decomposition level (default: 3)"),
+    max_depth: z
+      .number()
+      .int()
+      .min(1)
+      .max(10)
+      .optional()
+      .describe("Maximum decomposition depth (default: 3)"),
+  },
+  async ({ slug, question, granularity, max_depth }) => {
+    const body: Record<string, unknown> = { question };
+    if (granularity !== undefined) body.granularity = granularity;
+    if (max_depth !== undefined) body.max_depth = max_depth;
+
+    const resp = await pyramidFetch(
+      `/pyramid/${encodeURIComponent(slug)}/build/question`,
+      { method: "POST", body }
+    );
+    return toToolResult(resp);
+  }
+);
+
+// 11. pyramid_composed_view
+server.tool(
+  "pyramid_composed_view",
+  "Get a composed view of a question slug, showing all nodes and edges across the slug and its referenced source pyramids.",
+  {
+    slug: z.string().describe("Pyramid slug identifier (typically a question slug)"),
+  },
+  async ({ slug }) => {
+    const resp = await pyramidFetch(
+      `/pyramid/${encodeURIComponent(slug)}/composed`
+    );
+    return toToolResult(resp);
+  }
+);
+
+// 12. pyramid_references
+server.tool(
+  "pyramid_references",
+  "Get the reference graph for a slug — shows what slugs it references and what slugs reference it.",
+  {
+    slug: z.string().describe("Pyramid slug identifier"),
+  },
+  async ({ slug }) => {
+    const resp = await pyramidFetch(
+      `/pyramid/${encodeURIComponent(slug)}/references`
     );
     return toToolResult(resp);
   }

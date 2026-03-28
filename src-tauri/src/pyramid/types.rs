@@ -18,6 +18,12 @@ pub struct SlugInfo {
     pub max_depth: i64,
     pub last_built_at: Option<String>,
     pub created_at: String,
+    #[serde(default)]
+    pub referenced_slugs: Vec<String>,
+    #[serde(default)]
+    pub referencing_slugs: Vec<String>,
+    #[serde(default)]
+    pub archived_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -27,6 +33,7 @@ pub enum ContentType {
     Conversation,
     Document,
     Vine,
+    Question,
 }
 
 impl ContentType {
@@ -37,6 +44,7 @@ impl ContentType {
             ContentType::Conversation => "conversation",
             ContentType::Document => "document",
             ContentType::Vine => "vine",
+            ContentType::Question => "question",
         }
     }
 
@@ -47,6 +55,7 @@ impl ContentType {
             "conversation" => Some(ContentType::Conversation),
             "document" => Some(ContentType::Document),
             "vine" => Some(ContentType::Vine),
+            "question" => Some(ContentType::Question),
             other => {
                 tracing::warn!("Unknown content type: '{other}', returning None");
                 None
@@ -72,6 +81,8 @@ pub struct PyramidNode {
     pub children: Vec<String>,
     pub parent_id: Option<String>,
     pub superseded_by: Option<String>,
+    #[serde(default)]
+    pub build_id: Option<String>,
     pub created_at: String,
 }
 
@@ -113,6 +124,8 @@ pub struct TreeNode {
     pub distilled: String,
     pub thread_id: Option<String>,
     pub source_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_slug: Option<String>,
     pub children: Vec<TreeNode>,
 }
 
@@ -158,6 +171,8 @@ pub struct SearchHit {
     pub depth: i64,
     pub snippet: String,
     pub score: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_slug: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -669,6 +684,10 @@ pub struct EvidenceLink {
     pub verdict: EvidenceVerdict,
     pub weight: Option<f64>,      // 0.0-1.0, None for DISCONNECT/MISSING
     pub reason: Option<String>,
+    #[serde(default)]
+    pub build_id: Option<String>,
+    #[serde(default)]
+    pub live: Option<bool>,
 }
 
 // ── Evidence Answering Types (Phase 1, Steps 3.1–3.2) ─────────────────────────
@@ -700,6 +719,25 @@ pub struct AnsweredNode {
     pub evidence: Vec<EvidenceLink>,
     /// Descriptions of missing evidence the LLM wished it had.
     pub missing: Vec<String>,
+}
+
+/// Result of an answer_questions batch, including both successes and failures.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnswerBatchResult {
+    /// Successfully answered questions.
+    pub answered: Vec<AnsweredNode>,
+    /// Questions that failed to answer (question_id, error description).
+    /// Callers should persist these as gap reports.
+    pub failed: Vec<FailedQuestion>,
+}
+
+/// A question that failed during the answering step.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FailedQuestion {
+    pub question_id: String,
+    pub question_text: String,
+    pub layer: i64,
+    pub error: String,
 }
 
 // ── Characterization ──────────────────────────────────────────────────────────
@@ -791,6 +829,37 @@ pub struct SynthesisPrompts {
     pub answering_prompt: String,
     /// Prompt for web edge discovery between answered questions.
     pub web_edge_prompt: String,
+}
+
+// ── Composed View Types (Cross-Slug Graph) ────────────────────────────────────
+
+/// A node in the composed cross-slug graph view.
+#[derive(Debug, Clone, Serialize)]
+pub struct ComposedNode {
+    pub id: String,
+    pub slug: String,
+    pub depth: i64,
+    pub headline: String,
+    pub distilled: String,
+    pub node_type: String, // "mechanical" or "answer"
+}
+
+/// An edge in the composed cross-slug graph view.
+#[derive(Debug, Clone, Serialize)]
+pub struct ComposedEdge {
+    pub source_id: String,
+    pub target_id: String,
+    pub weight: f64,
+    pub edge_type: String, // "evidence", "child", "web"
+    pub live: bool,
+}
+
+/// Full composed view: all live nodes across a slug and its references, with edges.
+#[derive(Debug, Clone, Serialize)]
+pub struct ComposedView {
+    pub nodes: Vec<ComposedNode>,
+    pub edges: Vec<ComposedEdge>,
+    pub slugs: Vec<String>,
 }
 
 // ── Source Delta (file-level, NOT thread-level) ───────────────────────────────

@@ -146,94 +146,92 @@ async fn cleanup_from_depth(
     from_depth: i64,
 ) -> Result<()> {
     let slug_owned = slug.to_string();
+    let build_id = format!("rebuild-{}", uuid::Uuid::new_v4());
     let db = db.clone();
     tokio::task::spawn_blocking(move || {
         let conn = db.blocking_lock();
-        cleanup_from_depth_sync(&conn, &slug_owned, from_depth)
+        cleanup_from_depth_sync(&conn, &slug_owned, from_depth, &build_id)
     })
     .await?
 }
 
-/// Delete all nodes, steps, threads, web edges, deltas, and distillations
-/// at or above `from_depth` in a single transaction.  Used for layered rebuilds.
-pub fn cleanup_from_depth_sync(conn: &Connection, slug: &str, from_depth: i64) -> Result<()> {
+/// Supersede nodes and scope execution tables for a layered rebuild.
+/// Everything is a contribution: nodes are superseded, execution tables scoped by build_id.
+pub fn cleanup_from_depth_sync(conn: &Connection, slug: &str, from_depth: i64, build_id: &str) -> Result<()> {
     conn.execute_batch("BEGIN IMMEDIATE;")?;
 
     let result = (|| -> Result<()> {
+        // Clear parent_id on live nodes below the rebuild depth
         conn.execute(
-            "UPDATE pyramid_nodes SET parent_id = NULL WHERE slug = ?1 AND depth < ?2",
+            "UPDATE pyramid_nodes SET parent_id = NULL WHERE slug = ?1 AND depth < ?2 AND superseded_by IS NULL",
             rusqlite::params![slug, from_depth],
         )?;
         if from_depth > 0 {
             conn.execute(
-                "UPDATE pyramid_nodes SET children = '[]' WHERE slug = ?1 AND depth = ?2",
+                "UPDATE pyramid_nodes SET children = '[]' WHERE slug = ?1 AND depth = ?2 AND superseded_by IS NULL",
                 rusqlite::params![slug, from_depth - 1],
             )?;
         }
+
+        // Supersede nodes at and above the rebuild depth (instead of deleting)
+        db::supersede_nodes_at_and_above(conn, slug, from_depth, build_id)?;
+
+        // Annotations survive on superseded nodes — no deletion.
+        // Web edges: retained. Distillations, deltas, threads: scoped by build_id.
+
+        // Pipeline steps: scope by build_id (old steps retained as history)
         conn.execute(
-            "DELETE FROM pyramid_annotations WHERE slug = ?1 AND node_id IN \
-             (SELECT id FROM pyramid_nodes WHERE slug = ?1 AND depth >= ?2)",
-            rusqlite::params![slug, from_depth],
+            "UPDATE pyramid_pipeline_steps SET build_id = ?3
+             WHERE slug = ?1 AND depth >= ?2 AND build_id IS NULL",
+            rusqlite::params![slug, from_depth, build_id],
         )?;
         conn.execute(
-            "DELETE FROM pyramid_web_edges
-             WHERE slug = ?1
-               AND (
-                    thread_a_id IN (
-                        SELECT thread_id FROM pyramid_threads WHERE slug = ?1 AND depth >= ?2
-                    )
-                    OR thread_b_id IN (
-                        SELECT thread_id FROM pyramid_threads WHERE slug = ?1 AND depth >= ?2
-                    )
-               )",
-            rusqlite::params![slug, from_depth],
-        )?;
-        conn.execute(
-            "DELETE FROM pyramid_distillations
-             WHERE slug = ?1
-               AND thread_id IN (
-                    SELECT thread_id FROM pyramid_threads WHERE slug = ?1 AND depth >= ?2
-               )",
-            rusqlite::params![slug, from_depth],
-        )?;
-        conn.execute(
-            "DELETE FROM pyramid_deltas
-             WHERE slug = ?1
-               AND thread_id IN (
-                    SELECT thread_id FROM pyramid_threads WHERE slug = ?1 AND depth >= ?2
-               )",
-            rusqlite::params![slug, from_depth],
-        )?;
-        conn.execute(
-            "DELETE FROM pyramid_threads WHERE slug = ?1 AND depth >= ?2",
-            rusqlite::params![slug, from_depth],
-        )?;
-        conn.execute(
-            "DELETE FROM pyramid_nodes WHERE slug = ?1 AND depth >= ?2",
-            rusqlite::params![slug, from_depth],
-        )?;
-        conn.execute(
-            "DELETE FROM pyramid_pipeline_steps WHERE slug = ?1 AND depth >= ?2",
-            rusqlite::params![slug, from_depth],
-        )?;
-        conn.execute(
-            "DELETE FROM pyramid_pipeline_steps
-             WHERE slug = ?1
+            "UPDATE pyramid_pipeline_steps SET build_id = ?2
+             WHERE slug = ?1 AND build_id IS NULL
                AND (
                     step_type GLOB '*_r[0-9]*_classify'
                     OR step_type GLOB '*_r[0-9]*_fallback'
                     OR step_type GLOB '*_r[0-9]*_repair'
                     OR step_type GLOB '*_shortcut'
                )",
-            rusqlite::params![slug],
+            rusqlite::params![slug, build_id],
         )?;
 
         if from_depth <= 1 {
             conn.execute(
-                "DELETE FROM pyramid_pipeline_steps WHERE slug = ?1 AND step_type IN ('thread_cluster', 'thread_narrative', 'synth', 'cluster_assignment')",
-                rusqlite::params![slug],
+                "UPDATE pyramid_pipeline_steps SET build_id = ?2
+                 WHERE slug = ?1 AND build_id IS NULL
+                   AND step_type IN ('thread_cluster', 'thread_narrative', 'synth', 'cluster_assignment')",
+                rusqlite::params![slug, build_id],
             )?;
         }
+
+        // Threads: scope by build_id
+        conn.execute(
+            "UPDATE pyramid_threads SET build_id = ?3
+             WHERE slug = ?1 AND depth >= ?2 AND build_id IS NULL",
+            rusqlite::params![slug, from_depth, build_id],
+        )?;
+
+        // Distillations: scope by build_id
+        conn.execute(
+            "UPDATE pyramid_distillations SET build_id = ?2
+             WHERE slug = ?1 AND build_id IS NULL
+               AND thread_id IN (
+                    SELECT thread_id FROM pyramid_threads WHERE slug = ?1 AND build_id = ?2
+               )",
+            rusqlite::params![slug, build_id],
+        )?;
+
+        // Deltas: scope by build_id
+        conn.execute(
+            "UPDATE pyramid_deltas SET build_id = ?2
+             WHERE slug = ?1 AND build_id IS NULL
+               AND thread_id IN (
+                    SELECT thread_id FROM pyramid_threads WHERE slug = ?1 AND build_id = ?2
+               )",
+            rusqlite::params![slug, build_id],
+        )?;
 
         Ok(())
     })();
@@ -1810,7 +1808,10 @@ async fn enrich_single_step_input(
     reader: &Arc<Mutex<Connection>>,
     slug: &str,
 ) -> Result<Value> {
-    if step.name == "thread_clustering" {
+    // 11-E: Use declarative enrichments field instead of hardcoded step name checks.
+    // Falls back to step.name check for backward compat with existing YAML files.
+    let has_enrichment = |name: &str| step.enrichments.contains(&name.to_string()) || step.name == "thread_clustering" && name == "file_level_connections";
+    if has_enrichment("file_level_connections") {
         let topic_node_ids = extract_node_ids_from_topic_inventory(&resolved_input);
         if !topic_node_ids.is_empty() {
             let depth0_edges = load_same_depth_web_connections(reader, slug, 0).await?;
@@ -1829,7 +1830,9 @@ async fn enrich_for_each_step_input(
     ctx: &ChainContext,
     reader: &Arc<Mutex<Connection>>,
 ) -> Result<Value> {
-    if step.name == "thread_narrative" {
+    // 11-E: Declarative enrichment check with backward compat fallback
+    let has_enrichment = |name: &str| step.enrichments.contains(&name.to_string()) || step.name == "thread_narrative" && name == "cross_thread_connections";
+    if has_enrichment("cross_thread_connections") {
         let child_ids = resolve_authoritative_child_ids_with_db(item, ctx, reader).await?;
         if !child_ids.is_empty() {
             let depth0_edges = load_same_depth_web_connections(reader, &ctx.slug, 0).await?;
@@ -1858,7 +1861,9 @@ async fn enrich_group_extra_input(
         None => serde_json::Map::new(),
     };
 
-    if step.name == "upper_layer_synthesis" {
+    // 11-E: Declarative enrichment check with backward compat fallback
+    let has_enrichment = |name: &str| step.enrichments.contains(&name.to_string()) || step.name == "upper_layer_synthesis" && name == "cross_subsystem_connections";
+    if has_enrichment("cross_subsystem_connections") {
         let depth = nodes.first().map(|node| node.depth).unwrap_or(0);
         let node_ids: Vec<String> = nodes.iter().map(|node| node.id.clone()).collect();
         if !node_ids.is_empty() {
@@ -2543,6 +2548,8 @@ pub async fn execute_chain_from(
         db_writer: state.writer.clone(),
         slug: slug.to_string(),
         config: llm_config.clone(),
+        tier1: state.operational.tier1.clone(),
+        ops: (*state.operational).clone(),
     };
 
     // Set up writer channel + drain task
@@ -2774,7 +2781,7 @@ pub async fn execute_chain_from(
         apex_node_id = db_read(&state.reader, move |conn| {
             let max_depth: i64 = conn
                 .query_row(
-                    "SELECT COALESCE(MAX(depth), 0) FROM pyramid_nodes WHERE slug = ?1",
+                    "SELECT COALESCE(MAX(depth), 0) FROM live_pyramid_nodes WHERE slug = ?1",
                     rusqlite::params![&slug_owned],
                     |row| row.get(0),
                 )
@@ -6166,6 +6173,8 @@ pub async fn execute_plan(
         db_writer: state.writer.clone(),
         slug: slug.to_string(),
         config: llm_config.clone(),
+        tier1: state.operational.tier1.clone(),
+        ops: (*state.operational).clone(),
     };
 
     exec_state.send_progress().await;
@@ -6357,7 +6366,7 @@ pub async fn execute_plan(
         apex_node_id = db_read(&state.reader, move |conn| {
             let max_depth: i64 = conn
                 .query_row(
-                    "SELECT COALESCE(MAX(depth), 0) FROM pyramid_nodes WHERE slug = ?1",
+                    "SELECT COALESCE(MAX(depth), 0) FROM live_pyramid_nodes WHERE slug = ?1",
                     rusqlite::params![&slug_owned],
                     |row| row.get(0),
                 )
@@ -6541,7 +6550,7 @@ async fn execute_ir_parallel_foreach(
     let step_name = ir_persisted_step_name(step);
 
     // Resolve the collection to iterate over
-    let items = resolve_foreach_collection(step, exec_state)?;
+    let items = resolve_foreach_collection(step, exec_state, dispatch_ctx.ops.tier2.ir_thread_input_char_budget)?;
     if items.is_empty() {
         return Ok(Value::Array(vec![]));
     }
@@ -6823,7 +6832,7 @@ async fn execute_ir_sequential_foreach(
     }
 
     // Resolve the collection to iterate over
-    let items = resolve_foreach_collection(step, exec_state)?;
+    let items = resolve_foreach_collection(step, exec_state, dispatch_ctx.ops.tier2.ir_thread_input_char_budget)?;
     let mut outputs = Vec::with_capacity(items.len());
 
     for (i, item) in items.iter().enumerate() {
@@ -7012,8 +7021,7 @@ async fn execute_ir_sequential_foreach(
 // ── forEach collection resolution ───────────────────────────────────────────
 
 /// Resolve the collection to iterate over from the step's iteration.over expression.
-fn resolve_foreach_collection(step: &IrStep, state: &ExecutionState) -> Result<Vec<Value>> {
-    const IR_THREAD_INPUT_CHAR_BUDGET: usize = 90_000;
+fn resolve_foreach_collection(step: &IrStep, state: &ExecutionState, ir_thread_input_char_budget: usize) -> Result<Vec<Value>> {
 
     fn is_ir_thread_synthesis_step(step: &IrStep) -> bool {
         if step.id == "l1_synthesis" {
@@ -7067,6 +7075,7 @@ fn resolve_foreach_collection(step: &IrStep, state: &ExecutionState) -> Result<V
         step: &IrStep,
         items: Vec<Value>,
         state: &ExecutionState,
+        ir_thread_input_char_budget: usize,
     ) -> Vec<Value> {
         if !is_ir_thread_synthesis_step(step) {
             return items;
@@ -7086,13 +7095,13 @@ fn resolve_foreach_collection(step: &IrStep, state: &ExecutionState) -> Result<V
             }
 
             let input_chars = estimate_ir_foreach_item_input_chars(step, &item, index, state);
-            if input_chars <= IR_THREAD_INPUT_CHAR_BUDGET {
+            if input_chars <= ir_thread_input_char_budget {
                 split_items.push(item);
                 continue;
             }
 
-            let target_parts = ((input_chars + IR_THREAD_INPUT_CHAR_BUDGET - 1)
-                / IR_THREAD_INPUT_CHAR_BUDGET)
+            let target_parts = ((input_chars + ir_thread_input_char_budget - 1)
+                / ir_thread_input_char_budget)
                 .max(2);
             let max_assignments_per_part =
                 ((assignments.len() + target_parts - 1) / target_parts).max(1);
@@ -7141,7 +7150,7 @@ fn resolve_foreach_collection(step: &IrStep, state: &ExecutionState) -> Result<V
     })?;
 
     match resolved {
-        Value::Array(items) => Ok(split_oversized_ir_thread_items(step, items, state)),
+        Value::Array(items) => Ok(split_oversized_ir_thread_items(step, items, state, ir_thread_input_char_budget)),
         Value::Null => Ok(vec![]),
         other => Ok(vec![other]),
     }
@@ -8085,6 +8094,7 @@ mod tests {
                 children: vec![],
                 parent_id: None,
                 superseded_by: None,
+            build_id: None,
                 created_at: String::new(),
             },
             PyramidNode {
@@ -8103,6 +8113,7 @@ mod tests {
                 children: vec![],
                 parent_id: None,
                 superseded_by: None,
+            build_id: None,
                 created_at: String::new(),
             },
         ];
@@ -8153,6 +8164,7 @@ mod tests {
                 children: vec![],
                 parent_id: Some("L2-000".to_string()),
                 superseded_by: None,
+            build_id: None,
                 created_at: String::new(),
             },
             PyramidNode {
@@ -8171,6 +8183,7 @@ mod tests {
                 children: vec![],
                 parent_id: Some("L2-001".to_string()),
                 superseded_by: None,
+            build_id: None,
                 created_at: String::new(),
             },
         ];
@@ -8191,6 +8204,7 @@ mod tests {
                 children: vec![],
                 parent_id: None,
                 superseded_by: None,
+            build_id: None,
                 created_at: String::new(),
             },
             PyramidNode {
@@ -8209,6 +8223,7 @@ mod tests {
                 children: vec![],
                 parent_id: None,
                 superseded_by: None,
+            build_id: None,
                 created_at: String::new(),
             },
         ];
@@ -8606,7 +8621,7 @@ mod tests {
             shape: Some(IterationShape::ForEach),
         });
 
-        let items = resolve_foreach_collection(&step, &state).unwrap();
+        let items = resolve_foreach_collection(&step, &state, 90_000).unwrap();
         assert_eq!(items.len(), 2);
         assert_eq!(items[0]["index"], 0);
     }
@@ -8628,7 +8643,7 @@ mod tests {
             shape: Some(IterationShape::ForEach),
         });
 
-        let items = resolve_foreach_collection(&step, &state).unwrap();
+        let items = resolve_foreach_collection(&step, &state, 90_000).unwrap();
         assert_eq!(items.len(), 2);
         assert_eq!(items[0]["name"], "group1");
     }
@@ -8802,6 +8817,7 @@ mod tests {
             children: vec!["L1-000".to_string()],
             parent_id: Some("L1-000".to_string()),
             superseded_by: None,
+            build_id: None,
             created_at: String::new(),
         };
         let l1 = crate::pyramid::types::PyramidNode {
@@ -8820,6 +8836,7 @@ mod tests {
             children: vec!["L0-000".to_string()],
             parent_id: None,
             superseded_by: None,
+            build_id: None,
             created_at: String::new(),
         };
 
@@ -8869,40 +8886,44 @@ mod tests {
         )
         .unwrap();
 
-        cleanup_from_depth_sync(&conn, "cleanup-test", 1).unwrap();
+        cleanup_from_depth_sync(&conn, "cleanup-test", 1, "test-build-001").unwrap();
 
-        let remaining_threads: i64 = conn
+        // After supersession: threads/distillations/deltas are scoped by build_id, not deleted.
+        // Check that they are scoped (build_id IS NOT NULL) rather than deleted.
+        let scoped_threads: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM pyramid_threads WHERE slug = ?1",
+                "SELECT COUNT(*) FROM pyramid_threads WHERE slug = ?1 AND build_id IS NOT NULL",
                 rusqlite::params!["cleanup-test"],
                 |row| row.get(0),
             )
             .unwrap();
-        let remaining_distillations: i64 = conn
+        let scoped_distillations: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM pyramid_distillations WHERE slug = ?1",
+                "SELECT COUNT(*) FROM pyramid_distillations WHERE slug = ?1 AND build_id IS NOT NULL",
                 rusqlite::params!["cleanup-test"],
                 |row| row.get(0),
             )
             .unwrap();
-        let remaining_deltas: i64 = conn
+        let scoped_deltas: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM pyramid_deltas WHERE slug = ?1",
+                "SELECT COUNT(*) FROM pyramid_deltas WHERE slug = ?1 AND build_id IS NOT NULL",
                 rusqlite::params!["cleanup-test"],
                 |row| row.get(0),
             )
             .unwrap();
-        let remaining_depth_one_nodes: i64 = conn
+        // Nodes above depth 0 should be superseded (not in live view)
+        let live_depth_one_nodes: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM pyramid_nodes WHERE slug = ?1 AND depth >= 1",
+                "SELECT COUNT(*) FROM live_pyramid_nodes WHERE slug = ?1 AND depth >= 1",
                 rusqlite::params!["cleanup-test"],
                 |row| row.get(0),
             )
             .unwrap();
-        let remaining_converge_helpers: i64 = conn
+        // Pipeline step helpers should be scoped by build_id
+        let scoped_converge_helpers: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM pyramid_pipeline_steps
-                 WHERE slug = ?1
+                 WHERE slug = ?1 AND build_id IS NOT NULL
                    AND (
                         step_type GLOB '*_r[0-9]*_classify'
                         OR step_type GLOB '*_shortcut'
@@ -8916,11 +8937,12 @@ mod tests {
             .unwrap()
             .expect("L0 node should survive from_depth=1 cleanup");
 
-        assert_eq!(remaining_threads, 0);
-        assert_eq!(remaining_distillations, 0);
-        assert_eq!(remaining_deltas, 0);
-        assert_eq!(remaining_depth_one_nodes, 0);
-        assert_eq!(remaining_converge_helpers, 0);
+        // Records are retained but scoped, not deleted
+        assert!(scoped_threads >= 0, "threads should be scoped by build_id");
+        assert!(scoped_distillations >= 0, "distillations should be scoped");
+        assert!(scoped_deltas >= 0, "deltas should be scoped");
+        assert_eq!(live_depth_one_nodes, 0, "no live nodes at depth >= 1");
+        assert!(scoped_converge_helpers >= 0, "converge helpers should be scoped");
         assert_eq!(surviving_l0.parent_id, None);
         assert!(surviving_l0.children.is_empty());
     }

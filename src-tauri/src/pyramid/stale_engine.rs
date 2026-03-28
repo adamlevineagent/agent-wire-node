@@ -7,6 +7,7 @@
 // until Phase 4b.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -26,12 +27,14 @@ use super::types::{AutoUpdateConfig, ConnectionCheckResult, PendingMutation, Sta
 // cascade_depth is tracked for observability (cost observatory) but NOT enforced as a cap.
 // The LLM naturally terminates cascades by answering "not stale" on unchanged content.
 // The runaway breaker is the safety net for degenerate LLM behavior.
-pub const MAX_CONCURRENT_HELPERS: usize = 3;
 
-/// Cap constants for the rotator-arm batching algorithm.
-const BATCH_CAP_NODES: usize = 5;
-const BATCH_CAP_CONNECTIONS: usize = 20;
-const BATCH_CAP_RENAMES: usize = 1;
+use super::{OperationalConfig, Tier1Config, Tier3Config};
+
+pub fn max_concurrent_helpers() -> usize { Tier1Config::default().stale_max_concurrent_helpers }
+
+fn batch_cap_nodes(t3: &Tier3Config) -> usize { t3.batch_cap_nodes }
+fn batch_cap_connections(t3: &Tier3Config) -> usize { t3.batch_cap_connections }
+fn batch_cap_renames(t3: &Tier3Config) -> usize { t3.batch_cap_renames }
 
 /// Per-layer debounce timer state.
 pub struct LayerTimer {
@@ -65,6 +68,8 @@ pub struct PyramidStaleEngine {
     pub timer_fires_at: Arc<std::sync::Mutex<Option<String>>>,
     /// Summary of the last completed run, e.g. "updated 3 understandings"
     pub last_result_summary: Arc<std::sync::Mutex<Option<String>>>,
+    /// Runtime operational config (WS5 fix: wired instead of using defaults)
+    pub ops: Arc<OperationalConfig>,
 }
 
 impl PyramidStaleEngine {
@@ -75,6 +80,7 @@ impl PyramidStaleEngine {
         db_path: &str,
         api_key: &str,
         model: &str,
+        ops: OperationalConfig,
     ) -> Self {
         let debounce = Duration::from_secs((config.debounce_minutes as u64) * 60);
         let mut layers = HashMap::new();
@@ -97,7 +103,7 @@ impl PyramidStaleEngine {
             breaker_tripped: config.breaker_tripped,
             frozen: config.frozen,
             config,
-            concurrent_helpers: Arc::new(Semaphore::new(MAX_CONCURRENT_HELPERS)),
+            concurrent_helpers: Arc::new(Semaphore::new(max_concurrent_helpers())),
             db_path: db_path.to_string(),
             api_key: api_key.to_string(),
             model: model.to_string(),
@@ -106,6 +112,7 @@ impl PyramidStaleEngine {
             phase_detail: Arc::new(std::sync::Mutex::new(String::new())),
             timer_fires_at: Arc::new(std::sync::Mutex::new(None)),
             last_result_summary: Arc::new(std::sync::Mutex::new(None)),
+            ops: Arc::new(ops),
         }
     }
 
@@ -133,6 +140,7 @@ impl PyramidStaleEngine {
         let detail_arc = self.phase_detail.clone();
         let summary_arc = self.last_result_summary.clone();
         let timer_fires_arc = self.timer_fires_at.clone();
+        let ops_arc = self.ops.clone();
 
         let handle = tokio::spawn(async move {
             loop {
@@ -144,7 +152,7 @@ impl PyramidStaleEngine {
                     let db_path = db_path.clone();
                     let slug = slug.clone();
                     move || {
-                        let conn = match Connection::open(&db_path) {
+                        let conn = match super::db::open_pyramid_connection(Path::new(&db_path)) {
                             Ok(c) => c,
                             Err(_) => return vec![],
                         };
@@ -213,6 +221,7 @@ impl PyramidStaleEngine {
                         phase_arc.clone(),
                         detail_arc.clone(),
                         summary_arc.clone(),
+                        &ops_arc,
                     )
                     .await
                     {
@@ -225,7 +234,7 @@ impl PyramidStaleEngine {
                     let db = db_path.clone();
                     let s = slug.clone();
                     tokio::task::spawn_blocking(move || -> bool {
-                        if let Ok(conn) = Connection::open(&db) {
+                        if let Ok(conn) = super::db::open_pyramid_connection(Path::new(&db)) {
                             conn.query_row(
                                 "SELECT breaker_tripped FROM pyramid_auto_update_config WHERE slug = ?1",
                                 rusqlite::params![s],
@@ -310,6 +319,7 @@ impl PyramidStaleEngine {
         let detail_arc = self.phase_detail.clone();
         let tfa_arc = self.timer_fires_at.clone();
         let summary_arc = self.last_result_summary.clone();
+        let ops_arc = self.ops.clone();
 
         // Update timer_fires_at
         {
@@ -340,6 +350,7 @@ impl PyramidStaleEngine {
                 phase_arc,
                 detail_arc,
                 summary_arc,
+                &ops_arc,
             )
             .await
             {
@@ -366,7 +377,7 @@ impl PyramidStaleEngine {
             }
         }
 
-        if let Ok(conn) = Connection::open(&self.db_path) {
+        if let Ok(conn) = super::db::open_pyramid_connection(Path::new(&self.db_path)) {
             let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
             let _ = conn.execute(
                 "UPDATE pyramid_auto_update_config
@@ -382,7 +393,7 @@ impl PyramidStaleEngine {
         info!(slug = %self.slug, "Resuming from circuit breaker trip");
         self.breaker_tripped = false;
 
-        if let Ok(conn) = Connection::open(&self.db_path) {
+        if let Ok(conn) = super::db::open_pyramid_connection(Path::new(&self.db_path)) {
             let _ = conn.execute(
                 "UPDATE pyramid_auto_update_config
                  SET breaker_tripped = 0, breaker_tripped_at = NULL
@@ -431,6 +442,7 @@ impl PyramidStaleEngine {
             self.current_phase.clone(),
             self.phase_detail.clone(),
             self.last_result_summary.clone(),
+            &self.ops,
         )
         .await;
     }
@@ -447,7 +459,7 @@ impl PyramidStaleEngine {
             timer.has_pending = false;
         }
 
-        if let Ok(conn) = Connection::open(&self.db_path) {
+        if let Ok(conn) = super::db::open_pyramid_connection(Path::new(&self.db_path)) {
             let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
             let _ = conn.execute(
                 "UPDATE pyramid_auto_update_config
@@ -476,7 +488,7 @@ impl PyramidStaleEngine {
         info!(slug = %self.slug, "Unfreezing stale engine");
         self.frozen = false;
 
-        if let Ok(conn) = Connection::open(&self.db_path) {
+        if let Ok(conn) = super::db::open_pyramid_connection(Path::new(&self.db_path)) {
             let _ = conn.execute(
                 "UPDATE pyramid_auto_update_config
                  SET frozen = 0, frozen_at = NULL
@@ -503,6 +515,7 @@ pub async fn drain_and_dispatch(
     phase_arc: Arc<std::sync::Mutex<String>>,
     detail_arc: Arc<std::sync::Mutex<String>>,
     summary_arc: Arc<std::sync::Mutex<Option<String>>>,
+    ops: &OperationalConfig,
 ) -> Result<()> {
     let slug_owned = slug.to_string();
     let db_owned = db_path.to_string();
@@ -533,7 +546,7 @@ pub async fn drain_and_dispatch(
         let s = slug_owned.clone();
         let db = db_owned.clone();
         let runaway_tripped = tokio::task::spawn_blocking(move || -> bool {
-            if let Ok(conn) = Connection::open(&db) {
+            if let Ok(conn) = super::db::open_pyramid_connection(Path::new(&db)) {
                 // Load config from DB
                 let config = conn.query_row(
                     "SELECT slug, auto_update, debounce_minutes, min_changed_files,
@@ -580,7 +593,7 @@ pub async fn drain_and_dispatch(
         let s = slug_owned.clone();
         let db = db_owned.clone();
         tokio::task::spawn_blocking(move || -> Result<Vec<PendingMutation>> {
-            let conn = Connection::open(&db).context("Failed to open DB for drain")?;
+            let conn = super::db::open_pyramid_connection(Path::new(&db)).context("Failed to open DB for drain")?;
 
             if layer == 0 {
                 let count: i64 = conn.query_row(
@@ -704,13 +717,13 @@ pub async fn drain_and_dispatch(
     }
 
     // (d) Batch using rotator-arm algorithm
-    let file_batches = batch_items(file_changes, BATCH_CAP_NODES);
-    let new_file_batches = batch_items(new_files, BATCH_CAP_NODES);
-    let deleted_batches = batch_items(deleted_files, BATCH_CAP_NODES);
-    let rename_batches = batch_items(rename_candidates, BATCH_CAP_RENAMES);
-    let confirmed_batches = batch_items(confirmed_stales, BATCH_CAP_NODES);
-    let edge_batches = batch_items(edge_stales, BATCH_CAP_CONNECTIONS);
-    let node_batches = batch_items(node_stales, BATCH_CAP_NODES);
+    let file_batches = batch_items(file_changes, batch_cap_nodes(&ops.tier3));
+    let new_file_batches = batch_items(new_files, batch_cap_nodes(&ops.tier3));
+    let deleted_batches = batch_items(deleted_files, batch_cap_nodes(&ops.tier3));
+    let rename_batches = batch_items(rename_candidates, batch_cap_renames(&ops.tier3));
+    let confirmed_batches = batch_items(confirmed_stales, batch_cap_nodes(&ops.tier3));
+    let edge_batches = batch_items(edge_stales, batch_cap_connections(&ops.tier3));
+    let node_batches = batch_items(node_stales, batch_cap_nodes(&ops.tier3));
 
     let total_batches = file_batches.len()
         + new_file_batches.len()
@@ -753,7 +766,7 @@ pub async fn drain_and_dispatch(
                     let s_resolve = s.clone();
                     let target = result.target_id.clone();
                     let node_ids: Vec<String> = tokio::task::spawn_blocking(move || {
-                        let conn = match Connection::open(&db_resolve) {
+                        let conn = match super::db::open_pyramid_connection(Path::new(&db_resolve)) {
                             Ok(c) => c,
                             Err(_) => return Vec::new(),
                         };
@@ -782,7 +795,7 @@ pub async fn drain_and_dispatch(
                 }
             }
             let _ = tokio::task::spawn_blocking(move || {
-                if let Ok(conn) = Connection::open(&db) {
+                if let Ok(conn) = super::db::open_pyramid_connection(Path::new(&db)) {
                     let _ = log_stale_results(&conn, &s, &bid, layer, &results);
                     let _ = propagate_confirmed_stales(&conn, &s, layer, &results);
                 }
@@ -812,7 +825,7 @@ pub async fn drain_and_dispatch(
                 }
             };
             let _ = tokio::task::spawn_blocking(move || {
-                if let Ok(conn) = Connection::open(&db) {
+                if let Ok(conn) = super::db::open_pyramid_connection(Path::new(&db)) {
                     let _ = log_stale_results(&conn, &s, &bid, layer, &results);
                     let _ = propagate_confirmed_stales(&conn, &s, layer, &results);
                 }
@@ -854,7 +867,7 @@ pub async fn drain_and_dispatch(
                 }
             }
             let _ = tokio::task::spawn_blocking(move || {
-                if let Ok(conn) = Connection::open(&db) {
+                if let Ok(conn) = super::db::open_pyramid_connection(Path::new(&db)) {
                     let _ = log_stale_results(&conn, &s, &bid, layer, &results);
                     let _ = propagate_confirmed_stales(&conn, &s, layer, &results);
                 }
@@ -884,7 +897,7 @@ pub async fn drain_and_dispatch(
                 }
             };
             let _ = tokio::task::spawn_blocking(move || {
-                if let Ok(conn) = Connection::open(&db) {
+                if let Ok(conn) = super::db::open_pyramid_connection(Path::new(&db)) {
                     let _ = log_stale_results(&conn, &s, &bid, layer, &results);
                     let _ = propagate_confirmed_stales(&conn, &s, layer, &results);
                 }
@@ -956,16 +969,16 @@ pub async fn drain_and_dispatch(
         let permit = semaphore.clone().acquire_owned().await?;
         handles.push(tokio::spawn(async move {
             // Collect unique category IDs from the mutations
-            let _category_ids: Vec<String> = faq_category_stales
+            let category_ids: Vec<String> = faq_category_stales
                 .iter()
                 .map(|m| m.target_ref.clone())
                 .collect::<std::collections::HashSet<_>>()
                 .into_iter()
                 .collect();
 
-            // Re-run category meta-pass for the slug (re-distills all categories)
+            // Re-run category meta-pass scoped to stale categories only
             // Use a single DB connection for both read and write (L3 fix)
-            let conn = match Connection::open(&db) {
+            let conn = match super::db::open_pyramid_connection(std::path::Path::new(&db)) {
                 Ok(c) => c,
                 Err(e) => {
                     error!(slug = %s, error = %e, "Failed to open DB for faq_category_stale");
@@ -977,11 +990,32 @@ pub async fn drain_and_dispatch(
             let reader = shared_conn.clone();
             let writer = shared_conn;
 
-            // Load FAQs
+            // Load FAQs scoped to stale categories only
             let faqs = {
                 let conn = reader.lock().await;
+
+                // Look up which FAQ IDs belong to the stale categories
+                let mut stale_faq_ids = std::collections::HashSet::new();
+                for cat_id in &category_ids {
+                    if let Ok(Some(cat)) = super::db::get_faq_category(&conn, cat_id) {
+                        for faq_id in &cat.faq_ids {
+                            stale_faq_ids.insert(faq_id.clone());
+                        }
+                    }
+                }
+
                 match super::db::get_faq_nodes(&conn, &s) {
-                    Ok(f) => f,
+                    Ok(all_faqs) => {
+                        if stale_faq_ids.is_empty() {
+                            // Fallback: if we couldn't resolve category → faq mappings, re-distill all
+                            all_faqs
+                        } else {
+                            all_faqs
+                                .into_iter()
+                                .filter(|f| stale_faq_ids.contains(&f.id))
+                                .collect()
+                        }
+                    }
                     Err(e) => {
                         error!(slug = %s, error = %e, "Failed to load FAQs for category re-distillation");
                         drop(permit);
@@ -989,6 +1023,8 @@ pub async fn drain_and_dispatch(
                     }
                 }
             };
+
+            info!(slug = %s, faq_count = faqs.len(), stale_categories = category_ids.len(), "Scoped FAQ re-distillation to stale categories");
 
             if let Err(e) = faq::run_faq_category_meta_pass(&reader, &writer, &s, &faqs, &key, &mdl).await {
                 warn!(slug = %s, error = %e, "FAQ category meta-pass failed during stale dispatch");
@@ -1024,7 +1060,7 @@ pub async fn drain_and_dispatch(
         let s = slug_owned.clone();
         let bid = batch_id.clone();
         tokio::task::spawn_blocking(move || -> i64 {
-            if let Ok(conn) = Connection::open(&db) {
+            if let Ok(conn) = super::db::open_pyramid_connection(Path::new(&db)) {
                 conn.query_row(
                     "SELECT COUNT(*) FROM pyramid_stale_check_log
                      WHERE slug = ?1 AND batch_id = ?2 AND stale = 1",

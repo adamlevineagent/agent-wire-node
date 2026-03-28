@@ -22,6 +22,20 @@ pub fn open_pyramid_db(path: &std::path::Path) -> Result<Connection> {
     Ok(conn)
 }
 
+/// Open a pyramid DB connection with WAL, FK pragmas, and busy_timeout.
+///
+/// Unlike `open_pyramid_db`, this does NOT run schema initialization — it only
+/// sets connection pragmas. Use this for stale engine and helper code where the
+/// DB is already initialized at startup.
+pub fn open_pyramid_connection(path: &std::path::Path) -> Result<Connection> {
+    let conn = Connection::open(path)
+        .with_context(|| format!("Failed to open pyramid connection at {}", path.display()))?;
+    conn.execute_batch(
+        "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;",
+    )?;
+    Ok(conn)
+}
+
 // ── Schema Initialization ────────────────────────────────────────────────────
 
 /// Initialize pyramid tables. Call on app startup.
@@ -31,16 +45,21 @@ pub fn open_pyramid_db(path: &std::path::Path) -> Result<Connection> {
 pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
 
+    // 11-R: CASCADE DELETEs on FK constraints below only fire when a slug row is
+    // physically DELETEd, which only happens via admin-only `purge_slug`.
+    // Normal workflow uses `archive_slug` (sets archived_at), which never triggers cascades.
+    // The cascades are intentional for purge: removing a slug should clean up all its data.
     conn.execute_batch(
         "
         CREATE TABLE IF NOT EXISTS pyramid_slugs (
             slug TEXT PRIMARY KEY,
-            content_type TEXT NOT NULL CHECK(content_type IN ('code', 'conversation', 'document', 'vine')),
+            content_type TEXT NOT NULL CHECK(content_type IN ('code', 'conversation', 'document', 'vine', 'question')),
             source_path TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL DEFAULT (datetime('now')),
             last_built_at TEXT,
             node_count INTEGER NOT NULL DEFAULT 0,
-            max_depth INTEGER NOT NULL DEFAULT 0
+            max_depth INTEGER NOT NULL DEFAULT 0,
+            archived_at TEXT DEFAULT NULL
         );
 
         CREATE TABLE IF NOT EXISTS pyramid_batches (
@@ -402,11 +421,47 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
         [],
     );
 
+    // ── WS3: build_id columns for contribution model ──
+    let _ = conn.execute(
+        "ALTER TABLE pyramid_nodes ADD COLUMN build_id TEXT DEFAULT NULL",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE pyramid_threads ADD COLUMN build_id TEXT DEFAULT NULL",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE pyramid_pipeline_steps ADD COLUMN build_id TEXT DEFAULT NULL",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE pyramid_distillations ADD COLUMN build_id TEXT DEFAULT NULL",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE pyramid_deltas ADD COLUMN build_id TEXT DEFAULT NULL",
+        [],
+    );
+
+    // ── WS4: build_id scoping for question decomposition tables ──
+    let _ = conn.execute(
+        "ALTER TABLE pyramid_question_nodes ADD COLUMN build_id TEXT DEFAULT NULL",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE pyramid_question_tree ADD COLUMN build_id TEXT DEFAULT NULL",
+        [],
+    );
+
     // ── Compensating DELETE triggers for FK CASCADE on existing DBs ──
     // (SQLite cannot ALTER FK constraints, so these triggers handle cascading
     //  deletes for tables created before CASCADE was added)
+    // NOTE: fk_cascade_annotations_on_node_delete deliberately removed —
+    // supersession replaces deletion, annotations survive on superseded nodes.
     let _ = conn.execute_batch(
         "
+        DROP TRIGGER IF EXISTS fk_cascade_annotations_on_node_delete;
+
         CREATE TRIGGER IF NOT EXISTS fk_cascade_faq_on_slug_delete
         AFTER DELETE ON pyramid_slugs
         FOR EACH ROW BEGIN
@@ -423,12 +478,6 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
         AFTER DELETE ON pyramid_slugs
         FOR EACH ROW BEGIN
             DELETE FROM pyramid_usage_log WHERE slug = OLD.slug;
-        END;
-
-        CREATE TRIGGER IF NOT EXISTS fk_cascade_annotations_on_node_delete
-        AFTER DELETE ON pyramid_nodes
-        FOR EACH ROW BEGIN
-            DELETE FROM pyramid_annotations WHERE slug = OLD.slug AND node_id = OLD.id;
         END;
         ",
     );
@@ -487,23 +536,27 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
         -- Many-to-many weighted evidence links between nodes
         CREATE TABLE IF NOT EXISTS pyramid_evidence (
             slug TEXT NOT NULL,
+            build_id TEXT NOT NULL DEFAULT '',
             source_node_id TEXT NOT NULL,
             target_node_id TEXT NOT NULL,
             verdict TEXT NOT NULL CHECK(verdict IN ('KEEP', 'DISCONNECT', 'MISSING')),
             weight REAL,
             reason TEXT,
             created_at TEXT NOT NULL DEFAULT (datetime('now')),
-            PRIMARY KEY (slug, source_node_id, target_node_id)
+            PRIMARY KEY (slug, build_id, source_node_id, target_node_id)
         );
         CREATE INDEX IF NOT EXISTS idx_evidence_target ON pyramid_evidence(slug, target_node_id);
         CREATE INDEX IF NOT EXISTS idx_evidence_source ON pyramid_evidence(slug, source_node_id);
+        -- NOTE: idx_evidence_build is created by migrate_evidence_pk AFTER build_id column exists
 
         -- Question decomposition tree per slug (stored as JSON blob)
         CREATE TABLE IF NOT EXISTS pyramid_question_tree (
-            slug TEXT PRIMARY KEY,
+            slug TEXT NOT NULL,
+            build_id TEXT NOT NULL DEFAULT '',
             tree TEXT NOT NULL,
             created_at TEXT NOT NULL DEFAULT (datetime('now')),
-            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (slug, build_id)
         );
 
         -- Individual question decomposition nodes for incremental/resumable builds
@@ -611,6 +664,70 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
     // Backfill pyramid_evidence from existing pyramid_nodes.children arrays
     backfill_evidence_from_children(conn)?;
 
+    // ── WS3: live_pyramid_evidence view (joins against live nodes on both sides) ──
+    conn.execute_batch(
+        "
+        CREATE VIEW IF NOT EXISTS live_pyramid_evidence AS
+        SELECT e.* FROM pyramid_evidence e
+        INNER JOIN live_pyramid_nodes s ON e.source_node_id = s.id AND e.slug = s.slug
+        INNER JOIN live_pyramid_nodes t ON e.target_node_id = t.id AND e.slug = t.slug;
+        ",
+    )?;
+
+    // ── WS8-A: Multi-reference answer pyramid schema ─────────────────────────
+
+    // Junction table for slug cross-references (NO CASCADE DELETE on either FK)
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS pyramid_slug_references (
+            slug TEXT NOT NULL REFERENCES pyramid_slugs(slug),
+            referenced_slug TEXT NOT NULL REFERENCES pyramid_slugs(slug),
+            reference_type TEXT NOT NULL DEFAULT 'base',
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (slug, referenced_slug)
+        );
+        ",
+    )?;
+
+    // Slug archival column
+    let _ = conn.execute(
+        "ALTER TABLE pyramid_slugs ADD COLUMN archived_at TEXT DEFAULT NULL",
+        [],
+    );
+
+    // Evidence build_id column (added before PK rebuild migration)
+    let _ = conn.execute(
+        "ALTER TABLE pyramid_evidence ADD COLUMN build_id TEXT DEFAULT NULL",
+        [],
+    );
+
+    // Original question on builds table
+    let _ = conn.execute(
+        "ALTER TABLE pyramid_builds ADD COLUMN original_question TEXT DEFAULT NULL",
+        [],
+    );
+
+    // Gap report build_id
+    let _ = conn.execute(
+        "ALTER TABLE pyramid_gaps ADD COLUMN build_id TEXT DEFAULT NULL",
+        [],
+    );
+
+    // Migrate CHECK constraint to include 'question' content type
+    migrate_slugs_check_question(conn)?;
+
+    // Rebuild evidence table PK to include build_id
+    migrate_evidence_pk(conn)?;
+
+    // Rebuild question_tree PK to (slug, build_id)
+    migrate_question_tree_pk(conn)?;
+
+    // Create evidence build_id index — safe to run after migration ensures column exists
+    // For fresh DBs: column exists from CREATE TABLE. For existing: migration added it.
+    let _ = conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_evidence_build ON pyramid_evidence(slug, build_id);",
+    );
+
     Ok(())
 }
 
@@ -681,6 +798,237 @@ fn migrate_slugs_check_constraint(conn: &Connection) -> Result<()> {
     }
 }
 
+/// Migrate `pyramid_slugs` CHECK constraint to include 'question' content type.
+/// Idempotent: skips if CHECK already includes 'question'.
+fn migrate_slugs_check_question(conn: &Connection) -> Result<()> {
+    let table_sql: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='pyramid_slugs'",
+            [],
+            |row| row.get(0),
+        )
+        .ok();
+
+    let needs_migration = match &table_sql {
+        Some(sql) => sql.contains("CHECK") && !sql.contains("question"),
+        None => false,
+    };
+
+    if !needs_migration {
+        return Ok(());
+    }
+
+    tracing::info!("Migrating pyramid_slugs CHECK constraint to include 'question'...");
+
+    conn.execute_batch("PRAGMA foreign_keys=OFF;")?;
+
+    let result = (|| -> Result<()> {
+        let tx = conn.unchecked_transaction()?;
+
+        tx.execute_batch(
+            "
+            CREATE TABLE pyramid_slugs_new (
+                slug TEXT PRIMARY KEY,
+                content_type TEXT NOT NULL CHECK(content_type IN ('code', 'conversation', 'document', 'vine', 'question')),
+                source_path TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                last_built_at TEXT,
+                node_count INTEGER NOT NULL DEFAULT 0,
+                max_depth INTEGER NOT NULL DEFAULT 0,
+                archived_at TEXT DEFAULT NULL
+            );
+            INSERT INTO pyramid_slugs_new (slug, content_type, source_path, created_at, last_built_at, node_count, max_depth, archived_at)
+                SELECT slug, content_type, source_path, created_at, last_built_at, node_count, max_depth, archived_at
+                FROM pyramid_slugs;
+            DROP TABLE pyramid_slugs;
+            ALTER TABLE pyramid_slugs_new RENAME TO pyramid_slugs;
+            ",
+        )?;
+
+        tx.commit()?;
+        Ok(())
+    })();
+
+    conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+
+    match result {
+        Ok(()) => {
+            tracing::info!("pyramid_slugs CHECK constraint migrated to include 'question'.");
+            Ok(())
+        }
+        Err(e) => {
+            tracing::error!("pyramid_slugs question migration failed (FK re-enabled): {e}");
+            Err(e)
+        }
+    }
+}
+
+/// Migrate `pyramid_evidence` PK from `(slug, source_node_id, target_node_id)` to
+/// `(slug, build_id, source_node_id, target_node_id)`.
+/// Idempotent: skips if PK already includes `build_id`.
+fn migrate_evidence_pk(conn: &Connection) -> Result<()> {
+    let table_sql: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='pyramid_evidence'",
+            [],
+            |row| row.get(0),
+        )
+        .ok();
+
+    let needs_migration = match &table_sql {
+        Some(sql) => {
+            // Check if build_id is in the PRIMARY KEY clause specifically.
+            // ALTER TABLE adds build_id to the SQL but doesn't change the PK.
+            // We need to check if the PK definition itself includes build_id.
+            if let Some(pk_start) = sql.find("PRIMARY KEY") {
+                let pk_section = &sql[pk_start..];
+                // Find the closing paren of the PK definition
+                if let Some(pk_end) = pk_section.find(')') {
+                    let pk_def = &pk_section[..pk_end + 1];
+                    !pk_def.contains("build_id")
+                } else {
+                    true // malformed PK, try migration
+                }
+            } else {
+                false // no PK found, skip
+            }
+        }
+        None => false,
+    };
+
+    if !needs_migration {
+        return Ok(());
+    }
+
+    tracing::info!("Migrating pyramid_evidence PK to include build_id...");
+
+    // Must drop the view that depends on this table first
+    let _ = conn.execute_batch("DROP VIEW IF EXISTS live_pyramid_evidence;");
+
+    conn.execute_batch("PRAGMA foreign_keys=OFF;")?;
+
+    let result = (|| -> Result<()> {
+        let tx = conn.unchecked_transaction()?;
+
+        tx.execute_batch(
+            "
+            CREATE TABLE pyramid_evidence_new (
+                slug TEXT NOT NULL,
+                build_id TEXT NOT NULL DEFAULT '',
+                source_node_id TEXT NOT NULL,
+                target_node_id TEXT NOT NULL,
+                verdict TEXT NOT NULL CHECK(verdict IN ('KEEP', 'DISCONNECT', 'MISSING')),
+                weight REAL,
+                reason TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (slug, build_id, source_node_id, target_node_id)
+            );
+            INSERT INTO pyramid_evidence_new (slug, build_id, source_node_id, target_node_id, verdict, weight, reason, created_at)
+                SELECT slug, COALESCE(build_id, ''), source_node_id, target_node_id, verdict, weight, reason, created_at
+                FROM pyramid_evidence;
+            DROP TABLE pyramid_evidence;
+            ALTER TABLE pyramid_evidence_new RENAME TO pyramid_evidence;
+            CREATE INDEX IF NOT EXISTS idx_evidence_target ON pyramid_evidence(slug, target_node_id);
+            CREATE INDEX IF NOT EXISTS idx_evidence_source ON pyramid_evidence(slug, source_node_id);
+            CREATE INDEX IF NOT EXISTS idx_evidence_build ON pyramid_evidence(slug, build_id);
+            ",
+        )?;
+
+        tx.commit()?;
+        Ok(())
+    })();
+
+    conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+
+    // Recreate the live view
+    let _ = conn.execute_batch(
+        "
+        CREATE VIEW IF NOT EXISTS live_pyramid_evidence AS
+        SELECT e.* FROM pyramid_evidence e
+        INNER JOIN live_pyramid_nodes s ON e.source_node_id = s.id AND e.slug = s.slug
+        INNER JOIN live_pyramid_nodes t ON e.target_node_id = t.id AND e.slug = t.slug;
+        ",
+    );
+
+    match result {
+        Ok(()) => {
+            tracing::info!("pyramid_evidence PK migrated to include build_id.");
+            Ok(())
+        }
+        Err(e) => {
+            tracing::error!("pyramid_evidence PK migration failed (FK re-enabled): {e}");
+            Err(e)
+        }
+    }
+}
+
+/// Migrate `pyramid_question_tree` PK from `(slug)` to `(slug, build_id)`.
+/// Idempotent: skips if PK already includes `build_id`.
+fn migrate_question_tree_pk(conn: &Connection) -> Result<()> {
+    let table_sql: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='pyramid_question_tree'",
+            [],
+            |row| row.get(0),
+        )
+        .ok();
+
+    let needs_migration = match &table_sql {
+        Some(sql) => {
+            // The original table has `slug TEXT PRIMARY KEY` — no build_id in PK
+            // After migration it will have `PRIMARY KEY (slug, build_id)`
+            !sql.contains("build_id") || (sql.contains("build_id") && sql.contains("slug TEXT PRIMARY KEY"))
+        }
+        None => false,
+    };
+
+    if !needs_migration {
+        return Ok(());
+    }
+
+    tracing::info!("Migrating pyramid_question_tree PK to (slug, build_id)...");
+
+    conn.execute_batch("PRAGMA foreign_keys=OFF;")?;
+
+    let result = (|| -> Result<()> {
+        let tx = conn.unchecked_transaction()?;
+
+        tx.execute_batch(
+            "
+            CREATE TABLE pyramid_question_tree_new (
+                slug TEXT NOT NULL,
+                build_id TEXT NOT NULL DEFAULT '',
+                tree TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (slug, build_id)
+            );
+            INSERT INTO pyramid_question_tree_new (slug, build_id, tree, created_at, updated_at)
+                SELECT slug, COALESCE(build_id, ''), tree, created_at, updated_at
+                FROM pyramid_question_tree;
+            DROP TABLE pyramid_question_tree;
+            ALTER TABLE pyramid_question_tree_new RENAME TO pyramid_question_tree;
+            ",
+        )?;
+
+        tx.commit()?;
+        Ok(())
+    })();
+
+    conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+
+    match result {
+        Ok(()) => {
+            tracing::info!("pyramid_question_tree PK migrated to (slug, build_id).");
+            Ok(())
+        }
+        Err(e) => {
+            tracing::error!("pyramid_question_tree PK migration failed (FK re-enabled): {e}");
+            Err(e)
+        }
+    }
+}
+
 // ── Slug CRUD ────────────────────────────────────────────────────────────────
 
 /// Create a new slug entry. Returns the created SlugInfo.
@@ -703,7 +1051,7 @@ pub fn create_slug(
 /// Fetch a slug by name. Returns None if not found.
 pub fn get_slug(conn: &Connection, slug: &str) -> Result<Option<SlugInfo>> {
     let mut stmt = conn.prepare(
-        "SELECT slug, content_type, source_path, node_count, max_depth, last_built_at, created_at
+        "SELECT slug, content_type, source_path, node_count, max_depth, last_built_at, created_at, archived_at
          FROM pyramid_slugs WHERE slug = ?1",
     )?;
 
@@ -721,11 +1069,18 @@ pub fn get_slug(conn: &Connection, slug: &str) -> Result<Option<SlugInfo>> {
             max_depth: row.get(4)?,
             last_built_at: row.get(5)?,
             created_at: row.get(6)?,
+            archived_at: row.get(7)?,
+            referenced_slugs: Vec::new(),
+            referencing_slugs: Vec::new(),
         })
     });
 
     match result {
-        Ok(info) => Ok(Some(info)),
+        Ok(mut info) => {
+            info.referenced_slugs = get_slug_references(conn, &info.slug).unwrap_or_default();
+            info.referencing_slugs = get_slug_referrers(conn, &info.slug).unwrap_or_default();
+            Ok(Some(info))
+        }
         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
         Err(e) => Err(e.into()),
     }
@@ -738,13 +1093,14 @@ pub fn list_slugs(conn: &Connection) -> Result<Vec<SlugInfo>> {
 }
 
 /// List slugs with optional bunch filtering.
+/// Filters out archived slugs (archived_at IS NULL).
 pub fn list_slugs_filtered(conn: &Connection, exclude_bunches: bool) -> Result<Vec<SlugInfo>> {
     let sql = if exclude_bunches {
-        "SELECT slug, content_type, source_path, node_count, max_depth, last_built_at, created_at
-         FROM pyramid_slugs WHERE slug NOT LIKE '%--bunch-%' ORDER BY created_at DESC"
+        "SELECT slug, content_type, source_path, node_count, max_depth, last_built_at, created_at, archived_at
+         FROM pyramid_slugs WHERE slug NOT LIKE '%--bunch-%' AND archived_at IS NULL ORDER BY created_at DESC"
     } else {
-        "SELECT slug, content_type, source_path, node_count, max_depth, last_built_at, created_at
-         FROM pyramid_slugs ORDER BY created_at DESC"
+        "SELECT slug, content_type, source_path, node_count, max_depth, last_built_at, created_at, archived_at
+         FROM pyramid_slugs WHERE archived_at IS NULL ORDER BY created_at DESC"
     };
     let mut stmt = conn.prepare(sql)?;
 
@@ -762,12 +1118,18 @@ pub fn list_slugs_filtered(conn: &Connection, exclude_bunches: bool) -> Result<V
             max_depth: row.get(4)?,
             last_built_at: row.get(5)?,
             created_at: row.get(6)?,
+            archived_at: row.get(7)?,
+            referenced_slugs: Vec::new(),
+            referencing_slugs: Vec::new(),
         })
     })?;
 
     let mut slugs = Vec::new();
     for row in rows {
-        slugs.push(row?);
+        let mut info = row?;
+        info.referenced_slugs = get_slug_references(conn, &info.slug).unwrap_or_default();
+        info.referencing_slugs = get_slug_referrers(conn, &info.slug).unwrap_or_default();
+        slugs.push(info);
     }
     Ok(slugs)
 }
@@ -781,13 +1143,103 @@ pub fn delete_slug(conn: &Connection, slug: &str) -> Result<()> {
     Ok(())
 }
 
-/// Delete pipeline steps above a given depth for a slug.
-/// Needed for force-rebuild: step_exists() would skip work if old steps remain.
-pub fn delete_steps_above_depth(conn: &Connection, slug: &str, depth: i64) -> Result<i64> {
-    let count = conn.execute(
-        "DELETE FROM pyramid_pipeline_steps WHERE slug = ?1 AND depth > ?2",
-        rusqlite::params![slug, depth],
+// ── Slug References (WS8-A) ──────────────────────────────────────────────────
+
+/// Bulk-insert slug references: records that `slug` reads from each of `referenced_slugs`.
+/// Uses INSERT OR IGNORE to skip existing pairs.
+pub fn save_slug_references(conn: &Connection, slug: &str, referenced_slugs: &[String]) -> Result<()> {
+    let mut stmt = conn.prepare(
+        "INSERT OR IGNORE INTO pyramid_slug_references (slug, referenced_slug) VALUES (?1, ?2)",
     )?;
+    for ref_slug in referenced_slugs {
+        stmt.execute(rusqlite::params![slug, ref_slug])?;
+    }
+    Ok(())
+}
+
+/// What does this slug read from? Returns referenced slugs.
+pub fn get_slug_references(conn: &Connection, slug: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT referenced_slug FROM pyramid_slug_references WHERE slug = ?1 ORDER BY created_at",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![slug], |row| row.get(0))?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
+/// Who references this slug? Returns slugs that reference the given slug.
+pub fn get_slug_referrers(conn: &Connection, slug: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT slug FROM pyramid_slug_references WHERE referenced_slug = ?1 ORDER BY created_at",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![slug], |row| row.get(0))?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
+/// Returns true if any other slug references this one.
+pub fn has_slug_referrers(conn: &Connection, slug: &str) -> Result<bool> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pyramid_slug_references WHERE referenced_slug = ?1",
+        rusqlite::params![slug],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
+/// Archive a slug — sets `archived_at` timestamp. Does NOT delete.
+pub fn archive_slug(conn: &Connection, slug: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE pyramid_slugs SET archived_at = datetime('now') WHERE slug = ?1",
+        rusqlite::params![slug],
+    )?;
+    Ok(())
+}
+
+/// Admin-only hard delete of a slug and all associated data (like parity.rs exemption).
+/// Unlike `delete_slug`, this also removes slug reference entries in both directions.
+pub fn purge_slug(conn: &Connection, slug: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM pyramid_slug_references WHERE slug = ?1 OR referenced_slug = ?1",
+        rusqlite::params![slug],
+    )?;
+    conn.execute(
+        "DELETE FROM pyramid_slugs WHERE slug = ?1",
+        rusqlite::params![slug],
+    )?;
+    Ok(())
+}
+
+// ── Handle Path Utilities (WS8-A) ───────────────────────────────────────────
+
+/// Parse a handle path like "vibe-ev8/0/L0-003" into (slug, depth, node_id).
+/// Returns None for bare IDs that contain no '/'.
+pub fn parse_handle_path(id: &str) -> Option<(&str, i64, &str)> {
+    let parts: Vec<&str> = id.splitn(3, '/').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let depth: i64 = parts[1].parse().ok()?;
+    Some((parts[0], depth, parts[2]))
+}
+
+/// Format a handle path from components.
+pub fn format_handle_path(slug: &str, depth: i64, node_id: &str) -> String {
+    format!("{}/{}/{}", slug, depth, node_id)
+}
+
+/// 11-A: Supersede pipeline steps above a given depth for a slug + build_id.
+/// Scoped by build_id instead of bare DELETE. When build_id is None, scopes to
+/// steps with NULL build_id (legacy data).
+pub fn delete_steps_above_depth(conn: &Connection, slug: &str, depth: i64, build_id: Option<&str>) -> Result<i64> {
+    let count = match build_id {
+        Some(bid) => conn.execute(
+            "DELETE FROM pyramid_pipeline_steps WHERE slug = ?1 AND depth > ?2 AND build_id = ?3",
+            rusqlite::params![slug, depth, bid],
+        )?,
+        None => conn.execute(
+            "DELETE FROM pyramid_pipeline_steps WHERE slug = ?1 AND depth > ?2 AND build_id IS NULL",
+            rusqlite::params![slug, depth],
+        )?,
+    };
     Ok(count as i64)
 }
 
@@ -924,7 +1376,7 @@ fn load_source_paths_by_node_id(conn: &Connection) -> Result<HashMap<String, Str
 fn backfill_missing_headlines(conn: &Connection) -> Result<()> {
     let source_path_by_node_id = load_source_paths_by_node_id(conn)?;
     let sql = format!(
-        "SELECT {NODE_SELECT_COLS} FROM pyramid_nodes
+        "SELECT {NODE_SELECT_COLS} FROM live_pyramid_nodes
          WHERE headline IS NULL OR TRIM(headline) = ''"
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -985,13 +1437,16 @@ pub fn node_from_row(row: &rusqlite::Row) -> rusqlite::Result<PyramidNode> {
         superseded_by: row
             .get::<_, Option<String>>("superseded_by")
             .unwrap_or(None),
+        build_id: row
+            .get::<_, Option<String>>("build_id")
+            .unwrap_or(None),
         created_at: row.get::<_, String>("created_at").unwrap_or_default(),
     })
 }
 
 const NODE_SELECT_COLS: &str =
     "id, slug, depth, chunk_index, headline, distilled, topics, corrections, decisions, \
-     terms, dead_ends, self_prompt, children, parent_id, superseded_by, created_at";
+     terms, dead_ends, self_prompt, children, parent_id, superseded_by, build_id, created_at";
 
 /// Save (upsert) a PyramidNode. Serializes all Vec fields to JSON strings.
 ///
@@ -1013,8 +1468,8 @@ pub fn save_node(conn: &Connection, node: &PyramidNode, topics_json: Option<&str
     conn.execute(
         "INSERT INTO pyramid_nodes
             (id, slug, depth, chunk_index, headline, distilled, topics, corrections, decisions,
-             terms, dead_ends, self_prompt, children, parent_id, superseded_by)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+             terms, dead_ends, self_prompt, children, parent_id, superseded_by, build_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
          ON CONFLICT(slug, id) DO UPDATE SET
             depth = excluded.depth,
             chunk_index = excluded.chunk_index,
@@ -1029,6 +1484,7 @@ pub fn save_node(conn: &Connection, node: &PyramidNode, topics_json: Option<&str
             children = excluded.children,
             parent_id = excluded.parent_id,
             superseded_by = excluded.superseded_by,
+            build_id = excluded.build_id,
             build_version = build_version + 1",
         rusqlite::params![
             node.id,
@@ -1046,6 +1502,7 @@ pub fn save_node(conn: &Connection, node: &PyramidNode, topics_json: Option<&str
             children,
             node.parent_id,
             node.superseded_by,
+            node.build_id,
         ],
     )?;
 
@@ -1071,7 +1528,7 @@ pub fn get_node(conn: &Connection, slug: &str, node_id: &str) -> Result<Option<P
 pub fn get_node_summary(conn: &Connection, slug: &str, node_id: &str) -> Result<Option<PyramidNode>> {
     let sql = "SELECT id, slug, depth, chunk_index, headline, distilled, \
                '[]' as topics, '[]' as corrections, '[]' as decisions, \
-               '[]' as terms, '[]' as dead_ends, self_prompt, children, parent_id, superseded_by, created_at \
+               '[]' as terms, '[]' as dead_ends, self_prompt, children, parent_id, superseded_by, build_id, created_at \
                FROM pyramid_nodes WHERE slug = ?1 AND id = ?2";
     let mut stmt = conn.prepare(sql)?;
     let result = stmt.query_row(rusqlite::params![slug, node_id], node_from_row);
@@ -1100,6 +1557,25 @@ pub fn get_nodes_at_depth(conn: &Connection, slug: &str, depth: i64) -> Result<V
     Ok(nodes)
 }
 
+/// Get ALL live (non-superseded) nodes for a slug, across all depths.
+/// Used by cross-slug loading when a question slug references another question slug
+/// and needs all answer nodes as source material.
+pub fn get_all_live_nodes(conn: &Connection, slug: &str) -> Result<Vec<PyramidNode>> {
+    let sql = format!(
+        "SELECT {NODE_SELECT_COLS} FROM live_pyramid_nodes
+         WHERE slug = ?1
+         ORDER BY depth ASC, chunk_index ASC, id ASC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params![slug], node_from_row)?;
+
+    let mut nodes = Vec::new();
+    for row in rows {
+        nodes.push(row?);
+    }
+    Ok(nodes)
+}
+
 pub fn get_node_id_by_depth_and_chunk_index(
     conn: &Connection,
     slug: &str,
@@ -1107,7 +1583,7 @@ pub fn get_node_id_by_depth_and_chunk_index(
     chunk_index: i64,
 ) -> Result<Option<String>> {
     let result = conn.query_row(
-        "SELECT id FROM pyramid_nodes
+        "SELECT id FROM live_pyramid_nodes
          WHERE slug = ?1 AND depth = ?2 AND chunk_index = ?3
          ORDER BY build_version DESC, id ASC
          LIMIT 1",
@@ -1129,7 +1605,7 @@ pub fn get_node_id_by_depth_and_headline(
     headline: &str,
 ) -> Result<Option<String>> {
     let result = conn.query_row(
-        "SELECT id FROM pyramid_nodes
+        "SELECT id FROM live_pyramid_nodes
          WHERE slug = ?1 AND depth = ?2 AND headline = ?3
          ORDER BY build_version DESC, id ASC
          LIMIT 1",
@@ -1156,12 +1632,90 @@ pub fn count_nodes_at_depth(conn: &Connection, slug: &str, depth: i64) -> Result
 
 /// Delete all nodes with depth > the given depth. Returns count of deleted rows.
 /// Used when rebuilding upper layers of the pyramid.
+/// 11-M: Deprecated — use `supersede_nodes_above` instead. Retained for backward compat.
+#[deprecated(note = "Use supersede_nodes_above instead — delete_nodes_above destroys contributions")]
 pub fn delete_nodes_above(conn: &Connection, slug: &str, depth: i64) -> Result<i64> {
     let deleted = conn.execute(
         "DELETE FROM pyramid_nodes WHERE slug = ?1 AND depth > ?2",
         rusqlite::params![slug, depth],
     )?;
     Ok(deleted as i64)
+}
+
+// ── Supersession functions (WS3: Everything is a Contribution) ──────────────
+
+/// Supersede all live nodes above a given depth by setting superseded_by = build_id.
+/// Returns count of superseded nodes.
+pub fn supersede_nodes_above(conn: &Connection, slug: &str, depth: i64, build_id: &str) -> Result<i64> {
+    let count = conn.execute(
+        "UPDATE pyramid_nodes SET superseded_by = ?3
+         WHERE slug = ?1 AND depth > ?2 AND superseded_by IS NULL",
+        rusqlite::params![slug, depth, build_id],
+    )?;
+    Ok(count as i64)
+}
+
+/// Supersede all live nodes at or above a given depth by setting superseded_by = build_id.
+/// Returns count of superseded nodes.
+pub fn supersede_nodes_at_and_above(conn: &Connection, slug: &str, depth: i64, build_id: &str) -> Result<i64> {
+    let count = conn.execute(
+        "UPDATE pyramid_nodes SET superseded_by = ?3
+         WHERE slug = ?1 AND depth >= ?2 AND superseded_by IS NULL",
+        rusqlite::params![slug, depth, build_id],
+    )?;
+    Ok(count as i64)
+}
+
+/// Supersede a single node by setting superseded_by = build_id.
+pub fn supersede_node(conn: &Connection, slug: &str, node_id: &str, build_id: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE pyramid_nodes SET superseded_by = ?3
+         WHERE slug = ?1 AND id = ?2 AND superseded_by IS NULL",
+        rusqlite::params![slug, node_id, build_id],
+    )?;
+    Ok(())
+}
+
+/// Supersede ALL live nodes for a slug (full rebuild / partial-fail cleanup).
+/// Returns count of superseded nodes.
+pub fn supersede_all_nodes(conn: &Connection, slug: &str, build_id: &str) -> Result<i64> {
+    let count = conn.execute(
+        "UPDATE pyramid_nodes SET superseded_by = ?2
+         WHERE slug = ?1 AND superseded_by IS NULL",
+        rusqlite::params![slug, build_id],
+    )?;
+    Ok(count as i64)
+}
+
+/// Supersede live nodes matching a headline pattern at a given depth.
+/// Returns count of superseded nodes.
+pub fn supersede_nodes_by_headline_pattern(
+    conn: &Connection,
+    slug: &str,
+    depth: i64,
+    pattern1: &str,
+    pattern2: &str,
+    build_id: &str,
+) -> Result<i64> {
+    let count = conn.execute(
+        "UPDATE pyramid_nodes SET superseded_by = ?4
+         WHERE slug = ?1 AND depth = ?2 AND superseded_by IS NULL
+           AND (headline LIKE ?3 OR headline LIKE ?5)",
+        rusqlite::params![slug, depth, pattern1, build_id, pattern2],
+    )?;
+    Ok(count as i64)
+}
+
+/// Get a live node (non-superseded) by slug and node ID. Returns None if not found or superseded.
+pub fn get_live_node(conn: &Connection, slug: &str, node_id: &str) -> Result<Option<PyramidNode>> {
+    let sql = format!("SELECT {NODE_SELECT_COLS} FROM live_pyramid_nodes WHERE slug = ?1 AND id = ?2");
+    let mut stmt = conn.prepare(&sql)?;
+    let result = stmt.query_row(rusqlite::params![slug, node_id], node_from_row);
+    match result {
+        Ok(node) => Ok(Some(node)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Update a node's parent_id.
@@ -1825,10 +2379,31 @@ pub fn get_all_annotations(conn: &Connection, slug: &str) -> Result<Vec<PyramidA
 }
 
 /// Save an annotation. Returns the new row ID.
+/// 11-D: Checks node liveness — blocks annotation on superseded nodes and returns
+/// an error with the successor ID so callers can redirect.
 pub fn save_annotation(
     conn: &Connection,
     annotation: &PyramidAnnotation,
 ) -> Result<PyramidAnnotation> {
+    // 11-D: Check if the target node is superseded
+    if !annotation.node_id.is_empty() {
+        let superseded: Option<String> = conn
+            .query_row(
+                "SELECT superseded_by FROM pyramid_nodes WHERE slug = ?1 AND id = ?2",
+                rusqlite::params![annotation.slug, annotation.node_id],
+                |row| row.get(0),
+            )
+            .ok()
+            .flatten();
+        if let Some(successor_id) = superseded {
+            return Err(anyhow::anyhow!(
+                "Cannot annotate superseded node '{}'. Successor: '{}'",
+                annotation.node_id,
+                successor_id
+            ));
+        }
+    }
+
     conn.execute(
         "INSERT INTO pyramid_annotations (slug, node_id, annotation_type, content, question_context, author)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -2666,17 +3241,19 @@ pub fn get_faq_nodes_by_prefix(
 
 // ── Evidence System CRUD (Phase 1) ────────────────────────────────────────────
 
-/// Save an evidence link (upsert on slug + source + target).
+/// Save an evidence link (upsert on slug + build_id + source + target).
 pub fn save_evidence_link(conn: &Connection, link: &EvidenceLink) -> Result<()> {
+    let build_id = link.build_id.as_deref().unwrap_or("");
     conn.execute(
-        "INSERT INTO pyramid_evidence (slug, source_node_id, target_node_id, verdict, weight, reason)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-         ON CONFLICT(slug, source_node_id, target_node_id) DO UPDATE SET
+        "INSERT INTO pyramid_evidence (slug, build_id, source_node_id, target_node_id, verdict, weight, reason)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(slug, build_id, source_node_id, target_node_id) DO UPDATE SET
            verdict = excluded.verdict,
            weight = excluded.weight,
            reason = excluded.reason",
         rusqlite::params![
             link.slug,
+            build_id,
             link.source_node_id,
             link.target_node_id,
             link.verdict.as_str(),
@@ -2687,6 +3264,7 @@ pub fn save_evidence_link(conn: &Connection, link: &EvidenceLink) -> Result<()> 
     Ok(())
 }
 
+#[deprecated(note = "Use get_evidence_for_target_cross for handle-path support")]
 /// Get all evidence links pointing at a target node (i.e. its supporting evidence).
 pub fn get_evidence_for_target(
     conn: &Connection,
@@ -2694,13 +3272,14 @@ pub fn get_evidence_for_target(
     target_node_id: &str,
 ) -> Result<Vec<EvidenceLink>> {
     let mut stmt = conn.prepare(
-        "SELECT slug, source_node_id, target_node_id, verdict, weight, reason
-         FROM pyramid_evidence WHERE slug = ?1 AND target_node_id = ?2",
+        "SELECT slug, source_node_id, target_node_id, verdict, weight, reason, build_id
+         FROM live_pyramid_evidence WHERE slug = ?1 AND target_node_id = ?2",
     )?;
     let rows = stmt.query_map(rusqlite::params![slug, target_node_id], evidence_from_row)?;
     Ok(rows.filter_map(|r| r.ok()).collect())
 }
 
+#[deprecated(note = "Use get_evidence_for_source_cross for handle-path support")]
 /// Get all evidence links from a source node (i.e. what it supports).
 pub fn get_evidence_for_source(
     conn: &Connection,
@@ -2708,13 +3287,14 @@ pub fn get_evidence_for_source(
     source_node_id: &str,
 ) -> Result<Vec<EvidenceLink>> {
     let mut stmt = conn.prepare(
-        "SELECT slug, source_node_id, target_node_id, verdict, weight, reason
-         FROM pyramid_evidence WHERE slug = ?1 AND source_node_id = ?2",
+        "SELECT slug, source_node_id, target_node_id, verdict, weight, reason, build_id
+         FROM live_pyramid_evidence WHERE slug = ?1 AND source_node_id = ?2",
     )?;
     let rows = stmt.query_map(rusqlite::params![slug, source_node_id], evidence_from_row)?;
     Ok(rows.filter_map(|r| r.ok()).collect())
 }
 
+#[deprecated(note = "Use get_keep_evidence_for_target_cross for handle-path support")]
 /// Get only KEEP evidence links for a target node.
 pub fn get_keep_evidence_for_target(
     conn: &Connection,
@@ -2722,24 +3302,16 @@ pub fn get_keep_evidence_for_target(
     target_node_id: &str,
 ) -> Result<Vec<EvidenceLink>> {
     let mut stmt = conn.prepare(
-        "SELECT slug, source_node_id, target_node_id, verdict, weight, reason
-         FROM pyramid_evidence WHERE slug = ?1 AND target_node_id = ?2 AND verdict = 'KEEP'",
+        "SELECT slug, source_node_id, target_node_id, verdict, weight, reason, build_id
+         FROM live_pyramid_evidence WHERE slug = ?1 AND target_node_id = ?2 AND verdict = 'KEEP'",
     )?;
     let rows = stmt.query_map(rusqlite::params![slug, target_node_id], evidence_from_row)?;
     Ok(rows.filter_map(|r| r.ok()).collect())
 }
 
-/// Delete all evidence links for a slug.
-pub fn clear_evidence_for_slug(conn: &Connection, slug: &str) -> Result<()> {
-    conn.execute(
-        "DELETE FROM pyramid_evidence WHERE slug = ?1",
-        rusqlite::params![slug],
-    )?;
-    Ok(())
-}
-
 fn evidence_from_row(row: &rusqlite::Row) -> rusqlite::Result<EvidenceLink> {
     let verdict_str: String = row.get(3)?;
+    let build_id: String = row.get(6)?;
     Ok(EvidenceLink {
         slug: row.get(0)?,
         source_node_id: row.get(1)?,
@@ -2747,7 +3319,115 @@ fn evidence_from_row(row: &rusqlite::Row) -> rusqlite::Result<EvidenceLink> {
         verdict: EvidenceVerdict::from_str(&verdict_str),
         weight: row.get(4)?,
         reason: row.get(5)?,
+        build_id: if build_id.is_empty() { None } else { Some(build_id) },
+        live: Some(true), // Default to live; cross-slug resolution comes in WS8-C
     })
+}
+
+/// Row mapper for the raw `pyramid_evidence` table (includes build_id column).
+/// Unlike `evidence_from_row` which reads from the live view, this reads from the
+/// raw table and leaves `live` as None — the caller resolves liveness in Rust.
+fn evidence_from_raw_row(row: &rusqlite::Row) -> rusqlite::Result<EvidenceLink> {
+    let verdict_str: String = row.get(3)?;
+    let build_id: String = row.get(6)?;
+    Ok(EvidenceLink {
+        slug: row.get(0)?,
+        source_node_id: row.get(1)?,
+        target_node_id: row.get(2)?,
+        verdict: EvidenceVerdict::from_str(&verdict_str),
+        weight: row.get(4)?,
+        reason: row.get(5)?,
+        build_id: if build_id.is_empty() { None } else { Some(build_id) },
+        live: None, // Caller resolves liveness via get_live_node
+    })
+}
+
+// ── Cross-Slug Evidence Queries (WS8-C) ──────────────────────────────────────
+
+/// Get all evidence links pointing at a target node, resolving cross-slug handle-paths.
+///
+/// Queries the RAW `pyramid_evidence` table (not the `live_pyramid_evidence` view),
+/// then checks liveness of each source node in Rust. For handle-path source IDs,
+/// the parsed slug is used for the liveness check; for bare IDs, the evidence link's
+/// own slug is used.
+///
+/// Returns ALL links (both live and dead) annotated with `live: Some(true|false)`.
+pub fn get_evidence_for_target_cross(
+    conn: &Connection,
+    slug: &str,
+    target_node_id: &str,
+) -> Result<Vec<EvidenceLink>> {
+    let mut stmt = conn.prepare(
+        "SELECT slug, source_node_id, target_node_id, verdict, weight, reason, build_id
+         FROM pyramid_evidence WHERE slug = ?1 AND target_node_id = ?2",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![slug, target_node_id], evidence_from_raw_row)?;
+    let mut links: Vec<EvidenceLink> = rows.filter_map(|r| r.ok()).collect();
+
+    // Resolve liveness for each source node
+    for link in &mut links {
+        if let Some((parsed_slug, _depth, parsed_node_id)) = parse_handle_path(&link.source_node_id) {
+            // Cross-slug handle-path: check liveness in the source pyramid
+            link.live = Some(get_live_node(conn, parsed_slug, parsed_node_id)?.is_some());
+        } else {
+            // Bare ID: same-slug, check in the evidence link's slug
+            link.live = Some(get_live_node(conn, &link.slug, &link.source_node_id)?.is_some());
+        }
+    }
+
+    Ok(links)
+}
+
+/// Get all evidence links from a source node across ALL slugs, resolving liveness.
+///
+/// Queries the RAW `pyramid_evidence` table with NO slug filter on `source_node_id`.
+/// Used by supersession/staleness to find who cites a given source.
+///
+/// Returns ALL links annotated with `live: Some(true|false)` for the target nodes.
+pub fn get_evidence_for_source_cross(
+    conn: &Connection,
+    source_node_id: &str,
+) -> Result<Vec<EvidenceLink>> {
+    let mut stmt = conn.prepare(
+        "SELECT slug, source_node_id, target_node_id, verdict, weight, reason, build_id
+         FROM pyramid_evidence WHERE source_node_id = ?1",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![source_node_id], evidence_from_raw_row)?;
+    let mut links: Vec<EvidenceLink> = rows.filter_map(|r| r.ok()).collect();
+
+    // Resolve liveness for each target node
+    for link in &mut links {
+        link.live = Some(get_live_node(conn, &link.slug, &link.target_node_id)?.is_some());
+    }
+
+    Ok(links)
+}
+
+/// Get only KEEP evidence links for a target node, with cross-slug handle-path resolution.
+///
+/// Same as `get_evidence_for_target_cross` but filtered to `verdict = 'KEEP'`.
+pub fn get_keep_evidence_for_target_cross(
+    conn: &Connection,
+    slug: &str,
+    target_node_id: &str,
+) -> Result<Vec<EvidenceLink>> {
+    let mut stmt = conn.prepare(
+        "SELECT slug, source_node_id, target_node_id, verdict, weight, reason, build_id
+         FROM pyramid_evidence WHERE slug = ?1 AND target_node_id = ?2 AND verdict = 'KEEP'",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![slug, target_node_id], evidence_from_raw_row)?;
+    let mut links: Vec<EvidenceLink> = rows.filter_map(|r| r.ok()).collect();
+
+    // Resolve liveness for each source node
+    for link in &mut links {
+        if let Some((parsed_slug, _depth, parsed_node_id)) = parse_handle_path(&link.source_node_id) {
+            link.live = Some(get_live_node(conn, parsed_slug, parsed_node_id)?.is_some());
+        } else {
+            link.live = Some(get_live_node(conn, &link.slug, &link.source_node_id)?.is_some());
+        }
+    }
+
+    Ok(links)
 }
 
 // ── Question Tree CRUD ───────────────────────────────────────────────────────
@@ -2758,14 +3438,25 @@ pub fn save_question_tree(
     slug: &str,
     tree: &serde_json::Value,
 ) -> Result<()> {
+    save_question_tree_with_build_id(conn, slug, tree, None)
+}
+
+/// Save question tree with optional build_id for overlay scoping.
+pub fn save_question_tree_with_build_id(
+    conn: &Connection,
+    slug: &str,
+    tree: &serde_json::Value,
+    build_id: Option<&str>,
+) -> Result<()> {
     let json_str = serde_json::to_string(tree)?;
+    let build_id = build_id.unwrap_or("");
     conn.execute(
-        "INSERT INTO pyramid_question_tree (slug, tree)
-         VALUES (?1, ?2)
-         ON CONFLICT(slug) DO UPDATE SET
+        "INSERT INTO pyramid_question_tree (slug, build_id, tree)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(slug, build_id) DO UPDATE SET
            tree = excluded.tree,
            updated_at = datetime('now')",
-        rusqlite::params![slug, json_str],
+        rusqlite::params![slug, build_id, json_str],
     )?;
     Ok(())
 }
@@ -2806,6 +3497,18 @@ pub fn save_question_node(
     parent_id: Option<&str>,
     depth: u32,
 ) -> Result<()> {
+    save_question_node_with_build_id(conn, slug, node, parent_id, depth, None)
+}
+
+/// Save a question node with an optional build_id for overlay scoping.
+pub fn save_question_node_with_build_id(
+    conn: &Connection,
+    slug: &str,
+    node: &super::question_decomposition::QuestionNode,
+    parent_id: Option<&str>,
+    depth: u32,
+    build_id: Option<&str>,
+) -> Result<()> {
     let children_json = if node.children.is_empty() {
         None
     } else {
@@ -2814,8 +3517,8 @@ pub fn save_question_node(
     };
 
     conn.execute(
-        "INSERT INTO pyramid_question_nodes (slug, question_id, parent_id, depth, question, about, creates, prompt_hint, is_leaf, children_json)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+        "INSERT INTO pyramid_question_nodes (slug, question_id, parent_id, depth, question, about, creates, prompt_hint, is_leaf, children_json, build_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
          ON CONFLICT(slug, question_id) DO UPDATE SET
            parent_id = excluded.parent_id,
            depth = excluded.depth,
@@ -2824,7 +3527,8 @@ pub fn save_question_node(
            creates = excluded.creates,
            prompt_hint = excluded.prompt_hint,
            is_leaf = excluded.is_leaf,
-           children_json = excluded.children_json",
+           children_json = excluded.children_json,
+           build_id = excluded.build_id",
         rusqlite::params![
             slug,
             node.id,
@@ -2836,6 +3540,7 @@ pub fn save_question_node(
             node.prompt_hint,
             node.is_leaf as i32,
             children_json,
+            build_id,
         ],
     )?;
     Ok(())
@@ -2922,7 +3627,7 @@ pub fn get_undecomposed_nodes(
     Ok(rows)
 }
 
-/// Count total question nodes for a slug.
+/// Count total question nodes for a slug, optionally scoped by build_id.
 pub fn count_question_nodes(conn: &Connection, slug: &str) -> Result<i64> {
     let count: i64 = conn.query_row(
         "SELECT COUNT(*) FROM pyramid_question_nodes WHERE slug = ?1",
@@ -2932,12 +3637,107 @@ pub fn count_question_nodes(conn: &Connection, slug: &str) -> Result<i64> {
     Ok(count)
 }
 
-/// Delete all question nodes for a slug (used when starting a fresh decomposition).
-pub fn clear_question_nodes(conn: &Connection, slug: &str) -> Result<i64> {
-    let deleted = conn.execute(
-        "DELETE FROM pyramid_question_nodes WHERE slug = ?1",
-        rusqlite::params![slug],
+/// Count question nodes for a slug scoped to a specific build_id.
+pub fn count_question_nodes_for_build(conn: &Connection, slug: &str, build_id: &str) -> Result<i64> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pyramid_question_nodes WHERE slug = ?1 AND build_id = ?2",
+        rusqlite::params![slug, build_id],
+        |row| row.get(0),
     )?;
+    Ok(count)
+}
+
+/// Check if a slug has any live overlay nodes (L1+ with build_id LIKE 'qb-%')
+/// AND has question nodes. Used by delta decomposition to decide fresh vs delta path.
+pub fn has_existing_question_overlay(conn: &Connection, slug: &str) -> Result<bool> {
+    let has_overlay_nodes: bool = conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM live_pyramid_nodes
+            WHERE slug = ?1 AND depth > 0 AND build_id LIKE 'qb-%'
+        )",
+        rusqlite::params![slug],
+        |row| row.get(0),
+    )?;
+
+    if !has_overlay_nodes {
+        return Ok(false);
+    }
+
+    let has_question_nodes: bool = conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM pyramid_question_nodes WHERE slug = ?1
+        )",
+        rusqlite::params![slug],
+        |row| row.get(0),
+    )?;
+
+    Ok(has_question_nodes)
+}
+
+/// Get all existing question overlay build_ids for a slug.
+/// Returns (build_id, question, status, created_at) for each overlay.
+pub fn list_question_overlays(conn: &Connection, slug: &str) -> Result<Vec<QuestionOverlayInfo>> {
+    let mut stmt = conn.prepare(
+        "SELECT build_id, question, status, started_at
+         FROM pyramid_builds
+         WHERE slug = ?1 AND build_id LIKE 'qb-%'
+         ORDER BY started_at DESC",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![slug], |row| {
+        Ok(QuestionOverlayInfo {
+            build_id: row.get(0)?,
+            question: row.get(1)?,
+            status: row.get(2)?,
+            created_at: row.get(3)?,
+        })
+    })?;
+    let mut result = Vec::new();
+    for row in rows {
+        result.push(row?);
+    }
+    Ok(result)
+}
+
+/// Info about a question overlay build.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct QuestionOverlayInfo {
+    pub build_id: String,
+    pub question: String,
+    pub status: String,
+    pub created_at: String,
+}
+
+/// Get existing overlay answer nodes and their question tree for delta decomposition.
+/// Returns live L1+ nodes that belong to qb-* builds, plus their question tree context.
+pub fn get_existing_overlay_answers(conn: &Connection, slug: &str) -> Result<Vec<PyramidNode>> {
+    let sql = format!(
+        "SELECT {NODE_SELECT_COLS} FROM live_pyramid_nodes
+         WHERE slug = ?1 AND depth > 0 AND build_id LIKE 'qb-%'
+         ORDER BY depth ASC, id ASC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params![slug], node_from_row)?;
+    let mut nodes = Vec::new();
+    for row in rows {
+        nodes.push(row?);
+    }
+    Ok(nodes)
+}
+
+/// 11-O: Clear question nodes for a slug scoped by build_id.
+/// When build_id is None, clears nodes with NULL build_id (legacy data).
+/// Question nodes are contributions — scoping by build_id preserves history.
+pub fn clear_question_nodes(conn: &Connection, slug: &str, build_id: Option<&str>) -> Result<i64> {
+    let deleted = match build_id {
+        Some(bid) => conn.execute(
+            "DELETE FROM pyramid_question_nodes WHERE slug = ?1 AND build_id = ?2",
+            rusqlite::params![slug, bid],
+        )?,
+        None => conn.execute(
+            "DELETE FROM pyramid_question_nodes WHERE slug = ?1 AND build_id IS NULL",
+            rusqlite::params![slug],
+        )?,
+    };
     Ok(deleted as i64)
 }
 
@@ -3007,13 +3807,14 @@ pub fn reconstruct_question_tree(
 // ── Gap Reports CRUD ─────────────────────────────────────────────────────────
 
 /// Save a gap report for a slug.
-/// Deduplicates on (slug, question_id, description) — upserts layer on re-runs.
-pub fn save_gap(conn: &Connection, slug: &str, gap: &GapReport) -> Result<()> {
+/// 11-Z: Accepts optional build_id to scope gaps to a specific build.
+/// Deduplicates on (slug, question_id, description) — upserts layer and build_id on re-runs.
+pub fn save_gap(conn: &Connection, slug: &str, gap: &GapReport, build_id: Option<&str>) -> Result<()> {
     conn.execute(
-        "INSERT INTO pyramid_gaps (slug, question_id, description, layer)
-         VALUES (?1, ?2, ?3, ?4)
-         ON CONFLICT(slug, question_id, description) DO UPDATE SET layer = excluded.layer",
-        rusqlite::params![slug, gap.question_id, gap.description, gap.layer],
+        "INSERT INTO pyramid_gaps (slug, question_id, description, layer, build_id)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(slug, question_id, description) DO UPDATE SET layer = excluded.layer, build_id = excluded.build_id",
+        rusqlite::params![slug, gap.question_id, gap.description, gap.layer, build_id],
     )?;
     Ok(())
 }
@@ -3426,10 +4227,10 @@ fn backfill_evidence_from_children(conn: &Connection) -> Result<()> {
         nodes_with_children
     );
 
-    // Collect all rows first so we can release the borrow on conn before the transaction
+    // 11-S: Read from live_pyramid_nodes (excludes superseded) instead of pyramid_nodes
     let node_rows: Vec<(String, String, String)> = {
         let mut stmt = conn.prepare(
-            "SELECT slug, id, children FROM pyramid_nodes WHERE children IS NOT NULL AND children != '[]' AND children != ''",
+            "SELECT slug, id, children FROM live_pyramid_nodes WHERE children IS NOT NULL AND children != '[]' AND children != ''",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok((
@@ -3451,6 +4252,11 @@ fn backfill_evidence_from_children(conn: &Connection) -> Result<()> {
                 Err(_) => continue,
             };
             for child_id in &children {
+                // 11-K: Skip handle-path children (cross-slug references)
+                // These should have proper evidence from the answering step
+                if child_id.contains('/') {
+                    continue;
+                }
                 let _ = conn.execute(
                     "INSERT OR IGNORE INTO pyramid_evidence (slug, source_node_id, target_node_id, verdict, weight, reason)
                      VALUES (?1, ?2, ?3, 'KEEP', 1.0, 'legacy backfill')",
@@ -3477,20 +4283,20 @@ fn backfill_evidence_from_children(conn: &Connection) -> Result<()> {
 
 // ── Canonical L0 Helpers ─────────────────────────────────────────────────────
 
-/// Check if canonical L0 exists for a slug (any node matching C-L0-% pattern).
+/// Check if canonical L0 exists for a slug (any live node matching C-L0-% pattern).
 pub fn has_canonical_l0(conn: &Connection, slug: &str) -> Result<bool> {
     let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM pyramid_nodes WHERE slug = ?1 AND id LIKE 'C-L0-%'",
+        "SELECT COUNT(*) FROM live_pyramid_nodes WHERE slug = ?1 AND id LIKE 'C-L0-%'",
         rusqlite::params![slug],
         |row| row.get(0),
     )?;
     Ok(count > 0)
 }
 
-/// Get all canonical L0 nodes for a slug.
+/// Get all canonical L0 nodes for a slug (live only).
 pub fn get_canonical_l0_nodes(conn: &Connection, slug: &str) -> Result<Vec<PyramidNode>> {
     let sql = format!(
-        "SELECT {NODE_SELECT_COLS} FROM pyramid_nodes
+        "SELECT {NODE_SELECT_COLS} FROM live_pyramid_nodes
          WHERE slug = ?1 AND id LIKE 'C-L0-%'
          ORDER BY id ASC"
     );
@@ -3503,14 +4309,14 @@ pub fn get_canonical_l0_nodes(conn: &Connection, slug: &str) -> Result<Vec<Pyram
     Ok(nodes)
 }
 
-/// Build a summary of canonical L0 for decomposition context.
+/// Build a summary of canonical L0 for decomposition context (live only).
 /// Returns: Vec of (node_id, headline, distilled_truncated_to_300_chars).
 pub fn get_canonical_l0_summaries(
     conn: &Connection,
     slug: &str,
 ) -> Result<Vec<(String, String, String)>> {
     let mut stmt = conn.prepare(
-        "SELECT id, headline, distilled FROM pyramid_nodes
+        "SELECT id, headline, distilled FROM live_pyramid_nodes
          WHERE slug = ?1 AND id LIKE 'C-L0-%'
          ORDER BY id ASC",
     )?;
@@ -3539,22 +4345,24 @@ pub fn get_canonical_l0_summaries(
     Ok(summaries)
 }
 
-/// Delete only canonical L0 nodes (for re-extraction when source files change).
-pub fn clear_canonical_l0(conn: &Connection, slug: &str) -> Result<usize> {
-    let deleted = conn.execute(
-        "DELETE FROM pyramid_nodes WHERE slug = ?1 AND id LIKE 'C-L0-%'",
-        rusqlite::params![slug],
+/// Supersede canonical L0 nodes (for re-extraction when source files change).
+pub fn supersede_canonical_l0(conn: &Connection, slug: &str, build_id: &str) -> Result<usize> {
+    let count = conn.execute(
+        "UPDATE pyramid_nodes SET superseded_by = ?2
+         WHERE slug = ?1 AND id LIKE 'C-L0-%' AND superseded_by IS NULL",
+        rusqlite::params![slug, build_id],
     )?;
-    Ok(deleted)
+    Ok(count)
 }
 
-/// Delete only question L0 nodes (for rebuild with different question).
-pub fn clear_question_l0(conn: &Connection, slug: &str) -> Result<usize> {
-    let deleted = conn.execute(
-        "DELETE FROM pyramid_nodes WHERE slug = ?1 AND id LIKE 'L0-%' AND id NOT LIKE 'C-L0-%'",
-        rusqlite::params![slug],
+/// Supersede question L0 nodes (for rebuild with different question).
+pub fn supersede_question_l0(conn: &Connection, slug: &str, build_id: &str) -> Result<usize> {
+    let count = conn.execute(
+        "UPDATE pyramid_nodes SET superseded_by = ?2
+         WHERE slug = ?1 AND id LIKE 'L0-%' AND id NOT LIKE 'C-L0-%' AND superseded_by IS NULL",
+        rusqlite::params![slug, build_id],
     )?;
-    Ok(deleted)
+    Ok(count)
 }
 
 /// Load all chunk contents for a slug, ordered by chunk_index.
@@ -4065,5 +4873,50 @@ mod tests {
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].thread_a_id, "L2-000");
         assert_eq!(remaining[0].thread_b_id, "L2-001");
+    }
+
+    /// 11-J: Verify same-slug and cross-slug evidence can coexist with the same bare node ID.
+    /// E.g., (qslug, "L0-003", Q1-001) and (qslug, "base/0/L0-003", Q1-001) are distinct rows.
+    #[test]
+    fn test_evidence_pk_cross_slug_coexistence() {
+        let conn = test_conn();
+        create_slug(&conn, "qslug", &ContentType::Code, "").unwrap();
+
+        // Same-slug evidence: bare ID
+        let link_same = EvidenceLink {
+            slug: "qslug".to_string(),
+            source_node_id: "L0-003".to_string(),
+            target_node_id: "Q1-001".to_string(),
+            verdict: EvidenceVerdict::Keep,
+            weight: Some(0.8),
+            reason: Some("direct match".to_string()),
+            build_id: Some("b1".to_string()),
+            live: None,
+        };
+        save_evidence_link(&conn, &link_same).unwrap();
+
+        // Cross-slug evidence: handle-path ID (different source_node_id)
+        let link_cross = EvidenceLink {
+            slug: "qslug".to_string(),
+            source_node_id: "base/0/L0-003".to_string(),
+            target_node_id: "Q1-001".to_string(),
+            verdict: EvidenceVerdict::Keep,
+            weight: Some(0.9),
+            reason: Some("cross-slug match".to_string()),
+            build_id: Some("b1".to_string()),
+            live: None,
+        };
+        save_evidence_link(&conn, &link_cross).unwrap();
+
+        // Both should coexist — different source_node_id values
+        let all = get_evidence_for_target(&conn, "qslug", "Q1-001").unwrap();
+        assert_eq!(all.len(), 2, "same-slug and cross-slug evidence must coexist");
+
+        // Verify both round-trip correctly
+        let bare_link = all.iter().find(|l| l.source_node_id == "L0-003").unwrap();
+        assert_eq!(bare_link.weight, Some(0.8));
+
+        let handle_link = all.iter().find(|l| l.source_node_id == "base/0/L0-003").unwrap();
+        assert_eq!(handle_link.weight, Some(0.9));
     }
 }

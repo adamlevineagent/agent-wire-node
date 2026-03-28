@@ -551,6 +551,7 @@ pub(crate) fn node_from_analysis(
         children,
         parent_id: None,
         superseded_by: None,
+            build_id: None,
         created_at: String::new(),
     }
 }
@@ -3305,6 +3306,7 @@ mod tests {
             children: Vec::new(),
             parent_id: None,
             superseded_by: None,
+            build_id: None,
             created_at: String::new(),
         }
     }

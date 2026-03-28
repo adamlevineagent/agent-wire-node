@@ -143,17 +143,17 @@ impl PyramidPublisher {
         // Teaser is set explicitly (prose, not JSON) to avoid the Wire's
         // generateTeaser() truncating structured_data JSON into nonsense.
         // The em-dash separator " — " is 5 bytes (space + 3-byte UTF-8 + space).
-        const TEASER_MAX: usize = 200;
+        let teaser_max: usize = super::Tier2Config::default().teaser_max_chars;
         const SEPARATOR: &str = " — ";
-        let teaser = if node.headline.len() > TEASER_MAX {
-            truncate_str(&node.headline, TEASER_MAX).to_string()
-        } else if node.distilled.len() > TEASER_MAX {
+        let teaser = if node.headline.len() > teaser_max {
+            truncate_str(&node.headline, teaser_max).to_string()
+        } else if node.distilled.len() > teaser_max {
             let prefix_len = node.headline.len() + SEPARATOR.len();
-            if prefix_len >= TEASER_MAX {
+            if prefix_len >= teaser_max {
                 // Headline alone fills the teaser
-                truncate_str(&node.headline, TEASER_MAX).to_string()
+                truncate_str(&node.headline, teaser_max).to_string()
             } else {
-                let remaining = TEASER_MAX - prefix_len;
+                let remaining = teaser_max - prefix_len;
                 format!(
                     "{}{}{}",
                     node.headline,
@@ -274,12 +274,17 @@ impl PyramidPublisher {
         slug: &str,
         nodes_by_depth: &[(i64, Vec<PyramidNode>)],
     ) -> Result<PublishPyramidResult> {
-        self.publish_pyramid_idempotent(slug, nodes_by_depth, &HashMap::new())
+        self.publish_pyramid_idempotent(slug, nodes_by_depth, &HashMap::new(), &HashMap::new())
             .await
     }
 
-    /// Publish with idempotency: `already_published` maps local_id → wire_uuid
+    /// Publish with idempotency: `already_published` maps local_id -> wire_uuid
     /// for nodes that should be skipped (already on Wire).
+    ///
+    /// `evidence_weights` maps target_node_id -> (source_node_id -> weight) from
+    /// KEEP evidence links. When a child's weight is found here, it replaces the
+    /// flat 1.0 default. Build this map by calling `db::get_keep_evidence_for_target`
+    /// for each node before entering the async publish loop.
     ///
     /// Build this map by calling `collect_already_published()` synchronously
     /// before entering the async publish loop.
@@ -288,6 +293,7 @@ impl PyramidPublisher {
         slug: &str,
         nodes_by_depth: &[(i64, Vec<PyramidNode>)],
         already_published: &HashMap<String, String>,
+        evidence_weights: &HashMap<String, HashMap<String, f64>>,
     ) -> Result<PublishPyramidResult> {
         if nodes_by_depth.is_empty() {
             return Err(WirePublishError::NoNodes(slug.to_string()).into());
@@ -330,16 +336,24 @@ impl PyramidPublisher {
                     "contribution"
                 };
 
-                // Build derived_from entries with proper weights and source types
+                // Build derived_from entries with evidence weights when available,
+                // falling back to equal 1.0 weights when no evidence data exists.
+                let node_evidence = evidence_weights.get(&node.id);
                 let derived_from: Vec<DerivedFromEntry> = node
                     .children
                     .iter()
                     .filter_map(|child_id| {
-                        id_map.get(child_id).map(|wire_uuid| DerivedFromEntry {
-                            ref_path: wire_uuid.clone(),
-                            source_type: source_type.to_string(),
-                            weight: 1.0, // Equal weight when no evidence system data available
-                            justification: Some(format!("child node {}", child_id)),
+                        id_map.get(child_id).map(|wire_uuid| {
+                            let weight = node_evidence
+                                .and_then(|ev| ev.get(child_id))
+                                .copied()
+                                .unwrap_or(1.0);
+                            DerivedFromEntry {
+                                ref_path: wire_uuid.clone(),
+                                source_type: source_type.to_string(),
+                                weight,
+                                justification: Some(format!("child node {}", child_id)),
+                            }
                         })
                     })
                     .collect();
@@ -694,6 +708,7 @@ mod tests {
             children,
             parent_id: None,
             superseded_by: None,
+            build_id: None,
             created_at: "2026-03-25T00:00:00Z".to_string(),
         }
     }

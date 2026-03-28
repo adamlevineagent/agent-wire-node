@@ -16,13 +16,15 @@ use crate::pyramid::db;
 use crate::pyramid::llm;
 use crate::pyramid::types::*;
 
-// ── Constants ────────────────────────────────────────────────────────────────
+// ── Constants (loaded from OperationalConfig) ─────────────────────────────────
 
-const WEB_EDGE_COLLAPSE_THRESHOLD: i64 = 20;
+use super::Tier3Config;
+
+fn web_edge_collapse_threshold() -> i64 { Tier3Config::default().web_edge_collapse_threshold }
 #[allow(dead_code)]
-const MAX_EDGES_PER_THREAD: usize = 10;
-const EDGE_DECAY_RATE: f64 = 0.05;
-const EDGE_MIN_RELEVANCE: f64 = 0.1;
+fn max_edges_per_thread() -> usize { Tier3Config::default().max_edges_per_thread }
+fn edge_decay_rate() -> f64 { Tier3Config::default().edge_decay_rate }
+fn edge_min_relevance() -> f64 { Tier3Config::default().edge_min_relevance }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -154,12 +156,12 @@ pub async fn collapse_web_edge(
         (edge, deltas)
     };
 
-    if (deltas.len() as i64) < WEB_EDGE_COLLAPSE_THRESHOLD {
+    if (deltas.len() as i64) < web_edge_collapse_threshold() {
         info!(
             "[webbing] edge {} has {} deltas, below collapse threshold ({})",
             edge_id,
             deltas.len(),
-            WEB_EDGE_COLLAPSE_THRESHOLD
+            web_edge_collapse_threshold()
         );
         return Ok(());
     }
@@ -255,7 +257,7 @@ pub async fn check_and_collapse_edges(
 
     let mut collapsed = 0;
     for edge in &edges {
-        if edge.delta_count >= WEB_EDGE_COLLAPSE_THRESHOLD {
+        if edge.delta_count >= web_edge_collapse_threshold() {
             match collapse_web_edge(reader, writer, slug, edge.id, api_key, model).await {
                 Ok(()) => collapsed += 1,
                 Err(e) => warn!("[webbing] failed to collapse edge {}: {}", edge.id, e),
@@ -266,11 +268,11 @@ pub async fn check_and_collapse_edges(
     // After collapse cycle, decay all edges
     {
         let conn = writer.lock().await;
-        let archived = db::decay_web_edges(&conn, slug, EDGE_DECAY_RATE)?;
+        let archived = db::decay_web_edges(&conn, slug, edge_decay_rate())?;
         if archived > 0 {
             info!(
                 "[webbing] archived {} stale edges (relevance < {})",
-                archived, EDGE_MIN_RELEVANCE
+                archived, edge_min_relevance()
             );
         }
     }
@@ -384,19 +386,19 @@ mod tests {
         db::save_web_edge(&conn, &edge).unwrap();
 
         // First decay: 0.20 - 0.05 = 0.15, still >= 0.1, not archived
-        let archived = decay_web_edges(&conn, "test", EDGE_DECAY_RATE).unwrap();
+        let archived = decay_web_edges(&conn, "test", edge_decay_rate()).unwrap();
         assert_eq!(archived, 0);
 
         // Second decay: 0.15 - 0.05 = 0.10, still >= 0.1 (exact in float), not archived
-        let archived = decay_web_edges(&conn, "test", EDGE_DECAY_RATE).unwrap();
+        let archived = decay_web_edges(&conn, "test", edge_decay_rate()).unwrap();
         assert_eq!(archived, 0);
 
         // Third decay: 0.10 - 0.05 = 0.05, below 0.1, should be archived
-        let archived = decay_web_edges(&conn, "test", EDGE_DECAY_RATE).unwrap();
+        let archived = decay_web_edges(&conn, "test", edge_decay_rate()).unwrap();
         assert_eq!(archived, 1);
 
         // No edges should remain
-        let edges = get_active_edges(&conn, "test", EDGE_MIN_RELEVANCE).unwrap();
+        let edges = get_active_edges(&conn, "test", edge_min_relevance()).unwrap();
         assert!(edges.is_empty());
     }
 

@@ -20,22 +20,13 @@ use tokio::sync::Semaphore;
 use tracing::{info, warn};
 use uuid::Uuid;
 
+use super::db;
 use super::llm::{self, LlmConfig};
+use super::OperationalConfig;
 use super::types::{
-    AnsweredNode, CandidateMap, EvidenceLink, EvidenceVerdict, LayerQuestion,
-    PyramidNode,
+    AnswerBatchResult, AnsweredNode, CandidateMap, EvidenceLink, EvidenceVerdict,
+    FailedQuestion, LayerQuestion, PyramidNode,
 };
-
-// ── Constants ────────────────────────────────────────────────────────────────
-
-/// Max concurrency for parallel question answering.
-const ANSWER_CONCURRENCY: usize = 5;
-
-/// Maximum character budget for the L0 summary string.
-const L0_SUMMARY_BUDGET: usize = 100_000;
-
-/// Maximum character budget for the pre-mapping prompt before switching modes.
-const PRE_MAP_PROMPT_BUDGET: usize = 80_000;
 
 // ── L0 Summary Helper ────────────────────────────────────────────────────────
 
@@ -43,12 +34,13 @@ const PRE_MAP_PROMPT_BUDGET: usize = 80_000;
 ///
 /// Concatenates each node's headline + distilled text (truncated to ~200 chars
 /// per node). Total budget: ~100K chars. If it exceeds that, truncates from the end.
-pub fn build_l0_summary(nodes: &[PyramidNode]) -> String {
+pub fn build_l0_summary(nodes: &[PyramidNode], ops: &OperationalConfig) -> String {
+    let budget = ops.tier2.l0_summary_budget;
     let mut summary = String::new();
     for node in nodes {
         let distilled_trunc: String = node.distilled.chars().take(200).collect();
         let entry = format!("- {}: {}\n", node.headline, distilled_trunc);
-        if summary.len() + entry.len() > L0_SUMMARY_BUDGET {
+        if summary.len() + entry.len() > budget {
             summary.push_str("... (truncated)\n");
             break;
         }
@@ -72,6 +64,7 @@ pub async fn pre_map_layer(
     questions: &[LayerQuestion],
     lower_layer_nodes: &[PyramidNode],
     llm_config: &LlmConfig,
+    ops: &OperationalConfig,
 ) -> Result<CandidateMap> {
     if questions.is_empty() {
         return Ok(CandidateMap {
@@ -115,10 +108,10 @@ pub async fn pre_map_layer(
 
     // Token budget guard: if combined prompt exceeds budget, switch to headlines-only
     let combined_len = questions_text.len() + nodes_text.len();
-    if combined_len > PRE_MAP_PROMPT_BUDGET {
+    if combined_len > ops.tier2.pre_map_prompt_budget {
         warn!(
             combined_len,
-            budget = PRE_MAP_PROMPT_BUDGET,
+            budget = ops.tier2.pre_map_prompt_budget,
             "Pre-mapping prompt exceeds budget, switching to headlines-only mode"
         );
         nodes_text = lower_layer_nodes
@@ -134,8 +127,8 @@ pub async fn pre_map_layer(
             .join("\n");
 
         // If STILL too large after headlines-only, truncate node list
-        if questions_text.len() + nodes_text.len() > PRE_MAP_PROMPT_BUDGET {
-            let max_nodes = PRE_MAP_PROMPT_BUDGET.saturating_sub(questions_text.len()) / 220; // ~220 chars per headline entry
+        if questions_text.len() + nodes_text.len() > ops.tier2.pre_map_prompt_budget {
+            let max_nodes = ops.tier2.pre_map_prompt_budget.saturating_sub(questions_text.len()) / 220; // ~220 chars per headline entry
             warn!(
                 total_nodes = lower_layer_nodes.len(),
                 max_nodes,
@@ -177,13 +170,13 @@ Every question_id from the input MUST appear as a key in the mappings, even if i
         questions_text, nodes_text
     );
 
-    // ── LLM call (mercury-2 / primary model — fast classification) ──────
+    // ── LLM call (primary model — fast classification) ──────
     let response = llm::call_model_unified(
         llm_config,
         system_prompt,
         &user_prompt,
-        0.2, // low temperature for classification
-        4096,
+        ops.tier1.pre_map_temperature,
+        ops.tier1.pre_map_max_tokens,
         None,
     )
     .await?;
@@ -261,22 +254,30 @@ pub async fn answer_questions(
     audience: Option<&str>,
     llm_config: &LlmConfig,
     slug: &str,
-) -> Result<Vec<AnsweredNode>> {
+    answer_slug: &str,
+    ops: &OperationalConfig,
+) -> Result<AnswerBatchResult> {
     if questions.is_empty() {
-        return Ok(Vec::new());
+        return Ok(AnswerBatchResult {
+            answered: Vec::new(),
+            failed: Vec::new(),
+        });
     }
 
-    // Build a lookup map for all nodes by ID
+    // Build a lookup map for all nodes by ORIGINAL ID
     let node_map: HashMap<&str, &PyramidNode> =
         all_nodes.iter().map(|n| (n.id.as_str(), n)).collect();
 
-    let semaphore = Arc::new(Semaphore::new(ANSWER_CONCURRENCY));
+    let semaphore = Arc::new(Semaphore::new(ops.tier1.answer_concurrency));
     let llm_config = Arc::new(llm_config.clone());
     let slug = slug.to_string();
     let synthesis_prompt = synthesis_prompt.map(|s| s.to_string());
     let audience = audience.map(|s| s.to_string());
+    let answer_temperature = ops.tier1.answer_temperature;
+    let answer_max_tokens = ops.tier1.answer_max_tokens;
 
-    // Prepare per-question work items
+    // Prepare per-question work items, rewriting cross-slug node IDs to handle-paths
+    let answer_slug_owned = answer_slug.to_string();
     let work_items: Vec<AnswerWorkItem> = questions
         .iter()
         .map(|q| {
@@ -286,10 +287,19 @@ pub async fn answer_questions(
                 .cloned()
                 .unwrap_or_default();
 
-            // Resolve candidate IDs to full node data
+            // Resolve candidate IDs to full node data, rewriting IDs for cross-slug candidates
             let candidate_nodes: Vec<PyramidNode> = candidate_ids
                 .iter()
-                .filter_map(|id| node_map.get(id.as_str()).map(|n| (*n).clone()))
+                .filter_map(|id| {
+                    node_map.get(id.as_str()).map(|n| {
+                        let mut node = (*n).clone();
+                        // If candidate comes from a different slug, rewrite its ID to handle-path
+                        if node.slug != answer_slug_owned {
+                            node.id = db::format_handle_path(&node.slug, node.depth, &node.id);
+                        }
+                        node
+                    })
+                })
                 .collect();
 
             AnswerWorkItem {
@@ -299,14 +309,18 @@ pub async fn answer_questions(
         })
         .collect();
 
-    // Spawn parallel tasks
+    // Spawn parallel tasks — each returns (question_meta, Result<AnsweredNode>)
     let mut handles = Vec::new();
     for work in work_items {
         let semaphore = semaphore.clone();
         let llm_config = llm_config.clone();
         let slug = slug.clone();
+        let answer_slug = answer_slug_owned.clone();
         let synthesis_prompt = synthesis_prompt.clone();
         let audience = audience.clone();
+        let q_id = work.question.question_id.clone();
+        let q_text = work.question.question_text.clone();
+        let q_layer = work.question.layer;
 
         let handle = tokio::spawn(async move {
             let _permit = semaphore
@@ -314,8 +328,9 @@ pub async fn answer_questions(
                 .await
                 .expect("answer semaphore should remain open");
 
-            answer_single_question(&work.question, &work.candidate_nodes, synthesis_prompt.as_deref(), audience.as_deref(), &llm_config, &slug)
-                .await
+            let result = answer_single_question(&work.question, &work.candidate_nodes, synthesis_prompt.as_deref(), audience.as_deref(), &llm_config, &slug, &answer_slug, answer_temperature, answer_max_tokens)
+                .await;
+            (q_id, q_text, q_layer, result)
         });
 
         handles.push(handle);
@@ -323,11 +338,12 @@ pub async fn answer_questions(
 
     // Collect results — NO DB writes here. The caller persists via spawn_blocking.
     let mut answered_nodes = Vec::new();
+    let mut failed_questions = Vec::new();
     let mut total_evidence = 0usize;
     let mut total_missing = 0usize;
 
     for handle in handles {
-        let result = handle.await.map_err(|e| anyhow!("Answer task panicked: {}", e))?;
+        let (q_id, q_text, q_layer, result) = handle.await.map_err(|e| anyhow!("Answer task panicked: {}", e))?;
         match result {
             Ok(answered) => {
                 total_evidence += answered.evidence.len();
@@ -335,20 +351,29 @@ pub async fn answer_questions(
                 answered_nodes.push(answered);
             }
             Err(e) => {
-                warn!("Failed to answer question: {}", e);
-                // Continue with other questions rather than failing the whole batch
+                warn!(question_id = %q_id, error = %e, "Failed to answer question — recording as gap report");
+                failed_questions.push(FailedQuestion {
+                    question_id: q_id,
+                    question_text: q_text,
+                    layer: q_layer,
+                    error: e.to_string(),
+                });
             }
         }
     }
 
     info!(
         answered = answered_nodes.len(),
+        failed = failed_questions.len(),
         total_evidence,
         total_missing,
         "answering complete"
     );
 
-    Ok(answered_nodes)
+    Ok(AnswerBatchResult {
+        answered: answered_nodes,
+        failed: failed_questions,
+    })
 }
 
 // ── Internal Types ───────────────────────────────────────────────────────────
@@ -371,8 +396,18 @@ async fn answer_single_question(
     audience: Option<&str>,
     llm_config: &LlmConfig,
     slug: &str,
+    answer_slug: &str,
+    answer_temperature: f32,
+    answer_max_tokens: usize,
 ) -> Result<AnsweredNode> {
     let node_id = format!("L{}-{}", question.layer, Uuid::new_v4());
+
+    // Build candidate_map keyed by the IDs shown to the LLM (handle-paths for cross-slug, bare for same-slug).
+    // Node IDs have already been rewritten by answer_questions before reaching here.
+    let candidate_map: HashMap<String, &PyramidNode> = candidate_nodes
+        .iter()
+        .map(|n| (n.id.clone(), n))
+        .collect();
 
     // ── Build candidate evidence context ────────────────────────────────
     let evidence_context = if candidate_nodes.is_empty() {
@@ -455,8 +490,8 @@ Respond with ONLY a JSON object:
         llm_config,
         &system_prompt,
         &user_prompt,
-        0.3,
-        4096,
+        answer_temperature,
+        answer_max_tokens,
         None,
     )
     .await?;
@@ -525,13 +560,61 @@ Respond with ONLY a JSON object:
         })
         .collect();
 
-    // Children are the KEEP evidence nodes
-    let children: Vec<String> = raw
-        .verdicts
-        .iter()
-        .filter(|v| v.verdict.eq_ignore_ascii_case("KEEP"))
-        .map(|v| v.node_id.clone())
-        .collect();
+    // ── Build EvidenceLinks (KEEP and DISCONNECT only) ────────────────
+    // MISSING verdicts are NOT evidence links — they have fabricated source_node_ids.
+    // Missing evidence is captured via raw.missing and saved as gap reports by the caller.
+    //
+    // Resolve verdict node_ids against the candidate_map. The LLM sees handle-path IDs
+    // for cross-slug candidates, so it should return them. If a verdict references an
+    // unknown ID, skip it with a warning.
+    let mut evidence: Vec<EvidenceLink> = Vec::new();
+    let mut children: Vec<String> = Vec::new();
+
+    for v in &raw.verdicts {
+        let verdict = match v.verdict.to_uppercase().as_str() {
+            "KEEP" => EvidenceVerdict::Keep,
+            "DISCONNECT" => EvidenceVerdict::Disconnect,
+            "MISSING" => continue, // Skip — tracked via raw.missing gap reports
+            other => {
+                warn!(verdict = other, "Unknown verdict, defaulting to Keep");
+                EvidenceVerdict::Keep
+            }
+        };
+
+        // Resolve against candidate_map — ensures we only accept IDs we showed the LLM
+        if !candidate_map.contains_key(&v.node_id) {
+            warn!(
+                node_id = %v.node_id,
+                question_id = %question.question_id,
+                "LLM returned unknown node_id, skipping"
+            );
+            continue;
+        }
+
+        // Use the candidate_map key as source_node_id (handle-path for cross-slug, bare for same-slug)
+        let source_node_id = v.node_id.clone();
+
+        if verdict == EvidenceVerdict::Keep {
+            children.push(source_node_id.clone());
+        }
+
+        let weight = if verdict == EvidenceVerdict::Keep {
+            Some(v.weight.unwrap_or(0.5).clamp(0.0, 1.0))
+        } else {
+            None
+        };
+
+        evidence.push(EvidenceLink {
+            slug: answer_slug.to_string(),
+            source_node_id,
+            target_node_id: node_id.clone(),
+            verdict,
+            weight,
+            reason: v.reason.clone(),
+            build_id: None,
+            live: Some(true),
+        });
+    }
 
     let node = PyramidNode {
         id: node_id.clone(),
@@ -549,39 +632,9 @@ Respond with ONLY a JSON object:
         children,
         parent_id: None,
         superseded_by: None,
+        build_id: None,
         created_at: chrono::Utc::now().to_rfc3339(),
     };
-
-    // ── Build EvidenceLinks (KEEP and DISCONNECT only) ────────────────
-    // MISSING verdicts are NOT evidence links — they have fabricated source_node_ids.
-    // Missing evidence is captured via raw.missing and saved as gap reports by the caller.
-    let mut evidence: Vec<EvidenceLink> = Vec::new();
-    for v in &raw.verdicts {
-        let verdict = match v.verdict.to_uppercase().as_str() {
-            "KEEP" => EvidenceVerdict::Keep,
-            "DISCONNECT" => EvidenceVerdict::Disconnect,
-            "MISSING" => continue, // Skip — tracked via raw.missing gap reports
-            other => {
-                warn!(verdict = other, "Unknown verdict, defaulting to Keep");
-                EvidenceVerdict::Keep
-            }
-        };
-
-        let weight = if verdict == EvidenceVerdict::Keep {
-            Some(v.weight.unwrap_or(0.5).clamp(0.0, 1.0))
-        } else {
-            None
-        };
-
-        evidence.push(EvidenceLink {
-            slug: slug.to_string(),
-            source_node_id: v.node_id.clone(),
-            target_node_id: node_id.clone(),
-            verdict,
-            weight,
-            reason: v.reason.clone(),
-        });
-    }
 
     let missing = raw.missing.unwrap_or_default();
 

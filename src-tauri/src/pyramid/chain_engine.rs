@@ -172,6 +172,11 @@ pub struct ChainStep {
     pub context: Option<serde_json::Value>,
     #[serde(default = "default_compact_inputs")]
     pub compact_inputs: bool,
+    /// 11-E: Declarative enrichments — specifies which runtime enrichments to apply.
+    /// Replaces hardcoded step-name checks in chain_executor.rs.
+    /// Valid values: "file_level_connections", "cross_thread_connections", "cross_subsystem_connections"
+    #[serde(default)]
+    pub enrichments: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

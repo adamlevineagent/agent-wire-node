@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-dialog';
 import { AddWorkspace } from './AddWorkspace';
+import { AskQuestion } from './AskQuestion';
 import { BuildProgress } from './BuildProgress';
 import { VineBuildProgress } from './VineBuildProgress';
 import { DADBEARPanel } from './DADBEARPanel';
@@ -10,12 +11,14 @@ import { VineViewer } from './VineViewer';
 
 interface SlugInfo {
     slug: string;
-    content_type: string; // "code" | "document" | "conversation"
+    content_type: string; // "code" | "document" | "conversation" | "vine" | "question"
     source_path: string;
     node_count: number;
     max_depth: number;
     last_built_at: string | null;
     created_at: string;
+    referenced_slugs: string[];
+    referencing_slugs: string[];
 }
 
 interface BuildStatus {
@@ -30,7 +33,7 @@ interface DadbearStatus {
     breaker_tripped: boolean;
 }
 
-type View = 'list' | 'add' | 'building' | 'dadbear' | 'faq' | 'vine';
+type View = 'list' | 'add' | 'building' | 'dadbear' | 'faq' | 'vine' | 'asking';
 
 export function PyramidDashboard() {
     const [slugs, setSlugs] = useState<SlugInfo[]>([]);
@@ -42,6 +45,7 @@ export function PyramidDashboard() {
     const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
     const [selectedSlug, setSelectedSlug] = useState<string | null>(null);
     const [dadbearStatuses, setDadbearStatuses] = useState<Record<string, DadbearStatus>>({});
+    const [askingSlug, setAskingSlug] = useState<string | null>(null);
     const [vineAddFolders, setVineAddFolders] = useState<string | null>(null); // slug being edited
     const [vineNewPaths, setVineNewPaths] = useState<string[]>([]);
     const [vinePastePath, setVinePastePath] = useState('');
@@ -194,6 +198,7 @@ export function PyramidDashboard() {
             case 'document': return 'Documents';
             case 'conversation': return 'Conversation';
             case 'vine': return 'Vine';
+            case 'question': return 'Question';
             default: return ct;
         }
     };
@@ -204,9 +209,54 @@ export function PyramidDashboard() {
             case 'document': return 'badge-document';
             case 'conversation': return 'badge-conversation';
             case 'vine': return 'badge-vine';
+            case 'question': return 'badge-question';
             default: return '';
         }
     };
+
+    // Group question slugs after their base pyramids
+    const groupedSlugs = (() => {
+        const baseOrder: SlugInfo[] = [];
+        const questionsByBase = new Map<string, SlugInfo[]>();
+        const standaloneQuestions: SlugInfo[] = [];
+
+        for (const s of slugs) {
+            if (s.content_type === 'question') {
+                const baseRef = s.referenced_slugs?.[0];
+                if (baseRef) {
+                    const existing = questionsByBase.get(baseRef) ?? [];
+                    existing.push(s);
+                    questionsByBase.set(baseRef, existing);
+                } else {
+                    standaloneQuestions.push(s);
+                }
+            } else {
+                baseOrder.push(s);
+            }
+        }
+
+        const result: { slug: SlugInfo; isGroupedQuestion: boolean }[] = [];
+        for (const base of baseOrder) {
+            result.push({ slug: base, isGroupedQuestion: false });
+            const children = questionsByBase.get(base.slug);
+            if (children) {
+                for (const child of children) {
+                    result.push({ slug: child, isGroupedQuestion: true });
+                }
+                questionsByBase.delete(base.slug);
+            }
+        }
+        // Orphan question slugs whose base wasn't found
+        for (const orphans of questionsByBase.values()) {
+            for (const s of orphans) {
+                result.push({ slug: s, isGroupedQuestion: true });
+            }
+        }
+        for (const s of standaloneQuestions) {
+            result.push({ slug: s, isGroupedQuestion: false });
+        }
+        return result;
+    })();
 
     // Agent Onboarding card state
     const [onboardingOpen, setOnboardingOpen] = useState(false);
@@ -272,10 +322,16 @@ Always include the "Generalized understanding:" section — this triggers FAQ ge
         return (
             <DADBEARPanel
                 slug={selectedSlug}
+                contentType={slugs.find(s => s.slug === selectedSlug)?.content_type}
+                referencingSlugs={slugs.find(s => s.slug === selectedSlug)?.referencing_slugs ?? []}
                 onBack={() => {
                     setSelectedSlug(null);
                     setView('list');
                     fetchSlugs();
+                }}
+                onNavigateToSlug={(targetSlug, _nodeId) => {
+                    // Switch to the referenced slug's DADBEAR view
+                    setSelectedSlug(targetSlug);
                 }}
             />
         );
@@ -307,6 +363,23 @@ Always include the "Generalized understanding:" section — this triggers FAQ ge
                 }}
                 onOpenBunch={(bunchSlug) => {
                     window.open(`http://localhost:3333/space/${bunchSlug}`, '_blank');
+                }}
+            />
+        );
+    }
+
+    if (view === 'asking' && askingSlug) {
+        return (
+            <AskQuestion
+                baseSlug={askingSlug}
+                allSlugs={slugs}
+                onClose={() => {
+                    setAskingSlug(null);
+                    setView('list');
+                    fetchSlugs();
+                }}
+                onSlugCreated={() => {
+                    fetchSlugs();
                 }}
             />
         );
@@ -397,19 +470,33 @@ Always include the "Generalized understanding:" section — this triggers FAQ ge
 
             {!loading && slugs.length > 0 && (
                 <div className="pyramid-cards">
-                    {slugs.map((s) => (
-                        <div key={s.slug} className="pyramid-card">
+                    {groupedSlugs.map(({ slug: s, isGroupedQuestion }) => (
+                        <div key={s.slug} className={`pyramid-card${isGroupedQuestion ? ' pyramid-card-grouped-question' : ''}`}>
                             <div className="pyramid-card-header">
-                                <h3 className="pyramid-card-slug">{s.slug}</h3>
+                                <div className="pyramid-card-header-left">
+                                    {s.content_type === 'question' && (
+                                        <span
+                                            className="pyramid-q-badge"
+                                            title={s.referenced_slugs?.length
+                                                ? `Built on: ${s.referenced_slugs.join(', ')}`
+                                                : 'Question pyramid'}
+                                        >
+                                            Q
+                                        </span>
+                                    )}
+                                    <h3 className="pyramid-card-slug">{s.slug}</h3>
+                                </div>
                                 <span className={`pyramid-card-badge ${contentTypeBadgeClass(s.content_type)}`}>
                                     {contentTypeLabel(s.content_type)}
                                 </span>
                             </div>
 
                             <div className="pyramid-card-path" title={s.source_path}>
-                                {s.source_path.length > 50
-                                    ? '...' + s.source_path.slice(-47)
-                                    : s.source_path}
+                                {s.content_type === 'question' && s.referenced_slugs?.length > 0
+                                    ? <>References: {s.referenced_slugs.join(', ')}</>
+                                    : s.source_path.length > 50
+                                        ? '...' + s.source_path.slice(-47)
+                                        : s.source_path}
                             </div>
 
                             <div className="pyramid-card-stats">
@@ -464,6 +551,15 @@ Always include the "Generalized understanding:" section — this triggers FAQ ge
                                         disabled={s.node_count === 0}
                                     >
                                         Open in Vibesmithy
+                                    </button>
+                                )}
+                                {s.content_type !== 'vine' && s.node_count > 0 && (
+                                    <button
+                                        className="btn btn-small btn-ask-question"
+                                        onClick={() => { setAskingSlug(s.slug); setView('asking'); }}
+                                        title={s.content_type === 'question' ? 'Ask another question on this base' : 'Ask a question about this pyramid'}
+                                    >
+                                        {s.content_type === 'question' ? 'Ask Another' : 'Ask a Question'}
                                     </button>
                                 )}
                                 <button

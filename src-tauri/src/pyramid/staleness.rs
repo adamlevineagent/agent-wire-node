@@ -81,7 +81,9 @@ pub struct StalenessReport {
 
 // ── Default Threshold ─────────────────────────────────────────────────────────
 
-/// Default staleness threshold — questions with score above this get re-answered.
+/// 11-F: Deprecated — use OperationalConfig.tier2.staleness_threshold (default: 0.3) instead.
+/// Retained only for backward compatibility. All production code reads from config.
+#[deprecated(note = "Use OperationalConfig.tier2.staleness_threshold instead")]
 pub const DEFAULT_STALENESS_THRESHOLD: f64 = 0.3;
 
 // ── Step 1: Detect Source Changes ─────────────────────────────────────────────
@@ -244,8 +246,8 @@ fn propagate_from_node(
     }
 
     // Safety: stop propagation if we've gone too deep
-    const MAX_PROPAGATION_DEPTH: i64 = 20;
-    if current_depth >= MAX_PROPAGATION_DEPTH {
+    let max_propagation_depth = super::Tier3Config::default().staleness_max_propagation_depth;
+    if current_depth >= max_propagation_depth {
         warn!(slug, node_id, current_depth, "Hit max propagation depth, stopping");
         return Ok(());
     }

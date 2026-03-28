@@ -6,6 +6,7 @@
 
 use std::collections::BTreeSet;
 use std::fs;
+use std::path::Path;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -291,7 +292,7 @@ pub async fn dispatch_node_stale_check(
     }
 
     let (node_data, skipped_nodes) = tokio::task::spawn_blocking(move || -> Result<(Vec<PromptNode>, Vec<SkippedNode>)> {
-        let conn = Connection::open(&db).context("Failed to open DB for node stale-check")?;
+        let conn = super::db::open_pyramid_connection(Path::new(&db)).context("Failed to open DB for node stale-check")?;
         let mut results = Vec::new();
         let mut skipped = Vec::new();
         let mut covered_threads = BTreeSet::new();
@@ -451,7 +452,7 @@ pub async fn dispatch_node_stale_check(
         let cost = estimate_cost(&usage);
         let lyr = batch[0].layer;
         let _ = tokio::task::spawn_blocking(move || {
-            if let Ok(conn) = Connection::open(&db_cost) {
+            if let Ok(conn) = super::db::open_pyramid_connection(Path::new(&db_cost)) {
                 let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
                 let _ = conn.execute(
                     "INSERT INTO pyramid_cost_log (slug, operation, model, input_tokens, output_tokens, estimated_cost, source, layer, check_type, created_at, chain_id, step_name, tier, latency_ms, generation_id, estimated_cost_usd) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'auto-stale', ?7, ?8, ?9, NULL, NULL, NULL, NULL, NULL, NULL)",
@@ -554,7 +555,7 @@ pub async fn dispatch_connection_check(
 
     let (old_content, new_content, connections) =
         tokio::task::spawn_blocking(move || -> Result<(String, String, Vec<ConnectionItem>)> {
-            let conn = Connection::open(&db).context("Failed to open DB for connection check")?;
+            let conn = super::db::open_pyramid_connection(Path::new(&db)).context("Failed to open DB for connection check")?;
 
             // Get old and new node content
             let old_content: String = conn
@@ -679,7 +680,7 @@ pub async fn dispatch_connection_check(
         let nid = node_id.to_string();
         let s = slug.to_string();
         tokio::task::spawn_blocking(move || -> i32 {
-            Connection::open(&db)
+            super::db::open_pyramid_connection(Path::new(&db))
                 .ok()
                 .and_then(|conn| {
                     conn.query_row(
@@ -748,7 +749,7 @@ pub async fn dispatch_connection_check(
             let ct = conn_usage.completion_tokens;
             let cost = estimate_cost(&conn_usage);
             let _ = tokio::task::spawn_blocking(move || {
-                if let Ok(conn) = Connection::open(&db_cost) {
+                if let Ok(conn) = super::db::open_pyramid_connection(Path::new(&db_cost)) {
                     let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
                     let _ = conn.execute(
                         "INSERT INTO pyramid_cost_log (slug, operation, model, input_tokens, output_tokens, estimated_cost, source, layer, check_type, created_at, chain_id, step_name, tier, latency_ms, generation_id, estimated_cost_usd) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'auto-stale', ?7, ?8, ?9, NULL, NULL, NULL, NULL, NULL, NULL)",
@@ -774,7 +775,7 @@ pub async fn dispatch_connection_check(
             .collect();
 
         tokio::task::spawn_blocking(move || -> Result<()> {
-            let conn = Connection::open(&db)
+            let conn = super::db::open_pyramid_connection(Path::new(&db))
                 .context("Failed to open DB for connection post-processing")?;
 
             for cr in &results_for_db {
@@ -932,7 +933,7 @@ pub async fn dispatch_edge_stale_check(
         }
 
         let edge_data = tokio::task::spawn_blocking(move || -> Result<Option<EdgeData>> {
-            let conn = Connection::open(&db).context("Failed to open DB for edge stale-check")?;
+            let conn = super::db::open_pyramid_connection(Path::new(&db)).context("Failed to open DB for edge stale-check")?;
 
             let edge = conn.query_row(
                 "SELECT thread_a_id, thread_b_id, relationship FROM pyramid_web_edges
@@ -1085,7 +1086,7 @@ pub async fn dispatch_edge_stale_check(
             let cost = estimate_cost(&usage);
             let lyr = mutation.layer;
             let _ = tokio::task::spawn_blocking(move || {
-                if let Ok(conn) = Connection::open(&db_cost) {
+                if let Ok(conn) = super::db::open_pyramid_connection(Path::new(&db_cost)) {
                     let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
                     let _ = conn.execute(
                         "INSERT INTO pyramid_cost_log (slug, operation, model, input_tokens, output_tokens, estimated_cost, source, layer, check_type, created_at, chain_id, step_name, tier, latency_ms, generation_id, estimated_cost_usd) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'auto-stale', ?7, ?8, ?9, NULL, NULL, NULL, NULL, NULL, NULL)",
@@ -1138,7 +1139,7 @@ pub async fn dispatch_edge_stale_check(
             let layer = mutation.layer;
 
             tokio::task::spawn_blocking(move || -> Result<()> {
-                let conn = Connection::open(&db).context("Failed to open DB for edge update")?;
+                let conn = super::db::open_pyramid_connection(Path::new(&db)).context("Failed to open DB for edge update")?;
                 let now_str = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
 
                 // Update edge relationship text and reset delta_count
@@ -1260,7 +1261,7 @@ pub async fn execute_supersession(
         let nid = nid.clone();
         let s = s.clone();
         move || -> Result<NodeData> {
-            let conn = Connection::open(&db).context("Failed to open DB for supersession")?;
+            let conn = super::db::open_pyramid_connection(Path::new(&db)).context("Failed to open DB for supersession")?;
 
             let (headline, distilled, depth, parent_id, children_json, topics, corrections, decisions, terms, dead_ends, self_prompt): (
                 String, String, i64, Option<String>, String, String, String, String, String, String, String,
@@ -1440,6 +1441,7 @@ pub async fn execute_supersession(
                     children: node_data.children.clone(),
                     parent_id: node_data.parent_id.clone(),
                     superseded_by: None,
+                    build_id: None,
                     created_at: String::new(),
                 },
                 node_data.source_file_path.as_deref(),
@@ -1461,7 +1463,7 @@ pub async fn execute_supersession(
         let ct = supersession_usage.completion_tokens;
         let cost = estimate_cost(&supersession_usage);
         let _ = tokio::task::spawn_blocking(move || {
-            if let Ok(conn) = Connection::open(&db_cost) {
+            if let Ok(conn) = super::db::open_pyramid_connection(Path::new(&db_cost)) {
                 let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
                 let _ = conn.execute(
                     "INSERT INTO pyramid_cost_log (slug, operation, model, input_tokens, output_tokens, estimated_cost, source, layer, check_type, created_at, chain_id, step_name, tier, latency_ms, generation_id, estimated_cost_usd) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'auto-stale', ?7, ?8, ?9, NULL, NULL, NULL, NULL, NULL, NULL)",
@@ -1481,7 +1483,7 @@ pub async fn execute_supersession(
     let new_dist = new_distillation.clone();
 
     tokio::task::spawn_blocking(move || -> Result<()> {
-        let conn = Connection::open(&db).context("Failed to open DB for supersession write")?;
+        let conn = super::db::open_pyramid_connection(Path::new(&db)).context("Failed to open DB for supersession write")?;
         let now_str = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
 
         // Insert new node

@@ -12,11 +12,9 @@
 use anyhow::Result;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
+use tracing::info;
 
-use super::staleness::{
-    self, ChangedFile, ChangeType, StalenessReport, DEFAULT_STALENESS_THRESHOLD,
-};
+use super::staleness::{self, ChangedFile, ChangeType, StalenessReport};
 use super::types::StalenessItem;
 
 // ── Request / Response Types ─────────────────────────────────────────────────
@@ -118,7 +116,9 @@ pub fn auto_detect_changed_files(conn: &Connection, slug: &str) -> Result<Vec<Ch
     let mut stmt = conn.prepare(
         "SELECT DISTINCT target_ref, mutation_type
          FROM pyramid_pending_mutations
-         WHERE slug = ?1 AND target_ref IS NOT NULL AND target_ref != '' AND processed = 0
+         WHERE slug = ?1 AND target_ref IS NOT NULL AND target_ref != ''
+           AND mutation_type IN ('file_change', 'new_file', 'deleted_file', 'rename_candidate')
+           AND processed = 0
          ORDER BY detected_at DESC",
     )?;
 
@@ -132,9 +132,15 @@ pub fn auto_detect_changed_files(conn: &Connection, slug: &str) -> Result<Vec<Ch
     for row in rows {
         let (file_path, mutation_type) = row?;
         let change_type = match mutation_type.as_str() {
+            // New vocabulary (DADBEAR watcher)
+            "new_file" => ChangeType::Addition,
+            "deleted_file" => ChangeType::Deletion,
+            "file_change" => ChangeType::Modification,
+            "rename_candidate" => ChangeType::Modification,
+            // Backward compat (old vocabulary)
             "added" | "add" => ChangeType::Addition,
             "deleted" | "delete" | "removed" | "remove" => ChangeType::Deletion,
-            _ => ChangeType::Modification, // "modified", "changed", etc.
+            _ => ChangeType::Modification,
         };
         changed_files.push(ChangedFile {
             path: file_path,
@@ -142,10 +148,13 @@ pub fn auto_detect_changed_files(conn: &Connection, slug: &str) -> Result<Vec<Ch
         });
     }
 
-    // Mark consumed mutations as processed to prevent re-processing
+    // Mark only file-level mutations as processed — preserve non-file mutations
+    // (node_stale, edge_stale, faq_category_stale, confirmed_stale) for the stale engine.
     if !changed_files.is_empty() {
         conn.execute(
-            "UPDATE pyramid_pending_mutations SET processed = 1 WHERE slug = ?1 AND processed = 0",
+            "UPDATE pyramid_pending_mutations SET processed = 1
+             WHERE slug = ?1 AND processed = 0
+               AND mutation_type IN ('file_change', 'new_file', 'deleted_file', 'rename_candidate')",
             rusqlite::params![slug],
         )?;
     }

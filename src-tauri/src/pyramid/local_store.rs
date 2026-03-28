@@ -22,24 +22,28 @@ pub struct BuildMetadata {
 }
 
 /// Record the start of a new build.
+/// 11-X: `question` = enhanced question, `original_question` = user's original.
+/// original_question is preserved on conflict — never overwritten on re-run.
 pub fn save_build_start(
     conn: &Connection,
     slug: &str,
     build_id: &str,
     question: &str,
     total_layers: i64,
+    original_question: Option<&str>,
 ) -> Result<()> {
     conn.execute(
-        "INSERT INTO pyramid_builds (slug, build_id, question, total_layers, status)
-         VALUES (?1, ?2, ?3, ?4, 'running')
+        "INSERT INTO pyramid_builds (slug, build_id, question, total_layers, status, original_question)
+         VALUES (?1, ?2, ?3, ?4, 'running', ?5)
          ON CONFLICT(slug, build_id) DO UPDATE SET
            question = excluded.question,
            total_layers = excluded.total_layers,
            status = 'running',
            started_at = datetime('now'),
            completed_at = NULL,
-           error_message = NULL",
-        rusqlite::params![slug, build_id, question, total_layers],
+           error_message = NULL,
+           original_question = COALESCE(pyramid_builds.original_question, excluded.original_question)",
+        rusqlite::params![slug, build_id, question, total_layers, original_question],
     )?;
     Ok(())
 }
@@ -154,6 +158,7 @@ mod tests {
                 total_node_count INTEGER DEFAULT 0,
                 quality_score REAL,
                 error_message TEXT,
+                original_question TEXT DEFAULT NULL,
                 PRIMARY KEY (slug, build_id)
             )",
         )
@@ -164,7 +169,7 @@ mod tests {
     #[test]
     fn test_build_lifecycle() {
         let conn = setup_db();
-        save_build_start(&conn, "test", "b1", "What is this?", 3).unwrap();
+        save_build_start(&conn, "test", "b1", "What is this?", 3, None).unwrap();
 
         let meta = get_latest_build(&conn, "test").unwrap().unwrap();
         assert_eq!(meta.status, "running");
@@ -184,7 +189,7 @@ mod tests {
     #[test]
     fn test_build_failure() {
         let conn = setup_db();
-        save_build_start(&conn, "test", "b2", "Why?", 2).unwrap();
+        save_build_start(&conn, "test", "b2", "Why?", 2, None).unwrap();
         fail_build(&conn, "test", "b2", "LLM timeout").unwrap();
 
         let meta = get_latest_build(&conn, "test").unwrap().unwrap();
@@ -196,5 +201,37 @@ mod tests {
     fn test_no_build_returns_none() {
         let conn = setup_db();
         assert!(get_latest_build(&conn, "nonexistent").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_original_question_preserved_on_rebuild() {
+        let conn = setup_db();
+        // First insert: both question and original_question set
+        save_build_start(&conn, "test", "b1", "Enhanced?", 3, Some("Original?")).unwrap();
+
+        let row: String = conn
+            .query_row(
+                "SELECT original_question FROM pyramid_builds WHERE slug = 'test' AND build_id = 'b1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(row, "Original?");
+
+        // Re-run with different original_question — COALESCE should preserve the first one
+        save_build_start(&conn, "test", "b1", "Enhanced v2?", 4, Some("Different original?")).unwrap();
+
+        let row2: String = conn
+            .query_row(
+                "SELECT original_question FROM pyramid_builds WHERE slug = 'test' AND build_id = 'b1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(row2, "Original?", "COALESCE should preserve original_question on re-run");
+
+        // question column should be updated to the new enhanced version
+        let meta = get_latest_build(&conn, "test").unwrap().unwrap();
+        assert_eq!(meta.question, "Enhanced v2?");
     }
 }

@@ -35,12 +35,40 @@ pub async fn characterize(
     apex_question: &str,
     llm_config: &LlmConfig,
 ) -> Result<CharacterizationResult> {
+    characterize_with_fallback(source_path, apex_question, llm_config, None).await
+}
+
+/// Characterize source material with an optional L0 summary fallback.
+///
+/// When source files are no longer on disk (moved, deleted, remote), the folder
+/// map will be empty. If `l0_fallback` is provided, it's used instead — this
+/// gives the LLM the same quality of context from the existing pyramid's L0
+/// summaries rather than hard-failing.
+pub async fn characterize_with_fallback(
+    source_path: &str,
+    apex_question: &str,
+    llm_config: &LlmConfig,
+    l0_fallback: Option<&str>,
+) -> Result<CharacterizationResult> {
     // ── 1. Build folder map from source path for LLM context ─────────────
     let folder_map = question_decomposition::build_folder_map(source_path);
-    let folder_context = match folder_map.as_deref() {
-        Some(map) if !map.is_empty() => map,
-        _ => return Err(anyhow::anyhow!("Invalid source path: folder map is empty")),
+    let folder_context: String = match folder_map.as_deref() {
+        Some(map) if !map.is_empty() => map.to_string(),
+        _ => {
+            // Folder map is empty — source files may be gone. Fall back to L0 summaries.
+            match l0_fallback {
+                Some(fallback) if !fallback.is_empty() => {
+                    info!("source path unavailable, falling back to L0 summaries for characterization");
+                    fallback.to_string()
+                }
+                _ => return Err(anyhow::anyhow!(
+                    "Source path '{}' is not accessible and no L0 fallback available",
+                    source_path
+                )),
+            }
+        }
     };
+    let folder_context = folder_context.as_str();
 
     // ── 2. Construct prompts ─────────────────────────────────────────────
     let system_prompt = r#"You are analyzing a folder of source material to prepare for building a knowledge pyramid. Given the user's question and the folder contents below, determine:
@@ -69,11 +97,9 @@ Source material:
 Analyze this material and produce the characterization."#,
     );
 
-    // ── 3. Call LLM using the "max" tier (frontier model) ────────────────
-    // Override primary model to force the frontier model for characterization,
-    // same pattern as question_decomposition::call_decomposition_llm.
-    let mut char_config = llm_config.clone();
-    char_config.primary_model = llm_config.fallback_model_2.clone();
+    // ── 3. Call LLM ────────────────────────────────────────────────────────
+    // Model selection is controlled by YAML chain definitions, not Rust overrides.
+    // See Inviolable #4: "YAML is the single source of truth for model selection."
 
     let temperature = 0.3;
     let max_tokens: usize = 2048;
@@ -83,7 +109,7 @@ Analyze this material and produce the characterization."#,
         let temp = if attempt == 0 { temperature } else { 0.1 };
 
         let response = llm::call_model_unified(
-            &char_config,
+            llm_config,
             system_prompt,
             &user_prompt,
             temp,
