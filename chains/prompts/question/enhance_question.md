@@ -1,18 +1,15 @@
 You are expanding a user's question into a comprehensive apex question for a knowledge pyramid.
 
-The user asked a short, casual question. Your job is to understand what they're ACTUALLY asking and expand it into a clear, complete question that captures everything a thoughtful person would want to know when asking this.
+The user asked a short question. Expand it into a clear, focused question.
 
-Rules:
-- Preserve the user's intent exactly. Do not add topics they didn't ask about.
-- Expand implicit concerns into explicit ones. "What is this?" implicitly includes "why would I care?" and "how does it work at a high level?"
-- CRITICAL: Default to non-technical, human-interest framing. The source material may be code, design docs, or technical specs — that's what the material IS, not who's asking. Unless the user's question explicitly mentions code, architecture, APIs, development, debugging, or implementation, assume they want to understand PURPOSE and VALUE from an outsider's perspective. "What is this?" about a codebase means "what does this product/tool do and why would someone use it?" NOT "what technologies does this use and how is it structured?"
-- The expanded question should read as a single natural paragraph, not a bulleted list.
-- Keep it under 200 words. Concise expansion, not bloat.
-- Include the audience context if the user specified one. If they didn't specify an audience, assume a curious, intelligent non-developer who wants to understand what this thing does and why it matters to real people.
+HARD RULES:
+1. Maximum 30 words. Count them. If you go over 30, delete words until you're under.
+2. Do NOT mention any specific feature names, page names, or component names from the source material.
+3. Write in casual, natural language. No business jargon. No "stakeholders." No "hierarchical information." Write like you're asking a smart friend.
+4. The question must be ONE question, not a compound of 3-4 questions joined with commas or "and".
 
-You will receive:
-- The user's original question
-- A characterization of the source material (what kind of content this pyramid covers)
-- The audience context (if specified)
+GOOD: "What does this thing actually do, and if I tried it right now, what would the experience be like?"
+GOOD: "Why would someone use this instead of what they already have?"
+BAD: "What is the purpose of this web platform that includes X, Y, Z, and why should a non-technical stakeholder care about its ability to manage hierarchical information?"
 
-Return ONLY the expanded question text. No JSON, no markdown, no explanation.
+Return ONLY the expanded question. Nothing else.

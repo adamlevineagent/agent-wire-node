@@ -1,29 +1,25 @@
 You are decomposing a question into sub-questions to build a knowledge pyramid.
 
-WHAT YOU ARE DOING:
-You are helping build a layered understanding of a topic. The source material is "{{content_type}}" content. The original question will be answered by synthesizing answers to your sub-questions. Your sub-questions will either be answered directly from source material (leaves) or further decomposed by another instance of you (branches).
+The source material is "{{content_type}}" content. Your sub-questions will be answered from this material. Each will either be answered directly (leaf) or further decomposed (branch).
 
-HOW TO THINK ABOUT IT:
-- Ask yourself: "What are the genuinely distinct facets of this question that require separate investigation?"
-- Each sub-question should cover territory that NO other sibling covers
-- If a question can be answered by reading source files directly, it is a leaf — do not decompose further
-- If a question requires combining insights from multiple sources, it is a branch
-- Prefer FEWER, more focused questions over many overlapping ones
-- It is completely fine to produce just 1 or 2 sub-questions if that is what the question needs
-- It is also fine to say this question is already specific enough and return zero sub-questions (empty array)
-- The goal is the MINIMUM decomposition needed to fully answer the parent question — no more
+BEFORE YOU OUTPUT ANYTHING, do this mental exercise:
+1. Draft your sub-questions
+2. For each one, imagine writing a 3-sentence answer using the source material
+3. Check: do any two imagined answers describe the same things? If yes, they're the same question — merge or cut.
+4. Only output sub-questions whose imagined answers are GENUINELY DIFFERENT from each other.
 
-WHAT TO AVOID:
-- Do NOT pad with extra questions just to fill a quota — there is no quota
-- Do NOT create questions that overlap significantly with each other
-- Do NOT create questions that rephrase the parent in slightly different words
-- Do NOT decompose a question that is already answerable from source material
+THE GOLDEN RULE: If you find yourself listing the same features, components, or capabilities in multiple imagined answers, your questions aren't different enough. Go back to step 1.
 
-You are at decomposition depth {{depth}}. Deeper depth means the questions should be MORE specific and MORE likely to be leaves.
+LEAF vs BRANCH at depth {{depth}}:
+- Depth 1: ALL sub-questions must be branches (is_leaf: false). Period.
+- Depth 2: Most should be branches unless truly narrow.
+- Depth 3+: Most should be leaves.
+
+OUTPUT: 2-3 sub-questions. Not more. Fewer is better if they're truly distinct.
 
 Respond with a JSON array of objects, each with:
   "question": string,
-  "prompt_hint": string (what to focus on when answering),
+  "prompt_hint": string,
   "is_leaf": boolean
 
-Return ONLY the JSON array. An empty array [] is valid if the parent question needs no decomposition.
+Return ONLY the JSON array.

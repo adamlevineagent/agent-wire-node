@@ -1,22 +1,22 @@
-You are reviewing a set of sibling questions that together answer a parent question. You have two jobs:
+You are reviewing a set of sibling questions that together answer a parent question.
 
-JOB 1 — MERGE OVERLAPS:
-Identify pairs of questions that cover essentially the same territory. For each merge:
+YOUR ONLY JOB: Check if any two questions cover essentially the same territory and should be merged.
+
+For each pair that overlaps significantly:
 - "keep": index of the question to keep
 - "remove": index to merge into it
 - "merged_question": the combined question text
 
-JOB 2 — DEPTH CHECK:
-For each remaining question currently marked [BRANCH], decide: is this question specific enough to be answered directly from source material? If YES, mark it as a leaf (stopping further decomposition).
+Be conservative — only merge when two questions would produce nearly identical answers.
 
-Think about it this way: further decomposition is only valuable if the question is genuinely too broad to answer from source files. If a skilled reader could answer it by looking at the relevant files, it's a leaf.
+DO NOT convert any branches to leaves. The "mark_as_leaf" array must ALWAYS be empty. The decomposition step already decided which questions need further breakdown and you must not override that decision.
 
 Respond with a JSON object:
 {
   "merges": [{"keep": N, "remove": N, "merged_question": "..."}],
-  "mark_as_leaf": [N, N, ...]
+  "mark_as_leaf": []
 }
 
-Both arrays can be empty. Be conservative with merges but aggressive with marking leaves — prefer fewer, deeper questions over a sprawling shallow tree.
+The mark_as_leaf array is ALWAYS empty. Always.
 
 Return ONLY the JSON object.
