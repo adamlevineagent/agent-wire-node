@@ -20,8 +20,11 @@ use tokio::sync::Semaphore;
 use tracing::{info, warn};
 use uuid::Uuid;
 
+use std::path::PathBuf;
+
 use super::db;
 use super::llm::{self, LlmConfig};
+use super::question_decomposition::render_prompt_template;
 use super::OperationalConfig;
 use super::types::{
     AnswerBatchResult, AnsweredNode, CandidateMap, EvidenceLink, EvidenceVerdict,
@@ -66,6 +69,8 @@ pub async fn pre_map_layer(
     llm_config: &LlmConfig,
     ops: &OperationalConfig,
     audience: Option<&str>,
+    chains_dir: Option<&PathBuf>,
+    source_content_type: Option<&str>,
 ) -> Result<CandidateMap> {
     if questions.is_empty() {
         return Ok(CandidateMap {
@@ -151,29 +156,51 @@ pub async fn pre_map_layer(
     }
 
     // ── Prompts ─────────────────────────────────────────────────────────
-    let audience_hint = match audience {
+    let audience_block = match audience {
         Some(aud) if !aud.is_empty() => format!(
-            "\nThe questioner is {aud}. When assigning candidates, prioritize evidence describing user-facing behavior over internal implementation details.\n"
+            "The questioner is {aud}. ALL evidence is potentially relevant regardless of vocabulary — the answering step handles translation.\n"
         ),
         _ => String::new(),
     };
 
-    let system_prompt = format!(
-        r#"You are mapping questions to candidate evidence nodes. Your job is to determine which nodes from the layer below MIGHT contain relevant evidence for each question.
-{audience_hint}
-IMPORTANT: Over-include rather than miss. If a node MIGHT be relevant, include it. The next step will prune irrelevant candidates — a false positive here costs little, but a miss loses evidence permanently.
+    let content_type_block = match source_content_type {
+        Some(ct) if !ct.is_empty() => format!(
+            "The source material is \"{ct}\" content.\n"
+        ),
+        _ => String::new(),
+    };
 
+    let system_prompt = match chains_dir
+        .map(|d| d.join("prompts/question/pre_map.md"))
+        .and_then(|p| std::fs::read_to_string(&p).ok())
+    {
+        Some(template) => render_prompt_template(&template, &[
+            ("audience_block", &audience_block),
+            ("content_type_block", &content_type_block),
+        ]),
+        None => {
+            warn!("pre_map.md not found — using inline fallback");
+            format!(
+                r#"You are mapping questions to candidate evidence nodes. Your job is to determine which nodes from the layer below MIGHT contain relevant evidence for each question.
+
+{audience_block}IMPORTANT: Over-include rather than miss. If a node MIGHT be relevant, include it. The next step will prune irrelevant candidates — a false positive here costs little, but a miss loses evidence permanently.
+
+ALL evidence is potentially relevant regardless of how technical or internal it appears — the answering step handles translation for the audience.
+
+{content_type_block}
 Respond with ONLY a JSON object in this exact format:
-{{
-  "mappings": {{
+{{{{
+  "mappings": {{{{
     "question_id_1": ["node_id_a", "node_id_b"],
     "question_id_2": ["node_id_c"],
     ...
-  }}
-}}
+  }}}}
+}}}}
 
 Every question_id from the input MUST appear as a key in the mappings, even if its candidate list is empty."#
-    );
+            )
+        }
+    };
 
     let user_prompt = format!(
         "QUESTIONS for this layer:\n{}\n\nNODES from the layer below (candidate evidence):\n{}\n\nFor each question, identify which nodes likely contain relevant evidence. Include uncertain matches.",
@@ -265,6 +292,8 @@ pub async fn answer_questions(
     llm_config: &LlmConfig,
     slug: &str,
     answer_slug: &str,
+    chains_dir: Option<&PathBuf>,
+    source_content_type: Option<&str>,
     ops: &OperationalConfig,
 ) -> Result<AnswerBatchResult> {
     if questions.is_empty() {
@@ -328,6 +357,8 @@ pub async fn answer_questions(
         let answer_slug = answer_slug_owned.clone();
         let synthesis_prompt = synthesis_prompt.clone();
         let audience = audience.clone();
+        let chains_dir_owned = chains_dir.cloned();
+        let source_ct = source_content_type.map(|s| s.to_string());
         let q_id = work.question.question_id.clone();
         let q_text = work.question.question_text.clone();
         let q_layer = work.question.layer;
@@ -338,7 +369,7 @@ pub async fn answer_questions(
                 .await
                 .expect("answer semaphore should remain open");
 
-            let result = answer_single_question(&work.question, &work.candidate_nodes, synthesis_prompt.as_deref(), audience.as_deref(), &llm_config, &slug, &answer_slug, answer_temperature, answer_max_tokens)
+            let result = answer_single_question(&work.question, &work.candidate_nodes, synthesis_prompt.as_deref(), audience.as_deref(), &llm_config, &slug, &answer_slug, answer_temperature, answer_max_tokens, chains_dir_owned.as_ref(), source_ct.as_deref())
                 .await;
             (q_id, q_text, q_layer, result)
         });
@@ -409,6 +440,8 @@ async fn answer_single_question(
     answer_slug: &str,
     answer_temperature: f32,
     answer_max_tokens: usize,
+    chains_dir: Option<&PathBuf>,
+    source_content_type: Option<&str>,
 ) -> Result<AnsweredNode> {
     let node_id = format!("L{}-{}", question.layer, Uuid::new_v4());
 
@@ -443,17 +476,35 @@ async fn answer_single_question(
     };
 
     // ── Prompts ─────────────────────────────────────────────────────────
-    let extra_guidance = synthesis_prompt.unwrap_or("");
+    let synthesis_guidance = synthesis_prompt.unwrap_or("");
 
-    let audience_guidance = match audience {
+    let audience_block = match audience {
         Some(aud) if !aud.is_empty() => format!(
             "You are writing for {aud}. ALL technical terms from the evidence MUST be translated to plain language.\nThe reader should NEVER encounter framework names, file names, function names, API terms, or programming concepts unless they specifically asked about development.\nExtract the USER-FACING MEANING from technical evidence and express THAT.\n\n"
         ),
         _ => String::new(),
     };
 
-    let system_prompt = format!(
-        r#"{audience_guidance}You are answering a knowledge pyramid question using candidate evidence from the layer below.
+    let content_type_block = match source_content_type {
+        Some(ct) if !ct.is_empty() => format!(
+            "The source material is \"{ct}\" content.\n"
+        ),
+        _ => String::new(),
+    };
+
+    let system_prompt = match chains_dir
+        .map(|d| d.join("prompts/question/answer.md"))
+        .and_then(|p| std::fs::read_to_string(&p).ok())
+    {
+        Some(template) => render_prompt_template(&template, &[
+            ("audience_block", &audience_block),
+            ("synthesis_prompt", synthesis_guidance),
+            ("content_type_block", &content_type_block),
+        ]),
+        None => {
+            warn!("answer.md not found — using inline fallback");
+            format!(
+                r#"{audience_block}You are answering a knowledge pyramid question using candidate evidence from the layer below.
 
 For each candidate node, you MUST report a verdict:
 - KEEP(weight, reason) — this evidence is relevant. Weight 0.0-1.0 indicates how central it is.
@@ -465,19 +516,21 @@ Then synthesize your answer to the question using ONLY the KEEP evidence.
 Focus your synthesis on your STRONGEST evidence — the nodes that most directly answer the question.
 You do not need to mention every KEEP node. A focused answer drawing from your best sources is better than a sprawling answer trying to mention everything.
 
-{extra_guidance}
+{synthesis_guidance}
+
+{content_type_block}
 
 Respond with ONLY a JSON object:
-{{
+{{{{
   "headline": "short headline for this answer (max 120 chars)",
   "distilled": "2-4 sentence synthesis answering the question",
   "topics": [
-    {{"name": "topic_name", "current": "what we know about this topic"}}
+    {{{{"name": "topic_name", "current": "what we know about this topic"}}}}
   ],
   "verdicts": [
-    {{"node_id": "...", "verdict": "KEEP", "weight": 0.85, "reason": "..."}},
-    {{"node_id": "...", "verdict": "DISCONNECT", "reason": "..."}},
-    {{"node_id": "...", "verdict": "KEEP", "weight": 0.3, "reason": "..."}}
+    {{{{"node_id": "...", "verdict": "KEEP", "weight": 0.85, "reason": "..."}}}},
+    {{{{"node_id": "...", "verdict": "DISCONNECT", "reason": "..."}}}},
+    {{{{"node_id": "...", "verdict": "KEEP", "weight": 0.3, "reason": "..."}}}}
   ],
   "missing": [
     "description of evidence we wish we had"
@@ -486,8 +539,10 @@ Respond with ONLY a JSON object:
   "decisions": [],
   "terms": [],
   "dead_ends": []
-}}"#
-    );
+}}}}"#
+            )
+        }
+    };
 
     let user_prompt = format!(
         "QUESTION (id: {}):\n{}\n\nAbout: {}\nCreates: {}\n\nCANDIDATE EVIDENCE:\n{}\n\nEvaluate each candidate, produce verdicts, and synthesize your answer.",

@@ -500,6 +500,7 @@ pub async fn run_decomposed_build(
     // For cross-slug builds: load nodes from referenced slugs.
     // - Mechanical (base) slugs: load L0 nodes
     // - Question slugs in references: load ALL live nodes (answers become source material)
+    let mut source_content_type: Option<String> = None;
     let cross_slug_nodes: Option<Vec<types::PyramidNode>> = if is_cross_slug {
         let conn = state.reader.lock().await;
         let mut all_nodes = Vec::new();
@@ -518,8 +519,11 @@ pub async fn run_decomposed_build(
                     );
                     all_nodes.extend(nodes);
                 }
-                Some(_) => {
+                Some(info) => {
                     // Mechanical (base) slug: load L0 only
+                    if source_content_type.is_none() {
+                        source_content_type = Some(info.content_type.as_str().to_string());
+                    }
                     let nodes = db::get_nodes_at_depth(&conn, ref_slug, 0)?;
                     info!(
                         slug = slug_name,
@@ -1039,6 +1043,7 @@ pub async fn run_decomposed_build(
         // Step a: Pre-map questions to candidate evidence nodes
         let candidate_map = match evidence_answering::pre_map_layer(
             &layer_qs, &lower_nodes, &llm_config, &state.operational, tree.audience.as_deref(),
+            Some(&state.chains_dir), source_content_type.as_deref(),
         )
         .await
         {
@@ -1060,7 +1065,7 @@ pub async fn run_decomposed_build(
             &llm_config,
             slug_name,
             slug_name, // answer_slug — same as slug for single-pyramid builds
-            &state.operational,
+            Some(&state.chains_dir), source_content_type.as_deref(), &state.operational,
         )
         .await
         {
