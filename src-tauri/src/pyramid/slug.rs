@@ -238,6 +238,54 @@ pub fn get_slug(conn: &Connection, slug: &str) -> Result<Option<SlugInfo>> {
     db::get_slug(conn, slug)
 }
 
+// ── WS-ONLINE-D: Pinning ────────────────────────────────────────────────────
+
+/// Pin a remote pyramid: creates a pinned slug entry with source tunnel URL
+/// and inserts all exported nodes into local SQLite.
+///
+/// If the slug already exists, it updates the pinned flag and tunnel URL,
+/// then upserts all nodes. This handles both first-pin and re-pin (refresh).
+pub fn pin_remote_pyramid(
+    conn: &Connection,
+    slug: &str,
+    tunnel_url: &str,
+    nodes: &[PyramidNode],
+) -> Result<usize> {
+    let normalized = slugify(slug);
+    validate_slug(&normalized)?;
+
+    // Set pinned flag and tunnel URL (creates slug if needed)
+    db::pin_pyramid(conn, &normalized, tunnel_url)?;
+
+    // Upsert all nodes from the export
+    let count = db::upsert_pinned_nodes(conn, &normalized, nodes)?;
+
+    tracing::info!(
+        slug = %normalized,
+        tunnel_url = %tunnel_url,
+        node_count = count,
+        "pinned remote pyramid"
+    );
+
+    Ok(count)
+}
+
+/// Unpin a pyramid: clears the pinned flag and source_tunnel_url.
+/// NEVER deletes node data (Pillar 1).
+pub fn unpin_pyramid(conn: &Connection, slug: &str) -> Result<()> {
+    if db::get_slug(conn, slug)?.is_none() {
+        return Err(anyhow!("Slug '{}' not found", slug));
+    }
+    db::unpin_pyramid(conn, slug)?;
+    tracing::info!(slug = %slug, "unpinned pyramid (data preserved)");
+    Ok(())
+}
+
+/// Check whether a slug is pinned.
+pub fn is_pinned(conn: &Connection, slug: &str) -> Result<bool> {
+    db::is_pinned(conn, slug)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

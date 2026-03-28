@@ -855,6 +855,43 @@ impl RemotePyramidClient {
     }
 }
 
+// ─── WS-ONLINE-D: Pull remote pyramid for pinning ───────────
+
+impl RemotePyramidClient {
+    /// Pull a remote pyramid's full node data for local pinning.
+    ///
+    /// Calls GET /pyramid/{slug}/export and parses the response nodes
+    /// into Vec<PyramidNode>. Returns an error if the export fails or
+    /// the response cannot be parsed.
+    pub async fn pull_remote_pyramid(
+        &self,
+        slug: &str,
+    ) -> Result<Vec<super::types::PyramidNode>> {
+        let export = self.remote_export(slug).await?;
+
+        let mut nodes = Vec::with_capacity(export.nodes.len());
+        for node_val in &export.nodes {
+            let node: super::types::PyramidNode = serde_json::from_value(node_val.clone())
+                .map_err(|e| {
+                    WireImportError::InvalidResponse(format!(
+                        "failed to parse exported node: {}",
+                        e
+                    ))
+                })?;
+            nodes.push(node);
+        }
+
+        tracing::info!(
+            slug = %slug,
+            node_count = nodes.len(),
+            tunnel_url = %self.tunnel_url,
+            "pulled remote pyramid for pinning"
+        );
+
+        Ok(nodes)
+    }
+}
+
 // ─── SQLite persistence for imported chains ──────────────────
 
 /// Initialize the imported chains table in SQLite.

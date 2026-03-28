@@ -2621,6 +2621,14 @@ async fn post_build_seed(
         .to_string_lossy()
         .to_string();
 
+    // WS-ONLINE-E: Update cached emergent price after build
+    {
+        let conn = pyramid_state.writer.lock().await;
+        if let Err(e) = pyramid_db::update_cached_emergent_price(&conn, slug) {
+            tracing::warn!("Failed to update cached emergent price for '{}': {}", slug, e);
+        }
+    }
+
     // Get slug info for source paths
     let source_paths: Vec<String> = {
         let conn = pyramid_state.reader.lock().await;
@@ -3440,6 +3448,65 @@ async fn pyramid_archive_slug(
     drop(conn);
 
     result
+}
+
+/// Set the access tier for a pyramid slug (WS-ONLINE-E).
+///
+/// Mutations are IPC-only (S1 security model). Sets the access_tier, optional
+/// price override, and optional allowed_circles JSON array for a slug.
+#[tauri::command]
+async fn pyramid_set_access_tier(
+    state: tauri::State<'_, SharedState>,
+    slug: String,
+    tier: String,
+    price: Option<i64>,
+    circles: Option<String>,
+) -> Result<(), String> {
+    // Validate tier value
+    match tier.as_str() {
+        "public" | "circle-scoped" | "priced" | "embargoed" => {}
+        _ => return Err(format!("Invalid access tier '{}'. Must be one of: public, circle-scoped, priced, embargoed", tier)),
+    }
+
+    // Validate circles JSON if provided
+    if let Some(ref c) = circles {
+        let _: Vec<String> = serde_json::from_str(c)
+            .map_err(|e| format!("Invalid circles JSON (must be array of strings): {}", e))?;
+    }
+
+    let conn = state.pyramid.writer.lock().await;
+    pyramid_db::set_access_tier(&conn, &slug, &tier, price, circles.as_deref())
+        .map_err(|e| e.to_string())?;
+
+    tracing::info!(
+        slug = %slug,
+        tier = %tier,
+        price = ?price,
+        circles = ?circles,
+        "Access tier updated via IPC"
+    );
+
+    Ok(())
+}
+
+/// Get the access tier and cached emergent price for a pyramid slug (WS-ONLINE-E).
+#[tauri::command]
+async fn pyramid_get_access_tier(
+    state: tauri::State<'_, SharedState>,
+    slug: String,
+) -> Result<serde_json::Value, String> {
+    let conn = state.pyramid.reader.lock().await;
+    let (tier, price, circles) = pyramid_db::get_access_tier(&conn, &slug)
+        .map_err(|e| e.to_string())?;
+    let emergent_price = pyramid_db::get_cached_emergent_price(&conn, &slug)
+        .map_err(|e| e.to_string())?;
+
+    Ok(serde_json::json!({
+        "access_tier": tier,
+        "access_price": price,
+        "allowed_circles": circles.and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok()),
+        "cached_emergent_price": emergent_price,
+    }))
 }
 
 /// IPC equivalent of POST /pyramid/:slug/build/question — decomposed question build.
@@ -5922,6 +5989,8 @@ fn main() {
             auth_complete_ipc,
             pyramid_purge_slug,
             pyramid_archive_slug,
+            pyramid_set_access_tier,
+            pyramid_get_access_tier,
             pyramid_question_build,
             pyramid_question_preview,
             pyramid_characterize,

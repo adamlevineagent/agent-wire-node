@@ -11,9 +11,19 @@ interface PyramidPublicationInfo {
     last_published_build_id: string | null;
     current_build_id: string | null;
     last_built_at: string | null;
+    pinned: boolean;
+    source_tunnel_url: string | null;
 }
 
 type PublishingState = "idle" | "publishing";
+type AccessTier = "public" | "circle-scoped" | "priced" | "embargoed";
+
+interface AccessTierInfo {
+    access_tier: AccessTier;
+    access_price: number | null;
+    allowed_circles: string[] | null;
+    cached_emergent_price: number | null;
+}
 
 // ─── Component ───────────────────────────────────────────────────────────────
 
@@ -24,6 +34,16 @@ export function PyramidPublicationStatus() {
     const [publishingSlug, setPublishingSlug] = useState<string | null>(null);
     const [autoPublishSlugs, setAutoPublishSlugs] = useState<Set<string>>(new Set());
     const [lastPublishResult, setLastPublishResult] = useState<Record<string, { success: boolean; message: string }>>({});
+
+    // ─── WS-ONLINE-E: Access Tier State ─────────────────────────────────────
+    const [accessTiers, setAccessTiers] = useState<Record<string, AccessTierInfo>>({});
+    const [expandedAccessSlug, setExpandedAccessSlug] = useState<string | null>(null);
+    const [accessTierDraft, setAccessTierDraft] = useState<{
+        tier: AccessTier;
+        price: string;
+        circles: string;
+    }>({ tier: "public", price: "", circles: "" });
+    const [savingAccessTier, setSavingAccessTier] = useState(false);
 
     // ─── Fetch publication status ────────────────────────────────────────────
 
@@ -101,6 +121,113 @@ export function PyramidPublicationStatus() {
             return next;
         });
     }, []);
+
+    // ─── WS-ONLINE-E: Access tier management ──────────────────────────────────
+
+    const fetchAccessTier = useCallback(async (slug: string) => {
+        try {
+            const data = await invoke<AccessTierInfo>("pyramid_get_access_tier", { slug });
+            setAccessTiers(prev => ({ ...prev, [slug]: data }));
+            return data;
+        } catch (err) {
+            console.error("Failed to fetch access tier for", slug, err);
+            return null;
+        }
+    }, []);
+
+    const handleExpandAccessTier = useCallback(async (slug: string) => {
+        if (expandedAccessSlug === slug) {
+            setExpandedAccessSlug(null);
+            return;
+        }
+        const data = await fetchAccessTier(slug);
+        if (data) {
+            setAccessTierDraft({
+                tier: data.access_tier,
+                price: data.access_price != null ? String(data.access_price) : "",
+                circles: data.allowed_circles ? JSON.stringify(data.allowed_circles) : "",
+            });
+        }
+        setExpandedAccessSlug(slug);
+    }, [expandedAccessSlug, fetchAccessTier]);
+
+    const handleSaveAccessTier = useCallback(async (slug: string) => {
+        setSavingAccessTier(true);
+        try {
+            const price = accessTierDraft.price.trim() === "" ? null : parseInt(accessTierDraft.price, 10);
+            const circles = accessTierDraft.circles.trim() === "" ? null : accessTierDraft.circles.trim();
+
+            if (price !== null && isNaN(price)) {
+                setLastPublishResult(prev => ({
+                    ...prev,
+                    [slug]: { success: false, message: "Price must be a number" },
+                }));
+                return;
+            }
+
+            await invoke("pyramid_set_access_tier", {
+                slug,
+                tier: accessTierDraft.tier,
+                price,
+                circles,
+            });
+
+            await fetchAccessTier(slug);
+            setLastPublishResult(prev => ({
+                ...prev,
+                [slug]: { success: true, message: `Access tier set to ${accessTierDraft.tier}` },
+            }));
+        } catch (err) {
+            console.error("Failed to save access tier:", err);
+            setLastPublishResult(prev => ({
+                ...prev,
+                [slug]: { success: false, message: String(err) },
+            }));
+        } finally {
+            setSavingAccessTier(false);
+        }
+    }, [accessTierDraft, fetchAccessTier]);
+
+    // ─── WS-ONLINE-D: Pinning actions ─────────────────────────────────────────
+
+    const [unpinningSlug, setUnpinningSlug] = useState<string | null>(null);
+    const [refreshingSlug, setRefreshingSlug] = useState<string | null>(null);
+
+    const handleUnpin = useCallback(async (slug: string) => {
+        setUnpinningSlug(slug);
+        try {
+            await invoke("pyramid_unpin", { slug });
+            await fetchStatus();
+        } catch (err) {
+            console.error("Unpin failed:", err);
+            setLastPublishResult(prev => ({
+                ...prev,
+                [slug]: { success: false, message: `Unpin failed: ${String(err)}` },
+            }));
+        } finally {
+            setUnpinningSlug(null);
+        }
+    }, [fetchStatus]);
+
+    const handleRefreshPinned = useCallback(async (slug: string, tunnelUrl: string) => {
+        setRefreshingSlug(slug);
+        try {
+            await invoke("pyramid_pin_remote", { tunnelUrl: tunnelUrl, slug });
+            setLastPublishResult(prev => ({
+                ...prev,
+                [slug]: { success: true, message: "Refreshed from remote" },
+            }));
+            await fetchStatus();
+        } catch (err) {
+            console.error("Refresh pinned failed:", err);
+            setLastPublishResult(prev => ({
+                ...prev,
+                [slug]: { success: false, message: `Refresh failed: ${String(err)}` },
+            }));
+        } finally {
+            setRefreshingSlug(null);
+        }
+    }, [fetchStatus]);
 
     // ─── Helpers ─────────────────────────────────────────────────────────────
 
@@ -196,7 +323,8 @@ export function PyramidPublicationStatus() {
                 const published = pyramids.filter(p => publicationState(p) === "published").length;
                 const stale = pyramids.filter(p => publicationState(p) === "stale").length;
                 const unpublished = pyramids.filter(p => publicationState(p) === "unpublished").length;
-                return (published > 0 || stale > 0 || unpublished > 0) ? (
+                const pinned = pyramids.filter(p => p.pinned).length;
+                return (published > 0 || stale > 0 || unpublished > 0 || pinned > 0) ? (
                     <div className="sync-summary-bar">
                         {published > 0 && (
                             <span className="sync-summary-chip in-sync">{published} published</span>
@@ -206,6 +334,9 @@ export function PyramidPublicationStatus() {
                         )}
                         {unpublished > 0 && (
                             <span className="sync-summary-chip skipped">{unpublished} never published</span>
+                        )}
+                        {pinned > 0 && (
+                            <span className="sync-summary-chip in-sync">{pinned} pinned</span>
                         )}
                     </div>
                 ) : null;
@@ -222,7 +353,7 @@ export function PyramidPublicationStatus() {
                     return (
                         <div key={p.slug} className="pyramid-pub-item">
                             <div className="pyramid-pub-row">
-                                {/* Status dot + slug name */}
+                                {/* Status dot + slug name + pinned badge */}
                                 <div className="pyramid-pub-info">
                                     <span
                                         className={`pyramid-pub-dot ${statusDotClass(state)}`}
@@ -231,6 +362,14 @@ export function PyramidPublicationStatus() {
                                         {statusIcon(state)}
                                     </span>
                                     <span className="pyramid-pub-slug">{p.slug}</span>
+                                    {p.pinned && (
+                                        <span
+                                            className="pyramid-pinned-badge"
+                                            title={p.source_tunnel_url ? `Pinned from ${p.source_tunnel_url}` : "Pinned"}
+                                        >
+                                            pinned
+                                        </span>
+                                    )}
                                 </div>
 
                                 {/* Right side: counts + actions */}
@@ -262,21 +401,45 @@ export function PyramidPublicationStatus() {
                                         <span className="auto-sync-label">Auto</span>
                                     </label>
 
-                                    {/* Publish Now button */}
-                                    <button
-                                        className="folder-publish-btn"
-                                        onClick={() => handlePublishNow(p.slug)}
-                                        disabled={isPublishing || p.node_count === 0}
-                                        title={
-                                            p.node_count === 0
-                                                ? "No nodes to publish"
-                                                : p.unpublished_count === 0 && state === "published"
-                                                    ? "All nodes already published"
-                                                    : `Publish ${p.unpublished_count} unpublished nodes`
-                                        }
-                                    >
-                                        {isPublishing ? "Publishing..." : "Publish Now"}
-                                    </button>
+                                    {/* Publish Now button (for local pyramids) */}
+                                    {!p.pinned && (
+                                        <button
+                                            className="folder-publish-btn"
+                                            onClick={() => handlePublishNow(p.slug)}
+                                            disabled={isPublishing || p.node_count === 0}
+                                            title={
+                                                p.node_count === 0
+                                                    ? "No nodes to publish"
+                                                    : p.unpublished_count === 0 && state === "published"
+                                                        ? "All nodes already published"
+                                                        : `Publish ${p.unpublished_count} unpublished nodes`
+                                            }
+                                        >
+                                            {isPublishing ? "Publishing..." : "Publish Now"}
+                                        </button>
+                                    )}
+
+                                    {/* WS-ONLINE-D: Pinned pyramid actions */}
+                                    {p.pinned && p.source_tunnel_url && (
+                                        <button
+                                            className="folder-publish-btn"
+                                            onClick={() => handleRefreshPinned(p.slug, p.source_tunnel_url!)}
+                                            disabled={refreshingSlug === p.slug}
+                                            title={`Refresh from ${p.source_tunnel_url}`}
+                                        >
+                                            {refreshingSlug === p.slug ? "Refreshing..." : "Refresh Now"}
+                                        </button>
+                                    )}
+                                    {p.pinned && (
+                                        <button
+                                            className="folder-publish-btn pyramid-unpin-btn"
+                                            onClick={() => handleUnpin(p.slug)}
+                                            disabled={unpinningSlug === p.slug}
+                                            title="Unpin (node data will be preserved)"
+                                        >
+                                            {unpinningSlug === p.slug ? "Unpinning..." : "Unpin"}
+                                        </button>
+                                    )}
                                 </div>
                             </div>
 
@@ -298,6 +461,15 @@ export function PyramidPublicationStatus() {
                                             current: {p.current_build_id.slice(0, 8)}
                                         </span>
                                     )}
+                                </div>
+                            )}
+
+                            {/* WS-ONLINE-D: Pinned source info */}
+                            {p.pinned && p.source_tunnel_url && (
+                                <div className="pyramid-pub-build-info">
+                                    <span className="file-hash" title={`Source: ${p.source_tunnel_url}`}>
+                                        source: {p.source_tunnel_url.replace(/^https?:\/\//, "").slice(0, 24)}...
+                                    </span>
                                 </div>
                             )}
                         </div>

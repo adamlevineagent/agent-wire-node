@@ -59,6 +59,8 @@ pub struct PyramidQueryClaims {
     pub iss: Option<String>,
     /// JWT ID — for deduplication / logging
     pub jti: Option<String>,
+    /// Circle ID — for circle-scoped access tier checking (WS-ONLINE-E)
+    pub circle_id: Option<String>,
 }
 
 /// JWT claims for document access tokens

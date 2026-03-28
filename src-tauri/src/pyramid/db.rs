@@ -4167,6 +4167,93 @@ pub fn get_slug_online_fields(
     }
 }
 
+/// Read the access tier config for a slug: (tier, price, allowed_circles JSON).
+///
+/// Returns the access_tier string, optional access_price override, and the
+/// raw allowed_circles JSON string (a JSON array of circle UUIDs, or NULL).
+pub fn get_access_tier(
+    conn: &Connection,
+    slug: &str,
+) -> Result<(String, Option<i64>, Option<String>)> {
+    let result = conn.query_row(
+        "SELECT access_tier, access_price, allowed_circles FROM pyramid_slugs WHERE slug = ?1",
+        rusqlite::params![slug],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<i64>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        },
+    );
+    match result {
+        Ok(val) => Ok(val),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(("public".to_string(), None, None)),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Set the access tier config for a slug.
+///
+/// - `tier`: one of "public", "circle-scoped", "priced", "embargoed"
+/// - `price`: explicit price override (None = use emergent pricing)
+/// - `circles`: JSON array string of allowed circle UUIDs (only relevant for circle-scoped)
+pub fn set_access_tier(
+    conn: &Connection,
+    slug: &str,
+    tier: &str,
+    price: Option<i64>,
+    circles: Option<&str>,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE pyramid_slugs SET access_tier = ?1, access_price = ?2, allowed_circles = ?3 WHERE slug = ?4",
+        rusqlite::params![tier, price, circles, slug],
+    )?;
+    Ok(())
+}
+
+/// Compute the emergent price for a slug by counting unique source citations.
+///
+/// Counts unique `source_node_id` entries across all live evidence links for the slug.
+/// This represents the breadth of source material the pyramid synthesizes, which
+/// determines its emergent value.
+pub fn compute_emergent_price(conn: &Connection, slug: &str) -> Result<i64> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(DISTINCT source_node_id) FROM live_pyramid_evidence WHERE slug = ?1",
+        rusqlite::params![slug],
+        |row| row.get(0),
+    )?;
+    Ok(count)
+}
+
+/// Compute and cache the emergent price for a slug.
+///
+/// Calls `compute_emergent_price` and writes the result to `cached_emergent_price`
+/// in pyramid_slugs. Should be called after every successful build.
+pub fn update_cached_emergent_price(conn: &Connection, slug: &str) -> Result<()> {
+    let price = compute_emergent_price(conn, slug)?;
+    conn.execute(
+        "UPDATE pyramid_slugs SET cached_emergent_price = ?1 WHERE slug = ?2",
+        rusqlite::params![price, slug],
+    )?;
+    tracing::debug!(slug = %slug, emergent_price = %price, "Cached emergent price updated");
+    Ok(())
+}
+
+/// Read the cached emergent price for a slug (if computed).
+pub fn get_cached_emergent_price(conn: &Connection, slug: &str) -> Result<Option<i64>> {
+    let result = conn.query_row(
+        "SELECT cached_emergent_price FROM pyramid_slugs WHERE slug = ?1",
+        rusqlite::params![slug],
+        |row| row.get::<_, Option<i64>>(0),
+    );
+    match result {
+        Ok(val) => Ok(val),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// Store the metadata contribution UUID for a slug after publishing discovery metadata.
 pub fn set_slug_metadata_contribution_id(conn: &Connection, slug: &str, uuid: &str) -> Result<()> {
     conn.execute(
@@ -4644,6 +4731,124 @@ pub fn get_all_chunks(conn: &Connection, slug: &str) -> Result<Vec<(i64, String)
         chunks.push(row?);
     }
     Ok(chunks)
+}
+
+// ── WS-ONLINE-D: Pinning / Daemon Caching ────────────────────────────────────
+
+/// Pin a pyramid: set pinned=1 and store the source tunnel URL.
+/// Creates the slug row if it doesn't exist (for remote pyramids being pinned for the first time).
+pub fn pin_pyramid(conn: &Connection, slug: &str, tunnel_url: &str) -> Result<()> {
+    // Try to update existing slug first
+    let updated = conn.execute(
+        "UPDATE pyramid_slugs SET pinned = 1, source_tunnel_url = ?2 WHERE slug = ?1",
+        rusqlite::params![slug, tunnel_url],
+    )?;
+
+    if updated == 0 {
+        // Slug doesn't exist yet — create it as a pinned remote pyramid
+        conn.execute(
+            "INSERT INTO pyramid_slugs (slug, content_type, source_path, pinned, source_tunnel_url)
+             VALUES (?1, 'code', '', 1, ?2)",
+            rusqlite::params![slug, tunnel_url],
+        )?;
+    }
+
+    Ok(())
+}
+
+/// Unpin a pyramid: clear pinned flag and source_tunnel_url.
+/// NEVER deletes node data (Pillar 1 — pinned data may have been queried,
+/// cited, or used as evidence; it persists as historical record).
+pub fn unpin_pyramid(conn: &Connection, slug: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE pyramid_slugs SET pinned = 0, source_tunnel_url = NULL WHERE slug = ?1",
+        rusqlite::params![slug],
+    )?;
+    Ok(())
+}
+
+/// Bulk insert/update nodes from a remote export response.
+/// Uses save_node under the hood for each node, preserving the same upsert semantics.
+pub fn upsert_pinned_nodes(conn: &Connection, slug: &str, nodes: &[PyramidNode]) -> Result<usize> {
+    let mut count = 0;
+    for node in nodes {
+        // Ensure the node's slug matches the target slug
+        let mut pinned_node = node.clone();
+        pinned_node.slug = slug.to_string();
+        save_node(conn, &pinned_node, None)?;
+        count += 1;
+    }
+
+    // Update slug stats (node_count, max_depth)
+    let node_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM live_pyramid_nodes WHERE slug = ?1",
+        rusqlite::params![slug],
+        |row| row.get(0),
+    )?;
+    let max_depth: i64 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(depth), 0) FROM live_pyramid_nodes WHERE slug = ?1",
+            rusqlite::params![slug],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+
+    conn.execute(
+        "UPDATE pyramid_slugs SET node_count = ?2, max_depth = ?3 WHERE slug = ?1",
+        rusqlite::params![slug, node_count, max_depth],
+    )?;
+
+    Ok(count)
+}
+
+/// Check whether a slug is pinned.
+pub fn is_pinned(conn: &Connection, slug: &str) -> Result<bool> {
+    let result = conn.query_row(
+        "SELECT pinned FROM pyramid_slugs WHERE slug = ?1",
+        rusqlite::params![slug],
+        |row| row.get::<_, i64>(0),
+    );
+    match result {
+        Ok(val) => Ok(val != 0),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Get the source tunnel URL for a pinned pyramid.
+pub fn get_source_tunnel_url(conn: &Connection, slug: &str) -> Result<Option<String>> {
+    let result = conn.query_row(
+        "SELECT source_tunnel_url FROM pyramid_slugs WHERE slug = ?1",
+        rusqlite::params![slug],
+        |row| row.get::<_, Option<String>>(0),
+    );
+    match result {
+        Ok(url) => Ok(url),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// List all pinned pyramids (slug, source_tunnel_url).
+pub fn list_pinned_pyramids(conn: &Connection) -> Result<Vec<(String, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT slug, source_tunnel_url FROM pyramid_slugs
+         WHERE pinned = 1 AND source_tunnel_url IS NOT NULL AND archived_at IS NULL",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut pinned = Vec::new();
+    for row in rows {
+        pinned.push(row?);
+    }
+    Ok(pinned)
+}
+
+/// Get all live nodes for export (used by the export endpoint).
+/// Returns all non-superseded nodes for a slug, ordered by depth then chunk_index.
+pub fn get_all_nodes_for_export(conn: &Connection, slug: &str) -> Result<Vec<PyramidNode>> {
+    get_all_live_nodes(conn, slug)
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────

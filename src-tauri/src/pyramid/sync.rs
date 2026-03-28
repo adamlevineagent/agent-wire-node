@@ -33,14 +33,28 @@ pub struct PyramidPublicationLink {
     pub auto_publish: bool,
 }
 
+/// Configuration for a pinned pyramid's download link (WS-ONLINE-D).
+#[derive(Debug, Clone)]
+pub struct PinnedPyramidLink {
+    pub slug: String,
+    pub source_tunnel_url: String,
+    /// Last known build_id from the remote pyramid (for change detection).
+    pub last_known_build_id: Option<String>,
+    /// When the last refresh completed.
+    pub last_refreshed_at: Option<Instant>,
+}
+
 /// State for the pyramid sync timer.
 ///
 /// Tracks which pyramids are linked for publication and when the last tick ran.
+/// Also tracks pinned pyramids for download-direction sync (WS-ONLINE-D).
 /// Kept separate from corpus `SyncState` to avoid coupling file-level and
 /// SQLite-level sync concerns.
 pub struct PyramidSyncState {
     /// Pyramids linked for publication, keyed by slug.
     pub linked_pyramids: HashMap<String, PyramidPublicationLink>,
+    /// Pinned pyramids linked for download-direction sync, keyed by slug (WS-ONLINE-D).
+    pub pinned_pyramids: HashMap<String, PinnedPyramidLink>,
     /// When the last tick completed (for diagnostics).
     pub last_tick: Option<Instant>,
 }
@@ -49,6 +63,7 @@ impl PyramidSyncState {
     pub fn new() -> Self {
         Self {
             linked_pyramids: HashMap::new(),
+            pinned_pyramids: HashMap::new(),
             last_tick: None,
         }
     }
@@ -67,6 +82,24 @@ impl PyramidSyncState {
     /// Unlink a pyramid slug from auto-publication.
     pub fn unlink_pyramid(&mut self, slug: &str) {
         self.linked_pyramids.remove(slug);
+    }
+
+    /// Register a pinned pyramid for auto-refresh (WS-ONLINE-D).
+    pub fn pin_pyramid(&mut self, slug: String, source_tunnel_url: String) {
+        self.pinned_pyramids.insert(
+            slug.clone(),
+            PinnedPyramidLink {
+                slug,
+                source_tunnel_url,
+                last_known_build_id: None,
+                last_refreshed_at: None,
+            },
+        );
+    }
+
+    /// Remove a pinned pyramid from auto-refresh tracking (WS-ONLINE-D).
+    pub fn unpin_pyramid(&mut self, slug: &str) {
+        self.pinned_pyramids.remove(slug);
     }
 }
 
@@ -397,5 +430,143 @@ pub async fn pyramid_sync_tick(
     {
         let mut state = sync_state.lock().await;
         state.last_tick = Some(Instant::now());
+    }
+}
+
+// ─── WS-ONLINE-D: Pinned pyramid auto-refresh tick ──────────────────────────
+
+/// One tick of the pinned pyramid refresh timer.
+///
+/// Iterates all pinned pyramids. For each:
+/// 1. Fetches the remote pyramid's metadata to check for updated build timestamps.
+/// 2. If the remote build_id has changed, re-pulls the full export.
+/// 3. Upserts the new nodes into local SQLite.
+///
+/// The refresh interval is controlled by the caller (suggested: 5 minutes).
+pub async fn pinned_pyramid_refresh_tick(
+    pyramid_state: &super::PyramidState,
+    sync_state: &Arc<Mutex<PyramidSyncState>>,
+) {
+    use super::wire_import::RemotePyramidClient;
+    use super::slug;
+
+    let pinned_links: Vec<PinnedPyramidLink> = {
+        let state = sync_state.lock().await;
+        state.pinned_pyramids.values().cloned().collect()
+    };
+
+    if pinned_links.is_empty() {
+        return;
+    }
+
+    // Get Wire JWT for authenticating with remote nodes
+    let wire_jwt = {
+        let config = pyramid_state.config.read().await;
+        config.auth_token.clone()
+    };
+
+    if wire_jwt.is_empty() {
+        tracing::debug!("pinned_refresh_tick: no auth_token configured, skipping");
+        return;
+    }
+
+    let wire_server_url = std::env::var("WIRE_URL")
+        .unwrap_or_else(|_| "https://api.callmeplayful.com".to_string());
+
+    for link in &pinned_links {
+        let client = RemotePyramidClient::new(
+            link.source_tunnel_url.clone(),
+            wire_jwt.clone(),
+            wire_server_url.clone(),
+        );
+
+        // Check for updated build by fetching metadata (apex node is a lightweight check)
+        let remote_build_id = match client.remote_apex(&link.slug).await {
+            Ok(apex) => {
+                // Extract build_id from the apex response if present
+                apex.node
+                    .get("build_id")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            }
+            Err(e) => {
+                tracing::debug!(
+                    slug = %link.slug,
+                    tunnel_url = %link.source_tunnel_url,
+                    error = %e,
+                    "pinned_refresh_tick: failed to check remote apex (non-fatal)"
+                );
+                continue;
+            }
+        };
+
+        // Compare with last known build_id
+        let needs_refresh = match (&link.last_known_build_id, &remote_build_id) {
+            (Some(last), Some(current)) => last != current,
+            (None, Some(_)) => true, // Never refreshed, remote has a build
+            _ => false,
+        };
+
+        if !needs_refresh {
+            tracing::debug!(
+                slug = %link.slug,
+                "pinned_refresh_tick: no new build, skipping"
+            );
+            continue;
+        }
+
+        tracing::info!(
+            slug = %link.slug,
+            old_build_id = ?link.last_known_build_id,
+            new_build_id = ?remote_build_id,
+            "pinned_refresh_tick: new build detected, re-pulling"
+        );
+
+        // Pull the full export
+        match client.pull_remote_pyramid(&link.slug).await {
+            Ok(nodes) => {
+                // Upsert into local SQLite
+                let writer = pyramid_state.writer.lock().await;
+                match slug::pin_remote_pyramid(
+                    &writer,
+                    &link.slug,
+                    &link.source_tunnel_url,
+                    &nodes,
+                ) {
+                    Ok(count) => {
+                        tracing::info!(
+                            slug = %link.slug,
+                            node_count = count,
+                            "pinned_refresh_tick: refresh complete"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            slug = %link.slug,
+                            error = %e,
+                            "pinned_refresh_tick: failed to upsert nodes"
+                        );
+                        continue;
+                    }
+                }
+                // writer dropped here
+
+                // Update last_known_build_id in sync state
+                {
+                    let mut state = sync_state.lock().await;
+                    if let Some(entry) = state.pinned_pyramids.get_mut(&link.slug) {
+                        entry.last_known_build_id = remote_build_id;
+                        entry.last_refreshed_at = Some(Instant::now());
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    slug = %link.slug,
+                    error = %e,
+                    "pinned_refresh_tick: failed to pull remote pyramid"
+                );
+            }
+        }
     }
 }
