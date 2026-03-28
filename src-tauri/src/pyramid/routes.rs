@@ -487,6 +487,7 @@ fn with_agent_id() -> impl Filter<Extract = (Option<String>,), Error = warp::Rej
 
 // ── Payment token header filter (WS-ONLINE-H) ──────────────────────
 
+#[allow(dead_code)] // WS-ONLINE-H: used when payment enforcement is enabled
 fn with_payment_token(
 ) -> impl Filter<Extract = (Option<String>,), Error = warp::Rejection> + Clone {
     warp::header::optional::<String>("x-payment-token")
@@ -513,6 +514,7 @@ fn with_payment_token(
 /// 1. Require valid payment token for all priced pyramid queries
 /// 2. After query execution, call POST /api/v1/wire/payment-redeem with the token
 /// 3. On redeem failure, store in pyramid_unredeemed_tokens for retry
+#[allow(dead_code)] // WS-ONLINE-H: used when payment enforcement is enabled
 async fn validate_payment_token(
     payment_token_header: &Option<String>,
     auth_source: &AuthSource,
@@ -651,8 +653,7 @@ struct RemotePaymentRequired {
 pub fn pyramid_routes(
     state: Arc<PyramidState>,
     jwt_public_key: Arc<tokio::sync::RwLock<String>>,
-    /// Node operator ID for cost preview responses (WS-ONLINE-H).
-    /// This is the node's identity on the Wire — used as `serving_node_id`.
+    // WS-ONLINE-H: node operator ID for cost preview responses (serving_node_id)
     node_id: Arc<tokio::sync::RwLock<String>>,
 ) -> warp::filters::BoxedFilter<(warp::reply::Response,)> {
     let prefix = warp::path("pyramid");
@@ -5355,10 +5356,11 @@ async fn handle_remote_query(
         }
     }
 
-    // Get Wire JWT for authenticating with the remote node
+    // Get Wire auth token for authenticating with the remote node.
+    // The auth_token serves as the Wire JWT for remote pyramid queries.
     let wire_jwt = {
         let config = state.config.read().await;
-        config.wire_jwt.clone().unwrap_or_default()
+        config.auth_token.clone()
     };
     let wire_server_url = std::env::var("WIRE_URL")
         .unwrap_or_else(|_| "https://api.callmeplayful.com".to_string());
@@ -5380,10 +5382,12 @@ async fn handle_remote_query(
     // Step 1: Check cost (for priced pyramids)
     // For now, attempt the query directly. If the remote node returns 402,
     // we propagate it back. Full payment-intent flow depends on WS-ONLINE-H.
-    let has_payment_confirmation = confirm_payment
+    let _has_payment_confirmation = confirm_payment
         .as_ref()
         .map(|v| v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
+    // TODO(WS-ONLINE-H): When payment-intent flow lands, use _has_payment_confirmation
+    // to decide whether to call payment-intent or return 402 for priced pyramids.
 
     // Step 2: Forward the query based on action type
     let result: Result<serde_json::Value, String> = match body.action.as_str() {
@@ -5414,7 +5418,7 @@ async fn handle_remote_query(
                     "params.q required for search action",
                 ));
             }
-            match client.remote_search(&body.slug, &q, Some(20)).await {
+            match client.remote_search(&body.slug, &q).await {
                 Ok(resp) => serde_json::to_value(&resp).map_err(|e| e.to_string()),
                 Err(e) => Err(e.to_string()),
             }

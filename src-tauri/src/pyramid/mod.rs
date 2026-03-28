@@ -115,6 +115,13 @@ pub struct PyramidConfig {
     /// matching the original hardcoded values, so existing configs are backward compatible.
     #[serde(default)]
     pub operational: OperationalConfig,
+    /// WS-ONLINE-G: Absorption rate limiting for absorb-all mode.
+    /// Max builds per hour per external operator (default: 3).
+    #[serde(default = "default_absorption_rate_limit")]
+    pub absorption_rate_limit_per_operator: u32,
+    /// WS-ONLINE-G: Daily spend cap for absorb-all builds in credits (default: 100).
+    #[serde(default = "default_absorption_daily_cap")]
+    pub absorption_daily_spend_cap: u64,
 }
 
 fn default_primary_model() -> String {
@@ -131,6 +138,12 @@ fn default_partner_model() -> String {
 }
 fn default_collapse_model() -> String {
     "x-ai/grok-4.20-beta".into()
+}
+fn default_absorption_rate_limit() -> u32 {
+    3
+}
+fn default_absorption_daily_cap() -> u64 {
+    100
 }
 
 // ── Operational Config (Tiered) ─────────────────────────────────────────────
@@ -341,6 +354,8 @@ impl Default for PyramidConfig {
             use_chain_engine: false,
             use_ir_executor: false,
             operational: OperationalConfig::default(),
+            absorption_rate_limit_per_operator: default_absorption_rate_limit(),
+            absorption_daily_spend_cap: default_absorption_daily_cap(),
         }
     }
 }
@@ -429,6 +444,12 @@ pub struct PyramidState {
     /// Maps operator_id → (query_count, window_start).
     /// 100 queries per minute per operator.
     pub remote_query_rate_limiter: Arc<Mutex<HashMap<String, (u64, std::time::Instant)>>>,
+    /// WS-ONLINE-G: Rate limiter for absorb-all builds.
+    /// Maps operator_id → (build_count, window_start) — builds per hour per operator.
+    pub absorption_build_rate_limiter: Arc<Mutex<HashMap<String, (u32, std::time::Instant)>>>,
+    /// WS-ONLINE-G: Daily absorption spend tracker.
+    /// (total_credits_spent_today, day_start_instant).
+    pub absorption_daily_spend: Arc<Mutex<(u64, std::time::Instant)>>,
 }
 
 /// Handle to a running pyramid build.

@@ -4358,6 +4358,8 @@ async fn pyramid_vine_build(
         operational: state.pyramid.operational.clone(),
         chains_dir: state.pyramid.chains_dir.clone(),
         remote_query_rate_limiter: state.pyramid.remote_query_rate_limiter.clone(),
+        absorption_build_rate_limiter: state.pyramid.absorption_build_rate_limiter.clone(),
+        absorption_daily_spend: state.pyramid.absorption_daily_spend.clone(),
     });
 
     let slug_for_task = vine_slug_clean.clone();
@@ -4537,6 +4539,8 @@ async fn pyramid_vine_integrity(
         operational: state.pyramid.operational.clone(),
         chains_dir: state.pyramid.chains_dir.clone(),
         remote_query_rate_limiter: state.pyramid.remote_query_rate_limiter.clone(),
+        absorption_build_rate_limiter: state.pyramid.absorption_build_rate_limiter.clone(),
+        absorption_daily_spend: state.pyramid.absorption_daily_spend.clone(),
     });
 
     let summary = vine::run_integrity_check(&pyramid_state, &slug)
@@ -4580,6 +4584,8 @@ async fn pyramid_vine_rebuild_upper(
         operational: state.pyramid.operational.clone(),
         chains_dir: state.pyramid.chains_dir.clone(),
         remote_query_rate_limiter: state.pyramid.remote_query_rate_limiter.clone(),
+        absorption_build_rate_limiter: state.pyramid.absorption_build_rate_limiter.clone(),
+        absorption_daily_spend: state.pyramid.absorption_daily_spend.clone(),
     });
 
     let cancel = tokio_util::sync::CancellationToken::new();
@@ -5187,6 +5193,8 @@ fn main() {
         operational: Arc::new(pyramid_config.operational.clone()),
         chains_dir: chains_dir.clone(),
         remote_query_rate_limiter: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        absorption_build_rate_limiter: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        absorption_daily_spend: Arc::new(tokio::sync::Mutex::new((0u64, std::time::Instant::now()))),
     });
 
     // Load persisted event subscriptions into the in-memory event bus

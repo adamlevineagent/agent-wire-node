@@ -10091,6 +10091,9 @@ mod tests {
             event_bus: Arc::new(crate::pyramid::event_chain::LocalEventBus::new()),
             operational: Arc::new(crate::pyramid::OperationalConfig::default()),
             chains_dir: std::path::PathBuf::from("chains"),
+            remote_query_rate_limiter: Arc::new(Mutex::new(HashMap::new())),
+            absorption_build_rate_limiter: Arc::new(Mutex::new(HashMap::new())),
+            absorption_daily_spend: Arc::new(Mutex::new((0u64, std::time::Instant::now()))),
         };
 
         let chain = make_integration_code_chain();
@@ -10159,6 +10162,9 @@ mod tests {
             event_bus: Arc::new(crate::pyramid::event_chain::LocalEventBus::new()),
             operational: Arc::new(crate::pyramid::OperationalConfig::default()),
             chains_dir: std::path::PathBuf::from("chains"),
+            remote_query_rate_limiter: Arc::new(Mutex::new(HashMap::new())),
+            absorption_build_rate_limiter: Arc::new(Mutex::new(HashMap::new())),
+            absorption_daily_spend: Arc::new(Mutex::new((0u64, std::time::Instant::now()))),
         };
 
         let chain = make_integration_code_chain();
@@ -10247,6 +10253,9 @@ mod tests {
             event_bus: Arc::new(crate::pyramid::event_chain::LocalEventBus::new()),
             operational: Arc::new(crate::pyramid::OperationalConfig::default()),
             chains_dir: std::path::PathBuf::from("chains"),
+            remote_query_rate_limiter: Arc::new(Mutex::new(HashMap::new())),
+            absorption_build_rate_limiter: Arc::new(Mutex::new(HashMap::new())),
+            absorption_daily_spend: Arc::new(Mutex::new((0u64, std::time::Instant::now()))),
         };
 
         assert!(!pyramid_state
@@ -10299,6 +10308,9 @@ mod tests {
             event_bus: Arc::new(crate::pyramid::event_chain::LocalEventBus::new()),
             operational: Arc::new(crate::pyramid::OperationalConfig::default()),
             chains_dir: std::path::PathBuf::from("chains"),
+            remote_query_rate_limiter: Arc::new(Mutex::new(HashMap::new())),
+            absorption_build_rate_limiter: Arc::new(Mutex::new(HashMap::new())),
+            absorption_daily_spend: Arc::new(Mutex::new((0u64, std::time::Instant::now()))),
         };
 
         let chain = make_integration_code_chain();

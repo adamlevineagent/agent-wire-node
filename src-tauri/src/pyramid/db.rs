@@ -4338,6 +4338,48 @@ pub fn get_slug_online_fields(
     }
 }
 
+/// Read the absorption mode and chain ID for a slug (WS-ONLINE-G).
+///
+/// Returns `(mode, chain_id)` where mode is one of "open", "absorb-all",
+/// "absorb-selective". Defaults to ("open", None) if the slug doesn't exist.
+pub fn get_absorption_mode(
+    conn: &Connection,
+    slug: &str,
+) -> Result<(String, Option<String>)> {
+    let result = conn.query_row(
+        "SELECT absorption_mode, absorption_chain_id FROM pyramid_slugs WHERE slug = ?1",
+        rusqlite::params![slug],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+            ))
+        },
+    );
+    match result {
+        Ok(val) => Ok(val),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(("open".to_string(), None)),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Set the absorption mode for a slug (WS-ONLINE-G).
+///
+/// - `mode`: one of "open", "absorb-all", "absorb-selective"
+/// - `chain_id`: required for absorb-selective (the action chain that evaluates incoming webs)
+pub fn set_absorption_mode(
+    conn: &Connection,
+    slug: &str,
+    mode: &str,
+    chain_id: Option<&str>,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE pyramid_slugs SET absorption_mode = ?1, absorption_chain_id = ?2 WHERE slug = ?3",
+        rusqlite::params![mode, chain_id, slug],
+    )?;
+    Ok(())
+}
+
 /// Read the access tier config for a slug: (tier, price, allowed_circles JSON).
 ///
 /// Returns the access_tier string, optional access_price override, and the
@@ -5025,7 +5067,7 @@ pub fn get_all_nodes_for_export(conn: &Connection, slug: &str) -> Result<Vec<Pyr
 // ── WS-ONLINE-H: Unredeemed token CRUD ──────────────────────────────────────
 
 /// An unredeemed payment token awaiting retry (WS-ONLINE-H).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct UnredeemedToken {
     pub id: i64,
     pub nonce: String,
