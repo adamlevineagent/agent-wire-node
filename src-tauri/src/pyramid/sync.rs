@@ -284,7 +284,7 @@ pub async fn pyramid_sync_tick(
         let (wire_url, wire_auth) = {
             let config = pyramid_state.config.read().await;
             let url = std::env::var("WIRE_URL")
-                .unwrap_or_else(|_| "https://api.callmeplayful.com".to_string());
+                .unwrap_or_else(|_| "https://newsbleach.com".to_string());
             let auth = config.auth_token.clone();
             (url, auth)
         };
@@ -471,7 +471,7 @@ pub async fn pinned_pyramid_refresh_tick(
     }
 
     let wire_server_url = std::env::var("WIRE_URL")
-        .unwrap_or_else(|_| "https://api.callmeplayful.com".to_string());
+        .unwrap_or_else(|_| "https://newsbleach.com".to_string());
 
     for link in &pinned_links {
         let client = RemotePyramidClient::new(

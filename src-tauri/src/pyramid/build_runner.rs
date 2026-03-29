@@ -352,7 +352,7 @@ async fn resolve_remote_web_edges(
     drop(config);
 
     let wire_server_url = std::env::var("WIRE_URL")
-        .unwrap_or_else(|_| "https://api.callmeplayful.com".to_string());
+        .unwrap_or_else(|_| "https://newsbleach.com".to_string());
 
     // Group edges by remote tunnel URL to reuse clients
     let mut clients: HashMap<String, RemotePyramidClient> = HashMap::new();

@@ -170,7 +170,7 @@ impl ImportCache {
 
 /// HTTP client for fetching chain definitions from the Wire marketplace.
 pub struct WireImportClient {
-    /// Wire API base URL (e.g., "https://api.callmeplayful.com")
+    /// Wire API base URL (e.g., "https://newsbleach.com")
     pub wire_url: String,
     /// Agent's Wire auth token
     pub auth_token: String,

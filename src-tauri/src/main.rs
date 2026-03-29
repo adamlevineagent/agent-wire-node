@@ -3905,16 +3905,10 @@ async fn pyramid_publish(
             .ok_or_else(|| format!("slug '{}' not found", slug))?;
     }
 
-    // Read Wire config
-    let config = state.pyramid.config.read().await;
+    // Use session api_token (gne_live_...) for Wire auth, not local HTTP auth_token
     let wire_url =
-        std::env::var("WIRE_URL").unwrap_or_else(|_| "https://api.callmeplayful.com".to_string());
-    let wire_auth = config.auth_token.clone();
-    drop(config);
-
-    if wire_auth.is_empty() {
-        return Err("auth_token not configured".to_string());
-    }
+        std::env::var("WIRE_URL").unwrap_or_else(|_| "https://newsbleach.com".to_string());
+    let wire_auth = get_api_token(&state.auth).await?;
 
     let publisher = wire_publish::PyramidPublisher::new(wire_url, wire_auth);
 
@@ -4032,16 +4026,10 @@ async fn pyramid_publish_question_set(
         serde_yaml::from_str(&qs_yaml)
             .map_err(|e| format!("failed to parse question set YAML: {}", e))?;
 
-    // Read Wire config
-    let config = state.pyramid.config.read().await;
+    // Use session api_token (gne_live_...) for Wire auth, not local HTTP auth_token
     let wire_url =
-        std::env::var("WIRE_URL").unwrap_or_else(|_| "https://api.callmeplayful.com".to_string());
-    let wire_auth = config.auth_token.clone();
-    drop(config);
-
-    if wire_auth.is_empty() {
-        return Err("auth_token not configured".to_string());
-    }
+        std::env::var("WIRE_URL").unwrap_or_else(|_| "https://newsbleach.com".to_string());
+    let wire_auth = get_api_token(&state.auth).await?;
 
     let publisher = wire_publish::PyramidPublisher::new(wire_url, wire_auth);
     let desc = description.unwrap_or_else(|| {
@@ -4146,16 +4134,10 @@ async fn pyramid_chain_import(
         return Err("contribution_id is required".to_string());
     }
 
-    // Read Wire config from pyramid config
-    let config = state.pyramid.config.read().await;
+    // Use session api_token for Wire auth
     let wire_url =
-        std::env::var("WIRE_URL").unwrap_or_else(|_| "https://api.callmeplayful.com".to_string());
-    let wire_auth = config.auth_token.clone();
-    drop(config);
-
-    if wire_auth.is_empty() {
-        return Err("auth_token not configured".to_string());
-    }
+        std::env::var("WIRE_URL").unwrap_or_else(|_| "https://newsbleach.com".to_string());
+    let wire_auth = get_api_token(&state.auth).await?;
 
     let client = wire_import::WireImportClient::new(wire_url, wire_auth, None);
 
@@ -4220,17 +4202,11 @@ async fn pyramid_pin_remote(
         return Err("slug is required".to_string());
     }
 
-    // Get Wire auth token for authenticating with the remote node
-    let config = state.pyramid.config.read().await;
-    let wire_auth = config.auth_token.clone();
-    drop(config);
-
-    if wire_auth.is_empty() {
-        return Err("auth_token not configured".to_string());
-    }
+    // Use session api_token for Wire auth
+    let wire_auth = get_api_token(&state.auth).await?;
 
     let wire_server_url =
-        std::env::var("WIRE_URL").unwrap_or_else(|_| "https://api.callmeplayful.com".to_string());
+        std::env::var("WIRE_URL").unwrap_or_else(|_| "https://newsbleach.com".to_string());
 
     // Pull remote pyramid export
     let client = RemotePyramidClient::new(tunnel_url.clone(), wire_auth, wire_server_url);

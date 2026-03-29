@@ -4694,7 +4694,7 @@ async fn handle_chain_import(
     // Read Wire config from pyramid config
     let config = state.config.read().await;
     let wire_url =
-        std::env::var("WIRE_URL").unwrap_or_else(|_| "https://api.callmeplayful.com".to_string());
+        std::env::var("WIRE_URL").unwrap_or_else(|_| "https://newsbleach.com".to_string());
     let wire_auth = config.auth_token.clone();
     drop(config);
 
@@ -4808,7 +4808,7 @@ async fn handle_publish_pyramid(
     // Read Wire config
     let config = state.config.read().await;
     let wire_url =
-        std::env::var("WIRE_URL").unwrap_or_else(|_| "https://api.callmeplayful.com".to_string());
+        std::env::var("WIRE_URL").unwrap_or_else(|_| "https://newsbleach.com".to_string());
     let wire_auth = config.auth_token.clone();
     drop(config);
 
@@ -5044,7 +5044,7 @@ async fn handle_publish_question_set(
     // Read Wire config
     let config = state.config.read().await;
     let wire_url =
-        std::env::var("WIRE_URL").unwrap_or_else(|_| "https://api.callmeplayful.com".to_string());
+        std::env::var("WIRE_URL").unwrap_or_else(|_| "https://newsbleach.com".to_string());
     let wire_auth = config.auth_token.clone();
     drop(config);
 
@@ -5388,7 +5388,7 @@ async fn handle_remote_query(
         config.auth_token.clone()
     };
     let wire_server_url = std::env::var("WIRE_URL")
-        .unwrap_or_else(|_| "https://api.callmeplayful.com".to_string());
+        .unwrap_or_else(|_| "https://newsbleach.com".to_string());
 
     if wire_jwt.is_empty() {
         return Ok(json_error(

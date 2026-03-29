@@ -79,7 +79,7 @@ pub enum WirePublishError {
 
 /// HTTP client for publishing pyramid outputs to the Wire marketplace.
 pub struct PyramidPublisher {
-    /// Wire API base URL (e.g., "https://api.callmeplayful.com")
+    /// Wire API base URL (e.g., "https://newsbleach.com")
     pub wire_url: String,
     /// Agent's Wire auth token
     pub auth_token: String,
@@ -521,18 +521,17 @@ impl PyramidPublisher {
             .map_err(|e| WirePublishError::Network(e.to_string()))
             .context("wire publish: failed to parse response JSON")?;
 
-        // The contribute endpoint returns { contribution: { id: "uuid", handle_path: "..." } }
+        // The contribute endpoint returns { id: "uuid", handle_path: "...", ... } (flat object)
+        // or legacy { contribution: { id: "uuid", handle_path: "..." } } — support both.
         let contribution = body
             .get("contribution")
-            .ok_or_else(|| {
-                WirePublishError::Rejected("response missing contribution object".to_string())
-            })?;
+            .unwrap_or(&body);
 
         let contribution_id = contribution
             .get("id")
             .and_then(|id| id.as_str())
             .ok_or_else(|| {
-                WirePublishError::Rejected("response missing contribution.id".to_string())
+                WirePublishError::Rejected(format!("response missing id field: {}", body))
             })?;
 
         let handle_path = contribution
