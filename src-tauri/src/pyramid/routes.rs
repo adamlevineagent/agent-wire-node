@@ -1896,6 +1896,8 @@ async fn handle_list_slugs(
     }
 }
 
+// Retained as reference for IPC command implementations in main.rs
+#[allow(dead_code)]
 async fn handle_create_slug(
     state: Arc<PyramidState>,
     body: CreateSlugBody,
@@ -2250,6 +2252,8 @@ async fn handle_terms(
     }
 }
 
+// Retained as reference for IPC command implementations in main.rs
+#[allow(dead_code)]
 async fn handle_build(
     slug_name: String,
     query: std::collections::HashMap<String, String>,
@@ -2479,6 +2483,8 @@ async fn handle_build_status(
     }))
 }
 
+// Retained as reference for IPC command implementations in main.rs
+#[allow(dead_code)]
 async fn handle_build_cancel(
     slug_name: String,
     state: Arc<PyramidState>,
@@ -2505,6 +2511,8 @@ async fn handle_build_cancel(
     ))
 }
 
+// Retained as reference for IPC command implementations in main.rs
+#[allow(dead_code)]
 async fn handle_ingest(
     slug_name: String,
     state: Arc<PyramidState>,
@@ -2609,6 +2617,8 @@ async fn handle_ingest(
     }
 }
 
+// Retained as reference for IPC command implementations in main.rs
+#[allow(dead_code)]
 async fn handle_config(
     state: Arc<PyramidState>,
     body: ConfigBody,
@@ -4665,6 +4675,8 @@ async fn handle_crystallize_status(
 }
 
 /// POST /pyramid/chain/import — import a chain or question set from the Wire (P4.2)
+// Retained as reference for IPC command implementations in main.rs
+#[allow(dead_code)]
 async fn handle_chain_import(
     body: ChainImportBody,
     state: Arc<PyramidState>,
@@ -5437,34 +5449,9 @@ async fn handle_remote_query(
             }
         }
         "entities" => {
-            // RemotePyramidClient doesn't have a remote_entities method yet.
-            // Use a direct HTTP call via the client's tunnel URL for now.
-            let url = format!(
-                "{}/pyramid/{}/entities",
-                body.tunnel_url.trim_end_matches('/'),
-                urlencoding::encode(&body.slug),
-            );
-            let http_client = reqwest::Client::new();
-            match http_client
-                .get(&url)
-                .header("Authorization", format!("Bearer {}", wire_jwt))
-                .timeout(std::time::Duration::from_secs(30))
-                .send()
-                .await
-            {
-                Ok(resp) => {
-                    if resp.status().is_success() {
-                        match resp.json::<serde_json::Value>().await {
-                            Ok(val) => Ok(val),
-                            Err(e) => Err(format!("Failed to parse entities response: {}", e)),
-                        }
-                    } else {
-                        let status = resp.status().as_u16();
-                        let body_text = resp.text().await.unwrap_or_default();
-                        Err(format!("Remote returned {}: {}", status, body_text))
-                    }
-                }
-                Err(e) => Err(format!("Tunnel unreachable: {}", e)),
+            match client.remote_entities(&body.slug).await {
+                Ok(resp) => serde_json::to_value(&resp).map_err(|e| e.to_string()),
+                Err(e) => Err(e.to_string()),
             }
         }
         "export" => {

@@ -959,8 +959,16 @@ pub async fn create_version(
     let client = reqwest::Client::new();
     let url = format!("{}/api/v1/wire/documents/version", api_url);
 
+    // Derive a title from source_path (filename without extension)
+    let title = std::path::Path::new(source_path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(source_path)
+        .to_string();
+
     let payload = serde_json::json!({
         "original_document_id": original_doc_id,
+        "title": title,
         "body": body,
         "source_path": source_path,
     });
