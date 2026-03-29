@@ -617,6 +617,13 @@ pub struct RemoteEntitiesResponse {
     pub entities: Vec<serde_json::Value>,
 }
 
+/// Response from a remote pyramid tree query (C2).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteTreeResponse {
+    pub slug: String,
+    pub tree: Vec<serde_json::Value>,
+}
+
 /// Response from a remote pyramid export query.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemoteExportResponse {
@@ -888,6 +895,43 @@ impl RemotePyramidClient {
         Ok(RemoteEntitiesResponse {
             slug: slug.to_string(),
             entities,
+        })
+    }
+
+    /// Get tree of a remote pyramid (C2).
+    pub async fn remote_tree(&self, slug: &str) -> Result<RemoteTreeResponse> {
+        let url = format!(
+            "{}/pyramid/{}/tree",
+            self.tunnel_url.trim_end_matches('/'),
+            slug
+        );
+
+        let response = self
+            .client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", self.wire_jwt))
+            .send()
+            .await
+            .map_err(|e| {
+                if e.is_timeout() {
+                    WireImportError::Timeout(Duration::from_secs(30))
+                } else {
+                    WireImportError::Network(e.to_string())
+                }
+            })
+            .context("remote pyramid: tree request failed")?;
+
+        self.check_response_status(&response)?;
+
+        let tree: Vec<serde_json::Value> = response
+            .json()
+            .await
+            .map_err(|e| WireImportError::InvalidResponse(e.to_string()))
+            .context("remote pyramid: failed to parse tree response")?;
+
+        Ok(RemoteTreeResponse {
+            slug: slug.to_string(),
+            tree,
         })
     }
 

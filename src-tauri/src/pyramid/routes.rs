@@ -633,7 +633,7 @@ struct RemoteQueryBody {
     tunnel_url: String,
     /// Pyramid slug to query on the remote node
     slug: String,
-    /// Action: "apex", "drill", "search", "entities", "export"
+    /// Action: "apex", "drill", "search", "entities", "export", "tree"
     action: String,
     /// Action-specific parameters (e.g., node_id for drill, q for search)
     #[serde(default)]
@@ -5343,7 +5343,7 @@ async fn handle_remote_query(
     rate_limiter: Arc<Mutex<std::collections::HashMap<String, (u64, std::time::Instant)>>>,
 ) -> Result<warp::reply::Response, warp::Rejection> {
     // Validate action
-    let valid_actions = ["apex", "drill", "search", "entities", "export"];
+    let valid_actions = ["apex", "drill", "search", "entities", "export", "tree"];
     if !valid_actions.contains(&body.action.as_str()) {
         return Ok(json_error(
             warp::http::StatusCode::BAD_REQUEST,
@@ -5457,6 +5457,12 @@ async fn handle_remote_query(
         "export" => {
             match client.remote_export(&body.slug).await {
                 Ok(resp) => serde_json::to_value(&resp).map_err(|e| e.to_string()),
+                Err(e) => Err(e.to_string()),
+            }
+        }
+        "tree" => {
+            match client.remote_tree(&body.slug).await {
+                Ok(resp) => serde_json::to_value(&resp.tree).map_err(|e| e.to_string()),
                 Err(e) => Err(e.to_string()),
             }
         }
