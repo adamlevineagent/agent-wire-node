@@ -11465,3 +11465,130 @@ body {
     display: flex;
     gap: 8px;
 }
+
+/* ── Access Tier & Absorption Config Panels ─────────────────────── */
+
+.pyramid-access-tier-toggle,
+.pyramid-absorption-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 8px;
+    background: var(--glass);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-sm);
+    color: var(--text-secondary);
+    font-size: 11px;
+    cursor: pointer;
+    transition: var(--transition);
+}
+
+.pyramid-access-tier-toggle:hover,
+.pyramid-absorption-toggle:hover {
+    background: var(--bg-card-hover);
+    color: var(--text-primary);
+    border-color: var(--accent-cyan);
+}
+
+.pyramid-access-tier-chevron,
+.pyramid-absorption-chevron {
+    font-size: 10px;
+    transition: transform var(--transition);
+}
+
+.pyramid-access-tier-panel,
+.pyramid-absorption-panel {
+    margin-top: 8px;
+    padding: 12px;
+    background: var(--glass);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-sm);
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.pyramid-access-tier-section,
+.pyramid-absorption-section {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.pyramid-access-tier-field,
+.pyramid-absorption-field {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.pyramid-access-tier-field label,
+.pyramid-absorption-field label {
+    font-size: 11px;
+    color: var(--text-secondary);
+    min-width: 80px;
+}
+
+.pyramid-access-tier-field select,
+.pyramid-access-tier-field input,
+.pyramid-absorption-field select,
+.pyramid-absorption-field input {
+    flex: 1;
+    padding: 4px 8px;
+    background: var(--bg-surface);
+    border: 1px solid var(--glass-border);
+    border-radius: 4px;
+    color: var(--text-primary);
+    font-size: 12px;
+    font-family: inherit;
+}
+
+.pyramid-access-tier-field select:focus,
+.pyramid-access-tier-field input:focus,
+.pyramid-absorption-field select:focus,
+.pyramid-absorption-field input:focus {
+    outline: none;
+    border-color: var(--accent-cyan);
+}
+
+.pyramid-emergent-price {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 11px;
+    color: var(--accent-purple);
+}
+
+.pyramid-emergent-hint {
+    font-size: 10px;
+    color: var(--text-muted);
+    font-style: italic;
+}
+
+.pyramid-pinned-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    padding: 1px 6px;
+    background: rgba(34, 211, 238, 0.12);
+    border: 1px solid rgba(34, 211, 238, 0.25);
+    border-radius: 4px;
+    font-size: 10px;
+    color: var(--accent-cyan);
+}
+
+.pyramid-unpin-btn {
+    padding: 2px 8px;
+    background: rgba(255, 107, 107, 0.1);
+    border: 1px solid rgba(255, 107, 107, 0.25);
+    border-radius: 4px;
+    font-size: 10px;
+    color: #ff6b6b;
+    cursor: pointer;
+    transition: var(--transition);
+}
+
+.pyramid-unpin-btn:hover {
+    background: rgba(255, 107, 107, 0.2);
+    border-color: #ff6b6b;
+}
