@@ -672,6 +672,7 @@ pub async fn start_server(
         state.pyramid.clone(),
         state.jwt_public_key.clone(),
         state.node_id.clone(), // WS-ONLINE-H: serving_node_id for cost preview
+        state.auth.clone(),    // Sprint 3: wire agent token for remote query proxy
     );
 
     // Partner (Dennis) routes
@@ -886,7 +887,7 @@ fn verify_jwt(token: &str, public_key_pem: &str) -> Result<DocumentClaims, Strin
 ///   access_amount → UFF-routed access price (0 for public pyramids)
 ///   total_amount → stamp + access
 ///   nonce → single-use UUID (prevents replay)
-///   exp → expiration (60s TTL)
+///   exp → expiration (600s TTL)
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PaymentTokenClaims {
     /// Audience — must be "payment"

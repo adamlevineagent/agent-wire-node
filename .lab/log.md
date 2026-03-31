@@ -51,8 +51,17 @@ STATUS: Not yet addressed. Need to verify whether the chain executor actually ha
 ### Changes Made
 1. ✅ Backed up all templates to `.lab/baseline-templates/`
 2. ✅ Updated `chains/prompts/code/code_recluster.md` — dynamic target counts
-3. ✅ Updated `chains/prompts/document/doc_recluster.md` — dynamic target counts  
+3. ✅ Updated `chains/prompts/document/doc_recluster.md` — dynamic target counts
 4. ✅ Updated `chains/prompts/conversation/conv_recluster.md` — dynamic target counts
 5. ✅ Added convergence safety net in `chain_executor.rs` execute_recursive_cluster
 6. ✅ Added `compact_child_payload()` in `build.rs` + used in `dispatch_group()`
-7. ✅ `cargo check` passes
+7. ✅ `cargo check` passes (all changes)
+8. ✅ Implemented `zip_steps` in `enrich_for_each_step_input` (chain_executor.rs)
+   - Supports plain string form: `- forward_pass`
+   - Supports object form: `- step: reverse_pass\n  reverse: true`
+   - `reverse: true` flips index so reversed-chunk steps pair correctly
+   - Directive key removed from resolved_input before LLM dispatch
+9. ✅ Updated `conversation.yaml` — removed dead `user_template`, fixed `reverse_pass` zip entry
+10. ✅ Updated `combine.md` — references `forward_pass_output` / `reverse_pass_output` field names
+11. ✅ Written `.lab/chain-system-reference.md` — durable architecture documentation
+

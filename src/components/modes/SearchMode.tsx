@@ -5,7 +5,7 @@ import { EntityBrowser } from '../search/EntityBrowser';
 
 // --- Types ---
 
-type SearchTab = 'feed' | 'results' | 'entities' | 'topics';
+type SearchTab = 'feed' | 'results' | 'entities' | 'topics' | 'pyramids';
 type FeedMode = 'new' | 'popular' | 'trending';
 type SortOrder = 'relevance' | 'newest' | 'oldest' | 'price_asc' | 'price_desc' | 'significance';
 
@@ -753,6 +753,12 @@ export function SearchMode() {
                 >
                     Topics
                 </button>
+                <button
+                    className={`search-tab ${activeTab === 'pyramids' ? 'search-tab-active' : ''}`}
+                    onClick={() => setActiveTab('pyramids')}
+                >
+                    Pyramids
+                </button>
             </div>
 
             {/* Tab content */}
@@ -876,6 +882,25 @@ export function SearchMode() {
                                 )}
                             </div>
                         )}
+                    </div>
+                )}
+
+                {/* Pyramids tab — discover published pyramids on the Wire */}
+                {activeTab === 'pyramids' && (
+                    <div className="search-pyramids">
+                        <p style={{ color: 'var(--text-secondary)', fontSize: '14px', marginBottom: '16px' }}>
+                            Discover knowledge pyramids published by other operators on the Wire.
+                            Query costs: 1 credit stamp + access price (if set).
+                        </p>
+                        <div style={{ padding: '24px', textAlign: 'center', color: 'var(--text-tertiary)' }}>
+                            <p>Pyramid discovery will search the Wire for published pyramid metadata.</p>
+                            <p style={{ fontSize: '13px', marginTop: '8px' }}>
+                                Use the search bar above with the Pyramids tab selected to find pyramids by topic.
+                            </p>
+                            <p style={{ fontSize: '12px', marginTop: '16px', color: 'var(--text-tertiary)' }}>
+                                Coming: browsable pyramid catalog with access tiers, pricing, and one-click remote query.
+                            </p>
+                        </div>
                     </div>
                 )}
             </div>

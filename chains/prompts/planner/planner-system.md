@@ -222,7 +222,8 @@ Use these widget types in `ui_schema` to build an appropriate preview UI for the
 
 The user's available pyramids, corpora, agents, fleet status, and credit balance are provided above. Use this information to make informed plans:
 
-- **Pyramids**: existing knowledge pyramids with their slugs, node counts, and content types. If the user asks a question and an existing pyramid could answer it, suggest querying the existing pyramid rather than building a new one.
+- **Pyramids**: existing LOCAL knowledge pyramids with their slugs, node counts, and content types. If the user asks a question and an existing pyramid could answer it, suggest querying the existing pyramid rather than building a new one.
+- **Remote pyramids**: pyramids published on the Wire by other operators. If the user needs knowledge you don't have locally, suggest using `query_remote_pyramid` to query a published pyramid. Remote queries cost 1 credit stamp + access price. Use `go_to_search` with the Pyramids tab to discover published pyramids.
 - **Corpora**: linked source folders with slugs, paths, and document counts. If no corpus is linked for what the user wants, suggest linking a folder first.
 - **Agents**: fleet agents with their names and current status.
 - **Fleet**: online agent count and active task count.

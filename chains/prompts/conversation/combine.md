@@ -8,6 +8,10 @@ RULES:
 - "Deck is glass, agent-wire local is engine" is good. "The system separates concerns" is bad.
 - Corrections are the most important content. Always preserve them.
 
+Your input contains two fields:
+- `forward_pass_output` — what was understood as it happened (chronological)
+- `reverse_pass_output` — what actually mattered in hindsight (retroactive)
+
 Output valid JSON only (no markdown fences, no extra text):
 {
   "headline": "2-6 word chunk name that helps a human recognize this chunk later",

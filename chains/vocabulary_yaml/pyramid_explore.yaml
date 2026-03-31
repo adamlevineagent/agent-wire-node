@@ -179,3 +179,29 @@ commands:
         description: "The FAQ category identifier"
     dispatch:
       type: tauri
+
+  - name: query_remote_pyramid
+    description: "Query a knowledge pyramid hosted on another operator's node through the Wire network."
+    params:
+      - name: tunnel_url
+        type: string
+        required: true
+        description: "Tunnel URL of the remote node (from Wire search discovery)"
+      - name: slug
+        type: string
+        required: true
+        description: "Pyramid slug to query"
+      - name: action
+        type: string
+        required: true
+        description: "Query action: apex, drill, search, entities, tree"
+      - name: node_id
+        type: string
+        required: false
+        description: "Node ID for drill action"
+      - name: q
+        type: string
+        required: false
+        description: "Search query for search action"
+    dispatch:
+      type: tauri

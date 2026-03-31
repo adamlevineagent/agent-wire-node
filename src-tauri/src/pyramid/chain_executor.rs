@@ -1839,7 +1839,86 @@ async fn enrich_for_each_step_input(
     ctx: &ChainContext,
     reader: &Arc<Mutex<Connection>>,
 ) -> Result<Value> {
-    // 11-E: Declarative enrichment check with backward compat fallback
+    // ── zip_steps: per-iteration parallel step output injection ──────────
+    // Declared in step.input as a list of step names (or {step, reverse} objects):
+    //
+    //   zip_steps:
+    //     - forward_pass              ← simple string: forward index
+    //     - step: reverse_pass        ← object form: supports reverse: true
+    //       reverse: true             ← flip index: arr[total-1-i] for reversed steps
+    //
+    // For each entry, injects step_outputs[step_name][computed_index] as
+    // `{step_name}_output` (JSON) and `{step_name}_output_pretty` (string).
+    // The `zip_steps` directive key is removed from the payload before dispatch.
+    //
+    // Why reverse: reverse_pass runs over $chunks_reversed, so
+    //   reverse_pass[0] = analysis of the LAST chunk.
+    //   To pair combine_l0[i] with the correct reverse analysis:
+    //   use arr[total_len - 1 - i].
+    struct ZipEntry {
+        step_name: String,
+        reverse: bool,
+    }
+    let zip_entries: Vec<ZipEntry> = step
+        .input
+        .as_ref()
+        .and_then(|i| i.get("zip_steps"))
+        .and_then(|z| z.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| {
+                    if let Some(name) = v.as_str() {
+                        Some(ZipEntry { step_name: name.to_string(), reverse: false })
+                    } else if let Some(obj) = v.as_object() {
+                        let name = obj.get("step").and_then(|s| s.as_str())?;
+                        let reverse = obj.get("reverse").and_then(|r| r.as_bool()).unwrap_or(false);
+                        Some(ZipEntry { step_name: name.to_string(), reverse })
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if !zip_entries.is_empty() {
+        let index = ctx.current_index.unwrap_or(0);
+        if let Some(obj) = resolved_input.as_object_mut() {
+            // Remove the directive key so the LLM doesn't see it
+            obj.remove("zip_steps");
+
+            for entry in &zip_entries {
+                let item_output = ctx
+                    .step_outputs
+                    .get(&entry.step_name)
+                    .map(|out| {
+                        if let Some(arr) = out.as_array() {
+                            let resolved_idx = if entry.reverse {
+                                arr.len().saturating_sub(1 + index)
+                            } else {
+                                index
+                            };
+                            arr.get(resolved_idx).cloned().unwrap_or(Value::Null)
+                        } else {
+                            out.clone()
+                        }
+                    })
+                    .unwrap_or(Value::Null);
+
+                let pretty = serde_json::to_string_pretty(&item_output)
+                    .unwrap_or_else(|_| item_output.to_string());
+
+                obj.insert(format!("{}_output", entry.step_name), item_output);
+                obj.insert(
+                    format!("{}_output_pretty", entry.step_name),
+                    Value::String(pretty),
+                );
+            }
+        }
+    }
+
+
+    // ── 11-E: Declarative enrichment check with backward compat fallback ─
     let has_enrichment = |name: &str| {
         step.enrichments.contains(&name.to_string())
             || step.name == "thread_narrative" && name == "cross_thread_connections"
@@ -1855,6 +1934,7 @@ async fn enrich_for_each_step_input(
 
     Ok(resolved_input)
 }
+
 
 async fn enrich_group_extra_input(
     step: &ChainStep,

@@ -661,6 +661,8 @@ pub fn pyramid_routes(
     jwt_public_key: Arc<tokio::sync::RwLock<String>>,
     // WS-ONLINE-H: node operator ID for cost preview responses (serving_node_id)
     node_id: Arc<tokio::sync::RwLock<String>>,
+    // Sprint 3: auth state for Wire agent API token (used by remote query proxy)
+    wire_auth: Arc<tokio::sync::RwLock<crate::auth::AuthState>>,
 ) -> warp::filters::BoxedFilter<(warp::reply::Response,)> {
     let prefix = warp::path("pyramid");
 
@@ -1782,6 +1784,7 @@ pub fn pyramid_routes(
         Arc::new(Mutex::new(std::collections::HashMap::new()));
     let remote_query_rl_clone = remote_query_rl.clone();
     let remote_query_state = state.clone();
+    let wire_auth_for_rq = wire_auth.clone();
     let remote_query_route = route!(prefix
         .and(warp::path("remote-query"))
         .and(warp::path::end())
@@ -1791,6 +1794,7 @@ pub fn pyramid_routes(
         .and(warp::body::json::<RemoteQueryBody>())
         .and(warp::header::optional::<String>("x-confirm-payment"))
         .and(warp::any().map(move || remote_query_rl_clone.clone()))
+        .and(warp::any().map(move || wire_auth_for_rq.clone()))
         .and_then(handle_remote_query));
 
     // Combine routes. Box in groups to keep the nested Either type manageable.
@@ -5382,6 +5386,7 @@ async fn handle_remote_query(
     body: RemoteQueryBody,
     confirm_payment: Option<String>,
     rate_limiter: Arc<Mutex<std::collections::HashMap<String, (u64, std::time::Instant)>>>,
+    wire_auth: Arc<tokio::sync::RwLock<crate::auth::AuthState>>,
 ) -> Result<warp::reply::Response, warp::Rejection> {
     // Validate action
     let valid_actions = ["apex", "drill", "search", "entities", "export", "tree"];
@@ -5425,38 +5430,82 @@ async fn handle_remote_query(
         }
     }
 
-    // Get Wire auth token for authenticating with the remote node.
-    // The auth_token serves as the Wire JWT for remote pyramid queries.
-    let wire_jwt = {
-        let config = state.config.read().await;
-        config.auth_token.clone()
+    // Get the Wire agent API token from auth state for calling Wire server endpoints
+    let api_token = {
+        let auth = wire_auth.read().await;
+        auth.api_token.clone().unwrap_or_default()
     };
-    let wire_server_url =
-        std::env::var("WIRE_URL").unwrap_or_else(|_| "https://newsbleach.com".to_string());
+    let wire_server_url = std::env::var("WIRE_URL")
+        .unwrap_or_else(|_| "https://newsbleach.com".to_string());
 
-    if wire_jwt.is_empty() {
+    if api_token.is_empty() {
         return Ok(json_error(
             warp::http::StatusCode::UNAUTHORIZED,
-            "Wire JWT not configured on this node. Complete Wire authentication in the desktop app first.",
+            "Wire agent not registered. Complete Wire authentication in the desktop app first.",
         ));
     }
 
-    // Build the RemotePyramidClient
+    // Step 1: Acquire a real Wire JWT from the pyramid-query-token endpoint
+    let http_client = reqwest::Client::new();
+    let token_resp = http_client
+        .post(format!("{}/api/v1/wire/pyramid-query-token", wire_server_url))
+        .header("Authorization", format!("Bearer {}", api_token))
+        .json(&serde_json::json!({
+            "slug": body.slug,
+            "query_type": body.action,
+        }))
+        .send()
+        .await;
+
+    let wire_jwt = match token_resp {
+        Ok(resp) if resp.status().is_success() => {
+            let json: serde_json::Value = resp.json().await.unwrap_or_default();
+            json["token"].as_str().unwrap_or_default().to_string()
+        }
+        Ok(resp) => {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            tracing::warn!(
+                status = %status, body = %text,
+                "Failed to acquire pyramid-query-token"
+            );
+            return Ok(json_error(
+                warp::http::StatusCode::from_u16(status.as_u16())
+                    .unwrap_or(warp::http::StatusCode::BAD_GATEWAY),
+                &format!("Failed to acquire query token: {}", text),
+            ));
+        }
+        Err(e) => {
+            return Ok(json_error(
+                warp::http::StatusCode::BAD_GATEWAY,
+                &format!("Wire server unreachable for query token: {}", e),
+            ));
+        }
+    };
+
+    if wire_jwt.is_empty() {
+        return Ok(json_error(
+            warp::http::StatusCode::BAD_GATEWAY,
+            "Wire server returned empty query token",
+        ));
+    }
+
+    // Build the RemotePyramidClient with the real Wire JWT
     let client = wire_import::RemotePyramidClient::new(
         body.tunnel_url.clone(),
         wire_jwt.clone(),
         wire_server_url.clone(),
     );
 
-    // Step 1: Check cost (for priced pyramids)
-    // For now, attempt the query directly. If the remote node returns 402,
-    // we propagate it back. Full payment-intent flow depends on WS-ONLINE-H.
+    // Step 2: Payment flow
+    // TODO(Pillar-9): Stamp p2p payments may not use UFF — needs design clarity.
+    // TODO(Pillar-23): Cost estimation needs local/wire unification before enforcement.
     let _has_payment_confirmation = confirm_payment
         .as_ref()
         .map(|v| v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
-    // TODO(WS-ONLINE-H): When payment-intent flow lands, use _has_payment_confirmation
-    // to decide whether to call payment-intent or return 402 for priced pyramids.
+    // Payment enforcement will be activated when the server-side handoff items
+    // (payment-redeem call, retry queue) are built. See docs/handoffs/sprint-3-server-fixes.md
 
     // Step 2: Forward the query based on action type
     let result: Result<serde_json::Value, String> = match body.action.as_str() {

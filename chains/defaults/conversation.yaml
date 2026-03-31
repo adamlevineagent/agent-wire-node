@@ -79,10 +79,10 @@ steps:
     instruction: "$prompts/conversation/combine.md"
     for_each: $chunks
     input:
-      user_template: "## FORWARD (STONE)\n{forward_output_pretty}\n\n## REVERSE (WATER)\n{reverse_output_pretty}\n\nCombine into L0."
       zip_steps:
         - forward_pass
-        - reverse_pass
+        - step: reverse_pass
+          reverse: true
     save_as: node
     node_id_pattern: "L0-{index:03}"
     depth: 0

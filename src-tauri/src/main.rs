@@ -4809,6 +4809,48 @@ async fn pyramid_chain_import(
     }
 }
 
+/// WS-ONLINE-D: Query a remote pyramid via the local HTTP pyramid API.
+#[tauri::command]
+async fn pyramid_remote_query(
+    state: tauri::State<'_, SharedState>,
+    tunnel_url: String,
+    slug: String,
+    action: String,
+    params: Option<std::collections::HashMap<String, String>>,
+) -> Result<serde_json::Value, String> {
+    let auth_token = {
+        let config = state.pyramid.config.read().await;
+        config.auth_token.clone()
+    };
+
+    let client = reqwest::Client::new();
+    let mut body = serde_json::json!({
+        "tunnel_url": tunnel_url,
+        "slug": slug,
+        "action": action,
+    });
+    if let Some(p) = params {
+        body["params"] = serde_json::to_value(p).unwrap_or_default();
+    }
+
+    let resp = client
+        .post("http://localhost:8765/pyramid/remote-query")
+        .header("Authorization", format!("Bearer {}", auth_token))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("Remote query failed: {}", e))?;
+
+    let status = resp.status();
+    let result: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+
+    if !status.is_success() {
+        return Err(format!("Remote query returned {}: {}", status.as_u16(), result));
+    }
+
+    Ok(result)
+}
+
 /// WS-ONLINE-D: Pin a remote pyramid — pulls full export and stores locally.
 #[tauri::command]
 async fn pyramid_pin_remote(
@@ -6817,7 +6859,8 @@ fn main() {
             pyramid_publish_question_set,
             pyramid_check_staleness,
             pyramid_chain_import,
-            // WS-ONLINE-D: Pinning commands
+            // WS-ONLINE-D: Remote pyramid commands
+            pyramid_remote_query,
             pyramid_pin_remote,
             pyramid_unpin,
             partner_send_message,
