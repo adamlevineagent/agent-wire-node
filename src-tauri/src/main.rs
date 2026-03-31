@@ -7,6 +7,8 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod vocabulary;
+
 use tauri_plugin_deep_link::DeepLinkExt;
 use tauri_plugin_updater::UpdaterExt;
 
@@ -93,6 +95,8 @@ async fn verify_magic_link(
     cr.first_started_at = first_started;
 
     save_session(&config, &auth_write);
+    drop(auth_write);
+    drop(cr);
 
     // Start Cloudflare Tunnel in background
     if let Some(ref nid) = node_id {
@@ -162,6 +166,8 @@ async fn verify_otp(
     cr.first_started_at = first_started;
 
     save_session(&config, &auth_write);
+    drop(auth_write);
+    drop(cr);
 
     // Start Cloudflare Tunnel in background
     if let Some(ref nid) = node_id {
@@ -231,6 +237,8 @@ async fn login(
     cr.first_started_at = first_started;
 
     save_session(&config, &auth_write);
+    drop(auth_write);
+    drop(cr);
 
     // Start Cloudflare Tunnel in background
     if let Some(ref nid) = node_id {
@@ -297,7 +305,55 @@ async fn get_operator_session(
     Ok(body)
 }
 
-/// Make an authenticated API call using the operator session token
+/// Helper: build and send an HTTP request, returning (status, body_value).
+/// Checks status BEFORE parsing JSON — non-JSON error responses (nginx 502, raw 401)
+/// produce a text fallback instead of misleading JSON parse errors.
+async fn send_api_request(
+    api_url: &str,
+    method: &str,
+    path: &str,
+    token: &str,
+    body: Option<&serde_json::Value>,
+    extra_headers: Option<&std::collections::HashMap<String, String>>,
+) -> Result<(reqwest::StatusCode, serde_json::Value), String> {
+    let client = reqwest::Client::new();
+    let url = format!("{}{}", api_url, path);
+    let mut req = match method {
+        "GET" => client.get(&url),
+        "POST" => client.post(&url),
+        "PATCH" => client.patch(&url),
+        "PUT" => client.put(&url),
+        "DELETE" => client.delete(&url),
+        _ => return Err("Invalid method".to_string()),
+    };
+    req = req.header("Authorization", format!("Bearer {}", token));
+    if let Some(headers) = extra_headers {
+        for (k, v) in headers {
+            req = req.header(k.as_str(), v.as_str());
+        }
+    }
+    if let Some(b) = body {
+        req = req.json(b);
+    }
+
+    let resp = req.send().await.map_err(|e| e.to_string())?;
+    let status = resp.status();
+
+    // Check status BEFORE attempting JSON parse
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        // Try to parse as JSON for structured errors, fall back to text
+        let error_value = serde_json::from_str::<serde_json::Value>(&text)
+            .unwrap_or_else(|_| serde_json::json!({ "error": text, "status": status.as_u16() }));
+        return Err(format!("API error {}: {}", status.as_u16(), error_value));
+    }
+
+    let result: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    Ok((status, result))
+}
+
+/// Make an authenticated API call using the operator session token.
+/// Proactively refreshes session if close to expiry. Retries once on 401.
 #[tauri::command]
 async fn operator_api_call(
     state: tauri::State<'_, SharedState>,
@@ -305,38 +361,186 @@ async fn operator_api_call(
     path: String,
     body: Option<serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
-    let auth = state.auth.read().await;
-    let token = auth
-        .operator_session_token
-        .clone()
-        .ok_or("No operator session")?;
-    let config = state.config.read().await;
-    let api_url = config.api_url.clone();
-    drop(config);
-    drop(auth);
+    // Proactive expiry check — refresh before the request if within 5 minutes of expiry
+    {
+        let auth = state.auth.read().await;
+        if let Some(ref expires_at) = auth.operator_session_expires_at {
+            if let Ok(expiry) = chrono::DateTime::parse_from_rfc3339(expires_at) {
+                let now = chrono::Utc::now();
+                if expiry.signed_duration_since(now) < chrono::Duration::minutes(5) {
+                    drop(auth);
+                    tracing::info!("Operator session near expiry, proactively refreshing");
+                    try_acquire_operator_session(&state).await;
+                }
+            }
+        }
+    }
 
-    let client = reqwest::Client::new();
-    let mut req = match method.as_str() {
-        "GET" => client.get(format!("{}{}", api_url, path)),
-        "POST" => client.post(format!("{}{}", api_url, path)),
-        "PATCH" => client.patch(format!("{}{}", api_url, path)),
-        "DELETE" => client.delete(format!("{}{}", api_url, path)),
-        _ => return Err("Invalid method".to_string()),
+    let (token, api_url) = {
+        let auth = state.auth.read().await;
+        let token = auth
+            .operator_session_token
+            .clone()
+            .ok_or("No operator session")?;
+        let config = state.config.read().await;
+        let api_url = config.api_url.clone();
+        (token, api_url)
     };
-    req = req.header("Authorization", format!("Bearer {}", token));
-    if let Some(b) = body {
-        req = req.json(&b);
+
+    match send_api_request(&api_url, &method, &path, &token, body.as_ref(), None).await {
+        Ok((_status, result)) => Ok(result),
+        Err(e) if e.contains("401") => {
+            // 401 — try refreshing operator session and retry once
+            tracing::info!("operator_api_call got 401, refreshing session and retrying");
+            try_acquire_operator_session(&state).await;
+            let auth = state.auth.read().await;
+            let new_token = auth
+                .operator_session_token
+                .clone()
+                .ok_or("Session expired — please re-authenticate")?;
+            drop(auth);
+            let (_status, result) =
+                send_api_request(&api_url, &method, &path, &new_token, body.as_ref(), None).await?;
+            Ok(result)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Make an authenticated API call using the Wire agent API token (gne_live_*).
+/// Supports custom headers (required for mesh endpoints' X-Wire-Thread).
+/// Handles fresh-install (no token yet) by attempting registration.
+/// Retries on 401 by re-registering with a refreshed Supabase session.
+#[tauri::command]
+async fn wire_api_call(
+    state: tauri::State<'_, SharedState>,
+    method: String,
+    path: String,
+    body: Option<serde_json::Value>,
+    headers: Option<std::collections::HashMap<String, String>>,
+) -> Result<serde_json::Value, String> {
+    let (api_url, mut token) = {
+        let config = state.config.read().await;
+        let api_url = config.api_url.clone();
+        drop(config);
+        let token = get_api_token(&state.auth).await;
+        (api_url, token)
+    };
+
+    // Fresh-install handling: if no api_token, try to register first
+    if token.is_err() {
+        tracing::info!("wire_api_call: no api_token, attempting registration");
+        let registered = attempt_wire_registration(&state).await;
+        if registered {
+            token = get_api_token(&state.auth).await;
+        }
+        if token.is_err() {
+            return Err("Wire agent not registered — please log in first".to_string());
+        }
     }
 
-    let resp = req.send().await.map_err(|e| e.to_string())?;
-    let status = resp.status();
-    let result: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    let token_str = token.unwrap();
+    match send_api_request(
+        &api_url,
+        &method,
+        &path,
+        &token_str,
+        body.as_ref(),
+        headers.as_ref(),
+    )
+    .await
+    {
+        Ok((_status, result)) => Ok(result),
+        Err(e) if e.contains("401") => {
+            // 401 on wire token — attempt re-registration with refreshed Supabase session
+            tracing::info!("wire_api_call got 401, attempting re-registration");
+            let registered = attempt_wire_registration(&state).await;
+            if !registered {
+                return Err("Wire authentication failed — please re-authenticate".to_string());
+            }
+            let new_token = get_api_token(&state.auth)
+                .await
+                .map_err(|_| "Wire re-registration succeeded but no token available".to_string())?;
+            let (_status, result) = send_api_request(
+                &api_url,
+                &method,
+                &path,
+                &new_token,
+                body.as_ref(),
+                headers.as_ref(),
+            )
+            .await?;
+            Ok(result)
+        }
+        Err(e) => Err(e),
+    }
+}
 
-    if !status.is_success() {
-        return Err(format!("API error {}: {}", status, result));
+/// Attempt to (re-)register the Wire agent, refreshing the Supabase session if needed.
+/// Returns true if a valid api_token was obtained.
+async fn attempt_wire_registration(state: &AppState) -> bool {
+    let (access_token, api_url, node_name, supabase_url, supabase_key, refresh_token) = {
+        let auth = state.auth.read().await;
+        let config = state.config.read().await;
+        (
+            auth.access_token.clone(),
+            config.api_url.clone(),
+            config.node_name(),
+            config.supabase_url.clone(),
+            config.supabase_anon_key.clone(),
+            auth.refresh_token.clone(),
+        )
+    };
+
+    // Try registration with current access token
+    if let Some(ref at) = access_token {
+        match auth::register_with_session(&api_url, at, &node_name).await {
+            Ok(reg) => {
+                let mut auth = state.auth.write().await;
+                auth.api_token = Some(reg.api_token.clone());
+                auth.node_id = Some(reg.node_id.clone());
+                let config = state.config.read().await;
+                save_session(&config, &auth);
+                tracing::info!("Wire registration succeeded (existing session)");
+                return true;
+            }
+            Err(e) => tracing::warn!("Wire registration failed with current session: {}", e),
+        }
     }
 
-    Ok(result)
+    // Current session failed — try refreshing Supabase tokens first
+    if let Some(ref rt) = refresh_token {
+        match auth::refresh_session(&supabase_url, &supabase_key, rt).await {
+            Ok((new_access, new_refresh)) => {
+                // CRITICAL: write refreshed tokens to AuthState BEFORE re-registering
+                // Also persist to disk immediately so tokens survive a crash/restart
+                {
+                    let mut auth = state.auth.write().await;
+                    auth.access_token = Some(new_access.clone());
+                    auth.refresh_token = Some(new_refresh);
+                    let config = state.config.read().await;
+                    save_session(&config, &auth);
+                }
+
+                // Now register with the fresh access token
+                match auth::register_with_session(&api_url, &new_access, &node_name).await {
+                    Ok(reg) => {
+                        let mut auth = state.auth.write().await;
+                        auth.api_token = Some(reg.api_token.clone());
+                        auth.node_id = Some(reg.node_id.clone());
+                        let config = state.config.read().await;
+                        save_session(&config, &auth);
+                        tracing::info!("Wire registration succeeded after session refresh");
+                        return true;
+                    }
+                    Err(e) => tracing::warn!("Wire registration failed after refresh: {}", e),
+                }
+            }
+            Err(e) => tracing::warn!("Supabase session refresh failed: {}", e),
+        }
+    }
+
+    false
 }
 
 /// Try to acquire an operator session (best-effort, non-blocking).
@@ -380,6 +584,22 @@ async fn try_acquire_operator_session(state: &AppState) {
 async fn get_auth_state(state: tauri::State<'_, SharedState>) -> Result<auth::AuthState, String> {
     let auth = state.auth.read().await;
     Ok(auth.clone())
+}
+
+#[tauri::command]
+async fn get_wire_identity_status(state: tauri::State<'_, SharedState>) -> Result<String, String> {
+    let auth = state.auth.read().await;
+    // Check if we have a valid API token (gne_live_* machine token from registration)
+    if let Some(ref token) = auth.api_token {
+        if !token.is_empty() {
+            return Ok("connected".to_string());
+        }
+    }
+    // We have a Supabase session but no Wire API token — identity is missing/not registered
+    if auth.access_token.is_some() {
+        return Ok("expired".to_string());
+    }
+    Ok("missing".to_string())
 }
 
 #[tauri::command]
@@ -2391,8 +2611,277 @@ fn load_session(config: &WireNodeConfig) -> Option<auth::AuthState> {
     }
 }
 
+// --- Compose Drafts ----------------------------------------------------------
+
+fn compose_drafts_path(config: &WireNodeConfig) -> std::path::PathBuf {
+    config.data_dir().join("compose_drafts.json")
+}
+
+#[tauri::command]
+async fn save_compose_draft(
+    state: tauri::State<'_, SharedState>,
+    draft: serde_json::Value,
+) -> Result<(), String> {
+    let cfg = state.config.read().await;
+    let path = compose_drafts_path(&cfg);
+
+    // Load existing drafts
+    let mut drafts: Vec<serde_json::Value> = if path.exists() {
+        let data =
+            std::fs::read_to_string(&path).map_err(|e| format!("Failed to read drafts: {}", e))?;
+        let parsed: serde_json::Value =
+            serde_json::from_str(&data).unwrap_or(serde_json::json!([]));
+        match parsed {
+            serde_json::Value::Array(arr) => arr,
+            _ => vec![],
+        }
+    } else {
+        vec![]
+    };
+
+    // If draft has an "id", replace existing; otherwise append
+    if let Some(draft_id) = draft.get("id").and_then(|v| v.as_str()) {
+        if let Some(pos) = drafts
+            .iter()
+            .position(|d| d.get("id").and_then(|v| v.as_str()) == Some(draft_id))
+        {
+            drafts[pos] = draft;
+        } else {
+            drafts.push(draft);
+        }
+    } else {
+        drafts.push(draft);
+    }
+
+    let json = serde_json::to_string_pretty(&drafts).map_err(|e| e.to_string())?;
+    let _ = std::fs::create_dir_all(path.parent().unwrap_or(&path));
+    std::fs::write(&path, json).map_err(|e| format!("Failed to write drafts: {}", e))?;
+    tracing::info!("Compose draft saved to {:?}", path);
+    Ok(())
+}
+
+#[tauri::command]
+async fn get_compose_drafts(
+    state: tauri::State<'_, SharedState>,
+) -> Result<serde_json::Value, String> {
+    let cfg = state.config.read().await;
+    let path = compose_drafts_path(&cfg);
+    if !path.exists() {
+        return Ok(serde_json::json!([]));
+    }
+    let data =
+        std::fs::read_to_string(&path).map_err(|e| format!("Failed to read drafts: {}", e))?;
+    let parsed: serde_json::Value =
+        serde_json::from_str(&data).map_err(|e| format!("Failed to parse drafts: {}", e))?;
+    Ok(parsed)
+}
+
+#[tauri::command]
+async fn delete_compose_draft(
+    state: tauri::State<'_, SharedState>,
+    draft_id: String,
+) -> Result<(), String> {
+    let cfg = state.config.read().await;
+    let path = compose_drafts_path(&cfg);
+    if !path.exists() {
+        return Ok(());
+    }
+
+    let data =
+        std::fs::read_to_string(&path).map_err(|e| format!("Failed to read drafts: {}", e))?;
+    let parsed: serde_json::Value = serde_json::from_str(&data).unwrap_or(serde_json::json!([]));
+    let drafts: Vec<serde_json::Value> = match parsed {
+        serde_json::Value::Array(arr) => arr
+            .into_iter()
+            .filter(|d| d.get("id").and_then(|v| v.as_str()) != Some(&draft_id))
+            .collect(),
+        _ => vec![],
+    };
+
+    let json = serde_json::to_string_pretty(&drafts).map_err(|e| e.to_string())?;
+    std::fs::write(&path, json).map_err(|e| format!("Failed to write drafts: {}", e))?;
+    Ok(())
+}
+
+// --- Wire Handle Cache -------------------------------------------------------
+
+fn handle_cache_path(config: &WireNodeConfig) -> std::path::PathBuf {
+    config.data_dir().join("handle_cache.json")
+}
+
+#[tauri::command]
+async fn cache_wire_handles(
+    state: tauri::State<'_, SharedState>,
+    handles: serde_json::Value,
+) -> Result<(), String> {
+    let cfg = state.config.read().await;
+    let path = handle_cache_path(&cfg);
+    let wrapper = serde_json::json!({
+        "handles": handles,
+        "cached_at": chrono::Utc::now().to_rfc3339(),
+    });
+    let json = serde_json::to_string_pretty(&wrapper).map_err(|e| e.to_string())?;
+    let _ = std::fs::create_dir_all(path.parent().unwrap_or(&path));
+    std::fs::write(&path, json).map_err(|e| format!("Failed to write handle cache: {}", e))?;
+    tracing::info!("Wire handle cache saved to {:?}", path);
+    Ok(())
+}
+
+#[tauri::command]
+async fn get_cached_wire_handles(
+    state: tauri::State<'_, SharedState>,
+) -> Result<serde_json::Value, String> {
+    let cfg = state.config.read().await;
+    let path = handle_cache_path(&cfg);
+    if !path.exists() {
+        return Ok(serde_json::json!({ "handles": [], "cached_at": null }));
+    }
+    let data = std::fs::read_to_string(&path)
+        .map_err(|e| format!("Failed to read handle cache: {}", e))?;
+    let parsed: serde_json::Value =
+        serde_json::from_str(&data).map_err(|e| format!("Failed to parse handle cache: {}", e))?;
+    Ok(parsed)
+}
+
+// --- Planner ----------------------------------------------------------------
+
+const PLANNER_FALLBACK_PROMPT: &str = r#"You are the Wire Node intent planner. You take a user's natural language intent and produce a structured execution plan.
+
+## Available Commands
+
+{{VOCABULARY}}
+
+Use ONLY the command names from the vocabulary above. The executor handles all HTTP details — you never specify methods, paths, or URLs. Each step has exactly one of: command (with args), or navigate. Steps execute independently — no data flow between steps. Steps support on_error: "abort" | "continue" (default "continue").
+
+Your response must be valid JSON with this structure:
+{
+  "plan_id": "uuid",
+  "intent": "the original user text",
+  "steps": [{ "id": "step-1", "description": "what this step does", "estimated_cost": null, "command": "cmd_name", "args": {}, "on_error": "continue" }],
+  "total_estimated_cost": null,
+  "ui_schema": [{ "type": "widget_type", "field": "field_name", "label": "Label" }]
+}
+"#;
+
+const PLANNER_WIDGET_CATALOG: &str = r#"[
+  { "type": "corpus_selector", "description": "Dropdown to pick a corpus/pyramid slug" },
+  { "type": "text_input", "description": "Free-text input field" },
+  { "type": "cost_preview", "description": "Shows estimated cost before confirming" },
+  { "type": "toggle", "description": "Boolean on/off switch" },
+  { "type": "checkbox", "description": "Same as toggle" },
+  { "type": "agent_selector", "description": "Dropdown to pick an agent from the registry" },
+  { "type": "confirmation", "description": "Confirm/cancel button pair" },
+  { "type": "select", "description": "Dropdown with custom options" }
+]"#;
+
+/// Single-stage planner: loads the FULL vocabulary (all categories) and generates a plan in one LLM call.
+#[tauri::command]
+async fn planner_call(
+    state: tauri::State<'_, SharedState>,
+    intent: String,
+    context: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    use wire_node_lib::pyramid::llm;
+
+    let config = {
+        let cfg = state.pyramid.config.read().await;
+        cfg.clone()
+    };
+
+    // Load vocabulary from YAML registry — try local files first, fall back to bundled
+    let vocab_dir = state.pyramid.chains_dir.join("vocabulary_yaml");
+    let vocab_registry = match vocabulary::load_from_directory(&vocab_dir) {
+        Ok(reg) if !reg.domains.is_empty() => reg,
+        _ => {
+            tracing::info!("Using bundled vocabulary (no local YAML files found)");
+            vocabulary::load_bundled()
+        }
+    };
+    let full_vocabulary = vocab_registry.to_prompt_text();
+    tracing::info!(
+        "Vocabulary loaded: {} domains, {} commands, prompt text {} chars",
+        vocab_registry.domains.len(),
+        vocab_registry.domains.iter().map(|d| d.commands.len()).sum::<usize>(),
+        full_vocabulary.len(),
+    );
+
+    // Load planner system prompt from chains_dir with inline fallback
+    let prompt_path = state
+        .pyramid
+        .chains_dir
+        .join("prompts/planner/planner-system.md");
+    let system_template = match std::fs::read_to_string(&prompt_path) {
+        Ok(contents) => contents,
+        Err(_) => {
+            tracing::warn!("planner-system.md not found — using inline fallback");
+            PLANNER_FALLBACK_PROMPT.to_string()
+        }
+    };
+
+    // Replace template placeholders
+    let context_json =
+        serde_json::to_string_pretty(&context).unwrap_or_else(|_| "{}".to_string());
+    let system_prompt = system_template
+        .replace("{{VOCABULARY}}", &full_vocabulary)
+        .replace("{{WIDGET_CATALOG}}", PLANNER_WIDGET_CATALOG)
+        .replace("{{CONTEXT}}", &context_json);
+
+    tracing::info!(
+        "Planner system prompt: {} chars, user intent: {} chars",
+        system_prompt.len(),
+        intent.len(),
+    );
+
+    // Call LLM for plan generation — single call with full vocabulary
+    let response = llm::call_model_unified(
+        &config,
+        &system_prompt,
+        &intent,
+        0.3,
+        100_000, // Pillar 43: max_tokens is a safety ceiling, not a behavior control
+        Some(&serde_json::json!({"type": "json_object"})), // Pillar 43: prompt controls output, not max_tokens
+    )
+    .await
+    .map_err(|e| format!("Planner LLM call failed: {}", e))?;
+
+    // Parse response
+    let plan = llm::extract_json(&response.content)
+        .map_err(|e| format!("Failed to parse planner response: {}", e))?;
+
+    // Validate required fields
+    match plan.get("steps") {
+        Some(steps) if steps.is_array() && !steps.as_array().unwrap().is_empty() => {}
+        _ => return Err("Planner response missing non-empty 'steps' array".to_string()),
+    }
+    if !plan.get("ui_schema").map_or(false, |u| u.is_array()) {
+        return Err("Planner response missing 'ui_schema' array".to_string());
+    }
+
+    Ok(plan)
+}
+
+/// Return the vocabulary dispatch table to the frontend.
+/// The frontend uses this to translate named commands into API calls.
+#[tauri::command]
+async fn get_vocabulary_registry(
+    state: tauri::State<'_, SharedState>,
+) -> Result<serde_json::Value, String> {
+    let vocab_dir = state.pyramid.chains_dir.join("vocabulary_yaml");
+    let registry = match vocabulary::load_from_directory(&vocab_dir) {
+        Ok(reg) if !reg.domains.is_empty() => reg,
+        _ => vocabulary::load_bundled(),
+    };
+    Ok(registry.to_frontend_registry())
+}
+
 fn onboarding_file_path(config: &WireNodeConfig) -> std::path::PathBuf {
     config.data_dir().join("onboarding.json")
+}
+
+#[tauri::command]
+async fn get_node_name(state: tauri::State<'_, SharedState>) -> Result<String, String> {
+    let cfg = state.config.read().await;
+    Ok(cfg.node_name())
 }
 
 #[tauri::command]
@@ -2451,7 +2940,9 @@ async fn save_onboarding(
 async fn get_logs(state: tauri::State<'_, SharedState>) -> Result<Vec<String>, String> {
     let cfg = state.config.read().await;
     let log_path = cfg.data_dir().join("wire-node.log");
-    let content = std::fs::read_to_string(&log_path).unwrap_or_default();
+    let content = tokio::fs::read_to_string(&log_path)
+        .await
+        .unwrap_or_default();
     let lines: Vec<String> = content.lines().rev().take(500).map(String::from).collect();
     Ok(lines)
 }
@@ -2568,8 +3059,7 @@ async fn pyramid_list_question_overlays(
     slug: String,
 ) -> Result<Vec<wire_node_lib::pyramid::db::QuestionOverlayInfo>, String> {
     let conn = state.pyramid.reader.lock().await;
-    wire_node_lib::pyramid::db::list_question_overlays(&conn, &slug)
-        .map_err(|e| e.to_string())
+    wire_node_lib::pyramid::db::list_question_overlays(&conn, &slug).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -2625,7 +3115,11 @@ async fn post_build_seed(
     {
         let conn = pyramid_state.writer.lock().await;
         if let Err(e) = pyramid_db::update_cached_emergent_price(&conn, slug) {
-            tracing::warn!("Failed to update cached emergent price for '{}': {}", slug, e);
+            tracing::warn!(
+                "Failed to update cached emergent price for '{}': {}",
+                slug,
+                e
+            );
         }
     }
 
@@ -2778,7 +3272,12 @@ async fn post_build_seed(
     };
 
     let mut engine = wire_node_lib::pyramid::stale_engine::PyramidStaleEngine::new(
-        slug, config, &db_path, &api_key, &model, pyramid_state.operational.as_ref().clone(),
+        slug,
+        config,
+        &db_path,
+        &api_key,
+        &model,
+        pyramid_state.operational.as_ref().clone(),
     );
     engine.start_poll_loop();
 
@@ -3003,7 +3502,7 @@ async fn pyramid_build(
     let build_status = status.clone();
     let pyramid_state = state.pyramid.clone(); // Arc<PyramidState> for post-build seeding
 
-    tokio::spawn(async move {
+    let build_task_handle = tokio::spawn(async move {
         let start = std::time::Instant::now();
 
         // Create mpsc channel for WriteOps (used by legacy build path)
@@ -3158,6 +3657,18 @@ async fn pyramid_build(
                         tracing::error!("Post-build seeding failed for '{}': {}", slug, e);
                     }
                 }
+            }
+        }
+    });
+
+    // Monitor: catch panics in the build task and set status to "failed"
+    let monitor_status = status.clone();
+    tokio::spawn(async move {
+        if let Err(e) = build_task_handle.await {
+            tracing::error!("pyramid_build task panicked: {e:?}");
+            let mut s = monitor_status.write().await;
+            if s.status == "running" {
+                s.status = "failed".to_string();
             }
         }
     });
@@ -3320,6 +3831,7 @@ async fn pyramid_create_slug(
     slug: String,
     content_type: String,
     source_path: String,
+    referenced_slugs: Option<Vec<String>>,
 ) -> Result<SlugInfo, String> {
     let ct = ContentType::from_str(&content_type).ok_or_else(|| {
         format!(
@@ -3334,8 +3846,21 @@ async fn pyramid_create_slug(
     )
     .map_err(|e| e.to_string())?;
     let conn = state.pyramid.writer.lock().await;
-    wire_node_lib::pyramid::slug::create_slug(&conn, &slug, &ct, &normalized_source_path)
-        .map_err(|e| e.to_string())
+    let info =
+        wire_node_lib::pyramid::slug::create_slug(&conn, &slug, &ct, &normalized_source_path)
+            .map_err(|e| e.to_string())?;
+
+    // Save cross-references if provided (question pyramids referencing base slugs)
+    if let Some(refs) = &referenced_slugs {
+        if !refs.is_empty() {
+            use wire_node_lib::pyramid::db as pyramid_db;
+            if let Err(e) = pyramid_db::save_slug_references(&conn, &info.slug, refs) {
+                tracing::warn!(slug = %info.slug, error = %e, "failed to save slug references");
+            }
+        }
+    }
+
+    Ok(info)
 }
 
 #[tauri::command]
@@ -3358,7 +3883,8 @@ async fn pyramid_delete_slug(
     }
 
     let conn = state.pyramid.writer.lock().await;
-    let result = wire_node_lib::pyramid::slug::archive_slug(&conn, &slug).map_err(|e| e.to_string());
+    let result =
+        wire_node_lib::pyramid::slug::archive_slug(&conn, &slug).map_err(|e| e.to_string());
     drop(conn);
 
     result
@@ -3444,7 +3970,8 @@ async fn pyramid_archive_slug(
     }
 
     let conn = state.pyramid.writer.lock().await;
-    let result = wire_node_lib::pyramid::slug::archive_slug(&conn, &slug).map_err(|e| e.to_string());
+    let result =
+        wire_node_lib::pyramid::slug::archive_slug(&conn, &slug).map_err(|e| e.to_string());
     drop(conn);
 
     result
@@ -3465,7 +3992,12 @@ async fn pyramid_set_access_tier(
     // Validate tier value
     match tier.as_str() {
         "public" | "circle-scoped" | "priced" | "embargoed" => {}
-        _ => return Err(format!("Invalid access tier '{}'. Must be one of: public, circle-scoped, priced, embargoed", tier)),
+        _ => {
+            return Err(format!(
+            "Invalid access tier '{}'. Must be one of: public, circle-scoped, priced, embargoed",
+            tier
+        ))
+        }
     }
 
     // Validate circles JSON if provided
@@ -3505,10 +4037,12 @@ async fn pyramid_set_absorption_mode(
     // Validate mode value
     match mode.as_str() {
         "open" | "absorb-all" | "absorb-selective" => {}
-        _ => return Err(format!(
-            "Invalid absorption mode '{}'. Must be one of: open, absorb-all, absorb-selective",
-            mode
-        )),
+        _ => {
+            return Err(format!(
+                "Invalid absorption mode '{}'. Must be one of: open, absorb-all, absorb-selective",
+                mode
+            ))
+        }
     }
 
     // For absorb-selective, chain_id is required
@@ -3524,7 +4058,10 @@ async fn pyramid_set_absorption_mode(
 
     // Save rate limit config to pyramid_config.json if provided
     if rate_limit.is_some() || daily_cap.is_some() {
-        let data_dir = state.pyramid.data_dir.as_ref()
+        let data_dir = state
+            .pyramid
+            .data_dir
+            .as_ref()
             .ok_or_else(|| "data_dir not set".to_string())?;
         let mut cfg = wire_node_lib::pyramid::PyramidConfig::load(data_dir);
         if let Some(rl) = rate_limit {
@@ -3555,12 +4092,15 @@ async fn pyramid_get_absorption_config(
     slug: String,
 ) -> Result<serde_json::Value, String> {
     let conn = state.pyramid.reader.lock().await;
-    let (mode, chain_id) = pyramid_db::get_absorption_mode(&conn, &slug)
-        .map_err(|e| e.to_string())?;
+    let (mode, chain_id) =
+        pyramid_db::get_absorption_mode(&conn, &slug).map_err(|e| e.to_string())?;
 
     let (rate_limit, daily_cap) = if let Some(ref data_dir) = state.pyramid.data_dir {
         let cfg = wire_node_lib::pyramid::PyramidConfig::load(data_dir);
-        (cfg.absorption_rate_limit_per_operator, cfg.absorption_daily_spend_cap)
+        (
+            cfg.absorption_rate_limit_per_operator,
+            cfg.absorption_daily_spend_cap,
+        )
     } else {
         (3u32, 100u64)
     };
@@ -3580,10 +4120,10 @@ async fn pyramid_get_access_tier(
     slug: String,
 ) -> Result<serde_json::Value, String> {
     let conn = state.pyramid.reader.lock().await;
-    let (tier, price, circles) = pyramid_db::get_access_tier(&conn, &slug)
-        .map_err(|e| e.to_string())?;
-    let emergent_price = pyramid_db::get_cached_emergent_price(&conn, &slug)
-        .map_err(|e| e.to_string())?;
+    let (tier, price, circles) =
+        pyramid_db::get_access_tier(&conn, &slug).map_err(|e| e.to_string())?;
+    let emergent_price =
+        pyramid_db::get_cached_emergent_price(&conn, &slug).map_err(|e| e.to_string())?;
 
     Ok(serde_json::json!({
         "access_tier": tier,
@@ -3656,11 +4196,10 @@ async fn pyramid_question_build(
     let build_question = question.clone();
     let build_slug = slug.clone();
 
-    tokio::spawn(async move {
+    let question_build_handle = tokio::spawn(async move {
         let start = std::time::Instant::now();
 
-        let (progress_tx, mut progress_rx) =
-            tokio::sync::mpsc::channel::<BuildProgress>(64);
+        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel::<BuildProgress>(64);
         let progress_status = build_status.clone();
         let progress_start = start;
         let progress_handle = tokio::spawn(async move {
@@ -3710,6 +4249,18 @@ async fn pyramid_question_build(
                 }
             }
             s.elapsed_seconds = start.elapsed().as_secs_f64();
+        }
+    });
+
+    // Monitor: catch panics in the question build task and set status to "failed"
+    let monitor_status = status.clone();
+    tokio::spawn(async move {
+        if let Err(e) = question_build_handle.await {
+            tracing::error!("pyramid_question_build task panicked: {e:?}");
+            let mut s = monitor_status.write().await;
+            if s.status == "running" {
+                s.status = "failed".to_string();
+            }
         }
     });
 
@@ -3840,7 +4391,11 @@ async fn pyramid_meta_run(
     let reader = state.pyramid.reader.clone();
     let writer = state.pyramid.writer.clone();
 
-    match wire_node_lib::pyramid::meta::run_all_meta_passes(&reader, &writer, &slug, &api_key, &model).await {
+    match wire_node_lib::pyramid::meta::run_all_meta_passes(
+        &reader, &writer, &slug, &api_key, &model,
+    )
+    .await
+    {
         Ok(quickstart) => Ok(serde_json::json!({
             "slug": slug,
             "status": "complete",
@@ -3928,11 +4483,15 @@ async fn pyramid_publish(
             }
         }
 
-        let mut ev_weights: std::collections::HashMap<String, std::collections::HashMap<String, f64>> =
-            std::collections::HashMap::new();
+        let mut ev_weights: std::collections::HashMap<
+            String,
+            std::collections::HashMap<String, f64>,
+        > = std::collections::HashMap::new();
         for (_depth, nodes) in &result {
             for node in nodes {
-                if let Ok(links) = pyramid_db::get_keep_evidence_for_target(&conn, &slug, &node.id) {
+                if let Ok(links) =
+                    pyramid_db::get_keep_evidence_for_target_cross(&conn, &slug, &node.id)
+                {
                     if !links.is_empty() {
                         let mut child_weights = std::collections::HashMap::new();
                         for link in links {
@@ -3956,22 +4515,34 @@ async fn pyramid_publish(
     }
 
     // Phase 2: Publish nodes via HTTP
-    match publisher.publish_pyramid_idempotent(&slug, &nodes_by_depth, &std::collections::HashMap::new(), &evidence_weights).await {
+    match publisher
+        .publish_pyramid_idempotent(
+            &slug,
+            &nodes_by_depth,
+            &std::collections::HashMap::new(),
+            &evidence_weights,
+        )
+        .await
+    {
         Ok(result) => {
-            // Phase 3: Persist ID mappings
+            // Phase 3+4: Persist ID mappings, build_id, and metadata in a single writer lock
+            let persisted_build_id: Option<String>;
+            let persisted_metadata_id: Option<String>;
             {
                 let writer = state.pyramid.writer.lock().await;
+
+                // Phase 3: ID mappings
                 if let Err(e) = wire_publish::init_id_map_table(&writer) {
                     tracing::warn!(error = %e, "failed to init id_map table");
                 }
                 for mapping in &result.id_mappings {
-                    let uuid = mapping.wire_uuid.as_deref().unwrap_or(&mapping.wire_handle_path);
-                    if let Err(e) = wire_publish::save_id_mapping(
-                        &writer,
-                        &slug,
-                        &mapping.local_id,
-                        uuid,
-                    ) {
+                    let uuid = mapping
+                        .wire_uuid
+                        .as_deref()
+                        .unwrap_or(&mapping.wire_handle_path);
+                    if let Err(e) =
+                        wire_publish::save_id_mapping(&writer, &slug, &mapping.local_id, uuid)
+                    {
                         tracing::warn!(
                             local_id = %mapping.local_id,
                             error = %e,
@@ -3979,14 +4550,60 @@ async fn pyramid_publish(
                         );
                     }
                 }
+
+                // Phase 4: Persist last_published_build_id and metadata_contribution_id
+                // Read build_id inside the same writer lock to avoid TOCTOU race
+                // (a build could complete between a separate read and write)
+                persisted_build_id =
+                    pyramid_db::get_current_build_id(&writer, &slug).unwrap_or(None);
+                if let Some(ref build_id) = persisted_build_id {
+                    if let Err(e) =
+                        pyramid_db::set_last_published_build_id(&writer, &slug, build_id)
+                    {
+                        tracing::warn!(
+                            slug = %slug,
+                            build_id = %build_id,
+                            error = %e,
+                            "failed to update last_published_build_id after IPC publish"
+                        );
+                    }
+                }
+                if let Some(ref apex_uuid) = result.apex_wire_uuid {
+                    if let Err(e) =
+                        pyramid_db::set_slug_metadata_contribution_id(&writer, &slug, apex_uuid)
+                    {
+                        tracing::warn!(
+                            slug = %slug,
+                            apex_uuid = %apex_uuid,
+                            error = %e,
+                            "failed to update metadata_contribution_id after IPC publish"
+                        );
+                    }
+                }
             }
+            persisted_metadata_id = result.apex_wire_uuid.clone();
+
             tracing::info!(
                 slug = %slug,
                 node_count = result.node_count,
                 apex_uuid = ?result.apex_wire_uuid,
+                build_id = ?persisted_build_id,
                 "pyramid published to Wire"
             );
-            serde_json::to_value(&result).map_err(|e| e.to_string())
+
+            // Build return value with the persisted fields included
+            let mut value = serde_json::to_value(&result).map_err(|e| e.to_string())?;
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert(
+                    "last_published_build_id".to_string(),
+                    serde_json::json!(persisted_build_id),
+                );
+                obj.insert(
+                    "metadata_contribution_id".to_string(),
+                    serde_json::json!(persisted_metadata_id),
+                );
+            }
+            Ok(value)
         }
         Err(e) => {
             tracing::warn!(slug = %slug, error = %e, "publish failed");
@@ -4019,8 +4636,13 @@ async fn pyramid_publish_question_set(
         .join("questions")
         .join(format!("{}.yaml", content_type.as_str()));
 
-    let qs_yaml = std::fs::read_to_string(&qs_path)
-        .map_err(|e| format!("question set not found for content type '{}': {}", content_type.as_str(), e))?;
+    let qs_yaml = std::fs::read_to_string(&qs_path).map_err(|e| {
+        format!(
+            "question set not found for content type '{}': {}",
+            content_type.as_str(),
+            e
+        )
+    })?;
 
     let question_set: wire_node_lib::pyramid::question_yaml::QuestionSet =
         serde_yaml::from_str(&qs_yaml)
@@ -4143,7 +4765,9 @@ async fn pyramid_chain_import(
 
     match import_type {
         "chain" => {
-            let chain = client.fetch_chain(contribution_id).await
+            let chain = client
+                .fetch_chain(contribution_id)
+                .await
                 .map_err(|e| format!("failed to import chain: {}", e))?;
 
             let writer = state.pyramid.writer.lock().await;
@@ -4160,7 +4784,9 @@ async fn pyramid_chain_import(
             }))
         }
         "question_set" => {
-            let qs = client.fetch_question_set(contribution_id).await
+            let qs = client
+                .fetch_question_set(contribution_id)
+                .await
                 .map_err(|e| format!("failed to import question set: {}", e))?;
 
             let writer = state.pyramid.writer.lock().await;
@@ -4261,7 +4887,13 @@ async fn partner_send_message(
     session_id: String,
     message: String,
 ) -> Result<serde_json::Value, String> {
-    match wire_node_lib::partner::conversation::handle_message(&state.partner, &session_id, &message).await {
+    match wire_node_lib::partner::conversation::handle_message(
+        &state.partner,
+        &session_id,
+        &message,
+    )
+    .await
+    {
         Ok(response) => serde_json::to_value(&response).map_err(|e| e.to_string()),
         Err(e) => Err(e.to_string()),
     }
@@ -4295,8 +4927,7 @@ async fn partner_session_new(
     // Save to DB
     {
         let db = state.partner.partner_db.lock().await;
-        wire_node_lib::partner::save_session(&db, &session)
-            .map_err(|e| e.to_string())?;
+        wire_node_lib::partner::save_session(&db, &session).map_err(|e| e.to_string())?;
     }
 
     // Add to in-memory cache
@@ -4320,6 +4951,57 @@ async fn pyramid_get_config(
         "fallback_model_1": config.fallback_model_1,
         "fallback_model_2": config.fallback_model_2,
     }))
+}
+
+/// Test an OpenRouter API key server-side so the key never touches the renderer.
+#[tauri::command]
+async fn pyramid_test_api_key(state: tauri::State<'_, SharedState>) -> Result<String, String> {
+    let api_key = {
+        let config = state.pyramid.config.read().await;
+        config.api_key.clone()
+    };
+    if api_key.is_empty() {
+        return Err("No API key configured".to_string());
+    }
+    let client = reqwest::Client::new();
+    let resp = client
+        .get("https://openrouter.ai/api/v1/models")
+        .header("Authorization", format!("Bearer {}", api_key))
+        .send()
+        .await
+        .map_err(|e| format!("Request failed: {}", e))?;
+    if resp.status().is_success() {
+        Ok("API key is valid".to_string())
+    } else {
+        Err(format!(
+            "API key test failed: {} {}",
+            resp.status().as_u16(),
+            resp.status().canonical_reason().unwrap_or("Unknown")
+        ))
+    }
+}
+
+/// Test a remote tunnel connection server-side so the renderer cannot fetch arbitrary URLs.
+#[tauri::command]
+async fn test_remote_connection(url: String) -> Result<serde_json::Value, String> {
+    let url = url.trim().trim_end_matches('/').to_string();
+    let health_url = format!("{}/health", url);
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(&health_url)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|e| format!("Connection failed: {}", e))?;
+    if resp.status().is_success() {
+        let data: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("Invalid response: {}", e))?;
+        Ok(data)
+    } else {
+        Err(format!("Failed: HTTP {}", resp.status().as_u16()))
+    }
 }
 
 #[tauri::command]
@@ -4349,6 +5031,33 @@ async fn pyramid_build_cancel(
         }
     }
     Err("No active build to cancel".to_string())
+}
+
+/// Force-reset a build that has been running for > 30 minutes (stuck build).
+#[tauri::command]
+async fn pyramid_build_force_reset(
+    state: tauri::State<'_, SharedState>,
+    slug: String,
+) -> Result<(), String> {
+    let active = state.pyramid.active_build.read().await;
+    if let Some(handle) = active.get(&slug) {
+        let elapsed = handle.started_at.elapsed().as_secs();
+        if elapsed < 1800 {
+            return Err(format!(
+                "Build has only been running for {}s — force reset requires 30+ minutes",
+                elapsed
+            ));
+        }
+        let mut s = handle.status.write().await;
+        if s.status == "running" {
+            s.status = "failed".to_string();
+            // Also cancel the token so any still-running work stops
+            handle.cancel.cancel();
+            tracing::warn!("Force-reset build for '{}' after {}s", slug, elapsed);
+            return Ok(());
+        }
+    }
+    Err("No active running build to force-reset".to_string())
 }
 
 #[tauri::command]
@@ -4425,7 +5134,7 @@ async fn pyramid_vine_build(
     let slug_for_task = vine_slug_clean.clone();
     let vine_builds = state.pyramid.vine_builds.clone();
 
-    tokio::spawn(async move {
+    let vine_build_handle = tokio::spawn(async move {
         let result = vine::build_vine(&pyramid_state, &slug_for_task, &dirs, &cancel).await;
         let mut builds = vine_builds.lock().await;
         if let Some(handle) = builds.get_mut(&slug_for_task) {
@@ -4436,6 +5145,22 @@ async fn pyramid_vine_build(
                 Err(e) => {
                     handle.status = "failed".to_string();
                     handle.error = Some(e.to_string());
+                }
+            }
+        }
+    });
+
+    // Monitor: catch panics in the vine build task and set status to "failed"
+    let monitor_vine_builds = state.pyramid.vine_builds.clone();
+    let monitor_vine_slug = vine_slug_clean.clone();
+    tokio::spawn(async move {
+        if let Err(e) = vine_build_handle.await {
+            tracing::error!("pyramid_vine_build task panicked: {e:?}");
+            let mut builds = monitor_vine_builds.lock().await;
+            if let Some(handle) = builds.get_mut(&monitor_vine_slug) {
+                if handle.status == "running" {
+                    handle.status = "failed".to_string();
+                    handle.error = Some(format!("Build task panicked: {e:?}"));
                 }
             }
         }
@@ -5252,9 +5977,16 @@ fn main() {
         event_bus: Arc::new(wire_node_lib::pyramid::event_chain::LocalEventBus::new()),
         operational: Arc::new(pyramid_config.operational.clone()),
         chains_dir: chains_dir.clone(),
-        remote_query_rate_limiter: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-        absorption_build_rate_limiter: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-        absorption_daily_spend: Arc::new(tokio::sync::Mutex::new((0u64, std::time::Instant::now()))),
+        remote_query_rate_limiter: Arc::new(tokio::sync::Mutex::new(
+            std::collections::HashMap::new(),
+        )),
+        absorption_build_rate_limiter: Arc::new(tokio::sync::Mutex::new(
+            std::collections::HashMap::new(),
+        )),
+        absorption_daily_spend: Arc::new(tokio::sync::Mutex::new((
+            0u64,
+            std::time::Instant::now(),
+        ))),
     });
 
     // Load persisted event subscriptions into the in-memory event bus
@@ -5313,6 +6045,8 @@ fn main() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        // TODO: updater pubkey in tauri.conf.json is empty — needs a real keypair
+        // before production release. The pubkey must match the signing key used for releases.
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_deep_link::init())
@@ -5349,7 +6083,7 @@ fn main() {
                     }
                 })
                 .on_menu_event(|app, event| match event.id().as_ref() {
-                    "quit" => std::process::exit(0),
+                    "quit" => app.exit(0),
                     "show" => {
                         if let Some(window) = app.get_webview_window("main") {
                             let _ = window.show();
@@ -5409,11 +6143,17 @@ fn main() {
                                     };
 
                                     // Call register_with_session WITHOUT holding any lock
-                                    let registration = auth::register_with_session(
+                                    let registration = match auth::register_with_session(
                                         &c.api_url,
                                         &supabase_token,
                                         &c.node_name(),
-                                    ).await.ok();
+                                    ).await {
+                                        Ok(reg) => Some(reg),
+                                        Err(e) => {
+                                            tracing::error!("Wire registration after deep link failed: {}", e);
+                                            None
+                                        }
+                                    };
 
                                     let node_id = registration.as_ref().map(|r| r.node_id.clone());
                                     let api_token = registration.as_ref().map(|r| r.api_token.clone());
@@ -5975,6 +6715,7 @@ fn main() {
             verify_otp,
             login,
             get_auth_state,
+            get_wire_identity_status,
             logout,
             get_config,
             set_config,
@@ -5997,6 +6738,7 @@ fn main() {
             check_for_update,
             install_update,
             is_onboarded,
+            get_node_name,
             save_onboarding,
             get_logs,
             open_file,
@@ -6008,6 +6750,7 @@ fn main() {
             get_work_stats,
             get_operator_session,
             operator_api_call,
+            wire_api_call,
             get_home_dir,
             pyramid_list_slugs,
             pyramid_get_publication_status,
@@ -6022,6 +6765,7 @@ fn main() {
             pyramid_build,
             pyramid_build_status,
             pyramid_build_cancel,
+            pyramid_build_force_reset,
             pyramid_vine_build,
             pyramid_vine_build_status,
             pyramid_vine_bunches,
@@ -6038,6 +6782,8 @@ fn main() {
             pyramid_create_slug,
             pyramid_delete_slug,
             pyramid_get_config,
+            pyramid_test_api_key,
+            test_remote_connection,
             get_app_version,
             pyramid_auto_update_config_get,
             pyramid_auto_update_config_set,
@@ -6076,6 +6822,16 @@ fn main() {
             pyramid_unpin,
             partner_send_message,
             partner_session_new,
+            // Phase 4d: Wire handle cache persistence
+            cache_wire_handles,
+            get_cached_wire_handles,
+            // Phase 5c: Compose drafts
+            save_compose_draft,
+            get_compose_drafts,
+            delete_compose_draft,
+            // Sprint 1.5b: Single-stage intent planner (full vocabulary)
+            planner_call,
+            get_vocabulary_registry,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Wire Node");

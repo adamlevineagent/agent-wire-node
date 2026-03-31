@@ -25,11 +25,11 @@ use std::path::PathBuf;
 use super::db;
 use super::llm::{self, LlmConfig};
 use super::question_decomposition::render_prompt_template;
-use super::OperationalConfig;
 use super::types::{
-    AnswerBatchResult, AnsweredNode, CandidateMap, EvidenceLink, EvidenceVerdict,
-    FailedQuestion, LayerQuestion, PyramidNode,
+    AnswerBatchResult, AnsweredNode, CandidateMap, EvidenceLink, EvidenceVerdict, FailedQuestion,
+    LayerQuestion, PyramidNode,
 };
+use super::OperationalConfig;
 
 // ── L0 Summary Helper ────────────────────────────────────────────────────────
 
@@ -134,11 +134,14 @@ pub async fn pre_map_layer(
 
         // If STILL too large after headlines-only, truncate node list
         if questions_text.len() + nodes_text.len() > ops.tier2.pre_map_prompt_budget {
-            let max_nodes = ops.tier2.pre_map_prompt_budget.saturating_sub(questions_text.len()) / 220; // ~220 chars per headline entry
+            let max_nodes = ops
+                .tier2
+                .pre_map_prompt_budget
+                .saturating_sub(questions_text.len())
+                / 220; // ~220 chars per headline entry
             warn!(
                 total_nodes = lower_layer_nodes.len(),
-                max_nodes,
-                "Pre-mapping still too large, truncating node list"
+                max_nodes, "Pre-mapping still too large, truncating node list"
             );
             nodes_text = lower_layer_nodes
                 .iter()
@@ -164,9 +167,7 @@ pub async fn pre_map_layer(
     };
 
     let content_type_block = match source_content_type {
-        Some(ct) if !ct.is_empty() => format!(
-            "The source material is \"{ct}\" content.\n"
-        ),
+        Some(ct) if !ct.is_empty() => format!("The source material is \"{ct}\" content.\n"),
         _ => String::new(),
     };
 
@@ -174,10 +175,13 @@ pub async fn pre_map_layer(
         .map(|d| d.join("prompts/question/pre_map.md"))
         .and_then(|p| std::fs::read_to_string(&p).ok())
     {
-        Some(template) => render_prompt_template(&template, &[
-            ("audience_block", &audience_block),
-            ("content_type_block", &content_type_block),
-        ]),
+        Some(template) => render_prompt_template(
+            &template,
+            &[
+                ("audience_block", &audience_block),
+                ("content_type_block", &content_type_block),
+            ],
+        ),
         None => {
             warn!("pre_map.md not found — using inline fallback");
             format!(
@@ -369,8 +373,20 @@ pub async fn answer_questions(
                 .await
                 .expect("answer semaphore should remain open");
 
-            let result = answer_single_question(&work.question, &work.candidate_nodes, synthesis_prompt.as_deref(), audience.as_deref(), &llm_config, &slug, &answer_slug, answer_temperature, answer_max_tokens, chains_dir_owned.as_ref(), source_ct.as_deref())
-                .await;
+            let result = answer_single_question(
+                &work.question,
+                &work.candidate_nodes,
+                synthesis_prompt.as_deref(),
+                audience.as_deref(),
+                &llm_config,
+                &slug,
+                &answer_slug,
+                answer_temperature,
+                answer_max_tokens,
+                chains_dir_owned.as_ref(),
+                source_ct.as_deref(),
+            )
+            .await;
             (q_id, q_text, q_layer, result)
         });
 
@@ -384,7 +400,9 @@ pub async fn answer_questions(
     let mut total_missing = 0usize;
 
     for handle in handles {
-        let (q_id, q_text, q_layer, result) = handle.await.map_err(|e| anyhow!("Answer task panicked: {}", e))?;
+        let (q_id, q_text, q_layer, result) = handle
+            .await
+            .map_err(|e| anyhow!("Answer task panicked: {}", e))?;
         match result {
             Ok(answered) => {
                 total_evidence += answered.evidence.len();
@@ -447,10 +465,8 @@ async fn answer_single_question(
 
     // Build candidate_map keyed by the IDs shown to the LLM (handle-paths for cross-slug, bare for same-slug).
     // Node IDs have already been rewritten by answer_questions before reaching here.
-    let candidate_map: HashMap<String, &PyramidNode> = candidate_nodes
-        .iter()
-        .map(|n| (n.id.clone(), n))
-        .collect();
+    let candidate_map: HashMap<String, &PyramidNode> =
+        candidate_nodes.iter().map(|n| (n.id.clone(), n)).collect();
 
     // ── Build candidate evidence context ────────────────────────────────
     let evidence_context = if candidate_nodes.is_empty() {
@@ -486,9 +502,7 @@ async fn answer_single_question(
     };
 
     let content_type_block = match source_content_type {
-        Some(ct) if !ct.is_empty() => format!(
-            "The source material is \"{ct}\" content.\n"
-        ),
+        Some(ct) if !ct.is_empty() => format!("The source material is \"{ct}\" content.\n"),
         _ => String::new(),
     };
 
@@ -496,11 +510,14 @@ async fn answer_single_question(
         .map(|d| d.join("prompts/question/answer.md"))
         .and_then(|p| std::fs::read_to_string(&p).ok())
     {
-        Some(template) => render_prompt_template(&template, &[
-            ("audience_block", &audience_block),
-            ("synthesis_prompt", synthesis_guidance),
-            ("content_type_block", &content_type_block),
-        ]),
+        Some(template) => render_prompt_template(
+            &template,
+            &[
+                ("audience_block", &audience_block),
+                ("synthesis_prompt", synthesis_guidance),
+                ("content_type_block", &content_type_block),
+            ],
+        ),
         None => {
             warn!("answer.md not found — using inline fallback");
             format!(

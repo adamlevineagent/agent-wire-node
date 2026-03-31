@@ -177,7 +177,7 @@ fn assign_ids_recursive(node: &mut QuestionNode, max_depth: u32, current_level: 
 
 /// Build a deterministic question ID from question text, about, and depth.
 fn make_question_id(question: &str, about: &str, depth: u32) -> String {
-    use sha2::{Sha256, Digest};
+    use sha2::{Digest, Sha256};
     let input = format!("{}|{}|{}", question, about, depth);
     let hash = Sha256::digest(input.as_bytes());
     let hex_str = hex::encode(hash);
@@ -210,13 +210,16 @@ fn collect_layer_questions(
 ) {
     let depth = max_depth.saturating_sub(current_level) as i64;
 
-    result.entry(depth).or_default().push(super::types::LayerQuestion {
-        question_id: node.id.clone(),
-        question_text: node.question.clone(),
-        layer: depth,
-        about: node.about.clone(),
-        creates: node.creates.clone(),
-    });
+    result
+        .entry(depth)
+        .or_default()
+        .push(super::types::LayerQuestion {
+            question_id: node.id.clone(),
+            question_text: node.question.clone(),
+            layer: depth,
+            about: node.about.clone(),
+            creates: node.creates.clone(),
+        });
 
     for child in &node.children {
         collect_layer_questions(child, max_depth, current_level + 1, result);
@@ -254,7 +257,8 @@ pub async fn decompose_question_delta(
     }
 
     // Build context about existing answers for the LLM
-    let existing_context = existing_answers.iter()
+    let existing_context = existing_answers
+        .iter()
         .map(|n| {
             let summary: String = n.distilled.chars().take(200).collect();
             format!("- [{}] {}: {}", n.id, n.headline, summary)
@@ -266,7 +270,8 @@ pub async fn decompose_question_delta(
     let mut existing_questions: Vec<(String, String)> = Vec::new(); // (question_id, question_text)
     collect_existing_questions(&existing_tree.apex, &mut existing_questions);
 
-    let existing_q_context = existing_questions.iter()
+    let existing_q_context = existing_questions
+        .iter()
         .map(|(id, q)| format!("- [{}] {}", id, q))
         .collect::<Vec<_>>()
         .join("\n");
@@ -276,10 +281,13 @@ pub async fn decompose_question_delta(
         .map(|d| d.join("prompts/question/decompose_delta.md"))
         .and_then(|p| std::fs::read_to_string(&p).ok())
     {
-        Some(template) => render_prompt_template(&template, &[
-            ("existing_questions", &existing_q_context),
-            ("existing_answers", &existing_context),
-        ]),
+        Some(template) => render_prompt_template(
+            &template,
+            &[
+                ("existing_questions", &existing_q_context),
+                ("existing_answers", &existing_context),
+            ],
+        ),
         None => {
             warn!("decompose_delta.md not found — using inline fallback");
             format!(
@@ -316,18 +324,14 @@ Return ONLY the JSON object."#
         "New apex question: \"{}\"\n\nContent type: {}\n\n{}",
         config.apex_question,
         config.content_type,
-        config.folder_map.as_deref().unwrap_or("(no additional context)")
+        config
+            .folder_map
+            .as_deref()
+            .unwrap_or("(no additional context)")
     );
 
-    let response = llm::call_model_unified(
-        llm_config,
-        &system_prompt,
-        &user_prompt,
-        0.3,
-        4096,
-        None,
-    )
-    .await?;
+    let response =
+        llm::call_model_unified(llm_config, &system_prompt, &user_prompt, 0.3, 4096, None).await?;
 
     let json_value = llm::extract_json(&response.content)?;
 
@@ -406,7 +410,8 @@ Return ONLY the JSON object."#
 
     // Extract new questions (those NOT in reused set)
     let all_layer_qs = extract_layer_questions(&tree);
-    let reused_set: std::collections::HashSet<&str> = reused_question_ids.iter().map(|s| s.as_str()).collect();
+    let reused_set: std::collections::HashSet<&str> =
+        reused_question_ids.iter().map(|s| s.as_str()).collect();
 
     let new_questions: Vec<super::types::LayerQuestion> = all_layer_qs
         .into_iter()
@@ -725,7 +730,9 @@ pub async fn decompose_question_incremental(
     }
 
     // ── Horizontal review: merge overlaps + depth-check L1 siblings ────
-    let (merged, leafed) = horizontal_review_siblings(&mut apex_children, llm_config, config.chains_dir.as_deref()).await?;
+    let (merged, leafed) =
+        horizontal_review_siblings(&mut apex_children, llm_config, config.chains_dir.as_deref())
+            .await?;
     if merged > 0 || leafed > 0 {
         info!(
             merged = merged,
@@ -798,10 +805,19 @@ async fn save_tree_nodes_to_db(
     writer: &Arc<Mutex<Connection>>,
 ) -> Result<()> {
     let mut all_nodes = Vec::new();
-    collect_tree_nodes(node, parent_id.map(|s| s.to_string()), depth, &mut all_nodes);
+    collect_tree_nodes(
+        node,
+        parent_id.map(|s| s.to_string()),
+        depth,
+        &mut all_nodes,
+    );
 
     let node_count = all_nodes.len();
-    info!(nodes = node_count, slug = slug, "save_tree_nodes_to_db: batching all nodes in single transaction");
+    info!(
+        nodes = node_count,
+        slug = slug,
+        "save_tree_nodes_to_db: batching all nodes in single transaction"
+    );
 
     let conn = writer.clone();
     let slug_owned = slug.to_string();
@@ -815,8 +831,14 @@ async fn save_tree_nodes_to_db(
             Ok(())
         })();
         match result {
-            Ok(()) => { c.execute_batch("COMMIT")?; Ok(()) }
-            Err(e) => { let _ = c.execute_batch("ROLLBACK"); Err(e) }
+            Ok(()) => {
+                c.execute_batch("COMMIT")?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = c.execute_batch("ROLLBACK");
+                Err(e)
+            }
         }
     })
     .await
@@ -1107,11 +1129,14 @@ async fn call_decomposition_llm(
         .map(|d| d.join("prompts/question/decompose.md"))
         .and_then(|p| std::fs::read_to_string(&p).ok())
     {
-        Some(template) => render_prompt_template(&template, &[
-            ("content_type", content_type),
-            ("depth", &depth_str),
-            ("audience_block", &audience_block),
-        ]),
+        Some(template) => render_prompt_template(
+            &template,
+            &[
+                ("content_type", content_type),
+                ("depth", &depth_str),
+                ("audience_block", &audience_block),
+            ],
+        ),
         None => {
             warn!("decompose.md not found — using inline fallback");
             format!(
@@ -1870,15 +1895,8 @@ Return ONLY the JSON object."#.to_string()
          Which should be merged? Which branches are specific enough to be leaves?"
     );
 
-    let response = llm::call_model_unified(
-        llm_config,
-        &system_prompt,
-        &user_prompt,
-        0.1,
-        2048,
-        None,
-    )
-    .await?;
+    let response =
+        llm::call_model_unified(llm_config, &system_prompt, &user_prompt, 0.1, 2048, None).await?;
 
     let review: serde_json::Value = match llm::extract_json(&response.content) {
         Ok(v) => v,

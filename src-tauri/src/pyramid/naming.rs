@@ -5,8 +5,12 @@ use serde_json::Value;
 use super::types::{PyramidNode, Topic};
 use super::Tier2Config;
 
-fn max_headline_chars() -> usize { Tier2Config::default().max_headline_chars }
-fn max_headline_words() -> usize { Tier2Config::default().max_headline_words }
+fn max_headline_chars() -> usize {
+    Tier2Config::default().max_headline_chars
+}
+fn max_headline_words() -> usize {
+    Tier2Config::default().max_headline_words
+}
 
 pub fn clean_headline(raw: &str) -> Option<String> {
     let collapsed = raw

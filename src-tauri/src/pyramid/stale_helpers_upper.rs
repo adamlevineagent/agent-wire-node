@@ -71,6 +71,67 @@ fn lookup_thread_target_by_thread_id(
         .ok())
 }
 
+pub(crate) fn resolve_live_canonical_node_id(
+    conn: &Connection,
+    slug: &str,
+    target_id: &str,
+) -> Result<Option<String>> {
+    let thread_canonical: Option<String> = conn
+        .query_row(
+            "SELECT current_canonical_id FROM pyramid_threads
+             WHERE slug = ?1 AND thread_id = ?2",
+            rusqlite::params![slug, target_id],
+            |row| row.get(0),
+        )
+        .ok();
+
+    if let Some(current) = thread_canonical {
+        return Ok(Some(current));
+    }
+
+    let exists = conn
+        .query_row(
+            "SELECT 1 FROM pyramid_nodes WHERE slug = ?1 AND id = ?2",
+            rusqlite::params![slug, target_id],
+            |_| Ok(()),
+        )
+        .is_ok();
+
+    if !exists {
+        return Ok(None);
+    }
+
+    let mut current = target_id.to_string();
+    let mut visited = BTreeSet::new();
+
+    loop {
+        if !visited.insert(current.clone()) {
+            warn!(slug = %slug, target_id = %target_id, current = %current, "Detected supersession cycle while resolving live canonical node");
+            return Ok(Some(current));
+        }
+
+        let next_id: Option<String> = conn
+            .query_row(
+                "SELECT superseded_by FROM pyramid_nodes
+                 WHERE slug = ?1 AND id = ?2 AND superseded_by IS NOT NULL",
+                rusqlite::params![slug, current],
+                |row| row.get(0),
+            )
+            .ok()
+            .flatten();
+
+        let Some(next_id) = next_id else {
+            return Ok(Some(current));
+        };
+
+        if next_id == current {
+            return Ok(Some(current));
+        }
+
+        current = next_id;
+    }
+}
+
 fn summarize_for_thread_name(text: &str, max_chars: usize) -> String {
     let cleaned: String = text.chars().filter(|c| !c.is_control()).collect();
     let summary: String = cleaned.chars().take(max_chars).collect();
@@ -189,6 +250,105 @@ fn ensure_thread_target(
     }))
 }
 
+fn lookup_source_file_path_for_node(
+    conn: &Connection,
+    slug: &str,
+    node_id: &str,
+) -> Result<Option<String>> {
+    let direct_path: Option<String> = conn
+        .query_row(
+            "SELECT file_path FROM pyramid_file_hashes pfh
+             WHERE pfh.slug = ?1
+               AND EXISTS (
+                   SELECT 1 FROM json_each(pfh.node_ids)
+                   WHERE value = ?2
+               )
+             LIMIT 1",
+            rusqlite::params![slug, node_id],
+            |row| row.get(0),
+        )
+        .ok();
+
+    if direct_path.is_some() {
+        return Ok(direct_path);
+    }
+
+    let mut stmt = conn.prepare(
+        "SELECT file_path, node_ids FROM pyramid_file_hashes
+         WHERE slug = ?1",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![slug], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+
+    for row in rows {
+        let (file_path, node_ids_json) = row?;
+        let node_ids: Vec<String> = serde_json::from_str(&node_ids_json).unwrap_or_default();
+        for tracked_id in node_ids {
+            if resolve_live_canonical_node_id(conn, slug, &tracked_id)?.as_deref() == Some(node_id)
+            {
+                return Ok(Some(file_path));
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+fn rewrite_file_hash_node_reference(
+    conn: &Connection,
+    slug: &str,
+    file_path: &str,
+    old_node_id: &str,
+    new_node_id: &str,
+) -> Result<()> {
+    let node_ids_json: Option<String> = conn
+        .query_row(
+            "SELECT node_ids FROM pyramid_file_hashes
+             WHERE slug = ?1 AND file_path = ?2",
+            rusqlite::params![slug, file_path],
+            |row| row.get(0),
+        )
+        .ok();
+
+    let Some(node_ids_json) = node_ids_json else {
+        return Ok(());
+    };
+
+    let mut changed = false;
+    let mut seen = BTreeSet::new();
+    let mut updated_node_ids = Vec::new();
+    for node_id in serde_json::from_str::<Vec<String>>(&node_ids_json).unwrap_or_default() {
+        let replacement = if node_id == old_node_id {
+            changed = true;
+            new_node_id.to_string()
+        } else {
+            node_id
+        };
+
+        if seen.insert(replacement.clone()) {
+            updated_node_ids.push(replacement);
+        }
+    }
+
+    if !changed {
+        return Ok(());
+    }
+
+    conn.execute(
+        "UPDATE pyramid_file_hashes
+         SET node_ids = ?1, last_ingested_at = datetime('now')
+         WHERE slug = ?2 AND file_path = ?3",
+        rusqlite::params![
+            serde_json::to_string(&updated_node_ids).unwrap_or_else(|_| "[]".to_string()),
+            slug,
+            file_path,
+        ],
+    )?;
+
+    Ok(())
+}
+
 pub(crate) fn resolve_stale_target_for_node(
     conn: &Connection,
     slug: &str,
@@ -278,7 +438,9 @@ pub async fn dispatch_node_stale_check(
     #[derive(Debug, Clone)]
     struct PromptNode {
         source_index: usize,
-        node_id: String,
+        requested_target_id: String,
+        canonical_node_id: String,
+        thread_id: String,
         distilled: String,
         delta_content: String,
         depth: i32,
@@ -362,7 +524,9 @@ pub async fn dispatch_node_stale_check(
 
             results.push(PromptNode {
                 source_index: i,
-                node_id: node_id.clone(),
+                requested_target_id: node_id.clone(),
+                canonical_node_id: thread_target.canonical_node_id.clone(),
+                thread_id: thread_target.thread_id.clone(),
                 distilled,
                 delta_content,
                 depth,
@@ -418,10 +582,11 @@ pub async fn dispatch_node_stale_check(
 
     for (i, node) in node_data.iter().enumerate() {
         user_prompt.push_str(&format!(
-            "NODE {} of {}: {}\nLayer: L{}\n\nCurrent distillation:\n{}\n\nDelta(s):\n{}\n\n---\n\n",
+            "NODE {} of {}:\nCanonical node ID: {}\nThread ID: {}\nLayer: L{}\n\nCurrent distillation:\n{}\n\nDelta(s):\n{}\n\n---\n\n",
             i + 1,
             node_data.len(),
-            node.node_id,
+            node.canonical_node_id,
+            node.thread_id,
             node.depth,
             node.distilled,
             if node.delta_content.is_empty() {
@@ -472,18 +637,25 @@ pub async fn dispatch_node_stale_check(
         .iter()
         .enumerate()
         .map(|(i, nr)| {
-            let source_index = node_data
-                .iter()
-                .find(|node| node.node_id == nr.node_id)
+            let matched_node = node_data.iter().find(|node| {
+                node.canonical_node_id == nr.node_id
+                    || node.thread_id == nr.node_id
+                    || node.requested_target_id == nr.node_id
+            });
+            let source_index = matched_node
                 .map(|node| node.source_index)
                 .unwrap_or(i.min(batch.len().saturating_sub(1)));
+            let target_id = matched_node
+                .map(|node| node.canonical_node_id.clone())
+                .or_else(|| node_data.get(i).map(|node| node.canonical_node_id.clone()))
+                .unwrap_or_else(|| nr.node_id.clone());
             let m = &batch[source_index];
             StaleCheckResult {
                 id: 0,
                 slug: m.slug.clone(),
                 batch_id: m.batch_id.clone().unwrap_or_default(),
                 layer: m.layer,
-                target_id: nr.node_id.clone(),
+                target_id,
                 stale: nr.stale,
                 reason: nr.reason.clone(),
                 checker_index: i as i32,
@@ -555,7 +727,8 @@ pub async fn dispatch_connection_check(
 
     let (old_content, new_content, connections) =
         tokio::task::spawn_blocking(move || -> Result<(String, String, Vec<ConnectionItem>)> {
-            let conn = super::db::open_pyramid_connection(Path::new(&db)).context("Failed to open DB for connection check")?;
+            let conn = super::db::open_pyramid_connection(Path::new(&db))
+                .context("Failed to open DB for connection check")?;
 
             // Get old and new node content
             let old_content: String = conn
@@ -933,7 +1106,8 @@ pub async fn dispatch_edge_stale_check(
         }
 
         let edge_data = tokio::task::spawn_blocking(move || -> Result<Option<EdgeData>> {
-            let conn = super::db::open_pyramid_connection(Path::new(&db)).context("Failed to open DB for edge stale-check")?;
+            let conn = super::db::open_pyramid_connection(Path::new(&db))
+                .context("Failed to open DB for edge stale-check")?;
 
             let edge = conn.query_row(
                 "SELECT thread_a_id, thread_b_id, relationship FROM pyramid_web_edges
@@ -1230,10 +1404,36 @@ pub async fn execute_supersession(
     model: &str,
 ) -> Result<String> {
     let new_node_id = format!("N-{}", Uuid::new_v4());
+    let requested_node_id = node_id.to_string();
+    let resolved_node_id = tokio::task::spawn_blocking({
+        let db = db_path.to_string();
+        let slug = slug.to_string();
+        let target_id = requested_node_id.clone();
+        move || -> Result<String> {
+            let conn = super::db::open_pyramid_connection(Path::new(&db))
+                .context("Failed to open DB to resolve supersession target")?;
+            resolve_live_canonical_node_id(&conn, &slug, &target_id)?.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "No live canonical node found for stale target {}",
+                    target_id
+                )
+            })
+        }
+    })
+    .await??;
+
+    if resolved_node_id != requested_node_id {
+        info!(
+            requested_target = %requested_node_id,
+            resolved_target = %resolved_node_id,
+            slug = %slug,
+            "Resolved stale target to live canonical node before supersession"
+        );
+    }
 
     // Gather node data from DB
     let db = db_path.to_string();
-    let nid = node_id.to_string();
+    let nid = resolved_node_id.clone();
     let s = slug.to_string();
 
     #[derive(Debug, Clone)]
@@ -1318,18 +1518,7 @@ pub async fn execute_supersession(
             }
 
             let source_file_path: Option<String> = if depth == 0 {
-                conn.query_row(
-                    "SELECT file_path FROM pyramid_file_hashes pfh
-                     WHERE pfh.slug = ?1
-                       AND EXISTS (
-                           SELECT 1 FROM json_each(pfh.node_ids)
-                           WHERE value = ?2
-                       )
-                     LIMIT 1",
-                    rusqlite::params![s, nid],
-                    |row| row.get(0),
-                )
-                .ok()
+                lookup_source_file_path_for_node(&conn, &s, &nid)?
             } else {
                 None
             };
@@ -1476,7 +1665,7 @@ pub async fn execute_supersession(
     // Write new node, update old node, re-parent children, update thread
     let db = db_path.to_string();
     let s = slug.to_string();
-    let nid = node_id.to_string();
+    let nid = resolved_node_id.clone();
     let new_nid = new_node_id.clone();
     let nd = node_data.clone();
     let new_head = new_headline.clone();
@@ -1557,6 +1746,12 @@ pub async fn execute_supersession(
                  WHERE slug = ?4 AND thread_id = ?5",
                 rusqlite::params![new_nid, new_head, now_str, s, tid],
             )?;
+        }
+
+        if nd.depth == 0 {
+            if let Some(ref file_path) = nd.source_file_path {
+                rewrite_file_hash_node_reference(&conn, &s, file_path, &nid, &new_nid)?;
+            }
         }
 
         if let Some(ref tid) = nd.parent_thread_id {
@@ -1674,6 +1869,128 @@ pub async fn execute_supersession(
     }
 
     Ok(new_node_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        lookup_source_file_path_for_node, resolve_live_canonical_node_id,
+        rewrite_file_hash_node_reference,
+    };
+    use crate::pyramid::db::open_pyramid_db;
+    use rusqlite::{params, Connection};
+    use tempfile::NamedTempFile;
+
+    fn setup_test_db() -> (NamedTempFile, Connection) {
+        let file = NamedTempFile::new().expect("temp db");
+        let conn = open_pyramid_db(file.path()).expect("open pyramid db");
+        conn.execute(
+            "INSERT INTO pyramid_slugs (slug, content_type, source_path)
+             VALUES (?1, 'document', ?2)",
+            params!["test-slug", "/tmp/source"],
+        )
+        .expect("insert slug");
+        (file, conn)
+    }
+
+    fn insert_node(conn: &Connection, node_id: &str, parent_id: Option<&str>) {
+        conn.execute(
+            "INSERT INTO pyramid_nodes
+             (id, slug, depth, headline, distilled, children, parent_id, build_version, created_at)
+             VALUES (?1, 'test-slug', 1, ?2, ?3, '[]', ?4, 1, datetime('now'))",
+            params![
+                node_id,
+                format!("Headline {node_id}"),
+                format!("Distilled {node_id}"),
+                parent_id
+            ],
+        )
+        .expect("insert node");
+    }
+
+    #[test]
+    fn resolves_live_canonical_for_thread_and_historical_ids() {
+        let (_file, conn) = setup_test_db();
+        insert_node(&conn, "node-a", None);
+        insert_node(&conn, "node-b", None);
+        insert_node(&conn, "node-c", None);
+
+        conn.execute(
+            "UPDATE pyramid_nodes SET superseded_by = 'node-b'
+             WHERE slug = 'test-slug' AND id = 'node-a'",
+            [],
+        )
+        .expect("supersede node-a");
+        conn.execute(
+            "UPDATE pyramid_nodes SET superseded_by = 'node-c'
+             WHERE slug = 'test-slug' AND id = 'node-b'",
+            [],
+        )
+        .expect("supersede node-b");
+        conn.execute(
+            "INSERT INTO pyramid_threads
+             (slug, thread_id, thread_name, current_canonical_id, depth, delta_count, created_at, updated_at)
+             VALUES ('test-slug', 'thread-1', 'Thread 1', 'node-c', 1, 0, datetime('now'), datetime('now'))",
+            [],
+        )
+        .expect("insert thread");
+
+        assert_eq!(
+            resolve_live_canonical_node_id(&conn, "test-slug", "thread-1").unwrap(),
+            Some("node-c".to_string())
+        );
+        assert_eq!(
+            resolve_live_canonical_node_id(&conn, "test-slug", "node-a").unwrap(),
+            Some("node-c".to_string())
+        );
+        assert_eq!(
+            resolve_live_canonical_node_id(&conn, "test-slug", "node-c").unwrap(),
+            Some("node-c".to_string())
+        );
+        assert_eq!(
+            resolve_live_canonical_node_id(&conn, "test-slug", "missing").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn file_hash_lookup_and_rewrite_follow_live_node() {
+        let (_file, conn) = setup_test_db();
+        insert_node(&conn, "node-a", None);
+        insert_node(&conn, "node-b", None);
+
+        conn.execute(
+            "UPDATE pyramid_nodes SET superseded_by = 'node-b'
+             WHERE slug = 'test-slug' AND id = 'node-a'",
+            [],
+        )
+        .expect("supersede node-a");
+        conn.execute(
+            "INSERT INTO pyramid_file_hashes
+             (slug, file_path, hash, chunk_count, node_ids, last_ingested_at)
+             VALUES ('test-slug', '/tmp/doc.md', 'hash', 1, '[\"node-a\"]', datetime('now'))",
+            [],
+        )
+        .expect("insert file hash");
+
+        assert_eq!(
+            lookup_source_file_path_for_node(&conn, "test-slug", "node-b").unwrap(),
+            Some("/tmp/doc.md".to_string())
+        );
+
+        rewrite_file_hash_node_reference(&conn, "test-slug", "/tmp/doc.md", "node-a", "node-b")
+            .expect("rewrite file hash");
+
+        let node_ids_json: String = conn
+            .query_row(
+                "SELECT node_ids FROM pyramid_file_hashes
+                 WHERE slug = 'test-slug' AND file_path = '/tmp/doc.md'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("load node ids");
+        assert_eq!(node_ids_json, "[\"node-b\"]");
+    }
 }
 
 // ── Utility Functions ────────────────────────────────────────────────────────

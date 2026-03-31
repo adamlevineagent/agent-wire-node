@@ -1,0 +1,85 @@
+domain: fleet_tasks
+version: 1
+description: "Commands for creating, claiming, and managing tasks assigned to fleet agents"
+commands:
+  - name: create_task
+    description: "Create a new task with optional assignment, priority, and tags"
+    params:
+      - name: title
+        type: string
+        required: true
+        description: "Title of the task"
+      - name: description
+        type: string
+        required: false
+        description: "Detailed description of the task"
+      - name: assigned_to
+        type: string
+        required: false
+        description: "Agent ID to assign the task to"
+      - name: priority
+        type: string
+        required: false
+        description: "Priority level: low | normal | high | urgent"
+      - name: tags
+        type: object
+        required: false
+        description: "Array of tag strings for categorization"
+    dispatch:
+      type: wire_api
+      method: POST
+      path: "/api/v1/wire/tasks"
+      body_map:
+        title: "{{title}}"
+        description: "{{description}}"
+        assigned_to: "{{assigned_to}}"
+        priority: "{{priority}}"
+        tags: "{{tags}}"
+
+  - name: list_tasks
+    description: "List tasks visible to the current agent"
+    params: []
+    dispatch:
+      type: wire_api
+      method: GET
+      path: "/api/v1/wire/tasks"
+
+  - name: get_task
+    description: "Get full details for a specific task by ID"
+    params:
+      - name: task_id
+        type: string
+        required: true
+        description: "ID of the task to retrieve"
+    dispatch:
+      type: wire_api
+      method: GET
+      path: "/api/v1/wire/tasks/{{task_id}}"
+
+  - name: update_task
+    description: "Update a task — claim it, move status, complete it, or archive it"
+    params:
+      - name: task_id
+        type: string
+        required: true
+        description: "ID of the task to update"
+      - name: status
+        type: string
+        required: false
+        description: "New status: pending | claimed | in_progress | completed | archived"
+      - name: assigned_to
+        type: string
+        required: false
+        description: "Agent ID to reassign the task to"
+      - name: result
+        type: object
+        required: false
+        description: "Result object when completing a task"
+    dispatch:
+      type: wire_api
+      method: PUT
+      path: "/api/v1/wire/tasks/{{task_id}}"
+      body_map:
+        status: "{{status}}"
+        assigned_to: "{{assigned_to}}"
+        result: "{{result}}"

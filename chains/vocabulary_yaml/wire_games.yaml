@@ -1,0 +1,169 @@
+domain: wire_games
+version: 1
+description: "Commands for prediction markets, games, staking, and resolution."
+commands:
+  - name: create_game
+    description: "Create a new prediction game with possible outcomes and resolution date"
+    params:
+      - name: title
+        type: string
+        required: true
+        description: "Title of the prediction game"
+      - name: description
+        type: string
+        required: true
+        description: "Description of what is being predicted"
+      - name: options
+        type: object
+        required: true
+        description: "Array of possible outcome strings"
+      - name: resolution_date
+        type: string
+        required: true
+        description: "ISO 8601 date when the game should be resolved"
+      - name: stake_amount
+        type: integer
+        required: false
+        description: "Initial stake amount in credits"
+    dispatch:
+      type: wire_api
+      method: POST
+      path: "/api/v1/wire/games"
+      body_map:
+        title: "{{title}}"
+        description: "{{description}}"
+        options: "{{options}}"
+        resolution_date: "{{resolution_date}}"
+        stake_amount: "{{stake_amount}}"
+
+  - name: list_games
+    description: "List prediction games with optional status filter"
+    params:
+      - name: status
+        type: string
+        required: false
+        description: "Filter by status: open, resolved, or cancelled"
+      - name: limit
+        type: integer
+        required: false
+        description: "Max number of games to return"
+    dispatch:
+      type: wire_api
+      method: GET
+      path: "/api/v1/wire/games"
+      query_map:
+        status: "{{status}}"
+        limit: "{{limit}}"
+
+  - name: join_game
+    description: "Join a prediction game by staking credits"
+    params:
+      - name: id
+        type: string
+        required: true
+        description: "ID of the game to join"
+      - name: stake
+        type: integer
+        required: true
+        description: "Amount of credits to stake"
+    dispatch:
+      type: wire_api
+      method: POST
+      path: "/api/v1/wire/games/{{id}}/join"
+      body_map:
+        stake: "{{stake}}"
+
+  - name: pick_game_outcome
+    description: "Pick an outcome in a game you have joined"
+    params:
+      - name: id
+        type: string
+        required: true
+        description: "ID of the game"
+      - name: option
+        type: string
+        required: true
+        description: "The outcome option to pick"
+      - name: confidence
+        type: number
+        required: false
+        description: "Confidence level from 0.0 to 1.0"
+    dispatch:
+      type: wire_api
+      method: POST
+      path: "/api/v1/wire/games/{{id}}/pick"
+      body_map:
+        option: "{{option}}"
+        confidence: "{{confidence}}"
+
+  - name: resolve_game
+    description: "Resolve a game by declaring the winning outcome (creator only)"
+    params:
+      - name: id
+        type: string
+        required: true
+        description: "ID of the game to resolve"
+      - name: outcome
+        type: string
+        required: true
+        description: "The winning outcome"
+      - name: evidence
+        type: string
+        required: false
+        description: "Optional justification for the resolution"
+    dispatch:
+      type: wire_api
+      method: POST
+      path: "/api/v1/wire/games/{{id}}/resolve"
+      body_map:
+        outcome: "{{outcome}}"
+        evidence: "{{evidence}}"
+
+  - name: cancel_game
+    description: "Cancel a game and refund all stakes to participants"
+    params:
+      - name: id
+        type: string
+        required: true
+        description: "ID of the game to cancel"
+      - name: reason
+        type: string
+        required: false
+        description: "Reason for cancellation"
+    dispatch:
+      type: wire_api
+      method: POST
+      path: "/api/v1/wire/games/{{id}}/cancel"
+      body_map:
+        reason: "{{reason}}"
+
+  - name: list_ripe_predictions
+    description: "List predictions past their resolution date and ready for evaluation"
+    params: []
+    dispatch:
+      type: wire_api
+      method: GET
+      path: "/api/v1/wire/predictions/ripe"
+
+  - name: stake_on_market
+    description: "Stake credits on a market position"
+    params:
+      - name: id
+        type: string
+        required: true
+        description: "ID of the market"
+      - name: amount
+        type: integer
+        required: true
+        description: "Amount of credits to stake"
+      - name: position
+        type: string
+        required: true
+        description: "The option/outcome to back"
+    dispatch:
+      type: wire_api
+      method: POST
+      path: "/api/v1/wire/market/{{id}}/stake"
+      body_map:
+        amount: "{{amount}}"
+        position: "{{position}}"

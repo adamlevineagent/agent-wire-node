@@ -763,11 +763,7 @@ impl RemotePyramidClient {
     }
 
     /// GET /pyramid/{slug}/search?q={query} — search a remote pyramid.
-    pub async fn remote_search(
-        &self,
-        slug: &str,
-        query: &str,
-    ) -> Result<RemoteSearchResponse> {
+    pub async fn remote_search(&self, slug: &str, query: &str) -> Result<RemoteSearchResponse> {
         let url = format!(
             "{}/pyramid/{}/search?q={}",
             self.tunnel_url.trim_end_matches('/'),
@@ -949,12 +945,10 @@ impl RemotePyramidClient {
             reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => {
                 Err(WireImportError::AuthFailed(format!("status {}", status)).into())
             }
-            reqwest::StatusCode::TOO_MANY_REQUESTS => {
-                Err(WireImportError::RateLimited {
-                    retry_after_secs: 60,
-                }
-                .into())
+            reqwest::StatusCode::TOO_MANY_REQUESTS => Err(WireImportError::RateLimited {
+                retry_after_secs: 60,
             }
+            .into()),
             _ => Err(WireImportError::Network(format!(
                 "remote pyramid returned status {}",
                 status
@@ -1091,10 +1085,7 @@ impl RemotePyramidClient {
     /// Calls GET /pyramid/{slug}/export and parses the response nodes
     /// into Vec<PyramidNode>. Returns an error if the export fails or
     /// the response cannot be parsed.
-    pub async fn pull_remote_pyramid(
-        &self,
-        slug: &str,
-    ) -> Result<Vec<super::types::PyramidNode>> {
+    pub async fn pull_remote_pyramid(&self, slug: &str) -> Result<Vec<super::types::PyramidNode>> {
         let export = self.remote_export(slug).await?;
 
         let mut nodes = Vec::with_capacity(export.nodes.len());

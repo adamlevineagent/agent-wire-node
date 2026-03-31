@@ -11,13 +11,6 @@ interface RemoteConnectionStatusProps {
     tunnelConnected?: boolean;
 }
 
-interface RemoteQueryStats {
-    queries_served: number;
-    queries_made: number;
-    last_remote_query_at: string | null;
-    unique_operators: number;
-}
-
 export function RemoteConnectionStatus({
     tunnelUrl,
     tunnelConnected,
@@ -28,12 +21,6 @@ export function RemoteConnectionStatus({
     const [manualTunnelUrl, setManualTunnelUrl] = useState("");
     const [testResult, setTestResult] = useState<string | null>(null);
     const [testing, setTesting] = useState(false);
-    const [queryStats, setQueryStats] = useState<RemoteQueryStats>({
-        queries_served: 0,
-        queries_made: 0,
-        last_remote_query_at: null,
-        unique_operators: 0,
-    });
 
     // Poll for Wire identity status
     useEffect(() => {
@@ -63,7 +50,7 @@ export function RemoteConnectionStatus({
         };
     }, []);
 
-    // Test remote connection to a manual tunnel URL
+    // Test remote connection via IPC — renderer cannot fetch arbitrary URLs
     const handleTestConnection = useCallback(async () => {
         if (!manualTunnelUrl.trim()) return;
 
@@ -71,23 +58,16 @@ export function RemoteConnectionStatus({
         setTestResult(null);
 
         try {
-            const url = manualTunnelUrl.trim().replace(/\/$/, "");
-            const response = await fetch(`${url}/health`, {
-                method: "GET",
-                signal: AbortSignal.timeout(10000),
-            });
-
-            if (response.ok) {
-                const data = await response.json();
-                setTestResult(
-                    `Connected -- version ${data.version || "unknown"}, ${data.documents_cached || 0} documents cached`
-                );
-            } else {
-                setTestResult(`Failed: HTTP ${response.status}`);
-            }
+            const data = await invoke<{ version?: string; documents_cached?: number }>(
+                "test_remote_connection",
+                { url: manualTunnelUrl.trim() }
+            );
+            setTestResult(
+                `Connected -- version ${data.version || "unknown"}, ${data.documents_cached || 0} documents cached`
+            );
         } catch (err: unknown) {
             const message = err instanceof Error ? err.message : String(err);
-            setTestResult(`Connection failed: ${message}`);
+            setTestResult(message);
         } finally {
             setTesting(false);
         }
@@ -143,36 +123,6 @@ export function RemoteConnectionStatus({
                         )}
                     </div>
                 </div>
-            </div>
-
-            {/* Query Counts */}
-            <div className="remote-query-stats">
-                <div className="stat-row">
-                    <span className="stat-label">Queries Served</span>
-                    <span className="stat-value">
-                        {queryStats.queries_served.toLocaleString()}
-                    </span>
-                </div>
-                <div className="stat-row">
-                    <span className="stat-label">Queries Made</span>
-                    <span className="stat-value">
-                        {queryStats.queries_made.toLocaleString()}
-                    </span>
-                </div>
-                <div className="stat-row">
-                    <span className="stat-label">Unique Operators</span>
-                    <span className="stat-value">
-                        {queryStats.unique_operators}
-                    </span>
-                </div>
-                {queryStats.last_remote_query_at && (
-                    <div className="stat-row">
-                        <span className="stat-label">Last Remote Query</span>
-                        <span className="stat-value">
-                            {new Date(queryStats.last_remote_query_at).toLocaleString()}
-                        </span>
-                    </div>
-                )}
             </div>
 
             {/* Manual Tunnel URL for Testing */}

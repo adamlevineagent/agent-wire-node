@@ -88,23 +88,22 @@ export function OnboardingWizard({ onComplete, defaultNodeName }: OnboardingWiza
                         <div className="wire-logo-login">W</div>
                         <h1 className="onboarding-title">Welcome to Wire Node</h1>
                         <p className="onboarding-desc">
-                            You're about to turn this machine into a node in the
-                            Wire network -- a decentralized document hosting mesh that
-                            serves knowledge to consumers worldwide.
+                            Wire Node builds knowledge pyramids from your local files
+                            and connects them to the Wire intelligence network.
                         </p>
                         <div className="onboarding-benefit-list">
                             <div className="onboarding-benefit">
-                                <span className="benefit-icon">[W]</span>
+                                <span className="benefit-icon">[P]</span>
                                 <div>
-                                    <strong>Host documents</strong>
-                                    <p>Your computer caches and serves Wire documents to nearby consumers</p>
+                                    <strong>Build knowledge pyramids</strong>
+                                    <p>Turn any codebase or document folder into layered, queryable intelligence</p>
                                 </div>
                             </div>
                             <div className="onboarding-benefit">
-                                <span className="benefit-icon">[C]</span>
+                                <span className="benefit-icon">[W]</span>
                                 <div>
-                                    <strong>Earn credits</strong>
-                                    <p>Get Wire credits based on pulls served and documents hosted</p>
+                                    <strong>Publish to the Wire</strong>
+                                    <p>Share pyramids and contributions on the Wire network and earn credits</p>
                                 </div>
                             </div>
                             <div className="onboarding-benefit">
@@ -173,8 +172,9 @@ export function OnboardingWizard({ onComplete, defaultNodeName }: OnboardingWiza
                     <div className="onboarding-step">
                         <h2 className="onboarding-title">Link Your First Folder</h2>
                         <p className="onboarding-desc">
-                            Connect a local folder to a Wire corpus. Documents in this folder
-                            will be synced with the Wire network.
+                            Pick a project directory or document folder. Wire Node will
+                            create a corpus from its contents so you can build a knowledge
+                            pyramid from it.
                         </p>
 
                         <div className="folder-picker-row">
@@ -246,8 +246,10 @@ export function OnboardingWizard({ onComplete, defaultNodeName }: OnboardingWiza
                     <div className="onboarding-step">
                         <h2 className="onboarding-title">Mesh Hosting</h2>
                         <p className="onboarding-desc">
-                            Opt in to automatically discover and host high-demand documents
-                            from the Wire network. Your node earns credits for every pull served.
+                            Reserve storage for hosting Wire content on this node.
+                            When mesh hosting is enabled, your node can cache and serve
+                            pyramids and contributions to agents on the network.
+                            Hosted content is managed from the Fleet tab.
                         </p>
 
                         <div className="mesh-option-cards">
@@ -257,17 +259,17 @@ export function OnboardingWizard({ onComplete, defaultNodeName }: OnboardingWiza
                             >
                                 <div className="mesh-option-title">Enable Mesh Hosting</div>
                                 <div className="mesh-option-desc">
-                                    Auto-host popular documents and earn credits passively.
-                                    Uses up to {storageValue} GB of storage.
+                                    Reserve up to {storageValue} GB for hosting Wire documents.
+                                    You can manage hosted content from the Fleet tab.
                                 </div>
                             </button>
                             <button
                                 className={`mesh-option ${!meshHosting ? "active" : ""}`}
                                 onClick={() => setMeshHosting(false)}
                             >
-                                <div className="mesh-option-title">Manual Only</div>
+                                <div className="mesh-option-title">Skip for Now</div>
                                 <div className="mesh-option-desc">
-                                    Only sync documents from your linked folders.
+                                    Only use local pyramids and linked folders.
                                     You can enable mesh hosting later in Settings.
                                 </div>
                             </button>

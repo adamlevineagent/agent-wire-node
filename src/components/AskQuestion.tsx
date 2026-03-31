@@ -2,7 +2,6 @@ import { useState, useEffect, useCallback, useMemo } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { BuildProgress } from './BuildProgress';
 
-const PYRAMID_API_BASE = 'http://localhost:8765';
 
 interface SlugInfo {
     slug: string;
@@ -130,40 +129,23 @@ export function AskQuestion({ baseSlug, allSlugs, onClose, onSlugCreated }: AskQ
         setError(null);
 
         try {
-            // Step 1: Create the question slug via HTTP (supports referenced_slugs)
-            const createResp = await fetch(`${PYRAMID_API_BASE}/pyramid/slugs`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    slug: slug,
-                    content_type: 'question',
-                    source_path: '',
-                    referenced_slugs: effectiveRefs,
-                }),
+            // Step 1: Create the question slug via IPC
+            await invoke('pyramid_create_slug', {
+                slug: slug,
+                contentType: 'question',
+                sourcePath: '',
+                referencedSlugs: effectiveRefs,
             });
-
-            if (!createResp.ok) {
-                const errBody = await createResp.json().catch(() => ({ error: createResp.statusText }));
-                throw new Error(errBody.error || `Failed to create slug: ${createResp.status}`);
-            }
 
             onSlugCreated();
 
-            // Step 2: Trigger question build via HTTP
-            const buildResp = await fetch(`${PYRAMID_API_BASE}/pyramid/${slug}/build/question`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    question: question.trim(),
-                    granularity,
-                    max_depth: maxDepth,
-                }),
+            // Step 2: Trigger question build via IPC
+            await invoke('pyramid_question_build', {
+                slug: slug,
+                question: question.trim(),
+                granularity,
+                maxDepth: maxDepth,
             });
-
-            if (!buildResp.ok) {
-                const errBody = await buildResp.json().catch(() => ({ error: buildResp.statusText }));
-                throw new Error(errBody.error || `Failed to start build: ${buildResp.status}`);
-            }
 
             setPhase('building');
         } catch (err) {

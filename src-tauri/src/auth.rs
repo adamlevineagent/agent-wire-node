@@ -38,13 +38,6 @@ pub struct UserInfo {
     pub email: Option<String>,
 }
 
-/// Wire node registration response
-#[derive(Debug, Deserialize)]
-pub struct NodeRegistrationResponse {
-    pub node_id: String,
-    pub jwt_public_key: Option<String>,
-}
-
 // --- Magic Link Auth --------------------------------------------------------
 
 /// Send a magic link to the user's email via Wire's Supabase
@@ -299,48 +292,6 @@ pub async fn refresh_session(
 
     tracing::info!("Session refreshed successfully");
     Ok((lr.access_token, lr.refresh_token))
-}
-
-// --- Wire Node Registration -------------------------------------------------
-
-/// Register this machine as a Wire node on first login.
-/// POST to /api/v1/node/register, stores jwt_public_key from response.
-pub async fn register_wire_node(
-    api_url: &str,
-    access_token: &str,
-    node_name: &str,
-    _storage_cap_gb: f64,
-) -> Result<NodeRegistrationResponse, String> {
-    let client = reqwest::Client::new();
-
-    let url = format!("{}/api/v1/node/register", api_url);
-    let body = serde_json::json!({
-        "name": node_name,
-        "capabilities": ["cache", "verify", "grade", "enrich", "storage"],
-    });
-
-    let resp = client
-        .post(&url)
-        .header("Authorization", format!("Bearer {}", access_token))
-        .header("Content-Type", "application/json")
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("Node registration failed: {}", e))?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        return Err(format!("Registration failed ({}): {}", status, text));
-    }
-
-    let registration: NodeRegistrationResponse = resp
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse registration response: {}", e))?;
-
-    tracing::info!("Wire node registered: {}", registration.node_id);
-    Ok(registration)
 }
 
 // --- Session-based Registration ---------------------------------------------

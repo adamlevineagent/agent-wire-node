@@ -58,8 +58,15 @@ pub fn create_slug(
     let normalized = slugify(slug);
     validate_slug(&normalized)?;
 
-    // Check for duplicates
-    if db::get_slug(conn, &normalized)?.is_some() {
+    // Check for duplicates — archived slugs still block the name to avoid
+    // carrying stale nodes, old build IDs, and orphaned data
+    if let Some(existing) = db::get_slug(conn, &normalized)? {
+        if existing.archived_at.is_some() {
+            return Err(anyhow!(
+                "Slug '{}' was previously used and archived. Choose a different name.",
+                normalized
+            ));
+        }
         return Err(anyhow!("Slug '{}' already exists", normalized));
     }
 

@@ -161,12 +161,7 @@ export function SyncStatus({ syncState, syncing, onSync }: SyncStatusProps) {
     const handlePublishDoc = useCallback(async (docId: string, sourcePath: string) => {
         try {
             await invoke("update_document_status", { documentId: docId, status: "published" });
-            // Update local state optimistically
-            if (syncState?.cached_documents) {
-                const doc = syncState.cached_documents.find(d => d.document_id === docId);
-                if (doc) doc.document_status = "published";
-            }
-            onSync(); // refresh
+            onSync(); // refresh state from backend
         } catch (err) {
             console.error("Failed to publish:", err);
             alert(`Failed to publish ${sourcePath}: ${err}`);

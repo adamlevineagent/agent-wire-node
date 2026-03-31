@@ -2,24 +2,7 @@ import { useState, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { PyramidDashboard } from '../PyramidDashboard';
 import { PyramidFirstRun } from '../PyramidFirstRun';
-
-interface SlugInfo {
-    slug: string;
-    content_type: string;
-    source_path: string;
-    node_count: number;
-    max_depth: number;
-    last_built_at: string | null;
-    created_at: string;
-}
-
-interface PyramidConfigInfo {
-    api_key_set: boolean;
-    auth_token_set: boolean;
-    primary_model: string;
-    fallback_model_1: string;
-    fallback_model_2: string;
-}
+import { SlugInfo, PyramidConfigInfo } from '../pyramid-types';
 
 export function PyramidsMode() {
     const [showFirstRun, setShowFirstRun] = useState(false);

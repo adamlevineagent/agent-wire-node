@@ -40,7 +40,15 @@ pub async fn characterize(
     tier1: &Tier1Config,
     chains_dir: Option<&Path>,
 ) -> Result<CharacterizationResult> {
-    characterize_with_fallback(source_path, apex_question, llm_config, None, tier1, chains_dir).await
+    characterize_with_fallback(
+        source_path,
+        apex_question,
+        llm_config,
+        None,
+        tier1,
+        chains_dir,
+    )
+    .await
 }
 
 /// Characterize source material with an optional L0 summary fallback.
@@ -68,10 +76,12 @@ pub async fn characterize_with_fallback(
                     info!("source path unavailable, falling back to L0 summaries for characterization");
                     fallback.to_string()
                 }
-                _ => return Err(anyhow::anyhow!(
-                    "Source path '{}' is not accessible and no L0 fallback available",
-                    source_path
-                )),
+                _ => {
+                    return Err(anyhow::anyhow!(
+                        "Source path '{}' is not accessible and no L0 fallback available",
+                        source_path
+                    ))
+                }
             }
         }
     };
@@ -146,7 +156,10 @@ Analyze this material and produce the characterization."#,
             Ok(result) => return Ok(result),
             Err(e) => {
                 if attempt == 0 {
-                    info!("characterization parse failed ({}), retrying with lower temperature", e);
+                    info!(
+                        "characterization parse failed ({}), retrying with lower temperature",
+                        e
+                    );
                     continue;
                 }
                 return Err(e);
@@ -188,7 +201,10 @@ mod tests {
         let input = r#"{"material_profile":"Rust code repository","interpreted_question":"How does the build system work?","audience":"developers","tone":"technical"}"#;
         let result = parse_characterization_response(input).unwrap();
         assert_eq!(result.material_profile, "Rust code repository");
-        assert_eq!(result.interpreted_question, "How does the build system work?");
+        assert_eq!(
+            result.interpreted_question,
+            "How does the build system work?"
+        );
         assert_eq!(result.audience, "developers");
         assert_eq!(result.tone, "technical");
     }

@@ -1125,7 +1125,8 @@ fn migrate_question_tree_pk(conn: &Connection) -> Result<()> {
         Some(sql) => {
             // The original table has `slug TEXT PRIMARY KEY` — no build_id in PK
             // After migration it will have `PRIMARY KEY (slug, build_id)`
-            !sql.contains("build_id") || (sql.contains("build_id") && sql.contains("slug TEXT PRIMARY KEY"))
+            !sql.contains("build_id")
+                || (sql.contains("build_id") && sql.contains("slug TEXT PRIMARY KEY"))
         }
         None => false,
     };
@@ -1295,7 +1296,11 @@ pub fn delete_slug(conn: &Connection, slug: &str) -> Result<()> {
 
 /// Bulk-insert slug references: records that `slug` reads from each of `referenced_slugs`.
 /// Uses INSERT OR IGNORE to skip existing pairs.
-pub fn save_slug_references(conn: &Connection, slug: &str, referenced_slugs: &[String]) -> Result<()> {
+pub fn save_slug_references(
+    conn: &Connection,
+    slug: &str,
+    referenced_slugs: &[String],
+) -> Result<()> {
     let mut stmt = conn.prepare(
         "INSERT OR IGNORE INTO pyramid_slug_references (slug, referenced_slug) VALUES (?1, ?2)",
     )?;
@@ -1377,7 +1382,12 @@ pub fn format_handle_path(slug: &str, depth: i64, node_id: &str) -> String {
 /// 11-A: Supersede pipeline steps above a given depth for a slug + build_id.
 /// Scoped by build_id instead of bare DELETE. When build_id is None, scopes to
 /// steps with NULL build_id (legacy data).
-pub fn delete_steps_above_depth(conn: &Connection, slug: &str, depth: i64, build_id: Option<&str>) -> Result<i64> {
+pub fn delete_steps_above_depth(
+    conn: &Connection,
+    slug: &str,
+    depth: i64,
+    build_id: Option<&str>,
+) -> Result<i64> {
     let count = match build_id {
         Some(bid) => conn.execute(
             "DELETE FROM pyramid_pipeline_steps WHERE slug = ?1 AND depth > ?2 AND build_id = ?3",
@@ -1585,9 +1595,7 @@ pub fn node_from_row(row: &rusqlite::Row) -> rusqlite::Result<PyramidNode> {
         superseded_by: row
             .get::<_, Option<String>>("superseded_by")
             .unwrap_or(None),
-        build_id: row
-            .get::<_, Option<String>>("build_id")
-            .unwrap_or(None),
+        build_id: row.get::<_, Option<String>>("build_id").unwrap_or(None),
         created_at: row.get::<_, String>("created_at").unwrap_or_default(),
     })
 }
@@ -1673,7 +1681,11 @@ pub fn get_node(conn: &Connection, slug: &str, node_id: &str) -> Result<Option<P
 
 /// Lightweight node fetch — only the columns needed for drill child display.
 /// Skips heavy JSON columns (topics, corrections, decisions, terms, dead_ends).
-pub fn get_node_summary(conn: &Connection, slug: &str, node_id: &str) -> Result<Option<PyramidNode>> {
+pub fn get_node_summary(
+    conn: &Connection,
+    slug: &str,
+    node_id: &str,
+) -> Result<Option<PyramidNode>> {
     let sql = "SELECT id, slug, depth, chunk_index, headline, distilled, \
                '[]' as topics, '[]' as corrections, '[]' as decisions, \
                '[]' as terms, '[]' as dead_ends, self_prompt, children, parent_id, superseded_by, build_id, created_at \
@@ -1781,7 +1793,9 @@ pub fn count_nodes_at_depth(conn: &Connection, slug: &str, depth: i64) -> Result
 /// Delete all nodes with depth > the given depth. Returns count of deleted rows.
 /// Used when rebuilding upper layers of the pyramid.
 /// 11-M: Deprecated — use `supersede_nodes_above` instead. Retained for backward compat.
-#[deprecated(note = "Use supersede_nodes_above instead — delete_nodes_above destroys contributions")]
+#[deprecated(
+    note = "Use supersede_nodes_above instead — delete_nodes_above destroys contributions"
+)]
 pub fn delete_nodes_above(conn: &Connection, slug: &str, depth: i64) -> Result<i64> {
     let deleted = conn.execute(
         "DELETE FROM pyramid_nodes WHERE slug = ?1 AND depth > ?2",
@@ -1794,7 +1808,12 @@ pub fn delete_nodes_above(conn: &Connection, slug: &str, depth: i64) -> Result<i
 
 /// Supersede all live nodes above a given depth by setting superseded_by = build_id.
 /// Returns count of superseded nodes.
-pub fn supersede_nodes_above(conn: &Connection, slug: &str, depth: i64, build_id: &str) -> Result<i64> {
+pub fn supersede_nodes_above(
+    conn: &Connection,
+    slug: &str,
+    depth: i64,
+    build_id: &str,
+) -> Result<i64> {
     let count = conn.execute(
         "UPDATE pyramid_nodes SET superseded_by = ?3
          WHERE slug = ?1 AND depth > ?2 AND superseded_by IS NULL",
@@ -1805,7 +1824,12 @@ pub fn supersede_nodes_above(conn: &Connection, slug: &str, depth: i64, build_id
 
 /// Supersede all live nodes at or above a given depth by setting superseded_by = build_id.
 /// Returns count of superseded nodes.
-pub fn supersede_nodes_at_and_above(conn: &Connection, slug: &str, depth: i64, build_id: &str) -> Result<i64> {
+pub fn supersede_nodes_at_and_above(
+    conn: &Connection,
+    slug: &str,
+    depth: i64,
+    build_id: &str,
+) -> Result<i64> {
     let count = conn.execute(
         "UPDATE pyramid_nodes SET superseded_by = ?3
          WHERE slug = ?1 AND depth >= ?2 AND superseded_by IS NULL",
@@ -1856,7 +1880,8 @@ pub fn supersede_nodes_by_headline_pattern(
 
 /// Get a live node (non-superseded) by slug and node ID. Returns None if not found or superseded.
 pub fn get_live_node(conn: &Connection, slug: &str, node_id: &str) -> Result<Option<PyramidNode>> {
-    let sql = format!("SELECT {NODE_SELECT_COLS} FROM live_pyramid_nodes WHERE slug = ?1 AND id = ?2");
+    let sql =
+        format!("SELECT {NODE_SELECT_COLS} FROM live_pyramid_nodes WHERE slug = ?1 AND id = ?2");
     let mut stmt = conn.prepare(&sql)?;
     let result = stmt.query_row(rusqlite::params![slug, node_id], node_from_row);
     match result {
@@ -2488,7 +2513,11 @@ pub fn save_remote_web_edge(conn: &Connection, edge: &RemoteWebEdge) -> Result<i
 }
 
 /// Get remote web edges for a specific slug and build_id.
-pub fn get_remote_web_edges(conn: &Connection, slug: &str, build_id: &str) -> Result<Vec<RemoteWebEdge>> {
+pub fn get_remote_web_edges(
+    conn: &Connection,
+    slug: &str,
+    build_id: &str,
+) -> Result<Vec<RemoteWebEdge>> {
     let mut stmt = conn.prepare(
         "SELECT id, slug, local_thread_id, remote_handle_path, remote_tunnel_url, relationship, relevance, delta_count, build_id, created_at, updated_at
          FROM pyramid_remote_web_edges WHERE slug = ?1 AND build_id = ?2 ORDER BY relevance DESC",
@@ -3621,7 +3650,11 @@ fn evidence_from_row(row: &rusqlite::Row) -> rusqlite::Result<EvidenceLink> {
         verdict: EvidenceVerdict::from_str(&verdict_str),
         weight: row.get(4)?,
         reason: row.get(5)?,
-        build_id: if build_id.is_empty() { None } else { Some(build_id) },
+        build_id: if build_id.is_empty() {
+            None
+        } else {
+            Some(build_id)
+        },
         live: Some(true), // Default to live; cross-slug resolution comes in WS8-C
     })
 }
@@ -3639,7 +3672,11 @@ fn evidence_from_raw_row(row: &rusqlite::Row) -> rusqlite::Result<EvidenceLink> 
         verdict: EvidenceVerdict::from_str(&verdict_str),
         weight: row.get(4)?,
         reason: row.get(5)?,
-        build_id: if build_id.is_empty() { None } else { Some(build_id) },
+        build_id: if build_id.is_empty() {
+            None
+        } else {
+            Some(build_id)
+        },
         live: None, // Caller resolves liveness via get_live_node
     })
 }
@@ -3663,12 +3700,16 @@ pub fn get_evidence_for_target_cross(
         "SELECT slug, source_node_id, target_node_id, verdict, weight, reason, build_id
          FROM pyramid_evidence WHERE slug = ?1 AND target_node_id = ?2",
     )?;
-    let rows = stmt.query_map(rusqlite::params![slug, target_node_id], evidence_from_raw_row)?;
+    let rows = stmt.query_map(
+        rusqlite::params![slug, target_node_id],
+        evidence_from_raw_row,
+    )?;
     let mut links: Vec<EvidenceLink> = rows.filter_map(|r| r.ok()).collect();
 
     // Resolve liveness for each source node
     for link in &mut links {
-        if let Some((parsed_slug, _depth, parsed_node_id)) = parse_handle_path(&link.source_node_id) {
+        if let Some((parsed_slug, _depth, parsed_node_id)) = parse_handle_path(&link.source_node_id)
+        {
             // Cross-slug handle-path: check liveness in the source pyramid
             link.live = Some(get_live_node(conn, parsed_slug, parsed_node_id)?.is_some());
         } else {
@@ -3717,12 +3758,16 @@ pub fn get_keep_evidence_for_target_cross(
         "SELECT slug, source_node_id, target_node_id, verdict, weight, reason, build_id
          FROM pyramid_evidence WHERE slug = ?1 AND target_node_id = ?2 AND verdict = 'KEEP'",
     )?;
-    let rows = stmt.query_map(rusqlite::params![slug, target_node_id], evidence_from_raw_row)?;
+    let rows = stmt.query_map(
+        rusqlite::params![slug, target_node_id],
+        evidence_from_raw_row,
+    )?;
     let mut links: Vec<EvidenceLink> = rows.filter_map(|r| r.ok()).collect();
 
     // Resolve liveness for each source node
     for link in &mut links {
-        if let Some((parsed_slug, _depth, parsed_node_id)) = parse_handle_path(&link.source_node_id) {
+        if let Some((parsed_slug, _depth, parsed_node_id)) = parse_handle_path(&link.source_node_id)
+        {
             link.live = Some(get_live_node(conn, parsed_slug, parsed_node_id)?.is_some());
         } else {
             link.live = Some(get_live_node(conn, &link.slug, &link.source_node_id)?.is_some());
@@ -3735,11 +3780,7 @@ pub fn get_keep_evidence_for_target_cross(
 // ── Question Tree CRUD ───────────────────────────────────────────────────────
 
 /// Save (upsert) a question decomposition tree for a slug.
-pub fn save_question_tree(
-    conn: &Connection,
-    slug: &str,
-    tree: &serde_json::Value,
-) -> Result<()> {
+pub fn save_question_tree(conn: &Connection, slug: &str, tree: &serde_json::Value) -> Result<()> {
     save_question_tree_with_build_id(conn, slug, tree, None)
 }
 
@@ -3764,13 +3805,8 @@ pub fn save_question_tree_with_build_id(
 }
 
 /// Get the question tree for a slug.
-pub fn get_question_tree(
-    conn: &Connection,
-    slug: &str,
-) -> Result<Option<serde_json::Value>> {
-    let mut stmt = conn.prepare(
-        "SELECT tree FROM pyramid_question_tree WHERE slug = ?1",
-    )?;
+pub fn get_question_tree(conn: &Connection, slug: &str) -> Result<Option<serde_json::Value>> {
+    let mut stmt = conn.prepare("SELECT tree FROM pyramid_question_tree WHERE slug = ?1")?;
     let result = stmt.query_row(rusqlite::params![slug], |row| {
         let json_str: String = row.get(0)?;
         Ok(json_str)
@@ -3901,10 +3937,7 @@ pub struct QuestionNodeRow {
 
 /// Get nodes that are branch nodes (is_leaf = 0) but haven't been decomposed yet
 /// (children_json IS NULL). These are the nodes that need further LLM decomposition.
-pub fn get_undecomposed_nodes(
-    conn: &Connection,
-    slug: &str,
-) -> Result<Vec<QuestionNodeRow>> {
+pub fn get_undecomposed_nodes(conn: &Connection, slug: &str) -> Result<Vec<QuestionNodeRow>> {
     let mut stmt = conn.prepare(
         "SELECT question_id, parent_id, depth, question, about, creates, prompt_hint, is_leaf, children_json
          FROM pyramid_question_nodes
@@ -3940,7 +3973,11 @@ pub fn count_question_nodes(conn: &Connection, slug: &str) -> Result<i64> {
 }
 
 /// Count question nodes for a slug scoped to a specific build_id.
-pub fn count_question_nodes_for_build(conn: &Connection, slug: &str, build_id: &str) -> Result<i64> {
+pub fn count_question_nodes_for_build(
+    conn: &Connection,
+    slug: &str,
+    build_id: &str,
+) -> Result<i64> {
     let count: i64 = conn.query_row(
         "SELECT COUNT(*) FROM pyramid_question_nodes WHERE slug = ?1 AND build_id = ?2",
         rusqlite::params![slug, build_id],
@@ -4058,10 +4095,8 @@ pub fn reconstruct_question_tree(
     }
 
     // Build a map: question_id → row
-    let row_map: HashMap<String, &QuestionNodeRow> = rows
-        .iter()
-        .map(|r| (r.question_id.clone(), r))
-        .collect();
+    let row_map: HashMap<String, &QuestionNodeRow> =
+        rows.iter().map(|r| (r.question_id.clone(), r)).collect();
 
     // Find the root (no parent_id)
     let root_row = rows
@@ -4111,7 +4146,12 @@ pub fn reconstruct_question_tree(
 /// Save a gap report for a slug.
 /// 11-Z: Accepts optional build_id to scope gaps to a specific build.
 /// Deduplicates on (slug, question_id, description) — upserts layer and build_id on re-runs.
-pub fn save_gap(conn: &Connection, slug: &str, gap: &GapReport, build_id: Option<&str>) -> Result<()> {
+pub fn save_gap(
+    conn: &Connection,
+    slug: &str,
+    gap: &GapReport,
+    build_id: Option<&str>,
+) -> Result<()> {
     conn.execute(
         "INSERT INTO pyramid_gaps (slug, question_id, description, layer, build_id)
          VALUES (?1, ?2, ?3, ?4, ?5)
@@ -4137,7 +4177,11 @@ pub fn get_gaps_for_slug(conn: &Connection, slug: &str) -> Result<Vec<GapReport>
 }
 
 /// Get gap reports for a specific question node within a slug.
-pub fn get_gaps_for_question(conn: &Connection, slug: &str, question_id: &str) -> Result<Vec<GapReport>> {
+pub fn get_gaps_for_question(
+    conn: &Connection,
+    slug: &str,
+    question_id: &str,
+) -> Result<Vec<GapReport>> {
     let mut stmt = conn.prepare(
         "SELECT question_id, description, layer FROM pyramid_gaps WHERE slug = ?1 AND question_id = ?2 ORDER BY id ASC",
     )?;
@@ -4154,11 +4198,7 @@ pub fn get_gaps_for_question(conn: &Connection, slug: &str, question_id: &str) -
 // ── ID Map Extensions (wire_handle_path) ─────────────────────────────────────
 
 /// Save an ID mapping with wire_handle_path (extends existing pyramid_id_map).
-pub fn save_id_mapping_extended(
-    conn: &Connection,
-    slug: &str,
-    mapping: &IdMapping,
-) -> Result<()> {
+pub fn save_id_mapping_extended(conn: &Connection, slug: &str, mapping: &IdMapping) -> Result<()> {
     conn.execute(
         "INSERT INTO pyramid_id_map (slug, local_id, wire_uuid, wire_handle_path, published_at)
          VALUES (?1, ?2, ?3, ?4, ?5)
@@ -4188,9 +4228,8 @@ pub fn get_wire_handle_path(
     slug: &str,
     local_id: &str,
 ) -> Result<Option<String>> {
-    let mut stmt = conn.prepare(
-        "SELECT wire_handle_path FROM pyramid_id_map WHERE slug = ?1 AND local_id = ?2",
-    )?;
+    let mut stmt = conn
+        .prepare("SELECT wire_handle_path FROM pyramid_id_map WHERE slug = ?1 AND local_id = ?2")?;
     let result = stmt.query_row(rusqlite::params![slug, local_id], |row| {
         row.get::<_, String>(0)
     });
@@ -4213,7 +4252,11 @@ pub fn get_all_id_mappings(conn: &Connection, slug: &str) -> Result<Vec<IdMappin
         Ok(IdMapping {
             local_id: row.get(0)?,
             wire_handle_path: row.get(1)?,
-            wire_uuid: if wire_uuid.is_empty() { None } else { Some(wire_uuid) },
+            wire_uuid: if wire_uuid.is_empty() {
+                None
+            } else {
+                Some(wire_uuid)
+            },
             published_at: row.get(3)?,
         })
     })?;
@@ -4222,9 +4265,8 @@ pub fn get_all_id_mappings(conn: &Connection, slug: &str) -> Result<Vec<IdMappin
 
 /// Check if a local node has been published to Wire.
 pub fn is_already_published(conn: &Connection, slug: &str, local_id: &str) -> Result<bool> {
-    let result = conn.prepare(
-        "SELECT 1 FROM pyramid_id_map WHERE slug = ?1 AND local_id = ?2 LIMIT 1",
-    );
+    let result =
+        conn.prepare("SELECT 1 FROM pyramid_id_map WHERE slug = ?1 AND local_id = ?2 LIMIT 1");
     match result {
         Ok(mut stmt) => {
             let exists = stmt
@@ -4342,19 +4384,11 @@ pub fn get_slug_online_fields(
 ///
 /// Returns `(mode, chain_id)` where mode is one of "open", "absorb-all",
 /// "absorb-selective". Defaults to ("open", None) if the slug doesn't exist.
-pub fn get_absorption_mode(
-    conn: &Connection,
-    slug: &str,
-) -> Result<(String, Option<String>)> {
+pub fn get_absorption_mode(conn: &Connection, slug: &str) -> Result<(String, Option<String>)> {
     let result = conn.query_row(
         "SELECT absorption_mode, absorption_chain_id FROM pyramid_slugs WHERE slug = ?1",
         rusqlite::params![slug],
-        |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, Option<String>>(1)?,
-            ))
-        },
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
     );
     match result {
         Ok(val) => Ok(val),
@@ -4530,10 +4564,7 @@ pub fn save_source_delta(
 }
 
 /// Get all unprocessed source deltas for a slug.
-pub fn get_unprocessed_source_deltas(
-    conn: &Connection,
-    slug: &str,
-) -> Result<Vec<SourceDelta>> {
+pub fn get_unprocessed_source_deltas(conn: &Connection, slug: &str) -> Result<Vec<SourceDelta>> {
     let mut stmt = conn.prepare(
         "SELECT id, slug, file_path, change_type, diff_summary, processed, created_at
          FROM pyramid_source_deltas WHERE slug = ?1 AND processed = 0 ORDER BY id ASC",
@@ -4608,11 +4639,7 @@ pub fn enqueue_staleness(
 /// Dequeue the highest-priority staleness items for a slug.
 /// Returns up to `limit` items, deleting them from the queue.
 /// SELECT + DELETE are wrapped in a transaction to prevent TOCTOU races.
-pub fn dequeue_staleness(
-    conn: &Connection,
-    slug: &str,
-    limit: u32,
-) -> Result<Vec<StalenessItem>> {
+pub fn dequeue_staleness(conn: &Connection, slug: &str, limit: u32) -> Result<Vec<StalenessItem>> {
     // Use IMMEDIATE transaction to prevent concurrent readers from seeing the
     // same rows before we delete them.
     conn.execute_batch("BEGIN IMMEDIATE")?;
@@ -4654,7 +4681,9 @@ pub fn dequeue_staleness(
 
     match &result {
         Ok(_) => conn.execute_batch("COMMIT")?,
-        Err(_) => { let _ = conn.execute_batch("ROLLBACK"); }
+        Err(_) => {
+            let _ = conn.execute_batch("ROLLBACK");
+        }
     }
 
     result
@@ -4728,7 +4757,7 @@ fn migrate_gaps_unique(conn: &Connection) -> Result<()> {
     if !needs_migration {
         // Still ensure the question index exists even if UNIQUE is already there
         let _ = conn.execute_batch(
-            "CREATE INDEX IF NOT EXISTS idx_gaps_question ON pyramid_gaps(slug, question_id);"
+            "CREATE INDEX IF NOT EXISTS idx_gaps_question ON pyramid_gaps(slug, question_id);",
         );
         return Ok(());
     }
@@ -4767,11 +4796,10 @@ fn migrate_gaps_unique(conn: &Connection) -> Result<()> {
 /// Creates evidence links with verdict=KEEP, weight=1.0, reason="legacy backfill".
 fn backfill_evidence_from_children(conn: &Connection) -> Result<()> {
     // Check if pyramid_evidence already has data
-    let evidence_count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM pyramid_evidence",
-        [],
-        |row| row.get(0),
-    )?;
+    let evidence_count: i64 =
+        conn.query_row("SELECT COUNT(*) FROM pyramid_evidence", [], |row| {
+            row.get(0)
+        })?;
     if evidence_count > 0 {
         return Ok(());
     }
@@ -4834,12 +4862,17 @@ fn backfill_evidence_from_children(conn: &Connection) -> Result<()> {
 
     match &result {
         Ok(_) => conn.execute_batch("COMMIT")?,
-        Err(_) => { let _ = conn.execute_batch("ROLLBACK"); }
+        Err(_) => {
+            let _ = conn.execute_batch("ROLLBACK");
+        }
     }
 
     let count = result?;
     if count > 0 {
-        tracing::info!("Backfilled {} evidence links from existing children.", count);
+        tracing::info!(
+            "Backfilled {} evidence links from existing children.",
+            count
+        );
     }
 
     Ok(())
@@ -5837,13 +5870,20 @@ mod tests {
 
         // Both should coexist — different source_node_id values
         let all = get_evidence_for_target(&conn, "qslug", "Q1-001").unwrap();
-        assert_eq!(all.len(), 2, "same-slug and cross-slug evidence must coexist");
+        assert_eq!(
+            all.len(),
+            2,
+            "same-slug and cross-slug evidence must coexist"
+        );
 
         // Verify both round-trip correctly
         let bare_link = all.iter().find(|l| l.source_node_id == "L0-003").unwrap();
         assert_eq!(bare_link.weight, Some(0.8));
 
-        let handle_link = all.iter().find(|l| l.source_node_id == "base/0/L0-003").unwrap();
+        let handle_link = all
+            .iter()
+            .find(|l| l.source_node_id == "base/0/L0-003")
+            .unwrap();
         assert_eq!(handle_link.weight, Some(0.9));
     }
 }

@@ -188,7 +188,14 @@ pub async fn init_stale_engines(pyramid_state: &Arc<pyramid::PyramidState>) {
         }
 
         // Create the engine
-        let mut engine = PyramidStaleEngine::new(&slug, config.clone(), &db_path, &api_key, &model, pyramid_state.operational.as_ref().clone());
+        let mut engine = PyramidStaleEngine::new(
+            &slug,
+            config.clone(),
+            &db_path,
+            &api_key,
+            &model,
+            pyramid_state.operational.as_ref().clone(),
+        );
 
         // Breaker-tripped: create engine in tripped state, log warning, no watcher
         if config.breaker_tripped {
@@ -319,6 +326,8 @@ pub async fn start_server(
         "http://localhost:1420",
         "http://127.0.0.1:1420",
         "https://localhost:1420",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
         "tauri://localhost",
     ];
     let cors = warp::cors()
@@ -647,7 +656,10 @@ pub async fn start_server(
 
             // Only echo back origin if it's in our allowlist
             if let Some(ref o) = origin {
-                if CORS_ALLOWED_ORIGINS.iter().any(|allowed| *allowed == o.as_str()) {
+                if CORS_ALLOWED_ORIGINS
+                    .iter()
+                    .any(|allowed| *allowed == o.as_str())
+                {
                     builder = builder.header("Access-Control-Allow-Origin", o.as_str());
                 }
             }
@@ -927,10 +939,7 @@ pub fn verify_payment_token(
     let claims = &token_data.claims;
 
     // Verify serving_node_operator_id matches this node
-    let serving_id = claims
-        .serving_node_operator_id
-        .as_deref()
-        .unwrap_or("");
+    let serving_id = claims.serving_node_operator_id.as_deref().unwrap_or("");
     if serving_id.is_empty() {
         return Err("Missing serving_node_operator_id in payment token".into());
     }

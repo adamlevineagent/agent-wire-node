@@ -13,17 +13,17 @@ use warp::Reply;
 
 use super::build::WriteOp;
 use super::characterize;
-use super::types::CharacterizationResult;
 use super::db;
 use super::delta;
-use super::publication;
 use super::faq;
 use super::ingest;
 use super::meta;
+use super::publication;
 use super::query;
 use super::slug;
 use super::stale_engine;
 use super::staleness_bridge;
+use super::types::CharacterizationResult;
 use super::types::*;
 use super::vine;
 use super::webbing;
@@ -132,17 +132,14 @@ fn with_dual_auth(
 
                     match crate::server::verify_pyramid_query_jwt(&token, &pubkey_str) {
                         Ok(claims) => {
-                            let operator_id = claims
-                                .operator_id
-                                .unwrap_or_default();
+                            let operator_id = claims.operator_id.unwrap_or_default();
 
                             // Rate limiting: 100 queries per minute per operator
                             {
                                 let mut limiter = state.remote_query_rate_limiter.lock().await;
                                 let now = std::time::Instant::now();
-                                let entry = limiter
-                                    .entry(operator_id.clone())
-                                    .or_insert((0u64, now));
+                                let entry =
+                                    limiter.entry(operator_id.clone()).or_insert((0u64, now));
 
                                 // Reset window if more than 60s elapsed
                                 if now.duration_since(entry.1).as_secs() >= 60 {
@@ -161,7 +158,13 @@ fn with_dual_auth(
                             }
 
                             let circle_id = claims.circle_id;
-                            return Ok((state, AuthSource::WireJwt { operator_id, circle_id }));
+                            return Ok((
+                                state,
+                                AuthSource::WireJwt {
+                                    operator_id,
+                                    circle_id,
+                                },
+                            ));
                         }
                         Err(e) => {
                             tracing::warn!("Wire JWT validation failed: {}", e);
@@ -242,11 +245,8 @@ fn enforce_access_tier(
         } => (operator_id, circle_id),
     };
 
-    let (tier, _price, allowed_circles) = db::get_access_tier(conn, slug).unwrap_or((
-        "public".to_string(),
-        None,
-        None,
-    ));
+    let (tier, _price, allowed_circles) =
+        db::get_access_tier(conn, slug).unwrap_or(("public".to_string(), None, None));
 
     match tier.as_str() {
         "public" => Ok(()),
@@ -488,8 +488,8 @@ fn with_agent_id() -> impl Filter<Extract = (Option<String>,), Error = warp::Rej
 // ── Payment token header filter (WS-ONLINE-H) ──────────────────────
 
 #[allow(dead_code)] // WS-ONLINE-H: used when payment enforcement is enabled
-fn with_payment_token(
-) -> impl Filter<Extract = (Option<String>,), Error = warp::Rejection> + Clone {
+fn with_payment_token() -> impl Filter<Extract = (Option<String>,), Error = warp::Rejection> + Clone
+{
     warp::header::optional::<String>("x-payment-token")
 }
 
@@ -508,12 +508,18 @@ fn with_payment_token(
 /// contains the nonce from a valid token (for future redeem calls).
 ///
 /// ### WS-ONLINE-H ENFORCEMENT POINT ###
-/// When the Wire server payment-intent/redeem endpoints are live, change this
-/// function to return `Err(response)` on missing/invalid payment tokens for
-/// priced pyramids. At that point:
+/// Payment-intent/redeem endpoints are now live on prod. This function should be
+/// activated to enforce payment for priced pyramid queries. Steps:
 /// 1. Require valid payment token for all priced pyramid queries
 /// 2. After query execution, call POST /api/v1/wire/payment-redeem with the token
 /// 3. On redeem failure, store in pyramid_unredeemed_tokens for retry
+///
+/// TODO(Pillar-9): Verify that payment-escrow.ts:redeemToken() routes through
+/// the 80-slot rotator arm per Pillar 9, not a direct credit transfer. The p2p
+/// CDN economy (stamps) may not be part of UFF — this needs design clarity.
+///
+/// TODO(Pillar-23): Cost estimation for remote queries needs to unify local
+/// estimation with Wire-side pricing. Punt until local/wire cost model is settled.
 #[allow(dead_code)] // WS-ONLINE-H: used when payment enforcement is enabled
 async fn validate_payment_token(
     payment_token_header: &Option<String>,
@@ -1123,7 +1129,10 @@ pub fn pyramid_routes(
                 warp::http::Response::builder()
                     .status(410)
                     .header("Content-Type", "application/json")
-                    .body(r#"{"error":"moved to IPC","command":"pyramid_auto_update_config_set"}"#.into())
+                    .body(
+                        r#"{"error":"moved to IPC","command":"pyramid_auto_update_config_set"}"#
+                            .into(),
+                    )
                     .unwrap(),
             )
         })
@@ -1151,7 +1160,9 @@ pub fn pyramid_routes(
                 warp::http::Response::builder()
                     .status(410)
                     .header("Content-Type", "application/json")
-                    .body(r#"{"error":"moved to IPC","command":"pyramid_auto_update_freeze"}"#.into())
+                    .body(
+                        r#"{"error":"moved to IPC","command":"pyramid_auto_update_freeze"}"#.into(),
+                    )
                     .unwrap(),
             )
         })
@@ -1179,7 +1190,10 @@ pub fn pyramid_routes(
                 warp::http::Response::builder()
                     .status(410)
                     .header("Content-Type", "application/json")
-                    .body(r#"{"error":"moved to IPC","command":"pyramid_auto_update_unfreeze"}"#.into())
+                    .body(
+                        r#"{"error":"moved to IPC","command":"pyramid_auto_update_unfreeze"}"#
+                            .into(),
+                    )
                     .unwrap(),
             )
         })
@@ -1207,7 +1221,10 @@ pub fn pyramid_routes(
                 warp::http::Response::builder()
                     .status(410)
                     .header("Content-Type", "application/json")
-                    .body(r#"{"error":"moved to IPC","command":"pyramid_auto_update_l0_sweep"}"#.into())
+                    .body(
+                        r#"{"error":"moved to IPC","command":"pyramid_auto_update_l0_sweep"}"#
+                            .into(),
+                    )
                     .unwrap(),
             )
         })
@@ -1455,7 +1472,9 @@ pub fn pyramid_routes(
                 warp::http::Response::builder()
                     .status(410)
                     .header("Content-Type", "application/json")
-                    .body(r#"{"error":"moved to IPC","command":"pyramid_vine_rebuild_upper"}"#.into())
+                    .body(
+                        r#"{"error":"moved to IPC","command":"pyramid_vine_rebuild_upper"}"#.into(),
+                    )
                     .unwrap(),
             )
         })
@@ -1635,7 +1654,10 @@ pub fn pyramid_routes(
                 warp::http::Response::builder()
                     .status(410)
                     .header("Content-Type", "application/json")
-                    .body(r#"{"error":"moved to IPC","command":"pyramid_publish_question_set"}"#.into())
+                    .body(
+                        r#"{"error":"moved to IPC","command":"pyramid_publish_question_set"}"#
+                            .into(),
+                    )
                     .unwrap(),
             )
         })
@@ -1704,8 +1726,9 @@ pub fn pyramid_routes(
     // WS-ONLINE-D: GET /pyramid/:slug/export — full node export for pinning.
     // Gated behind Wire JWT auth (with_dual_auth). Has its own stricter rate limit
     // (5/minute per operator) enforced in the handler, separate from query rate limit.
-    let export_rate_limiter: Arc<Mutex<std::collections::HashMap<String, (u64, std::time::Instant)>>> =
-        Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let export_rate_limiter: Arc<
+        Mutex<std::collections::HashMap<String, (u64, std::time::Instant)>>,
+    > = Arc::new(Mutex::new(std::collections::HashMap::new()));
     let export_rl = export_rate_limiter.clone();
     let export_route = route!(prefix
         .and(warp::path::param::<String>())
@@ -1942,10 +1965,8 @@ async fn handle_create_slug(
             match db::get_slug(&conn, ref_slug) {
                 Ok(Some(info)) => {
                     if info.archived_at.is_some() {
-                        archived_warnings.push(format!(
-                            "Referenced slug '{}' is archived",
-                            ref_slug
-                        ));
+                        archived_warnings
+                            .push(format!("Referenced slug '{}' is archived", ref_slug));
                     }
                 }
                 Ok(None) => {
@@ -3205,7 +3226,16 @@ async fn handle_faq_directory(
     let model = config.primary_model.clone();
     drop(config);
 
-    match faq::get_faq_directory(&state.reader, &state.writer, &slug_name, &api_key, &model, &state.operational.tier2).await {
+    match faq::get_faq_directory(
+        &state.reader,
+        &state.writer,
+        &slug_name,
+        &api_key,
+        &model,
+        &state.operational.tier2,
+    )
+    .await
+    {
         Ok(directory) => Ok(json_ok(&directory)),
         Err(e) => Ok(json_error(
             warp::http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -4277,7 +4307,15 @@ async fn handle_characterize(
 
     let llm_config = state.config.read().await.clone();
 
-    match characterize::characterize(&source_path, &body.question, &llm_config, &state.operational.tier1, Some(&state.chains_dir)).await {
+    match characterize::characterize(
+        &source_path,
+        &body.question,
+        &llm_config,
+        &state.operational.tier1,
+        Some(&state.chains_dir),
+    )
+    .await
+    {
         Ok(result) => Ok(json_ok(&result)),
         Err(e) => Ok(json_error(
             warp::http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -4859,8 +4897,10 @@ async fn handle_publish_pyramid(
         // Build evidence weight map: target_node_id -> (source_node_id -> weight)
         // Uses KEEP evidence links so published contributions carry real weights
         // instead of flat 1.0.
-        let mut ev_weights: std::collections::HashMap<String, std::collections::HashMap<String, f64>> =
-            std::collections::HashMap::new();
+        let mut ev_weights: std::collections::HashMap<
+            String,
+            std::collections::HashMap<String, f64>,
+        > = std::collections::HashMap::new();
         for (_depth, nodes) in &result {
             for node in nodes {
                 if let Ok(links) = db::get_keep_evidence_for_target(&conn, &slug_name, &node.id) {
@@ -4890,7 +4930,15 @@ async fn handle_publish_pyramid(
     }
 
     // Phase 2: Publish nodes via HTTP (async, no DB lock held)
-    match publisher.publish_pyramid_idempotent(&slug_name, &nodes_by_depth, &std::collections::HashMap::new(), &evidence_weights).await {
+    match publisher
+        .publish_pyramid_idempotent(
+            &slug_name,
+            &nodes_by_depth,
+            &std::collections::HashMap::new(),
+            &evidence_weights,
+        )
+        .await
+    {
         Ok(result) => {
             // Phase 3: Persist ID mappings (scoped write lock)
             {
@@ -4899,13 +4947,13 @@ async fn handle_publish_pyramid(
                     tracing::warn!(error = %e, "failed to init id_map table");
                 }
                 for mapping in &result.id_mappings {
-                    let uuid = mapping.wire_uuid.as_deref().unwrap_or(&mapping.wire_handle_path);
-                    if let Err(e) = wire_publish::save_id_mapping(
-                        &writer,
-                        &slug_name,
-                        &mapping.local_id,
-                        uuid,
-                    ) {
+                    let uuid = mapping
+                        .wire_uuid
+                        .as_deref()
+                        .unwrap_or(&mapping.wire_handle_path);
+                    if let Err(e) =
+                        wire_publish::save_id_mapping(&writer, &slug_name, &mapping.local_id, uuid)
+                    {
                         tracing::warn!(
                             local_id = %mapping.local_id,
                             error = %e,
@@ -4939,9 +4987,7 @@ async fn handle_publish_pyramid(
                             // Re-acquire writer to persist UUID
                             let writer = state.writer.lock().await;
                             if let Err(e) = db::set_slug_metadata_contribution_id(
-                                &writer,
-                                &slug_name,
-                                &new_uuid,
+                                &writer, &slug_name, &new_uuid,
                             ) {
                                 tracing::warn!(
                                     slug = %slug_name,
@@ -5177,9 +5223,7 @@ async fn handle_export(
     if let Some(ref op_id) = operator_id {
         let mut limiter = export_rate_limiter.lock().await;
         let now = std::time::Instant::now();
-        let entry = limiter
-            .entry(op_id.clone())
-            .or_insert((0u64, now));
+        let entry = limiter.entry(op_id.clone()).or_insert((0u64, now));
 
         // Reset window if more than 60s elapsed
         if now.duration_since(entry.1).as_secs() >= 60 {
@@ -5271,11 +5315,8 @@ async fn handle_query_cost(
     }
 
     // Determine access price: explicit override first, then cached emergent price, then 0
-    let (tier, explicit_price, _circles) = db::get_access_tier(&conn, &slug_name).unwrap_or((
-        "public".to_string(),
-        None,
-        None,
-    ));
+    let (tier, explicit_price, _circles) =
+        db::get_access_tier(&conn, &slug_name).unwrap_or(("public".to_string(), None, None));
 
     let access_price: i64 = match tier.as_str() {
         "public" => 0, // Public pyramids: stamp only, no access fee
@@ -5347,7 +5388,10 @@ async fn handle_remote_query(
     if !valid_actions.contains(&body.action.as_str()) {
         return Ok(json_error(
             warp::http::StatusCode::BAD_REQUEST,
-            &format!("Invalid action '{}'. Must be one of: {:?}", body.action, valid_actions),
+            &format!(
+                "Invalid action '{}'. Must be one of: {:?}",
+                body.action, valid_actions
+            ),
         ));
     }
 
@@ -5387,8 +5431,8 @@ async fn handle_remote_query(
         let config = state.config.read().await;
         config.auth_token.clone()
     };
-    let wire_server_url = std::env::var("WIRE_URL")
-        .unwrap_or_else(|_| "https://newsbleach.com".to_string());
+    let wire_server_url =
+        std::env::var("WIRE_URL").unwrap_or_else(|_| "https://newsbleach.com".to_string());
 
     if wire_jwt.is_empty() {
         return Ok(json_error(
@@ -5416,12 +5460,10 @@ async fn handle_remote_query(
 
     // Step 2: Forward the query based on action type
     let result: Result<serde_json::Value, String> = match body.action.as_str() {
-        "apex" => {
-            match client.remote_apex(&body.slug).await {
-                Ok(resp) => serde_json::to_value(&resp).map_err(|e| e.to_string()),
-                Err(e) => Err(e.to_string()),
-            }
-        }
+        "apex" => match client.remote_apex(&body.slug).await {
+            Ok(resp) => serde_json::to_value(&resp).map_err(|e| e.to_string()),
+            Err(e) => Err(e.to_string()),
+        },
         "drill" => {
             let node_id = body.params.get("node_id").cloned().unwrap_or_default();
             if node_id.is_empty() {
@@ -5448,24 +5490,18 @@ async fn handle_remote_query(
                 Err(e) => Err(e.to_string()),
             }
         }
-        "entities" => {
-            match client.remote_entities(&body.slug).await {
-                Ok(resp) => serde_json::to_value(&resp).map_err(|e| e.to_string()),
-                Err(e) => Err(e.to_string()),
-            }
-        }
-        "export" => {
-            match client.remote_export(&body.slug).await {
-                Ok(resp) => serde_json::to_value(&resp).map_err(|e| e.to_string()),
-                Err(e) => Err(e.to_string()),
-            }
-        }
-        "tree" => {
-            match client.remote_tree(&body.slug).await {
-                Ok(resp) => serde_json::to_value(&resp.tree).map_err(|e| e.to_string()),
-                Err(e) => Err(e.to_string()),
-            }
-        }
+        "entities" => match client.remote_entities(&body.slug).await {
+            Ok(resp) => serde_json::to_value(&resp).map_err(|e| e.to_string()),
+            Err(e) => Err(e.to_string()),
+        },
+        "export" => match client.remote_export(&body.slug).await {
+            Ok(resp) => serde_json::to_value(&resp).map_err(|e| e.to_string()),
+            Err(e) => Err(e.to_string()),
+        },
+        "tree" => match client.remote_tree(&body.slug).await {
+            Ok(resp) => serde_json::to_value(&resp.tree).map_err(|e| e.to_string()),
+            Err(e) => Err(e.to_string()),
+        },
         _ => unreachable!(), // Already validated above
     };
 
@@ -5487,7 +5523,11 @@ async fn handle_remote_query(
                 Ok(warp::http::Response::builder()
                     .status(402)
                     .header("Content-Type", "application/json")
-                    .body(serde_json::to_string(&payment_info).unwrap_or_default().into())
+                    .body(
+                        serde_json::to_string(&payment_info)
+                            .unwrap_or_default()
+                            .into(),
+                    )
                     .unwrap())
             } else if err_msg.contains("403") || err_msg.contains("Forbidden") {
                 Ok(json_error(warp::http::StatusCode::FORBIDDEN, &err_msg))
@@ -5496,7 +5536,10 @@ async fn handle_remote_query(
                     warp::http::StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS,
                     &err_msg,
                 ))
-            } else if err_msg.contains("unreachable") || err_msg.contains("connect") || err_msg.contains("timeout") {
+            } else if err_msg.contains("unreachable")
+                || err_msg.contains("connect")
+                || err_msg.contains("timeout")
+            {
                 Ok(json_error(warp::http::StatusCode::BAD_GATEWAY, &format!(
                     "Tunnel unreachable: {}. If you have a pinned copy, it will be used as fallback.",
                     err_msg,
@@ -5562,7 +5605,10 @@ async fn handle_absorption_config(
     // Read rate limit config from pyramid_config.json
     let (rate_limit, daily_cap) = if let Some(ref data_dir) = state.data_dir {
         let cfg = super::PyramidConfig::load(data_dir);
-        (cfg.absorption_rate_limit_per_operator, cfg.absorption_daily_spend_cap)
+        (
+            cfg.absorption_rate_limit_per_operator,
+            cfg.absorption_daily_spend_cap,
+        )
     } else {
         (3u32, 100u64) // defaults
     };

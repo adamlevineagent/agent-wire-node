@@ -1,0 +1,50 @@
+experiment	slug	parent	composite	directness	audience	grounding	completeness	coherence	conciseness	status	description
+0	vibe-web-2	-	4.7	5	4	7	4	5	3	baseline	Original
+4	exp-4	3	5.7	6	7	8	5	4	4	keep	First structural fix
+15	exp-15	14	6.3	7	7	8	6	5	5	keep	Answer-sim decompose
+17	exp-17	14	6.7	7	6	8	7	7	5	keep	First forced-orthogonal
+23	exp-23	17	6.0	6	4	7	7	7	5	keep	Batch 1
+24	exp-24	17	5.7	5	7	6	5	7	4	keep	Batch 1
+25	exp-25	17	7.3	7	6	8	7	8	8	keep*	Batch 1 winner
+26	exp-26	17	5.3	6	5	5	6	6	4	discard	Batch 1 low
+27	exp-27	17	6.2	7	5	6	7	7	5	keep	Batch 1
+28	exp-28	17	8.3	9	8	8	8	9	8	keep*	Batch 2 winner
+29	exp-29	17	5.3	5	5	7	6	4	5	discard	Batch 2 low
+30	exp-30	17	8.5	9	8	9	9	9	7	keep*	Batch 2 winner
+31	exp-31	17	6.7	7	6	7	5	8	7	keep	Batch 2
+32	exp-32	17	6.7	7	6	7	5	8	7	keep	Batch 2
+33	exp-33	-	6.0	6	7	5	6	7	5	keep	Ultra-specific question
+34	exp-34	17	6.3	6	7	7	7	6	5	keep	Batch 3
+35	exp-35	17	7.8	8	8	8	8	8	7	keep*	Batch 3
+36	exp-36	17	8.7	9	8	9	9	9	8	keep*	BEST EVER: batch 3
+37	exp-37	17	6.3	6	5	7	7	7	6	keep	Batch 3
+38	exp-38	17	8.0	8	8	8	8	8	8	keep*	Batch 3
+39	exp-39	17	7.0	7	6	7	8	8	6	keep	Batch 4
+40	exp-40	17	6.0	6	6	6	4	7	7	keep	Batch 4 narrow-scope
+41	exp-41	17	6.0	7	7	4	5	6	7	keep	Batch 4 2-L1 only
+42	exp-42	17	7.2	7	5	9	9	8	5	keep*	Batch 4 deep-grounding
+43	exp-43	17	8.2	8	8	8	8	9	8	keep*	Batch 4 winner
+44	exp-44	17	7.0	7	6	8	8	7	6	keep	Batch 5
+45	exp-45	17	6.7	8	8	6	3	8	7	keep	Batch 5 narrow
+46	exp-46	17	7.7	7	7	8	9	8	7	keep*	Batch 5
+47	exp-47	17	6.8	8	7	7	4	8	7	keep	Batch 5 missing-facet
+48	exp-48	17	8.3	8	8	8	9	9	8	keep*	Batch 5 winner
+WS13-0	vibe-web-3	-	3.5	4	5	3	3	2	4	baseline	WS13 audience gating + deep tree (4L/36Q) - pre_map failure
+WS13-1	exp-49	17	4.2	3	4	5	2	6	5	discard	WS13 forced-ortho but narrow scope
+WS13-50	exp-50	17	6.5	6	6	7	4	8	8	keep	WS13 batch narrow-scope
+WS13-51	exp-51	17	7.3	8	6	8	8	8	6	keep*	WS13 batch best
+WS13-52	exp-52	17	6.8	6	8	7	3	8	9	keep	WS13 batch narrow+clean
+WS13-54	exp-54	17	7.0	7	6	7	8	7	7	keep	Post-externalization batch
+WS13-55	exp-55	17	6.2	7	7	7	5	4	7	keep	Post-ext narrow-scope
+WS13-56	exp-56	17	7.3	8	8	8	9	6	5	keep*	Post-ext best completeness
+WS13-57	exp-57	17	8.0	8	9	8	8	8	7	keep*	Post-ext best overall, A=9
+WS13-58	exp-58	17	6.0	5	7	8	6	5	5	discard	v2 tight evidence - regression
+WS13-59	exp-59	17	7.0	7	7	9	8	5	6	keep	v2 tight evidence
+WS13-60	exp-60	17	7.0	7	7	8	8	6	6	keep	v2 tight evidence
+WS13-61	exp-61	17	6.3	6	5	7	7	6	7	discard	v2 tight evidence - garbled output
+WS13-62	exp-62	17	5.8	6	4	7	5	6	7	discard	v2 tight evidence - worst jargon leak
+WS13-63	exp-63	clean-1	8.5	8	8	9	9	9	8	keep*	Clean base, new ATB candidate
+WS13-64	exp-64	clean-1	8.3	8	9	9	9	8	7	keep*	Clean base, A=9
+WS13-65	exp-65	clean-1	7.2	8	9	5	8	6	7	keep	Clean base, empty L1
+WS13-66	exp-66	clean-1	8.8	9	9	9	9	9	8	keep*	NEW ALL-TIME BEST
+WS13-67	exp-67	clean-1	6.8	7	9	7	4	6	8	discard	Clean base, narrow scope

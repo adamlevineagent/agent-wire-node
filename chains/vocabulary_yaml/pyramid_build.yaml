@@ -1,0 +1,177 @@
+domain: pyramid_build
+version: 1
+description: "Commands for creating pyramids, configuring build settings, and running builds"
+commands:
+  - name: pyramid_create_slug
+    description: "Create a new pyramid slug"
+    params:
+      - name: slug
+        type: string
+        required: true
+        description: "The slug identifier for the pyramid"
+      - name: contentType
+        type: string
+        required: true
+        description: "Type of content: codebase, documents, or question"
+      - name: sourcePath
+        type: string
+        required: true
+        description: "The local directory to index"
+      - name: referencedSlugs
+        type: object
+        required: false
+        description: "Array of other pyramid slugs this pyramid references"
+    dispatch:
+      type: tauri
+
+  - name: pyramid_build
+    description: "Start a mechanical pyramid build for the given slug"
+    params:
+      - name: slug
+        type: string
+        required: true
+        description: "The slug to build"
+    dispatch:
+      type: tauri
+
+  - name: pyramid_question_build
+    description: "Start a question pyramid build"
+    params:
+      - name: slug
+        type: string
+        required: true
+        description: "The slug to build"
+      - name: question
+        type: string
+        required: true
+        description: "The question to explore"
+      - name: granularity
+        type: integer
+        required: false
+        description: "Controls sub-question fan-out, default 3"
+      - name: maxDepth
+        type: integer
+        required: false
+        description: "Caps tree depth, default 3"
+      - name: fromDepth
+        type: integer
+        required: false
+        description: "Resumes build from a specific depth"
+      - name: characterization
+        type: object
+        required: false
+        description: "Seeds the build with a pre-run characterize result"
+    dispatch:
+      type: tauri
+
+  - name: pyramid_build_cancel
+    description: "Cancel a running pyramid build for the given slug"
+    params:
+      - name: slug
+        type: string
+        required: true
+        description: "The slug whose build to cancel"
+    dispatch:
+      type: tauri
+
+  - name: pyramid_build_force_reset
+    description: "Force-reset a stuck build. Only works if the build has been running for >30 minutes"
+    params:
+      - name: slug
+        type: string
+        required: true
+        description: "The slug whose build to force-reset"
+    dispatch:
+      type: tauri
+
+  - name: pyramid_set_config
+    description: "Set pyramid builder configuration. Only provided fields are updated"
+    params:
+      - name: apiKey
+        type: string
+        required: false
+        description: "OpenRouter API key"
+        source: context
+      - name: authToken
+        type: string
+        required: false
+        description: "Wire auth token"
+        source: context
+      - name: primaryModel
+        type: string
+        required: false
+        description: "Primary LLM model name"
+      - name: fallbackModel1
+        type: string
+        required: false
+        description: "First fallback model name"
+      - name: fallbackModel2
+        type: string
+        required: false
+        description: "Second fallback model name"
+      - name: useIrExecutor
+        type: boolean
+        required: false
+        description: "Whether to use the IR executor"
+    dispatch:
+      type: tauri
+
+  - name: pyramid_get_config
+    description: "Get current pyramid builder config"
+    params: []
+    dispatch:
+      type: tauri
+
+  - name: pyramid_test_api_key
+    description: "Test the configured OpenRouter API key by making a small request"
+    params: []
+    dispatch:
+      type: tauri
+
+  - name: pyramid_set_access_tier
+    description: "Set publication access tier for a pyramid"
+    params:
+      - name: slug
+        type: string
+        required: true
+        description: "The pyramid slug"
+      - name: tier
+        type: string
+        required: true
+        description: "Access tier: public, priced, circle, or private"
+      - name: price
+        type: integer
+        required: false
+        description: "Credit cost, required for priced tier"
+      - name: circles
+        type: string
+        required: false
+        description: "Comma-separated circle IDs, required for circle tier"
+    dispatch:
+      type: tauri
+
+  - name: pyramid_set_absorption_mode
+    description: "Set how a pyramid absorbs external contributions"
+    params:
+      - name: slug
+        type: string
+        required: true
+        description: "The pyramid slug"
+      - name: mode
+        type: string
+        required: true
+        description: "Absorption mode: open, absorb-all, or absorb-selective"
+      - name: chainId
+        type: string
+        required: false
+        description: "Action chain ID for selective mode"
+      - name: rateLimit
+        type: integer
+        required: false
+        description: "Maximum absorptions per hour"
+      - name: dailyCap
+        type: integer
+        required: false
+        description: "Maximum absorptions per day"
+    dispatch:
+      type: tauri

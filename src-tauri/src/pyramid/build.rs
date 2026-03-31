@@ -551,7 +551,7 @@ pub(crate) fn node_from_analysis(
         children,
         parent_id: None,
         superseded_by: None,
-            build_id: None,
+        build_id: None,
         created_at: String::new(),
     }
 }
@@ -2831,7 +2831,50 @@ pub(crate) fn child_payload_json(node: &PyramidNode) -> Value {
     }
 }
 
+/// Compact version of child_payload_json for upper-layer synthesis.
+/// Preserves topics (needed for synthesis quality) but truncates verbose text:
+/// - `distilled` capped to `max_distilled_chars`
+/// - each topic's `current` capped to `max_topic_chars`
+/// - corrections/decisions dropped (only topic summaries matter at L3+)
+pub(crate) fn compact_child_payload(
+    node: &PyramidNode,
+    max_distilled_chars: usize,
+    max_topic_chars: usize,
+) -> Value {
+    let distilled = truncate_text(&node.distilled, max_distilled_chars);
+
+    let compact_topics: Vec<Value> = node
+        .topics
+        .iter()
+        .map(|t| {
+            serde_json::json!({
+                "name": t.name,
+                "current": truncate_text(&t.current, max_topic_chars),
+                "entities": t.entities,
+            })
+        })
+        .collect();
+
+    serde_json::json!({
+        "headline": node.headline,
+        "distilled": distilled,
+        "topics": compact_topics,
+    })
+}
+
+/// Truncate text to max_chars (char-safe), appending "…" if truncated.
+fn truncate_text(text: &str, max_chars: usize) -> String {
+    let trimmed = text.trim();
+    if trimmed.chars().count() <= max_chars {
+        trimmed.to_string()
+    } else {
+        let prefix: String = trimmed.chars().take(max_chars).collect();
+        format!("{prefix}…")
+    }
+}
+
 // ── MECHANICAL PASSES (CODE PIPELINE) ────────────────────────────────────────
+
 
 /// Data structures for the import graph / mechanical analysis.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]

@@ -1,0 +1,57 @@
+domain: knowledge_sync
+version: 1
+description: "Commands for linking local folders to Wire corpora and syncing content"
+commands:
+  - name: link_folder
+    description: "Link a local folder to a Wire corpus for syncing"
+    params:
+      - name: folderPath
+        type: string
+        required: true
+        description: "Local folder path to link"
+      - name: corpusSlug
+        type: string
+        required: true
+        description: "Wire corpus slug to link to"
+      - name: direction
+        type: string
+        required: true
+        description: "Sync direction: push, pull, or bidirectional"
+    dispatch:
+      type: tauri
+
+  - name: unlink_folder
+    description: "Unlink a previously linked folder from its corpus"
+    params:
+      - name: folderPath
+        type: string
+        required: true
+        description: "Local folder path to unlink"
+    dispatch:
+      type: tauri
+
+  - name: sync_content
+    description: "Trigger an immediate sync of all linked folders"
+    params: []
+    dispatch:
+      type: tauri
+
+  - name: get_sync_status
+    description: "Get current sync state -- linked folders, sync progress, last sync time, auto-sync settings"
+    params: []
+    dispatch:
+      type: tauri
+
+  - name: set_auto_sync
+    description: "Enable or disable automatic periodic sync"
+    params:
+      - name: enabled
+        type: boolean
+        required: true
+        description: "Whether auto-sync is enabled"
+      - name: intervalSecs
+        type: integer
+        required: false
+        description: "Sync interval in seconds, minimum 60"
+    dispatch:
+      type: tauri

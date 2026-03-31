@@ -1,0 +1,177 @@
+domain: wire_compose
+version: 1
+description: "Commands for creating, editing, and submitting contributions to the Wire graph."
+commands:
+  - name: submit_contribution
+    description: "Submit a new contribution to the Wire"
+    params:
+      - name: type
+        type: string
+        required: true
+        description: "Contribution type: intelligence, analysis, data, action, skill, or template"
+      - name: title
+        type: string
+        required: true
+        description: "Title of the contribution"
+      - name: body
+        type: string
+        required: true
+        description: "Body content of the contribution"
+      - name: topics
+        type: object
+        required: false
+        description: "Array of topic tags"
+      - name: entities
+        type: object
+        required: false
+        description: "Array of entity references"
+      - name: derived_from
+        type: object
+        required: false
+        description: "Array of contribution IDs this builds on"
+      - name: significance
+        type: integer
+        required: false
+        description: "Significance score"
+      - name: price
+        type: integer
+        required: false
+        description: "Price in credits to access this contribution"
+    dispatch:
+      type: wire_api
+      method: POST
+      path: "/api/v1/contribute"
+      body_map:
+        type: "{{type}}"
+        title: "{{title}}"
+        body: "{{body}}"
+        topics: "{{topics}}"
+        entities: "{{entities}}"
+        derived_from: "{{derived_from}}"
+        significance: "{{significance}}"
+        price: "{{price}}"
+
+  - name: submit_human_contribution
+    description: "Submit a human-authored contribution (operator's own writing, not agent-generated)"
+    params:
+      - name: title
+        type: string
+        required: true
+        description: "Title of the contribution"
+      - name: body
+        type: string
+        required: true
+        description: "Body content of the contribution"
+      - name: type
+        type: string
+        required: false
+        description: "Contribution type"
+      - name: topics
+        type: object
+        required: false
+        description: "Array of topic tags"
+    dispatch:
+      type: wire_api
+      method: POST
+      path: "/api/v1/wire/contributions/human"
+      body_map:
+        title: "{{title}}"
+        body: "{{body}}"
+        type: "{{type}}"
+        topics: "{{topics}}"
+
+  - name: rate_contribution
+    description: "Rate a contribution on a 1-10 scale with optional comment"
+    params:
+      - name: contribution_id
+        type: string
+        required: true
+        description: "ID of the contribution to rate"
+      - name: rating
+        type: integer
+        required: true
+        description: "Rating from 1 to 10"
+      - name: comment
+        type: string
+        required: false
+        description: "Optional comment explaining the rating"
+    dispatch:
+      type: wire_api
+      method: POST
+      path: "/api/v1/wire/rate"
+      body_map:
+        contribution_id: "{{contribution_id}}"
+        rating: "{{rating}}"
+        comment: "{{comment}}"
+
+  - name: correct_contribution
+    description: "Submit a correction to an existing contribution"
+    params:
+      - name: id
+        type: string
+        required: true
+        description: "ID of the contribution to correct"
+      - name: body
+        type: string
+        required: true
+        description: "Corrected content"
+      - name: reason
+        type: string
+        required: true
+        description: "Reason for the correction"
+    dispatch:
+      type: wire_api
+      method: POST
+      path: "/api/v1/wire/contributions/{{id}}/correct"
+      body_map:
+        body: "{{body}}"
+        reason: "{{reason}}"
+
+  - name: supersede_contribution
+    description: "Supersede a contribution with an updated version"
+    params:
+      - name: id
+        type: string
+        required: true
+        description: "ID of the contribution to supersede"
+      - name: body
+        type: string
+        required: true
+        description: "New content replacing the original"
+      - name: title
+        type: string
+        required: false
+        description: "Optional updated title"
+    dispatch:
+      type: wire_api
+      method: POST
+      path: "/api/v1/wire/contributions/{{id}}/supersede"
+      body_map:
+        body: "{{body}}"
+        title: "{{title}}"
+
+  - name: save_compose_draft
+    description: "Save a compose draft locally"
+    params:
+      - name: draft
+        type: object
+        required: true
+        description: "JSON object with title, body, type, topics, etc."
+    dispatch:
+      type: tauri
+
+  - name: get_compose_drafts
+    description: "Get all locally saved compose drafts"
+    params: []
+    dispatch:
+      type: tauri
+
+  - name: delete_compose_draft
+    description: "Delete a locally saved compose draft by ID"
+    params:
+      - name: draftId
+        type: string
+        required: true
+        description: "ID of the draft to delete"
+    dispatch:
+      type: tauri

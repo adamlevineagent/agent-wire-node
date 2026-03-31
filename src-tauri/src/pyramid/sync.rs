@@ -70,13 +70,8 @@ impl PyramidSyncState {
 
     /// Link a pyramid slug for auto-publication.
     pub fn link_pyramid(&mut self, slug: String, auto_publish: bool) {
-        self.linked_pyramids.insert(
-            slug.clone(),
-            PyramidPublicationLink {
-                slug,
-                auto_publish,
-            },
-        );
+        self.linked_pyramids
+            .insert(slug.clone(), PyramidPublicationLink { slug, auto_publish });
     }
 
     /// Unlink a pyramid slug from auto-publication.
@@ -236,20 +231,18 @@ pub async fn pyramid_sync_tick(
             }
 
             // Pre-load already-published mappings
-            let already_published: HashMap<String, String> =
-                db::get_all_id_mappings(&conn, slug)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter_map(|m| {
-                        m.wire_uuid.map(|uuid| (m.local_id, uuid))
-                    })
-                    .collect();
+            let already_published: HashMap<String, String> = db::get_all_id_mappings(&conn, slug)
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|m| m.wire_uuid.map(|uuid| (m.local_id, uuid)))
+                .collect();
 
             // Pre-load evidence weights
             let mut evidence_weights: HashMap<String, HashMap<String, f64>> = HashMap::new();
             for (_depth, nodes) in &nodes_by_depth {
                 for node in nodes {
-                    if let Ok(links) = db::get_keep_evidence_for_target_cross(&conn, slug, &node.id) {
+                    if let Ok(links) = db::get_keep_evidence_for_target_cross(&conn, slug, &node.id)
+                    {
                         if !links.is_empty() {
                             let mut child_weights = HashMap::new();
                             for ev_link in links {
@@ -283,8 +276,8 @@ pub async fn pyramid_sync_tick(
         // Create publisher with current config
         let (wire_url, wire_auth) = {
             let config = pyramid_state.config.read().await;
-            let url = std::env::var("WIRE_URL")
-                .unwrap_or_else(|_| "https://newsbleach.com".to_string());
+            let url =
+                std::env::var("WIRE_URL").unwrap_or_else(|_| "https://newsbleach.com".to_string());
             let auth = config.auth_token.clone();
             (url, auth)
         };
@@ -376,9 +369,7 @@ pub async fn pyramid_sync_tick(
                                 // Re-acquire writer to persist the new metadata UUID
                                 let writer = pyramid_state.writer.lock().await;
                                 if let Err(e) = db::set_slug_metadata_contribution_id(
-                                    &writer,
-                                    &data.slug,
-                                    &new_uuid,
+                                    &writer, &data.slug, &new_uuid,
                                 ) {
                                     tracing::warn!(
                                         slug = %data.slug,
@@ -447,8 +438,8 @@ pub async fn pinned_pyramid_refresh_tick(
     pyramid_state: &super::PyramidState,
     sync_state: &Arc<Mutex<PyramidSyncState>>,
 ) {
-    use super::wire_import::RemotePyramidClient;
     use super::slug;
+    use super::wire_import::RemotePyramidClient;
 
     let pinned_links: Vec<PinnedPyramidLink> = {
         let state = sync_state.lock().await;
@@ -470,8 +461,8 @@ pub async fn pinned_pyramid_refresh_tick(
         return;
     }
 
-    let wire_server_url = std::env::var("WIRE_URL")
-        .unwrap_or_else(|_| "https://newsbleach.com".to_string());
+    let wire_server_url =
+        std::env::var("WIRE_URL").unwrap_or_else(|_| "https://newsbleach.com".to_string());
 
     for link in &pinned_links {
         let client = RemotePyramidClient::new(
@@ -527,12 +518,8 @@ pub async fn pinned_pyramid_refresh_tick(
             Ok(nodes) => {
                 // Upsert into local SQLite
                 let writer = pyramid_state.writer.lock().await;
-                match slug::pin_remote_pyramid(
-                    &writer,
-                    &link.slug,
-                    &link.source_tunnel_url,
-                    &nodes,
-                ) {
+                match slug::pin_remote_pyramid(&writer, &link.slug, &link.source_tunnel_url, &nodes)
+                {
                     Ok(count) => {
                         tracing::info!(
                             slug = %link.slug,

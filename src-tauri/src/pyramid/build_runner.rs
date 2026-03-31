@@ -20,6 +20,7 @@ use super::chain_loader;
 use super::chain_registry;
 use super::characterize;
 use super::db;
+use super::defaults_adapter;
 use super::evidence_answering;
 use super::extraction_schema;
 use super::ingest;
@@ -32,9 +33,10 @@ use super::question_decomposition::{
 use super::question_loader;
 use super::reconciliation;
 use super::slug;
-use super::types::{self, BuildProgress, CharacterizationResult, ContentType, HandlePath, RemoteWebEdge};
+use super::types::{
+    self, BuildProgress, CharacterizationResult, ContentType, HandlePath, RemoteWebEdge,
+};
 use super::wire_import::RemotePyramidClient;
-use super::defaults_adapter;
 use super::PyramidState;
 
 use std::collections::HashMap;
@@ -68,7 +70,10 @@ pub async fn check_absorption_rate_limit(
     // Read rate limits from config
     let (max_per_hour, daily_cap) = if let Some(ref data_dir) = state.data_dir {
         let cfg = super::PyramidConfig::load(data_dir);
-        (cfg.absorption_rate_limit_per_operator, cfg.absorption_daily_spend_cap)
+        (
+            cfg.absorption_rate_limit_per_operator,
+            cfg.absorption_daily_spend_cap,
+        )
     } else {
         (3u32, 100u64)
     };
@@ -88,7 +93,10 @@ pub async fn check_absorption_rate_limit(
             return Err(anyhow!(
                 "429: absorption build rate limit exceeded for operator '{}' on slug '{}'. \
                  Limit: {} builds/hour. Retry after {}s",
-                operator_id, slug_name, max_per_hour, retry_after
+                operator_id,
+                slug_name,
+                max_per_hour,
+                retry_after
             ));
         } else {
             entry.0 += 1;
@@ -109,7 +117,10 @@ pub async fn check_absorption_rate_limit(
             return Err(anyhow!(
                 "429: absorption daily spend cap exceeded for slug '{}'. \
                  Cap: {} credits/day, spent: {}. Retry after {}s",
-                slug_name, daily_cap, spend.0, retry_after
+                slug_name,
+                daily_cap,
+                spend.0,
+                retry_after
             ));
         } else {
             spend.0 += estimated_cost;
@@ -181,14 +192,14 @@ pub async fn run_build_from(
         // Retrieve the stored apex question and config from the question tree
         let (apex_question, stored_granularity, stored_max_depth) = {
             let conn = state.reader.lock().await;
-            let tree_json = db::get_question_tree(&conn, slug_name)?
-                .ok_or_else(|| anyhow!(
+            let tree_json = db::get_question_tree(&conn, slug_name)?.ok_or_else(|| {
+                anyhow!(
                     "Question slug '{}' has no stored question tree. \
                      Use the question build endpoint to set the initial question.",
                     slug_name
-                ))?;
-            let tree: question_decomposition::QuestionTree =
-                serde_json::from_value(tree_json)?;
+                )
+            })?;
+            let tree: question_decomposition::QuestionTree = serde_json::from_value(tree_json)?;
             (
                 tree.config.apex_question.clone(),
                 tree.config.granularity,
@@ -326,10 +337,7 @@ pub async fn run_build_from(
 /// node's content from the remote pyramid. Results are cached in-memory for the
 /// build session and logged. If a remote node cannot be reached, a gap report
 /// could be published (future: integrated with wire_publish).
-async fn resolve_remote_web_edges(
-    state: &PyramidState,
-    slug_name: &str,
-) -> Result<()> {
+async fn resolve_remote_web_edges(state: &PyramidState, slug_name: &str) -> Result<()> {
     // Load all remote web edges for this slug
     let remote_edges: Vec<RemoteWebEdge> = {
         let conn = state.reader.lock().await;
@@ -351,8 +359,8 @@ async fn resolve_remote_web_edges(
     let wire_jwt = config.auth_token.clone();
     drop(config);
 
-    let wire_server_url = std::env::var("WIRE_URL")
-        .unwrap_or_else(|_| "https://newsbleach.com".to_string());
+    let wire_server_url =
+        std::env::var("WIRE_URL").unwrap_or_else(|_| "https://newsbleach.com".to_string());
 
     // Group edges by remote tunnel URL to reuse clients
     let mut clients: HashMap<String, RemotePyramidClient> = HashMap::new();
@@ -610,7 +618,9 @@ async fn run_legacy_build(
             return Err(anyhow!("Vine builds use the vine-specific build endpoint"));
         }
         ContentType::Question => {
-            return Err(anyhow!("Question builds use the question-driven build endpoint"));
+            return Err(anyhow!(
+                "Question builds use the question-driven build endpoint"
+            ));
         }
     };
 
@@ -794,26 +804,32 @@ pub async fn run_decomposed_build(
             // Build L0 summary fallback — from cross-slug nodes or own L0
             let l0_fallback = if let Some(ref cs_nodes) = cross_slug_nodes {
                 // Cross-slug: characterize from loaded cross-slug nodes
-                Some(cs_nodes.iter()
-                    .map(|n| {
-                        let summary: String = n.distilled.chars().take(200).collect();
-                        format!("- {}: {}", n.headline, summary)
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n"))
+                Some(
+                    cs_nodes
+                        .iter()
+                        .map(|n| {
+                            let summary: String = n.distilled.chars().take(200).collect();
+                            format!("- {}: {}", n.headline, summary)
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                )
             } else {
                 let conn = state.reader.lock().await;
                 let existing_l0 = db::get_nodes_at_depth(&conn, slug_name, 0).unwrap_or_default();
                 if existing_l0.is_empty() {
                     None
                 } else {
-                    Some(existing_l0.iter()
-                        .map(|n| {
-                            let summary: String = n.distilled.chars().take(200).collect();
-                            format!("- {}: {}", n.headline, summary)
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n"))
+                    Some(
+                        existing_l0
+                            .iter()
+                            .map(|n| {
+                                let summary: String = n.distilled.chars().take(200).collect();
+                                format!("- {}: {}", n.headline, summary)
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    )
                 }
             };
             characterize::characterize_with_fallback(
@@ -823,7 +839,8 @@ pub async fn run_decomposed_build(
                 l0_fallback.as_deref(),
                 &state.operational.tier1,
                 Some(&state.chains_dir),
-            ).await?
+            )
+            .await?
         }
     };
 
@@ -844,21 +861,31 @@ pub async fn run_decomposed_build(
         };
 
         if base_l0_nodes.is_empty() {
-            info!(slug = slug_name, "no base L0 nodes found — running mechanical build first");
+            info!(
+                slug = slug_name,
+                "no base L0 nodes found — running mechanical build first"
+            );
             let (write_tx, mut write_rx) = tokio::sync::mpsc::channel::<WriteOp>(512);
-            let drain_handle = tokio::spawn(async move {
-                while write_rx.recv().await.is_some() {}
-            });
+            let drain_handle =
+                tokio::spawn(async move { while write_rx.recv().await.is_some() {} });
             run_build(state, slug_name, cancel, progress_tx.clone(), &write_tx).await?;
             drop(write_tx);
             let _ = drain_handle.await;
 
             let conn = state.reader.lock().await;
             let fresh_l0 = db::get_nodes_at_depth(&conn, slug_name, 0)?;
-            info!(slug = slug_name, l0_count = fresh_l0.len(), "base pyramid built — L0 nodes available");
+            info!(
+                slug = slug_name,
+                l0_count = fresh_l0.len(),
+                "base pyramid built — L0 nodes available"
+            );
             drop(conn);
         } else {
-            info!(slug = slug_name, l0_count = base_l0_nodes.len(), "base pyramid exists — using as overlay base");
+            info!(
+                slug = slug_name,
+                l0_count = base_l0_nodes.len(),
+                "base pyramid exists — using as overlay base"
+            );
         }
     }
 
@@ -869,7 +896,8 @@ pub async fn run_decomposed_build(
         let conn = state.reader.lock().await;
         db::get_nodes_at_depth(&conn, slug_name, 0)?
     };
-    let l0_context = base_l0_for_context.iter()
+    let l0_context = base_l0_for_context
+        .iter()
         .map(|n| {
             let summary: String = n.distilled.chars().take(200).collect();
             format!("- {}: {} — {}", n.id, n.headline, summary)
@@ -879,7 +907,11 @@ pub async fn run_decomposed_build(
     let decomp_context = format!(
         "Source material ({} extracted summaries from {}):\n{}",
         base_l0_for_context.len(),
-        if is_cross_slug { "referenced slugs" } else { "the base knowledge pyramid" },
+        if is_cross_slug {
+            "referenced slugs"
+        } else {
+            "the base knowledge pyramid"
+        },
         l0_context
     );
 
@@ -891,9 +923,13 @@ pub async fn run_decomposed_build(
         // Load the enhancement prompt from the contribution file (chains/prompts/question/)
         // Per Pillar #2: the prompt itself is a contribution, not hardcoded Rust.
         let enhance_system_prompt = {
-            let prompt_path = state.data_dir.as_ref()
+            let prompt_path = state
+                .data_dir
+                .as_ref()
                 .map(|d| d.join("chains/prompts/question/enhance_question.md"))
-                .unwrap_or_else(|| std::path::PathBuf::from("chains/prompts/question/enhance_question.md"));
+                .unwrap_or_else(|| {
+                    std::path::PathBuf::from("chains/prompts/question/enhance_question.md")
+                });
             match std::fs::read_to_string(&prompt_path) {
                 Ok(p) => p,
                 Err(e) => {
@@ -911,10 +947,17 @@ pub async fn run_decomposed_build(
              Expand this into a comprehensive apex question.",
             apex_question = apex_question,
             count = base_l0_for_context.len(),
-            sample = base_l0_for_context.iter().take(10)
+            sample = base_l0_for_context
+                .iter()
+                .take(10)
                 .map(|n| format!("- {}", n.headline))
-                .collect::<Vec<_>>().join("\n"),
-            audience = if characterization_result.audience.is_empty() { "a curious, intelligent non-developer" } else { &characterization_result.audience },
+                .collect::<Vec<_>>()
+                .join("\n"),
+            audience = if characterization_result.audience.is_empty() {
+                "a curious, intelligent non-developer"
+            } else {
+                &characterization_result.audience
+            },
         );
 
         let response = llm::call_model_unified(
@@ -924,7 +967,8 @@ pub async fn run_decomposed_build(
             0.3,
             1024,
             None,
-        ).await;
+        )
+        .await;
 
         match response {
             Ok(r) => {
@@ -978,7 +1022,10 @@ pub async fn run_decomposed_build(
 
     let mut tree = if pre_decomp_overlay_check {
         // Delta path: load existing tree and overlay answers for context
-        info!(slug = slug_name, "delta decomposition — existing overlay detected");
+        info!(
+            slug = slug_name,
+            "delta decomposition — existing overlay detected"
+        );
         let existing_tree = {
             let conn = state.reader.lock().await;
             let tree_json = db::get_question_tree(&conn, slug_name)?
@@ -1126,7 +1173,8 @@ pub async fn run_decomposed_build(
     if pre_decomp_overlay_check {
         // Delta path: only supersede existing overlay apex nodes (highest depth overlay nodes).
         // Shared answer nodes at lower depths are preserved for reuse.
-        let max_overlay_depth = existing_overlay_answers.iter()
+        let max_overlay_depth = existing_overlay_answers
+            .iter()
             .map(|n| n.depth)
             .max()
             .unwrap_or(0);
@@ -1148,7 +1196,10 @@ pub async fn run_decomposed_build(
             .await
             .map_err(|e| anyhow!("Delta overlay cleanup panicked: {e}"))??;
         }
-        info!(slug = slug_name, "delta path — old apex superseded, shared answers preserved");
+        info!(
+            slug = slug_name,
+            "delta path — old apex superseded, shared answers preserved"
+        );
     } else {
         // Fresh path: supersede all prior overlay nodes (L1+) but keep base L0.
         // Evidence and gaps are retained — live_pyramid_evidence view filters by live nodes.
@@ -1162,24 +1213,42 @@ pub async fn run_decomposed_build(
         })
         .await
         .map_err(|e| anyhow!("Overlay cleanup panicked: {e}"))??;
-        info!(slug = slug_name, "fresh path — all prior L1+ nodes superseded");
+        info!(
+            slug = slug_name,
+            "fresh path — all prior L1+ nodes superseded"
+        );
     }
 
-    info!(slug = slug_name, "overlay mode — using base pyramid L0, starting evidence loop");
+    info!(
+        slug = slug_name,
+        "overlay mode — using base pyramid L0, starting evidence loop"
+    );
 
     // ── 10. Evidence-weighted upper layer loop ───────────────────────────
     // Load L0 nodes for evidence loop: cross-slug nodes or own L0
     let l0_nodes = if let Some(cs_nodes) = cross_slug_nodes {
-        info!(slug = slug_name, l0_count = cs_nodes.len(), "using cross-slug nodes as L0 for evidence loop");
+        info!(
+            slug = slug_name,
+            l0_count = cs_nodes.len(),
+            "using cross-slug nodes as L0 for evidence loop"
+        );
         cs_nodes
     } else {
         let conn = state.reader.lock().await;
         db::get_nodes_at_depth(&conn, slug_name, 0)?
     };
-    info!(slug = slug_name, l0_count = l0_nodes.len(), "loaded L0 nodes for evidence loop");
+    info!(
+        slug = slug_name,
+        l0_count = l0_nodes.len(),
+        "loaded L0 nodes for evidence loop"
+    );
 
     let l0_summary = evidence_answering::build_l0_summary(&l0_nodes, &state.operational);
-    info!(slug = slug_name, summary_len = l0_summary.len(), "built L0 summary");
+    info!(
+        slug = slug_name,
+        summary_len = l0_summary.len(),
+        "built L0 summary"
+    );
 
     let synth_prompts = match extraction_schema::generate_synthesis_prompts(
         &tree,
@@ -1190,7 +1259,8 @@ pub async fn run_decomposed_build(
         &state.operational.tier1,
         Some(&state.chains_dir),
     )
-    .await {
+    .await
+    {
         Ok(p) => p,
         Err(e) => {
             error!(slug = slug_name, error = %e, "generate_synthesis_prompts failed");
@@ -1207,10 +1277,12 @@ pub async fn run_decomposed_build(
     let actual_l0_count = l0_nodes.len() as i32;
     let mut total_nodes = actual_l0_count;
     // Exclude layer 0 from estimate (L0 already counted via actual_l0_count from executor)
-    let estimated_total: i64 = layer_questions.iter()
+    let estimated_total: i64 = layer_questions
+        .iter()
         .filter(|(&k, _)| k > 0)
         .map(|(_, qs)| qs.len() as i64)
-        .sum::<i64>() + actual_l0_count as i64;
+        .sum::<i64>()
+        + actual_l0_count as i64;
     let mut layers_completed: i64 = 0;
     let mut build_error: Option<String> = None;
 
@@ -1218,7 +1290,10 @@ pub async fn run_decomposed_build(
     for layer in evidence_start_layer..=max_layer {
         // Check cancellation at each layer boundary
         if cancel.is_cancelled() {
-            warn!(slug = slug_name, layer, "build cancelled during evidence loop");
+            warn!(
+                slug = slug_name,
+                layer, "build cancelled during evidence loop"
+            );
             build_error = Some(format!("Cancelled at layer {}", layer));
             break;
         }
@@ -1232,13 +1307,20 @@ pub async fn run_decomposed_build(
         };
 
         // Filter out reused questions (delta path) — their answers already exist
-        let reused_set: std::collections::HashSet<&str> = reused_question_ids_for_skip.iter().map(|s| s.as_str()).collect();
-        let layer_qs: Vec<_> = layer_qs_raw.into_iter()
+        let reused_set: std::collections::HashSet<&str> = reused_question_ids_for_skip
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
+        let layer_qs: Vec<_> = layer_qs_raw
+            .into_iter()
             .filter(|q| !reused_set.contains(q.question_id.as_str()))
             .collect();
 
         if layer_qs.is_empty() {
-            info!(slug = slug_name, layer, "all questions at layer reused from existing overlay, skipping");
+            info!(
+                slug = slug_name,
+                layer, "all questions at layer reused from existing overlay, skipping"
+            );
             continue;
         }
 
@@ -1262,8 +1344,13 @@ pub async fn run_decomposed_build(
 
         // Step a: Pre-map questions to candidate evidence nodes
         let candidate_map = match evidence_answering::pre_map_layer(
-            &layer_qs, &lower_nodes, &llm_config, &state.operational, tree.audience.as_deref(),
-            Some(&state.chains_dir), source_content_type.as_deref(),
+            &layer_qs,
+            &lower_nodes,
+            &llm_config,
+            &state.operational,
+            tree.audience.as_deref(),
+            Some(&state.chains_dir),
+            source_content_type.as_deref(),
         )
         .await
         {
@@ -1285,7 +1372,9 @@ pub async fn run_decomposed_build(
             &llm_config,
             slug_name,
             slug_name, // answer_slug — same as slug for single-pyramid builds
-            Some(&state.chains_dir), source_content_type.as_deref(), &state.operational,
+            Some(&state.chains_dir),
+            source_content_type.as_deref(),
+            &state.operational,
         )
         .await
         {
@@ -1320,7 +1409,12 @@ pub async fn run_decomposed_build(
 
         // Step c: Persist answered nodes + evidence links + gaps in spawn_blocking
         {
-            info!(slug = slug_name, layer, nodes = layer_node_count, "acquiring writer lock: evidence persist");
+            info!(
+                slug = slug_name,
+                layer,
+                nodes = layer_node_count,
+                "acquiring writer lock: evidence persist"
+            );
             let conn = state.writer.clone();
             let slug_owned = slug_name.to_string();
             let bid_for_gaps = build_id.clone();
@@ -1371,8 +1465,14 @@ pub async fn run_decomposed_build(
                     Ok(())
                 })();
                 match result {
-                    Ok(()) => { c.execute_batch("COMMIT")?; Ok(()) }
-                    Err(e) => { let _ = c.execute_batch("ROLLBACK"); Err(e) }
+                    Ok(()) => {
+                        c.execute_batch("COMMIT")?;
+                        Ok(())
+                    }
+                    Err(e) => {
+                        let _ = c.execute_batch("ROLLBACK");
+                        Err(e)
+                    }
                 }
             })
             .await
@@ -1381,16 +1481,18 @@ pub async fn run_decomposed_build(
 
         // Step d: Reconcile layer in spawn_blocking
         {
-            info!(slug = slug_name, layer, "acquiring writer lock: reconcile_layer");
+            info!(
+                slug = slug_name,
+                layer, "acquiring writer lock: reconcile_layer"
+            );
             let conn = state.writer.clone();
             let slug_owned = slug_name.to_string();
             let aids = answered_ids;
             let lids = lower_ids;
             tokio::task::spawn_blocking(move || {
                 let c = conn.blocking_lock();
-                let _result = reconciliation::reconcile_layer(
-                    &c, &slug_owned, layer, &aids, &lids,
-                )?;
+                let _result =
+                    reconciliation::reconcile_layer(&c, &slug_owned, layer, &aids, &lids)?;
                 Ok::<(), anyhow::Error>(())
             })
             .await
@@ -1409,7 +1511,14 @@ pub async fn run_decomposed_build(
             let al0 = actual_l0_count;
             tokio::task::spawn_blocking(move || {
                 let c = conn.blocking_lock();
-                local_store::update_build_progress(&c, &slug_owned, &bid, layer, al0 as i64, tn as i64)?;
+                local_store::update_build_progress(
+                    &c,
+                    &slug_owned,
+                    &bid,
+                    layer,
+                    al0 as i64,
+                    tn as i64,
+                )?;
                 Ok::<(), anyhow::Error>(())
             })
             .await
@@ -1418,10 +1527,12 @@ pub async fn run_decomposed_build(
 
         // Step f: Send progress update if channel available
         if let Some(ref tx) = progress_tx {
-            let _ = tx.send(BuildProgress {
-                done: total_nodes as i64,
-                total: estimated_total,
-            }).await;
+            let _ = tx
+                .send(BuildProgress {
+                    done: total_nodes as i64,
+                    total: estimated_total,
+                })
+                .await;
         }
 
         info!(
@@ -1444,9 +1555,12 @@ pub async fn run_decomposed_build(
         tokio::task::spawn_blocking(move || {
             let c = conn.blocking_lock();
             if let Some(error_msg) = err {
-                local_store::fail_build(&c, &slug_owned, &bid, &format!(
-                    "Stopped at layer {}/{}: {}", lc, ml, error_msg
-                ))?;
+                local_store::fail_build(
+                    &c,
+                    &slug_owned,
+                    &bid,
+                    &format!("Stopped at layer {}/{}: {}", lc, ml, error_msg),
+                )?;
             } else {
                 local_store::complete_build(&c, &slug_owned, &bid, None)?;
             }
@@ -1524,7 +1638,8 @@ pub async fn preview_decomposed_build(
             // No base pyramid yet — fall back to folder map
             question_decomposition::build_folder_map(&source_path)
         } else {
-            let l0_context = base_l0.iter()
+            let l0_context = base_l0
+                .iter()
                 .map(|n| {
                     let summary: String = n.distilled.chars().take(200).collect();
                     format!("- {}: {} — {}", n.id, n.headline, summary)
@@ -1533,7 +1648,8 @@ pub async fn preview_decomposed_build(
                 .join("\n");
             Some(format!(
                 "Source material ({} extracted summaries from the base knowledge pyramid):\n{}",
-                base_l0.len(), l0_context
+                base_l0.len(),
+                l0_context
             ))
         }
     };
@@ -1550,7 +1666,13 @@ pub async fn preview_decomposed_build(
     };
 
     let llm_config = state.config.read().await.clone();
-    let tree = question_decomposition::decompose_question(&config, &llm_config, &state.operational.tier1, &state.operational.tier2).await?;
+    let tree = question_decomposition::decompose_question(
+        &config,
+        &llm_config,
+        &state.operational.tier1,
+        &state.operational.tier2,
+    )
+    .await?;
 
     // ── 4. Preview ───────────────────────────────────────────────────────
     let preview = question_decomposition::preview_decomposition(&tree);

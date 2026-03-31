@@ -502,7 +502,7 @@ pub fn assemble_vine_l0(
                     children: Vec::new(),
                     parent_id: None,
                     superseded_by: None,
-            build_id: None,
+                    build_id: None,
                     created_at: String::new(),
                 };
 
@@ -2761,7 +2761,9 @@ pub async fn notify_vine_of_bunch_change(
         let prefix_slash = format!("Session {} /", bunch.bunch_index);
         let reassembly_build_id = format!("vine-reassembly-{}", uuid::Uuid::new_v4());
         db::supersede_nodes_by_headline_pattern(
-            &conn, vine_slug, 0,
+            &conn,
+            vine_slug,
+            0,
             &format!("{}%", prefix_colon),
             &format!("{}%", prefix_slash),
             &reassembly_build_id,
@@ -2858,7 +2860,7 @@ pub async fn notify_vine_of_bunch_change(
                     children: Vec::new(),
                     parent_id: None,
                     superseded_by: None,
-            build_id: None,
+                    build_id: None,
                     created_at: String::new(),
                 };
                 db::save_node(

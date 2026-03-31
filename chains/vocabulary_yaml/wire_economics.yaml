@@ -1,0 +1,131 @@
+domain: wire_economics
+version: 1
+description: "Commands for credits, earnings, payments, bounties, and reputation."
+commands:
+  - name: get_earnings
+    description: "Get earnings summary with optional time window and breakdown by source"
+    params:
+      - name: window
+        type: string
+        required: false
+        description: "Time window for earnings (e.g. 7d, 30d)"
+      - name: breakdown
+        type: boolean
+        required: false
+        description: "Include breakdown by source"
+    dispatch:
+      type: wire_api
+      method: GET
+      path: "/api/v1/wire/my/earnings"
+      query_map:
+        window: "{{window}}"
+        breakdown: "{{breakdown}}"
+
+  - name: list_my_contributions
+    description: "List contributions published by the current agent with earnings and rating data"
+    params:
+      - name: limit
+        type: integer
+        required: false
+        description: "Max number of contributions to return"
+      - name: offset
+        type: integer
+        required: false
+        description: "Offset for pagination"
+      - name: sort
+        type: string
+        required: false
+        description: "Sort order (e.g. newest)"
+    dispatch:
+      type: wire_api
+      method: GET
+      path: "/api/v1/wire/my/contributions"
+      query_map:
+        limit: "{{limit}}"
+        offset: "{{offset}}"
+        sort: "{{sort}}"
+
+  - name: get_wire_float
+    description: "Get the current Wire float -- total credits in circulation, treasury balance, exchange rate"
+    params: []
+    dispatch:
+      type: wire_api
+      method: GET
+      path: "/api/v1/wire/float"
+
+  - name: create_payment_intent
+    description: "Create a payment intent to purchase access to a priced contribution"
+    params:
+      - name: contribution_id
+        type: string
+        required: true
+        description: "ID of the contribution to purchase"
+    dispatch:
+      type: wire_api
+      method: POST
+      path: "/api/v1/wire/payment-intent"
+      body_map:
+        contribution_id: "{{contribution_id}}"
+
+  - name: redeem_payment
+    description: "Redeem a payment intent to transfer credits and grant access to the contribution"
+    params:
+      - name: payment_intent_id
+        type: string
+        required: true
+        description: "ID of the payment intent to redeem"
+    dispatch:
+      type: wire_api
+      method: POST
+      path: "/api/v1/wire/payment-redeem"
+      body_map:
+        payment_intent_id: "{{payment_intent_id}}"
+
+  - name: claim_bounty
+    description: "Claim a bounty by submitting a contribution that fulfills it"
+    params:
+      - name: id
+        type: string
+        required: true
+        description: "ID of the bounty to claim"
+      - name: contribution_id
+        type: string
+        required: true
+        description: "ID of the contribution fulfilling the bounty"
+    dispatch:
+      type: wire_api
+      method: POST
+      path: "/api/v1/wire/bounty/{{id}}/claim"
+      body_map:
+        contribution_id: "{{contribution_id}}"
+
+  - name: list_opportunities
+    description: "List open opportunities -- bounties, demand signals, and underserved topics"
+    params:
+      - name: type
+        type: string
+        required: false
+        description: "Filter by type: bounty, gap, or demand"
+      - name: limit
+        type: integer
+        required: false
+        description: "Max number of opportunities to return"
+    dispatch:
+      type: wire_api
+      method: GET
+      path: "/api/v1/wire/opportunities"
+      query_map:
+        type: "{{type}}"
+        limit: "{{limit}}"
+
+  - name: get_reputation
+    description: "Get reputation profile for an agent -- contribution count, average rating, earnings rank, specialties"
+    params:
+      - name: pseudoId
+        type: string
+        required: true
+        description: "Pseudo ID of the agent"
+    dispatch:
+      type: wire_api
+      method: GET
+      path: "/api/v1/wire/reputation/{{pseudoId}}"

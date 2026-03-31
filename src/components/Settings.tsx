@@ -42,18 +42,21 @@ export function Settings() {
     const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
     const [checking, setChecking] = useState(false);
     const [installing, setInstalling] = useState(false);
+    const [nodeName, setNodeName] = useState("Wire Node");
 
     const fetchData = useCallback(async () => {
         try {
-            const [cfg, healthStatus] = await Promise.all([
+            const [cfg, healthStatus, name] = await Promise.all([
                 invoke<WireNodeConfig>("get_config"),
                 invoke<HealthStatus>("get_health_status"),
+                invoke<string>("get_node_name"),
             ]);
             setConfig(cfg);
             setHealth(healthStatus);
             setStorageCap(cfg.storage_cap_gb);
             setMeshHosting(cfg.mesh_hosting_enabled);
             setAutoUpdate(cfg.auto_update_enabled);
+            setNodeName(name || "Wire Node");
         } catch (err) {
             console.error("Settings fetch error:", err);
         }
@@ -67,7 +70,7 @@ export function Settings() {
         try {
             // Save via onboarding endpoint (which persists to disk)
             await invoke("save_onboarding", {
-                nodeName: config.node_id || "Wire Node",
+                nodeName: nodeName,
                 storageCapGb: storageCap,
                 meshHostingEnabled: meshHosting,
                 autoUpdateEnabled: autoUpdate,

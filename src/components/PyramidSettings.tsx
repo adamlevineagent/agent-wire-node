@@ -12,7 +12,7 @@ interface PyramidConfigInfo {
 export function PyramidSettings() {
     const [apiKey, setApiKey] = useState('');
     const [authToken, setAuthToken] = useState('');
-    const [vibesmithyUrl, setVibesmithyUrl] = useState('http://localhost:3333');
+    const [primaryModel, setPrimaryModel] = useState('');
     const [configInfo, setConfigInfo] = useState<PyramidConfigInfo | null>(null);
     const [saving, setSaving] = useState(false);
     const [saved, setSaved] = useState(false);
@@ -40,16 +40,18 @@ export function PyramidSettings() {
             await invoke('pyramid_set_config', {
                 apiKey: apiKey || '',
                 authToken: authToken || '',
+                ...(primaryModel ? { primaryModel } : {}),
             });
             setSaved(true);
             setTimeout(() => setSaved(false), 2000);
             await fetchConfig();
+            setPrimaryModel(''); // Clear the override field after save
         } catch (err) {
             setError(String(err));
         } finally {
             setSaving(false);
         }
-    }, [apiKey, authToken, fetchConfig]);
+    }, [apiKey, authToken, primaryModel, fetchConfig]);
 
     const handleTestApiKey = useCallback(async () => {
         if (!apiKey) {
@@ -64,16 +66,10 @@ export function PyramidSettings() {
                 apiKey,
                 authToken: authToken || '',
             });
-            // Try a minimal API call by listing models
-            const resp = await fetch('https://openrouter.ai/api/v1/models', {
-                headers: { Authorization: `Bearer ${apiKey}` },
-            });
-            if (resp.ok) {
-                setTestResult('API key is valid');
-                await fetchConfig();
-            } else {
-                setTestResult(`API key test failed: ${resp.status} ${resp.statusText}`);
-            }
+            // Test via IPC — key stays server-side
+            const result = await invoke<string>('pyramid_test_api_key');
+            setTestResult(result);
+            await fetchConfig();
         } catch (err) {
             setTestResult(`Test failed: ${err}`);
         } finally {
@@ -112,6 +108,41 @@ export function PyramidSettings() {
                             <span className="config-status-indicator">[&gt;&gt;]</span>
                             <span>Primary model: {configInfo.primary_model}</span>
                         </div>
+                    </div>
+                )}
+            </div>
+
+            <div className="settings-section">
+                <div className="settings-section-header">Primary Model</div>
+                <p className="settings-section-desc">
+                    OpenRouter model slug for the planner and pyramid builder.
+                    Browse models at{' '}
+                    <a href="https://openrouter.ai/models" target="_blank" rel="noreferrer"
+                       style={{ color: 'var(--accent-primary, #6366f1)' }}>
+                        openrouter.ai/models
+                    </a>.
+                </p>
+                <div className="settings-field-row">
+                    <input
+                        type="text"
+                        className="settings-input"
+                        value={primaryModel}
+                        onChange={(e) => setPrimaryModel(e.target.value)}
+                        placeholder={configInfo?.primary_model ?? 'inception/mercury-2'}
+                    />
+                    <button
+                        className="btn btn-secondary"
+                        onClick={() => {
+                            setPrimaryModel('inception/mercury-2');
+                        }}
+                        title="Reset to default model"
+                    >
+                        Reset
+                    </button>
+                </div>
+                {primaryModel && primaryModel !== configInfo?.primary_model && (
+                    <div style={{ fontSize: '12px', color: 'var(--accent-warning, #f59e0b)', marginTop: '4px' }}>
+                        Will change from {configInfo?.primary_model} → {primaryModel} on save
                     </div>
                 )}
             </div>
@@ -156,20 +187,6 @@ export function PyramidSettings() {
                     value={authToken}
                     onChange={(e) => setAuthToken(e.target.value)}
                     placeholder={configInfo?.auth_token_set ? '(token already set - enter new to replace)' : 'Enter auth token'}
-                />
-            </div>
-
-            <div className="settings-section">
-                <div className="settings-section-header">Vibesmithy URL</div>
-                <p className="settings-section-desc">
-                    The URL where your Vibesmithy client is running.
-                </p>
-                <input
-                    type="text"
-                    className="settings-input"
-                    value={vibesmithyUrl}
-                    onChange={(e) => setVibesmithyUrl(e.target.value)}
-                    placeholder="http://localhost:3333"
                 />
             </div>
 

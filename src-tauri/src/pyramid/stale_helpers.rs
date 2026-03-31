@@ -7,6 +7,7 @@
 //   - dispatch_tombstone: Tombstone deleted files
 //   - dispatch_rename_check: LLM-powered rename detection
 
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use anyhow::{anyhow, Context, Result};
@@ -20,7 +21,9 @@ use uuid::Uuid;
 use super::config_helper::{config_for_model, estimate_cost};
 use super::llm::{call_model_with_usage, extract_json};
 use super::naming::{headline_from_path, tombstone_headline};
-use super::stale_helpers_upper::resolve_parent_targets_for_node_ids;
+use super::stale_helpers_upper::{
+    resolve_live_canonical_node_id, resolve_parent_targets_for_node_ids,
+};
 use super::types::{FileStaleResult, PendingMutation, RenameResult, StaleCheckResult};
 
 // ── Utility Functions ────────────────────────────────────────────────────────
@@ -73,7 +76,18 @@ fn get_file_node_ids(conn: &Connection, slug: &str, file_path: &str) -> Result<V
 
     let ids: Vec<String> = serde_json::from_str(&json_str)
         .with_context(|| format!("Failed to parse node_ids JSON: {}", json_str))?;
-    Ok(ids)
+    let mut live_ids = Vec::new();
+    let mut seen = BTreeSet::new();
+
+    for node_id in ids {
+        let resolved = resolve_live_canonical_node_id(conn, slug, &node_id)?
+            .unwrap_or_else(|| node_id.clone());
+        if seen.insert(resolved.clone()) {
+            live_ids.push(resolved);
+        }
+    }
+
+    Ok(live_ids)
 }
 
 /// Compute SHA-256 hash of content bytes, matching watcher.rs pattern.
@@ -143,7 +157,8 @@ pub async fn dispatch_file_stale_check(
 
     let prompt_sections: Vec<(String, String, String, String)> =
         tokio::task::spawn_blocking(move || -> Result<Vec<(String, String, String, String)>> {
-            let conn = super::db::open_pyramid_connection(Path::new(&db)).context("Failed to open DB for file stale check")?;
+            let conn = super::db::open_pyramid_connection(Path::new(&db))
+                .context("Failed to open DB for file stale check")?;
             let mut sections = Vec::new();
 
             for m in &batch_c {
@@ -631,7 +646,8 @@ pub async fn dispatch_rename_check(
 
     let (old_distilled, new_content_head) =
         tokio::task::spawn_blocking(move || -> Result<(String, String)> {
-            let conn = super::db::open_pyramid_connection(Path::new(&db)).context("Failed to open DB for rename check")?;
+            let conn = super::db::open_pyramid_connection(Path::new(&db))
+                .context("Failed to open DB for rename check")?;
 
             // Look up old node content
             let node_ids = get_file_node_ids(&conn, &slug_c, &old_path_c).unwrap_or_default();

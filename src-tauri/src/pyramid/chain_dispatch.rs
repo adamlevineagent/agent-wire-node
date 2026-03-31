@@ -437,7 +437,7 @@ pub fn build_node_from_output(
             .unwrap_or_default(),
         parent_id: None,
         superseded_by: None,
-            build_id: None,
+        build_id: None,
         created_at: String::new(),
     })
 }
@@ -551,7 +551,11 @@ pub fn resolve_ir_model(reqs: &ModelRequirements, config: &LlmConfig) -> String 
 /// `call_model_unified` compares input size against the *original* config's
 /// primary_context_limit and may incorrectly fall back to a model that ignores
 /// response_format/response_schema.
-fn resolve_ir_context_limit(reqs: &ModelRequirements, config: &LlmConfig, tier1: &Tier1Config) -> usize {
+fn resolve_ir_context_limit(
+    reqs: &ModelRequirements,
+    config: &LlmConfig,
+    tier1: &Tier1Config,
+) -> usize {
     // Direct model override — we don't know the model's actual limit, so use a
     // generous value (covers most large-context models on OpenRouter).
     if reqs.model.is_some() {
@@ -570,7 +574,12 @@ fn resolve_ir_context_limit(reqs: &ModelRequirements, config: &LlmConfig, tier1:
 ///
 /// Same purpose as `resolve_ir_context_limit` but for the legacy `ChainStep` /
 /// `ChainDefaults` dispatch path.
-fn resolve_context_limit(step: &ChainStep, defaults: &ChainDefaults, config: &LlmConfig, tier1: &Tier1Config) -> usize {
+fn resolve_context_limit(
+    step: &ChainStep,
+    defaults: &ChainDefaults,
+    config: &LlmConfig,
+    tier1: &Tier1Config,
+) -> usize {
     // Direct model override on step or defaults
     if step.model.is_some() {
         return tier1.high_tier_context_limit;
@@ -675,7 +684,8 @@ pub async fn dispatch_ir_llm(
 ) -> Result<(Value, LlmResponse)> {
     let temperature = resolve_ir_temperature(&step.model_requirements, &ctx.tier1);
     let resolved_model = resolve_ir_model(&step.model_requirements, &ctx.config);
-    let resolved_limit = resolve_ir_context_limit(&step.model_requirements, &ctx.config, &ctx.tier1);
+    let resolved_limit =
+        resolve_ir_context_limit(&step.model_requirements, &ctx.config, &ctx.tier1);
     let max_tokens = resolve_ir_max_tokens(step, &ctx.tier1);
     let llm_options = resolve_ir_llm_call_options(step, &ctx.tier1);
 
@@ -1195,7 +1205,10 @@ mod tests {
         let tier1 = Tier1Config::default();
         let step = ir_step("l1_synthesis", StepOperation::Llm);
         assert_eq!(resolve_ir_max_tokens(&step, &tier1), tier1.ir_max_tokens);
-        assert_eq!(resolve_ir_llm_call_options(&step, &tier1).min_timeout_secs, None);
+        assert_eq!(
+            resolve_ir_llm_call_options(&step, &tier1).min_timeout_secs,
+            None
+        );
     }
 
     #[test]

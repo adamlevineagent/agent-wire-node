@@ -24,13 +24,19 @@ use super::types::{AffectedNode, Contradiction, EvidenceVerdict, PyramidNode, Su
 
 use super::Tier3Config;
 
-fn contradiction_confidence_threshold() -> f64 { Tier3Config::default().contradiction_confidence_threshold }
+fn contradiction_confidence_threshold() -> f64 {
+    Tier3Config::default().contradiction_confidence_threshold
+}
 
 /// Channel identifier for staleness queue entries created by supersession.
 const CHANNEL_BELIEF_SUPERSESSION: &str = "belief_supersession";
 
-fn supersession_priority() -> f64 { Tier3Config::default().supersession_priority }
-fn max_trace_depth() -> i64 { Tier3Config::default().max_trace_depth }
+fn supersession_priority() -> f64 {
+    Tier3Config::default().supersession_priority
+}
+fn max_trace_depth() -> i64 {
+    Tier3Config::default().max_trace_depth
+}
 
 // ── LLM Response Types ───────────────────────────────────────────────────────
 
@@ -207,7 +213,8 @@ pub fn trace_supersession(
             if depth > max_trace_depth() {
                 warn!(
                     "[supersession] Trace depth exceeded {} for node {}, stopping this branch",
-                    max_trace_depth(), current_node_id
+                    max_trace_depth(),
+                    current_node_id
                 );
                 continue;
             }
@@ -360,11 +367,7 @@ fn node_references_claim(node: &PyramidNode, claim: &str) -> bool {
 /// 1. Save a record to `pyramid_supersessions` table
 /// 2. Enqueue the node's question to `pyramid_staleness_queue` with
 ///    channel="belief_supersession" and priority=1.0
-pub fn record_supersession(
-    conn: &Connection,
-    slug: &str,
-    trace: &SupersessionTrace,
-) -> Result<()> {
+pub fn record_supersession(conn: &Connection, slug: &str, trace: &SupersessionTrace) -> Result<()> {
     if trace.affected_nodes.is_empty() {
         info!("[supersession] No affected nodes to record");
         return Ok(());
@@ -485,10 +488,7 @@ mod tests {
             "The auth module uses JWT tokens for session management",
             "Authentication System",
         );
-        assert!(node_references_claim(
-            &node,
-            "auth module uses JWT tokens"
-        ));
+        assert!(node_references_claim(&node, "auth module uses JWT tokens"));
     }
 
     #[test]

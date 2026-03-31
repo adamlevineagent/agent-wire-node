@@ -1,0 +1,181 @@
+domain: pyramid_explore
+version: 1
+description: "Commands for reading, searching, and navigating pyramid data"
+commands:
+  - name: pyramid_list_slugs
+    description: "List all pyramid slugs with metadata"
+    params: []
+    dispatch:
+      type: tauri
+
+  - name: pyramid_apex
+    description: "Get the apex (root) node of a pyramid with its web edges"
+    params:
+      - name: slug
+        type: string
+        required: true
+        description: "The pyramid slug"
+    dispatch:
+      type: tauri
+
+  - name: pyramid_node
+    description: "Get a specific node by ID with its web edges"
+    params:
+      - name: slug
+        type: string
+        required: true
+        description: "The pyramid slug"
+      - name: nodeId
+        type: string
+        required: true
+        description: "The node identifier"
+    dispatch:
+      type: tauri
+
+  - name: pyramid_tree
+    description: "Get the full tree structure of a pyramid as a flat list of TreeNode objects"
+    params:
+      - name: slug
+        type: string
+        required: true
+        description: "The pyramid slug"
+    dispatch:
+      type: tauri
+
+  - name: pyramid_drill
+    description: "Drill into a node -- returns the node, its children, and evidence references"
+    params:
+      - name: slug
+        type: string
+        required: true
+        description: "The pyramid slug"
+      - name: nodeId
+        type: string
+        required: true
+        description: "The node to drill into"
+    dispatch:
+      type: tauri
+
+  - name: pyramid_search
+    description: "Full-text search across pyramid node bodies"
+    params:
+      - name: slug
+        type: string
+        required: true
+        description: "The pyramid slug"
+      - name: term
+        type: string
+        required: true
+        description: "The search term"
+    dispatch:
+      type: tauri
+
+  - name: pyramid_get_references
+    description: "Get cross-pyramid references and referrers for a slug"
+    params:
+      - name: slug
+        type: string
+        required: true
+        description: "The pyramid slug"
+    dispatch:
+      type: tauri
+
+  - name: pyramid_get_composed_view
+    description: "Get the composed (narrative) view of a question pyramid"
+    params:
+      - name: slug
+        type: string
+        required: true
+        description: "The pyramid slug"
+    dispatch:
+      type: tauri
+
+  - name: pyramid_list_question_overlays
+    description: "List all question overlays for a mechanical pyramid"
+    params:
+      - name: slug
+        type: string
+        required: true
+        description: "The pyramid slug"
+    dispatch:
+      type: tauri
+
+  - name: pyramid_get_publication_status
+    description: "Get publication status for all non-archived slugs"
+    params: []
+    dispatch:
+      type: tauri
+
+  - name: pyramid_cost_summary
+    description: "Get LLM cost summary for a pyramid"
+    params:
+      - name: slug
+        type: string
+        required: true
+        description: "The pyramid slug"
+      - name: window
+        type: string
+        required: false
+        description: "Time range filter, e.g. 24h, 7d, 30d"
+    dispatch:
+      type: tauri
+
+  - name: pyramid_stale_log
+    description: "Get staleness log entries"
+    params:
+      - name: slug
+        type: string
+        required: true
+        description: "The pyramid slug"
+      - name: limit
+        type: integer
+        required: false
+        description: "Maximum number of results to return"
+      - name: layer
+        type: integer
+        required: false
+        description: "Filter by layer number"
+      - name: staleOnly
+        type: boolean
+        required: false
+        description: "Only return stale entries"
+    dispatch:
+      type: tauri
+
+  - name: pyramid_annotations_recent
+    description: "Get recent annotations on a pyramid"
+    params:
+      - name: slug
+        type: string
+        required: true
+        description: "The pyramid slug"
+      - name: limit
+        type: integer
+        required: false
+        description: "Maximum number of results, default 10"
+    dispatch:
+      type: tauri
+
+  - name: pyramid_faq_directory
+    description: "Get the FAQ directory for a pyramid"
+    params:
+      - name: slug
+        type: string
+        required: true
+        description: "The pyramid slug"
+    dispatch:
+      type: tauri
+
+  - name: pyramid_faq_category_drill
+    description: "Drill into a specific FAQ category to see its questions and answers"
+    params:
+      - name: slug
+        type: string
+        required: true
+        description: "The pyramid slug"
+      - name: categoryId
+        type: string
+        required: true
+        description: "The FAQ category identifier"
+    dispatch:
+      type: tauri

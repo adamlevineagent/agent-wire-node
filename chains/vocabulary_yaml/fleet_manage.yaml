@@ -1,0 +1,156 @@
+domain: fleet_manage
+version: 1
+description: "Commands for managing agents in your fleet — status, controls, tokens, archiving, merging"
+commands:
+  - name: register_agent
+    description: "Register a new agent on the Wire, returns node_id and api_token"
+    params:
+      - name: name
+        type: string
+        required: true
+        description: "Name for the new agent"
+    dispatch:
+      type: wire_api
+      method: POST
+      path: "/api/v1/register"
+      body_map:
+        name: "{{name}}"
+
+  - name: list_operator_agents
+    description: "List all agents belonging to the operator"
+    params: []
+    dispatch:
+      type: operator_api
+      method: GET
+      path: "/api/v1/operator/agents"
+
+  - name: get_operator_agent
+    description: "Get details for a specific agent by ID"
+    params:
+      - name: agent_id
+        type: string
+        required: true
+        description: "ID of the agent to retrieve"
+    dispatch:
+      type: operator_api
+      method: GET
+      path: "/api/v1/operator/agents/{{agent_id}}"
+
+  - name: update_agent_status
+    description: "Update agent status to active, suspended, or maintenance"
+    params:
+      - name: agent_id
+        type: string
+        required: true
+        description: "ID of the agent to update"
+      - name: status
+        type: string
+        required: true
+        description: "New status: active | suspended | maintenance"
+    dispatch:
+      type: operator_api
+      method: PATCH
+      path: "/api/v1/operator/agents/{{agent_id}}/status"
+      body_map:
+        status: "{{status}}"
+
+  - name: update_agent_controls
+    description: "Update agent operational controls (spending limits, model allowlist, rate limits)"
+    params:
+      - name: agent_id
+        type: string
+        required: true
+        description: "ID of the agent to update"
+      - name: max_daily_spend
+        type: integer
+        required: false
+        description: "Maximum daily spend limit"
+      - name: allowed_models
+        type: object
+        required: false
+        description: "Array of allowed model identifiers"
+      - name: rate_limit
+        type: integer
+        required: false
+        description: "Rate limit for the agent"
+    dispatch:
+      type: operator_api
+      method: PATCH
+      path: "/api/v1/operator/agents/{{agent_id}}/controls"
+      body_map:
+        max_daily_spend: "{{max_daily_spend}}"
+        allowed_models: "{{allowed_models}}"
+        rate_limit: "{{rate_limit}}"
+
+  - name: regenerate_agent_token
+    description: "Regenerate the API token for an agent, immediately invalidating the old token"
+    params:
+      - name: agent_id
+        type: string
+        required: true
+        description: "ID of the agent whose token to regenerate"
+    dispatch:
+      type: operator_api
+      method: POST
+      path: "/api/v1/operator/agents/{{agent_id}}/token/regenerate"
+
+  - name: archive_agent
+    description: "Archive an agent (soft-delete), agent is hidden but data is retained"
+    params:
+      - name: agent_id
+        type: string
+        required: true
+        description: "ID of the agent to archive"
+    dispatch:
+      type: wire_api
+      method: POST
+      path: "/api/v1/wire/agents/archive"
+      body_map:
+        agent_id: "{{agent_id}}"
+
+  - name: unarchive_agent
+    description: "Unarchive a previously archived agent"
+    params:
+      - name: agent_id
+        type: string
+        required: true
+        description: "ID of the agent to unarchive"
+    dispatch:
+      type: wire_api
+      method: DELETE
+      path: "/api/v1/wire/agents/archive"
+      body_map:
+        agent_id: "{{agent_id}}"
+
+  - name: merge_agents
+    description: "Merge one agent's identity into another, transferring contributions and reputation"
+    params:
+      - name: source_id
+        type: string
+        required: true
+        description: "ID of the agent to merge from"
+      - name: target_id
+        type: string
+        required: true
+        description: "ID of the agent to merge into"
+    dispatch:
+      type: wire_api
+      method: POST
+      path: "/api/v1/wire/agents/merge"
+      body_map:
+        source_id: "{{source_id}}"
+        target_id: "{{target_id}}"
+
+  - name: cancel_merge
+    description: "Cancel a pending merge operation"
+    params:
+      - name: merge_id
+        type: string
+        required: true
+        description: "ID of the merge operation to cancel"
+    dispatch:
+      type: wire_api
+      method: DELETE
+      path: "/api/v1/wire/agents/merge"
+      body_map:
+        merge_id: "{{merge_id}}"

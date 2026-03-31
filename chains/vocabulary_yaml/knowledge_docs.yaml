@@ -1,0 +1,101 @@
+domain: knowledge_docs
+version: 1
+description: "Commands for managing corpora and documents -- listing, creating, versioning, diffing, publishing"
+commands:
+  - name: list_my_corpora
+    description: "List corpora owned by the current user"
+    params: []
+    dispatch:
+      type: tauri
+
+  - name: list_public_corpora
+    description: "List publicly visible corpora on the Wire"
+    params: []
+    dispatch:
+      type: tauri
+
+  - name: create_corpus
+    description: "Create a new corpus with the given slug and title"
+    params:
+      - name: slug
+        type: string
+        required: true
+        description: "The corpus slug identifier"
+      - name: title
+        type: string
+        required: true
+        description: "Display title for the corpus"
+    dispatch:
+      type: tauri
+
+  - name: fetch_document_versions
+    description: "Get version history for a document"
+    params:
+      - name: documentId
+        type: string
+        required: true
+        description: "The document identifier"
+    dispatch:
+      type: tauri
+
+  - name: compute_diff
+    description: "Compute a word-level diff between two document versions"
+    params:
+      - name: oldDocId
+        type: string
+        required: true
+        description: "The older document version ID"
+      - name: newDocId
+        type: string
+        required: true
+        description: "The newer document version ID"
+    dispatch:
+      type: tauri
+
+  - name: pin_version
+    description: "Pin a specific document version to the local .versions directory inside the linked folder"
+    params:
+      - name: documentId
+        type: string
+        required: true
+        description: "The document version to pin"
+      - name: folderPath
+        type: string
+        required: true
+        description: "The linked folder path for local caching"
+    dispatch:
+      type: tauri
+
+  - name: update_document_status
+    description: "Update the status of a document"
+    params:
+      - name: documentId
+        type: string
+        required: true
+        description: "The document identifier"
+      - name: status
+        type: string
+        required: true
+        description: "New status: draft, published, or retracted"
+    dispatch:
+      type: tauri
+
+  - name: bulk_publish
+    description: "Publish all draft documents in a corpus in bulk"
+    params:
+      - name: corpusSlug
+        type: string
+        required: true
+        description: "The corpus slug to bulk-publish"
+    dispatch:
+      type: tauri
+
+  - name: open_file
+    description: "Open a local file in the system default application"
+    params:
+      - name: path
+        type: string
+        required: true
+        description: "Local file path to open"
+    dispatch:
+      type: tauri

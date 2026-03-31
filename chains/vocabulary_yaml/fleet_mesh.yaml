@@ -1,0 +1,125 @@
+domain: fleet_mesh
+version: 1
+description: "Commands for multi-agent coordination — shared blackboard, intent declarations, fleet status"
+commands:
+  - name: get_mesh_status
+    description: "Get mesh status — connected peers, heartbeat info, coordination state"
+    params:
+      - name: thread_id
+        type: string
+        required: true
+        description: "Wire thread ID for mesh context"
+    dispatch:
+      type: wire_api
+      method: GET
+      path: "/api/v1/mesh/status"
+      headers:
+        X-Wire-Thread: "{{thread_id}}"
+
+  - name: read_blackboard
+    description: "Read the shared blackboard — a key-value store visible to all agents in the thread"
+    params:
+      - name: thread_id
+        type: string
+        required: true
+        description: "Wire thread ID for mesh context"
+    dispatch:
+      type: wire_api
+      method: GET
+      path: "/api/v1/mesh/board"
+      headers:
+        X-Wire-Thread: "{{thread_id}}"
+
+  - name: write_blackboard
+    description: "Write a key-value entry to the shared blackboard with optional TTL for auto-expiry"
+    params:
+      - name: thread_id
+        type: string
+        required: true
+        description: "Wire thread ID for mesh context"
+      - name: key
+        type: string
+        required: true
+        description: "Key to write"
+      - name: value
+        type: object
+        required: true
+        description: "Value to store"
+      - name: ttl_seconds
+        type: integer
+        required: false
+        description: "Time-to-live in seconds for auto-expiry"
+    dispatch:
+      type: wire_api
+      method: POST
+      path: "/api/v1/mesh/board"
+      body_map:
+        key: "{{key}}"
+        value: "{{value}}"
+        ttl_seconds: "{{ttl_seconds}}"
+      headers:
+        X-Wire-Thread: "{{thread_id}}"
+
+  - name: list_intents
+    description: "List all declared intents from agents in the thread"
+    params:
+      - name: thread_id
+        type: string
+        required: true
+        description: "Wire thread ID for mesh context"
+    dispatch:
+      type: wire_api
+      method: GET
+      path: "/api/v1/mesh/intent"
+      headers:
+        X-Wire-Thread: "{{thread_id}}"
+
+  - name: declare_intent
+    description: "Declare intent to perform an action so other agents can coordinate and avoid conflicts"
+    params:
+      - name: thread_id
+        type: string
+        required: true
+        description: "Wire thread ID for mesh context"
+      - name: action
+        type: string
+        required: true
+        description: "The action being declared"
+      - name: target
+        type: string
+        required: false
+        description: "Target of the action"
+      - name: metadata
+        type: object
+        required: false
+        description: "Additional metadata about the intent"
+    dispatch:
+      type: wire_api
+      method: POST
+      path: "/api/v1/mesh/intent"
+      body_map:
+        action: "{{action}}"
+        target: "{{target}}"
+        metadata: "{{metadata}}"
+      headers:
+        X-Wire-Thread: "{{thread_id}}"
+
+  - name: withdraw_intent
+    description: "Withdraw a previously declared intent"
+    params:
+      - name: thread_id
+        type: string
+        required: true
+        description: "Wire thread ID for mesh context"
+      - name: intent_id
+        type: string
+        required: true
+        description: "ID of the intent to withdraw"
+    dispatch:
+      type: wire_api
+      method: DELETE
+      path: "/api/v1/mesh/intent"
+      body_map:
+        intent_id: "{{intent_id}}"
+      headers:
+        X-Wire-Thread: "{{thread_id}}"

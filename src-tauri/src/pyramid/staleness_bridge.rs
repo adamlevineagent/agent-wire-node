@@ -14,7 +14,7 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
-use super::staleness::{self, ChangedFile, ChangeType, StalenessReport};
+use super::staleness::{self, ChangeType, ChangedFile, StalenessReport};
 use super::types::StalenessItem;
 
 // ── Request / Response Types ─────────────────────────────────────────────────
@@ -66,7 +66,10 @@ pub fn run_staleness_check(
     threshold: f64,
 ) -> Result<(StalenessReport, Vec<StalenessItem>)> {
     if changed_files.is_empty() {
-        info!(slug, "No changed files provided, returning empty staleness report");
+        info!(
+            slug,
+            "No changed files provided, returning empty staleness report"
+        );
         return Ok((
             StalenessReport {
                 affected_questions: vec![],

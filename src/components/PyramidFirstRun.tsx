@@ -57,10 +57,11 @@ export function PyramidFirstRun({ onComplete }: PyramidFirstRunProps) {
                 {step === 'api-key' && (
                     <div className="first-run-step">
                         <div className="first-run-logo">W</div>
-                        <h1>Welcome to Wire Node</h1>
+                        <h1>Build Your First Knowledge Pyramid</h1>
                         <p className="first-run-subtitle">
-                            Enter your OpenRouter API key to get started with
-                            the Knowledge Pyramid engine.
+                            A knowledge pyramid distills a codebase or document folder
+                            into layered, queryable intelligence. To get started, you need
+                            an OpenRouter API key for the LLM that powers the build.
                         </p>
 
                         {error && (
@@ -76,6 +77,9 @@ export function PyramidFirstRun({ onComplete }: PyramidFirstRunProps) {
                                 placeholder="sk-or-..."
                                 onKeyDown={(e) => e.key === 'Enter' && handleSaveApiKey()}
                             />
+                            <span className="first-run-hint">
+                                Get a key at openrouter.ai -- any model with 100k+ context works.
+                            </span>
                         </div>
 
                         <div className="first-run-actions">
@@ -84,7 +88,7 @@ export function PyramidFirstRun({ onComplete }: PyramidFirstRunProps) {
                                 onClick={handleSaveApiKey}
                                 disabled={saving}
                             >
-                                {saving ? 'Saving...' : 'Continue'}
+                                {saving ? 'Saving...' : 'Save Key & Pick a Folder'}
                             </button>
                             <button
                                 className="btn btn-ghost"
@@ -98,9 +102,11 @@ export function PyramidFirstRun({ onComplete }: PyramidFirstRunProps) {
 
                 {step === 'workspace' && (
                     <div className="first-run-step">
-                        <h2>Add Your First Workspace</h2>
+                        <h2>Link a Folder</h2>
                         <p className="first-run-subtitle">
-                            Select a project directory to build your first knowledge pyramid.
+                            Pick a project directory or document folder. Wire Node will
+                            create a corpus from its contents and build a knowledge pyramid
+                            automatically.
                         </p>
                         <AddWorkspace
                             onComplete={handleWorkspaceComplete}
@@ -112,10 +118,11 @@ export function PyramidFirstRun({ onComplete }: PyramidFirstRunProps) {
                 {step === 'done' && (
                     <div className="first-run-step">
                         <div className="first-run-logo complete">&#x2713;</div>
-                        <h1>All Set</h1>
+                        <h1>Your First Build is Starting</h1>
                         <p className="first-run-subtitle">
-                            Your workspace is ready. You can open it in Vibesmithy
-                            or manage it from the Pyramids dashboard.
+                            Your workspace is linked and a pyramid build has been queued.
+                            Head to the dashboard to watch progress and explore results
+                            as layers complete.
                         </p>
                         <div className="first-run-actions">
                             <button

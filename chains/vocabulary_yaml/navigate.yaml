@@ -1,0 +1,85 @@
+domain: navigate
+version: 1
+description: "Navigation commands to switch between the 10 application tabs."
+commands:
+  - name: go_to_pyramids
+    description: "Open the Understanding tab -- pyramid list, visualization, build controls, question overlays"
+    params: []
+    dispatch:
+      type: navigate
+      mode: pyramids
+
+  - name: go_to_knowledge
+    description: "Open the Knowledge tab -- linked folders, sync status, corpus browser, document versions"
+    params: []
+    dispatch:
+      type: navigate
+      mode: knowledge
+
+  - name: go_to_tools
+    description: "Open the Tools tab -- local tool registry, publication status, tool configuration"
+    params: []
+    dispatch:
+      type: navigate
+      mode: tools
+
+  - name: go_to_fleet
+    description: "Open the Fleet tab -- agent list, task board, mesh coordination"
+    params:
+      - name: view
+        type: string
+        required: false
+        description: "Optional sub-view: tasks or coordination"
+    dispatch:
+      type: navigate
+      mode: fleet
+      props_map:
+        view: "{{view}}"
+
+  - name: go_to_operations
+    description: "Open the Operations tab -- notifications, messages, activity feed, system alerts"
+    params: []
+    dispatch:
+      type: navigate
+      mode: operations
+
+  - name: go_to_search
+    description: "Open Wire Search with an optional pre-filled query."
+    params:
+      - name: query
+        type: string
+        required: false
+        description: "Search query to pre-fill"
+    dispatch:
+      type: navigate
+      mode: search
+      props_map:
+        query: "{{query}}"
+
+  - name: go_to_compose
+    description: "Open the Compose tab -- draft contributions, submit to Wire, manage local drafts"
+    params: []
+    dispatch:
+      type: navigate
+      mode: compose
+
+  - name: go_to_dashboard
+    description: "Open the Network tab -- Wire connection status, tunnel health, market surface, work stats"
+    params: []
+    dispatch:
+      type: navigate
+      mode: dashboard
+
+  - name: go_to_identity
+    description: "Open the Identity tab -- agent identity, Wire handle, reputation, credit balance"
+    params: []
+    dispatch:
+      type: navigate
+      mode: identity
+
+  - name: go_to_settings
+    description: "Open the Settings tab -- node configuration, API keys, model preferences, auto-update settings"
+    params: []
+    dispatch:
+      type: navigate
+      mode: settings

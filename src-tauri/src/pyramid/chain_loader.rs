@@ -180,6 +180,7 @@ pub fn ensure_default_chains(chains_dir: &Path) -> Result<()> {
         chains_dir.join("prompts").join("conversation"),
         chains_dir.join("prompts").join("code"),
         chains_dir.join("prompts").join("document"),
+        chains_dir.join("prompts").join("planner"),
     ];
 
     for dir in &dirs_to_create {
@@ -203,6 +204,15 @@ pub fn ensure_default_chains(chains_dir: &Path) -> Result<()> {
                 .with_context(|| format!("failed to write default chain: {}", path.display()))?;
             tracing::info!(path = %path.display(), "wrote default chain file");
         }
+    }
+
+    // Write planner system prompt (bundled at compile time)
+    let planner_prompt_path = chains_dir.join("prompts").join("planner").join("planner-system.md");
+    if !planner_prompt_path.exists() {
+        let prompt_content = include_str!("../../../chains/prompts/planner/planner-system.md");
+        std::fs::write(&planner_prompt_path, prompt_content)
+            .with_context(|| format!("failed to write planner prompt: {}", planner_prompt_path.display()))?;
+        tracing::info!(path = %planner_prompt_path.display(), "wrote bundled planner-system.md");
     }
 
     Ok(())

@@ -221,12 +221,19 @@ impl PyramidPublisher {
             })
             .collect();
 
+        // Fall back to headline if distilled is empty — Wire requires non-empty body
+        let body = if node.distilled.is_empty() {
+            &node.headline
+        } else {
+            &node.distilled
+        };
+
         let payload = serde_json::json!({
             "type": "pyramid_node",
             "contribution_type": "mechanical",
             "title": node.headline,
             "teaser": teaser,
-            "body": node.distilled,
+            "body": body,
             "topics": topics,
             "entities": entities,
             "structured_data": structured_data,
@@ -240,7 +247,9 @@ impl PyramidPublisher {
     ///
     /// Converts each tuple into a DerivedFromEntry with source_type="contribution" and weight=1.0.
     /// Prefer calling `publish_pyramid_node` with `&[DerivedFromEntry]` directly for proper weights.
-    #[deprecated(note = "Use publish_pyramid_node with &[DerivedFromEntry] for proper evidence weights")]
+    #[deprecated(
+        note = "Use publish_pyramid_node with &[DerivedFromEntry] for proper evidence weights"
+    )]
     pub async fn publish_pyramid_node_legacy(
         &self,
         node: &PyramidNode,
@@ -358,7 +367,8 @@ impl PyramidPublisher {
                     })
                     .collect();
 
-                let (wire_uuid, handle_path) = self.publish_pyramid_node(node, &derived_from, None).await?;
+                let (wire_uuid, handle_path) =
+                    self.publish_pyramid_node(node, &derived_from, None).await?;
                 let resolved_handle = handle_path.unwrap_or_else(|| wire_uuid.clone());
 
                 id_map.insert(node.id.clone(), wire_uuid.clone());
@@ -457,7 +467,11 @@ impl PyramidPublisher {
         remote_handle_path: &str,
         gap_description: &str,
     ) -> Result<(String, Option<String>)> {
-        let title = format!("Gap: {} on {}", gap_description.chars().take(60).collect::<String>(), remote_handle_path);
+        let title = format!(
+            "Gap: {} on {}",
+            gap_description.chars().take(60).collect::<String>(),
+            remote_handle_path
+        );
         let teaser = truncate_str(gap_description, 200).to_string();
 
         let structured_data = serde_json::json!({
@@ -482,7 +496,10 @@ impl PyramidPublisher {
     }
 
     /// Post a contribution to the Wire API and return its UUID.
-    async fn post_contribution(&self, payload: &serde_json::Value) -> Result<(String, Option<String>)> {
+    async fn post_contribution(
+        &self,
+        payload: &serde_json::Value,
+    ) -> Result<(String, Option<String>)> {
         let url = format!("{}/api/v1/contribute", self.wire_url.trim_end_matches('/'),);
 
         let response = self
@@ -523,9 +540,7 @@ impl PyramidPublisher {
 
         // The contribute endpoint returns { id: "uuid", handle_path: "...", ... } (flat object)
         // or legacy { contribution: { id: "uuid", handle_path: "..." } } — support both.
-        let contribution = body
-            .get("contribution")
-            .unwrap_or(&body);
+        let contribution = body.get("contribution").unwrap_or(&body);
 
         let contribution_id = contribution
             .get("id")
@@ -793,9 +808,8 @@ pub fn is_already_published(
     slug: &str,
     local_id: &str,
 ) -> Result<bool> {
-    let result = conn.prepare(
-        "SELECT 1 FROM pyramid_id_map WHERE slug = ?1 AND local_id = ?2 LIMIT 1",
-    );
+    let result =
+        conn.prepare("SELECT 1 FROM pyramid_id_map WHERE slug = ?1 AND local_id = ?2 LIMIT 1");
     match result {
         Ok(mut stmt) => {
             let exists = stmt
@@ -1057,7 +1071,10 @@ mod tests {
             weight: 0.0,
             justification: None,
         };
-        assert!(entry.weight <= 0.0, "zero weight should be rejected by publish_pyramid_node");
+        assert!(
+            entry.weight <= 0.0,
+            "zero weight should be rejected by publish_pyramid_node"
+        );
     }
 
     #[test]
@@ -1082,11 +1099,19 @@ mod tests {
     fn test_l0_source_type_is_source_document() {
         // Verify depth-based source_type logic
         let depth: i64 = 0;
-        let source_type = if depth == 0 { "source_document" } else { "contribution" };
+        let source_type = if depth == 0 {
+            "source_document"
+        } else {
+            "contribution"
+        };
         assert_eq!(source_type, "source_document");
 
         let depth: i64 = 1;
-        let source_type = if depth == 0 { "source_document" } else { "contribution" };
+        let source_type = if depth == 0 {
+            "source_document"
+        } else {
+            "contribution"
+        };
         assert_eq!(source_type, "contribution");
     }
 

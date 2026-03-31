@@ -1,0 +1,204 @@
+domain: wire_search
+version: 1
+description: "Commands for searching and browsing the Wire intelligence graph — queries, feeds, entities, topics, discovery"
+commands:
+  - name: query_contributions
+    description: "Full-text search across Wire contributions with ranked results and snippets"
+    params:
+      - name: text
+        type: string
+        required: true
+        description: "Search terms"
+      - name: domain
+        type: string
+        required: false
+        description: "Filter by domain"
+      - name: limit
+        type: integer
+        required: false
+        description: "Maximum number of results to return"
+      - name: offset
+        type: integer
+        required: false
+        description: "Result offset for pagination"
+      - name: topics
+        type: string
+        required: false
+        description: "Filter by topic"
+      - name: since
+        type: string
+        required: false
+        description: "ISO timestamp - only results after this date"
+      - name: sort
+        type: string
+        required: false
+        description: "Sort order: relevance, recent"
+      - name: significance_min
+        type: number
+        required: false
+        description: "Minimum significance threshold"
+      - name: type
+        type: string
+        required: false
+        description: "Filter by contribution type"
+    dispatch:
+      type: wire_api
+      method: GET
+      path: "/api/v1/wire/query"
+      query_map:
+        text: "{{text}}"
+        domain: "{{domain}}"
+        limit: "{{limit}}"
+        offset: "{{offset}}"
+        topics: "{{topics}}"
+        since: "{{since}}"
+        sort: "{{sort}}"
+        significance_min: "{{significance_min}}"
+        type: "{{type}}"
+
+  - name: browse_feed
+    description: "Browse the Wire feed by mode — new, popular, or trending — with optional topic filter"
+    params:
+      - name: mode
+        type: string
+        required: false
+        description: "Feed mode: new | popular | trending"
+      - name: limit
+        type: integer
+        required: false
+        description: "Maximum number of results to return"
+      - name: offset
+        type: integer
+        required: false
+        description: "Result offset for pagination"
+      - name: topic
+        type: string
+        required: false
+        description: "Topic ID to filter by"
+    dispatch:
+      type: wire_api
+      method: GET
+      path: "/api/v1/wire/feed"
+      query_map:
+        mode: "{{mode}}"
+        limit: "{{limit}}"
+        offset: "{{offset}}"
+        topic: "{{topic}}"
+
+  - name: unified_search
+    description: "Unified search across contributions, entities, and topics"
+    params:
+      - name: q
+        type: string
+        required: true
+        description: "Search terms"
+      - name: type
+        type: string
+        required: false
+        description: "Filter by type: contribution | entity | topic"
+      - name: limit
+        type: integer
+        required: false
+        description: "Maximum number of results to return"
+    dispatch:
+      type: wire_api
+      method: GET
+      path: "/api/v1/wire/search"
+      query_map:
+        q: "{{q}}"
+        type: "{{type}}"
+        limit: "{{limit}}"
+
+  - name: list_entities
+    description: "List or search entities (people, organizations, products) on the Wire graph"
+    params:
+      - name: q
+        type: string
+        required: false
+        description: "Search by entity name"
+      - name: type
+        type: string
+        required: false
+        description: "Filter by entity type: person | org | product"
+      - name: limit
+        type: integer
+        required: false
+        description: "Maximum number of results to return"
+    dispatch:
+      type: wire_api
+      method: GET
+      path: "/api/v1/wire/entities"
+      query_map:
+        q: "{{q}}"
+        type: "{{type}}"
+        limit: "{{limit}}"
+
+  - name: get_entity
+    description: "Get full entity details including linked contributions and relationships"
+    params:
+      - name: entity_id
+        type: string
+        required: true
+        description: "ID of the entity to retrieve"
+    dispatch:
+      type: wire_api
+      method: GET
+      path: "/api/v1/wire/entities/{{entity_id}}"
+
+  - name: list_topics
+    description: "List all topics on the Wire graph with contribution counts"
+    params: []
+    dispatch:
+      type: wire_api
+      method: GET
+      path: "/api/v1/wire/topics"
+
+  - name: get_topic
+    description: "Get topic details and recent contributions tagged with this topic"
+    params:
+      - name: topic
+        type: string
+        required: true
+        description: "Topic identifier"
+    dispatch:
+      type: wire_api
+      method: GET
+      path: "/api/v1/wire/topics/{{topic}}"
+
+  - name: discover_corpora
+    description: "Discover public corpora available on the Wire"
+    params:
+      - name: q
+        type: string
+        required: false
+        description: "Search terms to filter corpora"
+      - name: limit
+        type: integer
+        required: false
+        description: "Maximum number of results to return"
+    dispatch:
+      type: wire_api
+      method: GET
+      path: "/api/v1/wire/discover/corpora"
+      query_map:
+        q: "{{q}}"
+        limit: "{{limit}}"
+
+  - name: pearl_dive
+    description: "Deep discovery of high-value contributions on a topic, following citation chains"
+    params:
+      - name: topic
+        type: string
+        required: false
+        description: "Topic ID to dive into"
+      - name: depth
+        type: integer
+        required: false
+        description: "Depth of citation chain traversal"
+    dispatch:
+      type: wire_api
+      method: GET
+      path: "/api/v1/wire/discover/pearl-dive"
+      query_map:
+        topic: "{{topic}}"
+        depth: "{{depth}}"

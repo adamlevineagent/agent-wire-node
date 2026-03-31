@@ -743,7 +743,7 @@ Output valid JSON matching this schema:
         children: canonical_node.children.clone(),
         parent_id: canonical_node.parent_id.clone(),
         superseded_by: None,
-            build_id: None,
+        build_id: None,
         created_at: now_ts(),
     };
 
@@ -941,8 +941,14 @@ pub fn propagate_staleness_parent_chain(
         if superseded.is_none() {
             affected.push(pid.clone());
             // Recurse upward
-            let mut upstream =
-                propagate_staleness_parent_chain(conn, slug, &pid, changed_depth + 1, visited, max_depth)?;
+            let mut upstream = propagate_staleness_parent_chain(
+                conn,
+                slug,
+                &pid,
+                changed_depth + 1,
+                visited,
+                max_depth,
+            )?;
             affected.append(&mut upstream);
         }
     }

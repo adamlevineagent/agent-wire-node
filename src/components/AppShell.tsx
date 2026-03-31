@@ -3,15 +3,17 @@ import { invoke } from '@tauri-apps/api/core';
 import { getVersion } from '@tauri-apps/api/app';
 import { useAppContext, TunnelStatusData } from '../contexts/AppContext';
 import { Sidebar } from './Sidebar';
+import { IntentBar } from './IntentBar';
 import { ModeRouter } from './ModeRouter';
 import type { CreditStats, SyncState } from './Dashboard';
+import type { SlugInfo } from './pyramid-types';
 
 interface AppShellProps {
     onLogout: () => void;
 }
 
 export function AppShell({ onLogout }: AppShellProps) {
-    const { state, dispatch } = useAppContext();
+    const { state, dispatch, operatorApiCall, wireApiCall } = useAppContext();
     const [appVersion, setAppVersion] = useState('');
     const [updateAvailable, setUpdateAvailable] = useState<{ version: string; body?: string } | null>(null);
     const [installing, setInstalling] = useState(false);
@@ -74,21 +76,89 @@ export function AppShell({ onLogout }: AppShellProps) {
         return () => clearInterval(interval);
     }, [dispatch]);
 
-    // Poll for notification count every 30 seconds
+    // Poll pyramid count every 30 seconds
     useEffect(() => {
-        const fetchNotifications = async () => {
+        const fetchPyramids = async () => {
             try {
-                const messages = await invoke<Array<{ read_at: string | null }>>('get_messages');
-                const unread = messages.filter(m => !m.read_at).length;
-                dispatch({ type: 'SET_NOTIFICATION_COUNT', count: unread });
+                const slugs = await invoke<SlugInfo[]>('pyramid_list_slugs');
+                dispatch({ type: 'SET_PYRAMID_COUNT', count: slugs.length });
             } catch {
                 // silent fail
             }
         };
-        fetchNotifications();
-        const interval = setInterval(fetchNotifications, 30000);
+        fetchPyramids();
+        const interval = setInterval(fetchPyramids, 30000);
         return () => clearInterval(interval);
     }, [dispatch]);
+
+    // Poll draft count every 30 seconds
+    useEffect(() => {
+        const fetchDrafts = async () => {
+            try {
+                const drafts = await invoke<unknown[]>('get_compose_drafts');
+                dispatch({ type: 'SET_DRAFT_COUNT', count: Array.isArray(drafts) ? drafts.length : 0 });
+            } catch {
+                // silent fail
+            }
+        };
+        fetchDrafts();
+        const interval = setInterval(fetchDrafts, 30000);
+        return () => clearInterval(interval);
+    }, [dispatch]);
+
+    // Poll fleet pulse every 60 seconds (lifted from DashboardMode)
+    useEffect(() => {
+        const fetchPulse = async () => {
+            try {
+                const data: any = await wireApiCall('GET', '/api/v1/wire/pulse');
+                dispatch({
+                    type: 'SET_FLEET_PULSE',
+                    fleetOnlineCount: data?.online_agents ?? 0,
+                    taskCount: data?.active_tasks ?? 0,
+                });
+            } catch {
+                // silent fail
+            }
+        };
+        fetchPulse();
+        const interval = setInterval(fetchPulse, 60000);
+        return () => clearInterval(interval);
+    }, [dispatch, wireApiCall]);
+
+    // Poll for Wire message count every 30 seconds (DMs/circle messages — separate from notifications)
+    useEffect(() => {
+        const fetchMessages = async () => {
+            try {
+                const messages = await invoke<Array<{ read_at: string | null }>>('get_messages');
+                const unread = messages.filter(m => !m.read_at).length;
+                dispatch({ type: 'SET_MESSAGE_COUNT', count: unread });
+            } catch {
+                // silent fail
+            }
+        };
+        fetchMessages();
+        const interval = setInterval(fetchMessages, 30000);
+        return () => clearInterval(interval);
+    }, [dispatch]);
+
+    // Poll for notification count every 60 seconds (uses operator auth — dual-auth endpoint)
+    useEffect(() => {
+        if (!state.operatorSessionToken) return;
+        const fetchNotificationCount = async () => {
+            try {
+                const data: any = await operatorApiCall('GET', '/api/v1/wire/notifications?read=false&limit=1');
+                const count = typeof data?.unread_count === 'number'
+                    ? data.unread_count
+                    : (Array.isArray(data?.notifications) ? data.notifications.length : 0);
+                dispatch({ type: 'SET_NOTIFICATION_COUNT', count });
+            } catch {
+                // silent fail — notification badge may be stale
+            }
+        };
+        fetchNotificationCount();
+        const interval = setInterval(fetchNotificationCount, 60000);
+        return () => clearInterval(interval);
+    }, [dispatch, state.operatorSessionToken, operatorApiCall]);
 
     // Try to acquire operator session on mount
     useEffect(() => {
@@ -191,6 +261,9 @@ export function AppShell({ onLogout }: AppShellProps) {
                         </button>
                     </div>
                 )}
+
+                {/* Intent bar */}
+                <IntentBar />
 
                 {/* Mode content */}
                 <div className="mode-content-area">

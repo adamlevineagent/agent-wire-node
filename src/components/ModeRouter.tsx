@@ -2,11 +2,11 @@ import { useAppContext } from '../contexts/AppContext';
 import { DashboardMode } from './modes/DashboardMode';
 import { PyramidsMode } from './modes/PyramidsMode';
 import { SearchMode } from './modes/SearchMode';
-import { WarroomMode } from './modes/WarroomMode';
 import { ComposeMode } from './modes/ComposeMode';
-import { AgentsMode } from './modes/AgentsMode';
-import { NodeMode } from './modes/NodeMode';
-import { ActivityMode } from './modes/ActivityMode';
+import { FleetMode } from './modes/FleetMode';
+import { KnowledgeMode } from './modes/KnowledgeMode';
+import { ToolsMode } from './modes/ToolsMode';
+import { OperationsMode } from './modes/OperationsMode';
 import { IdentityMode } from './modes/IdentityMode';
 import { SettingsMode } from './modes/SettingsMode';
 
@@ -16,20 +16,20 @@ export function ModeRouter() {
     switch (state.activeMode) {
         case 'pyramids':
             return <PyramidsMode />;
+        case 'knowledge':
+            return <KnowledgeMode />;
+        case 'tools':
+            return <ToolsMode />;
         case 'dashboard':
             return <DashboardMode />;
         case 'search':
             return <SearchMode />;
-        case 'warroom':
-            return <WarroomMode />;
         case 'compose':
             return <ComposeMode />;
-        case 'agents':
-            return <AgentsMode />;
-        case 'node':
-            return <NodeMode />;
-        case 'activity':
-            return <ActivityMode />;
+        case 'fleet':
+            return <FleetMode />;
+        case 'operations':
+            return <OperationsMode />;
         case 'identity':
             return <IdentityMode />;
         case 'settings':

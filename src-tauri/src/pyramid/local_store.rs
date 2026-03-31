@@ -61,7 +61,13 @@ pub fn update_build_progress(
         "UPDATE pyramid_builds SET
            layers_completed = ?1, l0_node_count = ?2, total_node_count = ?3
          WHERE slug = ?4 AND build_id = ?5",
-        rusqlite::params![layers_completed, l0_node_count, total_node_count, slug, build_id],
+        rusqlite::params![
+            layers_completed,
+            l0_node_count,
+            total_node_count,
+            slug,
+            build_id
+        ],
     )?;
     Ok(())
 }
@@ -219,7 +225,15 @@ mod tests {
         assert_eq!(row, "Original?");
 
         // Re-run with different original_question — COALESCE should preserve the first one
-        save_build_start(&conn, "test", "b1", "Enhanced v2?", 4, Some("Different original?")).unwrap();
+        save_build_start(
+            &conn,
+            "test",
+            "b1",
+            "Enhanced v2?",
+            4,
+            Some("Different original?"),
+        )
+        .unwrap();
 
         let row2: String = conn
             .query_row(
@@ -228,7 +242,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(row2, "Original?", "COALESCE should preserve original_question on re-run");
+        assert_eq!(
+            row2, "Original?",
+            "COALESCE should preserve original_question on re-run"
+        );
 
         // question column should be updated to the new enhanced version
         let meta = get_latest_build(&conn, "test").unwrap().unwrap();

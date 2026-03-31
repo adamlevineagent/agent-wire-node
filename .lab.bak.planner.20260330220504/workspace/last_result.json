@@ -1,0 +1,207 @@
+{
+  "valid_steps": 5,
+  "total_steps": 5,
+  "overall_rate": 100.0,
+  "per_intent": [
+    {
+      "intent": "Please archive all my agents with zero contributions",
+      "valid": 1,
+      "total": 1,
+      "rate": 100.0,
+      "plan": {
+        "plan_id": "plan-archive-agents-001",
+        "intent": "Archive selected agents with zero contributions",
+        "steps": [
+          {
+            "id": "step-1",
+            "api_call": {
+              "method": "POST",
+              "path": "/api/v1/wire/agents/archive",
+              "body": {
+                "agent_id": "{{agent_id}}"
+              }
+            },
+            "auth": "wire",
+            "description": "Archive each selected agent (fails gracefully if agent has contributions or already archived)",
+            "estimated_cost": null,
+            "on_error": "continue"
+          }
+        ],
+        "total_estimated_cost": null,
+        "ui_schema": [
+          {
+            "type": "agent_selector",
+            "field": "agent_id",
+            "label": "Agents to archive",
+            "multi": true
+          },
+          {
+            "type": "confirmation",
+            "summary": "Archive selected agents",
+            "details": "The selected agents will be archived (soft-delete). Agents with existing contributions will not be removed; the step will continue without aborting."
+          }
+        ]
+      }
+    },
+    {
+      "intent": "Build a pyramid from my agent-wire-node code",
+      "valid": 2,
+      "total": 2,
+      "rate": 100.0,
+      "plan": {
+        "plan_id": "plan-build-pyramid-1",
+        "intent": "Build a pyramid from my agent-wire-node code",
+        "steps": [
+          {
+            "id": "step-1",
+            "command": "pyramid_list_slugs",
+            "args": {},
+            "description": "List existing pyramid slugs to check for conflicts",
+            "estimated_cost": null,
+            "on_error": "continue"
+          },
+          {
+            "id": "step-2",
+            "command": "pyramid_build",
+            "args": {
+              "slug": "agent-wire-node"
+            },
+            "description": "Build the knowledge pyramid for the agent-wire-node codebase. LLM costs depend on corpus size",
+            "estimated_cost": null,
+            "on_error": "abort"
+          }
+        ],
+        "total_estimated_cost": null,
+        "ui_schema": [
+          {
+            "type": "text_input",
+            "field": "slug",
+            "label": "Pyramid slug",
+            "placeholder": "agent-wire-node"
+          },
+          {
+            "type": "confirmation",
+            "summary": "Build pyramid from agent-wire-node code",
+            "details": "This will start a mechanical build of the existing pyramid. LLM costs are dynamic and depend on the size of the linked code corpus."
+          }
+        ]
+      }
+    },
+    {
+      "intent": "Search the Wire for battery chemistry",
+      "valid": 1,
+      "total": 1,
+      "rate": 100.0,
+      "plan": {
+        "plan_id": "plan-search-battery",
+        "intent": "Search the Wire for battery chemistry",
+        "steps": [
+          {
+            "id": "step-1",
+            "navigate": {
+              "mode": "search",
+              "props": {
+                "query": "battery chemistry"
+              }
+            },
+            "description": "Open Wire Search with the query 'battery chemistry' pre-filled",
+            "estimated_cost": null,
+            "on_error": "abort"
+          }
+        ],
+        "total_estimated_cost": null,
+        "ui_schema": [
+          {
+            "type": "text_input",
+            "field": "query",
+            "label": "Search query",
+            "placeholder": "battery chemistry"
+          },
+          {
+            "type": "confirmation",
+            "summary": "Search the Wire for battery chemistry",
+            "details": "Opens the Search view with your query pre-filled. Query costs are dynamic."
+          }
+        ]
+      }
+    },
+    {
+      "intent": "Create a task: review auth security",
+      "valid": 1,
+      "total": 1,
+      "rate": 100.0,
+      "plan": {
+        "plan_id": "plan-create-task-1",
+        "intent": "Create a task: review auth security",
+        "steps": [
+          {
+            "id": "step-1",
+            "api_call": {
+              "method": "POST",
+              "path": "/api/v1/wire/tasks",
+              "body": {
+                "title": "",
+                "description": "",
+                "priority": "normal",
+                "tags": []
+              }
+            },
+            "auth": "wire",
+            "description": "Create a new task in the Fleet task board. Query costs are dynamic and depend on task metadata processing.",
+            "estimated_cost": null,
+            "on_error": "abort"
+          }
+        ],
+        "total_estimated_cost": null,
+        "ui_schema": [
+          {
+            "type": "text_input",
+            "field": "title",
+            "label": "Task title",
+            "placeholder": "Review auth security"
+          },
+          {
+            "type": "text_input",
+            "field": "description",
+            "label": "Description",
+            "placeholder": "Provide details about the security review"
+          },
+          {
+            "type": "select",
+            "field": "priority",
+            "label": "Priority",
+            "options": [
+              {
+                "value": "low",
+                "label": "Low"
+              },
+              {
+                "value": "normal",
+                "label": "Normal"
+              },
+              {
+                "value": "high",
+                "label": "High"
+              },
+              {
+                "value": "urgent",
+                "label": "Urgent"
+              }
+            ]
+          },
+          {
+            "type": "text_input",
+            "field": "tags",
+            "label": "Tags (comma-separated)",
+            "placeholder": "security,auth"
+          },
+          {
+            "type": "confirmation",
+            "summary": "Create a new task to review auth security",
+            "details": "The task will be added to the Fleet task board. You can set title, description, priority, and tags before confirming."
+          }
+        ]
+      }
+    }
+  ]
+}

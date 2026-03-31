@@ -1,0 +1,2 @@
+experiment	branch	parent	commit	metric	secondary_metrics	status	duration_s	description
+0	research/planner-command-names	-	02cdb17	100	navigate_copout:1of4	keep	8	Baseline: 5/5 valid but intent#1 uses navigate instead of API calls

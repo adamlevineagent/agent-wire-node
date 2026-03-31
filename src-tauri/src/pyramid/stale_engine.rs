@@ -30,11 +30,19 @@ use super::types::{AutoUpdateConfig, ConnectionCheckResult, PendingMutation, Sta
 
 use super::{OperationalConfig, Tier1Config, Tier3Config};
 
-pub fn max_concurrent_helpers() -> usize { Tier1Config::default().stale_max_concurrent_helpers }
+pub fn max_concurrent_helpers() -> usize {
+    Tier1Config::default().stale_max_concurrent_helpers
+}
 
-fn batch_cap_nodes(t3: &Tier3Config) -> usize { t3.batch_cap_nodes }
-fn batch_cap_connections(t3: &Tier3Config) -> usize { t3.batch_cap_connections }
-fn batch_cap_renames(t3: &Tier3Config) -> usize { t3.batch_cap_renames }
+fn batch_cap_nodes(t3: &Tier3Config) -> usize {
+    t3.batch_cap_nodes
+}
+fn batch_cap_connections(t3: &Tier3Config) -> usize {
+    t3.batch_cap_connections
+}
+fn batch_cap_renames(t3: &Tier3Config) -> usize {
+    t3.batch_cap_renames
+}
 
 /// Per-layer debounce timer state.
 pub struct LayerTimer {
@@ -593,7 +601,8 @@ pub async fn drain_and_dispatch(
         let s = slug_owned.clone();
         let db = db_owned.clone();
         tokio::task::spawn_blocking(move || -> Result<Vec<PendingMutation>> {
-            let conn = super::db::open_pyramid_connection(Path::new(&db)).context("Failed to open DB for drain")?;
+            let conn = super::db::open_pyramid_connection(Path::new(&db))
+                .context("Failed to open DB for drain")?;
 
             if layer == 0 {
                 let count: i64 = conn.query_row(

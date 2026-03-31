@@ -13,9 +13,10 @@ interface BuildProgressProps {
     slug: string;
     onComplete?: (status: BuildStatus) => void;
     onClose?: () => void;
+    onRetry?: (slug: string) => void;
 }
 
-export function BuildProgress({ slug, onComplete, onClose }: BuildProgressProps) {
+export function BuildProgress({ slug, onComplete, onClose, onRetry }: BuildProgressProps) {
     const [status, setStatus] = useState<BuildStatus | null>(null);
     const [error, setError] = useState<string | null>(null);
 
@@ -60,6 +61,18 @@ export function BuildProgress({ slug, onComplete, onClose }: BuildProgressProps)
         }
     }, [slug]);
 
+    const handleForceReset = useCallback(async () => {
+        try {
+            await invoke('pyramid_build_force_reset', { slug });
+        } catch (err) {
+            console.error('Force reset failed:', err);
+        }
+    }, [slug]);
+
+    const handleRetry = useCallback(() => {
+        onRetry?.(slug);
+    }, [slug, onRetry]);
+
     const pct = status?.progress.total
         ? Math.round((status.progress.done / status.progress.total) * 100)
         : 0;
@@ -76,6 +89,7 @@ export function BuildProgress({ slug, onComplete, onClose }: BuildProgressProps)
         isRunning &&
         (status?.progress.total ?? 0) > 0 &&
         (status?.progress.done ?? 0) >= (status?.progress.total ?? 0);
+    const isStuck = isRunning && (status?.elapsed_seconds ?? 0) > 1800;
 
     return (
         <div className="build-progress-panel">
@@ -138,11 +152,18 @@ export function BuildProgress({ slug, onComplete, onClose }: BuildProgressProps)
             {isFailed && (
                 <div className="build-failed-message">
                     Build failed. Check the logs for details.
-                    {onClose && (
-                        <button className="btn btn-secondary" onClick={onClose}>
-                            Back to Dashboard
-                        </button>
-                    )}
+                    <div className="build-complete-actions">
+                        {onRetry && (
+                            <button className="btn btn-primary" onClick={handleRetry}>
+                                Retry Build
+                            </button>
+                        )}
+                        {onClose && (
+                            <button className="btn btn-secondary" onClick={onClose}>
+                                Back to Dashboard
+                            </button>
+                        )}
+                    </div>
                 </div>
             )}
 
@@ -151,6 +172,11 @@ export function BuildProgress({ slug, onComplete, onClose }: BuildProgressProps)
                     <button className="btn btn-danger" onClick={handleCancel}>
                         Cancel Build
                     </button>
+                    {isStuck && (
+                        <button className="btn btn-danger" onClick={handleForceReset} style={{ marginLeft: 8 }}>
+                            Force Reset (stuck &gt;30m)
+                        </button>
+                    )}
                 </div>
             )}
         </div>

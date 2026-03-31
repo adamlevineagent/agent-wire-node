@@ -1,0 +1,52 @@
+[0] Syncing chain files...
+  L0 nodes: 112
+{"error":"No active build for this slug"}[1] Building from depth 1...
+  Build: {"slug":"opt-017","status":"running","progress":{"done":0,"total":0},"elapsed_seconds":0.0,"failures":0}
+[2] Polling...
+  [1/226] running (1s, failures: 0)
+  [1/226] running (6s, failures: 0)
+  [1/226] running (11s, failures: 0)
+  [1/226] running (16s, failures: 0)
+  [1/226] running (21s, failures: 0)
+  [2/226] running (26s, failures: 0)
+  [2/226] running (31s, failures: 0)
+  [2/226] running (37s, failures: 0)
+  [3/226] running (42s, failures: 0)
+  [3/226] running (47s, failures: 0)
+  [3/226] running (52s, failures: 0)
+  [3/226] running (57s, failures: 0)
+  [4/226] running (62s, failures: 0)
+  [5/226] running (67s, failures: 0)
+  [5/226] running (72s, failures: 0)
+  [5/226] running (77s, failures: 0)
+  [5/226] running (82s, failures: 0)
+  [6/226] running (87s, failures: 0)
+  [6/226] running (93s, failures: 0)
+  [6/226] running (98s, failures: 0)
+  [6/226] running (103s, failures: 0)
+  [8/226] running (108s, failures: 0)
+  [8/226] running (113s, failures: 0)
+  [8/226] running (118s, failures: 0)
+  [8/226] running (123s, failures: 0)
+  [10/226] running (128s, failures: 0)
+  [11/226] running (133s, failures: 0)
+  [11/226] running (138s, failures: 0)
+  [11/226] running (143s, failures: 0)
+  [11/226] running (149s, failures: 0)
+  [11/226] running (154s, failures: 0)
+  [11/226] running (159s, failures: 0)
+  [12/226] running (164s, failures: 0)
+  [13/226] running (169s, failures: 0)
+  [14/226] running (174s, failures: 0)
+  [14/226] running (179s, failures: 0)
+Build complete in 184s (failures: 0)
+
+=== Apex Check ===
+APEX: VALID
+
+=== Structure ===
+0|112
+1|10
+2|3
+3|1
+Max depth: 3 | Total: 126 | Duration: 184s

@@ -72,8 +72,7 @@ pub async fn process_web_edge_notes_with_build(
                 // Look up tunnel URL for the remote slug (if we have it pinned)
                 let tunnel_url = {
                     let conn = reader.lock().await;
-                    db::get_slug_tunnel_url(&conn, &handle.slug)?
-                        .unwrap_or_default()
+                    db::get_slug_tunnel_url(&conn, &handle.slug)?.unwrap_or_default()
                 };
 
                 let edge = RemoteWebEdge {

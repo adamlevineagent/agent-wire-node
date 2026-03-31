@@ -195,17 +195,25 @@ pub fn get_apex(conn: &Connection, slug: &str) -> Result<Option<PyramidNode>> {
         get_apex_filtered(conn, slug, "")
     } else {
         // Mechanical slug: exclude overlay nodes
-        get_apex_filtered(conn, slug, "AND (build_id IS NULL OR build_id = '' OR build_id NOT LIKE 'qb-%')")
+        get_apex_filtered(
+            conn,
+            slug,
+            "AND (build_id IS NULL OR build_id = '' OR build_id NOT LIKE 'qb-%')",
+        )
     }
 }
 
 /// Get the apex node for a specific build_id (question overlay).
 /// Filters to nodes belonging to that build_id and returns the highest-depth one.
-pub fn get_apex_for_build(conn: &Connection, slug: &str, build_id: &str) -> Result<Option<PyramidNode>> {
+pub fn get_apex_for_build(
+    conn: &Connection,
+    slug: &str,
+    build_id: &str,
+) -> Result<Option<PyramidNode>> {
     let result = conn
         .prepare(
             "SELECT * FROM live_pyramid_nodes WHERE slug = ?1 AND build_id = ?2
-             ORDER BY depth DESC LIMIT 1"
+             ORDER BY depth DESC LIMIT 1",
         )?
         .query_row(rusqlite::params![slug, build_id], row_to_node)
         .optional()
@@ -486,10 +494,7 @@ pub fn drill(conn: &Connection, slug: &str, node_id: &str) -> Result<Option<Dril
 }
 
 /// Walk a question tree JSON to find `node_id` and return its parent question + siblings.
-fn find_question_context(
-    tree_json: &serde_json::Value,
-    node_id: &str,
-) -> Option<QuestionContext> {
+fn find_question_context(tree_json: &serde_json::Value, node_id: &str) -> Option<QuestionContext> {
     find_in_tree(&tree_json["apex"], node_id, None)
 }
 
@@ -805,7 +810,11 @@ pub fn search(conn: &Connection, slug: &str, term: &str) -> Result<Vec<SearchHit
             let score = coverage * (depth as f64 + 1.0) * 10.0;
 
             // Tag with source_slug if it came from a different slug
-            let source_slug_tag = if hit_slug != slug { Some(hit_slug) } else { None };
+            let source_slug_tag = if hit_slug != slug {
+                Some(hit_slug)
+            } else {
+                None
+            };
 
             Ok(SearchHit {
                 node_id: id,
@@ -886,9 +895,8 @@ pub fn get_composed_view(conn: &Connection, slug: &str) -> Result<ComposedView> 
         }
 
         // Load children arrays to build child edges
-        let mut children_stmt = conn.prepare(
-            "SELECT id, children FROM live_pyramid_nodes WHERE slug = ?1",
-        )?;
+        let mut children_stmt =
+            conn.prepare("SELECT id, children FROM live_pyramid_nodes WHERE slug = ?1")?;
         let child_rows = children_stmt.query_map(rusqlite::params![s], |row| {
             let id: String = row.get(0)?;
             let children_json: String = row.get(1)?;
@@ -897,7 +905,8 @@ pub fn get_composed_view(conn: &Connection, slug: &str) -> Result<ComposedView> 
 
         for row in child_rows {
             if let Ok((parent_id, children_json)) = row {
-                let children: Vec<String> = serde_json::from_str(&children_json).unwrap_or_default();
+                let children: Vec<String> =
+                    serde_json::from_str(&children_json).unwrap_or_default();
                 for child_id in children {
                     composed_edges.push(ComposedEdge {
                         source_id: parent_id.clone(),
@@ -928,7 +937,9 @@ pub fn get_composed_view(conn: &Connection, slug: &str) -> Result<ComposedView> 
                     continue;
                 }
                 // Determine liveness: check if the source node is superseded
-                let live = if let Some((_ref_slug, _depth, ref_node_id)) = db::parse_handle_path(&source_id) {
+                let live = if let Some((_ref_slug, _depth, ref_node_id)) =
+                    db::parse_handle_path(&source_id)
+                {
                     // Cross-slug source: check if the node is still live
                     node_ids_seen.contains(ref_node_id)
                 } else {

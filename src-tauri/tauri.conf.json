@@ -26,7 +26,7 @@
       "tooltip": "Wire Node"
     },
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; connect-src 'self' https://openrouter.ai https://newsbleach.com https://supabase.newsbleach.com http://localhost:* https://localhost:*; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com"
     }
   },
   "bundle": {

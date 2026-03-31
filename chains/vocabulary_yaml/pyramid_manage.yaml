@@ -1,0 +1,199 @@
+domain: pyramid_manage
+version: 1
+description: "Commands for lifecycle management: archiving, publishing, staleness, and auto-update"
+commands:
+  - name: pyramid_archive_slug
+    description: "Archive a pyramid slug. Sets archived_at timestamp; data is retained"
+    params:
+      - name: slug
+        type: string
+        required: true
+        description: "The slug to archive"
+    dispatch:
+      type: tauri
+
+  - name: pyramid_delete_slug
+    description: "Delete a pyramid slug and all its nodes. Cancels any active build first"
+    params:
+      - name: slug
+        type: string
+        required: true
+        description: "The slug to delete"
+    dispatch:
+      type: tauri
+
+  - name: pyramid_purge_slug
+    description: "Purge a slug -- deletes all data including the slug record itself"
+    params:
+      - name: slug
+        type: string
+        required: true
+        description: "The slug to purge"
+    dispatch:
+      type: tauri
+
+  - name: pyramid_publish
+    description: "Publish a mechanical pyramid to the Wire as a contribution"
+    params:
+      - name: slug
+        type: string
+        required: true
+        description: "The slug to publish"
+    dispatch:
+      type: tauri
+
+  - name: pyramid_publish_question_set
+    description: "Publish a question pyramid's question set to the Wire"
+    params:
+      - name: slug
+        type: string
+        required: true
+        description: "The slug to publish"
+      - name: description
+        type: string
+        required: false
+        description: "Optional description for the contribution"
+    dispatch:
+      type: tauri
+
+  - name: pyramid_characterize
+    description: "Run LLM characterization on a question against a pyramid's source material"
+    params:
+      - name: slug
+        type: string
+        required: true
+        description: "The pyramid slug"
+      - name: question
+        type: string
+        required: true
+        description: "The question to characterize"
+      - name: sourcePath
+        type: string
+        required: false
+        description: "Optional source path override"
+    dispatch:
+      type: tauri
+
+  - name: pyramid_check_staleness
+    description: "Check staleness of a pyramid"
+    params:
+      - name: slug
+        type: string
+        required: true
+        description: "The pyramid slug"
+      - name: files
+        type: object
+        required: false
+        description: "Specific file changes to check as FileChangeEntry array"
+      - name: threshold
+        type: string
+        required: false
+        description: "Staleness threshold 0.0-1.0, default from config"
+    dispatch:
+      type: tauri
+
+  - name: pyramid_auto_update_config_get
+    description: "Get auto-update configuration for a slug"
+    params:
+      - name: slug
+        type: string
+        required: true
+        description: "The pyramid slug"
+    dispatch:
+      type: tauri
+
+  - name: pyramid_auto_update_config_set
+    description: "Set auto-update configuration for a slug. Only provided fields are updated"
+    params:
+      - name: slug
+        type: string
+        required: true
+        description: "The pyramid slug"
+      - name: debounceMinutes
+        type: integer
+        required: false
+        description: "Minutes to wait before triggering update after changes"
+      - name: minChangedFiles
+        type: integer
+        required: false
+        description: "Minimum number of changed files to trigger update"
+      - name: runawayThreshold
+        type: integer
+        required: false
+        description: "Cost threshold that trips the circuit breaker"
+      - name: autoUpdate
+        type: boolean
+        required: false
+        description: "Whether auto-update is enabled"
+    dispatch:
+      type: tauri
+
+  - name: pyramid_auto_update_freeze
+    description: "Freeze auto-updates for a slug -- pauses the stale engine without changing config"
+    params:
+      - name: slug
+        type: string
+        required: true
+        description: "The pyramid slug"
+    dispatch:
+      type: tauri
+
+  - name: pyramid_auto_update_unfreeze
+    description: "Unfreeze auto-updates for a slug -- resumes the stale engine"
+    params:
+      - name: slug
+        type: string
+        required: true
+        description: "The pyramid slug"
+    dispatch:
+      type: tauri
+
+  - name: pyramid_auto_update_status
+    description: "Get live auto-update status including phase tracking, pending nodes, last run time"
+    params:
+      - name: slug
+        type: string
+        required: true
+        description: "The pyramid slug"
+    dispatch:
+      type: tauri
+
+  - name: pyramid_auto_update_run_now
+    description: "Trigger an immediate auto-update cycle for a slug, bypassing debounce timer"
+    params:
+      - name: slug
+        type: string
+        required: true
+        description: "The pyramid slug"
+    dispatch:
+      type: tauri
+
+  - name: pyramid_auto_update_l0_sweep
+    description: "Enqueue a full L0 sweep -- marks all tracked files as pending re-check"
+    params:
+      - name: slug
+        type: string
+        required: true
+        description: "The pyramid slug"
+    dispatch:
+      type: tauri
+
+  - name: pyramid_breaker_resume
+    description: "Resume the circuit breaker for a slug after it tripped"
+    params:
+      - name: slug
+        type: string
+        required: true
+        description: "The pyramid slug"
+    dispatch:
+      type: tauri
+
+  - name: pyramid_breaker_archive_and_rebuild
+    description: "Archive the current slug and create a fresh one from the same source, then start a new build"
+    params:
+      - name: slug
+        type: string
+        required: true
+        description: "The pyramid slug"
+    dispatch:
+      type: tauri

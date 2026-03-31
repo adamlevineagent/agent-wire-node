@@ -59,6 +59,8 @@ export default function App() {
 
     const handleVerifyLink = useCallback(async (magicLinkUrl: string, email: string) => {
         await invoke("verify_magic_link", { magicLinkUrl, email });
+        const state = await invoke<AuthState>("get_auth_state");
+        setAuthState(state);
     }, []);
 
     const handleVerifyOtp = useCallback(async (email: string, otpCode: string) => {

@@ -1,5 +1,3 @@
-import { useState, useEffect } from "react";
-import { invoke } from "@tauri-apps/api/core";
 import type { CreditStats } from "./Dashboard";
 
 interface ServeEvent {
@@ -16,28 +14,8 @@ interface ActivityFeedProps {
 }
 
 export function ActivityFeed({ credits }: ActivityFeedProps) {
-    const [events, setEvents] = useState<ServeEvent[]>([]);
-
-    // Poll credits for recent events (the CreditTracker stores them)
-    useEffect(() => {
-        const poll = async () => {
-            try {
-                // The credits object from get_credits doesn't include events directly,
-                // so we poll get_credits and derive activity from changing stats.
-                // For now, build synthetic events from the credit stats.
-                const cr = await invoke<any>("get_credits");
-                if (cr && cr.recent_events) {
-                    setEvents(cr.recent_events || []);
-                }
-            } catch {
-                // Credits endpoint may not include recent_events in the DashboardStats shape
-                // That's OK -- we show what we can
-            }
-        };
-        poll();
-        const interval = setInterval(poll, 3000);
-        return () => clearInterval(interval);
-    }, []);
+    // Use recent_events from credits prop (already polled by parent Dashboard)
+    const events: ServeEvent[] = credits?.recent_events ?? [];
 
     if (events.length === 0) {
         return (
@@ -71,7 +49,7 @@ export function ActivityFeed({ credits }: ActivityFeedProps) {
                 return (
                     <div
                         key={`${event.timestamp}-${i}`}
-                        className={`activity-item ${itemClass}`}
+                        className={`activity-feed-item ${itemClass}`}
                         style={{ animationDelay: `${i * 50}ms` }}
                     >
                         <div className="activity-left">

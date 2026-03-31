@@ -86,7 +86,8 @@ impl NodeLockMap {
     /// Returns the number of entries removed.
     pub fn cleanup(&self) -> usize {
         let before = self.locks.len();
-        self.locks.retain(|_key, mutex| Arc::strong_count(mutex) > 1);
+        self.locks
+            .retain(|_key, mutex| Arc::strong_count(mutex) > 1);
         before - self.locks.len()
     }
 }

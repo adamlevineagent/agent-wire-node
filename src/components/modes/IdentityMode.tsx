@@ -1,16 +1,36 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
+import { invoke } from '@tauri-apps/api/core';
 import { useAppContext } from '../../contexts/AppContext';
+import { ReputationDisplay } from '../identity/ReputationDisplay';
 
 // --- Types ---
 
 interface HandleInfo {
+    id: string;
     handle: string;
+    display_handle: string;
+    payment_type: 'full' | 'layaway';
     status: 'active' | 'suspended' | 'released';
-    layaway_active: boolean;
-    registered_at?: string;
-    layaway_progress?: number;
-    layaway_paid?: number;
-    layaway_total?: number;
+    created_at: string;
+}
+
+interface Transaction {
+    id: string;
+    amount: number;
+    reason: string;
+    reference_id?: string;
+    balance_after?: number;
+    created_at: string;
+    // Legacy fields for backward compat
+    type?: string;
+    contribution_title?: string;
+}
+
+interface EarningsResponse {
+    current_balance: number;
+    recent_transactions: Transaction[];
+    total_transactions?: number;
+    has_more?: boolean;
 }
 
 interface HandleCheckResult {
@@ -20,15 +40,23 @@ interface HandleCheckResult {
     reason?: string;
 }
 
+interface HandleCacheData {
+    handles: HandleInfo[];
+    cached_at: string | null;
+}
+
 // --- Component ---
 
 export function IdentityMode() {
-    const { state, operatorApiCall } = useAppContext();
+    const { state, operatorApiCall, wireApiCall } = useAppContext();
 
     // Handle state
     const [myHandles, setMyHandles] = useState<HandleInfo[]>([]);
     const [loadingHandles, setLoadingHandles] = useState(true);
     const [handleError, setHandleError] = useState<string | null>(null);
+    const [syncing, setSyncing] = useState(false);
+    const [cachedAt, setCachedAt] = useState<string | null>(null);
+    const [showingCached, setShowingCached] = useState(false);
 
     // Handle check state
     const [checkInput, setCheckInput] = useState('');
@@ -41,35 +69,127 @@ export function IdentityMode() {
     const [registerError, setRegisterError] = useState<string | null>(null);
     const [registerSuccess, setRegisterSuccess] = useState<string | null>(null);
 
-    const creditBalance = state.creditBalance > 0
-        ? state.creditBalance
-        : (state.credits?.credits_earned ?? 0);
+    // Transaction history state
+    const [transactions, setTransactions] = useState<Transaction[]>([]);
+    const [loadingTransactions, setLoadingTransactions] = useState(true);
+    const [transactionError, setTransactionError] = useState<string | null>(null);
+    const [transactionOffset, setTransactionOffset] = useState(0);
+    const [transactionTotal, setTransactionTotal] = useState(0);
+    const [hasMoreTransactions, setHasMoreTransactions] = useState(false);
+    const TRANSACTION_LIMIT = 20;
 
-    // Fetch handles
-    const fetchHandles = useCallback(async () => {
-        if (!state.operatorSessionToken) {
-            setLoadingHandles(false);
-            return;
+    const mountedRef = useRef(true);
+    useEffect(() => {
+        mountedRef.current = true;
+        return () => { mountedRef.current = false; };
+    }, []);
+
+    // Write handle data to local cache
+    const cacheHandles = useCallback(async (handles: HandleInfo[]) => {
+        try {
+            await invoke('cache_wire_handles', { handles });
+        } catch (err) {
+            console.error('Failed to cache handles:', err);
         }
+    }, []);
+
+    // Load cached handles from disk
+    const loadCachedHandles = useCallback(async (): Promise<HandleCacheData | null> => {
+        try {
+            const data = await invoke<HandleCacheData>('get_cached_wire_handles');
+            return data;
+        } catch {
+            return null;
+        }
+    }, []);
+
+    // Fetch handles from Wire API (background refresh)
+    const refreshFromWire = useCallback(async (): Promise<HandleInfo[] | null> => {
+        if (!state.operatorSessionToken) return null;
         try {
             const data: any = await operatorApiCall('GET', '/api/v1/wire/handles');
             const handles = data?.handles || data || [];
-            setMyHandles(Array.isArray(handles) ? handles : []);
-            setHandleError(null);
-        } catch (err: any) {
-            setHandleError(err?.message || 'Failed to load handles');
-        } finally {
-            setLoadingHandles(false);
+            return Array.isArray(handles) ? handles : [];
+        } catch {
+            return null;
         }
     }, [operatorApiCall, state.operatorSessionToken]);
+
+    // Main fetch flow: cache-first, then background refresh
+    const fetchHandles = useCallback(async () => {
+        // Step 1: Load cached data immediately
+        const cached = await loadCachedHandles();
+        if (cached && cached.handles && cached.handles.length > 0) {
+            if (mountedRef.current) {
+                setMyHandles(cached.handles);
+                setCachedAt(cached.cached_at);
+                setShowingCached(true);
+                setLoadingHandles(false);
+            }
+        }
+
+        // Step 2: Background refresh from Wire API
+        if (mountedRef.current) {
+            setSyncing(true);
+        }
+
+        const fresh = await refreshFromWire();
+
+        if (!mountedRef.current) return;
+
+        if (fresh !== null) {
+            // Wire API succeeded — update display and cache
+            setMyHandles(fresh);
+            setHandleError(null);
+            setShowingCached(false);
+            setCachedAt(null);
+            setSyncing(false);
+            setLoadingHandles(false);
+            cacheHandles(fresh);
+        } else {
+            // Wire API failed — keep cached data if we have it
+            setSyncing(false);
+            setLoadingHandles(false);
+            if (!cached || !cached.handles || cached.handles.length === 0) {
+                setHandleError('Failed to load handles');
+            }
+            // If we have cached data, showingCached remains true
+        }
+    }, [loadCachedHandles, refreshFromWire, cacheHandles]);
 
     useEffect(() => {
         fetchHandles();
     }, [fetchHandles]);
 
+    // Fetch transaction history from Wire API
+    const fetchTransactions = useCallback(async (offset = 0, append = false) => {
+        setLoadingTransactions(true);
+        setTransactionError(null);
+        try {
+            const data = await wireApiCall('GET', `/api/v1/wire/my/earnings?limit=${TRANSACTION_LIMIT}&offset=${offset}`) as EarningsResponse;
+            const txns = data?.recent_transactions || [];
+            if (append) {
+                setTransactions(prev => [...prev, ...txns]);
+            } else {
+                setTransactions(txns);
+            }
+            setTransactionOffset(offset);
+            setTransactionTotal(data?.total_transactions ?? 0);
+            setHasMoreTransactions(data?.has_more ?? txns.length >= TRANSACTION_LIMIT);
+        } catch (err: any) {
+            setTransactionError(err?.message || 'Failed to load transactions');
+        } finally {
+            setLoadingTransactions(false);
+        }
+    }, [wireApiCall]);
+
+    useEffect(() => {
+        fetchTransactions();
+    }, [fetchTransactions]);
+
     // Check handle availability
     const handleCheck = useCallback(async () => {
-        const handle = checkInput.trim().replace(/^@/, '');
+        const handle = checkInput.trim().replace(/^@+/, '');
         if (!handle) return;
         setChecking(true);
         setCheckResult(null);
@@ -89,7 +209,7 @@ export function IdentityMode() {
     const handleRegister = useCallback(async (paymentType: 'full' | 'layaway') => {
         // checkResult.handle is already "@foo" from the server; checkInput may or may not have @
         const raw = checkResult?.handle || checkInput.trim();
-        const normalized = raw.replace(/^@/, '');
+        const normalized = raw.replace(/^@+/, '');
         if (!normalized) return;
 
         setRegistering(true);
@@ -119,9 +239,18 @@ export function IdentityMode() {
         }
     };
 
-    const activeHandle = myHandles.find(h => h.status === 'active' && !h.layaway_active);
-    const layawayHandle = myHandles.find(h => h.layaway_active);
-    const currentHandle = activeHandle || layawayHandle;
+    const activeHandle = myHandles.find(h => h.status === 'active');
+    const currentHandle = activeHandle || myHandles[0];
+
+    // Format cached_at timestamp for display
+    const formatCachedAt = (iso: string | null): string => {
+        if (!iso) return 'unknown';
+        try {
+            return new Date(iso).toLocaleString();
+        } catch {
+            return 'unknown';
+        }
+    };
 
     return (
         <div className="mode-container identity-mode">
@@ -142,14 +271,7 @@ export function IdentityMode() {
                                 : '\u2014'}
                         </span>
                     </div>
-                    <div className="identity-info-card">
-                        <span className="identity-label">Credit Balance</span>
-                        <span className="identity-value glow">{Math.floor(creditBalance).toLocaleString()}</span>
-                    </div>
-                    <div className="identity-info-card">
-                        <span className="identity-label">Reputation</span>
-                        <span className="identity-value">\u2014</span>
-                    </div>
+                    <ReputationDisplay />
                 </div>
             </div>
 
@@ -169,55 +291,37 @@ export function IdentityMode() {
                     /* Has a handle */
                     <div className="handle-card">
                         <div className="handle-card-header">
-                            <h3>Your Handle</h3>
+                            <h3>
+                                Your Handle
+                                {syncing && (
+                                    <span className="handle-sync-badge">syncing...</span>
+                                )}
+                            </h3>
                         </div>
 
-                        {currentHandle.status === 'active' && !currentHandle.layaway_active ? (
-                            <div className="handle-card-body">
-                                <div className="handle-display">
-                                    <span className="handle-name">@{currentHandle.handle.replace(/^@/, '')}</span>
-                                    <span className="handle-status handle-status-active">Active</span>
-                                </div>
-                                {currentHandle.registered_at && (
-                                    <div className="handle-meta">
-                                        Registered: {new Date(currentHandle.registered_at).toLocaleDateString()}
-                                    </div>
-                                )}
+                        <div className="handle-card-body">
+                            <div className="handle-display">
+                                <span className="handle-name">@{currentHandle.handle.replace(/^@+/, '')}</span>
+                                <span className={`handle-status ${currentHandle.status === 'active' ? 'handle-status-active' : ''}`}>
+                                    {currentHandle.status.charAt(0).toUpperCase() + currentHandle.status.slice(1)}
+                                </span>
                             </div>
-                        ) : currentHandle.layaway_active ? (
-                            <div className="handle-card-body">
-                                <div className="handle-display">
-                                    <span className="handle-name">@{currentHandle.handle.replace(/^@/, '')}</span>
-                                    <span className="handle-status handle-status-layaway">Layaway</span>
-                                </div>
-                                <div className="layaway-progress">
-                                    <div className="layaway-bar">
-                                        <div
-                                            className="layaway-fill"
-                                            style={{ width: `${currentHandle.layaway_progress || 0}%` }}
-                                        />
-                                    </div>
-                                    <div className="layaway-info">
-                                        <span className="layaway-pct">
-                                            {Math.round(currentHandle.layaway_progress || 0)}%
-                                        </span>
-                                        <span className="layaway-amounts">
-                                            {(currentHandle.layaway_paid || 0).toLocaleString()} / {(currentHandle.layaway_total || 0).toLocaleString()} credits
-                                        </span>
-                                    </div>
-                                </div>
+                            {currentHandle.payment_type === 'layaway' && (
                                 <div className="handle-meta">
-                                    Progress updates appear in your Activity feed.
+                                    Payment: Layaway
                                 </div>
-                            </div>
-                        ) : (
-                            <div className="handle-card-body">
-                                <div className="handle-display">
-                                    <span className="handle-name">@{currentHandle.handle.replace(/^@/, '')}</span>
-                                    <span className="handle-status">{currentHandle.status}</span>
+                            )}
+                            {currentHandle.created_at && (
+                                <div className="handle-meta">
+                                    Registered: {new Date(currentHandle.created_at).toLocaleDateString()}
                                 </div>
-                            </div>
-                        )}
+                            )}
+                            {showingCached && (
+                                <div className="handle-cache-indicator">
+                                    cached — last synced {formatCachedAt(cachedAt)}
+                                </div>
+                            )}
+                        </div>
                     </div>
                 ) : (
                     /* No handle -- claim form */
@@ -320,28 +424,71 @@ export function IdentityMode() {
                 )}
             </div>
 
-            {/* Credit History */}
+            {/* Transaction History */}
             <div className="credit-history">
-                <h3>Credit History</h3>
-                <div className="credit-history-summary">
-                    <div className="credit-history-balance">
-                        <span className="credit-history-label">Current Balance</span>
-                        <span className="credit-history-value glow">
-                            {Math.floor(creditBalance).toLocaleString()}
-                        </span>
+                <h3>Transaction History</h3>
+                {loadingTransactions && transactions.length === 0 ? (
+                    <div className="handle-loading">
+                        <div className="loading-spinner" />
+                        <span>Loading transactions...</span>
                     </div>
-                    <div className="credit-history-earned">
-                        <span className="credit-history-label">Total Earned</span>
-                        <span className="credit-history-value">
-                            {Math.floor(state.credits?.credits_earned ?? 0).toLocaleString()}
-                        </span>
+                ) : transactionError && transactions.length === 0 ? (
+                    <div className="handle-error">
+                        <span>{transactionError}</span>
+                        <button className="handle-retry-btn" onClick={() => fetchTransactions()}>Retry</button>
                     </div>
-                </div>
-                <div className="credit-history-list">
-                    <div className="credit-history-empty">
-                        Detailed transaction history coming soon.
+                ) : transactions.length === 0 ? (
+                    <div className="credit-history-list">
+                        <div className="credit-history-empty">
+                            No transactions yet.
+                        </div>
                     </div>
-                </div>
+                ) : (
+                    <>
+                        <div className="transaction-list">
+                            {transactions.map((tx) => {
+                                const reason = tx.reason || tx.type || 'unknown';
+                                const reasonLabel = reason
+                                    .replace(/_/g, ' ')
+                                    .replace(/\b\w/g, (c: string) => c.toUpperCase());
+                                return (
+                                    <div key={tx.id} className="transaction-row">
+                                        <div className="transaction-amount-col">
+                                            <span className={`transaction-amount ${tx.amount >= 0 ? 'transaction-positive' : 'transaction-negative'}`}>
+                                                {tx.amount >= 0 ? '+' : ''}{tx.amount.toLocaleString()}
+                                            </span>
+                                        </div>
+                                        <div className="transaction-detail-col">
+                                            <span className="transaction-type">{reasonLabel}</span>
+                                            {tx.reference_id && (
+                                                <span className="transaction-reference" title={tx.reference_id}>
+                                                    ref: {tx.reference_id.length > 20 ? tx.reference_id.slice(0, 20) + '...' : tx.reference_id}
+                                                </span>
+                                            )}
+                                            {tx.balance_after != null && (
+                                                <span className="transaction-balance">bal: {tx.balance_after.toLocaleString()}</span>
+                                            )}
+                                        </div>
+                                        <div className="transaction-time-col">
+                                            <span className="transaction-time">
+                                                {new Date(tx.created_at).toLocaleDateString()}
+                                            </span>
+                                        </div>
+                                    </div>
+                                );
+                            })}
+                        </div>
+                        {hasMoreTransactions && (
+                            <button
+                                className="handle-retry-btn"
+                                onClick={() => fetchTransactions(transactionOffset + TRANSACTION_LIMIT, true)}
+                                disabled={loadingTransactions}
+                            >
+                                {loadingTransactions ? 'Loading...' : 'Load More'}
+                            </button>
+                        )}
+                    </>
+                )}
             </div>
         </div>
     );

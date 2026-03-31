@@ -90,7 +90,11 @@ fn build_l0_derived_from(
                 ref_path,
                 source_type: "source_document".to_string(),
                 weight: e.weight.unwrap_or(1.0),
-                justification: Some(e.reason.clone().unwrap_or_else(|| "Evidence-based citation".to_string())),
+                justification: Some(
+                    e.reason
+                        .clone()
+                        .unwrap_or_else(|| "Evidence-based citation".to_string()),
+                ),
             }
         })
         .collect()
@@ -106,9 +110,10 @@ fn make_placeholder_uuid(local_id: &str) -> String {
     use uuid::Uuid;
     // Fixed namespace for Wire Node placeholder UUIDs (generated once, never changes).
     // This is a v4 UUID used solely as a namespace for deterministic v5 generation.
-    const WIRE_NODE_NAMESPACE: Uuid =
-        Uuid::from_bytes([0x9b, 0x6a, 0xe3, 0x2f, 0x1c, 0x4d, 0x4a, 0x7e,
-                          0xb8, 0x52, 0xd3, 0xf1, 0xa0, 0xc9, 0x67, 0x2b]);
+    const WIRE_NODE_NAMESPACE: Uuid = Uuid::from_bytes([
+        0x9b, 0x6a, 0xe3, 0x2f, 0x1c, 0x4d, 0x4a, 0x7e, 0xb8, 0x52, 0xd3, 0xf1, 0xa0, 0xc9, 0x67,
+        0x2b,
+    ]);
     Uuid::new_v5(&WIRE_NODE_NAMESPACE, local_id.as_bytes()).to_string()
 }
 
@@ -127,13 +132,16 @@ fn build_upper_derived_from(
     let mut entries = Vec::new();
     for e in evidence {
         // Try to resolve the source_node_id via handle-path parsing first
-        let wire_uuid = if let Some((ref_slug, _depth, bare_id)) = db::parse_handle_path(&e.source_node_id) {
-            // Cross-slug handle-path: look up in the referenced slug's id_map
-            id_maps.get(ref_slug).and_then(|m| m.get(bare_id))
-        } else {
-            // Same-slug bare node_id: look up in current slug's id_map
-            id_maps.get(current_slug).and_then(|m| m.get(&e.source_node_id))
-        };
+        let wire_uuid =
+            if let Some((ref_slug, _depth, bare_id)) = db::parse_handle_path(&e.source_node_id) {
+                // Cross-slug handle-path: look up in the referenced slug's id_map
+                id_maps.get(ref_slug).and_then(|m| m.get(bare_id))
+            } else {
+                // Same-slug bare node_id: look up in current slug's id_map
+                id_maps
+                    .get(current_slug)
+                    .and_then(|m| m.get(&e.source_node_id))
+            };
 
         match wire_uuid {
             Some(uuid) => {
@@ -141,7 +149,11 @@ fn build_upper_derived_from(
                     ref_path: uuid.clone(),
                     source_type: "contribution".to_string(),
                     weight: e.weight.unwrap_or(1.0),
-                    justification: Some(e.reason.clone().unwrap_or_else(|| "Evidence-based citation".to_string())),
+                    justification: Some(
+                        e.reason
+                            .clone()
+                            .unwrap_or_else(|| "Evidence-based citation".to_string()),
+                    ),
                 });
             }
             None => {
@@ -262,10 +274,7 @@ pub fn collect_layer_publish_data(
             .context("publication: failed to load evidence")?;
 
         // Build a flat id_map for L0 (only needs current slug's mappings)
-        let flat_id_map: HashMap<String, String> = id_maps
-            .get(slug)
-            .cloned()
-            .unwrap_or_default();
+        let flat_id_map: HashMap<String, String> = id_maps.get(slug).cloned().unwrap_or_default();
 
         // Build derived_from based on layer
         let mut derived_from = if layer == 0 {
@@ -299,10 +308,9 @@ pub fn collect_layer_publish_data(
             );
         }
 
-        result.nodes_to_publish.push(NodePublishData {
-            node,
-            derived_from,
-        });
+        result
+            .nodes_to_publish
+            .push(NodePublishData { node, derived_from });
     }
 
     Ok(result)
@@ -360,9 +368,7 @@ pub async fn publish_layer(
                     error = %e,
                     "failed to publish pyramid node"
                 );
-                result
-                    .failed
-                    .push((data.node.id.clone(), e.to_string()));
+                result.failed.push((data.node.id.clone(), e.to_string()));
                 // Continue — partial publication is better than none
             }
         }
@@ -419,11 +425,9 @@ pub async fn publish_pyramid_bottom_up(
     id_maps.insert(slug.to_string(), current_slug_map);
 
     // Referenced slugs (cross-slug evidence needs their id_maps)
-    let referenced_slugs = db::get_slug_references(conn, slug)
-        .unwrap_or_default();
+    let referenced_slugs = db::get_slug_references(conn, slug).unwrap_or_default();
     for ref_slug in &referenced_slugs {
-        let ref_mappings = db::get_all_id_mappings(conn, ref_slug)
-            .unwrap_or_default();
+        let ref_mappings = db::get_all_id_mappings(conn, ref_slug).unwrap_or_default();
         let ref_map: HashMap<String, String> = ref_mappings
             .into_iter()
             .map(|m| {
@@ -451,18 +455,15 @@ pub async fn publish_pyramid_bottom_up(
         let node_ids: Vec<String> = nodes_at_layer.iter().map(|n| n.id.clone()).collect();
 
         if node_ids.is_empty() {
-            tracing::info!(
-                slug = slug,
-                layer = layer,
-                "no nodes at layer, skipping"
-            );
+            tracing::info!(slug = slug, layer = layer, "no nodes at layer, skipping");
             continue;
         }
 
         let orphans = orphans_by_layer.get(&layer).unwrap_or(&empty_orphans);
 
         // Phase 1 (SYNC): collect all data from SQLite — conn ref is scoped here
-        let collected = collect_layer_publish_data(conn, slug, layer, &node_ids, orphans, &id_maps)?;
+        let collected =
+            collect_layer_publish_data(conn, slug, layer, &node_ids, orphans, &id_maps)?;
 
         // Phase 2 (ASYNC): publish to Wire — no conn reference held
         let layer_result = publish_layer(publisher, slug, layer, collected).await?;
@@ -792,22 +793,32 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].source_type, "source_document");
         // Issue 5: ref_path is now a placeholder UUID (not raw file path)
-        assert!(entries[0].ref_path.contains('-'), "ref_path should be UUID-formatted");
+        assert!(
+            entries[0].ref_path.contains('-'),
+            "ref_path should be UUID-formatted"
+        );
         assert_eq!(entries[0].weight, 0.7);
         assert_eq!(entries[1].source_type, "source_document");
         // Issue 4: justification is never None
-        assert_eq!(entries[0].justification, Some("evidence from src/main.rs".to_string()));
-        assert_eq!(entries[1].justification, Some("evidence from src/lib.rs".to_string()));
+        assert_eq!(
+            entries[0].justification,
+            Some("evidence from src/main.rs".to_string())
+        );
+        assert_eq!(
+            entries[1].justification,
+            Some("evidence from src/lib.rs".to_string())
+        );
     }
 
     #[test]
     fn test_build_l0_derived_from_with_wire_uuid_lookup() {
         let node = make_node("L0-001", 0);
-        let evidence = vec![
-            make_evidence("src/main.rs", "L0-001", 1.0),
-        ];
+        let evidence = vec![make_evidence("src/main.rs", "L0-001", 1.0)];
         let mut id_map = HashMap::new();
-        id_map.insert("src/main.rs".to_string(), "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_string());
+        id_map.insert(
+            "src/main.rs".to_string(),
+            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_string(),
+        );
 
         let entries = build_l0_derived_from(&node, &evidence, &id_map);
         assert_eq!(entries.len(), 1);
@@ -824,8 +835,14 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].source_type, "source_document");
         // Synthetic citation uses placeholder UUID
-        assert!(entries[0].ref_path.contains('-'), "ref_path should be UUID-formatted");
-        assert_eq!(entries[0].justification, Some("L0 extraction from source file".to_string()));
+        assert!(
+            entries[0].ref_path.contains('-'),
+            "ref_path should be UUID-formatted"
+        );
+        assert_eq!(
+            entries[0].justification,
+            Some("L0 extraction from source file".to_string())
+        );
     }
 
     #[test]
@@ -846,7 +863,10 @@ mod tests {
         let entries = build_l0_derived_from(&node, &evidence, &id_map);
         assert_eq!(entries.len(), 1);
         // Issue 4: justification defaults to non-empty string
-        assert_eq!(entries[0].justification, Some("Evidence-based citation".to_string()));
+        assert_eq!(
+            entries[0].justification,
+            Some("Evidence-based citation".to_string())
+        );
     }
 
     #[test]
@@ -874,8 +894,8 @@ mod tests {
     fn test_build_upper_derived_from_cross_slug() {
         // Evidence with cross-slug handle-path source_node_id
         let evidence = vec![
-            make_evidence("L0-001", "L1-001", 0.5),               // same-slug bare id
-            make_evidence("other-slug/0/L0-X01", "L1-001", 0.3),  // cross-slug handle-path
+            make_evidence("L0-001", "L1-001", 0.5), // same-slug bare id
+            make_evidence("other-slug/0/L0-X01", "L1-001", 0.3), // cross-slug handle-path
             make_evidence("missing-slug/0/L0-Y01", "L1-001", 0.2), // cross-slug, no mapping
         ];
 
@@ -915,7 +935,10 @@ mod tests {
         let entries = build_upper_derived_from(&evidence, &id_maps, "test");
         assert_eq!(entries.len(), 1);
         // Issue 4: justification defaults to non-empty string
-        assert_eq!(entries[0].justification, Some("Evidence-based citation".to_string()));
+        assert_eq!(
+            entries[0].justification,
+            Some("Evidence-based citation".to_string())
+        );
     }
 
     #[test]
@@ -991,14 +1014,12 @@ mod tests {
 
     #[test]
     fn test_normalize_weights_all_zero() {
-        let mut entries = vec![
-            DerivedFromEntry {
-                ref_path: "a".to_string(),
-                source_type: "contribution".to_string(),
-                weight: 0.0,
-                justification: None,
-            },
-        ];
+        let mut entries = vec![DerivedFromEntry {
+            ref_path: "a".to_string(),
+            source_type: "contribution".to_string(),
+            weight: 0.0,
+            justification: None,
+        }];
         normalize_weights(&mut entries);
         // Should leave as-is (no division by zero)
         assert_eq!(entries[0].weight, 0.0);
@@ -1009,11 +1030,7 @@ mod tests {
         let manifest = build_manifest(
             "my-slug",
             1,
-            &[
-                "A".to_string(),
-                "B".to_string(),
-                "C".to_string(),
-            ],
+            &["A".to_string(), "B".to_string(), "C".to_string()],
             &["B".to_string()],
         );
 

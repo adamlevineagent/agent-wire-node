@@ -80,8 +80,8 @@ export function CorpusDetail({ slug }: CorpusDetailProps) {
     useEffect(() => { loadCorpus(); }, [loadCorpus]);
     useEffect(() => { loadDocuments(); }, [loadDocuments]);
 
-    const pop = () => popView('agents');
-    const push = (view: string, props: Record<string, unknown>) => pushView('agents', view, props);
+    const pop = () => popView('knowledge');
+    const push = (view: string, props: Record<string, unknown>) => pushView('knowledge', view, props);
 
     // Save metadata
     const saveTitle = async () => {

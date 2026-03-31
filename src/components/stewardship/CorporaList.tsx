@@ -38,7 +38,7 @@ export function CorporaList() {
     }, [operatorApiCall]);
 
     const push = (view: string, props: Record<string, unknown>) => {
-        pushView('agents', view, props);
+        pushView('knowledge', view, props);
     };
 
     if (loading) {

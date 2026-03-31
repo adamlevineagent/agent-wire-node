@@ -1,11 +1,10 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
 export function LogViewer() {
     const [logs, setLogs] = useState<string[]>([]);
     const [autoRefresh, setAutoRefresh] = useState(true);
     const [filter, setFilter] = useState("");
-    const containerRef = useRef<HTMLDivElement>(null);
 
     const fetchLogs = async () => {
         try {
@@ -50,7 +49,7 @@ export function LogViewer() {
                     Refresh
                 </button>
             </div>
-            <div className="log-container" ref={containerRef}>
+            <div className="log-container">
                 {filtered.length === 0 ? (
                     <div className="log-empty">No logs yet</div>
                 ) : (

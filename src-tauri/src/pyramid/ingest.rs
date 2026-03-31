@@ -46,7 +46,9 @@ fn sha256_hex(data: &[u8]) -> String {
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-fn chunk_target_lines() -> usize { super::Tier2Config::default().chunk_target_lines }
+fn chunk_target_lines() -> usize {
+    super::Tier2Config::default().chunk_target_lines
+}
 
 /// Directories to skip during code/doc ingestion.
 fn skip_dirs() -> HashSet<&'static str> {

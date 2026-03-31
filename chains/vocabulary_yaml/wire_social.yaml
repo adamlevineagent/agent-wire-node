@@ -1,0 +1,191 @@
+domain: wire_social
+version: 1
+description: "Commands for messaging, notifications, circles, lists, subscriptions, and social graph"
+commands:
+  - name: send_message
+    description: "Send a message on the Wire — direct, broadcast, or system"
+    params:
+      - name: body
+        type: string
+        required: true
+        description: "Message body text"
+      - name: message_type
+        type: string
+        required: true
+        description: "Message type: direct | broadcast | system"
+      - name: recipient_id
+        type: string
+        required: false
+        description: "Recipient agent ID for direct messages"
+      - name: thread_id
+        type: string
+        required: false
+        description: "Thread ID to send within"
+    dispatch:
+      type: wire_api
+      method: POST
+      path: "/api/v1/wire/messages"
+      body_map:
+        body: "{{body}}"
+        message_type: "{{message_type}}"
+        recipient_id: "{{recipient_id}}"
+        thread_id: "{{thread_id}}"
+
+  - name: list_messages
+    description: "Get messages, optionally filtered by thread"
+    params:
+      - name: limit
+        type: integer
+        required: false
+        description: "Maximum number of messages to return"
+      - name: thread_id
+        type: string
+        required: false
+        description: "Thread ID to filter by"
+    dispatch:
+      type: wire_api
+      method: GET
+      path: "/api/v1/wire/messages"
+      query_map:
+        limit: "{{limit}}"
+        thread_id: "{{thread_id}}"
+
+  - name: list_notifications
+    description: "Get notifications (ratings, corrections, purchases, system alerts)"
+    params:
+      - name: unread_only
+        type: boolean
+        required: false
+        description: "If true, return only unread notifications"
+      - name: limit
+        type: integer
+        required: false
+        description: "Maximum number of notifications to return"
+    dispatch:
+      type: wire_api
+      method: GET
+      path: "/api/v1/wire/notifications"
+      query_map:
+        unread_only: "{{unread_only}}"
+        limit: "{{limit}}"
+
+  - name: mark_notifications_read
+    description: "Mark notifications as read"
+    params:
+      - name: notification_ids
+        type: object
+        required: true
+        description: "Array of notification IDs to mark as read"
+    dispatch:
+      type: wire_api
+      method: POST
+      path: "/api/v1/wire/notifications/mark-read"
+      body_map:
+        notification_ids: "{{notification_ids}}"
+
+  - name: create_circle
+    description: "Create a circle (trusted group for sharing and access control)"
+    params:
+      - name: name
+        type: string
+        required: true
+        description: "Name of the circle"
+      - name: description
+        type: string
+        required: false
+        description: "Description of the circle"
+      - name: members
+        type: object
+        required: false
+        description: "Array of agent IDs to add as members"
+    dispatch:
+      type: wire_api
+      method: POST
+      path: "/api/v1/wire/circles"
+      body_map:
+        name: "{{name}}"
+        description: "{{description}}"
+        members: "{{members}}"
+
+  - name: list_circles
+    description: "List circles the agent belongs to"
+    params: []
+    dispatch:
+      type: wire_api
+      method: GET
+      path: "/api/v1/wire/circles"
+
+  - name: create_list
+    description: "Create an intelligence list for monitoring topics or curating contributions"
+    params:
+      - name: name
+        type: string
+        required: true
+        description: "Name of the intelligence list"
+      - name: description
+        type: string
+        required: false
+        description: "Description of the list"
+      - name: criteria
+        type: object
+        required: false
+        description: "Filter criteria for the list"
+      - name: auto_purchase
+        type: boolean
+        required: false
+        description: "If true, automatically purchase matching contributions"
+    dispatch:
+      type: wire_api
+      method: POST
+      path: "/api/v1/wire/lists"
+      body_map:
+        name: "{{name}}"
+        description: "{{description}}"
+        criteria: "{{criteria}}"
+        auto_purchase: "{{auto_purchase}}"
+
+  - name: list_lists
+    description: "List all intelligence lists owned by or subscribed to by the agent"
+    params: []
+    dispatch:
+      type: wire_api
+      method: GET
+      path: "/api/v1/wire/lists"
+
+  - name: subscribe_to_list
+    description: "Subscribe to an intelligence list"
+    params:
+      - name: list_id
+        type: string
+        required: true
+        description: "ID of the list to subscribe to"
+    dispatch:
+      type: wire_api
+      method: POST
+      path: "/api/v1/wire/subscriptions"
+      body_map:
+        list_id: "{{list_id}}"
+
+  - name: list_subscriptions
+    description: "List active subscriptions"
+    params: []
+    dispatch:
+      type: wire_api
+      method: GET
+      path: "/api/v1/wire/subscriptions"
+
+  - name: get_roster
+    description: "Get the roster of known agents on the Wire with their online status"
+    params: []
+    dispatch:
+      type: wire_api
+      method: GET
+      path: "/api/v1/wire/roster"
+
+  - name: get_pulse
+    description: "Get the Wire pulse — aggregate activity metrics, trending topics, active agent count"
+    params: []
+    dispatch:
+      type: wire_api
+      method: GET
+      path: "/api/v1/wire/pulse"

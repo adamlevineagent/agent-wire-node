@@ -75,7 +75,12 @@ fn short_name(model: &str) -> &str {
     model.rsplit('/').next().unwrap_or(model)
 }
 
-fn compute_timeout(prompt_chars: usize, options: LlmCallOptions, base_secs: u64, max_secs: u64) -> std::time::Duration {
+fn compute_timeout(
+    prompt_chars: usize,
+    options: LlmCallOptions,
+    base_secs: u64,
+    max_secs: u64,
+) -> std::time::Duration {
     let derived_secs = std::cmp::min(max_secs, base_secs + (prompt_chars / 100_000) as u64 * 60);
     let timeout_secs = options.min_timeout_secs.unwrap_or(0).max(derived_secs);
     std::time::Duration::from_secs(timeout_secs)
@@ -191,7 +196,12 @@ pub async fn call_model_unified_with_options(
 
     // Scale timeout with prompt size: base + 60s per 100K chars, capped at max
     let prompt_chars = system_prompt.len() + user_prompt.len();
-    let timeout = compute_timeout(prompt_chars, options, config.base_timeout_secs, config.max_timeout_secs);
+    let timeout = compute_timeout(
+        prompt_chars,
+        options,
+        config.base_timeout_secs,
+        config.max_timeout_secs,
+    );
 
     for attempt in 0..config.max_retries {
         let mut body = serde_json::json!({

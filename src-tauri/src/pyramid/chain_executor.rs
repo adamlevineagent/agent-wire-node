@@ -22,7 +22,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use super::build::{
-    child_payload_json, flush_writes, send_save_node, send_save_step, send_update_parent, WriteOp,
+    child_payload_json, compact_child_payload, flush_writes, send_save_node, send_save_step,
+    send_update_parent, WriteOp,
 };
 use super::chain_dispatch::{self, build_node_from_output, generate_node_id, normalize_node_id};
 use super::chain_engine::{ChainDefinition, ChainStep};
@@ -157,7 +158,12 @@ async fn cleanup_from_depth(
 
 /// Supersede nodes and scope execution tables for a layered rebuild.
 /// Everything is a contribution: nodes are superseded, execution tables scoped by build_id.
-pub fn cleanup_from_depth_sync(conn: &Connection, slug: &str, from_depth: i64, build_id: &str) -> Result<()> {
+pub fn cleanup_from_depth_sync(
+    conn: &Connection,
+    slug: &str,
+    from_depth: i64,
+    build_id: &str,
+) -> Result<()> {
     conn.execute_batch("BEGIN IMMEDIATE;")?;
 
     let result = (|| -> Result<()> {
@@ -1810,7 +1816,10 @@ async fn enrich_single_step_input(
 ) -> Result<Value> {
     // 11-E: Use declarative enrichments field instead of hardcoded step name checks.
     // Falls back to step.name check for backward compat with existing YAML files.
-    let has_enrichment = |name: &str| step.enrichments.contains(&name.to_string()) || step.name == "thread_clustering" && name == "file_level_connections";
+    let has_enrichment = |name: &str| {
+        step.enrichments.contains(&name.to_string())
+            || step.name == "thread_clustering" && name == "file_level_connections"
+    };
     if has_enrichment("file_level_connections") {
         let topic_node_ids = extract_node_ids_from_topic_inventory(&resolved_input);
         if !topic_node_ids.is_empty() {
@@ -1831,7 +1840,10 @@ async fn enrich_for_each_step_input(
     reader: &Arc<Mutex<Connection>>,
 ) -> Result<Value> {
     // 11-E: Declarative enrichment check with backward compat fallback
-    let has_enrichment = |name: &str| step.enrichments.contains(&name.to_string()) || step.name == "thread_narrative" && name == "cross_thread_connections";
+    let has_enrichment = |name: &str| {
+        step.enrichments.contains(&name.to_string())
+            || step.name == "thread_narrative" && name == "cross_thread_connections"
+    };
     if has_enrichment("cross_thread_connections") {
         let child_ids = resolve_authoritative_child_ids_with_db(item, ctx, reader).await?;
         if !child_ids.is_empty() {
@@ -1862,7 +1874,10 @@ async fn enrich_group_extra_input(
     };
 
     // 11-E: Declarative enrichment check with backward compat fallback
-    let has_enrichment = |name: &str| step.enrichments.contains(&name.to_string()) || step.name == "upper_layer_synthesis" && name == "cross_subsystem_connections";
+    let has_enrichment = |name: &str| {
+        step.enrichments.contains(&name.to_string())
+            || step.name == "upper_layer_synthesis" && name == "cross_subsystem_connections"
+    };
     if has_enrichment("cross_subsystem_connections") {
         let depth = nodes.first().map(|node| node.depth).unwrap_or(0);
         let node_ids: Vec<String> = nodes.iter().map(|node| node.id.clone()).collect();
@@ -4328,10 +4343,47 @@ async fn execute_recursive_cluster(
         };
 
         info!(
-            "[CHAIN] [{}] clustering produced {} clusters",
+            "[CHAIN] [{}] clustering produced {} clusters from {} nodes",
             step.name,
-            clusters.len()
+            clusters.len(),
+            current_nodes.len()
         );
+
+        // CONVERGENCE SAFETY NET: if clustering returned >= input count, force-merge
+        // the smallest clusters to guarantee the pyramid narrows each layer.
+        if clusters.len() >= current_nodes.len() && current_nodes.len() > 1 {
+            warn!(
+                "[CHAIN] [{}] clustering returned {} clusters from {} nodes — no convergence! Force-merging.",
+                step.name, clusters.len(), current_nodes.len()
+            );
+            // Sort by cluster size ascending, merge smallest pairs
+            clusters.sort_by_key(|c| {
+                c.get("node_ids")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.len())
+                    .unwrap_or(0)
+            });
+            while clusters.len() >= current_nodes.len() && clusters.len() > 1 {
+                // Merge first two (smallest) clusters
+                let second = clusters.remove(1);
+                if let (Some(dest_ids), Some(src_ids)) = (
+                    clusters[0].get_mut("node_ids").and_then(|v| v.as_array_mut()),
+                    second.get("node_ids").and_then(|v| v.as_array()),
+                ) {
+                    dest_ids.extend(src_ids.iter().cloned());
+                }
+                // Update the merged cluster's name
+                if let Some(obj) = clusters[0].as_object_mut() {
+                    let old_name = obj.get("name").and_then(|v| v.as_str()).unwrap_or("Group").to_string();
+                    let merged_name = second.get("name").and_then(|v| v.as_str()).unwrap_or("Other");
+                    obj.insert("name".to_string(), Value::String(format!("{} & {}", old_name, merged_name)));
+                }
+            }
+            info!(
+                "[CHAIN] [{}] force-merged down to {} clusters",
+                step.name, clusters.len()
+            );
+        }
 
         // Validate: check all current nodes are assigned
         let mut assigned_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -4554,13 +4606,21 @@ async fn dispatch_group(
             .await?;
 
     // Build input: array of child payloads with headers
+    // For upper-layer synthesis (depth >= 2), compact the payloads to avoid
+    // context explosion. Topics are preserved but text is truncated.
     let mut sections = Vec::new();
+    let compact_upper = target_depth >= 3; // Compact at L3+ where content accumulates
     for (i, node) in nodes.iter().enumerate() {
+        let payload = if compact_upper {
+            compact_child_payload(node, 400, 200)
+        } else {
+            child_payload_json(node)
+        };
         sections.push(format!(
             "## CHILD NODE {}: \"{}\"\n{}",
             i + 1,
             node.headline,
-            serde_json::to_string_pretty(&child_payload_json(node))?
+            serde_json::to_string_pretty(&payload)?
         ));
     }
     let combined_input = sections.join("\n\n");
@@ -6551,7 +6611,11 @@ async fn execute_ir_parallel_foreach(
     let step_name = ir_persisted_step_name(step);
 
     // Resolve the collection to iterate over
-    let items = resolve_foreach_collection(step, exec_state, dispatch_ctx.ops.tier2.ir_thread_input_char_budget)?;
+    let items = resolve_foreach_collection(
+        step,
+        exec_state,
+        dispatch_ctx.ops.tier2.ir_thread_input_char_budget,
+    )?;
     if items.is_empty() {
         return Ok(Value::Array(vec![]));
     }
@@ -6833,7 +6897,11 @@ async fn execute_ir_sequential_foreach(
     }
 
     // Resolve the collection to iterate over
-    let items = resolve_foreach_collection(step, exec_state, dispatch_ctx.ops.tier2.ir_thread_input_char_budget)?;
+    let items = resolve_foreach_collection(
+        step,
+        exec_state,
+        dispatch_ctx.ops.tier2.ir_thread_input_char_budget,
+    )?;
     let mut outputs = Vec::with_capacity(items.len());
 
     for (i, item) in items.iter().enumerate() {
@@ -7022,8 +7090,11 @@ async fn execute_ir_sequential_foreach(
 // ── forEach collection resolution ───────────────────────────────────────────
 
 /// Resolve the collection to iterate over from the step's iteration.over expression.
-fn resolve_foreach_collection(step: &IrStep, state: &ExecutionState, ir_thread_input_char_budget: usize) -> Result<Vec<Value>> {
-
+fn resolve_foreach_collection(
+    step: &IrStep,
+    state: &ExecutionState,
+    ir_thread_input_char_budget: usize,
+) -> Result<Vec<Value>> {
     fn is_ir_thread_synthesis_step(step: &IrStep) -> bool {
         if step.id == "l1_synthesis" {
             return true;
@@ -7151,7 +7222,12 @@ fn resolve_foreach_collection(step: &IrStep, state: &ExecutionState, ir_thread_i
     })?;
 
     match resolved {
-        Value::Array(items) => Ok(split_oversized_ir_thread_items(step, items, state, ir_thread_input_char_budget)),
+        Value::Array(items) => Ok(split_oversized_ir_thread_items(
+            step,
+            items,
+            state,
+            ir_thread_input_char_budget,
+        )),
         Value::Null => Ok(vec![]),
         other => Ok(vec![other]),
     }
@@ -8095,7 +8171,7 @@ mod tests {
                 children: vec![],
                 parent_id: None,
                 superseded_by: None,
-            build_id: None,
+                build_id: None,
                 created_at: String::new(),
             },
             PyramidNode {
@@ -8114,7 +8190,7 @@ mod tests {
                 children: vec![],
                 parent_id: None,
                 superseded_by: None,
-            build_id: None,
+                build_id: None,
                 created_at: String::new(),
             },
         ];
@@ -8165,7 +8241,7 @@ mod tests {
                 children: vec![],
                 parent_id: Some("L2-000".to_string()),
                 superseded_by: None,
-            build_id: None,
+                build_id: None,
                 created_at: String::new(),
             },
             PyramidNode {
@@ -8184,7 +8260,7 @@ mod tests {
                 children: vec![],
                 parent_id: Some("L2-001".to_string()),
                 superseded_by: None,
-            build_id: None,
+                build_id: None,
                 created_at: String::new(),
             },
         ];
@@ -8205,7 +8281,7 @@ mod tests {
                 children: vec![],
                 parent_id: None,
                 superseded_by: None,
-            build_id: None,
+                build_id: None,
                 created_at: String::new(),
             },
             PyramidNode {
@@ -8224,7 +8300,7 @@ mod tests {
                 children: vec![],
                 parent_id: None,
                 superseded_by: None,
-            build_id: None,
+                build_id: None,
                 created_at: String::new(),
             },
         ];
@@ -8943,7 +9019,10 @@ mod tests {
         assert!(scoped_distillations >= 0, "distillations should be scoped");
         assert!(scoped_deltas >= 0, "deltas should be scoped");
         assert_eq!(live_depth_one_nodes, 0, "no live nodes at depth >= 1");
-        assert!(scoped_converge_helpers >= 0, "converge helpers should be scoped");
+        assert!(
+            scoped_converge_helpers >= 0,
+            "converge helpers should be scoped"
+        );
         assert_eq!(surviving_l0.parent_id, None);
         assert!(surviving_l0.children.is_empty());
     }

@@ -1,0 +1,67 @@
+domain: system
+version: 1
+description: "Commands for node configuration, authentication state, health, updates, and diagnostics."
+commands:
+  - name: get_config
+    description: "Get the current Wire Node configuration including api_url, supabase_url, server_port, node_name, and runtime overlay values"
+    params: []
+    dispatch:
+      type: tauri
+
+  - name: set_config
+    description: "Update Wire Node configuration (currently a no-op placeholder, config is read-only at runtime)"
+    params:
+      - name: config
+        type: object
+        required: true
+        description: "WireNodeConfig object with configuration values"
+    dispatch:
+      type: tauri
+
+  - name: get_health_status
+    description: "Get node health -- tunnel connectivity, API reachability, uptime, version"
+    params: []
+    dispatch:
+      type: tauri
+
+  - name: check_for_update
+    description: "Check for application updates, returns UpdateInfo with version, date, body, and availability"
+    params: []
+    dispatch:
+      type: tauri
+
+  - name: get_logs
+    description: "Get the last 500 log lines from the Wire Node log file, newest first"
+    params: []
+    dispatch:
+      type: tauri
+
+  - name: get_node_name
+    description: "Get the node display name derived from hostname or config"
+    params: []
+    dispatch:
+      type: tauri
+
+  - name: is_onboarded
+    description: "Check if the node has completed onboarding"
+    params: []
+    dispatch:
+      type: tauri
+
+  - name: get_credits
+    description: "Get credit dashboard stats -- balance, earned, spent, session totals"
+    params: []
+    dispatch:
+      type: tauri
+
+  - name: get_tunnel_status
+    description: "Get Cloudflare Tunnel status -- connected, url, error state, last heartbeat"
+    params: []
+    dispatch:
+      type: tauri
+
+  - name: retry_tunnel
+    description: "Retry establishing the Cloudflare Tunnel connection after a failure"
+    params: []
+    dispatch:
+      type: tauri

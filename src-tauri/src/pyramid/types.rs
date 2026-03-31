@@ -391,7 +391,8 @@ impl HandlePath {
     /// Parse a three-segment handle-path. Returns None if not exactly three segments.
     pub fn parse(s: &str) -> Option<Self> {
         let parts: Vec<&str> = s.splitn(3, '/').collect();
-        if parts.len() == 3 && !parts[0].is_empty() && !parts[1].is_empty() && !parts[2].is_empty() {
+        if parts.len() == 3 && !parts[0].is_empty() && !parts[1].is_empty() && !parts[2].is_empty()
+        {
             Some(HandlePath {
                 slug: parts[0].to_string(),
                 depth: parts[1].to_string(),
@@ -742,10 +743,10 @@ impl EvidenceVerdict {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvidenceLink {
     pub slug: String,
-    pub source_node_id: String,   // child node (evidence provider)
-    pub target_node_id: String,   // parent node (question answerer)
+    pub source_node_id: String, // child node (evidence provider)
+    pub target_node_id: String, // parent node (question answerer)
     pub verdict: EvidenceVerdict,
-    pub weight: Option<f64>,      // 0.0-1.0, None for DISCONNECT/MISSING
+    pub weight: Option<f64>, // 0.0-1.0, None for DISCONNECT/MISSING
     pub reason: Option<String>,
     #[serde(default)]
     pub build_id: Option<String>,
@@ -817,10 +818,10 @@ pub struct CharacterizationResult {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReconciliationResult {
-    pub orphans: Vec<String>,              // node IDs never referenced
-    pub gaps: Vec<GapReport>,              // MISSING evidence reports
-    pub central_nodes: Vec<String>,        // high-citation nodes
-    pub weight_map: HashMap<String, f64>,  // node_id → aggregate weight
+    pub orphans: Vec<String>,             // node IDs never referenced
+    pub gaps: Vec<GapReport>,             // MISSING evidence reports
+    pub central_nodes: Vec<String>,       // high-citation nodes
+    pub weight_map: HashMap<String, f64>, // node_id → aggregate weight
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -836,7 +837,7 @@ pub struct GapReport {
 pub struct PublicationManifest {
     pub slug: String,
     pub layer: i64,
-    pub nodes_to_publish: Vec<String>,  // non-orphan node IDs
+    pub nodes_to_publish: Vec<String>, // non-orphan node IDs
     pub skipped_orphans: Vec<String>,
 }
 
@@ -850,9 +851,9 @@ pub struct IdMapping {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DerivedFromEntry {
-    pub ref_path: String,           // handle-path or corpus path
-    pub source_type: String,        // "contribution" or "source_document"
-    pub weight: f64,                // 0.0-1.0
+    pub ref_path: String,    // handle-path or corpus path
+    pub source_type: String, // "contribution" or "source_document"
+    pub weight: f64,         // 0.0-1.0
     pub justification: Option<String>,
 }
 

@@ -189,7 +189,16 @@ pub async fn warm_pass(
         let collapse_model = collapse_model.to_string();
         let ops_clone = ops.clone();
         tokio::spawn(async move {
-            match crystal::crystallize(&reader, &writer, &slug, &api_key, &collapse_model, &ops_clone).await {
+            match crystal::crystallize(
+                &reader,
+                &writer,
+                &slug,
+                &api_key,
+                &collapse_model,
+                &ops_clone,
+            )
+            .await
+            {
                 Ok(result) => {
                     if result.collapses > 0 {
                         info!(

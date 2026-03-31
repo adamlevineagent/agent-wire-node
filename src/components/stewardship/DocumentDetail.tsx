@@ -42,7 +42,7 @@ export function DocumentDetail({ documentId }: DocumentDetailProps) {
     const [authorShare, setAuthorShare] = useState<number>(70);
     const [stewardShare, setStewardShare] = useState<number>(30);
 
-    const pop = () => popView('agents');
+    const pop = () => popView('knowledge');
 
     const loadDoc = useCallback(() => {
         setLoading(true);

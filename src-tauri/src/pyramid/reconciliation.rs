@@ -135,15 +135,12 @@ pub fn build_weight_map(evidence_links: &[EvidenceLink]) -> HashMap<String, f64>
             let key = super::db::parse_handle_path(&link.source_node_id)
                 .map(|(_, _, bare)| bare.to_string())
                 .unwrap_or_else(|| link.source_node_id.clone());
-            *weights
-                .entry(key)
-                .or_insert(0.0) += weight;
+            *weights.entry(key).or_insert(0.0) += weight;
         }
     }
 
     weights
 }
-
 
 // ── Tests ────────────────────────────────────────────────────────────────────
 
@@ -333,13 +330,7 @@ mod tests {
 
     #[test]
     fn test_build_weight_map_none_weight_treated_as_zero() {
-        let evidence = vec![make_link(
-            "a",
-            "q1",
-            EvidenceVerdict::Keep,
-            None,
-            None,
-        )];
+        let evidence = vec![make_link("a", "q1", EvidenceVerdict::Keep, None, None)];
 
         let wm = build_weight_map(&evidence);
         assert!((wm["a"]).abs() < 1e-10);
@@ -350,5 +341,4 @@ mod tests {
         let wm = build_weight_map(&[]);
         assert!(wm.is_empty());
     }
-
 }

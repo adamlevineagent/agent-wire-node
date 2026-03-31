@@ -1,6 +1,6 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { open } from '@tauri-apps/plugin-dialog';
+import { listen } from '@tauri-apps/api/event';
 import { AddWorkspace } from './AddWorkspace';
 import { AskQuestion } from './AskQuestion';
 import { BuildProgress } from './BuildProgress';
@@ -8,25 +8,27 @@ import { VineBuildProgress } from './VineBuildProgress';
 import { DADBEARPanel } from './DADBEARPanel';
 import { FAQDirectory } from './FAQDirectory';
 import { VineViewer } from './VineViewer';
+import PyramidToolbar from './PyramidToolbar';
+import { PyramidRow } from './PyramidRow';
+import { PyramidDetailDrawer } from './PyramidDetailDrawer';
+import {
+    SlugInfo,
+    PyramidPublicationInfo,
+    EnrichedSlug,
+    PublishResult,
+    ContentType,
+    AccessTier,
+    AbsorptionMode,
+    SortKey,
+    CONTENT_TYPE_CONFIG,
+    enrichSlug,
+    getPublicationState,
+    sortComparator,
+} from './pyramid-types';
 
-interface SlugInfo {
-    slug: string;
-    content_type: string; // "code" | "document" | "conversation" | "vine" | "question"
-    source_path: string;
-    node_count: number;
-    max_depth: number;
-    last_built_at: string | null;
-    created_at: string;
-    referenced_slugs: string[];
-    referencing_slugs: string[];
-}
+const VIBESMITHY_BASE_URL = 'http://localhost:3333';
 
-interface BuildStatus {
-    slug: string;
-    status: string;
-    progress: { done: number; total: number };
-    elapsed_seconds: number;
-}
+// ─── Types ──────────────────────────────────────────────────────────────────
 
 interface DadbearStatus {
     frozen: boolean;
@@ -35,52 +37,300 @@ interface DadbearStatus {
 
 type View = 'list' | 'add' | 'building' | 'dadbear' | 'faq' | 'vine' | 'asking';
 
+// ─── Component ──────────────────────────────────────────────────────────────
+
 export function PyramidDashboard() {
-    const [slugs, setSlugs] = useState<SlugInfo[]>([]);
+    // ─── Data ───────────────────────────────────────────────────────────────
+    const [enrichedSlugs, setEnrichedSlugs] = useState<EnrichedSlug[]>([]);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState<string | null>(null);
+
+    // ─── Filter / Sort ──────────────────────────────────────────────────────
+    const [searchQuery, setSearchQuery] = useState('');
+    const [activeTypes, setActiveTypes] = useState<Set<string>>(new Set());
+    const [activeStatuses, setActiveStatuses] = useState<Set<string>>(new Set());
+    const [sortBy, setSortBy] = useState<SortKey>('node_count');
+
+    // ─── Selection + Drawer ─────────────────────────────────────────────────
+    const [selectedSlug, setSelectedSlug] = useState<string | null>(null);
+
+    // ─── Publishing ─────────────────────────────────────────────────────────
+    const [publishingSlug, setPublishingSlug] = useState<string | null>(null);
+    const [lastPublishResult, setLastPublishResult] = useState<Record<string, { success: boolean; message: string; wireUuid?: string }>>({});
+
+    // ─── Sub-views ──────────────────────────────────────────────────────────
     const [view, setView] = useState<View>('list');
     const [buildingSlug, setBuildingSlug] = useState<string | null>(null);
-    const [deletingSlug, setDeletingSlug] = useState<string | null>(null);
-    const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
-    const [selectedSlug, setSelectedSlug] = useState<string | null>(null);
     const [dadbearStatuses, setDadbearStatuses] = useState<Record<string, DadbearStatus>>({});
     const [askingSlug, setAskingSlug] = useState<string | null>(null);
-    const [vineAddFolders, setVineAddFolders] = useState<string | null>(null); // slug being edited
-    const [vineNewPaths, setVineNewPaths] = useState<string[]>([]);
-    const [vinePastePath, setVinePastePath] = useState('');
 
-    const fetchDadbearStatuses = useCallback(async (slugList: SlugInfo[]) => {
-        const statuses: Record<string, DadbearStatus> = {};
-        for (const s of slugList) {
-            try {
-                const config = await invoke<{ frozen: boolean; breaker_tripped: boolean }>(
-                    'pyramid_auto_update_config_get', { slug: s.slug }
-                );
-                statuses[s.slug] = { frozen: config.frozen, breaker_tripped: config.breaker_tripped };
-            } catch {
-                // No auto-update config for this slug — skip
-            }
-        }
-        setDadbearStatuses(statuses);
-    }, []);
+    // TODO: Vine add-folders feature removed (dead code). Re-add when vine drawer gets a trigger button.
 
-    const fetchSlugs = useCallback(async () => {
+    // Collapsible sections
+    const [collapsedSections, setCollapsedSections] = useState<Set<string>>(new Set(['empty']));
+
+    // Agent onboarding
+    const [onboardingOpen, setOnboardingOpen] = useState(false);
+    const [onboardingCopied, setOnboardingCopied] = useState(false);
+    const onboardingCopyTimeout = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+    // ─── Data Fetching ──────────────────────────────────────────────────────
+
+    const fetchData = useCallback(async () => {
         try {
-            const data = await invoke<SlugInfo[]>('pyramid_list_slugs');
-            setSlugs(data);
+            const [slugs, pubStatus] = await Promise.all([
+                invoke<SlugInfo[]>('pyramid_list_slugs'),
+                invoke<PyramidPublicationInfo[]>('pyramid_get_publication_status'),
+            ]);
+
+            const pubMap = new Map<string, PyramidPublicationInfo>();
+            for (const p of pubStatus) {
+                pubMap.set(p.slug, p);
+            }
+
+            const enriched = slugs.map(s => enrichSlug(s, pubMap.get(s.slug)));
+            setEnrichedSlugs(enriched);
             setError(null);
-            fetchDadbearStatuses(data);
+            setLoading(false);
         } catch (err) {
             setError(String(err));
-        } finally {
             setLoading(false);
         }
     }, []);
 
+    const fetchDadbearStatuses = useCallback(async () => {
+        try {
+            const slugs = await invoke<SlugInfo[]>('pyramid_list_slugs');
+            const results = await Promise.allSettled(
+                slugs.map(s =>
+                    invoke<{ frozen: boolean; breaker_tripped: boolean }>(
+                        'pyramid_auto_update_config_get', { slug: s.slug }
+                    ).then(config => ({ slug: s.slug, status: { frozen: config.frozen, breaker_tripped: config.breaker_tripped } }))
+                )
+            );
+            const statuses: Record<string, DadbearStatus> = {};
+            for (const r of results) {
+                if (r.status === 'fulfilled') {
+                    statuses[r.value.slug] = r.value.status;
+                }
+            }
+            setDadbearStatuses(statuses);
+        } catch (err) {
+            // DADBEAR status is non-critical; log but don't surface
+            console.error('Failed to fetch DADBEAR statuses:', err);
+        }
+    }, []);
+
+    // Initial load + 15s lightweight refresh (slugs + pub status only)
     useEffect(() => {
-        fetchSlugs();
-    }, [fetchSlugs]);
+        fetchData().then(() => fetchDadbearStatuses());
+        const interval = setInterval(fetchData, 15000);
+        return () => clearInterval(interval);
+    }, [fetchData, fetchDadbearStatuses]);
+
+    // Listen for build-complete events — refresh both data and DADBEAR statuses
+    useEffect(() => {
+        const unlisten = listen('pyramid-build-complete', () => {
+            fetchData();
+            fetchDadbearStatuses();
+        });
+        return () => { unlisten.then(fn => fn()); };
+    }, [fetchData, fetchDadbearStatuses]);
+
+    // ─── Filtering ──────────────────────────────────────────────────────────
+
+    const filteredSlugs = useMemo(() => {
+        return enrichedSlugs
+            .filter(s => !s.archived_at)
+            .filter(s => !searchQuery ||
+                s.slug.toLowerCase().includes(searchQuery.toLowerCase()) ||
+                s.source_path.toLowerCase().includes(searchQuery.toLowerCase()))
+            .filter(s => activeTypes.size === 0 || activeTypes.has(s.content_type))
+            .filter(s => {
+                if (activeStatuses.size === 0) return true;
+                const state = getPublicationState(s, publishingSlug);
+                if (activeStatuses.has('built') && s.node_count > 0) return true;
+                if (activeStatuses.has('empty') && s.node_count === 0) return true;
+                if (activeStatuses.has('published') && state === 'published') return true;
+                if (activeStatuses.has('stale') && state === 'stale') return true;
+                if (activeStatuses.has('pinned') && s.pinned) return true;
+                return false;
+            })
+            .sort(sortComparator(sortBy));
+    }, [enrichedSlugs, searchQuery, activeTypes, activeStatuses, sortBy, publishingSlug]);
+
+    // ─── Grouping ───────────────────────────────────────────────────────────
+
+    const { groups, maxNodeCount, counts } = useMemo(() => {
+        const nonEmpty = filteredSlugs.filter(s => s.node_count > 0);
+        const empty = filteredSlugs.filter(s => s.node_count === 0);
+
+        // Group non-empty by content_type
+        const typeGroups = new Map<ContentType, EnrichedSlug[]>();
+        for (const s of nonEmpty) {
+            const list = typeGroups.get(s.content_type) ?? [];
+            list.push(s);
+            typeGroups.set(s.content_type, list);
+        }
+
+        // For each type group, sort so question pyramids with referenced_slugs
+        // matching a slug in the list appear after their parent
+        const sortedGroups: Array<{ key: string; label: string; color: string; slugs: EnrichedSlug[]; nestedSlugs: Set<string> }> = [];
+
+        for (const [type, slugsInGroup] of typeGroups) {
+            const config = CONTENT_TYPE_CONFIG[type];
+            const parentSlugs: EnrichedSlug[] = [];
+            const childrenByParent = new Map<string, EnrichedSlug[]>();
+
+            if (type === 'question') {
+                // Nesting is single-level within the question type group only.
+                // Cross-type references (questions referencing code/document pyramids) are shown
+                // in the drawer's "Built on:" section but don't affect list nesting.
+                const questionSlugsInGroup = new Set(slugsInGroup.map(s => s.slug));
+                for (const s of slugsInGroup) {
+                    const parentRef = s.referenced_slugs.find(ref => questionSlugsInGroup.has(ref));
+                    if (parentRef) {
+                        const children = childrenByParent.get(parentRef) ?? [];
+                        children.push(s);
+                        childrenByParent.set(parentRef, children);
+                    } else {
+                        parentSlugs.push(s);
+                    }
+                }
+            } else {
+                parentSlugs.push(...slugsInGroup);
+            }
+
+            // Build final order: parent, then children
+            const ordered: EnrichedSlug[] = [];
+            const nested = new Set<string>();
+            for (const p of parentSlugs) {
+                ordered.push(p);
+                const children = childrenByParent.get(p.slug);
+                if (children) {
+                    for (const c of children) {
+                        ordered.push(c);
+                        nested.add(c.slug);
+                    }
+                }
+            }
+
+            sortedGroups.push({
+                key: type,
+                label: `${config.label} (${slugsInGroup.length})`,
+                color: config.color,
+                slugs: ordered,
+                nestedSlugs: nested,
+            });
+        }
+
+        // Empty section
+        if (empty.length > 0) {
+            sortedGroups.push({
+                key: 'empty',
+                label: `Empty (${empty.length})`,
+                color: 'rgba(255,255,255,0.2)',
+                slugs: empty,
+                nestedSlugs: new Set(),
+            });
+        }
+
+        // Compute max node count for scale bars
+        let max = 0;
+        for (const s of filteredSlugs) {
+            if (s.node_count > max) max = s.node_count;
+        }
+
+        // Compute counts for toolbar chips
+        const allActive = enrichedSlugs.filter(s => !s.archived_at);
+        const chipCounts = {
+            total: allActive.length,
+            built: allActive.filter(s => s.node_count > 0).length,
+            empty: allActive.filter(s => s.node_count === 0).length,
+            published: allActive.filter(s => getPublicationState(s, publishingSlug) === 'published').length,
+            stale: allActive.filter(s => getPublicationState(s, publishingSlug) === 'stale').length,
+            pinned: allActive.filter(s => s.pinned).length,
+        };
+
+        return { groups: sortedGroups, maxNodeCount: max, counts: chipCounts };
+    }, [filteredSlugs, enrichedSlugs, publishingSlug]);
+
+    // ─── Toggle helpers ─────────────────────────────────────────────────────
+
+    const toggleType = useCallback((type: string) => {
+        setActiveTypes(prev => {
+            const next = new Set(prev);
+            if (next.has(type)) next.delete(type);
+            else next.add(type);
+            return next;
+        });
+    }, []);
+
+    const toggleStatus = useCallback((status: string) => {
+        setActiveStatuses(prev => {
+            const next = new Set(prev);
+            if (next.has(status)) next.delete(status);
+            else next.add(status);
+            return next;
+        });
+    }, []);
+
+    const toggleSection = useCallback((key: string) => {
+        setCollapsedSections(prev => {
+            const next = new Set(prev);
+            if (next.has(key)) next.delete(key);
+            else next.add(key);
+            return next;
+        });
+    }, []);
+
+    // ─── Drawer Callbacks ───────────────────────────────────────────────────
+
+    const handlePublish = useCallback(async (slug: string): Promise<PublishResult> => {
+        setPublishingSlug(slug);
+        setLastPublishResult(prev => {
+            const next = { ...prev };
+            delete next[slug];
+            return next;
+        });
+        try {
+            const result = await invoke<PublishResult>('pyramid_publish', { slug });
+            setLastPublishResult(prev => ({
+                ...prev,
+                [slug]: { success: true, message: 'Published to Wire', wireUuid: result.apex_wire_uuid ?? undefined },
+            }));
+            await fetchData();
+            return result;
+        } catch (err) {
+            setLastPublishResult(prev => ({
+                ...prev,
+                [slug]: { success: false, message: String(err) },
+            }));
+            throw err;
+        } finally {
+            setPublishingSlug(null);
+        }
+    }, [fetchData]);
+
+    const handleSetAccessTier = useCallback(async (slug: string, tier: AccessTier, price?: number, circles?: string[]) => {
+        await invoke('pyramid_set_access_tier', { slug, tier, price: price ?? null, circles: circles ?? null });
+    }, []);
+
+    const handleSetAbsorption = useCallback(async (slug: string, mode: AbsorptionMode, chainId?: string, rateLimit?: number, dailyCap?: number) => {
+        await invoke('pyramid_set_absorption_mode', {
+            slug,
+            mode,
+            chain_id: chainId ?? null,
+            rate_limit: rateLimit ?? null,
+            daily_cap: dailyCap ?? null,
+        });
+    }, []);
+
+    const handleDelete = useCallback(async (slug: string) => {
+        await invoke('pyramid_archive_slug', { slug });
+        setSelectedSlug(null);
+        await fetchData();
+    }, [fetchData]);
 
     const handleRebuild = useCallback(async (slug: string) => {
         try {
@@ -92,179 +342,25 @@ export function PyramidDashboard() {
         }
     }, []);
 
-    const handleDelete = useCallback(async (slug: string) => {
-        setDeletingSlug(slug);
-        try {
-            await invoke('pyramid_delete_slug', { slug });
-            setConfirmDelete(null);
-            await fetchSlugs();
-        } catch (err) {
-            setError(String(err));
-        } finally {
-            setDeletingSlug(null);
-        }
-    }, [fetchSlugs]);
+    // ─── Sub-view helpers (carried from original) ───────────────────────────
 
     const handleOpenVibesmithy = useCallback((slug: string) => {
-        window.open(`http://localhost:3333/space/${slug}`, '_blank');
+        window.open(`${VIBESMITHY_BASE_URL}/space/${slug}`, '_blank');
     }, []);
-
-    const handleVineAddFoldersOpen = useCallback((s: SlugInfo) => {
-        // Parse existing directories from source_path (semicolon-joined)
-        const existingDirs = s.source_path ? s.source_path.split(';').filter(Boolean) : [];
-        setVineNewPaths(existingDirs);
-        setVineAddFolders(s.slug);
-        setVinePastePath('');
-    }, []);
-
-    const handleVinePickNewDir = useCallback(async () => {
-        try {
-            const selected = await open({
-                directory: true,
-                title: 'Add JSONL Directory to Vine',
-                multiple: true,
-            });
-            if (selected) {
-                const newPaths = Array.isArray(selected) ? selected : [selected];
-                setVineNewPaths(prev => {
-                    const combined = [...prev];
-                    for (const p of newPaths) {
-                        if (!combined.includes(p)) combined.push(p);
-                    }
-                    return combined;
-                });
-            }
-        } catch (err) {
-            setError(String(err));
-        }
-    }, []);
-
-    const handleVineAddPastePath = useCallback(() => {
-        const val = vinePastePath.trim();
-        if (!val) return;
-        setVineNewPaths(prev => {
-            if (prev.includes(val)) return prev;
-            return [...prev, val];
-        });
-        setVinePastePath('');
-    }, [vinePastePath]);
-
-    const handleVineRebuildWithFolders = useCallback(async () => {
-        if (!vineAddFolders || vineNewPaths.length === 0) return;
-        setError(null);
-        try {
-            // Update the slug's source_path
-            const newSourcePath = vineNewPaths.join(';');
-            await invoke('pyramid_create_slug', {
-                slug: vineAddFolders,
-                contentType: 'vine',
-                sourcePath: newSourcePath,
-            }).catch(() => {
-                // Slug may already exist — that's fine, we just need to rebuild
-            });
-
-            // Trigger vine rebuild via Tauri command
-            await invoke('pyramid_vine_build', {
-                vineSlug: vineAddFolders,
-                jsonlDirs: vineNewPaths,
-            });
-
-            setBuildingSlug(vineAddFolders);
-            setVineAddFolders(null);
-            setView('building');
-        } catch (err) {
-            setError(String(err));
-        }
-    }, [vineAddFolders, vineNewPaths]);
 
     const handleAddComplete = useCallback(() => {
         setView('list');
-        fetchSlugs();
-    }, [fetchSlugs]);
+        fetchData();
+    }, [fetchData]);
 
     const handleBuildComplete = useCallback(() => {
-        fetchSlugs();
-    }, [fetchSlugs]);
+        fetchData();
+    }, [fetchData]);
 
-    const formatDate = (dateStr: string | null) => {
-        if (!dateStr) return 'Never';
-        const d = new Date(dateStr);
-        return d.toLocaleDateString() + ' ' + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-    };
-
-    const contentTypeLabel = (ct: string) => {
-        switch (ct) {
-            case 'code': return 'Code';
-            case 'document': return 'Documents';
-            case 'conversation': return 'Conversation';
-            case 'vine': return 'Vine';
-            case 'question': return 'Question';
-            default: return ct;
-        }
-    };
-
-    const contentTypeBadgeClass = (ct: string) => {
-        switch (ct) {
-            case 'code': return 'badge-code';
-            case 'document': return 'badge-document';
-            case 'conversation': return 'badge-conversation';
-            case 'vine': return 'badge-vine';
-            case 'question': return 'badge-question';
-            default: return '';
-        }
-    };
-
-    // Group question slugs after their base pyramids
-    const groupedSlugs = (() => {
-        const baseOrder: SlugInfo[] = [];
-        const questionsByBase = new Map<string, SlugInfo[]>();
-        const standaloneQuestions: SlugInfo[] = [];
-
-        for (const s of slugs) {
-            if (s.content_type === 'question') {
-                const baseRef = s.referenced_slugs?.[0];
-                if (baseRef) {
-                    const existing = questionsByBase.get(baseRef) ?? [];
-                    existing.push(s);
-                    questionsByBase.set(baseRef, existing);
-                } else {
-                    standaloneQuestions.push(s);
-                }
-            } else {
-                baseOrder.push(s);
-            }
-        }
-
-        const result: { slug: SlugInfo; isGroupedQuestion: boolean }[] = [];
-        for (const base of baseOrder) {
-            result.push({ slug: base, isGroupedQuestion: false });
-            const children = questionsByBase.get(base.slug);
-            if (children) {
-                for (const child of children) {
-                    result.push({ slug: child, isGroupedQuestion: true });
-                }
-                questionsByBase.delete(base.slug);
-            }
-        }
-        // Orphan question slugs whose base wasn't found
-        for (const orphans of questionsByBase.values()) {
-            for (const s of orphans) {
-                result.push({ slug: s, isGroupedQuestion: true });
-            }
-        }
-        for (const s of standaloneQuestions) {
-            result.push({ slug: s, isGroupedQuestion: false });
-        }
-        return result;
-    })();
-
-    // Agent Onboarding card state
-    const [onboardingOpen, setOnboardingOpen] = useState(false);
-    const [onboardingCopied, setOnboardingCopied] = useState(false);
-    const onboardingCopyTimeout = useRef<ReturnType<typeof setTimeout> | null>(null);
+    // ─── Agent Onboarding ───────────────────────────────────────────────────
 
     const generateOnboardingText = () => {
-        const slugList = slugs.map(s => `- ${s.slug} (${s.content_type}, ${s.node_count} nodes)`).join('\n');
+        const slugList = enrichedSlugs.map(s => `- ${s.slug} (${s.content_type}, ${s.node_count} nodes)`).join('\n');
         return `# Knowledge Pyramid Access
 
 You have access to a Knowledge Pyramid system running on localhost:8765. Use the pyramid CLI to explore and contribute.
@@ -314,6 +410,19 @@ Always include the "Generalized understanding:" section — this triggers FAQ ge
         });
     };
 
+    // ─── Drawer close (stable ref for escape handler) ────────────────────────
+
+    const handleDrawerClose = useCallback(() => setSelectedSlug(null), []);
+
+    // ─── Selected slug data for drawer ──────────────────────────────────────
+
+    const selectedSlugData = useMemo(() => {
+        if (!selectedSlug) return null;
+        return enrichedSlugs.find(s => s.slug === selectedSlug) ?? null;
+    }, [selectedSlug, enrichedSlugs]);
+
+    // ─── Sub-view rendering ─────────────────────────────────────────────────
+
     if (view === 'add') {
         return <AddWorkspace onComplete={handleAddComplete} onCancel={() => setView('list')} />;
     }
@@ -322,15 +431,14 @@ Always include the "Generalized understanding:" section — this triggers FAQ ge
         return (
             <DADBEARPanel
                 slug={selectedSlug}
-                contentType={slugs.find(s => s.slug === selectedSlug)?.content_type}
-                referencingSlugs={slugs.find(s => s.slug === selectedSlug)?.referencing_slugs ?? []}
+                contentType={enrichedSlugs.find(s => s.slug === selectedSlug)?.content_type}
+                referencingSlugs={enrichedSlugs.find(s => s.slug === selectedSlug)?.referencing_slugs ?? []}
                 onBack={() => {
                     setSelectedSlug(null);
                     setView('list');
-                    fetchSlugs();
+                    fetchData();
                 }}
                 onNavigateToSlug={(targetSlug, _nodeId) => {
-                    // Switch to the referenced slug's DADBEAR view
                     setSelectedSlug(targetSlug);
                 }}
             />
@@ -350,7 +458,7 @@ Always include the "Generalized understanding:" section — this triggers FAQ ge
     }
 
     if (view === 'vine' && selectedSlug) {
-        const vineInfo = slugs.find(s => s.slug === selectedSlug);
+        const vineInfo = enrichedSlugs.find(s => s.slug === selectedSlug);
         return (
             <VineViewer
                 slug={selectedSlug}
@@ -359,34 +467,49 @@ Always include the "Generalized understanding:" section — this triggers FAQ ge
                 onBack={() => {
                     setSelectedSlug(null);
                     setView('list');
-                    fetchSlugs();
+                    fetchData();
                 }}
                 onOpenBunch={(bunchSlug) => {
-                    window.open(`http://localhost:3333/space/${bunchSlug}`, '_blank');
+                    window.open(`${VIBESMITHY_BASE_URL}/space/${bunchSlug}`, '_blank');
                 }}
             />
         );
     }
 
     if (view === 'asking' && askingSlug) {
+        // Build a SlugInfo-compatible array for AskQuestion (exclude archived)
+        const allSlugsForAsking = enrichedSlugs
+            .filter(s => !s.archived_at)
+            .map(s => ({
+                slug: s.slug,
+                content_type: s.content_type,
+                source_path: s.source_path,
+                node_count: s.node_count,
+                max_depth: s.max_depth,
+                last_built_at: s.last_built_at,
+                created_at: s.created_at,
+                referenced_slugs: s.referenced_slugs,
+                referencing_slugs: s.referencing_slugs,
+                archived_at: s.archived_at ?? null,
+            }));
         return (
             <AskQuestion
                 baseSlug={askingSlug}
-                allSlugs={slugs}
+                allSlugs={allSlugsForAsking}
                 onClose={() => {
                     setAskingSlug(null);
                     setView('list');
-                    fetchSlugs();
+                    fetchData();
                 }}
                 onSlugCreated={() => {
-                    fetchSlugs();
+                    fetchData();
                 }}
             />
         );
     }
 
     if (view === 'building' && buildingSlug) {
-        const buildSlugInfo = slugs.find(s => s.slug === buildingSlug);
+        const buildSlugInfo = enrichedSlugs.find(s => s.slug === buildingSlug);
         const isVineBuild = buildSlugInfo?.content_type === 'vine';
         if (isVineBuild) {
             return (
@@ -396,7 +519,7 @@ Always include the "Generalized understanding:" section — this triggers FAQ ge
                     onClose={() => {
                         setBuildingSlug(null);
                         setView('list');
-                        fetchSlugs();
+                        fetchData();
                     }}
                 />
             );
@@ -405,6 +528,7 @@ Always include the "Generalized understanding:" section — this triggers FAQ ge
             <BuildProgress
                 slug={buildingSlug}
                 onComplete={handleBuildComplete}
+                onRetry={(s) => handleRebuild(s)}
                 onClose={() => {
                     setBuildingSlug(null);
                     setView('list');
@@ -412,6 +536,25 @@ Always include the "Generalized understanding:" section — this triggers FAQ ge
             />
         );
     }
+
+    // ─── Summary bar chips ──────────────────────────────────────────────────
+
+    const renderSummaryBar = () => {
+        const chips: Array<{ label: string; className: string }> = [];
+        if (counts.published > 0) chips.push({ label: `${counts.published} published`, className: 'pyramid-summary-chip pyramid-summary-chip-published' });
+        if (counts.stale > 0) chips.push({ label: `${counts.stale} stale`, className: 'pyramid-summary-chip pyramid-summary-chip-stale' });
+        if (counts.empty > 0) chips.push({ label: `${counts.empty} empty`, className: 'pyramid-summary-chip pyramid-summary-chip-empty' });
+        if (chips.length === 0) return null;
+        return (
+            <div className="pyramid-summary-bar">
+                {chips.map(c => (
+                    <span key={c.label} className={c.className}>{c.label}</span>
+                ))}
+            </div>
+        );
+    };
+
+    // ─── Main list view ─────────────────────────────────────────────────────
 
     return (
         <div className="pyramid-dashboard">
@@ -431,7 +574,7 @@ Always include the "Generalized understanding:" section — this triggers FAQ ge
                 </div>
             )}
 
-            {!loading && slugs.length > 0 && (
+            {!loading && enrichedSlugs.length > 0 && (
                 <div className="agent-onboarding-card">
                     <div className="agent-onboarding-header" onClick={() => setOnboardingOpen(!onboardingOpen)}>
                         <h3>Agent Onboarding Instructions</h3>
@@ -457,231 +600,107 @@ Always include the "Generalized understanding:" section — this triggers FAQ ge
                 <div className="pyramid-loading">Loading workspaces...</div>
             )}
 
-            {!loading && slugs.length === 0 && (
+            {!loading && enrichedSlugs.length === 0 && (
                 <div className="pyramid-empty">
-                    <div className="pyramid-empty-icon">&#x1F3D7;</div>
-                    <h3>No workspaces yet</h3>
-                    <p>Add a workspace to build your first knowledge pyramid.</p>
+                    <div className="pyramid-empty-icon">W</div>
+                    <h3>Build your first knowledge pyramid</h3>
+                    <p>
+                        Link a project directory or document folder to create a corpus,
+                        then build a layered knowledge pyramid you can query, publish,
+                        and share with agents.
+                    </p>
                     <button className="btn btn-primary" onClick={() => setView('add')}>
-                        Add Your First Workspace
+                        Link a Folder &amp; Build
                     </button>
                 </div>
             )}
 
-            {!loading && slugs.length > 0 && (
-                <div className="pyramid-cards">
-                    {groupedSlugs.map(({ slug: s, isGroupedQuestion }) => (
-                        <div key={s.slug} className={`pyramid-card${isGroupedQuestion ? ' pyramid-card-grouped-question' : ''}`}>
-                            <div className="pyramid-card-header">
-                                <div className="pyramid-card-header-left">
-                                    {s.content_type === 'question' && (
+            {!loading && enrichedSlugs.length > 0 && (
+                <>
+                    <div style={selectedSlugData ? { marginRight: 420 } : undefined}>
+                    <PyramidToolbar
+                        searchQuery={searchQuery}
+                        onSearchChange={setSearchQuery}
+                        activeTypes={activeTypes}
+                        onToggleType={toggleType}
+                        activeStatuses={activeStatuses}
+                        onToggleStatus={toggleStatus}
+                        sortBy={sortBy}
+                        onSortChange={setSortBy}
+                        counts={counts}
+                    />
+
+                    {renderSummaryBar()}
+
+                    <div className="pyramid-grouped-list">
+                        {groups.map(group => {
+                            const isCollapsed = collapsedSections.has(group.key);
+                            return (
+                                <div key={group.key} className="pyramid-section">
+                                    <div
+                                        className="pyramid-section-header"
+                                        onClick={() => toggleSection(group.key)}
+                                    >
                                         <span
-                                            className="pyramid-q-badge"
-                                            title={s.referenced_slugs?.length
-                                                ? `Built on: ${s.referenced_slugs.join(', ')}`
-                                                : 'Question pyramid'}
-                                        >
-                                            Q
+                                            className="pyramid-section-dot"
+                                            style={{ backgroundColor: group.color }}
+                                        />
+                                        {group.label}
+                                        <span className="pyramid-section-chevron">
+                                            {isCollapsed ? '\u25B8' : '\u25BE'}
                                         </span>
-                                    )}
-                                    <h3 className="pyramid-card-slug">{s.slug}</h3>
-                                </div>
-                                <span className={`pyramid-card-badge ${contentTypeBadgeClass(s.content_type)}`}>
-                                    {contentTypeLabel(s.content_type)}
-                                </span>
-                            </div>
-
-                            <div className="pyramid-card-path" title={s.source_path}>
-                                {s.content_type === 'question' && s.referenced_slugs?.length > 0
-                                    ? <>References: {s.referenced_slugs.join(', ')}</>
-                                    : s.source_path.length > 50
-                                        ? '...' + s.source_path.slice(-47)
-                                        : s.source_path}
-                            </div>
-
-                            <div className="pyramid-card-stats">
-                                <div className="pyramid-stat">
-                                    <span className="pyramid-stat-value">{s.node_count}</span>
-                                    <span className="pyramid-stat-label">nodes</span>
-                                </div>
-                                <div className="pyramid-stat">
-                                    <span className="pyramid-stat-value">{s.max_depth}</span>
-                                    <span className="pyramid-stat-label">depth</span>
-                                </div>
-                                <div className="pyramid-stat">
-                                    <span className="pyramid-stat-value">{formatDate(s.last_built_at)}</span>
-                                    <span className="pyramid-stat-label">last built</span>
-                                </div>
-                            </div>
-
-                            <div className="pyramid-card-status">
-                                {dadbearStatuses[s.slug]?.frozen ? (
-                                    <span className="pyramid-status-indicator frozen">Frozen — DADBEAR is hibernating</span>
-                                ) : dadbearStatuses[s.slug]?.breaker_tripped ? (
-                                    <span className="pyramid-status-indicator breaker-tripped">DADBEAR needs your attention</span>
-                                ) : s.node_count > 0 ? (
-                                    <span className="pyramid-status-indicator idle">Ready</span>
-                                ) : (
-                                    <span className="pyramid-status-indicator needs-build">Needs Build</span>
-                                )}
-                            </div>
-
-                            <div className="pyramid-card-actions">
-                                {s.content_type === 'vine' ? (
-                                    <>
-                                        <button
-                                            className="btn btn-small btn-primary"
-                                            onClick={() => { setSelectedSlug(s.slug); setView('vine'); }}
-                                            disabled={s.node_count === 0}
-                                        >
-                                            Open Vine
-                                        </button>
-                                        <button
-                                            className="btn btn-small btn-secondary vine-add-folders-btn"
-                                            onClick={() => handleVineAddFoldersOpen(s)}
-                                            title="Add folders to vine"
-                                        >
-                                            &#x1F4C1;+ Add Folders
-                                        </button>
-                                    </>
-                                ) : (
-                                    <button
-                                        className="btn btn-small btn-primary"
-                                        onClick={() => handleOpenVibesmithy(s.slug)}
-                                        disabled={s.node_count === 0}
-                                    >
-                                        Open in Vibesmithy
-                                    </button>
-                                )}
-                                {s.content_type !== 'vine' && s.node_count > 0 && (
-                                    <button
-                                        className="btn btn-small btn-ask-question"
-                                        onClick={() => { setAskingSlug(s.slug); setView('asking'); }}
-                                        title={s.content_type === 'question' ? 'Ask another question on this base' : 'Ask a question about this pyramid'}
-                                    >
-                                        {s.content_type === 'question' ? 'Ask Another' : 'Ask a Question'}
-                                    </button>
-                                )}
-                                <button
-                                    className={`pyramid-card-dadbear-btn${dadbearStatuses[s.slug]?.frozen ? ' dadbear-attention-frozen' : ''}${dadbearStatuses[s.slug]?.breaker_tripped ? ' dadbear-attention-tripped' : ''}`}
-                                    onClick={() => { setSelectedSlug(s.slug); setView('dadbear'); }}
-                                    title="DADBEAR Auto-Update Panel"
-                                    disabled={s.node_count === 0}
-                                >
-                                    &#x1F43B;
-                                </button>
-                                <button
-                                    className="pyramid-card-faq-btn"
-                                    onClick={() => { setSelectedSlug(s.slug); setView('faq'); }}
-                                    title="FAQ Directory"
-                                    disabled={s.node_count === 0}
-                                >
-                                    &#x1F4D6;
-                                </button>
-                                <button
-                                    className="btn btn-small btn-secondary"
-                                    onClick={() => handleRebuild(s.slug)}
-                                >
-                                    Rebuild
-                                </button>
-                                {confirmDelete === s.slug ? (
-                                    <div className="delete-confirm">
-                                        <span>Delete "{s.slug}"?</span>
-                                        <button
-                                            className="btn btn-small btn-danger"
-                                            onClick={() => handleDelete(s.slug)}
-                                            disabled={deletingSlug === s.slug}
-                                        >
-                                            {deletingSlug === s.slug ? 'Deleting...' : 'Confirm'}
-                                        </button>
-                                        <button
-                                            className="btn btn-small btn-ghost"
-                                            onClick={() => setConfirmDelete(null)}
-                                        >
-                                            Cancel
-                                        </button>
                                     </div>
-                                ) : (
-                                    <button
-                                        className="btn btn-small btn-ghost btn-danger-text"
-                                        onClick={() => setConfirmDelete(s.slug)}
-                                    >
-                                        Delete
-                                    </button>
-                                )}
-                            </div>
-                        </div>
-                    ))}
-                </div>
-            )}
-
-            {/* Vine Add Folders Dialog */}
-            {vineAddFolders && (
-                <div className="vine-add-folders-overlay">
-                    <div className="vine-add-folders-dialog">
-                        <h3>Add Folders to Vine: {vineAddFolders}</h3>
-                        <p className="step-description">
-                            Add directories containing JSONL conversation files.
-                        </p>
-
-                        <div className="selected-paths" style={{ marginBottom: '12px', maxHeight: '200px', overflowY: 'auto' }}>
-                            {vineNewPaths.map((p, i) => (
-                                <div key={p} className="selected-path-row">
-                                    <span className="selected-path-text">{p}</span>
-                                    <button
-                                        className="btn btn-ghost btn-sm"
-                                        onClick={() => setVineNewPaths(prev => prev.filter((_, idx) => idx !== i))}
-                                        title="Remove"
-                                    >
-                                        &times;
-                                    </button>
+                                    {!isCollapsed && group.slugs.map(s => (
+                                        <PyramidRow
+                                            key={s.slug}
+                                            slug={s}
+                                            isSelected={selectedSlug === s.slug}
+                                            publishingSlug={publishingSlug}
+                                            maxNodeCount={maxNodeCount}
+                                            onClick={() => setSelectedSlug(s.slug)}
+                                            isNested={group.nestedSlugs.has(s.slug)}
+                                        />
+                                    ))}
                                 </div>
-                            ))}
-                        </div>
-
-                        <div style={{ display: 'flex', gap: '8px', marginBottom: '8px' }}>
-                            <input
-                                type="text"
-                                placeholder="Paste a path..."
-                                className="input"
-                                style={{ flex: 1 }}
-                                value={vinePastePath}
-                                onChange={(e) => setVinePastePath(e.target.value)}
-                                onKeyDown={(e) => {
-                                    if (e.key === 'Enter') handleVineAddPastePath();
-                                }}
-                            />
-                            <button
-                                className="btn btn-secondary"
-                                onClick={handleVineAddPastePath}
-                                disabled={!vinePastePath.trim()}
-                            >
-                                +
-                            </button>
-                            <button className="btn btn-primary" onClick={handleVinePickNewDir}>
-                                Browse...
-                            </button>
-                        </div>
-
-                        <div className="vine-hint">
-                            Use <kbd>Cmd+Shift+.</kbd> to show hidden folders in the file picker.
-                        </div>
-
-                        <div className="step-nav" style={{ marginTop: '16px' }}>
-                            <button className="btn btn-ghost" onClick={() => { setVineAddFolders(null); setVineNewPaths([]); }}>
-                                Cancel
-                            </button>
-                            <button
-                                className="btn btn-primary"
-                                onClick={handleVineRebuildWithFolders}
-                                disabled={vineNewPaths.length === 0}
-                            >
-                                Rebuild Vine
-                            </button>
-                        </div>
+                            );
+                        })}
                     </div>
-                </div>
+                    </div>
+
+                    <PyramidDetailDrawer
+                        slug={selectedSlugData}
+                        onClose={handleDrawerClose}
+                        onPublish={handlePublish}
+                        onSetAccessTier={handleSetAccessTier}
+                        onSetAbsorption={handleSetAbsorption}
+                        onDelete={handleDelete}
+                        onRebuild={(slug) => {
+                            setSelectedSlug(null);
+                            handleRebuild(slug);
+                        }}
+                        onOpenDadbear={(slug) => {
+                            setSelectedSlug(slug);
+                            setView('dadbear');
+                        }}
+                        onOpenFaq={(slug) => {
+                            setSelectedSlug(slug);
+                            setView('faq');
+                        }}
+                        onOpenVine={(slug) => {
+                            setSelectedSlug(slug);
+                            setView('vine');
+                        }}
+                        onAskQuestion={(slug) => {
+                            setAskingSlug(slug);
+                            setView('asking');
+                        }}
+                        onOpenVibesmithy={handleOpenVibesmithy}
+                        publishingSlug={publishingSlug}
+                        lastPublishResult={lastPublishResult}
+                    />
+                </>
             )}
+
         </div>
     );
 }

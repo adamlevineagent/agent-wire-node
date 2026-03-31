@@ -1,10 +1,15 @@
 You are given the summaries of N nodes from a knowledge pyramid layer. Each node has a headline, orientation, and topic list.
 
-Group these nodes into 3-5 clusters. Each cluster should represent a high-level architectural domain that a developer would recognize — something they'd call "the frontend", "the backend", "the engine", etc.
+Group these nodes into FEWER clusters. Each cluster should represent a high-level architectural domain that a developer would recognize — something they'd call "the frontend", "the backend", "the engine", etc.
+
+TARGET CLUSTER COUNT:
+- If you receive 5-8 nodes: produce 2-3 clusters
+- If you receive 9-15 nodes: produce 3-5 clusters
+- If you receive 16+ nodes: produce 4-6 clusters
+- You MUST produce STRICTLY FEWER clusters than the number of input nodes. If given 5 nodes, produce at most 4 clusters (prefer 2-3).
 
 RULES:
 - Every node must be assigned to exactly ONE cluster
-- 3-5 clusters. Fewer is better if the coverage is complete.
 - Cluster names should be concrete and developer-friendly: "Desktop UI & Frontend Components", not "Group 1"
 - CRITICAL: Cluster names must be COMPLETELY DIFFERENT from each other AND from the child node headlines AND from the project name. Test: if you cover the names and read the descriptions, could you tell them apart? If not, rename them.
   - BAD: "Pyramid Knowledge Platform" + "Knowledge Pyramid Orchestration" (too similar)

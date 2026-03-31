@@ -201,9 +201,10 @@ All three prompts you generate MUST instruct the synthesizer to write for this a
         .map(|d| d.join("prompts/question/synthesis_prompt.md"))
         .and_then(|p| std::fs::read_to_string(&p).ok())
     {
-        Some(template) => render_prompt_template(&template, &[
-            ("audience_instruction", &audience_instruction),
-        ]),
+        Some(template) => render_prompt_template(
+            &template,
+            &[("audience_instruction", &audience_instruction)],
+        ),
         None => {
             warn!("synthesis_prompt.md not found — using inline fallback");
             format!(
@@ -329,10 +330,7 @@ fn collect_leaves_recursive<'a>(node: &'a QuestionNode, leaves: &mut Vec<&'a Que
 fn format_tree_for_prompt(node: &QuestionNode, depth: usize) -> String {
     let indent = "  ".repeat(depth);
     let leaf_marker = if node.is_leaf { " [LEAF]" } else { "" };
-    let mut lines = vec![format!(
-        "{indent}Q: {}{leaf_marker}",
-        node.question,
-    )];
+    let mut lines = vec![format!("{indent}Q: {}{leaf_marker}", node.question,)];
 
     for child in &node.children {
         lines.push(format_tree_for_prompt(child, depth + 1));
@@ -359,7 +357,10 @@ fn parse_extraction_schema_response(content: &str) -> Result<ExtractionSchema> {
             .filter_map(|item| {
                 let name = item.get("name")?.as_str()?.to_string();
                 let description = item.get("description")?.as_str()?.to_string();
-                let required = item.get("required").and_then(|v| v.as_bool()).unwrap_or(false);
+                let required = item
+                    .get("required")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
                 Some(TopicField {
                     name,
                     description,
@@ -484,10 +485,7 @@ mod tests {
                 vec![
                     make_parent(
                         "Mid A",
-                        vec![
-                            make_leaf("Leaf A1", ""),
-                            make_leaf("Leaf A2", ""),
-                        ],
+                        vec![make_leaf("Leaf A1", ""), make_leaf("Leaf A2", "")],
                     ),
                     make_leaf("Leaf B", ""),
                 ],

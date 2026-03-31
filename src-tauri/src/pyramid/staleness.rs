@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use tracing::{debug, info, warn};
 
 use super::db;
-use super::types::{EvidenceVerdict, StalenessItem, SourceDelta};
+use super::types::{EvidenceVerdict, SourceDelta, StalenessItem};
 
 // ── Public Types ──────────────────────────────────────────────────────────────
 
@@ -154,7 +154,11 @@ pub fn propagate_staleness(
         }
     }
 
-    info!(slug, l0_count = l0_change_types.len(), "Propagating staleness from L0 nodes");
+    info!(
+        slug,
+        l0_count = l0_change_types.len(),
+        "Propagating staleness from L0 nodes"
+    );
 
     // best_scores tracks the highest score propagated through each node across ALL
     // L0 starting points. A node is only re-propagated when a higher score arrives.
@@ -164,7 +168,17 @@ pub fn propagate_staleness(
     for (l0_id, change_type) in &l0_change_types {
         // Start with score 1.0 at the L0 node itself (it changed, so it's fully stale)
         let skip_first_attenuation = change_type.skip_first_attenuation();
-        propagate_from_node(conn, slug, l0_id, 1.0, 0, &mut all_scores, &mut max_depth, &mut best_scores, skip_first_attenuation)?;
+        propagate_from_node(
+            conn,
+            slug,
+            l0_id,
+            1.0,
+            0,
+            &mut all_scores,
+            &mut max_depth,
+            &mut best_scores,
+            skip_first_attenuation,
+        )?;
     }
 
     // Enqueue questions above threshold
@@ -179,7 +193,10 @@ pub fn propagate_staleness(
             affected_questions.push(question_id.clone());
             info!(slug, question_id, score, "Enqueued stale question");
         } else {
-            debug!(slug, question_id, score, threshold, "Below threshold, not enqueued");
+            debug!(
+                slug,
+                question_id, score, threshold, "Below threshold, not enqueued"
+            );
         }
     }
 
@@ -248,7 +265,10 @@ fn propagate_from_node(
     // Safety: stop propagation if we've gone too deep
     let max_propagation_depth = super::Tier3Config::default().staleness_max_propagation_depth;
     if current_depth >= max_propagation_depth {
-        warn!(slug, node_id, current_depth, "Hit max propagation depth, stopping");
+        warn!(
+            slug,
+            node_id, current_depth, "Hit max propagation depth, stopping"
+        );
         return Ok(());
     }
 
@@ -337,11 +357,7 @@ fn normalize_file_path(path: &str) -> String {
 /// Uses the `pyramid_file_hashes` table which stores `node_ids` as a JSON array
 /// keyed by `(slug, file_path)`. The path is normalized before lookup to handle
 /// trailing slashes and `.`/`..` segments.
-fn get_l0_node_ids_for_file(
-    conn: &Connection,
-    slug: &str,
-    file_path: &str,
-) -> Result<Vec<String>> {
+fn get_l0_node_ids_for_file(conn: &Connection, slug: &str, file_path: &str) -> Result<Vec<String>> {
     let normalized = normalize_file_path(file_path);
 
     let result: Result<String, _> = conn.query_row(
@@ -456,8 +472,14 @@ mod tests {
     #[test]
     fn test_change_type_roundtrip() {
         assert_eq!(ChangeType::from_str("addition"), ChangeType::Addition);
-        assert_eq!(ChangeType::from_str("modification"), ChangeType::Modification);
-        assert_eq!(ChangeType::from_str("supersession"), ChangeType::Supersession);
+        assert_eq!(
+            ChangeType::from_str("modification"),
+            ChangeType::Modification
+        );
+        assert_eq!(
+            ChangeType::from_str("supersession"),
+            ChangeType::Supersession
+        );
         assert_eq!(ChangeType::from_str("deletion"), ChangeType::Deletion);
         assert_eq!(ChangeType::from_str("unknown"), ChangeType::Modification); // default
         assert_eq!(ChangeType::Addition.as_str(), "addition");
@@ -480,8 +502,14 @@ mod tests {
         assert_eq!(normalize_file_path("src/./main.rs"), "src/main.rs");
         assert_eq!(normalize_file_path("src/lib/../main.rs"), "src/main.rs");
         assert_eq!(normalize_file_path("src/main.rs/"), "src/main.rs");
-        assert_eq!(normalize_file_path("/abs/path/file.rs"), "/abs/path/file.rs");
-        assert_eq!(normalize_file_path("/abs/path/file.rs/"), "/abs/path/file.rs");
+        assert_eq!(
+            normalize_file_path("/abs/path/file.rs"),
+            "/abs/path/file.rs"
+        );
+        assert_eq!(
+            normalize_file_path("/abs/path/file.rs/"),
+            "/abs/path/file.rs"
+        );
     }
 
     #[test]
@@ -529,7 +557,8 @@ mod tests {
             "INSERT INTO pyramid_file_hashes (slug, file_path, hash, chunk_count, node_ids)
              VALUES (?1, 'src/main.rs', 'abc123', 1, '[\"L0-001\", \"L0-002\"]')",
             rusqlite::params![slug],
-        ).unwrap();
+        )
+        .unwrap();
 
         // Create evidence links: L0-001 → L1-001 (weight 0.95)
         conn.execute(
@@ -624,7 +653,8 @@ mod tests {
             "INSERT INTO pyramid_file_hashes (slug, file_path, hash, chunk_count, node_ids)
              VALUES (?1, 'src/lib.rs', 'def456', 1, '[\"L0-001\"]')",
             rusqlite::params![slug],
-        ).unwrap();
+        )
+        .unwrap();
 
         // L0-001 → L1-001 with weight 0.2 (below default threshold of 0.3)
         conn.execute(
@@ -692,7 +722,8 @@ mod tests {
             "INSERT INTO pyramid_file_hashes (slug, file_path, hash, chunk_count, node_ids)
              VALUES (?1, 'src/deleted.rs', 'del789', 1, '[\"L0-D1\"]')",
             rusqlite::params![slug],
-        ).unwrap();
+        )
+        .unwrap();
 
         // L0-D1 → L1-D1 with weight 0.5 — normally would attenuate to 0.5,
         // but Deletion skips first attenuation so L1-D1 should get 1.0.
@@ -741,12 +772,14 @@ mod tests {
             "INSERT INTO pyramid_file_hashes (slug, file_path, hash, chunk_count, node_ids)
              VALUES (?1, 'src/a.rs', 'aaa', 1, '[\"L0-A\"]')",
             rusqlite::params![slug],
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO pyramid_file_hashes (slug, file_path, hash, chunk_count, node_ids)
              VALUES (?1, 'src/b.rs', 'bbb', 1, '[\"L0-B\"]')",
             rusqlite::params![slug],
-        ).unwrap();
+        )
+        .unwrap();
 
         // L0-A → L1-X with weight 0.3  (score arriving at L1-X = 0.3)
         conn.execute(
@@ -772,8 +805,14 @@ mod tests {
         ).unwrap();
 
         let changed = vec![
-            ChangedFile { path: "src/a.rs".to_string(), change_type: ChangeType::Modification },
-            ChangedFile { path: "src/b.rs".to_string(), change_type: ChangeType::Modification },
+            ChangedFile {
+                path: "src/a.rs".to_string(),
+                change_type: ChangeType::Modification,
+            },
+            ChangedFile {
+                path: "src/b.rs".to_string(),
+                change_type: ChangeType::Modification,
+            },
         ];
         let deltas = detect_source_changes(&conn, slug, &changed).unwrap();
         let report = propagate_staleness(&conn, slug, &deltas, 0.3).unwrap();

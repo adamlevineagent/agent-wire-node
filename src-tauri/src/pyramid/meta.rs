@@ -268,7 +268,7 @@ async fn save_meta_node(
         children: vec![],
         parent_id: None,
         superseded_by: None,
-            build_id: None,
+        build_id: None,
         created_at: String::new(),
     };
 
