@@ -171,6 +171,38 @@ const BLOCKED_COMMANDS = new Set([
     'regenerate_agent_token', 'merge_agents',
 ]);
 
+/** Safe-tier commands that can auto-execute without preview (Pillar 23).
+ *  Navigate commands and read-only queries. Everything else requires approval. */
+const SAFE_COMMANDS = new Set([
+    // Navigation
+    'go_to_pyramids', 'go_to_knowledge', 'go_to_tools', 'go_to_fleet',
+    'go_to_operations', 'go_to_search', 'go_to_compose', 'go_to_dashboard',
+    'go_to_identity', 'go_to_settings', 'go_to_fleet_tasks', 'go_to_fleet_mesh',
+    // Read-only queries
+    'pyramid_list_slugs', 'pyramid_apex', 'pyramid_node', 'pyramid_tree',
+    'pyramid_drill', 'pyramid_search', 'pyramid_get_references',
+    'pyramid_get_composed_view', 'pyramid_list_question_overlays',
+    'pyramid_get_publication_status', 'pyramid_cost_summary', 'pyramid_stale_log',
+    'pyramid_annotations_recent', 'pyramid_faq_directory', 'pyramid_faq_category_drill',
+    'pyramid_get_config', 'pyramid_auto_update_config_get', 'pyramid_auto_update_status',
+    // Read-only system
+    'get_config', 'get_health_status', 'get_node_name', 'is_onboarded',
+    'get_credits', 'get_tunnel_status', 'get_sync_status',
+    'list_my_corpora', 'list_public_corpora',
+    'get_compose_drafts',
+    // Read-only fleet
+    'list_operator_agents',
+]);
+
+/** Check if ALL steps in a plan are safe-tier (can auto-execute without preview) */
+function isAllSafeTier(steps: PlanStep[]): boolean {
+    return steps.every(step => {
+        if (step.navigate) return true; // Legacy navigate is always safe
+        if (!step.command) return false;
+        return SAFE_COMMANDS.has(step.command);
+    });
+}
+
 async function executeStep(
     step: PlanStep,
     _context: PlannerContext,
@@ -233,6 +265,7 @@ export function IntentBar() {
     const inputRef = useRef<HTMLInputElement>(null);
     const cancelRef = useRef(false);
     const completeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    const handleApproveRef = useRef<(() => void) | null>(null);
 
     const isIdle = barState.phase === 'idle';
 
@@ -331,6 +364,43 @@ export function IntentBar() {
                 (w: { type: string }) => KNOWN_WIDGETS.has(w.type),
             );
 
+            // Inject cost preview with per-step classification
+            const hasExistingCostPreview = plan.ui_schema.some(
+                (w: { type: string }) => w.type === 'cost_preview',
+            );
+            if (!hasExistingCostPreview && plan.steps.length > 0) {
+                // Classify each step's cost by looking up dispatch type in vocabulary registry
+                const breakdown: Record<string, unknown> = {};
+                for (const step of plan.steps) {
+                    if (!step.command) {
+                        breakdown[step.description || 'Navigation'] = 'Free';
+                        continue;
+                    }
+                    const entry = vocabRegistry?.[step.command];
+                    if (!entry) {
+                        breakdown[step.description || step.command] = 'Cost varies';
+                        continue;
+                    }
+                    const dt = entry.dispatch?.type;
+                    if (dt === 'navigate') {
+                        breakdown[step.description || step.command] = 'Free';
+                    } else if (dt === 'tauri') {
+                        const isLlm = step.command.includes('build') || step.command.includes('question');
+                        breakdown[step.description || step.command] = isLlm ? 'Local LLM cost' : 'Free';
+                    } else if (dt === 'wire_api' || dt === 'operator_api') {
+                        breakdown[step.description || step.command] = 'Wire credits (dynamic)';
+                    } else {
+                        breakdown[step.description || step.command] = 'Cost varies';
+                    }
+                }
+                const costWidget = {
+                    type: 'cost_preview' as const,
+                    amount: undefined as number | undefined,
+                    breakdown,
+                };
+                plan.ui_schema.unshift(costWidget as typeof plan.ui_schema[number]);
+            }
+
             // Inject publish toggle before the confirmation widget
             const confirmIdx = plan.ui_schema.findIndex(
                 (w: { type: string }) => w.type === 'confirmation',
@@ -347,14 +417,23 @@ export function IntentBar() {
                 plan.ui_schema.push(publishToggle);
             }
 
-            // Phase: Preview
-            setBarState({ phase: 'preview', intent, plan, context });
-            setInput('');
+            // Phase: Preview or Auto-Execute
+            if (state.autoExecute && isAllSafeTier(plan.steps)) {
+                // Safe plan + auto-execute ON → skip preview, execute immediately
+                setBarState({ phase: 'preview', intent, plan, context });
+                setInput('');
+                // Trigger execution in next tick (after state settles)
+                setTimeout(() => handleApproveRef.current?.(), 0);
+            } else {
+                // Effectful plan OR auto-execute OFF → show preview for approval
+                setBarState({ phase: 'preview', intent, plan, context });
+                setInput('');
+            }
         } catch (err) {
             if (cancelRef.current) return;
             setBarState({ phase: 'error', intent, error: String(err) });
         }
-    }, [input, isIdle, wireApiCall, state.creditBalance]);
+    }, [input, isIdle, wireApiCall, state.creditBalance, state.autoExecute]);
 
     const handleApprove = useCallback(async () => {
         if (barState.phase !== 'preview') return;
@@ -394,7 +473,31 @@ export function IntentBar() {
         let aborted = false;
         const accumulatedErrors: NonNullable<OperationEntry['stepErrors']> = [];
 
+        // EXECUTION PATH: Currently always local (node executes steps via vocabulary registry).
+        // When the Wire platform has helper support (platform-managed ephemeral agents),
+        // add a second execution path here:
+        //
+        // if (autoFulfill === 'helpers' && wireHelpersAvailable) {
+        //   // Dispatch chain to Wire: POST /api/v1/wire/action/chain
+        //   // with mode: 'trusted', chain definition from mergedSteps
+        //   // Poll GET /api/v1/wire/action/chain/{chainId}/status every 5s
+        //   // Handle async completion, cancellation, and errors
+        //   // Requires: executeLlmStep on Wire server, async job queue,
+        //   // helper pool infrastructure, chain status endpoint
+        //   // See docs/plans/v2-alpha-sprints/sprint-4-auto-fulfill.md
+        // }
+        //
+        // For now, all execution is local — the node has OpenRouter key + vocabulary registry.
+
         for (let i = 0; i < mergedSteps.length; i++) {
+            // Cancel check — allows stopping mid-execution
+            if (cancelRef.current) {
+                dispatch({ type: 'COMPLETE_OPERATION', id: operationId, error: 'Cancelled by user' });
+                setBarState({ phase: 'error', intent, error: 'Execution cancelled' });
+                aborted = true;
+                break;
+            }
+
             const step = mergedSteps[i];
             setBarState(prev =>
                 prev.phase === 'executing' ? { ...prev, currentStep: i } : prev,
@@ -474,6 +577,9 @@ export function IntentBar() {
             }, 30000);
         }
     }, [barState, dispatch, setMode, navigateView, vocabRegistry, widgetValues, wireApiCall]);
+
+    // Keep ref in sync for auto-execute
+    useEffect(() => { handleApproveRef.current = handleApprove; }, [handleApprove]);
 
     const handlePreviewCancel = useCallback(() => {
         setBarState({ phase: 'idle' });

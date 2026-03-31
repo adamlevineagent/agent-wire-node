@@ -40,6 +40,7 @@ export interface AppState {
     corpusCount: number;
     lastSyncTime: string | null;
     activeOperations: OperationEntry[];
+    autoExecute: boolean;
 }
 
 // --- Actions -----------------------------------------------------------------
@@ -63,7 +64,8 @@ type AppAction =
     | { type: 'ADD_OPERATION'; operation: OperationEntry }
     | { type: 'UPDATE_OPERATION'; id: string; updates: Partial<OperationEntry> }
     | { type: 'COMPLETE_OPERATION'; id: string; result?: unknown; error?: string }
-    | { type: 'DISMISS_OPERATION'; id: string };
+    | { type: 'DISMISS_OPERATION'; id: string }
+    | { type: 'SET_AUTO_EXECUTE'; enabled: boolean };
 
 // --- Initial State -----------------------------------------------------------
 
@@ -98,6 +100,7 @@ const initialState: AppState = {
     corpusCount: 0,
     lastSyncTime: null,
     activeOperations: [],
+    autoExecute: false,
 };
 
 // --- Reducer -----------------------------------------------------------------
@@ -221,6 +224,9 @@ function appReducer(state: AppState, action: AppAction): AppState {
                 ...state,
                 activeOperations: state.activeOperations.filter(op => op.id !== action.id),
             };
+
+        case 'SET_AUTO_EXECUTE':
+            return { ...state, autoExecute: action.enabled };
 
         default:
             return state;

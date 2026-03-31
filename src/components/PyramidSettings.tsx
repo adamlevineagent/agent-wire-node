@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { useAppContext } from '../contexts/AppContext';
 
 interface PyramidConfigInfo {
     api_key_set: boolean;
@@ -7,12 +8,15 @@ interface PyramidConfigInfo {
     primary_model: string;
     fallback_model_1: string;
     fallback_model_2: string;
+    auto_execute: boolean;
 }
 
 export function PyramidSettings() {
+    const { state, dispatch } = useAppContext();
     const [apiKey, setApiKey] = useState('');
     const [authToken, setAuthToken] = useState('');
     const [primaryModel, setPrimaryModel] = useState('');
+    const [autoExecute, setAutoExecute] = useState(false);
     const [configInfo, setConfigInfo] = useState<PyramidConfigInfo | null>(null);
     const [saving, setSaving] = useState(false);
     const [saved, setSaved] = useState(false);
@@ -24,10 +28,12 @@ export function PyramidSettings() {
         try {
             const info = await invoke<PyramidConfigInfo>('pyramid_get_config');
             setConfigInfo(info);
+            setAutoExecute(info.auto_execute);
+            dispatch({ type: 'SET_AUTO_EXECUTE', enabled: info.auto_execute });
         } catch (err) {
             console.error('Failed to fetch pyramid config:', err);
         }
-    }, []);
+    }, [dispatch]);
 
     useEffect(() => {
         fetchConfig();
@@ -41,6 +47,7 @@ export function PyramidSettings() {
                 apiKey: apiKey || '',
                 authToken: authToken || '',
                 ...(primaryModel ? { primaryModel } : {}),
+                autoExecute,
             });
             setSaved(true);
             setTimeout(() => setSaved(false), 2000);
@@ -145,6 +152,25 @@ export function PyramidSettings() {
                         Will change from {configInfo?.primary_model} → {primaryModel} on save
                     </div>
                 )}
+            </div>
+
+            <div className="settings-section">
+                <div className="settings-section-header">Auto-Execute</div>
+                <p className="settings-section-desc">
+                    When enabled, safe plans (navigation, read-only queries) execute immediately
+                    without showing a preview. Plans with costs or side effects always show a preview
+                    for your approval regardless of this setting.
+                </p>
+                <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer' }}>
+                    <input
+                        type="checkbox"
+                        checked={autoExecute}
+                        onChange={(e) => setAutoExecute(e.target.checked)}
+                    />
+                    <span style={{ fontSize: '14px', color: 'var(--text-primary, #e0e0e0)' }}>
+                        Auto-execute safe plans
+                    </span>
+                </label>
             </div>
 
             <div className="settings-section">

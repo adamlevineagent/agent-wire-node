@@ -122,6 +122,11 @@ pub struct PyramidConfig {
     /// WS-ONLINE-G: Daily spend cap for absorb-all builds in credits (default: 100).
     #[serde(default = "default_absorption_daily_cap")]
     pub absorption_daily_spend_cap: u64,
+    /// Sprint 4: Auto-execute toggle. When ON, safe plans (navigation, read-only)
+    /// execute immediately after planning without showing a preview.
+    /// Effectful plans (builds, writes, costs) always show preview regardless.
+    #[serde(default)]
+    pub auto_execute: bool,
 }
 
 fn default_primary_model() -> String {
@@ -356,6 +361,7 @@ impl Default for PyramidConfig {
             operational: OperationalConfig::default(),
             absorption_rate_limit_per_operator: default_absorption_rate_limit(),
             absorption_daily_spend_cap: default_absorption_daily_cap(),
+            auto_execute: false,
         }
     }
 }

@@ -3777,6 +3777,7 @@ async fn pyramid_set_config(
     fallback_model_1: Option<String>,
     fallback_model_2: Option<String>,
     use_ir_executor: Option<bool>,
+    auto_execute: Option<bool>,
 ) -> Result<(), String> {
     // Update in-memory LLM config
     {
@@ -3795,6 +3796,19 @@ async fn pyramid_set_config(
         }
         if let Some(ref model) = fallback_model_2 {
             config.fallback_model_2 = model.clone();
+        }
+    }
+
+    // auto_execute is stored in the PyramidConfig file, not in-memory LlmConfig
+    if let Some(ae) = auto_execute {
+        if let Some(ref data_dir) = state.pyramid.data_dir {
+            let config_path = data_dir.join("pyramid_config.json");
+            if let Ok(contents) = std::fs::read_to_string(&config_path) {
+                if let Ok(mut pconfig) = serde_json::from_str::<serde_json::Value>(&contents) {
+                    pconfig["auto_execute"] = serde_json::Value::Bool(ae);
+                    let _ = std::fs::write(&config_path, serde_json::to_string_pretty(&pconfig).unwrap_or_default());
+                }
+            }
         }
     }
 
@@ -4986,12 +5000,20 @@ async fn pyramid_get_config(
     state: tauri::State<'_, SharedState>,
 ) -> Result<serde_json::Value, String> {
     let config = state.pyramid.config.read().await;
+    // Read auto_execute from PyramidConfig file (not in-memory LlmConfig)
+    let auto_execute = state.pyramid.data_dir.as_ref()
+        .and_then(|d| std::fs::read_to_string(d.join("pyramid_config.json")).ok())
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| v["auto_execute"].as_bool())
+        .unwrap_or(false);
+
     Ok(serde_json::json!({
         "api_key_set": !config.api_key.is_empty(),
         "auth_token_set": !config.auth_token.is_empty(),
         "primary_model": config.primary_model,
         "fallback_model_1": config.fallback_model_1,
         "fallback_model_2": config.fallback_model_2,
+        "auto_execute": auto_execute,
     }))
 }
 
