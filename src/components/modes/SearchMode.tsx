@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
+import { invoke } from '@tauri-apps/api/core';
 import { useAppContext } from '../../contexts/AppContext';
 import { ContributionCard, type ContributionSummary } from '../search/ContributionCard';
 import { EntityBrowser } from '../search/EntityBrowser';
@@ -887,23 +888,175 @@ export function SearchMode() {
 
                 {/* Pyramids tab — discover published pyramids on the Wire */}
                 {activeTab === 'pyramids' && (
-                    <div className="search-pyramids">
-                        <p style={{ color: 'var(--text-secondary)', fontSize: '14px', marginBottom: '16px' }}>
-                            Discover knowledge pyramids published by other operators on the Wire.
-                            Query costs: 1 credit stamp + access price (if set).
-                        </p>
-                        <div style={{ padding: '24px', textAlign: 'center', color: 'var(--text-tertiary)' }}>
-                            <p>Pyramid discovery will search the Wire for published pyramid metadata.</p>
-                            <p style={{ fontSize: '13px', marginTop: '8px' }}>
-                                Use the search bar above with the Pyramids tab selected to find pyramids by topic.
-                            </p>
-                            <p style={{ fontSize: '12px', marginTop: '16px', color: 'var(--text-tertiary)' }}>
-                                Coming: browsable pyramid catalog with access tiers, pricing, and one-click remote query.
-                            </p>
-                        </div>
-                    </div>
+                    <PyramidDiscovery />
                 )}
             </div>
+        </div>
+    );
+}
+
+// --- Pyramid Discovery Component ---
+
+interface DiscoveredPyramid {
+    id: string;
+    title: string;
+    pyramid_slug: string;
+    node_count: number;
+    content_type: string;
+    tunnel_url: string | null;
+    access_tier: string;
+    access_price: number | null;
+    apex_headline: string;
+    citation_count: number;
+    created_at: string;
+}
+
+function PyramidDiscovery() {
+    const { wireApiCall } = useAppContext();
+    const [pyramids, setPyramids] = useState<DiscoveredPyramid[]>([]);
+    const [loading, setLoading] = useState(true);
+    const [error, setError] = useState<string | null>(null);
+    const [queryingSlug, setQueryingSlug] = useState<string | null>(null);
+    const [queryResult, setQueryResult] = useState<unknown>(null);
+
+    useEffect(() => {
+        let cancelled = false;
+        setLoading(true);
+        setError(null);
+
+        wireApiCall('GET', '/api/v1/wire/discover/pyramids?limit=20&sort=popular')
+            .then((data: unknown) => {
+                if (cancelled) return;
+                const items = (data as Record<string, unknown>)?.items;
+                if (Array.isArray(items)) {
+                    setPyramids(items as DiscoveredPyramid[]);
+                } else {
+                    setPyramids([]);
+                }
+            })
+            .catch((err: unknown) => {
+                if (cancelled) return;
+                setError(String(err));
+            })
+            .finally(() => {
+                if (!cancelled) setLoading(false);
+            });
+
+        return () => { cancelled = true; };
+    }, [wireApiCall]);
+
+    const handleQuery = async (p: DiscoveredPyramid) => {
+        if (!p.tunnel_url) return;
+        setQueryingSlug(p.pyramid_slug);
+        setQueryResult(null);
+        try {
+            const result = await invoke('pyramid_remote_query', {
+                tunnelUrl: p.tunnel_url,
+                slug: p.pyramid_slug,
+                action: 'apex',
+            });
+            setQueryResult(result);
+        } catch (err) {
+            setQueryResult({ error: String(err) });
+        } finally {
+            setQueryingSlug(null);
+        }
+    };
+
+    const TIER_COLORS: Record<string, string> = {
+        public: '#10b981',
+        priced: '#f59e0b',
+    };
+    const TYPE_COLORS: Record<string, string> = {
+        code: '#3b82f6',
+        document: '#8b5cf6',
+        question: '#ec4899',
+    };
+
+    return (
+        <div className="search-pyramids">
+            {loading && (
+                <div className="search-loading">
+                    <div className="search-loading-spinner" />
+                    Discovering pyramids on the Wire...
+                </div>
+            )}
+            {error && (
+                <div className="search-error">
+                    <span>{error}</span>
+                    <button className="search-retry-btn" onClick={() => setLoading(true)}>Retry</button>
+                </div>
+            )}
+            {!loading && !error && pyramids.length === 0 && (
+                <div className="search-empty">No published pyramids found on the Wire.</div>
+            )}
+            {!loading && pyramids.length > 0 && (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+                    {pyramids.map(p => (
+                        <div
+                            key={p.id}
+                            style={{
+                                background: 'var(--bg-secondary, #1a1a2e)',
+                                border: '1px solid var(--border-primary, #2a2a4a)',
+                                borderRadius: '8px',
+                                padding: '16px',
+                            }}
+                        >
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '6px', flexWrap: 'wrap' }}>
+                                <span style={{ fontSize: '15px', fontWeight: 600, color: 'var(--text-primary)' }}>
+                                    {p.apex_headline || p.pyramid_slug}
+                                </span>
+                                <span style={{
+                                    fontSize: '11px', fontWeight: 600, padding: '2px 6px', borderRadius: '4px',
+                                    background: TYPE_COLORS[p.content_type] ?? '#6b7280', color: '#fff',
+                                }}>
+                                    {p.content_type}
+                                </span>
+                                <span style={{
+                                    fontSize: '11px', padding: '2px 6px', borderRadius: '4px',
+                                    background: `${TIER_COLORS[p.access_tier] ?? '#6b7280'}22`,
+                                    color: TIER_COLORS[p.access_tier] ?? '#6b7280',
+                                }}>
+                                    {p.access_tier}{p.access_price ? ` · ${p.access_price} credits` : ''}
+                                </span>
+                            </div>
+                            <div style={{ fontSize: '13px', color: 'var(--text-secondary)', marginBottom: '8px' }}>
+                                {p.node_count} nodes · {p.citation_count} citations · {p.pyramid_slug}
+                            </div>
+                            <div style={{ display: 'flex', gap: '8px' }}>
+                                {p.tunnel_url ? (
+                                    <button
+                                        className="btn btn-secondary"
+                                        style={{ fontSize: '12px', padding: '4px 12px' }}
+                                        onClick={() => handleQuery(p)}
+                                        disabled={queryingSlug === p.pyramid_slug}
+                                    >
+                                        {queryingSlug === p.pyramid_slug ? 'Querying...' : 'Query Apex'}
+                                    </button>
+                                ) : (
+                                    <span style={{ fontSize: '12px', color: 'var(--text-tertiary)' }}>
+                                        No tunnel (offline)
+                                    </span>
+                                )}
+                            </div>
+                        </div>
+                    ))}
+                </div>
+            )}
+            {queryResult !== null && (
+                <div style={{
+                    marginTop: '16px', padding: '12px', background: 'var(--bg-tertiary, #0f0f1a)',
+                    borderRadius: '8px', fontSize: '12px', fontFamily: 'monospace',
+                    color: 'var(--text-secondary)', maxHeight: '300px', overflow: 'auto',
+                }}>
+                    <div style={{ marginBottom: '8px', fontSize: '13px', color: 'var(--text-primary)', fontFamily: 'inherit' }}>
+                        Remote Query Result
+                    </div>
+                    <pre style={{ margin: 0, whiteSpace: 'pre-wrap' }}>
+                        {JSON.stringify(queryResult, null, 2).slice(0, 3000)}
+                    </pre>
+                </div>
+            )}
         </div>
     );
 }
