@@ -44,6 +44,14 @@ pub struct LlmConfig {
     pub base_timeout_secs: u64,
     /// Maximum timeout in seconds for LLM calls (loaded from Tier2Config).
     pub max_timeout_secs: u64,
+    /// HTTP status codes that trigger a retry with exponential backoff.
+    pub retryable_status_codes: Vec<u16>,
+    /// Base sleep duration (seconds) between retries before exponential backoff.
+    pub retry_base_sleep_secs: u64,
+    /// Number of prompt characters per timeout increment (for scaling formula).
+    pub timeout_chars_per_increment: usize,
+    /// Seconds added per increment of chars in the timeout scaling formula.
+    pub timeout_increment_secs: u64,
 }
 
 impl Default for LlmConfig {
@@ -59,6 +67,10 @@ impl Default for LlmConfig {
             max_retries: 5,
             base_timeout_secs: 120,
             max_timeout_secs: 600,
+            retryable_status_codes: vec![429, 403, 502, 503],
+            retry_base_sleep_secs: 1,
+            timeout_chars_per_increment: 100_000,
+            timeout_increment_secs: 60,
         }
     }
 }
@@ -70,6 +82,33 @@ pub struct LlmCallOptions {
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
+/// Resolve the context limit for the current model based on config.
+fn resolve_context_limit(model: &str, config: &LlmConfig) -> usize {
+    if model == config.primary_model {
+        config.primary_context_limit
+    } else if model == config.fallback_model_1 {
+        config.fallback_1_context_limit
+    } else {
+        // fallback_model_2 or unknown — use the largest limit
+        config.fallback_1_context_limit.max(config.primary_context_limit)
+    }
+}
+
+/// Estimate token count for pre-flight model selection using tiktoken cl100k_base.
+/// Falls back to len/4 if the tokenizer fails to initialize.
+fn estimate_tokens_llm(system_prompt: &str, user_prompt: &str) -> usize {
+    use std::sync::OnceLock;
+    static BPE: OnceLock<Option<tiktoken_rs::CoreBPE>> = OnceLock::new();
+    let bpe = BPE.get_or_init(|| tiktoken_rs::cl100k_base().ok());
+    match bpe {
+        Some(encoder) => {
+            encoder.encode_with_special_tokens(system_prompt).len()
+                + encoder.encode_with_special_tokens(user_prompt).len()
+        }
+        None => (system_prompt.len() + user_prompt.len()) / 4,
+    }
+}
+
 /// Short model name for logging (part after the slash).
 fn short_name(model: &str) -> &str {
     model.rsplit('/').next().unwrap_or(model)
@@ -80,8 +119,15 @@ fn compute_timeout(
     options: LlmCallOptions,
     base_secs: u64,
     max_secs: u64,
+    chars_per_increment: usize,
+    increment_secs: u64,
 ) -> std::time::Duration {
-    let derived_secs = std::cmp::min(max_secs, base_secs + (prompt_chars / 100_000) as u64 * 60);
+    let increments = if chars_per_increment > 0 {
+        (prompt_chars / chars_per_increment) as u64
+    } else {
+        0
+    };
+    let derived_secs = std::cmp::min(max_secs, base_secs + increments * increment_secs);
     let timeout_secs = options.min_timeout_secs.unwrap_or(0).max(derived_secs);
     std::time::Duration::from_secs(timeout_secs)
 }
@@ -179,7 +225,7 @@ pub async fn call_model_unified_with_options(
 ) -> Result<LlmResponse> {
     // Model selection based on INPUT size only — max_tokens (output budget) is
     // irrelevant to whether the prompt fits in the model's context window.
-    let est_input_tokens = (system_prompt.len() + user_prompt.len()) / 4;
+    let est_input_tokens = estimate_tokens_llm(system_prompt, user_prompt);
 
     let mut use_model = if est_input_tokens > config.fallback_1_context_limit {
         info!("[fallback->{}]", short_name(&config.fallback_model_2));
@@ -194,16 +240,26 @@ pub async fn call_model_unified_with_options(
     let client = reqwest::Client::new();
     let url = "https://openrouter.ai/api/v1/chat/completions";
 
-    // Scale timeout with prompt size: base + 60s per 100K chars, capped at max
+    // Scale timeout with prompt size: base + increment_secs per chars_per_increment, capped at max
     let prompt_chars = system_prompt.len() + user_prompt.len();
     let timeout = compute_timeout(
         prompt_chars,
         options,
         config.base_timeout_secs,
         config.max_timeout_secs,
+        config.timeout_chars_per_increment,
+        config.timeout_increment_secs,
     );
 
     for attempt in 0..config.max_retries {
+        // Compute effective max_tokens: model context limit minus input, capped at 48K output.
+        // Works around OpenRouter counting max_tokens as reserved space.
+        let model_limit = resolve_context_limit(&use_model, config);
+        let effective_max_tokens = model_limit
+            .saturating_sub(est_input_tokens)
+            .min(48_000)
+            .max(1024);
+
         let mut body = serde_json::json!({
             "model": use_model,
             "messages": [
@@ -211,7 +267,7 @@ pub async fn call_model_unified_with_options(
                 {"role": "user", "content": user_prompt}
             ],
             "temperature": temperature,
-            "max_tokens": max_tokens
+            "max_tokens": effective_max_tokens
         });
         if let Some(rf) = response_format {
             body.as_object_mut()
@@ -233,18 +289,19 @@ pub async fn call_model_unified_with_options(
         let resp = match resp {
             Ok(r) => r,
             Err(e) => {
-                if attempt < 4 {
+                if attempt + 1 < config.max_retries {
                     info!(
                         "  request error (timeout={}s, err={}), retry {}...",
                         timeout.as_secs(),
                         e,
                         attempt + 1
                     );
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    tokio::time::sleep(std::time::Duration::from_secs(config.retry_base_sleep_secs)).await;
                     continue;
                 }
                 return Err(anyhow!(
-                    "Request failed after 5 attempts (timeout={}s): {}",
+                    "Request failed after {} attempts (timeout={}s): {}",
+                    config.max_retries,
                     timeout.as_secs(),
                     e
                 ));
@@ -253,29 +310,63 @@ pub async fn call_model_unified_with_options(
 
         let status = resp.status().as_u16();
 
-        // HTTP 400: cascade to next model if not already on last fallback
-        if status == 400 && use_model != config.fallback_model_2 {
-            let prev_model = use_model.clone();
-            if use_model == config.primary_model {
-                use_model = config.fallback_model_1.clone();
+        // HTTP 400: read body, only cascade on context-exceeded errors
+        if status == 400 {
+            let body_400 = resp.text().await.unwrap_or_default();
+            warn!(
+                "[LLM] HTTP 400 from {} — body: {}",
+                short_name(&use_model),
+                &body_400[..body_400.len().min(500)],
+            );
+
+            let body_lower = body_400.to_lowercase();
+            let is_context_exceeded = body_lower.contains("context")
+                || body_lower.contains("too many tokens")
+                || body_lower.contains("token limit");
+
+            if is_context_exceeded && use_model != config.fallback_model_2 {
+                let prev_model = use_model.clone();
+                if use_model == config.primary_model {
+                    use_model = config.fallback_model_1.clone();
+                } else {
+                    use_model = config.fallback_model_2.clone();
+                }
+                if response_format.is_some() {
+                    warn!(
+                        "[LLM] Context exceeded with response_format set — cascading from {} to {} (structured output may not be supported on fallback model)",
+                        short_name(&prev_model),
+                        short_name(&use_model),
+                    );
+                } else {
+                    warn!(
+                        "[LLM] Context exceeded on {}, cascading to {}",
+                        short_name(&prev_model),
+                        short_name(&use_model),
+                    );
+                }
+                continue;
             } else {
-                use_model = config.fallback_model_2.clone();
-            }
-            if response_format.is_some() {
+                // Not context-related 400 — fall through to retry/backoff on same model
                 warn!(
-                    "[LLM] HTTP 400 with response_format set — cascading from {} to {} (structured output may not be supported on fallback model)",
-                    short_name(&prev_model),
+                    "[LLM] HTTP 400 (not context-exceeded) from {}: retrying on same model",
                     short_name(&use_model),
                 );
-            } else {
-                info!("[400->{}]", short_name(&use_model));
+                if attempt + 1 < config.max_retries {
+                    let wait = config.retry_base_sleep_secs * 2u64.pow(attempt + 1);
+                    tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+                    continue;
+                }
+                return Err(anyhow!(
+                    "HTTP 400 (not context-exceeded) after {} attempts: {}",
+                    config.max_retries,
+                    &body_400[..body_400.len().min(500)],
+                ));
             }
-            continue;
         }
 
-        // Retryable HTTP errors with exponential backoff
-        if matches!(status, 429 | 403 | 502 | 503) {
-            let wait = 2u64.pow(attempt + 1);
+        // Retryable HTTP errors with exponential backoff (status codes from config)
+        if config.retryable_status_codes.contains(&status) {
+            let wait = config.retry_base_sleep_secs * 2u64.pow(attempt + 1);
             info!("  HTTP {}, waiting {}s...", status, wait);
             tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
             continue;
@@ -284,28 +375,28 @@ pub async fn call_model_unified_with_options(
         // Other non-success status
         if !resp.status().is_success() {
             let body_text = resp.text().await.unwrap_or_default();
-            if attempt < 4 {
+            if attempt + 1 < config.max_retries {
                 info!("  HTTP {}, retry {}...", status, attempt + 1);
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                tokio::time::sleep(std::time::Duration::from_secs(config.retry_base_sleep_secs)).await;
                 continue;
             }
-            return Err(anyhow!("HTTP {} after 5 attempts: {}", status, body_text));
+            return Err(anyhow!("HTTP {} after {} attempts: {}", status, config.max_retries, body_text));
         }
 
         let body_text = match resp.text().await {
             Ok(text) => text,
             Err(e) => {
-                if attempt < 4 {
+                if attempt + 1 < config.max_retries {
                     info!(
                         "  response-read error (timeout={}s, err={}), retry {}...",
                         timeout.as_secs(),
                         e,
                         attempt + 1
                     );
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    tokio::time::sleep(std::time::Duration::from_secs(config.retry_base_sleep_secs)).await;
                     continue;
                 }
-                return Err(anyhow!("Failed to read response after 5 attempts: {}", e));
+                return Err(anyhow!("Failed to read response after {} attempts: {}", config.max_retries, e));
             }
         };
 
@@ -319,12 +410,12 @@ pub async fn call_model_unified_with_options(
                     attempt + 1,
                     e
                 );
-                if attempt < 4 {
+                if attempt + 1 < config.max_retries {
                     info!("  parse error, retry {}...", attempt + 1);
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    tokio::time::sleep(std::time::Duration::from_secs(config.retry_base_sleep_secs)).await;
                     continue;
                 }
-                return Err(anyhow!("Failed to parse response after 5 attempts: {}", e));
+                return Err(anyhow!("Failed to parse response after {} attempts: {}", config.max_retries, e));
             }
         };
 
@@ -365,12 +456,12 @@ pub async fn call_model_unified_with_options(
                 });
             }
             None => {
-                if attempt < 4 {
+                if attempt + 1 < config.max_retries {
                     info!("  null content, retry {}...", attempt + 1);
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    tokio::time::sleep(std::time::Duration::from_secs(config.retry_base_sleep_secs)).await;
                     continue;
                 }
-                return Err(anyhow!("Model returned null content after 5 attempts"));
+                return Err(anyhow!("Model returned null content after {} attempts", config.max_retries));
             }
         }
     }
@@ -678,12 +769,47 @@ mod tests {
 
     #[test]
     fn test_compute_timeout_respects_min_timeout_floor() {
+        let defaults = LlmConfig::default();
         let timeout = compute_timeout(
             33_000,
             LlmCallOptions {
                 min_timeout_secs: Some(420),
             },
+            defaults.base_timeout_secs,
+            defaults.max_timeout_secs,
+            defaults.timeout_chars_per_increment,
+            defaults.timeout_increment_secs,
         );
         assert_eq!(timeout.as_secs(), 420);
+    }
+
+    #[test]
+    fn test_compute_timeout_scales_with_prompt_size() {
+        let defaults = LlmConfig::default();
+        // 200k chars = 2 increments * 60s = 120s added to base 120s = 240s
+        let timeout = compute_timeout(
+            200_000,
+            LlmCallOptions::default(),
+            defaults.base_timeout_secs,
+            defaults.max_timeout_secs,
+            defaults.timeout_chars_per_increment,
+            defaults.timeout_increment_secs,
+        );
+        assert_eq!(timeout.as_secs(), 240);
+    }
+
+    #[test]
+    fn test_compute_timeout_capped_at_max() {
+        let defaults = LlmConfig::default();
+        // Very large prompt should be capped at max_timeout_secs (600)
+        let timeout = compute_timeout(
+            10_000_000,
+            LlmCallOptions::default(),
+            defaults.base_timeout_secs,
+            defaults.max_timeout_secs,
+            defaults.timeout_chars_per_increment,
+            defaults.timeout_increment_secs,
+        );
+        assert_eq!(timeout.as_secs(), 600);
     }
 }

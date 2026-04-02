@@ -31,7 +31,7 @@ pub fn open_pyramid_connection(path: &std::path::Path) -> Result<Connection> {
     let conn = Connection::open(path)
         .with_context(|| format!("Failed to open pyramid connection at {}", path.display()))?;
     conn.execute_batch(
-        "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;",
+        "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=10000;",
     )?;
     Ok(conn)
 }
@@ -43,7 +43,7 @@ pub fn open_pyramid_connection(path: &std::path::Path) -> Result<Connection> {
 /// Enables WAL mode and foreign keys, then creates all five tables with
 /// proper constraints and indices.
 pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
+    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=10000;")?;
 
     // 11-R: CASCADE DELETEs on FK constraints below only fire when a slug row is
     // physically DELETEd, which only happens via admin-only `purge_slug`.

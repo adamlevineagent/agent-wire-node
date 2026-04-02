@@ -2318,7 +2318,7 @@ async fn handle_build(
         failures: 0,
     }));
 
-    {
+    let layer_state_for_build = {
         let mut active = state.active_build.write().await;
         if let Some(handle) = active.get(&slug_name) {
             let s = handle.status.read().await;
@@ -2332,17 +2332,32 @@ async fn handle_build(
             }
         }
 
+        let layer_state = std::sync::Arc::new(tokio::sync::RwLock::new(
+            super::types::BuildLayerState::default(),
+        ));
+        let layer_state_for_build = layer_state.clone();
         let handle = super::BuildHandle {
             slug: slug_name.clone(),
             cancel: cancel.clone(),
             status: status.clone(),
+            layer_state,
             started_at: std::time::Instant::now(),
         };
         active.insert(slug_name.clone(), handle);
-    }
+        layer_state_for_build
+    };
 
-    // Spawn the build task
-    let build_state = state.clone();
+    // Spawn the build task with its own reader connection so it doesn't
+    // compete with CLI/frontend queries for the shared reader Mutex.
+    let build_state = match state.with_build_reader() {
+        Ok(s) => s,
+        Err(e) => {
+            return Ok(json_error(
+                warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Failed to create build reader: {e}"),
+            ));
+        }
+    };
     let writer = state.writer.clone();
     let build_status = status.clone();
 
@@ -2415,6 +2430,56 @@ async fn handle_build(
             }
         });
 
+        // Create layer event channel for build visualization v2
+        let (layer_tx, mut layer_rx) =
+            tokio::sync::mpsc::channel::<super::types::LayerEvent>(256);
+        let layer_drain_state = layer_state_for_build;
+        let layer_drain_handle = tokio::spawn(async move {
+            use super::types::{LayerEvent, LayerProgress, LogEntry, NodeStatus};
+            while let Some(event) = layer_rx.recv().await {
+                let mut st = layer_drain_state.write().await;
+                match event {
+                    LayerEvent::Discovered { depth, step_name, estimated_nodes } => {
+                        st.layers.push(LayerProgress {
+                            depth, step_name, estimated_nodes,
+                            completed_nodes: 0, failed_nodes: 0,
+                            status: "pending".into(),
+                            nodes: if estimated_nodes <= 50 { Some(Vec::new()) } else { None },
+                        });
+                    }
+                    LayerEvent::NodeCompleted { depth, step_name, node_id, label } => {
+                        if let Some(layer) = st.layers.iter_mut().find(|l| l.depth == depth && l.step_name == step_name) {
+                            layer.completed_nodes += 1;
+                            layer.status = "active".into();
+                            if let Some(ref mut nodes) = layer.nodes {
+                                nodes.push(NodeStatus { node_id, status: "complete".into(), label });
+                            }
+                        }
+                    }
+                    LayerEvent::NodeFailed { depth, step_name, node_id } => {
+                        if let Some(layer) = st.layers.iter_mut().find(|l| l.depth == depth && l.step_name == step_name) {
+                            layer.failed_nodes += 1;
+                            if let Some(ref mut nodes) = layer.nodes {
+                                nodes.push(NodeStatus { node_id, status: "failed".into(), label: None });
+                            }
+                        }
+                    }
+                    LayerEvent::LayerCompleted { depth, step_name } => {
+                        if let Some(layer) = st.layers.iter_mut().find(|l| l.depth == depth && l.step_name == step_name) {
+                            layer.status = "complete".into();
+                        }
+                    }
+                    LayerEvent::StepStarted { step_name } => {
+                        st.current_step = Some(step_name);
+                    }
+                    LayerEvent::Log { elapsed_secs, message } => {
+                        st.log.push_back(LogEntry { elapsed_secs, message });
+                        if st.log.len() > 200 { st.log.pop_front(); }
+                    }
+                }
+            }
+        });
+
         // Unified build dispatch — chain engine or legacy based on feature flag
         let result = super::build_runner::run_build_from(
             &build_state,
@@ -2423,14 +2488,17 @@ async fn handle_build(
             &cancel,
             Some(progress_tx.clone()),
             &write_tx,
+            Some(layer_tx.clone()),
         )
         .await;
 
         // Drop the write sender so the writer task can finish
         drop(write_tx);
         drop(progress_tx);
+        drop(layer_tx);
         let _ = writer_handle.await;
         let _ = progress_handle.await;
+        let _ = layer_drain_handle.await;
 
         // Update final status
         {
@@ -4401,13 +4469,25 @@ async fn handle_question_build(
             slug: slug_name.clone(),
             cancel: cancel.clone(),
             status: status.clone(),
+            layer_state: std::sync::Arc::new(tokio::sync::RwLock::new(
+                super::types::BuildLayerState::default(),
+            )),
             started_at: std::time::Instant::now(),
         };
         active.insert(slug_name.clone(), handle);
     }
 
-    // Spawn the build task
-    let build_state = state.clone();
+    // Spawn the build task with its own reader connection so it doesn't
+    // compete with CLI/frontend queries for the shared reader Mutex.
+    let build_state = match state.with_build_reader() {
+        Ok(s) => s,
+        Err(e) => {
+            return Ok(json_error(
+                warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Failed to create build reader: {e}"),
+            ));
+        }
+    };
     let build_status = status.clone();
     let question = body.question.clone();
     let granularity = body.granularity;
@@ -5145,6 +5225,7 @@ async fn handle_check_staleness(
     let threshold = body
         .threshold
         .unwrap_or(state.operational.tier2.staleness_threshold);
+    let dequeue_cap = state.operational.tier2.staleness_queue_dequeue_cap;
 
     // Determine changed files: explicit body or auto-detect from pending mutations
     let (changed_files, source) = {
@@ -5178,7 +5259,7 @@ async fn handle_check_staleness(
     let slug_owned = slug_name.clone();
     let result = tokio::task::spawn_blocking(move || {
         let c = conn.blocking_lock();
-        staleness_bridge::run_staleness_check(&c, &slug_owned, &changed_files, threshold)
+        staleness_bridge::run_staleness_check(&c, &slug_owned, &changed_files, threshold, dequeue_cap)
     })
     .await;
 

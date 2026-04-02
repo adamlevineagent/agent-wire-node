@@ -48,6 +48,11 @@ pub const VALID_PRIMITIVES: &[&str] = &[
     "price",
     "metabolize",
     "embody",
+    // Sub-chain flow control
+    "container",
+    "split",
+    "loop",
+    "gate",
     // Escape hatch
     "custom",
 ];
@@ -156,6 +161,43 @@ pub struct ChainStep {
     #[serde(default)]
     pub merge_instruction: Option<String>,
     #[serde(default)]
+    pub batch_size: Option<usize>,
+    /// Token-aware batch sizing. When set, batches are filled greedily until
+    /// either batch_max_tokens or batch_size would be exceeded.
+    #[serde(default)]
+    pub batch_max_tokens: Option<usize>,
+    /// Field-level projection: only send these top-level fields from each item to the LLM.
+    #[serde(default)]
+    pub item_fields: Option<Vec<String>>,
+    /// When set, skip clustering and go straight to synthesis if node count <= this threshold.
+    /// When None, rely on apex_ready signal only (no hardcoded threshold).
+    #[serde(default)]
+    pub direct_synthesis_threshold: Option<usize>,
+    /// What to do when clustering fails to converge: "retry", "force_merge", or "abort".
+    #[serde(default)]
+    pub convergence_fallback: Option<String>,
+    /// What to do when a cluster LLM call fails: "positional(N)", "retry(N)", or "abort".
+    #[serde(default)]
+    pub cluster_on_error: Option<String>,
+    /// Positional fallback group size (only used with cluster_on_error = "positional(N)").
+    #[serde(default)]
+    pub cluster_fallback_size: Option<usize>,
+    /// Field-level projection for the clustering sub-call specifically.
+    #[serde(default)]
+    pub cluster_item_fields: Option<Vec<String>>,
+    /// If a for_each item exceeds this token count, split it into sub-chunks.
+    #[serde(default)]
+    pub max_input_tokens: Option<usize>,
+    /// How to split oversized items: "sections" (default), "lines", or "tokens".
+    #[serde(default)]
+    pub split_strategy: Option<String>,
+    /// Token overlap between adjacent sub-chunks for context continuity.
+    #[serde(default)]
+    pub split_overlap_tokens: Option<usize>,
+    /// Whether to merge sub-chunk extraction results into one output (default: true when max_input_tokens is set).
+    #[serde(default)]
+    pub split_merge: Option<bool>,
+    #[serde(default)]
     pub when: Option<String>,
     #[serde(default)]
     pub on_error: Option<String>,
@@ -177,6 +219,16 @@ pub struct ChainStep {
     /// Valid values: "file_level_connections", "cross_thread_connections", "cross_subsystem_connections"
     #[serde(default)]
     pub enrichments: Vec<String>,
+    /// Sub-chain: inner steps executed sequentially within this container step.
+    #[serde(default)]
+    pub steps: Option<Vec<ChainStep>>,
+    /// Loop termination condition (evaluated via evaluate_when). Used with primitive: "loop".
+    #[serde(default)]
+    pub until: Option<String>,
+    /// Gate break signal. When true on a "gate" primitive, exits the enclosing loop.
+    /// Named break_loop because "break" is a Rust keyword.
+    #[serde(default, rename = "break")]
+    pub break_loop: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -438,6 +490,18 @@ mod tests {
                 response_schema: None,
                 batch_threshold: None,
                 merge_instruction: None,
+                batch_size: None,
+                batch_max_tokens: None,
+                item_fields: None,
+                direct_synthesis_threshold: None,
+                convergence_fallback: None,
+                cluster_on_error: None,
+                cluster_fallback_size: None,
+                cluster_item_fields: None,
+                max_input_tokens: None,
+                split_strategy: None,
+                split_overlap_tokens: None,
+                split_merge: None,
                 when: None,
                 on_error: None,
                 save_as: None,
@@ -447,6 +511,10 @@ mod tests {
                 max_thread_size: None,
                 context: None,
                 compact_inputs: false,
+                enrichments: vec![],
+                steps: None,
+                until: None,
+                break_loop: None,
             }],
             post_build: vec![],
         }

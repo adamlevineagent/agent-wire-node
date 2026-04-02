@@ -3291,7 +3291,7 @@ async fn post_build_seed(
 
     if !source_paths.is_empty() {
         let mut watcher =
-            wire_node_lib::pyramid::watcher::PyramidFileWatcher::new(slug, source_paths);
+            wire_node_lib::pyramid::watcher::PyramidFileWatcher::new(slug, source_paths, &pyramid_state.operational.tier2);
 
         // Create mutation channel and wire it to the stale engine
         let (mutation_tx, mut mutation_rx) =
@@ -3456,19 +3456,6 @@ async fn pyramid_build(
     state: tauri::State<'_, SharedState>,
     slug: String,
 ) -> Result<BuildStatus, String> {
-    // Check if a build is already running
-    {
-        let active = state.pyramid.active_build.read().await;
-        if let Some(handle) = active.get(&slug) {
-            let s = handle.status.read().await;
-            let is_terminal = s.is_terminal();
-            drop(s);
-            if !handle.cancel.is_cancelled() && !is_terminal {
-                return Err("Build already running for this slug".to_string());
-            }
-        }
-    }
-
     // Verify slug exists
     {
         let conn = state.pyramid.reader.lock().await;
@@ -3486,21 +3473,42 @@ async fn pyramid_build(
         failures: 0,
     }));
 
-    let handle = wire_node_lib::pyramid::BuildHandle {
-        slug: slug.clone(),
-        cancel: cancel.clone(),
-        status: status.clone(),
-        started_at: std::time::Instant::now(),
-    };
-
-    {
+    // Use write lock for atomic check-and-set (prevents TOCTOU race where two
+    // rapid build requests both pass the "is already running" check).
+    let layer_state_for_build = {
         let mut active = state.pyramid.active_build.write().await;
+        if let Some(handle) = active.get(&slug) {
+            let s = handle.status.read().await;
+            let is_terminal = s.is_terminal();
+            drop(s);
+            if !handle.cancel.is_cancelled() && !is_terminal {
+                return Err("Build already running for this slug".to_string());
+            }
+        }
+
+        let layer_state = std::sync::Arc::new(tokio::sync::RwLock::new(
+            wire_node_lib::pyramid::types::BuildLayerState::default(),
+        ));
+        let layer_state_for_build = layer_state.clone();
+        let handle = wire_node_lib::pyramid::BuildHandle {
+            slug: slug.clone(),
+            cancel: cancel.clone(),
+            status: status.clone(),
+            layer_state,
+            started_at: std::time::Instant::now(),
+        };
         active.insert(slug.clone(), handle);
-    }
+        layer_state_for_build
+    };
 
     let writer = state.pyramid.writer.clone();
     let build_status = status.clone();
-    let pyramid_state = state.pyramid.clone(); // Arc<PyramidState> for post-build seeding
+    // Create a build-scoped PyramidState with its own reader connection so the
+    // build doesn't compete with CLI/frontend queries for the shared reader Mutex.
+    let pyramid_state = state
+        .pyramid
+        .with_build_reader()
+        .map_err(|e| format!("Failed to create build reader: {e}"))?;
 
     let build_task_handle = tokio::spawn(async move {
         let start = std::time::Instant::now();
@@ -3580,6 +3588,56 @@ async fn pyramid_build(
             }
         });
 
+        // Create layer event channel for build visualization v2
+        let (layer_tx, mut layer_rx) =
+            tokio::sync::mpsc::channel::<wire_node_lib::pyramid::types::LayerEvent>(256);
+        let layer_drain_state = layer_state_for_build;
+        let layer_drain_handle = tokio::spawn(async move {
+            use wire_node_lib::pyramid::types::{LayerEvent, LayerProgress, LogEntry, NodeStatus};
+            while let Some(event) = layer_rx.recv().await {
+                let mut state = layer_drain_state.write().await;
+                match event {
+                    LayerEvent::Discovered { depth, step_name, estimated_nodes } => {
+                        state.layers.push(LayerProgress {
+                            depth, step_name, estimated_nodes,
+                            completed_nodes: 0, failed_nodes: 0,
+                            status: "pending".into(),
+                            nodes: if estimated_nodes <= 50 { Some(Vec::new()) } else { None },
+                        });
+                    }
+                    LayerEvent::NodeCompleted { depth, step_name, node_id, label } => {
+                        if let Some(layer) = state.layers.iter_mut().find(|l| l.depth == depth && l.step_name == step_name) {
+                            layer.completed_nodes += 1;
+                            layer.status = "active".into();
+                            if let Some(ref mut nodes) = layer.nodes {
+                                nodes.push(NodeStatus { node_id, status: "complete".into(), label });
+                            }
+                        }
+                    }
+                    LayerEvent::NodeFailed { depth, step_name, node_id } => {
+                        if let Some(layer) = state.layers.iter_mut().find(|l| l.depth == depth && l.step_name == step_name) {
+                            layer.failed_nodes += 1;
+                            if let Some(ref mut nodes) = layer.nodes {
+                                nodes.push(NodeStatus { node_id, status: "failed".into(), label: None });
+                            }
+                        }
+                    }
+                    LayerEvent::LayerCompleted { depth, step_name } => {
+                        if let Some(layer) = state.layers.iter_mut().find(|l| l.depth == depth && l.step_name == step_name) {
+                            layer.status = "complete".into();
+                        }
+                    }
+                    LayerEvent::StepStarted { step_name } => {
+                        state.current_step = Some(step_name);
+                    }
+                    LayerEvent::Log { elapsed_secs, message } => {
+                        state.log.push_back(LogEntry { elapsed_secs, message });
+                        if state.log.len() > 200 { state.log.pop_front(); }
+                    }
+                }
+            }
+        });
+
         // Unified build dispatch — chain engine or legacy based on feature flag
         let result = wire_node_lib::pyramid::build_runner::run_build(
             &pyramid_state,
@@ -3587,6 +3645,7 @@ async fn pyramid_build(
             &cancel,
             Some(progress_tx.clone()),
             &write_tx,
+            Some(layer_tx.clone()),
         )
         .await;
 
@@ -3602,8 +3661,10 @@ async fn pyramid_build(
         // Drop senders so tasks finish
         drop(write_tx);
         drop(progress_tx);
+        drop(layer_tx);
         let _ = writer_handle.await;
         let _ = progress_handle.await;
+        let _ = layer_drain_handle.await;
 
         // Update final status
         {
@@ -3699,6 +3760,33 @@ async fn pyramid_build_status(
         elapsed_seconds: 0.0,
         failures: 0,
     })
+}
+
+#[tauri::command]
+async fn pyramid_build_progress_v2(
+    state: tauri::State<'_, SharedState>,
+    slug: String,
+) -> Result<wire_node_lib::pyramid::types::BuildProgressV2, String> {
+    let active = state.pyramid.active_build.read().await;
+    if let Some(handle) = active.get(&slug) {
+        let status = handle.status.read().await;
+        let layer_state = handle.layer_state.read().await;
+        Ok(wire_node_lib::pyramid::types::BuildProgressV2 {
+            done: status.progress.done,
+            total: status.progress.total,
+            layers: layer_state.layers.clone(),
+            current_step: layer_state.current_step.clone(),
+            log: layer_state.log.iter().cloned().collect(),
+        })
+    } else {
+        Ok(wire_node_lib::pyramid::types::BuildProgressV2 {
+            done: 0,
+            total: 0,
+            layers: vec![],
+            current_step: None,
+            log: vec![],
+        })
+    }
 }
 
 #[tauri::command]
@@ -4199,13 +4287,20 @@ async fn pyramid_question_build(
             slug: slug.clone(),
             cancel: cancel.clone(),
             status: status.clone(),
+            layer_state: std::sync::Arc::new(tokio::sync::RwLock::new(
+                wire_node_lib::pyramid::types::BuildLayerState::default(),
+            )),
             started_at: std::time::Instant::now(),
         };
         active.insert(slug.clone(), handle);
     }
 
-    // Spawn the build task
-    let pyramid_state = state.pyramid.clone();
+    // Spawn the build task with its own reader connection so the build
+    // doesn't compete with CLI/frontend queries for the shared reader Mutex.
+    let pyramid_state = state
+        .pyramid
+        .with_build_reader()
+        .map_err(|e| format!("Failed to create build reader: {e}"))?;
     let build_status = status.clone();
     let build_question = question.clone();
     let build_slug = slug.clone();
@@ -4704,6 +4799,7 @@ async fn pyramid_check_staleness(
     use wire_node_lib::pyramid::staleness_bridge;
 
     let threshold = threshold.unwrap_or(state.pyramid.operational.tier2.staleness_threshold);
+    let dequeue_cap = state.pyramid.operational.tier2.staleness_queue_dequeue_cap;
 
     // Determine changed files: explicit or auto-detect
     let (changed_files, source) = {
@@ -4729,7 +4825,7 @@ async fn pyramid_check_staleness(
     let slug_owned = slug.clone();
     let result = tokio::task::spawn_blocking(move || {
         let c = conn.blocking_lock();
-        staleness_bridge::run_staleness_check(&c, &slug_owned, &changed_files, threshold)
+        staleness_bridge::run_staleness_check(&c, &slug_owned, &changed_files, threshold, dequeue_cap)
     })
     .await;
 
@@ -5166,34 +5262,12 @@ async fn pyramid_vine_build(
         );
     }
 
-    let pyramid_state = Arc::new(wire_node_lib::pyramid::PyramidState {
-        reader: state.pyramid.reader.clone(),
-        writer: state.pyramid.writer.clone(),
-        config: state.pyramid.config.clone(),
-        active_build: state.pyramid.active_build.clone(),
-        data_dir: state.pyramid.data_dir.clone(),
-        stale_engines: state.pyramid.stale_engines.clone(),
-        file_watchers: state.pyramid.file_watchers.clone(),
-        vine_builds: state.pyramid.vine_builds.clone(),
-        use_chain_engine: std::sync::atomic::AtomicBool::new(
-            state
-                .pyramid
-                .use_chain_engine
-                .load(std::sync::atomic::Ordering::Relaxed),
-        ),
-        use_ir_executor: std::sync::atomic::AtomicBool::new(
-            state
-                .pyramid
-                .use_ir_executor
-                .load(std::sync::atomic::Ordering::Relaxed),
-        ),
-        event_bus: state.pyramid.event_bus.clone(),
-        operational: state.pyramid.operational.clone(),
-        chains_dir: state.pyramid.chains_dir.clone(),
-        remote_query_rate_limiter: state.pyramid.remote_query_rate_limiter.clone(),
-        absorption_build_rate_limiter: state.pyramid.absorption_build_rate_limiter.clone(),
-        absorption_daily_spend: state.pyramid.absorption_daily_spend.clone(),
-    });
+    // Use a build-scoped reader so the vine build doesn't compete with
+    // CLI/frontend queries for the shared reader Mutex.
+    let pyramid_state = state
+        .pyramid
+        .with_build_reader()
+        .map_err(|e| format!("Failed to create build reader: {e}"))?;
 
     let slug_for_task = vine_slug_clean.clone();
     let vine_builds = state.pyramid.vine_builds.clone();
@@ -6022,9 +6096,21 @@ fn main() {
 
     tracing::info!("chains_dir resolved to {:?}", chains_dir);
 
-    // Ensure default chain YAML files exist on disk (needed for release-mode bootstrapping)
-    if let Err(e) = wire_node_lib::pyramid::chain_loader::ensure_default_chains(&chains_dir) {
-        tracing::warn!("Failed to write default chain files: {e}");
+    // Sync chain files: source tree → data dir if available, else bootstrap with embedded defaults.
+    // In debug mode, chains_dir already points to the source tree so no sync needed.
+    // In release mode, we check if the source tree exists alongside the binary.
+    #[cfg(debug_assertions)]
+    let source_chains_for_sync: Option<&std::path::Path> = None; // chains_dir IS the source tree
+    #[cfg(not(debug_assertions))]
+    let source_chains_for_sync = {
+        let src = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../chains");
+        if src.exists() { Some(src) } else { None }
+    };
+    if let Err(e) = wire_node_lib::pyramid::chain_loader::ensure_default_chains(
+        &chains_dir,
+        source_chains_for_sync.as_deref(),
+    ) {
+        tracing::warn!("Failed to sync chain files: {e}");
     }
 
     let pyramid_state = Arc::new(wire_node_lib::pyramid::PyramidState {
@@ -6828,6 +6914,7 @@ fn main() {
             pyramid_get_composed_view,
             pyramid_build,
             pyramid_build_status,
+            pyramid_build_progress_v2,
             pyramid_build_cancel,
             pyramid_build_force_reset,
             pyramid_vine_build,

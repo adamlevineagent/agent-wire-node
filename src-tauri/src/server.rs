@@ -249,7 +249,7 @@ pub async fn init_stale_engines(pyramid_state: &Arc<pyramid::PyramidState>) {
         };
 
         if !source_paths.is_empty() {
-            let mut watcher = PyramidFileWatcher::new(&slug, source_paths);
+            let mut watcher = PyramidFileWatcher::new(&slug, source_paths, &pyramid_state.operational.tier2);
             watcher.set_mutation_sender(mutation_tx.clone());
             match watcher.start(&db_path) {
                 Ok(()) => {

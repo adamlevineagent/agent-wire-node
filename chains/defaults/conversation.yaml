@@ -1,32 +1,30 @@
-# Conversation Pipeline Chain Definition — Maximal Design
+# Conversation Pipeline Chain Definition v3.0.0
 #
-# The forward/reverse/combine pattern is preserved — it's the best
-# compression strategy for sequential content.
-#
-# The KEY CHANGE: after L0 combine, we go directly to semantic thread
-# clustering instead of blind positional pairing. This groups topics
-# across chunks by subject, producing L1 nodes that are coherent
-# knowledge areas instead of arbitrary chunk pairs.
+# Forward/reverse/combine is the compression pattern for sequential content.
+# After L0 combine, batched semantic thread clustering groups topics by
+# subject across chunks. LLM-driven convergence with apex_ready signal.
 #
 # Pipeline:
 #   1. Forward pass (sequential, context-accumulating)
 #   2. Reverse pass (sequential, backward annotation)
 #   3. Combine → L0 nodes (fuse forward + reverse)
-#   4. Thread clustering (LLM groups L0 topics by subject)
+#   4. Batched thread clustering (field-projected, token-aware)
 #   5. Thread synthesis → L1 nodes (per-thread, temporally-ordered)
 #   6. L1 cross-layer webbing
-#   7. Upper layers (recursive clustering → apex)
+#   7. Upper layers (recursive clustering → apex, with apex_ready)
 #   8. L2 cross-layer webbing
+#
+# All intelligence in YAML and prompts. Rust is a dumb execution engine.
 
 schema_version: 1
 id: conversation-default
 name: Conversation Pyramid
 description: >
-  Conversation analysis with forward/reverse compression, semantic thread
-  clustering (replacing blind L1 pairing), temporally-ordered synthesis,
-  cross-layer webbing, and recursive clustering to apex.
+  Conversation analysis with forward/reverse compression, batched semantic
+  thread clustering with field projection, temporally-ordered synthesis,
+  and LLM-driven convergence to apex. All decisions in YAML.
 content_type: conversation
-version: "2.0.0"
+version: "3.0.0"
 author: agent-wire
 
 defaults:
@@ -36,7 +34,6 @@ defaults:
 
 steps:
   # ── Step 1: Forward pass ────────────────────────────────────────────
-  # Sequential chronological compression with running context.
   - name: forward_pass
     primitive: compress
     instruction: "$prompts/conversation/forward.md"
@@ -54,7 +51,6 @@ steps:
     depth: -1
 
   # ── Step 2: Reverse pass ────────────────────────────────────────────
-  # Sequential backward annotation — marks what mattered vs noise.
   - name: reverse_pass
     primitive: compress
     instruction: "$prompts/conversation/reverse.md"
@@ -72,12 +68,16 @@ steps:
     depth: -1
 
   # ── Step 3: Combine forward + reverse → L0 nodes ───────────────────
-  # Fuses forward (what was understood) + reverse (what mattered).
-  # Keeps what survived, drops dead ends, preserves corrections.
   - name: combine_l0
     primitive: fuse
     instruction: "$prompts/conversation/combine.md"
     for_each: $chunks
+    # Conversation chunks are pre-split at ingest, but safety net for oversized ones
+    max_input_tokens: 80000
+    split_strategy: "lines"
+    split_overlap_tokens: 300
+    split_merge: true
+    split_merge_instruction: "$prompts/shared/merge_sub_chunks.md"
     input:
       zip_steps:
         - forward_pass
@@ -88,13 +88,16 @@ steps:
     depth: 0
 
   # ── Step 4: Thread clustering ───────────────────────────────────────
-  # Groups ALL L0 topics by SUBJECT across chunks. A topic discussed in
-  # chunks 3, 7, and 12 becomes ONE thread. Replaces blind L1 pairing.
+  # Groups ALL L0 topics by SUBJECT across chunks. Batched with field
+  # projection for large conversations.
   - name: thread_clustering
     primitive: classify
     instruction: "$prompts/conversation/conv_cluster.md"
     input:
       topics: $combine_l0
+    item_fields: ["node_id", "headline", "orientation"]
+    batch_size: 150
+    batch_max_tokens: 80000
     response_schema:
       type: object
       properties:
@@ -128,14 +131,11 @@ steps:
             additionalProperties: false
       required: ["threads"]
       additionalProperties: false
-    model: "qwen/qwen3.5-flash-02-23"
+    model_tier: mid
     temperature: 0.3
     on_error: "retry(3)"
 
   # ── Step 5: Thread synthesis → L1 nodes ─────────────────────────────
-  # Per-thread synthesis with strong temporal authority. Topics within
-  # each thread sorted by chunk order. Later topics override earlier.
-  # Corrections are first-class content.
   - name: thread_narrative
     primitive: synthesize
     instruction: "$prompts/conversation/conv_thread.md"
@@ -182,7 +182,7 @@ steps:
     save_as: web_edges
     model_tier: mid
     temperature: 0.2
-    on_error: skip
+    on_error: "skip"
 
   # ── Step 7: Upper layers (recursive clustering → apex) ──────────────
   - name: upper_layer_synthesis
@@ -190,10 +190,13 @@ steps:
     instruction: "$prompts/conversation/conv_distill.md"
     recursive_cluster: true
     cluster_instruction: "$prompts/conversation/conv_recluster.md"
-    cluster_model: "qwen/qwen3.5-flash-02-23"
+    cluster_item_fields: ["node_id", "headline", "orientation"]
     cluster_response_schema:
       type: object
       properties:
+        apex_ready:
+          type: boolean
+          description: "true if these nodes already represent the natural top-level knowledge domains"
         clusters:
           type: array
           items:
@@ -209,8 +212,12 @@ steps:
                   type: string
             required: ["name", "description", "node_ids"]
             additionalProperties: false
-      required: ["clusters"]
+      required: ["apex_ready", "clusters"]
       additionalProperties: false
+    direct_synthesis_threshold: null
+    convergence_fallback: "retry"
+    cluster_on_error: "retry(3)"
+    cluster_fallback_size: 3
     depth: 1
     save_as: node
     node_id_pattern: "L{depth}-{index:03}"
@@ -250,6 +257,6 @@ steps:
     save_as: web_edges
     model_tier: mid
     temperature: 0.2
-    on_error: skip
+    on_error: "skip"
 
 post_build: []

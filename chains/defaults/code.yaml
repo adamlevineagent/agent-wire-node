@@ -1,24 +1,25 @@
-# Code Pipeline Chain Definition — Semantic Grouping
+# Code Pipeline Chain Definition v3.0.0 — Semantic Grouping
 #
 # Pipeline:
-#   1. L0 code extraction (per-file LLM analysis)
-#   2. Thread clustering (LLM groups ALL L0 topics into 6-12 semantic threads)
-#   3. Thread narrative synthesis (per-thread LLM synthesis into L1 nodes)
-#   4. L1 cross-layer webbing
-#   5. Upper layers (recursive adjacent pairing from L1 to apex)
-#   6. L2 cross-layer webbing
+#   1. L0 code extraction (per-file, parallel — nodes visible immediately)
+#   2. L0 cross-file webbing
+#   3. Thread clustering (batched, field-projected for large codebases)
+#   4. Thread narrative synthesis (per-thread)
+#   5. L1 cross-layer webbing
+#   6. Upper layers (recursive clustering → apex, with apex_ready signal)
+#   7. L2 cross-layer webbing
 #
-# This produces meaningful semantic layers instead of blind 2:1 pairing.
+# All intelligence in YAML and prompts. Rust is a dumb execution engine.
 
 schema_version: 1
 id: code-default
 name: Code Pyramid
 description: >
   Code analysis pipeline with semantic grouping: per-file extraction,
-  LLM-based thread clustering, per-thread narrative synthesis, then
-  recursive pairing to apex.
+  batched thread clustering with field projection, per-thread narrative
+  synthesis, and LLM-driven convergence to apex. All decisions in YAML.
 content_type: code
-version: "2.0.0"
+version: "3.0.0"
 author: agent-wire
 
 defaults:
@@ -38,10 +39,17 @@ steps:
       extension:.jsx: "$prompts/code/code_extract_frontend.md"
       type:frontend: "$prompts/code/code_extract_frontend.md"
     for_each: $chunks
-    concurrency: 8
+    dispatch_order: "largest_first"
+    concurrency: 12
     node_id_pattern: "C-L0-{index:03}"
     depth: 0
     save_as: node
+    # Oversized file splitting — split by line boundaries, merge back into one L0 node
+    max_input_tokens: 80000
+    split_strategy: "lines"
+    split_overlap_tokens: 200
+    split_merge: true
+    split_merge_instruction: "$prompts/shared/merge_sub_chunks.md"
     model_tier: mid
     temperature: 0.3
     on_error: "retry(3)"
@@ -62,10 +70,10 @@ steps:
             properties:
               source:
                 type: string
-                description: "Exact sibling node ID from depth 0 (for example C-L0-000). Never use the headline here."
+                description: "Exact C-L0-XXX node ID"
               target:
                 type: string
-                description: "Exact sibling node ID from depth 0 (for example C-L0-001). Never use the headline here."
+                description: "Exact C-L0-XXX node ID"
               relationship:
                 type: string
               shared_resources:
@@ -81,22 +89,22 @@ steps:
     depth: 0
     save_as: web_edges
     compact_inputs: true
-    # model: uses default (mercury-2) — escalate to qwen only for 500K+ inputs
+    model_tier: mid
     temperature: 0.2
     on_error: "skip"
 
   # ── Step 3: Thread clustering ─────────────────────────────────────────
-  # Takes ALL L0 extraction topics and groups them into semantic threads.
-  # Uses default model (mercury-2) — compacted input is small enough.
-  # Only escalate to qwen for very large codebases (500K+ compacted).
-  # Input: the full array of L0 step outputs.
-  # Output: JSON with "threads" array, each containing assignments.
+  # Groups all L0 extractions into semantic threads. Uses item_fields to
+  # project down to just identifiers and headlines for the clustering call.
+  # Batched for large codebases (500+ files).
   - name: thread_clustering
     primitive: classify
     instruction: "$prompts/code/code_cluster.md"
     input:
       topics: $l0_code_extract
-    max_thread_size: 12
+    item_fields: ["node_id", "headline", "orientation"]
+    batch_size: 150
+    batch_max_tokens: 80000
     response_schema:
       type: object
       properties:
@@ -115,40 +123,32 @@ steps:
               assignments:
                 type: array
                 minItems: 1
-                maxItems: 12
                 items:
                   type: object
                   properties:
                     source_node:
                       type: string
-                      description: "Assigned L0 node ID copied EXACTLY from the input topic's node_id/source_node field (for example C-L0-005). Never put the headline text here."
+                      description: "Exact C-L0-XXX node ID"
                     topic_index:
                       type: integer
-                      description: "Index of the topic within the topic inventory"
                     topic_name:
                       type: string
-                      description: "Original headline or topic label"
                   required: ["source_node", "topic_index", "topic_name"]
                   additionalProperties: false
             required: ["name", "description", "assignments"]
             additionalProperties: false
       required: ["threads"]
       additionalProperties: false
-    # model: uses default (mercury-2) — escalate to qwen only for 500K+ inputs
+    model_tier: mid
     temperature: 0.3
     on_error: "retry(3)"
 
   # ── Step 4: Thread narrative synthesis ─────────────────────────────────
-  # For each thread from clustering, synthesize the assigned L0 topics
-  # into a coherent narrative node.
   - name: thread_narrative
     primitive: synthesize
     instruction: "$prompts/code/code_thread.md"
     for_each: $thread_clustering.threads
     concurrency: 5
-    # No response_schema — structured outputs constrain mercury-2 and cause
-    # token clipping on large threads (49K+ tokens). Free-form JSON + retry
-    # is more reliable and produces richer content.
     node_id_pattern: "L1-{index:03}"
     depth: 1
     save_as: node
@@ -157,8 +157,6 @@ steps:
     on_error: "retry(2)"
 
   # ── Step 5: L1 cross-layer webbing ────────────────────────────────────
-  # Identify cross-cutting relationships between sibling L1 nodes so the
-  # UI can show "see also" edges across the tree.
   - name: l1_webbing
     primitive: web
     instruction: "$prompts/code/code_web.md"
@@ -174,20 +172,16 @@ steps:
             properties:
               source:
                 type: string
-                description: "Exact sibling node ID from the input nodes array (for example L1-000). Never use the headline here."
               target:
                 type: string
-                description: "Exact sibling node ID from the input nodes array (for example L1-003). Never use the headline here."
               relationship:
                 type: string
-                description: "One concise sentence explaining the concrete connection"
               shared_resources:
                 type: array
                 items:
                   type: string
               strength:
                 type: number
-                description: "0.0-1.0 relevance score for the connection"
             required: ["source", "target", "relationship", "shared_resources", "strength"]
             additionalProperties: false
       required: ["edges"]
@@ -198,19 +192,21 @@ steps:
     temperature: 0.2
     on_error: "skip"
 
-  # ── Step 6: Upper layers (recursive clustering L1 → apex) ────────────
-  # Semantic re-clustering at each layer instead of blind 2:1 pairing.
-  # Each layer: LLM groups nodes into 3-5 clusters → synthesize each cluster.
-  # Produces 2-3 upper layers instead of 4-5, with better semantic structure.
+  # ── Step 6: Upper layers (recursive clustering → apex) ────────────────
+  # LLM-driven convergence. The LLM signals apex_ready when the current
+  # nodes are the natural top-level structure.
   - name: upper_layer_synthesis
     primitive: synthesize
     instruction: "$prompts/code/code_distill.md"
     recursive_cluster: true
     cluster_instruction: "$prompts/code/code_recluster.md"
-    # cluster_model: uses default (mercury-2) — escalate to qwen only for 500K+ inputs
+    cluster_item_fields: ["node_id", "headline", "orientation"]
     cluster_response_schema:
       type: object
       properties:
+        apex_ready:
+          type: boolean
+          description: "true if these nodes already represent the natural top-level architectural domains"
         clusters:
           type: array
           items:
@@ -218,19 +214,21 @@ steps:
             properties:
               name:
                 type: string
-                description: "2-6 word cluster label — must be unique across all clusters"
+                description: "2-6 word cluster label — unique across all clusters"
               description:
                 type: string
-                description: "1-2 sentences on what this architectural area covers"
               node_ids:
                 type: array
                 items:
                   type: string
-                description: "IDs of nodes in this cluster (e.g., L1-000, L1-003)"
             required: ["name", "description", "node_ids"]
             additionalProperties: false
-      required: ["clusters"]
+      required: ["apex_ready", "clusters"]
       additionalProperties: false
+    direct_synthesis_threshold: null
+    convergence_fallback: "retry"
+    cluster_on_error: "retry(3)"
+    cluster_fallback_size: 3
     depth: 1
     save_as: node
     node_id_pattern: "L{depth}-{index:03}"
@@ -239,8 +237,6 @@ steps:
     on_error: "retry(3)"
 
   # ── Step 7: L2 cross-layer webbing ────────────────────────────────────
-  # Runs after upper-layer synthesis completes and refreshes the peer edges
-  # between architectural-domain nodes at depth 2.
   - name: l2_webbing
     primitive: web
     instruction: "$prompts/code/code_web.md"
@@ -254,10 +250,8 @@ steps:
             properties:
               source:
                 type: string
-                description: "Exact sibling node ID from depth 2 (for example L2-000). Never use the headline here."
               target:
                 type: string
-                description: "Exact sibling node ID from depth 2 (for example L2-001). Never use the headline here."
               relationship:
                 type: string
               shared_resources:

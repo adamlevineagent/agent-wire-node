@@ -172,7 +172,20 @@ fn load_chain_metadata(yaml_path: &Path, is_default: bool) -> Result<ChainMetada
 /// ```
 ///
 /// Called on first run to bootstrap the chain system.
-pub fn ensure_default_chains(chains_dir: &Path) -> Result<()> {
+/// Two-tier chain sync strategy:
+///
+/// **Tier 1 (source tree present):** Copy the entire source tree `chains/` directory
+/// into the runtime data dir. Source tree is canonical — always overwrites.
+/// Detected via `source_chains_dir` parameter (set from CARGO_MANIFEST_DIR in dev,
+/// or checked alongside the binary in release).
+///
+/// **Tier 2 (no source tree / release standalone):** Bootstrap with embedded defaults,
+/// but only write files that don't already exist. Preserves user's runtime chain files
+/// across app restarts.
+pub fn ensure_default_chains(
+    chains_dir: &Path,
+    source_chains_dir: Option<&Path>,
+) -> Result<()> {
     // Create directory structure
     let dirs_to_create = [
         chains_dir.join("defaults"),
@@ -190,7 +203,20 @@ pub fn ensure_default_chains(chains_dir: &Path) -> Result<()> {
         }
     }
 
-    // Write default chain YAML files (only if they don't already exist)
+    // ── Tier 1: Source tree wins ─────────────────────────────────────────
+    if let Some(src) = source_chains_dir {
+        if src.exists() && src.is_dir() {
+            tracing::info!(
+                src = %src.display(),
+                dst = %chains_dir.display(),
+                "syncing chains from source tree"
+            );
+            copy_dir_recursive(src, chains_dir)?;
+            return Ok(());
+        }
+    }
+
+    // ── Tier 2: Embedded defaults (bootstrap only) ──────────────────────
     let defaults = [
         ("conversation.yaml", DEFAULT_CONVERSATION_CHAIN),
         ("code.yaml", DEFAULT_CODE_CHAIN),
@@ -202,19 +228,41 @@ pub fn ensure_default_chains(chains_dir: &Path) -> Result<()> {
         if !path.exists() {
             std::fs::write(&path, content)
                 .with_context(|| format!("failed to write default chain: {}", path.display()))?;
-            tracing::info!(path = %path.display(), "wrote default chain file");
+            tracing::info!(path = %path.display(), "bootstrapped default chain file");
         }
     }
 
-    // Write planner system prompt (bundled at compile time)
+    // Write planner system prompt (bundled at compile time) — bootstrap only
     let planner_prompt_path = chains_dir.join("prompts").join("planner").join("planner-system.md");
     if !planner_prompt_path.exists() {
         let prompt_content = include_str!("../../../chains/prompts/planner/planner-system.md");
         std::fs::write(&planner_prompt_path, prompt_content)
             .with_context(|| format!("failed to write planner prompt: {}", planner_prompt_path.display()))?;
-        tracing::info!(path = %planner_prompt_path.display(), "wrote bundled planner-system.md");
+        tracing::info!(path = %planner_prompt_path.display(), "bootstrapped bundled planner-system.md");
     }
 
+    Ok(())
+}
+
+/// Recursively copy `src` directory contents into `dst`, overwriting existing files.
+fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
+    if !dst.exists() {
+        std::fs::create_dir_all(dst)
+            .with_context(|| format!("failed to create dir: {}", dst.display()))?;
+    }
+    for entry in std::fs::read_dir(src)
+        .with_context(|| format!("failed to read dir: {}", src.display()))?
+    {
+        let entry = entry?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        if src_path.is_dir() {
+            copy_dir_recursive(&src_path, &dst_path)?;
+        } else {
+            std::fs::write(&dst_path, std::fs::read(&src_path)?)
+                .with_context(|| format!("failed to copy {} → {}", src_path.display(), dst_path.display()))?;
+        }
+    }
     Ok(())
 }
 

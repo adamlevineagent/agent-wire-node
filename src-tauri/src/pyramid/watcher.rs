@@ -15,6 +15,7 @@ use tokio::sync::mpsc;
 
 use super::db as pyramid_db;
 use super::types::AutoUpdateConfig;
+use super::Tier2Config;
 
 // ── Recent Remove tracker for rename-candidate detection ─────────────────────
 
@@ -41,11 +42,21 @@ pub struct PyramidFileWatcher {
     /// Channel to notify stale engines when mutations are written to the WAL.
     /// Sends (slug, layer) so the receiver can call engine.notify_mutation(layer).
     mutation_sender: Option<mpsc::UnboundedSender<(String, i32)>>,
+    /// Patterns to exclude from file watching (read from config).
+    watcher_exclude_patterns: Vec<String>,
+    /// Similarity threshold for rename detection (read from config).
+    rename_similarity_threshold: f64,
+    /// Time window in ms for rename candidate matching (read from config).
+    rename_candidate_window_ms: u64,
 }
 
 impl PyramidFileWatcher {
     /// Create a new file watcher. Does not start watching yet.
-    pub fn new(slug: &str, source_paths: Vec<String>) -> Self {
+    ///
+    /// `tier2` provides configurable watcher parameters (exclude patterns,
+    /// rename similarity threshold, rename candidate window). Pass
+    /// `&Tier2Config::default()` to preserve legacy behavior.
+    pub fn new(slug: &str, source_paths: Vec<String>, tier2: &Tier2Config) -> Self {
         Self {
             slug: slug.to_string(),
             watcher: None,
@@ -55,6 +66,9 @@ impl PyramidFileWatcher {
             ingested_extensions: Arc::new(Mutex::new(Vec::new())),
             ingested_config_files: Arc::new(Mutex::new(Vec::new())),
             mutation_sender: None,
+            watcher_exclude_patterns: tier2.watcher_exclude_patterns.clone(),
+            rename_similarity_threshold: tier2.rename_similarity_threshold,
+            rename_candidate_window_ms: tier2.rename_candidate_window_ms,
         }
     }
 
@@ -115,6 +129,9 @@ impl PyramidFileWatcher {
         let ingested_extensions_clone = Arc::clone(&self.ingested_extensions);
         let ingested_config_files_clone = Arc::clone(&self.ingested_config_files);
         let mutation_sender_clone = self.mutation_sender.clone();
+        let exclude_patterns_clone = self.watcher_exclude_patterns.clone();
+        let rename_threshold_clone = self.rename_similarity_threshold;
+        let rename_window_clone = self.rename_candidate_window_ms;
         // Shared recent-removes tracker for rename-candidate detection
         let recent_removes: Arc<Mutex<Vec<RecentRemove>>> = Arc::new(Mutex::new(Vec::new()));
         let recent_removes_clone = Arc::clone(&recent_removes);
@@ -147,6 +164,9 @@ impl PyramidFileWatcher {
                 &ingested_extensions_clone,
                 &ingested_config_files_clone,
                 &mutation_sender_clone,
+                &exclude_patterns_clone,
+                rename_threshold_clone,
+                rename_window_clone,
             ) {
                 tracing::warn!("Error handling file event: {}", e);
             }
@@ -207,23 +227,11 @@ fn is_trackable_path(
     tracked_paths: &Arc<Mutex<HashSet<String>>>,
     ingested_extensions: &Arc<Mutex<Vec<String>>>,
     ingested_config_files: &Arc<Mutex<Vec<String>>>,
+    exclude_patterns: &[String],
 ) -> bool {
-    // Fast reject: skip obvious non-source paths
-    let skip_patterns = [
-        "/target/",
-        "/node_modules/",
-        "/.git/",
-        "/dist/",
-        "/.next/",
-        "/.DS_Store",
-        ".tmp.",
-        ".swp",
-        ".swo",
-        "~",
-        "/build/",
-    ];
-    for pat in &skip_patterns {
-        if path.contains(pat) {
+    // Fast reject: skip paths matching configured exclusion patterns
+    for pat in exclude_patterns {
+        if path.contains(pat.as_str()) {
             return false;
         }
     }
@@ -271,12 +279,16 @@ fn handle_event_with_rename_tracking(
     ingested_extensions: &Arc<Mutex<Vec<String>>>,
     ingested_config_files: &Arc<Mutex<Vec<String>>>,
     mutation_sender: &Option<mpsc::UnboundedSender<(String, i32)>>,
+    exclude_patterns: &[String],
+    rename_similarity_threshold: f64,
+    rename_candidate_window_ms: u64,
 ) -> Result<()> {
     let now = Utc::now();
 
-    // Prune stale entries (older than 3 seconds)
+    // Prune stale entries (older than rename candidate window + 1s safety margin)
+    let prune_window_ms = rename_candidate_window_ms + 1000;
     if let Ok(mut removes) = recent_removes.lock() {
-        removes.retain(|r| (now - r.timestamp).num_seconds() < 3);
+        removes.retain(|r| (now - r.timestamp).num_milliseconds() < prune_window_ms as i64);
     }
 
     // Collect trackable paths first (uses caches only, no DB)
@@ -284,7 +296,7 @@ fn handle_event_with_rename_tracking(
         .paths
         .iter()
         .map(|p| p.to_string_lossy().to_string())
-        .filter(|p| is_trackable_path(p, tracked_paths, ingested_extensions, ingested_config_files))
+        .filter(|p| is_trackable_path(p, tracked_paths, ingested_extensions, ingested_config_files, exclude_patterns))
         .collect();
 
     if trackable_paths.is_empty() {
@@ -309,7 +321,13 @@ fn handle_event_with_rename_tracking(
             }
             EventKind::Create(_) => {
                 // Check if this Create pairs with a recent Remove (rename candidate)
-                let rename_pair = find_rename_candidate(recent_removes, path_str, now);
+                let rename_pair = find_rename_candidate(
+                    recent_removes,
+                    path_str,
+                    now,
+                    rename_candidate_window_ms,
+                    rename_similarity_threshold,
+                );
 
                 if let Some(old_path) = rename_pair {
                     // Write a rename_candidate mutation
@@ -372,11 +390,13 @@ fn handle_event_with_rename_tracking(
     Ok(())
 }
 
-/// Check if a Create path matches a recent Remove (within 2 seconds, similar filename).
+/// Check if a Create path matches a recent Remove (within the configured window, similar filename).
 fn find_rename_candidate(
     recent_removes: &Arc<Mutex<Vec<RecentRemove>>>,
     new_path: &str,
     now: chrono::DateTime<Utc>,
+    rename_candidate_window_ms: u64,
+    rename_similarity_threshold: f64,
 ) -> Option<String> {
     let mut removes = recent_removes.lock().ok()?;
     let new_filename = Path::new(new_path)
@@ -384,17 +404,17 @@ fn find_rename_candidate(
         .and_then(|f| f.to_str())
         .unwrap_or("");
 
-    // Find a remove within 2 seconds with a similar filename
+    // Find a remove within the configured window with a similar filename
     let idx = removes.iter().position(|r| {
         let elapsed = (now - r.timestamp).num_milliseconds();
-        if elapsed > 2000 {
+        if elapsed > rename_candidate_window_ms as i64 {
             return false;
         }
         let old_filename = Path::new(&r.path)
             .file_name()
             .and_then(|f| f.to_str())
             .unwrap_or("");
-        filenames_similar(old_filename, new_filename)
+        filenames_similar(old_filename, new_filename, rename_similarity_threshold)
     });
 
     if let Some(i) = idx {
@@ -406,8 +426,8 @@ fn find_rename_candidate(
 }
 
 /// Check if two filenames are similar enough to be a rename.
-/// Same extension + at least 50% character overlap or same base name.
-fn filenames_similar(a: &str, b: &str) -> bool {
+/// Same extension + character overlap >= configured threshold, or same base name.
+fn filenames_similar(a: &str, b: &str, similarity_threshold: f64) -> bool {
     if a == b {
         return true;
     }
@@ -434,7 +454,7 @@ fn filenames_similar(a: &str, b: &str) -> bool {
     if stem_a == stem_b {
         return true;
     }
-    // Check overlap: count shared chars
+    // Check overlap: count shared chars against configured threshold
     let shorter = stem_a.len().min(stem_b.len());
     if shorter == 0 {
         return false;
@@ -444,7 +464,7 @@ fn filenames_similar(a: &str, b: &str) -> bool {
         .zip(stem_b.chars())
         .filter(|(ca, cb)| ca == cb)
         .count();
-    shared * 2 >= shorter // at least 50% overlap
+    (shared as f64 / shorter as f64) >= similarity_threshold
 }
 
 // ── Individual event handlers (using shared connection) ──────────────────────

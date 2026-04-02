@@ -1,29 +1,33 @@
 You are given the summaries of N nodes from a knowledge pyramid layer. Each node has a headline, orientation, and topic list.
 
-Group these nodes into FEWER clusters. Each cluster should represent a high-level architectural domain that a developer would recognize — something they'd call "the frontend", "the backend", "the engine", etc.
+PURPOSE: Identify the natural higher-level architectural domains. A developer at the next level up wants to explore by broad system area — what are the domains that organize everything below them?
 
-TARGET CLUSTER COUNT:
-- If you receive 5-8 nodes: produce 2-3 clusters
-- If you receive 9-15 nodes: produce 3-5 clusters
-- If you receive 16+ nodes: produce 4-6 clusters
-- You MUST produce STRICTLY FEWER clusters than the number of input nodes. If given 5 nodes, produce at most 4 clusters (prefer 2-3).
+APEX READINESS: Set `apex_ready: true` ONLY when ALL of these are true:
+- There are roughly 12 or fewer nodes
+- The nodes are already distinct, well-scoped architectural domains
+- Grouping them further would only create vague super-categories that obscure rather than clarify
+- A developer could hold all these domains in their head as the "top-level map" of this codebase
 
-RULES:
-- Every node must be assigned to exactly ONE cluster
-- Cluster names should be concrete and developer-friendly: "Desktop UI & Frontend Components", not "Group 1"
-- CRITICAL: Cluster names must be COMPLETELY DIFFERENT from each other AND from the child node headlines AND from the project name. Test: if you cover the names and read the descriptions, could you tell them apart? If not, rename them.
+If you have more than 12 nodes, you almost certainly need to cluster. Group them.
+
+If `apex_ready` is true, return empty clusters. The system will synthesize all current nodes directly into the apex.
+
+PRINCIPLES:
+- **Let the material decide.** The number of groups should reflect the natural architecture, not a target count. If there are genuinely 2 broad domains, produce 2. If there are 6, produce 6.
+- **Every node must be assigned to exactly ONE cluster.**
+- **Cluster names should be concrete and developer-friendly:** "Desktop UI & Frontend Components", not "Group 1"
+- **CRITICAL: Cluster names must be COMPLETELY DIFFERENT from each other AND from the child node headlines AND from the project name.** Test: if you cover the names and read the descriptions, could you tell them apart? If not, rename them.
   - BAD: "Pyramid Knowledge Platform" + "Knowledge Pyramid Orchestration" (too similar)
-  - GOOD: "Tauri Desktop UI Stack" + "Rust Backend & Data Layer" + "LLM Pipeline & Chain Execution" + "CLI, MCP & External Integrations" (each clearly distinct)
-- Before finalizing, compare the cluster names side by side. If two names share the same head noun or both read like "project overview", rename them into distinct architectural responsibilities.
-- Explicitly avoid generic names like "System Overview", "Platform Overview", "Knowledge Pyramid Platform", "Wire Node System", "Project Architecture", or "Core Platform".
-- Use architectural LAYER or RESPONSIBILITY framing, not product name repetition
-- Balance: each cluster should have at least 2 nodes
-- If a node doesn't fit cleanly, assign it to the closest match — do not create a singleton cluster
-- Think about what a NEW DEVELOPER would want to explore: "I want to understand the UI" → one cluster. "I want to understand the data pipeline" → another cluster. "I want to understand the backend services" → another.
+  - GOOD: "Tauri Desktop UI Stack" + "Rust Backend & Data Layer" + "LLM Pipeline & Chain Execution" (each clearly distinct)
+- **Avoid generic names:** "System Overview", "Platform Overview", "Project Architecture"
+- **Use architectural LAYER or RESPONSIBILITY framing,** not product name repetition
+- **The only hard rule: fewer groups than inputs.** If you receive 5 nodes, you must produce fewer than 5 groups. This is how the pyramid converges toward an apex.
+- Think about what a NEW DEVELOPER would want to explore: "I want to understand the UI" → one cluster. "I want to understand the data pipeline" → another.
 
 You MUST output ONLY a valid JSON object. No markdown, no headings, no prose, no explanation, no code fences. Start your response with { and end with }. Any text before { or after } is a fatal error.
 
 {
+  "apex_ready": false,
   "clusters": [
     {
       "name": "Cluster Name",

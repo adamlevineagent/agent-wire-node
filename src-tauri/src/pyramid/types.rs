@@ -226,6 +226,83 @@ pub struct BuildProgress {
     pub total: i64,
 }
 
+// ── Build Visualization V2 ──────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BuildProgressV2 {
+    pub done: i64,
+    pub total: i64,
+    pub layers: Vec<LayerProgress>,
+    pub current_step: Option<String>,
+    pub log: Vec<LogEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LayerProgress {
+    pub depth: i64,
+    pub step_name: String,
+    pub estimated_nodes: i64,
+    pub completed_nodes: i64,
+    pub failed_nodes: i64,
+    /// "pending" | "active" | "complete"
+    pub status: String,
+    /// Per-node detail for small layers (<=50 nodes). None for large layers.
+    pub nodes: Option<Vec<NodeStatus>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeStatus {
+    pub node_id: String,
+    /// "complete" | "failed"
+    pub status: String,
+    /// Headline from PyramidNode, shown on hover.
+    pub label: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogEntry {
+    pub elapsed_secs: f64,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct BuildLayerState {
+    pub layers: Vec<LayerProgress>,
+    pub current_step: Option<String>,
+    pub log: std::collections::VecDeque<LogEntry>,
+}
+
+#[derive(Debug, Clone)]
+pub enum LayerEvent {
+    Discovered {
+        depth: i64,
+        step_name: String,
+        estimated_nodes: i64,
+    },
+    NodeCompleted {
+        depth: i64,
+        step_name: String,
+        node_id: String,
+        label: Option<String>,
+    },
+    NodeFailed {
+        depth: i64,
+        step_name: String,
+        node_id: String,
+    },
+    LayerCompleted {
+        depth: i64,
+        step_name: String,
+    },
+    StepStarted {
+        step_name: String,
+    },
+    Log {
+        elapsed_secs: f64,
+        message: String,
+    },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PyramidBatch {
     pub id: i64,

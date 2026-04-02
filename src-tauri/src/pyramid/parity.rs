@@ -612,6 +612,7 @@ pub async fn run_parity_test(state: &PyramidState, slug: &str) -> Result<ParityR
         Some(progress_tx),
         // We need a write_tx for the legacy path — create a dummy drain
         &create_dummy_write_tx(),
+        None,
     )
     .await;
     let legacy_elapsed = legacy_start.elapsed().as_secs_f64();
@@ -656,6 +657,7 @@ pub async fn run_parity_test(state: &PyramidState, slug: &str) -> Result<ParityR
         &cancel,
         Some(progress_tx2),
         &create_dummy_write_tx(),
+        None,
     )
     .await;
     let ir_elapsed = ir_start.elapsed().as_secs_f64();

@@ -34,7 +34,8 @@ use super::question_loader;
 use super::reconciliation;
 use super::slug;
 use super::types::{
-    self, BuildProgress, CharacterizationResult, ContentType, HandlePath, RemoteWebEdge,
+    self, BuildProgress, CharacterizationResult, ContentType, HandlePath, LayerEvent,
+    RemoteWebEdge,
 };
 use super::wire_import::RemotePyramidClient;
 use super::PyramidState;
@@ -78,6 +79,10 @@ pub async fn check_absorption_rate_limit(
         (3u32, 100u64)
     };
 
+    // Read rate limit window durations from operational config
+    let hourly_window_secs = state.operational.tier2.rate_limit_hourly_window_secs;
+    let daily_window_secs = state.operational.tier2.rate_limit_daily_window_secs;
+
     // Per-operator hourly rate limit
     {
         let mut limiter = state.absorption_build_rate_limiter.lock().await;
@@ -85,11 +90,11 @@ pub async fn check_absorption_rate_limit(
         let entry = limiter.entry(operator_id.to_string()).or_insert((0, now));
         let elapsed = now.duration_since(entry.1);
 
-        if elapsed > std::time::Duration::from_secs(3600) {
+        if elapsed > std::time::Duration::from_secs(hourly_window_secs) {
             // Window expired, reset
             *entry = (1, now);
         } else if entry.0 >= max_per_hour {
-            let retry_after = 3600 - elapsed.as_secs();
+            let retry_after = hourly_window_secs - elapsed.as_secs();
             return Err(anyhow!(
                 "429: absorption build rate limit exceeded for operator '{}' on slug '{}'. \
                  Limit: {} builds/hour. Retry after {}s",
@@ -109,11 +114,11 @@ pub async fn check_absorption_rate_limit(
         let now = std::time::Instant::now();
         let elapsed = now.duration_since(spend.1);
 
-        if elapsed > std::time::Duration::from_secs(86400) {
+        if elapsed > std::time::Duration::from_secs(daily_window_secs) {
             // Day expired, reset
             *spend = (estimated_cost, now);
         } else if spend.0 + estimated_cost > daily_cap {
-            let retry_after = 86400 - elapsed.as_secs();
+            let retry_after = daily_window_secs - elapsed.as_secs();
             return Err(anyhow!(
                 "429: absorption daily spend cap exceeded for slug '{}'. \
                  Cap: {} credits/day, spent: {}. Retry after {}s",
@@ -157,8 +162,9 @@ pub async fn run_build(
     cancel: &CancellationToken,
     progress_tx: Option<mpsc::Sender<BuildProgress>>,
     write_tx: &mpsc::Sender<WriteOp>,
+    layer_tx: Option<mpsc::Sender<LayerEvent>>,
 ) -> Result<(String, i32)> {
-    run_build_from(state, slug_name, 0, cancel, progress_tx, write_tx).await
+    run_build_from(state, slug_name, 0, cancel, progress_tx, write_tx, layer_tx).await
 }
 
 /// Run a build from a specific depth, reusing nodes below that depth.
@@ -169,6 +175,7 @@ pub async fn run_build_from(
     cancel: &CancellationToken,
     progress_tx: Option<mpsc::Sender<BuildProgress>>,
     write_tx: &mpsc::Sender<WriteOp>,
+    layer_tx: Option<mpsc::Sender<LayerEvent>>,
 ) -> Result<(String, i32)> {
     // ── 1. Determine content type ────────────────────────────────────────
     let content_type = {
@@ -244,6 +251,7 @@ pub async fn run_build_from(
             from_depth,
             cancel,
             progress_tx,
+            layer_tx,
         )
         .await
     } else {
@@ -446,6 +454,7 @@ async fn run_chain_build(
     from_depth: i64,
     cancel: &CancellationToken,
     progress_tx: Option<mpsc::Sender<BuildProgress>>,
+    layer_tx: Option<mpsc::Sender<LayerEvent>>,
 ) -> Result<(String, i32)> {
     let ct_str = content_type.as_str();
 
@@ -491,7 +500,7 @@ async fn run_chain_build(
         "starting chain engine build"
     );
 
-    chain_executor::execute_chain_from(state, &chain, slug_name, from_depth, cancel, progress_tx)
+    chain_executor::execute_chain_from(state, &chain, slug_name, from_depth, cancel, progress_tx, layer_tx)
         .await
 }
 
@@ -868,7 +877,7 @@ pub async fn run_decomposed_build(
             let (write_tx, mut write_rx) = tokio::sync::mpsc::channel::<WriteOp>(512);
             let drain_handle =
                 tokio::spawn(async move { while write_rx.recv().await.is_some() {} });
-            run_build(state, slug_name, cancel, progress_tx.clone(), &write_tx).await?;
+            run_build(state, slug_name, cancel, progress_tx.clone(), &write_tx, None).await?;
             drop(write_tx);
             let _ = drain_handle.await;
 

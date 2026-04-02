@@ -15697,3 +15697,263 @@ body {
     color: #f06060;
     border: 1px solid rgba(240, 96, 96, 0.2);
 }
+
+/* ═══════════════════════════════════════════════════════════════════
+   Pyramid Build Visualization (PyramidBuildViz.tsx)
+   ═══════════════════════════════════════════════════════════════════ */
+
+.pyramid-build-viz {
+    max-width: 640px;
+    margin: 0 auto;
+    padding: 32px 0;
+}
+
+.pbv-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 24px;
+}
+
+.pbv-header h3 {
+    font-size: 18px;
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+/* ─── Pyramid container — anchored to bottom, grows upward ───────── */
+
+.pbv-pyramid {
+    display: flex;
+    flex-direction: column-reverse;
+    justify-content: flex-start;
+    gap: 6px;
+    margin-bottom: 20px;
+    padding: 24px 16px;
+    min-height: 300px;
+    background: var(--glass);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-md);
+}
+
+.pbv-waiting {
+    text-align: center;
+    color: var(--text-muted);
+    font-size: 13px;
+    padding: 40px 0;
+}
+
+.pbv-step-indicator {
+    text-align: center;
+    font-size: 12px;
+    color: var(--accent-cyan);
+    padding: 8px 0;
+    animation: pulse-subtle 2s ease-in-out infinite;
+    letter-spacing: 0.02em;
+}
+
+/* ─── Layer row ──────────────────────────────────────────────────── */
+
+.pbv-layer {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    width: 100%;
+    padding: 6px 0;
+    transition: opacity var(--transition);
+}
+
+.pbv-layer-complete {
+    opacity: 0.5;
+}
+
+.pbv-layer-active {
+    opacity: 1;
+}
+
+.pbv-layer-label {
+    width: 36px;
+    text-align: right;
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 4px;
+}
+
+.pbv-layer-depth {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-secondary);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+
+.pbv-layer-check::after {
+    content: '\2713';
+    font-size: 10px;
+    color: var(--accent-green);
+}
+
+.pbv-layer-content {
+    flex: 1;
+    min-width: 0;
+}
+
+.pbv-layer-count {
+    width: 50px;
+    text-align: right;
+    flex-shrink: 0;
+    font-size: 11px;
+    color: var(--text-muted);
+    font-variant-numeric: tabular-nums;
+}
+
+/* ─── Apex diamond ───────────────────────────────────────────────── */
+
+.pbv-apex {
+    display: flex;
+    justify-content: center;
+    padding: 4px 0;
+}
+
+.pbv-apex-diamond {
+    width: 20px;
+    height: 20px;
+    background: var(--glass);
+    border: 1px solid var(--glass-border);
+    transform: rotate(45deg);
+    border-radius: 3px;
+    transition: all 0.6s ease;
+}
+
+.pbv-apex-lit .pbv-apex-diamond {
+    background: var(--gradient-hero);
+    border-color: var(--accent-cyan);
+    box-shadow: 0 0 16px rgba(34, 211, 238, 0.4);
+}
+
+/* ─── Cell grid — auto-sizing cells fill available width ─────────── */
+
+.pbv-cell-grid {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 2px;
+    justify-content: center;
+}
+
+.pbv-cell {
+    /* Auto-size: aim for cells that fill the row. For N cells in ~500px width,
+       each cell = roughly (500 / sqrt(N)) px, clamped between 4px and 24px. */
+    width: clamp(4px, calc(500px / max(var(--cell-count, 20), 1) * 2.5), 24px);
+    aspect-ratio: 1;
+    border-radius: 2px;
+    transition: all 0.3s ease;
+    cursor: default;
+}
+
+.pbv-cell-pending {
+    background: var(--glass);
+    border: 1px solid var(--glass-border);
+}
+
+.pbv-cell-complete {
+    background: var(--gradient-hero);
+    border: 1px solid rgba(34, 211, 238, 0.3);
+    animation: cell-glow 0.4s ease-out;
+}
+
+.pbv-cell-failed {
+    background: rgba(239, 68, 68, 0.5);
+    border: 1px solid rgba(239, 68, 68, 0.4);
+}
+
+@keyframes cell-glow {
+    0% {
+        box-shadow: 0 0 8px rgba(34, 211, 238, 0.6);
+        transform: scale(1.2);
+    }
+    100% {
+        box-shadow: none;
+        transform: scale(1);
+    }
+}
+
+.pbv-cell:hover {
+    transform: scale(1.3);
+    z-index: 1;
+}
+
+/* ─── Stats line ─────────────────────────────────────────────────── */
+
+.pbv-stats {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+    color: var(--text-secondary);
+    margin-bottom: 16px;
+}
+
+.pbv-stats-sep {
+    width: 3px;
+    height: 3px;
+    border-radius: 50%;
+    background: var(--text-muted);
+}
+
+/* ─── Log panel ──────────────────────────────────────────────────── */
+
+.pbv-log-panel {
+    background: var(--glass);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-sm);
+    overflow: hidden;
+    margin-bottom: 16px;
+}
+
+.pbv-log-header {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--text-muted);
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--glass-border);
+}
+
+.pbv-log-scroll {
+    max-height: 160px;
+    overflow-y: auto;
+    padding: 4px 0;
+}
+
+.pbv-log-scroll::-webkit-scrollbar {
+    width: 4px;
+}
+
+.pbv-log-scroll::-webkit-scrollbar-thumb {
+    background: var(--glass-border);
+    border-radius: 2px;
+}
+
+.pbv-log-entry {
+    display: flex;
+    gap: 8px;
+    padding: 3px 12px;
+    font-size: 11px;
+    line-height: 1.5;
+    font-family: 'SF Mono', 'Fira Code', monospace;
+}
+
+.pbv-log-time {
+    color: var(--text-muted);
+    flex-shrink: 0;
+    width: 36px;
+    text-align: right;
+}
+
+.pbv-log-msg {
+    color: var(--text-secondary);
+}

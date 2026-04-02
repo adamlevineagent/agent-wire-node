@@ -199,6 +199,54 @@ fn compile_straight_line_step(
             if let Some(ref merge_instruction) = step.merge_instruction {
                 meta["merge_instruction"] = json!(merge_instruction);
             }
+            if let Some(batch_size) = step.batch_size {
+                meta["batch_size"] = json!(batch_size);
+            }
+            if let Some(batch_max_tokens) = step.batch_max_tokens {
+                meta["batch_max_tokens"] = json!(batch_max_tokens);
+            }
+            if let Some(ref item_fields) = step.item_fields {
+                meta["item_fields"] = json!(item_fields);
+            }
+            // Everything-to-YAML: convergence control fields passthrough
+            if let Some(threshold) = step.direct_synthesis_threshold {
+                meta["direct_synthesis_threshold"] = json!(threshold);
+            }
+            if let Some(ref fallback) = step.convergence_fallback {
+                meta["convergence_fallback"] = json!(fallback);
+            }
+            if let Some(ref on_err) = step.cluster_on_error {
+                meta["cluster_on_error"] = json!(on_err);
+            }
+            if let Some(size) = step.cluster_fallback_size {
+                meta["cluster_fallback_size"] = json!(size);
+            }
+            if let Some(ref fields) = step.cluster_item_fields {
+                meta["cluster_item_fields"] = json!(fields);
+            }
+            // Oversized chunk splitting passthrough
+            if let Some(max_input_tokens) = step.max_input_tokens {
+                meta["max_input_tokens"] = json!(max_input_tokens);
+            }
+            if let Some(ref strategy) = step.split_strategy {
+                meta["split_strategy"] = json!(strategy);
+            }
+            if let Some(overlap) = step.split_overlap_tokens {
+                meta["split_overlap_tokens"] = json!(overlap);
+            }
+            if let Some(merge) = step.split_merge {
+                meta["split_merge"] = json!(merge);
+            }
+            // Sub-chain fields passthrough
+            if let Some(ref steps) = step.steps {
+                meta["steps"] = json!(steps);
+            }
+            if let Some(ref until) = step.until {
+                meta["until"] = json!(until);
+            }
+            if let Some(break_loop) = step.break_loop {
+                meta["break"] = json!(break_loop);
+            }
             meta
         }),
         scope: None,
@@ -623,8 +671,15 @@ fn compile_context_entries(step: &ChainStep, _content_type: &str) -> Vec<Context
 #[cfg(test)]
 mod tests {
     use super::super::chain_engine::{ChainDefinition, ChainStep};
+    use super::super::llm::LlmConfig;
     use super::*;
     use std::collections::HashMap;
+
+    /// Return the fallback_model_1 from LlmConfig defaults.
+    /// All test chains use this instead of hardcoding "qwen/qwen3.5-flash-02-23".
+    fn test_fallback_model() -> String {
+        LlmConfig::default().fallback_model_1
+    }
 
     fn make_defaults() -> ChainDefaults {
         ChainDefaults {
@@ -663,6 +718,18 @@ mod tests {
             response_schema: None,
             batch_threshold: None,
             merge_instruction: None,
+            batch_size: None,
+            batch_max_tokens: None,
+            item_fields: None,
+            direct_synthesis_threshold: None,
+            convergence_fallback: None,
+            cluster_on_error: None,
+            cluster_fallback_size: None,
+            cluster_item_fields: None,
+            max_input_tokens: None,
+            split_strategy: None,
+            split_overlap_tokens: None,
+            split_merge: None,
             when: None,
             on_error: None,
             save_as: None,
@@ -670,6 +737,10 @@ mod tests {
             depth: None,
             context: None,
             compact_inputs: false,
+            enrichments: vec![],
+            steps: None,
+            until: None,
+            break_loop: None,
         }
     }
 
@@ -715,7 +786,7 @@ mod tests {
                     s.depth = Some(0);
                     s.save_as = Some("web_edges".to_string());
                     s.compact_inputs = true;
-                    s.model = Some("qwen/qwen3.5-flash-02-23".to_string());
+                    s.model = Some(test_fallback_model());
                     s.on_error = Some("skip".to_string());
                     s.response_schema = Some(json!({ "type": "object" }));
                     s
@@ -725,7 +796,7 @@ mod tests {
                     let mut s = make_chain_step("thread_clustering", "classify");
                     s.input = Some(json!({ "topics": "$l0_code_extract" }));
                     s.compact_inputs = true; // Use headlines+topics only, not full distilled
-                    s.model = Some("qwen/qwen3.5-flash-02-23".to_string());
+                    s.model = Some(test_fallback_model());
                     s.response_schema = Some(json!({ "type": "object" }));
                     s.on_error = Some("retry(3)".to_string());
                     s
@@ -755,7 +826,7 @@ mod tests {
                     let mut s = make_chain_step("upper_layer_synthesis", "synthesize");
                     s.recursive_cluster = true;
                     s.cluster_instruction = Some("Group these into clusters".to_string());
-                    s.cluster_model = Some("qwen/qwen3.5-flash-02-23".to_string());
+                    s.cluster_model = Some(test_fallback_model());
                     s.cluster_response_schema = Some(json!({ "type": "object" }));
                     s.depth = Some(1);
                     s.save_as = Some("node".to_string());
@@ -794,7 +865,7 @@ mod tests {
                     s.for_each = Some("$chunks".to_string());
                     s.input = Some(json!({ "doc": "$item", "header_lines": 20 }));
                     s.concurrency = 8;
-                    s.model = Some("qwen/qwen3.5-flash-02-23".to_string());
+                    s.model = Some(test_fallback_model());
                     s.response_schema = Some(json!({ "type": "object" }));
                     s.on_error = Some("retry(3)".to_string());
                     s
@@ -803,7 +874,7 @@ mod tests {
                 {
                     let mut s = make_chain_step("doc_taxonomy", "classify");
                     s.input = Some(json!({ "per_doc_classifications": "$doc_classify_perdoc" }));
-                    s.model = Some("qwen/qwen3.5-flash-02-23".to_string());
+                    s.model = Some(test_fallback_model());
                     s.response_schema = Some(json!({ "type": "object" }));
                     s.on_error = Some("retry(3)".to_string());
                     s
@@ -827,7 +898,7 @@ mod tests {
                         json!({ "topics": "$l0_doc_extract", "classification": "$doc_taxonomy" }),
                     );
                     s.compact_inputs = true;
-                    s.model = Some("qwen/qwen3.5-flash-02-23".to_string());
+                    s.model = Some(test_fallback_model());
                     s.response_schema = Some(json!({ "type": "object" }));
                     s.on_error = Some("retry(3)".to_string());
                     s
@@ -841,7 +912,7 @@ mod tests {
                         "classification": "$doc_taxonomy"
                     }));
                     s.concurrency = 8;
-                    s.model = Some("qwen/qwen3.5-flash-02-23".to_string());
+                    s.model = Some(test_fallback_model());
                     s.response_schema = Some(json!({ "type": "object" }));
                     s.on_error = Some("retry(3)".to_string());
                     s
@@ -875,7 +946,7 @@ mod tests {
                     let mut s = make_chain_step("upper_layer_synthesis", "synthesize");
                     s.recursive_cluster = true;
                     s.cluster_instruction = Some("Group these into clusters".to_string());
-                    s.cluster_model = Some("qwen/qwen3.5-flash-02-23".to_string());
+                    s.cluster_model = Some(test_fallback_model());
                     s.cluster_response_schema = Some(json!({ "type": "object" }));
                     s.depth = Some(1);
                     s.save_as = Some("node".to_string());

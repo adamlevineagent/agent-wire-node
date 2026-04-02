@@ -1,6 +1,9 @@
 import { useState, useEffect, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 
+// Re-export PyramidBuildViz as BuildProgress so all existing imports get the new viz
+export { PyramidBuildViz as BuildProgress } from './PyramidBuildViz';
+
 interface BuildStatus {
     slug: string;
     status: string; // "idle" | "running" | "complete" | "complete_with_errors" | "failed" | "cancelled"
@@ -16,7 +19,8 @@ interface BuildProgressProps {
     onRetry?: (slug: string) => void;
 }
 
-export function BuildProgress({ slug, onComplete, onClose, onRetry }: BuildProgressProps) {
+/** @deprecated Use PyramidBuildViz instead */
+export function BuildProgressLegacy({ slug, onComplete, onClose, onRetry }: BuildProgressProps) {
     const [status, setStatus] = useState<BuildStatus | null>(null);
     const [error, setError] = useState<string | null>(null);
 
@@ -74,7 +78,7 @@ export function BuildProgress({ slug, onComplete, onClose, onRetry }: BuildProgr
     }, [slug, onRetry]);
 
     const pct = status?.progress.total
-        ? Math.round((status.progress.done / status.progress.total) * 100)
+        ? Math.min(Math.round((status.progress.done / status.progress.total) * 100), 100)
         : 0;
 
     const elapsed = status?.elapsed_seconds

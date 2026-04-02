@@ -11,6 +11,8 @@
 // See docs/plans/action-chain-refactor-v3.md Phase 4 for the full spec.
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -30,7 +32,7 @@ use super::chain_engine::{ChainDefinition, ChainStep};
 use super::chain_resolve::{resolve_prompt_template, ChainContext};
 use super::db;
 use super::stale_helpers_upper::resolve_stale_target_for_node;
-use super::types::{BuildProgress, PyramidNode, WebEdge};
+use super::types::{BuildProgress, LayerEvent, PyramidNode, WebEdge};
 use super::PyramidState;
 
 const CODE_THREAD_SPLIT_PROMPT: &str =
@@ -2316,6 +2318,384 @@ async fn send_progress(progress_tx: &Option<mpsc::Sender<BuildProgress>>, done: 
     }
 }
 
+fn try_send_layer_event(layer_tx: &Option<mpsc::Sender<LayerEvent>>, event: LayerEvent) {
+    if let Some(ref tx) = layer_tx {
+        let _ = tx.try_send(event);
+    }
+}
+
+/// Estimate token count using tiktoken cl100k_base encoding.
+/// Falls back to len/4 if the tokenizer fails to initialize.
+fn estimate_tokens(text: &str) -> usize {
+    use std::sync::OnceLock;
+    static BPE: OnceLock<Option<tiktoken_rs::CoreBPE>> = OnceLock::new();
+    let bpe = BPE.get_or_init(|| tiktoken_rs::cl100k_base().ok());
+    match bpe {
+        Some(encoder) => encoder.encode_with_special_tokens(text).len(),
+        None => text.len() / 4,
+    }
+}
+
+/// Project an item down to only the specified top-level fields.
+/// Project an item down to specified fields. Supports dot-notation for nested access:
+/// - `"headline"` → top-level field
+/// - `"topics.name"` → for each element in `topics` array, extract only `name`
+/// - `"topics.name,entities"` → extract `name` and `entities` from each topics element
+fn project_item(item: &Value, fields: &[String]) -> Value {
+    let Some(obj) = item.as_object() else { return item.clone() };
+    let mut projected = serde_json::Map::new();
+    for field in fields {
+        if field.contains('.') {
+            // Dot-notation: "parent.child" or "parent.child1,child2"
+            let (parent, rest) = field.split_once('.').unwrap();
+            let sub_fields: Vec<&str> = rest.split(',').collect();
+            if let Some(parent_val) = obj.get(parent) {
+                let projected_val = project_nested(parent_val, &sub_fields);
+                projected.insert(parent.to_string(), projected_val);
+            }
+        } else if let Some(value) = obj.get(field.as_str()) {
+            projected.insert(field.clone(), value.clone());
+        }
+    }
+    Value::Object(projected)
+}
+
+/// Project nested fields from a value. If the value is an array, project each element.
+fn project_nested(val: &Value, sub_fields: &[&str]) -> Value {
+    match val {
+        Value::Array(arr) => {
+            Value::Array(arr.iter().map(|elem| project_nested(elem, sub_fields)).collect())
+        }
+        Value::Object(obj) => {
+            let mut projected = serde_json::Map::new();
+            for &field in sub_fields {
+                let field = field.trim();
+                if let Some(v) = obj.get(field) {
+                    projected.insert(field.to_string(), v.clone());
+                }
+            }
+            Value::Object(projected)
+        }
+        // Scalar inside an array — keep as-is (e.g., array of strings)
+        other => other.clone(),
+    }
+}
+
+/// Greedy token-aware batch splitting. Fills each batch until either
+/// `max_tokens` or `max_items` would be exceeded. A single oversized item
+/// always gets its own batch (never dropped).
+fn batch_items_by_tokens(
+    items: Vec<Value>,
+    max_tokens: usize,
+    max_items: Option<usize>,
+) -> Vec<Value> {
+    let mut batches = Vec::new();
+    let mut current_batch = Vec::new();
+    let mut current_tokens = 0usize;
+
+    for item in items {
+        let item_tokens = serde_json::to_string(&item)
+            .map(|s| estimate_tokens(&s))
+            .unwrap_or(0);
+
+        let would_exceed_tokens = current_tokens + item_tokens > max_tokens && !current_batch.is_empty();
+        let would_exceed_items = max_items.map_or(false, |max| current_batch.len() >= max);
+
+        if would_exceed_tokens || would_exceed_items {
+            batches.push(Value::Array(current_batch));
+            current_batch = Vec::new();
+            current_tokens = 0;
+        }
+
+        current_tokens += item_tokens;
+        current_batch.push(item);
+    }
+
+    if !current_batch.is_empty() {
+        batches.push(Value::Array(current_batch));
+    }
+
+    batches
+}
+
+// ── Oversized chunk splitting ───────────────────────────────────────────────
+
+/// Default merge prompt used when split_merge is true and no custom instruction is provided.
+const SPLIT_MERGE_DEFAULT_PROMPT: &str = "You are given extractions from multiple parts of the SAME document. The document was too large to process in one call, so it was split into sections. Combine these into a single coherent extraction. Deduplicate topics. Preserve all entities, decisions, and corrections.";
+
+/// Estimate token count for a serde_json Value by serializing to JSON and
+/// running through the existing tiktoken estimator.
+fn estimate_tokens_for_item(item: &Value) -> usize {
+    serde_json::to_string(item)
+        .map(|s| estimate_tokens(&s))
+        .unwrap_or(0)
+}
+
+/// Split content by markdown section headers (## and ###).
+/// Groups consecutive sections until adding the next would exceed max_tokens.
+/// Overlap from the end of the previous chunk is prepended to the next.
+/// Single sections that exceed max_tokens fall through to line splitting.
+fn split_by_sections(content: &str, max_tokens: usize, overlap_tokens: usize) -> Vec<String> {
+    let lines: Vec<&str> = content.lines().collect();
+    if lines.is_empty() {
+        return vec![content.to_string()];
+    }
+
+    // Find section boundaries (lines starting with ## or ###)
+    let mut section_starts: Vec<usize> = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("## ") || trimmed.starts_with("### ") {
+            section_starts.push(i);
+        }
+    }
+
+    // If no headers found, fall through to line splitting
+    if section_starts.is_empty() {
+        return split_by_lines(content, max_tokens, overlap_tokens);
+    }
+
+    // Build sections: each section is from its header to the next header (or end)
+    let mut sections: Vec<String> = Vec::new();
+    for (idx, &start) in section_starts.iter().enumerate() {
+        let end = if idx + 1 < section_starts.len() {
+            section_starts[idx + 1]
+        } else {
+            lines.len()
+        };
+        let section_text = lines[start..end].join("\n");
+        sections.push(section_text);
+    }
+
+    // Include any preamble before the first header as a section
+    if section_starts[0] > 0 {
+        let preamble = lines[0..section_starts[0]].join("\n");
+        if !preamble.trim().is_empty() {
+            sections.insert(0, preamble);
+        }
+    }
+
+    // Group sections into chunks that fit within max_tokens
+    let mut chunks: Vec<String> = Vec::new();
+    let mut current_chunk = String::new();
+    let mut current_tokens = 0usize;
+
+    for section in &sections {
+        let section_tokens = estimate_tokens(section);
+
+        // If a single section exceeds max_tokens, split it by lines
+        if section_tokens > max_tokens {
+            // Flush current chunk first
+            if !current_chunk.is_empty() {
+                chunks.push(current_chunk.clone());
+                current_chunk.clear();
+                current_tokens = 0;
+            }
+            let sub_chunks = split_by_lines(section, max_tokens, overlap_tokens);
+            chunks.extend(sub_chunks);
+            continue;
+        }
+
+        if current_tokens + section_tokens > max_tokens && !current_chunk.is_empty() {
+            chunks.push(current_chunk.clone());
+            // Build overlap prefix from the end of the previous chunk
+            let overlap_prefix = build_overlap_suffix(&current_chunk, overlap_tokens);
+            current_chunk = overlap_prefix;
+            current_tokens = estimate_tokens(&current_chunk);
+        }
+
+        if !current_chunk.is_empty() {
+            current_chunk.push('\n');
+        }
+        current_chunk.push_str(section);
+        current_tokens += section_tokens;
+    }
+
+    if !current_chunk.is_empty() {
+        chunks.push(current_chunk);
+    }
+
+    if chunks.is_empty() {
+        vec![content.to_string()]
+    } else {
+        chunks
+    }
+}
+
+/// Split content on line boundaries at max_tokens intervals.
+/// Includes overlap_tokens worth of trailing lines from the previous chunk.
+fn split_by_lines(content: &str, max_tokens: usize, overlap_tokens: usize) -> Vec<String> {
+    let lines: Vec<&str> = content.lines().collect();
+    if lines.is_empty() {
+        return vec![content.to_string()];
+    }
+
+    let mut chunks: Vec<String> = Vec::new();
+    let mut start = 0;
+
+    while start < lines.len() {
+        let mut end = start;
+        let mut tokens = 0usize;
+
+        // Grow the chunk until we'd exceed max_tokens
+        while end < lines.len() {
+            let line_tokens = estimate_tokens(lines[end]);
+            if tokens + line_tokens > max_tokens && end > start {
+                break;
+            }
+            tokens += line_tokens;
+            end += 1;
+        }
+
+        let chunk_text = lines[start..end].join("\n");
+        chunks.push(chunk_text);
+
+        // Next chunk starts at end, but we add overlap by backing up
+        if end >= lines.len() {
+            break;
+        }
+
+        // Calculate how many lines from the end of this chunk to include as overlap
+        let mut overlap_line_count = 0;
+        let mut overlap_tok = 0usize;
+        for i in (start..end).rev() {
+            let lt = estimate_tokens(lines[i]);
+            if overlap_tok + lt > overlap_tokens && overlap_line_count > 0 {
+                break;
+            }
+            overlap_tok += lt;
+            overlap_line_count += 1;
+        }
+
+        start = end.saturating_sub(overlap_line_count);
+    }
+
+    if chunks.is_empty() {
+        vec![content.to_string()]
+    } else {
+        chunks
+    }
+}
+
+/// Split content at character positions estimated from token counts.
+/// Simple: chunk the text at roughly max_tokens * 4 chars, with overlap.
+fn split_by_tokens(content: &str, max_tokens: usize, overlap_tokens: usize) -> Vec<String> {
+    let chars_per_chunk = max_tokens * 4;
+    let overlap_chars = overlap_tokens * 4;
+    let content_chars: Vec<char> = content.chars().collect();
+
+    if content_chars.len() <= chars_per_chunk {
+        return vec![content.to_string()];
+    }
+
+    let mut chunks: Vec<String> = Vec::new();
+    let mut start = 0;
+
+    while start < content_chars.len() {
+        let end = (start + chars_per_chunk).min(content_chars.len());
+        let chunk: String = content_chars[start..end].iter().collect();
+        chunks.push(chunk);
+
+        if end >= content_chars.len() {
+            break;
+        }
+
+        start = end.saturating_sub(overlap_chars);
+    }
+
+    chunks
+}
+
+/// Build an overlap suffix: extract the last `overlap_tokens` worth of text
+/// from the given content, respecting line boundaries.
+fn build_overlap_suffix(content: &str, overlap_tokens: usize) -> String {
+    if overlap_tokens == 0 {
+        return String::new();
+    }
+    let lines: Vec<&str> = content.lines().collect();
+    let mut selected = Vec::new();
+    let mut tokens = 0usize;
+
+    for &line in lines.iter().rev() {
+        let lt = estimate_tokens(line);
+        if tokens + lt > overlap_tokens && !selected.is_empty() {
+            break;
+        }
+        tokens += lt;
+        selected.push(line);
+    }
+
+    selected.reverse();
+    selected.join("\n")
+}
+
+/// Split a for_each item into sub-chunks when it exceeds max_input_tokens.
+///
+/// Looks for text content in "content", "text", or "body" fields.
+/// Returns new items with the content field replaced by sub-chunk text,
+/// plus metadata: _split_part, _split_total, _split_source.
+fn split_chunk(
+    item: &Value,
+    max_tokens: usize,
+    strategy: &str,
+    overlap_tokens: usize,
+) -> Vec<Value> {
+    // Find the text content field
+    let (field_name, text_content) = if let Some(s) = item.get("content").and_then(|v| v.as_str()) {
+        ("content", s.to_string())
+    } else if let Some(s) = item.get("text").and_then(|v| v.as_str()) {
+        ("text", s.to_string())
+    } else if let Some(s) = item.get("body").and_then(|v| v.as_str()) {
+        ("body", s.to_string())
+    } else {
+        // No recognizable text field — return item as-is
+        return vec![item.clone()];
+    };
+
+    let sub_texts = match strategy {
+        "lines" => split_by_lines(&text_content, max_tokens, overlap_tokens),
+        "tokens" => split_by_tokens(&text_content, max_tokens, overlap_tokens),
+        _ => split_by_sections(&text_content, max_tokens, overlap_tokens), // "sections" is default
+    };
+
+    if sub_texts.len() <= 1 {
+        return vec![item.clone()];
+    }
+
+    let total = sub_texts.len();
+    let source_headline = item
+        .get("headline")
+        .or_else(|| item.get("title"))
+        .or_else(|| item.get("file_path"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+
+    sub_texts
+        .into_iter()
+        .enumerate()
+        .map(|(part, chunk_text)| {
+            let mut new_item = item.clone();
+            if let Some(obj) = new_item.as_object_mut() {
+                obj.insert(field_name.to_string(), Value::String(chunk_text));
+                obj.insert(
+                    "_split_part".to_string(),
+                    Value::Number(serde_json::Number::from(part + 1)),
+                );
+                obj.insert(
+                    "_split_total".to_string(),
+                    Value::Number(serde_json::Number::from(total)),
+                );
+                obj.insert(
+                    "_split_source".to_string(),
+                    Value::String(source_headline.clone()),
+                );
+            }
+            new_item
+        })
+        .collect()
+}
+
 /// Estimate total iterations for progress reporting.
 fn step_saves_node(step: &ChainStep) -> bool {
     step.save_as.as_deref() == Some("node")
@@ -2444,11 +2824,69 @@ fn evaluate_when(when: Option<&str>, ctx: &ChainContext) -> bool {
         }
     }
 
-    // Comparison: $var > N, $var == N, etc.
+    // count($ref) — resolves the inner ref, gets array length, then optionally compares.
+    // Handles: "count($extract_parts) > 1", "count($items) == 0", bare "count($items)" (truthy if > 0)
+    if expr.starts_with("count(") {
+        if let Some(close_paren) = expr.find(')') {
+            let inner_ref = expr[6..close_paren].trim();
+            let count_val = match ctx.resolve_ref(inner_ref) {
+                Ok(Value::Array(arr)) => arr.len() as f64,
+                Ok(_) => 1.0, // non-array resolved value counts as 1
+                Err(_) => 0.0,
+            };
+
+            let remainder = expr[close_paren + 1..].trim();
+            if remainder.is_empty() {
+                // Bare count($ref) — truthy if > 0
+                return count_val > 0.0;
+            }
+
+            // Check for comparison operator after count(...)
+            for op in &[" > ", " >= ", " < ", " <= ", " == ", " != "] {
+                if let Some(op_start) = remainder.find(op.trim_start()) {
+                    if op_start == 0 || remainder[..op_start].trim().is_empty() {
+                        let rhs_str = remainder[op_start + op.trim_start().len()..].trim();
+                        let rhs = rhs_str.parse::<f64>().unwrap_or(0.0);
+                        return match *op {
+                            " > " => count_val > rhs,
+                            " >= " => count_val >= rhs,
+                            " < " => count_val < rhs,
+                            " <= " => count_val <= rhs,
+                            " == " => (count_val - rhs).abs() < f64::EPSILON,
+                            " != " => (count_val - rhs).abs() >= f64::EPSILON,
+                            _ => true,
+                        };
+                    }
+                }
+            }
+
+            warn!("count() expression with unparseable comparison: '{expr}', defaulting to true");
+            return true;
+        }
+    }
+
+    // Comparison: $var > N, $var == N, $var == true, etc.
     for op in &[" > ", " >= ", " < ", " <= ", " == ", " != "] {
         if let Some(pos) = expr.find(op) {
             let lhs_expr = expr[..pos].trim();
             let rhs_str = expr[pos + op.len()..].trim();
+
+            // String-based boolean comparison: $ref == true / $ref == false
+            if (*op == " == " || *op == " != ") && (rhs_str == "true" || rhs_str == "false") {
+                let rhs_bool = rhs_str == "true";
+                let lhs_bool = match ctx.resolve_ref(lhs_expr) {
+                    Ok(Value::Bool(b)) => b,
+                    Ok(Value::String(s)) => s == "true",
+                    Ok(Value::Null) => false,
+                    Ok(Value::Number(n)) => n.as_f64().map(|f| f != 0.0).unwrap_or(false),
+                    _ => false,
+                };
+                return if *op == " == " {
+                    lhs_bool == rhs_bool
+                } else {
+                    lhs_bool != rhs_bool
+                };
+            }
 
             let lhs = ctx
                 .resolve_ref(lhs_expr)
@@ -2471,6 +2909,396 @@ fn evaluate_when(when: Option<&str>, ctx: &ChainContext) -> bool {
 
     warn!("Unknown when expression: '{expr}', defaulting to true");
     true
+}
+
+// ── Sub-chain execution primitives ─────────────────────────────────────────
+
+/// Execute a container step that has inner sub-steps (`steps: Some(inner_steps)`).
+///
+/// If the container has `for_each`, resolves the items and iterates, running the inner
+/// sub-chain for each item (with optional concurrency via semaphore). If no `for_each`,
+/// runs the inner steps once. Returns `(Vec<Value>, i32)` like execute_for_each.
+async fn execute_container_step(
+    step: &ChainStep,
+    ctx: &mut ChainContext,
+    dispatch_ctx: &chain_dispatch::StepContext,
+    defaults: &super::chain_engine::ChainDefaults,
+    error_strategy: &ErrorStrategy,
+    writer_tx: &mpsc::Sender<WriteOp>,
+    reader: &Arc<Mutex<Connection>>,
+    cancel: &CancellationToken,
+    progress_tx: &Option<mpsc::Sender<BuildProgress>>,
+    done: &mut i64,
+    total: &mut i64,
+    layer_tx: &Option<mpsc::Sender<LayerEvent>>,
+) -> Result<(Vec<Value>, i32)> {
+    let inner_steps = step.steps.as_ref().ok_or_else(|| {
+        anyhow!("execute_container_step called on step '{}' without inner steps", step.name)
+    })?;
+
+    let saves_node = step.save_as.as_deref() == Some("node");
+    let depth = step.depth.unwrap_or(0);
+
+    if let Some(ref for_each_ref_raw) = step.for_each {
+        // ── Container with for_each: iterate items, run sub-chain per item ──
+        let for_each_ref = normalize_context_ref(for_each_ref_raw);
+        let items = match ctx.resolve_ref(&for_each_ref) {
+            Ok(Value::Array(arr)) => arr,
+            Ok(other) => {
+                return Err(anyhow!(
+                    "Container step '{}' forEach ref '{}' resolved to {}, expected array",
+                    step.name, for_each_ref, other
+                ));
+            }
+            Err(e) => {
+                return Err(anyhow!(
+                    "Container step '{}' could not resolve forEach ref '{}': {e}",
+                    step.name, for_each_ref
+                ));
+            }
+        };
+
+        // Container for_each executes sequentially per item. The inner sub-chain
+        // for each item runs its own steps (which may themselves have concurrency
+        // via inner for_each steps). Container-level concurrency can be added later
+        // by spawning owned futures when the architecture supports it.
+        let mut outputs = vec![Value::Null; items.len()];
+        let mut failures: i32 = 0;
+
+        for (index, item) in items.iter().enumerate() {
+            if cancel.is_cancelled() {
+                info!("Container step '{}' cancelled at iteration {index}", step.name);
+                break;
+            }
+
+            // Clone parent context — child inherits all parent step_outputs so inner
+            // steps can reference outer step results. Inner step results are added to
+            // this child's step_outputs and don't leak back to the parent.
+            let mut child_ctx = ctx.clone();
+            child_ctx.current_item = Some(item.clone());
+            child_ctx.current_index = Some(index);
+            child_ctx.break_loop = false;
+
+            match execute_inner_steps(
+                inner_steps, &mut child_ctx, dispatch_ctx, defaults, error_strategy,
+                writer_tx, reader, cancel, progress_tx, done, total, layer_tx,
+            ).await {
+                Ok(last_output) => {
+                    let node_id = if let Some(ref pattern) = step.node_id_pattern {
+                        generate_node_id(pattern, index, Some(depth))
+                    } else {
+                        format!("L{depth}-{index:03}")
+                    };
+
+                    if saves_node {
+                        let chunk_index = item.get("index").and_then(|v| v.as_i64()).unwrap_or(index as i64);
+                        if let Ok(node) = build_node_from_output(&last_output, &node_id, &ctx.slug, depth, Some(chunk_index)) {
+                            let topics_json = serde_json::to_string(
+                                last_output.get("topics").unwrap_or(&serde_json::json!([]))
+                            )?;
+                            send_save_node(writer_tx, node, Some(topics_json)).await;
+                            *done += 1;
+                            send_progress(progress_tx, *done, *total).await;
+                            let label = last_output.get("headline").and_then(|v| v.as_str()).map(|s| s.to_string());
+                            try_send_layer_event(layer_tx, LayerEvent::NodeCompleted {
+                                depth, step_name: step.name.clone(), node_id: node_id.clone(), label,
+                            });
+                        }
+                    }
+
+                    outputs[index] = decorate_step_output(last_output, &node_id, index as i64);
+                }
+                Err(e) => {
+                    warn!("[CHAIN] Container step '{}' iteration {index} failed: {e}", step.name);
+                    failures += 1;
+                    if *error_strategy == ErrorStrategy::Abort {
+                        return Err(anyhow!("Container step '{}' aborted at iteration {index}: {e}", step.name));
+                    }
+                }
+            }
+        }
+
+        Ok((outputs, failures))
+    } else {
+        // ── Container without for_each: run inner steps once ──
+        let mut child_ctx = ctx.clone();
+        child_ctx.break_loop = false;
+
+        let last_output = execute_inner_steps(
+            inner_steps, &mut child_ctx, dispatch_ctx, defaults, error_strategy,
+            writer_tx, reader, cancel, progress_tx, done, total, layer_tx,
+        ).await?;
+
+        // Propagate inner step outputs back to the parent context
+        for (k, v) in &child_ctx.step_outputs {
+            ctx.step_outputs.insert(k.clone(), v.clone());
+        }
+
+        Ok((vec![last_output], 0))
+    }
+}
+
+/// Execute a slice of inner steps sequentially within a child context.
+///
+/// This is the core sub-chain executor — a mini version of the main dispatch loop
+/// but operating on a child ChainContext. Supports recursion: inner steps can themselves
+/// be containers, for_each, split, loop, or gate steps.
+///
+/// Returns the last step's output value.
+///
+/// Uses `Box::pin` to support mutual recursion with `execute_container_step` and
+/// `execute_loop_step` (Rust async fns cannot be directly mutually recursive without boxing).
+fn execute_inner_steps<'a>(
+    steps: &'a [ChainStep],
+    ctx: &'a mut ChainContext,
+    dispatch_ctx: &'a chain_dispatch::StepContext,
+    defaults: &'a super::chain_engine::ChainDefaults,
+    error_strategy: &'a ErrorStrategy,
+    writer_tx: &'a mpsc::Sender<WriteOp>,
+    reader: &'a Arc<Mutex<Connection>>,
+    cancel: &'a CancellationToken,
+    progress_tx: &'a Option<mpsc::Sender<BuildProgress>>,
+    done: &'a mut i64,
+    total: &'a mut i64,
+    layer_tx: &'a Option<mpsc::Sender<LayerEvent>>,
+) -> Pin<Box<dyn Future<Output = Result<Value>> + Send + 'a>> {
+    Box::pin(async move {
+        let mut last_output = Value::Null;
+
+        for inner_step in steps {
+            if cancel.is_cancelled() {
+                info!("Inner steps cancelled at step '{}'", inner_step.name);
+                break;
+            }
+
+            // Check break_loop signal from a gate step
+            if ctx.break_loop {
+                break;
+            }
+
+            // Check `when` condition
+            if !evaluate_when(inner_step.when.as_deref(), ctx) {
+                info!("  Inner step '{}' skipped (when condition false)", inner_step.name);
+                continue;
+            }
+
+            let inner_error_strategy = resolve_error_strategy(inner_step, defaults);
+            let inner_saves_node = inner_step.save_as.as_deref() == Some("node");
+
+            info!("[CHAIN] inner step '{}' started (primitive: {})", inner_step.name, inner_step.primitive);
+
+            let step_output = if inner_step.primitive == "gate" {
+                // ── Gate primitive: evaluate condition, optionally break loop ──
+                let condition_met = evaluate_when(inner_step.when.as_deref(), ctx);
+                if condition_met && inner_step.break_loop == Some(true) {
+                    ctx.break_loop = true;
+                    info!("[CHAIN] gate '{}' triggered break_loop", inner_step.name);
+                }
+                Ok(Value::Bool(condition_met))
+            } else if inner_step.primitive == "split" {
+                // ── Split primitive: text splitting without LLM ──
+                execute_split_step(inner_step, ctx)
+            } else if inner_step.primitive == "loop" {
+                // ── Loop primitive: repeat inner steps until condition ──
+                let (loop_outputs, loop_failures) = execute_loop_step(
+                    inner_step, ctx, dispatch_ctx, defaults, error_strategy,
+                    writer_tx, reader, cancel, progress_tx, done, total, layer_tx,
+                ).await?;
+                if loop_failures > 0 {
+                    warn!("[CHAIN] loop '{}' had {loop_failures} failures", inner_step.name);
+                }
+                // Loop output is the last iteration's result
+                Ok(loop_outputs.last().cloned().unwrap_or(Value::Null))
+            } else if inner_step.steps.is_some() {
+                // ── Nested container step ──
+                let (container_outputs, container_failures) = execute_container_step(
+                    inner_step, ctx, dispatch_ctx, defaults, &inner_error_strategy,
+                    writer_tx, reader, cancel, progress_tx, done, total, layer_tx,
+                ).await?;
+                if container_failures > 0 {
+                    warn!("[CHAIN] nested container '{}' had {container_failures} failures", inner_step.name);
+                }
+                Ok(Value::Array(container_outputs))
+            } else if inner_step.for_each.is_some() {
+                // ── Inner for_each: delegate to existing execute_for_each ──
+                let (for_each_outputs, for_each_failures) = execute_for_each(
+                    inner_step, ctx, dispatch_ctx, defaults, &inner_error_strategy,
+                    inner_saves_node, writer_tx, reader, cancel, progress_tx, done, *total, layer_tx,
+                ).await?;
+                if for_each_failures > 0 {
+                    warn!("[CHAIN] inner for_each '{}' had {for_each_failures} failures", inner_step.name);
+                }
+                Ok(Value::Array(for_each_outputs))
+            } else if inner_step.mechanical {
+                // ── Mechanical step ──
+                execute_mechanical(inner_step, ctx, dispatch_ctx, defaults).await
+            } else {
+                // ── Standard LLM dispatch (single step) ──
+                execute_single(
+                    inner_step, ctx, dispatch_ctx, defaults, &inner_error_strategy,
+                    inner_saves_node, writer_tx, reader, cancel, progress_tx, done, *total, layer_tx,
+                ).await
+            };
+
+            match step_output {
+                Ok(output) => {
+                    info!("[CHAIN] inner step '{}' complete", inner_step.name);
+                    if !output.is_null() {
+                        ctx.step_outputs.insert(inner_step.name.clone(), output.clone());
+                        last_output = output;
+                    }
+                }
+                Err(e) => {
+                    match inner_error_strategy {
+                        ErrorStrategy::Abort | ErrorStrategy::Retry(_) => {
+                            return Err(anyhow!("Inner step '{}' failed (abort): {e}", inner_step.name));
+                        }
+                        ErrorStrategy::Skip => {
+                            warn!("[CHAIN] inner step '{}' FAILED (skip): {e}", inner_step.name);
+                        }
+                        _ => {
+                            warn!("[CHAIN] inner step '{}' FAILED: {e}", inner_step.name);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(last_output)
+    })
+}
+
+/// Execute the `split` primitive: splits text content into chunks without any LLM call.
+///
+/// Resolves input from `step.input` or `ctx.current_item`, calls the existing `split_chunk()`
+/// utility, and stores the result as an array in `ctx.step_outputs`.
+fn execute_split_step(step: &ChainStep, ctx: &mut ChainContext) -> Result<Value> {
+    // Resolve the input content to split
+    let input = if let Some(ref input_spec) = step.input {
+        ctx.resolve_value(input_spec)?
+    } else if let Some(ref item) = ctx.current_item {
+        item.clone()
+    } else {
+        return Err(anyhow!("split step '{}' has no input and no current_item", step.name));
+    };
+
+    let max_tokens = step.max_input_tokens.or(step.batch_max_tokens).unwrap_or(60000);
+    let strategy = step.split_strategy.as_deref().unwrap_or("sections");
+    let overlap = step.split_overlap_tokens.unwrap_or(500);
+
+    // If input is a string, wrap it for split_chunk which expects an object with content/text/body
+    let item_for_split = match &input {
+        Value::String(s) => serde_json::json!({ "content": s }),
+        other => other.clone(),
+    };
+
+    let chunks = split_chunk(&item_for_split, max_tokens, strategy, overlap);
+
+    info!(
+        "[CHAIN] split '{}': produced {} chunks (strategy={}, max_tokens={})",
+        step.name, chunks.len(), strategy, max_tokens
+    );
+
+    let result = Value::Array(chunks);
+    ctx.step_outputs.insert(step.name.clone(), result.clone());
+    Ok(result)
+}
+
+/// Execute a `loop` primitive: repeats inner sub-steps until a condition is met.
+///
+/// Reads `step.until` (condition string) and `step.steps` (inner sub-chain).
+/// Loops up to 100 iterations (safety cap). Each iteration:
+///   1. Check `until` condition via evaluate_when — if met, exit loop
+///   2. Execute inner steps
+///   3. Check for `break_loop` signal from a gate step
+///
+/// The loop context's step_outputs persist across iterations so inner steps
+/// can reference prior iteration results. Returns the last iteration's last step output.
+async fn execute_loop_step(
+    step: &ChainStep,
+    ctx: &mut ChainContext,
+    dispatch_ctx: &chain_dispatch::StepContext,
+    defaults: &super::chain_engine::ChainDefaults,
+    error_strategy: &ErrorStrategy,
+    writer_tx: &mpsc::Sender<WriteOp>,
+    reader: &Arc<Mutex<Connection>>,
+    cancel: &CancellationToken,
+    progress_tx: &Option<mpsc::Sender<BuildProgress>>,
+    done: &mut i64,
+    total: &mut i64,
+    layer_tx: &Option<mpsc::Sender<LayerEvent>>,
+) -> Result<(Vec<Value>, i32)> {
+    let inner_steps = step.steps.as_ref().ok_or_else(|| {
+        anyhow!("loop step '{}' has no inner steps", step.name)
+    })?;
+
+    let until_condition = step.until.as_deref();
+    let max_iterations: usize = 100;
+    let mut outputs: Vec<Value> = Vec::new();
+    let mut total_failures: i32 = 0;
+
+    // Create a loop context — step_outputs persist across iterations
+    let mut loop_ctx = ctx.clone();
+    loop_ctx.break_loop = false;
+
+    for iteration in 0..max_iterations {
+        if cancel.is_cancelled() {
+            info!("Loop '{}' cancelled at iteration {iteration}", step.name);
+            break;
+        }
+
+        // Check `until` condition BEFORE executing this iteration's steps.
+        // The until condition is "exit when true" — so if it's met, we stop.
+        // On the first iteration, the condition variables may not exist yet, so
+        // evaluate_when will return false for unresolvable refs (which is correct:
+        // we want to enter the loop at least once).
+        if iteration > 0 {
+            // evaluate_when returns true when condition is met (or when is None).
+            // For loops, `until` means "stop when this is true".
+            // We pass it as a `when` and check if the result is true.
+            let until_met = if let Some(cond) = until_condition {
+                evaluate_when(Some(cond), &loop_ctx)
+            } else {
+                false
+            };
+
+            if until_met {
+                info!("[CHAIN] loop '{}' until condition met at iteration {iteration}", step.name);
+                break;
+            }
+        }
+
+        info!("[CHAIN] loop '{}' iteration {iteration}", step.name);
+
+        match execute_inner_steps(
+            inner_steps, &mut loop_ctx, dispatch_ctx, defaults, error_strategy,
+            writer_tx, reader, cancel, progress_tx, done, total, layer_tx,
+        ).await {
+            Ok(last_output) => {
+                outputs.push(last_output);
+            }
+            Err(e) => {
+                warn!("[CHAIN] loop '{}' iteration {iteration} failed: {e}", step.name);
+                total_failures += 1;
+                if *error_strategy == ErrorStrategy::Abort {
+                    return Err(anyhow!("Loop '{}' aborted at iteration {iteration}: {e}", step.name));
+                }
+            }
+        }
+
+        // Check break_loop signal (set by a gate step within the inner steps)
+        if loop_ctx.break_loop {
+            info!("[CHAIN] loop '{}' break signal at iteration {iteration}", step.name);
+            break;
+        }
+    }
+
+    // Propagate loop context step_outputs back to parent
+    for (k, v) in &loop_ctx.step_outputs {
+        ctx.step_outputs.insert(k.clone(), v.clone());
+    }
+
+    Ok((outputs, total_failures))
 }
 
 // ── Dispatch helpers ────────────────────────────────────────────────────────
@@ -2568,8 +3396,9 @@ pub async fn execute_chain(
     slug: &str,
     cancel: &CancellationToken,
     progress_tx: Option<mpsc::Sender<BuildProgress>>,
+    layer_tx: Option<mpsc::Sender<LayerEvent>>,
 ) -> Result<(String, i32)> {
-    execute_chain_from(state, chain, slug, 0, cancel, progress_tx).await
+    execute_chain_from(state, chain, slug, 0, cancel, progress_tx, layer_tx).await
 }
 
 /// Execute a chain from a specific depth, reusing nodes below that depth.
@@ -2580,6 +3409,7 @@ pub async fn execute_chain_from(
     from_depth: i64,
     cancel: &CancellationToken,
     progress_tx: Option<mpsc::Sender<BuildProgress>>,
+    layer_tx: Option<mpsc::Sender<LayerEvent>>,
 ) -> Result<(String, i32)> {
     let llm_config = state.config.read().await.clone();
 
@@ -2711,6 +3541,7 @@ pub async fn execute_chain_from(
             done,
             total,
         );
+        try_send_layer_event(&layer_tx, LayerEvent::StepStarted { step_name: step.name.clone() });
 
         let step_result = if step.mechanical {
             execute_mechanical(step, &mut ctx, &dispatch_ctx, &chain.defaults).await
@@ -2741,7 +3572,8 @@ pub async fn execute_chain_from(
                 cancel,
                 &progress_tx,
                 &mut done,
-                total,
+                &mut total,
+                &layer_tx,
             )
             .await?;
             apex_node_id = apex_id;
@@ -2762,7 +3594,8 @@ pub async fn execute_chain_from(
                 cancel,
                 &progress_tx,
                 &mut done,
-                total,
+                &mut total,
+                &layer_tx,
             )
             .await?;
             apex_node_id = apex_id;
@@ -2784,12 +3617,66 @@ pub async fn execute_chain_from(
                 &progress_tx,
                 &mut done,
                 total,
+                &layer_tx,
             )
             .await?;
             total_failures += failures;
             ctx.step_outputs
                 .insert(step.name.clone(), Value::Array(outputs));
             Ok(Value::Null)
+        } else if step.steps.is_some() && step.primitive != "loop" {
+            // Container step with sub-chain (not a loop — loops handle their own steps)
+            let (outputs, failures) = execute_container_step(
+                step,
+                &mut ctx,
+                &dispatch_ctx,
+                &chain.defaults,
+                &error_strategy,
+                &writer_tx,
+                &state.reader,
+                cancel,
+                &progress_tx,
+                &mut done,
+                &mut total,
+                &layer_tx,
+            )
+            .await?;
+            total_failures += failures;
+            ctx.step_outputs
+                .insert(step.name.clone(), Value::Array(outputs));
+            Ok(Value::Null)
+        } else if step.primitive == "split" {
+            // Split primitive (no LLM call) — text splitting
+            execute_split_step(step, &mut ctx)
+        } else if step.primitive == "loop" {
+            // Loop primitive — repeat inner steps until condition
+            let (outputs, failures) = execute_loop_step(
+                step,
+                &mut ctx,
+                &dispatch_ctx,
+                &chain.defaults,
+                &error_strategy,
+                &writer_tx,
+                &state.reader,
+                cancel,
+                &progress_tx,
+                &mut done,
+                &mut total,
+                &layer_tx,
+            )
+            .await?;
+            total_failures += failures;
+            let last = outputs.last().cloned().unwrap_or(Value::Null);
+            ctx.step_outputs.insert(step.name.clone(), last);
+            Ok(Value::Null)
+        } else if step.primitive == "gate" {
+            // Gate primitive (no LLM call) — evaluate condition, optionally break
+            let condition_met = evaluate_when(step.when.as_deref(), &ctx);
+            if condition_met && step.break_loop == Some(true) {
+                ctx.break_loop = true;
+                info!("[CHAIN] gate '{}' triggered break_loop", step.name);
+            }
+            Ok(Value::Bool(condition_met))
         } else if step.for_each.is_some() {
             let (outputs, failures) = execute_for_each(
                 step,
@@ -2804,6 +3691,7 @@ pub async fn execute_chain_from(
                 &progress_tx,
                 &mut done,
                 total,
+                &layer_tx,
             )
             .await?;
             total_failures += failures;
@@ -2824,6 +3712,7 @@ pub async fn execute_chain_from(
                 &progress_tx,
                 &mut done,
                 total,
+                &layer_tx,
             )
             .await
         };
@@ -2933,6 +3822,7 @@ async fn execute_for_each(
     progress_tx: &Option<mpsc::Sender<BuildProgress>>,
     done: &mut i64,
     total: i64,
+    layer_tx: &Option<mpsc::Sender<LayerEvent>>,
 ) -> Result<(Vec<Value>, i32)> {
     // Resolve the items to iterate over
     let for_each_ref = normalize_context_ref(step.for_each.as_deref().unwrap_or("$chunks"));
@@ -2953,7 +3843,63 @@ async fn execute_for_each(
         }
     };
 
+    // ── Step 1: item_fields projection (before batching/token estimation) ──
+    let items = if let Some(ref fields) = step.item_fields {
+        info!(
+            "[CHAIN] [{}] forEach: projecting items to fields {:?}",
+            step.name, fields
+        );
+        items.into_iter().map(|item| project_item(&item, fields)).collect()
+    } else {
+        items
+    };
+
+    // ── Step 2: batching ─────────────────────────────────────────────────
+    let items = if let Some(max_tokens) = step.batch_max_tokens {
+        // Token-aware greedy batching (composes with batch_size as max items per batch)
+        info!(
+            "[CHAIN] [{}] forEach: token-aware batching {} items (max_tokens={}, max_items={:?})",
+            step.name, items.len(), max_tokens, step.batch_size
+        );
+        batch_items_by_tokens(items, max_tokens, step.batch_size)
+    } else if let Some(batch_size) = step.batch_size {
+        // Proportional splitting: 127 items / batch_size=100 → [64, 63]
+        let bs = batch_size.max(1);
+        let num_batches = (items.len() + bs - 1) / bs;
+        if num_batches <= 1 {
+            info!(
+                "[CHAIN] [{}] forEach: batching {} items into 1 batch",
+                step.name, items.len()
+            );
+            vec![Value::Array(items)]
+        } else {
+            let base_size = items.len() / num_batches;
+            let remainder = items.len() % num_batches;
+            info!(
+                "[CHAIN] [{}] forEach: batching {} items into {} balanced batches (~{} each)",
+                step.name, items.len(), num_batches, base_size
+            );
+            let mut result = Vec::with_capacity(num_batches);
+            let mut offset = 0;
+            for i in 0..num_batches {
+                let size = base_size + if i < remainder { 1 } else { 0 };
+                result.push(Value::Array(items[offset..offset + size].to_vec()));
+                offset += size;
+            }
+            result
+        }
+    } else {
+        items
+    };
+
     info!("[CHAIN] [{}] forEach: {} items", step.name, items.len());
+    if saves_node {
+        try_send_layer_event(layer_tx, LayerEvent::Discovered {
+            depth: step.depth.unwrap_or(0),
+            step_name: step.name.clone(),
+            estimated_nodes: items.len() as i64,
+        });
+    }
     let mut outputs: Vec<Value> = Vec::with_capacity(items.len());
     let mut failures: i32 = 0;
 
@@ -2988,6 +3934,7 @@ async fn execute_for_each(
             progress_tx,
             done,
             total,
+            layer_tx,
         )
         .await;
     }
@@ -3026,6 +3973,7 @@ async fn execute_for_each(
             ResumeState::Complete => {
                 info!("[CHAIN] [{}] {} -- resumed (complete)", step.name, node_id);
 
+                let mut resume_label: Option<String> = None;
                 if let Some(prior_output) = load_prior_step_output(
                     reader,
                     &ctx.slug,
@@ -3036,6 +3984,7 @@ async fn execute_for_each(
                 )
                 .await?
                 {
+                    resume_label = prior_output.get("headline").and_then(|v| v.as_str()).map(|s| s.to_string());
                     if step.sequential {
                         update_accumulators(&mut ctx.accumulators, &prior_output, step);
                     }
@@ -3051,6 +4000,9 @@ async fn execute_for_each(
                 if saves_node {
                     *done += 1;
                     send_progress(progress_tx, *done, total).await;
+                    try_send_layer_event(layer_tx, LayerEvent::NodeCompleted {
+                        depth, step_name: step.name.clone(), node_id: node_id.clone(), label: resume_label,
+                    });
                 }
                 continue;
             }
@@ -3077,6 +4029,222 @@ async fn execute_for_each(
         let resolved_input = apply_header_lines(resolved_input);
         let resolved_input =
             enrich_for_each_step_input(step, resolved_input, item, ctx, reader).await?;
+
+        // ── Oversized chunk splitting ───────────────────────────────────────
+        if let Some(max_tokens) = step.max_input_tokens {
+            let est_tokens = estimate_tokens_for_item(&resolved_input);
+            if est_tokens > max_tokens {
+                let strategy = step.split_strategy.as_deref().unwrap_or("sections");
+                let overlap = step.split_overlap_tokens.unwrap_or(500);
+                let sub_chunks = split_chunk(&resolved_input, max_tokens, strategy, overlap);
+                let num_sub = sub_chunks.len();
+
+                info!(
+                    "[CHAIN] [{}] {node_id}: oversized ({est_tokens} tokens > {max_tokens}), splitting into {num_sub} sub-chunks via \"{strategy}\"",
+                    step.name
+                );
+
+                // Process each sub-chunk through the normal dispatch path
+                let mut sub_results: Vec<Value> = Vec::with_capacity(num_sub);
+                for (sub_idx, sub_item) in sub_chunks.iter().enumerate() {
+                    let sub_system_prompt = {
+                        let part_header = format!(
+                            "This is part {} of {} from document: {}",
+                            sub_idx + 1,
+                            num_sub,
+                            sub_item
+                                .get("_split_source")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("unknown"),
+                        );
+                        let base = build_system_prompt(step, sub_item, ctx)?;
+                        format!("{base}\n\n{part_header}")
+                    };
+                    let sub_fallback_key = format!("{}-{index}-sub{sub_idx}", step.name);
+                    let sub_t0 = Instant::now();
+
+                    match dispatch_with_retry(
+                        step,
+                        sub_item,
+                        &sub_system_prompt,
+                        defaults,
+                        dispatch_ctx,
+                        error_strategy,
+                        &sub_fallback_key,
+                    )
+                    .await
+                    {
+                        Ok(sub_output) => {
+                            let sub_elapsed = sub_t0.elapsed().as_secs_f64();
+                            info!(
+                                "[CHAIN] [{}] {node_id} sub-chunk {}/{} complete ({sub_elapsed:.1}s)",
+                                step.name,
+                                sub_idx + 1,
+                                num_sub
+                            );
+                            sub_results.push(sub_output);
+                        }
+                        Err(e) => match error_strategy {
+                            ErrorStrategy::Abort | ErrorStrategy::Retry(_) => {
+                                return Err(anyhow!(
+                                    "forEach abort at index {index} sub-chunk {sub_idx}: {e}"
+                                ));
+                            }
+                            _ => {
+                                warn!(
+                                    "[CHAIN] [{}] {node_id} sub-chunk {sub_idx} FAILED (skip): {e}",
+                                    step.name
+                                );
+                                // Include null so merge knows a part is missing
+                                sub_results.push(Value::Null);
+                            }
+                        },
+                    }
+                }
+
+                // Merge sub-chunk results if configured (default: true when max_input_tokens is set)
+                let should_merge = step.split_merge.unwrap_or(true);
+                let analysis = if should_merge && sub_results.len() > 1 {
+                    let merge_input = serde_json::json!({
+                        "sub_chunk_extractions": sub_results.iter()
+                            .filter(|v| !v.is_null())
+                            .cloned()
+                            .collect::<Vec<Value>>(),
+                        "original_source": resolved_input.get("headline")
+                            .or_else(|| resolved_input.get("title"))
+                            .or_else(|| resolved_input.get("file_path"))
+                            .cloned()
+                            .unwrap_or(Value::String("unknown".to_string())),
+                        "total_parts": num_sub,
+                    });
+                    let merge_system_prompt = SPLIT_MERGE_DEFAULT_PROMPT.to_string();
+                    let merge_fallback_key = format!("{}-{index}-merge", step.name);
+
+                    info!(
+                        "[CHAIN] [{}] {node_id}: merging {} sub-chunk results",
+                        step.name,
+                        sub_results.iter().filter(|v| !v.is_null()).count()
+                    );
+
+                    match dispatch_with_retry(
+                        step,
+                        &merge_input,
+                        &merge_system_prompt,
+                        defaults,
+                        dispatch_ctx,
+                        error_strategy,
+                        &merge_fallback_key,
+                    )
+                    .await
+                    {
+                        Ok(merged) => merged,
+                        Err(e) => {
+                            warn!(
+                                "[CHAIN] [{}] {node_id}: merge failed ({e}), using first sub-result",
+                                step.name
+                            );
+                            sub_results.into_iter().find(|v| !v.is_null()).unwrap_or(Value::Null)
+                        }
+                    }
+                } else if sub_results.len() == 1 {
+                    sub_results.into_iter().next().unwrap_or(Value::Null)
+                } else {
+                    // split_merge: false — extend outputs with each sub-result
+                    let merge_elapsed = 0.0;
+                    for (sub_idx, sub_output) in sub_results.into_iter().enumerate() {
+                        if sub_output.is_null() {
+                            failures += 1;
+                            continue;
+                        }
+                        let sub_node_id = format!("{node_id}s{sub_idx}");
+                        let decorated = decorate_step_output(sub_output.clone(), &sub_node_id, chunk_index);
+                        let output_json = serde_json::to_string(&decorated)?;
+                        send_save_step(
+                            writer_tx,
+                            &ctx.slug,
+                            &step.name,
+                            chunk_index,
+                            depth,
+                            &sub_node_id,
+                            &output_json,
+                            &dispatch_ctx.config.primary_model,
+                            merge_elapsed,
+                        )
+                        .await;
+
+                        if saves_node {
+                            let node = build_node_from_output(
+                                &sub_output,
+                                &sub_node_id,
+                                &ctx.slug,
+                                depth,
+                                Some(chunk_index),
+                            )?;
+                            let topics_json = serde_json::to_string(
+                                sub_output.get("topics").unwrap_or(&serde_json::json!([])),
+                            )?;
+                            send_save_node(writer_tx, node, Some(topics_json)).await;
+                        }
+                        outputs.push(decorated);
+                    }
+                    if saves_node {
+                        *done += 1;
+                        send_progress(progress_tx, *done, total).await;
+                    }
+                    continue;
+                };
+
+                let merge_elapsed_total = Instant::now();
+                // Fall through to the normal save path with the merged analysis
+                validate_step_output(step, &analysis)?;
+                let elapsed = merge_elapsed_total.elapsed().as_secs_f64();
+                let decorated_output =
+                    decorate_step_output(analysis.clone(), &node_id, chunk_index);
+                let output_json = serde_json::to_string(&decorated_output)?;
+                send_save_step(
+                    writer_tx,
+                    &ctx.slug,
+                    &step.name,
+                    chunk_index,
+                    depth,
+                    &node_id,
+                    &output_json,
+                    &dispatch_ctx.config.primary_model,
+                    elapsed,
+                )
+                .await;
+
+                if saves_node {
+                    let node = build_node_from_output(
+                        &analysis,
+                        &node_id,
+                        &ctx.slug,
+                        depth,
+                        Some(chunk_index),
+                    )?;
+                    let topics_json = serde_json::to_string(
+                        analysis.get("topics").unwrap_or(&serde_json::json!([])),
+                    )?;
+                    send_save_node(writer_tx, node, Some(topics_json)).await;
+                }
+
+                if step.sequential {
+                    update_accumulators(&mut ctx.accumulators, &analysis, step);
+                }
+
+                outputs.push(decorated_output);
+                info!("[CHAIN] [{}] {node_id} complete (split+merge)", step.name);
+                if saves_node {
+                    let label = analysis.get("headline").and_then(|v| v.as_str()).map(|s| s.to_string());
+                    try_send_layer_event(layer_tx, LayerEvent::NodeCompleted {
+                        depth, step_name: step.name.clone(), node_id: node_id.clone(), label,
+                    });
+                    *done += 1;
+                    send_progress(progress_tx, *done, total).await;
+                }
+                continue;
+            }
+        }
 
         // Resolve prompt template
         let system_prompt = build_system_prompt(step, &resolved_input, ctx)?;
@@ -3212,6 +4380,12 @@ async fn execute_for_each(
 
                 outputs.push(decorated_output);
                 info!("[CHAIN] [{}] {node_id} complete ({elapsed:.1}s)", step.name);
+                if saves_node {
+                    let label = analysis.get("headline").and_then(|v| v.as_str()).map(|s| s.to_string());
+                    try_send_layer_event(layer_tx, LayerEvent::NodeCompleted {
+                        depth, step_name: step.name.clone(), node_id: node_id.clone(), label,
+                    });
+                }
             }
             Err(e) => match error_strategy {
                 ErrorStrategy::Abort | ErrorStrategy::Retry(_) => {
@@ -3221,6 +4395,11 @@ async fn execute_for_each(
                     warn!("[CHAIN] [{}] {node_id} FAILED (skip): {e}", step.name);
                     failures += 1;
                     outputs.push(Value::Null);
+                    if saves_node {
+                        try_send_layer_event(layer_tx, LayerEvent::NodeFailed {
+                            depth, step_name: step.name.clone(), node_id: node_id.clone(),
+                        });
+                    }
                 }
             },
         }
@@ -3253,6 +4432,7 @@ async fn execute_for_each_concurrent(
     progress_tx: &Option<mpsc::Sender<BuildProgress>>,
     done: &mut i64,
     total: i64,
+    layer_tx: &Option<mpsc::Sender<LayerEvent>>,
 ) -> Result<(Vec<Value>, i32)> {
     let mut outputs = vec![Value::Null; items.len()];
     let mut failures: i32 = 0;
@@ -3291,6 +4471,7 @@ async fn execute_for_each_concurrent(
             ResumeState::Complete => {
                 info!("[CHAIN] [{}] {} -- resumed (complete)", step.name, node_id);
 
+                let mut resume_label: Option<String> = None;
                 if let Some(prior_output) = load_prior_step_output(
                     reader,
                     &ctx.slug,
@@ -3301,6 +4482,7 @@ async fn execute_for_each_concurrent(
                 )
                 .await?
                 {
+                    resume_label = prior_output.get("headline").and_then(|v| v.as_str()).map(|s| s.to_string());
                     outputs[index] = decorate_step_output(prior_output, &node_id, chunk_index);
                 } else {
                     warn!(
@@ -3312,6 +4494,9 @@ async fn execute_for_each_concurrent(
                 if saves_node {
                     *done += 1;
                     send_progress(progress_tx, *done, total).await;
+                    try_send_layer_event(layer_tx, LayerEvent::NodeCompleted {
+                        depth, step_name: step.name.clone(), node_id: node_id.clone(), label: resume_label,
+                    });
                 }
                 continue;
             }
@@ -3336,6 +4521,159 @@ async fn execute_for_each_concurrent(
         let resolved_input = apply_header_lines(resolved_input);
         let resolved_input =
             enrich_for_each_step_input(step, resolved_input, item, &item_ctx, reader).await?;
+
+        // ── Oversized chunk splitting (concurrent path: handle inline) ──────
+        if let Some(max_tokens) = step.max_input_tokens {
+            let est_tokens = estimate_tokens_for_item(&resolved_input);
+            if est_tokens > max_tokens {
+                let strategy = step.split_strategy.as_deref().unwrap_or("sections");
+                let overlap = step.split_overlap_tokens.unwrap_or(500);
+                let sub_chunks = split_chunk(&resolved_input, max_tokens, strategy, overlap);
+                let num_sub = sub_chunks.len();
+
+                info!(
+                    "[CHAIN] [{}] {node_id}: oversized ({est_tokens} tokens > {max_tokens}), splitting into {num_sub} sub-chunks via \"{strategy}\" (concurrent fallback)",
+                    step.name
+                );
+
+                let mut sub_results: Vec<Value> = Vec::with_capacity(num_sub);
+                for (sub_idx, sub_item) in sub_chunks.iter().enumerate() {
+                    let sub_system_prompt = {
+                        let part_header = format!(
+                            "This is part {} of {} from document: {}",
+                            sub_idx + 1,
+                            num_sub,
+                            sub_item.get("_split_source").and_then(|v| v.as_str()).unwrap_or("unknown"),
+                        );
+                        let base = build_system_prompt(step, sub_item, &item_ctx)?;
+                        format!("{base}\n\n{part_header}")
+                    };
+                    let sub_fallback_key = format!("{}-{index}-sub{sub_idx}", step.name);
+
+                    match dispatch_with_retry(
+                        step, sub_item, &sub_system_prompt, defaults,
+                        dispatch_ctx, error_strategy, &sub_fallback_key,
+                    )
+                    .await
+                    {
+                        Ok(sub_output) => sub_results.push(sub_output),
+                        Err(e) => match error_strategy {
+                            ErrorStrategy::Abort | ErrorStrategy::Retry(_) => {
+                                return Err(anyhow!("forEach abort at index {index} sub-chunk {sub_idx}: {e}"));
+                            }
+                            _ => {
+                                warn!("[CHAIN] [{}] {node_id} sub-chunk {sub_idx} FAILED (skip): {e}", step.name);
+                                sub_results.push(Value::Null);
+                            }
+                        },
+                    }
+                }
+
+                let should_merge = step.split_merge.unwrap_or(true);
+                if should_merge && sub_results.len() > 1 {
+                    let merge_input = serde_json::json!({
+                        "sub_chunk_extractions": sub_results.iter().filter(|v| !v.is_null()).cloned().collect::<Vec<Value>>(),
+                        "original_source": resolved_input.get("headline").or_else(|| resolved_input.get("title")).or_else(|| resolved_input.get("file_path")).cloned().unwrap_or(Value::String("unknown".to_string())),
+                        "total_parts": num_sub,
+                    });
+                    let merge_fallback_key = format!("{}-{index}-merge", step.name);
+                    let analysis = match dispatch_with_retry(
+                        step, &merge_input, SPLIT_MERGE_DEFAULT_PROMPT, defaults,
+                        dispatch_ctx, error_strategy, &merge_fallback_key,
+                    )
+                    .await
+                    {
+                        Ok(merged) => merged,
+                        Err(e) => {
+                            warn!("[CHAIN] [{}] {node_id}: merge failed ({e}), using first sub-result", step.name);
+                            sub_results.into_iter().find(|v| !v.is_null()).unwrap_or(Value::Null)
+                        }
+                    };
+
+                    let decorated = decorate_step_output(analysis.clone(), &node_id, chunk_index);
+                    let output_json = serde_json::to_string(&decorated)?;
+                    send_save_step(
+                        writer_tx, &ctx.slug, &step.name, chunk_index, depth, &node_id,
+                        &output_json, &dispatch_ctx.config.primary_model, 0.0,
+                    ).await;
+
+                    if saves_node {
+                        let node = build_node_from_output(&analysis, &node_id, &ctx.slug, depth, Some(chunk_index))?;
+                        let topics_json = serde_json::to_string(analysis.get("topics").unwrap_or(&serde_json::json!([])))?;
+                        send_save_node(writer_tx, node, Some(topics_json)).await;
+                        *done += 1;
+                        send_progress(progress_tx, *done, total).await;
+                        let label = analysis.get("headline").and_then(|v| v.as_str()).map(|s| s.to_string());
+                        try_send_layer_event(layer_tx, LayerEvent::NodeCompleted {
+                            depth, step_name: step.name.clone(), node_id: node_id.clone(), label,
+                        });
+                    }
+
+                    outputs[index] = decorated;
+                } else if !should_merge && sub_results.len() > 1 {
+                    // split_merge: false — save each sub-result as its own node
+                    let mut first_decorated: Option<Value> = None;
+                    for (sub_idx, sub_output) in sub_results.into_iter().enumerate() {
+                        if sub_output.is_null() {
+                            failures += 1;
+                            continue;
+                        }
+                        let sub_node_id = format!("{node_id}s{sub_idx}");
+                        let decorated = decorate_step_output(sub_output.clone(), &sub_node_id, chunk_index);
+                        let output_json = serde_json::to_string(&decorated)?;
+                        send_save_step(
+                            writer_tx, &ctx.slug, &step.name, chunk_index, depth, &sub_node_id,
+                            &output_json, &dispatch_ctx.config.primary_model, 0.0,
+                        ).await;
+
+                        if saves_node {
+                            let node = build_node_from_output(
+                                &sub_output, &sub_node_id, &ctx.slug, depth, Some(chunk_index),
+                            )?;
+                            let topics_json = serde_json::to_string(
+                                sub_output.get("topics").unwrap_or(&serde_json::json!([])),
+                            )?;
+                            send_save_node(writer_tx, node, Some(topics_json)).await;
+                        }
+                        if first_decorated.is_none() {
+                            first_decorated = Some(decorated);
+                        }
+                    }
+                    if saves_node {
+                        *done += 1;
+                        send_progress(progress_tx, *done, total).await;
+                    }
+                    // Put the first sub-result into the outputs slot for this index
+                    if let Some(d) = first_decorated {
+                        outputs[index] = d;
+                    }
+                } else {
+                    // Single sub-result or empty — save as the original node
+                    let analysis = sub_results.into_iter().find(|v| !v.is_null()).unwrap_or(Value::Null);
+                    let decorated = decorate_step_output(analysis.clone(), &node_id, chunk_index);
+                    let output_json = serde_json::to_string(&decorated)?;
+                    send_save_step(
+                        writer_tx, &ctx.slug, &step.name, chunk_index, depth, &node_id,
+                        &output_json, &dispatch_ctx.config.primary_model, 0.0,
+                    ).await;
+
+                    if saves_node {
+                        let node = build_node_from_output(&analysis, &node_id, &ctx.slug, depth, Some(chunk_index))?;
+                        let topics_json = serde_json::to_string(analysis.get("topics").unwrap_or(&serde_json::json!([])))?;
+                        send_save_node(writer_tx, node, Some(topics_json)).await;
+                        *done += 1;
+                        send_progress(progress_tx, *done, total).await;
+                        let label = analysis.get("headline").and_then(|v| v.as_str()).map(|s| s.to_string());
+                        try_send_layer_event(layer_tx, LayerEvent::NodeCompleted {
+                            depth, step_name: step.name.clone(), node_id: node_id.clone(), label,
+                        });
+                    }
+                    outputs[index] = decorated;
+                }
+                continue;
+            }
+        }
+
         let system_prompt = build_system_prompt(step, &resolved_input, &item_ctx)?;
 
         pending.push(ForEachPendingWork {
@@ -3368,6 +4706,7 @@ async fn execute_for_each_concurrent(
         let writer_tx = writer_tx.clone();
         let reader = reader.clone();
         let ctx_snapshot = ctx_snapshot.clone();
+        let layer_tx_clone = layer_tx.clone();
 
         let handle = tokio::spawn(async move {
             let _permit = semaphore
@@ -3385,6 +4724,7 @@ async fn execute_for_each_concurrent(
                 saves_node,
                 &writer_tx,
                 &reader,
+                layer_tx_clone,
             )
             .await;
 
@@ -3416,8 +4756,17 @@ async fn execute_for_each_concurrent(
         remaining -= 1;
 
         match result.output {
-            Ok(output) => {
-                outputs[result.index] = output;
+            Ok(ref output) => {
+                let label = output.get("headline").and_then(|v| v.as_str()).map(|s| s.to_string());
+                outputs[result.index] = output.clone();
+                if saves_node {
+                    try_send_layer_event(layer_tx, LayerEvent::NodeCompleted {
+                        depth: step.depth.unwrap_or(0),
+                        step_name: step.name.clone(),
+                        node_id: result.node_id.clone(),
+                        label,
+                    });
+                }
             }
             Err(e) => match error_strategy {
                 ErrorStrategy::Abort | ErrorStrategy::Retry(_) => {
@@ -3435,6 +4784,13 @@ async fn execute_for_each_concurrent(
                         step.name, result.node_id
                     );
                     failures += 1;
+                    if saves_node {
+                        try_send_layer_event(layer_tx, LayerEvent::NodeFailed {
+                            depth: step.depth.unwrap_or(0),
+                            step_name: step.name.clone(),
+                            node_id: result.node_id.clone(),
+                        });
+                    }
                 }
             },
         }
@@ -3463,6 +4819,7 @@ async fn execute_for_each_work_item(
     saves_node: bool,
     writer_tx: &mpsc::Sender<WriteOp>,
     reader: &Arc<Mutex<Connection>>,
+    layer_tx: Option<mpsc::Sender<LayerEvent>>,
 ) -> Result<Value> {
     let fallback_key = format!("{}-{}", step.name, work.index);
     let t0 = Instant::now();
@@ -3660,6 +5017,7 @@ async fn execute_pair_adjacent(
     progress_tx: &Option<mpsc::Sender<BuildProgress>>,
     done: &mut i64,
     total: i64,
+    layer_tx: &Option<mpsc::Sender<LayerEvent>>,
 ) -> Result<(Vec<Value>, i32)> {
     let target_depth = source_depth + 1;
 
@@ -3682,6 +5040,14 @@ async fn execute_pair_adjacent(
     let mut outputs = Vec::new();
     let mut failures: i32 = 0;
     let instruction = step.instruction.as_deref().unwrap_or("");
+
+    if saves_node {
+        try_send_layer_event(layer_tx, LayerEvent::Discovered {
+            depth: target_depth,
+            step_name: step.name.clone(),
+            estimated_nodes: ((source_nodes.len() + 1) / 2) as i64,
+        });
+    }
 
     let mut pair_idx: usize = 0;
     let mut i: usize = 0;
@@ -3717,6 +5083,9 @@ async fn execute_pair_adjacent(
                 if saves_node {
                     *done += 1;
                     send_progress(progress_tx, *done, total).await;
+                    try_send_layer_event(layer_tx, LayerEvent::NodeCompleted {
+                        depth: target_depth, step_name: step.name.clone(), node_id: node_id.clone(), label: None,
+                    });
                 }
                 if let Some(prior_output) = load_prior_step_output(
                     reader,
@@ -3765,7 +5134,15 @@ async fn execute_pair_adjacent(
             )
             .await
             {
-                Ok(analysis) => outputs.push(analysis),
+                Ok(analysis) => {
+                    let label = analysis.get("headline").and_then(|v| v.as_str()).map(|s| s.to_string());
+                    outputs.push(analysis);
+                    if saves_node {
+                        try_send_layer_event(layer_tx, LayerEvent::NodeCompleted {
+                            depth: target_depth, step_name: step.name.clone(), node_id: node_id.clone(), label,
+                        });
+                    }
+                }
                 Err(e) => match error_strategy {
                     ErrorStrategy::Abort | ErrorStrategy::Retry(_) => {
                         return Err(anyhow!("pair_adjacent abort at pair {pair_idx}: {e}"));
@@ -3786,11 +5163,21 @@ async fn execute_pair_adjacent(
                         .await;
                         failures += 1;
                         outputs.push(Value::Null);
+                        if saves_node {
+                            try_send_layer_event(layer_tx, LayerEvent::NodeFailed {
+                                depth: target_depth, step_name: step.name.clone(), node_id: node_id.clone(),
+                            });
+                        }
                     }
                     _ => {
                         warn!("[CHAIN] [{}] pair {pair_idx} FAILED (skip): {e}", step.name);
                         failures += 1;
                         outputs.push(Value::Null);
+                        if saves_node {
+                            try_send_layer_event(layer_tx, LayerEvent::NodeFailed {
+                                depth: target_depth, step_name: step.name.clone(), node_id: node_id.clone(),
+                            });
+                        }
                     }
                 },
             }
@@ -3813,6 +5200,11 @@ async fn execute_pair_adjacent(
             )
             .await;
             outputs.push(Value::Null);
+            if saves_node {
+                try_send_layer_event(layer_tx, LayerEvent::NodeCompleted {
+                    depth: target_depth, step_name: step.name.clone(), node_id: node_id.clone(), label: Some(carry.headline.clone()),
+                });
+            }
             i += 1;
         }
 
@@ -3942,7 +5334,8 @@ async fn execute_recursive_pair(
     cancel: &CancellationToken,
     progress_tx: &Option<mpsc::Sender<BuildProgress>>,
     done: &mut i64,
-    total: i64,
+    total: &mut i64,
+    layer_tx: &Option<mpsc::Sender<LayerEvent>>,
 ) -> Result<(String, i32)> {
     let mut total_failures: i32 = 0;
     let mut depth = starting_depth;
@@ -3984,10 +5377,22 @@ async fn execute_recursive_pair(
         if existing >= expected as i64 {
             info!("[CHAIN] depth {target_depth}: {existing} nodes (already complete)");
             *done += existing;
-            send_progress(progress_tx, *done, total).await;
+            // Emit Discovered + immediate LayerCompleted for this already-complete layer
+            try_send_layer_event(layer_tx, LayerEvent::Discovered {
+                depth: target_depth, step_name: step.name.clone(), estimated_nodes: existing,
+            });
+            try_send_layer_event(layer_tx, LayerEvent::LayerCompleted {
+                depth: target_depth, step_name: step.name.clone(),
+            });
+            send_progress(progress_tx, *done, *total).await;
             depth = target_depth;
             continue;
         }
+
+        // Emit Discovered for this new layer
+        try_send_layer_event(layer_tx, LayerEvent::Discovered {
+            depth: target_depth, step_name: step.name.clone(), estimated_nodes: expected as i64,
+        });
 
         info!(
             "=== DEPTH {target_depth}: PAIR {} -> {expected} ===",
@@ -4026,7 +5431,10 @@ async fn execute_recursive_pair(
                     i += 2;
                     if saves_node {
                         *done += 1;
-                        send_progress(progress_tx, *done, total).await;
+                        send_progress(progress_tx, *done, *total).await;
+                        try_send_layer_event(layer_tx, LayerEvent::NodeCompleted {
+                            depth: target_depth, step_name: step.name.clone(), node_id: node_id.clone(), label: None,
+                        });
                     }
                     continue;
                 }
@@ -4113,7 +5521,10 @@ async fn execute_recursive_pair(
             pair_idx += 1;
             if saves_node {
                 *done += 1;
-                send_progress(progress_tx, *done, total).await;
+                send_progress(progress_tx, *done, *total).await;
+                try_send_layer_event(layer_tx, LayerEvent::NodeCompleted {
+                    depth: target_depth, step_name: step.name.clone(), node_id: node_id.clone(), label: None,
+                });
             }
         }
 
@@ -4123,11 +5534,66 @@ async fn execute_recursive_pair(
         // causing premature apex declaration.
         flush_writes(writer_tx).await;
 
+        // Emit LayerCompleted and re-estimate total
+        try_send_layer_event(layer_tx, LayerEvent::LayerCompleted {
+            depth: target_depth, step_name: step.name.clone(),
+        });
+        let actual_at_this_depth = db_read(reader, {
+            let s = slug_owned.clone();
+            move |conn| db::count_nodes_at_depth(conn, &s, target_depth)
+        }).await.unwrap_or(0);
+        if actual_at_this_depth > 0 {
+            *total = *done + estimate_recursive_pair_nodes(actual_at_this_depth);
+            send_progress(progress_tx, *done, *total).await;
+        }
+
         depth = target_depth;
     }
 }
 
 // ── Recursive cluster execution ─────────────────────────────────────────────
+
+/// Force-merge the smallest clusters until cluster count < node count.
+/// Extracted from the convergence safety net for reuse by convergence_fallback strategies.
+fn force_merge_clusters(clusters: &mut Vec<Value>, node_count: usize, step_name: &str) {
+    clusters.sort_by_key(|c| {
+        c.get("node_ids")
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0)
+    });
+    while clusters.len() >= node_count && clusters.len() > 1 {
+        let second = clusters.remove(1);
+        if let (Some(dest_ids), Some(src_ids)) = (
+            clusters[0]
+                .get_mut("node_ids")
+                .and_then(|v| v.as_array_mut()),
+            second.get("node_ids").and_then(|v| v.as_array()),
+        ) {
+            dest_ids.extend(src_ids.iter().cloned());
+        }
+        if let Some(obj) = clusters[0].as_object_mut() {
+            let old_name = obj
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Group")
+                .to_string();
+            let merged_name = second
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Other");
+            obj.insert(
+                "name".to_string(),
+                Value::String(format!("{} & {}", old_name, merged_name)),
+            );
+        }
+    }
+    info!(
+        "[CHAIN] [{}] force-merged down to {} clusters",
+        step_name,
+        clusters.len()
+    );
+}
 
 /// Execute a recursive clustering step: at each layer, LLM clusters current nodes
 /// into 3-5 semantic groups, then synthesizes each group into a parent node.
@@ -4146,7 +5612,8 @@ async fn execute_recursive_cluster(
     cancel: &CancellationToken,
     progress_tx: &Option<mpsc::Sender<BuildProgress>>,
     done: &mut i64,
-    total: i64,
+    total: &mut i64,
+    layer_tx: &Option<mpsc::Sender<LayerEvent>>,
 ) -> Result<(String, i32)> {
     let mut depth = starting_depth;
     let mut failures: i32 = 0;
@@ -4210,6 +5677,16 @@ async fn execute_recursive_cluster(
             .await?;
             if recursive_cluster_layer_complete(&current_nodes, &target_nodes) {
                 info!("[CHAIN] depth {target_depth}: {existing} nodes (already complete)");
+                // FIX: pre-existing bug — update done count for already-complete layers
+                *done += existing;
+                send_progress(progress_tx, *done, *total).await;
+                // Emit Discovered + immediate LayerCompleted for this resume layer
+                try_send_layer_event(layer_tx, LayerEvent::Discovered {
+                    depth: target_depth, step_name: step.name.clone(), estimated_nodes: existing,
+                });
+                try_send_layer_event(layer_tx, LayerEvent::LayerCompleted {
+                    depth: target_depth, step_name: step.name.clone(),
+                });
                 depth = target_depth;
                 continue;
             }
@@ -4225,14 +5702,22 @@ async fn execute_recursive_cluster(
             cleanup_from_depth(&dispatch_ctx.db_writer, &ctx.slug, target_depth).await?;
         }
 
-        // ≤4 nodes: synthesize directly into apex without clustering
-        if current_nodes.len() <= 4 {
+        // ── direct_synthesis_threshold (1.1) ──
+        // When None: no hardcoded threshold — rely on apex_ready signal only.
+        // When Some(n): skip clustering and synthesize directly when <= n nodes.
+        // YAML can set `direct_synthesis_threshold: 4` to restore the old behavior.
+        if let Some(threshold) = step.direct_synthesis_threshold {
+            if threshold > 0 && current_nodes.len() <= threshold {
             info!(
                 "[CHAIN] [{}] direct synthesis: {} nodes → apex at depth {}",
                 step.name,
                 current_nodes.len(),
                 target_depth
             );
+            // Emit Discovered for direct synthesis layer
+            try_send_layer_event(layer_tx, LayerEvent::Discovered {
+                depth: target_depth, step_name: step.name.clone(), estimated_nodes: 1,
+            });
             let node_id = generate_node_id(
                 step.node_id_pattern
                     .as_deref()
@@ -4265,8 +5750,14 @@ async fn execute_recursive_cluster(
                 Ok(_) => {
                     if saves_node {
                         *done += 1;
-                        send_progress(progress_tx, *done, total).await;
+                        send_progress(progress_tx, *done, *total).await;
+                        try_send_layer_event(layer_tx, LayerEvent::NodeCompleted {
+                            depth: target_depth, step_name: step.name.clone(), node_id: node_id.clone(), label: None,
+                        });
                     }
+                    try_send_layer_event(layer_tx, LayerEvent::LayerCompleted {
+                        depth: target_depth, step_name: step.name.clone(),
+                    });
                 }
                 Err(e) => {
                     if matches!(
@@ -4291,6 +5782,7 @@ async fn execute_recursive_cluster(
             info!("[CHAIN] === APEX: {node_id} at depth {target_depth} ===");
             return Ok((node_id, failures));
         }
+        } // end if let Some(threshold)
 
         // Step A: CLUSTER — ask LLM to group current nodes into semantic clusters
         info!(
@@ -4301,18 +5793,38 @@ async fn execute_recursive_cluster(
             target_depth
         );
 
-        let cluster_input: Vec<serde_json::Value> = current_nodes
-            .iter()
-            .map(|n| {
-                let topic_names: Vec<String> = n.topics.iter().map(|t| t.name.clone()).collect();
-                serde_json::json!({
-                    "node_id": n.id,
-                    "headline": n.headline,
-                    "orientation": truncate_for_webbing(&n.distilled, 500),
-                    "topics": topic_names,
+        // ── CONVERGENCE LOOP REFACTOR: cluster_item_fields (1.5) ──
+        // When set, project each node through the existing project_item() function.
+        // When None, keep the hardcoded projection (current behavior preserved).
+        let cluster_input: Vec<serde_json::Value> = if let Some(ref fields) = step.cluster_item_fields {
+            current_nodes
+                .iter()
+                .map(|n| {
+                    // Build full node representation, then project down to requested fields
+                    let topic_names: Vec<String> = n.topics.iter().map(|t| t.name.clone()).collect();
+                    let full = serde_json::json!({
+                        "node_id": n.id,
+                        "headline": n.headline,
+                        "orientation": n.distilled,
+                        "topics": topic_names,
+                    });
+                    project_item(&full, fields)
                 })
-            })
-            .collect();
+                .collect()
+        } else {
+            current_nodes
+                .iter()
+                .map(|n| {
+                    let topic_names: Vec<String> = n.topics.iter().map(|t| t.name.clone()).collect();
+                    serde_json::json!({
+                        "node_id": n.id,
+                        "headline": n.headline,
+                        "orientation": truncate_for_webbing(&n.distilled, 500),
+                        "topics": topic_names,
+                    })
+                })
+                .collect()
+        };
 
         let cluster_input_value = serde_json::json!(cluster_input);
         let cluster_assignment_node_id = format!("CLUSTER-L{target_depth}");
@@ -4324,6 +5836,10 @@ async fn execute_recursive_cluster(
         cluster_step.instruction = Some(cluster_instruction.to_string());
         // Use cluster_response_schema if available for structured output
         cluster_step.response_schema = step.cluster_response_schema.clone();
+
+        // ── CONVERGENCE LOOP REFACTOR: cluster failure fallback size (1.4) ──
+        // Configurable positional fallback chunk size. Default 3 preserves current behavior.
+        let fallback_size = step.cluster_fallback_size.unwrap_or(3).max(2);
 
         let cluster_assignments = if let Some(saved) = load_cluster_assignment_output(
             reader,
@@ -4340,26 +5856,50 @@ async fn execute_recursive_cluster(
             saved
         } else {
             let cluster_system = build_system_prompt(&cluster_step, &cluster_input_value, ctx)?;
+            // ── CONVERGENCE LOOP REFACTOR: clustering retry strategy (1.7) ──
+            // Parse retry count from step.cluster_on_error if it contains "retry(N)".
+            // Fall back to step's on_error, then to ErrorStrategy::Retry(3) (current default).
+            let cluster_error_strategy = if let Some(ref coe) = step.cluster_on_error {
+                parse_error_strategy(coe)
+            } else if let Some(ref oe) = step.on_error {
+                parse_error_strategy(oe)
+            } else {
+                ErrorStrategy::Retry(3)
+            };
             let cluster_result = dispatch_with_retry(
                 &cluster_step,
                 &cluster_input_value,
                 &cluster_system,
                 defaults,
                 dispatch_ctx,
-                &ErrorStrategy::Retry(3),
+                &cluster_error_strategy,
                 &format!("{}-cluster-d{target_depth}", step.name),
             )
             .await;
 
+            // ── CONVERGENCE LOOP REFACTOR: cluster failure fallback (1.4) ──
+            // When the cluster LLM call fails, check step.cluster_on_error to decide:
+            //   "abort"          → propagate the error
+            //   "positional(N)"  → positional groups of N (or cluster_fallback_size)
+            //   "retry(N)"       → already handled above by cluster_error_strategy; if we
+            //                      still land here, all retries are exhausted — positional fallback
+            //   None / other     → positional fallback (preserves current behavior)
             let output = match cluster_result {
                 Ok(v) => v,
                 Err(e) => {
+                    let coe = step.cluster_on_error.as_deref().unwrap_or("");
+                    if coe == "abort" {
+                        return Err(anyhow!(
+                            "[{}] clustering FAILED at depth {} and cluster_on_error=abort: {}",
+                            step.name, depth, e
+                        ));
+                    }
                     warn!(
-                        "[CHAIN] [{}] clustering FAILED at depth {}, falling back to positional groups of 3: {e}",
-                        step.name, depth
+                        "[CHAIN] [{}] clustering FAILED at depth {}, falling back to positional groups of {}: {e}",
+                        step.name, depth, fallback_size
                     );
                     let mut fallback_clusters = Vec::new();
-                    for (i, chunk) in current_nodes.chunks(3).enumerate() {
+                    for (i, chunk) in current_nodes.chunks(fallback_size).enumerate() {
                         let ids: Vec<String> = chunk.iter().map(|n| n.id.clone()).collect();
                         fallback_clusters.push(serde_json::json!({
                             "name": format!("Group {}", i + 1),
@@ -4382,6 +5922,73 @@ async fn execute_recursive_cluster(
             .await?;
             output
         };
+
+        // ── CONVERGENCE LOOP REFACTOR: apex_ready signal (1.2) ──
+        // If the LLM signals apex_ready=true, the current nodes ARE the right
+        // top-level structure. Jump to direct synthesis with all current nodes.
+        if cluster_assignments.get("apex_ready").and_then(|v| v.as_bool()).unwrap_or(false) {
+            info!("[CHAIN] [{}] apex_ready signal received at depth {depth}", step.name);
+            // Jump to direct synthesis with current nodes (reuse the direct synthesis code path)
+            try_send_layer_event(layer_tx, LayerEvent::Discovered {
+                depth: target_depth, step_name: step.name.clone(), estimated_nodes: 1,
+            });
+            let node_id = generate_node_id(
+                step.node_id_pattern
+                    .as_deref()
+                    .unwrap_or("L{depth}-{index:03}"),
+                0,
+                Some(target_depth),
+            );
+            let result = dispatch_group(
+                step,
+                ctx,
+                dispatch_ctx,
+                defaults,
+                error_strategy,
+                synthesis_instruction,
+                &current_nodes,
+                &node_id,
+                target_depth,
+                0,
+                Some(serde_json::json!({
+                    "merge_mode": "apex_ready",
+                    "child_ids": current_nodes.iter().map(|node| node.id.clone()).collect::<Vec<_>>(),
+                    "child_headlines": current_nodes.iter().map(|node| node.headline.clone()).collect::<Vec<_>>(),
+                })),
+                saves_node,
+                writer_tx,
+            )
+            .await;
+
+            match result {
+                Ok(_) => {
+                    if saves_node {
+                        *done += 1;
+                        send_progress(progress_tx, *done, *total).await;
+                        try_send_layer_event(layer_tx, LayerEvent::NodeCompleted {
+                            depth: target_depth, step_name: step.name.clone(), node_id: node_id.clone(), label: None,
+                        });
+                    }
+                    try_send_layer_event(layer_tx, LayerEvent::LayerCompleted {
+                        depth: target_depth, step_name: step.name.clone(),
+                    });
+                }
+                Err(e) => {
+                    if matches!(error_strategy, ErrorStrategy::Abort | ErrorStrategy::Retry(_)) {
+                        return Err(anyhow!(
+                            "[{}] apex_ready synthesis FAILED at depth {}: {}",
+                            step.name, target_depth, e
+                        ));
+                    }
+                    warn!("[CHAIN] [{}] apex_ready synthesis FAILED: {e}", step.name);
+                    failures += 1;
+                }
+            }
+
+            flush_writes(writer_tx).await;
+            info!("[CHAIN] === APEX (apex_ready): {node_id} at depth {target_depth} ===");
+            return Ok((node_id, failures));
+        }
 
         // Parse cluster assignments — try "clusters" key first, fall back to "groups"
         let clusters = cluster_assignments
@@ -4407,9 +6014,9 @@ async fn execute_recursive_cluster(
         // If clustering returned 0 clusters (LLM returned wrong key or empty array),
         // fall back to positional groups of 3 instead of aborting
         let mut clusters = if clusters.is_empty() {
-            warn!("[CHAIN] [{}] clustering returned 0 clusters, falling back to positional groups of 3", step.name);
+            warn!("[CHAIN] [{}] clustering returned 0 clusters, falling back to positional groups of {}", step.name, fallback_size);
             let mut fallback: Vec<serde_json::Value> = Vec::new();
-            for (i, chunk) in current_nodes.chunks(3).enumerate() {
+            for (i, chunk) in current_nodes.chunks(fallback_size).enumerate() {
                 let ids: Vec<String> = chunk.iter().map(|n| n.id.clone()).collect();
                 fallback.push(serde_json::json!({
                     "name": format!("Group {}", i + 1),
@@ -4429,40 +6036,74 @@ async fn execute_recursive_cluster(
             current_nodes.len()
         );
 
-        // CONVERGENCE SAFETY NET: if clustering returned >= input count, force-merge
-        // the smallest clusters to guarantee the pyramid narrows each layer.
+        // ── convergence_fallback (1.3) ──
+        // Default "retry": ask the LLM again with a stronger instruction before resorting
+        // to mechanical merge. YAML can set "force_merge" to skip retry.
         if clusters.len() >= current_nodes.len() && current_nodes.len() > 1 {
+            let fallback_strategy = step.convergence_fallback.as_deref().unwrap_or("retry");
             warn!(
-                "[CHAIN] [{}] clustering returned {} clusters from {} nodes — no convergence! Force-merging.",
-                step.name, clusters.len(), current_nodes.len()
+                "[CHAIN] [{}] clustering returned {} clusters from {} nodes — no convergence! Strategy: {}",
+                step.name, clusters.len(), current_nodes.len(), fallback_strategy
             );
-            // Sort by cluster size ascending, merge smallest pairs
-            clusters.sort_by_key(|c| {
-                c.get("node_ids")
-                    .and_then(|v| v.as_array())
-                    .map(|a| a.len())
-                    .unwrap_or(0)
-            });
-            while clusters.len() >= current_nodes.len() && clusters.len() > 1 {
-                // Merge first two (smallest) clusters
-                let second = clusters.remove(1);
-                if let (Some(dest_ids), Some(src_ids)) = (
-                    clusters[0].get_mut("node_ids").and_then(|v| v.as_array_mut()),
-                    second.get("node_ids").and_then(|v| v.as_array()),
-                ) {
-                    dest_ids.extend(src_ids.iter().cloned());
+
+            match fallback_strategy {
+                "abort" => {
+                    return Err(anyhow!(
+                        "[{}] clustering produced {} clusters from {} nodes — no convergence and convergence_fallback=abort",
+                        step.name, clusters.len(), current_nodes.len()
+                    ));
                 }
-                // Update the merged cluster's name
-                if let Some(obj) = clusters[0].as_object_mut() {
-                    let old_name = obj.get("name").and_then(|v| v.as_str()).unwrap_or("Group").to_string();
-                    let merged_name = second.get("name").and_then(|v| v.as_str()).unwrap_or("Other");
-                    obj.insert("name".to_string(), Value::String(format!("{} & {}", old_name, merged_name)));
+                "retry" => {
+                    // Re-call LLM with stronger instruction demanding fewer clusters
+                    let retry_instruction = format!(
+                        "{}\n\nCRITICAL: You MUST produce fewer clusters than input nodes. There are {} input nodes. You returned {} clusters, which is not convergent. Produce at most {} clusters.",
+                        cluster_instruction,
+                        current_nodes.len(),
+                        clusters.len(),
+                        (current_nodes.len() / 2).max(2)
+                    );
+                    let mut retry_step = cluster_step.clone();
+                    retry_step.instruction = Some(retry_instruction);
+                    let retry_system = build_system_prompt(&retry_step, &cluster_input_value, ctx)?;
+                    let retry_result = dispatch_with_retry(
+                        &retry_step,
+                        &cluster_input_value,
+                        &retry_system,
+                        defaults,
+                        dispatch_ctx,
+                        &ErrorStrategy::Retry(1),
+                        &format!("{}-cluster-d{target_depth}-convergence-retry", step.name),
+                    )
+                    .await;
+
+                    match retry_result {
+                        Ok(retried) => {
+                            let retried_clusters = retried
+                                .get("clusters")
+                                .or_else(|| retried.get("groups"))
+                                .and_then(|v| v.as_array())
+                                .cloned()
+                                .unwrap_or_default();
+                            if !retried_clusters.is_empty() && retried_clusters.len() < current_nodes.len() {
+                                info!("[CHAIN] [{}] convergence retry succeeded: {} clusters", step.name, retried_clusters.len());
+                                clusters = retried_clusters;
+                            } else {
+                                warn!("[CHAIN] [{}] convergence retry still non-convergent ({} clusters), falling back to force_merge", step.name, retried_clusters.len());
+                                // Fall through to force_merge below
+                                force_merge_clusters(&mut clusters, current_nodes.len(), &step.name);
+                            }
+                        }
+                        Err(e) => {
+                            warn!("[CHAIN] [{}] convergence retry FAILED: {e}, falling back to force_merge", step.name);
+                            force_merge_clusters(&mut clusters, current_nodes.len(), &step.name);
+                        }
+                    }
+                }
+                _ => {
+                    // "force_merge" (default) — current behavior: merge smallest clusters
+                    force_merge_clusters(&mut clusters, current_nodes.len(), &step.name);
                 }
             }
-            info!(
-                "[CHAIN] [{}] force-merged down to {} clusters",
-                step.name, clusters.len()
-            );
         }
 
         // Validate: check all current nodes are assigned
@@ -4511,6 +6152,11 @@ async fn execute_recursive_cluster(
                 step.name
             );
         }
+
+        // Emit Discovered now that we know cluster count
+        try_send_layer_event(layer_tx, LayerEvent::Discovered {
+            depth: target_depth, step_name: step.name.clone(), estimated_nodes: clusters.len() as i64,
+        });
 
         // Step B: SYNTHESIZE — for each cluster, synthesize assigned nodes into one parent
         for (cluster_idx, cluster) in clusters.iter().enumerate() {
@@ -4571,7 +6217,10 @@ async fn execute_recursive_cluster(
                     info!("[CHAIN] [{}] {node_id} -- resumed (complete)", step.name);
                     if saves_node {
                         *done += 1;
-                        send_progress(progress_tx, *done, total).await;
+                        send_progress(progress_tx, *done, *total).await;
+                        try_send_layer_event(layer_tx, LayerEvent::NodeCompleted {
+                            depth: target_depth, step_name: step.name.clone(), node_id: node_id.clone(), label: None,
+                        });
                     }
                     continue;
                 }
@@ -4633,7 +6282,10 @@ async fn execute_recursive_cluster(
             match result {
                 Ok(_) => {
                     *done += 1;
-                    send_progress(progress_tx, *done, total).await;
+                    send_progress(progress_tx, *done, *total).await;
+                    try_send_layer_event(layer_tx, LayerEvent::NodeCompleted {
+                        depth: target_depth, step_name: step.name.clone(), node_id: node_id.clone(), label: None,
+                    });
                 }
                 Err(e) => {
                     if matches!(
@@ -4653,12 +6305,29 @@ async fn execute_recursive_cluster(
                         step.name, cluster_name
                     );
                     failures += 1;
+                    try_send_layer_event(layer_tx, LayerEvent::NodeFailed {
+                        depth: target_depth, step_name: step.name.clone(), node_id: node_id.clone(),
+                    });
                 }
             }
         }
 
         // Flush writer before reading next layer
         flush_writes(writer_tx).await;
+
+        // Emit LayerCompleted and re-estimate total
+        try_send_layer_event(layer_tx, LayerEvent::LayerCompleted {
+            depth: target_depth, step_name: step.name.clone(),
+        });
+        let slug_owned = ctx.slug.clone();
+        let td = target_depth;
+        let actual_at_this_depth = db_read(reader, move |conn| {
+            db::count_nodes_at_depth(conn, &slug_owned, td)
+        }).await.unwrap_or(0);
+        if actual_at_this_depth > 0 {
+            *total = *done + estimate_recursive_cluster_nodes(actual_at_this_depth);
+            send_progress(progress_tx, *done, *total).await;
+        }
 
         depth = target_depth;
     }
@@ -4958,6 +6627,7 @@ async fn execute_single(
     progress_tx: &Option<mpsc::Sender<BuildProgress>>,
     done: &mut i64,
     total: i64,
+    layer_tx: &Option<mpsc::Sender<LayerEvent>>,
 ) -> Result<Value> {
     let depth = step.depth.unwrap_or(0);
     let node_id = if let Some(ref pattern) = step.node_id_pattern {
@@ -7957,15 +9627,31 @@ mod tests {
             response_schema: None,
             batch_threshold: None,
             merge_instruction: None,
+            batch_size: None,
+            batch_max_tokens: None,
+            item_fields: None,
+            direct_synthesis_threshold: None,
+            convergence_fallback: None,
+            cluster_on_error: None,
+            cluster_fallback_size: None,
+            cluster_item_fields: None,
+            max_input_tokens: None,
+            split_strategy: None,
+            split_overlap_tokens: None,
+            split_merge: None,
             instruction_map: None,
             max_thread_size: None,
             context: None,
             compact_inputs: false,
+            enrichments: vec![],
             when: None,
             on_error: None,
             save_as: None,
             node_id_pattern: None,
             depth: None,
+            steps: None,
+            until: None,
+            break_loop: None,
         }
     }
 
@@ -9863,6 +11549,18 @@ mod tests {
             response_schema: None,
             batch_threshold: None,
             merge_instruction: None,
+            batch_size: None,
+            batch_max_tokens: None,
+            item_fields: None,
+            direct_synthesis_threshold: None,
+            convergence_fallback: None,
+            cluster_on_error: None,
+            cluster_fallback_size: None,
+            cluster_item_fields: None,
+            max_input_tokens: None,
+            split_strategy: None,
+            split_overlap_tokens: None,
+            split_merge: None,
             when: None,
             on_error: None,
             save_as: None,
@@ -9870,6 +11568,10 @@ mod tests {
             depth: None,
             context: None,
             compact_inputs: false,
+            enrichments: vec![],
+            steps: None,
+            until: None,
+            break_loop: None,
         }
     }
 

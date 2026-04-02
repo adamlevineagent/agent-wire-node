@@ -34,6 +34,22 @@ pub fn max_concurrent_helpers() -> usize {
     Tier1Config::default().stale_max_concurrent_helpers
 }
 
+/// Query the actual maximum depth of the pyramid from the database.
+/// Falls back to 3 (the default for a 4-layer pyramid: L0..L3) if the
+/// query fails or the pyramid has no nodes yet.
+fn query_max_depth(db_path: &str, slug: &str) -> i32 {
+    match super::db::open_pyramid_connection(Path::new(db_path)) {
+        Ok(conn) => conn
+            .query_row(
+                "SELECT COALESCE(MAX(depth), 3) FROM pyramid_nodes WHERE slug = ?1",
+                rusqlite::params![slug],
+                |row| row.get::<_, i32>(0),
+            )
+            .unwrap_or(3),
+        Err(_) => 3,
+    }
+}
+
 fn batch_cap_nodes(t3: &Tier3Config) -> usize {
     t3.batch_cap_nodes
 }
@@ -92,7 +108,8 @@ impl PyramidStaleEngine {
     ) -> Self {
         let debounce = Duration::from_secs((config.debounce_minutes as u64) * 60);
         let mut layers = HashMap::new();
-        for layer in 0..=3 {
+        let max_depth = query_max_depth(db_path, slug);
+        for layer in 0..=max_depth {
             layers.insert(
                 layer,
                 LayerTimer {
@@ -139,7 +156,7 @@ impl PyramidStaleEngine {
             .layers
             .get(&0)
             .map(|t| t.debounce)
-            .unwrap_or(Duration::from_secs(300));
+            .expect("Layer 0 timer must exist — engine was constructed without layers");
         let semaphore = self.concurrent_helpers.clone();
         let min_changed_files = self.config.min_changed_files;
         let api_key = self.api_key.clone();
@@ -152,7 +169,9 @@ impl PyramidStaleEngine {
 
         let handle = tokio::spawn(async move {
             loop {
-                // Sleep 60 seconds between polls
+                // TODO(config): WAL poll interval (60s) should move to config once a
+                // wal_poll_interval_secs field is added to Tier2Config / Tier3Config.
+                // Currently structural: belt-and-suspenders fallback for mutation pickup.
                 tokio::time::sleep(Duration::from_secs(60)).await;
 
                 // Check each layer for unprocessed mutations
@@ -164,8 +183,9 @@ impl PyramidStaleEngine {
                             Ok(c) => c,
                             Err(_) => return vec![],
                         };
+                        let max_depth = query_max_depth(&db_path, &slug);
                         let mut results = vec![];
-                        for layer in 0..=3 {
+                        for layer in 0..=max_depth {
                             let count: i64 = conn
                                 .query_row(
                                     "SELECT COUNT(*) FROM pyramid_pending_mutations
@@ -288,7 +308,7 @@ impl PyramidStaleEngine {
             {
                 let fires_at = Utc::now()
                     + chrono::Duration::from_std(timer.debounce)
-                        .unwrap_or(chrono::Duration::seconds(300));
+                        .expect("Debounce duration must be convertible to chrono::Duration — config is invalid");
                 let mut tfa = self.timer_fires_at.lock().unwrap();
                 *tfa = Some(fires_at.to_rfc3339());
             }
@@ -332,7 +352,8 @@ impl PyramidStaleEngine {
         // Update timer_fires_at
         {
             let fires_at = Utc::now()
-                + chrono::Duration::from_std(debounce).unwrap_or(chrono::Duration::seconds(300));
+                + chrono::Duration::from_std(debounce)
+                    .expect("Debounce duration must be convertible to chrono::Duration — config is invalid");
             let mut tfa = tfa_arc.lock().unwrap();
             *tfa = Some(fires_at.to_rfc3339());
         }
@@ -409,7 +430,8 @@ impl PyramidStaleEngine {
                 rusqlite::params![self.slug],
             );
 
-            for layer in 0..=3 {
+            let max_depth = query_max_depth(&self.db_path, &self.slug);
+            for layer in 0..=max_depth {
                 let count: i64 = conn
                     .query_row(
                         "SELECT COUNT(*) FROM pyramid_pending_mutations
@@ -632,7 +654,7 @@ pub async fn drain_and_dispatch(
 
     if mutations.is_empty() {
         info!(slug = %slug_owned, layer, "No pending mutations to drain (or below threshold)");
-        // Set phase to done_clean briefly, then revert to idle after 10s
+        // Set phase to done_clean briefly, then revert to idle after configured display duration
         {
             let mut phase = phase_arc.lock().unwrap();
             *phase = "done_clean".to_string();
@@ -642,8 +664,9 @@ pub async fn drain_and_dispatch(
             *summary = Some("found nothing actionable".to_string());
         }
         let pa = phase_arc.clone();
+        let display_secs = ops.tier2.phase_display_duration_secs;
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(10)).await;
+            tokio::time::sleep(Duration::from_secs(display_secs)).await;
             let mut phase = pa.lock().unwrap();
             if *phase == "done_clean" || *phase == "done_stale" {
                 *phase = "idle".to_string();
@@ -1055,9 +1078,10 @@ pub async fn drain_and_dispatch(
         "All helpers completed for batch"
     );
 
-    // Ensure the evaluating/cascading phase is visible for at least 3 seconds
-    // so the frontend poll (10s interval) can catch it.
-    let min_display = Duration::from_secs(3);
+    // Ensure the evaluating/cascading phase is visible for at least a fraction of
+    // the configured phase display duration so the frontend poll can catch it.
+    // Uses ~1/3 of the display duration as the minimum visibility window.
+    let min_display = Duration::from_secs((ops.tier2.phase_display_duration_secs / 3).max(1));
     let elapsed = phase_started_at.elapsed();
     if elapsed < min_display {
         tokio::time::sleep(min_display - elapsed).await;
@@ -1101,10 +1125,11 @@ pub async fn drain_and_dispatch(
         *summary = Some("found nothing actionable".to_string());
     }
 
-    // Revert to idle after 10 seconds
+    // Revert to idle after configured phase display duration
     let pa = phase_arc.clone();
+    let display_secs = ops.tier2.phase_display_duration_secs;
     tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(10)).await;
+        tokio::time::sleep(Duration::from_secs(display_secs)).await;
         let mut phase = pa.lock().unwrap();
         if *phase == "done_clean" || *phase == "done_stale" {
             *phase = "idle".to_string();
@@ -1218,7 +1243,15 @@ fn propagate_confirmed_stales(
     results: &[StaleCheckResult],
 ) -> Result<()> {
     let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
-    let next_layer = (layer + 1).min(3);
+    // Derive max depth from actual pyramid data, not a hardcoded constant.
+    let max_depth: i32 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(depth), 3) FROM pyramid_nodes WHERE slug = ?1",
+            rusqlite::params![slug],
+            |row| row.get(0),
+        )
+        .unwrap_or(3);
+    let next_layer = (layer + 1).min(max_depth);
 
     // Don't propagate from the apex layer back to itself
     if next_layer == layer {
@@ -1471,7 +1504,7 @@ mod tests {
             frozen_at: None,
         };
         let engine =
-            PyramidStaleEngine::new("test", config, "/tmp/test.db", "", "inception/mercury-2");
+            PyramidStaleEngine::new("test", config, "/tmp/test.db", "", "inception/mercury-2", super::OperationalConfig::default());
         assert_eq!(engine.slug, "test");
         assert_eq!(engine.layers.len(), 4);
         assert!(!engine.breaker_tripped);

@@ -1,22 +1,27 @@
-You are given all the thread nodes at one depth of a conversation Knowledge Pyramid. Group them into FEWER higher-level clusters representing distinct KNOWLEDGE DOMAINS from the conversation.
+You are given all the thread nodes at one depth of a conversation Knowledge Pyramid. Group them into higher-level clusters representing distinct KNOWLEDGE DOMAINS from the conversation.
 
-TARGET CLUSTER COUNT:
-- If you receive 5-8 nodes: produce 2-3 clusters
-- If you receive 9-15 nodes: produce 3-5 clusters
-- If you receive 16+ nodes: produce 4-6 clusters
-- You MUST produce STRICTLY FEWER clusters than the number of input nodes.
+APEX READINESS: Set `apex_ready: true` ONLY when ALL of these are true:
+- There are roughly 12 or fewer nodes
+- The nodes are already distinct, well-scoped knowledge domains
+- Grouping them further would only create vague super-categories that obscure rather than clarify
+- A reader could hold all these domains in their head as the "top-level map" of this conversation
 
-RULES:
+If you have more than 12 nodes, you almost certainly need to cluster. Group them.
+
+If `apex_ready` is true, return empty clusters. The system will synthesize all current nodes directly into the apex.
+
+PRINCIPLES:
+- **Let the material decide.** The number of groups should reflect the natural structure of the conversation's knowledge, not a target count.
+- **You MUST produce STRICTLY FEWER clusters than the number of input nodes.** This is how the pyramid converges toward an apex.
 - Every node must be in exactly ONE cluster
-- Fewer clusters is better — the pyramid must converge toward a single apex
 - Cluster headlines MUST be unique and concrete
 - Do NOT use: Overview, Summary, Integration, Layer, Platform, System, Architecture
 - DO use the conversation's own language and concepts
-- Each cluster should have at least 2 nodes. Avoid singletons.
 
 You MUST output ONLY a valid JSON object. Start with { and end with }.
 
 {
+  "apex_ready": false,
   "clusters": [
     {
       "name": "2-6 word cluster label — unique, from the conversation's vocabulary",

@@ -42,6 +42,8 @@ pub struct ChainContext {
     pub accumulators: HashMap<String, String>,
     /// Whether a prior build exists for this slug (any nodes present).
     pub has_prior_build: bool,
+    /// Set to true by a `gate` primitive with `break: true` to exit the enclosing loop.
+    pub break_loop: bool,
 }
 
 impl ChainContext {
@@ -61,6 +63,7 @@ impl ChainContext {
             pair_is_carry: false,
             accumulators: HashMap::new(),
             has_prior_build: false,
+            break_loop: false,
         }
     }
 

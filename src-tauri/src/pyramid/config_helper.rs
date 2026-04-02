@@ -23,6 +23,7 @@ pub fn config_for_model(api_key: &str, model: &str) -> LlmConfig {
         max_retries: defaults.llm_max_retries,
         base_timeout_secs: 120,
         max_timeout_secs: 600,
+        ..Default::default()
     }
 }
 

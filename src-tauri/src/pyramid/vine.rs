@@ -859,7 +859,13 @@ pub async fn build_bunch(
     }
 
     // Step 3: Build pyramid via shared pipeline helper
-    let reader = state.reader.clone();
+    // Use a build-scoped reader so the build doesn't block CLI/frontend queries.
+    let reader = if let Some(data_dir) = state.data_dir.as_ref() {
+        let build_conn = db::open_pyramid_connection(&data_dir.join("pyramid.db"))?;
+        Arc::new(Mutex::new(build_conn))
+    } else {
+        state.reader.clone()
+    };
     let writer = state.writer.clone();
     let llm_config = {
         let cfg = state.config.read().await;

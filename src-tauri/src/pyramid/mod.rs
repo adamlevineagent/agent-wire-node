@@ -151,6 +151,57 @@ fn default_absorption_daily_cap() -> u64 {
     100
 }
 
+// ── Tier1 default functions (everything-to-YAML: Part 2) ──────────────────
+
+fn default_llm_retryable_status_codes() -> Vec<u16> {
+    vec![429, 403, 502, 503]
+}
+fn default_llm_retry_base_sleep_secs() -> u64 {
+    1
+}
+fn default_llm_timeout_chars_per_increment() -> usize {
+    100_000
+}
+fn default_llm_timeout_increment_secs() -> u64 {
+    60
+}
+
+// ── Tier2 default functions (everything-to-YAML: Part 3) ──────────────────
+
+fn default_watcher_exclude_patterns() -> Vec<String> {
+    vec![
+        "/target/".into(),
+        "/node_modules/".into(),
+        "/.git/".into(),
+        "/dist/".into(),
+        "/.next/".into(),
+        "/.DS_Store".into(),
+        ".tmp.".into(),
+        ".swp".into(),
+        ".swo".into(),
+        "~".into(),
+        "/build/".into(),
+    ]
+}
+fn default_rename_similarity_threshold() -> f64 {
+    0.5
+}
+fn default_rename_candidate_window_ms() -> u64 {
+    2000
+}
+fn default_staleness_queue_dequeue_cap() -> usize {
+    50
+}
+fn default_phase_display_duration_secs() -> u64 {
+    10
+}
+fn default_rate_limit_hourly_window_secs() -> u64 {
+    3600
+}
+fn default_rate_limit_daily_window_secs() -> u64 {
+    86400
+}
+
 // ── Operational Config (Tiered) ─────────────────────────────────────────────
 //
 // All operational constants externalized from Rust source. Organized into tiers
@@ -195,6 +246,15 @@ pub struct Tier1Config {
     pub classify_min_timeout_secs: u64,
     pub web_min_timeout_secs: u64,
     pub default_structured_min_timeout_secs: u64,
+    // LLM retry/timeout tuning (everything-to-YAML: Part 2)
+    #[serde(default = "default_llm_retryable_status_codes")]
+    pub llm_retryable_status_codes: Vec<u16>,
+    #[serde(default = "default_llm_retry_base_sleep_secs")]
+    pub llm_retry_base_sleep_secs: u64,
+    #[serde(default = "default_llm_timeout_chars_per_increment")]
+    pub llm_timeout_chars_per_increment: usize,
+    #[serde(default = "default_llm_timeout_increment_secs")]
+    pub llm_timeout_increment_secs: u64,
 }
 
 impl Default for Tier1Config {
@@ -225,6 +285,10 @@ impl Default for Tier1Config {
             classify_min_timeout_secs: 420,
             web_min_timeout_secs: 240,
             default_structured_min_timeout_secs: 180,
+            llm_retryable_status_codes: default_llm_retryable_status_codes(),
+            llm_retry_base_sleep_secs: default_llm_retry_base_sleep_secs(),
+            llm_timeout_chars_per_increment: default_llm_timeout_chars_per_increment(),
+            llm_timeout_increment_secs: default_llm_timeout_increment_secs(),
         }
     }
 }
@@ -247,6 +311,21 @@ pub struct Tier2Config {
     pub teaser_max_chars: usize,
     pub granularity_ranges: Vec<(u32, u32)>,
     pub faq_category_threshold: usize,
+    // Watcher / stale / rate-limit tuning (everything-to-YAML: Part 3+5)
+    #[serde(default = "default_watcher_exclude_patterns")]
+    pub watcher_exclude_patterns: Vec<String>,
+    #[serde(default = "default_rename_similarity_threshold")]
+    pub rename_similarity_threshold: f64,
+    #[serde(default = "default_rename_candidate_window_ms")]
+    pub rename_candidate_window_ms: u64,
+    #[serde(default = "default_staleness_queue_dequeue_cap")]
+    pub staleness_queue_dequeue_cap: usize,
+    #[serde(default = "default_phase_display_duration_secs")]
+    pub phase_display_duration_secs: u64,
+    #[serde(default = "default_rate_limit_hourly_window_secs")]
+    pub rate_limit_hourly_window_secs: u64,
+    #[serde(default = "default_rate_limit_daily_window_secs")]
+    pub rate_limit_daily_window_secs: u64,
 }
 
 impl Default for Tier2Config {
@@ -275,6 +354,13 @@ impl Default for Tier2Config {
                 (5, 6), // granularity 5
             ],
             faq_category_threshold: 20,
+            watcher_exclude_patterns: default_watcher_exclude_patterns(),
+            rename_similarity_threshold: default_rename_similarity_threshold(),
+            rename_candidate_window_ms: default_rename_candidate_window_ms(),
+            staleness_queue_dequeue_cap: default_staleness_queue_dequeue_cap(),
+            phase_display_duration_secs: default_phase_display_duration_secs(),
+            rate_limit_hourly_window_secs: default_rate_limit_hourly_window_secs(),
+            rate_limit_daily_window_secs: default_rate_limit_daily_window_secs(),
         }
     }
 }
@@ -400,6 +486,10 @@ impl PyramidConfig {
             max_retries: self.operational.tier1.llm_max_retries,
             base_timeout_secs: self.operational.tier2.llm_base_timeout_secs,
             max_timeout_secs: self.operational.tier2.llm_max_timeout_secs,
+            retryable_status_codes: self.operational.tier1.llm_retryable_status_codes.clone(),
+            retry_base_sleep_secs: self.operational.tier1.llm_retry_base_sleep_secs,
+            timeout_chars_per_increment: self.operational.tier1.llm_timeout_chars_per_increment,
+            timeout_increment_secs: self.operational.tier1.llm_timeout_increment_secs,
         }
     }
 }
@@ -458,6 +548,48 @@ pub struct PyramidState {
     pub absorption_daily_spend: Arc<Mutex<(u64, std::time::Instant)>>,
 }
 
+impl PyramidState {
+    /// Create a build-scoped copy of this state with its own reader connection.
+    ///
+    /// The build's reader won't compete with CLI/frontend queries for the shared
+    /// reader Mutex. All other fields (writer, config, active_build, etc.) are
+    /// shared via Arc so mutations are visible to both.
+    pub fn with_build_reader(&self) -> anyhow::Result<Arc<PyramidState>> {
+        let db_path = self
+            .data_dir
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("data_dir not set, cannot open build reader"))?
+            .join("pyramid.db");
+        let build_reader = db::open_pyramid_connection(&db_path)?;
+        Ok(Arc::new(PyramidState {
+            reader: Arc::new(Mutex::new(build_reader)),
+            writer: self.writer.clone(),
+            config: self.config.clone(),
+            active_build: self.active_build.clone(),
+            data_dir: self.data_dir.clone(),
+            stale_engines: self.stale_engines.clone(),
+            file_watchers: self.file_watchers.clone(),
+            vine_builds: self.vine_builds.clone(),
+            // Snapshot copies — won't reflect runtime changes to the originals.
+            // This is fine: these flags are only toggled in parity tests, not at runtime.
+            use_chain_engine: AtomicBool::new(
+                self.use_chain_engine
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            use_ir_executor: AtomicBool::new(
+                self.use_ir_executor
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            event_bus: self.event_bus.clone(),
+            operational: self.operational.clone(),
+            chains_dir: self.chains_dir.clone(),
+            remote_query_rate_limiter: self.remote_query_rate_limiter.clone(),
+            absorption_build_rate_limiter: self.absorption_build_rate_limiter.clone(),
+            absorption_daily_spend: self.absorption_daily_spend.clone(),
+        }))
+    }
+}
+
 /// Handle to a running pyramid build.
 pub struct BuildHandle {
     /// Slug being built.
@@ -466,6 +598,8 @@ pub struct BuildHandle {
     pub cancel: tokio_util::sync::CancellationToken,
     /// Live status (progress, elapsed time, etc.)
     pub status: Arc<tokio::sync::RwLock<BuildStatus>>,
+    /// Layer-level build state for the v2 pyramid visualization.
+    pub layer_state: Arc<tokio::sync::RwLock<types::BuildLayerState>>,
     /// When the build started — used to compute elapsed time live.
     pub started_at: std::time::Instant,
 }

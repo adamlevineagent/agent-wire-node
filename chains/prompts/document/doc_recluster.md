@@ -1,22 +1,28 @@
-You are given all the thread nodes at a single depth level of a document Knowledge Pyramid. Each represents a topic area with its headline, orientation, and sub-topics.
+You are given all the nodes at a single depth level of a document Knowledge Pyramid. Each represents a knowledge area with its headline, orientation, and sub-topics.
 
-PURPOSE: Group these threads into higher-level knowledge domains. Each domain should be a coherent area that a reader would naturally explore as a unit. The goal is to REDUCE the number of items at this level into a SMALLER set of meaningful groups.
+PURPOSE: Identify the natural higher-level dimensions of understanding. A reader at the next level up wants to explore by broad knowledge domain — what are the areas that organize everything below them into coherent groups?
 
-TARGET CLUSTER COUNT:
-- If you receive 5-8 nodes: produce 2-3 clusters
-- If you receive 9-15 nodes: produce 3-5 clusters
-- If you receive 16+ nodes: produce 4-6 clusters
-- You MUST produce STRICTLY FEWER clusters than the number of input nodes. If given 5 nodes, produce at most 4 clusters (prefer 2-3).
+APEX READINESS: Set `apex_ready: true` ONLY when ALL of these are true:
+- There are roughly 12 or fewer nodes
+- The nodes are already distinct, well-scoped knowledge domains
+- Grouping them further would only create vague super-categories that obscure rather than clarify
+- A reader could hold all these domains in their head as the "top-level map" of this knowledge
+
+If you have more than 12 nodes, you almost certainly need to cluster. 32 nodes cannot be meaningfully synthesized into one apex — a reader can't hold 32 domains in their head. Group them.
+
+If `apex_ready` is true, return empty clusters. The system will synthesize all current nodes directly into the apex.
 
 PRINCIPLES:
-- **Let the material decide.** If there are 10 threads and they naturally form 3 domains, make 3. If they form 7, still merge to at most 5 — the pyramid must converge.
-- **Every node must be assigned to exactly one group.** No orphans at synthesis layers — these are already synthesized threads, not raw documents.
+- **Let the material decide.** The number of groups should reflect the natural structure of the knowledge, not a target count. If there are genuinely 2 broad domains, produce 2. If there are 7, produce 7.
+- **Group by understanding, not by surface similarity.** Nodes that contribute to understanding the same domain belong together, even if their headlines sound different.
+- **Every node must be assigned to exactly one group.** No orphans — these are already synthesized nodes.
 - **Names must be concrete.** "Auth & Security Decisions" not "Overview." Avoid generic words: Overview, Summary, Integration, Layer, Platform, System.
-- **Single-node groups are discouraged** unless unavoidable. Prefer merging into the closest match.
+- **The only hard rule: fewer groups than inputs.** If you receive 5 nodes, you must produce fewer than 5 groups. This is how the pyramid converges toward an apex.
 
 You MUST output ONLY a valid JSON object. No markdown, no prose, no code fences. Start with { and end with }.
 
 {
+  "apex_ready": false,
   "clusters": [
     {
       "name": "2-6 word cluster label — unique and concrete",

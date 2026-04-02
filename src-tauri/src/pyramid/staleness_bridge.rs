@@ -46,7 +46,7 @@ pub struct CheckStalenessResponse {
     pub files_processed: usize,
     /// The staleness propagation report.
     pub report: StalenessReport,
-    /// Items dequeued for re-answering (up to 50).
+    /// Items dequeued for re-answering (capped by staleness_queue_dequeue_cap config).
     pub queued_items: Vec<StalenessItem>,
 }
 
@@ -59,11 +59,15 @@ pub struct CheckStalenessResponse {
 ///
 /// `changed_files` is the list of files that changed. If empty, this is a no-op
 /// that returns an empty report (the caller should auto-detect before calling).
+///
+/// `dequeue_cap` limits how many items are dequeued for re-answering per call.
+/// Read from `operational.tier2.staleness_queue_dequeue_cap` in config.
 pub fn run_staleness_check(
     conn: &Connection,
     slug: &str,
     changed_files: &[ChangedFile],
     threshold: f64,
+    dequeue_cap: usize,
 ) -> Result<(StalenessReport, Vec<StalenessItem>)> {
     if changed_files.is_empty() {
         info!(
@@ -93,8 +97,8 @@ pub fn run_staleness_check(
     // Step 2: Propagate staleness through evidence graph
     let report = staleness::propagate_staleness(conn, slug, &deltas, threshold)?;
 
-    // Step 3: Dequeue items for re-answering (cap at 50 for the response)
-    let queued_items = staleness::process_staleness_queue(conn, slug, 50)?;
+    // Step 3: Dequeue items for re-answering (capped by config)
+    let queued_items = staleness::process_staleness_queue(conn, slug, dequeue_cap as u32)?;
 
     info!(
         slug,
@@ -216,7 +220,7 @@ mod tests {
     fn test_empty_changed_files_returns_empty_report() {
         // Use an in-memory DB (we won't hit it since changed_files is empty)
         let conn = rusqlite::Connection::open_in_memory().unwrap();
-        let (report, items) = run_staleness_check(&conn, "test", &[], 0.3).unwrap();
+        let (report, items) = run_staleness_check(&conn, "test", &[], 0.3, 50).unwrap();
         assert!(report.affected_questions.is_empty());
         assert!(items.is_empty());
     }
