@@ -37,7 +37,7 @@ steps:
     instruction: "$prompts/document/doc_extract.md"
     for_each: $chunks
     dispatch_order: "largest_first"
-    concurrency: 12
+    concurrency: 6
     node_id_pattern: "D-L0-{index:03}"
     depth: 0
     save_as: node
@@ -46,6 +46,8 @@ steps:
     split_overlap_tokens: 500
     split_merge: true
     split_merge_instruction: "$prompts/shared/merge_sub_chunks.md"
+    # No response_schema — structured output makes Mercury 2 30-60x slower
+    # (67-90s per doc vs 1-3s). Free-form JSON + walker parse is faster.
     model_tier: mid
     temperature: 0.3
     on_error: "retry(3)"
@@ -99,51 +101,11 @@ steps:
         primitive: classify
         instruction: "$prompts/document/doc_cluster.md"
         for_each: $l0_doc_extract
-        item_fields: ["node_id", "headline", "orientation", "topics.name"]
+        item_fields: ["node_id", "headline", "orientation", "topics.name,summary"]
         batch_size: 150
-        batch_max_tokens: 80000
+        batch_max_tokens: 50000
         concurrency: 3
-        response_schema:
-          type: object
-          properties:
-            threads:
-              type: array
-              minItems: 1
-              items:
-                type: object
-                properties:
-                  name:
-                    type: string
-                    description: "2-6 word thread label based on concept"
-                  description:
-                    type: string
-                  concept_tags:
-                    type: array
-                    items:
-                      type: string
-                  assignments:
-                    type: array
-                    minItems: 1
-                    items:
-                      type: object
-                      properties:
-                        source_node:
-                          type: string
-                          description: "Exact D-L0-XXX node ID"
-                        topic_index:
-                          type: integer
-                        topic_name:
-                          type: string
-                      required: ["source_node", "topic_index", "topic_name"]
-                      additionalProperties: false
-                required: ["name", "description", "assignments"]
-                additionalProperties: false
-            unassigned:
-              type: array
-              items:
-                type: string
-          required: ["threads"]
-          additionalProperties: false
+        # No response_schema — structured output makes Mercury 2 30-60x slower
         model_tier: mid
         temperature: 0.3
         on_error: "retry(3)"
@@ -152,78 +114,25 @@ steps:
         instruction: "$prompts/document/doc_cluster_merge.md"
         input:
           batch_results: $batch_cluster
-        response_schema:
-          type: object
-          properties:
-            threads:
-              type: array
-              minItems: 1
-              items:
-                type: object
-                properties:
-                  name:
-                    type: string
-                  description:
-                    type: string
-                  concept_tags:
-                    type: array
-                    items:
-                      type: string
-                  assignments:
-                    type: array
-                    minItems: 1
-                    items:
-                      type: object
-                      properties:
-                        source_node:
-                          type: string
-                        topic_index:
-                          type: integer
-                        topic_name:
-                          type: string
-                      required: ["source_node", "topic_index", "topic_name"]
-                      additionalProperties: false
-                required: ["name", "description", "assignments"]
-                additionalProperties: false
-            unassigned:
-              type: array
-              items:
-                type: string
-          required: ["threads"]
-          additionalProperties: false
+        # No response_schema — structured output makes Mercury 2 30-60x slower
         model_tier: mid
         temperature: 0.3
         on_error: "retry(3)"
 
-  # ── Step 4: Thread narrative (sub-chain: batch docs → merge) ───────
-  # Per-thread synthesis. If a thread's assigned docs exceed Mercury 2's
-  # context, the sub-chain batches them and merges the partial syntheses.
+  # ── Step 4: Thread narrative synthesis ─────────────────────────────
+  # Per-thread: synthesize assigned L0 docs into one authoritative node.
+  # The executor loads L0 nodes by their assignment IDs from the thread.
   - name: thread_narrative
-    primitive: container
+    primitive: synthesize
+    instruction: "$prompts/document/doc_thread.md"
     for_each: $thread_clustering.threads
     concurrency: 5
     node_id_pattern: "L1-{index:03}"
     depth: 1
     save_as: node
-    steps:
-      - name: batch_synthesize
-        primitive: synthesize
-        instruction: "$prompts/document/doc_thread.md"
-        for_each: $item.assigned_docs
-        batch_max_tokens: 60000
-        concurrency: 3
-        model_tier: mid
-        temperature: 0.3
-        on_error: "retry(2)"
-      - name: merge_thread
-        primitive: synthesize
-        instruction: "$prompts/document/doc_thread_merge.md"
-        input:
-          parts: $batch_synthesize
-        when: "count($batch_synthesize) > 1"
-        model_tier: mid
-        temperature: 0.3
-        on_error: "retry(2)"
+    model_tier: mid
+    temperature: 0.3
+    on_error: "retry(2)"
 
   # ── Step 5: L1 cross-layer webbing ─────────────────────────────────
   - name: l1_webbing
@@ -261,63 +170,49 @@ steps:
     temperature: 0.2
     on_error: "skip"
 
-  # ── Step 6: Upper layers (loop: recluster → apex check → synthesize) ─
-  # Replaces recursive_cluster with an explicit YAML loop.
-  # Each iteration: cluster current nodes, check apex_ready, synthesize.
-  # Loop exits when LLM signals apex_ready or only 1 node remains.
-  - name: upper_layers
-    primitive: loop
-    until: "count($current_nodes) <= 1"
+  # ── Step 6: Upper layers (recursive clustering → apex) ─────────────
+  # Uses recursive_cluster until the loop primitive supports depth-aware
+  # node loading ($current_nodes). The apex_ready signal and convergence
+  # controls are still YAML-driven via cluster_response_schema.
+  - name: upper_layer_synthesis
+    primitive: synthesize
+    instruction: "$prompts/document/doc_distill.md"
+    recursive_cluster: true
+    cluster_instruction: "$prompts/document/doc_recluster.md"
+    cluster_item_fields: ["node_id", "headline", "orientation"]
+    cluster_response_schema:
+      type: object
+      properties:
+        apex_ready:
+          type: boolean
+          description: "true if nodes are the natural top-level dimensions"
+        clusters:
+          type: array
+          items:
+            type: object
+            properties:
+              name:
+                type: string
+              description:
+                type: string
+              node_ids:
+                type: array
+                items:
+                  type: string
+            required: ["name", "description", "node_ids"]
+            additionalProperties: false
+      required: ["apex_ready", "clusters"]
+      additionalProperties: false
+    direct_synthesis_threshold: null
+    convergence_fallback: "retry"
+    cluster_on_error: "retry(3)"
+    cluster_fallback_size: 3
     depth: 1
     save_as: node
     node_id_pattern: "L{depth}-{index:03}"
-    steps:
-      - name: recluster
-        primitive: classify
-        instruction: "$prompts/document/doc_recluster.md"
-        input:
-          nodes: $current_nodes
-        item_fields: ["node_id", "headline", "orientation"]
-        response_schema:
-          type: object
-          properties:
-            apex_ready:
-              type: boolean
-              description: "true if nodes are the natural top-level dimensions"
-            clusters:
-              type: array
-              items:
-                type: object
-                properties:
-                  name:
-                    type: string
-                  description:
-                    type: string
-                  node_ids:
-                    type: array
-                    items:
-                      type: string
-                required: ["name", "description", "node_ids"]
-                additionalProperties: false
-          required: ["apex_ready", "clusters"]
-          additionalProperties: false
-        model_tier: mid
-        temperature: 0.3
-        on_error: "retry(3)"
-      - name: check_apex
-        primitive: gate
-        when: "$recluster.apex_ready == true"
-        break: true
-      - name: synthesize_layer
-        primitive: synthesize
-        instruction: "$prompts/document/doc_distill.md"
-        for_each: $recluster.clusters
-        concurrency: 5
-        save_as: node
-        node_id_pattern: "L{depth}-{index:03}"
-        model_tier: mid
-        temperature: 0.3
-        on_error: "retry(3)"
+    model_tier: mid
+    temperature: 0.3
+    on_error: "retry(3)"
 
   # ── Step 7: L2 cross-layer webbing ─────────────────────────────────
   - name: l2_webbing

@@ -1,6 +1,6 @@
 You are organizing a collection of documents into concept threads. Each thread groups documents that tell a coherent story about the same subject — a reader exploring that thread should come away understanding one complete area of knowledge.
 
-You have projected metadata from every document: `node_id`, `headline`, `orientation`, and `topics` (with topic names and details). Use the headline, orientation, and topic structure to understand what each document is about and group accordingly.
+You have projected metadata from every document: `node_id`, `headline`, `orientation`, and `topics` (each with `name` and `summary`). Each item represents ONE DOCUMENT, not one topic. Group DOCUMENTS into threads — do not split a document's topics across different threads.
 
 PURPOSE: A reader will explore this collection one thread at a time. Each thread becomes a synthesis that traces how understanding of a concept evolved across documents. Your groupings determine what stories get told.
 

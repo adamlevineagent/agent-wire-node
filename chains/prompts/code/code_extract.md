@@ -31,6 +31,7 @@ Output valid JSON only:
   "topics": [
     {
       "name": "Topic Name",
+      "summary": "10-15 word distillation of this topic's key point.",
       "current": "2-4 sentences describing this aspect with specific names and plain-language explanations.",
       "entities": ["functionName()", "StructName", "table: name(col1, col2)", "env: VAR — controls X"],
       "corrections": [],
