@@ -5,19 +5,13 @@ Your job: identify coherent THREADS that organize ALL these files into meaningfu
 The input may include `file_level_connections`: concrete cross-file links discovered from L0 webbing. Use those as strong evidence when deciding what belongs together, especially when files share tables, endpoints, IPC channels, or types.
 
 RULES:
-- Most files should be assigned to ONE thread — the one where they are MOST relevant
-- Files that genuinely span multiple subsystems (e.g., routes.rs defines auth + API + IPC; mod.rs re-exports from multiple domains; AppShell.tsx manages auth state + routing + layout) may be assigned to up to 3 threads. Use this sparingly — only when the file's TOPICS are genuinely split across domains, not just because it imports from multiple modules
+- Group files into coherent architectural subsystems (e.g., "Authentication System", "Build Pipeline", "UI Components", "Database Layer")
+- A file should usually be assigned to the subsystem where it's most relevant. However, if a file genuinely sits on a structural seam and spans multiple subsystems (e.g., a router file, a massive orchestrator, or cross-cutting middleware), you MAY assign it to multiple threads. Do this when both subsystems require the file's context to be complete.
 - Group by functional relatedness, not directory structure
 - Files that import from each other or share types/APIs belong together
-- Configuration files (package.json, tsconfig, Cargo.toml) go with the system they configure
-- Test files go with the module they test
-- Let the material decide how many threads. Prefer splitting over merging.
-- Keep threads focused. If a subsystem has many files, consider whether it's actually multiple related subsystems that deserve their own threads.
-- NO catch-all threads: do NOT create threads like "Utilities", "Miscellaneous", or "Other". Every file belongs to a real subsystem. Small helper files go with the system they support.
-- Thread names should be concrete and recognizable: "Chain Execution Engine", not "Module Group 3"
-- Balance: very small threads (1-2 files) should usually be merged into the closest related thread unless they're genuinely distinct.
-- ZERO ORPHANS: Every single source_node in the input MUST appear in at least one thread assignment. After generating your output, mentally verify: does every C-L0-XXX from the input appear in at least one assignment? If not, add it to the most relevant thread. Missing files are a critical failure.
-- CRITICAL FIELD RULE: `assignments[].source_node` MUST be the exact `C-L0-XXX` ID copied verbatim from the input topic's `node_id` / `source_node` field. Do NOT put the headline in `source_node`.
+- Configuration files (e.g., package.json) and test files go with the system they support
+- ZERO ORPHANS: Every single source_node from the input MUST appear in at least one thread assignment. Missing files are a critical failure.
+- CRITICAL FIELD RULE: `assignments[].source_node` MUST be the exact `C-L0-XXX` ID from the input. Use `topic_name` for the human-readable headline.
 - Put the human-readable file/topic title in `topic_name`, not `source_node`.
 - BAD: `{"source_node":"MCP Server Package Config","topic_index":0,"topic_name":"MCP Server Package Config"}`
 - GOOD: `{"source_node":"C-L0-000","topic_index":0,"topic_name":"MCP Server Package Config"}`

@@ -136,12 +136,9 @@ steps:
                       additionalProperties: false
                 required: ["name", "description", "assignments"]
                 additionalProperties: false
-            unassigned:
-              type: array
-              items:
-                type: string
           required: ["threads"]
           additionalProperties: false
+
         model_tier: mid
         temperature: 0.3
         on_error: "retry(3)"

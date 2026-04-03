@@ -5341,6 +5341,7 @@ mod tests {
             children: vec!["c1".to_string(), "c2".to_string()],
             parent_id: None,
             superseded_by: None,
+            build_id: None,
             created_at: String::new(),
         };
 
@@ -5378,6 +5379,7 @@ mod tests {
                 children: vec![],
                 parent_id: None,
                 superseded_by: None,
+                build_id: None,
                 created_at: String::new(),
             };
             save_node(&conn, &node, None).unwrap();
@@ -5413,6 +5415,7 @@ mod tests {
             children: vec![],
             parent_id: None,
             superseded_by: None,
+            build_id: None,
             created_at: String::new(),
         };
         let second = PyramidNode {
@@ -5431,6 +5434,7 @@ mod tests {
             children: vec![],
             parent_id: None,
             superseded_by: None,
+            build_id: None,
             created_at: String::new(),
         };
 
@@ -5469,6 +5473,7 @@ mod tests {
                 children: vec![],
                 parent_id: None,
                 superseded_by: None,
+                build_id: None,
                 created_at: String::new(),
             };
             save_node(&conn, &node, None).unwrap();
@@ -5592,6 +5597,7 @@ mod tests {
                 children: vec![],
                 parent_id: None,
                 superseded_by: None,
+                build_id: None,
                 created_at: String::new(),
             };
             save_node(&conn, &node, None).unwrap();
@@ -5612,6 +5618,7 @@ mod tests {
             children: vec!["d0-0".into(), "d0-1".into(), "d0-2".into()],
             parent_id: None,
             superseded_by: None,
+            build_id: None,
             created_at: String::new(),
         };
         save_node(&conn, &apex, None).unwrap();
@@ -5645,6 +5652,7 @@ mod tests {
             children: vec![],
             parent_id: None,
             superseded_by: None,
+            build_id: None,
             created_at: String::new(),
         };
         save_node(&conn, &node, None).unwrap();

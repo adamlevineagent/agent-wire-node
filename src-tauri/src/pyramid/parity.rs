@@ -2064,4 +2064,39 @@ mod tests {
             }
         }
     }
+
+    /// Inner steps inside containers must preserve on_parse_error and heal_instruction.
+    /// Regression test for: batch_cluster has on_parse_error: "heal" in YAML but
+    /// step.on_parse_error is None at dispatch time.
+    #[test]
+    fn inner_steps_preserve_on_parse_error() {
+        use crate::pyramid::chain_engine::ChainDefinition;
+
+        for (label, yaml) in [
+            ("code", include_str!("../../../chains/defaults/code.yaml")),
+            ("document", include_str!("../../../chains/defaults/document.yaml")),
+        ] {
+            let chain: ChainDefinition = serde_yaml::from_str(yaml)
+                .unwrap_or_else(|e| panic!("{label}: failed to parse YAML: {e}"));
+
+            for step in &chain.steps {
+                if let Some(ref inner_steps) = step.steps {
+                    for inner in inner_steps {
+                        if inner.name == "batch_cluster" {
+                            assert_eq!(
+                                inner.on_parse_error.as_deref(),
+                                Some("heal"),
+                                "{label}: batch_cluster.on_parse_error should be Some(\"heal\"), got {:?}",
+                                inner.on_parse_error
+                            );
+                            assert!(
+                                inner.heal_instruction.is_some(),
+                                "{label}: batch_cluster.heal_instruction should be Some(...)"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 }

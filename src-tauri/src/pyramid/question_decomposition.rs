@@ -2156,6 +2156,7 @@ mod tests {
                 max_depth: 3,
                 folder_map: None,
                 chains_dir: None,
+                audience: None,
             },
             audience: None,
         }
@@ -2532,7 +2533,7 @@ That should cover it."#;
 
     #[test]
     fn granularity_affects_range() {
-        let tier2 = super::Tier2Config::default();
+        let tier2 = crate::pyramid::Tier2Config::default();
         let (min1, max1) = granularity_to_range(1, &tier2);
         let (min5, max5) = granularity_to_range(5, &tier2);
         assert!(min5 > min1);
@@ -2551,6 +2552,7 @@ That should cover it."#;
             max_depth: 1,
             folder_map: None,
             chains_dir: None,
+            audience: None,
         };
         // Can't test the async decompose directly without LLM, but we can test
         // that build_subtree respects depth limits via the terminal condition.
@@ -2564,6 +2566,8 @@ That should cover it."#;
         let rt = tokio::runtime::Runtime::new().unwrap();
         let llm_config = LlmConfig::default();
         // build_subtree is async but will hit the terminal condition before any LLM call
+        let tier1 = crate::pyramid::Tier1Config::default();
+        let tier2 = crate::pyramid::Tier2Config::default();
         let result = rt.block_on(build_subtree(
             &raw,
             "code",
@@ -2573,6 +2577,9 @@ That should cover it."#;
             1, // current_depth == max_depth
             &llm_config,
             None,
+            None,
+            &tier1,
+            &tier2,
         ));
         let node = result.unwrap();
         assert!(node.is_leaf);

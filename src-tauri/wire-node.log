@@ -1,0 +1,1421 @@
+[2m2026-04-03T06:34:19.394646Z[0m [32m INFO[0m [2mwire_node_desktop[0m[2m:[0m Loaded saved session for Some("hello@callmeplayful.com")
+[2m2026-04-03T06:34:19.394869Z[0m [32m INFO[0m [2mwire_node_desktop[0m[2m:[0m Loaded saved session for Some("hello@callmeplayful.com")
+[2m2026-04-03T06:34:20.059293Z[0m [32m INFO[0m [2mwire_node_desktop[0m[2m:[0m Pyramid config loaded (api_key set: true)
+[2m2026-04-03T06:34:20.059325Z[0m [32m INFO[0m [2mwire_node_desktop[0m[2m:[0m chains_dir resolved to "/Users/adamlevine/Library/Application Support/wire-node/chains"
+[2m2026-04-03T06:34:20.059388Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::chain_loader[0m[2m:[0m syncing chains from source tree [3msrc[0m[2m=[0m/Users/adamlevine/AI Project Files/agent-wire-node/src-tauri/../chains [3mdst[0m[2m=[0m/Users/adamlevine/Library/Application Support/wire-node/chains
+[2m2026-04-03T06:34:20.081090Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::event_chain[0m[2m:[0m event bus: loaded subscriptions from DB [3mcount[0m[2m=[0m0
+[2m2026-04-03T06:34:20.081158Z[0m [32m INFO[0m [2mwire_node_desktop[0m[2m:[0m Pyramid engine initialized at "/Users/adamlevine/Library/Application Support/wire-node/pyramid.db", ir_executor=false
+[2m2026-04-03T06:34:20.176199Z[0m [32m INFO[0m [2mwire_node_desktop[0m[2m:[0m Partner (Dennis) initialized at "/Users/adamlevine/Library/Application Support/wire-node/partner.db"
+[2m2026-04-03T06:34:20.340164Z[0m [35mTRACE[0m [2mtao::platform_impl::platform::app_delegate[0m[2m:[0m Triggered `applicationDidFinishLaunching`
+[2m2026-04-03T06:34:20.341261Z[0m [35mTRACE[0m [2mtao::platform_impl::platform::app_state[0m[2m:[0m Activating visible window
+[2m2026-04-03T06:34:20.343410Z[0m [35mTRACE[0m [2mtao::platform_impl::platform::window[0m[2m:[0m Creating new window
+[2m2026-04-03T06:34:20.353281Z[0m [35mTRACE[0m [2mtao::platform_impl::platform::view[0m[2m:[0m Triggered `viewDidMoveToWindow`
+[2m2026-04-03T06:34:20.353324Z[0m [35mTRACE[0m [2mtao::platform_impl::platform::view[0m[2m:[0m Completed `viewDidMoveToWindow`
+[2m2026-04-03T06:34:20.353363Z[0m [35mTRACE[0m [2mtao::platform_impl::platform::view[0m[2m:[0m Triggered `validAttributesForMarkedText`
+[2m2026-04-03T06:34:20.353371Z[0m [35mTRACE[0m [2mtao::platform_impl::platform::view[0m[2m:[0m Completed `validAttributesForMarkedText`
+[2m2026-04-03T06:34:20.353380Z[0m [35mTRACE[0m [2mtao::platform_impl::platform::view[0m[2m:[0m Triggered `validAttributesForMarkedText`
+[2m2026-04-03T06:34:20.353384Z[0m [35mTRACE[0m [2mtao::platform_impl::platform::view[0m[2m:[0m Completed `validAttributesForMarkedText`
+[2m2026-04-03T06:34:20.353402Z[0m [35mTRACE[0m [2mtao::platform_impl::platform::view[0m[2m:[0m Triggered `validAttributesForMarkedText`
+[2m2026-04-03T06:34:20.353407Z[0m [35mTRACE[0m [2mtao::platform_impl::platform::view[0m[2m:[0m Completed `validAttributesForMarkedText`
+[2m2026-04-03T06:34:20.353410Z[0m [35mTRACE[0m [2mtao::platform_impl::platform::view[0m[2m:[0m Triggered `validAttributesForMarkedText`
+[2m2026-04-03T06:34:20.353414Z[0m [35mTRACE[0m [2mtao::platform_impl::platform::view[0m[2m:[0m Completed `validAttributesForMarkedText`
+[2m2026-04-03T06:34:20.353417Z[0m [35mTRACE[0m [2mtao::platform_impl::platform::view[0m[2m:[0m Triggered `validAttributesForMarkedText`
+[2m2026-04-03T06:34:20.353420Z[0m [35mTRACE[0m [2mtao::platform_impl::platform::view[0m[2m:[0m Completed `validAttributesForMarkedText`
+[2m2026-04-03T06:34:20.353612Z[0m [35mTRACE[0m [2mtao::platform_impl::platform::window[0m[2m:[0m Locked shared state in `set_fullscreen`
+[2m2026-04-03T06:34:20.353619Z[0m [35mTRACE[0m [2mtao::platform_impl::platform::window[0m[2m:[0m Unlocked shared state in `set_fullscreen`
+[2m2026-04-03T06:34:20.419875Z[0m [35mTRACE[0m [2mtao::platform_impl::platform::view[0m[2m:[0m Triggered `validAttributesForMarkedText`
+[2m2026-04-03T06:34:20.419905Z[0m [35mTRACE[0m [2mtao::platform_impl::platform::view[0m[2m:[0m Completed `validAttributesForMarkedText`
+[2m2026-04-03T06:34:20.419930Z[0m [35mTRACE[0m [2mtao::platform_impl::platform::view[0m[2m:[0m Triggered `validAttributesForMarkedText`
+[2m2026-04-03T06:34:20.419935Z[0m [35mTRACE[0m [2mtao::platform_impl::platform::view[0m[2m:[0m Completed `validAttributesForMarkedText`
+[2m2026-04-03T06:34:20.419954Z[0m [35mTRACE[0m [2mtao::platform_impl::platform::view[0m[2m:[0m Triggered `validAttributesForMarkedText`
+[2m2026-04-03T06:34:20.419958Z[0m [35mTRACE[0m [2mtao::platform_impl::platform::view[0m[2m:[0m Completed `validAttributesForMarkedText`
+[2m2026-04-03T06:34:20.419961Z[0m [35mTRACE[0m [2mtao::platform_impl::platform::view[0m[2m:[0m Triggered `validAttributesForMarkedText`
+[2m2026-04-03T06:34:20.419964Z[0m [35mTRACE[0m [2mtao::platform_impl::platform::view[0m[2m:[0m Completed `validAttributesForMarkedText`
+[2m2026-04-03T06:34:20.419967Z[0m [35mTRACE[0m [2mtao::platform_impl::platform::view[0m[2m:[0m Triggered `validAttributesForMarkedText`
+[2m2026-04-03T06:34:20.419970Z[0m [35mTRACE[0m [2mtao::platform_impl::platform::view[0m[2m:[0m Completed `validAttributesForMarkedText`
+[2m2026-04-03T06:34:20.420013Z[0m [35mTRACE[0m [2mtao::platform_impl::platform::view[0m[2m:[0m Triggered `viewDidMoveToWindow`
+[2m2026-04-03T06:34:20.420030Z[0m [35mTRACE[0m [2mtao::platform_impl::platform::view[0m[2m:[0m Completed `viewDidMoveToWindow`
+[2m2026-04-03T06:34:20.429465Z[0m [35mTRACE[0m [2mtao::platform_impl::platform::app_delegate[0m[2m:[0m Completed `applicationDidFinishLaunching`
+[2m2026-04-03T06:34:20.451800Z[0m [35mTRACE[0m [2mtao::platform_impl::platform::window_delegate[0m[2m:[0m Triggered `windowDidBecomeKey:`
+[2m2026-04-03T06:34:20.451828Z[0m [35mTRACE[0m [2mtao::platform_impl::platform::window_delegate[0m[2m:[0m Completed `windowDidBecomeKey:`
+[2m2026-04-03T06:34:20.466644Z[0m [32m INFO[0m [2mwire_node_lib::server[0m[2m:[0m Pyramid 'agent-wire-nodepoststaleupdate' is frozen — skipping engine and watcher on startup
+[2m2026-04-03T06:34:20.466693Z[0m [32m INFO[0m [2mwire_node_lib::server[0m[2m:[0m Pyramid 'agent-wire-nodepostdadbear' is frozen — skipping engine and watcher on startup
+[2m2026-04-03T06:34:20.466698Z[0m [32m INFO[0m [2mwire_node_lib::server[0m[2m:[0m Pyramid 'agent-wire-nodecanonical' is frozen — skipping engine and watcher on startup
+[2m2026-04-03T06:34:20.466702Z[0m [32m INFO[0m [2mwire_node_lib::server[0m[2m:[0m Pyramid 'docs' is frozen — skipping engine and watcher on startup
+[2m2026-04-03T06:34:20.467395Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::stale_engine[0m[2m:[0m WAL poll loop started (60s interval) [3mslug[0m[2m=[0malldesigndocs3projects
+[2m2026-04-03T06:34:20.468536Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::watcher[0m[2m:[0m Watcher caches populated for slug='alldesigndocs3projects': 705 tracked paths, 2 extensions, 0 config files
+[2m2026-04-03T06:34:20.471923Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::watcher[0m[2m:[0m File watcher started for slug='alldesigndocs3projects' on 3 paths
+[2m2026-04-03T06:34:20.471953Z[0m [32m INFO[0m [2mwire_node_lib::server[0m[2m:[0m File watcher started for pyramid 'alldesigndocs3projects'
+[2m2026-04-03T06:34:20.472567Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::stale_engine[0m[2m:[0m WAL poll loop started (60s interval) [3mslug[0m[2m=[0mgoodnewseveryone
+[2m2026-04-03T06:34:20.473235Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::watcher[0m[2m:[0m Watcher caches populated for slug='goodnewseveryone': 796 tracked paths, 10 extensions, 8 config files
+[2m2026-04-03T06:34:20.473573Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::watcher[0m[2m:[0m File watcher started for slug='goodnewseveryone' on 1 paths
+[2m2026-04-03T06:34:20.473579Z[0m [32m INFO[0m [2mwire_node_lib::server[0m[2m:[0m File watcher started for pyramid 'goodnewseveryone'
+[2m2026-04-03T06:34:20.474070Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::stale_engine[0m[2m:[0m WAL poll loop started (60s interval) [3mslug[0m[2m=[0mcore-selected-docs
+[2m2026-04-03T06:34:20.474557Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::watcher[0m[2m:[0m Watcher caches populated for slug='core-selected-docs': 127 tracked paths, 2 extensions, 0 config files
+[2m2026-04-03T06:34:20.474943Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::watcher[0m[2m:[0m File watcher started for slug='core-selected-docs' on 1 paths
+[2m2026-04-03T06:34:20.474963Z[0m [32m INFO[0m [2mwire_node_lib::server[0m[2m:[0m File watcher started for pyramid 'core-selected-docs'
+[2m2026-04-03T06:34:20.475465Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::stale_engine[0m[2m:[0m WAL poll loop started (60s interval) [3mslug[0m[2m=[0mvibesmithy1
+[2m2026-04-03T06:34:20.475851Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::watcher[0m[2m:[0m Watcher caches populated for slug='vibesmithy1': 34 tracked paths, 10 extensions, 8 config files
+[2m2026-04-03T06:34:20.476193Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::watcher[0m[2m:[0m File watcher started for slug='vibesmithy1' on 1 paths
+[2m2026-04-03T06:34:20.476203Z[0m [32m INFO[0m [2mwire_node_lib::server[0m[2m:[0m File watcher started for pyramid 'vibesmithy1'
+[2m2026-04-03T06:34:20.476678Z[0m [32m INFO[0m [2mwire_node_lib::server[0m[2m:[0m Pyramid 'agent-wire-node2' layer 0 has 38 unprocessed WAL entries — starting timer
+[2m2026-04-03T06:34:20.476729Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::stale_engine[0m[2m:[0m WAL poll loop started (60s interval) [3mslug[0m[2m=[0magent-wire-node2
+[2m2026-04-03T06:34:20.477445Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::watcher[0m[2m:[0m Watcher caches populated for slug='agent-wire-node2': 141 tracked paths, 10 extensions, 8 config files
+[2m2026-04-03T06:34:20.477812Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::watcher[0m[2m:[0m File watcher started for slug='agent-wire-node2' on 1 paths
+[2m2026-04-03T06:34:20.477818Z[0m [32m INFO[0m [2mwire_node_lib::server[0m[2m:[0m File watcher started for pyramid 'agent-wire-node2'
+[2m2026-04-03T06:34:20.478432Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::stale_engine[0m[2m:[0m WAL poll loop started (60s interval) [3mslug[0m[2m=[0magentwirenodedocs
+[2m2026-04-03T06:34:20.478891Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::watcher[0m[2m:[0m Watcher caches populated for slug='agentwirenodedocs': 60 tracked paths, 2 extensions, 0 config files
+[2m2026-04-03T06:34:20.479271Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::watcher[0m[2m:[0m File watcher started for slug='agentwirenodedocs' on 1 paths
+[2m2026-04-03T06:34:20.479289Z[0m [32m INFO[0m [2mwire_node_lib::server[0m[2m:[0m File watcher started for pyramid 'agentwirenodedocs'
+[2m2026-04-03T06:34:20.480000Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::stale_engine[0m[2m:[0m WAL poll loop started (60s interval) [3mslug[0m[2m=[0magentwiredocsmaster
+[2m2026-04-03T06:34:20.480532Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::watcher[0m[2m:[0m Watcher caches populated for slug='agentwiredocsmaster': 599 tracked paths, 2 extensions, 0 config files
+[2m2026-04-03T06:34:20.480906Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::watcher[0m[2m:[0m File watcher started for slug='agentwiredocsmaster' on 1 paths
+[2m2026-04-03T06:34:20.480912Z[0m [32m INFO[0m [2mwire_node_lib::server[0m[2m:[0m File watcher started for pyramid 'agentwiredocsmaster'
+[2m2026-04-03T06:34:20.481288Z[0m [32m INFO[0m [2mwire_node_lib::server[0m[2m:[0m Pyramid 'agent-wire-node3chainexecutor' layer 0 has 32 unprocessed WAL entries — starting timer
+[2m2026-04-03T06:34:20.481322Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::stale_engine[0m[2m:[0m WAL poll loop started (60s interval) [3mslug[0m[2m=[0magent-wire-node3chainexecutor
+[2m2026-04-03T06:34:20.481674Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::watcher[0m[2m:[0m Watcher caches populated for slug='agent-wire-node3chainexecutor': 159 tracked paths, 10 extensions, 8 config files
+[2m2026-04-03T06:34:20.481945Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::watcher[0m[2m:[0m File watcher started for slug='agent-wire-node3chainexecutor' on 1 paths
+[2m2026-04-03T06:34:20.481951Z[0m [32m INFO[0m [2mwire_node_lib::server[0m[2m:[0m File watcher started for pyramid 'agent-wire-node3chainexecutor'
+[2m2026-04-03T06:34:20.482330Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::stale_engine[0m[2m:[0m WAL poll loop started (60s interval) [3mslug[0m[2m=[0mcore-selected-docsnewchainexec
+[2m2026-04-03T06:34:20.482667Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::watcher[0m[2m:[0m Watcher caches populated for slug='core-selected-docsnewchainexec': 127 tracked paths, 2 extensions, 0 config files
+[2m2026-04-03T06:34:20.482994Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::watcher[0m[2m:[0m File watcher started for slug='core-selected-docsnewchainexec' on 1 paths
+[2m2026-04-03T06:34:20.483007Z[0m [32m INFO[0m [2mwire_node_lib::server[0m[2m:[0m File watcher started for pyramid 'core-selected-docsnewchainexec'
+[2m2026-04-03T06:34:20.483427Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::stale_engine[0m[2m:[0m WAL poll loop started (60s interval) [3mslug[0m[2m=[0mcore-selected-docstest6
+[2m2026-04-03T06:34:20.483765Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::watcher[0m[2m:[0m Watcher caches populated for slug='core-selected-docstest6': 127 tracked paths, 2 extensions, 0 config files
+[2m2026-04-03T06:34:20.484066Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::watcher[0m[2m:[0m File watcher started for slug='core-selected-docstest6' on 1 paths
+[2m2026-04-03T06:34:20.485444Z[0m [32m INFO[0m [2mwire_node_lib::server[0m[2m:[0m File watcher started for pyramid 'core-selected-docstest6'
+[2m2026-04-03T06:34:20.486021Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::stale_engine[0m[2m:[0m WAL poll loop started (60s interval) [3mslug[0m[2m=[0mcore-selected-docstest7
+[2m2026-04-03T06:34:20.486583Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::watcher[0m[2m:[0m Watcher caches populated for slug='core-selected-docstest7': 127 tracked paths, 2 extensions, 0 config files
+[2m2026-04-03T06:34:20.487146Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::watcher[0m[2m:[0m File watcher started for slug='core-selected-docstest7' on 1 paths
+[2m2026-04-03T06:34:20.487185Z[0m [32m INFO[0m [2mwire_node_lib::server[0m[2m:[0m File watcher started for pyramid 'core-selected-docstest7'
+[2m2026-04-03T06:34:20.487939Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::stale_engine[0m[2m:[0m WAL poll loop started (60s interval) [3mslug[0m[2m=[0mcore-selected-docstest8
+[2m2026-04-03T06:34:20.488377Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::watcher[0m[2m:[0m Watcher caches populated for slug='core-selected-docstest8': 127 tracked paths, 2 extensions, 0 config files
+[2m2026-04-03T06:34:20.488781Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::watcher[0m[2m:[0m File watcher started for slug='core-selected-docstest8' on 1 paths
+[2m2026-04-03T06:34:20.488799Z[0m [32m INFO[0m [2mwire_node_lib::server[0m[2m:[0m File watcher started for pyramid 'core-selected-docstest8'
+[2m2026-04-03T06:34:20.489312Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::stale_engine[0m[2m:[0m WAL poll loop started (60s interval) [3mslug[0m[2m=[0mcore-selected-docstest10
+[2m2026-04-03T06:34:20.489692Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::watcher[0m[2m:[0m Watcher caches populated for slug='core-selected-docstest10': 127 tracked paths, 2 extensions, 0 config files
+[2m2026-04-03T06:34:20.490102Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::watcher[0m[2m:[0m File watcher started for slug='core-selected-docstest10' on 1 paths
+[2m2026-04-03T06:34:20.490113Z[0m [32m INFO[0m [2mwire_node_lib::server[0m[2m:[0m File watcher started for pyramid 'core-selected-docstest10'
+[2m2026-04-03T06:34:20.490560Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::stale_engine[0m[2m:[0m WAL poll loop started (60s interval) [3mslug[0m[2m=[0mcore-selected-docs29
+[2m2026-04-03T06:34:20.490934Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::watcher[0m[2m:[0m Watcher caches populated for slug='core-selected-docs29': 127 tracked paths, 2 extensions, 0 config files
+[2m2026-04-03T06:34:20.491278Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::watcher[0m[2m:[0m File watcher started for slug='core-selected-docs29' on 1 paths
+[2m2026-04-03T06:34:20.491299Z[0m [32m INFO[0m [2mwire_node_lib::server[0m[2m:[0m File watcher started for pyramid 'core-selected-docs29'
+[2m2026-04-03T06:34:20.491816Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::stale_engine[0m[2m:[0m WAL poll loop started (60s interval) [3mslug[0m[2m=[0mvibesmithyfinalmaybe
+[2m2026-04-03T06:34:20.492197Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::watcher[0m[2m:[0m Watcher caches populated for slug='vibesmithyfinalmaybe': 34 tracked paths, 10 extensions, 8 config files
+[2m2026-04-03T06:34:20.492539Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::watcher[0m[2m:[0m File watcher started for slug='vibesmithyfinalmaybe' on 1 paths
+[2m2026-04-03T06:34:20.492548Z[0m [32m INFO[0m [2mwire_node_lib::server[0m[2m:[0m File watcher started for pyramid 'vibesmithyfinalmaybe'
+[2m2026-04-03T06:34:20.493057Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::stale_engine[0m[2m:[0m WAL poll loop started (60s interval) [3mslug[0m[2m=[0mvibesmithy5
+[2m2026-04-03T06:34:20.493424Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::watcher[0m[2m:[0m Watcher caches populated for slug='vibesmithy5': 34 tracked paths, 10 extensions, 8 config files
+[2m2026-04-03T06:34:20.493710Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::watcher[0m[2m:[0m File watcher started for slug='vibesmithy5' on 1 paths
+[2m2026-04-03T06:34:20.493716Z[0m [32m INFO[0m [2mwire_node_lib::server[0m[2m:[0m File watcher started for pyramid 'vibesmithy5'
+[2m2026-04-03T06:34:20.493721Z[0m [32m INFO[0m [2mwire_node_lib::server[0m[2m:[0m Stale engine init complete: 16 engines, 16 watchers
+[2m2026-04-03T06:34:20.493917Z[0m [32m INFO[0m [2mwire_node_lib::server[0m[2m:[0m Wire Node HTTP server starting on 127.0.0.1:8765
+[2m2026-04-03T06:34:20.494019Z[0m [32m INFO[0m [1mServer::run[0m[1m{[0m[3maddr[0m[2m=[0m127.0.0.1:8765[1m}[0m[2m:[0m [2mwarp::server[0m[2m:[0m listening on http://127.0.0.1:8765
+[2m2026-04-03T06:34:20.607797Z[0m [34mDEBUG[0m [2mtauri_plugin_updater::updater[0m[2m:[0m checking for updates https://newsbleach.com/api/releases/wire-node/darwin/aarch64/0.2.0
+[2m2026-04-03T06:34:20.609813Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m checkout waiting for idle connection: ("https", newsbleach.com)
+[2m2026-04-03T06:34:20.609813Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m checkout waiting for idle connection: ("https", newsbleach.com)
+[2m2026-04-03T06:34:20.609817Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m checkout waiting for idle connection: ("https", newsbleach.com)
+[2m2026-04-03T06:34:20.609950Z[0m [34mDEBUG[0m [2mreqwest::connect[0m[2m:[0m starting new connection: https://newsbleach.com/
+[2m2026-04-03T06:34:20.609951Z[0m [34mDEBUG[0m [2mreqwest::connect[0m[2m:[0m starting new connection: https://newsbleach.com/
+[2m2026-04-03T06:34:20.609953Z[0m [34mDEBUG[0m [2mreqwest::connect[0m[2m:[0m starting new connection: https://newsbleach.com/
+[2m2026-04-03T06:34:20.609994Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::connect::http[0m[2m:[0m Http::connect; scheme=Some("https"), host=Some("newsbleach.com"), port=None
+[2m2026-04-03T06:34:20.609995Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::connect::http[0m[2m:[0m Http::connect; scheme=Some("https"), host=Some("newsbleach.com"), port=None
+[2m2026-04-03T06:34:20.610002Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::connect::http[0m[2m:[0m Http::connect; scheme=Some("https"), host=Some("newsbleach.com"), port=None
+[2m2026-04-03T06:34:20.610011Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m checkout waiting for idle connection: ("https", newsbleach.com)
+[2m2026-04-03T06:34:20.610054Z[0m [34mDEBUG[0m [2mreqwest::connect[0m[2m:[0m starting new connection: https://newsbleach.com/
+[2m2026-04-03T06:34:20.610103Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::connect::http[0m[2m:[0m Http::connect; scheme=Some("https"), host=Some("newsbleach.com"), port=None
+[2m2026-04-03T06:34:20.655521Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::connect::http[0m[2m:[0m connecting to 178.128.73.140:443
+[2m2026-04-03T06:34:20.655545Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::connect::http[0m[2m:[0m connecting to 178.128.73.140:443
+[2m2026-04-03T06:34:20.655546Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::connect::http[0m[2m:[0m connecting to 178.128.73.140:443
+[2m2026-04-03T06:34:20.655545Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::connect::http[0m[2m:[0m connecting to 178.128.73.140:443
+[2m2026-04-03T06:34:20.689031Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::connect::http[0m[2m:[0m connected to 178.128.73.140:443
+[2m2026-04-03T06:34:20.689267Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::connect::http[0m[2m:[0m connected to 178.128.73.140:443
+[2m2026-04-03T06:34:20.693116Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::connect::http[0m[2m:[0m connected to 178.128.73.140:443
+[2m2026-04-03T06:34:20.693214Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::connect::http[0m[2m:[0m connected to 178.128.73.140:443
+[2m2026-04-03T06:34:20.728770Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::client[0m[2m:[0m http1 handshake complete, spawning background dispatcher task
+[2m2026-04-03T06:34:20.728806Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::client[0m[2m:[0m waiting for connection to be ready
+[2m2026-04-03T06:34:20.728843Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::client[0m[2m:[0m connection is ready
+[2m2026-04-03T06:34:20.728869Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m checkout dropped for ("https", newsbleach.com)
+[2m2026-04-03T06:34:20.782080Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::client[0m[2m:[0m http1 handshake complete, spawning background dispatcher task
+[2m2026-04-03T06:34:20.782122Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::client[0m[2m:[0m waiting for connection to be ready
+[2m2026-04-03T06:34:20.782156Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::client[0m[2m:[0m connection is ready
+[2m2026-04-03T06:34:20.782182Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m checkout dropped for ("https", newsbleach.com)
+[2m2026-04-03T06:34:20.784853Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::client[0m[2m:[0m http1 handshake complete, spawning background dispatcher task
+[2m2026-04-03T06:34:20.784877Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::client[0m[2m:[0m waiting for connection to be ready
+[2m2026-04-03T06:34:20.784887Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::client[0m[2m:[0m connection is ready
+[2m2026-04-03T06:34:20.784893Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m checkout dropped for ("https", newsbleach.com)
+[2m2026-04-03T06:34:20.784950Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::client[0m[2m:[0m http1 handshake complete, spawning background dispatcher task
+[2m2026-04-03T06:34:20.784956Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::client[0m[2m:[0m waiting for connection to be ready
+[2m2026-04-03T06:34:20.784961Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::client[0m[2m:[0m connection is ready
+[2m2026-04-03T06:34:20.784965Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m checkout dropped for ("https", newsbleach.com)
+[2m2026-04-03T06:34:21.169905Z[0m [35mTRACE[0m [2mreqwest::retry[0m[2m:[0m shouldn't retry!
+[2m2026-04-03T06:34:21.170106Z[0m [31mERROR[0m [2mtauri_plugin_updater::updater[0m[2m:[0m update endpoint did not respond with a successful status code
+[2m2026-04-03T06:34:21.170186Z[0m [33m WARN[0m [2mwire_node_desktop[0m[2m:[0m Update check failed: Could not fetch a valid release JSON from the remote
+[2m2026-04-03T06:34:21.286884Z[0m [35mTRACE[0m [2mreqwest::retry[0m[2m:[0m shouldn't retry!
+[2m2026-04-03T06:34:21.286994Z[0m [34mDEBUG[0m [2mwire_node_lib::messaging[0m[2m:[0m Messages endpoint returned 404 — not yet available
+[2m2026-04-03T06:34:21.352935Z[0m [35mTRACE[0m [2mreqwest::retry[0m[2m:[0m shouldn't retry!
+[2m2026-04-03T06:34:21.527626Z[0m [35mTRACE[0m [2mreqwest::retry[0m[2m:[0m shouldn't retry!
+[2m2026-04-03T06:34:21.527764Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m put; add idle connection for ("https", newsbleach.com)
+[2m2026-04-03T06:34:21.527779Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m pooling idle connection for ("https", newsbleach.com)
+[2m2026-04-03T06:34:21.527872Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m pool closed, canceling idle interval
+[2m2026-04-03T06:34:22.430860Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m checkout waiting for idle connection: ("https", supabase.newsbleach.com)
+[2m2026-04-03T06:34:22.430954Z[0m [34mDEBUG[0m [2mreqwest::connect[0m[2m:[0m starting new connection: https://supabase.newsbleach.com/
+[2m2026-04-03T06:34:22.430993Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::connect::http[0m[2m:[0m Http::connect; scheme=Some("https"), host=Some("supabase.newsbleach.com"), port=None
+[2m2026-04-03T06:34:22.474444Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::connect::http[0m[2m:[0m connecting to 178.128.73.140:443
+[2m2026-04-03T06:34:22.506868Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::connect::http[0m[2m:[0m connected to 178.128.73.140:443
+[2m2026-04-03T06:34:22.587075Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::client[0m[2m:[0m http1 handshake complete, spawning background dispatcher task
+[2m2026-04-03T06:34:22.587152Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::client[0m[2m:[0m waiting for connection to be ready
+[2m2026-04-03T06:34:22.587204Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::client[0m[2m:[0m connection is ready
+[2m2026-04-03T06:34:22.587228Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m checkout dropped for ("https", supabase.newsbleach.com)
+[2m2026-04-03T06:34:22.637067Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m put; add idle connection for ("https", supabase.newsbleach.com)
+[2m2026-04-03T06:34:22.637126Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m pooling idle connection for ("https", supabase.newsbleach.com)
+[2m2026-04-03T06:34:22.637142Z[0m [35mTRACE[0m [2mreqwest::retry[0m[2m:[0m shouldn't retry!
+[2m2026-04-03T06:34:22.637238Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m pool closed, canceling idle interval
+[2m2026-04-03T06:34:22.637251Z[0m [33m WARN[0m [2mwire_node_desktop[0m[2m:[0m Token refresh failed: Refresh failed: {"code":500,"error_code":"unexpected_failure","msg":"missing destination name oauth_client_id in *models.Session","error_id":"e3f9abae-6951-4554-8b19-5bfcb7c5c22a"}
+[2m2026-04-03T06:34:22.677069Z[0m [32m INFO[0m [2mwire_node_lib::tunnel[0m[2m:[0m cloudflared already installed at "/Users/adamlevine/Library/Application Support/wire-node/bin/cloudflared"
+[2m2026-04-03T06:34:22.677103Z[0m [32m INFO[0m [2mwire_node_desktop[0m[2m:[0m cloudflared binary ready
+[2m2026-04-03T06:34:22.677108Z[0m [32m INFO[0m [2mwire_node_desktop[0m[2m:[0m Using persisted tunnel credentials
+[2m2026-04-03T06:34:22.677307Z[0m [34mDEBUG[0m [2mwire_node_lib::tunnel[0m[2m:[0m Tunnel state saved
+[2m2026-04-03T06:34:23.202964Z[0m [32m INFO[0m [2mwire_node_lib::tunnel[0m[2m:[0m Starting cloudflared tunnel...
+[2m2026-04-03T06:34:23.204070Z[0m [32m INFO[0m [2mwire_node_lib::tunnel[0m[2m:[0m cloudflared started (pid: Some(41578))
+[2m2026-04-03T06:34:23.204169Z[0m [32m INFO[0m [2mwire_node_desktop[0m[2m:[0m cloudflared started, monitoring...
+[2m2026-04-03T06:34:23.241559Z[0m [34mDEBUG[0m [2mwire_node_lib::tunnel[0m[2m:[0m cloudflared: 2026-04-03T06:34:23Z INF Starting tunnel tunnelID=541004e6-b051-4ab0-8542-b9fbe48a6ae7
+[2m2026-04-03T06:34:23.241659Z[0m [34mDEBUG[0m [2mwire_node_lib::tunnel[0m[2m:[0m cloudflared: 2026-04-03T06:34:23Z INF Version 2026.3.0 (Checksum 633cee0fd41fd2020e17498beecc54811bf4fc99f891c080dc9343eb0f449c60)
+[2m2026-04-03T06:34:23.241674Z[0m [34mDEBUG[0m [2mwire_node_lib::tunnel[0m[2m:[0m cloudflared: 2026-04-03T06:34:23Z INF GOOS: darwin, GOVersion: go1.26.0, GoArch: arm64
+[2m2026-04-03T06:34:23.241685Z[0m [34mDEBUG[0m [2mwire_node_lib::tunnel[0m[2m:[0m cloudflared: 2026-04-03T06:34:23Z INF Settings: map[token:*****]
+[2m2026-04-03T06:34:23.241868Z[0m [34mDEBUG[0m [2mwire_node_lib::tunnel[0m[2m:[0m cloudflared: 2026-04-03T06:34:23Z INF Autoupdate frequency is set autoupdateFreq=86400000
+[2m2026-04-03T06:34:23.279827Z[0m [34mDEBUG[0m [2mwire_node_lib::tunnel[0m[2m:[0m cloudflared: 2026-04-03T06:34:23Z INF Generated Connector ID: 722f8473-6d8b-449f-b963-e5b44236b3a5
+[2m2026-04-03T06:34:23.323800Z[0m [34mDEBUG[0m [2mwire_node_lib::tunnel[0m[2m:[0m cloudflared: 2026-04-03T06:34:23Z INF Initial protocol quic
+[2m2026-04-03T06:34:23.324108Z[0m [34mDEBUG[0m [2mwire_node_lib::tunnel[0m[2m:[0m cloudflared: 2026-04-03T06:34:23Z INF ICMP proxy will use 192.168.1.160 as source for IPv4
+[2m2026-04-03T06:34:23.324221Z[0m [34mDEBUG[0m [2mwire_node_lib::tunnel[0m[2m:[0m cloudflared: 2026-04-03T06:34:23Z INF ICMP proxy will use fe80::183b:446c:6d25:24d in zone en0 as source for IPv6
+[2m2026-04-03T06:34:23.324271Z[0m [34mDEBUG[0m [2mwire_node_lib::tunnel[0m[2m:[0m cloudflared: 2026-04-03T06:34:23Z INF Created ICMP proxy listening on 192.168.1.160:0
+[2m2026-04-03T06:34:23.422948Z[0m [34mDEBUG[0m [2mwire_node_lib::tunnel[0m[2m:[0m cloudflared: 2026-04-03T06:34:23Z INF ICMP proxy will use 192.168.1.160 as source for IPv4
+[2m2026-04-03T06:34:23.423027Z[0m [34mDEBUG[0m [2mwire_node_lib::tunnel[0m[2m:[0m cloudflared: 2026-04-03T06:34:23Z INF ICMP proxy will use fe80::183b:446c:6d25:24d in zone en0 as source for IPv6
+[2m2026-04-03T06:34:23.423114Z[0m [34mDEBUG[0m [2mwire_node_lib::tunnel[0m[2m:[0m cloudflared: 2026-04-03T06:34:23Z INF Starting metrics server on 127.0.0.1:20241/metrics
+[2m2026-04-03T06:34:23.427693Z[0m [34mDEBUG[0m [2mwire_node_lib::tunnel[0m[2m:[0m cloudflared: 2026-04-03T06:34:23Z INF Tunnel connection curve preferences: [X25519MLKEM768 CurveP256] connIndex=0 event=0 ip=198.41.192.27
+[2m2026-04-03T06:34:23.427745Z[0m [32m INFO[0m [2mwire_node_desktop[0m[2m:[0m Tunnel connected!
+[2m2026-04-03T06:34:23.427776Z[0m [32m INFO[0m [2mwire_node_desktop[0m[2m:[0m Syncing folder /Users/adamlevine/AI Project Files/GoodNewsEveryone/docs -> corpus agent-wire-canon-v2 (Upload)
+[2m2026-04-03T06:34:23.428046Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m checkout waiting for idle connection: ("https", newsbleach.com)
+[2m2026-04-03T06:34:23.428061Z[0m [34mDEBUG[0m [2mreqwest::connect[0m[2m:[0m starting new connection: https://newsbleach.com/
+[2m2026-04-03T06:34:23.428072Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::connect::http[0m[2m:[0m Http::connect; scheme=Some("https"), host=Some("newsbleach.com"), port=None
+[2m2026-04-03T06:34:23.428847Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::connect::http[0m[2m:[0m connecting to 178.128.73.140:443
+[2m2026-04-03T06:34:23.431512Z[0m [32m INFO[0m [2mwire_node_lib::server[0m[2m:[0m Pyramid 'agent-wire-nodepoststaleupdate' is frozen — skipping engine and watcher on startup
+[2m2026-04-03T06:34:23.431535Z[0m [32m INFO[0m [2mwire_node_lib::server[0m[2m:[0m Pyramid 'agent-wire-nodepostdadbear' is frozen — skipping engine and watcher on startup
+[2m2026-04-03T06:34:23.431540Z[0m [32m INFO[0m [2mwire_node_lib::server[0m[2m:[0m Pyramid 'agent-wire-nodecanonical' is frozen — skipping engine and watcher on startup
+[2m2026-04-03T06:34:23.431556Z[0m [32m INFO[0m [2mwire_node_lib::server[0m[2m:[0m Pyramid 'docs' is frozen — skipping engine and watcher on startup
+[2m2026-04-03T06:34:23.432166Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::stale_engine[0m[2m:[0m WAL poll loop started (60s interval) [3mslug[0m[2m=[0malldesigndocs3projects
+[2m2026-04-03T06:34:23.432809Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::watcher[0m[2m:[0m Watcher caches populated for slug='alldesigndocs3projects': 705 tracked paths, 2 extensions, 0 config files
+[2m2026-04-03T06:34:23.434134Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::watcher[0m[2m:[0m File watcher started for slug='alldesigndocs3projects' on 3 paths
+[2m2026-04-03T06:34:23.434149Z[0m [32m INFO[0m [2mwire_node_lib::server[0m[2m:[0m File watcher started for pyramid 'alldesigndocs3projects'
+[2m2026-04-03T06:34:23.434826Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::stale_engine[0m[2m:[0m WAL poll loop started (60s interval) [3mslug[0m[2m=[0mgoodnewseveryone
+[2m2026-04-03T06:34:23.435346Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::watcher[0m[2m:[0m Watcher caches populated for slug='goodnewseveryone': 796 tracked paths, 10 extensions, 8 config files
+[2m2026-04-03T06:34:23.435628Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::watcher[0m[2m:[0m File watcher started for slug='goodnewseveryone' on 1 paths
+[2m2026-04-03T06:34:23.435633Z[0m [32m INFO[0m [2mwire_node_lib::server[0m[2m:[0m File watcher started for pyramid 'goodnewseveryone'
+[2m2026-04-03T06:34:23.436209Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::stale_engine[0m[2m:[0m WAL poll loop started (60s interval) [3mslug[0m[2m=[0mcore-selected-docs
+[2m2026-04-03T06:34:23.436865Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::watcher[0m[2m:[0m Watcher caches populated for slug='core-selected-docs': 127 tracked paths, 2 extensions, 0 config files
+[2m2026-04-03T06:34:23.437246Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::watcher[0m[2m:[0m File watcher started for slug='core-selected-docs' on 1 paths
+[2m2026-04-03T06:34:23.437259Z[0m [32m INFO[0m [2mwire_node_lib::server[0m[2m:[0m File watcher started for pyramid 'core-selected-docs'
+[2m2026-04-03T06:34:23.437870Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::stale_engine[0m[2m:[0m WAL poll loop started (60s interval) [3mslug[0m[2m=[0mvibesmithy1
+[2m2026-04-03T06:34:23.438249Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::watcher[0m[2m:[0m Watcher caches populated for slug='vibesmithy1': 34 tracked paths, 10 extensions, 8 config files
+[2m2026-04-03T06:34:23.438574Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::watcher[0m[2m:[0m File watcher started for slug='vibesmithy1' on 1 paths
+[2m2026-04-03T06:34:23.438579Z[0m [32m INFO[0m [2mwire_node_lib::server[0m[2m:[0m File watcher started for pyramid 'vibesmithy1'
+[2m2026-04-03T06:34:23.439063Z[0m [32m INFO[0m [2mwire_node_lib::server[0m[2m:[0m Pyramid 'agent-wire-node2' layer 0 has 38 unprocessed WAL entries — starting timer
+[2m2026-04-03T06:34:23.439093Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::stale_engine[0m[2m:[0m WAL poll loop started (60s interval) [3mslug[0m[2m=[0magent-wire-node2
+[2m2026-04-03T06:34:23.439453Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::watcher[0m[2m:[0m Watcher caches populated for slug='agent-wire-node2': 141 tracked paths, 10 extensions, 8 config files
+[2m2026-04-03T06:34:23.439890Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::watcher[0m[2m:[0m File watcher started for slug='agent-wire-node2' on 1 paths
+[2m2026-04-03T06:34:23.439902Z[0m [32m INFO[0m [2mwire_node_lib::server[0m[2m:[0m File watcher started for pyramid 'agent-wire-node2'
+[2m2026-04-03T06:34:23.440677Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::stale_engine[0m[2m:[0m WAL poll loop started (60s interval) [3mslug[0m[2m=[0magentwirenodedocs
+[2m2026-04-03T06:34:23.441077Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::watcher[0m[2m:[0m Watcher caches populated for slug='agentwirenodedocs': 60 tracked paths, 2 extensions, 0 config files
+[2m2026-04-03T06:34:23.441575Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::watcher[0m[2m:[0m File watcher started for slug='agentwirenodedocs' on 1 paths
+[2m2026-04-03T06:34:23.441590Z[0m [32m INFO[0m [2mwire_node_lib::server[0m[2m:[0m File watcher started for pyramid 'agentwirenodedocs'
+[2m2026-04-03T06:34:23.442243Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::stale_engine[0m[2m:[0m WAL poll loop started (60s interval) [3mslug[0m[2m=[0magentwiredocsmaster
+[2m2026-04-03T06:34:23.442767Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::watcher[0m[2m:[0m Watcher caches populated for slug='agentwiredocsmaster': 599 tracked paths, 2 extensions, 0 config files
+[2m2026-04-03T06:34:23.443265Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::watcher[0m[2m:[0m File watcher started for slug='agentwiredocsmaster' on 1 paths
+[2m2026-04-03T06:34:23.443277Z[0m [32m INFO[0m [2mwire_node_lib::server[0m[2m:[0m File watcher started for pyramid 'agentwiredocsmaster'
+[2m2026-04-03T06:34:23.443885Z[0m [32m INFO[0m [2mwire_node_lib::server[0m[2m:[0m Pyramid 'agent-wire-node3chainexecutor' layer 0 has 32 unprocessed WAL entries — starting timer
+[2m2026-04-03T06:34:23.443916Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::stale_engine[0m[2m:[0m WAL poll loop started (60s interval) [3mslug[0m[2m=[0magent-wire-node3chainexecutor
+[2m2026-04-03T06:34:23.444270Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::watcher[0m[2m:[0m Watcher caches populated for slug='agent-wire-node3chainexecutor': 159 tracked paths, 10 extensions, 8 config files
+[2m2026-04-03T06:34:23.444570Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::watcher[0m[2m:[0m File watcher started for slug='agent-wire-node3chainexecutor' on 1 paths
+[2m2026-04-03T06:34:23.444577Z[0m [32m INFO[0m [2mwire_node_lib::server[0m[2m:[0m File watcher started for pyramid 'agent-wire-node3chainexecutor'
+[2m2026-04-03T06:34:23.445322Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::stale_engine[0m[2m:[0m WAL poll loop started (60s interval) [3mslug[0m[2m=[0mcore-selected-docsnewchainexec
+[2m2026-04-03T06:34:23.445709Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::watcher[0m[2m:[0m Watcher caches populated for slug='core-selected-docsnewchainexec': 127 tracked paths, 2 extensions, 0 config files
+[2m2026-04-03T06:34:23.446056Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::watcher[0m[2m:[0m File watcher started for slug='core-selected-docsnewchainexec' on 1 paths
+[2m2026-04-03T06:34:23.446068Z[0m [32m INFO[0m [2mwire_node_lib::server[0m[2m:[0m File watcher started for pyramid 'core-selected-docsnewchainexec'
+[2m2026-04-03T06:34:23.446673Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::stale_engine[0m[2m:[0m WAL poll loop started (60s interval) [3mslug[0m[2m=[0mcore-selected-docstest6
+[2m2026-04-03T06:34:23.447046Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::watcher[0m[2m:[0m Watcher caches populated for slug='core-selected-docstest6': 127 tracked paths, 2 extensions, 0 config files
+[2m2026-04-03T06:34:23.447350Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::watcher[0m[2m:[0m File watcher started for slug='core-selected-docstest6' on 1 paths
+[2m2026-04-03T06:34:23.447357Z[0m [32m INFO[0m [2mwire_node_lib::server[0m[2m:[0m File watcher started for pyramid 'core-selected-docstest6'
+[2m2026-04-03T06:34:23.447869Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::stale_engine[0m[2m:[0m WAL poll loop started (60s interval) [3mslug[0m[2m=[0mcore-selected-docstest7
+[2m2026-04-03T06:34:23.448217Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::watcher[0m[2m:[0m Watcher caches populated for slug='core-selected-docstest7': 127 tracked paths, 2 extensions, 0 config files
+[2m2026-04-03T06:34:23.448502Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::watcher[0m[2m:[0m File watcher started for slug='core-selected-docstest7' on 1 paths
+[2m2026-04-03T06:34:23.448520Z[0m [32m INFO[0m [2mwire_node_lib::server[0m[2m:[0m File watcher started for pyramid 'core-selected-docstest7'
+[2m2026-04-03T06:34:23.449073Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::stale_engine[0m[2m:[0m WAL poll loop started (60s interval) [3mslug[0m[2m=[0mcore-selected-docstest8
+[2m2026-04-03T06:34:23.449433Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::watcher[0m[2m:[0m Watcher caches populated for slug='core-selected-docstest8': 127 tracked paths, 2 extensions, 0 config files
+[2m2026-04-03T06:34:23.449721Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::watcher[0m[2m:[0m File watcher started for slug='core-selected-docstest8' on 1 paths
+[2m2026-04-03T06:34:23.449737Z[0m [32m INFO[0m [2mwire_node_lib::server[0m[2m:[0m File watcher started for pyramid 'core-selected-docstest8'
+[2m2026-04-03T06:34:23.450296Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::stale_engine[0m[2m:[0m WAL poll loop started (60s interval) [3mslug[0m[2m=[0mcore-selected-docstest10
+[2m2026-04-03T06:34:23.450631Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::watcher[0m[2m:[0m Watcher caches populated for slug='core-selected-docstest10': 127 tracked paths, 2 extensions, 0 config files
+[2m2026-04-03T06:34:23.450897Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::watcher[0m[2m:[0m File watcher started for slug='core-selected-docstest10' on 1 paths
+[2m2026-04-03T06:34:23.450903Z[0m [32m INFO[0m [2mwire_node_lib::server[0m[2m:[0m File watcher started for pyramid 'core-selected-docstest10'
+[2m2026-04-03T06:34:23.451429Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::stale_engine[0m[2m:[0m WAL poll loop started (60s interval) [3mslug[0m[2m=[0mcore-selected-docs29
+[2m2026-04-03T06:34:23.451791Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::watcher[0m[2m:[0m Watcher caches populated for slug='core-selected-docs29': 127 tracked paths, 2 extensions, 0 config files
+[2m2026-04-03T06:34:23.452086Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::watcher[0m[2m:[0m File watcher started for slug='core-selected-docs29' on 1 paths
+[2m2026-04-03T06:34:23.452094Z[0m [32m INFO[0m [2mwire_node_lib::server[0m[2m:[0m File watcher started for pyramid 'core-selected-docs29'
+[2m2026-04-03T06:34:23.452938Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::stale_engine[0m[2m:[0m WAL poll loop started (60s interval) [3mslug[0m[2m=[0mvibesmithyfinalmaybe
+[2m2026-04-03T06:34:23.453269Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::watcher[0m[2m:[0m Watcher caches populated for slug='vibesmithyfinalmaybe': 34 tracked paths, 10 extensions, 8 config files
+[2m2026-04-03T06:34:23.453572Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::watcher[0m[2m:[0m File watcher started for slug='vibesmithyfinalmaybe' on 1 paths
+[2m2026-04-03T06:34:23.453580Z[0m [32m INFO[0m [2mwire_node_lib::server[0m[2m:[0m File watcher started for pyramid 'vibesmithyfinalmaybe'
+[2m2026-04-03T06:34:23.454111Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::stale_engine[0m[2m:[0m WAL poll loop started (60s interval) [3mslug[0m[2m=[0mvibesmithy5
+[2m2026-04-03T06:34:23.454426Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::watcher[0m[2m:[0m Watcher caches populated for slug='vibesmithy5': 34 tracked paths, 10 extensions, 8 config files
+[2m2026-04-03T06:34:23.454692Z[0m [32m INFO[0m [2mwire_node_lib::pyramid::watcher[0m[2m:[0m File watcher started for slug='vibesmithy5' on 1 paths
+[2m2026-04-03T06:34:23.454698Z[0m [32m INFO[0m [2mwire_node_lib::server[0m[2m:[0m File watcher started for pyramid 'vibesmithy5'
+[2m2026-04-03T06:34:23.454848Z[0m [32m INFO[0m [2mwire_node_lib::server[0m[2m:[0m Stale engine init complete: 16 engines, 16 watchers
+[2m2026-04-03T06:34:23.459848Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::connect::http[0m[2m:[0m connected to 178.128.73.140:443
+[2m2026-04-03T06:34:23.545909Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::client[0m[2m:[0m http1 handshake complete, spawning background dispatcher task
+[2m2026-04-03T06:34:23.545950Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::client[0m[2m:[0m waiting for connection to be ready
+[2m2026-04-03T06:34:23.545961Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::client[0m[2m:[0m connection is ready
+[2m2026-04-03T06:34:23.545966Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m checkout dropped for ("https", newsbleach.com)
+[2m2026-04-03T06:34:23.610266Z[0m [35mTRACE[0m [2mwire_node_lib::tunnel[0m[2m:[0m cloudflared: 2026-04-03T06:34:23Z INF Registered tunnel connection connIndex=0 connection=ce95a685-cb1a-4939-b536-dc2ee61f3e9d event=0 ip=198.41.192.27 location=sjc06 protocol=quic
+[2m2026-04-03T06:34:23.610426Z[0m [35mTRACE[0m [2mwire_node_lib::tunnel[0m[2m:[0m cloudflared: 2026-04-03T06:34:23Z INF Tunnel connection curve preferences: [X25519MLKEM768 CurveP256] connIndex=1 event=0 ip=198.41.200.193
+[2m2026-04-03T06:34:23.615746Z[0m [35mTRACE[0m [2mwire_node_lib::tunnel[0m[2m:[0m cloudflared: 2026-04-03T06:34:23Z INF Updated to new configuration config="{\"ingress\":[{\"hostname\":\"node-3168b8cb-55d5-450e-b31e-285be26100a4.agent-wire.com\",\"service\":\"http://localhost:8765\"},{\"service\":\"http_status:404\"}]}" version=0
+[2m2026-04-03T06:34:23.780513Z[0m [35mTRACE[0m [2mwire_node_lib::tunnel[0m[2m:[0m cloudflared: 2026-04-03T06:34:23Z INF Registered tunnel connection connIndex=1 connection=c5bb07d8-3bf3-4dd3-a493-d12e9b9e6540 event=0 ip=198.41.200.193 location=sjc11 protocol=quic
+[2m2026-04-03T06:34:24.233806Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m Conn::read_head
+[2m2026-04-03T06:34:24.233922Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m flushed({role=server}): State { reading: Init, writing: Init, keep_alive: Busy }
+[2m2026-04-03T06:34:24.235696Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m Conn::read_head
+[2m2026-04-03T06:34:24.235754Z[0m [35mTRACE[0m [2mhyper::proto::h1::io[0m[2m:[0m received 282 bytes
+[2m2026-04-03T06:34:24.235846Z[0m [35mTRACE[0m [1mparse_headers[0m[2m:[0m [2mhyper::proto::h1::role[0m[2m:[0m Request.parse [3mbytes[0m[2m=[0m282
+[2m2026-04-03T06:34:24.235891Z[0m [35mTRACE[0m [1mparse_headers[0m[2m:[0m [2mhyper::proto::h1::role[0m[2m:[0m Request.parse Complete(282)
+[2m2026-04-03T06:34:24.235970Z[0m [34mDEBUG[0m [2mhyper::proto::h1::io[0m[2m:[0m parsed 9 headers
+[2m2026-04-03T06:34:24.235991Z[0m [34mDEBUG[0m [2mhyper::proto::h1::conn[0m[2m:[0m incoming body is empty
+[2m2026-04-03T06:34:24.236063Z[0m [35mTRACE[0m [2mwarp::filters::method[0m[2m:[0m method::OPTIONS?: GET
+[2m2026-04-03T06:34:24.236126Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:24.236354Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:24.236464Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:24.236576Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:24.236602Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:34:24.236950Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:24.237213Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:24.237260Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:34:24.237276Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:24.237292Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:24.237309Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:34:24.237325Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:24.237371Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:24.237432Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:34:24.237446Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:24.237485Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:24.237500Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:34:24.237515Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:24.237554Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:24.237569Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:34:24.237583Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:24.237597Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:24.237610Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:34:24.237625Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:24.237663Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:24.237678Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:34:24.237691Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:24.237705Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:24.237718Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:34:24.237733Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:24.237770Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:24.237785Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "crystallize"?: "build"
+[2m2026-04-03T06:34:24.237799Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:24.237813Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:24.237826Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "crystallize"?: "build"
+[2m2026-04-03T06:34:24.237840Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:24.237878Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "chain"?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:24.237894Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:24.237918Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "remote-query"?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:24.237934Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:24.237948Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "slugs"?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:24.237962Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:24.237975Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "slugs"?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:24.237989Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:24.238004Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:24.238034Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "build"?: "build"
+[2m2026-04-03T06:34:24.238047Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "status"?: "status"
+[2m2026-04-03T06:34:24.238060Z[0m [35mTRACE[0m [2mwarp::filters::method[0m[2m:[0m method::GET?: GET
+[2m2026-04-03T06:34:24.238103Z[0m [35mTRACE[0m [2mwarp::filters::header[0m[2m:[0m optional("authorization")
+[2m2026-04-03T06:34:24.238443Z[0m [35mTRACE[0m [1mencode_headers[0m[2m:[0m [2mhyper::proto::h1::role[0m[2m:[0m Server::encode status=200, body=Some(Known(109)), req_method=Some(GET)
+[2m2026-04-03T06:34:24.238482Z[0m [35mTRACE[0m [2mhyper::proto::h1::io[0m[2m:[0m buffer.queue [3mself.len[0m[2m=[0m109 [3mbuf.len[0m[2m=[0m109
+[2m2026-04-03T06:34:24.238537Z[0m [34mDEBUG[0m [2mhyper::proto::h1::io[0m[2m:[0m flushed 218 bytes
+[2m2026-04-03T06:34:24.238555Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m flushed({role=server}): State { reading: Init, writing: Init, keep_alive: Idle }
+[2m2026-04-03T06:34:24.242566Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m Conn::read_head
+[2m2026-04-03T06:34:24.242596Z[0m [35mTRACE[0m [2mhyper::proto::h1::io[0m[2m:[0m received 0 bytes
+[2m2026-04-03T06:34:24.242605Z[0m [35mTRACE[0m [2mhyper::proto::h1::io[0m[2m:[0m parse eof
+[2m2026-04-03T06:34:24.242614Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m State::close_read()
+[2m2026-04-03T06:34:24.242622Z[0m [34mDEBUG[0m [2mhyper::proto::h1::conn[0m[2m:[0m read eof
+[2m2026-04-03T06:34:24.242629Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m State::close_write()
+[2m2026-04-03T06:34:24.242636Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m State::close_read()
+[2m2026-04-03T06:34:24.242643Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m State::close_write()
+[2m2026-04-03T06:34:24.242650Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m flushed({role=server}): State { reading: Closed, writing: Closed, keep_alive: Disabled }
+[2m2026-04-03T06:34:24.242665Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m shut down IO complete
+[2m2026-04-03T06:34:24.612151Z[0m [35mTRACE[0m [2mwire_node_lib::tunnel[0m[2m:[0m cloudflared: 2026-04-03T06:34:24Z INF Tunnel connection curve preferences: [X25519MLKEM768 CurveP256] connIndex=2 event=0 ip=198.41.192.7
+[2m2026-04-03T06:34:24.767472Z[0m [35mTRACE[0m [2mwire_node_lib::tunnel[0m[2m:[0m cloudflared: 2026-04-03T06:34:24Z INF Registered tunnel connection connIndex=2 connection=937a1f42-3627-472c-8a38-981bbb217282 event=0 ip=198.41.192.7 location=sjc01 protocol=quic
+[2m2026-04-03T06:34:25.613089Z[0m [35mTRACE[0m [2mwire_node_lib::tunnel[0m[2m:[0m cloudflared: 2026-04-03T06:34:25Z INF Tunnel connection curve preferences: [X25519MLKEM768 CurveP256] connIndex=3 event=0 ip=198.41.200.53
+[2m2026-04-03T06:34:25.782890Z[0m [35mTRACE[0m [2mwire_node_lib::tunnel[0m[2m:[0m cloudflared: 2026-04-03T06:34:25Z INF Registered tunnel connection connIndex=3 connection=7157e8a4-9168-43aa-a3af-95b0abc2605a event=0 ip=198.41.200.53 location=sjc08 protocol=quic
+[2m2026-04-03T06:34:25.850138Z[0m [35mTRACE[0m [2mreqwest::retry[0m[2m:[0m shouldn't retry!
+[2m2026-04-03T06:34:25.917930Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m put; add idle connection for ("https", newsbleach.com)
+[2m2026-04-03T06:34:25.917973Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m pooling idle connection for ("https", newsbleach.com)
+[2m2026-04-03T06:34:25.918105Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m take? ("https", newsbleach.com): expiration = Some(90s)
+[2m2026-04-03T06:34:25.918120Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m reuse idle connection for ("https", newsbleach.com)
+[2m2026-04-03T06:34:26.110317Z[0m [35mTRACE[0m [2mtao::platform_impl::platform::window_delegate[0m[2m:[0m Triggered `windowDidResignKey:`
+[2m2026-04-03T06:34:26.110354Z[0m [35mTRACE[0m [2mtao::platform_impl::platform::window_delegate[0m[2m:[0m Completed `windowDidResignKey:`
+[2m2026-04-03T06:34:27.743216Z[0m [35mTRACE[0m [2mreqwest::retry[0m[2m:[0m shouldn't retry!
+[2m2026-04-03T06:34:27.807868Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m put; add idle connection for ("https", newsbleach.com)
+[2m2026-04-03T06:34:27.807998Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m pooling idle connection for ("https", newsbleach.com)
+[2m2026-04-03T06:34:27.808180Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m take? ("https", newsbleach.com): expiration = Some(90s)
+[2m2026-04-03T06:34:27.808223Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m reuse idle connection for ("https", newsbleach.com)
+[2m2026-04-03T06:34:27.940089Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m Conn::read_head
+[2m2026-04-03T06:34:27.940128Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m flushed({role=server}): State { reading: Init, writing: Init, keep_alive: Busy }
+[2m2026-04-03T06:34:27.941205Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m Conn::read_head
+[2m2026-04-03T06:34:27.941237Z[0m [35mTRACE[0m [2mhyper::proto::h1::io[0m[2m:[0m received 300 bytes
+[2m2026-04-03T06:34:27.941246Z[0m [35mTRACE[0m [1mparse_headers[0m[2m:[0m [2mhyper::proto::h1::role[0m[2m:[0m Request.parse [3mbytes[0m[2m=[0m300
+[2m2026-04-03T06:34:27.941253Z[0m [35mTRACE[0m [1mparse_headers[0m[2m:[0m [2mhyper::proto::h1::role[0m[2m:[0m Request.parse Complete(300)
+[2m2026-04-03T06:34:27.941263Z[0m [34mDEBUG[0m [2mhyper::proto::h1::io[0m[2m:[0m parsed 10 headers
+[2m2026-04-03T06:34:27.941266Z[0m [34mDEBUG[0m [2mhyper::proto::h1::conn[0m[2m:[0m incoming body is empty
+[2m2026-04-03T06:34:27.941272Z[0m [35mTRACE[0m [2mwarp::filters::method[0m[2m:[0m method::OPTIONS?: POST
+[2m2026-04-03T06:34:27.941280Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:27.941287Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "agent-wire-node-code"
+[2m2026-04-03T06:34:27.941290Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:27.941296Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "agent-wire-node-code"
+[2m2026-04-03T06:34:27.941299Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:34:27.941303Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:27.941306Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "agent-wire-node-code"
+[2m2026-04-03T06:34:27.941309Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:34:27.941312Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:27.941314Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "agent-wire-node-code"
+[2m2026-04-03T06:34:27.941317Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:34:27.941320Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:27.941323Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "agent-wire-node-code"
+[2m2026-04-03T06:34:27.941325Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:34:27.941328Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:27.941331Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "agent-wire-node-code"
+[2m2026-04-03T06:34:27.941333Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:34:27.941336Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:27.941339Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "agent-wire-node-code"
+[2m2026-04-03T06:34:27.941341Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:34:27.941344Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:27.941347Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "agent-wire-node-code"
+[2m2026-04-03T06:34:27.941350Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:34:27.941353Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:27.941364Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "agent-wire-node-code"
+[2m2026-04-03T06:34:27.941367Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:34:27.941370Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:27.941373Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "agent-wire-node-code"
+[2m2026-04-03T06:34:27.941375Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:34:27.941378Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:27.941381Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "agent-wire-node-code"
+[2m2026-04-03T06:34:27.941384Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "crystallize"?: "build"
+[2m2026-04-03T06:34:27.941386Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:27.941390Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "agent-wire-node-code"
+[2m2026-04-03T06:34:27.941392Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "crystallize"?: "build"
+[2m2026-04-03T06:34:27.941395Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:27.941398Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "chain"?: "agent-wire-node-code"
+[2m2026-04-03T06:34:27.941401Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:27.941404Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "remote-query"?: "agent-wire-node-code"
+[2m2026-04-03T06:34:27.941407Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:27.941410Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "slugs"?: "agent-wire-node-code"
+[2m2026-04-03T06:34:27.941413Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:27.941416Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "slugs"?: "agent-wire-node-code"
+[2m2026-04-03T06:34:27.941418Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:27.941421Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "agent-wire-node-code"
+[2m2026-04-03T06:34:27.941435Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "build"?: "build"
+[2m2026-04-03T06:34:27.941437Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "status"?: ""
+[2m2026-04-03T06:34:27.941440Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:27.941443Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "agent-wire-node-code"
+[2m2026-04-03T06:34:27.941446Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "build"?: "build"
+[2m2026-04-03T06:34:27.941449Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "cancel"?: ""
+[2m2026-04-03T06:34:27.941451Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:27.941455Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "agent-wire-node-code"
+[2m2026-04-03T06:34:27.941457Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "build"?: "build"
+[2m2026-04-03T06:34:27.941460Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "question"?: ""
+[2m2026-04-03T06:34:27.941462Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:27.941465Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "agent-wire-node-code"
+[2m2026-04-03T06:34:27.941468Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "build"?: "build"
+[2m2026-04-03T06:34:27.941470Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "preview"?: ""
+[2m2026-04-03T06:34:27.941473Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:27.941476Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "agent-wire-node-code"
+[2m2026-04-03T06:34:27.941485Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "characterize"?: "build"
+[2m2026-04-03T06:34:27.941488Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:27.941491Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "agent-wire-node-code"
+[2m2026-04-03T06:34:27.941495Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "build"?: "build"
+[2m2026-04-03T06:34:27.941498Z[0m [35mTRACE[0m [2mwarp::filters::method[0m[2m:[0m method::POST?: POST
+[2m2026-04-03T06:34:27.941508Z[0m [35mTRACE[0m [1mencode_headers[0m[2m:[0m [2mhyper::proto::h1::role[0m[2m:[0m Server::encode status=410, body=Some(Known(50)), req_method=Some(POST)
+[2m2026-04-03T06:34:27.941515Z[0m [35mTRACE[0m [2mhyper::proto::h1::io[0m[2m:[0m buffer.queue [3mself.len[0m[2m=[0m110 [3mbuf.len[0m[2m=[0m50
+[2m2026-04-03T06:34:27.941539Z[0m [34mDEBUG[0m [2mhyper::proto::h1::io[0m[2m:[0m flushed 160 bytes
+[2m2026-04-03T06:34:27.941543Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m flushed({role=server}): State { reading: Init, writing: Init, keep_alive: Idle }
+[2m2026-04-03T06:34:27.946794Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m Conn::read_head
+[2m2026-04-03T06:34:27.946843Z[0m [35mTRACE[0m [2mhyper::proto::h1::io[0m[2m:[0m received 0 bytes
+[2m2026-04-03T06:34:27.946851Z[0m [35mTRACE[0m [2mhyper::proto::h1::io[0m[2m:[0m parse eof
+[2m2026-04-03T06:34:27.946858Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m State::close_read()
+[2m2026-04-03T06:34:27.946863Z[0m [34mDEBUG[0m [2mhyper::proto::h1::conn[0m[2m:[0m read eof
+[2m2026-04-03T06:34:27.946867Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m State::close_write()
+[2m2026-04-03T06:34:27.946871Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m State::close_read()
+[2m2026-04-03T06:34:27.946874Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m State::close_write()
+[2m2026-04-03T06:34:27.946877Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m flushed({role=server}): State { reading: Closed, writing: Closed, keep_alive: Disabled }
+[2m2026-04-03T06:34:27.946891Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m shut down IO complete
+[2m2026-04-03T06:34:29.350672Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m Conn::read_head
+[2m2026-04-03T06:34:29.350734Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m flushed({role=server}): State { reading: Init, writing: Init, keep_alive: Busy }
+[2m2026-04-03T06:34:29.352573Z[0m [35mTRACE[0m [2mreqwest::retry[0m[2m:[0m shouldn't retry!
+[2m2026-04-03T06:34:29.352734Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m Conn::read_head
+[2m2026-04-03T06:34:29.352751Z[0m [35mTRACE[0m [2mhyper::proto::h1::io[0m[2m:[0m received 282 bytes
+[2m2026-04-03T06:34:29.352774Z[0m [35mTRACE[0m [1mparse_headers[0m[2m:[0m [2mhyper::proto::h1::role[0m[2m:[0m Request.parse [3mbytes[0m[2m=[0m282
+[2m2026-04-03T06:34:29.352788Z[0m [35mTRACE[0m [1mparse_headers[0m[2m:[0m [2mhyper::proto::h1::role[0m[2m:[0m Request.parse Complete(282)
+[2m2026-04-03T06:34:29.352807Z[0m [34mDEBUG[0m [2mhyper::proto::h1::io[0m[2m:[0m parsed 9 headers
+[2m2026-04-03T06:34:29.352815Z[0m [34mDEBUG[0m [2mhyper::proto::h1::conn[0m[2m:[0m incoming body is empty
+[2m2026-04-03T06:34:29.352826Z[0m [35mTRACE[0m [2mwarp::filters::method[0m[2m:[0m method::OPTIONS?: GET
+[2m2026-04-03T06:34:29.352840Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:29.352851Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:29.352860Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:29.352868Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:29.352908Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:34:29.352917Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:29.352927Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:29.352934Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:34:29.352942Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:29.352950Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:29.352962Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:34:29.352971Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:29.352981Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:29.352988Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:34:29.352996Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:29.353006Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:29.353013Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:34:29.353021Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:29.353032Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:29.353039Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:34:29.353047Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:29.353056Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:29.353063Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:34:29.353072Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:29.353080Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:29.353087Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:34:29.353095Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:29.353105Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:29.353112Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:34:29.353121Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:29.353129Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:29.353137Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "crystallize"?: "build"
+[2m2026-04-03T06:34:29.353145Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:29.353154Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:29.353161Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "crystallize"?: "build"
+[2m2026-04-03T06:34:29.353169Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:29.353177Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "chain"?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:29.353197Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:29.353210Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "remote-query"?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:29.353224Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:29.353232Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "slugs"?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:29.353262Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:29.353281Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "slugs"?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:29.353294Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:29.353308Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:29.353318Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "build"?: "build"
+[2m2026-04-03T06:34:29.353326Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "status"?: "status"
+[2m2026-04-03T06:34:29.353334Z[0m [35mTRACE[0m [2mwarp::filters::method[0m[2m:[0m method::GET?: GET
+[2m2026-04-03T06:34:29.353343Z[0m [35mTRACE[0m [2mwarp::filters::header[0m[2m:[0m optional("authorization")
+[2m2026-04-03T06:34:29.353389Z[0m [35mTRACE[0m [1mencode_headers[0m[2m:[0m [2mhyper::proto::h1::role[0m[2m:[0m Server::encode status=200, body=Some(Known(109)), req_method=Some(GET)
+[2m2026-04-03T06:34:29.353406Z[0m [35mTRACE[0m [2mhyper::proto::h1::io[0m[2m:[0m buffer.queue [3mself.len[0m[2m=[0m109 [3mbuf.len[0m[2m=[0m109
+[2m2026-04-03T06:34:29.353445Z[0m [34mDEBUG[0m [2mhyper::proto::h1::io[0m[2m:[0m flushed 218 bytes
+[2m2026-04-03T06:34:29.353455Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m flushed({role=server}): State { reading: Init, writing: Init, keep_alive: Idle }
+[2m2026-04-03T06:34:29.358521Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m Conn::read_head
+[2m2026-04-03T06:34:29.358617Z[0m [35mTRACE[0m [2mhyper::proto::h1::io[0m[2m:[0m received 0 bytes
+[2m2026-04-03T06:34:29.358679Z[0m [35mTRACE[0m [2mhyper::proto::h1::io[0m[2m:[0m parse eof
+[2m2026-04-03T06:34:29.358731Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m State::close_read()
+[2m2026-04-03T06:34:29.358751Z[0m [34mDEBUG[0m [2mhyper::proto::h1::conn[0m[2m:[0m read eof
+[2m2026-04-03T06:34:29.358763Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m State::close_write()
+[2m2026-04-03T06:34:29.358774Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m State::close_read()
+[2m2026-04-03T06:34:29.358783Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m State::close_write()
+[2m2026-04-03T06:34:29.358791Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m flushed({role=server}): State { reading: Closed, writing: Closed, keep_alive: Disabled }
+[2m2026-04-03T06:34:29.358819Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m shut down IO complete
+[2m2026-04-03T06:34:29.421501Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m put; add idle connection for ("https", newsbleach.com)
+[2m2026-04-03T06:34:29.421576Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m pooling idle connection for ("https", newsbleach.com)
+[2m2026-04-03T06:34:29.421792Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m take? ("https", newsbleach.com): expiration = Some(90s)
+[2m2026-04-03T06:34:29.421838Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m reuse idle connection for ("https", newsbleach.com)
+[2m2026-04-03T06:34:30.430848Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m checkout waiting for idle connection: ("https", newsbleach.com)
+[2m2026-04-03T06:34:30.430893Z[0m [34mDEBUG[0m [2mreqwest::connect[0m[2m:[0m starting new connection: https://newsbleach.com/
+[2m2026-04-03T06:34:30.430904Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::connect::http[0m[2m:[0m Http::connect; scheme=Some("https"), host=Some("newsbleach.com"), port=None
+[2m2026-04-03T06:34:30.432641Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::connect::http[0m[2m:[0m connecting to 178.128.73.140:443
+[2m2026-04-03T06:34:30.467749Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::connect::http[0m[2m:[0m connected to 178.128.73.140:443
+[2m2026-04-03T06:34:30.545010Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::client[0m[2m:[0m http1 handshake complete, spawning background dispatcher task
+[2m2026-04-03T06:34:30.545069Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::client[0m[2m:[0m waiting for connection to be ready
+[2m2026-04-03T06:34:30.545081Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::client[0m[2m:[0m connection is ready
+[2m2026-04-03T06:34:30.545088Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m checkout dropped for ("https", newsbleach.com)
+[2m2026-04-03T06:34:31.181072Z[0m [35mTRACE[0m [2mreqwest::retry[0m[2m:[0m shouldn't retry!
+[2m2026-04-03T06:34:31.247368Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m put; add idle connection for ("https", newsbleach.com)
+[2m2026-04-03T06:34:31.247495Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m pooling idle connection for ("https", newsbleach.com)
+[2m2026-04-03T06:34:31.247672Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m take? ("https", newsbleach.com): expiration = Some(90s)
+[2m2026-04-03T06:34:31.247716Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m reuse idle connection for ("https", newsbleach.com)
+[2m2026-04-03T06:34:33.141007Z[0m [35mTRACE[0m [2mreqwest::retry[0m[2m:[0m shouldn't retry!
+[2m2026-04-03T06:34:33.211268Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m put; add idle connection for ("https", newsbleach.com)
+[2m2026-04-03T06:34:33.211379Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m pooling idle connection for ("https", newsbleach.com)
+[2m2026-04-03T06:34:33.211546Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m take? ("https", newsbleach.com): expiration = Some(90s)
+[2m2026-04-03T06:34:33.211584Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m reuse idle connection for ("https", newsbleach.com)
+[2m2026-04-03T06:34:34.566256Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m Conn::read_head
+[2m2026-04-03T06:34:34.566382Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m flushed({role=server}): State { reading: Init, writing: Init, keep_alive: Busy }
+[2m2026-04-03T06:34:34.570942Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m Conn::read_head
+[2m2026-04-03T06:34:34.571031Z[0m [35mTRACE[0m [2mhyper::proto::h1::io[0m[2m:[0m received 282 bytes
+[2m2026-04-03T06:34:34.571057Z[0m [35mTRACE[0m [1mparse_headers[0m[2m:[0m [2mhyper::proto::h1::role[0m[2m:[0m Request.parse [3mbytes[0m[2m=[0m282
+[2m2026-04-03T06:34:34.571081Z[0m [35mTRACE[0m [1mparse_headers[0m[2m:[0m [2mhyper::proto::h1::role[0m[2m:[0m Request.parse Complete(282)
+[2m2026-04-03T06:34:34.571113Z[0m [34mDEBUG[0m [2mhyper::proto::h1::io[0m[2m:[0m parsed 9 headers
+[2m2026-04-03T06:34:34.571122Z[0m [34mDEBUG[0m [2mhyper::proto::h1::conn[0m[2m:[0m incoming body is empty
+[2m2026-04-03T06:34:34.571138Z[0m [35mTRACE[0m [2mwarp::filters::method[0m[2m:[0m method::OPTIONS?: GET
+[2m2026-04-03T06:34:34.571191Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:34.571204Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:34.571211Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:34.571219Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:34.571226Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:34:34.571234Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:34.571242Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:34.571248Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:34:34.571254Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:34.571268Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:34.571273Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:34:34.571280Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:34.571286Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:34.571292Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:34:34.571297Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:34.571304Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:34.571309Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:34:34.571315Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:34.571322Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:34.571327Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:34:34.571333Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:34.571340Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:34.571345Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:34:34.571352Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:34.571358Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:34.571364Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:34:34.571370Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:34.571377Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:34.571382Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:34:34.571389Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:34.571395Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:34.571400Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "crystallize"?: "build"
+[2m2026-04-03T06:34:34.571406Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:34.571413Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:34.571419Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "crystallize"?: "build"
+[2m2026-04-03T06:34:34.571425Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:34.571431Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "chain"?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:34.571437Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:34.571447Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "remote-query"?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:34.571456Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:34.571462Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "slugs"?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:34.571469Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:34.571475Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "slugs"?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:34.571482Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:34.571489Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:34.571495Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "build"?: "build"
+[2m2026-04-03T06:34:34.571500Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "status"?: "status"
+[2m2026-04-03T06:34:34.571507Z[0m [35mTRACE[0m [2mwarp::filters::method[0m[2m:[0m method::GET?: GET
+[2m2026-04-03T06:34:34.571514Z[0m [35mTRACE[0m [2mwarp::filters::header[0m[2m:[0m optional("authorization")
+[2m2026-04-03T06:34:34.571550Z[0m [35mTRACE[0m [1mencode_headers[0m[2m:[0m [2mhyper::proto::h1::role[0m[2m:[0m Server::encode status=200, body=Some(Known(109)), req_method=Some(GET)
+[2m2026-04-03T06:34:34.571573Z[0m [35mTRACE[0m [2mhyper::proto::h1::io[0m[2m:[0m buffer.queue [3mself.len[0m[2m=[0m109 [3mbuf.len[0m[2m=[0m109
+[2m2026-04-03T06:34:34.571627Z[0m [34mDEBUG[0m [2mhyper::proto::h1::io[0m[2m:[0m flushed 218 bytes
+[2m2026-04-03T06:34:34.571666Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m flushed({role=server}): State { reading: Init, writing: Init, keep_alive: Idle }
+[2m2026-04-03T06:34:34.580867Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m Conn::read_head
+[2m2026-04-03T06:34:34.580947Z[0m [35mTRACE[0m [2mhyper::proto::h1::io[0m[2m:[0m received 0 bytes
+[2m2026-04-03T06:34:34.580958Z[0m [35mTRACE[0m [2mhyper::proto::h1::io[0m[2m:[0m parse eof
+[2m2026-04-03T06:34:34.580967Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m State::close_read()
+[2m2026-04-03T06:34:34.580974Z[0m [34mDEBUG[0m [2mhyper::proto::h1::conn[0m[2m:[0m read eof
+[2m2026-04-03T06:34:34.580999Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m State::close_write()
+[2m2026-04-03T06:34:34.581045Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m State::close_read()
+[2m2026-04-03T06:34:34.581053Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m State::close_write()
+[2m2026-04-03T06:34:34.581072Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m flushed({role=server}): State { reading: Closed, writing: Closed, keep_alive: Disabled }
+[2m2026-04-03T06:34:34.581102Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m shut down IO complete
+[2m2026-04-03T06:34:34.946904Z[0m [35mTRACE[0m [2mreqwest::retry[0m[2m:[0m shouldn't retry!
+[2m2026-04-03T06:34:35.013083Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m put; add idle connection for ("https", newsbleach.com)
+[2m2026-04-03T06:34:35.013160Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m pooling idle connection for ("https", newsbleach.com)
+[2m2026-04-03T06:34:35.013411Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m take? ("https", newsbleach.com): expiration = Some(90s)
+[2m2026-04-03T06:34:35.013458Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m reuse idle connection for ("https", newsbleach.com)
+[2m2026-04-03T06:34:36.446728Z[0m [35mTRACE[0m [2mreqwest::retry[0m[2m:[0m shouldn't retry!
+[2m2026-04-03T06:34:36.512485Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m put; add idle connection for ("https", newsbleach.com)
+[2m2026-04-03T06:34:36.512584Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m pooling idle connection for ("https", newsbleach.com)
+[2m2026-04-03T06:34:36.512677Z[0m [32m INFO[0m [2mwire_node_lib::sync[0m[2m:[0m Found 689 documents in corpus agent-wire-canon-v2
+[2m2026-04-03T06:34:36.513075Z[0m [35mTRACE[0m [2mignore::walk[0m[2m:[0m automatically discovered CWD: /Users/adamlevine/AI Project Files/agent-wire-node/src-tauri
+[2m2026-04-03T06:34:36.513647Z[0m [34mDEBUG[0m [2mignore::gitignore[0m[2m:[0m opened gitignore file: /Users/adamlevine/.config/git/ignore
+[2m2026-04-03T06:34:36.513715Z[0m [34mDEBUG[0m [2mglobset[0m[2m:[0m built glob set; 1 literals, 0 basenames, 0 extensions, 0 prefixes, 1 suffixes, 0 required extensions, 0 regexes
+[2m2026-04-03T06:34:36.514289Z[0m [34mDEBUG[0m [2mignore::gitignore[0m[2m:[0m opened gitignore file: /Users/adamlevine/AI Project Files/GoodNewsEveryone/.gitignore
+[2m2026-04-03T06:34:36.514540Z[0m [34mDEBUG[0m [2mglobset[0m[2m:[0m glob `Glob("**/.pnp.*")` converted to regex: `"(?-u)^(?:/?|.*/)\\.pnp\\.[^/]*$"`
+[2m2026-04-03T06:34:36.514550Z[0m [34mDEBUG[0m [2mglobset[0m[2m:[0m glob `Glob(".yarn/*")` converted to regex: `"(?-u)^\\.yarn/[^/]*$"`
+[2m2026-04-03T06:34:36.514562Z[0m [34mDEBUG[0m [2mglobset[0m[2m:[0m glob `Glob("**/npm-debug.log*")` converted to regex: `"(?-u)^(?:/?|.*/)npm\\-debug\\.log[^/]*$"`
+[2m2026-04-03T06:34:36.514567Z[0m [34mDEBUG[0m [2mglobset[0m[2m:[0m glob `Glob("**/yarn-debug.log*")` converted to regex: `"(?-u)^(?:/?|.*/)yarn\\-debug\\.log[^/]*$"`
+[2m2026-04-03T06:34:36.514588Z[0m [34mDEBUG[0m [2mglobset[0m[2m:[0m glob `Glob("**/yarn-error.log*")` converted to regex: `"(?-u)^(?:/?|.*/)yarn\\-error\\.log[^/]*$"`
+[2m2026-04-03T06:34:36.514593Z[0m [34mDEBUG[0m [2mglobset[0m[2m:[0m glob `Glob("**/.pnpm-debug.log*")` converted to regex: `"(?-u)^(?:/?|.*/)\\.pnpm\\-debug\\.log[^/]*$"`
+[2m2026-04-03T06:34:36.514604Z[0m [34mDEBUG[0m [2mglobset[0m[2m:[0m built glob set; 11 literals, 5 basenames, 2 extensions, 0 prefixes, 0 suffixes, 1 required extensions, 6 regexes
+[2m2026-04-03T06:34:36.515268Z[0m [34mDEBUG[0m [2mignore::gitignore[0m[2m:[0m opened gitignore file: /Users/adamlevine/AI Project Files/GoodNewsEveryone/.git/info/exclude
+[2m2026-04-03T06:34:36.517043Z[0m [34mDEBUG[0m [2mignore::walk[0m[2m:[0m ignoring /Users/adamlevine/AI Project Files/GoodNewsEveryone/docs/vibesmithy/.DS_Store: Ignore(IgnoreMatch(Gitignore(Glob { from: Some("/Users/adamlevine/AI Project Files/GoodNewsEveryone/.gitignore"), original: ".DS_Store", actual: "**/.DS_Store", is_whitelist: false, is_only_dir: false })))
+[2m2026-04-03T06:34:36.518372Z[0m [34mDEBUG[0m [2mwire_node_lib::sync[0m[2m:[0m Skipping non-UTF8 file /Users/adamlevine/AI Project Files/GoodNewsEveryone/docs/vibesmithy/stitch_deep_nebula_tactile_edition_prd.zip: stream did not contain valid UTF-8
+[2m2026-04-03T06:34:36.519978Z[0m [34mDEBUG[0m [2mwire_node_lib::sync[0m[2m:[0m Skipping non-UTF8 file /Users/adamlevine/AI Project Files/GoodNewsEveryone/docs/vibesmithy/stitch_deep_nebula_tactile_edition_prd 2/onboarding_first_light/screen.png: stream did not contain valid UTF-8
+[2m2026-04-03T06:34:36.520773Z[0m [34mDEBUG[0m [2mwire_node_lib::sync[0m[2m:[0m Skipping non-UTF8 file /Users/adamlevine/AI Project Files/GoodNewsEveryone/docs/vibesmithy/stitch_deep_nebula_tactile_edition_prd 2/partner_view_crystallizing/screen.png: stream did not contain valid UTF-8
+[2m2026-04-03T06:34:36.521631Z[0m [34mDEBUG[0m [2mwire_node_lib::sync[0m[2m:[0m Skipping non-UTF8 file /Users/adamlevine/AI Project Files/GoodNewsEveryone/docs/vibesmithy/stitch_deep_nebula_tactile_edition_prd 2/partner_view_aura_s_focus/screen.png: stream did not contain valid UTF-8
+[2m2026-04-03T06:34:36.522280Z[0m [34mDEBUG[0m [2mwire_node_lib::sync[0m[2m:[0m Skipping non-UTF8 file /Users/adamlevine/AI Project Files/GoodNewsEveryone/docs/vibesmithy/stitch_deep_nebula_tactile_edition_prd 2/desktop_galactic_workbench/screen.png: stream did not contain valid UTF-8
+[2m2026-04-03T06:34:36.522912Z[0m [34mDEBUG[0m [2mwire_node_lib::sync[0m[2m:[0m Skipping non-UTF8 file /Users/adamlevine/AI Project Files/GoodNewsEveryone/docs/vibesmithy/stitch_deep_nebula_tactile_edition_prd 2/node_focus_reactive_nebula/screen.png: stream did not contain valid UTF-8
+[2m2026-04-03T06:34:36.523619Z[0m [34mDEBUG[0m [2mwire_node_lib::sync[0m[2m:[0m Skipping non-UTF8 file /Users/adamlevine/AI Project Files/GoodNewsEveryone/docs/vibesmithy/stitch_deep_nebula_tactile_edition_prd 2/desktop_layout_dual_surface/screen.png: stream did not contain valid UTF-8
+[2m2026-04-03T06:34:36.524363Z[0m [34mDEBUG[0m [2mwire_node_lib::sync[0m[2m:[0m Skipping non-UTF8 file /Users/adamlevine/AI Project Files/GoodNewsEveryone/docs/vibesmithy/stitch_deep_nebula_tactile_edition_prd/chat_with_aura_glass_panel/screen.png: stream did not contain valid UTF-8
+[2m2026-04-03T06:34:36.524910Z[0m [34mDEBUG[0m [2mwire_node_lib::sync[0m[2m:[0m Skipping non-UTF8 file /Users/adamlevine/AI Project Files/GoodNewsEveryone/docs/vibesmithy/stitch_deep_nebula_tactile_edition_prd/onboarding_first_light/screen.png: stream did not contain valid UTF-8
+[2m2026-04-03T06:34:36.525835Z[0m [34mDEBUG[0m [2mwire_node_lib::sync[0m[2m:[0m Skipping non-UTF8 file /Users/adamlevine/AI Project Files/GoodNewsEveryone/docs/vibesmithy/stitch_deep_nebula_tactile_edition_prd/macro_nebula_living_galaxy/screen.png: stream did not contain valid UTF-8
+[2m2026-04-03T06:34:36.526323Z[0m [34mDEBUG[0m [2mwire_node_lib::sync[0m[2m:[0m Skipping non-UTF8 file /Users/adamlevine/AI Project Files/GoodNewsEveryone/docs/vibesmithy/stitch_deep_nebula_tactile_edition_prd/voice_capture_tactile_button/screen.png: stream did not contain valid UTF-8
+[2m2026-04-03T06:34:36.526781Z[0m [34mDEBUG[0m [2mwire_node_lib::sync[0m[2m:[0m Skipping non-UTF8 file /Users/adamlevine/AI Project Files/GoodNewsEveryone/docs/vibesmithy/stitch_deep_nebula_tactile_edition_prd/system_config_hardware_style/screen.png: stream did not contain valid UTF-8
+[2m2026-04-03T06:34:36.527340Z[0m [34mDEBUG[0m [2mwire_node_lib::sync[0m[2m:[0m Skipping non-UTF8 file /Users/adamlevine/AI Project Files/GoodNewsEveryone/docs/vibesmithy/stitch_deep_nebula_tactile_edition_prd/partner_view_aura_s_focus/screen.png: stream did not contain valid UTF-8
+[2m2026-04-03T06:34:36.528078Z[0m [34mDEBUG[0m [2mwire_node_lib::sync[0m[2m:[0m Skipping non-UTF8 file /Users/adamlevine/AI Project Files/GoodNewsEveryone/docs/vibesmithy/stitch_deep_nebula_tactile_edition_prd/node_focus_tactile_details/screen.png: stream did not contain valid UTF-8
+[2m2026-04-03T06:34:36.528856Z[0m [34mDEBUG[0m [2mwire_node_lib::sync[0m[2m:[0m Skipping non-UTF8 file /Users/adamlevine/AI Project Files/GoodNewsEveryone/docs/vibesmithy/stitch_deep_nebula_tactile_edition_prd/desktop_layout_dual_surface/screen.png: stream did not contain valid UTF-8
+[2m2026-04-03T06:34:36.530208Z[0m [34mDEBUG[0m [2mwire_node_lib::sync[0m[2m:[0m Skipping non-UTF8 file /Users/adamlevine/AI Project Files/GoodNewsEveryone/docs/vibesmithy/stitch_deep_nebula_tactile_edition_prd second round of screens.zip: stream did not contain valid UTF-8
+[2m2026-04-03T06:34:36.547193Z[0m [34mDEBUG[0m [2mignore::walk[0m[2m:[0m ignoring /Users/adamlevine/AI Project Files/GoodNewsEveryone/docs/.DS_Store: Ignore(IgnoreMatch(Gitignore(Glob { from: Some("/Users/adamlevine/AI Project Files/GoodNewsEveryone/.gitignore"), original: ".DS_Store", actual: "**/.DS_Store", is_whitelist: false, is_only_dir: false })))
+[2m2026-04-03T06:34:36.562844Z[0m [34mDEBUG[0m [2mwire_node_lib::sync[0m[2m:[0m Skipping non-UTF8 file /Users/adamlevine/AI Project Files/GoodNewsEveryone/docs/audits/wire_platform_triagemarch182026.xlsx: stream did not contain valid UTF-8
+[2m2026-04-03T06:34:36.586952Z[0m [34mDEBUG[0m [2mignore::walk[0m[2m:[0m ignoring /Users/adamlevine/AI Project Files/GoodNewsEveryone/docs/testing/.DS_Store: Ignore(IgnoreMatch(Gitignore(Glob { from: Some("/Users/adamlevine/AI Project Files/GoodNewsEveryone/.gitignore"), original: ".DS_Store", actual: "**/.DS_Store", is_whitelist: false, is_only_dir: false })))
+[2m2026-04-03T06:34:36.648779Z[0m [34mDEBUG[0m [2mignore::walk[0m[2m:[0m ignoring /Users/adamlevine/AI Project Files/GoodNewsEveryone/docs/pyramid-prototype/.DS_Store: Ignore(IgnoreMatch(Gitignore(Glob { from: Some("/Users/adamlevine/AI Project Files/GoodNewsEveryone/.gitignore"), original: ".DS_Store", actual: "**/.DS_Store", is_whitelist: false, is_only_dir: false })))
+[2m2026-04-03T06:34:36.649907Z[0m [34mDEBUG[0m [2mwire_node_lib::sync[0m[2m:[0m Skipping non-UTF8 file /Users/adamlevine/AI Project Files/GoodNewsEveryone/docs/pyramid-prototype/BitDrop-20260321T043109Z-1-001.zip: stream did not contain valid UTF-8
+[2m2026-04-03T06:34:36.661503Z[0m [34mDEBUG[0m [2mwire_node_lib::sync[0m[2m:[0m Skipping non-UTF8 file /Users/adamlevine/AI Project Files/GoodNewsEveryone/docs/pyramid-prototype/BitDrop/Draft/Part 5 - Chapters 13-15.docx: stream did not contain valid UTF-8
+[2m2026-04-03T06:34:36.661832Z[0m [34mDEBUG[0m [2mwire_node_lib::sync[0m[2m:[0m Skipping non-UTF8 file /Users/adamlevine/AI Project Files/GoodNewsEveryone/docs/pyramid-prototype/BitDrop/Draft/Part 3 - Chapter 7-9.docx: stream did not contain valid UTF-8
+[2m2026-04-03T06:34:36.662051Z[0m [34mDEBUG[0m [2mwire_node_lib::sync[0m[2m:[0m Skipping non-UTF8 file /Users/adamlevine/AI Project Files/GoodNewsEveryone/docs/pyramid-prototype/BitDrop/Draft/Part 2 - Chapter 4-6.docx: stream did not contain valid UTF-8
+[2m2026-04-03T06:34:36.662537Z[0m [34mDEBUG[0m [2mwire_node_lib::sync[0m[2m:[0m Skipping non-UTF8 file /Users/adamlevine/AI Project Files/GoodNewsEveryone/docs/pyramid-prototype/BitDrop/Draft/Part 4 Chapter 10-12.docx: stream did not contain valid UTF-8
+[2m2026-04-03T06:34:36.662685Z[0m [34mDEBUG[0m [2mwire_node_lib::sync[0m[2m:[0m Skipping non-UTF8 file /Users/adamlevine/AI Project Files/GoodNewsEveryone/docs/pyramid-prototype/BitDrop/Draft/Outline covering chapter 13 through the remainder of the storyline.docx: stream did not contain valid UTF-8
+[2m2026-04-03T06:34:36.662886Z[0m [34mDEBUG[0m [2mwire_node_lib::sync[0m[2m:[0m Skipping non-UTF8 file /Users/adamlevine/AI Project Files/GoodNewsEveryone/docs/pyramid-prototype/BitDrop/Draft/Part 1 - Chapter 1-3.docx: stream did not contain valid UTF-8
+[2m2026-04-03T06:34:36.663139Z[0m [34mDEBUG[0m [2mwire_node_lib::sync[0m[2m:[0m Skipping non-UTF8 file /Users/adamlevine/AI Project Files/GoodNewsEveryone/docs/pyramid-prototype/BitDrop/bitdroppedforgeorge.pdf: stream did not contain valid UTF-8
+[2m2026-04-03T06:34:36.663276Z[0m [34mDEBUG[0m [2mwire_node_lib::sync[0m[2m:[0m Skipping non-UTF8 file /Users/adamlevine/AI Project Files/GoodNewsEveryone/docs/pyramid-prototype/BitDrop/Characters/Jay Groom.docx: stream did not contain valid UTF-8
+[2m2026-04-03T06:34:36.663439Z[0m [34mDEBUG[0m [2mwire_node_lib::sync[0m[2m:[0m Skipping non-UTF8 file /Users/adamlevine/AI Project Files/GoodNewsEveryone/docs/pyramid-prototype/BitDrop/Characters/Ton Skarda.docx: stream did not contain valid UTF-8
+[2m2026-04-03T06:34:36.663613Z[0m [34mDEBUG[0m [2mwire_node_lib::sync[0m[2m:[0m Skipping non-UTF8 file /Users/adamlevine/AI Project Files/GoodNewsEveryone/docs/pyramid-prototype/BitDrop/Characters/Zing.docx: stream did not contain valid UTF-8
+[2m2026-04-03T06:34:36.664114Z[0m [34mDEBUG[0m [2mwire_node_lib::sync[0m[2m:[0m Skipping non-UTF8 file /Users/adamlevine/AI Project Files/GoodNewsEveryone/docs/pyramid-prototype/BitDrop/Characters/Lin Noble.docx: stream did not contain valid UTF-8
+[2m2026-04-03T06:34:36.664354Z[0m [34mDEBUG[0m [2mwire_node_lib::sync[0m[2m:[0m Skipping non-UTF8 file /Users/adamlevine/AI Project Files/GoodNewsEveryone/docs/pyramid-prototype/BitDrop/Research & Continuity/Partial Transcript of April 2011 Interview Nefario and Hiro White.docx: stream did not contain valid UTF-8
+[2m2026-04-03T06:34:36.664512Z[0m [34mDEBUG[0m [2mwire_node_lib::sync[0m[2m:[0m Skipping non-UTF8 file /Users/adamlevine/AI Project Files/GoodNewsEveryone/docs/pyramid-prototype/BitDrop/Research & Continuity/Original Bitdrop Spec.docx: stream did not contain valid UTF-8
+[2m2026-04-03T06:34:36.664663Z[0m [34mDEBUG[0m [2mwire_node_lib::sync[0m[2m:[0m Skipping non-UTF8 file /Users/adamlevine/AI Project Files/GoodNewsEveryone/docs/pyramid-prototype/BitDrop/Research & Continuity/Script Kitty Exploration (Lin_s Game).docx: stream did not contain valid UTF-8
+[2m2026-04-03T06:34:36.664717Z[0m [34mDEBUG[0m [2mwire_node_lib::sync[0m[2m:[0m Skipping non-UTF8 file /Users/adamlevine/AI Project Files/GoodNewsEveryone/docs/pyramid-prototype/BitDrop/Research & Continuity/Roles, Terms and Acronyms.docx: stream did not contain valid UTF-8
+[2m2026-04-03T06:34:36.664768Z[0m [34mDEBUG[0m [2mwire_node_lib::sync[0m[2m:[0m Skipping non-UTF8 file /Users/adamlevine/AI Project Files/GoodNewsEveryone/docs/pyramid-prototype/BitDrop/Research & Continuity/General Setting Notes.docx: stream did not contain valid UTF-8
+[2m2026-04-03T06:34:36.664821Z[0m [34mDEBUG[0m [2mwire_node_lib::sync[0m[2m:[0m Skipping non-UTF8 file /Users/adamlevine/AI Project Files/GoodNewsEveryone/docs/pyramid-prototype/BitDrop/Research & Continuity/Voodoo and Hercules Chat.docx: stream did not contain valid UTF-8
+[2m2026-04-03T06:34:36.664878Z[0m [34mDEBUG[0m [2mwire_node_lib::sync[0m[2m:[0m Skipping non-UTF8 file /Users/adamlevine/AI Project Files/GoodNewsEveryone/docs/pyramid-prototype/BitDrop/initial points.docx: stream did not contain valid UTF-8
+[2m2026-04-03T06:34:36.723614Z[0m [32m INFO[0m [2mwire_node_lib::sync[0m[2m:[0m Scanned 686 files in /Users/adamlevine/AI Project Files/GoodNewsEveryone/docs (gitignore-aware)
+[2m2026-04-03T06:34:36.724362Z[0m [34mDEBUG[0m [2mwire_node_lib::sync[0m[2m:[0m Hash fallback match: local 'worksheets/wire-identity-resolution-worksheet.md' == remote '788f713a-ee6d-4bd0-a8f0-d4311b14594a' (hash bde21dbc11e7)
+[2m2026-04-03T06:34:36.724461Z[0m [32m INFO[0m [2mwire_node_desktop[0m[2m:[0m Sync diff for agent-wire-canon-v2: 7 to push, 0 to pull, 1 to update
+[2m2026-04-03T06:34:36.755687Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m pool closed, canceling idle interval
+[2m2026-04-03T06:34:36.958471Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m checkout waiting for idle connection: ("https", newsbleach.com)
+[2m2026-04-03T06:34:36.958539Z[0m [34mDEBUG[0m [2mreqwest::connect[0m[2m:[0m starting new connection: https://newsbleach.com/
+[2m2026-04-03T06:34:36.958550Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::connect::http[0m[2m:[0m Http::connect; scheme=Some("https"), host=Some("newsbleach.com"), port=None
+[2m2026-04-03T06:34:36.960422Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::connect::http[0m[2m:[0m connecting to 178.128.73.140:443
+[2m2026-04-03T06:34:36.998085Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::connect::http[0m[2m:[0m connected to 178.128.73.140:443
+[2m2026-04-03T06:34:37.075439Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::client[0m[2m:[0m http1 handshake complete, spawning background dispatcher task
+[2m2026-04-03T06:34:37.075539Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::client[0m[2m:[0m waiting for connection to be ready
+[2m2026-04-03T06:34:37.075565Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::client[0m[2m:[0m connection is ready
+[2m2026-04-03T06:34:37.075579Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m checkout dropped for ("https", newsbleach.com)
+[2m2026-04-03T06:34:37.373847Z[0m [35mTRACE[0m [2mreqwest::retry[0m[2m:[0m shouldn't retry!
+[2m2026-04-03T06:34:37.374207Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m put; add idle connection for ("https", newsbleach.com)
+[2m2026-04-03T06:34:37.374254Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m pooling idle connection for ("https", newsbleach.com)
+[2m2026-04-03T06:34:37.374256Z[0m [32m INFO[0m [2mwire_node_desktop[0m[2m:[0m Skipped vibesmithy/stitch_deep_nebula_tactile_edition_prd/deep_nebula_tactile/DESIGN.md (already exists remotely)
+[2m2026-04-03T06:34:37.374269Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m pool closed, canceling idle interval
+[2m2026-04-03T06:34:37.576215Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m checkout waiting for idle connection: ("https", newsbleach.com)
+[2m2026-04-03T06:34:37.576256Z[0m [34mDEBUG[0m [2mreqwest::connect[0m[2m:[0m starting new connection: https://newsbleach.com/
+[2m2026-04-03T06:34:37.576265Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::connect::http[0m[2m:[0m Http::connect; scheme=Some("https"), host=Some("newsbleach.com"), port=None
+[2m2026-04-03T06:34:37.578364Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::connect::http[0m[2m:[0m connecting to 178.128.73.140:443
+[2m2026-04-03T06:34:37.612214Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::connect::http[0m[2m:[0m connected to 178.128.73.140:443
+[2m2026-04-03T06:34:37.695269Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::client[0m[2m:[0m http1 handshake complete, spawning background dispatcher task
+[2m2026-04-03T06:34:37.695300Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::client[0m[2m:[0m waiting for connection to be ready
+[2m2026-04-03T06:34:37.695318Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::client[0m[2m:[0m connection is ready
+[2m2026-04-03T06:34:37.695325Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m checkout dropped for ("https", newsbleach.com)
+[2m2026-04-03T06:34:37.912114Z[0m [35mTRACE[0m [2mreqwest::retry[0m[2m:[0m shouldn't retry!
+[2m2026-04-03T06:34:37.912221Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m put; add idle connection for ("https", newsbleach.com)
+[2m2026-04-03T06:34:37.912240Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m pooling idle connection for ("https", newsbleach.com)
+[2m2026-04-03T06:34:37.912291Z[0m [32m INFO[0m [2mwire_node_desktop[0m[2m:[0m Skipped testing/processed/qa-wander-75-circular-1773848451.md (already exists remotely)
+[2m2026-04-03T06:34:37.912365Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m pool closed, canceling idle interval
+[2m2026-04-03T06:34:38.115816Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m checkout waiting for idle connection: ("https", newsbleach.com)
+[2m2026-04-03T06:34:38.115893Z[0m [34mDEBUG[0m [2mreqwest::connect[0m[2m:[0m starting new connection: https://newsbleach.com/
+[2m2026-04-03T06:34:38.115912Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::connect::http[0m[2m:[0m Http::connect; scheme=Some("https"), host=Some("newsbleach.com"), port=None
+[2m2026-04-03T06:34:38.117459Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::connect::http[0m[2m:[0m connecting to 178.128.73.140:443
+[2m2026-04-03T06:34:38.150292Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::connect::http[0m[2m:[0m connected to 178.128.73.140:443
+[2m2026-04-03T06:34:38.224480Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::client[0m[2m:[0m http1 handshake complete, spawning background dispatcher task
+[2m2026-04-03T06:34:38.224524Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::client[0m[2m:[0m waiting for connection to be ready
+[2m2026-04-03T06:34:38.224546Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::client[0m[2m:[0m connection is ready
+[2m2026-04-03T06:34:38.224559Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m checkout dropped for ("https", newsbleach.com)
+[2m2026-04-03T06:34:38.938281Z[0m [35mTRACE[0m [2mreqwest::retry[0m[2m:[0m shouldn't retry!
+[2m2026-04-03T06:34:38.938501Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m put; add idle connection for ("https", newsbleach.com)
+[2m2026-04-03T06:34:38.938517Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m pooling idle connection for ("https", newsbleach.com)
+[2m2026-04-03T06:34:38.938516Z[0m [33m WARN[0m [2mwire_node_desktop[0m[2m:[0m Push failed for testing/processed/qa-wander-68-1773846449.md: Push failed (400 Bad Request): {"error":"body must be 500000 characters or fewer","param":"body"}
+[2m2026-04-03T06:34:38.938532Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m pool closed, canceling idle interval
+[2m2026-04-03T06:34:39.140631Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m checkout waiting for idle connection: ("https", newsbleach.com)
+[2m2026-04-03T06:34:39.140772Z[0m [34mDEBUG[0m [2mreqwest::connect[0m[2m:[0m starting new connection: https://newsbleach.com/
+[2m2026-04-03T06:34:39.140793Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::connect::http[0m[2m:[0m Http::connect; scheme=Some("https"), host=Some("newsbleach.com"), port=None
+[2m2026-04-03T06:34:39.141951Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::connect::http[0m[2m:[0m connecting to 178.128.73.140:443
+[2m2026-04-03T06:34:39.175220Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::connect::http[0m[2m:[0m connected to 178.128.73.140:443
+[2m2026-04-03T06:34:39.248223Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::client[0m[2m:[0m http1 handshake complete, spawning background dispatcher task
+[2m2026-04-03T06:34:39.248340Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::client[0m[2m:[0m waiting for connection to be ready
+[2m2026-04-03T06:34:39.248361Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::client[0m[2m:[0m connection is ready
+[2m2026-04-03T06:34:39.248371Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m checkout dropped for ("https", newsbleach.com)
+[2m2026-04-03T06:34:39.451819Z[0m [35mTRACE[0m [2mreqwest::retry[0m[2m:[0m shouldn't retry!
+[2m2026-04-03T06:34:39.451976Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m put; add idle connection for ("https", newsbleach.com)
+[2m2026-04-03T06:34:39.451994Z[0m [32m INFO[0m [2mwire_node_desktop[0m[2m:[0m Skipped testing/processed/qa-wander-75-circular-1773848478.md (already exists remotely)
+[2m2026-04-03T06:34:39.452008Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m pooling idle connection for ("https", newsbleach.com)
+[2m2026-04-03T06:34:39.452100Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m pool closed, canceling idle interval
+[2m2026-04-03T06:34:39.653525Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m checkout waiting for idle connection: ("https", newsbleach.com)
+[2m2026-04-03T06:34:39.653635Z[0m [34mDEBUG[0m [2mreqwest::connect[0m[2m:[0m starting new connection: https://newsbleach.com/
+[2m2026-04-03T06:34:39.653654Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::connect::http[0m[2m:[0m Http::connect; scheme=Some("https"), host=Some("newsbleach.com"), port=None
+[2m2026-04-03T06:34:39.655610Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::connect::http[0m[2m:[0m connecting to 178.128.73.140:443
+[2m2026-04-03T06:34:39.688036Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::connect::http[0m[2m:[0m connected to 178.128.73.140:443
+[2m2026-04-03T06:34:39.699447Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m Conn::read_head
+[2m2026-04-03T06:34:39.699504Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m flushed({role=server}): State { reading: Init, writing: Init, keep_alive: Busy }
+[2m2026-04-03T06:34:39.701737Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m Conn::read_head
+[2m2026-04-03T06:34:39.701820Z[0m [35mTRACE[0m [2mhyper::proto::h1::io[0m[2m:[0m received 282 bytes
+[2m2026-04-03T06:34:39.701839Z[0m [35mTRACE[0m [1mparse_headers[0m[2m:[0m [2mhyper::proto::h1::role[0m[2m:[0m Request.parse [3mbytes[0m[2m=[0m282
+[2m2026-04-03T06:34:39.701857Z[0m [35mTRACE[0m [1mparse_headers[0m[2m:[0m [2mhyper::proto::h1::role[0m[2m:[0m Request.parse Complete(282)
+[2m2026-04-03T06:34:39.701885Z[0m [34mDEBUG[0m [2mhyper::proto::h1::io[0m[2m:[0m parsed 9 headers
+[2m2026-04-03T06:34:39.701890Z[0m [34mDEBUG[0m [2mhyper::proto::h1::conn[0m[2m:[0m incoming body is empty
+[2m2026-04-03T06:34:39.701903Z[0m [35mTRACE[0m [2mwarp::filters::method[0m[2m:[0m method::OPTIONS?: GET
+[2m2026-04-03T06:34:39.701919Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:39.701938Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:39.701945Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:39.701953Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:39.701958Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:34:39.701965Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:39.701970Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:39.701982Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:34:39.701987Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:39.701993Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:39.701998Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:34:39.702003Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:39.702008Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:39.702013Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:34:39.702018Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:39.702023Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:39.702026Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:34:39.702031Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:39.702035Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:39.702039Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:34:39.702043Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:39.702048Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:39.702052Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:34:39.702056Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:39.702060Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:39.702064Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:34:39.702069Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:39.702074Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:39.702078Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:34:39.702083Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:39.702088Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:39.702092Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "crystallize"?: "build"
+[2m2026-04-03T06:34:39.702096Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:39.702102Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:39.702106Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "crystallize"?: "build"
+[2m2026-04-03T06:34:39.702110Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:39.702115Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "chain"?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:39.702119Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:39.702126Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "remote-query"?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:39.702131Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:39.702137Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "slugs"?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:39.702140Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:39.702145Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "slugs"?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:39.702149Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:39.702154Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:39.702158Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "build"?: "build"
+[2m2026-04-03T06:34:39.702162Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "status"?: "status"
+[2m2026-04-03T06:34:39.702166Z[0m [35mTRACE[0m [2mwarp::filters::method[0m[2m:[0m method::GET?: GET
+[2m2026-04-03T06:34:39.702171Z[0m [35mTRACE[0m [2mwarp::filters::header[0m[2m:[0m optional("authorization")
+[2m2026-04-03T06:34:39.702196Z[0m [35mTRACE[0m [1mencode_headers[0m[2m:[0m [2mhyper::proto::h1::role[0m[2m:[0m Server::encode status=200, body=Some(Known(109)), req_method=Some(GET)
+[2m2026-04-03T06:34:39.702210Z[0m [35mTRACE[0m [2mhyper::proto::h1::io[0m[2m:[0m buffer.queue [3mself.len[0m[2m=[0m109 [3mbuf.len[0m[2m=[0m109
+[2m2026-04-03T06:34:39.702229Z[0m [34mDEBUG[0m [2mhyper::proto::h1::io[0m[2m:[0m flushed 218 bytes
+[2m2026-04-03T06:34:39.702239Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m flushed({role=server}): State { reading: Init, writing: Init, keep_alive: Idle }
+[2m2026-04-03T06:34:39.707239Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m Conn::read_head
+[2m2026-04-03T06:34:39.707330Z[0m [35mTRACE[0m [2mhyper::proto::h1::io[0m[2m:[0m received 0 bytes
+[2m2026-04-03T06:34:39.707339Z[0m [35mTRACE[0m [2mhyper::proto::h1::io[0m[2m:[0m parse eof
+[2m2026-04-03T06:34:39.707348Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m State::close_read()
+[2m2026-04-03T06:34:39.707353Z[0m [34mDEBUG[0m [2mhyper::proto::h1::conn[0m[2m:[0m read eof
+[2m2026-04-03T06:34:39.707359Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m State::close_write()
+[2m2026-04-03T06:34:39.707365Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m State::close_read()
+[2m2026-04-03T06:34:39.707370Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m State::close_write()
+[2m2026-04-03T06:34:39.707375Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m flushed({role=server}): State { reading: Closed, writing: Closed, keep_alive: Disabled }
+[2m2026-04-03T06:34:39.707408Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m shut down IO complete
+[2m2026-04-03T06:34:39.764205Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::client[0m[2m:[0m http1 handshake complete, spawning background dispatcher task
+[2m2026-04-03T06:34:39.764295Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::client[0m[2m:[0m waiting for connection to be ready
+[2m2026-04-03T06:34:39.764318Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::client[0m[2m:[0m connection is ready
+[2m2026-04-03T06:34:39.764328Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m checkout dropped for ("https", newsbleach.com)
+[2m2026-04-03T06:34:40.076508Z[0m [35mTRACE[0m [2mreqwest::retry[0m[2m:[0m shouldn't retry!
+[2m2026-04-03T06:34:40.076698Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m put; add idle connection for ("https", newsbleach.com)
+[2m2026-04-03T06:34:40.076712Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m pooling idle connection for ("https", newsbleach.com)
+[2m2026-04-03T06:34:40.076729Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m pool closed, canceling idle interval
+[2m2026-04-03T06:34:40.076731Z[0m [32m INFO[0m [2mwire_node_desktop[0m[2m:[0m Skipped testing/processed/qa-wander-75-circular-1773848568.md (already exists remotely)
+[2m2026-04-03T06:34:40.278702Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m checkout waiting for idle connection: ("https", newsbleach.com)
+[2m2026-04-03T06:34:40.278787Z[0m [34mDEBUG[0m [2mreqwest::connect[0m[2m:[0m starting new connection: https://newsbleach.com/
+[2m2026-04-03T06:34:40.278803Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::connect::http[0m[2m:[0m Http::connect; scheme=Some("https"), host=Some("newsbleach.com"), port=None
+[2m2026-04-03T06:34:40.280524Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::connect::http[0m[2m:[0m connecting to 178.128.73.140:443
+[2m2026-04-03T06:34:40.314560Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::connect::http[0m[2m:[0m connected to 178.128.73.140:443
+[2m2026-04-03T06:34:40.388933Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::client[0m[2m:[0m http1 handshake complete, spawning background dispatcher task
+[2m2026-04-03T06:34:40.389051Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::client[0m[2m:[0m waiting for connection to be ready
+[2m2026-04-03T06:34:40.389095Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::client[0m[2m:[0m connection is ready
+[2m2026-04-03T06:34:40.389106Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m checkout dropped for ("https", newsbleach.com)
+[2m2026-04-03T06:34:40.598925Z[0m [35mTRACE[0m [2mreqwest::retry[0m[2m:[0m shouldn't retry!
+[2m2026-04-03T06:34:40.599175Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m put; add idle connection for ("https", newsbleach.com)
+[2m2026-04-03T06:34:40.599184Z[0m [32m INFO[0m [2mwire_node_desktop[0m[2m:[0m Skipped testing/processed/qa-wander-75-1773848650.md (already exists remotely)
+[2m2026-04-03T06:34:40.599244Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m pooling idle connection for ("https", newsbleach.com)
+[2m2026-04-03T06:34:40.599292Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m pool closed, canceling idle interval
+[2m2026-04-03T06:34:40.801848Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m checkout waiting for idle connection: ("https", newsbleach.com)
+[2m2026-04-03T06:34:40.801900Z[0m [34mDEBUG[0m [2mreqwest::connect[0m[2m:[0m starting new connection: https://newsbleach.com/
+[2m2026-04-03T06:34:40.801913Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::connect::http[0m[2m:[0m Http::connect; scheme=Some("https"), host=Some("newsbleach.com"), port=None
+[2m2026-04-03T06:34:40.803757Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::connect::http[0m[2m:[0m connecting to 178.128.73.140:443
+[2m2026-04-03T06:34:40.841032Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::connect::http[0m[2m:[0m connected to 178.128.73.140:443
+[2m2026-04-03T06:34:40.915296Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::client[0m[2m:[0m http1 handshake complete, spawning background dispatcher task
+[2m2026-04-03T06:34:40.915416Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::client[0m[2m:[0m waiting for connection to be ready
+[2m2026-04-03T06:34:40.915443Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::client[0m[2m:[0m connection is ready
+[2m2026-04-03T06:34:40.915454Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m checkout dropped for ("https", newsbleach.com)
+[2m2026-04-03T06:34:41.185306Z[0m [35mTRACE[0m [2mreqwest::retry[0m[2m:[0m shouldn't retry!
+[2m2026-04-03T06:34:41.185444Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m put; add idle connection for ("https", newsbleach.com)
+[2m2026-04-03T06:34:41.185459Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m pooling idle connection for ("https", newsbleach.com)
+[2m2026-04-03T06:34:41.185460Z[0m [32m INFO[0m [2mwire_node_desktop[0m[2m:[0m Skipped testing/processed/qa-wander-75-circular-1773848506.md (already exists remotely)
+[2m2026-04-03T06:34:41.185473Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m pool closed, canceling idle interval
+[2m2026-04-03T06:34:41.388172Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m checkout waiting for idle connection: ("https", newsbleach.com)
+[2m2026-04-03T06:34:41.388244Z[0m [34mDEBUG[0m [2mreqwest::connect[0m[2m:[0m starting new connection: https://newsbleach.com/
+[2m2026-04-03T06:34:41.388260Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::connect::http[0m[2m:[0m Http::connect; scheme=Some("https"), host=Some("newsbleach.com"), port=None
+[2m2026-04-03T06:34:41.389432Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::connect::http[0m[2m:[0m connecting to 178.128.73.140:443
+[2m2026-04-03T06:34:41.417416Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::connect::http[0m[2m:[0m connected to 178.128.73.140:443
+[2m2026-04-03T06:34:41.834210Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::client[0m[2m:[0m http1 handshake complete, spawning background dispatcher task
+[2m2026-04-03T06:34:41.834303Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::client[0m[2m:[0m waiting for connection to be ready
+[2m2026-04-03T06:34:41.834353Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::client[0m[2m:[0m connection is ready
+[2m2026-04-03T06:34:41.834371Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m checkout dropped for ("https", newsbleach.com)
+[2m2026-04-03T06:34:42.160344Z[0m [35mTRACE[0m [2mreqwest::retry[0m[2m:[0m shouldn't retry!
+[2m2026-04-03T06:34:42.160516Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m put; add idle connection for ("https", newsbleach.com)
+[2m2026-04-03T06:34:42.160549Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m pooling idle connection for ("https", newsbleach.com)
+[2m2026-04-03T06:34:42.160550Z[0m [32m INFO[0m [2mwire_node_desktop[0m[2m:[0m Document 23557d9a-9032-4d8b-a0fc-0d462bbe8409 is published, creating new version
+[2m2026-04-03T06:34:42.160577Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m pool closed, canceling idle interval
+[2m2026-04-03T06:34:42.161100Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m checkout waiting for idle connection: ("https", newsbleach.com)
+[2m2026-04-03T06:34:42.161128Z[0m [34mDEBUG[0m [2mreqwest::connect[0m[2m:[0m starting new connection: https://newsbleach.com/
+[2m2026-04-03T06:34:42.161144Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::connect::http[0m[2m:[0m Http::connect; scheme=Some("https"), host=Some("newsbleach.com"), port=None
+[2m2026-04-03T06:34:42.163030Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::connect::http[0m[2m:[0m connecting to 178.128.73.140:443
+[2m2026-04-03T06:34:42.246113Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::connect::http[0m[2m:[0m connected to 178.128.73.140:443
+[2m2026-04-03T06:34:42.686677Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::client[0m[2m:[0m http1 handshake complete, spawning background dispatcher task
+[2m2026-04-03T06:34:42.686757Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::client[0m[2m:[0m waiting for connection to be ready
+[2m2026-04-03T06:34:42.686788Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::client[0m[2m:[0m connection is ready
+[2m2026-04-03T06:34:42.686800Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m checkout dropped for ("https", newsbleach.com)
+[2m2026-04-03T06:34:43.025182Z[0m [35mTRACE[0m [2mreqwest::retry[0m[2m:[0m shouldn't retry!
+[2m2026-04-03T06:34:43.025468Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m put; add idle connection for ("https", newsbleach.com)
+[2m2026-04-03T06:34:43.025484Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m pooling idle connection for ("https", newsbleach.com)
+[2m2026-04-03T06:34:43.025487Z[0m [33m WARN[0m [2mwire_node_desktop[0m[2m:[0m Version creation failed for 23557d9a-9032-4d8b-a0fc-0d462bbe8409: Version creation failed (500 Internal Server Error): {"error":"Failed to create document version"}
+[2m2026-04-03T06:34:43.025513Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m pool closed, canceling idle interval
+[2m2026-04-03T06:34:43.025958Z[0m [32m INFO[0m [2mwire_node_desktop[0m[2m:[0m Syncing folder /Users/adamlevine/AI Project Files/agent-wire-node -> corpus agent-wire-node-repo (Upload)
+[2m2026-04-03T06:34:43.026394Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m checkout waiting for idle connection: ("https", newsbleach.com)
+[2m2026-04-03T06:34:43.026415Z[0m [34mDEBUG[0m [2mreqwest::connect[0m[2m:[0m starting new connection: https://newsbleach.com/
+[2m2026-04-03T06:34:43.026430Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::connect::http[0m[2m:[0m Http::connect; scheme=Some("https"), host=Some("newsbleach.com"), port=None
+[2m2026-04-03T06:34:43.028098Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::connect::http[0m[2m:[0m connecting to 178.128.73.140:443
+[2m2026-04-03T06:34:43.063194Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::connect::http[0m[2m:[0m connected to 178.128.73.140:443
+[2m2026-04-03T06:34:43.137135Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::client[0m[2m:[0m http1 handshake complete, spawning background dispatcher task
+[2m2026-04-03T06:34:43.137242Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::client[0m[2m:[0m waiting for connection to be ready
+[2m2026-04-03T06:34:43.137267Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::client[0m[2m:[0m connection is ready
+[2m2026-04-03T06:34:43.137281Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m checkout dropped for ("https", newsbleach.com)
+[2m2026-04-03T06:34:44.825307Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m Conn::read_head
+[2m2026-04-03T06:34:44.825390Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m flushed({role=server}): State { reading: Init, writing: Init, keep_alive: Busy }
+[2m2026-04-03T06:34:44.827954Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m Conn::read_head
+[2m2026-04-03T06:34:44.828019Z[0m [35mTRACE[0m [2mhyper::proto::h1::io[0m[2m:[0m received 282 bytes
+[2m2026-04-03T06:34:44.828037Z[0m [35mTRACE[0m [1mparse_headers[0m[2m:[0m [2mhyper::proto::h1::role[0m[2m:[0m Request.parse [3mbytes[0m[2m=[0m282
+[2m2026-04-03T06:34:44.828056Z[0m [35mTRACE[0m [1mparse_headers[0m[2m:[0m [2mhyper::proto::h1::role[0m[2m:[0m Request.parse Complete(282)
+[2m2026-04-03T06:34:44.828085Z[0m [34mDEBUG[0m [2mhyper::proto::h1::io[0m[2m:[0m parsed 9 headers
+[2m2026-04-03T06:34:44.828090Z[0m [34mDEBUG[0m [2mhyper::proto::h1::conn[0m[2m:[0m incoming body is empty
+[2m2026-04-03T06:34:44.828103Z[0m [35mTRACE[0m [2mwarp::filters::method[0m[2m:[0m method::OPTIONS?: GET
+[2m2026-04-03T06:34:44.828124Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:44.828136Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:44.828142Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:44.828150Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:44.828155Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:34:44.828161Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:44.828166Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:44.828171Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:34:44.828175Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:44.828180Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:44.828242Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:34:44.828302Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:44.828316Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:44.828322Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:34:44.828329Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:44.828355Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:44.828361Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:34:44.828365Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:44.828369Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:44.828373Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:34:44.828379Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:44.828385Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:44.828389Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:34:44.828394Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:44.828399Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:44.828403Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:34:44.828407Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:44.828413Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:44.828417Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:34:44.828422Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:44.828427Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:44.828430Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "crystallize"?: "build"
+[2m2026-04-03T06:34:44.828434Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:44.828440Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:44.828443Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "crystallize"?: "build"
+[2m2026-04-03T06:34:44.828447Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:44.828451Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "chain"?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:44.828456Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:44.828460Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "remote-query"?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:44.828465Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:44.828469Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "slugs"?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:44.828473Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:44.828477Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "slugs"?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:44.828481Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:44.828486Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:44.828489Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "build"?: "build"
+[2m2026-04-03T06:34:44.828493Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "status"?: "status"
+[2m2026-04-03T06:34:44.828497Z[0m [35mTRACE[0m [2mwarp::filters::method[0m[2m:[0m method::GET?: GET
+[2m2026-04-03T06:34:44.828502Z[0m [35mTRACE[0m [2mwarp::filters::header[0m[2m:[0m optional("authorization")
+[2m2026-04-03T06:34:44.828531Z[0m [35mTRACE[0m [1mencode_headers[0m[2m:[0m [2mhyper::proto::h1::role[0m[2m:[0m Server::encode status=200, body=Some(Known(109)), req_method=Some(GET)
+[2m2026-04-03T06:34:44.828543Z[0m [35mTRACE[0m [2mhyper::proto::h1::io[0m[2m:[0m buffer.queue [3mself.len[0m[2m=[0m109 [3mbuf.len[0m[2m=[0m109
+[2m2026-04-03T06:34:44.828564Z[0m [34mDEBUG[0m [2mhyper::proto::h1::io[0m[2m:[0m flushed 218 bytes
+[2m2026-04-03T06:34:44.828573Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m flushed({role=server}): State { reading: Init, writing: Init, keep_alive: Idle }
+[2m2026-04-03T06:34:44.833718Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m Conn::read_head
+[2m2026-04-03T06:34:44.833819Z[0m [35mTRACE[0m [2mhyper::proto::h1::io[0m[2m:[0m received 0 bytes
+[2m2026-04-03T06:34:44.833827Z[0m [35mTRACE[0m [2mhyper::proto::h1::io[0m[2m:[0m parse eof
+[2m2026-04-03T06:34:44.833837Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m State::close_read()
+[2m2026-04-03T06:34:44.833842Z[0m [34mDEBUG[0m [2mhyper::proto::h1::conn[0m[2m:[0m read eof
+[2m2026-04-03T06:34:44.833849Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m State::close_write()
+[2m2026-04-03T06:34:44.833857Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m State::close_read()
+[2m2026-04-03T06:34:44.833861Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m State::close_write()
+[2m2026-04-03T06:34:44.833868Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m flushed({role=server}): State { reading: Closed, writing: Closed, keep_alive: Disabled }
+[2m2026-04-03T06:34:44.833900Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m shut down IO complete
+[2m2026-04-03T06:34:45.083504Z[0m [35mTRACE[0m [2mreqwest::retry[0m[2m:[0m shouldn't retry!
+[2m2026-04-03T06:34:45.153143Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m put; add idle connection for ("https", newsbleach.com)
+[2m2026-04-03T06:34:45.153274Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m pooling idle connection for ("https", newsbleach.com)
+[2m2026-04-03T06:34:45.153414Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m take? ("https", newsbleach.com): expiration = Some(90s)
+[2m2026-04-03T06:34:45.153435Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m reuse idle connection for ("https", newsbleach.com)
+[2m2026-04-03T06:34:46.510787Z[0m [35mTRACE[0m [2mreqwest::retry[0m[2m:[0m shouldn't retry!
+[2m2026-04-03T06:34:46.576431Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m put; add idle connection for ("https", newsbleach.com)
+[2m2026-04-03T06:34:46.576503Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m pooling idle connection for ("https", newsbleach.com)
+[2m2026-04-03T06:34:46.576593Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m take? ("https", newsbleach.com): expiration = Some(90s)
+[2m2026-04-03T06:34:46.576614Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m reuse idle connection for ("https", newsbleach.com)
+[2m2026-04-03T06:34:48.053282Z[0m [35mTRACE[0m [2mreqwest::retry[0m[2m:[0m shouldn't retry!
+[2m2026-04-03T06:34:48.121544Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m put; add idle connection for ("https", newsbleach.com)
+[2m2026-04-03T06:34:48.121662Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m pooling idle connection for ("https", newsbleach.com)
+[2m2026-04-03T06:34:48.121791Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m take? ("https", newsbleach.com): expiration = Some(90s)
+[2m2026-04-03T06:34:48.121833Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m reuse idle connection for ("https", newsbleach.com)
+[2m2026-04-03T06:34:49.485177Z[0m [35mTRACE[0m [2mreqwest::retry[0m[2m:[0m shouldn't retry!
+[2m2026-04-03T06:34:49.555207Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m put; add idle connection for ("https", newsbleach.com)
+[2m2026-04-03T06:34:49.555310Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m pooling idle connection for ("https", newsbleach.com)
+[2m2026-04-03T06:34:49.555416Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m take? ("https", newsbleach.com): expiration = Some(90s)
+[2m2026-04-03T06:34:49.555441Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m reuse idle connection for ("https", newsbleach.com)
+[2m2026-04-03T06:34:49.959048Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m Conn::read_head
+[2m2026-04-03T06:34:49.959154Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m flushed({role=server}): State { reading: Init, writing: Init, keep_alive: Busy }
+[2m2026-04-03T06:34:49.961858Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m Conn::read_head
+[2m2026-04-03T06:34:49.961961Z[0m [35mTRACE[0m [2mhyper::proto::h1::io[0m[2m:[0m received 282 bytes
+[2m2026-04-03T06:34:49.961982Z[0m [35mTRACE[0m [1mparse_headers[0m[2m:[0m [2mhyper::proto::h1::role[0m[2m:[0m Request.parse [3mbytes[0m[2m=[0m282
+[2m2026-04-03T06:34:49.962002Z[0m [35mTRACE[0m [1mparse_headers[0m[2m:[0m [2mhyper::proto::h1::role[0m[2m:[0m Request.parse Complete(282)
+[2m2026-04-03T06:34:49.962025Z[0m [34mDEBUG[0m [2mhyper::proto::h1::io[0m[2m:[0m parsed 9 headers
+[2m2026-04-03T06:34:49.962031Z[0m [34mDEBUG[0m [2mhyper::proto::h1::conn[0m[2m:[0m incoming body is empty
+[2m2026-04-03T06:34:49.962045Z[0m [35mTRACE[0m [2mwarp::filters::method[0m[2m:[0m method::OPTIONS?: GET
+[2m2026-04-03T06:34:49.962064Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:49.962073Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:49.962078Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:49.962087Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:49.962091Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:34:49.962097Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:49.962102Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:49.962106Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:34:49.962110Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:49.962114Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:49.962118Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:34:49.962123Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:49.962128Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:49.962132Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:34:49.962136Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:49.962140Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:49.962144Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:34:49.962148Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:49.962152Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:49.962156Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:34:49.962160Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:49.962164Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:49.962168Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:34:49.962172Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:49.962176Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:49.962194Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:34:49.962198Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:49.962203Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:49.962207Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:34:49.962212Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:49.962216Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:49.962220Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "crystallize"?: "build"
+[2m2026-04-03T06:34:49.962224Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:49.962228Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:49.962232Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "crystallize"?: "build"
+[2m2026-04-03T06:34:49.962236Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:49.962240Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "chain"?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:49.962244Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:49.962250Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "remote-query"?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:49.962256Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:49.962261Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "slugs"?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:49.962265Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:49.962270Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "slugs"?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:49.962275Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:49.962279Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:49.962283Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "build"?: "build"
+[2m2026-04-03T06:34:49.962287Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "status"?: "status"
+[2m2026-04-03T06:34:49.962291Z[0m [35mTRACE[0m [2mwarp::filters::method[0m[2m:[0m method::GET?: GET
+[2m2026-04-03T06:34:49.962295Z[0m [35mTRACE[0m [2mwarp::filters::header[0m[2m:[0m optional("authorization")
+[2m2026-04-03T06:34:49.962328Z[0m [35mTRACE[0m [1mencode_headers[0m[2m:[0m [2mhyper::proto::h1::role[0m[2m:[0m Server::encode status=200, body=Some(Known(109)), req_method=Some(GET)
+[2m2026-04-03T06:34:49.962340Z[0m [35mTRACE[0m [2mhyper::proto::h1::io[0m[2m:[0m buffer.queue [3mself.len[0m[2m=[0m109 [3mbuf.len[0m[2m=[0m109
+[2m2026-04-03T06:34:49.962379Z[0m [34mDEBUG[0m [2mhyper::proto::h1::io[0m[2m:[0m flushed 218 bytes
+[2m2026-04-03T06:34:49.962388Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m flushed({role=server}): State { reading: Init, writing: Init, keep_alive: Idle }
+[2m2026-04-03T06:34:49.967560Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m Conn::read_head
+[2m2026-04-03T06:34:49.967670Z[0m [35mTRACE[0m [2mhyper::proto::h1::io[0m[2m:[0m received 0 bytes
+[2m2026-04-03T06:34:49.967680Z[0m [35mTRACE[0m [2mhyper::proto::h1::io[0m[2m:[0m parse eof
+[2m2026-04-03T06:34:49.967690Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m State::close_read()
+[2m2026-04-03T06:34:49.967695Z[0m [34mDEBUG[0m [2mhyper::proto::h1::conn[0m[2m:[0m read eof
+[2m2026-04-03T06:34:49.967699Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m State::close_write()
+[2m2026-04-03T06:34:49.967705Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m State::close_read()
+[2m2026-04-03T06:34:49.967708Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m State::close_write()
+[2m2026-04-03T06:34:49.967713Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m flushed({role=server}): State { reading: Closed, writing: Closed, keep_alive: Disabled }
+[2m2026-04-03T06:34:49.967741Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m shut down IO complete
+[2m2026-04-03T06:34:50.707373Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m checkout waiting for idle connection: ("https", newsbleach.com)
+[2m2026-04-03T06:34:50.707484Z[0m [34mDEBUG[0m [2mreqwest::connect[0m[2m:[0m starting new connection: https://newsbleach.com/
+[2m2026-04-03T06:34:50.707503Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::connect::http[0m[2m:[0m Http::connect; scheme=Some("https"), host=Some("newsbleach.com"), port=None
+[2m2026-04-03T06:34:50.710024Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::connect::http[0m[2m:[0m connecting to 178.128.73.140:443
+[2m2026-04-03T06:34:50.749628Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::connect::http[0m[2m:[0m connected to 178.128.73.140:443
+[2m2026-04-03T06:34:50.780929Z[0m [35mTRACE[0m [2mreqwest::retry[0m[2m:[0m shouldn't retry!
+[2m2026-04-03T06:34:50.818396Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::client[0m[2m:[0m http1 handshake complete, spawning background dispatcher task
+[2m2026-04-03T06:34:50.818504Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::client[0m[2m:[0m waiting for connection to be ready
+[2m2026-04-03T06:34:50.818517Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::client[0m[2m:[0m connection is ready
+[2m2026-04-03T06:34:50.818536Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m checkout dropped for ("https", newsbleach.com)
+[2m2026-04-03T06:34:50.846531Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m put; add idle connection for ("https", newsbleach.com)
+[2m2026-04-03T06:34:50.846636Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m pooling idle connection for ("https", newsbleach.com)
+[2m2026-04-03T06:34:50.846730Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m take? ("https", newsbleach.com): expiration = Some(90s)
+[2m2026-04-03T06:34:50.846764Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m reuse idle connection for ("https", newsbleach.com)
+[2m2026-04-03T06:34:50.888950Z[0m [35mTRACE[0m [2mreqwest::retry[0m[2m:[0m shouldn't retry!
+[2m2026-04-03T06:34:50.889028Z[0m [34mDEBUG[0m [2mwire_node_lib::messaging[0m[2m:[0m Messages endpoint returned 404 — not yet available
+[2m2026-04-03T06:34:50.889105Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m pool dropped, dropping pooled (("https", newsbleach.com))
+[2m2026-04-03T06:34:52.287631Z[0m [35mTRACE[0m [2mreqwest::retry[0m[2m:[0m shouldn't retry!
+[2m2026-04-03T06:34:52.350752Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m put; add idle connection for ("https", newsbleach.com)
+[2m2026-04-03T06:34:52.350810Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m pooling idle connection for ("https", newsbleach.com)
+[2m2026-04-03T06:34:52.350930Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m take? ("https", newsbleach.com): expiration = Some(90s)
+[2m2026-04-03T06:34:52.350961Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m reuse idle connection for ("https", newsbleach.com)
+[2m2026-04-03T06:34:53.889360Z[0m [35mTRACE[0m [2mreqwest::retry[0m[2m:[0m shouldn't retry!
+[2m2026-04-03T06:34:53.959817Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m put; add idle connection for ("https", newsbleach.com)
+[2m2026-04-03T06:34:53.959952Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m pooling idle connection for ("https", newsbleach.com)
+[2m2026-04-03T06:34:53.960108Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m take? ("https", newsbleach.com): expiration = Some(90s)
+[2m2026-04-03T06:34:53.960129Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m reuse idle connection for ("https", newsbleach.com)
+[2m2026-04-03T06:34:55.097008Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m Conn::read_head
+[2m2026-04-03T06:34:55.097117Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m flushed({role=server}): State { reading: Init, writing: Init, keep_alive: Busy }
+[2m2026-04-03T06:34:55.099998Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m Conn::read_head
+[2m2026-04-03T06:34:55.100061Z[0m [35mTRACE[0m [2mhyper::proto::h1::io[0m[2m:[0m received 282 bytes
+[2m2026-04-03T06:34:55.100077Z[0m [35mTRACE[0m [1mparse_headers[0m[2m:[0m [2mhyper::proto::h1::role[0m[2m:[0m Request.parse [3mbytes[0m[2m=[0m282
+[2m2026-04-03T06:34:55.100088Z[0m [35mTRACE[0m [1mparse_headers[0m[2m:[0m [2mhyper::proto::h1::role[0m[2m:[0m Request.parse Complete(282)
+[2m2026-04-03T06:34:55.100101Z[0m [34mDEBUG[0m [2mhyper::proto::h1::io[0m[2m:[0m parsed 9 headers
+[2m2026-04-03T06:34:55.100106Z[0m [34mDEBUG[0m [2mhyper::proto::h1::conn[0m[2m:[0m incoming body is empty
+[2m2026-04-03T06:34:55.100115Z[0m [35mTRACE[0m [2mwarp::filters::method[0m[2m:[0m method::OPTIONS?: GET
+[2m2026-04-03T06:34:55.100142Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:55.100158Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:55.100164Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:55.100172Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:55.100176Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:34:55.100183Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:55.100190Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:55.100194Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:34:55.100199Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:55.100205Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:55.100209Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:34:55.100213Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:55.100218Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:55.100222Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:34:55.100227Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:55.100231Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:55.100236Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:34:55.100240Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:55.100245Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:55.100249Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:34:55.100255Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:55.100260Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:55.100264Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:34:55.100270Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:55.100274Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:55.100279Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:34:55.100284Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:55.100291Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:55.100295Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:34:55.100301Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:55.100305Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:55.100310Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "crystallize"?: "build"
+[2m2026-04-03T06:34:55.100315Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:55.100321Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:55.100325Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "crystallize"?: "build"
+[2m2026-04-03T06:34:55.100330Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:55.100335Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "chain"?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:55.100340Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:55.100347Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "remote-query"?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:55.100353Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:55.100359Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "slugs"?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:55.100363Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:55.100368Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "slugs"?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:55.100373Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:34:55.100378Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:34:55.100382Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "build"?: "build"
+[2m2026-04-03T06:34:55.100386Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "status"?: "status"
+[2m2026-04-03T06:34:55.100391Z[0m [35mTRACE[0m [2mwarp::filters::method[0m[2m:[0m method::GET?: GET
+[2m2026-04-03T06:34:55.100397Z[0m [35mTRACE[0m [2mwarp::filters::header[0m[2m:[0m optional("authorization")
+[2m2026-04-03T06:34:55.100433Z[0m [35mTRACE[0m [1mencode_headers[0m[2m:[0m [2mhyper::proto::h1::role[0m[2m:[0m Server::encode status=200, body=Some(Known(109)), req_method=Some(GET)
+[2m2026-04-03T06:34:55.100459Z[0m [35mTRACE[0m [2mhyper::proto::h1::io[0m[2m:[0m buffer.queue [3mself.len[0m[2m=[0m109 [3mbuf.len[0m[2m=[0m109
+[2m2026-04-03T06:34:55.100497Z[0m [34mDEBUG[0m [2mhyper::proto::h1::io[0m[2m:[0m flushed 218 bytes
+[2m2026-04-03T06:34:55.100509Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m flushed({role=server}): State { reading: Init, writing: Init, keep_alive: Idle }
+[2m2026-04-03T06:34:55.106622Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m Conn::read_head
+[2m2026-04-03T06:34:55.106742Z[0m [35mTRACE[0m [2mhyper::proto::h1::io[0m[2m:[0m received 0 bytes
+[2m2026-04-03T06:34:55.106753Z[0m [35mTRACE[0m [2mhyper::proto::h1::io[0m[2m:[0m parse eof
+[2m2026-04-03T06:34:55.106765Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m State::close_read()
+[2m2026-04-03T06:34:55.106771Z[0m [34mDEBUG[0m [2mhyper::proto::h1::conn[0m[2m:[0m read eof
+[2m2026-04-03T06:34:55.106775Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m State::close_write()
+[2m2026-04-03T06:34:55.106782Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m State::close_read()
+[2m2026-04-03T06:34:55.106796Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m State::close_write()
+[2m2026-04-03T06:34:55.106801Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m flushed({role=server}): State { reading: Closed, writing: Closed, keep_alive: Disabled }
+[2m2026-04-03T06:34:55.106841Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m shut down IO complete
+[2m2026-04-03T06:34:55.306104Z[0m [35mTRACE[0m [2mreqwest::retry[0m[2m:[0m shouldn't retry!
+[2m2026-04-03T06:34:55.381531Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m put; add idle connection for ("https", newsbleach.com)
+[2m2026-04-03T06:34:55.381580Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m pooling idle connection for ("https", newsbleach.com)
+[2m2026-04-03T06:34:55.381692Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m take? ("https", newsbleach.com): expiration = Some(90s)
+[2m2026-04-03T06:34:55.381716Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m reuse idle connection for ("https", newsbleach.com)
+[2m2026-04-03T06:34:56.648350Z[0m [35mTRACE[0m [2mreqwest::retry[0m[2m:[0m shouldn't retry!
+[2m2026-04-03T06:34:56.716588Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m put; add idle connection for ("https", newsbleach.com)
+[2m2026-04-03T06:34:56.716717Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m pooling idle connection for ("https", newsbleach.com)
+[2m2026-04-03T06:34:56.716848Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m take? ("https", newsbleach.com): expiration = Some(90s)
+[2m2026-04-03T06:34:56.716881Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m reuse idle connection for ("https", newsbleach.com)
+[2m2026-04-03T06:34:56.722628Z[0m [35mTRACE[0m [2mreqwest::retry[0m[2m:[0m shouldn't retry!
+[2m2026-04-03T06:34:56.722757Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m put; add idle connection for ("https", newsbleach.com)
+[2m2026-04-03T06:34:56.722771Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m pooling idle connection for ("https", newsbleach.com)
+[2m2026-04-03T06:34:56.722817Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m pool closed, canceling idle interval
+[2m2026-04-03T06:34:58.296954Z[0m [35mTRACE[0m [2mreqwest::retry[0m[2m:[0m shouldn't retry!
+[2m2026-04-03T06:34:58.364024Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m put; add idle connection for ("https", newsbleach.com)
+[2m2026-04-03T06:34:58.364112Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m pooling idle connection for ("https", newsbleach.com)
+[2m2026-04-03T06:34:58.364222Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m take? ("https", newsbleach.com): expiration = Some(90s)
+[2m2026-04-03T06:34:58.364258Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m reuse idle connection for ("https", newsbleach.com)
+[2m2026-04-03T06:35:00.203326Z[0m [35mTRACE[0m [2mreqwest::retry[0m[2m:[0m shouldn't retry!
+[2m2026-04-03T06:35:00.245495Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m Conn::read_head
+[2m2026-04-03T06:35:00.245540Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m flushed({role=server}): State { reading: Init, writing: Init, keep_alive: Busy }
+[2m2026-04-03T06:35:00.248536Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m Conn::read_head
+[2m2026-04-03T06:35:00.248612Z[0m [35mTRACE[0m [2mhyper::proto::h1::io[0m[2m:[0m received 282 bytes
+[2m2026-04-03T06:35:00.248640Z[0m [35mTRACE[0m [1mparse_headers[0m[2m:[0m [2mhyper::proto::h1::role[0m[2m:[0m Request.parse [3mbytes[0m[2m=[0m282
+[2m2026-04-03T06:35:00.248652Z[0m [35mTRACE[0m [1mparse_headers[0m[2m:[0m [2mhyper::proto::h1::role[0m[2m:[0m Request.parse Complete(282)
+[2m2026-04-03T06:35:00.248669Z[0m [34mDEBUG[0m [2mhyper::proto::h1::io[0m[2m:[0m parsed 9 headers
+[2m2026-04-03T06:35:00.248676Z[0m [34mDEBUG[0m [2mhyper::proto::h1::conn[0m[2m:[0m incoming body is empty
+[2m2026-04-03T06:35:00.248685Z[0m [35mTRACE[0m [2mwarp::filters::method[0m[2m:[0m method::OPTIONS?: GET
+[2m2026-04-03T06:35:00.248698Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:35:00.248706Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "vibesmithy-exp1"
+[2m2026-04-03T06:35:00.248712Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:35:00.248719Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:35:00.248723Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:35:00.248730Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:35:00.248735Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:35:00.248739Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:35:00.248744Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:35:00.248748Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:35:00.248753Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:35:00.248757Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:35:00.248762Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:35:00.248766Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:35:00.248771Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:35:00.248775Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:35:00.248779Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:35:00.248784Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:35:00.248788Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:35:00.248793Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:35:00.248797Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:35:00.248802Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:35:00.248806Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:35:00.248811Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:35:00.248815Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:35:00.248819Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:35:00.248824Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:35:00.248829Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:35:00.248833Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:35:00.248837Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:35:00.248842Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:35:00.248846Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "crystallize"?: "build"
+[2m2026-04-03T06:35:00.248851Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:35:00.248856Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:35:00.248860Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "crystallize"?: "build"
+[2m2026-04-03T06:35:00.248865Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:35:00.248869Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "chain"?: "vibesmithy-exp1"
+[2m2026-04-03T06:35:00.248874Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:35:00.248879Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "remote-query"?: "vibesmithy-exp1"
+[2m2026-04-03T06:35:00.248885Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:35:00.248889Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "slugs"?: "vibesmithy-exp1"
+[2m2026-04-03T06:35:00.248894Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:35:00.248898Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "slugs"?: "vibesmithy-exp1"
+[2m2026-04-03T06:35:00.248903Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:35:00.248908Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:35:00.248912Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "build"?: "build"
+[2m2026-04-03T06:35:00.248916Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "status"?: "status"
+[2m2026-04-03T06:35:00.248925Z[0m [35mTRACE[0m [2mwarp::filters::method[0m[2m:[0m method::GET?: GET
+[2m2026-04-03T06:35:00.248929Z[0m [35mTRACE[0m [2mwarp::filters::header[0m[2m:[0m optional("authorization")
+[2m2026-04-03T06:35:00.248946Z[0m [35mTRACE[0m [1mencode_headers[0m[2m:[0m [2mhyper::proto::h1::role[0m[2m:[0m Server::encode status=200, body=Some(Known(109)), req_method=Some(GET)
+[2m2026-04-03T06:35:00.248956Z[0m [35mTRACE[0m [2mhyper::proto::h1::io[0m[2m:[0m buffer.queue [3mself.len[0m[2m=[0m109 [3mbuf.len[0m[2m=[0m109
+[2m2026-04-03T06:35:00.248995Z[0m [34mDEBUG[0m [2mhyper::proto::h1::io[0m[2m:[0m flushed 218 bytes
+[2m2026-04-03T06:35:00.249002Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m flushed({role=server}): State { reading: Init, writing: Init, keep_alive: Idle }
+[2m2026-04-03T06:35:00.254946Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m Conn::read_head
+[2m2026-04-03T06:35:00.255031Z[0m [35mTRACE[0m [2mhyper::proto::h1::io[0m[2m:[0m received 0 bytes
+[2m2026-04-03T06:35:00.255039Z[0m [35mTRACE[0m [2mhyper::proto::h1::io[0m[2m:[0m parse eof
+[2m2026-04-03T06:35:00.255046Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m State::close_read()
+[2m2026-04-03T06:35:00.255051Z[0m [34mDEBUG[0m [2mhyper::proto::h1::conn[0m[2m:[0m read eof
+[2m2026-04-03T06:35:00.255056Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m State::close_write()
+[2m2026-04-03T06:35:00.255062Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m State::close_read()
+[2m2026-04-03T06:35:00.255066Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m State::close_write()
+[2m2026-04-03T06:35:00.255071Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m flushed({role=server}): State { reading: Closed, writing: Closed, keep_alive: Disabled }
+[2m2026-04-03T06:35:00.255111Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m shut down IO complete
+[2m2026-04-03T06:35:00.271123Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m put; add idle connection for ("https", newsbleach.com)
+[2m2026-04-03T06:35:00.271193Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m pooling idle connection for ("https", newsbleach.com)
+[2m2026-04-03T06:35:00.271318Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m take? ("https", newsbleach.com): expiration = Some(90s)
+[2m2026-04-03T06:35:00.271347Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m reuse idle connection for ("https", newsbleach.com)
+[2m2026-04-03T06:35:01.725484Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m checkout waiting for idle connection: ("https", newsbleach.com)
+[2m2026-04-03T06:35:01.725583Z[0m [34mDEBUG[0m [2mreqwest::connect[0m[2m:[0m starting new connection: https://newsbleach.com/
+[2m2026-04-03T06:35:01.725599Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::connect::http[0m[2m:[0m Http::connect; scheme=Some("https"), host=Some("newsbleach.com"), port=None
+[2m2026-04-03T06:35:01.727701Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::connect::http[0m[2m:[0m connecting to 178.128.73.140:443
+[2m2026-04-03T06:35:01.767384Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::connect::http[0m[2m:[0m connected to 178.128.73.140:443
+[2m2026-04-03T06:35:01.865790Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::client[0m[2m:[0m http1 handshake complete, spawning background dispatcher task
+[2m2026-04-03T06:35:01.865862Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::client[0m[2m:[0m waiting for connection to be ready
+[2m2026-04-03T06:35:01.865884Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::client[0m[2m:[0m connection is ready
+[2m2026-04-03T06:35:01.865894Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m checkout dropped for ("https", newsbleach.com)
+[2m2026-04-03T06:35:02.455060Z[0m [35mTRACE[0m [2mreqwest::retry[0m[2m:[0m shouldn't retry!
+[2m2026-04-03T06:35:02.535681Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m put; add idle connection for ("https", newsbleach.com)
+[2m2026-04-03T06:35:02.535785Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m pooling idle connection for ("https", newsbleach.com)
+[2m2026-04-03T06:35:02.535948Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m take? ("https", newsbleach.com): expiration = Some(90s)
+[2m2026-04-03T06:35:02.535997Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m reuse idle connection for ("https", newsbleach.com)
+[2m2026-04-03T06:35:04.609455Z[0m [35mTRACE[0m [2mreqwest::retry[0m[2m:[0m shouldn't retry!
+[2m2026-04-03T06:35:04.677589Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m put; add idle connection for ("https", newsbleach.com)
+[2m2026-04-03T06:35:04.677666Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m pooling idle connection for ("https", newsbleach.com)
+[2m2026-04-03T06:35:04.677900Z[0m [35mTRACE[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m take? ("https", newsbleach.com): expiration = Some(90s)
+[2m2026-04-03T06:35:04.677966Z[0m [34mDEBUG[0m [2mhyper_util::client::legacy::pool[0m[2m:[0m reuse idle connection for ("https", newsbleach.com)
+[2m2026-04-03T06:35:05.397455Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m Conn::read_head
+[2m2026-04-03T06:35:05.397544Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m flushed({role=server}): State { reading: Init, writing: Init, keep_alive: Busy }
+[2m2026-04-03T06:35:05.399764Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m Conn::read_head
+[2m2026-04-03T06:35:05.399820Z[0m [35mTRACE[0m [2mhyper::proto::h1::io[0m[2m:[0m received 282 bytes
+[2m2026-04-03T06:35:05.399849Z[0m [35mTRACE[0m [1mparse_headers[0m[2m:[0m [2mhyper::proto::h1::role[0m[2m:[0m Request.parse [3mbytes[0m[2m=[0m282
+[2m2026-04-03T06:35:05.399878Z[0m [35mTRACE[0m [1mparse_headers[0m[2m:[0m [2mhyper::proto::h1::role[0m[2m:[0m Request.parse Complete(282)
+[2m2026-04-03T06:35:05.399913Z[0m [34mDEBUG[0m [2mhyper::proto::h1::io[0m[2m:[0m parsed 9 headers
+[2m2026-04-03T06:35:05.399939Z[0m [34mDEBUG[0m [2mhyper::proto::h1::conn[0m[2m:[0m incoming body is empty
+[2m2026-04-03T06:35:05.399963Z[0m [35mTRACE[0m [2mwarp::filters::method[0m[2m:[0m method::OPTIONS?: GET
+[2m2026-04-03T06:35:05.399991Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:35:05.400017Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "vibesmithy-exp1"
+[2m2026-04-03T06:35:05.400037Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:35:05.400065Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:35:05.400084Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:35:05.400104Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:35:05.400125Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:35:05.400143Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:35:05.400161Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:35:05.400180Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:35:05.400198Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:35:05.400217Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:35:05.400236Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:35:05.400255Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:35:05.400272Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:35:05.400290Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:35:05.400309Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:35:05.400327Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:35:05.400345Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:35:05.400363Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:35:05.400381Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:35:05.400399Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:35:05.400417Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:35:05.400437Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:35:05.400457Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:35:05.400475Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:35:05.400493Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:35:05.400512Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:35:05.400530Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:35:05.400550Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:35:05.400569Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:35:05.400587Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "crystallize"?: "build"
+[2m2026-04-03T06:35:05.400605Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:35:05.400624Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:35:05.400642Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "crystallize"?: "build"
+[2m2026-04-03T06:35:05.400660Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:35:05.400679Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "chain"?: "vibesmithy-exp1"
+[2m2026-04-03T06:35:05.400698Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:35:05.400718Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "remote-query"?: "vibesmithy-exp1"
+[2m2026-04-03T06:35:05.400739Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:35:05.400758Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "slugs"?: "vibesmithy-exp1"
+[2m2026-04-03T06:35:05.400776Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:35:05.400795Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "slugs"?: "vibesmithy-exp1"
+[2m2026-04-03T06:35:05.400814Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:35:05.400832Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:35:05.400850Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "build"?: "build"
+[2m2026-04-03T06:35:05.400868Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "status"?: "status"
+[2m2026-04-03T06:35:05.400886Z[0m [35mTRACE[0m [2mwarp::filters::method[0m[2m:[0m method::GET?: GET
+[2m2026-04-03T06:35:05.400904Z[0m [35mTRACE[0m [2mwarp::filters::header[0m[2m:[0m optional("authorization")
+[2m2026-04-03T06:35:05.400947Z[0m [35mTRACE[0m [1mencode_headers[0m[2m:[0m [2mhyper::proto::h1::role[0m[2m:[0m Server::encode status=200, body=Some(Known(109)), req_method=Some(GET)
+[2m2026-04-03T06:35:05.400979Z[0m [35mTRACE[0m [2mhyper::proto::h1::io[0m[2m:[0m buffer.queue [3mself.len[0m[2m=[0m109 [3mbuf.len[0m[2m=[0m109
+[2m2026-04-03T06:35:05.401029Z[0m [34mDEBUG[0m [2mhyper::proto::h1::io[0m[2m:[0m flushed 218 bytes
+[2m2026-04-03T06:35:05.401052Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m flushed({role=server}): State { reading: Init, writing: Init, keep_alive: Idle }
+[2m2026-04-03T06:35:05.405731Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m Conn::read_head
+[2m2026-04-03T06:35:05.405785Z[0m [35mTRACE[0m [2mhyper::proto::h1::io[0m[2m:[0m received 0 bytes
+[2m2026-04-03T06:35:05.405805Z[0m [35mTRACE[0m [2mhyper::proto::h1::io[0m[2m:[0m parse eof
+[2m2026-04-03T06:35:05.405829Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m State::close_read()
+[2m2026-04-03T06:35:05.405846Z[0m [34mDEBUG[0m [2mhyper::proto::h1::conn[0m[2m:[0m read eof
+[2m2026-04-03T06:35:05.405863Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m State::close_write()
+[2m2026-04-03T06:35:05.405881Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m State::close_read()
+[2m2026-04-03T06:35:05.405899Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m State::close_write()
+[2m2026-04-03T06:35:05.405917Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m flushed({role=server}): State { reading: Closed, writing: Closed, keep_alive: Disabled }
+[2m2026-04-03T06:35:05.405952Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m shut down IO complete
+[2m2026-04-03T06:35:10.536445Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m Conn::read_head
+[2m2026-04-03T06:35:10.536655Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m flushed({role=server}): State { reading: Init, writing: Init, keep_alive: Busy }
+[2m2026-04-03T06:35:10.539571Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m Conn::read_head
+[2m2026-04-03T06:35:10.539636Z[0m [35mTRACE[0m [2mhyper::proto::h1::io[0m[2m:[0m received 282 bytes
+[2m2026-04-03T06:35:10.539665Z[0m [35mTRACE[0m [1mparse_headers[0m[2m:[0m [2mhyper::proto::h1::role[0m[2m:[0m Request.parse [3mbytes[0m[2m=[0m282
+[2m2026-04-03T06:35:10.539698Z[0m [35mTRACE[0m [1mparse_headers[0m[2m:[0m [2mhyper::proto::h1::role[0m[2m:[0m Request.parse Complete(282)
+[2m2026-04-03T06:35:10.539758Z[0m [34mDEBUG[0m [2mhyper::proto::h1::io[0m[2m:[0m parsed 9 headers
+[2m2026-04-03T06:35:10.539789Z[0m [34mDEBUG[0m [2mhyper::proto::h1::conn[0m[2m:[0m incoming body is empty
+[2m2026-04-03T06:35:10.539827Z[0m [35mTRACE[0m [2mwarp::filters::method[0m[2m:[0m method::OPTIONS?: GET
+[2m2026-04-03T06:35:10.539878Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:35:10.539918Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "vibesmithy-exp1"
+[2m2026-04-03T06:35:10.539946Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:35:10.539976Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:35:10.540003Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:35:10.540033Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:35:10.540062Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:35:10.540102Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:35:10.540129Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:35:10.540158Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:35:10.540184Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:35:10.540213Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:35:10.540242Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:35:10.540269Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:35:10.540296Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:35:10.540324Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:35:10.540350Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:35:10.540378Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:35:10.540406Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:35:10.540433Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:35:10.540459Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:35:10.540488Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:35:10.540538Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:35:10.540657Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:35:10.540704Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:35:10.540739Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:35:10.540769Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:35:10.540800Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:35:10.540829Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "vine"?: "build"
+[2m2026-04-03T06:35:10.540869Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:35:10.540900Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:35:10.540928Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "crystallize"?: "build"
+[2m2026-04-03T06:35:10.540957Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:35:10.540986Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:35:10.541013Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "crystallize"?: "build"
+[2m2026-04-03T06:35:10.541041Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:35:10.541080Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "chain"?: "vibesmithy-exp1"
+[2m2026-04-03T06:35:10.541110Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:35:10.541144Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "remote-query"?: "vibesmithy-exp1"
+[2m2026-04-03T06:35:10.541176Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:35:10.541207Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "slugs"?: "vibesmithy-exp1"
+[2m2026-04-03T06:35:10.541236Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:35:10.541264Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "slugs"?: "vibesmithy-exp1"
+[2m2026-04-03T06:35:10.541292Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "pyramid"?: "pyramid"
+[2m2026-04-03T06:35:10.541321Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m param?: "vibesmithy-exp1"
+[2m2026-04-03T06:35:10.541350Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "build"?: "build"
+[2m2026-04-03T06:35:10.541377Z[0m [35mTRACE[0m [2mwarp::filters::path[0m[2m:[0m "status"?: "status"
+[2m2026-04-03T06:35:10.541409Z[0m [35mTRACE[0m [2mwarp::filters::method[0m[2m:[0m method::GET?: GET
+[2m2026-04-03T06:35:10.541439Z[0m [35mTRACE[0m [2mwarp::filters::header[0m[2m:[0m optional("authorization")
+[2m2026-04-03T06:35:10.541519Z[0m [35mTRACE[0m [1mencode_headers[0m[2m:[0m [2mhyper::proto::h1::role[0m[2m:[0m Server::encode status=200, body=Some(Known(109)), req_method=Some(GET)
+[2m2026-04-03T06:35:10.541590Z[0m [35mTRACE[0m [2mhyper::proto::h1::io[0m[2m:[0m buffer.queue [3mself.len[0m[2m=[0m109 [3mbuf.len[0m[2m=[0m109
+[2m2026-04-03T06:35:10.541676Z[0m [34mDEBUG[0m [2mhyper::proto::h1::io[0m[2m:[0m flushed 218 bytes
+[2m2026-04-03T06:35:10.541708Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m flushed({role=server}): State { reading: Init, writing: Init, keep_alive: Idle }
+[2m2026-04-03T06:35:10.548059Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m Conn::read_head
+[2m2026-04-03T06:35:10.548124Z[0m [35mTRACE[0m [2mhyper::proto::h1::io[0m[2m:[0m received 0 bytes
+[2m2026-04-03T06:35:10.548156Z[0m [35mTRACE[0m [2mhyper::proto::h1::io[0m[2m:[0m parse eof
+[2m2026-04-03T06:35:10.548185Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m State::close_read()
+[2m2026-04-03T06:35:10.548212Z[0m [34mDEBUG[0m [2mhyper::proto::h1::conn[0m[2m:[0m read eof
+[2m2026-04-03T06:35:10.548239Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m State::close_write()
+[2m2026-04-03T06:35:10.548267Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m State::close_read()
+[2m2026-04-03T06:35:10.548305Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m State::close_write()
+[2m2026-04-03T06:35:10.548334Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m flushed({role=server}): State { reading: Closed, writing: Closed, keep_alive: Disabled }
+[2m2026-04-03T06:35:10.548380Z[0m [35mTRACE[0m [2mhyper::proto::h1::conn[0m[2m:[0m shut down IO complete

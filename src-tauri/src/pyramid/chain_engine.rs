@@ -110,7 +110,9 @@ pub struct ChainDefaults {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChainStep {
+    #[serde(default)]
     pub name: String,
+    #[serde(default)]
     pub primitive: String,
     #[serde(default)]
     pub instruction: Option<String>,
@@ -202,6 +204,10 @@ pub struct ChainStep {
     #[serde(default)]
     pub on_error: Option<String>,
     #[serde(default)]
+    pub on_parse_error: Option<String>,
+    #[serde(default)]
+    pub heal_instruction: Option<String>,
+    #[serde(default)]
     pub save_as: Option<String>,
     #[serde(default)]
     pub node_id_pattern: Option<String>,
@@ -229,6 +235,64 @@ pub struct ChainStep {
     /// Named break_loop because "break" is a Rust keyword.
     #[serde(default, rename = "break")]
     pub break_loop: Option<bool>,
+}
+
+impl Default for ChainStep {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            primitive: String::new(),
+            instruction: None,
+            instruction_map: None,
+            mechanical: false,
+            rust_function: None,
+            input: None,
+            output_schema: None,
+            model_tier: None,
+            model: None,
+            temperature: None,
+            sequential: false,
+            accumulate: None,
+            for_each: None,
+            concurrency: default_concurrency(),
+            max_thread_size: None,
+            pair_adjacent: false,
+            recursive_pair: false,
+            recursive_cluster: false,
+            cluster_instruction: None,
+            cluster_model: None,
+            cluster_response_schema: None,
+            target_clusters: None,
+            response_schema: None,
+            batch_threshold: None,
+            merge_instruction: None,
+            batch_size: None,
+            batch_max_tokens: None,
+            item_fields: None,
+            direct_synthesis_threshold: None,
+            convergence_fallback: None,
+            cluster_on_error: None,
+            cluster_fallback_size: None,
+            cluster_item_fields: None,
+            max_input_tokens: None,
+            split_strategy: None,
+            split_overlap_tokens: None,
+            split_merge: None,
+            when: None,
+            on_error: None,
+            on_parse_error: None,
+            heal_instruction: None,
+            save_as: None,
+            node_id_pattern: None,
+            depth: None,
+            context: None,
+            compact_inputs: false,
+            enrichments: vec![],
+            steps: None,
+            until: None,
+            break_loop: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -469,52 +533,7 @@ mod tests {
                 name: "step1".into(),
                 primitive: "compress".into(),
                 instruction: Some("Do something".into()),
-                mechanical: false,
-                rust_function: None,
-                input: None,
-                output_schema: None,
-                model_tier: None,
-                model: None,
-                temperature: None,
-                sequential: false,
-                accumulate: None,
-                for_each: None,
-                concurrency: 1,
-                pair_adjacent: false,
-                recursive_pair: false,
-                recursive_cluster: false,
-                cluster_instruction: None,
-                cluster_model: None,
-                cluster_response_schema: None,
-                target_clusters: None,
-                response_schema: None,
-                batch_threshold: None,
-                merge_instruction: None,
-                batch_size: None,
-                batch_max_tokens: None,
-                item_fields: None,
-                direct_synthesis_threshold: None,
-                convergence_fallback: None,
-                cluster_on_error: None,
-                cluster_fallback_size: None,
-                cluster_item_fields: None,
-                max_input_tokens: None,
-                split_strategy: None,
-                split_overlap_tokens: None,
-                split_merge: None,
-                when: None,
-                on_error: None,
-                save_as: None,
-                node_id_pattern: None,
-                depth: None,
-                instruction_map: None,
-                max_thread_size: None,
-                context: None,
-                compact_inputs: false,
-                enrichments: vec![],
-                steps: None,
-                until: None,
-                break_loop: None,
+                ..Default::default()
             }],
             post_build: vec![],
         }

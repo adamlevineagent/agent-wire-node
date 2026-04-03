@@ -168,13 +168,22 @@ async fn dispatch_llm(
             &schema_name,
         )
         .await?;
-        return llm::extract_json(&response).map_err(|e| {
-            anyhow!(
-                "Step '{}': structured output JSON parse failed: {}",
-                step.name,
-                e
-            )
-        });
+        match llm::extract_json(&response) {
+            Ok(json) => return Ok(json),
+            Err(e) => {
+                info!("[CHAIN] step '{}' parse failed, on_parse_error={:?}", step.name, step.on_parse_error);
+                if step.on_parse_error.as_deref() == Some("heal") {
+                    info!("[CHAIN] step '{}' → parse failed ({}), attempting self-healing (1 max attempts)", step.name, e);
+                    let heal_instruction = step.heal_instruction.as_deref().unwrap_or("Fix the JSON.");
+                    let heal_sys = format!("{}\n\n{}", system_prompt, heal_instruction);
+                    let heal_user = format!("Target Schema:\n{}\n\nMalformed Response:\n{}\n\nError:\n{}", serde_json::to_string_pretty(schema).unwrap_or_default(), response, e);
+                    let retry_resp = llm::call_model(config_ref, &heal_sys, &heal_user, 0.1, max_tokens).await?;
+                    return llm::extract_json(&retry_resp).map_err(|he| anyhow!("Step '{}': JSON parse failed after self-healing: {}", step.name, he));
+                } else {
+                    return Err(anyhow!("Step '{}': structured output JSON parse failed: {}", step.name, e));
+                }
+            }
+        }
     }
 
     // Standard path: call model, parse JSON, retry at temp 0.1 on failure
@@ -193,21 +202,31 @@ async fn dispatch_llm(
             Ok(json)
         }
         Err(_first_err) => {
-            // JSON-retry guarantee: retry at temperature 0.1
-            info!(
-                "[CHAIN] step '{}' → JSON parse failed, retrying at temp 0.1",
-                step.name
-            );
-            let retry_response =
-                llm::call_model(config_ref, system_prompt, &user_prompt, 0.1, max_tokens).await?;
+            info!("[CHAIN] step '{}' parse failed, on_parse_error={:?}", step.name, step.on_parse_error);
+            if step.on_parse_error.as_deref() == Some("heal") {
+                info!("[CHAIN] step '{}' → parse failed ({}), attempting self-healing (1 max attempts)", step.name, _first_err);
+                let heal_instruction = step.heal_instruction.as_deref().unwrap_or("Fix the JSON.");
+                let heal_sys = format!("{}\n\n{}", system_prompt, heal_instruction);
+                let heal_user = format!("Malformed Response:\n{}\n\nError:\n{}", response, _first_err);
+                let retry_resp = llm::call_model(config_ref, &heal_sys, &heal_user, 0.1, max_tokens).await?;
+                return llm::extract_json(&retry_resp).map_err(|he| anyhow!("Step '{}': JSON parse failed after self-healing: {}", step.name, he));
+            } else {
+                // JSON-retry guarantee: retry at temperature 0.1
+                info!(
+                    "[CHAIN] step '{}' → JSON parse failed, retrying at temp 0.1",
+                    step.name
+                );
+                let retry_response =
+                    llm::call_model(config_ref, system_prompt, &user_prompt, 0.1, max_tokens).await?;
 
-            llm::extract_json(&retry_response).map_err(|e| {
-                anyhow!(
-                    "Step '{}': JSON parse failed after retry at temp 0.1: {}",
-                    step.name,
-                    e
-                )
-            })
+                llm::extract_json(&retry_response).map_err(|e| {
+                    anyhow!(
+                        "Step '{}': JSON parse failed after retry at temp 0.1: {}",
+                        step.name,
+                        e
+                    )
+                })
+            }
         }
     }
 }
@@ -971,52 +990,8 @@ mod tests {
             name: "test".into(),
             primitive: "compress".into(),
             model: Some("custom/model".into()),
-            model_tier: None,
             instruction: Some("x".into()),
-            mechanical: false,
-            rust_function: None,
-            input: None,
-            output_schema: None,
-            temperature: None,
-            sequential: false,
-            accumulate: None,
-            for_each: None,
-            concurrency: 1,
-            pair_adjacent: false,
-            recursive_pair: false,
-            recursive_cluster: false,
-            cluster_instruction: None,
-            cluster_model: None,
-            cluster_response_schema: None,
-            target_clusters: None,
-            response_schema: None,
-            batch_threshold: None,
-            merge_instruction: None,
-            batch_size: None,
-            batch_max_tokens: None,
-            item_fields: None,
-            direct_synthesis_threshold: None,
-            convergence_fallback: None,
-            cluster_on_error: None,
-            cluster_fallback_size: None,
-            cluster_item_fields: None,
-            max_input_tokens: None,
-            split_strategy: None,
-            split_overlap_tokens: None,
-            split_merge: None,
-            instruction_map: None,
-            max_thread_size: None,
-            context: None,
-            compact_inputs: false,
-            enrichments: vec![],
-            when: None,
-            on_error: None,
-            save_as: None,
-            node_id_pattern: None,
-            depth: None,
-            steps: None,
-            until: None,
-            break_loop: None,
+            ..Default::default()
         };
         let defaults = ChainDefaults {
             model_tier: "mid".into(),
@@ -1033,53 +1008,9 @@ mod tests {
         let make_step = |tier: &str| ChainStep {
             name: "test".into(),
             primitive: "compress".into(),
-            model: None,
             model_tier: Some(tier.into()),
             instruction: Some("x".into()),
-            mechanical: false,
-            rust_function: None,
-            input: None,
-            output_schema: None,
-            temperature: None,
-            sequential: false,
-            accumulate: None,
-            for_each: None,
-            concurrency: 1,
-            pair_adjacent: false,
-            recursive_pair: false,
-            recursive_cluster: false,
-            cluster_instruction: None,
-            cluster_model: None,
-            cluster_response_schema: None,
-            target_clusters: None,
-            response_schema: None,
-            batch_threshold: None,
-            merge_instruction: None,
-            batch_size: None,
-            batch_max_tokens: None,
-            item_fields: None,
-            direct_synthesis_threshold: None,
-            convergence_fallback: None,
-            cluster_on_error: None,
-            cluster_fallback_size: None,
-            cluster_item_fields: None,
-            max_input_tokens: None,
-            split_strategy: None,
-            split_overlap_tokens: None,
-            split_merge: None,
-            instruction_map: None,
-            max_thread_size: None,
-            context: None,
-            compact_inputs: false,
-            enrichments: vec![],
-            when: None,
-            on_error: None,
-            save_as: None,
-            node_id_pattern: None,
-            depth: None,
-            steps: None,
-            until: None,
-            break_loop: None,
+            ..Default::default()
         };
         let defaults = ChainDefaults {
             model_tier: "mid".into(),

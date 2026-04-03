@@ -53,6 +53,10 @@ pub fn load_chain(yaml_path: &Path, chains_dir: &Path) -> Result<ChainDefinition
 /// `"{chains_dir}/prompts/conversation/forward.md"` and is replaced with
 /// the file content.
 fn resolve_prompt_refs(def: &mut ChainDefinition, chains_dir: &Path) -> Result<()> {
+    resolve_step_refs(&mut def.steps, chains_dir)
+}
+
+fn resolve_step_refs(steps: &mut [crate::pyramid::chain_engine::ChainStep], chains_dir: &Path) -> Result<()> {
     let resolve_prompt = |prompt_ref: &str, step_name: &str, field_name: &str| -> Result<String> {
         if let Some(rel_path) = prompt_ref.strip_prefix("$prompts/") {
             let prompt_path = chains_dir.join("prompts").join(rel_path);
@@ -68,7 +72,7 @@ fn resolve_prompt_refs(def: &mut ChainDefinition, chains_dir: &Path) -> Result<(
         Ok(prompt_ref.to_string())
     };
 
-    for step in &mut def.steps {
+    for step in steps {
         if let Some(ref instruction) = step.instruction {
             step.instruction = Some(resolve_prompt(instruction, &step.name, "instruction")?);
         }
@@ -82,10 +86,18 @@ fn resolve_prompt_refs(def: &mut ChainDefinition, chains_dir: &Path) -> Result<(
             step.merge_instruction = Some(resolve_prompt(merge_instr, &step.name, "merge")?);
         }
 
+        if let Some(ref heal_instr) = step.heal_instruction {
+            step.heal_instruction = Some(resolve_prompt(heal_instr, &step.name, "heal_instruction")?);
+        }
+
         if let Some(instruction_map) = step.instruction_map.as_mut() {
             for (key, value) in instruction_map.iter_mut() {
                 *value = resolve_prompt(value, &step.name, key)?;
             }
+        }
+
+        if let Some(ref mut inner_steps) = step.steps {
+            resolve_step_refs(inner_steps, chains_dir)?;
         }
     }
     Ok(())
