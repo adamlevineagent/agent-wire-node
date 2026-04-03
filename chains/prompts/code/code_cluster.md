@@ -1,4 +1,4 @@
-You are given projected metadata from every source file in a codebase: `node_id`, `headline`, and `orientation`. Use the headline and orientation to understand what each file does and group accordingly.
+You are given projected metadata from every source file in a codebase: `node_id`, `headline`, `orientation`, and `topics` (each with `name` and `summary`). Each item represents ONE FILE. Use the headline, orientation, and topic names/summaries to understand what each file does and group accordingly. Group FILES into threads — do not split a file's topics across different threads.
 
 Your job: identify coherent THREADS that organize ALL these files into meaningful groups. A thread represents a subsystem, feature area, or architectural layer — something a developer would recognize as "the auth system", "the build pipeline", "the UI components", "the database layer", etc. Let the material decide how many threads — don't force a specific range.
 

@@ -37,7 +37,7 @@ steps:
     instruction: "$prompts/document/doc_extract.md"
     for_each: $chunks
     dispatch_order: "largest_first"
-    concurrency: 6
+    concurrency: 12
     node_id_pattern: "D-L0-{index:03}"
     depth: 0
     save_as: node
@@ -51,6 +51,8 @@ steps:
     model_tier: mid
     temperature: 0.3
     on_error: "retry(3)"
+    on_parse_error: "heal"
+    heal_instruction: "$prompts/shared/heal_json.md"
 
   # ── Step 2: L0 cross-doc webbing ───────────────────────────────────
   - name: l0_webbing
@@ -105,19 +107,99 @@ steps:
         batch_size: 150
         batch_max_tokens: 50000
         concurrency: 3
-        # No response_schema — structured output makes Mercury 2 30-60x slower
+        response_schema:
+          type: object
+          properties:
+            threads:
+              type: array
+              minItems: 1
+              items:
+                type: object
+                properties:
+                  name:
+                    type: string
+                  description:
+                    type: string
+                  concept_tags:
+                    type: array
+                    items:
+                      type: string
+                  assignments:
+                    type: array
+                    minItems: 1
+                    items:
+                      type: object
+                      properties:
+                        source_node:
+                          type: string
+                        topic_index:
+                          type: integer
+                        topic_name:
+                          type: string
+                      required: ["source_node", "topic_index", "topic_name"]
+                      additionalProperties: false
+                required: ["name", "description", "assignments"]
+                additionalProperties: false
+            unassigned:
+              type: array
+              items:
+                type: string
+          required: ["threads"]
+          additionalProperties: false
         model_tier: mid
         temperature: 0.3
         on_error: "retry(3)"
+        on_parse_error: "heal"
+        heal_instruction: "$prompts/shared/heal_json.md"
       - name: merge_clusters
         primitive: classify
         instruction: "$prompts/document/doc_cluster_merge.md"
         input:
           batch_results: $batch_cluster
-        # No response_schema — structured output makes Mercury 2 30-60x slower
+        response_schema:
+          type: object
+          properties:
+            threads:
+              type: array
+              minItems: 1
+              items:
+                type: object
+                properties:
+                  name:
+                    type: string
+                  description:
+                    type: string
+                  concept_tags:
+                    type: array
+                    items:
+                      type: string
+                  assignments:
+                    type: array
+                    minItems: 1
+                    items:
+                      type: object
+                      properties:
+                        source_node:
+                          type: string
+                        topic_index:
+                          type: integer
+                        topic_name:
+                          type: string
+                      required: ["source_node", "topic_index", "topic_name"]
+                      additionalProperties: false
+                required: ["name", "description", "assignments"]
+                additionalProperties: false
+            unassigned:
+              type: array
+              items:
+                type: string
+          required: ["threads"]
+          additionalProperties: false
         model_tier: mid
         temperature: 0.3
         on_error: "retry(3)"
+        on_parse_error: "heal"
+        heal_instruction: "$prompts/shared/heal_json.md"
 
   # ── Step 4: Thread narrative synthesis ─────────────────────────────
   # Per-thread: synthesize assigned L0 docs into one authoritative node.
@@ -133,6 +215,8 @@ steps:
     model_tier: mid
     temperature: 0.3
     on_error: "retry(2)"
+    on_parse_error: "heal"
+    heal_instruction: "$prompts/shared/heal_json.md"
 
   # ── Step 5: L1 cross-layer webbing ─────────────────────────────────
   - name: l1_webbing
@@ -213,6 +297,8 @@ steps:
     model_tier: mid
     temperature: 0.3
     on_error: "retry(3)"
+    on_parse_error: "heal"
+    heal_instruction: "$prompts/shared/heal_json.md"
 
   # ── Step 7: L2 cross-layer webbing ─────────────────────────────────
   - name: l2_webbing

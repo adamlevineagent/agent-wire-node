@@ -53,6 +53,8 @@ steps:
     model_tier: mid
     temperature: 0.3
     on_error: "retry(3)"
+    on_parse_error: "heal"
+    heal_instruction: "$prompts/shared/heal_json.md"
 
   # ── Step 2: L0 cross-file webbing ──────────────────────────────────────
   - name: l0_webbing
@@ -93,55 +95,103 @@ steps:
     temperature: 0.2
     on_error: "skip"
 
-  # ── Step 3: Thread clustering ─────────────────────────────────────────
-  # Groups all L0 extractions into semantic threads. Uses item_fields to
-  # project down to just identifiers and headlines for the clustering call.
-  # Batched for large codebases (500+ files).
+  # ── Step 3: Thread clustering (sub-chain: batch → merge) ───────────────
   - name: thread_clustering
-    primitive: classify
-    instruction: "$prompts/code/code_cluster.md"
-    input:
-      topics: $l0_code_extract
-    item_fields: ["node_id", "headline", "orientation"]
-    batch_size: 150
-    batch_max_tokens: 80000
-    response_schema:
-      type: object
-      properties:
-        threads:
-          type: array
-          minItems: 1
-          items:
-            type: object
-            properties:
-              name:
+    primitive: container
+    steps:
+      - name: batch_cluster
+        primitive: classify
+        instruction: "$prompts/code/code_cluster.md"
+        for_each: $l0_code_extract
+        item_fields: ["node_id", "headline", "orientation", "topics.name,summary"]
+        batch_size: 150
+        batch_max_tokens: 50000
+        concurrency: 3
+        response_schema:
+          type: object
+          properties:
+            threads:
+              type: array
+              minItems: 1
+              items:
+                type: object
+                properties:
+                  name:
+                    type: string
+                  description:
+                    type: string
+                  assignments:
+                    type: array
+                    minItems: 1
+                    items:
+                      type: object
+                      properties:
+                        source_node:
+                          type: string
+                        topic_index:
+                          type: integer
+                        topic_name:
+                          type: string
+                      required: ["source_node", "topic_index", "topic_name"]
+                      additionalProperties: false
+                required: ["name", "description", "assignments"]
+                additionalProperties: false
+            unassigned:
+              type: array
+              items:
                 type: string
-                description: "2-6 word thread label"
-              description:
+          required: ["threads"]
+          additionalProperties: false
+        model_tier: mid
+        temperature: 0.3
+        on_error: "retry(3)"
+        on_parse_error: "heal"
+        heal_instruction: "$prompts/shared/heal_json.md"
+      - name: merge_clusters
+        primitive: classify
+        instruction: "$prompts/document/doc_cluster_merge.md"
+        input:
+          batch_results: $batch_cluster
+        response_schema:
+          type: object
+          properties:
+            threads:
+              type: array
+              minItems: 1
+              items:
+                type: object
+                properties:
+                  name:
+                    type: string
+                  description:
+                    type: string
+                  assignments:
+                    type: array
+                    minItems: 1
+                    items:
+                      type: object
+                      properties:
+                        source_node:
+                          type: string
+                        topic_index:
+                          type: integer
+                        topic_name:
+                          type: string
+                      required: ["source_node", "topic_index", "topic_name"]
+                      additionalProperties: false
+                required: ["name", "description", "assignments"]
+                additionalProperties: false
+            unassigned:
+              type: array
+              items:
                 type: string
-                description: "1-2 sentence description of the subsystem"
-              assignments:
-                type: array
-                minItems: 1
-                items:
-                  type: object
-                  properties:
-                    source_node:
-                      type: string
-                      description: "Exact C-L0-XXX node ID"
-                    topic_index:
-                      type: integer
-                    topic_name:
-                      type: string
-                  required: ["source_node", "topic_index", "topic_name"]
-                  additionalProperties: false
-            required: ["name", "description", "assignments"]
-            additionalProperties: false
-      required: ["threads"]
-      additionalProperties: false
-    model_tier: mid
+          required: ["threads"]
+          additionalProperties: false
+        model_tier: mid
     temperature: 0.3
     on_error: "retry(3)"
+    on_parse_error: "heal"
+    heal_instruction: "$prompts/shared/heal_json.md"
 
   # ── Step 4: Thread narrative synthesis ─────────────────────────────────
   - name: thread_narrative
@@ -155,6 +205,8 @@ steps:
     model_tier: mid
     temperature: 0.3
     on_error: "retry(2)"
+    on_parse_error: "heal"
+    heal_instruction: "$prompts/shared/heal_json.md"
 
   # ── Step 5: L1 cross-layer webbing ────────────────────────────────────
   - name: l1_webbing
@@ -192,60 +244,48 @@ steps:
     temperature: 0.2
     on_error: "skip"
 
-  # ── Step 6: Upper layers (loop: recluster → apex check → synthesize) ──
-  - name: upper_layers
-    primitive: loop
-    until: "count($current_nodes) <= 1"
+  # ── Step 6: Upper layers (recursive clustering → apex) ────────────────
+  - name: upper_layer_synthesis
+    primitive: synthesize
+    instruction: "$prompts/code/code_distill.md"
+    recursive_cluster: true
+    cluster_instruction: "$prompts/code/code_recluster.md"
+    cluster_item_fields: ["node_id", "headline", "orientation"]
+    cluster_response_schema:
+      type: object
+      properties:
+        apex_ready:
+          type: boolean
+          description: "true if nodes are the natural top-level architectural domains"
+        clusters:
+          type: array
+          items:
+            type: object
+            properties:
+              name:
+                type: string
+              description:
+                type: string
+              node_ids:
+                type: array
+                items:
+                  type: string
+            required: ["name", "description", "node_ids"]
+            additionalProperties: false
+      required: ["apex_ready", "clusters"]
+      additionalProperties: false
+    direct_synthesis_threshold: null
+    convergence_fallback: "retry"
+    cluster_on_error: "retry(3)"
+    cluster_fallback_size: 3
     depth: 1
     save_as: node
     node_id_pattern: "L{depth}-{index:03}"
-    steps:
-      - name: recluster
-        primitive: classify
-        instruction: "$prompts/code/code_recluster.md"
-        input:
-          nodes: $current_nodes
-        item_fields: ["node_id", "headline", "orientation"]
-        response_schema:
-          type: object
-          properties:
-            apex_ready:
-              type: boolean
-              description: "true if nodes are the natural top-level architectural domains"
-            clusters:
-              type: array
-              items:
-                type: object
-                properties:
-                  name:
-                    type: string
-                  description:
-                    type: string
-                  node_ids:
-                    type: array
-                    items:
-                      type: string
-                required: ["name", "description", "node_ids"]
-                additionalProperties: false
-          required: ["apex_ready", "clusters"]
-          additionalProperties: false
-        model_tier: mid
-        temperature: 0.3
-        on_error: "retry(3)"
-      - name: check_apex
-        primitive: gate
-        when: "$recluster.apex_ready == true"
-        break: true
-      - name: synthesize_layer
-        primitive: synthesize
-        instruction: "$prompts/code/code_distill.md"
-        for_each: $recluster.clusters
-        concurrency: 5
-        save_as: node
-        node_id_pattern: "L{depth}-{index:03}"
-        model_tier: mid
-        temperature: 0.3
-        on_error: "retry(3)"
+    model_tier: mid
+    temperature: 0.3
+    on_error: "retry(3)"
+    on_parse_error: "heal"
+    heal_instruction: "$prompts/shared/heal_json.md"
 
   # ── Step 7: L2 cross-layer webbing ────────────────────────────────────
   - name: l2_webbing

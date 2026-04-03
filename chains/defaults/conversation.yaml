@@ -134,6 +134,8 @@ steps:
     model_tier: mid
     temperature: 0.3
     on_error: "retry(3)"
+    on_parse_error: "heal"
+    heal_instruction: "$prompts/shared/heal_json.md"
 
   # ── Step 5: Thread synthesis → L1 nodes ─────────────────────────────
   - name: thread_narrative
@@ -147,6 +149,8 @@ steps:
     model_tier: mid
     temperature: 0.3
     on_error: "retry(2)"
+    on_parse_error: "heal"
+    heal_instruction: "$prompts/shared/heal_json.md"
 
   # ── Step 6: L1 cross-layer webbing ──────────────────────────────────
   - name: l1_webbing
@@ -224,6 +228,8 @@ steps:
         model_tier: mid
         temperature: 0.3
         on_error: "retry(3)"
+        on_parse_error: "heal"
+        heal_instruction: "$prompts/shared/heal_json.md"
       - name: check_apex
         primitive: gate
         when: "$recluster.apex_ready == true"
@@ -238,6 +244,8 @@ steps:
         model_tier: mid
         temperature: 0.3
         on_error: "retry(3)"
+        on_parse_error: "heal"
+        heal_instruction: "$prompts/shared/heal_json.md"
 
   # ── Step 8: L2 cross-layer webbing ──────────────────────────────────
   - name: l2_webbing
