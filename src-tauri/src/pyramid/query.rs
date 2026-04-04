@@ -194,12 +194,25 @@ pub fn get_apex(conn: &Connection, slug: &str) -> Result<Option<PyramidNode>> {
         // Question slug: return the highest-depth node, no filter
         get_apex_filtered(conn, slug, "")
     } else {
-        // Mechanical slug: exclude overlay nodes
-        get_apex_filtered(
+        // Mechanical slug: try mechanical nodes first, then check for overlay
+        let mechanical_result = get_apex_filtered(
             conn,
             slug,
             "AND (build_id IS NULL OR build_id = '' OR build_id NOT LIKE 'qb-%')",
-        )
+        );
+        // If the mechanical slug has a question overlay, the overlay apex is the true apex
+        if db::has_existing_question_overlay(conn, slug)? {
+            let overlay_result = get_apex_filtered(conn, slug, "AND build_id LIKE 'qb-%'");
+            match (&mechanical_result, &overlay_result) {
+                (_, Ok(Some(overlay_node))) => {
+                    // Overlay exists and has a valid apex — use it (it's always deeper)
+                    Ok(Some(overlay_node.clone()))
+                }
+                _ => mechanical_result, // No overlay apex found, fall back to mechanical
+            }
+        } else {
+            mechanical_result
+        }
     }
 }
 

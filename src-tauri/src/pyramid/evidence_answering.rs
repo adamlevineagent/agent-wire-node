@@ -33,6 +33,18 @@ use super::types::{
 };
 use super::OperationalConfig;
 
+/// Check if an L0 node ID is a targeted re-examination (L0-{uuid} format).
+/// Canonical L0 nodes use patterns like C-L0-001, D-L0-042, or short sequential IDs.
+/// Targeted evidence nodes use L0-{uuid} where the UUID part is 36 chars.
+fn is_targeted_l0_id(id: &str) -> bool {
+    // Targeted: "L0-" followed by a UUID (36 chars with hyphens, e.g., L0-491a10ef-4b59-...)
+    if let Some(suffix) = id.strip_prefix("L0-") {
+        suffix.len() >= 36 && suffix.chars().nth(8) == Some('-')
+    } else {
+        false
+    }
+}
+
 // ── L0 Summary Helper ────────────────────────────────────────────────────────
 
 /// Build a summary string from L0 nodes for use in synthesis prompt generation.
@@ -1252,13 +1264,16 @@ pub fn resolve_files_for_gap(
 
     let mut scored_nodes: Vec<(String, String, usize)> = Vec::new(); // (slug, node_id, score)
 
-    // ── 2. For each base slug, get canonical L0 nodes (empty self_prompt) ──
+    // ── 2. For each base slug, get canonical L0 nodes ──
+    // Canonical L0 nodes are from the original extraction (C-L0-*, D-L0-*, or short index IDs).
+    // Targeted evidence L0 nodes (from gap re-examination) use L0-{uuid} format (long UUID).
+    // We include ALL L0 that are NOT targeted evidence — self_prompt is NOT a reliable
+    // discriminator because canonical nodes also have self_prompt populated (orientation text).
     for base_slug in base_slugs {
         let all_l0 = db::get_nodes_at_depth(conn, base_slug, 0)?;
-        // Canonical L0 nodes have empty self_prompt (not targeted evidence)
         let canonical: Vec<&PyramidNode> = all_l0
             .iter()
-            .filter(|n| n.self_prompt.is_empty())
+            .filter(|n| !n.id.starts_with("ES-") && !is_targeted_l0_id(&n.id))
             .collect();
 
         // ── 3. Score each by keyword overlap ────────────────────────────
