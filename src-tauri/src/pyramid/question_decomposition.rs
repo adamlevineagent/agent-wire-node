@@ -168,7 +168,7 @@ fn compute_max_depth(node: &QuestionNode) -> u32 {
 /// how far from the root (0 = root). The node's depth = max_depth - current_level
 /// (so leaves = 0, root = max_depth).
 fn assign_ids_recursive(node: &mut QuestionNode, max_depth: u32, current_level: u32) {
-    let depth = max_depth.saturating_sub(current_level);
+    let depth = max_depth.saturating_sub(current_level) + 1;
     node.id = make_question_id(&node.question, &node.about, depth);
     for child in &mut node.children {
         assign_ids_recursive(child, max_depth, current_level + 1);
@@ -208,7 +208,7 @@ fn collect_layer_questions(
     current_level: u32,
     result: &mut std::collections::HashMap<i64, Vec<super::types::LayerQuestion>>,
 ) {
-    let depth = max_depth.saturating_sub(current_level) as i64;
+    let depth = (max_depth.saturating_sub(current_level) + 1) as i64;
 
     result
         .entry(depth)

@@ -873,6 +873,7 @@ mod tests {
                 entities: vec!["entity-a".to_string(), "entity-b".to_string()],
                 corrections: vec![],
                 decisions: vec![],
+                extra: serde_json::Map::new(),
             }],
             corrections: vec![Correction {
                 wrong: "old".to_string(),

@@ -3455,6 +3455,9 @@ fn backfill_node_ids(conn: &rusqlite::Connection, slug: &str) -> Result<(), Stri
 async fn pyramid_build(
     state: tauri::State<'_, SharedState>,
     slug: String,
+    from_depth: Option<i64>,
+    stop_after: Option<String>,
+    force_from: Option<String>,
 ) -> Result<BuildStatus, String> {
     // Verify slug exists
     {
@@ -3471,6 +3474,7 @@ async fn pyramid_build(
         progress: BuildProgress { done: 0, total: 0 },
         elapsed_seconds: 0.0,
         failures: 0,
+        steps: vec![],
     }));
 
     // Use write lock for atomic check-and-set (prevents TOCTOU race where two
@@ -3639,9 +3643,12 @@ async fn pyramid_build(
         });
 
         // Unified build dispatch — chain engine or legacy based on feature flag
-        let result = wire_node_lib::pyramid::build_runner::run_build(
+        let result = wire_node_lib::pyramid::build_runner::run_build_from(
             &pyramid_state,
             &slug,
+            from_depth.unwrap_or(0),
+            stop_after.as_deref(),
+            force_from.as_deref(),
             &cancel,
             Some(progress_tx.clone()),
             &write_tx,
@@ -3673,8 +3680,9 @@ async fn pyramid_build(
                 s.status = "cancelled".to_string();
             } else {
                 match result {
-                    Ok((_apex_id, failures)) => {
+                    Ok((_apex_id, failures, activities)) => {
                         s.failures = failures;
+                        s.steps = activities;
                         if failures > 0 {
                             s.status = "complete_with_errors".to_string();
                             tracing::warn!(
@@ -3759,6 +3767,7 @@ async fn pyramid_build_status(
         progress: BuildProgress { done: 0, total: 0 },
         elapsed_seconds: 0.0,
         failures: 0,
+        steps: vec![],
     })
 }
 
@@ -4270,6 +4279,7 @@ async fn pyramid_question_build(
         progress: BuildProgress { done: 0, total: 0 },
         elapsed_seconds: 0.0,
         failures: 0,
+        steps: vec![],
     }));
 
     {
@@ -4342,13 +4352,14 @@ async fn pyramid_question_build(
                 s.status = "cancelled".to_string();
             } else {
                 match result {
-                    Ok((_apex, failures)) => {
+                    Ok((_apex, failures, activities)) => {
                         if failures > 0 {
                             s.status = "complete_with_errors".to_string();
                         } else {
                             s.status = "complete".to_string();
                         }
                         s.failures = failures;
+                        s.steps = activities;
                     }
                     Err(e) => {
                         tracing::error!(slug = %build_slug, error = %e, "question build failed");

@@ -618,7 +618,7 @@ pub async fn run_parity_test(state: &PyramidState, slug: &str) -> Result<ParityR
     let legacy_elapsed = legacy_start.elapsed().as_secs_f64();
 
     let (legacy_apex, legacy_failures) = match legacy_build {
-        Ok((apex, failures)) => (apex, failures),
+        Ok((apex, failures, _)) => (apex, failures),
         Err(e) => {
             warn!(slug, error = %e, "legacy build failed");
             (String::new(), -1)
@@ -663,7 +663,7 @@ pub async fn run_parity_test(state: &PyramidState, slug: &str) -> Result<ParityR
     let ir_elapsed = ir_start.elapsed().as_secs_f64();
 
     let (ir_apex, ir_failures) = match ir_build {
-        Ok((apex, failures)) => (apex, failures),
+        Ok((apex, failures, _)) => (apex, failures),
         Err(e) => {
             warn!(slug, error = %e, "IR build failed");
             (String::new(), -1)

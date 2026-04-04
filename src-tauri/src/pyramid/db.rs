@@ -5329,6 +5329,7 @@ mod tests {
                     why: "Standard".to_string(),
                     rejected: String::new(),
                 }],
+                extra: serde_json::Map::new(),
             }],
             corrections: vec![],
             decisions: vec![],

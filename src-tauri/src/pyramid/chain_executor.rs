@@ -2381,6 +2381,23 @@ fn project_nested(val: &Value, sub_fields: &[&str]) -> Value {
     }
 }
 
+/// Drop a field from a JSON value using dot-notation.
+/// - "orientation" → remove top-level field
+/// - "topics.current" → for each element in topics array, remove current
+fn drop_field(value: &mut Value, field_path: &str) {
+    if let Some((parent, child)) = field_path.split_once('.') {
+        if let Some(Value::Array(arr)) = value.get_mut(parent) {
+            for item in arr.iter_mut() {
+                if let Some(obj) = item.as_object_mut() {
+                    obj.remove(child);
+                }
+            }
+        }
+    } else if let Some(obj) = value.as_object_mut() {
+        obj.remove(field_path);
+    }
+}
+
 /// Greedy token-aware batch splitting. Fills each batch until either
 /// `max_tokens` or `max_items` would be exceeded. A single oversized item
 /// always gets its own batch (never dropped).
@@ -2388,15 +2405,39 @@ fn batch_items_by_tokens(
     items: Vec<Value>,
     max_tokens: usize,
     max_items: Option<usize>,
+    dehydrate: Option<&[super::chain_engine::DehydrateStep]>,
 ) -> Vec<Value> {
     let mut batches = Vec::new();
     let mut current_batch = Vec::new();
     let mut current_tokens = 0usize;
 
     for item in items {
-        let item_tokens = serde_json::to_string(&item)
+        let mut item_value = item;
+        let mut item_tokens = serde_json::to_string(&item_value)
             .map(|s| estimate_tokens(&s))
             .unwrap_or(0);
+
+        // Adaptive dehydration: if item doesn't fit, progressively strip fields
+        if let Some(cascade) = dehydrate {
+            let original_tokens = item_tokens;
+            let mut drops_applied = 0;
+            for step in cascade {
+                if current_batch.is_empty() || current_tokens + item_tokens <= max_tokens {
+                    break;
+                }
+                drop_field(&mut item_value, &step.drop);
+                item_tokens = serde_json::to_string(&item_value)
+                    .map(|s| estimate_tokens(&s))
+                    .unwrap_or(0);
+                drops_applied += 1;
+            }
+            if drops_applied > 0 {
+                info!(
+                    "[CHAIN] dehydrated item from {} to {} tokens ({} drops applied)",
+                    original_tokens, item_tokens, drops_applied
+                );
+            }
+        }
 
         let would_exceed_tokens = current_tokens + item_tokens > max_tokens && !current_batch.is_empty();
         let would_exceed_items = max_items.map_or(false, |max| current_batch.len() >= max);
@@ -2408,7 +2449,7 @@ fn batch_items_by_tokens(
         }
 
         current_tokens += item_tokens;
-        current_batch.push(item);
+        current_batch.push(item_value);
     }
 
     if !current_batch.is_empty() {
@@ -3397,8 +3438,8 @@ pub async fn execute_chain(
     cancel: &CancellationToken,
     progress_tx: Option<mpsc::Sender<BuildProgress>>,
     layer_tx: Option<mpsc::Sender<LayerEvent>>,
-) -> Result<(String, i32)> {
-    execute_chain_from(state, chain, slug, 0, cancel, progress_tx, layer_tx).await
+) -> Result<(String, i32, Vec<super::types::StepActivity>)> {
+    execute_chain_from(state, chain, slug, 0, None, None, cancel, progress_tx, layer_tx).await
 }
 
 /// Execute a chain from a specific depth, reusing nodes below that depth.
@@ -3407,10 +3448,12 @@ pub async fn execute_chain_from(
     chain: &ChainDefinition,
     slug: &str,
     from_depth: i64,
+    stop_after: Option<&str>,
+    force_from: Option<&str>,
     cancel: &CancellationToken,
     progress_tx: Option<mpsc::Sender<BuildProgress>>,
     layer_tx: Option<mpsc::Sender<LayerEvent>>,
-) -> Result<(String, i32)> {
+) -> Result<(String, i32, Vec<super::types::StepActivity>)> {
     let llm_config = state.config.read().await.clone();
 
     // Count chunks
@@ -3459,6 +3502,51 @@ pub async fn execute_chain_from(
         cleanup_from_depth(&state.writer, slug, from_depth).await?;
     }
 
+    // Validate stop_after and force_from step names
+    let step_names: Vec<&str> = chain.steps.iter().map(|s| s.name.as_str()).collect();
+    if let Some(sa) = stop_after {
+        if !step_names.contains(&sa) {
+            return Err(anyhow!(
+                "stop_after step '{}' not found in chain. Valid steps: {:?}",
+                sa, step_names
+            ));
+        }
+    }
+    if let Some(ff) = force_from {
+        if !step_names.contains(&ff) {
+            return Err(anyhow!(
+                "force_from step '{}' not found in chain. Valid steps: {:?}",
+                ff, step_names
+            ));
+        }
+    }
+    let force_from_idx = force_from.and_then(|ff| step_names.iter().position(|s| *s == ff));
+
+    // If force_from is set, invalidate cached step outputs from that step onward
+    if let Some(ff_idx) = force_from_idx {
+        let invalidated_steps: Vec<String> = chain.steps[ff_idx..]
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+        info!(
+            "[CHAIN] force_from='{}': invalidating cached outputs for steps {:?}",
+            chain.steps[ff_idx].name, invalidated_steps
+        );
+        let slug_owned2 = slug.to_string();
+        let writer = state.writer.clone();
+        let conn = writer.lock().await;
+        conn.execute_batch("BEGIN IMMEDIATE").map_err(|e| anyhow!("force_from transaction: {e}"))?;
+        for step_name in &invalidated_steps {
+            if let Err(e) = conn.execute(
+                "DELETE FROM pyramid_pipeline_steps WHERE slug = ?1 AND step_type = ?2",
+                rusqlite::params![slug_owned2, step_name],
+            ) {
+                warn!("[CHAIN] force_from: failed to delete step '{}': {}", step_name, e);
+            }
+        }
+        conn.execute_batch("COMMIT").map_err(|e| anyhow!("force_from commit: {e}"))?;
+    }
+
     // Build chain context (from chain_resolve)
     let mut ctx = ChainContext::new(slug, &chain.content_type, chunks);
     ctx.has_prior_build = has_prior_build;
@@ -3467,6 +3555,7 @@ pub async fn execute_chain_from(
     let mut done: i64 = 0;
     let mut total_failures: i32 = 0;
     let mut apex_node_id = String::new();
+    let mut step_activities: Vec<super::types::StepActivity> = Vec::new();
 
     // Build dispatch context (from chain_dispatch)
     let dispatch_ctx = chain_dispatch::StepContext {
@@ -3485,6 +3574,7 @@ pub async fn execute_chain_from(
 
     // Execute each step
     for (step_idx, step) in chain.steps.iter().enumerate() {
+        let step_start = std::time::Instant::now();
         if cancel.is_cancelled() {
             info!("Chain execution cancelled at step '{}'", step.name);
             break;
@@ -3493,6 +3583,12 @@ pub async fn execute_chain_from(
         // Check `when` condition
         if !evaluate_when(step.when.as_deref(), &ctx) {
             info!("  Step '{}' skipped (when condition false)", step.name);
+            step_activities.push(super::types::StepActivity {
+                name: step.name.clone(),
+                status: "skipped".into(),
+                elapsed_seconds: None,
+                items: None,
+            });
             continue;
         }
 
@@ -3525,6 +3621,12 @@ pub async fn execute_chain_from(
                     total = estimate_total(chain, &ctx, num_chunks).max(done);
                     send_progress(&progress_tx, done, total).await;
                 }
+                step_activities.push(super::types::StepActivity {
+                    name: step.name.clone(),
+                    status: "reused".into(),
+                    elapsed_seconds: Some(step_start.elapsed().as_secs_f64()),
+                    items: None,
+                });
                 continue;
             }
         }
@@ -3626,6 +3728,7 @@ pub async fn execute_chain_from(
             Ok(Value::Null)
         } else if step.steps.is_some() && step.primitive != "loop" {
             // Container step with sub-chain (not a loop — loops handle their own steps)
+            let has_for_each = step.for_each.is_some();
             let (outputs, failures) = execute_container_step(
                 step,
                 &mut ctx,
@@ -3642,8 +3745,16 @@ pub async fn execute_chain_from(
             )
             .await?;
             total_failures += failures;
+            // Container with for_each: store as array (one result per iteration).
+            // Container without for_each: store the last inner step's output directly
+            // so $container_name.field references resolve naturally.
+            let output_value = if has_for_each {
+                Value::Array(outputs)
+            } else {
+                outputs.into_iter().last().unwrap_or(Value::Null)
+            };
             ctx.step_outputs
-                .insert(step.name.clone(), Value::Array(outputs));
+                .insert(step.name.clone(), output_value);
             Ok(Value::Null)
         } else if step.primitive == "split" {
             // Split primitive (no LLM call) — text splitting
@@ -3725,6 +3836,24 @@ pub async fn execute_chain_from(
                 }
                 total = estimate_total(chain, &ctx, num_chunks).max(done);
                 send_progress(&progress_tx, done, total).await;
+                step_activities.push(super::types::StepActivity {
+                    name: step.name.clone(),
+                    status: "ran".into(),
+                    elapsed_seconds: Some(step_start.elapsed().as_secs_f64()),
+                    items: Some(done),
+                });
+                if stop_after == Some(step.name.as_str()) {
+                    info!("[CHAIN] stop_after reached: halting after step \"{}\"", step.name);
+                    for remaining in &chain.steps[step_idx + 1..] {
+                        step_activities.push(super::types::StepActivity {
+                            name: remaining.name.clone(),
+                            status: "stopped".into(),
+                            elapsed_seconds: None,
+                            items: None,
+                        });
+                    }
+                    break;
+                }
             }
             Err(e) => match error_strategy {
                 ErrorStrategy::Abort | ErrorStrategy::Retry(_) => {
@@ -3787,7 +3916,7 @@ pub async fn execute_chain_from(
         chain.name, slug, apex_node_id, total_failures
     );
 
-    Ok((apex_node_id, total_failures))
+    Ok((apex_node_id, total_failures, step_activities))
 }
 
 // ── forEach execution ───────────────────────────────────────────────────────
@@ -3861,7 +3990,7 @@ async fn execute_for_each(
             "[CHAIN] [{}] forEach: token-aware batching {} items (max_tokens={}, max_items={:?})",
             step.name, items.len(), max_tokens, step.batch_size
         );
-        batch_items_by_tokens(items, max_tokens, step.batch_size)
+        batch_items_by_tokens(items, max_tokens, step.batch_size, step.dehydrate.as_deref())
     } else if let Some(batch_size) = step.batch_size {
         // Proportional splitting: 127 items / batch_size=100 → [64, 63]
         let bs = batch_size.max(1);

@@ -529,6 +529,7 @@ mod tests {
             entities: vec![],
             corrections: vec![],
             decisions: vec![],
+            extra: serde_json::Map::new(),
         });
         assert!(node_references_claim(
             &node,

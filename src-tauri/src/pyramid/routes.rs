@@ -681,30 +681,14 @@ pub fn pyramid_routes(
         .and(with_read_auth(state.clone(), jwt_public_key.clone()))
         .and_then(handle_list_slugs));
 
-    // MOVED TO IPC: see main.rs — pyramid_create_slug command
     // POST /pyramid/slugs
-    // let create_slug_route = route!(prefix
-    //     .and(warp::path("slugs"))
-    //     .and(warp::path::end())
-    //     .and(warp::post())
-    //     .and(with_auth_state(state.clone()))
-    //     .and(warp::body::json())
-    //     .and_then(handle_create_slug));
-    let create_slug_route = prefix
+    let create_slug_route = route!(prefix
         .and(warp::path("slugs"))
         .and(warp::path::end())
         .and(warp::post())
-        .and_then(|| async {
-            Ok::<warp::reply::Response, warp::Rejection>(
-                warp::http::Response::builder()
-                    .status(410)
-                    .header("Content-Type", "application/json")
-                    .body(r#"{"error":"moved to IPC","command":"pyramid_create_slug"}"#.into())
-                    .unwrap(),
-            )
-        })
-        .map(|r: warp::reply::Response| r)
-        .boxed();
+        .and(with_auth_state(state.clone()))
+        .and(warp::body::json())
+        .and_then(handle_create_slug));
 
     // REMOTE-SAFE: GET /pyramid/:slug/build/status (must be before /pyramid/:slug/build)
     let build_status = route!(prefix
@@ -716,60 +700,25 @@ pub fn pyramid_routes(
         .and(with_slug_read_auth(state.clone(), jwt_public_key.clone()))
         .and_then(handle_build_status));
 
-    // MOVED TO IPC: see main.rs — pyramid_build_cancel command
     // POST /pyramid/:slug/build/cancel (must be before /pyramid/:slug/build)
-    // let build_cancel = route!(prefix
-    //     .and(warp::path::param::<String>())
-    //     .and(warp::path("build"))
-    //     .and(warp::path("cancel"))
-    //     .and(warp::path::end())
-    //     .and(warp::post())
-    //     .and(with_auth_state(state.clone()))
-    //     .and_then(handle_build_cancel));
-    let build_cancel = prefix
+    let build_cancel = route!(prefix
         .and(warp::path::param::<String>())
         .and(warp::path("build"))
         .and(warp::path("cancel"))
         .and(warp::path::end())
         .and(warp::post())
-        .and_then(|_slug: String| async {
-            Ok::<warp::reply::Response, warp::Rejection>(
-                warp::http::Response::builder()
-                    .status(410)
-                    .header("Content-Type", "application/json")
-                    .body(r#"{"error":"moved to IPC","command":"pyramid_build_cancel"}"#.into())
-                    .unwrap(),
-            )
-        })
-        .map(|r: warp::reply::Response| r)
-        .boxed();
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_build_cancel));
 
-    // MOVED TO IPC: see main.rs — pyramid_build command
     // POST /pyramid/:slug/build?from_depth=N
-    // let build = route!(prefix
-    //     .and(warp::path::param::<String>())
-    //     .and(warp::path("build"))
-    //     .and(warp::path::end())
-    //     .and(warp::post())
-    //     .and(warp::query::<std::collections::HashMap<String, String>>())
-    //     .and(with_auth_state(state.clone()))
-    //     .and_then(handle_build));
-    let build = prefix
+    let build = route!(prefix
         .and(warp::path::param::<String>())
         .and(warp::path("build"))
         .and(warp::path::end())
         .and(warp::post())
-        .and_then(|_slug: String| async {
-            Ok::<warp::reply::Response, warp::Rejection>(
-                warp::http::Response::builder()
-                    .status(410)
-                    .header("Content-Type", "application/json")
-                    .body(r#"{"error":"moved to IPC","command":"pyramid_build"}"#.into())
-                    .unwrap(),
-            )
-        })
-        .map(|r: warp::reply::Response| r)
-        .boxed();
+        .and(warp::query::<std::collections::HashMap<String, String>>())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_build));
 
     // REMOTE-SAFE: GET /pyramid/:slug/apex — read-only, dual auth + access tier (WS-ONLINE-E)
     let apex = route!(prefix
@@ -859,57 +808,23 @@ pub fn pyramid_routes(
         .and(with_slug_read_auth(state.clone(), jwt_public_key.clone()))
         .and_then(handle_terms));
 
-    // MOVED TO IPC: see main.rs — pyramid_ingest command
     // POST /pyramid/:slug/ingest
-    // let ingest_route = route!(prefix
-    //     .and(warp::path::param::<String>())
-    //     .and(warp::path("ingest"))
-    //     .and(warp::path::end())
-    //     .and(warp::post())
-    //     .and(with_auth_state(state.clone()))
-    //     .and_then(handle_ingest));
-    let ingest_route = prefix
+    let ingest_route = route!(prefix
         .and(warp::path::param::<String>())
         .and(warp::path("ingest"))
         .and(warp::path::end())
         .and(warp::post())
-        .and_then(|_slug: String| async {
-            Ok::<warp::reply::Response, warp::Rejection>(
-                warp::http::Response::builder()
-                    .status(410)
-                    .header("Content-Type", "application/json")
-                    .body(r#"{"error":"moved to IPC","command":"pyramid_ingest"}"#.into())
-                    .unwrap(),
-            )
-        })
-        .map(|r: warp::reply::Response| r)
-        .boxed();
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_ingest));
 
-    // MOVED TO IPC: see main.rs — pyramid_set_config command
     // POST /pyramid/config — credential write, now IPC-only
-    // let config_route = route!(prefix
-    //     .and(warp::path("config"))
-    //     .and(warp::path::end())
-    //     .and(warp::post())
-    //     .and(with_auth_state(state.clone()))
-    //     .and(warp::body::json())
-    //     .and_then(handle_config));
-    // Stub: return 410 Gone so callers know to use IPC
-    let config_route = prefix
+    let config_route = route!(prefix
         .and(warp::path("config"))
         .and(warp::path::end())
         .and(warp::post())
-        .and_then(|| async {
-            Ok::<warp::reply::Response, warp::Rejection>(
-                warp::http::Response::builder()
-                    .status(410)
-                    .header("Content-Type", "application/json")
-                    .body(r#"{"error":"moved to IPC","command":"pyramid_set_config"}"#.into())
-                    .unwrap(),
-            )
-        })
-        .map(|r: warp::reply::Response| r)
-        .boxed();
+        .and(with_auth_state(state.clone()))
+        .and(warp::body::json())
+        .and_then(handle_config));
 
     // REMOTE-SAFE: GET /pyramid/:slug/threads — read-only, dual auth
     let threads = route!(prefix
@@ -950,31 +865,14 @@ pub fn pyramid_routes(
         .and(with_read_auth(state.clone(), jwt_public_key.clone()))
         .and_then(handle_edges));
 
-    // MOVED TO IPC: see main.rs — pyramid_meta_run command
     // POST /pyramid/:slug/meta (run all meta passes)
-    // let meta_run = route!(prefix
-    //     .and(warp::path::param::<String>())
-    //     .and(warp::path("meta"))
-    //     .and(warp::path::end())
-    //     .and(warp::post())
-    //     .and(with_auth_state(state.clone()))
-    //     .and_then(handle_meta_run));
-    let meta_run = prefix
+    let meta_run = route!(prefix
         .and(warp::path::param::<String>())
         .and(warp::path("meta"))
         .and(warp::path::end())
         .and(warp::post())
-        .and_then(|_slug: String| async {
-            Ok::<warp::reply::Response, warp::Rejection>(
-                warp::http::Response::builder()
-                    .status(410)
-                    .header("Content-Type", "application/json")
-                    .body(r#"{"error":"moved to IPC","command":"pyramid_meta_run"}"#.into())
-                    .unwrap(),
-            )
-        })
-        .map(|r: warp::reply::Response| r)
-        .boxed();
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_meta_run));
 
     // REMOTE-SAFE: GET /pyramid/:slug/meta (read meta nodes) — read-only, dual auth
     let meta_read = route!(prefix
@@ -1036,57 +934,23 @@ pub fn pyramid_routes(
         .and(with_read_auth(state.clone(), jwt_public_key.clone()))
         .and_then(handle_faq_category_drill));
 
-    // MOVED TO IPC: see main.rs — pyramid_archive_slug command
     // POST /pyramid/:slug/archive — state mutation, now IPC-only
-    // let archive_slug_route = route!(prefix
-    //     .and(warp::path::param::<String>())
-    //     .and(warp::path("archive"))
-    //     .and(warp::path::end())
-    //     .and(warp::post())
-    //     .and(with_auth_state(state.clone()))
-    //     .and_then(handle_archive_slug));
-    let archive_slug_route = prefix
+    let archive_slug_route = route!(prefix
         .and(warp::path::param::<String>())
         .and(warp::path("archive"))
         .and(warp::path::end())
         .and(warp::post())
-        .and_then(|_slug: String| async {
-            Ok::<warp::reply::Response, warp::Rejection>(
-                warp::http::Response::builder()
-                    .status(410)
-                    .header("Content-Type", "application/json")
-                    .body(r#"{"error":"moved to IPC","command":"pyramid_archive_slug"}"#.into())
-                    .unwrap(),
-            )
-        })
-        .map(|r: warp::reply::Response| r)
-        .boxed();
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_archive_slug));
 
-    // MOVED TO IPC: see main.rs — pyramid_purge_slug command
     // DELETE /pyramid/:slug/purge — CASCADE DELETE, now IPC-only
-    // let purge_slug_route = route!(prefix
-    //     .and(warp::path::param::<String>())
-    //     .and(warp::path("purge"))
-    //     .and(warp::path::end())
-    //     .and(warp::delete())
-    //     .and(with_auth_state(state.clone()))
-    //     .and_then(handle_purge_slug));
-    let purge_slug_route = prefix
+    let purge_slug_route = route!(prefix
         .and(warp::path::param::<String>())
         .and(warp::path("purge"))
         .and(warp::path::end())
         .and(warp::delete())
-        .and_then(|_slug: String| async {
-            Ok::<warp::reply::Response, warp::Rejection>(
-                warp::http::Response::builder()
-                    .status(410)
-                    .header("Content-Type", "application/json")
-                    .body(r#"{"error":"moved to IPC","command":"pyramid_purge_slug"}"#.into())
-                    .unwrap(),
-            )
-        })
-        .map(|r: warp::reply::Response| r)
-        .boxed();
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_purge_slug));
 
     // REMOTE-SAFE: GET /pyramid/:slug/references — read-only, dual auth
     let slug_references_route = route!(prefix
@@ -1109,189 +973,68 @@ pub fn pyramid_routes(
         .and(with_read_auth(state.clone(), jwt_public_key.clone()))
         .and_then(handle_auto_update_config_get));
 
-    // MOVED TO IPC: see main.rs — pyramid_auto_update_config_set command
     // POST /pyramid/:slug/auto-update/config
-    // let auto_update_config_post = route!(prefix
-    //     .and(warp::path::param::<String>())
-    //     .and(warp::path("auto-update"))
-    //     .and(warp::path("config"))
-    //     .and(warp::path::end())
-    //     .and(warp::post())
-    //     .and(with_auth_state(state.clone()))
-    //     .and(warp::body::json())
-    //     .and_then(handle_auto_update_config_post));
-    let auto_update_config_post = prefix
+    let auto_update_config_post = route!(prefix
         .and(warp::path::param::<String>())
         .and(warp::path("auto-update"))
         .and(warp::path("config"))
         .and(warp::path::end())
         .and(warp::post())
-        .and_then(|_slug: String| async {
-            Ok::<warp::reply::Response, warp::Rejection>(
-                warp::http::Response::builder()
-                    .status(410)
-                    .header("Content-Type", "application/json")
-                    .body(
-                        r#"{"error":"moved to IPC","command":"pyramid_auto_update_config_set"}"#
-                            .into(),
-                    )
-                    .unwrap(),
-            )
-        })
-        .map(|r: warp::reply::Response| r)
-        .boxed();
+        .and(with_auth_state(state.clone()))
+        .and(warp::body::json())
+        .and_then(handle_auto_update_config_post));
 
-    // MOVED TO IPC: see main.rs — pyramid_auto_update_freeze command
     // POST /pyramid/:slug/auto-update/freeze
-    // let auto_update_freeze = route!(prefix
-    //     .and(warp::path::param::<String>())
-    //     .and(warp::path("auto-update"))
-    //     .and(warp::path("freeze"))
-    //     .and(warp::path::end())
-    //     .and(warp::post())
-    //     .and(with_auth_state(state.clone()))
-    //     .and_then(handle_auto_update_freeze));
-    let auto_update_freeze = prefix
+    let auto_update_freeze = route!(prefix
         .and(warp::path::param::<String>())
         .and(warp::path("auto-update"))
         .and(warp::path("freeze"))
         .and(warp::path::end())
         .and(warp::post())
-        .and_then(|_slug: String| async {
-            Ok::<warp::reply::Response, warp::Rejection>(
-                warp::http::Response::builder()
-                    .status(410)
-                    .header("Content-Type", "application/json")
-                    .body(
-                        r#"{"error":"moved to IPC","command":"pyramid_auto_update_freeze"}"#.into(),
-                    )
-                    .unwrap(),
-            )
-        })
-        .map(|r: warp::reply::Response| r)
-        .boxed();
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_auto_update_freeze));
 
-    // MOVED TO IPC: see main.rs — pyramid_auto_update_unfreeze command
     // POST /pyramid/:slug/auto-update/unfreeze
-    // let auto_update_unfreeze = route!(prefix
-    //     .and(warp::path::param::<String>())
-    //     .and(warp::path("auto-update"))
-    //     .and(warp::path("unfreeze"))
-    //     .and(warp::path::end())
-    //     .and(warp::post())
-    //     .and(with_auth_state(state.clone()))
-    //     .and_then(handle_auto_update_unfreeze));
-    let auto_update_unfreeze = prefix
+    let auto_update_unfreeze = route!(prefix
         .and(warp::path::param::<String>())
         .and(warp::path("auto-update"))
         .and(warp::path("unfreeze"))
         .and(warp::path::end())
         .and(warp::post())
-        .and_then(|_slug: String| async {
-            Ok::<warp::reply::Response, warp::Rejection>(
-                warp::http::Response::builder()
-                    .status(410)
-                    .header("Content-Type", "application/json")
-                    .body(
-                        r#"{"error":"moved to IPC","command":"pyramid_auto_update_unfreeze"}"#
-                            .into(),
-                    )
-                    .unwrap(),
-            )
-        })
-        .map(|r: warp::reply::Response| r)
-        .boxed();
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_auto_update_unfreeze));
 
-    // MOVED TO IPC: see main.rs — pyramid_auto_update_l0_sweep command
     // POST /pyramid/:slug/auto-update/l0-sweep
-    // let auto_update_l0_sweep = route!(prefix
-    //     .and(warp::path::param::<String>())
-    //     .and(warp::path("auto-update"))
-    //     .and(warp::path("l0-sweep"))
-    //     .and(warp::path::end())
-    //     .and(warp::post())
-    //     .and(with_auth_state(state.clone()))
-    //     .and_then(handle_auto_update_l0_sweep));
-    let auto_update_l0_sweep = prefix
+    let auto_update_l0_sweep = route!(prefix
         .and(warp::path::param::<String>())
         .and(warp::path("auto-update"))
         .and(warp::path("l0-sweep"))
         .and(warp::path::end())
         .and(warp::post())
-        .and_then(|_slug: String| async {
-            Ok::<warp::reply::Response, warp::Rejection>(
-                warp::http::Response::builder()
-                    .status(410)
-                    .header("Content-Type", "application/json")
-                    .body(
-                        r#"{"error":"moved to IPC","command":"pyramid_auto_update_l0_sweep"}"#
-                            .into(),
-                    )
-                    .unwrap(),
-            )
-        })
-        .map(|r: warp::reply::Response| r)
-        .boxed();
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_auto_update_l0_sweep));
 
-    // MOVED TO IPC: see main.rs — pyramid_breaker_resume command
     // POST /pyramid/:slug/auto-update/breaker/resume
-    // let breaker_resume = route!(prefix
-    //     .and(warp::path::param::<String>())
-    //     .and(warp::path("auto-update"))
-    //     .and(warp::path("breaker"))
-    //     .and(warp::path("resume"))
-    //     .and(warp::path::end())
-    //     .and(warp::post())
-    //     .and(with_auth_state(state.clone()))
-    //     .and_then(handle_breaker_resume));
-    let breaker_resume = prefix
+    let breaker_resume = route!(prefix
         .and(warp::path::param::<String>())
         .and(warp::path("auto-update"))
         .and(warp::path("breaker"))
         .and(warp::path("resume"))
         .and(warp::path::end())
         .and(warp::post())
-        .and_then(|_slug: String| async {
-            Ok::<warp::reply::Response, warp::Rejection>(
-                warp::http::Response::builder()
-                    .status(410)
-                    .header("Content-Type", "application/json")
-                    .body(r#"{"error":"moved to IPC","command":"pyramid_breaker_resume"}"#.into())
-                    .unwrap(),
-            )
-        })
-        .map(|r: warp::reply::Response| r)
-        .boxed();
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_breaker_resume));
 
-    // MOVED TO IPC: see main.rs — pyramid_breaker_archive_and_rebuild command
     // POST /pyramid/:slug/auto-update/breaker/build-new
-    // let breaker_build_new = route!(prefix
-    //     .and(warp::path::param::<String>())
-    //     .and(warp::path("auto-update"))
-    //     .and(warp::path("breaker"))
-    //     .and(warp::path("build-new"))
-    //     .and(warp::path::end())
-    //     .and(warp::post())
-    //     .and(with_auth_state(state.clone()))
-    //     .and_then(handle_breaker_build_new));
-    let breaker_build_new = prefix
+    let breaker_build_new = route!(prefix
         .and(warp::path::param::<String>())
         .and(warp::path("auto-update"))
         .and(warp::path("breaker"))
         .and(warp::path("build-new"))
         .and(warp::path::end())
         .and(warp::post())
-        .and_then(|_slug: String| async {
-            Ok::<warp::reply::Response, warp::Rejection>(
-                warp::http::Response::builder()
-                    .status(410)
-                    .header("Content-Type", "application/json")
-                    .body(r#"{"error":"moved to IPC","command":"pyramid_breaker_archive_and_rebuild"}"#.into())
-                    .unwrap(),
-            )
-        })
-        .map(|r: warp::reply::Response| r)
-        .boxed();
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_breaker_build_new));
 
     // REMOTE-SAFE: GET /pyramid/:slug/auto-update/status — read-only, dual auth
     let auto_update_status = route!(prefix
@@ -1327,32 +1070,15 @@ pub fn pyramid_routes(
 
     // ── P3.3: Crystallization chain pattern routes ────────────────────
 
-    // MOVED TO IPC: see main.rs — pyramid_crystallize command
     // POST /pyramid/:slug/crystallize — manually trigger a delta check
-    // let crystallize_trigger = route!(prefix
-    //     .and(warp::path::param::<String>())
-    //     .and(warp::path("crystallize"))
-    //     .and(warp::path::end())
-    //     .and(warp::post())
-    //     .and(with_auth_state(state.clone()))
-    //     .and(warp::body::json())
-    //     .and_then(handle_crystallize_trigger));
-    let crystallize_trigger = prefix
+    let crystallize_trigger = route!(prefix
         .and(warp::path::param::<String>())
         .and(warp::path("crystallize"))
         .and(warp::path::end())
         .and(warp::post())
-        .and_then(|_slug: String| async {
-            Ok::<warp::reply::Response, warp::Rejection>(
-                warp::http::Response::builder()
-                    .status(410)
-                    .header("Content-Type", "application/json")
-                    .body(r#"{"error":"moved to IPC","command":"pyramid_crystallize"}"#.into())
-                    .unwrap(),
-            )
-        })
-        .map(|r: warp::reply::Response| r)
-        .boxed();
+        .and(with_auth_state(state.clone()))
+        .and(warp::body::json())
+        .and_then(handle_crystallize_trigger));
 
     // REMOTE-SAFE: GET /pyramid/:slug/crystallize/status — read-only, dual auth
     let crystallize_status = route!(prefix
@@ -1366,32 +1092,15 @@ pub fn pyramid_routes(
 
     // ── Vine Conversation System routes ─────────────────────────────
 
-    // MOVED TO IPC: see main.rs — pyramid_vine_build command
     // POST /pyramid/vine/build — must come BEFORE :slug param routes
-    // let vine_build = route!(prefix
-    //     .and(warp::path("vine"))
-    //     .and(warp::path("build"))
-    //     .and(warp::path::end())
-    //     .and(warp::post())
-    //     .and(with_auth_state(state.clone()))
-    //     .and(warp::body::json())
-    //     .and_then(handle_vine_build));
-    let vine_build = prefix
+    let vine_build = route!(prefix
         .and(warp::path("vine"))
         .and(warp::path("build"))
         .and(warp::path::end())
         .and(warp::post())
-        .and_then(|| async {
-            Ok::<warp::reply::Response, warp::Rejection>(
-                warp::http::Response::builder()
-                    .status(410)
-                    .header("Content-Type", "application/json")
-                    .body(r#"{"error":"moved to IPC","command":"pyramid_vine_build"}"#.into())
-                    .unwrap(),
-            )
-        })
-        .map(|r: warp::reply::Response| r)
-        .boxed();
+        .and(with_auth_state(state.clone()))
+        .and(warp::body::json())
+        .and_then(handle_vine_build));
 
     // REMOTE-SAFE: GET /pyramid/:slug/vine/bunches — read-only, dual auth
     let vine_bunches = route!(prefix
@@ -1453,63 +1162,25 @@ pub fn pyramid_routes(
         .and(with_read_auth(state.clone(), jwt_public_key.clone()))
         .and_then(handle_vine_drill));
 
-    // MOVED TO IPC: see main.rs — pyramid_vine_rebuild_upper command
     // POST /pyramid/:slug/vine/rebuild-upper
-    // let vine_rebuild_upper = route!(prefix
-    //     .and(warp::path::param::<String>())
-    //     .and(warp::path("vine"))
-    //     .and(warp::path("rebuild-upper"))
-    //     .and(warp::path::end())
-    //     .and(warp::post())
-    //     .and(with_auth_state(state.clone()))
-    //     .and_then(handle_vine_rebuild_upper));
-    let vine_rebuild_upper = prefix
+    let vine_rebuild_upper = route!(prefix
         .and(warp::path::param::<String>())
         .and(warp::path("vine"))
         .and(warp::path("rebuild-upper"))
         .and(warp::path::end())
         .and(warp::post())
-        .and_then(|_slug: String| async {
-            Ok::<warp::reply::Response, warp::Rejection>(
-                warp::http::Response::builder()
-                    .status(410)
-                    .header("Content-Type", "application/json")
-                    .body(
-                        r#"{"error":"moved to IPC","command":"pyramid_vine_rebuild_upper"}"#.into(),
-                    )
-                    .unwrap(),
-            )
-        })
-        .map(|r: warp::reply::Response| r)
-        .boxed();
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_vine_rebuild_upper));
 
-    // MOVED TO IPC: see main.rs — pyramid_vine_integrity command
     // POST /pyramid/:slug/vine/integrity
-    // let vine_integrity = route!(prefix
-    //     .and(warp::path::param::<String>())
-    //     .and(warp::path("vine"))
-    //     .and(warp::path("integrity"))
-    //     .and(warp::path::end())
-    //     .and(warp::post())
-    //     .and(with_auth_state(state.clone()))
-    //     .and_then(handle_vine_integrity));
-    let vine_integrity = prefix
+    let vine_integrity = route!(prefix
         .and(warp::path::param::<String>())
         .and(warp::path("vine"))
         .and(warp::path("integrity"))
         .and(warp::path::end())
         .and(warp::post())
-        .and_then(|_slug: String| async {
-            Ok::<warp::reply::Response, warp::Rejection>(
-                warp::http::Response::builder()
-                    .status(410)
-                    .header("Content-Type", "application/json")
-                    .body(r#"{"error":"moved to IPC","command":"pyramid_vine_integrity"}"#.into())
-                    .unwrap(),
-            )
-        })
-        .map(|r: warp::reply::Response| r)
-        .boxed();
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_vine_integrity));
 
     // REMOTE-SAFE: GET /pyramid/:slug/vine/build/status — read-only, dual auth
     let vine_build_status = route!(prefix
@@ -1522,176 +1193,68 @@ pub fn pyramid_routes(
         .and(with_read_auth(state.clone(), jwt_public_key.clone()))
         .and_then(handle_vine_build_status));
 
-    // MOVED TO IPC: see main.rs — pyramid_question_build command
     // POST /pyramid/:slug/build/question — decomposed question build (P2.2)
-    // let question_build = route!(prefix
-    //     .and(warp::path::param::<String>())
-    //     .and(warp::path("build"))
-    //     .and(warp::path("question"))
-    //     .and(warp::path::end())
-    //     .and(warp::post())
-    //     .and(warp::query::<std::collections::HashMap<String, String>>())
-    //     .and(warp::body::json::<QuestionBuildBody>())
-    //     .and(with_auth_state(state.clone()))
-    //     .and_then(handle_question_build));
-    let question_build = prefix
+    let question_build = route!(prefix
         .and(warp::path::param::<String>())
         .and(warp::path("build"))
         .and(warp::path("question"))
         .and(warp::path::end())
         .and(warp::post())
-        .and_then(|_slug: String| async {
-            Ok::<warp::reply::Response, warp::Rejection>(
-                warp::http::Response::builder()
-                    .status(410)
-                    .header("Content-Type", "application/json")
-                    .body(r#"{"error":"moved to IPC","command":"pyramid_question_build"}"#.into())
-                    .unwrap(),
-            )
-        })
-        .map(|r: warp::reply::Response| r)
-        .boxed();
+        .and(warp::query::<std::collections::HashMap<String, String>>())
+        .and(warp::body::json::<QuestionBuildBody>())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_question_build));
 
-    // MOVED TO IPC: see main.rs — pyramid_question_preview command
     // POST /pyramid/:slug/build/preview — preview decomposition without building (P2.2)
-    // let question_preview = route!(prefix
-    //     .and(warp::path::param::<String>())
-    //     .and(warp::path("build"))
-    //     .and(warp::path("preview"))
-    //     .and(warp::path::end())
-    //     .and(warp::post())
-    //     .and(warp::body::json::<QuestionBuildBody>())
-    //     .and(with_auth_state(state.clone()))
-    //     .and_then(handle_question_preview));
-    let question_preview = prefix
+    let question_preview = route!(prefix
         .and(warp::path::param::<String>())
         .and(warp::path("build"))
         .and(warp::path("preview"))
         .and(warp::path::end())
         .and(warp::post())
-        .and_then(|_slug: String| async {
-            Ok::<warp::reply::Response, warp::Rejection>(
-                warp::http::Response::builder()
-                    .status(410)
-                    .header("Content-Type", "application/json")
-                    .body(r#"{"error":"moved to IPC","command":"pyramid_question_preview"}"#.into())
-                    .unwrap(),
-            )
-        })
-        .map(|r: warp::reply::Response| r)
-        .boxed();
+        .and(warp::body::json::<QuestionBuildBody>())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_question_preview));
 
-    // MOVED TO IPC: see main.rs — pyramid_characterize command
     // POST /pyramid/:slug/characterize — characterize source material before build (P1.1)
-    // let characterize_route = route!(prefix
-    //     .and(warp::path::param::<String>())
-    //     .and(warp::path("characterize"))
-    //     .and(warp::path::end())
-    //     .and(warp::post())
-    //     .and(warp::body::json::<CharacterizeBody>())
-    //     .and(with_auth_state(state.clone()))
-    //     .and_then(handle_characterize));
-    let characterize_route = prefix
+    let characterize_route = route!(prefix
         .and(warp::path::param::<String>())
         .and(warp::path("characterize"))
         .and(warp::path::end())
         .and(warp::post())
-        .and_then(|_slug: String| async {
-            Ok::<warp::reply::Response, warp::Rejection>(
-                warp::http::Response::builder()
-                    .status(410)
-                    .header("Content-Type", "application/json")
-                    .body(r#"{"error":"moved to IPC","command":"pyramid_characterize"}"#.into())
-                    .unwrap(),
-            )
-        })
-        .map(|r: warp::reply::Response| r)
-        .boxed();
+        .and(warp::body::json::<CharacterizeBody>())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_characterize));
 
-    // MOVED TO IPC: see main.rs — pyramid_publish command
     // POST /pyramid/:slug/publish — publish pyramid to Wire (P4.3)
-    // let publish_pyramid = route!(prefix
-    //     .and(warp::path::param::<String>())
-    //     .and(warp::path("publish"))
-    //     .and(warp::path::end())
-    //     .and(warp::post())
-    //     .and(with_auth_state(state.clone()))
-    //     .and_then(handle_publish_pyramid));
-    let publish_pyramid = prefix
+    let publish_pyramid = route!(prefix
         .and(warp::path::param::<String>())
         .and(warp::path("publish"))
         .and(warp::path::end())
         .and(warp::post())
-        .and_then(|_slug: String| async {
-            Ok::<warp::reply::Response, warp::Rejection>(
-                warp::http::Response::builder()
-                    .status(410)
-                    .header("Content-Type", "application/json")
-                    .body(r#"{"error":"moved to IPC","command":"pyramid_publish"}"#.into())
-                    .unwrap(),
-            )
-        })
-        .map(|r: warp::reply::Response| r)
-        .boxed();
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_publish_pyramid));
 
-    // MOVED TO IPC: see main.rs — pyramid_publish_question_set command
     // POST /pyramid/:slug/publish/question-set — publish question set to Wire (P4.3)
-    // let publish_question_set = route!(prefix
-    //     .and(warp::path::param::<String>())
-    //     .and(warp::path("publish"))
-    //     .and(warp::path("question-set"))
-    //     .and(warp::path::end())
-    //     .and(warp::post())
-    //     .and(warp::body::json::<PublishQuestionSetBody>())
-    //     .and(with_auth_state(state.clone()))
-    //     .and_then(handle_publish_question_set));
-    let publish_question_set = prefix
+    let publish_question_set = route!(prefix
         .and(warp::path::param::<String>())
         .and(warp::path("publish"))
         .and(warp::path("question-set"))
         .and(warp::path::end())
         .and(warp::post())
-        .and_then(|_slug: String| async {
-            Ok::<warp::reply::Response, warp::Rejection>(
-                warp::http::Response::builder()
-                    .status(410)
-                    .header("Content-Type", "application/json")
-                    .body(
-                        r#"{"error":"moved to IPC","command":"pyramid_publish_question_set"}"#
-                            .into(),
-                    )
-                    .unwrap(),
-            )
-        })
-        .map(|r: warp::reply::Response| r)
-        .boxed();
+        .and(warp::body::json::<PublishQuestionSetBody>())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_publish_question_set));
 
-    // MOVED TO IPC: see main.rs — pyramid_check_staleness command
     // POST /pyramid/:slug/check-staleness — run crystallization staleness pipeline (WS-E)
-    // let check_staleness = route!(prefix
-    //     .and(warp::path::param::<String>())
-    //     .and(warp::path("check-staleness"))
-    //     .and(warp::path::end())
-    //     .and(warp::post())
-    //     .and(with_auth_state(state.clone()))
-    //     .and(warp::body::json::<staleness_bridge::CheckStalenessRequest>())
-    //     .and_then(handle_check_staleness));
-    let check_staleness = prefix
+    let check_staleness = route!(prefix
         .and(warp::path::param::<String>())
         .and(warp::path("check-staleness"))
         .and(warp::path::end())
         .and(warp::post())
-        .and_then(|_slug: String| async {
-            Ok::<warp::reply::Response, warp::Rejection>(
-                warp::http::Response::builder()
-                    .status(410)
-                    .header("Content-Type", "application/json")
-                    .body(r#"{"error":"moved to IPC","command":"pyramid_check_staleness"}"#.into())
-                    .unwrap(),
-            )
-        })
-        .map(|r: warp::reply::Response| r)
-        .boxed();
+        .and(with_auth_state(state.clone()))
+        .and(warp::body::json::<staleness_bridge::CheckStalenessRequest>())
+        .and_then(handle_check_staleness));
 
     // REMOTE-SAFE: GET /pyramid/:slug/question-overlays — read-only, dual auth
     let question_overlays_route = route!(prefix
@@ -1750,32 +1313,15 @@ pub fn pyramid_routes(
         .and(with_read_auth(state.clone(), jwt_public_key.clone()))
         .and_then(handle_question_tree));
 
-    // MOVED TO IPC: see main.rs — pyramid_chain_import command
     // POST /pyramid/chain/import — import a chain or question set from the Wire (P4.2)
-    // let chain_import = route!(prefix
-    //     .and(warp::path("chain"))
-    //     .and(warp::path("import"))
-    //     .and(warp::path::end())
-    //     .and(warp::post())
-    //     .and(warp::body::json::<ChainImportBody>())
-    //     .and(with_auth_state(state.clone()))
-    //     .and_then(handle_chain_import));
-    let chain_import = prefix
+    let chain_import = route!(prefix
         .and(warp::path("chain"))
         .and(warp::path("import"))
         .and(warp::path::end())
         .and(warp::post())
-        .and_then(|| async {
-            Ok::<warp::reply::Response, warp::Rejection>(
-                warp::http::Response::builder()
-                    .status(410)
-                    .header("Content-Type", "application/json")
-                    .body(r#"{"error":"moved to IPC","command":"pyramid_chain_import"}"#.into())
-                    .unwrap(),
-            )
-        })
-        .map(|r: warp::reply::Response| r)
-        .boxed();
+        .and(warp::body::json::<ChainImportBody>())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_chain_import));
 
     // LOCAL-ONLY: POST /pyramid/remote-query — Vibesmithy proxy for remote pyramid queries.
     // Authenticated via local auth_token ONLY (never Wire JWT — this is the local node proxying).
@@ -2288,6 +1834,8 @@ async fn handle_build(
         .get("from_depth")
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
+    let stop_after: Option<String> = query.get("stop_after").cloned();
+    let force_from: Option<String> = query.get("force_from").cloned();
     // Verify slug exists before taking the write lock
     {
         let conn = state.reader.lock().await;
@@ -2316,6 +1864,7 @@ async fn handle_build(
         progress: BuildProgress { done: 0, total: 0 },
         elapsed_seconds: 0.0,
         failures: 0,
+        steps: vec![],
     }));
 
     let layer_state_for_build = {
@@ -2485,6 +2034,8 @@ async fn handle_build(
             &build_state,
             &slug_name,
             from_depth,
+            stop_after.as_deref(),
+            force_from.as_deref(),
             &cancel,
             Some(progress_tx.clone()),
             &write_tx,
@@ -2507,8 +2058,9 @@ async fn handle_build(
                 s.status = "cancelled".to_string();
             } else {
                 match result {
-                    Ok((_apex_id, failures)) => {
+                    Ok((_apex_id, failures, activities)) => {
                         s.failures = failures;
+                        s.steps = activities;
                         if failures > 0 {
                             s.status = "complete_with_errors".to_string();
                             tracing::warn!(
@@ -2573,6 +2125,7 @@ async fn handle_build_status(
         progress: BuildProgress { done: 0, total: 0 },
         elapsed_seconds: 0.0,
         failures: 0,
+        steps: vec![],
     }))
 }
 
@@ -4449,6 +4002,7 @@ async fn handle_question_build(
         progress: BuildProgress { done: 0, total: 0 },
         elapsed_seconds: 0.0,
         failures: 0,
+        steps: vec![],
     }));
 
     {
@@ -4533,13 +4087,14 @@ async fn handle_question_build(
                 s.status = "cancelled".to_string();
             } else {
                 match result {
-                    Ok((_apex, failures)) => {
+                    Ok((_apex, failures, activities)) => {
                         if failures > 0 {
                             s.status = "complete_with_errors".to_string();
                         } else {
                             s.status = "complete".to_string();
                         }
                         s.failures = failures;
+                        s.steps = activities;
                     }
                     Err(e) => {
                         tracing::error!(slug = %slug_name, error = %e, "question build failed");

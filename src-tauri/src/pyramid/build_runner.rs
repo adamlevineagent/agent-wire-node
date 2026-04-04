@@ -163,8 +163,8 @@ pub async fn run_build(
     progress_tx: Option<mpsc::Sender<BuildProgress>>,
     write_tx: &mpsc::Sender<WriteOp>,
     layer_tx: Option<mpsc::Sender<LayerEvent>>,
-) -> Result<(String, i32)> {
-    run_build_from(state, slug_name, 0, cancel, progress_tx, write_tx, layer_tx).await
+) -> Result<(String, i32, Vec<super::types::StepActivity>)> {
+    run_build_from(state, slug_name, 0, None, None, cancel, progress_tx, write_tx, layer_tx).await
 }
 
 /// Run a build from a specific depth, reusing nodes below that depth.
@@ -172,11 +172,13 @@ pub async fn run_build_from(
     state: &PyramidState,
     slug_name: &str,
     from_depth: i64,
+    stop_after: Option<&str>,
+    force_from: Option<&str>,
     cancel: &CancellationToken,
     progress_tx: Option<mpsc::Sender<BuildProgress>>,
     write_tx: &mpsc::Sender<WriteOp>,
     layer_tx: Option<mpsc::Sender<LayerEvent>>,
-) -> Result<(String, i32)> {
+) -> Result<(String, i32, Vec<super::types::StepActivity>)> {
     // ── 1. Determine content type ────────────────────────────────────────
     let content_type = {
         let conn = state.reader.lock().await;
@@ -243,12 +245,15 @@ pub async fn run_build_from(
             progress_tx,
         )
         .await
+        .map(|(apex, failures)| (apex, failures, vec![]))
     } else if use_chain {
         run_chain_build(
             state,
             slug_name,
             &content_type,
             from_depth,
+            stop_after,
+            force_from,
             cancel,
             progress_tx,
             layer_tx,
@@ -269,6 +274,7 @@ pub async fn run_build_from(
             write_tx,
         )
         .await
+        .map(|(apex, failures)| (apex, failures, vec![]))
     };
 
     // ── WS8-F: Notify cross-slug referrers on successful build ──────────
@@ -452,10 +458,12 @@ async fn run_chain_build(
     slug_name: &str,
     content_type: &ContentType,
     from_depth: i64,
+    stop_after: Option<&str>,
+    force_from: Option<&str>,
     cancel: &CancellationToken,
     progress_tx: Option<mpsc::Sender<BuildProgress>>,
     layer_tx: Option<mpsc::Sender<LayerEvent>>,
-) -> Result<(String, i32)> {
+) -> Result<(String, i32, Vec<super::types::StepActivity>)> {
     let ct_str = content_type.as_str();
 
     // Determine which chain to use: slug-specific assignment or default
@@ -500,7 +508,7 @@ async fn run_chain_build(
         "starting chain engine build"
     );
 
-    chain_executor::execute_chain_from(state, &chain, slug_name, from_depth, cancel, progress_tx, layer_tx)
+    chain_executor::execute_chain_from(state, &chain, slug_name, from_depth, stop_after, force_from, cancel, progress_tx, layer_tx)
         .await
 }
 
@@ -711,7 +719,7 @@ pub async fn run_decomposed_build(
     characterization: Option<CharacterizationResult>,
     cancel: &CancellationToken,
     progress_tx: Option<mpsc::Sender<BuildProgress>>,
-) -> Result<(String, i32)> {
+) -> Result<(String, i32, Vec<super::types::StepActivity>)> {
     // ── 1. Determine content type ────────────────────────────────────────
     let (content_type, source_path) = {
         let conn = state.reader.lock().await;
@@ -1612,7 +1620,7 @@ pub async fn run_decomposed_build(
         );
     }
 
-    Ok((slug_name.to_string(), failure_count))
+    Ok((slug_name.to_string(), failure_count, vec![]))
 }
 
 /// Preview a decomposed question build — returns the question tree and cost estimates

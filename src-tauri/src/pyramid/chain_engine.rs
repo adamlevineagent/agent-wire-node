@@ -109,6 +109,11 @@ pub struct ChainDefaults {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DehydrateStep {
+    pub drop: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChainStep {
     #[serde(default)]
     pub name: String,
@@ -171,6 +176,11 @@ pub struct ChainStep {
     /// Field-level projection: only send these top-level fields from each item to the LLM.
     #[serde(default)]
     pub item_fields: Option<Vec<String>>,
+    /// Adaptive per-item dehydration cascade. Progressively drops fields from
+    /// oversized items until they fit within batch_max_tokens. Mutually exclusive
+    /// with item_fields — dehydrate is adaptive, item_fields is uniform.
+    #[serde(default)]
+    pub dehydrate: Option<Vec<DehydrateStep>>,
     /// When set, skip clustering and go straight to synthesis if node count <= this threshold.
     /// When None, rely on apex_ready signal only (no hardcoded threshold).
     #[serde(default)]
@@ -269,6 +279,7 @@ impl Default for ChainStep {
             batch_size: None,
             batch_max_tokens: None,
             item_fields: None,
+            dehydrate: None,
             direct_synthesis_threshold: None,
             convergence_fallback: None,
             cluster_on_error: None,
@@ -398,9 +409,21 @@ pub fn validate_chain(def: &ChainDefinition) -> ValidationResult {
             ));
         }
 
-        // LLM steps (non-mechanical) must have instruction
-        if !step.mechanical && step.instruction.is_none() {
+        // LLM steps (non-mechanical, non-orchestration) must have instruction
+        let orchestration = matches!(
+            step.primitive.as_str(),
+            "container" | "loop" | "gate" | "split"
+        );
+        if !step.mechanical && !orchestration && step.instruction.is_none() {
             errors.push(format!("{}: LLM step must specify instruction", prefix));
+        }
+
+        // dehydrate and item_fields are mutually exclusive
+        if step.dehydrate.is_some() && step.item_fields.is_some() {
+            errors.push(format!(
+                "{}: dehydrate and item_fields are mutually exclusive",
+                prefix
+            ));
         }
 
         // on_error validation

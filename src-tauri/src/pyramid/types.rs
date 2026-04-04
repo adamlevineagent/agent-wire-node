@@ -88,11 +88,23 @@ pub struct PyramidNode {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Topic {
+    // ── Load-bearing fields: Rust business logic reads these ──
     pub name: String,
+    #[serde(default)]
     pub current: String,
+    #[serde(default)]
     pub entities: Vec<String>,
+    #[serde(default)]
     pub corrections: Vec<Correction>,
+    #[serde(default)]
     pub decisions: Vec<Decision>,
+
+    // ── Pass-through: everything else the LLM produces. ──
+    // Prompts can add any fields (summary, current_dense, current_core,
+    // future fields) without Rust changes. Stored in DB, served in API,
+    // available to dehydration and cluster_item_fields — never read by Rust.
+    #[serde(flatten, default)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -195,6 +207,18 @@ pub struct EntityEntry {
     pub topic_names: Vec<String>,
 }
 
+/// Per-step activity report for bounded builds.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StepActivity {
+    pub name: String,
+    /// One of: "ran", "reused", "skipped", "stopped"
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub elapsed_seconds: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub items: Option<i64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BuildStatus {
     pub slug: String,
@@ -205,6 +229,9 @@ pub struct BuildStatus {
     /// Number of nodes that failed during the build (LLM errors, timeouts, etc.)
     #[serde(default)]
     pub failures: i32,
+    /// Per-step activity breakdown (populated after build completes)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub steps: Vec<StepActivity>,
 }
 
 impl BuildStatus {

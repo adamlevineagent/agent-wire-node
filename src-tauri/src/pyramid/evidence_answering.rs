@@ -610,6 +610,7 @@ Respond with ONLY a JSON object:
             entities: Vec::new(),
             corrections: Vec::new(),
             decisions: Vec::new(),
+            extra: serde_json::Map::new(),
         })
         .collect();
 

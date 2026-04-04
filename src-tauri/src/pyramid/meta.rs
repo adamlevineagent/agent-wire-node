@@ -259,6 +259,7 @@ async fn save_meta_node(
             entities: vec![],
             corrections: vec![],
             decisions: vec![],
+            extra: serde_json::Map::new(),
         }],
         corrections: vec![],
         decisions: vec![],
