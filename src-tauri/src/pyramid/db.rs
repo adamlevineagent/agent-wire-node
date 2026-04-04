@@ -728,6 +728,17 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
         "CREATE INDEX IF NOT EXISTS idx_evidence_build ON pyramid_evidence(slug, build_id);",
     );
 
+    // ── Understanding Web: targeted L0 index + gap resolution ──
+    let _ = conn.execute(
+        "ALTER TABLE pyramid_gaps ADD COLUMN resolved INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
+    let _ = conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_nodes_targeted_l0
+         ON pyramid_nodes(slug, depth)
+         WHERE depth = 0 AND self_prompt != '';",
+    );
+
     // ── Schema Prep Migration for Wire Online push ──────────────────────────
     migrate_online_push_columns(conn)?;
 
@@ -3806,7 +3817,7 @@ pub fn save_question_tree_with_build_id(
 
 /// Get the question tree for a slug.
 pub fn get_question_tree(conn: &Connection, slug: &str) -> Result<Option<serde_json::Value>> {
-    let mut stmt = conn.prepare("SELECT tree FROM pyramid_question_tree WHERE slug = ?1")?;
+    let mut stmt = conn.prepare("SELECT tree FROM pyramid_question_tree WHERE slug = ?1 ORDER BY updated_at DESC LIMIT 1")?;
     let result = stmt.query_row(rusqlite::params![slug], |row| {
         let json_str: String = row.get(0)?;
         Ok(json_str)
@@ -4164,13 +4175,31 @@ pub fn save_gap(
 /// Get all gap reports for a slug.
 pub fn get_gaps_for_slug(conn: &Connection, slug: &str) -> Result<Vec<GapReport>> {
     let mut stmt = conn.prepare(
-        "SELECT question_id, description, layer FROM pyramid_gaps WHERE slug = ?1 ORDER BY id ASC",
+        "SELECT question_id, description, layer, COALESCE(resolved, 0) FROM pyramid_gaps WHERE slug = ?1 ORDER BY id ASC",
     )?;
     let rows = stmt.query_map(rusqlite::params![slug], |row| {
         Ok(GapReport {
             question_id: row.get(0)?,
             description: row.get(1)?,
             layer: row.get(2)?,
+            resolved: row.get::<_, i64>(3).unwrap_or(0) != 0,
+        })
+    })?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
+/// Get unresolved gap reports for a slug (for gap processing pass).
+pub fn get_unresolved_gaps_for_slug(conn: &Connection, slug: &str) -> Result<Vec<GapReport>> {
+    let mut stmt = conn.prepare(
+        "SELECT question_id, description, layer FROM pyramid_gaps
+         WHERE slug = ?1 AND COALESCE(resolved, 0) = 0 ORDER BY id ASC",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![slug], |row| {
+        Ok(GapReport {
+            question_id: row.get(0)?,
+            description: row.get(1)?,
+            layer: row.get(2)?,
+            resolved: false,
         })
     })?;
     Ok(rows.filter_map(|r| r.ok()).collect())
@@ -4183,16 +4212,138 @@ pub fn get_gaps_for_question(
     question_id: &str,
 ) -> Result<Vec<GapReport>> {
     let mut stmt = conn.prepare(
-        "SELECT question_id, description, layer FROM pyramid_gaps WHERE slug = ?1 AND question_id = ?2 ORDER BY id ASC",
+        "SELECT question_id, description, layer, COALESCE(resolved, 0) FROM pyramid_gaps
+         WHERE slug = ?1 AND question_id = ?2 ORDER BY id ASC",
     )?;
     let rows = stmt.query_map(rusqlite::params![slug, question_id], |row| {
         Ok(GapReport {
             question_id: row.get(0)?,
             description: row.get(1)?,
             layer: row.get(2)?,
+            resolved: row.get::<_, i64>(3).unwrap_or(0) != 0,
         })
     })?;
     Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
+/// Mark a gap as resolved after successful targeted re-examination.
+pub fn mark_gap_resolved(
+    conn: &Connection,
+    slug: &str,
+    question_id: &str,
+    description: &str,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE pyramid_gaps SET resolved = 1
+         WHERE slug = ?1 AND question_id = ?2 AND description = ?3",
+        rusqlite::params![slug, question_id, description],
+    )?;
+    Ok(())
+}
+
+// ── Evidence Set Queries ────────────────────────────────────────────────────
+
+/// Get all evidence sets for a slug (targeted L0 nodes grouped by self_prompt).
+/// Does NOT load member IDs — use get_evidence_set_member_ids() for that.
+pub fn get_evidence_sets(conn: &Connection, slug: &str) -> Result<Vec<EvidenceSet>> {
+    let mut stmt = conn.prepare(
+        "SELECT n.self_prompt, COUNT(*) as member_count,
+                (SELECT headline FROM pyramid_nodes
+                 WHERE slug = ?1 AND depth = 0 AND id LIKE 'ES-%'
+                   AND self_prompt = n.self_prompt AND superseded_by IS NULL
+                 LIMIT 1) as index_headline
+         FROM live_pyramid_nodes n
+         WHERE n.slug = ?1 AND n.depth = 0 AND n.self_prompt != '' AND n.id NOT LIKE 'ES-%'
+         GROUP BY n.self_prompt
+         ORDER BY member_count DESC",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![slug], |row| {
+        Ok(EvidenceSet {
+            self_prompt: row.get(0)?,
+            member_count: row.get(1)?,
+            index_headline: row.get(2)?,
+        })
+    })?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
+/// Load member node IDs for a specific evidence set (by self_prompt).
+pub fn get_evidence_set_member_ids(
+    conn: &Connection,
+    slug: &str,
+    self_prompt: &str,
+) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT id FROM live_pyramid_nodes
+         WHERE slug = ?1 AND depth = 0 AND self_prompt = ?2 AND id NOT LIKE 'ES-%'
+         ORDER BY created_at ASC",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![slug, self_prompt], |row| {
+        row.get::<_, String>(0)
+    })?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
+/// Append a targeted L0 node ID to a file's node_ids JSON array in pyramid_file_hashes.
+pub fn append_node_id_to_file_hash(
+    conn: &Connection,
+    slug: &str,
+    file_path: &str,
+    node_id: &str,
+) -> Result<()> {
+    let rows = conn.execute(
+        "UPDATE pyramid_file_hashes
+         SET node_ids = COALESCE(json_insert(node_ids, '$[#]', ?3), json_array(?3))
+         WHERE slug = ?1 AND file_path = ?2",
+        rusqlite::params![slug, file_path, node_id],
+    )?;
+    if rows == 0 {
+        tracing::warn!(slug, file_path, node_id, "append_node_id_to_file_hash: no matching row in pyramid_file_hashes");
+    }
+    Ok(())
+}
+
+/// Find targeted L0 nodes linked to the same source files as the given canonical node IDs.
+/// Lookup: canonical_node_id -> file_hashes rows containing that ID -> all node_ids -> filter targeted.
+pub fn get_targeted_l0_for_canonical_nodes(
+    conn: &Connection,
+    slug: &str,
+    canonical_node_ids: &[String],
+) -> Result<Vec<String>> {
+    let mut targeted = std::collections::BTreeSet::new();
+    for canon_id in canonical_node_ids {
+        // Find file_path rows whose node_ids JSON array contains this canonical ID
+        let mut stmt = conn.prepare(
+            "SELECT file_path, node_ids FROM pyramid_file_hashes
+             WHERE slug = ?1 AND EXISTS (SELECT 1 FROM json_each(node_ids) WHERE value = ?2)",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![slug, canon_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows.flatten() {
+            let (_file_path, node_ids_json) = row;
+            // Parse the JSON array and find targeted L0 nodes (non-empty self_prompt)
+            if let Ok(ids) = serde_json::from_str::<Vec<String>>(&node_ids_json) {
+                for nid in ids {
+                    if nid != *canon_id {
+                        // Check if this node is a targeted L0 (non-empty self_prompt)
+                        let is_targeted: bool = conn
+                            .query_row(
+                                "SELECT self_prompt != '' FROM pyramid_nodes
+                                 WHERE slug = ?1 AND id = ?2 AND superseded_by IS NULL",
+                                rusqlite::params![slug, nid],
+                                |row| row.get(0),
+                            )
+                            .unwrap_or(false);
+                        if is_targeted {
+                            targeted.insert(nid);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(targeted.into_iter().collect())
 }
 
 // ── ID Map Extensions (wire_handle_path) ─────────────────────────────────────
@@ -4773,6 +4924,8 @@ fn migrate_gaps_unique(conn: &Connection) -> Result<()> {
             description TEXT NOT NULL,
             layer INTEGER NOT NULL,
             created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            build_id TEXT DEFAULT NULL,
+            resolved INTEGER NOT NULL DEFAULT 0,
             UNIQUE(slug, question_id, description)
         );
         INSERT OR REPLACE INTO pyramid_gaps_new (id, slug, question_id, description, layer, created_at)

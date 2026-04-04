@@ -22,12 +22,14 @@ use uuid::Uuid;
 
 use std::path::PathBuf;
 
+use rusqlite;
+
 use super::db;
 use super::llm::{self, LlmConfig};
 use super::question_decomposition::render_prompt_template;
 use super::types::{
-    AnswerBatchResult, AnsweredNode, CandidateMap, EvidenceLink, EvidenceVerdict, FailedQuestion,
-    LayerQuestion, PyramidNode,
+    AnswerBatchResult, AnsweredNode, CandidateMap, EvidenceLink, EvidenceSet, EvidenceVerdict,
+    FailedQuestion, LayerQuestion, PyramidNode,
 };
 use super::OperationalConfig;
 
@@ -71,6 +73,7 @@ pub async fn pre_map_layer(
     audience: Option<&str>,
     chains_dir: Option<&PathBuf>,
     source_content_type: Option<&str>,
+    evidence_sets: Option<&[EvidenceSet]>, // loaded by caller, None for single-pass
 ) -> Result<CandidateMap> {
     if questions.is_empty() {
         return Ok(CandidateMap {
@@ -112,9 +115,26 @@ pub async fn pre_map_layer(
         .collect::<Vec<_>>()
         .join("\n");
 
-    // Token budget guard: if combined prompt exceeds budget, switch to headlines-only
+    // Token budget guard: if combined prompt exceeds budget, try two-stage first, then headlines-only
     let combined_len = questions_text.len() + nodes_text.len();
     if combined_len > ops.tier2.pre_map_prompt_budget {
+        // WS-3B: Two-stage pre-mapping via evidence set indexes
+        if let Some(sets) = evidence_sets {
+            if !sets.is_empty() {
+                return pre_map_layer_two_stage(
+                    questions,
+                    sets,
+                    lower_layer_nodes,
+                    llm_config,
+                    ops,
+                    audience,
+                    chains_dir,
+                    source_content_type,
+                )
+                .await;
+            }
+        }
+        // else: fall through to existing headlines-only path
         warn!(
             combined_len,
             budget = ops.tier2.pre_map_prompt_budget,
@@ -262,6 +282,216 @@ Every question_id from the input MUST appear as a key in the mappings, even if i
     );
 
     Ok(CandidateMap { mappings })
+}
+
+// ── WS-3B: Two-Stage Pre-Mapping ─────────────────────────────────────────────
+
+/// Stage 1 asks the LLM which evidence sets are relevant per question (using
+/// lightweight index headlines). Stage 2 filters the full node list to only
+/// members of the relevant sets, then delegates to the existing single-pass
+/// pre-mapping logic on the smaller subset.
+async fn pre_map_layer_two_stage(
+    questions: &[LayerQuestion],
+    evidence_sets: &[EvidenceSet],
+    all_l0_nodes: &[PyramidNode],
+    llm_config: &LlmConfig,
+    ops: &OperationalConfig,
+    audience: Option<&str>,
+    chains_dir: Option<&PathBuf>,
+    source_content_type: Option<&str>,
+) -> Result<CandidateMap> {
+    info!(
+        questions = questions.len(),
+        evidence_sets = evidence_sets.len(),
+        total_l0 = all_l0_nodes.len(),
+        "starting two-stage pre-mapping"
+    );
+
+    // ── Stage 1: Map questions to evidence sets ──────────────────────────
+
+    // Build evidence set listing
+    let sets_text = evidence_sets
+        .iter()
+        .map(|s| {
+            let headline = s
+                .index_headline
+                .as_deref()
+                .unwrap_or("(no index headline)");
+            format!(
+                "  - self_prompt: \"{}\"\n    index_headline: \"{}\"\n    member_count: {}",
+                s.self_prompt, headline, s.member_count
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // Build question listing (same format as single-pass)
+    let questions_text = questions
+        .iter()
+        .map(|q| {
+            format!(
+                "  - id: \"{}\"\n    question: \"{}\"\n    about: \"{}\"\n    creates: \"{}\"",
+                q.question_id, q.question_text, q.about, q.creates
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // Load stage1 prompt
+    let audience_block = match audience {
+        Some(aud) if !aud.is_empty() => format!(
+            "The questioner is {aud}. ALL evidence sets are potentially relevant regardless of vocabulary.\n"
+        ),
+        _ => String::new(),
+    };
+
+    let content_type_block = match source_content_type {
+        Some(ct) if !ct.is_empty() => format!("The source material is \"{ct}\" content.\n"),
+        _ => String::new(),
+    };
+
+    let system_prompt = match chains_dir
+        .map(|d| d.join("prompts/question/pre_map_stage1.md"))
+        .and_then(|p| std::fs::read_to_string(&p).ok())
+    {
+        Some(template) => super::question_decomposition::render_prompt_template(
+            &template,
+            &[
+                ("audience_block", &audience_block),
+                ("content_type_block", &content_type_block),
+            ],
+        ),
+        None => {
+            warn!("pre_map_stage1.md not found — using inline fallback");
+            format!(
+                r#"You are mapping questions to EVIDENCE SETS. Each evidence set is a group of related L0 nodes identified by a self_prompt. Your job is to determine which evidence sets MIGHT contain relevant evidence for each question.
+
+{audience_block}IMPORTANT: Over-include rather than miss. If an evidence set MIGHT be relevant, include it. The next stage will do fine-grained mapping within the selected sets.
+
+{content_type_block}
+Respond with ONLY a JSON object in this exact format:
+{{{{
+  "set_mappings": {{{{
+    "question_id_1": ["self_prompt_a", "self_prompt_b"],
+    "question_id_2": ["self_prompt_c"],
+    ...
+  }}}}
+}}}}
+
+Every question_id from the input MUST appear as a key in set_mappings, even if its list is empty."#
+            )
+        }
+    };
+
+    let user_prompt = format!(
+        "QUESTIONS for this layer:\n{}\n\nEVIDENCE SETS available:\n{}\n\nFor each question, identify which evidence sets likely contain relevant evidence. Include uncertain matches.",
+        questions_text, sets_text
+    );
+
+    // LLM call — stage 1 (fast classification)
+    let response = llm::call_model_unified(
+        llm_config,
+        &system_prompt,
+        &user_prompt,
+        ops.tier1.pre_map_temperature,
+        ops.tier1.pre_map_max_tokens,
+        None,
+    )
+    .await?;
+
+    info!(
+        tokens_in = response.usage.prompt_tokens,
+        tokens_out = response.usage.completion_tokens,
+        "two-stage pre-mapping stage 1 LLM call complete"
+    );
+
+    // Parse stage 1 response
+    let json_value = llm::extract_json(&response.content)?;
+    let mut stage1: Stage1Response = serde_json::from_value(json_value).map_err(|e| {
+        anyhow!(
+            "Failed to parse stage 1 set_mappings response: {} — raw: {}",
+            e,
+            &response.content[..response.content.len().min(400)]
+        )
+    })?;
+
+    // Validate stage 1: filter to only valid self_prompts, fill missing questions
+    let valid_prompts: std::collections::HashSet<&str> =
+        evidence_sets.iter().map(|s| s.self_prompt.as_str()).collect();
+
+    for q in questions {
+        let entry = stage1.set_mappings.entry(q.question_id.clone()).or_insert_with(Vec::new);
+        let before = entry.len();
+        entry.retain(|sp| valid_prompts.contains(sp.as_str()));
+        let removed = before - entry.len();
+        if removed > 0 {
+            warn!(
+                question_id = %q.question_id,
+                removed,
+                "stage 1 validation: filtered out hallucinated self_prompt strings"
+            );
+        }
+    }
+
+    // Collect all relevant set self_prompts across all questions
+    let relevant_self_prompts: std::collections::HashSet<&str> = stage1
+        .set_mappings
+        .values()
+        .flat_map(|v| v.iter().map(|s| s.as_str()))
+        .collect();
+
+    info!(
+        relevant_sets = relevant_self_prompts.len(),
+        total_sets = evidence_sets.len(),
+        "stage 1 selected evidence sets"
+    );
+
+    // ── Stage 2: Filter nodes to relevant sets + canonical, then single-pass ─
+
+    // Filtered node list: canonical L0 (empty self_prompt) + members of relevant sets
+    // Exclude evidence set index nodes (id starts with "ES-")
+    let filtered_nodes: Vec<&PyramidNode> = all_l0_nodes
+        .iter()
+        .filter(|n| {
+            if n.id.starts_with("ES-") {
+                return false;
+            }
+            if n.self_prompt.is_empty() {
+                return true; // canonical L0
+            }
+            relevant_self_prompts.contains(n.self_prompt.as_str())
+        })
+        .collect();
+
+    info!(
+        total_l0 = all_l0_nodes.len(),
+        filtered = filtered_nodes.len(),
+        "stage 2 filtered node list"
+    );
+
+    // Clone filtered nodes into an owned vec for the single-pass call
+    let filtered_owned: Vec<PyramidNode> = filtered_nodes.into_iter().cloned().collect();
+
+    // Delegate to existing single-pass pre-mapping on the filtered subset.
+    // Pass evidence_sets=None so it won't recurse back into two-stage.
+    // Box::pin required because pre_map_layer → two_stage → pre_map_layer is recursive async.
+    Box::pin(pre_map_layer(
+        questions,
+        &filtered_owned,
+        llm_config,
+        ops,
+        audience,
+        chains_dir,
+        source_content_type,
+        None, // single-pass — no evidence sets
+    ))
+    .await
+}
+
+/// Internal deserialization target for stage 1 of two-stage pre-mapping.
+#[derive(Deserialize)]
+struct Stage1Response {
+    set_mappings: HashMap<String, Vec<String>>,
 }
 
 /// Internal deserialization target for the pre-mapping LLM response.
@@ -704,7 +934,7 @@ Respond with ONLY a JSON object:
 
     let node = PyramidNode {
         id: node_id.clone(),
-        slug: slug.to_string(),
+        slug: answer_slug.to_string(),
         depth: question.layer,
         chunk_index: None,
         headline: raw.headline,
@@ -788,6 +1018,302 @@ struct RawDecision {
 struct RawTerm {
     term: String,
     definition: String,
+}
+
+// ── Targeted Re-examination (WS-2B) ────────────────────────────────────────
+
+/// Raw LLM response for targeted extraction.
+#[derive(Deserialize)]
+struct RawTargetedExtraction {
+    #[serde(default)]
+    extractions: Vec<RawTargetedEntry>,
+}
+
+#[derive(Deserialize)]
+struct RawTargetedEntry {
+    headline: String,
+    distilled: String,
+    #[serde(default)]
+    topics: Vec<RawTopic>,
+}
+
+/// Re-examine source files through the lens of a specific gap.
+///
+/// Loads the targeted_extract.md prompt and calls the LLM for each source file
+/// to extract evidence specifically relevant to the question and gap. Returns
+/// new L0 PyramidNodes with non-empty self_prompt (targeted evidence).
+pub async fn targeted_reexamination(
+    question_text: &str,
+    gap_description: &str,
+    source_candidates: &[(String, String)], // (file_path, content)
+    llm_config: &LlmConfig,
+    target_slug: &str,
+    build_id: &str,
+    audience: Option<&str>,
+    chains_dir: Option<&PathBuf>,
+    ops: &OperationalConfig,
+) -> Result<Vec<PyramidNode>> {
+    if source_candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // ── Build template variables ────────────────────────────────────────
+    let audience_block = match audience {
+        Some(aud) if !aud.is_empty() => format!(
+            "You are writing for {aud}. Translate technical evidence into plain language.\n\n"
+        ),
+        _ => String::new(),
+    };
+
+    let content_type_block = String::new(); // targeted extraction is content-type agnostic
+
+    // ── Load prompt template ────────────────────────────────────────────
+    let system_prompt = match chains_dir
+        .map(|d| d.join("prompts/question/targeted_extract.md"))
+        .and_then(|p| std::fs::read_to_string(&p).ok())
+    {
+        Some(template) => render_prompt_template(
+            &template,
+            &[
+                ("audience_block", &audience_block),
+                ("question_text", question_text),
+                ("gap_description", gap_description),
+                ("content_type_block", &content_type_block),
+            ],
+        ),
+        None => {
+            warn!("targeted_extract.md not found — using inline fallback");
+            format!(
+                r#"{audience_block}You are performing a TARGETED re-examination of a source file. This file was already extracted generically, but a specific question needed evidence that the generic extraction didn't capture.
+
+THE QUESTION: {question_text}
+
+WHAT WAS MISSING: {gap_description}
+
+Your job: read this source file through the lens of the question above. Extract ONLY information relevant to answering that question. Do not repeat what a generic extraction would capture — focus on the specific evidence the question needs.
+
+Be precise and specific. Names, values, relationships, mechanisms. Not summaries or overviews.
+
+Respond with ONLY a JSON object:
+{{{{
+  "extractions": [
+    {{{{
+      "headline": "short headline describing this piece of evidence",
+      "distilled": "detailed extraction — the specific evidence relevant to the question",
+      "topics": [
+        {{{{"name": "topic_name", "current": "what this extraction reveals about this topic"}}}}
+      ]
+    }}}}
+  ]
+}}}}"#
+            )
+        }
+    };
+
+    // ── Process each source file ────────────────────────────────────────
+    let mut all_nodes = Vec::new();
+
+    for (file_path, content) in source_candidates {
+        let user_prompt = format!(
+            "SOURCE FILE: {}\n\n{}",
+            file_path,
+            content
+        );
+
+        let response = match llm::call_model_unified(
+            llm_config,
+            &system_prompt,
+            &user_prompt,
+            ops.tier1.answer_temperature,
+            ops.tier1.answer_max_tokens,
+            None,
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(
+                    file_path = %file_path,
+                    error = %e,
+                    "targeted extraction LLM call failed, skipping file"
+                );
+                continue;
+            }
+        };
+
+        info!(
+            file_path = %file_path,
+            tokens_in = response.usage.prompt_tokens,
+            tokens_out = response.usage.completion_tokens,
+            "targeted extraction LLM call complete"
+        );
+
+        // ── Parse response ──────────────────────────────────────────────
+        let json_value = match llm::extract_json(&response.content) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(
+                    file_path = %file_path,
+                    error = %e,
+                    "targeted extraction JSON parse failed, skipping file"
+                );
+                continue;
+            }
+        };
+
+        let raw: RawTargetedExtraction = match serde_json::from_value(json_value) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(
+                    file_path = %file_path,
+                    error = %e,
+                    "targeted extraction deserialization failed, skipping file"
+                );
+                continue;
+            }
+        };
+
+        // ── Create PyramidNodes for each extraction ─────────────────────
+        for entry in raw.extractions {
+            let topics = entry
+                .topics
+                .into_iter()
+                .map(|t| super::types::Topic {
+                    name: t.name,
+                    current: t.current,
+                    entities: Vec::new(),
+                    corrections: Vec::new(),
+                    decisions: Vec::new(),
+                    extra: serde_json::Map::new(),
+                })
+                .collect();
+
+            let node = PyramidNode {
+                id: format!("L0-{}", Uuid::new_v4()),
+                slug: target_slug.to_string(),
+                depth: 0,
+                chunk_index: None,
+                headline: entry.headline,
+                distilled: entry.distilled,
+                topics,
+                corrections: Vec::new(),
+                decisions: Vec::new(),
+                terms: Vec::new(),
+                dead_ends: Vec::new(),
+                self_prompt: question_text.to_string(), // MUST be non-empty
+                children: Vec::new(),
+                parent_id: None,
+                superseded_by: None,
+                build_id: Some(build_id.to_string()),
+                created_at: chrono::Utc::now().to_rfc3339(),
+            };
+
+            all_nodes.push(node);
+        }
+    }
+
+    info!(
+        question = %question_text,
+        gap = %gap_description,
+        source_files = source_candidates.len(),
+        new_nodes = all_nodes.len(),
+        "targeted re-examination complete"
+    );
+
+    Ok(all_nodes)
+}
+
+// ── Gap File Resolution (WS-2B) ────────────────────────────────────────────
+
+/// Resolve source files that might contain evidence for a gap.
+///
+/// Rule-based (NO LLM): tokenizes the gap description into keywords, scores
+/// canonical L0 nodes by keyword overlap, then looks up the top-scoring nodes'
+/// source file paths via pyramid_file_hashes.
+///
+/// Returns (base_slug, file_path, content) triples.
+pub fn resolve_files_for_gap(
+    conn: &rusqlite::Connection,
+    base_slugs: &[String],
+    gap_description: &str,
+    _existing_l0_nodes: &[PyramidNode],
+    max_files: usize,
+) -> Result<Vec<(String, String, String)>> {
+    // ── 1. Tokenize gap description into keywords ───────────────────────
+    let keywords: Vec<String> = gap_description
+        .split_whitespace()
+        .map(|w| w.to_lowercase().replace(|c: char| !c.is_alphanumeric(), ""))
+        .filter(|w| w.len() >= 3)
+        .collect();
+
+    if keywords.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut scored_nodes: Vec<(String, String, usize)> = Vec::new(); // (slug, node_id, score)
+
+    // ── 2. For each base slug, get canonical L0 nodes (empty self_prompt) ──
+    for base_slug in base_slugs {
+        let all_l0 = db::get_nodes_at_depth(conn, base_slug, 0)?;
+        // Canonical L0 nodes have empty self_prompt (not targeted evidence)
+        let canonical: Vec<&PyramidNode> = all_l0
+            .iter()
+            .filter(|n| n.self_prompt.is_empty())
+            .collect();
+
+        // ── 3. Score each by keyword overlap ────────────────────────────
+        for node in &canonical {
+            let text = format!("{} {}", node.headline, node.distilled).to_lowercase();
+            let score = keywords.iter().filter(|kw| text.contains(kw.as_str())).count();
+            if score > 0 {
+                scored_nodes.push((base_slug.clone(), node.id.clone(), score));
+            }
+        }
+    }
+
+    // ── 4. Sort by score descending, take top N ────────────────────────
+    scored_nodes.sort_by(|a, b| b.2.cmp(&a.2));
+    scored_nodes.truncate(max_files);
+
+    // ── 5. Look up file paths and read content ─────────────────────────
+    let mut results = Vec::new();
+
+    for (slug, node_id, _score) in &scored_nodes {
+        // Find file_path from pyramid_file_hashes where node_ids contains this node
+        let mut stmt = conn.prepare(
+            "SELECT file_path FROM pyramid_file_hashes
+             WHERE slug = ?1 AND EXISTS (SELECT 1 FROM json_each(node_ids) WHERE value = ?2)
+             LIMIT 1",
+        )?;
+        let file_path: Option<String> = stmt
+            .query_row(rusqlite::params![slug, node_id], |row| row.get(0))
+            .ok();
+
+        if let Some(path) = file_path {
+            match std::fs::read_to_string(&path) {
+                Ok(content) => {
+                    results.push((slug.clone(), path, content));
+                }
+                Err(e) => {
+                    warn!(
+                        file_path = %path,
+                        error = %e,
+                        "failed to read source file for gap resolution, skipping"
+                    );
+                }
+            }
+        }
+    }
+
+    info!(
+        gap = %gap_description,
+        keywords = keywords.len(),
+        candidates_scored = scored_nodes.len(),
+        files_resolved = results.len(),
+        "gap file resolution complete"
+    );
+
+    Ok(results)
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────

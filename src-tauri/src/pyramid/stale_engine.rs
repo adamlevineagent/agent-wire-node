@@ -730,6 +730,8 @@ pub async fn drain_and_dispatch(
     let mut edge_stales: Vec<PendingMutation> = Vec::new();
     let mut node_stales: Vec<PendingMutation> = Vec::new();
     let mut faq_category_stales: Vec<PendingMutation> = Vec::new();
+    let mut evidence_set_mutations: Vec<PendingMutation> = Vec::new();
+    let mut targeted_l0_stales: Vec<PendingMutation> = Vec::new();
 
     for m in mutations {
         match m.mutation_type.as_str() {
@@ -741,6 +743,8 @@ pub async fn drain_and_dispatch(
             "edge_stale" => edge_stales.push(m),
             "node_stale" => node_stales.push(m),
             "faq_category_stale" => faq_category_stales.push(m),
+            "evidence_set_growth" => evidence_set_mutations.push(m),
+            "targeted_l0_stale" => targeted_l0_stales.push(m),
             other => {
                 warn!(slug = %slug_owned, mutation_type = other, "Unknown mutation type, treating as node_stale");
                 node_stales.push(m);
@@ -756,6 +760,8 @@ pub async fn drain_and_dispatch(
     let confirmed_batches = batch_items(confirmed_stales, batch_cap_nodes(&ops.tier3));
     let edge_batches = batch_items(edge_stales, batch_cap_connections(&ops.tier3));
     let node_batches = batch_items(node_stales, batch_cap_nodes(&ops.tier3));
+    let es_batches = batch_items(evidence_set_mutations, batch_cap_nodes(&ops.tier3));
+    let tl0_batches = batch_items(targeted_l0_stales, batch_cap_nodes(&ops.tier3));
 
     let total_batches = file_batches.len()
         + new_file_batches.len()
@@ -763,7 +769,9 @@ pub async fn drain_and_dispatch(
         + rename_batches.len()
         + confirmed_batches.len()
         + edge_batches.len()
-        + node_batches.len();
+        + node_batches.len()
+        + es_batches.len()
+        + tl0_batches.len();
     {
         let mut detail = detail_arc.lock().unwrap();
         *detail = format!("L{}: {} batches to process", layer, total_batches);
@@ -830,6 +838,63 @@ pub async fn drain_and_dispatch(
                 if let Ok(conn) = super::db::open_pyramid_connection(Path::new(&db)) {
                     let _ = log_stale_results(&conn, &s, &bid, layer, &results);
                     let _ = propagate_confirmed_stales(&conn, &s, layer, &results);
+
+                    // Propagate to targeted L0 nodes from the same source files
+                    let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+                    for result in &results {
+                        if !result.stale || layer != 0 {
+                            continue;
+                        }
+                        // Resolve file path → canonical node IDs
+                        let node_ids_json: String = conn
+                            .query_row(
+                                "SELECT node_ids FROM pyramid_file_hashes WHERE slug = ?1 AND file_path = ?2",
+                                rusqlite::params![s, result.target_id],
+                                |row| row.get(0),
+                            )
+                            .unwrap_or_else(|_| "[]".to_string());
+                        let canonical_ids: Vec<String> =
+                            serde_json::from_str(&node_ids_json).unwrap_or_default();
+
+                        if canonical_ids.is_empty() {
+                            continue;
+                        }
+
+                        match super::db::get_targeted_l0_for_canonical_nodes(&conn, &s, &canonical_ids) {
+                            Ok(targeted_ids) => {
+                                for tid in &targeted_ids {
+                                    let _ = conn.execute(
+                                        "INSERT INTO pyramid_pending_mutations
+                                         (slug, layer, mutation_type, target_ref, detail, cascade_depth, detected_at, processed)
+                                         VALUES (?1, 0, 'targeted_l0_stale', ?2, ?3, ?4, ?5, 0)",
+                                        rusqlite::params![
+                                            s,
+                                            tid,
+                                            format!("Canonical L0 stale: {}", result.reason),
+                                            result.cascade_depth + 1,
+                                            now,
+                                        ],
+                                    );
+                                }
+                                if !targeted_ids.is_empty() {
+                                    info!(
+                                        slug = %s,
+                                        file = %result.target_id,
+                                        count = targeted_ids.len(),
+                                        "Propagated staleness to targeted L0 nodes"
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                warn!(
+                                    slug = %s,
+                                    file = %result.target_id,
+                                    error = %e,
+                                    "Failed to find targeted L0 nodes for canonical stale propagation"
+                                );
+                            }
+                        }
+                    }
                 }
             }).await;
             drop(permit);
@@ -990,6 +1055,68 @@ pub async fn drain_and_dispatch(
                 drop(permit);
             }));
         }
+    }
+
+    // ── Evidence set apex synthesis ──────────────────────────────────────────
+    for batch in es_batches {
+        let permit = semaphore.clone().acquire_owned().await?;
+        let db = db_owned.clone();
+        let s = slug_owned.clone();
+        let bid = batch_id.clone();
+        let key = api_key_owned.clone();
+        let mdl = model_owned.clone();
+        handles.push(tokio::spawn(async move {
+            let results = match stale_helpers::dispatch_evidence_set_apex_synthesis(
+                batch, &db, &key, &mdl,
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    error!(slug = %s, error = %e, "dispatch_evidence_set_apex_synthesis failed");
+                    Vec::new()
+                }
+            };
+            let _ = tokio::task::spawn_blocking(move || {
+                if let Ok(conn) = super::db::open_pyramid_connection(Path::new(&db)) {
+                    let _ = log_stale_results(&conn, &s, &bid, layer, &results);
+                    let _ = propagate_confirmed_stales(&conn, &s, layer, &results);
+                }
+            })
+            .await;
+            drop(permit);
+        }));
+    }
+
+    // ── L0: Targeted L0 stale checks (LLM via stale_helpers) ─────────────────
+    for batch in tl0_batches {
+        let permit = semaphore.clone().acquire_owned().await?;
+        let db = db_owned.clone();
+        let s = slug_owned.clone();
+        let bid = batch_id.clone();
+        let key = api_key_owned.clone();
+        let mdl = model_owned.clone();
+        handles.push(tokio::spawn(async move {
+            let results = match stale_helpers::dispatch_targeted_l0_stale_check(
+                batch, &db, &key, &mdl,
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    error!(slug = %s, error = %e, "dispatch_targeted_l0_stale_check failed");
+                    Vec::new()
+                }
+            };
+            let _ = tokio::task::spawn_blocking(move || {
+                if let Ok(conn) = super::db::open_pyramid_connection(Path::new(&db)) {
+                    let _ = log_stale_results(&conn, &s, &bid, layer, &results);
+                    let _ = propagate_confirmed_stales(&conn, &s, layer, &results);
+                }
+            })
+            .await;
+            drop(permit);
+        }));
     }
 
     // ── FAQ category stale: re-distill affected categories ──────────────────
@@ -1263,6 +1390,16 @@ fn propagate_confirmed_stales(
         return Ok(());
     }
 
+    // Determine propagation strategy based on content type:
+    // question pyramids propagate through the evidence DAG, mechanical pyramids use parent_id.
+    let content_type: Option<String> = conn
+        .query_row(
+            "SELECT content_type FROM pyramid_slugs WHERE slug = ?1",
+            rusqlite::params![slug],
+            |row| row.get(0),
+        )
+        .ok();
+
     for result in results {
         if !result.stale {
             debug!(
@@ -1280,8 +1417,38 @@ fn propagate_confirmed_stales(
 
         // Resolve the propagation target: we need the PARENT node, not the current node.
         // For L0, target_id is a file path — resolve via pyramid_file_hashes.
-        // For L1+, target_id is a node ID — look up its parent directly.
-        let propagation_targets = if layer == 0 {
+        // For L1+, target_id is a node ID — look up its parent directly (mechanical)
+        // or follow evidence KEEP links (question).
+        let propagation_targets = if layer == 0 && content_type.as_deref() == Some("question") {
+            // Question pyramids at L0: resolve canonical node IDs from the file,
+            // then find answer nodes that KEEP those L0 nodes via evidence links.
+            let node_ids_json: Option<String> = conn
+                .query_row(
+                    "SELECT node_ids FROM pyramid_file_hashes
+                     WHERE slug = ?1 AND file_path = ?2",
+                    rusqlite::params![slug, result.target_id],
+                    |row| row.get(0),
+                )
+                .ok();
+            let node_ids: Vec<String> = node_ids_json
+                .and_then(|j| serde_json::from_str(&j).ok())
+                .unwrap_or_default();
+            let targets = stale_helpers_upper::resolve_evidence_targets_for_node_ids(
+                conn,
+                slug,
+                &node_ids,
+            )?;
+            if targets.is_empty() {
+                warn!(
+                    slug = %slug,
+                    target = %result.target_id,
+                    "L0 question stale file has no evidence KEEP targets — skipping propagation"
+                );
+                continue;
+            }
+            targets
+        } else if layer == 0 {
+            // Mechanical pyramids at L0: resolve via parent_id
             let targets = stale_helpers_upper::resolve_parent_targets_for_file(
                 conn,
                 slug,
@@ -1292,6 +1459,23 @@ fn propagate_confirmed_stales(
                     slug = %slug,
                     target = %result.target_id,
                     "L0 stale file has no live parent thread target — skipping propagation"
+                );
+                continue;
+            }
+            targets
+        } else if content_type.as_deref() == Some("question") {
+            let targets = stale_helpers_upper::resolve_evidence_targets_for_node_ids(
+                conn,
+                slug,
+                std::slice::from_ref(&result.target_id),
+            )?;
+            if targets.is_empty() {
+                warn!(
+                    slug = %slug,
+                    target = %result.target_id,
+                    layer,
+                    "Node has no evidence KEEP targets — skipping propagation to L{}",
+                    next_layer
                 );
                 continue;
             }

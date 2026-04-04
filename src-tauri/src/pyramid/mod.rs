@@ -201,6 +201,9 @@ fn default_rate_limit_hourly_window_secs() -> u64 {
 fn default_rate_limit_daily_window_secs() -> u64 {
     86400
 }
+fn default_gap_resolution_max_files() -> usize {
+    5
+}
 
 // ── Operational Config (Tiered) ─────────────────────────────────────────────
 //
@@ -326,6 +329,8 @@ pub struct Tier2Config {
     pub rate_limit_hourly_window_secs: u64,
     #[serde(default = "default_rate_limit_daily_window_secs")]
     pub rate_limit_daily_window_secs: u64,
+    #[serde(default = "default_gap_resolution_max_files")]
+    pub gap_resolution_max_files: usize,
 }
 
 impl Default for Tier2Config {
@@ -361,6 +366,7 @@ impl Default for Tier2Config {
             phase_display_duration_secs: default_phase_display_duration_secs(),
             rate_limit_hourly_window_secs: default_rate_limit_hourly_window_secs(),
             rate_limit_daily_window_secs: default_rate_limit_daily_window_secs(),
+            gap_resolution_max_files: default_gap_resolution_max_files(),
         }
     }
 }

@@ -1054,12 +1054,47 @@ pub async fn run_decomposed_build(
             db::get_existing_overlay_answers(&conn, slug_name)?
         };
 
+        // Load evidence sets and unresolved gaps for richer delta context
+        let evidence_set_ctx = {
+            let conn = state.reader.lock().await;
+            let sets = db::get_evidence_sets(&conn, slug_name).unwrap_or_default();
+            if sets.is_empty() {
+                None
+            } else {
+                Some(
+                    sets.iter()
+                        .map(|s| {
+                            let headline = s.index_headline.as_deref().unwrap_or("(no headline)");
+                            format!("- {} ({} nodes): {}", s.self_prompt, s.member_count, headline)
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                )
+            }
+        };
+        let gap_ctx = {
+            let conn = state.reader.lock().await;
+            let gaps = db::get_unresolved_gaps_for_slug(&conn, slug_name).unwrap_or_default();
+            if gaps.is_empty() {
+                None
+            } else {
+                Some(
+                    gaps.iter()
+                        .map(|g| format!("- {}", g.description))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                )
+            }
+        };
+
         let delta_result = question_decomposition::decompose_question_delta(
             &config,
             &llm_config,
             &existing_tree,
             &existing_answers,
             Some(&state.chains_dir),
+            evidence_set_ctx.as_deref(),
+            gap_ctx.as_deref(),
         )
         .await?;
 
@@ -1359,6 +1394,20 @@ pub async fn run_decomposed_build(
             "starting evidence answering for layer"
         );
 
+        // WS-3B: Load evidence sets for two-stage pre-mapping
+        let evidence_sets = {
+            let conn = state.reader.lock().await;
+            let mut all_sets = Vec::new();
+            if is_cross_slug {
+                for rs in &referenced_slugs {
+                    all_sets.extend(db::get_evidence_sets(&conn, rs)?);
+                }
+            } else {
+                all_sets = db::get_evidence_sets(&conn, slug_name)?;
+            }
+            all_sets
+        };
+
         // Step a: Pre-map questions to candidate evidence nodes
         let candidate_map = match evidence_answering::pre_map_layer(
             &layer_qs,
@@ -1368,6 +1417,7 @@ pub async fn run_decomposed_build(
             tree.audience.as_deref(),
             Some(&state.chains_dir),
             source_content_type.as_deref(),
+            Some(&evidence_sets),
         )
         .await
         {
@@ -1463,6 +1513,7 @@ pub async fn run_decomposed_build(
                                 question_id: a.node.id.clone(),
                                 description: missing_desc.clone(),
                                 layer: a.node.depth as i64,
+                                resolved: false,
                             };
                             db::save_gap(&c, &slug_owned, &gap, Some(&bid_for_gaps))?;
                         }
@@ -1476,6 +1527,7 @@ pub async fn run_decomposed_build(
                                 fq.question_text, fq.error
                             ),
                             layer: fq.layer,
+                            resolved: false,
                         };
                         db::save_gap(&c, &slug_owned, &gap, Some(&bid_for_gaps))?;
                     }
@@ -1559,6 +1611,239 @@ pub async fn run_decomposed_build(
             total_nodes,
             "layer complete"
         );
+    }
+
+    // ── Gap Processing: targeted re-examination for MISSING verdicts ──
+    if build_error.is_none() && !cancel.is_cancelled() {
+        let unresolved_gaps = {
+            let conn = state.reader.lock().await;
+            db::get_unresolved_gaps_for_slug(&conn, slug_name).unwrap_or_default()
+        };
+
+        if !unresolved_gaps.is_empty() {
+            info!(
+                slug = slug_name,
+                gap_count = unresolved_gaps.len(),
+                "starting gap processing pass"
+            );
+
+            for gap in &unresolved_gaps {
+                if cancel.is_cancelled() {
+                    warn!(slug = slug_name, "build cancelled during gap processing");
+                    break;
+                }
+
+                // a. Load the answer node to get question_text from self_prompt
+                let answer_node = {
+                    let conn = state.reader.lock().await;
+                    db::get_live_node(&conn, slug_name, &gap.question_id)
+                        .ok()
+                        .flatten()
+                };
+
+                let question_text = match &answer_node {
+                    Some(node) if !node.self_prompt.is_empty() => node.self_prompt.clone(),
+                    _ => {
+                        warn!(
+                            slug = slug_name,
+                            question_id = %gap.question_id,
+                            "gap references node with no self_prompt, skipping"
+                        );
+                        continue;
+                    }
+                };
+
+                // b. Determine base slugs for file resolution
+                let base_slugs_for_gap = if is_cross_slug {
+                    referenced_slugs.clone()
+                } else {
+                    vec![slug_name.to_string()]
+                };
+
+                // c. Resolve source files (rule-based, no LLM)
+                let resolved_files = {
+                    let conn = state.reader.lock().await;
+                    match evidence_answering::resolve_files_for_gap(
+                        &conn,
+                        &base_slugs_for_gap,
+                        &gap.description,
+                        &[], // existing_l0_nodes not needed for rule-based resolution
+                        state.operational.tier2.gap_resolution_max_files,
+                    ) {
+                        Ok(files) => files,
+                        Err(e) => {
+                            warn!(
+                                slug = slug_name,
+                                question_id = %gap.question_id,
+                                error = %e,
+                                "gap file resolution failed, skipping gap"
+                            );
+                            continue;
+                        }
+                    }
+                };
+
+                if resolved_files.is_empty() {
+                    info!(
+                        slug = slug_name,
+                        question_id = %gap.question_id,
+                        "no source files resolved for gap, marking resolved with no new evidence"
+                    );
+                    // Mark gap resolved even with no files — nothing more we can do
+                    let conn = state.writer.clone();
+                    let slug_owned = slug_name.to_string();
+                    let gap_qid = gap.question_id.clone();
+                    let gap_desc = gap.description.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        let c = conn.blocking_lock();
+                        db::mark_gap_resolved(&c, &slug_owned, &gap_qid, &gap_desc)
+                    })
+                    .await;
+                    continue;
+                }
+
+                // d. Call targeted_reexamination for each base slug's files
+                // Group resolved files by slug
+                let mut files_by_slug: HashMap<String, Vec<(String, String)>> = HashMap::new();
+                for (slug, path, content) in resolved_files {
+                    files_by_slug
+                        .entry(slug)
+                        .or_default()
+                        .push((path, content));
+                }
+
+                let mut gap_produced_nodes = false;
+
+                for (base_slug, file_candidates) in &files_by_slug {
+                    // Process ONE file at a time so every returned node maps
+                    // unambiguously to the file that produced it.
+                    for (file_path, content) in file_candidates {
+                        let single_file = vec![(file_path.clone(), content.clone())];
+                        let new_nodes = match evidence_answering::targeted_reexamination(
+                            &question_text,
+                            &gap.description,
+                            &single_file,
+                            &llm_config,
+                            base_slug,
+                            &build_id,
+                            tree.audience.as_deref(),
+                            Some(&state.chains_dir),
+                            &state.operational,
+                        )
+                        .await
+                        {
+                            Ok(nodes) => nodes,
+                            Err(e) => {
+                                warn!(
+                                    slug = slug_name,
+                                    base_slug = %base_slug,
+                                    question_id = %gap.question_id,
+                                    file_path = %file_path,
+                                    error = %e,
+                                    "targeted re-examination failed for file, skipping"
+                                );
+                                continue;
+                            }
+                        };
+
+                        if new_nodes.is_empty() {
+                            continue;
+                        }
+
+                        gap_produced_nodes = true;
+
+                        // e. Save new L0 nodes to BASE slug + register in file hashes
+                        let conn = state.writer.clone();
+                        let base_slug_owned = base_slug.clone();
+                        let bid = build_id.clone();
+                        let nodes_owned = new_nodes;
+                        let file_path_owned = file_path.clone();
+                        let now = chrono::Utc::now().to_rfc3339();
+                        let _ = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                            let c = conn.blocking_lock();
+                            c.execute_batch("BEGIN")?;
+                            let result = (|| -> anyhow::Result<()> {
+                                for node in nodes_owned.iter() {
+                                    db::save_node(&c, node, None)?;
+
+                                    db::append_node_id_to_file_hash(
+                                        &c,
+                                        &base_slug_owned,
+                                        &file_path_owned,
+                                        &node.id,
+                                    )?;
+
+                                    // Write evidence_set_growth mutation (only if self_prompt non-empty)
+                                    if !node.self_prompt.is_empty() {
+                                        c.execute(
+                                            "INSERT INTO pyramid_pending_mutations
+                                             (slug, layer, mutation_type, target_ref, detail, cascade_depth, detected_at, processed)
+                                             VALUES (?1, 0, 'evidence_set_growth', ?2, ?3, 0, ?4, 0)",
+                                            rusqlite::params![
+                                                base_slug_owned,
+                                                node.self_prompt,
+                                                serde_json::json!({
+                                                    "reason": "targeted_reexamination",
+                                                    "build_id": bid,
+                                                    "node_id": node.id,
+                                                })
+                                                .to_string(),
+                                                now
+                                            ],
+                                        )?;
+                                    }
+                                }
+                                Ok(())
+                            })();
+                            match result {
+                                Ok(()) => {
+                                    c.execute_batch("COMMIT")?;
+                                    Ok(())
+                                }
+                                Err(e) => {
+                                    let _ = c.execute_batch("ROLLBACK");
+                                    Err(e)
+                                }
+                            }
+                        })
+                        .await
+                        .map_err(|e| anyhow!("Gap save panicked: {e}"))
+                        .ok();
+                    }
+                }
+
+                // f. Mark gap resolved
+                let conn = state.writer.clone();
+                let slug_owned = slug_name.to_string();
+                let gap_qid = gap.question_id.clone();
+                let gap_desc = gap.description.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    let c = conn.blocking_lock();
+                    db::mark_gap_resolved(&c, &slug_owned, &gap_qid, &gap_desc)
+                })
+                .await;
+
+                if gap_produced_nodes {
+                    info!(
+                        slug = slug_name,
+                        question_id = %gap.question_id,
+                        "gap resolved with new targeted evidence"
+                    );
+                } else {
+                    info!(
+                        slug = slug_name,
+                        question_id = %gap.question_id,
+                        "gap resolved but no new evidence found"
+                    );
+                }
+            }
+
+            info!(
+                slug = slug_name,
+                gaps_processed = unresolved_gaps.len(),
+                "gap processing pass complete"
+            );
+        }
     }
 
     // Mark build complete or failed

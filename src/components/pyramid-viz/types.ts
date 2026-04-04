@@ -10,6 +10,7 @@ export interface TreeNode {
   depth: number;
   headline: string;
   distilled: string;
+  selfPrompt?: string | null;
   threadId?: string | null;
   sourcePath?: string | null;
   children: TreeNode[];
@@ -21,6 +22,7 @@ export interface FlatNode {
   depth: number;
   headline: string;
   distilled: string;
+  selfPrompt?: string | null;
   threadId?: string | null;
   sourcePath?: string | null;
   parentId: string | null;

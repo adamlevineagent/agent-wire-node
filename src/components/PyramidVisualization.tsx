@@ -50,6 +50,7 @@ interface GapReport {
   question_id: string;
   description: string;
   layer: number;
+  resolved?: boolean;
 }
 
 interface QuestionContext {
@@ -172,6 +173,7 @@ function flattenTree(roots: TreeNode[], parentId: string | null = null, seen?: S
         depth: node.depth,
         headline: node.headline,
         distilled: node.distilled,
+        selfPrompt: node.selfPrompt ?? null,
         threadId: node.threadId ?? null,
         sourcePath: node.sourcePath ?? null,
         parentId, // first parent encountered
@@ -210,6 +212,8 @@ function normalizeTreeNode(value: unknown): TreeNode | null {
         ? raw.headline
         : raw.id,
     distilled: typeof raw.distilled === 'string' ? raw.distilled : '',
+    selfPrompt: typeof raw.selfPrompt === 'string' ? raw.selfPrompt
+      : typeof raw.self_prompt === 'string' ? raw.self_prompt : null,
     threadId:
       typeof raw.threadId === 'string'
         ? raw.threadId
@@ -226,7 +230,8 @@ function normalizeTreeNode(value: unknown): TreeNode | null {
   };
 }
 
-function nodeTitle(node: Pick<FlatNode, 'headline' | 'id'>): string {
+function nodeTitle(node: Pick<FlatNode, 'headline' | 'id' | 'selfPrompt'>): string {
+  if (node.selfPrompt?.trim()) return node.selfPrompt;
   return node.headline?.trim() ? node.headline : node.id;
 }
 
@@ -953,7 +958,11 @@ export function PyramidVisualization({ slug, contentType, referencingSlugs, stal
                 : drillData?.node.distilled ?? popoverNode.distilled}
             </div>
 
-            {/* Evidence */}
+            {/* Evidence
+                TODO: Group evidence by set (canonical vs targeted L0) when the backend
+                includes source node self_prompt on each EvidenceLink. Currently EvidenceLink
+                only carries source_node_id — needs self_prompt to distinguish targeted L0
+                nodes and group them under their triggering question. */}
             {drillData?.evidence && drillData.evidence.length > 0 && (
               <div style={{ marginBottom: 12 }}>
                 <div style={{
@@ -1004,8 +1013,22 @@ export function PyramidVisualization({ slug, contentType, referencingSlugs, stal
                   Gaps
                 </div>
                 {drillData.gaps.map((gap, i) => (
-                  <div key={`gap-${i}`} style={{ fontSize: 12, padding: '2px 0', opacity: 0.8, color: '#e8c840' }}>
-                    {'\u26A0'} {gap.description}
+                  <div key={`gap-${i}`} style={{ fontSize: 12, padding: '2px 0', opacity: gap.resolved ? 0.5 : 0.8, color: gap.resolved ? '#8a8a6a' : '#e8c840', display: 'flex', alignItems: 'center', gap: 6 }}>
+                    <span>{gap.resolved ? '\u2713' : '\u26A0'}</span>
+                    <span style={{ flex: 1 }}>{gap.description}</span>
+                    {gap.resolved && (
+                      <span style={{
+                        fontSize: 9,
+                        padding: '1px 5px',
+                        borderRadius: 3,
+                        background: 'rgba(80, 160, 80, 0.15)',
+                        color: 'var(--accent-green, #50a050)',
+                        fontWeight: 600,
+                        textTransform: 'uppercase',
+                        letterSpacing: '0.3px',
+                        flexShrink: 0,
+                      }}>Resolved</span>
+                    )}
                   </div>
                 ))}
               </div>

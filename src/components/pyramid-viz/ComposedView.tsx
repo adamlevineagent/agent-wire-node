@@ -18,6 +18,7 @@ export interface ComposedNode {
   depth: number;
   headline: string;
   distilled: string;
+  self_prompt?: string | null;
   node_type: 'mechanical' | 'answer';
 }
 
@@ -336,7 +337,7 @@ export function ComposedView({ slug, onDrill }: ComposedViewProps) {
 
       // Label for larger nodes
       if (node.radius >= 10) {
-        const label = truncate(node.headline, 18);
+        const label = truncate(node.self_prompt || node.headline, 18);
         ctx.font = '9px Inter, sans-serif';
         ctx.fillStyle = 'rgba(255, 255, 255, 0.45)';
         ctx.textAlign = 'center';
@@ -544,7 +545,7 @@ export function ComposedView({ slug, onDrill }: ComposedViewProps) {
           }}
         >
           <div style={{ fontWeight: 500, marginBottom: 2 }}>
-            {hoveredNode.headline || hoveredNode.id}
+            {hoveredNode.self_prompt?.trim() || hoveredNode.headline || hoveredNode.id}
           </div>
           <div style={{ opacity: 0.45, fontSize: 10, marginBottom: 4 }}>
             {hoveredNode.id}

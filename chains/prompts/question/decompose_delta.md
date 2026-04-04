@@ -7,6 +7,8 @@ EXISTING ANSWERED QUESTIONS:
 
 EXISTING ANSWER SUMMARIES:
 {{existing_answers}}
+{{evidence_set_context_block}}
+{{gap_context_block}}
 
 For the new apex question, produce sub-questions. For each sub-question, indicate whether it can be answered by an existing question (reuse) or needs fresh evidence gathering (new).
 

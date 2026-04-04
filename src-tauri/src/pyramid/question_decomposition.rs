@@ -251,6 +251,8 @@ pub async fn decompose_question_delta(
     existing_tree: &QuestionTree,
     existing_answers: &[super::types::PyramidNode],
     chains_dir: Option<&std::path::Path>,
+    evidence_set_context: Option<&str>,
+    gap_context: Option<&str>,
 ) -> Result<DeltaDecompositionResult> {
     if config.apex_question.trim().is_empty() {
         return Err(anyhow!("apex_question cannot be empty"));
@@ -276,6 +278,14 @@ pub async fn decompose_question_delta(
         .collect::<Vec<_>>()
         .join("\n");
 
+    // Build optional context blocks for evidence sets and gaps
+    let evidence_block = evidence_set_context
+        .map(|ctx| format!("\n\nEXISTING EVIDENCE SETS:\n{}", ctx))
+        .unwrap_or_default();
+    let gap_block = gap_context
+        .map(|ctx| format!("\n\nKNOWN EVIDENCE GAPS:\n{}", ctx))
+        .unwrap_or_default();
+
     // Ask the LLM to decompose the new question, given what already exists
     let system_prompt = match chains_dir
         .map(|d| d.join("prompts/question/decompose_delta.md"))
@@ -286,6 +296,8 @@ pub async fn decompose_question_delta(
             &[
                 ("existing_questions", &existing_q_context),
                 ("existing_answers", &existing_context),
+                ("evidence_set_context_block", &evidence_block),
+                ("gap_context_block", &gap_block),
             ],
         ),
         None => {
@@ -300,6 +312,7 @@ EXISTING ANSWERED QUESTIONS:
 
 EXISTING ANSWER SUMMARIES:
 {existing_context}
+{evidence_block}{gap_block}
 
 For the new apex question, produce sub-questions. For each sub-question, indicate whether it can be answered by an existing question (reuse) or needs fresh evidence gathering (new).
 

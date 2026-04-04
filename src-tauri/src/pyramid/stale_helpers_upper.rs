@@ -389,6 +389,42 @@ pub(crate) fn resolve_parent_targets_for_node_ids(
     Ok(targets.into_iter().collect())
 }
 
+/// Resolve propagation targets for question pyramids by following the evidence DAG.
+///
+/// For each node_id, finds all answer nodes that KEEP it as evidence (across all slugs),
+/// then resolves those answer nodes to their thread targets for staleness propagation.
+pub(crate) fn resolve_evidence_targets_for_node_ids(
+    conn: &Connection,
+    slug: &str,
+    node_ids: &[String],
+) -> Result<Vec<String>> {
+    let mut targets = BTreeSet::new();
+
+    for node_id in node_ids {
+        let evidence_links = super::db::get_evidence_for_source_cross(conn, node_id)?;
+
+        for link in evidence_links {
+            if link.verdict != super::types::EvidenceVerdict::Keep {
+                continue;
+            }
+
+            if let Some(target) = resolve_stale_target_for_node(conn, &link.slug, &link.target_node_id)? {
+                targets.insert(target);
+            } else {
+                warn!(
+                    slug = %slug,
+                    node_id = %node_id,
+                    evidence_target = %link.target_node_id,
+                    evidence_slug = %link.slug,
+                    "Evidence KEEP target does not map to a live thread target"
+                );
+            }
+        }
+    }
+
+    Ok(targets.into_iter().collect())
+}
+
 pub(crate) fn resolve_parent_targets_for_file(
     conn: &Connection,
     slug: &str,
@@ -1797,8 +1833,30 @@ pub async fn execute_supersession(
         }
 
         // Write confirmed_stale mutations for: parent layer (layer+1) and all edges
-        let next_layer = (nd.depth as i32 + 1).min(3);
-        let propagation_targets = resolve_parent_targets_for_node_ids(&conn, &s, std::slice::from_ref(&nid))?;
+        let max_depth: i32 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(depth), 3) FROM pyramid_nodes WHERE slug = ?1",
+                rusqlite::params![s],
+                |row| row.get(0),
+            )
+            .unwrap_or(3);
+        let next_layer = (nd.depth as i32 + 1).min(max_depth);
+
+        // Dispatch propagation based on content type: question pyramids follow
+        // evidence DAG, mechanical pyramids follow parent_id.
+        let content_type: Option<String> = conn
+            .query_row(
+                "SELECT content_type FROM pyramid_slugs WHERE slug = ?1",
+                rusqlite::params![s],
+                |row| row.get(0),
+            )
+            .ok();
+
+        let propagation_targets = if content_type.as_deref() == Some("question") {
+            resolve_evidence_targets_for_node_ids(&conn, &s, std::slice::from_ref(&nid))?
+        } else {
+            resolve_parent_targets_for_node_ids(&conn, &s, std::slice::from_ref(&nid))?
+        };
         for target in propagation_targets {
             conn.execute(
                 "INSERT INTO pyramid_pending_mutations

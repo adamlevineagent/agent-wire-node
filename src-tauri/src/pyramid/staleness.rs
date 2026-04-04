@@ -273,7 +273,7 @@ fn propagate_from_node(
     }
 
     // Find all evidence links where this node is the source
-    let evidence_links = db::get_evidence_for_source(conn, slug, node_id)?;
+    let evidence_links = db::get_evidence_for_source_cross(conn, node_id)?;
 
     for link in &evidence_links {
         // Only follow KEEP links — DISCONNECT/MISSING don't propagate staleness

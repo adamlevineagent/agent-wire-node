@@ -416,6 +416,7 @@ pub fn get_tree(conn: &Connection, slug: &str) -> Result<Vec<TreeNode>> {
                                 depth: s.depth,
                                 headline: s.headline.clone(),
                                 distilled: s.distilled.clone(),
+                                self_prompt: None,
                                 thread_id: None,
                                 source_path: None,
                                 source_slug: Some(ref_slug.to_string()),
@@ -444,6 +445,7 @@ pub fn get_tree(conn: &Connection, slug: &str) -> Result<Vec<TreeNode>> {
                 depth: node.depth,
                 headline: node.headline.clone(),
                 distilled: node.distilled.clone(),
+                self_prompt: if node.self_prompt.is_empty() { None } else { Some(node.self_prompt.clone()) },
                 thread_id: thread_id_by_canonical_id.get(&node.id).cloned(),
                 source_path: source_path_by_node_id.get(&node.id).cloned(),
                 source_slug: None,
@@ -487,6 +489,7 @@ pub fn get_tree(conn: &Connection, slug: &str) -> Result<Vec<TreeNode>> {
                             depth: child_node.depth,
                             headline: child_node.headline.clone(),
                             distilled: child_node.distilled.clone(),
+                            self_prompt: None,
                             thread_id: None,
                             source_path: None,
                             source_slug: Some(ref_slug.to_string()),
@@ -515,6 +518,7 @@ pub fn get_tree(conn: &Connection, slug: &str) -> Result<Vec<TreeNode>> {
             depth: node.depth,
             headline: node.headline.clone(),
             distilled: node.distilled.clone(),
+            self_prompt: None,
             thread_id: thread_id_by_canonical_id.get(&node.id).cloned(),
             source_path: source_path_by_node_id.get(&node.id).cloned(),
             source_slug: source_slug,
@@ -598,8 +602,12 @@ pub fn drill(conn: &Connection, slug: &str, node_id: &str) -> Result<Option<Dril
 
     let gaps = db::get_gaps_for_question(conn, slug, node_id)?;
 
-    let question_context = db::get_question_tree(conn, slug)?
-        .and_then(|tree_json| find_question_context(&tree_json, node_id));
+    let question_context = if !parent.self_prompt.is_empty() {
+        db::get_question_tree(conn, slug)?
+            .and_then(|tree_json| find_question_context(&tree_json, &parent.self_prompt))
+    } else {
+        None
+    };
 
     // WS-ONLINE-F: Load remote web edges for this node's thread
     let remote_web_edges = load_remote_web_edges(conn, slug, node_id);
@@ -615,23 +623,23 @@ pub fn drill(conn: &Connection, slug: &str, node_id: &str) -> Result<Option<Dril
     }))
 }
 
-/// Walk a question tree JSON to find `node_id` and return its parent question + siblings.
-fn find_question_context(tree_json: &serde_json::Value, node_id: &str) -> Option<QuestionContext> {
-    find_in_tree(&tree_json["apex"], node_id, None)
+/// Walk a question tree JSON to find a node by question text and return its parent question + siblings.
+fn find_question_context(tree_json: &serde_json::Value, question_text: &str) -> Option<QuestionContext> {
+    find_in_tree(&tree_json["apex"], question_text, None)
 }
 
-/// Recursive helper: searches the question tree for `target_id`.
+/// Recursive helper: searches the question tree for `target_question`.
 /// `parent_question` is the question text of the caller's node (None at root).
 fn find_in_tree(
     node: &serde_json::Value,
-    target_id: &str,
+    target_question: &str,
     parent_question: Option<&str>,
 ) -> Option<QuestionContext> {
-    let current_id = node["id"].as_str().unwrap_or("");
+    let current_question = node["question"].as_str().unwrap_or("");
 
     // If the current node IS the target, return context only if there's a parent.
     // Apex nodes (no parent, no siblings) return None so the frontend skips the section.
-    if current_id == target_id {
+    if current_question == target_question {
         return match parent_question {
             Some(pq) => Some(QuestionContext {
                 parent_question: Some(pq.to_string()),
@@ -642,18 +650,16 @@ fn find_in_tree(
     }
 
     if let Some(kids) = node["children"].as_array() {
-        let this_question = node["question"].as_str().unwrap_or("");
-
         // Check if target is a direct child — then we can compute siblings.
         for child in kids {
-            if child["id"].as_str() == Some(target_id) {
+            if child["question"].as_str() == Some(target_question) {
                 let siblings: Vec<String> = kids
                     .iter()
-                    .filter(|k| k["id"].as_str() != Some(target_id))
+                    .filter(|k| k["question"].as_str() != Some(target_question))
                     .filter_map(|k| k["question"].as_str().map(String::from))
                     .collect();
                 return Some(QuestionContext {
-                    parent_question: Some(this_question.to_string()),
+                    parent_question: Some(current_question.to_string()),
                     sibling_questions: siblings,
                 });
             }
@@ -661,7 +667,7 @@ fn find_in_tree(
 
         // Recurse into children.
         for child in kids {
-            if let Some(ctx) = find_in_tree(child, target_id, Some(this_question)) {
+            if let Some(ctx) = find_in_tree(child, target_question, Some(current_question)) {
                 return Some(ctx);
             }
         }
@@ -985,7 +991,7 @@ pub fn get_composed_view(conn: &Connection, slug: &str) -> Result<ComposedView> 
     for s in &all_slugs {
         // Load all live nodes for this slug
         let mut stmt = conn.prepare(
-            "SELECT id, slug, depth, headline, distilled, build_id FROM live_pyramid_nodes WHERE slug = ?1 ORDER BY depth, id",
+            "SELECT id, slug, depth, headline, distilled, build_id, self_prompt FROM live_pyramid_nodes WHERE slug = ?1 ORDER BY depth, id",
         )?;
         let rows = stmt.query_map(rusqlite::params![s], |row| {
             let id: String = row.get(0)?;
@@ -994,6 +1000,7 @@ pub fn get_composed_view(conn: &Connection, slug: &str) -> Result<ComposedView> 
             let headline: String = row.get(3)?;
             let distilled: String = row.get(4)?;
             let build_id: Option<String> = row.get(5)?;
+            let self_prompt: Option<String> = row.get(6)?;
             let node_type = if build_id.as_deref().map_or(false, |b| b.starts_with("qb-")) {
                 "answer".to_string()
             } else {
@@ -1005,6 +1012,7 @@ pub fn get_composed_view(conn: &Connection, slug: &str) -> Result<ComposedView> 
                 depth,
                 headline,
                 distilled,
+                self_prompt,
                 node_type,
             })
         })?;

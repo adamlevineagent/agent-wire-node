@@ -264,7 +264,7 @@ pub fn trace_supersession(
             // Continue upward regardless of whether this node was affected —
             // a higher node may reference the claim even if an intermediate doesn't.
             // Find all KEEP evidence links where this node is the source (evidence provider).
-            let evidence_links = db::get_evidence_for_source(conn, slug, &current_node_id)?;
+            let evidence_links = db::get_evidence_for_source_cross(conn, &current_node_id)?;
             let keep_links: Vec<_> = evidence_links
                 .into_iter()
                 .filter(|e| e.verdict == EvidenceVerdict::Keep)

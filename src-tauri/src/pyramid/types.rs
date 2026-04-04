@@ -134,6 +134,7 @@ pub struct TreeNode {
     pub depth: i64,
     pub headline: String,
     pub distilled: String,
+    pub self_prompt: Option<String>,
     pub thread_id: Option<String>,
     pub source_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -933,6 +934,16 @@ pub struct GapReport {
     pub question_id: String,
     pub description: String,
     pub layer: i64,
+    #[serde(default)]
+    pub resolved: bool,
+}
+
+/// A group of targeted L0 nodes sharing the same triggering question (self_prompt).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvidenceSet {
+    pub self_prompt: String,
+    pub member_count: i64,
+    pub index_headline: Option<String>,
 }
 
 // ── Publication ───────────────────────────────────────────────────────────────
@@ -1009,6 +1020,7 @@ pub struct ComposedNode {
     pub depth: i64,
     pub headline: String,
     pub distilled: String,
+    pub self_prompt: Option<String>,
     pub node_type: String, // "mechanical" or "answer"
 }
 
