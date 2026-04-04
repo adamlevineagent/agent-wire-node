@@ -1,24 +1,27 @@
-You are decomposing a question into sub-questions to build a knowledge pyramid.
+You are decomposing a question into sub-questions to build a knowledge pyramid from "{{content_type}}" content.
 
-The source material is "{{content_type}}" content. Your sub-questions will be answered from this material. Each will either be answered directly (leaf) or further decomposed (branch).
+You will receive the parent question AND summaries of the source material. USE THE SOURCE MATERIAL to inform your decomposition — your sub-questions should address what the material actually covers.
 
-BEFORE YOU OUTPUT ANYTHING, do this mental exercise:
-1. Draft your sub-questions
-2. For each one, imagine writing a 3-sentence answer using the source material
-3. Check: do any two imagined answers describe the same things? If yes, they're the same question — merge or cut.
-4. Only output sub-questions whose imagined answers are GENUINELY DIFFERENT from each other.
+HOW TO DECOMPOSE:
+1. Read the source material summaries. What are the major DIMENSIONS of this body of knowledge?
+2. For each dimension: what question would someone ask to understand it?
+3. Check: does each sub-question address a genuinely different slice of the source material? If two questions would draw from mostly the same documents, merge them.
 
-THE GOLDEN RULE: If you find yourself listing the same features, components, or capabilities in multiple imagined answers, your questions aren't different enough. Go back to step 1.
+BRANCH vs LEAF — THIS IS CRITICAL:
+- A BRANCH is a major area that needs its own sub-questions to organize. Branches become their own section of the pyramid with multiple evidence sources synthesized underneath.
+- A LEAF is a specific, focused question that can be answered directly.
+- When the parent question is broad (like asking about an entire corpus), its children should mostly be BRANCHES — each representing a major dimension that warrants its own section.
+- Make something a leaf ONLY when it is genuinely narrow enough that a single focused answer covers it completely.
 
-LEAF vs BRANCH: For each sub-question, decide based on the question's complexity. If the question can be answered directly from source material, make it a leaf. If it needs further decomposition to be answerable, make it a branch.
-
-Produce the MINIMUM number of sub-questions needed to fully answer the parent question. If 1 suffices, use 1. If 5 are genuinely needed, use 5. Do not pad and do not artificially limit.
+THE KEY DISTINCTION: If a sub-question would need to draw evidence from many different source documents across multiple concerns, it is a BRANCH. If it draws from a small, coherent set of sources about one specific thing, it is a LEAF.
 
 {{audience_block}}
 
+You are at decomposition depth {{depth}}.
+
 Respond with a JSON array of objects, each with:
   "question": string,
-  "prompt_hint": string,
+  "prompt_hint": string (guidance for what to focus on when gathering evidence),
   "is_leaf": boolean
 
 Return ONLY the JSON array.

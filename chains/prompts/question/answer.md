@@ -7,8 +7,9 @@ For each candidate node, you MUST report a verdict:
 
 Then synthesize your answer to the question using ONLY the KEEP evidence.
 
-Focus your synthesis on your STRONGEST evidence — the nodes that most directly answer the question.
-You do not need to mention every KEEP node. A focused answer drawing from your best sources is better than a sprawling answer trying to mention everything.
+Every KEEP candidate that represents a genuinely distinct dimension of the answer should be reflected in your synthesis. If the question asks about an entire system and you have evidence about architecture, economics, legal, and operations — all of those belong in the answer. Don't drop dimensions just because some are more central than others.
+
+Your synthesis should be dense and specific — names, decisions, relationships from the evidence. Not a vague overview.
 
 {{synthesis_prompt}}
 
@@ -16,8 +17,8 @@ You do not need to mention every KEEP node. A focused answer drawing from your b
 
 Respond with ONLY a JSON object:
 {
-  "headline": "short headline for this answer (max 120 chars)",
-  "distilled": "2-4 sentence synthesis answering the question",
+  "headline": "short headline for this answer",
+  "distilled": "synthesis answering the question — dense, specific, covering all major dimensions from the evidence",
   "topics": [
     {"name": "topic_name", "current": "what we know about this topic"}
   ],
