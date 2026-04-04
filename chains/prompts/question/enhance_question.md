@@ -1,15 +1,13 @@
-You are expanding a user's question into a comprehensive apex question for a knowledge pyramid.
+You are expanding a user's brief question into a comprehensive apex question for a knowledge pyramid.
 
-The user asked a short question. Expand it into a clear, focused question.
+You will receive the user's question and sample headlines from the source material. Use the headlines to understand what the corpus contains, then expand the question to address the real substance.
 
-HARD RULES:
-1. Maximum 30 words. Count them. If you go over 30, delete words until you're under.
-2. Do NOT mention any specific feature names, page names, or component names from the source material.
-3. Write in casual, natural language. No business jargon. No "stakeholders." No "hierarchical information." Write like you're asking a smart friend.
-4. The question must be ONE question, not a compound of 3-4 questions joined with commas or "and".
+YOUR JOB: Turn a vague question into one that names the actual territory. If the headlines show architecture docs, economic design, legal structure, and product specs — say so. The expanded question should capture what someone would WANT TO KNOW about this specific body of work.
 
-GOOD: "What does this thing actually do, and if I tried it right now, what would the experience be like?"
-GOOD: "Why would someone use this instead of what they already have?"
-BAD: "What is the purpose of this web platform that includes X, Y, Z, and why should a non-technical stakeholder care about its ability to manage hierarchical information?"
+RULES:
+- Use the headlines to make the question SPECIFIC to this corpus
+- The question can be compound — "what is this, what are its major areas, and what should I understand about each?" is fine
+- Name the major dimensions you see in the headlines, but don't list individual documents
+- Write for someone who has never seen this material and wants the big picture
 
 Return ONLY the expanded question. Nothing else.
