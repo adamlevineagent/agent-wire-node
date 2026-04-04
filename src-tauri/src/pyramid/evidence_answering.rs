@@ -1252,10 +1252,13 @@ pub fn resolve_files_for_gap(
     max_files: usize,
 ) -> Result<Vec<(String, String, String)>> {
     // ── 1. Tokenize gap description into keywords ───────────────────────
+    // Split on non-alphanumeric boundaries (not just whitespace) to handle
+    // hyphenated words like "foreign-key" → ["foreign", "key"]
     let keywords: Vec<String> = gap_description
-        .split_whitespace()
-        .map(|w| w.to_lowercase().replace(|c: char| !c.is_alphanumeric(), ""))
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
         .filter(|w| w.len() >= 3)
+        .map(String::from)
         .collect();
 
     if keywords.is_empty() {
@@ -1276,9 +1279,23 @@ pub fn resolve_files_for_gap(
             .filter(|n| !n.id.starts_with("ES-") && !is_targeted_l0_id(&n.id))
             .collect();
 
-        // ── 3. Score each by keyword overlap ────────────────────────────
+        info!(
+            base_slug,
+            all_l0_count = all_l0.len(),
+            canonical_count = canonical.len(),
+            keywords_count = keywords.len(),
+            first_keywords = %keywords.iter().take(5).cloned().collect::<Vec<_>>().join(", "),
+            first_canonical_headline = %canonical.first().map(|n| n.headline.as_str()).unwrap_or("(none)"),
+            "gap file resolution: scanning canonical L0 nodes"
+        );
+
+        // ── 3. Score each by keyword overlap (headline + distilled + topics) ──
         for node in &canonical {
-            let text = format!("{} {}", node.headline, node.distilled).to_lowercase();
+            let topics_text = node.topics.iter()
+                .map(|t| format!("{} {}", t.name, t.current))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let text = format!("{} {} {}", node.headline, node.distilled, topics_text).to_lowercase();
             let score = keywords.iter().filter(|kw| text.contains(kw.as_str())).count();
             if score > 0 {
                 scored_nodes.push((base_slug.clone(), node.id.clone(), score));
