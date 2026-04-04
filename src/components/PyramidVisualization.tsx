@@ -142,22 +142,48 @@ function parseCrossSlugId(childId: string): { isExternal: boolean; slug: string;
 
 // ── Helpers ───────────────────────────────────────────────────────────
 
-function flattenTree(roots: TreeNode[], parentId: string | null = null): FlatNode[] {
+/**
+ * Flatten a tree into unique nodes + a separate edge list.
+ * The pyramid is a DAG (multiple parents can cite the same child node),
+ * so we deduplicate by ID and track all parent→child edges separately.
+ */
+interface FlattenResult {
+  nodes: FlatNode[];
+  edges: Array<{ childId: string; parentId: string }>;
+}
+
+function flattenTree(roots: TreeNode[], parentId: string | null = null, seen?: Set<string>, edgeAccum?: Array<{ childId: string; parentId: string }>): FlattenResult {
+  const isRoot = !seen;
+  const seenIds = seen ?? new Set<string>();
+  const allEdges = edgeAccum ?? [];
   const result: FlatNode[] = [];
+
   for (const node of roots) {
-    result.push({
-      id: node.id,
-      depth: node.depth,
-      headline: node.headline,
-      distilled: node.distilled,
-      threadId: node.threadId ?? null,
-      sourcePath: node.sourcePath ?? null,
-      parentId,
-      childIds: node.children.map((c) => c.id),
-    });
-    result.push(...flattenTree(node.children, node.id));
+    // Record the parent→child edge even if the node was already seen
+    if (parentId) {
+      allEdges.push({ childId: node.id, parentId });
+    }
+
+    // Only create the FlatNode once per unique ID
+    if (!seenIds.has(node.id)) {
+      seenIds.add(node.id);
+      result.push({
+        id: node.id,
+        depth: node.depth,
+        headline: node.headline,
+        distilled: node.distilled,
+        threadId: node.threadId ?? null,
+        sourcePath: node.sourcePath ?? null,
+        parentId, // first parent encountered
+        childIds: node.children.map((c) => c.id),
+      });
+      // Recurse into children
+      const sub = flattenTree(node.children, node.id, seenIds, allEdges);
+      result.push(...sub.nodes);
+    }
   }
-  return result;
+
+  return isRoot ? { nodes: result, edges: allEdges } : { nodes: result, edges: allEdges };
 }
 
 function normalizeTreeNode(value: unknown): TreeNode | null {
@@ -287,6 +313,9 @@ const NODE_COLORS: Record<NodeState, { fill: string; hover: string }> = {
 };
 
 const EDGE_COLOR = 'rgba(34, 211, 238, 0.15)';
+const BEDROCK_EDGE_COLOR = 'rgba(120, 160, 180, 0.1)';
+const BEDROCK_FILL = 'rgba(120, 160, 180, 0.3)';
+const BEDROCK_HOVER_FILL = 'rgba(120, 160, 180, 0.55)';
 const LABEL_COLOR = 'rgba(255, 255, 255, 0.2)';
 
 // ── Component ─────────────────────────────────────────────────────────
@@ -334,13 +363,38 @@ export function PyramidVisualization({ slug, contentType, referencingSlugs, stal
   // Canvas setup
   const { width, height } = useCanvasSetup([canvasRef], containerRef);
 
-  // Flatten tree
-  const flatNodes = useMemo(() => {
-    return flattenTree(treeData);
+  // Flatten tree (DAG-aware: deduplicates nodes, collects all edges)
+  // Then add BEDROCK layer (source files below L0)
+  const { flatNodes, dagEdges } = useMemo(() => {
+    const { nodes, edges: treeEdges } = flattenTree(treeData);
+
+    // Add BEDROCK layer: unique source files from L0 nodes
+    const sourceToL0 = new Map<string, string[]>();
+    for (const node of nodes) {
+      if (node.depth === 0 && node.sourcePath) {
+        const existing = sourceToL0.get(node.sourcePath) ?? [];
+        existing.push(node.id);
+        sourceToL0.set(node.sourcePath, existing);
+      }
+    }
+    for (const [sourcePath, l0Ids] of sourceToL0) {
+      nodes.push({
+        id: `bedrock:${sourcePath}`,
+        depth: -1,
+        headline: sourcePath.split('/').pop() ?? sourcePath,
+        distilled: sourcePath,
+        threadId: null,
+        sourcePath: sourcePath,
+        parentId: null,
+        childIds: l0Ids,
+      });
+    }
+
+    return { flatNodes: nodes, dagEdges: treeEdges };
   }, [treeData]);
 
-  // Layout
-  const { nodes: layoutNodes, edges } = usePyramidLayout(flatNodes, width, height);
+  // Layout (pass explicit DAG edges so multi-parent connections render correctly)
+  const { nodes: layoutNodes, edges } = usePyramidLayout(flatNodes, width, height, dagEdges);
 
   // Diagnostic: log layout results
   // Apply stale log state to layout nodes
@@ -351,10 +405,15 @@ export function PyramidVisualization({ slug, contentType, referencingSlugs, stal
     }));
   }, [layoutNodes, staleLog]);
 
-  // maxDepth for layer labels
+  // maxDepth and minDepth for layer labels
   const maxDepth = useMemo(() => {
     if (stateNodes.length === 0) return 0;
     return Math.max(...stateNodes.map((n) => n.depth));
+  }, [stateNodes]);
+
+  const minDepth = useMemo(() => {
+    if (stateNodes.length === 0) return 0;
+    return Math.min(...stateNodes.map((n) => n.depth));
   }, [stateNodes]);
 
   // ── Fetch tree data ─────────────────────────────────────────────────
@@ -412,17 +471,18 @@ export function PyramidVisualization({ slug, contentType, referencingSlugs, stal
       return;
     }
 
-    // Draw edges
-    ctx.strokeStyle = EDGE_COLOR;
+    // Draw edges (BEDROCK edges use muted color)
     ctx.lineWidth = 0.5;
     for (const edge of edges) {
+      const isBedrock = edge.toId.startsWith('bedrock:') || edge.fromId.startsWith('bedrock:');
+      ctx.strokeStyle = isBedrock ? BEDROCK_EDGE_COLOR : EDGE_COLOR;
       ctx.beginPath();
       ctx.moveTo(edge.fromX, edge.fromY);
       ctx.quadraticCurveTo(edge.controlX, edge.controlY, edge.toX, edge.toY);
       ctx.stroke();
     }
 
-    // Draw layer labels
+    // Draw layer labels on canvas
     ctx.font = '10px monospace';
     ctx.fillStyle = LABEL_COLOR;
     ctx.textAlign = 'left';
@@ -430,7 +490,8 @@ export function PyramidVisualization({ slug, contentType, referencingSlugs, stal
     for (const node of stateNodes) {
       if (!drawnLabels.has(node.depth)) {
         drawnLabels.add(node.depth);
-        ctx.fillText(`L${node.depth}`, 12, node.y + 3);
+        const label = node.depth === -1 ? 'BEDROCK' : `L${node.depth}`;
+        ctx.fillText(label, 12, node.y + 3);
       }
     }
 
@@ -439,33 +500,58 @@ export function PyramidVisualization({ slug, contentType, referencingSlugs, stal
 
     for (const node of sortedNodes) {
       const isHovered = hoveredNode?.id === node.id;
-      const colors = NODE_COLORS[node.state];
-      const fillColor = isHovered ? colors.hover : colors.fill;
-      const drawRadius = isHovered ? node.radius * 1.4 : node.radius;
+      const isBedrock = node.depth === -1;
 
-      if (node.state === NodeState.STALE_CONFIRMED || node.state === NodeState.JUST_UPDATED) {
-        ctx.shadowBlur = isHovered ? 22 : 16;
-        ctx.shadowColor = 'rgba(64, 208, 128, 0.55)';
-      } else if (node.state === NodeState.NOT_STALE) {
-        ctx.shadowBlur = isHovered ? 18 : 12;
-        ctx.shadowColor = 'rgba(72, 230, 255, 0.42)';
-      } else {
+      if (isBedrock) {
+        // BEDROCK: muted tiny dots with filename labels
+        const drawRadius = isHovered ? node.radius * 1.6 : node.radius;
         ctx.shadowBlur = 0;
         ctx.shadowColor = 'transparent';
-      }
+        ctx.beginPath();
+        ctx.arc(node.x, node.y, drawRadius, 0, Math.PI * 2);
+        ctx.fillStyle = isHovered ? BEDROCK_HOVER_FILL : BEDROCK_FILL;
+        ctx.fill();
 
-      ctx.beginPath();
-      ctx.arc(node.x, node.y, drawRadius, 0, Math.PI * 2);
-      ctx.fillStyle = fillColor;
-      ctx.fill();
+        // Draw rotated filename label below each BEDROCK node
+        ctx.save();
+        ctx.font = '8px Inter, sans-serif';
+        ctx.fillStyle = 'rgba(120, 160, 180, 0.5)';
+        ctx.textAlign = 'left';
+        ctx.translate(node.x, node.y + drawRadius + 6);
+        ctx.rotate(-Math.PI / 4);
+        const label = node.headline.length > 24 ? node.headline.slice(0, 22) + '..' : node.headline;
+        ctx.fillText(label, 0, 0);
+        ctx.restore();
+      } else {
+        // Standard pyramid node rendering
+        const colors = NODE_COLORS[node.state];
+        const fillColor = isHovered ? colors.hover : colors.fill;
+        const drawRadius = isHovered ? node.radius * 1.4 : node.radius;
 
-      if (node.state !== NodeState.STABLE) {
-        ctx.lineWidth = isHovered ? 1.5 : 1;
-        ctx.strokeStyle =
-          node.state === NodeState.NOT_STALE
-            ? 'rgba(180, 248, 255, 0.65)'
-            : 'rgba(140, 255, 190, 0.7)';
-        ctx.stroke();
+        if (node.state === NodeState.STALE_CONFIRMED || node.state === NodeState.JUST_UPDATED) {
+          ctx.shadowBlur = isHovered ? 22 : 16;
+          ctx.shadowColor = 'rgba(64, 208, 128, 0.55)';
+        } else if (node.state === NodeState.NOT_STALE) {
+          ctx.shadowBlur = isHovered ? 18 : 12;
+          ctx.shadowColor = 'rgba(72, 230, 255, 0.42)';
+        } else {
+          ctx.shadowBlur = 0;
+          ctx.shadowColor = 'transparent';
+        }
+
+        ctx.beginPath();
+        ctx.arc(node.x, node.y, drawRadius, 0, Math.PI * 2);
+        ctx.fillStyle = fillColor;
+        ctx.fill();
+
+        if (node.state !== NodeState.STABLE) {
+          ctx.lineWidth = isHovered ? 1.5 : 1;
+          ctx.strokeStyle =
+            node.state === NodeState.NOT_STALE
+              ? 'rgba(180, 248, 255, 0.65)'
+              : 'rgba(140, 255, 190, 0.7)';
+          ctx.stroke();
+        }
       }
     }
 
@@ -589,6 +675,11 @@ export function PyramidVisualization({ slug, contentType, referencingSlugs, stal
       if (node) {
         setPopoverNode(node);
         setDrillData(null);
+        // BEDROCK nodes are synthetic — no drill data available
+        if (node.depth === -1) {
+          setDrillLoading(false);
+          return;
+        }
         setDrillLoading(true);
         invoke<DrillResult>('pyramid_drill', { slug, nodeId: node.id })
           .then((data) => {
@@ -758,7 +849,7 @@ export function PyramidVisualization({ slug, contentType, referencingSlugs, stal
                 className="pyramid-viz-layer-label"
                 style={{ top: yCenter - 5 }}
               >
-                L{depth}
+                {depth === -1 ? 'BEDROCK' : `L${depth}`}
               </span>
             );
           })}
@@ -774,7 +865,9 @@ export function PyramidVisualization({ slug, contentType, referencingSlugs, stal
             }}
           >
             <div style={{ fontWeight: 500, marginBottom: 2 }}>
-              {nodeTitle(hoveredNode)}
+              {nodeTitle(hoveredNode).length > 80
+                ? nodeTitle(hoveredNode).slice(0, 78) + '…'
+                : nodeTitle(hoveredNode)}
             </div>
             <div style={{ opacity: 0.45, fontSize: 10, marginBottom: 4 }}>
               {hoveredNode.id}
@@ -794,7 +887,7 @@ export function PyramidVisualization({ slug, contentType, referencingSlugs, stal
               {hoveredNode.distilled.length > 100 ? '...' : ''}
             </div>
             <div style={{ opacity: 0.5, fontSize: 10, marginTop: 2 }}>
-              L{hoveredNode.depth}
+              {hoveredNode.depth === -1 ? 'BEDROCK' : `L${hoveredNode.depth}`}
             </div>
           </div>
         )}
@@ -833,7 +926,7 @@ export function PyramidVisualization({ slug, contentType, referencingSlugs, stal
             <div style={{ fontWeight: 600, marginBottom: 14, paddingRight: 20, fontSize: 15 }}>
               {nodeTitle(popoverNode)}
               <span style={{ opacity: 0.4, marginLeft: 8, fontWeight: 400, fontSize: 11 }}>
-                L{popoverNode.depth}
+                {popoverNode.depth === -1 ? 'BEDROCK' : `L${popoverNode.depth}`}
               </span>
             </div>
 
@@ -919,44 +1012,78 @@ export function PyramidVisualization({ slug, contentType, referencingSlugs, stal
             )}
 
             {/* Children */}
-            {drillData && drillData.children.length > 0 && (
-              <div style={{ marginBottom: 12 }}>
-                <div style={{
-                  fontSize: 11, opacity: 0.5, marginBottom: 4, marginTop: 12,
-                  textTransform: 'uppercase', letterSpacing: '0.5px',
-                }}>
-                  Children
-                </div>
-                {drillData.children.map((child) => {
-                  const crossSlug = parseCrossSlugId(child.id);
-                  return (
-                    <div
-                      key={child.id}
-                      className="drill-child-row"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        if (crossSlug && onNavigateToSlug) {
-                          onNavigateToSlug(crossSlug.slug, crossSlug.nodeId);
-                        } else {
-                          handlePopoverChildClick(child.id);
-                        }
-                      }}
-                    >
-                      {crossSlug && (
-                        <span className="cross-slug-badge" title={`From ${crossSlug.slug} at depth ${crossSlug.depth}`}>
-                          {crossSlug.slug}
-                          <span className="cross-slug-depth">L{crossSlug.depth}</span>
+            {drillData && (() => {
+              const keepSources = (drillData.evidence ?? []).filter(e => e.verdict === 'KEEP');
+              const hasChildren = drillData.children.length > 0;
+              const useEvidenceSources = !hasChildren && keepSources.length > 0;
+
+              if (!hasChildren && !useEvidenceSources) return null;
+
+              return (
+                <div style={{ marginBottom: 12 }}>
+                  <div style={{
+                    fontSize: 11, opacity: 0.5, marginBottom: 4, marginTop: 12,
+                    textTransform: 'uppercase', letterSpacing: '0.5px',
+                  }}>
+                    {useEvidenceSources ? 'Sources' : 'Children'}
+                  </div>
+                  {hasChildren && drillData.children.map((child) => {
+                    const crossSlug = parseCrossSlugId(child.id);
+                    return (
+                      <div
+                        key={child.id}
+                        className="drill-child-row"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          if (crossSlug && onNavigateToSlug) {
+                            onNavigateToSlug(crossSlug.slug, crossSlug.nodeId);
+                          } else {
+                            handlePopoverChildClick(child.id);
+                          }
+                        }}
+                      >
+                        {crossSlug && (
+                          <span className="cross-slug-badge" title={`From ${crossSlug.slug} at depth ${crossSlug.depth}`}>
+                            {crossSlug.slug}
+                            <span className="cross-slug-depth">L{crossSlug.depth}</span>
+                          </span>
+                        )}
+                        <span className="drill-child-text">
+                          {(child.headline?.trim() ? child.headline : child.id)}: {child.distilled.slice(0, 60)}
+                          {child.distilled.length > 60 ? '...' : ''}
                         </span>
-                      )}
-                      <span className="drill-child-text">
-                        {(child.headline?.trim() ? child.headline : child.id)}: {child.distilled.slice(0, 60)}
-                        {child.distilled.length > 60 ? '...' : ''}
-                      </span>
-                    </div>
-                  );
-                })}
-              </div>
-            )}
+                      </div>
+                    );
+                  })}
+                  {useEvidenceSources && keepSources.map((ev, i) => {
+                    const crossSlug = parseCrossSlugId(ev.source_node_id);
+                    const displayId = crossSlug ? `${crossSlug.slug} / ${crossSlug.nodeId}` : ev.source_node_id;
+                    return (
+                      <div
+                        key={`ev-src-${i}`}
+                        className="drill-child-row"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          if (crossSlug && onNavigateToSlug) {
+                            onNavigateToSlug(crossSlug.slug, crossSlug.nodeId);
+                          } else {
+                            handlePopoverChildClick(ev.source_node_id);
+                          }
+                        }}
+                      >
+                        <span style={{ fontSize: 10, opacity: 0.5, marginRight: 4 }}>
+                          {ev.weight != null ? `(${ev.weight.toFixed(1)})` : ''}
+                        </span>
+                        <span className="drill-child-text">
+                          {displayId}
+                          {ev.reason ? ` — ${ev.reason.slice(0, 50)}${ev.reason.length > 50 ? '…' : ''}` : ''}
+                        </span>
+                      </div>
+                    );
+                  })}
+                </div>
+              );
+            })()}
 
             {/* Question Tree Context */}
             {drillData?.question_context && (

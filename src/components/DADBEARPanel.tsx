@@ -588,168 +588,10 @@ Last check: ${lastCheckStr}
                 </div>
             )}
 
-            <div className="dadbear-grid">
-                {/* ── Config Section ──────────────────────────────────── */}
-                <div className="dadbear-config-section">
-                    <h3>Configuration</h3>
-
-                    <div className="dadbear-field">
-                        <label>Auto-Update</label>
-                        <label className="dadbear-toggle">
-                            <input
-                                type="checkbox"
-                                checked={editAutoUpdate}
-                                onChange={(e) => { setEditAutoUpdate(e.target.checked); setConfigDirty(true); }}
-                            />
-                            <span className="dadbear-toggle-track" />
-                            <span className="dadbear-toggle-thumb" />
-                        </label>
-                    </div>
-
-                    <div className="dadbear-field">
-                        <label>Debounce ({editDebounce} min)</label>
-                        <input
-                            type="range"
-                            className="dadbear-slider"
-                            min={1}
-                            max={30}
-                            value={editDebounce}
-                            onChange={(e) => { setEditDebounce(parseInt(e.target.value)); setConfigDirty(true); }}
-                        />
-                    </div>
-
-                    <div className="dadbear-field">
-                        <label>Min Changed Files ({editMinFiles})</label>
-                        <input
-                            type="range"
-                            className="dadbear-slider"
-                            min={1}
-                            max={20}
-                            value={editMinFiles}
-                            onChange={(e) => { setEditMinFiles(parseInt(e.target.value)); setConfigDirty(true); }}
-                        />
-                    </div>
-
-                    <div className="dadbear-field">
-                        <label>Runaway Threshold ({(editThreshold * 100).toFixed(0)}%)</label>
-                        <input
-                            type="range"
-                            className="dadbear-slider"
-                            min={10}
-                            max={100}
-                            value={editThreshold * 100}
-                            onChange={(e) => { setEditThreshold(parseInt(e.target.value) / 100); setConfigDirty(true); }}
-                        />
-                    </div>
-
-                    <button
-                        className="dadbear-save-btn"
-                        onClick={handleSaveConfig}
-                        disabled={!configDirty || saving}
-                    >
-                        {saving ? 'Saving...' : 'Save Config'}
-                    </button>
-                </div>
-
-                {/* ── Status + Controls Section ──────────────────────── */}
-                <div className="dadbear-status-section">
-                    <h3>Live Status</h3>
-
-                    <div className={`dadbear-status-text ${statusInfo.className}`}>
-                        {statusInfo.text}
-                    </div>
-
-                    {/* Phase detail */}
-                    {status?.phase_detail && (status.phase === 'evaluating' || status.phase === 'cascading') && (
-                        <div className="dadbear-phase-detail">{status.phase_detail}</div>
-                    )}
-
-                    {/* Live countdown during debounce */}
-                    {enginePhase === 'debounce' && countdownSeconds != null && (
-                        <div>
-                            <div className="dadbear-countdown">
-                                {Math.floor(countdownSeconds / 60)}:{String(countdownSeconds % 60).padStart(2, '0')}
-                            </div>
-                            {countdownRestarted && (
-                                <div className="dadbear-countdown-reset">NEW CHANGE — RESTARTING COUNTDOWN</div>
-                            )}
-                        </div>
-                    )}
-
-                    {/* Vertical bar chart — fills available space */}
-                    {status && (
-                        <div className="dadbear-bar-chart">
-                            {[0, 1, 2, 3].map(layer => {
-                                const count = status.pending_mutations_by_layer[String(layer)] ?? 0;
-                                const heightPct = (count / maxPending) * 100;
-                                return (
-                                    <div key={layer} className="dadbear-bar-column">
-                                        <div className="dadbear-bar-fill" style={{ height: `${heightPct}%` }} />
-                                        <span className="dadbear-bar-label">L{layer}</span>
-                                        <span className="dadbear-bar-count">{count}</span>
-                                    </div>
-                                );
-                            })}
-                        </div>
-                    )}
-
-                    {/* Bottom section: last check + controls */}
-                    <div className="dadbear-status-footer">
-                        {status && (
-                            <div className="dadbear-last-check">
-                                Last check: {formatDate(status.last_check_at)}
-                            </div>
-                        )}
-
-                        <div className="dadbear-controls">
-                            <button
-                                className={`dadbear-freeze-btn ${isFrozen ? 'frozen' : 'active'}`}
-                                onClick={isFrozen ? handleUnfreeze : handleFreeze}
-                            >
-                                {isFrozen ? 'Unfreeze' : 'Freeze'}
-                            </button>
-
-                            <span className={`dadbear-breaker-indicator ${isBreakerTripped ? 'tripped' : 'ok'}`}>
-                                <span className={`dadbear-breaker-dot ${isBreakerTripped ? 'tripped' : 'ok'}`} />
-                                Breaker: {isBreakerTripped ? 'TRIPPED' : 'OK'}
-                            </span>
-
-                            {isBreakerTripped && (
-                                <>
-                                    <button className="dadbear-action-btn" onClick={handleBreakerResume}>
-                                        Resume
-                                    </button>
-                                    <button className="dadbear-action-btn danger" onClick={handleArchiveAndRebuild}>
-                                        Archive + Rebuild
-                                    </button>
-                                </>
-                            )}
-
-                            {!isFrozen && !isBreakerTripped && (
-                                <button
-                                    className="dadbear-action-btn l0-sweep"
-                                    onClick={handleL0Sweep}
-                                    disabled={sweepingL0 || runningNow}
-                                >
-                                    {sweepingL0 ? 'Sweeping L0...' : 'Force L0 Sweep'}
-                                </button>
-                            )}
-
-                            {!isFrozen && !isBreakerTripped && totalPending > 0 && (
-                                <button
-                                    className="dadbear-action-btn run-now"
-                                    onClick={handleRunNow}
-                                    disabled={runningNow || sweepingL0}
-                                >
-                                    {runningNow ? 'Running...' : 'Run Now'}
-                                </button>
-                            )}
-                        </div>
-                    </div>
-                </div>
-
-                {/* ── Pyramid Visualization ─────────────────────────── */}
-                <div className="dadbear-grid-full">
+            {/* ── Body: 2-column layout ─────────────────────────────── */}
+            <div className="dadbear-body-layout">
+                {/* ── Left column: pyramid visualization ──────────────── */}
+                <div className="dadbear-left-col">
                     <PyramidVisualization
                         slug={slug}
                         contentType={contentType}
@@ -760,199 +602,361 @@ Last check: ${lastCheckStr}
                     />
                 </div>
 
-                {/* ── Stale Log Section ──────────────────────────────── */}
-                <div className="dadbear-log-section dadbear-grid-full">
-                    <h3>Stale Check Log</h3>
+                {/* ── Right column: all monitoring panels ─────────────── */}
+                <div className="dadbear-right-col">
+                    {/* ── Status + Controls Section ──────────────────── */}
+                    <div className="dadbear-status-section">
+                        <h3>Live Status</h3>
 
-                    <div className="dadbear-log-filters">
-                        <select value={logLayerFilter} onChange={(e) => setLogLayerFilter(e.target.value)}>
-                            <option value="all">All Layers</option>
-                            <option value="0">L0</option>
-                            <option value="1">L1</option>
-                            <option value="2">L2</option>
-                            <option value="3">L3</option>
-                        </select>
-                        <select value={logStaleFilter} onChange={(e) => setLogStaleFilter(e.target.value)}>
-                            <option value="all">All Results</option>
-                            <option value="yes">Stale Only</option>
-                            <option value="no">Not Stale</option>
-                        </select>
-                    </div>
+                        <div className={`dadbear-status-text ${statusInfo.className}`}>
+                            {statusInfo.text}
+                        </div>
 
-                    <table className="stale-log-table">
-                        <thead>
-                            <tr>
-                                <th>Layer</th>
-                                <th>Target</th>
-                                <th>Stale</th>
-                                <th>Reason</th>
-                                <th>Cost</th>
-                                <th>Time</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            {staleLog.length === 0 ? (
-                                <tr>
-                                    <td colSpan={6} style={{ textAlign: 'center', color: 'var(--text-muted)', padding: 20 }}>
-                                        No stale checks recorded yet
-                                    </td>
-                                </tr>
-                            ) : staleLog.map(entry => (
-                                <tr key={entry.id}>
-                                    <td>L{entry.layer}</td>
-                                    <td title={entry.target_id}>
-                                        {entry.target_id.length > 20
-                                            ? entry.target_id.slice(0, 20) + '...'
-                                            : entry.target_id}
-                                    </td>
-                                    <td>
-                                        <span className={`stale-badge ${entry.stale === '1' || entry.stale === 'true' || entry.stale === 'yes' ? 'stale-yes' : 'stale-no'}`}>
-                                            {entry.stale === '1' || entry.stale === 'true' || entry.stale === 'yes' ? 'Yes' : 'No'}
-                                        </span>
-                                    </td>
-                                    <td title={entry.reason}>
-                                        {entry.reason.length > 40
-                                            ? entry.reason.slice(0, 40) + '...'
-                                            : entry.reason}
-                                    </td>
-                                    <td>{entry.cost_usd != null ? `$${entry.cost_usd.toFixed(4)}` : '-'}</td>
-                                    <td>{formatDate(entry.checked_at)}</td>
-                                </tr>
-                            ))}
-                        </tbody>
-                    </table>
-                </div>
+                        {/* Phase detail */}
+                        {status?.phase_detail && (status.phase === 'evaluating' || status.phase === 'cascading') && (
+                            <div className="dadbear-phase-detail">{status.phase_detail}</div>
+                        )}
 
-                {/* ── Cost Section ───────────────────────────────────── */}
-                <div className="dadbear-cost-section">
-                    <h3>Cost Observatory</h3>
-
-                    <div className="dadbear-cost-window">
-                        {['all', '24h', '7d', '30d'].map(w => (
-                            <button
-                                key={w}
-                                className={costWindow === w ? 'active' : ''}
-                                onClick={() => setCostWindow(w)}
-                            >
-                                {w === 'all' ? 'All' : w}
-                            </button>
-                        ))}
-                    </div>
-
-                    {cost && (
-                        <>
-                            <div className="dadbear-cost-total">
-                                ${cost.total_spend.toFixed(4)}
-                            </div>
-                            <div className="dadbear-cost-calls">
-                                {cost.total_calls} API call{cost.total_calls !== 1 ? 's' : ''}
-                            </div>
-
-                            {cost.by_check_type.length > 0 && (
-                                <div className="dadbear-cost-breakdown">
-                                    {cost.by_check_type.map(ct => (
-                                        <div key={ct.check_type} className="dadbear-cost-row">
-                                            <span className="dadbear-cost-row-label">{ct.check_type}</span>
-                                            <span className="dadbear-cost-row-value">
-                                                ${ct.spend.toFixed(4)} ({ct.calls})
-                                            </span>
-                                        </div>
-                                    ))}
+                        {/* Live countdown during debounce */}
+                        {enginePhase === 'debounce' && countdownSeconds != null && (
+                            <div>
+                                <div className="dadbear-countdown">
+                                    {Math.floor(countdownSeconds / 60)}:{String(countdownSeconds % 60).padStart(2, '0')}
                                 </div>
-                            )}
-                        </>
-                    )}
-                </div>
-
-                {/* ── Knowledge Contributions ──────────────────────── */}
-                <div className="dadbear-contributions">
-                    <h3>Knowledge Contributions</h3>
-                    {contributions ? (
-                        <>
-                            <div className="contribution-stats">
-                                <div className="contribution-stat-row">
-                                    <span>\uD83D\uDCDD {contributions.totalAnnotations} annotation{contributions.totalAnnotations !== 1 ? 's' : ''} from {contributions.uniqueAuthors} agent{contributions.uniqueAuthors !== 1 ? 's' : ''}</span>
-                                </div>
-                                <div className="contribution-stat-row">
-                                    <span>\uD83D\uDCDA {contributions.totalFaqs} FAQ entr{contributions.totalFaqs !== 1 ? 'ies' : 'y'} (flat mode)</span>
-                                </div>
-                                {contributions.lastAuthor && (
-                                    <div className="contribution-stat-row">
-                                        <span>\uD83D\uDD04 Last contribution: {formatTimeAgo(contributions.lastContributionAt)} by <span className="contribution-author-badge">{contributions.lastAuthor}</span></span>
-                                    </div>
+                                {countdownRestarted && (
+                                    <div className="dadbear-countdown-reset">NEW CHANGE — RESTARTING COUNTDOWN</div>
                                 )}
                             </div>
-                            {contributions.annotations.length > 0 && (
-                                <div className="contribution-recent">
-                                    <div className="contribution-recent-label">Recent:</div>
-                                    {contributions.annotations.map(a => (
-                                        <div key={a.id} className="contribution-item">
-                                            <span className="contribution-author-badge">{a.author}</span>
-                                            <span className="contribution-content" title={a.content}>
-                                                {a.content.length > 60 ? a.content.slice(0, 60) + '...' : a.content}
-                                            </span>
+                        )}
+
+                        {/* Vertical bar chart — fills available space */}
+                        {status && (
+                            <div className="dadbear-bar-chart">
+                                {[0, 1, 2, 3].map(layer => {
+                                    const count = status.pending_mutations_by_layer[String(layer)] ?? 0;
+                                    const heightPct = (count / maxPending) * 100;
+                                    return (
+                                        <div key={layer} className="dadbear-bar-column">
+                                            <div className="dadbear-bar-fill" style={{ height: `${heightPct}%` }} />
+                                            <span className="dadbear-bar-label">L{layer}</span>
+                                            <span className="dadbear-bar-count">{count}</span>
                                         </div>
-                                    ))}
+                                    );
+                                })}
+                            </div>
+                        )}
+
+                        {/* Bottom section: last check + controls */}
+                        <div className="dadbear-status-footer">
+                            {status && (
+                                <div className="dadbear-last-check">
+                                    Last check: {formatDate(status.last_check_at)}
                                 </div>
                             )}
-                        </>
-                    ) : (
-                        <div className="contribution-empty">No contributions yet</div>
-                    )}
-                </div>
 
-                {/* ── Recent Calls ───────────────────────────────────── */}
-                {cost && cost.recent_calls.length > 0 && (
+                            <div className="dadbear-controls">
+                                <button
+                                    className={`dadbear-freeze-btn ${isFrozen ? 'frozen' : 'active'}`}
+                                    onClick={isFrozen ? handleUnfreeze : handleFreeze}
+                                >
+                                    {isFrozen ? 'Unfreeze' : 'Freeze'}
+                                </button>
+
+                                <span className={`dadbear-breaker-indicator ${isBreakerTripped ? 'tripped' : 'ok'}`}>
+                                    <span className={`dadbear-breaker-dot ${isBreakerTripped ? 'tripped' : 'ok'}`} />
+                                    Breaker: {isBreakerTripped ? 'TRIPPED' : 'OK'}
+                                </span>
+
+                                {isBreakerTripped && (
+                                    <>
+                                        <button className="dadbear-action-btn" onClick={handleBreakerResume}>
+                                            Resume
+                                        </button>
+                                        <button className="dadbear-action-btn danger" onClick={handleArchiveAndRebuild}>
+                                            Archive + Rebuild
+                                        </button>
+                                    </>
+                                )}
+
+                                {!isFrozen && !isBreakerTripped && (
+                                    <button
+                                        className="dadbear-action-btn l0-sweep"
+                                        onClick={handleL0Sweep}
+                                        disabled={sweepingL0 || runningNow}
+                                    >
+                                        {sweepingL0 ? 'Sweeping L0...' : 'Force L0 Sweep'}
+                                    </button>
+                                )}
+
+                                {!isFrozen && !isBreakerTripped && totalPending > 0 && (
+                                    <button
+                                        className="dadbear-action-btn run-now"
+                                        onClick={handleRunNow}
+                                        disabled={runningNow || sweepingL0}
+                                    >
+                                        {runningNow ? 'Running...' : 'Run Now'}
+                                    </button>
+                                )}
+                            </div>
+                        </div>
+                    </div>
+
+                    {/* ── Config Section ─────────────────────────────── */}
+                    <div className="dadbear-config-section">
+                        <h3>Configuration</h3>
+
+                        <div className="dadbear-field">
+                            <label>Auto-Update</label>
+                            <label className="dadbear-toggle">
+                                <input
+                                    type="checkbox"
+                                    checked={editAutoUpdate}
+                                    onChange={(e) => { setEditAutoUpdate(e.target.checked); setConfigDirty(true); }}
+                                />
+                                <span className="dadbear-toggle-track" />
+                                <span className="dadbear-toggle-thumb" />
+                            </label>
+                        </div>
+
+                        <div className="dadbear-field">
+                            <label>Debounce ({editDebounce} min)</label>
+                            <input
+                                type="range"
+                                className="dadbear-slider"
+                                min={1}
+                                max={30}
+                                value={editDebounce}
+                                onChange={(e) => { setEditDebounce(parseInt(e.target.value)); setConfigDirty(true); }}
+                            />
+                        </div>
+
+                        <div className="dadbear-field">
+                            <label>Min Changed Files ({editMinFiles})</label>
+                            <input
+                                type="range"
+                                className="dadbear-slider"
+                                min={1}
+                                max={20}
+                                value={editMinFiles}
+                                onChange={(e) => { setEditMinFiles(parseInt(e.target.value)); setConfigDirty(true); }}
+                            />
+                        </div>
+
+                        <div className="dadbear-field">
+                            <label>Runaway Threshold ({(editThreshold * 100).toFixed(0)}%)</label>
+                            <input
+                                type="range"
+                                className="dadbear-slider"
+                                min={10}
+                                max={100}
+                                value={editThreshold * 100}
+                                onChange={(e) => { setEditThreshold(parseInt(e.target.value) / 100); setConfigDirty(true); }}
+                            />
+                        </div>
+
+                        <button
+                            className="dadbear-save-btn"
+                            onClick={handleSaveConfig}
+                            disabled={!configDirty || saving}
+                        >
+                            {saving ? 'Saving...' : 'Save Config'}
+                        </button>
+                    </div>
+
+                    {/* ── Stale Log Section ──────────────────────────── */}
                     <div className="dadbear-log-section">
-                        <h3>Recent API Calls</h3>
+                        <h3>Stale Check Log</h3>
+
+                        <div className="dadbear-log-filters">
+                            <select value={logLayerFilter} onChange={(e) => setLogLayerFilter(e.target.value)}>
+                                <option value="all">All Layers</option>
+                                <option value="0">L0</option>
+                                <option value="1">L1</option>
+                                <option value="2">L2</option>
+                                <option value="3">L3</option>
+                            </select>
+                            <select value={logStaleFilter} onChange={(e) => setLogStaleFilter(e.target.value)}>
+                                <option value="all">All Results</option>
+                                <option value="yes">Stale Only</option>
+                                <option value="no">Not Stale</option>
+                            </select>
+                        </div>
+
                         <table className="stale-log-table">
                             <thead>
                                 <tr>
-                                    <th>Operation</th>
-                                    <th>Model</th>
-                                    <th>Tokens</th>
+                                    <th>Layer</th>
+                                    <th>Target</th>
+                                    <th>Stale</th>
+                                    <th>Reason</th>
                                     <th>Cost</th>
-                                    <th>Source</th>
                                     <th>Time</th>
                                 </tr>
                             </thead>
                             <tbody>
-                                {cost.recent_calls.map(call => (
-                                    <tr key={call.id}>
-                                        <td>{call.operation}</td>
-                                        <td title={call.model}>
-                                            {call.model.length > 20 ? '...' + call.model.slice(-18) : call.model}
+                                {staleLog.length === 0 ? (
+                                    <tr>
+                                        <td colSpan={6} style={{ textAlign: 'center', color: 'var(--text-muted)', padding: 20 }}>
+                                            No stale checks recorded yet
                                         </td>
-                                        <td>{call.input_tokens + call.output_tokens}</td>
-                                        <td>${call.cost_usd.toFixed(4)}</td>
-                                        <td>{call.source}</td>
-                                        <td>{formatDate(call.created_at)}</td>
+                                    </tr>
+                                ) : staleLog.map(entry => (
+                                    <tr key={entry.id}>
+                                        <td>L{entry.layer}</td>
+                                        <td title={entry.target_id}>
+                                            {entry.target_id.length > 20
+                                                ? entry.target_id.slice(0, 20) + '...'
+                                                : entry.target_id}
+                                        </td>
+                                        <td>
+                                            <span className={`stale-badge ${entry.stale === '1' || entry.stale === 'true' || entry.stale === 'yes' ? 'stale-yes' : 'stale-no'}`}>
+                                                {entry.stale === '1' || entry.stale === 'true' || entry.stale === 'yes' ? 'Yes' : 'No'}
+                                            </span>
+                                        </td>
+                                        <td title={entry.reason}>
+                                            {entry.reason.length > 40
+                                                ? entry.reason.slice(0, 40) + '...'
+                                                : entry.reason}
+                                        </td>
+                                        <td>{entry.cost_usd != null ? `$${entry.cost_usd.toFixed(4)}` : '-'}</td>
+                                        <td>{formatDate(entry.checked_at)}</td>
                                     </tr>
                                 ))}
                             </tbody>
                         </table>
                     </div>
-                )}
 
-                {/* ── Agent Instructions ──────────────────────────────── */}
-                <div className="agent-onboarding-card dadbear-grid-full">
-                    <div className="agent-onboarding-header" onClick={() => setAgentInstructionsOpen(!agentInstructionsOpen)}>
-                        <h3>Agent Instructions</h3>
-                        <div className="agent-onboarding-header-actions">
-                            <button
-                                className={`copy-btn${agentInstructionsCopied ? ' copied' : ''}`}
-                                onClick={(e) => { e.stopPropagation(); handleCopyAgentInstructions(); }}
-                            >
-                                {agentInstructionsCopied ? 'Copied!' : 'Copy to Clipboard'}
-                            </button>
-                            <span className="agent-onboarding-toggle">{agentInstructionsOpen ? '\u25B2' : '\u25BC'}</span>
+                    {/* ── Cost Section ───────────────────────────────── */}
+                    <div className="dadbear-cost-section">
+                        <h3>Cost Observatory</h3>
+
+                        <div className="dadbear-cost-window">
+                            {['all', '24h', '7d', '30d'].map(w => (
+                                <button
+                                    key={w}
+                                    className={costWindow === w ? 'active' : ''}
+                                    onClick={() => setCostWindow(w)}
+                                >
+                                    {w === 'all' ? 'All' : w}
+                                </button>
+                            ))}
                         </div>
+
+                        {cost && (
+                            <>
+                                <div className="dadbear-cost-total">
+                                    ${cost.total_spend.toFixed(4)}
+                                </div>
+                                <div className="dadbear-cost-calls">
+                                    {cost.total_calls} API call{cost.total_calls !== 1 ? 's' : ''}
+                                </div>
+
+                                {cost.by_check_type.length > 0 && (
+                                    <div className="dadbear-cost-breakdown">
+                                        {cost.by_check_type.map(ct => (
+                                            <div key={ct.check_type} className="dadbear-cost-row">
+                                                <span className="dadbear-cost-row-label">{ct.check_type}</span>
+                                                <span className="dadbear-cost-row-value">
+                                                    ${ct.spend.toFixed(4)} ({ct.calls})
+                                                </span>
+                                            </div>
+                                        ))}
+                                    </div>
+                                )}
+                            </>
+                        )}
                     </div>
-                    {agentInstructionsOpen && (
-                        <div className="agent-onboarding-content">
-                            <pre>{generateAgentInstructions()}</pre>
+
+                    {/* ── Knowledge Contributions ────────────────────── */}
+                    <div className="dadbear-contributions">
+                        <h3>Knowledge Contributions</h3>
+                        {contributions ? (
+                            <>
+                                <div className="contribution-stats">
+                                    <div className="contribution-stat-row">
+                                        <span>\uD83D\uDCDD {contributions.totalAnnotations} annotation{contributions.totalAnnotations !== 1 ? 's' : ''} from {contributions.uniqueAuthors} agent{contributions.uniqueAuthors !== 1 ? 's' : ''}</span>
+                                    </div>
+                                    <div className="contribution-stat-row">
+                                        <span>\uD83D\uDCDA {contributions.totalFaqs} FAQ entr{contributions.totalFaqs !== 1 ? 'ies' : 'y'} (flat mode)</span>
+                                    </div>
+                                    {contributions.lastAuthor && (
+                                        <div className="contribution-stat-row">
+                                            <span>\uD83D\uDD04 Last contribution: {formatTimeAgo(contributions.lastContributionAt)} by <span className="contribution-author-badge">{contributions.lastAuthor}</span></span>
+                                        </div>
+                                    )}
+                                </div>
+                                {contributions.annotations.length > 0 && (
+                                    <div className="contribution-recent">
+                                        <div className="contribution-recent-label">Recent:</div>
+                                        {contributions.annotations.map(a => (
+                                            <div key={a.id} className="contribution-item">
+                                                <span className="contribution-author-badge">{a.author}</span>
+                                                <span className="contribution-content" title={a.content}>
+                                                    {a.content.length > 60 ? a.content.slice(0, 60) + '...' : a.content}
+                                                </span>
+                                            </div>
+                                        ))}
+                                    </div>
+                                )}
+                            </>
+                        ) : (
+                            <div className="contribution-empty">No contributions yet</div>
+                        )}
+                    </div>
+
+                    {/* ── Recent Calls ───────────────────────────────── */}
+                    {cost && cost.recent_calls.length > 0 && (
+                        <div className="dadbear-log-section">
+                            <h3>Recent API Calls</h3>
+                            <table className="stale-log-table">
+                                <thead>
+                                    <tr>
+                                        <th>Operation</th>
+                                        <th>Model</th>
+                                        <th>Tokens</th>
+                                        <th>Cost</th>
+                                        <th>Source</th>
+                                        <th>Time</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {cost.recent_calls.map(call => (
+                                        <tr key={call.id}>
+                                            <td>{call.operation}</td>
+                                            <td title={call.model}>
+                                                {call.model.length > 20 ? '...' + call.model.slice(-18) : call.model}
+                                            </td>
+                                            <td>{call.input_tokens + call.output_tokens}</td>
+                                            <td>${call.cost_usd.toFixed(4)}</td>
+                                            <td>{call.source}</td>
+                                            <td>{formatDate(call.created_at)}</td>
+                                        </tr>
+                                    ))}
+                                </tbody>
+                            </table>
                         </div>
                     )}
+
+                    {/* ── Agent Instructions ─────────────────────────── */}
+                    <div className="agent-onboarding-card">
+                        <div className="agent-onboarding-header" onClick={() => setAgentInstructionsOpen(!agentInstructionsOpen)}>
+                            <h3>Agent Instructions</h3>
+                            <div className="agent-onboarding-header-actions">
+                                <button
+                                    className={`copy-btn${agentInstructionsCopied ? ' copied' : ''}`}
+                                    onClick={(e) => { e.stopPropagation(); handleCopyAgentInstructions(); }}
+                                >
+                                    {agentInstructionsCopied ? 'Copied!' : 'Copy to Clipboard'}
+                                </button>
+                                <span className="agent-onboarding-toggle">{agentInstructionsOpen ? '\u25B2' : '\u25BC'}</span>
+                            </div>
+                        </div>
+                        {agentInstructionsOpen && (
+                            <div className="agent-onboarding-content">
+                                <pre>{generateAgentInstructions()}</pre>
+                            </div>
+                        )}
+                    </div>
                 </div>
             </div>
         </div>

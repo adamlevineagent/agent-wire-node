@@ -370,6 +370,103 @@ pub fn get_tree(conn: &Connection, slug: &str) -> Result<Vec<TreeNode>> {
     // Apex nodes are all nodes at max depth
     let apex_nodes: Vec<&PyramidNode> = nodes.iter().filter(|n| n.depth == max_depth).collect();
 
+    // Check if this is a question pyramid — build tree via evidence links instead of children[]
+    let content_type: Option<String> = conn
+        .query_row(
+            "SELECT content_type FROM pyramid_slugs WHERE slug = ?1",
+            rusqlite::params![slug],
+            |row| row.get(0),
+        )
+        .optional()
+        .unwrap_or(None);
+
+    if content_type.as_deref() == Some("question") {
+        // Load KEEP evidence links: source (child layer) → target (parent layer)
+        let mut children_by_parent: HashMap<String, Vec<String>> = HashMap::new();
+        {
+            let mut stmt = conn.prepare(
+                "SELECT source_node_id, target_node_id FROM pyramid_evidence WHERE slug = ?1 AND verdict = 'KEEP'",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![slug], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let Ok((src_id, tgt_id)) = row else { continue };
+                children_by_parent.entry(tgt_id).or_default().push(src_id);
+            }
+        }
+
+        fn build_question_tree_node(
+            node: &PyramidNode,
+            node_map: &HashMap<&str, &PyramidNode>,
+            children_by_parent: &HashMap<String, Vec<String>>,
+            conn: &Connection,
+            thread_id_by_canonical_id: &HashMap<String, String>,
+            source_path_by_node_id: &HashMap<String, String>,
+        ) -> TreeNode {
+            let child_ids = children_by_parent.get(&node.id).cloned().unwrap_or_default();
+            let children: Vec<TreeNode> = child_ids
+                .iter()
+                .filter_map(|child_id| {
+                    if let Some((ref_slug, _depth, ref_node_id)) = db::parse_handle_path(child_id) {
+                        // Cross-slug: load as leaf
+                        match db::get_node_summary(conn, ref_slug, ref_node_id) {
+                            Ok(Some(s)) => Some(TreeNode {
+                                id: s.id.clone(),
+                                depth: s.depth,
+                                headline: s.headline.clone(),
+                                distilled: s.distilled.clone(),
+                                thread_id: None,
+                                source_path: None,
+                                source_slug: Some(ref_slug.to_string()),
+                                children: vec![],
+                            }),
+                            _ => None,
+                        }
+                    } else {
+                        // Same-slug: recurse
+                        node_map.get(child_id.as_str()).map(|child| {
+                            build_question_tree_node(
+                                child,
+                                node_map,
+                                children_by_parent,
+                                conn,
+                                thread_id_by_canonical_id,
+                                source_path_by_node_id,
+                            )
+                        })
+                    }
+                })
+                .collect();
+
+            TreeNode {
+                id: node.id.clone(),
+                depth: node.depth,
+                headline: node.headline.clone(),
+                distilled: node.distilled.clone(),
+                thread_id: thread_id_by_canonical_id.get(&node.id).cloned(),
+                source_path: source_path_by_node_id.get(&node.id).cloned(),
+                source_slug: None,
+                children,
+            }
+        }
+
+        let result: Vec<TreeNode> = apex_nodes
+            .iter()
+            .map(|apex| {
+                build_question_tree_node(
+                    apex,
+                    &node_map,
+                    &children_by_parent,
+                    conn,
+                    &thread_id_by_canonical_id,
+                    &source_path_by_node_id,
+                )
+            })
+            .collect();
+        return Ok(result);
+    }
+
     fn build_tree_node(
         node: &PyramidNode,
         source_slug: Option<String>,
@@ -467,6 +564,31 @@ pub fn drill(conn: &Connection, slug: &str, node_id: &str) -> Result<Option<Dril
             // Same-slug child: existing behavior
             if let Some(child) = db::get_node_summary(conn, slug, child_id)? {
                 children.push(child);
+            }
+        }
+    }
+
+    // For question pyramid nodes: if children[] is empty, use evidence KEEP sources as children.
+    // Gate on content_type so mechanical pyramids with empty L0 leaves don't query evidence.
+    let is_question_slug = conn
+        .query_row(
+            "SELECT content_type FROM pyramid_slugs WHERE slug = ?1",
+            rusqlite::params![slug],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .unwrap_or(None)
+        .map_or(false, |ct| ct == "question");
+    if children.is_empty() && is_question_slug {
+        let keep_links = db::get_keep_evidence_for_target_cross(conn, slug, node_id)?;
+        for link in &keep_links {
+            let child = if let Some((ref_slug, _depth, ref_node_id)) = db::parse_handle_path(&link.source_node_id) {
+                db::get_node_summary(conn, ref_slug, ref_node_id)?
+            } else {
+                db::get_node_summary(conn, slug, &link.source_node_id)?
+            };
+            if let Some(child_node) = child {
+                children.push(child_node);
             }
         }
     }
