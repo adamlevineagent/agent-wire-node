@@ -44,8 +44,8 @@ export function PyramidSettings() {
         setError(null);
         try {
             await invoke('pyramid_set_config', {
-                apiKey: apiKey || '',
-                authToken: authToken || '',
+                ...(apiKey ? { apiKey } : {}),
+                ...(authToken ? { authToken } : {}),
                 ...(primaryModel ? { primaryModel } : {}),
                 autoExecute,
             });
@@ -71,7 +71,7 @@ export function PyramidSettings() {
             // Save first so the key is available
             await invoke('pyramid_set_config', {
                 apiKey,
-                authToken: authToken || '',
+                ...(authToken ? { authToken } : {}),
             });
             // Test via IPC — key stays server-side
             const result = await invoke<string>('pyramid_test_api_key');
