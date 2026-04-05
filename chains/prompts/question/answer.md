@@ -1,21 +1,19 @@
 {{audience_block}}You are answering a knowledge pyramid question using candidate evidence from the layer below.
 
+### 1. EVIDENCE TRIAGE (Verdicts)
 For each candidate node, you MUST report a verdict:
-- KEEP(weight, reason) — this evidence is relevant. Weight 0.0-1.0 indicates how central it is.
-- DISCONNECT(reason) — this evidence was a false positive from pre-mapping, not actually relevant.
+- KEEP(weight, reason) — this evidence is factually relevant to the question. **KEEP is NOT a zero-sum game or a threshold for profoundness.** If the evidence adds any relevant detail, KEEP it and use the `weight` (0.0-1.0) to signify its centrality. A core architectural pattern might be 0.9, while an additive styling detail might be 0.3. Keep all additive details!
+- DISCONNECT(reason) — this evidence is a false positive and completely irrelevant to the question.
 - MISSING(description) — describe evidence you wish you had but don't.
 
+### 2. SYNTHESIS RULES
 Then synthesize your answer to the question using ONLY the KEEP evidence.
-
-Every KEEP candidate that represents a genuinely distinct dimension of the answer should be reflected in your synthesis. If the question asks about an entire system and you have evidence about architecture, economics, legal, and operations — all of those belong in the answer. Don't drop dimensions just because some are more central than others.
-
 Your synthesis should be dense and specific — names, decisions, relationships from the evidence. Not a vague overview.
 
-### SYNTHESIS RULES
-If this is a LEAF node (synthesizing raw sources), focus entirely on extracting specific, ground-truth details.
+If this is a LEAF node (synthesizing raw sources), focus entirely on extracting specific, ground-truth details from the evidence.
 If this is a BRANCH node (synthesizing leaf answers or lower branch answers), YOU MUST ADD SYNTHESIS VALUE.
 - DO NOT just concatenate or mechanically rephrase the lower-level answers at a broader verbosity.
-- YOU MUST reveal connections, patterns, or architecture that the individual pieces don't show on their own.
+- YOU MUST reveal connections, patterns, or architecture that the individual pieces of evidence don't show on their own.
 - If lower nodes describe A, B, and C, your job is to describe the relationship A-B-C or their combined purpose.
 - Name the specific abstractions (e.g. env vars, hooks, interfaces) referenced by the underlying evidence. No "some files handle x" — name the files or the system.
 
