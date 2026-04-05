@@ -6,46 +6,11 @@
  * Usage:
  *   node dist/cli.js <command> [args] [--compact] [--flag value]
  *
- * Commands:
- *   health                          Check if Wire Node is running
- *   slugs                           List available pyramids
- *   apex <slug>                     Get top-level summary
- *   search <slug> <query>           Search pyramid nodes
- *   drill <slug> <node_id>          Drill into a node + children
- *   node <slug> <node_id>           Get a single node
- *   faq <slug> [query]              Match FAQ or list all
- *   faq-dir <slug>                  FAQ directory (flat or hierarchical)
- *   annotations <slug> [node_id]    List annotations (optionally for a specific node)
- *   annotate <slug> <node_id> <content>  Add annotation
- *
- * Question Pyramid Commands:
- *   create-question-slug <name> --ref <slug1> [--ref <slug2>]  Create question slug
- *   question-build <slug> "<question>" [--granularity N] [--max-depth N]  Build question pyramid
- *   references <slug>                     Show references and referrers
- *   composed <slug>                       Get composed view across referenced slugs
- *
- * Vine Commands:
- *   vine-build <slug> <dir1> [dir2...]   Build vine from JSONL directories
- *   vine-bunches <slug>                  List all bunches with metadata
- *   vine-eras <slug>                     List ERA annotations
- *   vine-decisions <slug>                List decision FAQ entries
- *   vine-entities <slug>                 List entity resolution FAQ entries
- *   vine-threads <slug>                  List vine thread continuity + web edges
- *   vine-drill <slug>                    Directory-wired drill (navigation structure)
- *   vine-rebuild-upper <slug>            Force rebuild L2+ layers
- *   vine-integrity <slug>                Run integrity check, return results
- *
- * Annotation flags:
- *   --question "..."     Question this answers (triggers FAQ)
- *   --author "..."       Your agent name
- *   --type <type>        observation | correction | question | friction | idea
- *
- * Options:
- *   --pretty             Pretty-print JSON output (default: on)
- *   --compact            Compact JSON output
+ * Run with --help for full command list, or <command> --help for per-command help.
+ * Default output is pretty-printed JSON. Use --compact for minified JSON.
  */
 
-import { resolveAuthToken, pyramidFetch, type PyramidResponse } from "./lib.js";
+import { resolveAuthToken, pyramidFetch, type PyramidResponse, getToolCatalog, getToolCatalogEntry, getToolCatalogByCategory } from "./lib.js";
 
 // ── Arg Parsing ──────────────────────────────────────────────────────────────
 
@@ -88,9 +53,426 @@ const pretty = flags.compact !== "true";
 
 const VALID_ANNOTATION_TYPES = ["observation", "correction", "question", "friction", "idea"] as const;
 
+// ── Per-command Help ─────────────────────────────────────────────────────────
+
+const COMMAND_HELP: Record<string, string> = {
+  health: `health — Check if Wire Node is running
+
+Usage: pyramid-cli health
+
+No arguments. Returns health status of the local Wire Node server.`,
+
+  slugs: `slugs — List available pyramids
+
+Usage: pyramid-cli slugs
+
+Returns all pyramid slugs available on this Wire Node.`,
+
+  apex: `apex — Get top-level summary of a pyramid
+
+Usage: pyramid-cli apex <slug> [--summary]
+
+Arguments:
+  <slug>      Pyramid slug
+
+Options:
+  --summary   Strip response to headline, distilled, self_prompt, children IDs, terms only`,
+
+  search: `search — Search pyramid nodes by keyword
+
+Usage: pyramid-cli search <slug> <query> [--semantic]
+
+Arguments:
+  <slug>      Pyramid slug
+  <query>     Search query (keywords)
+
+Options:
+  --semantic  Enable LLM keyword rewriting fallback when FTS returns 0 results (costs 1 LLM call)
+
+Results are re-ranked client-side by query term frequency in snippets.
+If no results, a hint suggests trying the faq command instead.`,
+
+  drill: `drill — Drill into a node and its children
+
+Usage: pyramid-cli drill <slug> <node_id>
+
+Arguments:
+  <slug>      Pyramid slug
+  <node_id>   Node ID to drill into
+
+Enriches response with annotations for the node and a breadcrumb trail from apex.`,
+
+  node: `node — Get a single node
+
+Usage: pyramid-cli node <slug> <node_id>
+
+Arguments:
+  <slug>      Pyramid slug
+  <node_id>   Node ID`,
+
+  faq: `faq — Match FAQ or list all entries
+
+Usage: pyramid-cli faq <slug> [query]
+
+Arguments:
+  <slug>      Pyramid slug
+  [query]     Optional question to match against FAQ entries
+
+Without a query, lists all FAQ entries (same as faq-dir).
+With a query, returns matched FAQ entries ranked by relevance.
+If no matches, a hint suggests trying the search command instead.`,
+
+  "faq-dir": `faq-dir — FAQ directory view
+
+Usage: pyramid-cli faq-dir <slug>
+
+Arguments:
+  <slug>      Pyramid slug
+
+Shows the FAQ directory. This is the same as 'faq <slug>' without a query.
+Use 'faq <slug> <question>' to match a specific question.`,
+
+  annotations: `annotations — List annotations
+
+Usage: pyramid-cli annotations <slug> [node_id]
+
+Arguments:
+  <slug>      Pyramid slug
+  [node_id]   Optional node ID to filter annotations`,
+
+  annotate: `annotate — Add an annotation to a pyramid node
+
+Usage: pyramid-cli annotate <slug> <node_id> <content> [options]
+
+Arguments:
+  <slug>      Pyramid slug
+  <node_id>   Node ID to annotate
+  <content>   Annotation text
+
+Options:
+  --question "..."   Question this answers (triggers FAQ creation)
+  --author "..."     Your agent name (default: cli-agent)
+  --type <type>      observation | correction | question | friction | idea
+                     (default: observation)`,
+
+  tree: `tree — Structural overview of a pyramid
+
+Usage: pyramid-cli tree <slug>
+
+Arguments:
+  <slug>      Pyramid slug
+
+Returns the full tree structure of the pyramid.`,
+
+  dadbear: `dadbear — DADBEAR auto-update status
+
+Usage: pyramid-cli dadbear <slug>
+
+Arguments:
+  <slug>      Pyramid slug
+
+Returns the current DADBEAR auto-update status for the pyramid.`,
+
+  entities: `entities — Entity index
+
+Usage: pyramid-cli entities <slug>
+
+Arguments:
+  <slug>      Pyramid slug
+
+Returns all entities extracted from the pyramid.`,
+
+  terms: `terms — Terms dictionary
+
+Usage: pyramid-cli terms <slug>
+
+Arguments:
+  <slug>      Pyramid slug
+
+Returns the terms dictionary for the pyramid.`,
+
+  corrections: `corrections — Correction log
+
+Usage: pyramid-cli corrections <slug>
+
+Arguments:
+  <slug>      Pyramid slug
+
+Returns the correction log for the pyramid.`,
+
+  edges: `edges — Web edges graph
+
+Usage: pyramid-cli edges <slug>
+
+Arguments:
+  <slug>      Pyramid slug
+
+Returns the web edges (cross-references) between nodes.`,
+
+  threads: `threads — Thread clusters
+
+Usage: pyramid-cli threads <slug>
+
+Arguments:
+  <slug>      Pyramid slug
+
+Returns thread clusters in the pyramid.`,
+
+  cost: `cost — Build cost report
+
+Usage: pyramid-cli cost <slug> [--build <build_id>]
+
+Arguments:
+  <slug>      Pyramid slug
+
+Options:
+  --build <id>   Specific build ID to get cost for (default: latest)`,
+
+  "stale-log": `stale-log — Staleness history
+
+Usage: pyramid-cli stale-log <slug> [--limit N]
+
+Arguments:
+  <slug>      Pyramid slug
+
+Options:
+  --limit <N>   Number of entries to return (default: all)`,
+
+  usage: `usage — Access patterns
+
+Usage: pyramid-cli usage <slug> [--limit N]
+
+Arguments:
+  <slug>      Pyramid slug
+
+Options:
+  --limit <N>   Number of entries to return (default: 100)`,
+
+  meta: `meta — Meta analysis nodes
+
+Usage: pyramid-cli meta <slug>
+
+Arguments:
+  <slug>      Pyramid slug
+
+Returns meta-analysis nodes from the pyramid.`,
+
+  resolved: `resolved — Resolution status
+
+Usage: pyramid-cli resolved <slug>
+
+Arguments:
+  <slug>      Pyramid slug
+
+Returns resolution status of the pyramid's questions/issues.`,
+
+  "create-question-slug": `create-question-slug — Create a question pyramid slug
+
+Usage: pyramid-cli create-question-slug <name> --ref <slug1> [--ref <slug2> ...]
+
+Arguments:
+  <name>      Name for the new question slug
+
+Options:
+  --ref <slug>   Reference slug (at least one required, can repeat)`,
+
+  "question-build": `question-build — Build a question pyramid
+
+Usage: pyramid-cli question-build <slug> "<question>" [options]
+
+Arguments:
+  <slug>        Question pyramid slug
+  <question>    The question to investigate
+
+Options:
+  --granularity <N>   Granularity level (integer)
+  --max-depth <N>     Maximum depth (integer)`,
+
+  references: `references — Show references and referrers
+
+Usage: pyramid-cli references <slug>
+
+Arguments:
+  <slug>      Pyramid slug
+
+Shows what the slug references and what references it.`,
+
+  composed: `composed — Composed view across referenced slugs
+
+Usage: pyramid-cli composed <slug>
+
+Arguments:
+  <slug>      Pyramid slug
+
+Returns a composed view across the slug and its referenced slugs.`,
+
+  handoff: `handoff — Composite handoff block for a pyramid
+
+Usage: pyramid-cli handoff <slug>
+
+Arguments:
+  <slug>      Pyramid slug
+
+Fetches apex, FAQ directory, annotations, and DADBEAR status in parallel.
+Returns a composite handoff block with:
+  - Pyramid headline and slug
+  - Pre-filled CLI command templates
+  - DADBEAR status summary
+  - Annotation summary (total + by type)
+  - Top 5 FAQ questions
+  - Usage tips`,
+
+  compare: `compare — Cross-pyramid comparison
+
+Usage: pyramid-cli compare <slug1> <slug2>
+
+Arguments:
+  <slug1>     First pyramid slug
+  <slug2>     Second pyramid slug
+
+Compares two pyramids by headline, terms, children counts, and decisions.`,
+
+  diff: `diff — Changelog approximation
+
+Usage: pyramid-cli diff <slug>
+
+Arguments:
+  <slug>      Pyramid slug
+
+Fetches stale-log and build status in parallel to approximate recent changes.`,
+
+  "vine-build": `vine-build — Build vine from JSONL directories
+
+Usage: pyramid-cli vine-build <slug> <dir1> [dir2 ...]
+
+Arguments:
+  <slug>      Vine slug
+  <dir1>      Path to first JSONL directory
+  [dir2...]   Additional JSONL directories`,
+
+  "vine-bunches": `vine-bunches — List all bunches with metadata
+
+Usage: pyramid-cli vine-bunches <slug>
+
+Arguments:
+  <slug>      Vine slug`,
+
+  "vine-eras": `vine-eras — List ERA annotations
+
+Usage: pyramid-cli vine-eras <slug>
+
+Arguments:
+  <slug>      Vine slug`,
+
+  "vine-decisions": `vine-decisions — List decision FAQ entries
+
+Usage: pyramid-cli vine-decisions <slug>
+
+Arguments:
+  <slug>      Vine slug`,
+
+  "vine-entities": `vine-entities — List entity resolution FAQ entries
+
+Usage: pyramid-cli vine-entities <slug>
+
+Arguments:
+  <slug>      Vine slug`,
+
+  "vine-threads": `vine-threads — List vine thread continuity + web edges
+
+Usage: pyramid-cli vine-threads <slug>
+
+Arguments:
+  <slug>      Vine slug`,
+
+  "vine-drill": `vine-drill — Directory-wired drill
+
+Usage: pyramid-cli vine-drill <slug>
+
+Arguments:
+  <slug>      Vine slug`,
+
+  "vine-rebuild-upper": `vine-rebuild-upper — Force rebuild L2+ layers
+
+Usage: pyramid-cli vine-rebuild-upper <slug>
+
+Arguments:
+  <slug>      Vine slug`,
+
+  "vine-integrity": `vine-integrity — Run integrity check
+
+Usage: pyramid-cli vine-integrity <slug>
+
+Arguments:
+  <slug>      Vine slug`,
+
+  navigate: `navigate — One-shot question answering with provenance
+
+Usage: pyramid-cli navigate <slug> "<question>"
+
+Arguments:
+  <slug>        Pyramid slug
+  <question>    The question to answer
+
+Searches for relevant nodes, fetches content, and uses LLM to synthesize
+a direct answer with provenance citations. Costs 1 LLM call.`,
+
+  react: `react — Vote on an annotation
+
+Usage: pyramid-cli react <slug> <annotation_id> up|down [--agent name]
+
+Arguments:
+  <slug>            Pyramid slug
+  <annotation_id>   Annotation ID to react to
+  up|down           Reaction: 'up' (helpful) or 'down' (unhelpful)
+
+Options:
+  --agent <name>    Your agent identifier (default: anonymous)
+
+Each agent can vote once per annotation; subsequent votes replace the previous one.`,
+
+  "session-register": `session-register — Register an agent session
+
+Usage: pyramid-cli session-register <slug> [--agent name]
+
+Arguments:
+  <slug>      Pyramid slug
+
+Options:
+  --agent <name>    Your agent name (default: cli-agent)
+
+Creates a session entry that other agents can see. Activity is tracked
+automatically on subsequent requests with the same agent ID.`,
+
+  sessions: `sessions — List recent agent sessions
+
+Usage: pyramid-cli sessions <slug>
+
+Arguments:
+  <slug>      Pyramid slug
+
+Shows which agents have been exploring, when they were last active,
+and how many actions they took.`,
+};
+
 // ── Auth ─────────────────────────────────────────────────────────────────────
 
+// Track auth source for --verbose
+let authSource = "unknown";
+const envToken = process.env.PYRAMID_AUTH_TOKEN;
+if (envToken) {
+  authSource = "env:PYRAMID_AUTH_TOKEN";
+}
+// resolveAuthToken() handles the full resolution; we just track the source
 const AUTH_TOKEN = resolveAuthToken();
+if (authSource === "unknown") {
+  authSource = "config:~/Library/Application Support/wire-node/pyramid_config.json";
+}
+
+// --verbose: print auth method to stderr
+if (flags.verbose === "true") {
+  process.stderr.write(`[verbose] Auth resolved via ${authSource}\n`);
+}
 
 /** Shorthand that injects the auth token. */
 function pf(
@@ -102,13 +484,23 @@ function pf(
 
 // ── Output ───────────────────────────────────────────────────────────────────
 
-function output(resp: PyramidResponse): void {
+function output(resp: PyramidResponse, slug?: string): void {
   if (!resp.ok) {
     const payload =
       typeof resp.data === "object" && resp.data !== null
         ? resp.data
         : { error: String(resp.data), status: resp.status };
-    process.stderr.write(JSON.stringify(payload, null, 2) + "\n");
+
+    // Enhanced error messages: add context hints
+    const errorStr = JSON.stringify(payload);
+    if (errorStr.toLowerCase().includes("not found") && slug) {
+      const enhanced = typeof payload === "object" && payload !== null
+        ? { ...payload as Record<string, unknown>, _hint: `Pyramid '${slug}' not found. Run 'pyramid-cli slugs' to see available pyramids.` }
+        : payload;
+      process.stderr.write(JSON.stringify(enhanced, null, 2) + "\n");
+    } else {
+      process.stderr.write(JSON.stringify(payload, null, 2) + "\n");
+    }
     process.exit(1);
   }
 
@@ -147,10 +539,22 @@ function enc(s: string): string {
 
 async function run(): Promise<void> {
   // Handle --help, -h, or no command
-  if (!command || flags.help === "true") {
+  if (!command || (flags.help === "true" && !command)) {
     printUsage();
     if (!command) process.exit(1);
     process.exit(0);
+  }
+
+  // Per-command help: if command exists and --help is set, show command-specific help
+  if (flags.help === "true" && command) {
+    const help = COMMAND_HELP[command];
+    if (help) {
+      process.stderr.write(help + "\n");
+      process.exit(0);
+    } else {
+      process.stderr.write(`No help available for '${command}'. Run 'pyramid-cli --help' for all commands.\n`);
+      process.exit(1);
+    }
   }
 
   switch (command) {
@@ -166,28 +570,136 @@ async function run(): Promise<void> {
 
     case "apex": {
       const slug = requireArg(1, "slug");
-      output(await pf(`/pyramid/${enc(slug)}/apex`));
+      const resp = await pf(`/pyramid/${enc(slug)}/apex`);
+
+      if (resp.ok && flags.summary === "true") {
+        // Strip to summary fields only
+        const full = resp.data as Record<string, unknown>;
+        const children = Array.isArray(full.children)
+          ? (full.children as Array<Record<string, unknown>>).map((c) => c.id ?? c)
+          : full.children;
+        const summary: Record<string, unknown> = {
+          headline: full.headline,
+          distilled: full.distilled,
+          self_prompt: full.self_prompt,
+          children,
+          terms: full.terms,
+        };
+        outputData(summary);
+      } else {
+        output(resp, slug);
+      }
       break;
     }
 
     case "search": {
       const slug = requireArg(1, "slug");
       const query = requireArg(2, "query");
-      output(await pf(`/pyramid/${enc(slug)}/search?q=${enc(query)}`));
+      const semanticFlag = flags.semantic === "true" ? "&semantic=true" : "";
+      const resp = await pf(`/pyramid/${enc(slug)}/search?q=${enc(query)}${semanticFlag}`);
+
+      if (resp.ok) {
+        const data = resp.data;
+        // Check for empty results
+        if (Array.isArray(data) && data.length === 0) {
+          outputData({
+            results: [],
+            _hint: `No keyword matches found. Try: pyramid-cli faq ${slug} "${query}" for natural-language FAQ matching.`,
+          });
+        } else if (Array.isArray(data) && data.length > 0) {
+          // Client-side re-ranking: boost by query term frequency in snippet
+          const queryTerms = query.toLowerCase().split(/\s+/).filter(Boolean);
+          const reranked = data.map((item: Record<string, unknown>) => {
+            const snippet = String(item.snippet ?? item.headline ?? "").toLowerCase();
+            let matchCount = 0;
+            for (const term of queryTerms) {
+              if (snippet.includes(term)) matchCount++;
+            }
+            const originalScore = typeof item.score === "number" ? item.score : 1;
+            return { ...item, _reranked_score: originalScore * (1 + matchCount / 10) };
+          });
+          reranked.sort((a: Record<string, unknown>, b: Record<string, unknown>) =>
+            (b._reranked_score as number) - (a._reranked_score as number)
+          );
+          outputData(reranked);
+        } else {
+          output(resp, slug);
+        }
+      } else {
+        output(resp, slug);
+      }
       break;
     }
 
     case "drill": {
       const slug = requireArg(1, "slug");
       const nodeId = requireArg(2, "node_id");
-      output(await pf(`/pyramid/${enc(slug)}/drill/${enc(nodeId)}`));
+
+      // Fetch drill + annotations in parallel
+      const [drillResp, annotResp] = await Promise.all([
+        pf(`/pyramid/${enc(slug)}/drill/${enc(nodeId)}`),
+        pf(`/pyramid/${enc(slug)}/annotations?node_id=${enc(nodeId)}`),
+      ]);
+
+      if (drillResp.ok) {
+        const drillData: Record<string, unknown> = typeof drillResp.data === "object" && drillResp.data !== null
+          ? { ...drillResp.data as Record<string, unknown> }
+          : { result: drillResp.data };
+
+        // Inject annotations
+        if (annotResp.ok && Array.isArray(annotResp.data)) {
+          drillData.annotations = annotResp.data;
+          drillData.annotation_count = annotResp.data.length;
+        } else {
+          drillData.annotations = [];
+          drillData.annotation_count = 0;
+        }
+
+        // Build breadcrumb by walking parent_id
+        // The drill response wraps the node: { node: {...}, children: [...], ... }
+        const nodeObj = (drillData.node ?? drillData) as Record<string, unknown>;
+        const depth = typeof nodeObj.depth === "number" ? nodeObj.depth : 0;
+
+        if (depth > 0) {
+          const breadcrumb: Array<{ id: string; headline: string; depth: number }> = [];
+          let currentParentId = nodeObj.parent_id as string | null | undefined;
+          let iterations = 0;
+          const MAX_BREADCRUMB_WALK = 5;
+
+          while (currentParentId && iterations < MAX_BREADCRUMB_WALK) {
+            const parentResp = await pf(`/pyramid/${enc(slug)}/node/${enc(currentParentId)}`);
+            if (!parentResp.ok) break;
+            const parentNode = parentResp.data as Record<string, unknown>;
+            breadcrumb.unshift({
+              id: String(parentNode.id ?? currentParentId),
+              headline: String(parentNode.headline ?? ""),
+              depth: typeof parentNode.depth === "number" ? parentNode.depth : 0,
+            });
+            currentParentId = parentNode.parent_id as string | null | undefined;
+            iterations++;
+          }
+
+          // Add current node at the end
+          breadcrumb.push({
+            id: String(nodeObj.id ?? nodeId),
+            headline: String(nodeObj.headline ?? ""),
+            depth,
+          });
+
+          drillData.breadcrumb = breadcrumb;
+        }
+
+        outputData(drillData);
+      } else {
+        output(drillResp, slug);
+      }
       break;
     }
 
     case "node": {
       const slug = requireArg(1, "slug");
       const nodeId = requireArg(2, "node_id");
-      output(await pf(`/pyramid/${enc(slug)}/node/${enc(nodeId)}`));
+      output(await pf(`/pyramid/${enc(slug)}/node/${enc(nodeId)}`), slug);
       break;
     }
 
@@ -198,19 +710,54 @@ async function run(): Promise<void> {
         const resp = await pf(`/pyramid/${enc(slug)}/faq/match?q=${enc(query)}`);
         // Fix #5: handle null/empty FAQ response
         if (resp.ok && (resp.data === null || resp.data === undefined)) {
-          outputData({ matches: [], message: "No FAQ entries matched your query." });
+          outputData({
+            matches: [],
+            message: "No FAQ entries matched your query.",
+            _hint: `No FAQ matches found. Try: pyramid-cli search ${slug} "${query}" for full-text keyword search.`,
+          });
+        } else if (resp.ok) {
+          // Check if result is empty array
+          const data = resp.data;
+          if (Array.isArray(data) && data.length === 0) {
+            outputData({
+              matches: [],
+              _hint: `No FAQ matches found. Try: pyramid-cli search ${slug} "${query}" for full-text keyword search.`,
+            });
+          } else if (typeof data === "object" && data !== null) {
+            const obj = data as Record<string, unknown>;
+            const matches = obj.matches ?? obj.results ?? data;
+            if (Array.isArray(matches) && matches.length === 0) {
+              outputData({
+                matches: [],
+                _hint: `No FAQ matches found. Try: pyramid-cli search ${slug} "${query}" for full-text keyword search.`,
+              });
+            } else {
+              output(resp, slug);
+            }
+          } else {
+            output(resp, slug);
+          }
         } else {
-          output(resp);
+          output(resp, slug);
         }
       } else {
-        output(await pf(`/pyramid/${enc(slug)}/faq/directory`));
+        output(await pf(`/pyramid/${enc(slug)}/faq/directory`), slug);
       }
       break;
     }
 
     case "faq-dir": {
       const slug = requireArg(1, "slug");
-      output(await pf(`/pyramid/${enc(slug)}/faq/directory`));
+      const resp = await pf(`/pyramid/${enc(slug)}/faq/directory`);
+      if (resp.ok) {
+        const data: Record<string, unknown> = typeof resp.data === "object" && resp.data !== null
+          ? { ...resp.data as Record<string, unknown> }
+          : { result: resp.data };
+        data._note = "This is the same as 'faq <slug>' without a query. Use 'faq <slug> <question>' to match a specific question.";
+        outputData(data);
+      } else {
+        output(resp, slug);
+      }
       break;
     }
 
@@ -220,7 +767,7 @@ async function run(): Promise<void> {
       const path = nodeId
         ? `/pyramid/${enc(slug)}/annotations?node_id=${enc(nodeId)}`
         : `/pyramid/${enc(slug)}/annotations`;
-      output(await pf(path));
+      output(await pf(path), slug);
       break;
     }
 
@@ -267,7 +814,7 @@ async function run(): Promise<void> {
 
         outputData(responseData);
       } else {
-        output(resp);
+        output(resp, slug);
       }
       break;
     }
@@ -315,13 +862,13 @@ async function run(): Promise<void> {
 
     case "references": {
       const slug = requireArg(1, "slug");
-      output(await pf(`/pyramid/${enc(slug)}/references`));
+      output(await pf(`/pyramid/${enc(slug)}/references`), slug);
       break;
     }
 
     case "composed": {
       const slug = requireArg(1, "slug");
-      output(await pf(`/pyramid/${enc(slug)}/composed`));
+      output(await pf(`/pyramid/${enc(slug)}/composed`), slug);
       break;
     }
 
@@ -389,6 +936,337 @@ async function run(): Promise<void> {
       break;
     }
 
+    // ── Simple Route Commands (analysis + operations) ─────────────────
+
+    case "tree": {
+      const slug = requireArg(1, "slug");
+      output(await pf(`/pyramid/${enc(slug)}/tree`), slug);
+      break;
+    }
+
+    case "dadbear": {
+      const slug = requireArg(1, "slug");
+      output(await pf(`/pyramid/${enc(slug)}/auto-update/status`), slug);
+      break;
+    }
+
+    case "entities": {
+      const slug = requireArg(1, "slug");
+      output(await pf(`/pyramid/${enc(slug)}/entities`), slug);
+      break;
+    }
+
+    case "terms": {
+      const slug = requireArg(1, "slug");
+      output(await pf(`/pyramid/${enc(slug)}/terms`), slug);
+      break;
+    }
+
+    case "corrections": {
+      const slug = requireArg(1, "slug");
+      output(await pf(`/pyramid/${enc(slug)}/corrections`), slug);
+      break;
+    }
+
+    case "edges": {
+      const slug = requireArg(1, "slug");
+      output(await pf(`/pyramid/${enc(slug)}/edges`), slug);
+      break;
+    }
+
+    case "threads": {
+      const slug = requireArg(1, "slug");
+      output(await pf(`/pyramid/${enc(slug)}/threads`), slug);
+      break;
+    }
+
+    case "cost": {
+      const slug = requireArg(1, "slug");
+      const buildId = flags.build;
+      const path = buildId
+        ? `/pyramid/${enc(slug)}/cost?build_id=${enc(buildId)}`
+        : `/pyramid/${enc(slug)}/cost`;
+      output(await pf(path), slug);
+      break;
+    }
+
+    case "stale-log": {
+      const slug = requireArg(1, "slug");
+      const limit = flags.limit;
+      const path = limit
+        ? `/pyramid/${enc(slug)}/stale-log?limit=${enc(limit)}`
+        : `/pyramid/${enc(slug)}/stale-log`;
+      output(await pf(path), slug);
+      break;
+    }
+
+    case "usage": {
+      const slug = requireArg(1, "slug");
+      const limit = flags.limit || "100";
+      output(await pf(`/pyramid/${enc(slug)}/usage?limit=${enc(limit)}`), slug);
+      break;
+    }
+
+    case "meta": {
+      const slug = requireArg(1, "slug");
+      output(await pf(`/pyramid/${enc(slug)}/meta`), slug);
+      break;
+    }
+
+    case "resolved": {
+      const slug = requireArg(1, "slug");
+      output(await pf(`/pyramid/${enc(slug)}/resolved`), slug);
+      break;
+    }
+
+    // ── Composite Commands ────────────────────────────────────────────
+
+    case "handoff": {
+      const slug = requireArg(1, "slug");
+
+      const [apexResp, faqResp, annotResp, dadbearResp] = await Promise.all([
+        pf(`/pyramid/${enc(slug)}/apex`),
+        pf(`/pyramid/${enc(slug)}/faq/directory`),
+        pf(`/pyramid/${enc(slug)}/annotations`),
+        pf(`/pyramid/${enc(slug)}/auto-update/status`),
+      ]);
+
+      if (!apexResp.ok) {
+        output(apexResp, slug);
+        break;
+      }
+
+      const apex = apexResp.data as Record<string, unknown>;
+
+      // Build annotation summary
+      let annotationTotal = 0;
+      const byType: Record<string, number> = {};
+      if (annotResp.ok && Array.isArray(annotResp.data)) {
+        annotationTotal = annotResp.data.length;
+        for (const ann of annotResp.data as Array<Record<string, unknown>>) {
+          const t = String(ann.annotation_type ?? "unknown");
+          byType[t] = (byType[t] || 0) + 1;
+        }
+      }
+
+      // Build top FAQ questions
+      let topFaqQuestions: string[] = [];
+      if (faqResp.ok) {
+        const faqData = faqResp.data;
+        let entries: Array<Record<string, unknown>> = [];
+        if (Array.isArray(faqData)) {
+          entries = faqData;
+        } else if (typeof faqData === "object" && faqData !== null) {
+          const fd = faqData as Record<string, unknown>;
+          if (Array.isArray(fd.entries)) entries = fd.entries as Array<Record<string, unknown>>;
+          else if (Array.isArray(fd.questions)) entries = fd.questions as Array<Record<string, unknown>>;
+          else if (Array.isArray(fd.items)) entries = fd.items as Array<Record<string, unknown>>;
+        }
+        topFaqQuestions = entries
+          .slice(0, 5)
+          .map((e) => String(e.question ?? e.title ?? e.headline ?? ""))
+          .filter(Boolean);
+      }
+
+      // DADBEAR summary
+      let dadbearSummary: unknown = null;
+      if (dadbearResp.ok) {
+        dadbearSummary = dadbearResp.data;
+      }
+
+      const handoff = {
+        slug,
+        pyramid_headline: apex.headline ?? null,
+        cli_commands: {
+          apex: `pyramid-cli apex ${slug}`,
+          search: `pyramid-cli search ${slug} "<query>"`,
+          drill: `pyramid-cli drill ${slug} <node_id>`,
+          faq: `pyramid-cli faq ${slug} "<question>"`,
+          tree: `pyramid-cli tree ${slug}`,
+          annotations: `pyramid-cli annotations ${slug}`,
+          entities: `pyramid-cli entities ${slug}`,
+          terms: `pyramid-cli terms ${slug}`,
+          cost: `pyramid-cli cost ${slug}`,
+        },
+        dadbear_status: dadbearSummary,
+        annotation_summary: {
+          total: annotationTotal,
+          by_type: byType,
+        },
+        top_faq_questions: topFaqQuestions,
+        tips: [
+          "Use 'drill' to navigate the pyramid tree structure depth-first.",
+          "Use 'search' for keyword matching, 'faq' for natural-language question matching.",
+          "Annotations are immediately visible after creation via 'annotations' and 'drill'.",
+          "Use 'tree' for a structural overview before drilling.",
+          "Use 'cost' to check build token spend.",
+        ],
+      };
+
+      outputData(handoff);
+      break;
+    }
+
+    case "compare": {
+      const slug1 = requireArg(1, "slug1");
+      const slug2 = requireArg(2, "slug2");
+
+      const [apex1Resp, apex2Resp] = await Promise.all([
+        pf(`/pyramid/${enc(slug1)}/apex`),
+        pf(`/pyramid/${enc(slug2)}/apex`),
+      ]);
+
+      if (!apex1Resp.ok) {
+        output(apex1Resp, slug1);
+        break;
+      }
+      if (!apex2Resp.ok) {
+        output(apex2Resp, slug2);
+        break;
+      }
+
+      const apex1 = apex1Resp.data as Record<string, unknown>;
+      const apex2 = apex2Resp.data as Record<string, unknown>;
+
+      // Compare terms
+      const terms1 = Array.isArray(apex1.terms) ? apex1.terms.map(String) : [];
+      const terms2 = Array.isArray(apex2.terms) ? apex2.terms.map(String) : [];
+      const terms1Set = new Set(terms1.map((t: string) => t.toLowerCase()));
+      const terms2Set = new Set(terms2.map((t: string) => t.toLowerCase()));
+      const shared = terms1.filter((t: string) => terms2Set.has(t.toLowerCase()));
+      const uniqueTo1 = terms1.filter((t: string) => !terms2Set.has(t.toLowerCase()));
+      const uniqueTo2 = terms2.filter((t: string) => !terms1Set.has(t.toLowerCase()));
+
+      // Compare children counts
+      const children1 = Array.isArray(apex1.children) ? apex1.children.length : 0;
+      const children2 = Array.isArray(apex2.children) ? apex2.children.length : 0;
+
+      // Compare decisions if present
+      const decisions1 = Array.isArray(apex1.decisions) ? apex1.decisions : [];
+      const decisions2 = Array.isArray(apex2.decisions) ? apex2.decisions : [];
+
+      const comparison = {
+        slug1,
+        slug2,
+        headlines: {
+          [slug1]: apex1.headline ?? null,
+          [slug2]: apex2.headline ?? null,
+        },
+        terms: {
+          shared,
+          [`unique_to_${slug1}`]: uniqueTo1,
+          [`unique_to_${slug2}`]: uniqueTo2,
+        },
+        children_count: {
+          [slug1]: children1,
+          [slug2]: children2,
+        },
+        decisions: {
+          [slug1]: decisions1.length,
+          [slug2]: decisions2.length,
+        },
+      };
+
+      outputData(comparison);
+      break;
+    }
+
+    case "diff": {
+      const slug = requireArg(1, "slug");
+
+      const [staleResp, buildResp] = await Promise.all([
+        pf(`/pyramid/${enc(slug)}/stale-log`),
+        pf(`/pyramid/${enc(slug)}/build/status`),
+      ]);
+
+      const result: Record<string, unknown> = { slug };
+
+      if (staleResp.ok) {
+        result.recent_changes = staleResp.data;
+      } else {
+        result.recent_changes = null;
+        result._stale_log_error = staleResp.data;
+      }
+
+      if (buildResp.ok) {
+        result.build_status = buildResp.data;
+      } else {
+        result.build_status = null;
+        result._build_status_error = buildResp.data;
+      }
+
+      outputData(result);
+      break;
+    }
+
+    // ── Self-Documenting Help ─────────────────────────────────────────
+
+    case "help": {
+      const topic = positional[1]; // optional: command name
+      const categoryFilter = flags.category;
+
+      if (topic) {
+        // Help for a specific command
+        const entry = getToolCatalogEntry(topic);
+        if (entry) {
+          outputData(entry);
+        } else {
+          process.stderr.write(`Unknown command: '${topic}'. Run 'pyramid-cli help' for the full catalog.\n`);
+          process.exit(1);
+        }
+      } else if (categoryFilter) {
+        // Filter by category
+        const entries = getToolCatalogByCategory(categoryFilter);
+        if (entries.length > 0) {
+          outputData({ category: categoryFilter, commands: entries });
+        } else {
+          const catalog = getToolCatalog();
+          process.stderr.write(
+            `Unknown category: '${categoryFilter}'. Available: ${Object.keys(catalog.categories).join(", ")}\n`
+          );
+          process.exit(1);
+        }
+      } else {
+        // Full catalog
+        outputData(getToolCatalog());
+      }
+      break;
+    }
+
+    case "navigate": {
+      const slug = requireArg(1, "slug");
+      const question = requireArg(2, "question");
+      output(await pf(`/pyramid/${enc(slug)}/navigate`, { method: "POST", body: { question } }), slug);
+      break;
+    }
+
+    case "react": {
+      const slug = requireArg(1, "slug");
+      const annotationId = requireArg(2, "annotation_id");
+      const reaction = requireArg(3, "reaction");
+      if (reaction !== "up" && reaction !== "down") {
+        process.stderr.write("Error: reaction must be 'up' or 'down'\n");
+        process.exit(1);
+      }
+      const body: Record<string, string> = { reaction };
+      if (flags.agent) body.agent_id = flags.agent;
+      output(await pf(`/pyramid/${enc(slug)}/annotations/${enc(annotationId)}/react`, { method: "POST", body }), slug);
+      break;
+    }
+
+    case "session-register": {
+      const slug = requireArg(1, "slug");
+      const agentId = flags.agent || "cli-agent";
+      output(await pf(`/pyramid/${enc(slug)}/sessions/register`, { method: "POST", body: { agent_id: agentId } }), slug);
+      break;
+    }
+
+    case "sessions": {
+      const slug = requireArg(1, "slug");
+      output(await pf(`/pyramid/${enc(slug)}/sessions`), slug);
+      break;
+    }
+
     default: {
       process.stderr.write(`Unknown command: ${command}\n\n`);
       printUsage();
@@ -400,12 +1278,16 @@ async function run(): Promise<void> {
 function printUsage(): void {
   process.stderr.write(`pyramid-cli — Knowledge Pyramid CLI for agent access
 
-Commands:
+Default output is pretty-printed JSON. Use --compact for minified JSON.
+
+Core Commands:
   health                          Check if Wire Node is running
   slugs                           List available pyramids
-  apex <slug>                     Get top-level summary
-  search <slug> <query>           Search pyramid nodes
-  drill <slug> <node_id>          Drill into a node + children
+
+Exploration Commands:
+  apex <slug> [--summary]         Get top-level summary (--summary for stripped version)
+  search <slug> <query> [--semantic] Search pyramid nodes (--semantic for LLM fallback)
+  drill <slug> <node_id>          Drill into a node + children (enriched with annotations + breadcrumb)
   node <slug> <node_id>           Get a single node
   faq <slug> [query]              Match FAQ or list all
   faq-dir <slug>                  FAQ directory (flat or hierarchical)
@@ -429,6 +1311,33 @@ Vine Commands:
   vine-rebuild-upper <slug>            Force rebuild L2+ layers
   vine-integrity <slug>                Run integrity check, return results
 
+Analysis Commands:
+  entities <slug>                 Entity index
+  terms <slug>                    Terms dictionary
+  corrections <slug>              Correction log
+  edges <slug>                    Web edges graph
+  threads <slug>                  Thread clusters
+  meta <slug>                     Meta analysis nodes
+  resolved <slug>                 Resolution status
+
+Operations Commands:
+  tree <slug>                     Structural overview
+  dadbear <slug>                  DADBEAR auto-update status
+  cost <slug> [--build ID]        Build cost report
+  stale-log <slug> [--limit N]    Staleness history
+  usage <slug> [--limit N]        Access patterns (default limit=100)
+  diff <slug>                     Changelog approximation (stale-log + build status)
+
+Composite Commands:
+  handoff <slug>                  Composite handoff block (apex + FAQ + annotations + DADBEAR)
+  compare <slug1> <slug2>         Cross-pyramid comparison (terms, children, decisions)
+  navigate <slug> "<question>"    One-shot question answering with provenance
+
+Agent Coordination:
+  react <slug> <annotation_id> up|down  Vote on an annotation
+  session-register <slug> [--agent name]  Register an agent session
+  sessions <slug>                List recent agent sessions
+
 Annotation flags:
   --question "..."     Question this answers (triggers FAQ)
   --author "..."       Your agent name
@@ -436,12 +1345,20 @@ Annotation flags:
 
 Options:
   --pretty             Pretty-print JSON output (default: on)
-  --compact            Compact JSON output
+  --compact            Compact JSON output (minified)
+  --verbose            Print auth method and diagnostics to stderr
+  --help               Show help (use <command> --help for per-command help)
 
 Examples:
-  pyramid-cli apex agent-wire-nodepostdadbear
-  pyramid-cli search agent-wire-nodepostdadbear "stale engine"
-  pyramid-cli annotate agent-wire-nodepostdadbear C-L0-071 "Finding text" --question "Q?" --author "my-agent"
+  pyramid-cli apex <your-slug>
+  pyramid-cli apex <your-slug> --summary
+  pyramid-cli search <your-slug> "stale engine"
+  pyramid-cli drill <your-slug> C-L0-071
+  pyramid-cli faq <your-slug> "How does the stale engine work?"
+  pyramid-cli annotate <your-slug> C-L0-071 "Finding text" --question "Q?" --author "my-agent"
+  pyramid-cli tree <your-slug>
+  pyramid-cli handoff <your-slug>
+  pyramid-cli compare slug-one slug-two
   pyramid-cli vine-build my-vine /path/to/jsonl-dir1 /path/to/jsonl-dir2
   pyramid-cli vine-bunches my-vine
 `);
