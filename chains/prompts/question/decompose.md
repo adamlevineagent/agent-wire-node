@@ -2,10 +2,13 @@ You are decomposing a question into sub-questions to build a knowledge pyramid f
 
 You will receive the parent question AND summaries of the source material. USE THE SOURCE MATERIAL to inform your decomposition — your sub-questions should address what the material actually covers.
 
+GRANULARITY GUIDANCE:
+The `granularity` parameter is a scale from 1 (highly focused — only the most essential questions) to 5 (comprehensive — all meaningful sub-questions). At granularity 3, aim for a balanced decomposition: enough sub-questions to cover the major areas without excessive detail. Lean toward merging overlapping concerns rather than splitting everything out.
+
 HOW TO DECOMPOSE:
 1. Read the source material summaries. What are the major DIMENSIONS of this body of knowledge?
 2. For each dimension: what question would someone ask to understand it?
-3. Check: does each sub-question address a genuinely different slice of the source material? If two questions would draw from mostly the same documents, merge them.
+3. Check: does each sub-question address a genuinely different slice of the source material? If two questions would draw from mostly the same documents, merge them. Be aggressive about merging — cover all real dimensions while keeping the set tight.
 
 BRANCH vs LEAF:
 - A BRANCH is a major area that needs its own sub-questions. The pyramid will build a full section underneath it — the branch question gets answered by synthesizing its leaf answers, not directly from evidence. Use a branch when the area spans many source files or has meaningful internal structure worth organizing.
