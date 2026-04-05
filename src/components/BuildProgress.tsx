@@ -131,7 +131,7 @@ export function BuildProgressLegacy({ slug, onComplete, onClose, onRetry }: Buil
                     />
                 </div>
                 <div className="build-progress-stats">
-                    <span>{pct}% ({status?.progress.done || 0}/{status?.progress.total || 0} estimated nodes)</span>
+                    <span>{pct}% ({status?.progress.done || 0}/{status?.progress.total || 0} steps)</span>
                     <span>Elapsed: {elapsed}</span>
                 </div>
             </div>

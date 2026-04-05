@@ -270,6 +270,9 @@ pub struct Tier1Config {
     /// Sliding window duration in seconds for rate limiting.
     #[serde(default = "default_llm_rate_limit_window_secs")]
     pub llm_rate_limit_window_secs: f64,
+    /// When true, log full LLM response bodies for failed/truncated calls.
+    #[serde(default)]
+    pub llm_debug_logging: bool,
 }
 
 impl Default for Tier1Config {
@@ -306,6 +309,7 @@ impl Default for Tier1Config {
             llm_timeout_increment_secs: default_llm_timeout_increment_secs(),
             llm_rate_limit_max_requests: default_llm_rate_limit_max_requests(),
             llm_rate_limit_window_secs: default_llm_rate_limit_window_secs(),
+            llm_debug_logging: false,
         }
     }
 }
@@ -512,6 +516,7 @@ impl PyramidConfig {
             timeout_increment_secs: self.operational.tier1.llm_timeout_increment_secs,
             rate_limit_max_requests: self.operational.tier1.llm_rate_limit_max_requests,
             rate_limit_window_secs: self.operational.tier1.llm_rate_limit_window_secs,
+            llm_debug_logging: self.operational.tier1.llm_debug_logging,
         }
     }
 }

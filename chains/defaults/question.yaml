@@ -1,9 +1,9 @@
 schema_version: 1
 id: question-pipeline
 name: Question Pipeline
-description: "Question-driven knowledge pyramid build. Forkable recipe — Pillar 28."
+description: "Extract-first question-driven knowledge pyramid. Generic L0 → web → decompose → evidence → gaps."
 content_type: question
-version: "1.1.0"
+version: "2.0.0"
 author: "wire-node"
 
 defaults:
@@ -12,19 +12,94 @@ defaults:
   on_error: "retry(2)"
 
 steps:
+  # ── Phase 0: Load prior state ───────────────────────────────────────
   - name: load_prior_state
     primitive: cross_build_input
     save_as: step_only
 
-  # characterize: removed — build_runner does characterization before chain
-  # starts and injects the result as initial_params.$characterize (a string).
+  # ── Phase 1: Generic L0 extraction (first question only) ───────────
+  # Content-type neutral. Same dehydration-friendly schema as document
+  # pipeline. Produces headline / orientation / topics[summary, current,
+  # entities] — multiple summary levels for downstream dehydration.
+  - name: source_extract
+    primitive: extract
+    instruction: "$prompts/question/source_extract.md"
+    for_each: "$chunks"
+    when: "$load_prior_state.l0_count == 0"
+    dispatch_order: "largest_first"
+    concurrency: 4
+    node_id_pattern: "Q-L0-{index:03}"
+    depth: 0
+    save_as: node
+    max_input_tokens: 80000
+    split_strategy: "sections"
+    split_overlap_tokens: 500
+    split_merge: true
+    merge_instruction: "$prompts/shared/merge_sub_chunks.md"
+    on_error: "retry(3)"
+    on_parse_error: "heal"
+    heal_instruction: "$prompts/shared/heal_json.md"
+
+  # ── Phase 2: L0 webbing (first question only) ──────────────────────
+  # Build corpus structure map before decomposition. compact_inputs
+  # strips to headline + entities (~60-70% smaller). Web edges inform
+  # decompose about thematic boundaries in the corpus.
+  - name: l0_webbing
+    primitive: web
+    instruction: "$prompts/question/question_web.md"
+    input:
+      nodes: "$source_extract"
+    compact_inputs: true
+    response_schema: &web_schema
+      type: object
+      properties:
+        edges:
+          type: array
+          items:
+            type: object
+            properties:
+              source:
+                type: string
+              target:
+                type: string
+              relationship:
+                type: string
+              shared_resources:
+                type: array
+                items:
+                  type: string
+              strength:
+                type: number
+            required: ["source", "target", "relationship", "shared_resources", "strength"]
+            additionalProperties: false
+      required: ["edges"]
+      additionalProperties: false
+    depth: 0
+    save_as: web_edges
+    model_tier: mid
+    temperature: 0.2
+    on_error: "skip"
+    when: "$load_prior_state.l0_count == 0"
+
+  # ── Phase 3: Refresh state after extraction ─────────────────────────
+  # Re-runs cross_build_input to pick up L0 nodes and web edges created
+  # by source_extract + l0_webbing. Provides populated l0_summary for
+  # enhance and decompose. Always runs (cheap DB read, not LLM call).
+  - name: refresh_state
+    primitive: cross_build_input
+    save_as: step_only
+
+  # ── Phase 4: Question-driven decomposition ──────────────────────────
+  # Now informed by real L0 content (via refresh_state.l0_summary and
+  # L0 nodes in DB). Decompose sees actual extracted content, not just
+  # $characterize. Cannot ask about absent topics.
 
   - name: enhance_question
     primitive: extract
     instruction: "$prompts/question/enhance_question.md"
     input:
       apex_question: "$apex_question"
-      corpus_context: "$load_prior_state.l0_summary"
+      corpus_context: "$refresh_state.l0_summary"
       characterization: "$characterize"
     save_as: step_only
 
@@ -38,6 +113,7 @@ steps:
       max_depth: "$max_depth"
       characterize: "$characterize"
       audience: "$audience"
+      l0_summary: "$refresh_state.l0_summary"
     save_as: step_only
 
   - name: decompose_delta
@@ -55,7 +131,7 @@ steps:
       existing_answers: "$load_prior_state.overlay_answers"
       evidence_sets: "$load_prior_state.evidence_sets"
       gaps: "$load_prior_state.unresolved_gaps"
-      l0_summary: "$load_prior_state.l0_summary"
+      l0_summary: "$refresh_state.l0_summary"
     save_as: step_only
 
   # Both decompose and decompose_delta write to $decomposed_tree (canonical alias).
@@ -70,34 +146,17 @@ steps:
       audience: "$audience"
     save_as: step_only
 
-  # synthesis_prompts: removed — evidence_loop generates synthesis prompts
-  # internally via extraction_schema::generate_synthesis_prompts(). This step
-  # was a wasted LLM call whose output was never consumed.
-
-  - name: l0_extract
-    primitive: extract
-    instruction_from: "$extraction_schema.extraction_prompt"
-    for_each: "$chunks"
-    when: "$load_prior_state.l0_count == 0"
-    concurrency: 4
-    node_id_pattern: "Q-L0-{index:03}"
-    depth: 0
-    save_as: node
-    max_input_tokens: 80000
-    split_strategy: "sections"
-    split_overlap_tokens: 500
-    split_merge: true
-    merge_instruction: "$prompts/shared/merge_sub_chunks.md"
-    on_error: "retry(3)"
-    on_parse_error: "heal"
-    heal_instruction: "$prompts/shared/heal_json.md"
+  # ── Phase 5: Evidence answering ─────────────────────────────────────
+  # No separate l0_extract step. evidence_loop works from generic L0
+  # nodes created by source_extract. extraction_schema is used internally
+  # for synthesis prompts and gap targeting.
 
   - name: evidence_loop
     primitive: evidence_loop
     input:
       question_tree: "$decomposed_tree"
       extraction_schema: "$extraction_schema"
-      load_prior_state: "$load_prior_state"
+      load_prior_state: "$refresh_state"
       reused_question_ids: "$reused_question_ids"
       build_id: "$build_id"
     save_as: step_only
@@ -106,7 +165,33 @@ steps:
     primitive: process_gaps
     input:
       evidence_loop: "$evidence_loop"
-      load_prior_state: "$load_prior_state"
+      load_prior_state: "$refresh_state"
     save_as: step_only
+
+  # ── Phase 6: Cross-cutting webbing ──────────────────────────────────
+  # Web sibling answer nodes at each depth level. Finds connections
+  # the question tree hierarchy misses.
+
+  - name: l1_webbing
+    primitive: web
+    instruction: "$prompts/question/question_web.md"
+    compact_inputs: true
+    response_schema: *web_schema
+    depth: 1
+    save_as: web_edges
+    model_tier: mid
+    temperature: 0.2
+    on_error: "skip"
+
+  - name: l2_webbing
+    primitive: web
+    instruction: "$prompts/question/question_web.md"
+    compact_inputs: true
+    response_schema: *web_schema
+    depth: 2
+    save_as: web_edges
+    model_tier: mid
+    temperature: 0.2
+    on_error: "skip"
 
 post_build: []

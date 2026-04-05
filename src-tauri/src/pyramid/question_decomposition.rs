@@ -143,8 +143,8 @@ pub struct DecompositionPreview {
 /// Assign deterministic IDs to every node in the question tree.
 ///
 /// ID format: `q-{sha256_hex_first_12}` where the hash input is
-/// `"{question}|{about}|{depth}"`. Depth is 0 for leaves, increasing toward
-/// the root (i.e. the root/apex gets the highest depth value).
+/// `"{question}|{about}|{depth}"`. Depth is 1 for leaves (offset by 1 so layer 0
+/// is reserved for L0 extraction nodes), increasing toward the root/apex.
 ///
 /// Two passes: first compute max_depth, then assign IDs with correct depths.
 pub fn assign_question_ids(tree: &mut QuestionTree) {
@@ -165,8 +165,8 @@ fn compute_max_depth(node: &QuestionNode) -> u32 {
 }
 
 /// Recursively assign IDs. `max_depth` is the tree height, `current_level` is
-/// how far from the root (0 = root). The node's depth = max_depth - current_level
-/// (so leaves = 0, root = max_depth).
+/// how far from the root (0 = root). The node's depth = max_depth - current_level + 1
+/// (so leaves = 1, root = max_depth + 1). The +1 offset reserves layer 0 for L0 extraction nodes.
 fn assign_ids_recursive(node: &mut QuestionNode, max_depth: u32, current_level: u32) {
     let depth = max_depth.saturating_sub(current_level) + 1;
     node.id = make_question_id(&node.question, &node.about, depth);
@@ -188,8 +188,9 @@ fn make_question_id(question: &str, about: &str, depth: u32) -> String {
 
 /// Extract per-layer question sets from a question tree.
 ///
-/// Leaves are layer 0 (L0). Their parents are layer 1. Root/apex is the highest
-/// layer. Returns a HashMap<layer, Vec<LayerQuestion>>.
+/// Leaves are layer 1 (reserved for evidence answering). Their parents are layer 2.
+/// Root/apex is the highest layer. Layer 0 is reserved for L0 extraction nodes.
+/// Returns a HashMap<layer, Vec<LayerQuestion>>.
 ///
 /// Requires `assign_question_ids` to have been called first (IDs must be populated).
 pub fn extract_layer_questions(

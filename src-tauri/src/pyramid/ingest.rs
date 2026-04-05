@@ -589,7 +589,7 @@ pub fn ingest_code(conn: &Connection, slug: &str, dir_path: &Path) -> Result<Ing
 /// Ingest a directory of documents (.txt, .md) into the pyramid database.
 ///
 /// - Walks the directory, skipping hidden dirs/files
-/// - Each document = 1 chunk, formatted as `## DOCUMENT: <rel_path>\n\n<content>`
+/// - Each document = 1 chunk, formatted as `## FILE: <rel_path>\n\n<content>`
 /// - Computes SHA-256 per file for file hash tracking
 /// - Returns IngestResult with slug name, extensions, and file hash info
 pub fn ingest_docs(conn: &Connection, slug: &str, dir_path: &Path) -> Result<IngestResult> {
@@ -683,7 +683,7 @@ pub fn ingest_docs(conn: &Connection, slug: &str, dir_path: &Path) -> Result<Ing
     // Each document = 1 chunk, collect file hash info
     let mut file_infos: Vec<IngestFileInfo> = Vec::new();
     for (i, d) in doc_entries.iter().enumerate() {
-        let chunk_content = format!("## DOCUMENT: {}\n\n{}", d.rel_path, d.content);
+        let chunk_content = format!("## FILE: {}\n\n{}", d.rel_path, d.content);
         let chunk_index = chunk_offset + i as i64;
         db::insert_chunk(conn, slug, batch_id, chunk_index, &chunk_content)?;
 

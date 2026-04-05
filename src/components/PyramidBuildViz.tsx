@@ -182,7 +182,7 @@ export function PyramidBuildViz({ slug, onComplete, onClose, onRetry }: PyramidB
             <div className="pbv-stats">
                 <span>{elapsed} elapsed</span>
                 <span className="pbv-stats-sep" />
-                <span>{done}/{total} nodes</span>
+                <span>{done}/{total} steps</span>
             </div>
 
             {/* Log panel */}

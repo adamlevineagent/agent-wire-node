@@ -1919,6 +1919,7 @@ pub async fn build_docs(
                             .lines()
                             .next()
                             .unwrap_or("")
+                            .trim_start_matches("## FILE: ")
                             .trim_start_matches("## DOCUMENT: ")
                             .to_string();
                         doc_names.push(name);

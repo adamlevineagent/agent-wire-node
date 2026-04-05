@@ -2841,6 +2841,8 @@ fn estimate_total(chain: &ChainDefinition, ctx: &ChainContext, num_chunks: i64) 
     let mut total: i64 = 0;
     for step in &chain.steps {
         if !step_saves_node(step) {
+            // Count setup steps (non-node-saving) so progress isn't stuck at 0/0
+            total += 1;
             continue;
         }
 
@@ -3650,6 +3652,11 @@ pub async fn execute_chain_from(
         // Check `when` condition
         if !evaluate_when(step.when.as_deref(), &ctx) {
             info!("  Step '{}' skipped (when condition false)", step.name);
+            // Skipped setup steps still count toward done to keep totals balanced
+            if !step_saves_node(step) {
+                done += 1;
+                send_progress(&progress_tx, done, total).await;
+            }
             step_activities.push(super::types::StepActivity {
                 name: step.name.clone(),
                 status: "skipped".into(),
@@ -3887,13 +3894,16 @@ pub async fn execute_chain_from(
             if saves_node && step.depth.unwrap_or(0) == 0 {
                 for (i, output) in outputs.iter().enumerate() {
                     if let Some(node_id) = output.get("node_id").and_then(|v| v.as_str()) {
-                        // Extract file_path from chunk content (format: "## FILE: path\n...")
+                        // Extract file_path from chunk content header ("## FILE: path").
+                        // Legacy compat: also accepts "## DOCUMENT: path" from pre-unification ingests.
                         let file_path = ctx.chunks.get(i)
                             .and_then(|chunk| chunk.get("content"))
                             .and_then(|c| c.as_str())
                             .and_then(|content| {
                                 content.lines().next().and_then(|first_line| {
-                                    first_line.strip_prefix("## FILE: ").map(|p| p.to_string())
+                                    first_line.strip_prefix("## FILE: ")
+                                        .or_else(|| first_line.strip_prefix("## DOCUMENT: "))
+                                        .map(|p| p.to_string())
                                 })
                             });
                         if let Some(fp) = file_path {
@@ -3934,6 +3944,11 @@ pub async fn execute_chain_from(
                 info!("[CHAIN] step \"{}\" complete", step.name);
                 if !output.is_null() {
                     ctx.step_outputs.insert(step.name.clone(), output);
+                }
+                // Count setup steps (non-node-saving) toward progress so the
+                // UI doesn't sit at 0/0 during the initial chain phases.
+                if !saves_node {
+                    done += 1;
                 }
                 total = estimate_total(chain, &ctx, num_chunks).max(done);
                 send_progress(&progress_tx, done, total).await;
@@ -11093,7 +11108,8 @@ mod tests {
         };
 
         let mut ctx = ChainContext::new("slug", "code", vec![]);
-        assert_eq!(estimate_total(&chain, &ctx, 112), 112);
+        // 112 chunks for l0_code_extract + 1 setup step (thread_clustering) = 113
+        assert_eq!(estimate_total(&chain, &ctx, 112), 113);
 
         ctx.step_outputs.insert(
             "thread_clustering".to_string(),
@@ -11102,7 +11118,8 @@ mod tests {
             }),
         );
 
-        assert_eq!(estimate_total(&chain, &ctx, 112), 122);
+        // 112 + 1 setup + 10 thread_narrative nodes = 123
+        assert_eq!(estimate_total(&chain, &ctx, 112), 123);
     }
 
     #[test]

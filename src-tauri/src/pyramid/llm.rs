@@ -97,6 +97,8 @@ pub struct LlmConfig {
     pub rate_limit_max_requests: usize,
     /// Sliding window duration in seconds for rate limiting.
     pub rate_limit_window_secs: f64,
+    /// When true, log full LLM response bodies for failed/truncated calls to the debug log file.
+    pub llm_debug_logging: bool,
 }
 
 impl Default for LlmConfig {
@@ -118,6 +120,7 @@ impl Default for LlmConfig {
             timeout_increment_secs: 60,
             rate_limit_max_requests: 4,
             rate_limit_window_secs: 5.0,
+            llm_debug_logging: false,
         }
     }
 }
@@ -460,6 +463,16 @@ pub async fn call_model_unified_with_options(
                     attempt + 1,
                     e
                 );
+                // Log the raw response that failed to parse so we can see what the LLM returned
+                if config.llm_debug_logging {
+                    let preview_len = body_text.len().min(2000);
+                    warn!(
+                        "[LLM-DEBUG] Raw response body that failed envelope parse (model={}, len={}):\n{}",
+                        short_name(&use_model),
+                        body_text.len(),
+                        &body_text[..preview_len],
+                    );
+                }
                 if attempt + 1 < config.max_retries {
                     info!("  parse error, retry {}...", attempt + 1);
                     tokio::time::sleep(std::time::Duration::from_secs(config.retry_base_sleep_secs)).await;
@@ -496,6 +509,42 @@ pub async fn call_model_unified_with_options(
             .get("id")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
+
+        // Extract finish_reason for diagnostics
+        let finish_reason = data
+            .get("choices")
+            .and_then(|c| c.get(0))
+            .and_then(|c| c.get("finish_reason"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+
+        // Always log finish_reason so it shows up in normal tracing
+        info!(
+            "[LLM] model={} finish_reason={} prompt_tokens={} completion_tokens={}",
+            short_name(&use_model),
+            finish_reason,
+            usage.prompt_tokens,
+            usage.completion_tokens,
+        );
+
+        // Debug logging for truncated/abnormal responses
+        if config.llm_debug_logging {
+            let content_len = content.map(|s| s.len()).unwrap_or(0);
+            if finish_reason != "stop" || content_len > 20_000 {
+                let preview = content
+                    .map(|s| &s[..s.len().min(2000)])
+                    .unwrap_or("<null content>");
+                warn!(
+                    "[LLM-DEBUG] Abnormal response (model={}, finish_reason={}, content_len={}, prompt_tokens={}, completion_tokens={}):\n{}",
+                    short_name(&use_model),
+                    finish_reason,
+                    content_len,
+                    usage.prompt_tokens,
+                    usage.completion_tokens,
+                    preview,
+                );
+            }
+        }
 
         match content {
             Some(text) => {

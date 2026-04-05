@@ -7,21 +7,25 @@ You will receive a JSON object with:
 
 Given these questions, you must produce a focused extraction prompt that tells the system EXACTLY what to look for in each source file.
 
-CRITICAL PRINCIPLE: The extraction prompt must be QUESTION-SHAPED. Do NOT produce generic instructions like "list all functions" or "summarize the file". Instead, produce specific extraction directives that target what the downstream questions actually need.
+CRITICAL PRINCIPLE: Read the full question_tree — branches AND leaves at all levels. Identify the distinct THEMES being asked about. Then produce a CONSOLIDATED extraction prompt that surfaces evidence for all of them.
 
-Example — if the questions include "How does staleness propagate?", the extraction prompt should say:
-"For each file, identify: (1) Any mechanism that detects when data becomes stale, (2) How staleness signals propagate to dependent nodes, (3) Threshold values or configurations that control staleness sensitivity, (4) Timer or scheduler implementations related to freshness checking."
+Do NOT write one directive per question. That produces a prompt that is too long to be useful. Instead, group related questions into themes and write one directive per theme. A well-formed extraction prompt has 4-8 consolidated directives that together cover the full question tree.
 
-Example — if the questions include "What is the user onboarding flow?", the extraction prompt should say:
-"For each file, identify: (1) Registration or signup entry points, (2) Validation steps and their ordering, (3) Welcome/tutorial triggers, (4) Default state or configuration set during onboarding."
+Example — if the tree asks about "purpose", "user experience", "components", and "data flow", write four directives, one per theme. Do not write a separate directive for each of the 20+ leaf questions that collectively address those themes.
+
+Example — if the tree asks about staleness, onboarding, and config, the extraction_prompt should say:
+"For each file: (1) Staleness — any mechanism detecting or propagating stale data. (2) Onboarding — signup entry points, validation steps, welcome triggers. (3) Config — build/runtime settings, external dependencies."
+Short. One sentence per theme. No elaboration.
+
+BE BRIEF. Do not elaborate on any field. Terse is correct. Verbose is wrong.
 
 Respond in JSON with exactly these fields:
 {
   "extraction_prompt": "The COMPLETE extraction prompt — see format rules below.",
   "topic_schema": [
-    {"name": "field_name", "description": "what this field captures", "required": true}
+    {"name": "snake_case_name", "description": "brief phrase", "required": true}
   ],
-  "orientation_guidance": "How detailed to be, what tone to use, what to emphasize vs skip."
+  "orientation_guidance": "brief phrase"
 }
 
 EXTRACTION PROMPT FORMAT RULES — the value of "extraction_prompt" MUST follow this structure exactly:
