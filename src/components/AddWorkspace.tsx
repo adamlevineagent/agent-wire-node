@@ -248,8 +248,8 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
         setError(null);
 
         try {
-            // source_path is a JSON array of paths
-            const sourcePath = JSON.stringify(paths);
+            // Single path as plain string; multiple paths as JSON array
+            const sourcePath = paths.length === 1 ? paths[0] : JSON.stringify(paths);
 
             // Create the slug
             await invoke('pyramid_create_slug', {

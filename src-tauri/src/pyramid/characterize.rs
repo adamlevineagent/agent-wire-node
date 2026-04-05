@@ -66,7 +66,18 @@ pub async fn characterize_with_fallback(
     chains_dir: Option<&Path>,
 ) -> Result<CharacterizationResult> {
     // ── 1. Build folder map from source path for LLM context ─────────────
-    let folder_map = question_decomposition::build_folder_map(source_path);
+    // Defense-in-depth: parse JSON array source_paths (e.g. '["/path"]') into
+    // the first path. Existing DB rows may have this format from the old
+    // AddWorkspace flow that used JSON.stringify(paths).
+    let effective_path = if source_path.trim().starts_with('[') {
+        serde_json::from_str::<Vec<String>>(source_path)
+            .ok()
+            .and_then(|v| v.into_iter().next())
+            .unwrap_or_else(|| source_path.to_string())
+    } else {
+        source_path.to_string()
+    };
+    let folder_map = question_decomposition::build_folder_map(&effective_path);
     let folder_context: String = match folder_map.as_deref() {
         Some(map) if !map.is_empty() => map.to_string(),
         _ => {
@@ -79,7 +90,7 @@ pub async fn characterize_with_fallback(
                 _ => {
                     return Err(anyhow::anyhow!(
                         "Source path '{}' is not accessible and no L0 fallback available",
-                        source_path
+                        effective_path
                     ))
                 }
             }

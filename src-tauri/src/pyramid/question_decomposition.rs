@@ -964,6 +964,22 @@ async fn build_subtree_incremental(
         children.push(child);
     }
 
+    // Horizontal review: deduplicate siblings at every depth, not just depth 1
+    if children.len() > 1 {
+        let (merged, leafed) =
+            horizontal_review_siblings(&mut children, llm_config, chains_dir).await?;
+        if merged > 0 || leafed > 0 {
+            info!(
+                depth = current_depth,
+                merged,
+                marked_as_leaf = leafed,
+                remaining = children.len(),
+                "horizontal review (incremental) at depth {}",
+                current_depth
+            );
+        }
+    }
+
     let (about, creates) = scope_for_depth(current_depth);
 
     let node = QuestionNode {
@@ -1087,6 +1103,22 @@ async fn build_subtree(
         ))
         .await?;
         children.push(child);
+    }
+
+    // Horizontal review: deduplicate siblings at every depth, not just depth 1
+    if children.len() > 1 {
+        let (merged, leafed) =
+            horizontal_review_siblings(&mut children, llm_config, chains_dir).await?;
+        if merged > 0 || leafed > 0 {
+            info!(
+                depth = current_depth,
+                merged,
+                marked_as_leaf = leafed,
+                remaining = children.len(),
+                "horizontal review at depth {}",
+                current_depth
+            );
+        }
     }
 
     // Non-leaf: this node synthesizes its children
@@ -1879,28 +1911,25 @@ async fn horizontal_review_siblings(
         Some(loaded) => loaded,
         None => {
             warn!("horizontal_review.md not found — using inline fallback");
-            r#"You are reviewing a set of sibling questions that together answer a parent question. You have two jobs:
+            r#"You are reviewing a set of sibling questions that together answer a parent question.
 
-JOB 1 — MERGE OVERLAPS:
-Identify pairs of questions that cover essentially the same territory. For each merge:
+YOUR ONLY JOB: Check if any two questions cover essentially the same territory and should be merged.
+
+For each pair that overlaps significantly:
 - "keep": index of the question to keep
 - "remove": index to merge into it
 - "merged_question": the combined question text
 
-JOB 2 — DEPTH CHECK:
-For each remaining question currently marked [BRANCH], decide: is this question specific enough to be answered directly from source material? If YES, mark it as a leaf (stopping further decomposition).
+Be conservative with merges — only merge when two questions would produce nearly identical answers from the same evidence.
 
-Think about it this way: further decomposition is only valuable if the question is genuinely too broad to answer from source files. If a skilled reader could answer it by looking at the relevant files, it's a leaf.
+IMPORTANT: Do NOT convert branches to leaves. If a question is marked as a branch, it stays a branch. The branch/leaf designation reflects the question's role in the pyramid structure, not just its complexity.
 
 Respond with a JSON object:
 {
-  "merges": [{"keep": N, "remove": N, "merged_question": "..."}],
-  "mark_as_leaf": [N, N, ...]
+  "merges": [{"keep": N, "remove": N, "merged_question": "..."}]
 }
 
-Both arrays can be empty. Be conservative with merges but aggressive with marking leaves — prefer fewer, deeper questions over a sprawling shallow tree.
-
-Return ONLY the JSON object."#.to_string()
+The merges array can be empty if no questions overlap. Return ONLY the JSON object."#.to_string()
         }
     };
 

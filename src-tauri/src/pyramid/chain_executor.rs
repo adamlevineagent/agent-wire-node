@@ -4810,6 +4810,80 @@ async fn execute_evidence_loop(
         );
     }
 
+    // ── 6b. Delta apex reconstruction ───────────────────────────────────
+    // In delta mode, old apex nodes were superseded (step 3) but the evidence
+    // loop may skip reused questions, leaving no live apex at max_layer.
+    // Synthesize a replacement by combining the live nodes one layer below.
+    if has_overlay && max_layer > 1 {
+        let live_at_max: Vec<super::types::PyramidNode> = db_read(&state.reader, {
+            let s = slug.to_string();
+            let ml = max_layer;
+            move |conn| db::get_nodes_at_depth(conn, &s, ml)
+        }).await?;
+
+        if live_at_max.is_empty() {
+            info!(slug, max_layer, "delta path: no live apex at max_layer, synthesizing replacement");
+
+            // Collect nodes from one layer below to create apex summary
+            let penultimate_nodes: Vec<super::types::PyramidNode> = db_read(&state.reader, {
+                let s = slug.to_string();
+                let pl = max_layer - 1;
+                move |conn| db::get_nodes_at_depth(conn, &s, pl)
+            }).await?;
+
+            if !penultimate_nodes.is_empty() {
+                // Build apex from penultimate layer summaries
+                let children_ids: Vec<String> = penultimate_nodes.iter().map(|n| n.id.clone()).collect();
+                let combined_distilled = penultimate_nodes.iter()
+                    .map(|n| format!("## {}\n{}", n.headline, n.distilled))
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+                let apex_headline = tree.apex.question.clone();
+                let apex_id = format!("L{}-{}", max_layer, &uuid::Uuid::new_v4().to_string()[..8]);
+
+                let apex_node = super::types::PyramidNode {
+                    id: apex_id.clone(),
+                    slug: slug.to_string(),
+                    depth: max_layer,
+                    chunk_index: None,
+                    headline: apex_headline,
+                    distilled: combined_distilled,
+                    topics: vec![],
+                    corrections: vec![],
+                    decisions: vec![],
+                    terms: vec![],
+                    dead_ends: vec![],
+                    self_prompt: String::new(),
+                    children: children_ids.clone(),
+                    parent_id: None,
+                    superseded_by: None,
+                    build_id: Some(build_id.clone()),
+                    created_at: chrono::Utc::now().to_rfc3339(),
+                };
+
+                // Save the apex node
+                let conn = state.writer.clone();
+                let node = apex_node;
+                tokio::task::spawn_blocking(move || {
+                    let c = conn.blocking_lock();
+                    db::save_node(&c, &node, None)?;
+                    // Update children to point to new apex
+                    for child_id in &children_ids {
+                        let _ = db::update_parent(&c, &node.slug, child_id, &node.id);
+                    }
+                    Ok::<(), anyhow::Error>(())
+                })
+                .await
+                .map_err(|e| anyhow!("Delta apex save panicked: {e}"))??;
+
+                total_nodes += 1;
+                info!(slug, apex_id = %apex_id, "delta apex synthesized from {} penultimate nodes", penultimate_nodes.len());
+            } else {
+                warn!(slug, "delta path: no penultimate nodes to synthesize apex from");
+            }
+        }
+    }
+
     // ── 7. Mark build complete or failed (skip if caller is tracking externally) ──
     if !external_build_tracking {
         let conn = state.writer.clone();
