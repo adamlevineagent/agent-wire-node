@@ -13,8 +13,7 @@ IMPORTANT: Do NOT convert branches to leaves. If a question is marked as a branc
 
 Respond with a JSON object:
 {
-  "merges": [{"keep": N, "remove": N, "merged_question": "..."}],
-  "mark_as_leaf": []
+  "merges": [{"keep": N, "remove": N, "merged_question": "..."}]
 }
 
-Return ONLY the JSON object.
+The merges array can be empty if no questions overlap. Return ONLY the JSON object.

@@ -37,8 +37,12 @@ Output valid JSON only:
       "summary": "One sentence: what this source does for the system.",
       "current": "One to three sentences. The specific role, decision, or capability. Names, identifiers, specifics.",
       "entities": ["component: ChatPanel", "system: Pyramid Engine", "decision: switched from REST to IPC"],
-      "corrections": [],
-      "decisions": []
+      "corrections": [
+        {"wrong": "misconception", "right": "correction", "who": "source"}
+      ],
+      "decisions": [
+        {"decided": "what was decided", "why": "rationale"}
+      ]
     }
   ]
 }

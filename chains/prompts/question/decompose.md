@@ -3,25 +3,19 @@ You are decomposing a question into sub-questions to build a knowledge pyramid f
 You will receive the parent question AND summaries of the source material. USE THE SOURCE MATERIAL to understand what the system or corpus IS and DOES — not to derive a list of files or folders.
 
 WHAT GOOD DECOMPOSITION LOOKS LIKE:
-Ask about what the system DOES, how it WORKS, why it EXISTS, and how it behaves across time and space. You MUST use a MULTI-LENS ABSTRACTION FRAMEWORK to break down the question, rather than just splitting it by structural paths.
+Ask about what the system DOES, how it WORKS, why it EXISTS, and what makes it distinctive. Do NOT split by structural paths, file layout, or generic categories.
 
-Force your sub-questions to view the corpus through these lenses:
-1. **The Value/Intent Lens**: "What human or business value does this enable? Why was it built?"
-2. **The Kinetic/State Flow Lens**: "How do data, leverage, and events move through this space? How is state mutated?"
-3. **The Temporal Lens**: "How do the components of the corpus relate to time relative to each other? (e.g., Pre-flight builds vs Active lifecycles vs Historical state)"
-4. **The Metaphorical Lens**: "What underlying physical or societal mechanism does this system emulate conceptually?"
+BEFORE writing any sub-questions, read the source material and identify the TENSIONS AND ORGANIZING PRINCIPLES unique to THIS corpus. Every body of knowledge has its own natural fault lines — the dimensions along which it divides into meaningfully different concerns. Your job is to FIND those dimensions, not impose predetermined ones.
+
+Ask yourself: "What are the fundamental tensions in this material? What trade-offs does it navigate? What are the distinct mechanisms that can't be understood through each other?" Your sub-questions should explore along THOSE dimensions.
 
 BAD decomposition:
-- "What files are in the X folder?"
-- "What does the config file do?"
-- "What is the UI made of?"
-These tell someone WHERE things are or what they are made of mechanically, not what they mean conceptually. Sub-questions must evaluate profound systemic abstraction.
+- "What files are in the X folder?" (file layout)
+- "What does the config file do?" (implementation detail)
+- "What is the UI made of?" (structural inventory)
+- Generic questions that could apply to ANY corpus without reading it (purpose/architecture/data/operations)
 
-GOOD decomposition:
-- "What is the overarching value and intent of this corpus?"
-- "How does the system mutate and distribute state across its kinetic flow?"
-- "Where do these capabilities sit across the temporal lifecycle (build vs runtime)?"
-- "What core conceptual mechanisms and policies define the architecture?"
+GOOD decomposition asks questions that could ONLY emerge from reading THIS specific material — questions that reveal what makes this corpus distinctive, what tensions it contains, what problems it uniquely solves, what trade-offs it navigates.
 
 GRANULARITY GUIDANCE:
 The `granularity` parameter is a scale from 1 (highly focused — only the most essential questions) to 5 (comprehensive — all meaningful sub-questions). At granularity 3, aim for a balanced decomposition: enough sub-questions to cover the major areas without excessive detail. Lean toward merging overlapping concerns rather than splitting everything out.

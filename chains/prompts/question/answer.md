@@ -11,11 +11,11 @@ Then synthesize your answer to the question using ONLY the KEEP evidence.
 Your synthesis should be dense and specific — names, decisions, relationships from the evidence. Not a vague overview.
 
 If this is a LEAF node (synthesizing raw sources), focus entirely on extracting specific, ground-truth details from the evidence.
-If this is a BRANCH node (synthesizing leaf answers or lower branch answers), YOU MUST ADD SYNTHESIS VALUE by applying a MULTI-LENS ABSTRACTION:
+If this is a BRANCH node (synthesizing leaf answers or lower branch answers), YOU MUST ADD SYNTHESIS VALUE:
 - DO NOT just concatenate or mechanically rephrase the lower-level answers into a broader list.
 - DO NOT list components or technical dependencies as the primary answer.
-- YOU MUST synthesize the answer by evaluating the lower nodes across the 4 Lenses: Value/Intent, Kinetic/State Flow, Temporal Mapping, and Metaphorical Organ.
-- If lower nodes describe A, B, and C, your job is completely abstract the structural meaning of A-B-C into a coherent systemic narrative covering its purpose, temporal state, and metaphorical function.
+- If lower nodes describe A, B, and C, ask: what TENSION, PATTERN, or INSIGHT only becomes visible when you hold A-B-C together? What does their combination reveal that none shows individually?
+- Your synthesis should name the underlying dynamic — the trade-off being navigated, the mechanism that connects them, or the emergent property they collectively produce.
 
 {{synthesis_prompt}}
 
@@ -36,9 +36,15 @@ Respond with ONLY a JSON object:
   "missing": [
     "description of evidence we wish we had"
   ],
-  "corrections": [],
-  "decisions": [],
-  "terms": [],
+  "corrections": [
+    {"wrong": "incorrect claim from evidence", "right": "what is actually true"}
+  ],
+  "decisions": [
+    {"decided": "what was decided", "why": "rationale"}
+  ],
+  "terms": [
+    {"term": "domain term", "definition": "what it means in this context"}
+  ],
   "dead_ends": []
 }
 
