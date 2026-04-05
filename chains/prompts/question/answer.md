@@ -11,6 +11,14 @@ Every KEEP candidate that represents a genuinely distinct dimension of the answe
 
 Your synthesis should be dense and specific — names, decisions, relationships from the evidence. Not a vague overview.
 
+### SYNTHESIS RULES
+If this is a LEAF node (synthesizing raw sources), focus entirely on extracting specific, ground-truth details.
+If this is a BRANCH node (synthesizing leaf answers or lower branch answers), YOU MUST ADD SYNTHESIS VALUE.
+- DO NOT just concatenate or mechanically rephrase the lower-level answers at a broader verbosity.
+- YOU MUST reveal connections, patterns, or architecture that the individual pieces don't show on their own.
+- If lower nodes describe A, B, and C, your job is to describe the relationship A-B-C or their combined purpose.
+- Name the specific abstractions (e.g. env vars, hooks, interfaces) referenced by the underlying evidence. No "some files handle x" — name the files or the system.
+
 {{synthesis_prompt}}
 
 {{content_type_block}}
