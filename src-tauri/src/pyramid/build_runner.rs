@@ -681,6 +681,31 @@ pub async fn run_decomposed_build(
     };
     let is_cross_slug = !referenced_slugs.is_empty();
 
+    // ── 2b. For question pyramids, resolve the base pyramid's source
+    //        path and L0 nodes for characterization context. The question
+    //        slug itself has empty source_path and zero L0 nodes.
+    let (effective_source_path, effective_l0_slug) =
+        if ct_str == "question" && !referenced_slugs.is_empty() {
+            let base_slug = &referenced_slugs[0]; // first ref is always the base
+            let conn = state.reader.lock().await;
+            let base_info = slug::get_slug(&conn, base_slug)?
+                .ok_or_else(|| anyhow!("Referenced base slug '{}' not found", base_slug))?;
+            info!(
+                slug = slug_name,
+                base = %base_slug,
+                base_source = %base_info.source_path,
+                "question pyramid: using base pyramid for characterization"
+            );
+            (base_info.source_path, base_slug.clone())
+        } else if ct_str == "question" {
+            return Err(anyhow!(
+                "Question pyramid '{}' has no base pyramid reference — cannot build",
+                slug_name
+            ));
+        } else {
+            (source_path.clone(), slug_name.to_string())
+        };
+
     // ── 3. Characterize if not provided ────────────────────────────
     let llm_config = state.config.read().await.clone();
 
@@ -696,9 +721,10 @@ pub async fn run_decomposed_build(
         None => {
             info!(slug = slug_name, "running automatic characterization");
             // Build L0 summary fallback for characterization context
+            // For question pyramids, use the base pyramid's L0 nodes
             let l0_fallback = {
                 let conn = state.reader.lock().await;
-                let existing_l0 = db::get_nodes_at_depth(&conn, slug_name, 0)
+                let existing_l0 = db::get_nodes_at_depth(&conn, &effective_l0_slug, 0)
                     .unwrap_or_default();
                 if existing_l0.is_empty() {
                     None
@@ -716,7 +742,7 @@ pub async fn run_decomposed_build(
                 }
             };
             characterize::characterize_with_fallback(
-                &source_path,
+                &effective_source_path,
                 apex_question,
                 &llm_config,
                 l0_fallback.as_deref(),
@@ -871,15 +897,37 @@ pub async fn preview_decomposed_build(
 
     let ct_str = content_type.as_str();
 
+    // ── 1b. For question pyramids, resolve the base pyramid's source path
+    //        and slug for L0 lookup (mirrors run_decomposed_build logic).
+    let referenced_slugs = {
+        let conn = state.reader.lock().await;
+        db::get_slug_references(&conn, slug_name)?
+    };
+    let (effective_source_path, effective_l0_slug) =
+        if ct_str == "question" && !referenced_slugs.is_empty() {
+            let base_slug = &referenced_slugs[0];
+            let conn = state.reader.lock().await;
+            let base_info = slug::get_slug(&conn, base_slug)?
+                .ok_or_else(|| anyhow!("Referenced base slug '{}' not found", base_slug))?;
+            (base_info.source_path, base_slug.clone())
+        } else if ct_str == "question" {
+            return Err(anyhow!(
+                "Question pyramid '{}' has no base pyramid reference — cannot preview",
+                slug_name
+            ));
+        } else {
+            (source_path.clone(), slug_name.to_string())
+        };
+
     // ── 2. Build context from L0 summaries (aligned with actual build path) ──
     // The actual build uses L0 summaries, not folder_map. Align preview to
     // use the same context source so decomposition matches the real build.
     let decomp_context = {
         let conn = state.reader.lock().await;
-        let base_l0 = db::get_nodes_at_depth(&conn, slug_name, 0)?;
+        let base_l0 = db::get_nodes_at_depth(&conn, &effective_l0_slug, 0)?;
         if base_l0.is_empty() {
             // No base pyramid yet — fall back to folder map
-            question_decomposition::build_folder_map(&source_path)
+            question_decomposition::build_folder_map(&effective_source_path)
         } else {
             let l0_context = base_l0
                 .iter()

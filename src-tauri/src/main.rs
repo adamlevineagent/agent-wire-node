@@ -5691,6 +5691,122 @@ async fn pyramid_auto_update_config_set(
 }
 
 #[tauri::command]
+async fn pyramid_auto_update_config_init(
+    state: tauri::State<'_, SharedState>,
+    slug: String,
+) -> Result<serde_json::Value, String> {
+    // Validate slug exists and get its info
+    let slug_info = {
+        let conn = state.pyramid.reader.lock().await;
+        wire_node_lib::pyramid::slug::get_slug(&conn, &slug)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("Slug '{}' not found", slug))?
+    };
+
+    // DADBEAR is only meaningful for code/document pyramids with source files
+    let ct = slug_info.content_type.as_str();
+    if ct == "question" || ct == "conversation" || ct == "vine" {
+        return Err(format!(
+            "DADBEAR auto-update is not supported for {} pyramids",
+            ct
+        ));
+    }
+
+    // INSERT OR IGNORE — idempotent, safe if config already exists
+    {
+        let conn = state.pyramid.writer.lock().await;
+        pyramid_db::insert_auto_update_config_defaults(&conn, &slug, "[]", "[]")
+            .map_err(|e| e.to_string())?;
+    }
+
+    // Read back the config (possibly pre-existing)
+    let config = {
+        let conn = state.pyramid.reader.lock().await;
+        pyramid_db::get_auto_update_config(&conn, &slug)
+            .ok_or_else(|| "Failed to initialize DADBEAR config".to_string())?
+    };
+
+    // Start the stale engine if one isn't already running for this slug
+    {
+        let mut engines = state.pyramid.stale_engines.lock().await;
+        if !engines.contains_key(&slug) {
+            let db_path = state
+                .pyramid
+                .data_dir
+                .as_ref()
+                .expect("data_dir not set")
+                .join("pyramid.db")
+                .to_string_lossy()
+                .to_string();
+            let (api_key, model) = {
+                let cfg = state.pyramid.config.read().await;
+                (cfg.api_key.clone(), cfg.primary_model.clone())
+            };
+
+            let mut engine = wire_node_lib::pyramid::stale_engine::PyramidStaleEngine::new(
+                &slug,
+                config.clone(),
+                &db_path,
+                &api_key,
+                &model,
+                state.pyramid.operational.as_ref().clone(),
+            );
+            engine.start_poll_loop();
+            engines.insert(slug.clone(), engine);
+            tracing::info!(slug = %slug, "DADBEAR engine started via config_init");
+
+            // Start file watcher if source paths exist
+            drop(engines); // release engines lock before watcher setup
+            let source_paths: Vec<String> =
+                wire_node_lib::pyramid::slug::resolve_validated_source_paths(
+                    &slug_info.source_path,
+                    &slug_info.content_type,
+                    state.pyramid.data_dir.as_deref(),
+                )
+                .unwrap_or_default()
+                .into_iter()
+                .map(|path| path.to_string_lossy().to_string())
+                .collect();
+
+            if !source_paths.is_empty() {
+                let mut watcher =
+                    wire_node_lib::pyramid::watcher::PyramidFileWatcher::new(
+                        &slug,
+                        source_paths,
+                        &state.pyramid.operational.tier2,
+                    );
+                let (mutation_tx, mut mutation_rx) =
+                    tokio::sync::mpsc::unbounded_channel::<(String, i32)>();
+                watcher.set_mutation_sender(mutation_tx);
+
+                let ps = state.pyramid.clone();
+                tokio::spawn(async move {
+                    while let Some((s, layer)) = mutation_rx.recv().await {
+                        let mut engs = ps.stale_engines.lock().await;
+                        if let Some(eng) = engs.get_mut(&s) {
+                            eng.notify_mutation(layer);
+                        }
+                    }
+                });
+
+                match watcher.start(&db_path) {
+                    Ok(()) => {
+                        tracing::info!(slug = %slug, "File watcher started via config_init");
+                        let mut watchers = state.pyramid.file_watchers.lock().await;
+                        watchers.insert(slug.clone(), watcher);
+                    }
+                    Err(e) => {
+                        tracing::warn!(slug = %slug, error = %e, "File watcher failed to start via config_init");
+                    }
+                }
+            }
+        }
+    }
+
+    serde_json::to_value(&config).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 async fn pyramid_auto_update_freeze(
     state: tauri::State<'_, SharedState>,
     slug: String,
@@ -7002,6 +7118,7 @@ fn main() {
             get_app_version,
             pyramid_auto_update_config_get,
             pyramid_auto_update_config_set,
+            pyramid_auto_update_config_init,
             pyramid_auto_update_freeze,
             pyramid_auto_update_unfreeze,
             pyramid_auto_update_status,

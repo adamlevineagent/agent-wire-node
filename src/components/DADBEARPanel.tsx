@@ -643,19 +643,16 @@ Last check: ${lastCheckStr}
                             </div>
                         )}
 
-                        {statusError && !status && (
+                        {statusError && !status && contentType !== 'question' && contentType !== 'conversation' && (
                             <button
                                 className="btn btn-primary btn-sm"
                                 style={{ marginTop: '8px' }}
                                 onClick={async () => {
                                     try {
-                                        await invoke('pyramid_auto_update_config_post', {
-                                            slug,
-                                            body: { auto_update: true, debounce_minutes: 5, min_changed_files: 1, runaway_threshold: 0.5 }
-                                        });
+                                        await invoke('pyramid_auto_update_config_init', { slug });
                                         setStatusError(null);
-                                        loadConfig();
-                                        loadStatus();
+                                        await loadConfig();
+                                        await loadStatus();
                                     } catch (err) {
                                         setStatusError(String(err));
                                     }
