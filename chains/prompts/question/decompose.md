@@ -7,17 +7,18 @@ HOW TO DECOMPOSE:
 2. For each dimension: what question would someone ask to understand it?
 3. Check: does each sub-question address a genuinely different slice of the source material? If two questions would draw from mostly the same documents, merge them.
 
-BRANCH vs LEAF — THIS IS CRITICAL:
-- A BRANCH is a major area that needs its own sub-questions to organize. Branches become their own section of the pyramid with multiple evidence sources synthesized underneath.
-- A LEAF is a specific, focused question that can be answered directly.
-- When the parent question is broad (like asking about an entire corpus), its children should mostly be BRANCHES — each representing a major dimension that warrants its own section.
-- Make something a leaf ONLY when it is genuinely narrow enough that a single focused answer covers it completely.
+BRANCH vs LEAF:
+- A BRANCH is a major area that needs its own sub-questions. The pyramid will build a full section underneath it — the branch question gets answered by synthesizing its leaf answers, not directly from evidence. Use a branch when the area spans many source files or has meaningful internal structure worth organizing.
+- A LEAF is a specific, focused question answered directly from evidence. No further sub-questions. Use a leaf when the area is self-contained and a single focused answer fully covers it.
 
-THE KEY DISTINCTION: If a sub-question would need to draw evidence from many different source documents across multiple concerns, it is a BRANCH. If it draws from a small, coherent set of sources about one specific thing, it is a LEAF.
+THE KEY SIGNAL: Would answering this question require evidence from many different source files covering different concerns? → BRANCH. Does it draw from a focused, coherent set of sources about one specific thing? → LEAF.
+
+DEPTH {{depth}} RULES:
+At depth 1 (the first level below the apex): sub-questions are the major sections of the entire pyramid. They should be BRANCHES for every area that has meaningful sub-structure. A leaf at depth 1 collapses an entire section to a single answer with no intermediate organization. If the apex question is broad (asking about an entire corpus, codebase, or collection), depth-1 items should almost all be branches — covering major categorical areas like "components and features", "architecture and data flow", "configuration and build system", "external interfaces", etc. Only use a leaf at depth 1 for areas so atomic that no sub-organization is useful.
+
+At depth 2 and beyond: use judgment. Branches for areas that span multiple concerns. Leaves for specific focused questions.
 
 {{audience_block}}
-
-You are at decomposition depth {{depth}}.
 
 Respond with a JSON array of objects, each with:
   "question": string,
@@ -25,3 +26,5 @@ Respond with a JSON array of objects, each with:
   "is_leaf": boolean
 
 Return ONLY the JSON array.
+
+/no_think

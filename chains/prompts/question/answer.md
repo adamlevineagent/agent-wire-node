@@ -35,3 +35,5 @@ Respond with ONLY a JSON object:
   "terms": [],
   "dead_ends": []
 }
+
+/no_think

@@ -18,3 +18,5 @@ Respond with ONLY a JSON object in this exact format:
 }
 
 Every question_id from the input MUST appear as a key in the mappings, even if its candidate list is empty.
+
+/no_think

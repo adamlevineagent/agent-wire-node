@@ -52,3 +52,5 @@ The extraction prompt you generate MUST shape the output for the target audience
 If the audience IS technical, the extraction can use appropriate technical vocabulary freely.
 
 Return ONLY the JSON object, no other text.
+
+/no_think
