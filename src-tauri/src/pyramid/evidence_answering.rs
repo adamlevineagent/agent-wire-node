@@ -705,33 +705,65 @@ async fn answer_single_question(
 ) -> Result<AnsweredNode> {
     let node_id = format!("L{}-{}", question.layer, Uuid::new_v4());
 
+    // Short-circuit: no candidates → skip LLM, emit placeholder + MISSING verdict
+    if candidate_nodes.is_empty() {
+        info!(
+            slug,
+            question = %question.question_text,
+            layer = question.layer,
+            "Zero candidates — skipping LLM, emitting MISSING for gap_processing"
+        );
+        return Ok(AnsweredNode {
+            node: PyramidNode {
+                id: node_id,
+                slug: answer_slug.to_string(),
+                depth: question.layer,
+                chunk_index: None,
+                headline: question.question_text.clone(),
+                distilled: "Awaiting evidence — no candidates mapped during pre-mapping.".to_string(),
+                topics: vec![],
+                corrections: vec![],
+                decisions: vec![],
+                terms: vec![],
+                dead_ends: vec![],
+                self_prompt: String::new(),
+                children: vec![],
+                parent_id: None,
+                superseded_by: None,
+                build_id: None,
+                created_at: chrono::Utc::now().to_rfc3339(),
+            },
+            evidence: vec![],
+            missing: vec![format!(
+                "No candidate evidence was mapped during pre-mapping for question: {}",
+                question.question_text
+            )],
+        });
+    }
+
     // Build candidate_map keyed by the IDs shown to the LLM (handle-paths for cross-slug, bare for same-slug).
     // Node IDs have already been rewritten by answer_questions before reaching here.
     let candidate_map: HashMap<String, &PyramidNode> =
         candidate_nodes.iter().map(|n| (n.id.clone(), n)).collect();
 
-    // ── Build candidate evidence context ────────────────────────────────
-    let evidence_context = if candidate_nodes.is_empty() {
-        "(no candidate evidence nodes were mapped to this question)".to_string()
-    } else {
-        candidate_nodes
-            .iter()
-            .map(|n| {
-                format!(
-                    "--- NODE {} ---\nHeadline: {}\nDistilled: {}\nTopics: {}\n",
-                    n.id,
-                    n.headline,
-                    n.distilled,
-                    n.topics
-                        .iter()
-                        .map(|t| format!("{}: {}", t.name, t.current))
-                        .collect::<Vec<_>>()
-                        .join("; ")
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
+    // ── Build candidate evidence context (guaranteed non-empty after short-circuit) ──
+    let evidence_context = candidate_nodes
+        .iter()
+        .map(|n| {
+            format!(
+                "--- NODE {} ---\nHeadline: {}\nDistilled: {}\nTopics: {}\n",
+                n.id,
+                n.headline,
+                n.distilled,
+                n.topics
+                    .iter()
+                    .map(|t| format!("{}: {}", t.name, t.current))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
 
     // ── Prompts ─────────────────────────────────────────────────────────
     let synthesis_guidance = synthesis_prompt.unwrap_or("");
