@@ -1,7 +1,7 @@
 # Recipe-as-Contribution: Question Pipeline Refactor
 
 **Date:** 2026-04-04
-**Status:** Fully audited (informed + discovery), all issues resolved. Ready to build.
+**Status:** IMPLEMENTED. All 4 phases built, serial-verified, post-completion audit in progress.
 **Pillars:** 2 (contributions all the way down), 18 (any number of chain definitions, one IR, one executor), 26 (extraction is question-shaped), 28 (recipe is itself a contribution), 37 (never prescribe outputs to intelligence)
 
 ## Problem

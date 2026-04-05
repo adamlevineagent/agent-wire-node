@@ -405,6 +405,15 @@ impl WireImportClient {
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
             return Err(WireImportError::AuthFailed(format!("status {}", status)).into());
         }
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            let retry_after_secs = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(60);
+            return Err(WireImportError::RateLimited { retry_after_secs }.into());
+        }
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
             return Err(WireImportError::Network(format!(
@@ -945,10 +954,15 @@ impl RemotePyramidClient {
             reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => {
                 Err(WireImportError::AuthFailed(format!("status {}", status)).into())
             }
-            reqwest::StatusCode::TOO_MANY_REQUESTS => Err(WireImportError::RateLimited {
-                retry_after_secs: 60,
+            reqwest::StatusCode::TOO_MANY_REQUESTS => {
+                let retry_after_secs = response
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(60);
+                Err(WireImportError::RateLimited { retry_after_secs }.into())
             }
-            .into()),
             _ => Err(WireImportError::Network(format!(
                 "remote pyramid returned status {}",
                 status

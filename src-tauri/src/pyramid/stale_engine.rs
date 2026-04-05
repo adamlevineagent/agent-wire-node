@@ -22,7 +22,7 @@ use uuid::Uuid;
 use super::faq;
 use super::stale_helpers;
 use super::stale_helpers_upper;
-use super::types::{AutoUpdateConfig, ConnectionCheckResult, PendingMutation, StaleCheckResult};
+use super::types::{AutoUpdateConfig, PendingMutation, StaleCheckResult};
 
 // cascade_depth is tracked for observability (cost observatory) but NOT enforced as a cap.
 // The LLM naturally terminates cascades by answering "not stale" on unchanged content.
@@ -1531,98 +1531,6 @@ fn propagate_confirmed_stales(
     }
 
     Ok(())
-}
-
-// ── Placeholder Dispatch Functions (Phase 4b will replace these) ──────────────
-
-#[allow(dead_code)]
-async fn dispatch_node_stale_check(batch: Vec<PendingMutation>) -> Vec<StaleCheckResult> {
-    let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
-    let batch_size = batch.len() as i32;
-
-    info!(
-        count = batch.len(),
-        targets = ?batch.iter().map(|m| &m.target_ref).collect::<Vec<_>>(),
-        "PLACEHOLDER: dispatch_node_stale_check (Phase 4b)"
-    );
-
-    batch
-        .iter()
-        .enumerate()
-        .map(|(i, m)| StaleCheckResult {
-            id: 0,
-            slug: m.slug.clone(),
-            batch_id: m.batch_id.clone().unwrap_or_default(),
-            layer: m.layer,
-            target_id: m.target_ref.clone(),
-            stale: false,
-            reason: "Phase 4b placeholder — no L1+ LLM check performed yet".to_string(),
-            checker_index: i as i32,
-            checker_batch_size: batch_size,
-            checked_at: now.clone(),
-            cost_tokens: None,
-            cost_usd: None,
-            cascade_depth: m.cascade_depth,
-        })
-        .collect()
-}
-
-#[allow(dead_code)]
-async fn dispatch_connection_check(batch: Vec<PendingMutation>) -> Vec<ConnectionCheckResult> {
-    let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
-
-    info!(
-        count = batch.len(),
-        targets = ?batch.iter().map(|m| &m.target_ref).collect::<Vec<_>>(),
-        "PLACEHOLDER: dispatch_connection_check (Phase 4b)"
-    );
-
-    batch
-        .iter()
-        .map(|m| ConnectionCheckResult {
-            id: 0,
-            slug: m.slug.clone(),
-            supersession_node_id: m.target_ref.clone(),
-            new_node_id: String::new(),
-            connection_type: "placeholder".to_string(),
-            connection_id: String::new(),
-            still_valid: true,
-            reason: "Phase 4b placeholder — no LLM check performed yet".to_string(),
-            checked_at: now.clone(),
-        })
-        .collect()
-}
-
-#[allow(dead_code)]
-async fn dispatch_edge_stale_check(batch: Vec<PendingMutation>) -> Vec<StaleCheckResult> {
-    let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
-    let batch_size = batch.len() as i32;
-
-    info!(
-        count = batch.len(),
-        targets = ?batch.iter().map(|m| &m.target_ref).collect::<Vec<_>>(),
-        "PLACEHOLDER: dispatch_edge_stale_check (Phase 4b)"
-    );
-
-    batch
-        .iter()
-        .enumerate()
-        .map(|(i, m)| StaleCheckResult {
-            id: 0,
-            slug: m.slug.clone(),
-            batch_id: m.batch_id.clone().unwrap_or_default(),
-            layer: m.layer,
-            target_id: m.target_ref.clone(),
-            stale: false,
-            reason: "Phase 4b placeholder — no edge LLM check performed yet".to_string(),
-            checker_index: i as i32,
-            checker_batch_size: batch_size,
-            checked_at: now.clone(),
-            cost_tokens: None,
-            cost_usd: None,
-            cascade_depth: m.cascade_depth,
-        })
-        .collect()
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────

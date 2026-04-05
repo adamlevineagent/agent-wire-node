@@ -507,6 +507,29 @@ pub struct VineBuildHandle {
     pub error: Option<String>, // error message if failed
 }
 
+/// WS-ONLINE-G: Combined absorption rate-limit and spend-cap state.
+///
+/// Both the per-operator hourly build count and the global daily spend are held
+/// behind a single Mutex to eliminate the TOCTOU race that existed when they
+/// were guarded separately.  A single `lock()` call checks both limits and
+/// commits both increments atomically — if the daily cap rejects the request
+/// the hourly counter is never bumped.
+pub struct AbsorptionGate {
+    /// Per-operator hourly build count: operator_id → (count, window_start).
+    pub hourly: HashMap<String, (u32, std::time::Instant)>,
+    /// Global daily spend: (total_credits_spent_today, day_window_start).
+    pub daily: (u64, std::time::Instant),
+}
+
+impl AbsorptionGate {
+    pub fn new() -> Self {
+        Self {
+            hourly: HashMap::new(),
+            daily: (0u64, std::time::Instant::now()),
+        }
+    }
+}
+
 /// Shared state for the pyramid engine.
 ///
 /// Two SQLite connections: `reader` for concurrent reads, `writer` for
@@ -546,12 +569,9 @@ pub struct PyramidState {
     /// Maps operator_id → (query_count, window_start).
     /// 100 queries per minute per operator.
     pub remote_query_rate_limiter: Arc<Mutex<HashMap<String, (u64, std::time::Instant)>>>,
-    /// WS-ONLINE-G: Rate limiter for absorb-all builds.
-    /// Maps operator_id → (build_count, window_start) — builds per hour per operator.
-    pub absorption_build_rate_limiter: Arc<Mutex<HashMap<String, (u32, std::time::Instant)>>>,
-    /// WS-ONLINE-G: Daily absorption spend tracker.
-    /// (total_credits_spent_today, day_start_instant).
-    pub absorption_daily_spend: Arc<Mutex<(u64, std::time::Instant)>>,
+    /// WS-ONLINE-G: Combined per-operator hourly rate limit + global daily spend cap.
+    /// Single mutex eliminates the TOCTOU race between the two checks.
+    pub absorption_gate: Arc<Mutex<AbsorptionGate>>,
 }
 
 impl PyramidState {
@@ -590,8 +610,7 @@ impl PyramidState {
             operational: self.operational.clone(),
             chains_dir: self.chains_dir.clone(),
             remote_query_rate_limiter: self.remote_query_rate_limiter.clone(),
-            absorption_build_rate_limiter: self.absorption_build_rate_limiter.clone(),
-            absorption_daily_spend: self.absorption_daily_spend.clone(),
+            absorption_gate: self.absorption_gate.clone(),
         }))
     }
 }

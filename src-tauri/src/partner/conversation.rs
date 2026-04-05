@@ -534,6 +534,9 @@ pub async fn handle_message(
 
     // 7. Mechanical lift — move tool results to lifted_results
     session.lifted_results.extend(all_lifted);
+    if session.lifted_results.len() > 20 {
+        session.lifted_results.drain(..session.lifted_results.len() - 20);
+    }
 
     // 8. Apply context schedule
     apply_context_schedule(

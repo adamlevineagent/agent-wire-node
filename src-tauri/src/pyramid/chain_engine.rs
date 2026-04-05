@@ -53,6 +53,11 @@ pub const VALID_PRIMITIVES: &[&str] = &[
     "split",
     "loop",
     "gate",
+    // Recipe primitives
+    "recursive_decompose",
+    "evidence_loop",
+    "cross_build_input",
+    "process_gaps",
     // Escape hatch
     "custom",
 ];
@@ -121,6 +126,9 @@ pub struct ChainStep {
     pub primitive: String,
     #[serde(default)]
     pub instruction: Option<String>,
+    /// Get instruction from a prior step's output (e.g., `$extraction_schema.extraction_prompt`).
+    #[serde(default)]
+    pub instruction_from: Option<String>,
     #[serde(default)]
     pub instruction_map: Option<HashMap<String, String>>,
     #[serde(default)]
@@ -209,6 +217,10 @@ pub struct ChainStep {
     /// Whether to merge sub-chunk extraction results into one output (default: true when max_input_tokens is set).
     #[serde(default)]
     pub split_merge: Option<bool>,
+    /// Desired dispatch order for for_each items (e.g., "largest_first").
+    /// Parsed from YAML but not yet implemented in the executor.
+    #[serde(default)]
+    pub dispatch_order: Option<String>,
     #[serde(default)]
     pub when: Option<String>,
     #[serde(default)]
@@ -238,6 +250,9 @@ pub struct ChainStep {
     /// Sub-chain: inner steps executed sequentially within this container step.
     #[serde(default)]
     pub steps: Option<Vec<ChainStep>>,
+    /// Execution mode for primitives that support multiple behaviors (e.g., "delta" vs "fresh" for recursive_decompose).
+    #[serde(default)]
+    pub mode: Option<String>,
     /// Loop termination condition (evaluated via evaluate_when). Used with primitive: "loop".
     #[serde(default)]
     pub until: Option<String>,
@@ -253,6 +268,7 @@ impl Default for ChainStep {
             name: String::new(),
             primitive: String::new(),
             instruction: None,
+            instruction_from: None,
             instruction_map: None,
             mechanical: false,
             rust_function: None,
@@ -289,6 +305,7 @@ impl Default for ChainStep {
             split_strategy: None,
             split_overlap_tokens: None,
             split_merge: None,
+            dispatch_order: None,
             when: None,
             on_error: None,
             on_parse_error: None,
@@ -300,6 +317,7 @@ impl Default for ChainStep {
             compact_inputs: false,
             enrichments: vec![],
             steps: None,
+            mode: None,
             until: None,
             break_loop: None,
         }
@@ -335,7 +353,7 @@ pub struct ValidationResult {
     pub warnings: Vec<String>,
 }
 
-const VALID_CONTENT_TYPES: &[&str] = &["conversation", "code", "document"];
+const VALID_CONTENT_TYPES: &[&str] = &["conversation", "code", "document", "question"];
 const VALID_MODEL_TIERS: &[&str] = &["low", "mid", "high", "max"];
 
 /// Validate a chain definition, returning errors and warnings.
@@ -409,13 +427,17 @@ pub fn validate_chain(def: &ChainDefinition) -> ValidationResult {
             ));
         }
 
-        // LLM steps (non-mechanical, non-orchestration) must have instruction
+        // LLM steps (non-mechanical, non-orchestration, non-recipe) must have instruction
         let orchestration = matches!(
             step.primitive.as_str(),
             "container" | "loop" | "gate" | "split"
         );
-        if !step.mechanical && !orchestration && step.instruction.is_none() {
-            errors.push(format!("{}: LLM step must specify instruction", prefix));
+        let recipe = matches!(
+            step.primitive.as_str(),
+            "cross_build_input" | "evidence_loop" | "process_gaps" | "recursive_decompose"
+        );
+        if !step.mechanical && !orchestration && !recipe && step.instruction.is_none() && step.instruction_from.is_none() {
+            errors.push(format!("{}: LLM step must specify instruction or instruction_from", prefix));
         }
 
         // dehydrate and item_fields are mutually exclusive
@@ -489,6 +511,17 @@ pub fn validate_chain(def: &ChainDefinition) -> ValidationResult {
                 warnings.push(format!(
                     "{}: model_tier \"{}\" is not a standard tier",
                     prefix, tier
+                ));
+            }
+        }
+
+        // save_as validation
+        if let Some(ref save) = step.save_as {
+            const VALID_SAVE_AS: &[&str] = &["node", "web_edges", "step_only"];
+            if !VALID_SAVE_AS.contains(&save.as_str()) {
+                warnings.push(format!(
+                    "{}: save_as \"{}\" is not a recognized value (expected one of {:?})",
+                    prefix, save, VALID_SAVE_AS
                 ));
             }
         }

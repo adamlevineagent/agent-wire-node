@@ -8,14 +8,18 @@ use warp::Reply;
 // ── Auth helpers ─────────────────────────────────────────────────────
 
 /// Constant-time string comparison to prevent timing attacks on auth tokens.
+/// Pads to max length so timing does not leak length information.
 pub fn ct_eq(a: &str, b: &str) -> bool {
-    if a.len() != b.len() {
-        return false;
+    let max_len = a.len().max(b.len());
+    let a_bytes = a.as_bytes();
+    let b_bytes = b.as_bytes();
+    let mut acc = (a.len() != b.len()) as u8; // mismatch if lengths differ
+    for i in 0..max_len {
+        let x = if i < a_bytes.len() { a_bytes[i] } else { 0xFF };
+        let y = if i < b_bytes.len() { b_bytes[i] } else { 0x00 };
+        acc |= x ^ y;
     }
-    a.bytes()
-        .zip(b.bytes())
-        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
-        == 0
+    acc == 0
 }
 
 #[derive(Debug)]

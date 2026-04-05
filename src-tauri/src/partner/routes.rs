@@ -9,14 +9,11 @@
 //
 // All routes require bearer token authentication (same as pyramid routes).
 
-use serde::Deserialize;
 use std::sync::Arc;
 use warp::Filter;
-use warp::Reply;
 
-use super::conversation::handle_message;
 use super::{
-    list_sessions, load_session, save_session, BrainState, DennisState, PartnerState, Session,
+    list_sessions, load_session, BrainState, PartnerState,
     BUFFER_HARD_LIMIT,
 };
 use crate::http_utils::{ct_eq, json_error, json_ok, Unauthorized};
@@ -51,14 +48,6 @@ fn with_auth_state(
                 Ok(state)
             },
         )
-}
-
-// ── Request body types ──────────────────────────────────────────────
-
-#[derive(Deserialize)]
-struct NewSessionBody {
-    slug: Option<String>,
-    is_lobby: Option<bool>,
 }
 
 // ── Route definitions ───────────────────────────────────────────────
@@ -162,31 +151,6 @@ pub fn partner_routes(
 
 // ── Route handlers ──────────────────────────────────────────────────
 
-#[derive(Deserialize)]
-struct SendMessageBody {
-    session_id: String,
-    message: String,
-}
-
-async fn handle_send_message(
-    state: Arc<PartnerState>,
-    body: SendMessageBody,
-) -> Result<warp::reply::Response, warp::Rejection> {
-    match handle_message(&state, &body.session_id, &body.message).await {
-        Ok(response) => Ok(json_ok(&response)),
-        Err(e) => {
-            let msg = e.to_string();
-            if msg.contains("not found") {
-                Ok(json_error(warp::http::StatusCode::NOT_FOUND, &msg))
-            } else {
-                Ok(json_error(
-                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
-                    &msg,
-                ))
-            }
-        }
-    }
-}
 
 async fn handle_get_session(
     session_id: String,
@@ -213,54 +177,6 @@ async fn handle_get_session(
             &e.to_string(),
         )),
     }
-}
-
-async fn handle_new_session(
-    state: Arc<PartnerState>,
-    body: NewSessionBody,
-) -> Result<warp::reply::Response, warp::Rejection> {
-    let is_lobby = body.is_lobby.unwrap_or(body.slug.is_none());
-    let session_id = uuid::Uuid::new_v4().to_string();
-    let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
-
-    let session = Session {
-        id: session_id.clone(),
-        slug: body.slug,
-        is_lobby,
-        conversation_buffer: Vec::new(),
-        session_topics: Vec::new(),
-        hydrated_node_ids: Vec::new(),
-        lifted_results: Vec::new(),
-        dennis_state: DennisState::Idle,
-        warm_cursor: 0,
-        created_at: now.clone(),
-        last_active_at: now,
-    };
-
-    // Save to DB
-    {
-        let db = state.partner_db.lock().await;
-        match save_session(&db, &session) {
-            Ok(()) => {}
-            Err(e) => {
-                return Ok(json_error(
-                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
-                    &e.to_string(),
-                ));
-            }
-        }
-    }
-
-    // Add to in-memory cache
-    {
-        let mut sessions = state.sessions.lock().await;
-        sessions.insert(session_id.clone(), session.clone());
-    }
-
-    Ok(
-        warp::reply::with_status(warp::reply::json(&session), warp::http::StatusCode::CREATED)
-            .into_response(),
-    )
 }
 
 async fn handle_get_brain(

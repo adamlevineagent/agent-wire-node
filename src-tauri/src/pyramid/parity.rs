@@ -14,6 +14,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use anyhow::{anyhow, Result};
@@ -25,6 +26,22 @@ use tracing::{info, warn};
 use super::build_runner;
 use super::types::{BuildProgress, ContentType};
 use super::PyramidState;
+
+/// Drop guard that restores `use_ir_executor` and `use_chain_engine` flags
+/// when dropped — whether via normal completion, early `?` return, or panic.
+struct ExecutorFlagGuard<'a> {
+    use_ir_executor: &'a AtomicBool,
+    use_chain_engine: &'a AtomicBool,
+    prev_ir: bool,
+    prev_chain: bool,
+}
+
+impl<'a> Drop for ExecutorFlagGuard<'a> {
+    fn drop(&mut self) {
+        self.use_ir_executor.store(self.prev_ir, Ordering::Relaxed);
+        self.use_chain_engine.store(self.prev_chain, Ordering::Relaxed);
+    }
+}
 
 // ── Structs ─────────────────────────────────────────────────────────────────
 
@@ -596,10 +613,15 @@ pub async fn run_parity_test(state: &PyramidState, slug: &str) -> Result<ParityR
     // Drain progress so we don't block
     tokio::spawn(async move { while progress_rx.recv().await.is_some() {} });
 
-    // Force legacy chain engine path
-    use std::sync::atomic::Ordering;
+    // Force legacy chain engine path — guard restores flags on any exit path
     let prev_ir = state.use_ir_executor.load(Ordering::Relaxed);
     let prev_chain = state.use_chain_engine.load(Ordering::Relaxed);
+    let _flag_guard = ExecutorFlagGuard {
+        use_ir_executor: &state.use_ir_executor,
+        use_chain_engine: &state.use_chain_engine,
+        prev_ir,
+        prev_chain,
+    };
 
     state.use_ir_executor.store(false, Ordering::Relaxed);
     state.use_chain_engine.store(true, Ordering::Relaxed);
@@ -683,10 +705,7 @@ pub async fn run_parity_test(state: &PyramidState, slug: &str) -> Result<ParityR
         "IR build complete"
     );
 
-    // ── Phase 3: Restore flags and compare ──────────────────────────────
-    state.use_ir_executor.store(prev_ir, Ordering::Relaxed);
-    state.use_chain_engine.store(prev_chain, Ordering::Relaxed);
-
+    // ── Phase 3: Compare (flags restored automatically by _flag_guard drop) ─
     let report = compare_builds(slug, &ct_str, &legacy_result, &ir_result);
 
     info!(

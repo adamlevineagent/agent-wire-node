@@ -433,7 +433,7 @@ export function IntentBar() {
             if (cancelRef.current) return;
             setBarState({ phase: 'error', intent, error: String(err) });
         }
-    }, [input, isIdle, wireApiCall, state.creditBalance, state.autoExecute]);
+    }, [input, isIdle, wireApiCall, state.creditBalance, state.autoExecute, vocabRegistry]);
 
     const handleApprove = useCallback(async () => {
         if (barState.phase !== 'preview') return;

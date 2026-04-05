@@ -1,0 +1,35 @@
+schema_version: 1
+id: extract-only
+name: Extract Only (test)
+description: Single L0 extraction step only — for Mercury runaway experiments.
+content_type: document
+version: "1.0.0"
+author: agent-wire
+
+defaults:
+  model_tier: mid
+  temperature: 0.3
+  on_error: "retry(3)"
+
+steps:
+  - name: l0_doc_extract
+    primitive: extract
+    instruction: "$prompts/document/doc_extract.md"
+    for_each: $chunks
+    dispatch_order: "largest_first"
+    concurrency: 12
+    node_id_pattern: "D-L0-{index:03}"
+    depth: 0
+    save_as: node
+    max_input_tokens: 80000
+    split_strategy: "sections"
+    split_overlap_tokens: 500
+    split_merge: true
+    merge_instruction: "$prompts/shared/merge_sub_chunks.md"
+    model_tier: mid
+    temperature: 0.3
+    on_error: "retry(3)"
+    on_parse_error: "heal"
+    heal_instruction: "$prompts/shared/heal_json.md"
+
+post_build: []

@@ -963,6 +963,25 @@ fn build_system_prompt(
     resolved_input: &Value,
     ctx: &ChainContext,
 ) -> anyhow::Result<String> {
+    // Check instruction_from first (highest precedence: instruction_from > instruction_map > instruction)
+    if let Some(ref instr_from) = step.instruction_from {
+        if let Ok(val) = ctx.resolve_ref(instr_from) {
+            if let Some(s) = val.as_str() {
+                let base_prompt = match resolve_prompt_template(s, resolved_input) {
+                    Ok(rendered) => rendered,
+                    Err(_) => s.to_string(),
+                };
+                // Apply the same context enrichment as the normal path
+                if let Some(ref context_map) = step.context {
+                    let suffix = resolve_context_sections(context_map, ctx)?;
+                    return Ok(format!("{base_prompt}{suffix}"));
+                }
+                return Ok(base_prompt);
+            }
+        }
+        warn!("instruction_from '{}' could not be resolved, falling through", instr_from);
+    }
+
     let instruction = resolve_instruction(step, resolved_input);
     let base_prompt = match resolve_prompt_template(&instruction, resolved_input) {
         Ok(s) => s,
@@ -2920,7 +2939,11 @@ fn evaluate_when(when: Option<&str>, ctx: &ChainContext) -> bool {
                     Ok(Value::String(s)) => s == "true",
                     Ok(Value::Null) => false,
                     Ok(Value::Number(n)) => n.as_f64().map(|f| f != 0.0).unwrap_or(false),
-                    _ => false,
+                    Ok(_) => false,
+                    Err(_e) => {
+                        warn!("when condition '{}': unresolved ref '{}', skipping step", expr, lhs_expr);
+                        return false;
+                    }
                 };
                 return if *op == " == " {
                     lhs_bool == rhs_bool
@@ -2929,11 +2952,13 @@ fn evaluate_when(when: Option<&str>, ctx: &ChainContext) -> bool {
                 };
             }
 
-            let lhs = ctx
-                .resolve_ref(lhs_expr)
-                .ok()
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.0);
+            let lhs = match ctx.resolve_ref(lhs_expr) {
+                Ok(v) => v.as_f64().unwrap_or(0.0),
+                Err(_) => {
+                    warn!("when condition '{}': unresolved ref '{}', skipping step", expr, lhs_expr);
+                    return false;
+                }
+            };
             let rhs = rhs_str.parse::<f64>().unwrap_or(0.0);
 
             return match *op {
@@ -2948,8 +2973,8 @@ fn evaluate_when(when: Option<&str>, ctx: &ChainContext) -> bool {
         }
     }
 
-    warn!("Unknown when expression: '{expr}', defaulting to true");
-    true
+    warn!("Unknown when expression: '{expr}', skipping step (defaulting to false)");
+    false
 }
 
 // ── Sub-chain execution primitives ─────────────────────────────────────────
@@ -3439,7 +3464,7 @@ pub async fn execute_chain(
     progress_tx: Option<mpsc::Sender<BuildProgress>>,
     layer_tx: Option<mpsc::Sender<LayerEvent>>,
 ) -> Result<(String, i32, Vec<super::types::StepActivity>)> {
-    execute_chain_from(state, chain, slug, 0, None, None, cancel, progress_tx, layer_tx).await
+    execute_chain_from(state, chain, slug, 0, None, None, cancel, progress_tx, layer_tx, None).await
 }
 
 /// Execute a chain from a specific depth, reusing nodes below that depth.
@@ -3453,6 +3478,7 @@ pub async fn execute_chain_from(
     cancel: &CancellationToken,
     progress_tx: Option<mpsc::Sender<BuildProgress>>,
     layer_tx: Option<mpsc::Sender<LayerEvent>>,
+    initial_context: Option<HashMap<String, Value>>,
 ) -> Result<(String, i32, Vec<super::types::StepActivity>)> {
     let llm_config = state.config.read().await.clone();
 
@@ -3465,7 +3491,12 @@ pub async fn execute_chain_from(
     .await?;
 
     if num_chunks == 0 {
-        return Err(anyhow!("No chunks found for slug '{slug}'"));
+        if chain.content_type != "question" {
+            return Err(anyhow!("No chunks found for slug '{}' — cannot run non-question pipeline with zero chunks", slug));
+        }
+        warn!(slug, "No chunks found — steps requiring $chunks will be skipped or fail");
+        // Question pipelines can proceed without chunks.
+        // Steps with for_each: "$chunks" will get an empty array and produce no nodes.
     }
 
     // Load chunks as Value array for ChainContext
@@ -3536,20 +3567,32 @@ pub async fn execute_chain_from(
         let writer = state.writer.clone();
         let conn = writer.lock().await;
         conn.execute_batch("BEGIN IMMEDIATE").map_err(|e| anyhow!("force_from transaction: {e}"))?;
-        for step_name in &invalidated_steps {
-            if let Err(e) = conn.execute(
-                "DELETE FROM pyramid_pipeline_steps WHERE slug = ?1 AND step_type = ?2",
-                rusqlite::params![slug_owned2, step_name],
-            ) {
-                warn!("[CHAIN] force_from: failed to delete step '{}': {}", step_name, e);
+        let result = (|| -> Result<()> {
+            for step_name in &invalidated_steps {
+                conn.execute(
+                    "DELETE FROM pyramid_pipeline_steps WHERE slug = ?1 AND step_type = ?2",
+                    rusqlite::params![slug_owned2, step_name],
+                ).map_err(|e| anyhow!("force_from: failed to delete step '{}': {}", step_name, e))?;
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                conn.execute_batch("COMMIT").map_err(|e| anyhow!("force_from commit: {e}"))?;
+            }
+            Err(err) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(err);
             }
         }
-        conn.execute_batch("COMMIT").map_err(|e| anyhow!("force_from commit: {e}"))?;
     }
 
     // Build chain context (from chain_resolve)
     let mut ctx = ChainContext::new(slug, &chain.content_type, chunks);
     ctx.has_prior_build = has_prior_build;
+    if let Some(params) = initial_context {
+        ctx.initial_params = params;
+    }
 
     let mut total = estimate_total(chain, &ctx, num_chunks);
     let mut done: i64 = 0;
@@ -3788,6 +3831,14 @@ pub async fn execute_chain_from(
                 info!("[CHAIN] gate '{}' triggered break_loop", step.name);
             }
             Ok(Value::Bool(condition_met))
+        } else if step.primitive == "cross_build_input" {
+            execute_cross_build_input(state, step, &mut ctx, slug).await
+        } else if step.primitive == "recursive_decompose" {
+            execute_recursive_decompose(state, step, &mut ctx, slug, cancel).await
+        } else if step.primitive == "evidence_loop" {
+            execute_evidence_loop(state, step, &mut ctx, slug, cancel, &progress_tx, &layer_tx, &mut done, total).await
+        } else if step.primitive == "process_gaps" {
+            execute_process_gaps(state, step, &mut ctx, slug, cancel).await
         } else if step.for_each.is_some() {
             let (outputs, failures) = execute_for_each(
                 step,
@@ -3919,6 +3970,1146 @@ pub async fn execute_chain_from(
     Ok((apex_node_id, total_failures, step_activities))
 }
 
+// ── Recipe primitives: cross_build_input, recursive_decompose, evidence_loop, process_gaps ──
+
+/// Load all prior-build state from the DB into a single JSON value.
+/// Used by question pyramid chains to gather evidence sets, overlay answers,
+/// question tree, gaps, and L0 summary in one step.
+async fn execute_cross_build_input(
+    state: &PyramidState,
+    step: &ChainStep,
+    ctx: &mut ChainContext,
+    slug: &str,
+) -> Result<Value> {
+    info!(slug, step_name = %step.name, "executing cross_build_input primitive");
+
+    // Load all prior state from DB
+    let slug_owned = slug.to_string();
+    let reader = state.reader.clone();
+    let operational = state.operational.clone();
+
+    let result = {
+        let s = slug_owned.clone();
+        db_read(&reader, move |conn| {
+            let evidence_sets = db::get_evidence_sets(conn, &s)?;
+            let overlay_answers = db::get_existing_overlay_answers(conn, &s)?;
+            let question_tree = db::get_question_tree(conn, &s)?;
+            let unresolved_gaps = db::get_unresolved_gaps_for_slug(conn, &s).unwrap_or_default();
+            let l0_count = db::count_nodes_at_depth(conn, &s, 0)?;
+            let has_overlay = db::has_existing_question_overlay(conn, &s)?;
+            let referenced_slugs = db::get_slug_references(conn, &s)?;
+            let l0_nodes = db::get_nodes_at_depth(conn, &s, 0)?;
+
+            let l0_summary = super::evidence_answering::build_l0_summary(&l0_nodes, &operational);
+
+            // For cross-slug: also load nodes from referenced slugs
+            let is_cross_slug = !referenced_slugs.is_empty();
+            let effective_l0_summary = if is_cross_slug {
+                let mut cross_slug_l0_nodes = Vec::new();
+                for ref_slug in &referenced_slugs {
+                    let ref_info = super::slug::get_slug(conn, ref_slug)?;
+                    match ref_info {
+                        Some(info) if info.content_type == super::types::ContentType::Question => {
+                            let nodes = db::get_all_live_nodes(conn, ref_slug)?;
+                            cross_slug_l0_nodes.extend(nodes);
+                        }
+                        Some(_) => {
+                            let nodes = db::get_nodes_at_depth(conn, ref_slug, 0)?;
+                            cross_slug_l0_nodes.extend(nodes);
+                        }
+                        None => {
+                            // Cannot use tracing inside spawn_blocking easily, just skip
+                        }
+                    }
+                }
+                if cross_slug_l0_nodes.is_empty() {
+                    l0_summary
+                } else {
+                    super::evidence_answering::build_l0_summary(&cross_slug_l0_nodes, &operational)
+                }
+            } else {
+                l0_summary
+            };
+
+            Ok(serde_json::json!({
+                "evidence_sets": serde_json::to_value(&evidence_sets)?,
+                "overlay_answers": serde_json::to_value(&overlay_answers)?,
+                "question_tree": question_tree.unwrap_or(Value::Null),
+                "unresolved_gaps": serde_json::to_value(&unresolved_gaps)?,
+                "l0_count": l0_count,
+                "l0_summary": effective_l0_summary,
+                "has_overlay": has_overlay,
+                "is_cross_slug": is_cross_slug,
+                "referenced_slugs": serde_json::to_value(&referenced_slugs)?,
+            }))
+        })
+        .await?
+    };
+
+    Ok(result)
+}
+
+/// Execute recursive question decomposition (fresh or delta).
+/// Resolves $apex_question, $granularity, $max_depth from context.
+/// Persists the resulting QuestionTree to the database.
+async fn execute_recursive_decompose(
+    state: &PyramidState,
+    step: &ChainStep,
+    ctx: &mut ChainContext,
+    slug: &str,
+    cancel: &CancellationToken,
+) -> Result<Value> {
+    let _ = cancel; // Available for future cancellation support within decomposition
+    info!(slug, step_name = %step.name, "executing recursive_decompose primitive");
+
+    let llm_config = state.config.read().await.clone();
+
+    // ── Resolve step.input (Pillar 28: forkable wiring) ────────────────
+    // Try step.input first so forked chains that rename steps still work.
+    // Fall back to hardcoded context refs for backward compatibility.
+    let resolved_input = if let Some(ref input) = step.input {
+        ctx.resolve_value(input).unwrap_or(Value::Object(serde_json::Map::new()))
+    } else {
+        Value::Object(serde_json::Map::new())
+    };
+
+    let apex_question = resolved_input.get("apex_question")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| ctx.resolve_ref("$apex_question").ok().and_then(|v| v.as_str().map(|s| s.to_string())))
+        .ok_or_else(|| anyhow!("recursive_decompose: apex_question not found in input or context"))?;
+
+    let granularity = resolved_input.get("granularity")
+        .and_then(|v| v.as_u64())
+        .or_else(|| ctx.resolve_ref("$granularity").ok().and_then(|v| v.as_u64()))
+        .unwrap_or(3) as u32;
+
+    let max_depth = resolved_input.get("max_depth")
+        .and_then(|v| v.as_u64())
+        .or_else(|| ctx.resolve_ref("$max_depth").ok().and_then(|v| v.as_u64()))
+        .unwrap_or(3) as u32;
+
+    // Get content_type from context
+    let content_type = ctx.content_type.clone();
+
+    // Build DecompositionConfig — characterize with l0_summary fallback
+    let decomp_context = resolved_input.get("characterize")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| ctx.resolve_ref("$characterize").ok().and_then(|v| v.as_str().map(|s| s.to_string())))
+        .or_else(|| {
+            ctx.resolve_ref("$load_prior_state.l0_summary")
+                .ok()
+                .and_then(|v| v.as_str().map(|s| s.to_string()))
+        })
+        .unwrap_or_default();
+
+    let audience = resolved_input.get("audience")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| ctx.resolve_ref("$audience").ok().and_then(|v| v.as_str().map(|s| s.to_string())));
+
+    let config = super::question_decomposition::DecompositionConfig {
+        apex_question: apex_question.clone(),
+        content_type,
+        granularity,
+        max_depth,
+        folder_map: Some(decomp_context),
+        chains_dir: Some(state.chains_dir.clone()),
+        audience,
+    };
+
+    // Check if this is delta or fresh decomposition
+    let is_delta = step.mode.as_deref() == Some("delta");
+
+    let tree = if is_delta {
+        // Delta decomposition: needs existing tree, answers, evidence, gaps
+        // Read from resolved_input first, fall back to hardcoded context refs
+        let existing_tree_val = resolved_input.get("existing_tree")
+            .cloned()
+            .or_else(|| ctx.resolve_ref("$load_prior_state.question_tree").ok())
+            .ok_or_else(|| anyhow!("recursive_decompose delta: existing tree not found in input or context"))?;
+        let existing_tree: super::question_decomposition::QuestionTree =
+            serde_json::from_value(existing_tree_val)?;
+
+        let existing_answers_val = resolved_input.get("existing_answers")
+            .cloned()
+            .or_else(|| ctx.resolve_ref("$load_prior_state.overlay_answers").ok())
+            .unwrap_or(Value::Array(vec![]));
+        let existing_answers: Vec<super::types::PyramidNode> =
+            serde_json::from_value(existing_answers_val)?;
+
+        // Build evidence and gap context strings
+        let evidence_sets_val = resolved_input.get("evidence_sets")
+            .cloned()
+            .or_else(|| ctx.resolve_ref("$load_prior_state.evidence_sets").ok());
+        let evidence_set_ctx = evidence_sets_val
+            .and_then(|v| {
+                let sets: Vec<super::types::EvidenceSet> = serde_json::from_value(v).ok()?;
+                if sets.is_empty() {
+                    return None;
+                }
+                Some(
+                    sets.iter()
+                        .map(|s| {
+                            let headline = s.index_headline.as_deref().unwrap_or("(no headline)");
+                            format!(
+                                "- {} ({} nodes): {}",
+                                s.self_prompt, s.member_count, headline
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                )
+            });
+
+        let gaps_val = resolved_input.get("gaps")
+            .cloned()
+            .or_else(|| ctx.resolve_ref("$load_prior_state.unresolved_gaps").ok());
+        let gap_ctx = gaps_val
+            .and_then(|v| {
+                let gaps: Vec<super::types::GapReport> = serde_json::from_value(v).ok()?;
+                if gaps.is_empty() {
+                    return None;
+                }
+                Some(
+                    gaps.iter()
+                        .map(|g| format!("- {}", g.description))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                )
+            });
+
+        let delta_result = super::question_decomposition::decompose_question_delta(
+            &config,
+            &llm_config,
+            &existing_tree,
+            &existing_answers,
+            Some(&state.chains_dir),
+            evidence_set_ctx.as_deref(),
+            gap_ctx.as_deref(),
+        )
+        .await?;
+
+        // Store reused IDs for evidence loop to skip
+        ctx.step_outputs.insert(
+            "reused_question_ids".to_string(),
+            serde_json::to_value(&delta_result.reused_question_ids)?,
+        );
+
+        delta_result.tree
+    } else {
+        // Fresh decomposition
+        super::question_decomposition::decompose_question_incremental(
+            &config,
+            &llm_config,
+            state.writer.clone(),
+            slug,
+            &state.operational.tier1,
+            &state.operational.tier2,
+        )
+        .await?
+    };
+
+    // Persist the question tree
+    let tree_json = serde_json::to_value(&tree)?;
+    {
+        let conn = state.writer.clone();
+        let slug_owned = slug.to_string();
+        let tj = tree_json.clone();
+        tokio::task::spawn_blocking(move || {
+            let c = conn.blocking_lock();
+            db::save_question_tree(&c, &slug_owned, &tj)?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .map_err(|e| anyhow!("Question tree save panicked: {e}"))??;
+    }
+
+    // Canonical alias: both decompose (fresh) and decompose_delta write here,
+    // so downstream steps can reference $decomposed_tree regardless of which path ran.
+    ctx.step_outputs.insert("decomposed_tree".to_string(), tree_json.clone());
+
+    Ok(tree_json)
+}
+
+// ── Recipe primitives: evidence_loop, process_gaps ───────────────────────────
+
+/// Orchestrate per-layer evidence answering for a question pyramid.
+/// Wraps the evidence loop from build_runner.rs: pre-map, answer, persist, reconcile per layer.
+async fn execute_evidence_loop(
+    state: &PyramidState,
+    step: &ChainStep,
+    ctx: &mut ChainContext,
+    slug: &str,
+    cancel: &CancellationToken,
+    progress_tx: &Option<mpsc::Sender<BuildProgress>>,
+    _layer_tx: &Option<mpsc::Sender<LayerEvent>>,
+    done: &mut i64,
+    total: i64,
+) -> Result<Value> {
+    info!(slug, "executing evidence_loop primitive");
+
+    let llm_config = state.config.read().await.clone();
+
+    // ── Resolve step.input (Pillar 28: forkable wiring) ────────────────
+    let resolved_input = if let Some(ref input) = step.input {
+        ctx.resolve_value(input).unwrap_or(Value::Object(serde_json::Map::new()))
+    } else {
+        Value::Object(serde_json::Map::new())
+    };
+
+    // Resolve the nested load_prior_state object from input (or fall back to context)
+    let load_prior_state_val = resolved_input.get("load_prior_state")
+        .cloned()
+        .or_else(|| ctx.resolve_ref("$load_prior_state").ok())
+        .unwrap_or(Value::Object(serde_json::Map::new()));
+
+    // ── 1. Deserialize inputs from resolved_input / ctx ────────────────
+    // Get the question tree — try input.question_tree, then input.question_tree_delta,
+    // then fall back to hardcoded $decompose / $decompose_delta
+    let tree_val = resolved_input.get("question_tree")
+        .cloned()
+        .filter(|v| !v.is_null())
+        .or_else(|| resolved_input.get("question_tree_delta").cloned().filter(|v| !v.is_null()))
+        .or_else(|| ctx.resolve_ref("$decompose").ok())
+        .or_else(|| ctx.resolve_ref("$decompose_delta").ok())
+        .ok_or_else(|| anyhow!("evidence_loop: no question_tree in input or $decompose/$decompose_delta in context"))?;
+    let mut tree: super::question_decomposition::QuestionTree =
+        serde_json::from_value(tree_val)?;
+
+    // Attach audience from initial params or characterize step
+    if tree.audience.is_none() {
+        tree.audience = ctx
+            .resolve_ref("$audience")
+            .ok()
+            .and_then(|v| v.as_str().map(|s| s.to_string()));
+    }
+
+    // Get layer questions from the tree
+    let layer_questions = super::question_decomposition::extract_layer_questions(&tree);
+    let max_layer = layer_questions.keys().copied().max().unwrap_or(0);
+
+    // Get reused question IDs (from delta decomposition, empty for fresh)
+    let reused_question_ids: Vec<String> = resolved_input.get("reused_question_ids")
+        .cloned()
+        .and_then(|v| serde_json::from_value(v).ok())
+        .or_else(|| ctx.resolve_ref("$reused_question_ids").ok().and_then(|v| serde_json::from_value(v).ok()))
+        .unwrap_or_default();
+
+    // Get cross-slug info from load_prior_state
+    let is_cross_slug = load_prior_state_val.get("is_cross_slug")
+        .and_then(|v| v.as_bool())
+        .or_else(|| ctx.resolve_ref("$load_prior_state.is_cross_slug").ok().and_then(|v| v.as_bool()))
+        .unwrap_or(false);
+    let referenced_slugs: Vec<String> = load_prior_state_val.get("referenced_slugs")
+        .cloned()
+        .and_then(|v| serde_json::from_value(v).ok())
+        .or_else(|| ctx.resolve_ref("$load_prior_state.referenced_slugs").ok().and_then(|v| serde_json::from_value(v).ok()))
+        .unwrap_or_default();
+
+    // Get source_content_type for cross-slug builds
+    let source_content_type: Option<String> = if is_cross_slug {
+        let conn_guard = state.reader.lock().await;
+        let mut sct = None;
+        for rs in &referenced_slugs {
+            if let Ok(Some(info)) = super::slug::get_slug(&conn_guard, rs) {
+                if info.content_type != super::types::ContentType::Question {
+                    sct = Some(info.content_type.as_str().to_string());
+                    break;
+                }
+            }
+        }
+        drop(conn_guard);
+        sct
+    } else {
+        None
+    };
+
+    // ── 2. Generate build_id and record build start ─────────────────────
+    let input_build_id = resolved_input.get("build_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let external_build_tracking = input_build_id.is_some() || ctx.resolve_ref("$build_id").is_ok();
+    let build_id = input_build_id
+        .or_else(|| ctx.resolve_ref("$build_id").ok().and_then(|v| v.as_str().map(|s| s.to_string())))
+        .unwrap_or_else(|| format!(
+            "qb-{}",
+            uuid::Uuid::new_v4()
+                .to_string()
+                .split('-')
+                .next()
+                .unwrap_or("0000")
+        ));
+
+    // Record build start (skip if caller is tracking externally)
+    if !external_build_tracking {
+        let conn = state.writer.clone();
+        let slug_owned = slug.to_string();
+        let bid = build_id.clone();
+        let q = tree.apex.question.clone();
+        let orig_q = ctx
+            .resolve_ref("$apex_question")
+            .ok()
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
+            .unwrap_or_else(|| tree.apex.question.clone());
+        let ml = max_layer + 1;
+        tokio::task::spawn_blocking(move || {
+            let c = conn.blocking_lock();
+            super::local_store::save_build_start(&c, &slug_owned, &bid, &q, ml, Some(&orig_q))?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .map_err(|e| anyhow!("Build start save panicked: {e}"))??;
+    }
+
+    // ── 3. Overlay cleanup ──────────────────────────────────────────────
+    let has_overlay = load_prior_state_val.get("has_overlay")
+        .and_then(|v| v.as_bool())
+        .or_else(|| ctx.resolve_ref("$load_prior_state.has_overlay").ok().and_then(|v| v.as_bool()))
+        .unwrap_or(false);
+
+    if has_overlay {
+        // Delta path: supersede existing overlay apex nodes
+        let existing_answers_val = load_prior_state_val.get("overlay_answers")
+            .cloned()
+            .or_else(|| ctx.resolve_ref("$load_prior_state.overlay_answers").ok())
+            .unwrap_or(Value::Array(vec![]));
+        let existing_answers: Vec<super::types::PyramidNode> =
+            serde_json::from_value(existing_answers_val)?;
+        let max_overlay_depth = existing_answers.iter().map(|n| n.depth).max().unwrap_or(0);
+        if max_overlay_depth > 0 {
+            let conn = state.writer.clone();
+            let slug_owned = slug.to_string();
+            let overlay_build_id = build_id.clone();
+            let depth_threshold = max_overlay_depth;
+            tokio::task::spawn_blocking(move || {
+                let c = conn.blocking_lock();
+                c.execute(
+                    "UPDATE pyramid_nodes SET superseded_by = ?3
+                     WHERE slug = ?1 AND depth >= ?2 AND build_id LIKE 'qb-%' AND superseded_by IS NULL",
+                    rusqlite::params![slug_owned, depth_threshold, overlay_build_id],
+                )?;
+                Ok::<(), anyhow::Error>(())
+            })
+            .await
+            .map_err(|e| anyhow!("Delta overlay cleanup panicked: {e}"))??;
+        }
+        info!(slug, "delta path — old apex superseded, shared answers preserved");
+    } else {
+        // Fresh path: supersede all prior L1+ overlay nodes
+        let conn = state.writer.clone();
+        let slug_owned = slug.to_string();
+        let overlay_build_id = build_id.clone();
+        tokio::task::spawn_blocking(move || {
+            let c = conn.blocking_lock();
+            db::supersede_nodes_above(&c, &slug_owned, 0, &overlay_build_id)?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .map_err(|e| anyhow!("Overlay cleanup panicked: {e}"))??;
+        info!(slug, "fresh path — all prior L1+ nodes superseded");
+    }
+
+    // ── 4. Load L0 nodes ────────────────────────────────────────────────
+    let l0_nodes = if is_cross_slug {
+        let conn_guard = state.reader.lock().await;
+        let mut all_nodes = Vec::new();
+        for ref_slug in &referenced_slugs {
+            if let Ok(Some(info)) = super::slug::get_slug(&conn_guard, ref_slug) {
+                match info.content_type {
+                    super::types::ContentType::Question => {
+                        all_nodes.extend(db::get_all_live_nodes(&conn_guard, ref_slug)?);
+                    }
+                    _ => {
+                        all_nodes
+                            .extend(db::get_nodes_at_depth(&conn_guard, ref_slug, 0)?);
+                    }
+                }
+            }
+        }
+        drop(conn_guard);
+        all_nodes
+    } else {
+        db_read(&state.reader, {
+            let s = slug.to_string();
+            move |conn| db::get_nodes_at_depth(conn, &s, 0)
+        })
+        .await?
+    };
+
+    let l0_summary =
+        super::evidence_answering::build_l0_summary(&l0_nodes, &state.operational);
+
+    // ── 5. Generate synthesis prompts ───────────────────────────────────
+    let ext_schema_val = resolved_input.get("extraction_schema")
+        .cloned()
+        .filter(|v| !v.is_null())
+        .or_else(|| ctx.resolve_ref("$extraction_schema").ok())
+        .unwrap_or(Value::Null);
+    let ext_schema: super::types::ExtractionSchema =
+        serde_json::from_value(ext_schema_val).unwrap_or_else(|_| {
+            super::types::ExtractionSchema {
+                extraction_prompt: String::new(),
+                topic_schema: vec![],
+                orientation_guidance: String::new(),
+            }
+        });
+
+    if cancel.is_cancelled() {
+        warn!(slug, "build cancelled before synthesis prompt generation");
+        return Ok(serde_json::json!({
+            "build_id": build_id,
+            "error": "Cancelled before synthesis",
+            "total_nodes": 0,
+            "layers_completed": 0,
+            "max_layer": max_layer,
+        }));
+    }
+
+    let synth_prompts = super::extraction_schema::generate_synthesis_prompts(
+        &tree,
+        &l0_summary,
+        &ext_schema,
+        tree.audience.as_deref(),
+        &llm_config,
+        &state.operational.tier1,
+        Some(&state.chains_dir),
+    )
+    .await?;
+
+    // ── 6. Per-layer evidence loop ──────────────────────────────────────
+    let from_depth = ctx
+        .resolve_ref("$from_depth")
+        .ok()
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let evidence_start_layer = std::cmp::max(1, from_depth);
+
+    let mut total_nodes: i32 = l0_nodes.len() as i32;
+    let mut layers_completed: i64 = 0;
+    let mut build_error: Option<String> = None;
+
+    let reused_set: HashSet<String> = reused_question_ids.into_iter().collect();
+
+    for layer in evidence_start_layer..=max_layer {
+        if cancel.is_cancelled() {
+            warn!(slug, layer, "build cancelled during evidence loop");
+            build_error = Some(format!("Cancelled at layer {}", layer));
+            break;
+        }
+
+        let layer_qs_raw = match layer_questions.get(&layer) {
+            Some(qs) => qs.clone(),
+            None => {
+                info!(slug, layer, "no questions at layer, skipping");
+                continue;
+            }
+        };
+
+        // Filter out reused questions (delta path)
+        let layer_qs: Vec<_> = layer_qs_raw
+            .into_iter()
+            .filter(|q| !reused_set.contains(&q.question_id))
+            .collect();
+
+        if layer_qs.is_empty() {
+            info!(slug, layer, "all questions at layer reused, skipping");
+            continue;
+        }
+
+        // Load lower-layer nodes
+        let lower_nodes = if is_cross_slug && layer == 1 {
+            l0_nodes.clone()
+        } else {
+            db_read(&state.reader, {
+                let s = slug.to_string();
+                let l = layer - 1;
+                move |conn| db::get_nodes_at_depth(conn, &s, l)
+            })
+            .await?
+        };
+
+        // Load evidence sets for two-stage pre-mapping
+        let evidence_sets = db_read(&state.reader, {
+            let s = slug.to_string();
+            let refs = referenced_slugs.clone();
+            let is_cs = is_cross_slug;
+            move |conn| {
+                let mut all_sets = Vec::new();
+                if is_cs {
+                    for rs in &refs {
+                        all_sets.extend(db::get_evidence_sets(conn, rs)?);
+                    }
+                } else {
+                    all_sets = db::get_evidence_sets(conn, &s)?;
+                }
+                Ok(all_sets)
+            }
+        })
+        .await?;
+
+        info!(
+            slug,
+            layer,
+            questions = layer_qs.len(),
+            lower_nodes = lower_nodes.len(),
+            "starting evidence answering for layer"
+        );
+
+        // Step a: Pre-map questions to candidate evidence nodes
+        let candidate_map = match super::evidence_answering::pre_map_layer(
+            &layer_qs,
+            &lower_nodes,
+            &llm_config,
+            &state.operational,
+            tree.audience.as_deref(),
+            Some(&state.chains_dir),
+            source_content_type.as_deref(),
+            Some(&evidence_sets),
+        )
+        .await
+        {
+            Ok(map) => map,
+            Err(e) => {
+                warn!(slug, layer, error = %e, "pre-mapping failed");
+                build_error =
+                    Some(format!("Pre-mapping failed at layer {}: {}", layer, e));
+                break;
+            }
+        };
+
+        // Step b: Answer questions
+        let batch_result = match super::evidence_answering::answer_questions(
+            &layer_qs,
+            &candidate_map,
+            &lower_nodes,
+            Some(&synth_prompts.answering_prompt),
+            tree.audience.as_deref(),
+            &llm_config,
+            slug,
+            slug, // answer_slug
+            Some(&state.chains_dir),
+            source_content_type.as_deref(),
+            &state.operational,
+        )
+        .await
+        {
+            Ok(a) => a,
+            Err(e) => {
+                warn!(slug, layer, error = %e, "answer_questions failed");
+                build_error =
+                    Some(format!("Answer failed at layer {}: {}", layer, e));
+                break;
+            }
+        };
+
+        let mut answered = batch_result.answered;
+        let failed = batch_result.failed;
+
+        // Stamp build_id
+        for a in &mut answered {
+            a.node.build_id = Some(build_id.clone());
+        }
+
+        let answered_ids: Vec<String> =
+            answered.iter().map(|a| a.node.id.clone()).collect();
+        let lower_ids: Vec<String> =
+            lower_nodes.iter().map(|n| n.id.clone()).collect();
+        let layer_node_count = answered.len() as i32;
+
+        // Step c: Persist answered nodes + evidence links + gaps
+        {
+            let conn = state.writer.clone();
+            let slug_owned = slug.to_string();
+            let bid_for_gaps = build_id.clone();
+            let answered_owned = answered;
+            let failed_owned = failed;
+            tokio::task::spawn_blocking(move || {
+                let c = conn.blocking_lock();
+                c.execute_batch("BEGIN")?;
+                let result = (|| -> anyhow::Result<()> {
+                    for a in &answered_owned {
+                        db::save_node(&c, &a.node, None)?;
+                        for child_id in &a.node.children {
+                            if child_id.contains('/') {
+                                continue;
+                            }
+                            let _ =
+                                db::update_parent(&c, &slug_owned, child_id, &a.node.id);
+                        }
+                        for link in &a.evidence {
+                            db::save_evidence_link(&c, link)?;
+                        }
+                        for missing_desc in &a.missing {
+                            let gap = super::types::GapReport {
+                                question_id: a.node.id.clone(),
+                                description: missing_desc.clone(),
+                                layer: a.node.depth as i64,
+                                resolved: false,
+                            };
+                            db::save_gap(&c, &slug_owned, &gap, Some(&bid_for_gaps))?;
+                        }
+                    }
+                    for fq in &failed_owned {
+                        let gap = super::types::GapReport {
+                            question_id: fq.question_id.clone(),
+                            description: format!(
+                                "Question failed: {}. Error: {}",
+                                fq.question_text, fq.error
+                            ),
+                            layer: fq.layer,
+                            resolved: false,
+                        };
+                        db::save_gap(&c, &slug_owned, &gap, Some(&bid_for_gaps))?;
+                    }
+                    Ok(())
+                })();
+                match result {
+                    Ok(()) => {
+                        c.execute_batch("COMMIT")?;
+                        Ok(())
+                    }
+                    Err(e) => {
+                        let _ = c.execute_batch("ROLLBACK");
+                        Err(e)
+                    }
+                }
+            })
+            .await
+            .map_err(|e| anyhow!("Evidence save panicked: {e}"))??;
+        }
+
+        // Step d: Reconcile layer
+        {
+            let conn = state.writer.clone();
+            let slug_owned = slug.to_string();
+            let aids = answered_ids;
+            let lids = lower_ids;
+            let l = layer;
+            tokio::task::spawn_blocking(move || {
+                let c = conn.blocking_lock();
+                let _ =
+                    super::reconciliation::reconcile_layer(&c, &slug_owned, l, &aids, &lids)?;
+                Ok::<(), anyhow::Error>(())
+            })
+            .await
+            .map_err(|e| anyhow!("Reconciliation panicked: {e}"))??;
+        }
+
+        total_nodes += layer_node_count;
+        layers_completed = layer;
+        *done += layer_node_count as i64;
+
+        // Step e: Update build progress
+        {
+            let conn = state.writer.clone();
+            let slug_owned = slug.to_string();
+            let bid = build_id.clone();
+            let tn = total_nodes;
+            let al0 = l0_nodes.len() as i64;
+            tokio::task::spawn_blocking(move || {
+                let c = conn.blocking_lock();
+                super::local_store::update_build_progress(
+                    &c,
+                    &slug_owned,
+                    &bid,
+                    layer,
+                    al0,
+                    tn as i64,
+                )?;
+                Ok::<(), anyhow::Error>(())
+            })
+            .await
+            .map_err(|e| anyhow!("Progress update panicked: {e}"))??;
+        }
+
+        // Step f: Send progress
+        if let Some(ref tx) = progress_tx {
+            let _ = tx
+                .send(BuildProgress {
+                    done: total_nodes as i64,
+                    total,
+                })
+                .await;
+        }
+
+        info!(
+            slug,
+            layer,
+            nodes_created = layer_node_count,
+            total_nodes,
+            "layer complete"
+        );
+    }
+
+    // ── 7. Mark build complete or failed (skip if caller is tracking externally) ──
+    if !external_build_tracking {
+        let conn = state.writer.clone();
+        let slug_owned = slug.to_string();
+        let bid = build_id.clone();
+        let err = build_error.clone();
+        let lc = layers_completed;
+        let ml = max_layer;
+        tokio::task::spawn_blocking(move || {
+            let c = conn.blocking_lock();
+            if let Some(error_msg) = err {
+                super::local_store::fail_build(
+                    &c,
+                    &slug_owned,
+                    &bid,
+                    &format!("Stopped at layer {}/{}: {}", lc, ml, error_msg),
+                )?;
+            } else {
+                super::local_store::complete_build(&c, &slug_owned, &bid, None)?;
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .map_err(|e| anyhow!("Build status save panicked: {e}"))??;
+    }
+
+    // Update slug stats (skip if caller is tracking externally)
+    if !external_build_tracking {
+        let conn = state.writer.clone();
+        let slug_owned = slug.to_string();
+        tokio::task::spawn_blocking(move || {
+            let c = conn.blocking_lock();
+            let _ = db::update_slug_stats(&c, &slug_owned);
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .map_err(|e| anyhow!("Slug stats update panicked: {e}"))??;
+    }
+
+    let result = serde_json::json!({
+        "build_id": build_id,
+        "total_nodes": total_nodes,
+        "layers_completed": layers_completed,
+        "max_layer": max_layer,
+        "error": build_error,
+    });
+
+    Ok(result)
+}
+
+/// Process unresolved gaps by targeted re-examination of source files.
+/// Wraps the gap processing logic from build_runner.rs: load gaps, resolve files,
+/// call targeted_reexamination per file, persist new L0 nodes and mutations.
+async fn execute_process_gaps(
+    state: &PyramidState,
+    step: &ChainStep,
+    ctx: &mut ChainContext,
+    slug: &str,
+    cancel: &CancellationToken,
+) -> Result<Value> {
+    info!(slug, "executing process_gaps primitive");
+
+    let llm_config = state.config.read().await.clone();
+
+    // ── Resolve step.input (Pillar 28: forkable wiring) ────────────────
+    let resolved_input = if let Some(ref input) = step.input {
+        ctx.resolve_value(input).unwrap_or(Value::Object(serde_json::Map::new()))
+    } else {
+        Value::Object(serde_json::Map::new())
+    };
+
+    // Resolve nested load_prior_state from input (or fall back to context)
+    let load_prior_state_val = resolved_input.get("load_prior_state")
+        .cloned()
+        .or_else(|| ctx.resolve_ref("$load_prior_state").ok())
+        .unwrap_or(Value::Object(serde_json::Map::new()));
+
+    // Get build context from evidence_loop step output
+    let evidence_result = resolved_input.get("evidence_loop")
+        .cloned()
+        .or_else(|| ctx.resolve_ref("$evidence_loop").ok())
+        .unwrap_or(Value::Null);
+    let build_id = evidence_result
+        .get("build_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let evidence_error = evidence_result
+        .get("error")
+        .and_then(|v| v.as_str().map(|s| s.to_string()));
+
+    // Skip gap processing if evidence loop had errors or was cancelled
+    if evidence_error.is_some() || cancel.is_cancelled() {
+        info!(
+            slug,
+            "skipping gap processing (evidence loop had errors or cancelled)"
+        );
+        return Ok(
+            serde_json::json!({"skipped": true, "reason": "evidence_loop_error_or_cancelled"}),
+        );
+    }
+
+    // Get cross-slug info
+    let is_cross_slug = load_prior_state_val.get("is_cross_slug")
+        .and_then(|v| v.as_bool())
+        .or_else(|| ctx.resolve_ref("$load_prior_state.is_cross_slug").ok().and_then(|v| v.as_bool()))
+        .unwrap_or(false);
+    let referenced_slugs: Vec<String> = load_prior_state_val.get("referenced_slugs")
+        .cloned()
+        .and_then(|v| serde_json::from_value(v).ok())
+        .or_else(|| ctx.resolve_ref("$load_prior_state.referenced_slugs").ok().and_then(|v| serde_json::from_value(v).ok()))
+        .unwrap_or_default();
+
+    // Get audience from tree
+    let tree_val = ctx
+        .resolve_ref("$decomposed_tree")
+        .or_else(|_| ctx.resolve_ref("$decompose"))
+        .or_else(|_| ctx.resolve_ref("$decompose_delta"))
+        .ok();
+    let audience: Option<String> = tree_val
+        .and_then(|v| v.get("audience").and_then(|a| a.as_str().map(|s| s.to_string())));
+
+    // Load unresolved gaps
+    let unresolved_gaps = db_read(&state.reader, {
+        let s = slug.to_string();
+        move |conn| db::get_unresolved_gaps_for_slug(conn, &s)
+    })
+    .await
+    .unwrap_or_default();
+
+    if unresolved_gaps.is_empty() {
+        info!(slug, "no unresolved gaps to process");
+        return Ok(serde_json::json!({"gaps_processed": 0}));
+    }
+
+    info!(
+        slug,
+        gap_count = unresolved_gaps.len(),
+        "starting gap processing pass"
+    );
+
+    let mut gaps_processed = 0;
+    let mut gaps_with_new_evidence = 0;
+
+    for gap in &unresolved_gaps {
+        if cancel.is_cancelled() {
+            warn!(slug, "build cancelled during gap processing");
+            break;
+        }
+
+        // a. Load answer node for question_text
+        let answer_node = db_read(&state.reader, {
+            let s = slug.to_string();
+            let qid = gap.question_id.clone();
+            move |conn| Ok(db::get_live_node(conn, &s, &qid).ok().flatten())
+        })
+        .await?;
+
+        let question_text = match &answer_node {
+            Some(node) if !node.self_prompt.is_empty() => node.self_prompt.clone(),
+            _ => {
+                warn!(
+                    slug,
+                    question_id = %gap.question_id,
+                    "gap references node with no self_prompt, skipping"
+                );
+                continue;
+            }
+        };
+
+        // b. Determine base slugs
+        let base_slugs_for_gap = if is_cross_slug {
+            referenced_slugs.clone()
+        } else {
+            vec![slug.to_string()]
+        };
+
+        // c. Resolve source files (rule-based, no LLM)
+        let resolved_files = db_read(&state.reader, {
+            let base_slugs = base_slugs_for_gap.clone();
+            let gap_desc = gap.description.clone();
+            let max_files = state.operational.tier2.gap_resolution_max_files;
+            move |conn| {
+                super::evidence_answering::resolve_files_for_gap(
+                    conn,
+                    &base_slugs,
+                    &gap_desc,
+                    &[],
+                    max_files,
+                )
+            }
+        })
+        .await;
+
+        let resolved_files = match resolved_files {
+            Ok(files) => files,
+            Err(e) => {
+                warn!(
+                    slug,
+                    question_id = %gap.question_id,
+                    error = %e,
+                    "gap file resolution failed, skipping"
+                );
+                continue;
+            }
+        };
+
+        if resolved_files.is_empty() {
+            // Mark gap resolved with no new evidence
+            let conn = state.writer.clone();
+            let slug_owned = slug.to_string();
+            let gap_qid = gap.question_id.clone();
+            let gap_desc = gap.description.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                let c = conn.blocking_lock();
+                db::mark_gap_resolved(&c, &slug_owned, &gap_qid, &gap_desc)
+            })
+            .await;
+            gaps_processed += 1;
+            continue;
+        }
+
+        // d. Group by slug and call targeted_reexamination per file
+        let mut files_by_slug: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        for (file_slug, path, content) in resolved_files {
+            files_by_slug
+                .entry(file_slug)
+                .or_default()
+                .push((path, content));
+        }
+
+        let mut gap_produced_nodes = false;
+
+        for (base_slug, file_candidates) in &files_by_slug {
+            for (file_path, content) in file_candidates {
+                let single_file = vec![(file_path.clone(), content.clone())];
+                let new_nodes = match super::evidence_answering::targeted_reexamination(
+                    &question_text,
+                    &gap.description,
+                    &single_file,
+                    &llm_config,
+                    base_slug,
+                    &build_id,
+                    audience.as_deref(),
+                    Some(&state.chains_dir),
+                    &state.operational,
+                )
+                .await
+                {
+                    Ok(nodes) => nodes,
+                    Err(e) => {
+                        warn!(
+                            slug,
+                            base_slug = %base_slug,
+                            question_id = %gap.question_id,
+                            file_path = %file_path,
+                            error = %e,
+                            "targeted re-examination failed"
+                        );
+                        continue;
+                    }
+                };
+
+                if new_nodes.is_empty() {
+                    continue;
+                }
+                gap_produced_nodes = true;
+
+                // e. Save new L0 nodes + register in file hashes + queue mutation
+                let conn = state.writer.clone();
+                let base_slug_owned = base_slug.clone();
+                let bid = build_id.clone();
+                let nodes_owned = new_nodes;
+                let file_path_owned = file_path.clone();
+                let now = chrono::Utc::now().to_rfc3339();
+                let gap_save_result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                    let c = conn.blocking_lock();
+                    c.execute_batch("BEGIN")?;
+                    let result = (|| -> anyhow::Result<()> {
+                        for node in nodes_owned.iter() {
+                            db::save_node(&c, node, None)?;
+                            db::append_node_id_to_file_hash(
+                                &c,
+                                &base_slug_owned,
+                                &file_path_owned,
+                                &node.id,
+                            )?;
+                            if !node.self_prompt.is_empty() {
+                                c.execute(
+                                    "INSERT INTO pyramid_pending_mutations
+                                     (slug, layer, mutation_type, target_ref, detail, cascade_depth, detected_at, processed)
+                                     VALUES (?1, 0, 'evidence_set_growth', ?2, ?3, 0, ?4, 0)",
+                                    rusqlite::params![
+                                        base_slug_owned,
+                                        node.self_prompt,
+                                        serde_json::json!({
+                                            "reason": "targeted_reexamination",
+                                            "build_id": bid,
+                                            "node_id": node.id,
+                                        })
+                                        .to_string(),
+                                        now
+                                    ],
+                                )?;
+                            }
+                        }
+                        Ok(())
+                    })();
+                    match result {
+                        Ok(()) => {
+                            c.execute_batch("COMMIT")?;
+                            Ok(())
+                        }
+                        Err(e) => {
+                            let _ = c.execute_batch("ROLLBACK");
+                            Err(e)
+                        }
+                    }
+                })
+                .await;
+                match gap_save_result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        warn!(slug, question_id = %gap.question_id, error = %e, "gap node save failed");
+                    }
+                    Err(e) => {
+                        warn!(slug, question_id = %gap.question_id, error = %e, "gap node save panicked");
+                    }
+                }
+            }
+        }
+
+        // f. Mark gap resolved
+        let conn = state.writer.clone();
+        let slug_owned = slug.to_string();
+        let gap_qid = gap.question_id.clone();
+        let gap_desc = gap.description.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            let c = conn.blocking_lock();
+            db::mark_gap_resolved(&c, &slug_owned, &gap_qid, &gap_desc)
+        })
+        .await;
+
+        gaps_processed += 1;
+        if gap_produced_nodes {
+            gaps_with_new_evidence += 1;
+        }
+
+        info!(
+            slug,
+            question_id = %gap.question_id,
+            gap_produced_nodes,
+            "gap processed"
+        );
+    }
+
+    info!(
+        slug,
+        gaps_processed, gaps_with_new_evidence, "gap processing pass complete"
+    );
+
+    Ok(serde_json::json!({
+        "gaps_processed": gaps_processed,
+        "gaps_with_new_evidence": gaps_with_new_evidence,
+    }))
+}
+
 // ── forEach execution ───────────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -4040,6 +5231,10 @@ async fn execute_for_each(
                 ctx.accumulators.insert(name.clone(), init.to_string());
             }
         }
+    }
+
+    if let Some(ref order) = step.dispatch_order {
+        warn!("[CHAIN] [{}] dispatch_order '{}' specified but not yet implemented — using insertion order", step.name, order);
     }
 
     let concurrency = step.concurrency.max(1);
@@ -4246,7 +5441,17 @@ async fn execute_for_each(
                             .unwrap_or(Value::String("unknown".to_string())),
                         "total_parts": num_sub,
                     });
-                    let merge_system_prompt = SPLIT_MERGE_DEFAULT_PROMPT.to_string();
+                    let merge_system_prompt = if let Some(ref mi) = step.merge_instruction {
+                        match resolve_prompt_template(mi, &serde_json::json!({})) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                warn!("[CHAIN] [{}] merge_instruction resolve failed ({e}), using default", step.name);
+                                SPLIT_MERGE_DEFAULT_PROMPT.to_string()
+                            }
+                        }
+                    } else {
+                        SPLIT_MERGE_DEFAULT_PROMPT.to_string()
+                    };
                     let merge_fallback_key = format!("{}-{index}-merge", step.name);
 
                     info!(
@@ -4706,8 +5911,19 @@ async fn execute_for_each_concurrent(
                         "total_parts": num_sub,
                     });
                     let merge_fallback_key = format!("{}-{index}-merge", step.name);
+                    let merge_prompt = if let Some(ref mi) = step.merge_instruction {
+                        match resolve_prompt_template(mi, &serde_json::json!({})) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                warn!("[CHAIN] [{}] merge_instruction resolve failed ({e}), using default", step.name);
+                                SPLIT_MERGE_DEFAULT_PROMPT.to_string()
+                            }
+                        }
+                    } else {
+                        SPLIT_MERGE_DEFAULT_PROMPT.to_string()
+                    };
                     let analysis = match dispatch_with_retry(
-                        step, &merge_input, SPLIT_MERGE_DEFAULT_PROMPT, defaults,
+                        step, &merge_input, &merge_prompt, defaults,
                         dispatch_ctx, error_strategy, &merge_fallback_key,
                     )
                     .await
@@ -8613,11 +9829,12 @@ async fn execute_ir_parallel_foreach(
             }
 
             let start = Instant::now();
-            let dispatch_result = chain_dispatch::dispatch_ir_step(
+            let dispatch_result = dispatch_ir_with_retry(
                 &step_clone,
                 &resolved_input,
                 &system_prompt,
                 &ctx_clone,
+                &step_clone.error_policy,
             )
             .await;
             let elapsed = start.elapsed().as_secs_f64();
@@ -11991,8 +13208,7 @@ mod tests {
             operational: Arc::new(crate::pyramid::OperationalConfig::default()),
             chains_dir: std::path::PathBuf::from("chains"),
             remote_query_rate_limiter: Arc::new(Mutex::new(HashMap::new())),
-            absorption_build_rate_limiter: Arc::new(Mutex::new(HashMap::new())),
-            absorption_daily_spend: Arc::new(Mutex::new((0u64, std::time::Instant::now()))),
+            absorption_gate: Arc::new(Mutex::new(crate::pyramid::AbsorptionGate::new())),
         };
 
         let chain = make_integration_code_chain();
@@ -12062,8 +13278,7 @@ mod tests {
             operational: Arc::new(crate::pyramid::OperationalConfig::default()),
             chains_dir: std::path::PathBuf::from("chains"),
             remote_query_rate_limiter: Arc::new(Mutex::new(HashMap::new())),
-            absorption_build_rate_limiter: Arc::new(Mutex::new(HashMap::new())),
-            absorption_daily_spend: Arc::new(Mutex::new((0u64, std::time::Instant::now()))),
+            absorption_gate: Arc::new(Mutex::new(crate::pyramid::AbsorptionGate::new())),
         };
 
         let chain = make_integration_code_chain();
@@ -12153,8 +13368,7 @@ mod tests {
             operational: Arc::new(crate::pyramid::OperationalConfig::default()),
             chains_dir: std::path::PathBuf::from("chains"),
             remote_query_rate_limiter: Arc::new(Mutex::new(HashMap::new())),
-            absorption_build_rate_limiter: Arc::new(Mutex::new(HashMap::new())),
-            absorption_daily_spend: Arc::new(Mutex::new((0u64, std::time::Instant::now()))),
+            absorption_gate: Arc::new(Mutex::new(crate::pyramid::AbsorptionGate::new())),
         };
 
         assert!(!pyramid_state
@@ -12208,8 +13422,7 @@ mod tests {
             operational: Arc::new(crate::pyramid::OperationalConfig::default()),
             chains_dir: std::path::PathBuf::from("chains"),
             remote_query_rate_limiter: Arc::new(Mutex::new(HashMap::new())),
-            absorption_build_rate_limiter: Arc::new(Mutex::new(HashMap::new())),
-            absorption_daily_spend: Arc::new(Mutex::new((0u64, std::time::Instant::now()))),
+            absorption_gate: Arc::new(Mutex::new(crate::pyramid::AbsorptionGate::new())),
         };
 
         let chain = make_integration_code_chain();

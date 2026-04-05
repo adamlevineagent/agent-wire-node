@@ -306,7 +306,18 @@ fn enforce_access_tier(
                 .unwrap()
                 .into_response())
         }
-        _ => Ok(()), // Unknown tier = allow (fail open for forward compat)
+        unknown => {
+            tracing::warn!(
+                operator_id = %operator_id,
+                slug = %slug,
+                tier = %unknown,
+                "Unknown access tier — rejecting request"
+            );
+            Err(json_error(
+                warp::http::StatusCode::FORBIDDEN,
+                &format!("Access denied: unknown access tier '{}'", unknown),
+            ))
+        }
     }
 }
 
@@ -4005,7 +4016,7 @@ async fn handle_question_build(
         steps: vec![],
     }));
 
-    {
+    let layer_state_for_build = {
         let mut active = state.active_build.write().await;
         if let Some(handle) = active.get(&slug_name) {
             let s = handle.status.read().await;
@@ -4019,17 +4030,20 @@ async fn handle_question_build(
             }
         }
 
+        let layer_state = std::sync::Arc::new(tokio::sync::RwLock::new(
+            super::types::BuildLayerState::default(),
+        ));
+        let layer_state_for_build = layer_state.clone();
         let handle = super::BuildHandle {
             slug: slug_name.clone(),
             cancel: cancel.clone(),
             status: status.clone(),
-            layer_state: std::sync::Arc::new(tokio::sync::RwLock::new(
-                super::types::BuildLayerState::default(),
-            )),
+            layer_state,
             started_at: std::time::Instant::now(),
         };
         active.insert(slug_name.clone(), handle);
-    }
+        layer_state_for_build
+    };
 
     // Spawn the build task with its own reader connection so it doesn't
     // compete with CLI/frontend queries for the shared reader Mutex.
@@ -4064,6 +4078,56 @@ async fn handle_question_build(
             }
         });
 
+        // Create layer event channel for build visualization
+        let (layer_tx, mut layer_rx) =
+            tokio::sync::mpsc::channel::<super::types::LayerEvent>(256);
+        let layer_drain_state = layer_state_for_build;
+        let layer_drain_handle = tokio::spawn(async move {
+            use super::types::{LayerEvent, LayerProgress, LogEntry, NodeStatus};
+            while let Some(event) = layer_rx.recv().await {
+                let mut state = layer_drain_state.write().await;
+                match event {
+                    LayerEvent::Discovered { depth, step_name, estimated_nodes } => {
+                        state.layers.push(LayerProgress {
+                            depth, step_name, estimated_nodes,
+                            completed_nodes: 0, failed_nodes: 0,
+                            status: "pending".into(),
+                            nodes: if estimated_nodes <= 50 { Some(Vec::new()) } else { None },
+                        });
+                    }
+                    LayerEvent::NodeCompleted { depth, step_name, node_id, label } => {
+                        if let Some(layer) = state.layers.iter_mut().find(|l| l.depth == depth && l.step_name == step_name) {
+                            layer.completed_nodes += 1;
+                            layer.status = "active".into();
+                            if let Some(ref mut nodes) = layer.nodes {
+                                nodes.push(NodeStatus { node_id, status: "complete".into(), label });
+                            }
+                        }
+                    }
+                    LayerEvent::NodeFailed { depth, step_name, node_id } => {
+                        if let Some(layer) = state.layers.iter_mut().find(|l| l.depth == depth && l.step_name == step_name) {
+                            layer.failed_nodes += 1;
+                            if let Some(ref mut nodes) = layer.nodes {
+                                nodes.push(NodeStatus { node_id, status: "failed".into(), label: None });
+                            }
+                        }
+                    }
+                    LayerEvent::LayerCompleted { depth, step_name } => {
+                        if let Some(layer) = state.layers.iter_mut().find(|l| l.depth == depth && l.step_name == step_name) {
+                            layer.status = "complete".into();
+                        }
+                    }
+                    LayerEvent::StepStarted { step_name } => {
+                        state.current_step = Some(step_name);
+                    }
+                    LayerEvent::Log { elapsed_secs, message } => {
+                        state.log.push_back(LogEntry { elapsed_secs, message });
+                        if state.log.len() > 200 { state.log.pop_front(); }
+                    }
+                }
+            }
+        });
+
         let result = super::build_runner::run_decomposed_build(
             &build_state,
             &slug_name,
@@ -4074,11 +4138,14 @@ async fn handle_question_build(
             characterization,
             &cancel,
             Some(progress_tx.clone()),
+            Some(layer_tx.clone()),
         )
         .await;
 
         drop(progress_tx);
+        drop(layer_tx);
         let _ = progress_handle.await;
+        let _ = layer_drain_handle.await;
 
         // Update final status
         {

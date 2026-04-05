@@ -10,6 +10,15 @@ use anyhow::{bail, Context, Result};
 use regex::Regex;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::LazyLock;
+use tracing::warn;
+
+static REF_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\$([a-zA-Z_][a-zA-Z0-9_.]*(?:\[[^\]]*\])*)").unwrap()
+});
+static TEMPLATE_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\{\{([^}]+)\}\}").unwrap()
+});
 
 // ── ChainContext ─────────────────────────────────────────────────────────
 
@@ -42,6 +51,8 @@ pub struct ChainContext {
     pub accumulators: HashMap<String, String>,
     /// Whether a prior build exists for this slug (any nodes present).
     pub has_prior_build: bool,
+    /// Initial parameters passed at chain start (e.g., $apex_question, $granularity).
+    pub initial_params: HashMap<String, Value>,
     /// Set to true by a `gate` primitive with `break: true` to exit the enclosing loop.
     pub break_loop: bool,
 }
@@ -63,6 +74,7 @@ impl ChainContext {
             pair_is_carry: false,
             accumulators: HashMap::new(),
             has_prior_build: false,
+            initial_params: HashMap::new(),
             break_loop: false,
         }
     }
@@ -170,19 +182,25 @@ impl ChainContext {
                 if let Some(val) = self.step_outputs.get(path) {
                     return Ok(val.clone());
                 }
+                // Fallback: check initial_params
+                if let Some(val) = self.initial_params.get(path) {
+                    return Ok(val.clone());
+                }
                 bail!("Unknown reference: {}", path);
             }
         };
 
-        let step_output = self
+        // Try step_outputs first, then fall back to initial_params
+        let source = self
             .step_outputs
             .get(step_name)
-            .ok_or_else(|| anyhow::anyhow!("No output for step \"{}\"", step_name))?;
+            .or_else(|| self.initial_params.get(step_name))
+            .ok_or_else(|| anyhow::anyhow!("No output or initial param for \"{}\"", step_name))?;
 
         let rest = rest.unwrap(); // safe: we're in the Some branch
 
         // Parse the remaining path segments
-        self.navigate_value(step_output, rest, step_name)
+        self.navigate_value(source, rest, step_name)
     }
 
     /// Navigate into a JSON value by a dot-separated path that may contain
@@ -363,6 +381,11 @@ fn parse_index_expr(s: &str) -> IndexExpr {
         IndexExpr::Literal(n)
     } else {
         // Fallback — treat as literal 0 (this shouldn't happen with valid refs)
+        warn!(
+            expr = trimmed,
+            "Unparseable index expression in chain reference, falling back to index 0 — \
+             this likely indicates a bug in the YAML chain definition"
+        );
         IndexExpr::Literal(0)
     }
 }
@@ -386,7 +409,7 @@ fn is_single_ref(s: &str) -> bool {
 /// Finds each `$ref` token and replaces it with the stringified resolved value.
 fn interpolate_refs(s: &str, ctx: &ChainContext) -> Result<String> {
     // Match $identifier patterns (including dots and brackets)
-    let re = Regex::new(r"\$([a-zA-Z_][a-zA-Z0-9_.]*(?:\[[^\]]*\])*)").unwrap();
+    let re = &*REF_PATTERN;
     let mut result = String::new();
     let mut last_end = 0;
 
@@ -432,7 +455,7 @@ fn value_to_interpolation_string(val: &Value) -> String {
 ///
 /// Uses the step's resolved input map for variable values. Unresolved `{{ref}}` is an error.
 pub fn resolve_prompt_template(template: &str, input: &Value) -> Result<String> {
-    let re = Regex::new(r"\{\{([^}]+)\}\}").unwrap();
+    let re = &*TEMPLATE_PATTERN;
     let mut result = String::new();
     let mut last_end = 0;
 

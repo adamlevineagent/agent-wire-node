@@ -1,4 +1,4 @@
-import { createContext, useContext, useReducer, useCallback, ReactNode } from 'react';
+import { createContext, useContext, useReducer, useCallback, useMemo, useRef, ReactNode } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import type { CreditStats, SyncState } from '../components/Dashboard';
 import type { OperationEntry } from '../types/planner';
@@ -286,10 +286,13 @@ export function AppProvider({ children, email }: AppProviderProps) {
         dispatch({ type: 'NAVIGATE_VIEW', mode, entry: { view, props } });
     }, []);
 
+    const modeStacksRef = useRef(state.modeStacks);
+    modeStacksRef.current = state.modeStacks;
+
     const currentView = useCallback((mode: Mode): ViewStackEntry => {
-        const stack = state.modeStacks[mode];
+        const stack = modeStacksRef.current[mode];
         return stack[stack.length - 1];
-    }, [state.modeStacks]);
+    }, []);
 
     const operatorApiCall = useCallback(async (method: string, path: string, body?: unknown) => {
         return invoke('operator_api_call', { method, path, body: body ?? null });
@@ -299,18 +302,20 @@ export function AppProvider({ children, email }: AppProviderProps) {
         return invoke('wire_api_call', { method, path, body: body ?? null, headers: headers ?? null });
     }, []);
 
+    const value = useMemo<AppContextValue>(() => ({
+        state,
+        dispatch,
+        setMode,
+        pushView,
+        popView,
+        navigateView,
+        currentView,
+        operatorApiCall,
+        wireApiCall,
+    }), [state, dispatch, setMode, pushView, popView, navigateView, currentView, operatorApiCall, wireApiCall]);
+
     return (
-        <AppContext.Provider value={{
-            state,
-            dispatch,
-            setMode,
-            pushView,
-            popView,
-            navigateView,
-            currentView,
-            operatorApiCall,
-            wireApiCall,
-        }}>
+        <AppContext.Provider value={value}>
             {children}
         </AppContext.Provider>
     );

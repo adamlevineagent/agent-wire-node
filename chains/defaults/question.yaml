@@ -1,0 +1,112 @@
+schema_version: 1
+id: question-pipeline
+name: Question Pipeline
+description: "Question-driven knowledge pyramid build. Forkable recipe — Pillar 28."
+content_type: question
+version: "1.1.0"
+author: "wire-node"
+
+defaults:
+  model_tier: mid
+  temperature: 0.3
+  on_error: "retry(2)"
+
+steps:
+  - name: load_prior_state
+    primitive: cross_build_input
+    save_as: step_only
+
+  # characterize: removed — build_runner does characterization before chain
+  # starts and injects the result as initial_params.$characterize (a string).
+
+  - name: enhance_question
+    primitive: extract
+    instruction: "$prompts/question/enhance_question.md"
+    input:
+      apex_question: "$apex_question"
+      corpus_context: "$load_prior_state.l0_summary"
+      characterization: "$characterize"
+    save_as: step_only
+
+  - name: decompose
+    primitive: recursive_decompose
+    instruction: "$prompts/question/decompose.md"
+    when: "$load_prior_state.has_overlay == false"
+    input:
+      apex_question: "$apex_question"
+      granularity: "$granularity"
+      max_depth: "$max_depth"
+      characterize: "$characterize"
+      audience: "$audience"
+    save_as: step_only
+
+  - name: decompose_delta
+    primitive: recursive_decompose
+    mode: delta
+    instruction: "$prompts/question/decompose_delta.md"
+    when: "$load_prior_state.has_overlay == true"
+    input:
+      apex_question: "$apex_question"
+      granularity: "$granularity"
+      max_depth: "$max_depth"
+      characterize: "$characterize"
+      audience: "$audience"
+      existing_tree: "$load_prior_state.question_tree"
+      existing_answers: "$load_prior_state.overlay_answers"
+      evidence_sets: "$load_prior_state.evidence_sets"
+      gaps: "$load_prior_state.unresolved_gaps"
+      l0_summary: "$load_prior_state.l0_summary"
+    save_as: step_only
+
+  # Both decompose and decompose_delta write to $decomposed_tree (canonical alias).
+  # Downstream steps use $decomposed_tree so they work regardless of which path ran.
+
+  - name: extraction_schema
+    primitive: extract
+    instruction: "$prompts/question/extraction_schema.md"
+    input:
+      question_tree: "$decomposed_tree"
+      characterize: "$characterize"
+      audience: "$audience"
+    save_as: step_only
+
+  # synthesis_prompts: removed — evidence_loop generates synthesis prompts
+  # internally via extraction_schema::generate_synthesis_prompts(). This step
+  # was a wasted LLM call whose output was never consumed.
+
+  - name: l0_extract
+    primitive: extract
+    instruction_from: "$extraction_schema.extraction_prompt"
+    for_each: "$chunks"
+    when: "$load_prior_state.l0_count == 0"
+    concurrency: 12
+    node_id_pattern: "Q-L0-{index:03}"
+    depth: 0
+    save_as: node
+    max_input_tokens: 80000
+    split_strategy: "sections"
+    split_overlap_tokens: 500
+    split_merge: true
+    merge_instruction: "$prompts/shared/merge_sub_chunks.md"
+    on_error: "retry(3)"
+    on_parse_error: "heal"
+    heal_instruction: "$prompts/shared/heal_json.md"
+
+  - name: evidence_loop
+    primitive: evidence_loop
+    input:
+      question_tree: "$decomposed_tree"
+      extraction_schema: "$extraction_schema"
+      load_prior_state: "$load_prior_state"
+      reused_question_ids: "$reused_question_ids"
+      build_id: "$build_id"
+    save_as: step_only
+
+  - name: gap_processing
+    primitive: process_gaps
+    input:
+      evidence_loop: "$evidence_loop"
+      load_prior_state: "$load_prior_state"
+    save_as: step_only
+
+post_build: []

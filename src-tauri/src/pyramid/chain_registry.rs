@@ -82,6 +82,7 @@ pub fn default_chain_id(content_type: &str) -> &'static str {
         "conversation" => "conversation-default",
         "code" => "code-default",
         "document" => "document-default",
+        "question" => "question-pipeline",
         _ => "conversation-default",
     }
 }

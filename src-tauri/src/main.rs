@@ -4282,7 +4282,7 @@ async fn pyramid_question_build(
         steps: vec![],
     }));
 
-    {
+    let layer_state_for_build = {
         let mut active = state.pyramid.active_build.write().await;
         if let Some(handle) = active.get(&slug) {
             let s = handle.status.read().await;
@@ -4293,17 +4293,20 @@ async fn pyramid_question_build(
             }
         }
 
+        let layer_state = std::sync::Arc::new(tokio::sync::RwLock::new(
+            wire_node_lib::pyramid::types::BuildLayerState::default(),
+        ));
+        let layer_state_for_build = layer_state.clone();
         let handle = wire_node_lib::pyramid::BuildHandle {
             slug: slug.clone(),
             cancel: cancel.clone(),
             status: status.clone(),
-            layer_state: std::sync::Arc::new(tokio::sync::RwLock::new(
-                wire_node_lib::pyramid::types::BuildLayerState::default(),
-            )),
+            layer_state,
             started_at: std::time::Instant::now(),
         };
         active.insert(slug.clone(), handle);
-    }
+        layer_state_for_build
+    };
 
     // Spawn the build task with its own reader connection so the build
     // doesn't compete with CLI/frontend queries for the shared reader Mutex.
@@ -4329,6 +4332,56 @@ async fn pyramid_question_build(
             }
         });
 
+        // Create layer event channel for build visualization
+        let (layer_tx, mut layer_rx) =
+            tokio::sync::mpsc::channel::<wire_node_lib::pyramid::types::LayerEvent>(256);
+        let layer_drain_state = layer_state_for_build;
+        let layer_drain_handle = tokio::spawn(async move {
+            use wire_node_lib::pyramid::types::{LayerEvent, LayerProgress, LogEntry, NodeStatus};
+            while let Some(event) = layer_rx.recv().await {
+                let mut state = layer_drain_state.write().await;
+                match event {
+                    LayerEvent::Discovered { depth, step_name, estimated_nodes } => {
+                        state.layers.push(LayerProgress {
+                            depth, step_name, estimated_nodes,
+                            completed_nodes: 0, failed_nodes: 0,
+                            status: "pending".into(),
+                            nodes: if estimated_nodes <= 50 { Some(Vec::new()) } else { None },
+                        });
+                    }
+                    LayerEvent::NodeCompleted { depth, step_name, node_id, label } => {
+                        if let Some(layer) = state.layers.iter_mut().find(|l| l.depth == depth && l.step_name == step_name) {
+                            layer.completed_nodes += 1;
+                            layer.status = "active".into();
+                            if let Some(ref mut nodes) = layer.nodes {
+                                nodes.push(NodeStatus { node_id, status: "complete".into(), label });
+                            }
+                        }
+                    }
+                    LayerEvent::NodeFailed { depth, step_name, node_id } => {
+                        if let Some(layer) = state.layers.iter_mut().find(|l| l.depth == depth && l.step_name == step_name) {
+                            layer.failed_nodes += 1;
+                            if let Some(ref mut nodes) = layer.nodes {
+                                nodes.push(NodeStatus { node_id, status: "failed".into(), label: None });
+                            }
+                        }
+                    }
+                    LayerEvent::LayerCompleted { depth, step_name } => {
+                        if let Some(layer) = state.layers.iter_mut().find(|l| l.depth == depth && l.step_name == step_name) {
+                            layer.status = "complete".into();
+                        }
+                    }
+                    LayerEvent::StepStarted { step_name } => {
+                        state.current_step = Some(step_name);
+                    }
+                    LayerEvent::Log { elapsed_secs, message } => {
+                        state.log.push_back(LogEntry { elapsed_secs, message });
+                        if state.log.len() > 200 { state.log.pop_front(); }
+                    }
+                }
+            }
+        });
+
         let result = wire_node_lib::pyramid::build_runner::run_decomposed_build(
             &pyramid_state,
             &build_slug,
@@ -4339,11 +4392,14 @@ async fn pyramid_question_build(
             characterization,
             &cancel,
             Some(progress_tx.clone()),
+            Some(layer_tx.clone()),
         )
         .await;
 
         drop(progress_tx);
+        drop(layer_tx);
         let _ = progress_handle.await;
+        let _ = layer_drain_handle.await;
 
         // Update final status
         {
@@ -5473,8 +5529,7 @@ async fn pyramid_vine_integrity(
         operational: state.pyramid.operational.clone(),
         chains_dir: state.pyramid.chains_dir.clone(),
         remote_query_rate_limiter: state.pyramid.remote_query_rate_limiter.clone(),
-        absorption_build_rate_limiter: state.pyramid.absorption_build_rate_limiter.clone(),
-        absorption_daily_spend: state.pyramid.absorption_daily_spend.clone(),
+        absorption_gate: state.pyramid.absorption_gate.clone(),
     });
 
     let summary = vine::run_integrity_check(&pyramid_state, &slug)
@@ -5518,8 +5573,7 @@ async fn pyramid_vine_rebuild_upper(
         operational: state.pyramid.operational.clone(),
         chains_dir: state.pyramid.chains_dir.clone(),
         remote_query_rate_limiter: state.pyramid.remote_query_rate_limiter.clone(),
-        absorption_build_rate_limiter: state.pyramid.absorption_build_rate_limiter.clone(),
-        absorption_daily_spend: state.pyramid.absorption_daily_spend.clone(),
+        absorption_gate: state.pyramid.absorption_gate.clone(),
     });
 
     let cancel = tokio_util::sync::CancellationToken::new();
@@ -6141,13 +6195,9 @@ fn main() {
         remote_query_rate_limiter: Arc::new(tokio::sync::Mutex::new(
             std::collections::HashMap::new(),
         )),
-        absorption_build_rate_limiter: Arc::new(tokio::sync::Mutex::new(
-            std::collections::HashMap::new(),
+        absorption_gate: Arc::new(tokio::sync::Mutex::new(
+            wire_node_lib::pyramid::AbsorptionGate::new(),
         )),
-        absorption_daily_spend: Arc::new(tokio::sync::Mutex::new((
-            0u64,
-            std::time::Instant::now(),
-        ))),
     });
 
     // Load persisted event subscriptions into the in-memory event bus

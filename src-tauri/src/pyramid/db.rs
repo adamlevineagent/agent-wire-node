@@ -1361,14 +1361,16 @@ pub fn archive_slug(conn: &Connection, slug: &str) -> Result<()> {
 /// Admin-only hard delete of a slug and all associated data (like parity.rs exemption).
 /// Unlike `delete_slug`, this also removes slug reference entries in both directions.
 pub fn purge_slug(conn: &Connection, slug: &str) -> Result<()> {
-    conn.execute(
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
         "DELETE FROM pyramid_slug_references WHERE slug = ?1 OR referenced_slug = ?1",
         rusqlite::params![slug],
     )?;
-    conn.execute(
+    tx.execute(
         "DELETE FROM pyramid_slugs WHERE slug = ?1",
         rusqlite::params![slug],
     )?;
+    tx.commit()?;
     Ok(())
 }
 

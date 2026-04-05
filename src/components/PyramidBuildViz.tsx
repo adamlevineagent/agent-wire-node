@@ -54,6 +54,8 @@ export function PyramidBuildViz({ slug, onComplete, onClose, onRetry }: PyramidB
     const [status, setStatus] = useState<BuildStatus | null>(null);
     const [error, setError] = useState<string | null>(null);
     const logRef = useRef<HTMLDivElement>(null);
+    const onCompleteRef = useRef(onComplete);
+    useEffect(() => { onCompleteRef.current = onComplete; });
 
     // Poll both v1 (for status) and v2 (for layers)
     useEffect(() => {
@@ -73,7 +75,7 @@ export function PyramidBuildViz({ slug, onComplete, onClose, onRetry }: PyramidB
                     if (v2Data) setV2(v2Data);
 
                     if (['complete', 'complete_with_errors', 'failed', 'cancelled'].includes(s.status)) {
-                        onComplete?.(s);
+                        onCompleteRef.current?.(s);
                         break;
                     }
 
@@ -92,7 +94,7 @@ export function PyramidBuildViz({ slug, onComplete, onClose, onRetry }: PyramidB
 
         poll();
         return () => { active = false; };
-    }, [slug, onComplete]);
+    }, [slug]);
 
     // Auto-scroll log
     useEffect(() => {

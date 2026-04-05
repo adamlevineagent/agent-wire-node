@@ -83,12 +83,37 @@ impl NodeLockMap {
     /// waiting on the lock. This is safe to call periodically (e.g. after a
     /// build completes) to prevent unbounded growth of the map over time.
     ///
+    /// Uses a two-phase approach to avoid a TOCTOU race: phase 1 collects
+    /// candidate keys (no shard lock held), phase 2 uses `remove_if()` which
+    /// holds the shard lock while re-checking strong_count, so no concurrent
+    /// `acquire()` can clone the Arc between the check and the removal.
+    ///
     /// Returns the number of entries removed.
     pub fn cleanup(&self) -> usize {
-        let before = self.locks.len();
-        self.locks
-            .retain(|_key, mutex| Arc::strong_count(mutex) > 1);
-        before - self.locks.len()
+        // Phase 1: collect candidate keys where strong_count == 1.
+        // This snapshot may include false positives (a task acquired between
+        // our read and phase 2), but remove_if will safely skip those.
+        let candidates: Vec<String> = self
+            .locks
+            .iter()
+            .filter(|entry| Arc::strong_count(entry.value()) == 1)
+            .map(|entry| entry.key().clone())
+            .collect();
+
+        // Phase 2: atomically re-check and remove. remove_if holds the
+        // DashMap shard lock during the predicate, so acquire() cannot
+        // interleave between the check and the removal.
+        let mut removed = 0;
+        for key in candidates {
+            if self
+                .locks
+                .remove_if(&key, |_k, mutex| Arc::strong_count(mutex) == 1)
+                .is_some()
+            {
+                removed += 1;
+            }
+        }
+        removed
     }
 }
 

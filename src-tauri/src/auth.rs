@@ -1,5 +1,16 @@
 use serde::{Deserialize, Serialize};
 
+/// Mask an email for safe log output: "a***@example.com"
+fn mask_email(email: &str) -> String {
+    match email.split_once('@') {
+        Some((local, domain)) => {
+            let first = local.chars().next().unwrap_or('*');
+            format!("{}***@{}", first, domain)
+        }
+        None => "***".to_string(),
+    }
+}
+
 /// Auth state — stores Supabase session + Wire node registration + operator session
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AuthState {
@@ -76,7 +87,7 @@ pub async fn send_magic_link(
         return Err(format!("Magic link failed ({}): {}", status, text));
     }
 
-    tracing::info!("Magic link sent to {}", email);
+    tracing::info!("Magic link sent to {}", mask_email(email));
     Ok(())
 }
 
@@ -169,7 +180,7 @@ pub async fn verify_otp(
         "email": email,
     });
 
-    tracing::info!("Verifying OTP code for {}", email);
+    tracing::info!("Verifying OTP code for {}", mask_email(email));
 
     let resp = client
         .post(&verify_url)
@@ -454,7 +465,7 @@ pub async fn set_tokens_from_deep_link(
         }
     };
 
-    tracing::info!("Deep link auth: user_id={:?}, email={:?}", user_id, email);
+    tracing::info!("Deep link auth: user_id={:?}, email={:?}", user_id, email.as_deref().map(mask_email));
 
     // Only update auth state after successful user verification
     let mut auth = app_state.auth.write().await;

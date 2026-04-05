@@ -176,11 +176,16 @@ fn load_chain_metadata(yaml_path: &Path, is_default: bool) -> Result<ChainMetada
 ///     conversation.yaml
 ///     code.yaml
 ///     document.yaml
+///     question.yaml
+///     extract-only.yaml
 ///   variants/
 ///   prompts/
 ///     conversation/
 ///     code/
 ///     document/
+///     question/
+///     shared/
+///     planner/
 /// ```
 ///
 /// Called on first run to bootstrap the chain system.
@@ -205,6 +210,8 @@ pub fn ensure_default_chains(
         chains_dir.join("prompts").join("conversation"),
         chains_dir.join("prompts").join("code"),
         chains_dir.join("prompts").join("document"),
+        chains_dir.join("prompts").join("question"),
+        chains_dir.join("prompts").join("shared"),
         chains_dir.join("prompts").join("planner"),
     ];
 
@@ -229,13 +236,15 @@ pub fn ensure_default_chains(
     }
 
     // ── Tier 2: Embedded defaults (bootstrap only) ──────────────────────
-    let defaults = [
+    let defaults: &[(&str, &str)] = &[
         ("conversation.yaml", DEFAULT_CONVERSATION_CHAIN),
         ("code.yaml", DEFAULT_CODE_CHAIN),
         ("document.yaml", DEFAULT_DOCUMENT_CHAIN),
+        ("question.yaml", include_str!("../../../chains/defaults/question.yaml")),
+        ("extract-only.yaml", include_str!("../../../chains/defaults/extract-only.yaml")),
     ];
 
-    for (filename, content) in &defaults {
+    for (filename, content) in defaults {
         let path = chains_dir.join("defaults").join(filename);
         if !path.exists() {
             std::fs::write(&path, content)
@@ -251,6 +260,36 @@ pub fn ensure_default_chains(
         std::fs::write(&planner_prompt_path, prompt_content)
             .with_context(|| format!("failed to write planner prompt: {}", planner_prompt_path.display()))?;
         tracing::info!(path = %planner_prompt_path.display(), "bootstrapped bundled planner-system.md");
+    }
+
+    // Write question prompts (bundled at compile time) — bootstrap only
+    let question_prompts: &[(&str, &str)] = &[
+        ("enhance_question.md", include_str!("../../../chains/prompts/question/enhance_question.md")),
+        ("decompose.md", include_str!("../../../chains/prompts/question/decompose.md")),
+        ("decompose_delta.md", include_str!("../../../chains/prompts/question/decompose_delta.md")),
+        ("extraction_schema.md", include_str!("../../../chains/prompts/question/extraction_schema.md")),
+    ];
+    for (filename, content) in question_prompts {
+        let path = chains_dir.join("prompts").join("question").join(filename);
+        if !path.exists() {
+            std::fs::write(&path, content)
+                .with_context(|| format!("failed to write question prompt: {}", path.display()))?;
+            tracing::info!(path = %path.display(), "bootstrapped bundled question prompt");
+        }
+    }
+
+    // Write shared prompts (bundled at compile time) — bootstrap only
+    let shared_prompts: &[(&str, &str)] = &[
+        ("heal_json.md", include_str!("../../../chains/prompts/shared/heal_json.md")),
+        ("merge_sub_chunks.md", include_str!("../../../chains/prompts/shared/merge_sub_chunks.md")),
+    ];
+    for (filename, content) in shared_prompts {
+        let path = chains_dir.join("prompts").join("shared").join(filename);
+        if !path.exists() {
+            std::fs::write(&path, content)
+                .with_context(|| format!("failed to write shared prompt: {}", path.display()))?;
+            tracing::info!(path = %path.display(), "bootstrapped bundled shared prompt");
+        }
     }
 
     Ok(())

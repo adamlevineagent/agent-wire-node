@@ -18,7 +18,7 @@
 #   7.  L2 cross-layer webbing
 
 schema_version: 1
-id: document-default
+id: document-v4-classified
 name: Document Pyramid
 description: >
   Four-axis document analysis: parallel per-doc classification, taxonomy
@@ -298,6 +298,9 @@ steps:
     cluster_response_schema:
       type: object
       properties:
+        apex_ready:
+          type: boolean
+          description: "true if nodes are the natural top-level dimensions"
         clusters:
           type: array
           items:
@@ -314,7 +317,7 @@ steps:
                   type: string
             required: ["name", "description", "node_ids"]
             additionalProperties: false
-      required: ["clusters"]
+      required: ["apex_ready", "clusters"]
       additionalProperties: false
     depth: 1
     save_as: node

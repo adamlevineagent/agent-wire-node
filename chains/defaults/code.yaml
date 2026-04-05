@@ -49,7 +49,7 @@ steps:
     split_strategy: "lines"
     split_overlap_tokens: 200
     split_merge: true
-    split_merge_instruction: "$prompts/shared/merge_sub_chunks.md"
+    merge_instruction: "$prompts/shared/merge_sub_chunks.md"
     model_tier: mid
     temperature: 0.3
     on_error: "retry(3)"

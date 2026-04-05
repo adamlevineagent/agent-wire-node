@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 
 // Re-export PyramidBuildViz as BuildProgress so all existing imports get the new viz
@@ -23,6 +23,8 @@ interface BuildProgressProps {
 export function BuildProgressLegacy({ slug, onComplete, onClose, onRetry }: BuildProgressProps) {
     const [status, setStatus] = useState<BuildStatus | null>(null);
     const [error, setError] = useState<string | null>(null);
+    const onCompleteRef = useRef(onComplete);
+    useEffect(() => { onCompleteRef.current = onComplete; });
 
     useEffect(() => {
         let active = true;
@@ -35,7 +37,7 @@ export function BuildProgressLegacy({ slug, onComplete, onClose, onRetry }: Buil
                     setStatus(s);
 
                     if (['complete', 'complete_with_errors', 'failed', 'cancelled'].includes(s.status)) {
-                        onComplete?.(s);
+                        onCompleteRef.current?.(s);
                         break;
                     }
 
@@ -55,7 +57,7 @@ export function BuildProgressLegacy({ slug, onComplete, onClose, onRetry }: Buil
 
         poll();
         return () => { active = false; };
-    }, [slug, onComplete]);
+    }, [slug]);
 
     const handleCancel = useCallback(async () => {
         try {

@@ -120,13 +120,20 @@ pub fn auto_detect_changed_files(conn: &Connection, slug: &str) -> Result<Vec<Ch
     // pyramid_pending_mutations columns: id, slug, layer, mutation_type, target_ref, detail,
     // cascade_depth, detected_at, processed, batch_id.
     // target_ref holds the file path for file-level mutations. Only process unprocessed entries.
+    //
+    // Atomic CTE: SELECT + UPDATE in a single statement so no concurrent caller can
+    // double-process or miss entries between the read and the flag flip.
     let mut stmt = conn.prepare(
-        "SELECT DISTINCT target_ref, mutation_type
-         FROM pyramid_pending_mutations
-         WHERE slug = ?1 AND target_ref IS NOT NULL AND target_ref != ''
-           AND mutation_type IN ('file_change', 'new_file', 'deleted_file', 'rename_candidate')
-           AND processed = 0
-         ORDER BY detected_at DESC",
+        "WITH batch AS (
+             SELECT id, target_ref, mutation_type
+             FROM pyramid_pending_mutations
+             WHERE slug = ?1 AND target_ref IS NOT NULL AND target_ref != ''
+               AND mutation_type IN ('file_change', 'new_file', 'deleted_file', 'rename_candidate')
+               AND processed = 0
+         )
+         UPDATE pyramid_pending_mutations SET processed = 1
+         WHERE id IN (SELECT id FROM batch)
+         RETURNING target_ref, mutation_type",
     )?;
 
     let rows = stmt.query_map(rusqlite::params![slug], |row| {
@@ -135,9 +142,14 @@ pub fn auto_detect_changed_files(conn: &Connection, slug: &str) -> Result<Vec<Ch
         Ok((file_path, mutation_type))
     })?;
 
+    // Deduplicate by (path, mutation_type) — the old query used SELECT DISTINCT.
+    let mut seen = std::collections::HashSet::new();
     let mut changed_files = Vec::new();
     for row in rows {
         let (file_path, mutation_type) = row?;
+        if !seen.insert((file_path.clone(), mutation_type.clone())) {
+            continue;
+        }
         let change_type = match mutation_type.as_str() {
             // New vocabulary (DADBEAR watcher)
             "new_file" => ChangeType::Addition,
@@ -153,17 +165,6 @@ pub fn auto_detect_changed_files(conn: &Connection, slug: &str) -> Result<Vec<Ch
             path: file_path,
             change_type,
         });
-    }
-
-    // Mark only file-level mutations as processed — preserve non-file mutations
-    // (node_stale, edge_stale, faq_category_stale, confirmed_stale) for the stale engine.
-    if !changed_files.is_empty() {
-        conn.execute(
-            "UPDATE pyramid_pending_mutations SET processed = 1
-             WHERE slug = ?1 AND processed = 0
-               AND mutation_type IN ('file_change', 'new_file', 'deleted_file', 'rename_candidate')",
-            rusqlite::params![slug],
-        )?;
     }
 
     info!(

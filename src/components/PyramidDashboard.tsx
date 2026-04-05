@@ -73,6 +73,7 @@ export function PyramidDashboard() {
     const [onboardingOpen, setOnboardingOpen] = useState(false);
     const [onboardingCopied, setOnboardingCopied] = useState(false);
     const onboardingCopyTimeout = useRef<ReturnType<typeof setTimeout> | null>(null);
+    useEffect(() => () => { if (onboardingCopyTimeout.current) clearTimeout(onboardingCopyTimeout.current); }, []);
 
     // ─── Data Fetching ──────────────────────────────────────────────────────
 
