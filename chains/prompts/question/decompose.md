@@ -3,25 +3,25 @@ You are decomposing a question into sub-questions to build a knowledge pyramid f
 You will receive the parent question AND summaries of the source material. USE THE SOURCE MATERIAL to understand what the system or corpus IS and DOES — not to derive a list of files or folders.
 
 WHAT GOOD DECOMPOSITION LOOKS LIKE:
-Ask about what the system DOES, how it WORKS, why it EXISTS, what someone would NEED TO UNDERSTAND to grasp it fully. Good sub-questions address purpose, behavior, architecture, capabilities, data flow, and user experience.
+Ask about what the system DOES, how it WORKS, why it EXISTS, and how it behaves across time and space. You MUST use a MULTI-LENS ABSTRACTION FRAMEWORK to break down the question, rather than just splitting it by structural paths.
+
+Force your sub-questions to view the corpus through these lenses:
+1. **The Value/Intent Lens**: "What human or business value does this enable? Why was it built?"
+2. **The Kinetic/State Flow Lens**: "How do data, leverage, and events move through this space? How is state mutated?"
+3. **The Temporal Lens**: "How do the components of the corpus relate to time relative to each other? (e.g., Pre-flight builds vs Active lifecycles vs Historical state)"
+4. **The Metaphorical Lens**: "What underlying physical or societal mechanism does this system emulate conceptually?"
 
 BAD decomposition:
 - "What files are in the X folder?"
-- "What is the top-level directory layout?"
 - "What does the config file do?"
-These tell someone WHERE things are, not what they mean. Sub-questions ask about knowledge areas, not about files or file locations.
+- "What is the UI made of?"
+These tell someone WHERE things are or what they are made of mechanically, not what they mean conceptually. Sub-questions must evaluate profound systemic abstraction.
 
-GOOD decomposition for code:
-- "What is this software and what problem does it solve?"
-- "What are the core user-facing capabilities?"
-- "How does the [major system] work?"
-- "What are the key data models and how does data flow?"
-- "How are [major feature areas] implemented?"
-
-GOOD decomposition for documents:
-- "What is the central argument or purpose of this body of work?"
-- "What are the key mechanisms, policies, or decisions described?"
-- "What are the implications or outcomes?"
+GOOD decomposition:
+- "What is the overarching value and intent of this corpus?"
+- "How does the system mutate and distribute state across its kinetic flow?"
+- "Where do these capabilities sit across the temporal lifecycle (build vs runtime)?"
+- "What core conceptual mechanisms and policies define the architecture?"
 
 GRANULARITY GUIDANCE:
 The `granularity` parameter is a scale from 1 (highly focused — only the most essential questions) to 5 (comprehensive — all meaningful sub-questions). At granularity 3, aim for a balanced decomposition: enough sub-questions to cover the major areas without excessive detail. Lean toward merging overlapping concerns rather than splitting everything out.

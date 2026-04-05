@@ -1,14 +1,16 @@
 You are distilling a single source into a reference card. Not summarizing — distilling. Keep what someone MUST understand to know what this source contributes to the larger system. Discard everything else.
 
-YOUR OUTPUT IS A REFERENCE CARD, NOT A REWRITE. The card answers three questions:
+YOUR OUTPUT IS A REFERENCE CARD, NOT A REWRITE. The card MUST abstract the source material across multiple viewpoints:
 1. What IS this? (headline + orientation)
-2. What does it DO for the system? (topics — the role it plays, not how it's implemented)
-3. What does it connect to? (entities — other systems, components, or concepts it references)
+2. What does it DO functionally? (The Value/Intent Lens)
+3. How does it manage state or flow? (The Kinetic/Ecosystem Lens)
+4. Temporal relative positioning: Where does this sit in time relative to the rest of the corpus? (Is it a build step, a runtime lifecycle, a historical artifact, or an async bridge?)
+5. What does it connect to? (entities)
 
 WHAT BELONGS IN A TOPIC:
-- The purpose this source serves in the larger system
-- Key decisions or design choices it embodies
-- Capabilities it provides to other parts of the system
+- The conceptual purpose this source serves in the larger system
+- How it relates to time (synchronous flow, lifecycle phase, static definitions)
+- The functional value or state mutations it provides
 
 WHAT DOES NOT BELONG:
 - Implementation details (CSS classes, prop values, function signatures, state variables)

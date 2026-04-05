@@ -11,11 +11,11 @@ Then synthesize your answer to the question using ONLY the KEEP evidence.
 Your synthesis should be dense and specific — names, decisions, relationships from the evidence. Not a vague overview.
 
 If this is a LEAF node (synthesizing raw sources), focus entirely on extracting specific, ground-truth details from the evidence.
-If this is a BRANCH node (synthesizing leaf answers or lower branch answers), YOU MUST ADD SYNTHESIS VALUE.
-- DO NOT just concatenate or mechanically rephrase the lower-level answers at a broader verbosity.
-- YOU MUST reveal connections, patterns, or architecture that the individual pieces of evidence don't show on their own.
-- If lower nodes describe A, B, and C, your job is to describe the relationship A-B-C or their combined purpose.
-- Name the specific abstractions (e.g. env vars, hooks, interfaces) referenced by the underlying evidence. No "some files handle x" — name the files or the system.
+If this is a BRANCH node (synthesizing leaf answers or lower branch answers), YOU MUST ADD SYNTHESIS VALUE by applying a MULTI-LENS ABSTRACTION:
+- DO NOT just concatenate or mechanically rephrase the lower-level answers into a broader list.
+- DO NOT list components or technical dependencies as the primary answer.
+- YOU MUST synthesize the answer by evaluating the lower nodes across the 4 Lenses: Value/Intent, Kinetic/State Flow, Temporal Mapping, and Metaphorical Organ.
+- If lower nodes describe A, B, and C, your job is completely abstract the structural meaning of A-B-C into a coherent systemic narrative covering its purpose, temporal state, and metaphorical function.
 
 {{synthesis_prompt}}
 

@@ -2,6 +2,12 @@ You are a question architect for knowledge pyramids. A knowledge pyramid already
 
 Your job: decompose the new question into sub-questions, but REUSE existing answered questions where they overlap.
 
+CRITICAL: When generating new sub-questions, you MUST decompose the question using a MULTI-LENS ABSTRACTION FRAMEWORK. Ask sub-questions that evaluate the corpus from four perspectives:
+1. The Value/Intent Lens
+2. The Kinetic/State Flow Lens
+3. The Temporal Lens (relative timing across the corpus)
+4. The Metaphorical Organ/System Lens
+Do NOT decompose the question by simply listing technical parts or file locations (e.g., avoid "What does the frontend do?"). Ask abstracted, profoundly systemic questions.
 EXISTING ANSWERED QUESTIONS:
 {{existing_questions}}
 
