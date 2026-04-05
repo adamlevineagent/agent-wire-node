@@ -4712,6 +4712,7 @@ async fn execute_evidence_loop(
                                 description: missing_desc.clone(),
                                 layer: a.node.depth as i64,
                                 resolved: false,
+                                resolution_confidence: 0.0,
                             };
                             db::save_gap(&c, &slug_owned, &gap, Some(&bid_for_gaps))?;
                         }
@@ -4725,6 +4726,7 @@ async fn execute_evidence_loop(
                             ),
                             layer: fq.layer,
                             resolved: false,
+                            resolution_confidence: 0.0,
                         };
                         db::save_gap(&c, &slug_owned, &gap, Some(&bid_for_gaps))?;
                     }

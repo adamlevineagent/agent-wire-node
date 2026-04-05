@@ -238,6 +238,28 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_annotations_node ON pyramid_annotations(slug, node_id);
 
+        -- Annotation reactions (voting)
+        CREATE TABLE IF NOT EXISTS pyramid_annotation_reactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            annotation_id INTEGER NOT NULL REFERENCES pyramid_annotations(id) ON DELETE CASCADE,
+            reaction TEXT NOT NULL CHECK(reaction IN ('up', 'down')),
+            agent_id TEXT NOT NULL DEFAULT 'anonymous',
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(annotation_id, agent_id)
+        );
+
+        -- Agent session tracking
+        CREATE TABLE IF NOT EXISTS pyramid_agent_sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            slug TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
+            started_at TEXT NOT NULL DEFAULT (datetime('now')),
+            last_activity TEXT NOT NULL DEFAULT (datetime('now')),
+            actions_count INTEGER NOT NULL DEFAULT 0,
+            summary TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_agent_sessions_slug ON pyramid_agent_sessions(slug);
+
         -- Cost monitoring table
         CREATE TABLE IF NOT EXISTS pyramid_cost_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -737,6 +759,17 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
         "CREATE INDEX IF NOT EXISTS idx_nodes_targeted_l0
          ON pyramid_nodes(slug, depth)
          WHERE depth = 0 AND self_prompt != '';",
+    );
+
+    // Migrate pyramid_gaps: add resolution_confidence column
+    let _ = conn.execute(
+        "ALTER TABLE pyramid_gaps ADD COLUMN resolution_confidence REAL NOT NULL DEFAULT 0.0",
+        [],
+    );
+    // Backfill: existing resolved=1 gaps get confidence=1.0
+    let _ = conn.execute(
+        "UPDATE pyramid_gaps SET resolution_confidence = 1.0 WHERE resolved = 1 AND resolution_confidence = 0.0",
+        [],
     );
 
     // ── Schema Prep Migration for Wire Online push ──────────────────────────
@@ -4177,7 +4210,7 @@ pub fn save_gap(
 /// Get all gap reports for a slug.
 pub fn get_gaps_for_slug(conn: &Connection, slug: &str) -> Result<Vec<GapReport>> {
     let mut stmt = conn.prepare(
-        "SELECT question_id, description, layer, COALESCE(resolved, 0) FROM pyramid_gaps WHERE slug = ?1 ORDER BY id ASC",
+        "SELECT question_id, description, layer, COALESCE(resolved, 0), COALESCE(resolution_confidence, CASE WHEN COALESCE(resolved, 0) = 1 THEN 1.0 ELSE 0.0 END) FROM pyramid_gaps WHERE slug = ?1 ORDER BY id ASC",
     )?;
     let rows = stmt.query_map(rusqlite::params![slug], |row| {
         Ok(GapReport {
@@ -4185,6 +4218,7 @@ pub fn get_gaps_for_slug(conn: &Connection, slug: &str) -> Result<Vec<GapReport>
             description: row.get(1)?,
             layer: row.get(2)?,
             resolved: row.get::<_, i64>(3).unwrap_or(0) != 0,
+            resolution_confidence: row.get::<_, f64>(4).unwrap_or(0.0),
         })
     })?;
     Ok(rows.filter_map(|r| r.ok()).collect())
@@ -4193,15 +4227,16 @@ pub fn get_gaps_for_slug(conn: &Connection, slug: &str) -> Result<Vec<GapReport>
 /// Get unresolved gap reports for a slug (for gap processing pass).
 pub fn get_unresolved_gaps_for_slug(conn: &Connection, slug: &str) -> Result<Vec<GapReport>> {
     let mut stmt = conn.prepare(
-        "SELECT question_id, description, layer FROM pyramid_gaps
-         WHERE slug = ?1 AND COALESCE(resolved, 0) = 0 ORDER BY id ASC",
+        "SELECT question_id, description, layer, 0, COALESCE(resolution_confidence, 0.0) FROM pyramid_gaps
+         WHERE slug = ?1 AND COALESCE(resolution_confidence, CASE WHEN COALESCE(resolved, 0) = 1 THEN 1.0 ELSE 0.0 END) < 0.8 ORDER BY id ASC",
     )?;
     let rows = stmt.query_map(rusqlite::params![slug], |row| {
         Ok(GapReport {
             question_id: row.get(0)?,
             description: row.get(1)?,
             layer: row.get(2)?,
-            resolved: false,
+            resolved: row.get::<_, i64>(3).unwrap_or(0) != 0,
+            resolution_confidence: row.get::<_, f64>(4).unwrap_or(0.0),
         })
     })?;
     Ok(rows.filter_map(|r| r.ok()).collect())
@@ -4214,7 +4249,7 @@ pub fn get_gaps_for_question(
     question_id: &str,
 ) -> Result<Vec<GapReport>> {
     let mut stmt = conn.prepare(
-        "SELECT question_id, description, layer, COALESCE(resolved, 0) FROM pyramid_gaps
+        "SELECT question_id, description, layer, COALESCE(resolved, 0), COALESCE(resolution_confidence, CASE WHEN COALESCE(resolved, 0) = 1 THEN 1.0 ELSE 0.0 END) FROM pyramid_gaps
          WHERE slug = ?1 AND question_id = ?2 ORDER BY id ASC",
     )?;
     let rows = stmt.query_map(rusqlite::params![slug, question_id], |row| {
@@ -4223,6 +4258,7 @@ pub fn get_gaps_for_question(
             description: row.get(1)?,
             layer: row.get(2)?,
             resolved: row.get::<_, i64>(3).unwrap_or(0) != 0,
+            resolution_confidence: row.get::<_, f64>(4).unwrap_or(0.0),
         })
     })?;
     Ok(rows.filter_map(|r| r.ok()).collect())
@@ -4236,7 +4272,7 @@ pub fn mark_gap_resolved(
     description: &str,
 ) -> Result<()> {
     conn.execute(
-        "UPDATE pyramid_gaps SET resolved = 1
+        "UPDATE pyramid_gaps SET resolved = 1, resolution_confidence = 1.0
          WHERE slug = ?1 AND question_id = ?2 AND description = ?3",
         rusqlite::params![slug, question_id, description],
     )?;
@@ -5405,6 +5441,91 @@ pub fn expire_unredeemed_tokens(conn: &Connection) -> Result<usize> {
         [],
     )?;
     Ok(expired)
+}
+
+// ── Annotation Reactions & Agent Sessions ───────────────────────────────────
+
+/// Save an annotation reaction (up/down vote). Uses INSERT OR REPLACE to allow changing votes.
+pub fn save_annotation_reaction(
+    conn: &Connection,
+    annotation_id: i64,
+    reaction: &str,
+    agent_id: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO pyramid_annotation_reactions (annotation_id, reaction, agent_id) VALUES (?1, ?2, ?3)",
+        rusqlite::params![annotation_id, reaction, agent_id],
+    )?;
+    Ok(())
+}
+
+/// Get reaction counts for an annotation.
+pub fn get_annotation_reactions(conn: &Connection, annotation_id: i64) -> Result<(i64, i64)> {
+    let up: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pyramid_annotation_reactions WHERE annotation_id = ?1 AND reaction = 'up'",
+        rusqlite::params![annotation_id],
+        |row| row.get(0),
+    ).unwrap_or(0);
+    let down: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pyramid_annotation_reactions WHERE annotation_id = ?1 AND reaction = 'down'",
+        rusqlite::params![annotation_id],
+        |row| row.get(0),
+    ).unwrap_or(0);
+    Ok((up, down))
+}
+
+/// Register an agent session.
+pub fn register_agent_session(conn: &Connection, slug: &str, agent_id: &str) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO pyramid_agent_sessions (slug, agent_id) VALUES (?1, ?2)",
+        rusqlite::params![slug, agent_id],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// Get recent agent sessions for a slug.
+pub fn get_agent_sessions(conn: &Connection, slug: &str, limit: i64) -> Result<Vec<serde_json::Value>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, slug, agent_id, started_at, last_activity, actions_count, summary
+         FROM pyramid_agent_sessions WHERE slug = ?1
+         ORDER BY last_activity DESC LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![slug, limit], |row| {
+        Ok(serde_json::json!({
+            "id": row.get::<_, i64>(0)?,
+            "slug": row.get::<_, String>(1)?,
+            "agent_id": row.get::<_, String>(2)?,
+            "started_at": row.get::<_, String>(3)?,
+            "last_activity": row.get::<_, String>(4)?,
+            "actions_count": row.get::<_, i64>(5)?,
+            "summary": row.get::<_, Option<String>>(6)?,
+        }))
+    })?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
+/// Bump session activity (fire-and-forget on each request with X-Agent-Id).
+pub fn bump_agent_session(conn: &Connection, slug: &str, agent_id: &str) {
+    let _ = conn.execute(
+        "UPDATE pyramid_agent_sessions SET last_activity = datetime('now'), actions_count = actions_count + 1
+         WHERE slug = ?1 AND agent_id = ?2 AND id = (SELECT MAX(id) FROM pyramid_agent_sessions WHERE slug = ?1 AND agent_id = ?2)",
+        rusqlite::params![slug, agent_id],
+    );
+}
+
+/// Set gap resolution confidence to a specific value.
+pub fn set_gap_confidence(
+    conn: &Connection,
+    slug: &str,
+    question_id: &str,
+    description: &str,
+    confidence: f64,
+) -> Result<usize> {
+    let rows = conn.execute(
+        "UPDATE pyramid_gaps SET resolution_confidence = ?1, resolved = CASE WHEN ?1 >= 0.8 THEN 1 ELSE 0 END WHERE slug = ?2 AND question_id = ?3 AND description = ?4",
+        rusqlite::params![confidence, slug, question_id, description],
+    )?;
+    Ok(rows)
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────

@@ -194,10 +194,17 @@ pub struct NodeWithWebEdges {
 pub struct SearchHit {
     pub node_id: String,
     pub depth: i64,
+    pub headline: String,
     pub snippet: String,
     pub score: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_slug: Option<String>,
+    #[serde(default)]
+    pub child_count: i64,
+    #[serde(default)]
+    pub annotation_count: i64,
+    #[serde(default)]
+    pub has_web_edges: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -934,8 +941,12 @@ pub struct GapReport {
     pub question_id: String,
     pub description: String,
     pub layer: i64,
+    /// Backward compat: kept for serde deserialization of existing data
     #[serde(default)]
     pub resolved: bool,
+    /// 0.0 = completely open, 1.0 = definitively answered. Threshold for "resolved" display: 0.8.
+    #[serde(default)]
+    pub resolution_confidence: f64,
 }
 
 /// A group of targeted L0 nodes sharing the same triggering question (self_prompt).

@@ -336,6 +336,8 @@ struct CreateSlugBody {
 #[derive(Deserialize)]
 struct SearchQuery {
     q: String,
+    #[serde(default)]
+    semantic: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -1462,7 +1464,54 @@ pub fn pyramid_routes(
         .and_then(handle_absorption_config));
 
     let top15 = top14.or(absorption_config).unify().boxed(); // WS-ONLINE-G: Absorption config
-    top15
+
+    // POST /pyramid/:slug/navigate — LLM-guided question answering
+    let navigate = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("navigate"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(with_slug_read_auth(state.clone(), jwt_public_key.clone()))
+        .and(warp::body::json())
+        .and_then(handle_navigate));
+
+    // POST /pyramid/:slug/annotations/:id/react — annotation voting
+    let react = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("annotations"))
+        .and(warp::path::param::<String>())
+        .and(warp::path("react"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(with_auth_state(state.clone()))
+        .and(warp::body::json())
+        .and_then(handle_react));
+
+    // POST /pyramid/:slug/sessions/register — agent session registration
+    let session_register = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("sessions"))
+        .and(warp::path("register"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(with_auth_state(state.clone()))
+        .and(warp::body::json())
+        .and_then(handle_session_register));
+
+    // GET /pyramid/:slug/sessions — list agent sessions
+    let sessions_list = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("sessions"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(with_slug_read_auth(state.clone(), jwt_public_key.clone()))
+        .and_then(handle_sessions_list));
+
+    let r_new1 = navigate.or(react).unify().boxed();
+    let r_new2 = session_register.or(sessions_list).unify().boxed();
+    let top16 = top15.or(r_new1).unify().boxed();
+    let top17 = top16.or(r_new2).unify().boxed();
+    top17
 }
 
 // ── Route handlers ──────────────────────────────────────────────────
@@ -1720,30 +1769,100 @@ async fn handle_search(
     params: SearchQuery,
     agent_id: Option<String>,
 ) -> Result<warp::reply::Response, warp::Rejection> {
-    let conn = state.reader.lock().await;
-    // WS-ONLINE-E: Access tier enforcement for remote queries
-    if let Err(response) = enforce_access_tier(&conn, &slug_name, &auth_source) {
-        return Ok(response);
-    }
-    match query::search(&conn, &slug_name, &params.q) {
-        Ok(hits) => {
-            let response = json_ok(&hits);
-            let ids: Vec<String> = hits.iter().map(|h| h.node_id.clone()).collect();
-            log_query_usage(
-                state.writer.clone(),
-                slug_name,
-                "search".to_string(),
-                serde_json::json!({"q": params.q}).to_string(),
-                ids,
-                agent_id,
-            );
-            Ok(response)
+    // Initial search with reader lock
+    let hits = {
+        let conn = state.reader.lock().await;
+        // WS-ONLINE-E: Access tier enforcement for remote queries
+        if let Err(response) = enforce_access_tier(&conn, &slug_name, &auth_source) {
+            return Ok(response);
         }
-        Err(e) => Ok(json_error(
-            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
-            &e.to_string(),
-        )),
+        match query::search(&conn, &slug_name, &params.q) {
+            Ok(h) => h,
+            Err(e) => {
+                return Ok(json_error(
+                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    &e.to_string(),
+                ));
+            }
+        }
+    }; // reader lock dropped here
+
+    // If semantic=true and 0 results, try LLM keyword rewrite
+    if hits.is_empty() && params.semantic.unwrap_or(false) {
+        let config = state.config.read().await;
+        if !config.api_key.is_empty() {
+            let llm_config = config.clone();
+            drop(config);
+
+            let system = "You extract search keywords from natural language questions. Given a question, output 3-5 keyword phrases that would match technical documentation. Output one phrase per line, nothing else.";
+            let user = &params.q;
+
+            match super::llm::call_model_unified(&llm_config, system, user, 0.0, 200, None).await {
+                Ok(response) => {
+                    // Re-acquire reader lock for keyword searches
+                    let conn = state.reader.lock().await;
+                    let mut all_hits = Vec::new();
+                    let mut seen_ids = std::collections::HashSet::new();
+
+                    for keyword in response.content.lines() {
+                        let kw = keyword.trim();
+                        if kw.is_empty() {
+                            continue;
+                        }
+                        if let Ok(kw_hits) = query::search(&conn, &slug_name, kw) {
+                            for hit in kw_hits {
+                                if seen_ids.insert(hit.node_id.clone()) {
+                                    all_hits.push(hit);
+                                }
+                            }
+                        }
+                    }
+
+                    let ids: Vec<String> = all_hits.iter().map(|h| h.node_id.clone()).collect();
+                    let rewritten_keywords: Vec<&str> = response
+                        .content
+                        .lines()
+                        .map(|l| l.trim())
+                        .filter(|l| !l.is_empty())
+                        .collect();
+                    drop(conn);
+
+                    log_query_usage(
+                        state.writer.clone(),
+                        slug_name,
+                        "search".to_string(),
+                        serde_json::json!({"q": params.q, "semantic_rewrite": true}).to_string(),
+                        ids,
+                        agent_id,
+                    );
+
+                    let response_json = serde_json::json!({
+                        "results": all_hits,
+                        "semantic_rewrite": true,
+                        "original_query": params.q,
+                        "rewritten_keywords": rewritten_keywords,
+                    });
+                    return Ok(json_ok(&response_json));
+                }
+                Err(_) => {
+                    // LLM failed, fall through to return empty results
+                }
+            }
+        }
     }
+
+    // Normal path: return results directly
+    let response = json_ok(&hits);
+    let ids: Vec<String> = hits.iter().map(|h| h.node_id.clone()).collect();
+    log_query_usage(
+        state.writer.clone(),
+        slug_name,
+        "search".to_string(),
+        serde_json::json!({"q": params.q}).to_string(),
+        ids,
+        agent_id,
+    );
+    Ok(response)
 }
 
 async fn handle_usage(
@@ -5374,4 +5493,227 @@ async fn handle_absorption_config(
         "rate_limit_per_operator": rate_limit,
         "daily_spend_cap": daily_cap,
     })))
+}
+
+// ── Navigate handler (LLM-guided question answering) ────────────────
+
+#[derive(Debug, Deserialize)]
+struct NavigateBody {
+    question: String,
+}
+
+async fn handle_navigate(
+    slug_name: String,
+    (state, _auth_source): (Arc<PyramidState>, AuthSource),
+    body: NavigateBody,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    // Check LLM configuration
+    let config = state.config.read().await;
+    if config.api_key.is_empty() {
+        return Ok(json_error(
+            warp::http::StatusCode::SERVICE_UNAVAILABLE,
+            "LLM not configured. Set an OpenRouter API key to use navigate.",
+        ));
+    }
+    let llm_config = config.clone();
+    drop(config);
+
+    // Search for relevant nodes
+    let search_results = {
+        let conn = state.reader.lock().await;
+        match super::query::search(&conn, &slug_name, &body.question) {
+            Ok(r) => r,
+            Err(e) => {
+                return Ok(json_error(
+                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    &e.to_string(),
+                ))
+            }
+        }
+    };
+
+    if search_results.is_empty() {
+        return Ok(json_ok(&serde_json::json!({
+            "answer": null,
+            "message": "No relevant nodes found for this question.",
+            "search_results": [],
+        })));
+    }
+
+    // Fetch full content for top 5 results
+    let top_results: Vec<_> = search_results.iter().take(5).collect();
+    let mut node_contents = Vec::new();
+    {
+        let conn = state.reader.lock().await;
+        for hit in &top_results {
+            if let Ok(Some(node)) = super::db::get_node(&conn, &slug_name, &hit.node_id) {
+                let content = format!(
+                    "Node {}: {}\n{}",
+                    node.id,
+                    node.headline,
+                    if node.distilled.len() > 800 {
+                        &node.distilled[..800]
+                    } else {
+                        &node.distilled
+                    }
+                );
+                node_contents.push((node.id.clone(), content));
+            }
+        }
+    }
+
+    if node_contents.is_empty() {
+        return Ok(json_ok(&serde_json::json!({
+            "answer": null,
+            "message": "Could not fetch node content.",
+            "search_results": search_results.iter().take(5).collect::<Vec<_>>(),
+        })));
+    }
+
+    // Build LLM prompt
+    let system = "You answer questions using knowledge pyramid nodes. Cite the node ID (e.g. L1-xxx) that supports each claim. Be concise and direct. If the nodes don't contain enough information to fully answer, say what you can and note what's missing.";
+    let user = format!(
+        "Question: {}\n\nKnowledge nodes:\n{}",
+        body.question,
+        node_contents
+            .iter()
+            .map(|(_, c)| c.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n---\n\n")
+    );
+
+    match super::llm::call_model_unified(&llm_config, system, &user, 0.2, 600, None).await {
+        Ok(response) => {
+            let cited_nodes: Vec<&str> = node_contents
+                .iter()
+                .filter(|(id, _)| response.content.contains(id))
+                .map(|(id, _)| id.as_str())
+                .collect();
+
+            Ok(json_ok(&serde_json::json!({
+                "answer": response.content,
+                "cited_nodes": cited_nodes,
+                "search_results": search_results.iter().take(5).collect::<Vec<_>>(),
+            })))
+        }
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("LLM call failed: {}", e),
+        )),
+    }
+}
+
+// ── React handler (annotation voting) ───────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct ReactBody {
+    reaction: String,
+    agent_id: Option<String>,
+}
+
+async fn handle_react(
+    _slug_name: String,
+    annotation_id: String,
+    state: Arc<PyramidState>,
+    body: ReactBody,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    if body.reaction != "up" && body.reaction != "down" {
+        return Ok(json_error(
+            warp::http::StatusCode::BAD_REQUEST,
+            "reaction must be 'up' or 'down'",
+        ));
+    }
+
+    let ann_id: i64 = match annotation_id.parse() {
+        Ok(id) => id,
+        Err(_) => {
+            return Ok(json_error(
+                warp::http::StatusCode::BAD_REQUEST,
+                "invalid annotation ID",
+            ))
+        }
+    };
+
+    let agent = body.agent_id.unwrap_or_else(|| "anonymous".to_string());
+
+    let conn = state.writer.lock().await;
+    if let Err(e) = super::db::save_annotation_reaction(&conn, ann_id, &body.reaction, &agent) {
+        return Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        ));
+    }
+
+    match super::db::get_annotation_reactions(&conn, ann_id) {
+        Ok((up, down)) => Ok(json_ok(&serde_json::json!({
+            "annotation_id": ann_id,
+            "up": up,
+            "down": down,
+        }))),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
+    }
+}
+
+// ── Session handlers (agent session registration & listing) ─────────
+
+#[derive(Debug, Deserialize)]
+struct SessionRegisterBody {
+    agent_id: String,
+}
+
+async fn handle_session_register(
+    slug_name: String,
+    state: Arc<PyramidState>,
+    body: SessionRegisterBody,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let conn = state.writer.lock().await;
+    // Validate slug exists
+    match super::slug::get_slug(&conn, &slug_name) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return Ok(json_error(
+                warp::http::StatusCode::NOT_FOUND,
+                &format!("Slug '{}' not found", slug_name),
+            ))
+        }
+        Err(e) => {
+            return Ok(json_error(
+                warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                &e.to_string(),
+            ))
+        }
+    }
+
+    match super::db::register_agent_session(&conn, &slug_name, &body.agent_id) {
+        Ok(session_id) => Ok(warp::reply::with_status(
+            warp::reply::json(&serde_json::json!({
+                "session_id": session_id,
+                "slug": slug_name,
+                "agent_id": body.agent_id,
+            })),
+            warp::http::StatusCode::CREATED,
+        )
+        .into_response()),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
+    }
+}
+
+async fn handle_sessions_list(
+    slug_name: String,
+    (state, _auth_source): (Arc<PyramidState>, AuthSource),
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let conn = state.reader.lock().await;
+    match super::db::get_agent_sessions(&conn, &slug_name, 50) {
+        Ok(sessions) => Ok(json_ok(&sessions)),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
+    }
 }

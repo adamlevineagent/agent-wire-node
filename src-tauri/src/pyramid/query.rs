@@ -960,9 +960,13 @@ pub fn search(conn: &Connection, slug: &str, term: &str) -> Result<Vec<SearchHit
             Ok(SearchHit {
                 node_id: id,
                 depth,
+                headline,
                 snippet,
                 score,
                 source_slug: source_slug_tag,
+                child_count: 0,
+                annotation_count: 0,
+                has_web_edges: false,
             })
         })?
         .filter_map(|r| match r {
@@ -981,6 +985,100 @@ pub fn search(conn: &Connection, slug: &str, term: &str) -> Result<Vec<SearchHit
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
+
+    // ── Enrichment pass: fill child_count, annotation_count, has_web_edges ──
+    if !sorted.is_empty() {
+        // Build node ID list for batch queries
+        let node_ids: Vec<String> = sorted.iter().map(|h| h.node_id.clone()).collect();
+
+        // 1. Child counts from live_pyramid_nodes.children (JSON array)
+        {
+            let placeholders: String = node_ids.iter().enumerate()
+                .map(|(i, _)| format!("?{}", i + 1))
+                .collect::<Vec<_>>().join(", ");
+            let sql = format!(
+                "SELECT id, json_array_length(children) FROM live_pyramid_nodes WHERE id IN ({})",
+                placeholders
+            );
+            let params: Vec<&dyn rusqlite::types::ToSql> = node_ids.iter()
+                .map(|id| id as &dyn rusqlite::types::ToSql)
+                .collect();
+            if let Ok(mut stmt) = conn.prepare(&sql) {
+                let mut child_map: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+                if let Ok(rows) = stmt.query_map(params.as_slice(), |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1).unwrap_or(0)))
+                }) {
+                    for row in rows.flatten() {
+                        child_map.insert(row.0, row.1);
+                    }
+                }
+                for hit in sorted.iter_mut() {
+                    if let Some(&count) = child_map.get(&hit.node_id) {
+                        hit.child_count = count;
+                    }
+                }
+            }
+        }
+
+        // 2. Annotation counts from pyramid_annotations
+        {
+            let placeholders: String = node_ids.iter().enumerate()
+                .map(|(i, _)| format!("?{}", i + 1))
+                .collect::<Vec<_>>().join(", ");
+            let sql = format!(
+                "SELECT node_id, COUNT(*) FROM pyramid_annotations WHERE node_id IN ({}) GROUP BY node_id",
+                placeholders
+            );
+            let params: Vec<&dyn rusqlite::types::ToSql> = node_ids.iter()
+                .map(|id| id as &dyn rusqlite::types::ToSql)
+                .collect();
+            if let Ok(mut stmt) = conn.prepare(&sql) {
+                let mut annot_map: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+                if let Ok(rows) = stmt.query_map(params.as_slice(), |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1).unwrap_or(0)))
+                }) {
+                    for row in rows.flatten() {
+                        annot_map.insert(row.0, row.1);
+                    }
+                }
+                for hit in sorted.iter_mut() {
+                    if let Some(&count) = annot_map.get(&hit.node_id) {
+                        hit.annotation_count = count;
+                    }
+                }
+            }
+        }
+
+        // 3. Web edges: check if node's thread has any edges
+        // Web edges use thread_id, not node_id. We need to go through pyramid_threads.
+        {
+            let placeholders: String = node_ids.iter().enumerate()
+                .map(|(i, _)| format!("?{}", i + 1))
+                .collect::<Vec<_>>().join(", ");
+            let sql = format!(
+                "SELECT DISTINCT t.current_canonical_id FROM pyramid_threads t \
+                 JOIN pyramid_web_edges e ON t.slug = e.slug AND (t.thread_id = e.thread_a_id OR t.thread_id = e.thread_b_id) \
+                 WHERE t.current_canonical_id IN ({})",
+                placeholders
+            );
+            let params: Vec<&dyn rusqlite::types::ToSql> = node_ids.iter()
+                .map(|id| id as &dyn rusqlite::types::ToSql)
+                .collect();
+            if let Ok(mut stmt) = conn.prepare(&sql) {
+                let mut edge_set: std::collections::HashSet<String> = std::collections::HashSet::new();
+                if let Ok(rows) = stmt.query_map(params.as_slice(), |row| {
+                    row.get::<_, String>(0)
+                }) {
+                    for row in rows.flatten() {
+                        edge_set.insert(row);
+                    }
+                }
+                for hit in sorted.iter_mut() {
+                    hit.has_web_edges = edge_set.contains(&hit.node_id);
+                }
+            }
+        }
+    }
 
     Ok(sorted)
 }
