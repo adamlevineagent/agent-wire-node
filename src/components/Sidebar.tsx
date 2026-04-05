@@ -33,9 +33,29 @@ function formatTimeAgo(isoString: string | null): string {
 export function Sidebar() {
     const { state, setMode } = useAppContext();
     const [appVersion, setAppVersion] = useState<string>('');
+    const [activeBuildCount, setActiveBuildCount] = useState(0);
 
     useEffect(() => {
         invoke<string>('get_app_version').then(setAppVersion).catch(() => {});
+    }, []);
+
+    useEffect(() => {
+        const checkBuilds = async () => {
+            try {
+                const slugs = await invoke<Array<{ slug: string }>>('pyramid_list_slugs');
+                let count = 0;
+                const results = await Promise.allSettled(
+                    slugs.map(s => invoke<{ status: string }>('pyramid_build_status', { slug: s.slug }))
+                );
+                for (const r of results) {
+                    if (r.status === 'fulfilled' && r.value.status === 'running') count++;
+                }
+                setActiveBuildCount(count);
+            } catch {}
+        };
+        checkBuilds();
+        const interval = setInterval(checkBuilds, 5000);
+        return () => clearInterval(interval);
     }, []);
 
     const localToolCount = LOCAL_TOOLS.length;
@@ -47,8 +67,10 @@ export function Sidebar() {
             label: 'Understanding',
             section: 'YOUR WORLD' as const,
             headline: () => `${state.pyramidCount} pyramid${state.pyramidCount !== 1 ? 's' : ''}`,
-            context: () => state.latestApexQuestion ?? 'No pyramids yet',
-            shouldGlow: () => state.syncState?.is_syncing === true, // building proxy
+            context: () => activeBuildCount > 0
+                ? `${activeBuildCount} building`
+                : (state.latestApexQuestion ?? 'No pyramids yet'),
+            shouldGlow: () => activeBuildCount > 0 || state.syncState?.is_syncing === true,
         },
         {
             key: 'knowledge' as Mode,
@@ -106,7 +128,7 @@ export function Sidebar() {
             context: () => '',
             shouldGlow: () => false,
         },
-    ], [state, localToolCount, publishedToolCount]);
+    ], [state, localToolCount, publishedToolCount, activeBuildCount]);
 
     // Compute glow assignments: max 2 glow, rest get bright dot
     const glowMap = useMemo(() => {

@@ -11,9 +11,15 @@ interface AddWorkspaceProps {
     onCancel: () => void;
 }
 
-type Step = 'directory' | 'content-type' | 'vine-dirs' | 'configure' | 'confirm' | 'building';
+type Step = 'directory' | 'content-type' | 'vine-dirs' | 'configure' | 'question' | 'confirm' | 'building';
 
 const PYRAMID_API_BASE = 'http://localhost:8765';
+
+const DEFAULT_QUESTIONS: Record<string, string> = {
+    code: "What are the key systems, patterns, and architecture of this codebase?",
+    document: "What are the key concepts, decisions, and relationships in these documents?",
+    conversation: "What are the key themes, decisions, and evolution across these conversations?",
+};
 
 const DEFAULT_IGNORES = [
     'node_modules', '.git', 'target', 'dist', 'build', '.next',
@@ -37,6 +43,7 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
     const [customIgnores, setCustomIgnores] = useState('');
     const [slug, setSlug] = useState('');
     const [creating, setCreating] = useState(false);
+    const [apexQuestion, setApexQuestion] = useState('');
     const [error, setError] = useState<string | null>(null);
 
     const handlePickDirectory = useCallback(async () => {
@@ -118,7 +125,7 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
                 const filePath = selected as string;
                 addPathAndAutoSlug(filePath);
                 setContentType('conversation');
-                setStep('confirm');  // Skip configure for conversations (no ignore patterns needed)
+                setStep('question');  // Skip configure for conversations (no ignore patterns needed)
             }
         } catch (err) {
             setError(String(err));
@@ -141,6 +148,7 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
 
     const handleContentTypeSelect = useCallback((type: 'code' | 'document' | 'conversation' | 'vine') => {
         setContentType(type);
+        setApexQuestion(DEFAULT_QUESTIONS[type] || '');
         if (type === 'vine') {
             // Go to vine directory selection step
             // Clear paths from step 1 since vine uses its own directory list
@@ -150,7 +158,7 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
         } else if (type === 'conversation') {
             // If path already pasted and it's a .jsonl, skip picker
             if (paths.length > 0 && paths[0].endsWith('.jsonl')) {
-                setStep('confirm');
+                setStep('question');
             } else {
                 handlePickConversation();
             }
@@ -231,7 +239,7 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
     }, [paths, slug]);
 
     const handleContinueToConfirm = useCallback(() => {
-        setStep('confirm');
+        setStep('question');
     }, []);
 
     const handleCreate = useCallback(async (andBuild: boolean) => {
@@ -254,8 +262,13 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
             await invoke('pyramid_ingest', { slug });
 
             if (andBuild) {
-                // Start build
-                await invoke('pyramid_build', { slug });
+                // Start question build (modern pipeline)
+                await invoke('pyramid_question_build', {
+                    slug,
+                    question: apexQuestion,
+                    granularity: 3,
+                    maxDepth: 3,
+                });
                 setStep('building');
             } else {
                 onComplete();
@@ -265,7 +278,7 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
         } finally {
             setCreating(false);
         }
-    }, [paths, contentType, slug, onComplete]);
+    }, [paths, contentType, slug, apexQuestion, onComplete]);
 
     const allIgnores = [
         ...DEFAULT_IGNORES,
@@ -278,11 +291,15 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
             <div className="workspace-steps">
                 {(contentType === 'vine'
                     ? (['directory', 'content-type', 'vine-dirs', 'confirm'] as Step[])
-                    : (['directory', 'content-type', 'configure', 'confirm'] as Step[])
+                    : contentType === 'conversation'
+                    ? (['directory', 'content-type', 'question', 'confirm'] as Step[])
+                    : (['directory', 'content-type', 'configure', 'question', 'confirm'] as Step[])
                 ).map((s, i) => {
                     const stepOrder = contentType === 'vine'
                         ? ['directory', 'content-type', 'vine-dirs', 'confirm']
-                        : ['directory', 'content-type', 'configure', 'confirm'];
+                        : contentType === 'conversation'
+                        ? ['directory', 'content-type', 'question', 'confirm']
+                        : ['directory', 'content-type', 'configure', 'question', 'confirm'];
                     const currentIndex = stepOrder.indexOf(step);
                     return (
                         <div
@@ -293,7 +310,7 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
                         >
                             <span className="step-number">{i + 1}</span>
                             <span className="step-label">
-                                {s === 'directory' ? (contentType === 'vine' ? 'Source' : 'Directories') : s === 'content-type' ? 'Type' : s === 'vine-dirs' ? 'Folders' : s === 'configure' ? 'Configure' : 'Confirm'}
+                                {s === 'directory' ? (contentType === 'vine' ? 'Source' : 'Directories') : s === 'content-type' ? 'Type' : s === 'vine-dirs' ? 'Folders' : s === 'configure' ? 'Configure' : s === 'question' ? 'Question' : 'Confirm'}
                             </span>
                         </div>
                     );
@@ -565,6 +582,39 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
                 </div>
             )}
 
+            {/* Step: Apex Question */}
+            {step === 'question' && (
+                <div className="workspace-step-content">
+                    <h2>Apex Question</h2>
+                    <p className="step-description">
+                        What should this pyramid answer? The question YAML pipeline will decompose this into sub-questions and build structured understanding.
+                    </p>
+                    <textarea
+                        className="input"
+                        rows={3}
+                        value={apexQuestion}
+                        onChange={(e) => setApexQuestion(e.target.value)}
+                        placeholder="e.g. What are the key systems and architecture of this codebase?"
+                        style={{ width: '100%', resize: 'vertical', fontFamily: 'inherit' }}
+                    />
+                    <div style={{ marginTop: '12px', display: 'flex', gap: '8px' }}>
+                        <button className="btn btn-ghost" onClick={() => {
+                            if (contentType === 'conversation') setStep('content-type');
+                            else setStep('configure');
+                        }}>
+                            Back
+                        </button>
+                        <button
+                            className="btn btn-primary"
+                            onClick={() => setStep('confirm')}
+                            disabled={!apexQuestion.trim()}
+                        >
+                            Next
+                        </button>
+                    </div>
+                </div>
+            )}
+
             {/* Step 4: Name & Confirm */}
             {step === 'confirm' && (
                 <div className="workspace-step-content">
@@ -596,6 +646,12 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
                                 {contentType === 'code' ? 'Code Project' : contentType === 'vine' ? 'Conversation Vine' : contentType === 'conversation' ? 'Conversation' : 'Documents'}
                             </span>
                         </div>
+                        {contentType !== 'vine' && (
+                            <div className="summary-row">
+                                <span className="summary-label">Question:</span>
+                                <span className="summary-value">{apexQuestion}</span>
+                            </div>
+                        )}
                         {contentType !== 'vine' && contentType !== 'conversation' && (
                             <div className="summary-row">
                                 <span className="summary-label">Ignoring:</span>
@@ -617,8 +673,7 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
                     <div className="step-nav">
                         <button className="btn btn-ghost" onClick={() => {
                             if (contentType === 'vine') setStep('vine-dirs');
-                            else if (contentType === 'conversation') setStep('content-type');
-                            else setStep('configure');
+                            else setStep('question');
                         }}>
                             Back
                         </button>

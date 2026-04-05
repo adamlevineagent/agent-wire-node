@@ -13,6 +13,8 @@ interface PyramidRowProps {
     maxNodeCount: number;
     onClick: () => void;
     isNested?: boolean;
+    activeBuild?: { status: string; progress: { done: number; total: number } } | null;
+    onBuildClick?: (slug: string) => void;
 }
 
 export const PyramidRow: React.FC<PyramidRowProps> = ({
@@ -22,6 +24,8 @@ export const PyramidRow: React.FC<PyramidRowProps> = ({
     maxNodeCount,
     onClick,
     isNested,
+    activeBuild,
+    onBuildClick,
 }) => {
     const config = CONTENT_TYPE_CONFIG[slug.content_type];
     const pubState = getPublicationState(slug, publishingSlug);
@@ -115,6 +119,35 @@ export const PyramidRow: React.FC<PyramidRowProps> = ({
 
             {/* Slug name */}
             <span className="pyramid-row-name">{slug.slug}</span>
+
+            {/* Active build badge */}
+            {activeBuild && (
+                <span
+                    className="build-badge"
+                    style={{
+                        display: 'inline-flex',
+                        alignItems: 'center',
+                        gap: '4px',
+                        padding: '2px 8px',
+                        borderRadius: '10px',
+                        fontSize: '11px',
+                        fontWeight: 600,
+                        backgroundColor: 'rgba(0, 200, 150, 0.15)',
+                        color: 'rgb(0, 200, 150)',
+                        animation: 'pulse 2s ease-in-out infinite',
+                        cursor: 'pointer',
+                        marginLeft: '8px',
+                    }}
+                    onClick={(e) => {
+                        e.stopPropagation();
+                        onBuildClick?.(slug.slug);
+                    }}
+                >
+                    Building... {activeBuild.progress.total > 0
+                        ? `${activeBuild.progress.done}/${activeBuild.progress.total}`
+                        : ''}
+                </span>
+            )}
 
             {/* Flex spacer */}
             <span style={{ flex: 1 }} />

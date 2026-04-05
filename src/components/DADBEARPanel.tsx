@@ -110,6 +110,7 @@ export function DADBEARPanel({ slug, contentType, referencingSlugs, onBack, onNa
 
     // Status state
     const [status, setStatus] = useState<AutoUpdateStatus | null>(null);
+    const [statusError, setStatusError] = useState<string | null>(null);
     const pollInFlight = useRef(false);
 
     // Stale log state
@@ -132,6 +133,9 @@ export function DADBEARPanel({ slug, contentType, referencingSlugs, onBack, onNa
     const [countdownSeconds, setCountdownSeconds] = useState<number | null>(null);
     const [countdownRestarted, setCountdownRestarted] = useState(false);
     const prevTimerFiresAt = useRef<string | null>(null);
+
+    // Node counts (independent of DADBEAR)
+    const [nodeCounts, setNodeCounts] = useState<Record<number, number> | null>(null);
 
     // Loading
     const [loading, setLoading] = useState(true);
@@ -164,8 +168,8 @@ export function DADBEARPanel({ slug, contentType, referencingSlugs, onBack, onNa
         try {
             const data = await invoke<AutoUpdateStatus>('pyramid_auto_update_status', { slug });
             setStatus(data);
-        } catch {
-            // Silent fail on polling
+        } catch (err) {
+            setStatusError(String(err));
         } finally {
             pollInFlight.current = false;
         }
@@ -225,6 +229,20 @@ export function DADBEARPanel({ slug, contentType, referencingSlugs, onBack, onNa
             .catch(() => setError('Failed to load DADBEAR data'))
             .finally(() => setLoading(false));
     }, [loadConfig, loadStatus, loadStaleLog, loadCost, loadContributions]);
+
+    // ── Node counts (works independently of DADBEAR config) ─────────
+
+    useEffect(() => {
+        invoke<Array<{ depth: number }>>('pyramid_tree', { slug }).then(tree => {
+            const counts: Record<number, number> = {};
+            for (const node of tree) {
+                counts[node.depth] = (counts[node.depth] || 0) + 1;
+            }
+            setNodeCounts(counts);
+        }).catch(() => {
+            // Tree endpoint may not exist for all pyramids, that's OK
+        });
+    }, [slug]);
 
     // ── Polling (10s interval, skip if in-flight) ───────────────────
 
@@ -454,6 +472,7 @@ export function DADBEARPanel({ slug, contentType, referencingSlugs, onBack, onNa
     ];
 
     const getStatusInfo = (): { text: string; className: string } => {
+        if (!status && statusError) return { text: 'DADBEAR not configured', className: 'dadbear-status-hibernating' };
         if (!status) return { text: 'Loading...', className: '' };
         if (config?.frozen) return { text: 'DADBEAR is hibernating, wake him up by unfreezing on pyramid page', className: 'dadbear-status-snowcave' };
         if (config?.breaker_tripped) return { text: 'DADBEAR needs your attention', className: 'dadbear-status-tripped' };
@@ -611,6 +630,40 @@ Last check: ${lastCheckStr}
                         <div className={`dadbear-status-text ${statusInfo.className}`}>
                             {statusInfo.text}
                         </div>
+
+                        {nodeCounts && (
+                            <div className="dadbear-node-counts" style={{
+                                display: 'flex', gap: '12px', marginTop: '8px', fontSize: '13px', opacity: 0.8
+                            }}>
+                                {[3, 2, 1, 0].filter(d => nodeCounts[d]).map(d => (
+                                    <span key={d} style={{ fontFamily: 'monospace' }}>
+                                        L{d}: {nodeCounts[d]}
+                                    </span>
+                                ))}
+                            </div>
+                        )}
+
+                        {statusError && !status && (
+                            <button
+                                className="btn btn-primary btn-sm"
+                                style={{ marginTop: '8px' }}
+                                onClick={async () => {
+                                    try {
+                                        await invoke('pyramid_auto_update_config_post', {
+                                            slug,
+                                            body: { auto_update: true, debounce_minutes: 5, min_changed_files: 1, runaway_threshold: 0.5 }
+                                        });
+                                        setStatusError(null);
+                                        loadConfig();
+                                        loadStatus();
+                                    } catch (err) {
+                                        setStatusError(String(err));
+                                    }
+                                }}
+                            >
+                                Initialize DADBEAR
+                            </button>
+                        )}
 
                         {/* Phase detail */}
                         {status?.phase_detail && (status.phase === 'evaluating' || status.phase === 'cascading') && (

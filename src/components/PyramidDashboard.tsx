@@ -63,6 +63,7 @@ export function PyramidDashboard() {
     const [buildingSlug, setBuildingSlug] = useState<string | null>(null);
     const [dadbearStatuses, setDadbearStatuses] = useState<Record<string, DadbearStatus>>({});
     const [askingSlug, setAskingSlug] = useState<string | null>(null);
+    const [activeBuilds, setActiveBuilds] = useState<Record<string, { status: string; progress: { done: number; total: number } }>>({});
 
     // TODO: Vine add-folders feature removed (dead code). Re-add when vine drawer gets a trigger button.
 
@@ -128,6 +129,43 @@ export function PyramidDashboard() {
         const interval = setInterval(fetchData, 15000);
         return () => clearInterval(interval);
     }, [fetchData, fetchDadbearStatuses]);
+
+    // Poll for active builds every 5 seconds
+    useEffect(() => {
+        let active = true;
+        const checkBuilds = async () => {
+            if (!active) return;
+            try {
+                const slugs = enrichedSlugs.map(s => s.slug);
+                const builds: Record<string, { status: string; progress: { done: number; total: number } }> = {};
+                const results = await Promise.allSettled(
+                    slugs.map(slug =>
+                        invoke<{ status: string; progress: { done: number; total: number } }>('pyramid_build_status', { slug })
+                            .then(s => ({ slug, ...s }))
+                    )
+                );
+                for (const r of results) {
+                    if (r.status === 'fulfilled' && r.value.status === 'running') {
+                        builds[r.value.slug] = { status: r.value.status, progress: r.value.progress };
+                    }
+                }
+                if (active) setActiveBuilds(builds);
+            } catch {
+                // Non-critical
+            }
+        };
+        checkBuilds();
+        const interval = setInterval(checkBuilds, 5000);
+        return () => { active = false; clearInterval(interval); };
+    }, [enrichedSlugs]);
+
+    // Inject pulse animation keyframes
+    useEffect(() => {
+        const style = document.createElement('style');
+        style.textContent = `@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }`;
+        document.head.appendChild(style);
+        return () => { document.head.removeChild(style); };
+    }, []);
 
     // Listen for build-complete events — refresh both data and DADBEAR statuses
     useEffect(() => {
@@ -660,6 +698,11 @@ Always include the "Generalized understanding:" section — this triggers FAQ ge
                                             maxNodeCount={maxNodeCount}
                                             onClick={() => setSelectedSlug(s.slug)}
                                             isNested={group.nestedSlugs.has(s.slug)}
+                                            activeBuild={activeBuilds[s.slug] ?? null}
+                                            onBuildClick={(slug) => {
+                                                setBuildingSlug(slug);
+                                                setView('building');
+                                            }}
                                         />
                                     ))}
                                 </div>
