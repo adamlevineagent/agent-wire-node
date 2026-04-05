@@ -41,15 +41,14 @@ steps:
     heal_instruction: "$prompts/shared/heal_json.md"
 
   # ── Phase 2: L0 webbing (first question only) ──────────────────────
-  # Build corpus structure map before decomposition. compact_inputs
-  # strips to headline + entities (~60-70% smaller). Web edges inform
-  # decompose about thematic boundaries in the corpus.
+  # Build corpus structure map before decomposition. Token-aware
+  # dehydration only strips fields when content exceeds the budget.
+  # Web edges inform decompose about thematic boundaries in the corpus.
   - name: l0_webbing
     primitive: web
     instruction: "$prompts/question/question_web.md"
     input:
       nodes: "$source_extract"
-    compact_inputs: true
     response_schema: &web_schema
       type: object
       properties:
