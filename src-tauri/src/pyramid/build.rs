@@ -74,6 +74,12 @@ pub enum WriteOp {
     UpdateStats {
         slug: String,
     },
+    /// Record a file→node mapping in pyramid_file_hashes after L0 extraction.
+    UpdateFileHash {
+        slug: String,
+        file_path: String,
+        node_id: String,
+    },
     Flush {
         done: oneshot::Sender<()>,
     },

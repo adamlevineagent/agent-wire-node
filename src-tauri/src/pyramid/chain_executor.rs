@@ -2315,6 +2315,10 @@ fn spawn_write_drain(
                         ref parent_id,
                     } => db::update_parent(&conn, slug, node_id, parent_id),
                     WriteOp::UpdateStats { ref slug } => db::update_slug_stats(&conn, slug),
+                    WriteOp::UpdateFileHash { ref slug, ref file_path, ref node_id } => {
+                        // Append node_id to existing file_hash entry, or create new one
+                        db::append_node_id_to_file_hash(&conn, slug, file_path, node_id)
+                    }
                     WriteOp::Flush { done } => {
                         let _ = done.send(());
                         Ok(())
@@ -3406,7 +3410,17 @@ async fn dispatch_with_retry(
                     );
                     last_err = Some(e);
                     if attempt + 1 < max_attempts {
-                        let delay = std::time::Duration::from_secs(2u64.pow(attempt + 1));
+                        let base_delay_ms = 2000u64 * 2u64.pow(attempt);
+                        // Jitter: hash the fallback_key for deterministic per-item spread
+                        let hash_jitter = {
+                            use std::hash::{Hash, Hasher};
+                            let mut h = std::collections::hash_map::DefaultHasher::new();
+                            fallback_key.hash(&mut h);
+                            attempt.hash(&mut h);
+                            (h.finish() % (base_delay_ms / 2)).max(100)
+                        };
+                        let delay = std::time::Duration::from_millis(base_delay_ms + hash_jitter);
+                        info!("  Retrying {fallback_key} after {}ms (attempt {}/{})", delay.as_millis(), attempt + 1, max_attempts);
                         tokio::time::sleep(delay).await;
                     }
                 }
@@ -3419,7 +3433,17 @@ async fn dispatch_with_retry(
                 );
                 last_err = Some(e);
                 if attempt + 1 < max_attempts {
-                    let delay = std::time::Duration::from_secs(2u64.pow(attempt + 1));
+                    let base_delay_ms = 2000u64 * 2u64.pow(attempt);
+                    // Jitter: hash the fallback_key for deterministic per-item spread
+                    let jitter_ms = {
+                        use std::hash::{Hash, Hasher};
+                        let mut h = std::collections::hash_map::DefaultHasher::new();
+                        fallback_key.hash(&mut h);
+                        attempt.hash(&mut h);
+                        (h.finish() % (base_delay_ms / 2)).max(100)
+                    };
+                    let delay = std::time::Duration::from_millis(base_delay_ms + jitter_ms);
+                    info!("  Retrying {fallback_key} after {}ms (attempt {}/{})", delay.as_millis(), attempt + 1, max_attempts);
                     tokio::time::sleep(delay).await;
                 }
             }
@@ -3857,6 +3881,32 @@ pub async fn execute_chain_from(
             )
             .await?;
             total_failures += failures;
+
+            // For depth-0 for_each steps that save nodes, record file→node mappings
+            // in pyramid_file_hashes so the stale engine can track source connections.
+            if saves_node && step.depth.unwrap_or(0) == 0 {
+                for (i, output) in outputs.iter().enumerate() {
+                    if let Some(node_id) = output.get("node_id").and_then(|v| v.as_str()) {
+                        // Extract file_path from chunk content (format: "## FILE: path\n...")
+                        let file_path = ctx.chunks.get(i)
+                            .and_then(|chunk| chunk.get("content"))
+                            .and_then(|c| c.as_str())
+                            .and_then(|content| {
+                                content.lines().next().and_then(|first_line| {
+                                    first_line.strip_prefix("## FILE: ").map(|p| p.to_string())
+                                })
+                            });
+                        if let Some(fp) = file_path {
+                            let _ = writer_tx.send(WriteOp::UpdateFileHash {
+                                slug: slug.to_string(),
+                                file_path: fp,
+                                node_id: node_id.to_string(),
+                            }).await;
+                        }
+                    }
+                }
+            }
+
             ctx.step_outputs
                 .insert(step.name.clone(), Value::Array(outputs));
             Ok(Value::Null)
@@ -6054,10 +6104,15 @@ async fn execute_for_each_concurrent(
         let layer_tx_clone = layer_tx.clone();
 
         let handle = tokio::spawn(async move {
+            let sem_t0 = Instant::now();
             let _permit = semaphore
                 .acquire_owned()
                 .await
                 .expect("for_each semaphore should remain open");
+            let sem_wait = sem_t0.elapsed().as_secs_f64();
+            if sem_wait > 1.0 {
+                info!("[CHAIN] [{}] {} waited {:.1}s for semaphore permit", step_owned.name, work.node_id, sem_wait);
+            }
 
             let output = execute_for_each_work_item(
                 &step_owned,
@@ -6168,6 +6223,7 @@ async fn execute_for_each_work_item(
 ) -> Result<Value> {
     let fallback_key = format!("{}-{}", step.name, work.index);
     let t0 = Instant::now();
+    info!("[CHAIN] [{}] {} dispatching LLM call", step.name, work.node_id);
 
     let analysis = dispatch_with_retry(
         step,
@@ -6182,6 +6238,11 @@ async fn execute_for_each_work_item(
 
     validate_step_output(step, &analysis)?;
     let elapsed = t0.elapsed().as_secs_f64();
+    if elapsed > 10.0 {
+        warn!("[CHAIN] [{}] {} SLOW dispatch: {:.1}s", step.name, work.node_id, elapsed);
+    } else {
+        info!("[CHAIN] [{}] {} dispatch complete: {:.1}s", step.name, work.node_id, elapsed);
+    }
     let decorated_output = decorate_step_output(analysis.clone(), &work.node_id, work.chunk_index);
 
     let output_json = serde_json::to_string(&decorated_output)?;

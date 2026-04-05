@@ -79,7 +79,7 @@ steps:
     instruction_from: "$extraction_schema.extraction_prompt"
     for_each: "$chunks"
     when: "$load_prior_state.l0_count == 0"
-    concurrency: 12
+    concurrency: 4
     node_id_pattern: "Q-L0-{index:03}"
     depth: 0
     save_as: node

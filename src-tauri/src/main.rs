@@ -3567,6 +3567,9 @@ async fn pyramid_build(
                             wire_node_lib::pyramid::build::WriteOp::UpdateStats { ref slug } => {
                                 wire_node_lib::pyramid::db::update_slug_stats(&conn, slug)
                             }
+                            wire_node_lib::pyramid::build::WriteOp::UpdateFileHash { ref slug, ref file_path, ref node_id } => {
+                                wire_node_lib::pyramid::db::append_node_id_to_file_hash(&conn, slug, file_path, node_id)
+                            }
                             wire_node_lib::pyramid::build::WriteOp::Flush { done } => {
                                 let _ = done.send(());
                                 Ok(())

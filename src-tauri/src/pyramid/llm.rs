@@ -7,10 +7,51 @@
 use anyhow::{anyhow, Result};
 use regex::Regex;
 use serde_json::Value;
+use std::collections::VecDeque;
 use std::sync::LazyLock;
+use tokio::sync::Mutex as TokioMutex;
 use tracing::{info, warn};
 
 use super::types::TokenUsage;
+
+// ── Global rate limiter: configurable sliding window ────────────────────────
+
+static RATE_LIMITER: LazyLock<TokioMutex<VecDeque<std::time::Instant>>> =
+    LazyLock::new(|| TokioMutex::new(VecDeque::new()));
+
+/// Wait until we have capacity in the sliding window before making an LLM call.
+/// Parameters come from Tier1Config (llm_rate_limit_max_requests, llm_rate_limit_window_secs).
+async fn rate_limit_wait(max_requests: usize, window_secs: f64) {
+    if max_requests == 0 {
+        return; // rate limiting disabled
+    }
+    loop {
+        let now = std::time::Instant::now();
+        let mut window = RATE_LIMITER.lock().await;
+
+        // Evict entries older than the window
+        while let Some(&oldest) = window.front() {
+            if now.duration_since(oldest).as_secs_f64() >= window_secs {
+                window.pop_front();
+            } else {
+                break;
+            }
+        }
+
+        if window.len() < max_requests {
+            window.push_back(now);
+            return;
+        }
+
+        // Window full — compute how long until the oldest entry expires
+        let oldest = window[0];
+        let wait = window_secs - now.duration_since(oldest).as_secs_f64();
+        drop(window); // release lock while sleeping
+        if wait > 0.0 {
+            tokio::time::sleep(std::time::Duration::from_secs_f64(wait + 0.05)).await;
+        }
+    }
+}
 
 // ── Response types ───────────────────────────────────────────────────────────
 
@@ -52,6 +93,10 @@ pub struct LlmConfig {
     pub timeout_chars_per_increment: usize,
     /// Seconds added per increment of chars in the timeout scaling formula.
     pub timeout_increment_secs: u64,
+    /// Max LLM requests per sliding window (0 = disabled).
+    pub rate_limit_max_requests: usize,
+    /// Sliding window duration in seconds for rate limiting.
+    pub rate_limit_window_secs: f64,
 }
 
 impl Default for LlmConfig {
@@ -71,6 +116,8 @@ impl Default for LlmConfig {
             retry_base_sleep_secs: 1,
             timeout_chars_per_increment: 100_000,
             timeout_increment_secs: 60,
+            rate_limit_max_requests: 4,
+            rate_limit_window_secs: 5.0,
         }
     }
 }
@@ -274,6 +321,9 @@ pub async fn call_model_unified_with_options(
                 .unwrap()
                 .insert("response_format".to_string(), rf.clone());
         }
+
+        // Rate limit: wait for sliding window capacity
+        rate_limit_wait(config.rate_limit_max_requests, config.rate_limit_window_secs).await;
 
         let resp = client
             .post(url)

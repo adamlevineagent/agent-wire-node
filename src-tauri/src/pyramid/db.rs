@@ -4287,6 +4287,7 @@ pub fn get_evidence_set_member_ids(
 }
 
 /// Append a targeted L0 node ID to a file's node_ids JSON array in pyramid_file_hashes.
+/// If no row exists for this file_path, creates one with the node_id.
 pub fn append_node_id_to_file_hash(
     conn: &Connection,
     slug: &str,
@@ -4300,7 +4301,12 @@ pub fn append_node_id_to_file_hash(
         rusqlite::params![slug, file_path, node_id],
     )?;
     if rows == 0 {
-        tracing::warn!(slug, file_path, node_id, "append_node_id_to_file_hash: no matching row in pyramid_file_hashes");
+        // No existing row — insert a new one
+        conn.execute(
+            "INSERT INTO pyramid_file_hashes (slug, file_path, hash, chunk_count, node_ids, last_ingested_at)
+             VALUES (?1, ?2, '', 1, ?3, datetime('now'))",
+            rusqlite::params![slug, file_path, serde_json::json!([node_id]).to_string()],
+        )?;
     }
     Ok(())
 }

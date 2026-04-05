@@ -165,6 +165,12 @@ fn default_llm_timeout_chars_per_increment() -> usize {
 fn default_llm_timeout_increment_secs() -> u64 {
     60
 }
+fn default_llm_rate_limit_max_requests() -> usize {
+    4
+}
+fn default_llm_rate_limit_window_secs() -> f64 {
+    5.0
+}
 
 // ── Tier2 default functions (everything-to-YAML: Part 3) ──────────────────
 
@@ -258,6 +264,12 @@ pub struct Tier1Config {
     pub llm_timeout_chars_per_increment: usize,
     #[serde(default = "default_llm_timeout_increment_secs")]
     pub llm_timeout_increment_secs: u64,
+    /// Max LLM requests per sliding window (rate limiter).
+    #[serde(default = "default_llm_rate_limit_max_requests")]
+    pub llm_rate_limit_max_requests: usize,
+    /// Sliding window duration in seconds for rate limiting.
+    #[serde(default = "default_llm_rate_limit_window_secs")]
+    pub llm_rate_limit_window_secs: f64,
 }
 
 impl Default for Tier1Config {
@@ -292,6 +304,8 @@ impl Default for Tier1Config {
             llm_retry_base_sleep_secs: default_llm_retry_base_sleep_secs(),
             llm_timeout_chars_per_increment: default_llm_timeout_chars_per_increment(),
             llm_timeout_increment_secs: default_llm_timeout_increment_secs(),
+            llm_rate_limit_max_requests: default_llm_rate_limit_max_requests(),
+            llm_rate_limit_window_secs: default_llm_rate_limit_window_secs(),
         }
     }
 }
@@ -496,6 +510,8 @@ impl PyramidConfig {
             retry_base_sleep_secs: self.operational.tier1.llm_retry_base_sleep_secs,
             timeout_chars_per_increment: self.operational.tier1.llm_timeout_chars_per_increment,
             timeout_increment_secs: self.operational.tier1.llm_timeout_increment_secs,
+            rate_limit_max_requests: self.operational.tier1.llm_rate_limit_max_requests,
+            rate_limit_window_secs: self.operational.tier1.llm_rate_limit_window_secs,
         }
     }
 }
