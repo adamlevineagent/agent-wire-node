@@ -321,6 +321,9 @@ pub struct Tier2Config {
     pub staleness_threshold: f64,
     pub l0_summary_budget: usize,
     pub pre_map_prompt_budget: usize,
+    /// Max nodes per pre-mapping batch (None = no item limit, only token budget).
+    #[serde(default)]
+    pub pre_map_max_batch_nodes: Option<usize>,
     pub ir_thread_input_char_budget: usize,
     pub distillation_token_budget: usize,
     pub distillation_early_collapse: usize,
@@ -357,6 +360,7 @@ impl Default for Tier2Config {
             staleness_threshold: 0.3,
             l0_summary_budget: 100_000,
             pre_map_prompt_budget: 80_000,
+            pre_map_max_batch_nodes: None,
             ir_thread_input_char_budget: 90_000,
             distillation_token_budget: 800,
             distillation_early_collapse: 1200,

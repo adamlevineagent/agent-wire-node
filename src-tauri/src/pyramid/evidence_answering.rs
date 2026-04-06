@@ -113,82 +113,60 @@ pub async fn pre_map_layer(
         .collect::<Vec<_>>()
         .join("\n");
 
-    // ── Build node listing with token budget guard ────────────────────
-    let mut nodes_text = lower_layer_nodes
+    // ── Build node payloads as Value items for batching ────────────────
+    let node_payloads: Vec<serde_json::Value> = lower_layer_nodes
         .iter()
         .map(|n| {
-            format!(
-                "  - id: \"{}\"\n    headline: \"{}\"\n    distilled: \"{}\"",
-                n.id,
-                n.headline.chars().take(200).collect::<String>(),
-                n.distilled.chars().take(300).collect::<String>()
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    // Token budget guard: if combined prompt exceeds budget, try two-stage first, then headlines-only
-    let combined_len = questions_text.len() + nodes_text.len();
-    if combined_len > ops.tier2.pre_map_prompt_budget {
-        // WS-3B: Two-stage pre-mapping via evidence set indexes
-        if let Some(sets) = evidence_sets {
-            if !sets.is_empty() {
-                return pre_map_layer_two_stage(
-                    questions,
-                    sets,
-                    lower_layer_nodes,
-                    llm_config,
-                    ops,
-                    audience,
-                    chains_dir,
-                    source_content_type,
-                    audit,
-                )
-                .await;
-            }
-        }
-        // else: fall through to existing headlines-only path
-        warn!(
-            combined_len,
-            budget = ops.tier2.pre_map_prompt_budget,
-            "Pre-mapping prompt exceeds budget, switching to headlines-only mode"
-        );
-        nodes_text = lower_layer_nodes
-            .iter()
-            .map(|n| {
-                format!(
-                    "  - id: \"{}\"\n    headline: \"{}\"",
-                    n.id,
-                    n.headline.chars().take(200).collect::<String>()
-                )
+            serde_json::json!({
+                "id": n.id,
+                "headline": n.headline.chars().take(200).collect::<String>(),
+                "distilled": n.distilled.chars().take(300).collect::<String>(),
+                "topics": n.topics.iter().map(|t| {
+                    let summary = t.extra.get("summary")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    serde_json::json!({
+                        "name": &t.name,
+                        "summary": summary,
+                        "current": t.current.chars().take(240).collect::<String>(),
+                        "entities": &t.entities,
+                    })
+                }).collect::<Vec<_>>(),
             })
-            .collect::<Vec<_>>()
-            .join("\n");
+        })
+        .collect();
 
-        // If STILL too large after headlines-only, truncate node list
-        if questions_text.len() + nodes_text.len() > ops.tier2.pre_map_prompt_budget {
-            let max_nodes = ops
-                .tier2
-                .pre_map_prompt_budget
-                .saturating_sub(questions_text.len())
-                / 220; // ~220 chars per headline entry
-            warn!(
-                total_nodes = lower_layer_nodes.len(),
-                max_nodes, "Pre-mapping still too large, truncating node list"
-            );
-            nodes_text = lower_layer_nodes
-                .iter()
-                .take(max_nodes)
-                .map(|n| {
-                    format!(
-                        "  - id: \"{}\"\n    headline: \"{}\"",
-                        n.id,
-                        n.headline.chars().take(200).collect::<String>()
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-        }
+    // Token-aware batching: pack nodes into batches that fit within budget,
+    // adaptively dehydrating oversized items (drop topics.current → distilled → topics).
+    // Small items keep full content. Only outliers get stripped.
+    let dehydrate_cascade = vec![
+        super::chain_engine::DehydrateStep { drop: "topics.current".to_string() },
+        super::chain_engine::DehydrateStep { drop: "distilled".to_string() },
+        super::chain_engine::DehydrateStep { drop: "topics".to_string() },
+    ];
+
+    let budget = ops.tier2.pre_map_prompt_budget;
+    // Reserve space for questions + system prompt overhead (~questions_text.len() + 2000)
+    let node_budget = budget.saturating_sub(questions_text.len() + 2000);
+    let max_batch_items = ops.tier2.pre_map_max_batch_nodes.unwrap_or(200);
+
+    let batches = super::chain_executor::batch_items_by_tokens(
+        node_payloads,
+        node_budget,
+        Some(max_batch_items),
+        Some(&dehydrate_cascade),
+    );
+
+    let num_batches = batches.len();
+    if num_batches > 1 {
+        info!(
+            total_nodes = lower_layer_nodes.len(),
+            num_batches,
+            budget = node_budget,
+            "pre-mapping: splitting {} nodes into {} batches",
+            lower_layer_nodes.len(),
+            num_batches
+        );
     }
 
     // ── Prompts ─────────────────────────────────────────────────────────
@@ -239,66 +217,116 @@ Every question_id from the input MUST appear as a key in the mappings, even if i
         }
     };
 
-    let user_prompt = format!(
-        "QUESTIONS for this layer:\n{}\n\nNODES from the layer below (candidate evidence):\n{}\n\nFor each question, identify which nodes likely contain relevant evidence. Include uncertain matches.",
-        questions_text, nodes_text
-    );
-
-    // ── LLM call (primary model — fast classification) ──────
-    let response = if let Some(ctx) = audit {
-        let ctx = AuditContext {
-            call_purpose: "pre_map".to_string(),
-            step_name: "evidence_pre_map".to_string(),
-            ..ctx.clone()
-        };
-        let (resp, _) = llm::call_model_audited(
-            llm_config, &system_prompt, &user_prompt,
-            ops.tier1.pre_map_temperature, ops.tier1.pre_map_max_tokens,
-            None, &ctx,
-        ).await?;
-        resp
-    } else {
-        llm::call_model_unified(
-            llm_config, &system_prompt, &user_prompt,
-            ops.tier1.pre_map_temperature, ops.tier1.pre_map_max_tokens,
-            None,
-        ).await?
-    };
-
-    info!(
-        questions = questions.len(),
-        nodes = lower_layer_nodes.len(),
-        tokens_in = response.usage.prompt_tokens,
-        tokens_out = response.usage.completion_tokens,
-        "pre-mapping LLM call complete"
-    );
-
-    // ── Parse response ──────────────────────────────────────────────────
-    let json_value = llm::extract_json(&response.content)?;
-
-    let raw: PreMapResponse = serde_json::from_value(json_value).map_err(|e| {
-        anyhow!(
-            "Failed to parse pre-mapping response: {} — raw: {}",
-            e,
-            &response.content[..response.content.len().min(400)]
-        )
-    })?;
-
-    // Validate: every question should have an entry; add empty vec for any missing
-    let mut mappings = raw.mappings;
+    // ── Dispatch each batch and merge candidate maps ────────────────────
+    let mut merged_mappings: HashMap<String, Vec<String>> = HashMap::new();
+    // Ensure every question has an entry
     for q in questions {
-        mappings.entry(q.question_id.clone()).or_default();
+        merged_mappings.entry(q.question_id.clone()).or_default();
+    }
+
+    for (batch_idx, batch) in batches.iter().enumerate() {
+        let empty_batch = Vec::new();
+        let batch_items = batch.as_array().unwrap_or(&empty_batch);
+        let nodes_text = batch_items
+            .iter()
+            .map(|n| {
+                let mut parts = vec![
+                    format!("  - id: \"{}\"", n["id"].as_str().unwrap_or("")),
+                    format!("    headline: \"{}\"", n["headline"].as_str().unwrap_or("")),
+                ];
+                if let Some(distilled) = n.get("distilled").and_then(|v| v.as_str()) {
+                    parts.push(format!("    distilled: \"{}\"", distilled));
+                }
+                if let Some(topics) = n.get("topics").and_then(|v| v.as_array()) {
+                    if !topics.is_empty() {
+                        let topic_strs: Vec<String> = topics.iter().map(|t| {
+                            let mut s = format!("      name: \"{}\"", t["name"].as_str().unwrap_or(""));
+                            if let Some(summary) = t.get("summary").and_then(|v| v.as_str()) {
+                                s.push_str(&format!(", summary: \"{}\"", summary));
+                            }
+                            if let Some(current) = t.get("current").and_then(|v| v.as_str()) {
+                                s.push_str(&format!(", current: \"{}\"", current));
+                            }
+                            if let Some(entities) = t.get("entities").and_then(|v| v.as_array()) {
+                                let ents: Vec<&str> = entities.iter().filter_map(|e| e.as_str()).collect();
+                                if !ents.is_empty() {
+                                    s.push_str(&format!(", entities: [{}]", ents.join(", ")));
+                                }
+                            }
+                            s
+                        }).collect();
+                        parts.push(format!("    topics:\n{}", topic_strs.join("\n")));
+                    }
+                }
+                parts.join("\n")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let batch_label = if num_batches > 1 {
+            format!(" (batch {} of {}, {} nodes)", batch_idx + 1, num_batches, batch_items.len())
+        } else {
+            String::new()
+        };
+
+        let user_prompt = format!(
+            "QUESTIONS for this layer:\n{}\n\nNODES from the layer below (candidate evidence){batch_label}:\n{}\n\nFor each question, identify which nodes likely contain relevant evidence. Include uncertain matches.",
+            questions_text, nodes_text
+        );
+
+        let response = if let Some(ctx) = audit {
+            let ctx = AuditContext {
+                call_purpose: format!("pre_map_batch_{}", batch_idx),
+                step_name: "evidence_pre_map".to_string(),
+                ..ctx.clone()
+            };
+            let (resp, _) = llm::call_model_audited(
+                llm_config, &system_prompt, &user_prompt,
+                ops.tier1.pre_map_temperature, ops.tier1.pre_map_max_tokens,
+                None, &ctx,
+            ).await?;
+            resp
+        } else {
+            llm::call_model_unified(
+                llm_config, &system_prompt, &user_prompt,
+                ops.tier1.pre_map_temperature, ops.tier1.pre_map_max_tokens,
+                None,
+            ).await?
+        };
+
+        info!(
+            batch = batch_idx,
+            batch_nodes = batch_items.len(),
+            tokens_in = response.usage.prompt_tokens,
+            tokens_out = response.usage.completion_tokens,
+            "pre-mapping batch complete"
+        );
+
+        // Parse and merge this batch's mappings
+        if let Ok(json_value) = llm::extract_json(&response.content) {
+            if let Ok(raw) = serde_json::from_value::<PreMapResponse>(json_value) {
+                for (q_id, candidates) in raw.mappings {
+                    merged_mappings.entry(q_id).or_default().extend(candidates);
+                }
+            } else {
+                warn!(batch = batch_idx, "Failed to parse pre-mapping batch response");
+            }
+        } else {
+            warn!(batch = batch_idx, "Failed to extract JSON from pre-mapping batch response");
+        }
     }
 
     // Filter out any node IDs that don't actually exist in the lower layer
     let valid_ids: std::collections::HashSet<&str> =
         lower_layer_nodes.iter().map(|n| n.id.as_str()).collect();
-    let raw_total: usize = mappings.values().map(|v| v.len()).sum();
-    for candidates in mappings.values_mut() {
+    let raw_total: usize = merged_mappings.values().map(|v| v.len()).sum();
+    for candidates in merged_mappings.values_mut() {
         candidates.retain(|id| valid_ids.contains(id.as_str()));
+        candidates.sort();
+        candidates.dedup();
     }
 
-    let total_candidates: usize = mappings.values().map(|v| v.len()).sum();
+    let total_candidates: usize = merged_mappings.values().map(|v| v.len()).sum();
     if total_candidates < raw_total {
         warn!(
             raw_total,
@@ -310,10 +338,11 @@ Every question_id from the input MUST appear as a key in the mappings, even if i
     info!(
         total_candidates,
         questions = questions.len(),
+        batches = num_batches,
         "pre-mapping complete"
     );
 
-    Ok(CandidateMap { mappings })
+    Ok(CandidateMap { mappings: merged_mappings })
 }
 
 // ── WS-3B: Two-Stage Pre-Mapping ─────────────────────────────────────────────

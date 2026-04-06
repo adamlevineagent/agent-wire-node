@@ -2553,7 +2553,7 @@ fn drop_field(value: &mut Value, field_path: &str) {
 /// Greedy token-aware batch splitting. Fills each batch until either
 /// `max_tokens` or `max_items` would be exceeded. A single oversized item
 /// always gets its own batch (never dropped).
-fn batch_items_by_tokens(
+pub fn batch_items_by_tokens(
     items: Vec<Value>,
     max_tokens: usize,
     max_items: Option<usize>,
