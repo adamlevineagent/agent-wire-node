@@ -3840,10 +3840,16 @@ pub async fn execute_chain_from(
         let saves_node = step.save_as.as_deref() == Some("node");
 
         // Step-level checkpoint sentinel: skip re-execution if step already completed
-        // (unless force_from invalidated it). Evidence_loop is excluded because it has
-        // its own internal layer-level resume logic.
+        // (unless force_from invalidated it).
+        // Excluded primitives:
+        //   - evidence_loop: has its own internal layer-level resume logic
+        //   - cross_build_input: cheap DB read that must always re-run to pick up
+        //     current state (load_prior_state, refresh_state). Skipping it on rebuild
+        //     causes "missing saved output" failures because cached output references
+        //     the previous build's context.
         let should_check_sentinel = force_from_idx.map_or(true, |ff| step_idx < ff)
-            && step.primitive != "evidence_loop";
+            && step.primitive != "evidence_loop"
+            && step.primitive != "cross_build_input";
         if should_check_sentinel {
             let sentinel_exists = db_read(&state.reader, {
                 let s = slug.to_string();
