@@ -1210,6 +1210,74 @@ Respond with ONLY a JSON object:
 
 /// Merge multiple batch answer results into a single unified RawAnswerResponse.
 /// Uses an LLM merge call to synthesize partial answers from batched evidence.
+/// Serialize one batch result as a complete JSON item carrying ALL its fields
+/// (synthesis + verdicts + topics + structural notes). Used as input to the
+/// merge LLM call so it can reconcile across batches with full context.
+fn serialize_batch_full(idx: usize, batch: &RawAnswerResponse) -> Value {
+    let topics_val: Vec<Value> = batch
+        .topics
+        .iter()
+        .map(|t| serde_json::json!({"name": t.name, "current": t.current}))
+        .collect();
+    let verdicts_val: Vec<Value> = batch
+        .verdicts
+        .iter()
+        .map(|v| {
+            let mut obj = serde_json::json!({
+                "node_id": v.node_id,
+                "verdict": v.verdict,
+            });
+            if let Some(w) = v.weight {
+                obj["weight"] = serde_json::json!(w);
+            }
+            if let Some(ref r) = v.reason {
+                obj["reason"] = serde_json::json!(r);
+            }
+            obj
+        })
+        .collect();
+    let corrections_val: Vec<Value> = batch
+        .corrections
+        .as_ref()
+        .map(|cs| {
+            cs.iter()
+                .map(|c| serde_json::json!({"wrong": c.wrong, "right": c.right, "who": c.who}))
+                .collect()
+        })
+        .unwrap_or_default();
+    let decisions_val: Vec<Value> = batch
+        .decisions
+        .as_ref()
+        .map(|ds| {
+            ds.iter()
+                .map(|d| serde_json::json!({"decided": d.decided, "why": d.why, "rejected": d.rejected}))
+                .collect()
+        })
+        .unwrap_or_default();
+    let terms_val: Vec<Value> = batch
+        .terms
+        .as_ref()
+        .map(|ts| {
+            ts.iter()
+                .map(|t| serde_json::json!({"term": t.term, "definition": t.definition}))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    serde_json::json!({
+        "batch_index": idx + 1,
+        "headline": batch.headline,
+        "distilled": batch.distilled,
+        "topics": topics_val,
+        "verdicts": verdicts_val,
+        "missing": batch.missing.clone().unwrap_or_default(),
+        "corrections": corrections_val,
+        "decisions": decisions_val,
+        "terms": terms_val,
+        "dead_ends": batch.dead_ends.clone().unwrap_or_default(),
+    })
+}
+
 async fn merge_answer_batches(
     question: &LayerQuestion,
     batch_results: &[RawAnswerResponse],
@@ -1224,133 +1292,130 @@ async fn merge_answer_batches(
     node_id: &str,
     ops: &OperationalConfig,
 ) -> Result<RawAnswerResponse> {
-    // ── Programmatic merges (no LLM needed) ─────────────────────────────
-    // Verdicts, corrections, decisions, terms, dead_ends, missing are all
-    // set unions — merge in Rust, never send through the LLM. Only headline,
-    // distilled, and topics (narrative fields) need LLM-driven synthesis.
+    // Pillar 44: this step's input scales with the number of batches and the
+    // size of each batch's verdicts/topics/corrections/etc. Use the
+    // token-aware batching + auto-dehydration pattern. The LLM still does the
+    // reconciliation (Pillar 37) — we shape the input to fit the pipe, we do
+    // not strip fields and replace intelligence with rules.
 
-    // Deduplicate verdicts by node_id, keeping highest weight
-    let mut verdict_map: HashMap<String, RawVerdict> = HashMap::new();
-    for batch in batch_results {
-        for v in &batch.verdicts {
-            let entry = verdict_map
-                .entry(v.node_id.clone())
-                .or_insert_with(|| v.clone());
-            if v.weight.unwrap_or(0.0) > entry.weight.unwrap_or(0.0) {
-                *entry = v.clone();
-            }
-        }
-    }
-    let merged_verdicts: Vec<RawVerdict> = verdict_map.into_values().collect();
-
-    // Deduplicate missing / dead_ends by string value
-    let mut missing_set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    let mut dead_ends_set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    for batch in batch_results {
-        if let Some(ref m) = batch.missing {
-            missing_set.extend(m.iter().cloned());
-        }
-        if let Some(ref de) = batch.dead_ends {
-            dead_ends_set.extend(de.iter().cloned());
-        }
-    }
-    let merged_missing: Vec<String> = missing_set.into_iter().collect();
-    let merged_dead_ends: Vec<String> = dead_ends_set.into_iter().collect();
-
-    // Deduplicate corrections / decisions / terms by their key field
-    let mut corr_map: HashMap<String, RawCorrection> = HashMap::new();
-    let mut dec_map: HashMap<String, RawDecision> = HashMap::new();
-    let mut term_map: HashMap<String, RawTerm> = HashMap::new();
-    for batch in batch_results {
-        if let Some(ref corrections) = batch.corrections {
-            for c in corrections {
-                corr_map.entry(c.wrong.clone()).or_insert_with(|| RawCorrection {
-                    wrong: c.wrong.clone(),
-                    right: c.right.clone(),
-                    who: c.who.clone(),
-                });
-            }
-        }
-        if let Some(ref decisions) = batch.decisions {
-            for d in decisions {
-                dec_map.entry(d.decided.clone()).or_insert_with(|| RawDecision {
-                    decided: d.decided.clone(),
-                    why: d.why.clone(),
-                    rejected: d.rejected.clone(),
-                });
-            }
-        }
-        if let Some(ref terms) = batch.terms {
-            for t in terms {
-                term_map.entry(t.term.clone()).or_insert_with(|| RawTerm {
-                    term: t.term.clone(),
-                    definition: t.definition.clone(),
-                });
-            }
-        }
-    }
-    let merged_corrections: Vec<RawCorrection> = corr_map.into_values().collect();
-    let merged_decisions: Vec<RawDecision> = dec_map.into_values().collect();
-    let merged_terms: Vec<RawTerm> = term_map.into_values().collect();
-
-    // ── Synthesis merge via LLM (with auto-dehydration) ─────────────────
-    // Build per-batch synthesis items. Each item carries headline + distilled
-    // + topics. Dehydration cascade drops topics.current → topics → distilled
-    // if the total package exceeds budget. The LLM only produces the unified
-    // narrative (headline, distilled, topics) — everything else was merged
-    // programmatically above.
-
-    let synthesis_items: Vec<Value> = batch_results
+    let items: Vec<Value> = batch_results
         .iter()
         .enumerate()
-        .map(|(idx, batch)| {
-            let topics_val: Vec<Value> = batch
-                .topics
-                .iter()
-                .map(|t| {
-                    serde_json::json!({
-                        "name": t.name,
-                        "current": t.current,
-                    })
-                })
-                .collect();
-            serde_json::json!({
-                "batch_index": idx + 1,
-                "headline": batch.headline,
-                "distilled": batch.distilled,
-                "topics": topics_val,
-            })
-        })
+        .map(|(idx, batch)| serialize_batch_full(idx, batch))
         .collect();
 
+    // Dehydration cascade: drop the heaviest fields first (verdict reasons,
+    // then full verdicts, then topic.current, then topics). The LLM still
+    // sees node IDs and verdict labels even after dehydration so it can
+    // reconcile by reference.
     let dehydrate_cascade = vec![
+        super::chain_engine::DehydrateStep { drop: "verdicts.reason".to_string() },
         super::chain_engine::DehydrateStep { drop: "topics.current".to_string() },
+        super::chain_engine::DehydrateStep { drop: "verdicts".to_string() },
         super::chain_engine::DehydrateStep { drop: "topics".to_string() },
         super::chain_engine::DehydrateStep { drop: "distilled".to_string() },
     ];
 
-    // Reserve space for the question text + system prompt overhead (~3K tokens)
-    let overhead = question.question_text.len() / 4 + 3000;
+    // Overhead: question text + system prompt + JSON syntax slack
+    let overhead = question.question_text.len() / 4 + 4000;
     let budget = ops.tier2.answer_prompt_budget.saturating_sub(overhead);
 
-    // batch_items_by_tokens applies dehydration per-item if any single item
-    // exceeds remaining budget. For merge, we want all syntheses in one call,
-    // so we pass max_items = None and let dehydration shrink oversized items.
     let packed = super::chain_executor::batch_items_by_tokens(
-        synthesis_items.clone(),
+        items,
         budget,
-        None,
+        None, // no item-count cap; let token budget decide
         Some(&dehydrate_cascade),
     );
 
-    // Take the first batch as the synthesis payload. If dehydration caused a
-    // split (unlikely with merge since we usually have <10 batches), we'd need
-    // a nested merge, but in practice the dehydration cascade handles it.
-    let dehydrated_syntheses: Vec<Value> = match packed.into_iter().next() {
-        Some(Value::Array(items)) => items,
-        _ => synthesis_items,
-    };
+    // If everything fits in one batch, do a single merge call.
+    // If dehydration produced multiple batches, do nested pairwise merging:
+    // merge each batch group into a partial result, then merge those results.
+    if packed.len() == 1 {
+        let items_in_batch = match packed.into_iter().next() {
+            Some(Value::Array(items)) => items,
+            _ => return Err(anyhow!("merge: batch_items_by_tokens returned malformed batch")),
+        };
+        return single_merge_call(
+            question,
+            &items_in_batch,
+            audience_block,
+            synthesis_guidance,
+            content_type_block,
+            llm_config,
+            answer_temperature,
+            answer_max_tokens,
+            chains_dir,
+            audit,
+            node_id,
+        )
+        .await;
+    }
 
+    // Multi-batch path: merge each group into a partial RawAnswerResponse,
+    // then recurse to merge the partials. This is the "nested merge"
+    // requirement of Pillar 44 when even after dehydration the input still
+    // exceeds the budget.
+    info!(
+        question_id = %question.question_id,
+        groups = packed.len(),
+        "answer merge nested: dehydration cascade still exceeded budget, merging in groups"
+    );
+
+    let mut partial_results: Vec<RawAnswerResponse> = Vec::with_capacity(packed.len());
+    for (gidx, group) in packed.into_iter().enumerate() {
+        let group_items = match group {
+            Value::Array(items) => items,
+            other => vec![other],
+        };
+        let partial = single_merge_call(
+            question,
+            &group_items,
+            audience_block,
+            synthesis_guidance,
+            content_type_block,
+            llm_config,
+            answer_temperature,
+            answer_max_tokens,
+            chains_dir,
+            audit,
+            &format!("{}-mg{}", node_id, gidx),
+        )
+        .await?;
+        partial_results.push(partial);
+    }
+
+    // Recurse: merge the partials. If the partials are also too large after
+    // dehydration, this will recurse again and merge in larger groupings.
+    Box::pin(merge_answer_batches(
+        question,
+        &partial_results,
+        audience_block,
+        synthesis_guidance,
+        content_type_block,
+        llm_config,
+        answer_temperature,
+        answer_max_tokens,
+        chains_dir,
+        audit,
+        node_id,
+        ops,
+    ))
+    .await
+}
+
+async fn single_merge_call(
+    question: &LayerQuestion,
+    items: &[Value],
+    audience_block: &str,
+    synthesis_guidance: &str,
+    content_type_block: &str,
+    llm_config: &LlmConfig,
+    answer_temperature: f32,
+    answer_max_tokens: usize,
+    chains_dir: Option<&PathBuf>,
+    audit: Option<&AuditContext>,
+    node_id: &str,
+) -> Result<RawAnswerResponse> {
     let merge_system = match chains_dir
         .map(|d| d.join("prompts/question/answer_merge.md"))
         .and_then(|p| std::fs::read_to_string(&p).ok())
@@ -1366,29 +1431,41 @@ async fn merge_answer_batches(
         None => {
             warn!("answer_merge.md not found — using inline fallback");
             format!(
-                r#"{audience_block}You are merging partial answers to a knowledge pyramid question. The evidence was too large for a single pass, so it was split into batches. Each batch produced a partial synthesis. Produce a SINGLE unified answer covering what all batches discovered.
+                r#"{audience_block}You are merging partial answers to a knowledge pyramid question. The evidence was too large for a single pass, so it was split into batches. Each batch produced verdicts and a partial synthesis. Your job is to produce a SINGLE unified answer that reconciles across batches.
+
+### MERGE RULES
+1. VERDICTS: Combine across batches. When the same node_id appears in multiple batches with different verdicts, judge which is more accurate based on the reasoning given. When verdicts agree, keep one. The verdicts you keep are the final verdicts for this answer.
+2. SYNTHESIS: Read all partial syntheses and produce ONE unified synthesis that covers all dimensions. Synthesize across batches as if you had seen all evidence at once.
+3. TOPICS: Merge topics from all batches. Deduplicate by name, keeping the richest "current" text.
+4. MISSING/CORRECTIONS/DECISIONS/TERMS/DEAD_ENDS: Union all entries, deduplicate by meaning (not just exact string match).
 
 {synthesis_guidance}
 
 {content_type_block}
 
-Respond with ONLY a JSON object containing just the narrative fields:
+Respond with ONLY a JSON object:
 {{{{
   "headline": "short headline",
-  "distilled": "unified synthesis across all batches",
-  "topics": [{{{{"name": "...", "current": "..."}}}}]
+  "distilled": "unified synthesis",
+  "topics": [{{{{"name": "...", "current": "..."}}}}],
+  "verdicts": [{{{{"node_id": "...", "verdict": "KEEP", "weight": 0.85, "reason": "..."}}}}],
+  "missing": [],
+  "corrections": [],
+  "decisions": [],
+  "terms": [],
+  "dead_ends": []
 }}}}"#
             )
         }
     };
 
     let merge_user = format!(
-        "QUESTION (id: {}):\n{}\n\nAbout: {}\nCreates: {}\n\nPARTIAL SYNTHESES FROM BATCHES:\n{}\n\nProduce the unified narrative answer (headline, distilled, topics). Do not include verdicts or other structured fields — those are merged separately.",
+        "QUESTION (id: {}):\n{}\n\nAbout: {}\nCreates: {}\n\nPARTIAL ANSWERS FROM BATCHES (each carries its own verdicts, synthesis, topics, and structural notes — reconcile across them):\n{}\n\nProduce the unified answer.",
         question.question_id,
         question.question_text,
         question.about,
         question.creates,
-        serde_json::to_string_pretty(&dehydrated_syntheses).unwrap_or_default(),
+        serde_json::to_string_pretty(items).unwrap_or_default(),
     );
 
     let response = if let Some(ctx) = audit {
@@ -1411,40 +1488,20 @@ Respond with ONLY a JSON object containing just the narrative fields:
         question_id = %question.question_id,
         tokens_in = response.usage.prompt_tokens,
         tokens_out = response.usage.completion_tokens,
-        "answer merge LLM call complete (narrative only; verdicts merged programmatically)"
+        "answer merge LLM call complete"
     );
 
-    // The LLM only returns narrative fields. Parse them loosely and combine
-    // with the programmatically-merged structured fields.
-    #[derive(Deserialize)]
-    struct NarrativeMerge {
-        headline: String,
-        distilled: String,
-        #[serde(default)]
-        topics: Vec<RawTopic>,
-    }
-
     let json_value = llm::extract_json(&response.content)?;
-    let narrative: NarrativeMerge = serde_json::from_value(json_value).map_err(|e| {
+    let raw: RawAnswerResponse = serde_json::from_value(json_value).map_err(|e| {
         anyhow!(
-            "Failed to parse merge narrative for {}: {} — raw: {}",
+            "Failed to parse merge response for {}: {} — raw: {}",
             question.question_id,
             e,
             &response.content[..response.content.len().min(400)]
         )
     })?;
 
-    Ok(RawAnswerResponse {
-        headline: narrative.headline,
-        distilled: narrative.distilled,
-        topics: narrative.topics,
-        verdicts: merged_verdicts,
-        missing: if merged_missing.is_empty() { None } else { Some(merged_missing) },
-        corrections: if merged_corrections.is_empty() { None } else { Some(merged_corrections) },
-        decisions: if merged_decisions.is_empty() { None } else { Some(merged_decisions) },
-        terms: if merged_terms.is_empty() { None } else { Some(merged_terms) },
-        dead_ends: if merged_dead_ends.is_empty() { None } else { Some(merged_dead_ends) },
-    })
+    Ok(raw)
 }
 
 // ── Raw LLM Response Types (internal) ────────────────────────────────────────
