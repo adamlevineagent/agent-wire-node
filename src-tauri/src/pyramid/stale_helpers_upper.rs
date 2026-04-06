@@ -407,6 +407,13 @@ pub(crate) fn resolve_evidence_targets_for_node_ids(
                 continue;
             }
 
+            // Only follow evidence links within the same slug.
+            // Cross-slug links use handle paths (slug/depth/node_id) and are
+            // handled separately by the cross-slug propagation system.
+            if link.slug != slug {
+                continue;
+            }
+
             if let Some(target) = resolve_stale_target_for_node(conn, &link.slug, &link.target_node_id)? {
                 targets.insert(target);
             } else {
