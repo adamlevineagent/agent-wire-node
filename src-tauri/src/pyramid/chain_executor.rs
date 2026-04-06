@@ -1206,6 +1206,14 @@ async fn hydrate_skipped_step_output(
     ctx: &ChainContext,
     reader: &Arc<Mutex<Connection>>,
 ) -> Result<Option<Value>> {
+    // step_only steps don't persist their outputs for hydration — they run and
+    // feed the next step in memory. On sentinel skip, return None (no output
+    // to hydrate). Downstream steps that actually need the output will re-read
+    // from DB state via cross_build_input steps.
+    if step.save_as.as_deref() == Some("step_only") {
+        return Ok(None);
+    }
+
     if let Some(for_each_ref) = step.for_each.as_deref() {
         let resolved_ref = normalize_context_ref(for_each_ref);
         let items = match ctx.resolve_ref(&resolved_ref)? {
