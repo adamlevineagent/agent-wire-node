@@ -50,6 +50,7 @@ steps:
     input:
       nodes: "$source_extract"
     compact_inputs: true
+    max_input_tokens: 80000
     response_schema: &web_schema
       type: object
       properties:

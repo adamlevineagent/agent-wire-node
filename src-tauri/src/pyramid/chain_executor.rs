@@ -8365,20 +8365,85 @@ async fn execute_web_step(
     }
 
     let normalized_edges = if nodes.len() >= 2 {
-        let web_input = build_webbing_input(&nodes, depth, &resolved_input, step.compact_inputs);
-        let system_prompt = build_system_prompt(step, &web_input, ctx)?;
-        let fallback_key = format!("{}-d{depth}", step.name);
-        let analysis = dispatch_with_retry(
-            step,
-            &web_input,
-            &system_prompt,
-            defaults,
-            dispatch_ctx,
-            error_strategy,
-            &fallback_key,
-        )
-        .await?;
-        parse_web_edges(&step.name, &analysis, &nodes)
+        // Token-aware batched webbing: if the full payload exceeds max_input_tokens,
+        // split nodes into batches, web each batch, and merge all edges.
+        let max_tokens = step.max_input_tokens.unwrap_or(80_000);
+        let full_input = build_webbing_input(&nodes, depth, &resolved_input, step.compact_inputs);
+        let est_tokens = estimate_tokens_for_item(&full_input);
+
+        if est_tokens <= max_tokens {
+            // Fits in one call — dispatch as-is
+            let system_prompt = build_system_prompt(step, &full_input, ctx)?;
+            let fallback_key = format!("{}-d{depth}", step.name);
+            let analysis = dispatch_with_retry(
+                step, &full_input, &system_prompt, defaults,
+                dispatch_ctx, error_strategy, &fallback_key,
+            )
+            .await?;
+            parse_web_edges(&step.name, &analysis, &nodes)
+        } else {
+            // Split nodes into batches that fit within token budget
+            info!(
+                "[CHAIN] [{}] webbing input oversized ({} tokens > {}), splitting {} nodes into batches",
+                step.name, est_tokens, max_tokens, nodes.len()
+            );
+            let mut all_edges = Vec::new();
+            let mut batch_start = 0;
+            let mut batch_idx = 0;
+
+            while batch_start < nodes.len() {
+                // Greedy packing: add nodes until we exceed the budget
+                let mut batch_end = batch_start + 1;
+                while batch_end < nodes.len() {
+                    let candidate = build_webbing_input(
+                        &nodes[batch_start..batch_end + 1], depth, &resolved_input, step.compact_inputs,
+                    );
+                    if estimate_tokens_for_item(&candidate) > max_tokens && batch_end > batch_start + 1 {
+                        break;
+                    }
+                    batch_end += 1;
+                }
+
+                let batch_nodes = &nodes[batch_start..batch_end];
+                let batch_input = build_webbing_input(batch_nodes, depth, &resolved_input, step.compact_inputs);
+                let batch_system_prompt = build_system_prompt(step, &batch_input, ctx)?;
+                let fallback_key = format!("{}-d{depth}-b{batch_idx}", step.name);
+
+                info!(
+                    "[CHAIN] [{}] webbing batch {}: nodes {}-{} ({} nodes, ~{} tokens)",
+                    step.name, batch_idx, batch_start, batch_end - 1,
+                    batch_nodes.len(), estimate_tokens_for_item(&batch_input)
+                );
+
+                match dispatch_with_retry(
+                    step, &batch_input, &batch_system_prompt, defaults,
+                    dispatch_ctx, error_strategy, &fallback_key,
+                )
+                .await
+                {
+                    Ok(analysis) => {
+                        let mut batch_edges = parse_web_edges(&step.name, &analysis, batch_nodes);
+                        all_edges.append(&mut batch_edges);
+                    }
+                    Err(e) => {
+                        warn!("[CHAIN] [{}] webbing batch {} failed: {e}", step.name, batch_idx);
+                        if matches!(error_strategy, ErrorStrategy::Abort | ErrorStrategy::Retry(_)) {
+                            return Err(e);
+                        }
+                        // skip strategy: continue with remaining batches
+                    }
+                }
+
+                batch_start = batch_end;
+                batch_idx += 1;
+            }
+
+            info!(
+                "[CHAIN] [{}] webbing complete: {} batches, {} total edges",
+                step.name, batch_idx, all_edges.len()
+            );
+            all_edges
+        }
     } else {
         Vec::new()
     };
