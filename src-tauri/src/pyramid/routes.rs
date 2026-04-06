@@ -3435,6 +3435,10 @@ fn collect_files_recursive(
 /// - Files with changed SHA-256 hashes → `file_change`
 /// - Files in pyramid_file_hashes missing from disk → `deleted_file`
 ///
+/// Handles both relative and absolute path formats in pyramid_file_hashes.
+/// If pyramid_file_hashes is empty for this slug (pyramid was built before
+/// file hash tracking existed), attempts to backfill from chunk headers.
+///
 /// Returns (new_count, changed_count, deleted_count, unchanged_count).
 pub fn reconcile_source_files(
     conn: &Connection,
@@ -3443,38 +3447,68 @@ pub fn reconcile_source_files(
     ingested_extensions: &[String],
     content_type: &str,
 ) -> (i64, i64, i64, i64) {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use std::path::Path;
 
-    // Collect all files on disk from source directories
-    let mut disk_files: HashSet<String> = HashSet::new();
-    for source_path in source_paths {
-        let path = Path::new(source_path);
-        if !path.is_dir() {
-            continue;
+    // Get file hashes from DB
+    let mut tracked_hashes: HashMap<String, String> = HashMap::new();
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT file_path, hash FROM pyramid_file_hashes WHERE slug = ?1",
+    ) {
+        if let Ok(rows) = stmt.query_map(rusqlite::params![slug], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        }) {
+            for row in rows.flatten() {
+                tracked_hashes.insert(row.0, row.1);
+            }
         }
-        collect_files_recursive(path, ingested_extensions, content_type, &mut disk_files);
     }
 
-    // Get tracked files from DB
-    let tracked: HashSet<String> = db::get_tracked_paths(conn, slug).unwrap_or_default();
-
-    // Get file hashes for comparison
-    let tracked_hashes: std::collections::HashMap<String, String> = {
-        let mut map = std::collections::HashMap::new();
-        if let Ok(mut stmt) = conn.prepare(
-            "SELECT file_path, hash FROM pyramid_file_hashes WHERE slug = ?1",
-        ) {
-            if let Ok(rows) = stmt.query_map(rusqlite::params![slug], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            }) {
-                for row in rows.flatten() {
-                    map.insert(row.0, row.1);
+    // If file_hashes is empty, try to backfill from chunk headers.
+    // Pyramids built before DADBEAR file-hash tracking have L0 nodes
+    // but no entries in pyramid_file_hashes.
+    if tracked_hashes.is_empty() {
+        let backfilled = backfill_file_hashes_from_chunks(conn, slug, source_paths);
+        if backfilled > 0 {
+            tracing::info!(
+                slug,
+                backfilled,
+                "Backfilled pyramid_file_hashes from chunk headers"
+            );
+            // Re-read after backfill
+            if let Ok(mut stmt) = conn.prepare(
+                "SELECT file_path, hash FROM pyramid_file_hashes WHERE slug = ?1",
+            ) {
+                if let Ok(rows) = stmt.query_map(rusqlite::params![slug], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                }) {
+                    for row in rows.flatten() {
+                        tracked_hashes.insert(row.0, row.1);
+                    }
                 }
             }
         }
-        map
-    };
+        if tracked_hashes.is_empty() {
+            tracing::info!(
+                slug,
+                "No file_hashes baseline and backfill found nothing — skipping reconciliation"
+            );
+            return (0, 0, 0, 0);
+        }
+    }
+
+    // Collect all files on disk from source directories (absolute paths).
+    // All file_hashes entries are normalized to absolute, so we compare directly.
+    let mut disk_files: HashSet<String> = HashSet::new();
+    for source_path in source_paths {
+        let source_dir = Path::new(source_path);
+        if !source_dir.is_dir() {
+            continue;
+        }
+        collect_files_recursive(source_dir, ingested_extensions, content_type, &mut disk_files);
+    }
+
+    let tracked_keys: HashSet<String> = tracked_hashes.keys().cloned().collect();
 
     let mut new_count: i64 = 0;
     let mut changed_count: i64 = 0;
@@ -3498,29 +3532,51 @@ pub fn reconcile_source_files(
 
         if let Some(db_hash) = tracked_hashes.get(file_path) {
             // File is tracked — check if hash changed
-            match super::watcher::compute_file_hash(file_path) {
-                Ok(disk_hash) => {
-                    if disk_hash != *db_hash {
-                        let _ = super::watcher::write_mutation(
-                            conn,
-                            slug,
-                            0,
-                            "file_change",
-                            file_path,
-                            Some("startup reconciliation: hash changed"),
+            if db_hash.is_empty() {
+                // Backfilled entry with no hash — compute and store, not a change
+                match super::watcher::compute_file_hash(file_path) {
+                    Ok(disk_hash) => {
+                        let _ = conn.execute(
+                            "UPDATE pyramid_file_hashes SET hash = ?1, last_ingested_at = datetime('now')
+                             WHERE slug = ?2 AND file_path = ?3",
+                            rusqlite::params![disk_hash, slug, file_path],
                         );
-                        changed_count += 1;
-                    } else {
                         unchanged_count += 1;
                     }
+                    Err(e) => {
+                        tracing::warn!(
+                            slug,
+                            file = file_path.as_str(),
+                            error = %e,
+                            "Failed to hash file during reconciliation"
+                        );
+                    }
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        slug,
-                        file = file_path,
-                        error = %e,
-                        "Failed to hash file during reconciliation"
-                    );
+            } else {
+                match super::watcher::compute_file_hash(file_path) {
+                    Ok(disk_hash) => {
+                        if disk_hash != *db_hash {
+                            let _ = super::watcher::write_mutation(
+                                conn,
+                                slug,
+                                0,
+                                "file_change",
+                                file_path,
+                                Some("startup reconciliation: hash changed"),
+                            );
+                            changed_count += 1;
+                        } else {
+                            unchanged_count += 1;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            slug,
+                            file = file_path.as_str(),
+                            error = %e,
+                            "Failed to hash file during reconciliation"
+                        );
+                    }
                 }
             }
         } else {
@@ -3538,7 +3594,7 @@ pub fn reconcile_source_files(
     }
 
     // Check for deleted files (in DB but not on disk)
-    for tracked_path in &tracked {
+    for tracked_path in &tracked_keys {
         if !disk_files.contains(tracked_path) {
             // Skip if already has an unprocessed mutation
             let already_pending: i64 = conn
@@ -3566,6 +3622,130 @@ pub fn reconcile_source_files(
     }
 
     (new_count, changed_count, deleted_count, unchanged_count)
+}
+
+/// Backfill pyramid_file_hashes from chunk headers for pyramids that were built
+/// before file-hash tracking was added. Extracts `## FILE: path` from L0 chunks,
+/// resolves against source_paths, and inserts entries with the current hash.
+/// Returns the number of entries backfilled.
+fn backfill_file_hashes_from_chunks(
+    conn: &Connection,
+    slug: &str,
+    source_paths: &[String],
+) -> i64 {
+    use std::path::Path;
+
+    // Check if there are any L0 nodes — if not, nothing to backfill from
+    let l0_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pyramid_nodes
+             WHERE slug = ?1 AND depth = 0 AND superseded_by IS NULL",
+            rusqlite::params![slug],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    if l0_count == 0 {
+        return 0;
+    }
+
+    // Read chunk headers to extract file paths and map to node IDs
+    // L0 nodes have chunk_index matching their chunk in pyramid_chunks
+    let mut stmt = match conn.prepare(
+        "SELECT c.chunk_index, SUBSTR(c.content, 1, 300), n.id
+         FROM pyramid_chunks c
+         JOIN pyramid_nodes n ON n.slug = c.slug AND n.chunk_index = c.chunk_index AND n.depth = 0
+         WHERE c.slug = ?1 AND n.superseded_by IS NULL",
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(slug, error = %e, "Failed to query chunks for backfill");
+            return 0;
+        }
+    };
+
+    let rows: Vec<(i32, String, String)> = match stmt.query_map(rusqlite::params![slug], |row| {
+        Ok((
+            row.get::<_, i32>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    }) {
+        Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+        Err(_) => return 0,
+    };
+
+    let mut backfilled: i64 = 0;
+
+    for (_chunk_idx, header, node_id) in &rows {
+        // Extract file path from first line: "## FILE: path" or "## DOCUMENT: path"
+        let file_path = match header.lines().next() {
+            Some(line) => line
+                .strip_prefix("## FILE: ")
+                .or_else(|| line.strip_prefix("## DOCUMENT: "))
+                .map(|p| p.trim().to_string()),
+            None => None,
+        };
+
+        let file_path = match file_path {
+            Some(fp) => fp,
+            None => continue,
+        };
+
+        // Resolve the relative path to absolute for hashing
+        let abs_path = if file_path.starts_with('/') {
+            // Already absolute
+            file_path.clone()
+        } else {
+            // Try to find the file under source_paths
+            let mut found = None;
+            for sp in source_paths {
+                let candidate = Path::new(sp).join(&file_path);
+                if candidate.exists() {
+                    found = Some(candidate.to_string_lossy().to_string());
+                    break;
+                }
+            }
+            match found {
+                Some(p) => p,
+                None => continue, // File not found on disk, skip
+            }
+        };
+
+        // Compute current hash
+        let hash = match super::watcher::compute_file_hash(&abs_path) {
+            Ok(h) => h,
+            Err(_) => String::new(),
+        };
+
+        // Insert into pyramid_file_hashes with absolute path
+        match conn.execute(
+            "INSERT OR IGNORE INTO pyramid_file_hashes
+             (slug, file_path, hash, chunk_count, node_ids, last_ingested_at)
+             VALUES (?1, ?2, ?3, 1, ?4, datetime('now'))",
+            rusqlite::params![
+                slug,
+                abs_path,
+                hash,
+                serde_json::json!([node_id]).to_string()
+            ],
+        ) {
+            Ok(rows) => {
+                if rows > 0 {
+                    backfilled += 1;
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    slug,
+                    file = abs_path.as_str(),
+                    error = %e,
+                    "Failed to backfill file_hash entry"
+                );
+            }
+        }
+    }
+
+    backfilled
 }
 
 /// POST /pyramid/:slug/auto-update/breaker/resume

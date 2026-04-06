@@ -233,14 +233,32 @@ export function DADBEARPanel({ slug, contentType, referencingSlugs, onBack, onNa
     // ── Node counts (works independently of DADBEAR config) ─────────
 
     useEffect(() => {
-        invoke<Array<{ depth: number }>>('pyramid_tree', { slug }).then(tree => {
+        // Count ALL live nodes by depth (not just tree-reachable ones)
+        invoke<Array<{ depth: number }>>('pyramid_build_live_nodes', { slug }).then(nodes => {
             const counts: Record<number, number> = {};
-            for (const node of tree) {
+            for (const node of nodes) {
                 counts[node.depth] = (counts[node.depth] || 0) + 1;
             }
             setNodeCounts(counts);
         }).catch(() => {
-            // Tree endpoint may not exist for all pyramids, that's OK
+            // Fallback: try pyramid_tree if live_nodes doesn't work
+            invoke<Array<{ id: string; depth: number }>>('pyramid_tree', { slug }).then(tree => {
+                const counts: Record<number, number> = {};
+                const seen = new Set<string>();
+                const countNodes = (nodes: Array<{ id: string; depth: number; children?: unknown[] }>) => {
+                    for (const node of nodes) {
+                        if (!seen.has(node.id)) {
+                            seen.add(node.id);
+                            counts[node.depth] = (counts[node.depth] || 0) + 1;
+                        }
+                        if (Array.isArray((node as Record<string, unknown>).children)) {
+                            countNodes((node as Record<string, unknown>).children as Array<{ id: string; depth: number; children?: unknown[] }>);
+                        }
+                    }
+                };
+                countNodes(tree);
+                setNodeCounts(counts);
+            }).catch(() => {});
         });
     }, [slug]);
 
@@ -422,7 +440,7 @@ export function DADBEARPanel({ slug, contentType, referencingSlugs, onBack, onNa
 
         const l0Entries = recent.filter(e => e.layer === 0);
         const l1PlusEntries = recent.filter(e => e.layer > 0);
-        const staleEntries = recent.filter(e => e.stale === 'Yes' || e.stale === 'yes' || e.stale === '1' || e.stale === 'true');
+        const staleEntries = recent.filter(e => e.stale === 'yes' || e.stale === 'new' || e.stale === 'deleted' || e.stale === 'renamed');
 
         return {
             D: l0Entries.length,       // Detect
@@ -446,7 +464,7 @@ export function DADBEARPanel({ slug, contentType, referencingSlugs, onBack, onNa
             return l1Plus[0]?.checked_at;
         }
         if (stepKey === 'A2') {
-            const stale = recent.filter(e => e.stale === 'Yes' || e.stale === 'yes' || e.stale === '1' || e.stale === 'true');
+            const stale = recent.filter(e => e.stale === 'yes' || e.stale === 'new' || e.stale === 'deleted' || e.stale === 'renamed');
             return stale[0]?.checked_at;
         }
         return recent[0]?.checked_at; // D, A1, D2, B, E all use most recent entry
@@ -859,8 +877,18 @@ Last check: ${lastCheckStr}
                                                 : entry.target_id}
                                         </td>
                                         <td>
-                                            <span className={`stale-badge ${entry.stale === '1' || entry.stale === 'true' || entry.stale === 'yes' ? 'stale-yes' : 'stale-no'}`}>
-                                                {entry.stale === '1' || entry.stale === 'true' || entry.stale === 'yes' ? 'Yes' : 'No'}
+                                            <span className={`stale-badge ${
+                                                entry.stale === 'yes' ? 'stale-yes'
+                                                : entry.stale === 'new' ? 'stale-new'
+                                                : entry.stale === 'deleted' ? 'stale-deleted'
+                                                : entry.stale === 'renamed' ? 'stale-renamed'
+                                                : 'stale-no'
+                                            }`}>
+                                                {entry.stale === 'yes' ? 'Yes'
+                                                : entry.stale === 'new' ? 'New'
+                                                : entry.stale === 'deleted' ? 'Del'
+                                                : entry.stale === 'renamed' ? 'Ren'
+                                                : 'No'}
                                             </span>
                                         </td>
                                         <td title={entry.reason}>

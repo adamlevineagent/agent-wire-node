@@ -1791,23 +1791,37 @@ pub async fn execute_supersession(
             }
         }
 
+        // Record the supersession delta on all upstream threads so the next layer's
+        // stale checker has content to evaluate. For question pyramids, upstream
+        // relationships are through evidence KEEP links, not parent_id.
+        let delta_summary = format!(
+            "Child node {} superseded by {}.\n\nPrevious child distillation:\n{}\n\nUpdated child distillation:\n{}",
+            nid,
+            new_nid,
+            excerpt(&nd.distilled, 400),
+            excerpt(&new_dist, 400),
+        );
+
+        // Find all upstream threads via evidence KEEP links
+        let upstream_threads: Vec<String> = {
+            let evidence_targets =
+                resolve_evidence_targets_for_node_ids(&conn, &s, std::slice::from_ref(&nid))?;
+            evidence_targets
+        };
+
+        // Also include the mechanical parent_thread_id as fallback
+        let mut all_target_threads: std::collections::BTreeSet<String> = upstream_threads.into_iter().collect();
         if let Some(ref tid) = nd.parent_thread_id {
-            // Record the child supersession on the parent thread so the next layer
-            // evaluates the updated child information instead of seeing an empty delta set.
+            all_target_threads.insert(tid.clone());
+        }
+
+        for tid in &all_target_threads {
             let next_seq: i64 = conn.query_row(
                 "SELECT COALESCE(MAX(sequence), 0) + 1 FROM pyramid_deltas
                  WHERE slug = ?1 AND thread_id = ?2",
                 rusqlite::params![s, tid],
                 |row| row.get(0),
             ).unwrap_or(1);
-
-            let delta_summary = format!(
-                "Child node {} superseded by {}.\n\nPrevious child distillation:\n{}\n\nUpdated child distillation:\n{}",
-                nid,
-                new_nid,
-                excerpt(&nd.distilled, 400),
-                excerpt(&new_dist, 400),
-            );
 
             conn.execute(
                 "INSERT INTO pyramid_deltas
@@ -1843,21 +1857,9 @@ pub async fn execute_supersession(
             .unwrap_or(3);
         let next_layer = (nd.depth as i32 + 1).min(max_depth);
 
-        // Dispatch propagation based on content type: question pyramids follow
-        // evidence DAG, mechanical pyramids follow parent_id.
-        let content_type: Option<String> = conn
-            .query_row(
-                "SELECT content_type FROM pyramid_slugs WHERE slug = ?1",
-                rusqlite::params![s],
-                |row| row.get(0),
-            )
-            .ok();
-
-        let propagation_targets = if content_type.as_deref() == Some("question") {
-            resolve_evidence_targets_for_node_ids(&conn, &s, std::slice::from_ref(&nid))?
-        } else {
-            resolve_parent_targets_for_node_ids(&conn, &s, std::slice::from_ref(&nid))?
-        };
+        // All pyramids now use the question chain — always propagate via evidence DAG.
+        let propagation_targets =
+            resolve_evidence_targets_for_node_ids(&conn, &s, std::slice::from_ref(&nid))?;
         for target in propagation_targets {
             conn.execute(
                 "INSERT INTO pyramid_pending_mutations

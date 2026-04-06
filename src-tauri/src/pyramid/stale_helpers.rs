@@ -105,20 +105,8 @@ fn enqueue_parent_confirmed_stales(
     detail: &str,
     now: &str,
 ) -> Result<usize> {
-    // Content-type dispatch: question pyramids use evidence DAG, mechanical use parent_id
-    let content_type: Option<String> = conn
-        .query_row(
-            "SELECT content_type FROM pyramid_slugs WHERE slug = ?1",
-            rusqlite::params![slug],
-            |row| row.get(0),
-        )
-        .ok();
-
-    let parent_targets = if content_type.as_deref() == Some("question") {
-        resolve_evidence_targets_for_node_ids(conn, slug, source_node_ids)?
-    } else {
-        resolve_parent_targets_for_node_ids(conn, slug, source_node_ids)?
-    };
+    // All pyramids now use the question chain — always propagate via evidence DAG.
+    let parent_targets = resolve_evidence_targets_for_node_ids(conn, slug, source_node_ids)?;
 
     for target in &parent_targets {
         conn.execute(
@@ -470,6 +458,20 @@ pub async fn dispatch_new_file_ingest(batch: Vec<PendingMutation>, db_path: &str
                 info!(file = %file_path, node_id = %node_id, "New file ingested without an existing parent thread target");
             }
 
+            // Log to stale check log (stale=2 means "new")
+            let _ = conn.execute(
+                "INSERT INTO pyramid_stale_check_log
+                 (slug, batch_id, layer, target_id, stale, reason,
+                  checker_index, checker_batch_size, checked_at, cost_tokens, cost_usd)
+                 VALUES (?1, '', 0, ?2, 2, ?3, 0, 1, ?4, NULL, NULL)",
+                rusqlite::params![
+                    slug_c,
+                    file_path,
+                    format!("New file ingested as node {}", node_id),
+                    now,
+                ],
+            );
+
             info!(file = %file_path, node_id = %node_id, "New file ingested into pyramid");
         }
 
@@ -600,6 +602,20 @@ pub async fn dispatch_tombstone(batch: Vec<PendingMutation>, db_path: &str) -> R
             if parent_count == 0 {
                 info!(file = %file_path, tombstone = %tombstone_id, "Tombstone created without an existing parent thread target");
             }
+
+            // Log to stale check log (stale=3 means "deleted")
+            let _ = conn.execute(
+                "INSERT INTO pyramid_stale_check_log
+                 (slug, batch_id, layer, target_id, stale, reason,
+                  checker_index, checker_batch_size, checked_at, cost_tokens, cost_usd)
+                 VALUES (?1, '', 0, ?2, 3, ?3, 0, 1, ?4, NULL, NULL)",
+                rusqlite::params![
+                    slug_c,
+                    file_path,
+                    format!("File deleted, tombstoned as {}", tombstone_id),
+                    now,
+                ],
+            );
 
             info!(file = %file_path, tombstone = %tombstone_id, "File tombstoned");
         }

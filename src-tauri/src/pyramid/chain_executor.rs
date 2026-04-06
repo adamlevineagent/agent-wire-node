@@ -3839,6 +3839,47 @@ pub async fn execute_chain_from(
         let error_strategy = resolve_error_strategy(step, &chain.defaults);
         let saves_node = step.save_as.as_deref() == Some("node");
 
+        // Step-level checkpoint sentinel: skip re-execution if step already completed
+        // (unless force_from invalidated it). Evidence_loop is excluded because it has
+        // its own internal layer-level resume logic.
+        let should_check_sentinel = force_from_idx.map_or(true, |ff| step_idx < ff)
+            && step.primitive != "evidence_loop";
+        if should_check_sentinel {
+            let sentinel_exists = db_read(&state.reader, {
+                let s = slug.to_string();
+                let sn = step.name.clone();
+                move |conn| db::step_exists(conn, &s, &sn, -1, -1, "__step_done__")
+            }).await.unwrap_or(false);
+            if sentinel_exists {
+                info!("[CHAIN] step \"{}\" skipped (sentinel: already completed)", step.name);
+                // Try to hydrate cached output so downstream steps can reference it
+                if let Some(hydrated_output) =
+                    hydrate_skipped_step_output(step, &ctx, &state.reader).await?
+                {
+                    if saves_node {
+                        done += match &hydrated_output {
+                            Value::Array(items) => items.len() as i64,
+                            Value::Null => 0,
+                            _ => 1,
+                        };
+                    }
+                    Arc::make_mut(&mut ctx.step_outputs).insert(step.name.clone(), hydrated_output);
+                    total = estimate_total(chain, &ctx, num_chunks).max(done);
+                }
+                if !saves_node {
+                    done += 1;
+                }
+                send_progress(&progress_tx, done, total).await;
+                step_activities.push(super::types::StepActivity {
+                    name: step.name.clone(),
+                    status: "sentinel_skip".into(),
+                    elapsed_seconds: Some(step_start.elapsed().as_secs_f64()),
+                    items: None,
+                });
+                continue;
+            }
+        }
+
         info!(
             "[CHAIN] step \"{}\" started ({}/{}, primitive: {}, done={}/{})",
             step.name,
@@ -4039,11 +4080,13 @@ pub async fn execute_chain_from(
                             _ => None,
                         };
                         if let Some(fp) = file_path {
-                            let _ = writer_tx.send(WriteOp::UpdateFileHash {
+                            if let Err(e) = writer_tx.send(WriteOp::UpdateFileHash {
                                 slug: slug.to_string(),
                                 file_path: fp,
                                 node_id: node_id.to_string(),
-                            }).await;
+                            }).await {
+                                warn!("writer channel closed, file hash update dropped: {e}");
+                            }
                         }
                     }
                 }
@@ -4076,6 +4119,19 @@ pub async fn execute_chain_from(
                 info!("[CHAIN] step \"{}\" complete", step.name);
                 if !output.is_null() {
                     Arc::make_mut(&mut ctx.step_outputs).insert(step.name.clone(), output);
+                }
+                // Write step-level sentinel so restarts skip this step
+                {
+                    let writer = state.writer.clone();
+                    let slug_s = slug.to_string();
+                    let step_name = step.name.clone();
+                    let elapsed = step_start.elapsed().as_secs_f64();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        let c = writer.blocking_lock();
+                        if let Err(e) = db::save_step(&c, &slug_s, &step_name, -1, -1, "__step_done__", "", "", elapsed) {
+                            warn!("[CHAIN] failed to write step sentinel for '{}': {e}", step_name);
+                        }
+                    }).await;
                 }
                 // Count setup steps (non-node-saving) toward progress so the
                 // UI doesn't sit at 0/0 during the initial chain phases.
@@ -4851,6 +4907,8 @@ async fn execute_evidence_loop(
         let layer_node_count = answered.len() as i32;
 
         // Step c: Persist answered nodes + evidence links + gaps
+        // Per-question atomic save: each answer is its own transaction so a crash
+        // loses at most one answer, not the entire layer.
         {
             let conn = state.writer.clone();
             let slug_owned = slug.to_string();
@@ -4859,9 +4917,9 @@ async fn execute_evidence_loop(
             let failed_owned = failed;
             tokio::task::spawn_blocking(move || {
                 let c = conn.blocking_lock();
-                c.execute_batch("BEGIN")?;
-                let result = (|| -> anyhow::Result<()> {
-                    for a in &answered_owned {
+                for a in &answered_owned {
+                    c.execute_batch("BEGIN")?;
+                    let result = (|| -> anyhow::Result<()> {
                         db::save_node(&c, &a.node, None)?;
                         for child_id in &a.node.children {
                             if child_id.contains('/') {
@@ -4883,7 +4941,19 @@ async fn execute_evidence_loop(
                             };
                             db::save_gap(&c, &slug_owned, &gap, Some(&bid_for_gaps))?;
                         }
+                        Ok(())
+                    })();
+                    match result {
+                        Ok(()) => { c.execute_batch("COMMIT")?; }
+                        Err(e) => {
+                            let _ = c.execute_batch("ROLLBACK");
+                            warn!(slug = %slug_owned, node_id = %a.node.id, error = %e, "failed to save answered node — continuing");
+                        }
                     }
+                }
+                // Save failed questions as gaps (single transaction, low risk)
+                if !failed_owned.is_empty() {
+                    c.execute_batch("BEGIN")?;
                     for fq in &failed_owned {
                         let gap = super::types::GapReport {
                             question_id: fq.question_id.clone(),
@@ -4897,18 +4967,9 @@ async fn execute_evidence_loop(
                         };
                         db::save_gap(&c, &slug_owned, &gap, Some(&bid_for_gaps))?;
                     }
-                    Ok(())
-                })();
-                match result {
-                    Ok(()) => {
-                        c.execute_batch("COMMIT")?;
-                        Ok(())
-                    }
-                    Err(e) => {
-                        let _ = c.execute_batch("ROLLBACK");
-                        Err(e)
-                    }
+                    c.execute_batch("COMMIT")?;
                 }
+                Ok::<(), anyhow::Error>(())
             })
             .await
             .map_err(|e| anyhow!("Evidence save panicked: {e}"))??;
@@ -10627,7 +10688,7 @@ async fn execute_ir_parallel_foreach(
 
                     // Save step record
                     let output_json = serde_json::to_string(&output).unwrap_or_default();
-                    let _ = writer_tx
+                    if let Err(e) = writer_tx
                         .send(IrWriteOp::SaveStep {
                             slug: slug.clone(),
                             step_type: step_name_owned.clone(),
@@ -10638,7 +10699,9 @@ async fn execute_ir_parallel_foreach(
                             model: model.clone(),
                             elapsed,
                         })
-                        .await;
+                        .await {
+                            warn!("[IR] writer channel closed, step save dropped for {}: {e}", node_id_clone);
+                        }
 
                     // Save node if needed
                     if saves_node {
@@ -10666,20 +10729,24 @@ async fn execute_ir_parallel_foreach(
                                 );
                             }
                             let children = node.children.clone();
-                            let _ = writer_tx
+                            if let Err(e) = writer_tx
                                 .send(IrWriteOp::SaveNode {
                                     node,
                                     topics_json: None,
                                 })
-                                .await;
+                                .await {
+                                    warn!("[IR] writer channel closed, node save dropped for {}: {e}", node_id_clone);
+                                }
                             for child_id in &children {
-                                let _ = writer_tx
+                                if let Err(e) = writer_tx
                                     .send(IrWriteOp::UpdateParent {
                                         slug: slug.clone(),
                                         node_id: child_id.clone(),
                                         parent_id: node_id_clone.clone(),
                                     })
-                                    .await;
+                                    .await {
+                                        warn!("[IR] writer channel closed, parent update dropped for {}: {e}", child_id);
+                                    }
                             }
                         }
                     }

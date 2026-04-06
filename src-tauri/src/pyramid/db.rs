@@ -3339,10 +3339,13 @@ pub fn get_stale_log(
         sql.push_str(&format!(" AND layer = ?{}", param_vals.len()));
     }
     if let Some(stale_str) = stale {
-        let stale_val: i32 = if stale_str == "yes" || stale_str == "true" || stale_str == "1" {
-            1
-        } else {
-            0
+        let stale_val: i32 = match stale_str {
+            "yes" | "true" | "1" => 1,
+            "no" | "false" | "0" => 0,
+            "new" | "2" => 2,
+            "deleted" | "3" => 3,
+            "renamed" | "4" => 4,
+            _ => 0,
         };
         param_vals.push(Box::new(stale_val));
         sql.push_str(&format!(" AND stale = ?{}", param_vals.len()));
@@ -3368,7 +3371,14 @@ pub fn get_stale_log(
                 "batch_id": row.get::<_, String>(2)?,
                 "layer": row.get::<_, i32>(3)?,
                 "target_id": row.get::<_, String>(4)?,
-                "stale": if row.get::<_, i32>(5)? == 1 { "yes" } else { "no" },
+                "stale": match row.get::<_, i32>(5)? {
+                    0 => "no",
+                    1 => "yes",
+                    2 => "new",
+                    3 => "deleted",
+                    4 => "renamed",
+                    _ => "unknown",
+                },
                 "reason": row.get::<_, String>(6)?,
                 "checker_index": row.get::<_, i32>(7)?,
                 "checker_batch_size": row.get::<_, i32>(8)?,
@@ -4649,26 +4659,55 @@ pub fn get_evidence_set_member_ids(
     Ok(rows.filter_map(|r| r.ok()).collect())
 }
 
+/// Resolve a potentially relative file path to absolute using the slug's source directories.
+/// If the path is already absolute, returns it unchanged.
+/// If resolution fails, returns the original path.
+pub fn resolve_to_absolute(conn: &Connection, slug: &str, path: &str) -> String {
+    if path.starts_with('/') {
+        return path.to_string();
+    }
+    let source_path: Option<String> = conn
+        .query_row(
+            "SELECT source_path FROM pyramid_slugs WHERE slug = ?1",
+            rusqlite::params![slug],
+            |row| row.get(0),
+        )
+        .ok();
+    if let Some(sp) = source_path {
+        let dirs: Vec<String> =
+            serde_json::from_str(&sp).unwrap_or_else(|_| vec![sp]);
+        for dir in &dirs {
+            let candidate = std::path::Path::new(dir).join(path);
+            if candidate.exists() {
+                return candidate.to_string_lossy().to_string();
+            }
+        }
+    }
+    path.to_string()
+}
+
 /// Append a targeted L0 node ID to a file's node_ids JSON array in pyramid_file_hashes.
 /// If no row exists for this file_path, creates one with the node_id.
+/// File paths are normalized to absolute before storage.
 pub fn append_node_id_to_file_hash(
     conn: &Connection,
     slug: &str,
     file_path: &str,
     node_id: &str,
 ) -> Result<()> {
+    let abs_path = resolve_to_absolute(conn, slug, file_path);
     let rows = conn.execute(
         "UPDATE pyramid_file_hashes
          SET node_ids = COALESCE(json_insert(node_ids, '$[#]', ?3), json_array(?3))
          WHERE slug = ?1 AND file_path = ?2",
-        rusqlite::params![slug, file_path, node_id],
+        rusqlite::params![slug, abs_path, node_id],
     )?;
     if rows == 0 {
         // No existing row — insert a new one
         conn.execute(
             "INSERT INTO pyramid_file_hashes (slug, file_path, hash, chunk_count, node_ids, last_ingested_at)
              VALUES (?1, ?2, '', 1, ?3, datetime('now'))",
-            rusqlite::params![slug, file_path, serde_json::json!([node_id]).to_string()],
+            rusqlite::params![slug, abs_path, serde_json::json!([node_id]).to_string()],
         )?;
     }
     Ok(())

@@ -408,12 +408,14 @@ impl PyramidStaleEngine {
 
         if let Ok(conn) = super::db::open_pyramid_connection(Path::new(&self.db_path)) {
             let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
-            let _ = conn.execute(
+            if let Err(e) = conn.execute(
                 "UPDATE pyramid_auto_update_config
                  SET breaker_tripped = 1, breaker_tripped_at = ?1
                  WHERE slug = ?2",
                 rusqlite::params![now, self.slug],
-            );
+            ) {
+                warn!(slug = %self.slug, "Failed to persist circuit breaker trip to DB: {e}");
+            }
         }
     }
 
@@ -423,12 +425,14 @@ impl PyramidStaleEngine {
         self.breaker_tripped = false;
 
         if let Ok(conn) = super::db::open_pyramid_connection(Path::new(&self.db_path)) {
-            let _ = conn.execute(
+            if let Err(e) = conn.execute(
                 "UPDATE pyramid_auto_update_config
                  SET breaker_tripped = 0, breaker_tripped_at = NULL
                  WHERE slug = ?1",
                 rusqlite::params![self.slug],
-            );
+            ) {
+                warn!(slug = %self.slug, "Failed to persist circuit breaker reset to DB: {e}");
+            }
 
             let max_depth = query_max_depth(&self.db_path, &self.slug);
             for layer in 0..=max_depth {
@@ -491,18 +495,22 @@ impl PyramidStaleEngine {
 
         if let Ok(conn) = super::db::open_pyramid_connection(Path::new(&self.db_path)) {
             let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
-            let _ = conn.execute(
+            if let Err(e) = conn.execute(
                 "UPDATE pyramid_auto_update_config
                  SET frozen = 1, frozen_at = ?1
                  WHERE slug = ?2",
                 rusqlite::params![now, self.slug],
-            );
-            let _ = conn.execute(
+            ) {
+                warn!(slug = %self.slug, "Failed to persist frozen state to DB: {e}");
+            }
+            if let Err(e) = conn.execute(
                 "UPDATE pyramid_pending_mutations
                  SET processed = 1
                  WHERE processed = 0 AND slug = ?1",
                 rusqlite::params![self.slug],
-            );
+            ) {
+                warn!(slug = %self.slug, "Failed to mark pending mutations as processed on freeze: {e}");
+            }
         }
     }
 
@@ -519,12 +527,14 @@ impl PyramidStaleEngine {
         self.frozen = false;
 
         if let Ok(conn) = super::db::open_pyramid_connection(Path::new(&self.db_path)) {
-            let _ = conn.execute(
+            if let Err(e) = conn.execute(
                 "UPDATE pyramid_auto_update_config
                  SET frozen = 0, frozen_at = NULL
                  WHERE slug = ?1",
                 rusqlite::params![self.slug],
-            );
+            ) {
+                warn!(slug = %self.slug, "Failed to persist unfrozen state to DB: {e}");
+            }
         }
     }
 }
@@ -602,10 +612,12 @@ pub async fn drain_and_dispatch(
                     if super::watcher::check_runaway(&conn, &s, &config) {
                         // Trip the breaker in the database
                         let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
-                        let _ = conn.execute(
+                        if let Err(e) = conn.execute(
                             "UPDATE pyramid_auto_update_config SET breaker_tripped = 1, breaker_tripped_at = ?1 WHERE slug = ?2",
                             rusqlite::params![now, s],
-                        );
+                        ) {
+                            warn!(slug = %s, "Failed to persist runaway-detected breaker trip to DB: {e}");
+                        }
                         return true;
                     }
                 }
@@ -863,7 +875,7 @@ pub async fn drain_and_dispatch(
                         match super::db::get_targeted_l0_for_canonical_nodes(&conn, &s, &canonical_ids) {
                             Ok(targeted_ids) => {
                                 for tid in &targeted_ids {
-                                    let _ = conn.execute(
+                                    if let Err(e) = conn.execute(
                                         "INSERT INTO pyramid_pending_mutations
                                          (slug, layer, mutation_type, target_ref, detail, cascade_depth, detected_at, processed)
                                          VALUES (?1, 0, 'targeted_l0_stale', ?2, ?3, ?4, ?5, 0)",
@@ -874,7 +886,9 @@ pub async fn drain_and_dispatch(
                                             result.cascade_depth + 1,
                                             now,
                                         ],
-                                    );
+                                    ) {
+                                        warn!(slug = %s, target = %tid, "Failed to insert targeted_l0_stale pending mutation: {e}");
+                                    }
                                 }
                                 if !targeted_ids.is_empty() {
                                     info!(
@@ -1390,15 +1404,8 @@ fn propagate_confirmed_stales(
         return Ok(());
     }
 
-    // Determine propagation strategy based on content type:
-    // question pyramids propagate through the evidence DAG, mechanical pyramids use parent_id.
-    let content_type: Option<String> = conn
-        .query_row(
-            "SELECT content_type FROM pyramid_slugs WHERE slug = ?1",
-            rusqlite::params![slug],
-            |row| row.get(0),
-        )
-        .ok();
+    // All pyramids now use the question chain internally regardless of content_type.
+    // Propagation always follows evidence KEEP links through the evidence DAG.
 
     for result in results {
         if !result.stale {
@@ -1415,13 +1422,11 @@ fn propagate_confirmed_stales(
         // a DB lookup that would fail because propagated mutations lack batch_id.
         let new_depth = result.cascade_depth + 1;
 
-        // Resolve the propagation target: we need the PARENT node, not the current node.
-        // For L0, target_id is a file path — resolve via pyramid_file_hashes.
-        // For L1+, target_id is a node ID — look up its parent directly (mechanical)
-        // or follow evidence KEEP links (question).
-        let propagation_targets = if layer == 0 && content_type.as_deref() == Some("question") {
-            // Question pyramids at L0: resolve canonical node IDs from the file,
-            // then find answer nodes that KEEP those L0 nodes via evidence links.
+        // Resolve the propagation target via evidence KEEP links.
+        // For L0, target_id is a file path — resolve to node IDs via pyramid_file_hashes first.
+        // For L1+, target_id is already a node ID.
+        let propagation_targets = if layer == 0 {
+            // L0: resolve file path → canonical node IDs → evidence KEEP targets
             let node_ids_json: Option<String> = conn
                 .query_row(
                     "SELECT node_ids FROM pyramid_file_hashes
@@ -1442,28 +1447,13 @@ fn propagate_confirmed_stales(
                 warn!(
                     slug = %slug,
                     target = %result.target_id,
-                    "L0 question stale file has no evidence KEEP targets — skipping propagation"
+                    "L0 stale file has no evidence KEEP targets — skipping propagation"
                 );
                 continue;
             }
             targets
-        } else if layer == 0 {
-            // Mechanical pyramids at L0: resolve via parent_id
-            let targets = stale_helpers_upper::resolve_parent_targets_for_file(
-                conn,
-                slug,
-                &result.target_id,
-            )?;
-            if targets.is_empty() {
-                warn!(
-                    slug = %slug,
-                    target = %result.target_id,
-                    "L0 stale file has no live parent thread target — skipping propagation"
-                );
-                continue;
-            }
-            targets
-        } else if content_type.as_deref() == Some("question") {
+        } else {
+            // L1+: follow evidence KEEP links upward
             let targets = stale_helpers_upper::resolve_evidence_targets_for_node_ids(
                 conn,
                 slug,
@@ -1475,23 +1465,6 @@ fn propagate_confirmed_stales(
                     target = %result.target_id,
                     layer,
                     "Node has no evidence KEEP targets — skipping propagation to L{}",
-                    next_layer
-                );
-                continue;
-            }
-            targets
-        } else {
-            let targets = stale_helpers_upper::resolve_parent_targets_for_node_ids(
-                conn,
-                slug,
-                std::slice::from_ref(&result.target_id),
-            )?;
-            if targets.is_empty() {
-                warn!(
-                    slug = %slug,
-                    target = %result.target_id,
-                    layer,
-                    "Node has no live parent thread target — skipping propagation to L{}",
                     next_layer
                 );
                 continue;

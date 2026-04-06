@@ -179,41 +179,9 @@ pub fn get_node_with_edges(
 /// If multiple nodes exist at the max depth (e.g. cancelled build), logs a warning
 /// and falls back one level to find the completed apex.
 pub fn get_apex(conn: &Connection, slug: &str) -> Result<Option<PyramidNode>> {
-    // For question slugs, all nodes are question nodes — no filter needed.
-    // For mechanical slugs, filter out overlay nodes (build_id LIKE 'qb-%').
-    let content_type: Option<String> = conn
-        .query_row(
-            "SELECT content_type FROM pyramid_slugs WHERE slug = ?1",
-            rusqlite::params![slug],
-            |row| row.get(0),
-        )
-        .optional()
-        .unwrap_or(None);
-
-    if content_type.as_deref() == Some("question") {
-        // Question slug: return the highest-depth node, no filter
-        get_apex_filtered(conn, slug, "")
-    } else {
-        // Mechanical slug: try mechanical nodes first, then check for overlay
-        let mechanical_result = get_apex_filtered(
-            conn,
-            slug,
-            "AND (build_id IS NULL OR build_id = '' OR build_id NOT LIKE 'qb-%')",
-        );
-        // If the mechanical slug has a question overlay, the overlay apex is the true apex
-        if db::has_existing_question_overlay(conn, slug)? {
-            let overlay_result = get_apex_filtered(conn, slug, "AND build_id LIKE 'qb-%'");
-            match (&mechanical_result, &overlay_result) {
-                (_, Ok(Some(overlay_node))) => {
-                    // Overlay exists and has a valid apex — use it (it's always deeper)
-                    Ok(Some(overlay_node.clone()))
-                }
-                _ => mechanical_result, // No overlay apex found, fall back to mechanical
-            }
-        } else {
-            mechanical_result
-        }
-    }
+    // All pyramids now use the question chain — return the highest-depth live node.
+    // No need to filter by build_id since all nodes participate in the same evidence DAG.
+    get_apex_filtered(conn, slug, "")
 }
 
 /// Get the apex node for a specific build_id (question overlay).
@@ -383,17 +351,18 @@ pub fn get_tree(conn: &Connection, slug: &str) -> Result<Vec<TreeNode>> {
     // Apex nodes are all nodes at max depth
     let apex_nodes: Vec<&PyramidNode> = nodes.iter().filter(|n| n.depth == max_depth).collect();
 
-    // Check if this is a question pyramid — build tree via evidence links instead of children[]
-    let content_type: Option<String> = conn
+    // All pyramids now use the question chain internally — build tree via evidence
+    // links. Fall back to mechanical children[] only if no evidence links exist.
+    let has_evidence: bool = conn
         .query_row(
-            "SELECT content_type FROM pyramid_slugs WHERE slug = ?1",
+            "SELECT COUNT(*) FROM pyramid_evidence WHERE slug = ?1 AND verdict = 'KEEP' LIMIT 1",
             rusqlite::params![slug],
-            |row| row.get(0),
+            |row| row.get::<_, i64>(0),
         )
-        .optional()
-        .unwrap_or(None);
+        .unwrap_or(0)
+        > 0;
 
-    if content_type.as_deref() == Some("question") {
+    if has_evidence {
         // Load KEEP evidence links: source (child layer) → target (parent layer)
         let mut children_by_parent: HashMap<String, Vec<String>> = HashMap::new();
         {

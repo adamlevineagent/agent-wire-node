@@ -117,6 +117,73 @@ pub async fn init_stale_engines(pyramid_state: &Arc<pyramid::PyramidState>) {
         }
     }
 
+    // Migrate relative file_hashes paths to absolute (one-time normalization)
+    {
+        let conn = pyramid_state.writer.lock().await;
+        // Find all slugs that have relative paths (don't start with /)
+        let slugs_with_relative: Vec<(String, String)> = conn
+            .prepare(
+                "SELECT DISTINCT fh.slug, s.source_path
+                 FROM pyramid_file_hashes fh
+                 JOIN pyramid_slugs s ON s.slug = fh.slug
+                 WHERE fh.file_path NOT LIKE '/%'",
+            )
+            .and_then(|mut stmt| {
+                stmt.query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map(|iter| iter.filter_map(|r| r.ok()).collect())
+            })
+            .unwrap_or_default();
+
+        let mut total_migrated = 0usize;
+        for (slug, source_path_json) in &slugs_with_relative {
+            let dirs: Vec<String> = serde_json::from_str(source_path_json)
+                .unwrap_or_else(|_| vec![source_path_json.clone()]);
+
+            // Get all relative paths for this slug
+            let rel_paths: Vec<(String, )> = {
+                let mut stmt = match conn.prepare(
+                    "SELECT file_path FROM pyramid_file_hashes WHERE slug = ?1 AND file_path NOT LIKE '/%'",
+                ) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                stmt.query_map(rusqlite::params![slug], |row| {
+                    Ok((row.get::<_, String>(0)?,))
+                })
+                .map(|iter| iter.filter_map(|r| r.ok()).collect())
+                .unwrap_or_default()
+            };
+
+            for (rel_path,) in &rel_paths {
+                // Try to resolve against source directories
+                let mut resolved = None;
+                for dir in &dirs {
+                    let candidate = std::path::Path::new(dir).join(rel_path);
+                    if candidate.exists() {
+                        resolved = Some(candidate.to_string_lossy().to_string());
+                        break;
+                    }
+                }
+                if let Some(abs_path) = resolved {
+                    let _ = conn.execute(
+                        "UPDATE pyramid_file_hashes SET file_path = ?1 WHERE slug = ?2 AND file_path = ?3",
+                        rusqlite::params![abs_path, slug, rel_path],
+                    );
+                    total_migrated += 1;
+                }
+            }
+        }
+
+        if total_migrated > 0 {
+            tracing::info!(
+                "Migrated {} relative file_hashes paths to absolute",
+                total_migrated
+            );
+        }
+    }
+
     // Get API key and model from pyramid config
     let (api_key, model) = {
         let config = pyramid_state.config.read().await;
