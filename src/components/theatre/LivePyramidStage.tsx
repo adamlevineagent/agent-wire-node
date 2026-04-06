@@ -175,18 +175,45 @@ export function LivePyramidStage({ nodes, currentStep, isActive, onNodeClick }: 
         // Build lookup for edges
         const nodeMap = new Map(spatial.map(n => [n.id, n]));
 
-        // Draw edges
+        // Draw edges: use parentId (mechanical) AND children arrays (evidence-based).
+        // Question pyramids store L0→L1 connections in children[], not parent_id.
         ctx.lineWidth = 1;
+        const drawnEdges = new Set<string>();
         for (const node of spatial) {
-            if (!node.parentId) continue;
-            const parent = nodeMap.get(node.parentId);
-            if (!parent) continue;
-            ctx.strokeStyle = node.status === 'complete' ? COLORS.edgeActive : COLORS.edge;
-            ctx.beginPath();
-            const cpY = (node.y + parent.y) / 2;
-            ctx.moveTo(parent.x, parent.y);
-            ctx.quadraticCurveTo(parent.x, cpY, node.x, node.y);
-            ctx.stroke();
+            // Parent-based edges (L1→L2, L2→L3)
+            if (node.parentId) {
+                const parent = nodeMap.get(node.parentId);
+                if (parent) {
+                    const edgeKey = `${node.id}-${parent.id}`;
+                    if (!drawnEdges.has(edgeKey)) {
+                        drawnEdges.add(edgeKey);
+                        ctx.strokeStyle = node.status === 'complete' ? COLORS.edgeActive : COLORS.edge;
+                        ctx.beginPath();
+                        const cpY = (node.y + parent.y) / 2;
+                        ctx.moveTo(parent.x, parent.y);
+                        ctx.quadraticCurveTo(parent.x, cpY, node.x, node.y);
+                        ctx.stroke();
+                    }
+                }
+            }
+            // Children-based edges (L1→L0 via children array)
+            if (node.children) {
+                for (const childId of node.children) {
+                    const child = nodeMap.get(childId);
+                    if (child) {
+                        const edgeKey = `${child.id}-${node.id}`;
+                        if (!drawnEdges.has(edgeKey)) {
+                            drawnEdges.add(edgeKey);
+                            ctx.strokeStyle = child.status === 'complete' ? COLORS.edgeActive : COLORS.edge;
+                            ctx.beginPath();
+                            const cpY = (child.y + node.y) / 2;
+                            ctx.moveTo(node.x, node.y);
+                            ctx.quadraticCurveTo(node.x, cpY, child.x, child.y);
+                            ctx.stroke();
+                        }
+                    }
+                }
+            }
         }
 
         // Draw nodes
