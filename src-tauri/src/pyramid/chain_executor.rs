@@ -4127,12 +4127,16 @@ pub async fn execute_chain_from(
                     Arc::make_mut(&mut ctx.step_outputs).insert(step.name.clone(), output);
                 }
                 // Write step-level sentinel so restarts skip this step.
-                // Exception: step_only steps are in-memory pipeline plumbing that
-                // don't persist their output. Sentineling them causes hydration
-                // failures on rebuild because the "output" was never saved.
-                // These steps must re-run on rebuild — they're cheap relative to
-                // the LLM work already done, and downstream steps need their outputs.
-                if step.save_as.as_deref() != Some("step_only") {
+                // Exceptions that must ALWAYS re-run on rebuild:
+                //   - step_only: in-memory pipeline plumbing, output never persisted
+                //     (sentineling causes hydration failures downstream)
+                //   - web primitive: webbing edges depend on the current node set.
+                //     DADBEAR can supersede/add nodes between builds, and there is
+                //     no coordination to invalidate webbing sentinels when nodes
+                //     change. Skipping webbing on rebuild leaves new/updated nodes
+                //     orphaned from the sibling web graph. The dehydration cascade
+                //     keeps re-webbing cheap; correctness wins.
+                if step.save_as.as_deref() != Some("step_only") && step.primitive != "web" {
                     let writer = state.writer.clone();
                     let slug_s = slug.to_string();
                     let step_name = step.name.clone();
