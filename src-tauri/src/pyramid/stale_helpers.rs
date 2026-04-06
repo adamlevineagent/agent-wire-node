@@ -443,6 +443,39 @@ pub async fn dispatch_new_file_ingest(batch: Vec<PendingMutation>, db_path: &str
             )
             .with_context(|| format!("Failed to update file_hashes for {}", file_path))?;
 
+            // Write deltas to upstream L1 threads so their stale checks have content
+            let upstream_threads = resolve_evidence_targets_for_node_ids(
+                &conn, &slug_c, std::slice::from_ref(&node_id),
+            ).unwrap_or_default();
+
+            let delta_summary = format!(
+                "New file added to corpus: {}\n\nContent summary:\n{}",
+                file_path,
+                distilled.chars().take(800).collect::<String>(),
+            );
+
+            for tid in &upstream_threads {
+                let next_seq: i64 = conn.query_row(
+                    "SELECT COALESCE(MAX(sequence), 0) + 1 FROM pyramid_deltas
+                     WHERE slug = ?1 AND thread_id = ?2",
+                    rusqlite::params![slug_c, tid],
+                    |row| row.get(0),
+                ).unwrap_or(1);
+
+                let _ = conn.execute(
+                    "INSERT INTO pyramid_deltas
+                     (slug, thread_id, sequence, content, relevance, source_node_id, flag, created_at)
+                     VALUES (?1, ?2, ?3, ?4, 'high', ?5, NULL, ?6)",
+                    rusqlite::params![slug_c, tid, next_seq, delta_summary, node_id, now],
+                );
+
+                let _ = conn.execute(
+                    "UPDATE pyramid_threads SET delta_count = delta_count + 1, updated_at = ?1
+                     WHERE slug = ?2 AND thread_id = ?3",
+                    rusqlite::params![now, slug_c, tid],
+                );
+            }
+
             let parent_count = enqueue_parent_confirmed_stales(
                 &conn,
                 &slug_c,
@@ -590,6 +623,38 @@ pub async fn dispatch_tombstone(batch: Vec<PendingMutation>, db_path: &str) -> R
                 "DELETE FROM pyramid_file_hashes WHERE slug = ?1 AND file_path = ?2",
                 rusqlite::params![slug_c, file_path],
             )?;
+
+            // Write deltas to upstream L1 threads so their stale checks know this file was removed
+            let upstream_threads = resolve_evidence_targets_for_node_ids(
+                &conn, &slug_c, &node_ids,
+            ).unwrap_or_default();
+
+            let delta_summary = format!(
+                "File deleted from corpus: {}\n\nPrevious content was tombstoned as node {}.",
+                file_path, tombstone_id,
+            );
+
+            for tid in &upstream_threads {
+                let next_seq: i64 = conn.query_row(
+                    "SELECT COALESCE(MAX(sequence), 0) + 1 FROM pyramid_deltas
+                     WHERE slug = ?1 AND thread_id = ?2",
+                    rusqlite::params![slug_c, tid],
+                    |row| row.get(0),
+                ).unwrap_or(1);
+
+                let _ = conn.execute(
+                    "INSERT INTO pyramid_deltas
+                     (slug, thread_id, sequence, content, relevance, source_node_id, flag, created_at)
+                     VALUES (?1, ?2, ?3, ?4, 'high', ?5, NULL, ?6)",
+                    rusqlite::params![slug_c, tid, next_seq, delta_summary, tombstone_id, now],
+                );
+
+                let _ = conn.execute(
+                    "UPDATE pyramid_threads SET delta_count = delta_count + 1, updated_at = ?1
+                     WHERE slug = ?2 AND thread_id = ?3",
+                    rusqlite::params![now, slug_c, tid],
+                );
+            }
 
             let parent_count = enqueue_parent_confirmed_stales(
                 &conn,
