@@ -641,8 +641,7 @@ pub async fn drain_and_dispatch(
             if layer == 0 {
                 let count: i64 = conn.query_row(
                     "SELECT COUNT(*) FROM pyramid_pending_mutations
-                     WHERE processed = 0 AND slug = ?1 AND layer = 0
-                     AND mutation_type NOT IN ('new_file', 'deleted_file')",
+                     WHERE processed = 0 AND slug = ?1 AND layer = 0",
                     rusqlite::params![s],
                     |row| row.get(0),
                 )?;
