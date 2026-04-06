@@ -4468,6 +4468,57 @@ async fn pyramid_question_build(
     }))
 }
 
+/// Rebuild a pyramid using the question from its last build.
+/// This is the sole rebuild path — all pyramids are question pyramids.
+#[tauri::command]
+async fn pyramid_rebuild(
+    state: tauri::State<'_, SharedState>,
+    slug: String,
+) -> Result<serde_json::Value, String> {
+    // Look up the question from the last build record
+    let (question, _build_id) = {
+        let conn = state.pyramid.reader.lock().await;
+        let mut stmt = conn
+            .prepare(
+                "SELECT question, build_id FROM pyramid_builds \
+                 WHERE slug = ?1 AND question IS NOT NULL AND question != '' \
+                 ORDER BY rowid DESC LIMIT 1",
+            )
+            .map_err(|e| format!("Failed to query build history: {e}"))?;
+        let result: Result<(String, String), _> = stmt.query_row(
+            rusqlite::params![&slug],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        );
+        match result {
+            Ok(r) => r,
+            Err(_) => {
+                return Err(format!(
+                    "No previous question build found for '{}'. Use the question build flow instead.",
+                    slug
+                ));
+            }
+        }
+    };
+
+    tracing::info!(
+        slug = %slug,
+        question = %question,
+        "pyramid_rebuild: re-triggering question build from stored params"
+    );
+
+    // Delegate to pyramid_question_build with the stored question and defaults
+    pyramid_question_build(
+        state,
+        slug,
+        question,
+        None, // granularity: default 3
+        None, // max_depth: default 3
+        None, // from_depth: default 0
+        None, // characterization: auto
+    )
+    .await
+}
+
 /// IPC equivalent of POST /pyramid/:slug/build/preview — preview decomposition.
 #[tauri::command]
 async fn pyramid_question_preview(
@@ -7223,6 +7274,7 @@ fn main() {
             pyramid_set_absorption_mode,
             pyramid_get_absorption_config,
             pyramid_question_build,
+            pyramid_rebuild,
             pyramid_question_preview,
             pyramid_characterize,
             pyramid_parity_run,

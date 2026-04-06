@@ -373,7 +373,7 @@ export function PyramidDashboard() {
 
     const handleRebuild = useCallback(async (slug: string) => {
         try {
-            await invoke('pyramid_build', { slug });
+            await invoke('pyramid_rebuild', { slug });
             setBuildingSlug(slug);
             setView('building');
         } catch (err) {
