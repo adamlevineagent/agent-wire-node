@@ -18,14 +18,13 @@ use anyhow::{anyhow, Result};
 use serde::Deserialize;
 use tokio::sync::Semaphore;
 use tracing::{info, warn};
-use uuid::Uuid;
 
 use std::path::PathBuf;
 
 use rusqlite;
 
 use super::db;
-use super::llm::{self, LlmConfig};
+use super::llm::{self, AuditContext, LlmConfig};
 use super::question_decomposition::render_prompt_template;
 use super::types::{
     AnswerBatchResult, AnsweredNode, CandidateMap, EvidenceLink, EvidenceSet, EvidenceVerdict,
@@ -86,6 +85,7 @@ pub async fn pre_map_layer(
     chains_dir: Option<&PathBuf>,
     source_content_type: Option<&str>,
     evidence_sets: Option<&[EvidenceSet]>, // loaded by caller, None for single-pass
+    audit: Option<&AuditContext>,
 ) -> Result<CandidateMap> {
     if questions.is_empty() {
         return Ok(CandidateMap {
@@ -142,6 +142,7 @@ pub async fn pre_map_layer(
                     audience,
                     chains_dir,
                     source_content_type,
+                    audit,
                 )
                 .await;
             }
@@ -244,15 +245,25 @@ Every question_id from the input MUST appear as a key in the mappings, even if i
     );
 
     // ── LLM call (primary model — fast classification) ──────
-    let response = llm::call_model_unified(
-        llm_config,
-        &system_prompt,
-        &user_prompt,
-        ops.tier1.pre_map_temperature,
-        ops.tier1.pre_map_max_tokens,
-        None,
-    )
-    .await?;
+    let response = if let Some(ctx) = audit {
+        let ctx = AuditContext {
+            call_purpose: "pre_map".to_string(),
+            step_name: "evidence_pre_map".to_string(),
+            ..ctx.clone()
+        };
+        let (resp, _) = llm::call_model_audited(
+            llm_config, &system_prompt, &user_prompt,
+            ops.tier1.pre_map_temperature, ops.tier1.pre_map_max_tokens,
+            None, &ctx,
+        ).await?;
+        resp
+    } else {
+        llm::call_model_unified(
+            llm_config, &system_prompt, &user_prompt,
+            ops.tier1.pre_map_temperature, ops.tier1.pre_map_max_tokens,
+            None,
+        ).await?
+    };
 
     info!(
         questions = questions.len(),
@@ -282,11 +293,20 @@ Every question_id from the input MUST appear as a key in the mappings, even if i
     // Filter out any node IDs that don't actually exist in the lower layer
     let valid_ids: std::collections::HashSet<&str> =
         lower_layer_nodes.iter().map(|n| n.id.as_str()).collect();
+    let raw_total: usize = mappings.values().map(|v| v.len()).sum();
     for candidates in mappings.values_mut() {
         candidates.retain(|id| valid_ids.contains(id.as_str()));
     }
 
     let total_candidates: usize = mappings.values().map(|v| v.len()).sum();
+    if total_candidates < raw_total {
+        warn!(
+            raw_total,
+            resolved = total_candidates,
+            dropped = raw_total - total_candidates,
+            "pre-mapping: some LLM-returned IDs did not match any node in the lower layer"
+        );
+    }
     info!(
         total_candidates,
         questions = questions.len(),
@@ -311,6 +331,7 @@ async fn pre_map_layer_two_stage(
     audience: Option<&str>,
     chains_dir: Option<&PathBuf>,
     source_content_type: Option<&str>,
+    audit: Option<&AuditContext>,
 ) -> Result<CandidateMap> {
     info!(
         questions = questions.len(),
@@ -401,15 +422,25 @@ Every question_id from the input MUST appear as a key in set_mappings, even if i
     );
 
     // LLM call — stage 1 (fast classification)
-    let response = llm::call_model_unified(
-        llm_config,
-        &system_prompt,
-        &user_prompt,
-        ops.tier1.pre_map_temperature,
-        ops.tier1.pre_map_max_tokens,
-        None,
-    )
-    .await?;
+    let response = if let Some(ctx) = audit {
+        let ctx = AuditContext {
+            call_purpose: "pre_map_refinement".to_string(),
+            step_name: "evidence_pre_map_stage1".to_string(),
+            ..ctx.clone()
+        };
+        let (resp, _) = llm::call_model_audited(
+            llm_config, &system_prompt, &user_prompt,
+            ops.tier1.pre_map_temperature, ops.tier1.pre_map_max_tokens,
+            None, &ctx,
+        ).await?;
+        resp
+    } else {
+        llm::call_model_unified(
+            llm_config, &system_prompt, &user_prompt,
+            ops.tier1.pre_map_temperature, ops.tier1.pre_map_max_tokens,
+            None,
+        ).await?
+    };
 
     info!(
         tokens_in = response.usage.prompt_tokens,
@@ -496,6 +527,7 @@ Every question_id from the input MUST appear as a key in set_mappings, even if i
         chains_dir,
         source_content_type,
         None, // single-pass — no evidence sets
+        audit,
     ))
     .await
 }
@@ -541,6 +573,7 @@ pub async fn answer_questions(
     chains_dir: Option<&PathBuf>,
     source_content_type: Option<&str>,
     ops: &OperationalConfig,
+    audit: Option<&AuditContext>,
 ) -> Result<AnswerBatchResult> {
     if questions.is_empty() {
         return Ok(AnswerBatchResult {
@@ -565,7 +598,8 @@ pub async fn answer_questions(
     let answer_slug_owned = answer_slug.to_string();
     let work_items: Vec<AnswerWorkItem> = questions
         .iter()
-        .map(|q| {
+        .enumerate()
+        .map(|(idx, q)| {
             let candidate_ids = candidate_map
                 .mappings
                 .get(&q.question_id)
@@ -590,11 +624,13 @@ pub async fn answer_questions(
             AnswerWorkItem {
                 question: q.clone(),
                 candidate_nodes,
+                seq_index: idx,
             }
         })
         .collect();
 
     // Spawn parallel tasks — each returns (question_meta, Result<AnsweredNode>)
+    let audit_owned = audit.cloned();
     let mut handles = Vec::new();
     for work in work_items {
         let semaphore = semaphore.clone();
@@ -608,7 +644,9 @@ pub async fn answer_questions(
         let q_id = work.question.question_id.clone();
         let q_text = work.question.question_text.clone();
         let q_layer = work.question.layer;
+        let task_audit = audit_owned.clone();
 
+        let seq_index = work.seq_index;
         let handle = tokio::spawn(async move {
             let _permit = semaphore
                 .acquire_owned()
@@ -618,6 +656,7 @@ pub async fn answer_questions(
             let result = answer_single_question(
                 &work.question,
                 &work.candidate_nodes,
+                seq_index,
                 synthesis_prompt.as_deref(),
                 audience.as_deref(),
                 &llm_config,
@@ -627,6 +666,7 @@ pub async fn answer_questions(
                 answer_max_tokens,
                 chains_dir_owned.as_ref(),
                 source_ct.as_deref(),
+                task_audit.as_ref(),
             )
             .await;
             (q_id, q_text, q_layer, result)
@@ -682,6 +722,9 @@ pub async fn answer_questions(
 struct AnswerWorkItem {
     question: LayerQuestion,
     candidate_nodes: Vec<PyramidNode>,
+    /// Sequential index within this batch, used to generate short deterministic
+    /// node IDs (e.g. L2-003) instead of UUIDs.
+    seq_index: usize,
 }
 
 // ── Per-Question Answering ───────────────────────────────────────────────────
@@ -693,6 +736,7 @@ struct AnswerWorkItem {
 async fn answer_single_question(
     question: &LayerQuestion,
     candidate_nodes: &[PyramidNode],
+    seq_index: usize,
     synthesis_prompt: Option<&str>,
     audience: Option<&str>,
     llm_config: &LlmConfig,
@@ -702,8 +746,11 @@ async fn answer_single_question(
     answer_max_tokens: usize,
     chains_dir: Option<&PathBuf>,
     source_content_type: Option<&str>,
+    audit: Option<&AuditContext>,
 ) -> Result<AnsweredNode> {
-    let node_id = format!("L{}-{}", question.layer, Uuid::new_v4());
+    // Use short sequential IDs (L2-003) matching the pattern used by build.rs.
+    // UUIDs are impossible for LLMs to reproduce in downstream pre-mapping steps.
+    let node_id = format!("L{}-{:03}", question.layer, seq_index);
 
     // Short-circuit: no candidates → skip LLM, emit placeholder + MISSING verdict
     if candidate_nodes.is_empty() {
@@ -845,15 +892,21 @@ Respond with ONLY a JSON object:
     );
 
     // ── LLM call ────────────────────────────────────────────────────────
-    let response = llm::call_model_unified(
-        llm_config,
-        &system_prompt,
-        &user_prompt,
-        answer_temperature,
-        answer_max_tokens,
-        None,
-    )
-    .await?;
+    let response = if let Some(ctx) = audit {
+        let ctx = ctx.for_node(&node_id, "answer", question.layer as i64);
+        let (resp, _) = llm::call_model_audited(
+            llm_config, &system_prompt, &user_prompt,
+            answer_temperature, answer_max_tokens,
+            None, &ctx,
+        ).await?;
+        resp
+    } else {
+        llm::call_model_unified(
+            llm_config, &system_prompt, &user_prompt,
+            answer_temperature, answer_max_tokens,
+            None,
+        ).await?
+    };
 
     info!(
         question_id = %question.question_id,
@@ -1096,10 +1149,14 @@ pub async fn targeted_reexamination(
     audience: Option<&str>,
     chains_dir: Option<&PathBuf>,
     ops: &OperationalConfig,
+    audit: Option<&AuditContext>,
 ) -> Result<Vec<PyramidNode>> {
     if source_candidates.is_empty() {
         return Ok(Vec::new());
     }
+
+    // Counter for sequential node IDs within this batch of targeted extractions
+    let mut targeted_node_counter: usize = 0;
 
     // ── Build template variables ────────────────────────────────────────
     let audience_block = match audience {
@@ -1164,24 +1221,34 @@ Respond with ONLY a JSON object:
             content
         );
 
-        let response = match llm::call_model_unified(
-            llm_config,
-            &system_prompt,
-            &user_prompt,
-            ops.tier1.answer_temperature,
-            ops.tier1.answer_max_tokens,
-            None,
-        )
-        .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                warn!(
-                    file_path = %file_path,
-                    error = %e,
-                    "targeted extraction LLM call failed, skipping file"
-                );
-                continue;
+        let response = if let Some(ctx) = audit {
+            let ctx = AuditContext {
+                call_purpose: "gap_answer".to_string(),
+                step_name: "targeted_reexamination".to_string(),
+                ..ctx.clone()
+            };
+            match llm::call_model_audited(
+                llm_config, &system_prompt, &user_prompt,
+                ops.tier1.answer_temperature, ops.tier1.answer_max_tokens,
+                None, &ctx,
+            ).await {
+                Ok((resp, _)) => resp,
+                Err(e) => {
+                    warn!(file_path = %file_path, error = %e, "targeted extraction LLM call failed, skipping file");
+                    continue;
+                }
+            }
+        } else {
+            match llm::call_model_unified(
+                llm_config, &system_prompt, &user_prompt,
+                ops.tier1.answer_temperature, ops.tier1.answer_max_tokens,
+                None,
+            ).await {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!(file_path = %file_path, error = %e, "targeted extraction LLM call failed, skipping file");
+                    continue;
+                }
             }
         };
 
@@ -1233,7 +1300,7 @@ Respond with ONLY a JSON object:
                 .collect();
 
             let node = PyramidNode {
-                id: format!("L0-{}", Uuid::new_v4()),
+                id: format!("L0-T{:03}", targeted_node_counter),
                 slug: target_slug.to_string(),
                 depth: 0,
                 chunk_index: None,
@@ -1253,6 +1320,7 @@ Respond with ONLY a JSON object:
             };
 
             all_nodes.push(node);
+            targeted_node_counter += 1;
         }
     }
 

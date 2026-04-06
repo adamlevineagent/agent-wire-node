@@ -15990,3 +15990,618 @@ body {
 .pbv-log-msg {
     color: var(--text-secondary);
 }
+
+/* ── Live Pyramid Theatre ─────────────────────────────────────────────────── */
+
+.pyramid-theatre {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    min-height: 400px;
+    background: var(--bg-primary, #111);
+    border-radius: 8px;
+    overflow: hidden;
+}
+
+.theatre-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border-primary, #333);
+}
+
+.theatre-header h3 {
+    margin: 0;
+    font-size: 14px;
+    font-weight: 600;
+}
+
+.theatre-header-right {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+
+.theatre-stats {
+    font-size: 12px;
+    color: var(--text-muted, #888);
+    font-family: 'SF Mono', 'Fira Code', monospace;
+}
+
+/* Stage (canvas container) */
+.theatre-stage {
+    flex: 1;
+    position: relative;
+    min-height: 200px;
+    overflow: hidden;
+}
+
+.theatre-stage canvas {
+    display: block;
+    width: 100%;
+    height: 100%;
+}
+
+.theatre-stage-waiting {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    color: var(--text-muted, #888);
+    font-size: 14px;
+}
+
+.theatre-tooltip {
+    position: absolute;
+    transform: translateX(-50%);
+    background: rgba(0, 0, 0, 0.85);
+    color: #fff;
+    padding: 4px 8px;
+    border-radius: 4px;
+    font-size: 11px;
+    white-space: nowrap;
+    pointer-events: none;
+    max-width: 300px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* Activity log */
+.theatre-log-toggle {
+    padding: 4px 16px;
+    font-size: 11px;
+    color: var(--text-muted, #888);
+    cursor: pointer;
+    border-top: 1px solid var(--border-primary, #333);
+    user-select: none;
+}
+
+.theatre-log-toggle:hover {
+    color: var(--text-secondary, #ccc);
+}
+
+.theatre-log {
+    max-height: 160px;
+    overflow-y: auto;
+    border-top: 1px solid var(--border-primary, #333);
+    transition: max-height 0.2s ease;
+}
+
+.theatre-log-collapsed {
+    max-height: 0;
+    overflow: hidden;
+}
+
+.theatre-log-header {
+    padding: 6px 16px;
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-muted, #888);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+.theatre-log-scroll {
+    padding: 0 16px 8px;
+}
+
+.theatre-log-entry {
+    display: flex;
+    gap: 8px;
+    padding: 1px 0;
+    font-size: 11px;
+    font-family: 'SF Mono', 'Fira Code', monospace;
+}
+
+.theatre-log-time {
+    color: var(--text-muted, #888);
+    min-width: 36px;
+}
+
+.theatre-log-msg {
+    color: var(--text-secondary, #ccc);
+}
+
+/* ── Node Inspector Modal ─────────────────────────────────────────────────── */
+
+.inspector-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.6);
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    z-index: 1000;
+}
+
+.inspector-modal {
+    background: var(--bg-secondary, #1a1a1a);
+    border: 1px solid var(--border-primary, #333);
+    border-radius: 8px;
+    width: min(800px, 90vw);
+    max-height: 80vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+
+.inspector-header {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border-primary, #333);
+}
+
+.inspector-nav {
+    display: flex;
+    gap: 4px;
+}
+
+.inspector-nav-btn {
+    width: 28px;
+    height: 28px;
+    border: 1px solid var(--border-primary, #444);
+    border-radius: 4px;
+    background: transparent;
+    color: var(--text-secondary, #ccc);
+    cursor: pointer;
+    font-size: 12px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.inspector-nav-btn:disabled {
+    opacity: 0.3;
+    cursor: default;
+}
+
+.inspector-nav-btn:not(:disabled):hover {
+    background: var(--bg-hover, #333);
+}
+
+.inspector-title {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+}
+
+.inspector-headline {
+    font-weight: 600;
+    font-size: 14px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.inspector-depth-badge {
+    background: var(--accent, #4ecdc4);
+    color: #000;
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: 700;
+    flex-shrink: 0;
+}
+
+.inspector-close {
+    width: 28px;
+    height: 28px;
+    border: none;
+    background: transparent;
+    color: var(--text-muted, #888);
+    cursor: pointer;
+    font-size: 14px;
+    border-radius: 4px;
+}
+
+.inspector-close:hover {
+    background: var(--bg-hover, #333);
+    color: var(--text-primary, #fff);
+}
+
+/* Inspector tabs */
+.inspector-tabs {
+    display: flex;
+    border-bottom: 1px solid var(--border-primary, #333);
+    padding: 0 16px;
+}
+
+.inspector-tab {
+    padding: 8px 16px;
+    border: none;
+    background: transparent;
+    color: var(--text-muted, #888);
+    cursor: pointer;
+    font-size: 13px;
+    border-bottom: 2px solid transparent;
+    transition: color 0.15s, border-color 0.15s;
+}
+
+.inspector-tab:hover {
+    color: var(--text-secondary, #ccc);
+}
+
+.inspector-tab.active {
+    color: var(--text-primary, #fff);
+    border-bottom-color: var(--accent, #4ecdc4);
+}
+
+.inspector-content {
+    flex: 1;
+    overflow-y: auto;
+    padding: 16px;
+}
+
+.inspector-loading {
+    text-align: center;
+    padding: 40px;
+    color: var(--text-muted, #888);
+}
+
+.inspector-empty {
+    text-align: center;
+    padding: 40px;
+    color: var(--text-muted, #888);
+}
+
+.inspector-footer {
+    display: flex;
+    gap: 16px;
+    padding: 8px 16px;
+    border-top: 1px solid var(--border-primary, #333);
+    font-size: 11px;
+    color: var(--text-muted, #888);
+    font-family: 'SF Mono', 'Fira Code', monospace;
+}
+
+/* Prompt tab */
+.prompt-tab {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.prompt-section-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 4px 0;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-secondary, #ccc);
+    cursor: pointer;
+    user-select: none;
+}
+
+.prompt-char-count {
+    font-weight: 400;
+    color: var(--text-muted, #888);
+    font-size: 11px;
+}
+
+.prompt-content {
+    background: var(--bg-primary, #111);
+    border: 1px solid var(--border-primary, #333);
+    border-radius: 4px;
+    padding: 12px;
+    font-size: 12px;
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 300px;
+    overflow-y: auto;
+    margin: 0;
+    color: var(--text-secondary, #ccc);
+}
+
+.prompt-inflight {
+    text-align: center;
+    padding: 20px;
+    color: var(--accent, #4ecdc4);
+    font-style: italic;
+}
+
+/* Response tab */
+.response-tab {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.response-toggle {
+    display: flex;
+    gap: 4px;
+}
+
+.response-toggle-btn {
+    padding: 4px 12px;
+    border: 1px solid var(--border-primary, #444);
+    border-radius: 4px;
+    background: transparent;
+    color: var(--text-muted, #888);
+    cursor: pointer;
+    font-size: 12px;
+}
+
+.response-toggle-btn.active {
+    background: var(--bg-hover, #333);
+    color: var(--text-primary, #fff);
+}
+
+.response-raw {
+    background: var(--bg-primary, #111);
+    border: 1px solid var(--border-primary, #333);
+    border-radius: 4px;
+    padding: 12px;
+    font-size: 12px;
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 400px;
+    overflow-y: auto;
+    margin: 0;
+    color: var(--text-secondary, #ccc);
+}
+
+.response-structured {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.response-field strong {
+    color: var(--text-secondary, #ccc);
+    font-size: 12px;
+}
+
+.response-field p {
+    margin: 4px 0 0;
+    color: var(--text-secondary, #ccc);
+    font-size: 13px;
+    line-height: 1.5;
+}
+
+.response-field ul {
+    margin: 4px 0 0;
+    padding-left: 20px;
+}
+
+.response-field li {
+    color: var(--text-secondary, #ccc);
+    font-size: 12px;
+    margin: 2px 0;
+}
+
+.response-error {
+    color: #e74c3c;
+    padding: 12px;
+    background: rgba(231, 76, 60, 0.1);
+    border-radius: 4px;
+}
+
+.verdict-list {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin-top: 4px;
+}
+
+.verdict-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 8px;
+    border-radius: 4px;
+    font-size: 12px;
+}
+
+.verdict-keep { background: rgba(78, 205, 196, 0.1); }
+.verdict-disconnect { background: rgba(231, 76, 60, 0.1); }
+
+.verdict-badge {
+    font-size: 10px;
+    font-weight: 700;
+    padding: 1px 4px;
+    border-radius: 2px;
+    text-transform: uppercase;
+}
+
+.verdict-keep .verdict-badge { background: #4ecdc4; color: #000; }
+.verdict-disconnect .verdict-badge { background: #e74c3c; color: #fff; }
+
+.verdict-node { font-family: 'SF Mono', 'Fira Code', monospace; color: var(--text-muted, #888); }
+.verdict-weight { color: var(--text-muted, #888); }
+.verdict-reason { color: var(--text-secondary, #ccc); font-size: 11px; }
+
+/* Details tab */
+.details-tab {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+}
+
+.details-section h4 {
+    margin: 0 0 8px;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-secondary, #ccc);
+}
+
+.details-section ul {
+    margin: 0;
+    padding-left: 20px;
+}
+
+.details-section li {
+    color: var(--text-secondary, #ccc);
+    font-size: 12px;
+    margin: 2px 0;
+}
+
+.details-evidence-list,
+.details-children,
+.details-web-edges {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.details-evidence-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 8px;
+    border-radius: 4px;
+    font-size: 12px;
+}
+
+.clickable {
+    cursor: pointer;
+}
+
+.clickable:hover {
+    background: var(--bg-hover, #333);
+}
+
+.details-child {
+    display: flex;
+    gap: 8px;
+    padding: 4px 8px;
+    border-radius: 4px;
+    font-size: 12px;
+}
+
+.details-child-id {
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    color: var(--text-muted, #888);
+    min-width: 80px;
+}
+
+.details-child-headline {
+    color: var(--text-secondary, #ccc);
+}
+
+.details-web-edge {
+    display: flex;
+    gap: 8px;
+    padding: 4px 8px;
+    font-size: 12px;
+}
+
+.details-edge-target { color: var(--text-secondary, #ccc); }
+.details-edge-rel { color: var(--text-muted, #888); font-style: italic; }
+.details-edge-strength { color: var(--accent, #4ecdc4); }
+
+.gap-resolved { opacity: 0.5; }
+.gap-resolved-badge {
+    font-size: 10px;
+    margin-left: 6px;
+    color: #4ecdc4;
+}
+
+.details-meta-table {
+    border-collapse: collapse;
+    font-size: 12px;
+}
+
+.details-meta-table td {
+    padding: 2px 12px 2px 0;
+    color: var(--text-secondary, #ccc);
+}
+
+.details-meta-table td:first-child {
+    color: var(--text-muted, #888);
+    font-weight: 500;
+}
+
+.details-field {
+    margin: 4px 0;
+    font-size: 12px;
+    color: var(--text-secondary, #ccc);
+}
+
+.mono {
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 11px;
+}
+
+/* ── Pipeline Timeline ────────────────────────────────────────────────────── */
+
+.pipeline-timeline {
+    display: flex;
+    gap: 4px;
+    padding: 8px 16px;
+    overflow-x: auto;
+    border-bottom: 1px solid var(--border-primary, #333);
+}
+
+.pipeline-chip {
+    padding: 3px 10px;
+    border-radius: 12px;
+    font-size: 11px;
+    white-space: nowrap;
+    flex-shrink: 0;
+    transition: all 0.2s ease;
+}
+
+.pipeline-chip-pending {
+    background: var(--bg-secondary, #1a1a1a);
+    color: var(--text-muted, #888);
+    border: 1px solid var(--border-primary, #333);
+}
+
+.pipeline-chip-active {
+    background: rgba(78, 205, 196, 0.15);
+    color: var(--accent, #4ecdc4);
+    border: 1px solid var(--accent, #4ecdc4);
+    animation: chipPulse 1.5s ease-in-out infinite;
+}
+
+.pipeline-chip-complete {
+    background: rgba(78, 205, 196, 0.1);
+    color: var(--accent, #4ecdc4);
+    border: 1px solid transparent;
+}
+
+.pipeline-chip-skipped {
+    background: transparent;
+    color: var(--text-muted, #888);
+    border: 1px solid transparent;
+    text-decoration: line-through;
+    opacity: 0.5;
+}
+
+.pipeline-check {
+    margin-right: 3px;
+    font-size: 10px;
+}
+
+@keyframes chipPulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.6; }
+}

@@ -3634,6 +3634,13 @@ async fn pyramid_build(
                             layer.status = "complete".into();
                         }
                     }
+                    LayerEvent::NodeStarted { depth, step_name, node_id, .. } => {
+                        if let Some(layer) = state.layers.iter_mut().find(|l| l.depth == depth && l.step_name == step_name) {
+                            if let Some(ref mut nodes) = layer.nodes {
+                                nodes.push(NodeStatus { node_id, status: "pending".into(), label: None });
+                            }
+                        }
+                    }
                     LayerEvent::StepStarted { step_name } => {
                         state.current_step = Some(step_name);
                     }
@@ -4372,6 +4379,13 @@ async fn pyramid_question_build(
                     LayerEvent::LayerCompleted { depth, step_name } => {
                         if let Some(layer) = state.layers.iter_mut().find(|l| l.depth == depth && l.step_name == step_name) {
                             layer.status = "complete".into();
+                        }
+                    }
+                    LayerEvent::NodeStarted { depth, step_name, node_id, .. } => {
+                        if let Some(layer) = state.layers.iter_mut().find(|l| l.depth == depth && l.step_name == step_name) {
+                            if let Some(ref mut nodes) = layer.nodes {
+                                nodes.push(NodeStatus { node_id, status: "pending".into(), label: None });
+                            }
                         }
                     }
                     LayerEvent::StepStarted { step_name } => {
@@ -5926,6 +5940,47 @@ async fn pyramid_cost_summary(
     pyramid_db::get_cost_summary(&conn, &slug, window.as_deref()).map_err(|e| e.to_string())
 }
 
+// ── Live Pyramid Theatre: Audit IPC Commands ────────────────────────────────
+
+#[tauri::command]
+async fn pyramid_build_live_nodes(
+    state: tauri::State<'_, SharedState>,
+    slug: String,
+) -> Result<Vec<wire_node_lib::pyramid::types::LiveNodeInfo>, String> {
+    let conn = state.pyramid.reader.lock().await;
+    // build_id not needed — returns all non-superseded nodes for the slug
+    pyramid_db::get_build_live_nodes(&conn, &slug, "").map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn pyramid_node_audit(
+    state: tauri::State<'_, SharedState>,
+    slug: String,
+    node_id: String,
+) -> Result<Vec<wire_node_lib::pyramid::types::LlmAuditRecord>, String> {
+    let conn = state.pyramid.reader.lock().await;
+    pyramid_db::get_node_audit_records(&conn, &slug, &node_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn pyramid_audit_by_id(
+    state: tauri::State<'_, SharedState>,
+    audit_id: i64,
+) -> Result<Option<wire_node_lib::pyramid::types::LlmAuditRecord>, String> {
+    let conn = state.pyramid.reader.lock().await;
+    pyramid_db::get_llm_audit_by_id(&conn, audit_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn pyramid_audit_cleanup(
+    state: tauri::State<'_, SharedState>,
+    slug: String,
+) -> Result<serde_json::Value, String> {
+    let conn = state.pyramid.writer.lock().await;
+    let deleted = pyramid_db::cleanup_old_audit_records(&conn, &slug).map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({"deleted": deleted, "slug": slug}))
+}
+
 #[tauri::command]
 async fn pyramid_breaker_resume(
     state: tauri::State<'_, SharedState>,
@@ -5995,9 +6050,28 @@ async fn pyramid_auto_update_l0_sweep(
     state: tauri::State<'_, SharedState>,
     slug: String,
 ) -> Result<serde_json::Value, String> {
-    let (tracked_files, enqueued, already_pending) = {
+    // Get slug info for reconciliation
+    let (source_paths, content_type) = {
+        let conn = state.pyramid.reader.lock().await;
+        match wire_node_lib::pyramid::slug::get_slug(&conn, &slug) {
+            Ok(Some(info)) => {
+                let paths: Vec<String> = serde_json::from_str(&info.source_path)
+                    .unwrap_or_else(|_| vec![info.source_path.clone()]);
+                (paths, info.content_type.as_str().to_string())
+            }
+            _ => (Vec::new(), String::new()),
+        }
+    };
+    let ingested_extensions: Vec<String> = {
+        let conn = state.pyramid.reader.lock().await;
+        wire_node_lib::pyramid::db::get_ingested_extensions(&conn, &slug).unwrap_or_default()
+    };
+
+    let (tracked_files, enqueued, already_pending, r_new, r_changed, r_deleted) = {
         let conn = state.pyramid.writer.lock().await;
-        wire_node_lib::pyramid::routes::enqueue_full_l0_sweep(&conn, &slug)
+        wire_node_lib::pyramid::routes::enqueue_full_l0_sweep_with_reconciliation(
+            &conn, &slug, &source_paths, &ingested_extensions, &content_type,
+        )
     };
 
     let (db_path, api_key, model, semaphore, phase_arc, detail_arc, summary_arc) = {
@@ -6039,6 +6113,11 @@ async fn pyramid_auto_update_l0_sweep(
         "tracked_files": tracked_files,
         "enqueued": enqueued,
         "already_pending": already_pending,
+        "reconciliation": {
+            "new_files": r_new,
+            "changed_files": r_changed,
+            "deleted_files": r_deleted,
+        },
     }))
 }
 
@@ -7124,6 +7203,10 @@ fn main() {
             pyramid_auto_update_status,
             pyramid_stale_log,
             pyramid_cost_summary,
+            pyramid_build_live_nodes,
+            pyramid_node_audit,
+            pyramid_audit_by_id,
+            pyramid_audit_cleanup,
             pyramid_breaker_resume,
             pyramid_auto_update_run_now,
             pyramid_auto_update_l0_sweep,

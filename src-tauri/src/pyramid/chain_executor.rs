@@ -143,6 +143,123 @@ where
     .await?
 }
 
+// ── ChunkProvider: lazy chunk loading for large corpus builds ────────────────
+
+/// Lightweight chunk provider that loads content on-demand from SQLite.
+/// Replaces the previous `Vec<Value>` preloading that caused StackOverflow at 698+ docs.
+///
+/// Holds count + slug + DB reader. No chunk content is ever held in memory
+/// beyond the current dispatch window.
+#[derive(Clone)]
+pub struct ChunkProvider {
+    pub count: i64,
+    pub slug: String,
+    pub reader: Arc<Mutex<Connection>>,
+}
+
+impl ChunkProvider {
+    pub fn len(&self) -> usize {
+        self.count.max(0) as usize
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.count <= 0
+    }
+
+    /// Build lightweight stubs: [{"index": 0}, {"index": 1}, ...]
+    /// No content loaded — stubs are used for forEach iteration counting.
+    pub fn stubs(&self) -> Vec<Value> {
+        (0..self.count.max(0))
+            .map(|i| serde_json::json!({"index": i}))
+            .collect()
+    }
+
+    /// Load a single chunk's full content from DB. Async-safe via db_read pattern.
+    pub async fn load_content(&self, index: i64) -> Result<String> {
+        let slug = self.slug.clone();
+        db_read(&self.reader, move |conn| db::get_chunk(conn, &slug, index))
+            .await
+            .map(|opt| opt.unwrap_or_default())
+    }
+
+    /// Load just the first ~200 bytes of a chunk (for file path header extraction).
+    /// Delegates to db::get_chunk_header() — all SQL stays in db.rs.
+    pub async fn load_header(&self, index: i64) -> Result<Option<String>> {
+        let slug = self.slug.clone();
+        db_read(&self.reader, move |conn| {
+            db::get_chunk_header(conn, &slug, index)
+        })
+        .await
+    }
+
+    /// In-memory variant for tests.
+    #[cfg(test)]
+    pub fn test(items: Vec<Value>) -> Self {
+        let conn = rusqlite::Connection::open_in_memory().expect("test db");
+        conn.execute_batch(
+            "CREATE TABLE pyramid_chunks (
+                slug TEXT NOT NULL, chunk_index INTEGER NOT NULL, content TEXT NOT NULL,
+                id INTEGER PRIMARY KEY AUTOINCREMENT, batch_id INTEGER,
+                line_count INTEGER, char_count INTEGER,
+                UNIQUE(slug, chunk_index)
+            )",
+        )
+        .expect("test schema");
+        for (i, item) in items.iter().enumerate() {
+            let content = item
+                .get("content")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            conn.execute(
+                "INSERT INTO pyramid_chunks (slug, chunk_index, content) VALUES ('test', ?1, ?2)",
+                rusqlite::params![i as i64, content],
+            )
+            .expect("test insert");
+        }
+        Self {
+            count: items.len() as i64,
+            slug: "test".to_string(),
+            reader: Arc::new(Mutex::new(conn)),
+        }
+    }
+
+    /// Empty provider (0 chunks).
+    pub fn empty() -> Self {
+        let conn = rusqlite::Connection::open_in_memory().expect("empty db");
+        Self {
+            count: 0,
+            slug: String::new(),
+            reader: Arc::new(Mutex::new(conn)),
+        }
+    }
+
+    /// Provider with N stubs (for tests). Stubs return `{"index": i}`.
+    #[cfg(test)]
+    pub fn with_count(n: i64) -> Self {
+        let conn = rusqlite::Connection::open_in_memory().expect("test db");
+        Self {
+            count: n,
+            slug: String::new(),
+            reader: Arc::new(Mutex::new(conn)),
+        }
+    }
+}
+
+/// Enrich a chunk stub with content from DB. No-op if content already present.
+/// Used by all forEach paths before dispatch to lazily load chunk content.
+///
+/// MUST use the stub's "index" field (not the loop counter) because
+/// $chunks_reversed makes them differ.
+async fn hydrate_chunk_stub(item: &mut Value, provider: &ChunkProvider) -> Result<()> {
+    if item.get("content").is_none() {
+        if let Some(idx) = item.get("index").and_then(|v| v.as_i64()) {
+            let content = provider.load_content(idx).await?;
+            item["content"] = Value::String(content);
+        }
+    }
+    Ok(())
+}
+
 async fn cleanup_from_depth(
     db: &Arc<Mutex<Connection>>,
     slug: &str,
@@ -396,7 +513,7 @@ fn lookup_analysis_by_node_id(ctx: &ChainContext, node_id: &str) -> Option<Value
     let idx = parse_node_index(node_id)?;
     let mut best: Option<(i32, Value)> = None;
 
-    for (step_name, output) in &ctx.step_outputs {
+    for (step_name, output) in ctx.step_outputs.iter() {
         let Some(candidate) = output.as_array().and_then(|arr| arr.get(idx)) else {
             continue;
         };
@@ -641,7 +758,7 @@ fn resolve_node_id_from_context(
 ) -> Option<String> {
     let mut best: Option<(i32, String)> = None;
 
-    for (step_name, output) in &ctx.step_outputs {
+    for (step_name, output) in ctx.step_outputs.iter() {
         let Some(items) = output.as_array() else {
             continue;
         };
@@ -2347,16 +2464,11 @@ fn try_send_layer_event(layer_tx: &Option<mpsc::Sender<LayerEvent>>, event: Laye
     }
 }
 
-/// Estimate token count using tiktoken cl100k_base encoding.
-/// Falls back to len/4 if the tokenizer fails to initialize.
+/// Rough token estimate for batching/splitting decisions inside the chain
+/// executor. Keep this cheap and stack-safe: these estimates decide routing,
+/// not billing, and the chain guide documents `json.len() / 4` semantics.
 fn estimate_tokens(text: &str) -> usize {
-    use std::sync::OnceLock;
-    static BPE: OnceLock<Option<tiktoken_rs::CoreBPE>> = OnceLock::new();
-    let bpe = BPE.get_or_init(|| tiktoken_rs::cl100k_base().ok());
-    match bpe {
-        Some(encoder) => encoder.encode_with_special_tokens(text).len(),
-        None => text.len() / 4,
-    }
+    text.len().div_ceil(4)
 }
 
 /// Project an item down to only the specified top-level fields.
@@ -3102,8 +3214,8 @@ async fn execute_container_step(
         ).await?;
 
         // Propagate inner step outputs back to the parent context
-        for (k, v) in &child_ctx.step_outputs {
-            ctx.step_outputs.insert(k.clone(), v.clone());
+        for (k, v) in child_ctx.step_outputs.iter() {
+            Arc::make_mut(&mut ctx.step_outputs).insert(k.clone(), v.clone());
         }
 
         Ok((vec![last_output], 0))
@@ -3216,7 +3328,7 @@ fn execute_inner_steps<'a>(
                 Ok(output) => {
                     info!("[CHAIN] inner step '{}' complete", inner_step.name);
                     if !output.is_null() {
-                        ctx.step_outputs.insert(inner_step.name.clone(), output.clone());
+                        Arc::make_mut(&mut ctx.step_outputs).insert(inner_step.name.clone(), output.clone());
                         last_output = output;
                     }
                 }
@@ -3272,7 +3384,7 @@ fn execute_split_step(step: &ChainStep, ctx: &mut ChainContext) -> Result<Value>
     );
 
     let result = Value::Array(chunks);
-    ctx.step_outputs.insert(step.name.clone(), result.clone());
+    Arc::make_mut(&mut ctx.step_outputs).insert(step.name.clone(), result.clone());
     Ok(result)
 }
 
@@ -3366,8 +3478,8 @@ async fn execute_loop_step(
     }
 
     // Propagate loop context step_outputs back to parent
-    for (k, v) in &loop_ctx.step_outputs {
-        ctx.step_outputs.insert(k.clone(), v.clone());
+    for (k, v) in loop_ctx.step_outputs.iter() {
+        Arc::make_mut(&mut ctx.step_outputs).insert(k.clone(), v.clone());
     }
 
     Ok((outputs, total_failures))
@@ -3525,20 +3637,12 @@ pub async fn execute_chain_from(
         // Steps with for_each: "$chunks" will get an empty array and produce no nodes.
     }
 
-    // Load chunks as Value array for ChainContext
-    let chunks: Vec<Value> = {
-        let mut items = Vec::new();
-        for i in 0..num_chunks {
-            let s = slug.to_string();
-            let content = db_read(&state.reader, move |conn| db::get_chunk(conn, &s, i))
-                .await?
-                .unwrap_or_default();
-            items.push(serde_json::json!({
-                "index": i,
-                "content": content,
-            }));
-        }
-        items
+    // Lazy chunk provider — loads content on-demand, not upfront.
+    // Supports 6,000-10,000 doc corpora without OOM/StackOverflow.
+    let chunks = ChunkProvider {
+        count: num_chunks,
+        slug: slug.to_string(),
+        reader: state.reader.clone(),
     };
 
     // Check if prior build exists (for $has_prior_build)
@@ -3627,6 +3731,7 @@ pub async fn execute_chain_from(
     let mut step_activities: Vec<super::types::StepActivity> = Vec::new();
 
     // Build dispatch context (from chain_dispatch)
+    let chain_build_id = format!("chain-{}", uuid::Uuid::new_v4().to_string().split('-').next().unwrap_or("0"));
     let dispatch_ctx = chain_dispatch::StepContext {
         db_reader: state.reader.clone(),
         db_writer: state.writer.clone(),
@@ -3634,6 +3739,15 @@ pub async fn execute_chain_from(
         config: llm_config.clone(),
         tier1: state.operational.tier1.clone(),
         ops: (*state.operational).clone(),
+        audit: Some(super::llm::AuditContext {
+            conn: state.writer.clone(),
+            slug: slug.to_string(),
+            build_id: chain_build_id,
+            node_id: None,
+            step_name: String::new(),
+            call_purpose: String::new(),
+            depth: None,
+        }),
     };
 
     // Set up writer channel + drain task
@@ -3691,7 +3805,7 @@ pub async fn execute_chain_from(
                             _ => 1,
                         };
                     }
-                    ctx.step_outputs.insert(step.name.clone(), hydrated_output);
+                    Arc::make_mut(&mut ctx.step_outputs).insert(step.name.clone(), hydrated_output);
                     total = estimate_total(chain, &ctx, num_chunks).max(done);
                     send_progress(&progress_tx, done, total).await;
                 }
@@ -3797,7 +3911,7 @@ pub async fn execute_chain_from(
             )
             .await?;
             total_failures += failures;
-            ctx.step_outputs
+            Arc::make_mut(&mut ctx.step_outputs)
                 .insert(step.name.clone(), Value::Array(outputs));
             Ok(Value::Null)
         } else if step.steps.is_some() && step.primitive != "loop" {
@@ -3827,7 +3941,7 @@ pub async fn execute_chain_from(
             } else {
                 outputs.into_iter().last().unwrap_or(Value::Null)
             };
-            ctx.step_outputs
+            Arc::make_mut(&mut ctx.step_outputs)
                 .insert(step.name.clone(), output_value);
             Ok(Value::Null)
         } else if step.primitive == "split" {
@@ -3852,7 +3966,7 @@ pub async fn execute_chain_from(
             .await?;
             total_failures += failures;
             let last = outputs.last().cloned().unwrap_or(Value::Null);
-            ctx.step_outputs.insert(step.name.clone(), last);
+            Arc::make_mut(&mut ctx.step_outputs).insert(step.name.clone(), last);
             Ok(Value::Null)
         } else if step.primitive == "gate" {
             // Gate primitive (no LLM call) — evaluate condition, optionally break
@@ -3891,21 +4005,22 @@ pub async fn execute_chain_from(
 
             // For depth-0 for_each steps that save nodes, record file→node mappings
             // in pyramid_file_hashes so the stale engine can track source connections.
+            // INVARIANT: outputs[i] corresponds to chunk index i (guaranteed for forward $chunks iteration)
             if saves_node && step.depth.unwrap_or(0) == 0 {
                 for (i, output) in outputs.iter().enumerate() {
                     if let Some(node_id) = output.get("node_id").and_then(|v| v.as_str()) {
-                        // Extract file_path from chunk content header ("## FILE: path").
-                        // Legacy compat: also accepts "## DOCUMENT: path" from pre-unification ingests.
-                        let file_path = ctx.chunks.get(i)
-                            .and_then(|chunk| chunk.get("content"))
-                            .and_then(|c| c.as_str())
-                            .and_then(|content| {
-                                content.lines().next().and_then(|first_line| {
+                        // Extract file_path from chunk header ("## FILE: path" / "## DOCUMENT: path").
+                        // Uses load_header (SUBSTR 200 bytes) to avoid loading full 50KB content.
+                        let file_path = match ctx.chunks.load_header(i as i64).await {
+                            Ok(Some(header)) => {
+                                header.lines().next().and_then(|first_line| {
                                     first_line.strip_prefix("## FILE: ")
                                         .or_else(|| first_line.strip_prefix("## DOCUMENT: "))
                                         .map(|p| p.to_string())
                                 })
-                            });
+                            }
+                            _ => None,
+                        };
                         if let Some(fp) = file_path {
                             let _ = writer_tx.send(WriteOp::UpdateFileHash {
                                 slug: slug.to_string(),
@@ -3917,7 +4032,7 @@ pub async fn execute_chain_from(
                 }
             }
 
-            ctx.step_outputs
+            Arc::make_mut(&mut ctx.step_outputs)
                 .insert(step.name.clone(), Value::Array(outputs));
             Ok(Value::Null)
         } else {
@@ -3943,7 +4058,7 @@ pub async fn execute_chain_from(
             Ok(output) => {
                 info!("[CHAIN] step \"{}\" complete", step.name);
                 if !output.is_null() {
-                    ctx.step_outputs.insert(step.name.clone(), output);
+                    Arc::make_mut(&mut ctx.step_outputs).insert(step.name.clone(), output);
                 }
                 // Count setup steps (non-node-saving) toward progress so the
                 // UI doesn't sit at 0/0 during the initial chain phases.
@@ -4257,7 +4372,7 @@ async fn execute_recursive_decompose(
         .await?;
 
         // Store reused IDs for evidence loop to skip
-        ctx.step_outputs.insert(
+        Arc::make_mut(&mut ctx.step_outputs).insert(
             "reused_question_ids".to_string(),
             serde_json::to_value(&delta_result.reused_question_ids)?,
         );
@@ -4293,7 +4408,7 @@ async fn execute_recursive_decompose(
 
     // Canonical alias: both decompose (fresh) and decompose_delta write here,
     // so downstream steps can reference $decomposed_tree regardless of which path ran.
-    ctx.step_outputs.insert("decomposed_tree".to_string(), tree_json.clone());
+    Arc::make_mut(&mut ctx.step_outputs).insert("decomposed_tree".to_string(), tree_json.clone());
 
     Ok(tree_json)
 }
@@ -4622,6 +4737,17 @@ async fn execute_evidence_loop(
             "starting evidence answering for layer"
         );
 
+        // Build audit context for Theatre LLM audit trail
+        let audit_ctx = super::llm::AuditContext {
+            conn: state.writer.clone(),
+            slug: slug.to_string(),
+            build_id: build_id.clone(),
+            node_id: None,
+            step_name: "evidence_loop".to_string(),
+            call_purpose: "pre_map".to_string(),
+            depth: Some(layer as i64),
+        };
+
         // Step a: Pre-map questions to candidate evidence nodes
         let candidate_map = match super::evidence_answering::pre_map_layer(
             &layer_qs,
@@ -4632,6 +4758,7 @@ async fn execute_evidence_loop(
             Some(&state.chains_dir),
             source_content_type.as_deref(),
             Some(&evidence_sets),
+            Some(&audit_ctx),
         )
         .await
         {
@@ -4657,6 +4784,7 @@ async fn execute_evidence_loop(
             Some(&state.chains_dir),
             source_content_type.as_deref(),
             &state.operational,
+            Some(&audit_ctx),
         )
         .await
         {
@@ -4839,7 +4967,7 @@ async fn execute_evidence_loop(
                     .collect::<Vec<_>>()
                     .join("\n\n");
                 let apex_headline = tree.apex.question.clone();
-                let apex_id = format!("L{}-{}", max_layer, &uuid::Uuid::new_v4().to_string()[..8]);
+                let apex_id = format!("L{}-000", max_layer);
 
                 let apex_node = super::types::PyramidNode {
                     id: apex_id.clone(),
@@ -5117,6 +5245,17 @@ async fn execute_process_gaps(
 
         let mut gap_produced_nodes = false;
 
+        // Build audit context for gap processing
+        let gap_audit_ctx = super::llm::AuditContext {
+            conn: state.writer.clone(),
+            slug: slug.to_string(),
+            build_id: build_id.clone(),
+            node_id: None,
+            step_name: "process_gaps".to_string(),
+            call_purpose: "gap_answer".to_string(),
+            depth: None,
+        };
+
         for (base_slug, file_candidates) in &files_by_slug {
             for (file_path, content) in file_candidates {
                 let single_file = vec![(file_path.clone(), content.clone())];
@@ -5130,6 +5269,7 @@ async fn execute_process_gaps(
                     audience.as_deref(),
                     Some(&state.chains_dir),
                     &state.operational,
+                    Some(&gap_audit_ctx),
                 )
                 .await
                 {
@@ -5268,6 +5408,7 @@ struct ForEachTaskOutcome {
     index: usize,
     node_id: String,
     output: Result<Value>,
+    sub_failures: i32,
 }
 
 async fn execute_for_each(
@@ -5480,8 +5621,12 @@ async fn execute_for_each(
             ResumeState::Missing => {}
         }
 
+        // Hydrate chunk stub with content if needed (lazy loading for large corpora)
+        let mut enriched_item = item.clone();
+        hydrate_chunk_stub(&mut enriched_item, &ctx.chunks).await?;
+
         // Set up forEach loop variables on the context
-        ctx.current_item = Some(item.clone());
+        ctx.current_item = Some(enriched_item);
         ctx.current_index = Some(index);
 
         // Resolve step input using the context (handles $item, $index, $running_context, etc.)
@@ -5913,338 +6058,541 @@ async fn execute_for_each_concurrent(
     let mut failures: i32 = 0;
     let depth = step.depth.unwrap_or(0);
     let ctx_snapshot = Arc::new(ctx.clone());
-    let mut pending = Vec::new();
+    let concurrency = step.concurrency.max(1);
+    let semaphore = Arc::new(Semaphore::new(concurrency));
+    let (result_tx, mut result_rx) =
+        mpsc::channel::<ForEachTaskOutcome>(concurrency * 4);
 
-    for (index, item) in items.iter().enumerate() {
-        if cancel.is_cancelled() {
-            info!("forEach cancelled while preparing iteration {index}");
-            break;
-        }
+    // ── Capture clones for the producer task ────────────────────────────
+    let step_owned = step.clone();
+    let ctx_snap_producer = ctx_snapshot.clone();
+    let reader_producer = reader.clone();
+    let writer_tx_producer = writer_tx.clone();
+    let dispatch_ctx_producer = dispatch_ctx.clone();
+    let defaults_producer = defaults.clone();
+    let error_strategy_producer = error_strategy.clone();
+    let semaphore_producer = semaphore.clone();
+    let cancel_producer = cancel.clone();
+    let result_tx_producer = result_tx;
 
-        let chunk_index = item
-            .get("index")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(index as i64);
-        let node_id = if let Some(ref pattern) = step.node_id_pattern {
-            generate_node_id(pattern, index, Some(depth))
-        } else {
-            format!("L{depth}-{index:03}")
-        };
+    // ── Producer task ───────────────────────────────────────────────────
+    let producer_handle = tokio::spawn(async move {
+        let mut work_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
-        let resume = get_resume_state(
-            reader,
-            &ctx.slug,
-            &step.name,
-            chunk_index,
-            depth,
-            &node_id,
-            saves_node,
-        )
-        .await?;
-
-        match resume {
-            ResumeState::Complete => {
-                info!("[CHAIN] [{}] {} -- resumed (complete)", step.name, node_id);
-
-                let mut resume_label: Option<String> = None;
-                if let Some(prior_output) = load_prior_step_output(
-                    reader,
-                    &ctx.slug,
-                    &step.name,
-                    chunk_index,
-                    depth,
-                    &node_id,
-                )
-                .await?
-                {
-                    resume_label = prior_output.get("headline").and_then(|v| v.as_str()).map(|s| s.to_string());
-                    outputs[index] = decorate_step_output(prior_output, &node_id, chunk_index);
-                } else {
-                    warn!(
-                        "[CHAIN] [{}] {} -- resume hit without saved output_json",
-                        step.name, node_id
-                    );
-                }
-
-                if saves_node {
-                    *done += 1;
-                    send_progress(progress_tx, *done, total).await;
-                    try_send_layer_event(layer_tx, LayerEvent::NodeCompleted {
-                        depth, step_name: step.name.clone(), node_id: node_id.clone(), label: resume_label,
-                    });
-                }
-                continue;
+        for (index, item) in items.iter().enumerate() {
+            // Check cancel at loop top
+            if cancel_producer.is_cancelled() {
+                info!("forEach cancelled while preparing iteration {index}");
+                break;
             }
-            ResumeState::StaleStep => {
-                warn!(
-                    "[CHAIN] [{}] {} -- stale step (node missing), rebuilding",
-                    step.name, node_id
-                );
-            }
-            ResumeState::Missing => {}
-        }
 
-        let mut item_ctx = (*ctx_snapshot).clone();
-        item_ctx.current_item = Some(item.clone());
-        item_ctx.current_index = Some(index);
+            let chunk_index = item
+                .get("index")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(index as i64);
+            let node_id = if let Some(ref pattern) = step_owned.node_id_pattern {
+                generate_node_id(pattern, index, Some(depth))
+            } else {
+                format!("L{depth}-{index:03}")
+            };
 
-        let resolved_input = if let Some(ref input) = step.input {
-            item_ctx.resolve_value(input)?
-        } else {
-            enrich_group_item_input(item, &item_ctx)
-        };
-        let resolved_input = apply_header_lines(resolved_input);
-        let resolved_input =
-            enrich_for_each_step_input(step, resolved_input, item, &item_ctx, reader).await?;
+            // Resume check
+            let resume = match get_resume_state(
+                &reader_producer,
+                &ctx_snap_producer.slug,
+                &step_owned.name,
+                chunk_index,
+                depth,
+                &node_id,
+                saves_node,
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = result_tx_producer
+                        .send(ForEachTaskOutcome {
+                            index,
+                            node_id: node_id.clone(),
+                            output: Err(e),
+                            sub_failures: 0,
+                        })
+                        .await;
+                    continue;
+                }
+            };
 
-        // ── Oversized chunk splitting (concurrent path: handle inline) ──────
-        if let Some(max_tokens) = step.max_input_tokens {
-            let est_tokens = estimate_tokens_for_item(&resolved_input);
-            if est_tokens > max_tokens {
-                let strategy = step.split_strategy.as_deref().unwrap_or("sections");
-                let overlap = step.split_overlap_tokens.unwrap_or(500);
-                let sub_chunks = split_chunk(&resolved_input, max_tokens, strategy, overlap);
-                let num_sub = sub_chunks.len();
+            match resume {
+                ResumeState::Complete => {
+                    info!("[CHAIN] [{}] {} -- resumed (complete)", step_owned.name, node_id);
 
-                info!(
-                    "[CHAIN] [{}] {node_id}: oversized ({est_tokens} tokens > {max_tokens}), splitting into {num_sub} sub-chunks via \"{strategy}\" (concurrent fallback)",
-                    step.name
-                );
-
-                let mut sub_results: Vec<Value> = Vec::with_capacity(num_sub);
-                for (sub_idx, sub_item) in sub_chunks.iter().enumerate() {
-                    let sub_system_prompt = {
-                        let part_header = format!(
-                            "This is part {} of {} from document: {}",
-                            sub_idx + 1,
-                            num_sub,
-                            sub_item.get("_split_source").and_then(|v| v.as_str()).unwrap_or("unknown"),
-                        );
-                        let base = build_system_prompt(step, sub_item, &item_ctx)?;
-                        format!("{base}\n\n{part_header}")
-                    };
-                    let sub_fallback_key = format!("{}-{index}-sub{sub_idx}", step.name);
-
-                    match dispatch_with_retry(
-                        step, sub_item, &sub_system_prompt, defaults,
-                        dispatch_ctx, error_strategy, &sub_fallback_key,
+                    let mut output_val = Value::Null;
+                    let mut resume_label: Option<String> = None;
+                    match load_prior_step_output(
+                        &reader_producer,
+                        &ctx_snap_producer.slug,
+                        &step_owned.name,
+                        chunk_index,
+                        depth,
+                        &node_id,
                     )
                     .await
                     {
-                        Ok(sub_output) => sub_results.push(sub_output),
-                        Err(e) => match error_strategy {
-                            ErrorStrategy::Abort | ErrorStrategy::Retry(_) => {
-                                return Err(anyhow!("forEach abort at index {index} sub-chunk {sub_idx}: {e}"));
-                            }
-                            _ => {
-                                warn!("[CHAIN] [{}] {node_id} sub-chunk {sub_idx} FAILED (skip): {e}", step.name);
-                                sub_results.push(Value::Null);
-                            }
-                        },
-                    }
-                }
-
-                let should_merge = step.split_merge.unwrap_or(true);
-                if should_merge && sub_results.len() > 1 {
-                    let merge_input = serde_json::json!({
-                        "sub_chunk_extractions": sub_results.iter().filter(|v| !v.is_null()).cloned().collect::<Vec<Value>>(),
-                        "original_source": resolved_input.get("headline").or_else(|| resolved_input.get("title")).or_else(|| resolved_input.get("file_path")).cloned().unwrap_or(Value::String("unknown".to_string())),
-                        "total_parts": num_sub,
-                    });
-                    let merge_fallback_key = format!("{}-{index}-merge", step.name);
-                    let merge_prompt = if let Some(ref mi) = step.merge_instruction {
-                        match resolve_prompt_template(mi, &serde_json::json!({})) {
-                            Ok(p) => p,
-                            Err(e) => {
-                                warn!("[CHAIN] [{}] merge_instruction resolve failed ({e}), using default", step.name);
-                                SPLIT_MERGE_DEFAULT_PROMPT.to_string()
-                            }
+                        Ok(Some(prior_output)) => {
+                            resume_label = prior_output.get("headline").and_then(|v| v.as_str()).map(|s| s.to_string());
+                            output_val = decorate_step_output(prior_output, &node_id, chunk_index);
                         }
-                    } else {
-                        SPLIT_MERGE_DEFAULT_PROMPT.to_string()
-                    };
-                    let analysis = match dispatch_with_retry(
-                        step, &merge_input, &merge_prompt, defaults,
-                        dispatch_ctx, error_strategy, &merge_fallback_key,
-                    )
-                    .await
-                    {
-                        Ok(merged) => merged,
+                        Ok(None) => {
+                            warn!(
+                                "[CHAIN] [{}] {} -- resume hit without saved output_json",
+                                step_owned.name, node_id
+                            );
+                        }
                         Err(e) => {
-                            warn!("[CHAIN] [{}] {node_id}: merge failed ({e}), using first sub-result", step.name);
-                            sub_results.into_iter().find(|v| !v.is_null()).unwrap_or(Value::Null)
-                        }
-                    };
-
-                    let decorated = decorate_step_output(analysis.clone(), &node_id, chunk_index);
-                    let output_json = serde_json::to_string(&decorated)?;
-                    send_save_step(
-                        writer_tx, &ctx.slug, &step.name, chunk_index, depth, &node_id,
-                        &output_json, &dispatch_ctx.config.primary_model, 0.0,
-                    ).await;
-
-                    if saves_node {
-                        let node = build_node_from_output(&analysis, &node_id, &ctx.slug, depth, Some(chunk_index))?;
-                        let topics_json = serde_json::to_string(analysis.get("topics").unwrap_or(&serde_json::json!([])))?;
-                        send_save_node(writer_tx, node, Some(topics_json)).await;
-                        *done += 1;
-                        send_progress(progress_tx, *done, total).await;
-                        let label = analysis.get("headline").and_then(|v| v.as_str()).map(|s| s.to_string());
-                        try_send_layer_event(layer_tx, LayerEvent::NodeCompleted {
-                            depth, step_name: step.name.clone(), node_id: node_id.clone(), label,
-                        });
-                    }
-
-                    outputs[index] = decorated;
-                } else if !should_merge && sub_results.len() > 1 {
-                    // split_merge: false — save each sub-result as its own node
-                    let mut first_decorated: Option<Value> = None;
-                    for (sub_idx, sub_output) in sub_results.into_iter().enumerate() {
-                        if sub_output.is_null() {
-                            failures += 1;
+                            let _ = result_tx_producer
+                                .send(ForEachTaskOutcome {
+                                    index,
+                                    node_id: node_id.clone(),
+                                    output: Err(e),
+                                    sub_failures: 0,
+                                })
+                                .await;
                             continue;
                         }
-                        let sub_node_id = format!("{node_id}s{sub_idx}");
-                        let decorated = decorate_step_output(sub_output.clone(), &sub_node_id, chunk_index);
-                        let output_json = serde_json::to_string(&decorated)?;
-                        send_save_step(
-                            writer_tx, &ctx.slug, &step.name, chunk_index, depth, &sub_node_id,
-                            &output_json, &dispatch_ctx.config.primary_model, 0.0,
-                        ).await;
+                    }
 
-                        if saves_node {
-                            let node = build_node_from_output(
-                                &sub_output, &sub_node_id, &ctx.slug, depth, Some(chunk_index),
-                            )?;
-                            let topics_json = serde_json::to_string(
-                                sub_output.get("topics").unwrap_or(&serde_json::json!([])),
-                            )?;
-                            send_save_node(writer_tx, node, Some(topics_json)).await;
-                        }
-                        if first_decorated.is_none() {
-                            first_decorated = Some(decorated);
-                        }
+                    // Send resumed outcome — collector will handle done/progress
+                    if result_tx_producer
+                        .send(ForEachTaskOutcome {
+                            index,
+                            node_id: node_id.clone(),
+                            output: Ok(output_val),
+                            sub_failures: 0,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        break; // collector gone
                     }
-                    if saves_node {
-                        *done += 1;
-                        send_progress(progress_tx, *done, total).await;
-                    }
-                    // Put the first sub-result into the outputs slot for this index
-                    if let Some(d) = first_decorated {
-                        outputs[index] = d;
+                    continue;
+                }
+                ResumeState::StaleStep => {
+                    warn!(
+                        "[CHAIN] [{}] {} -- stale step (node missing), rebuilding",
+                        step_owned.name, node_id
+                    );
+                }
+                ResumeState::Missing => {}
+            }
+
+            // Acquire semaphore permit, respecting cancel
+            let permit = tokio::select! {
+                biased;
+                _ = cancel_producer.cancelled() => {
+                    info!("forEach cancelled while waiting for semaphore at iteration {index}");
+                    break;
+                }
+                permit = semaphore_producer.clone().acquire_owned() => {
+                    permit.expect("for_each semaphore should remain open")
+                }
+            };
+
+            // Spawn work task
+            let step_work = step_owned.clone();
+            let ctx_snap_work = ctx_snap_producer.clone();
+            let reader_work = reader_producer.clone();
+            let writer_tx_work = writer_tx_producer.clone();
+            let dispatch_ctx_work = dispatch_ctx_producer.clone();
+            let defaults_work = defaults_producer.clone();
+            let error_strategy_work = error_strategy_producer.clone();
+            let result_tx_work = result_tx_producer.clone();
+            let item_owned = item.clone();
+
+            let work_handle = tokio::spawn(async move {
+                let _permit = permit; // held until task completes
+
+                // Clone item_ctx from snapshot (cheap — Arc<HashMap> for step_outputs)
+                let mut item_ctx = (*ctx_snap_work).clone();
+
+                // Hydrate chunk stub
+                let mut enriched_item = item_owned.clone();
+                let hydrate_result = hydrate_chunk_stub(&mut enriched_item, &item_ctx.chunks).await;
+                if let Err(e) = hydrate_result {
+                    let _ = result_tx_work
+                        .send(ForEachTaskOutcome {
+                            index,
+                            node_id: node_id.clone(),
+                            output: Err(e),
+                            sub_failures: 0,
+                        })
+                        .await;
+                    return;
+                }
+
+                item_ctx.current_item = Some(enriched_item.clone());
+                item_ctx.current_index = Some(index);
+
+                // Resolve input
+                let resolved_input = if let Some(ref input) = step_work.input {
+                    match item_ctx.resolve_value(input) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            let _ = result_tx_work
+                                .send(ForEachTaskOutcome {
+                                    index,
+                                    node_id: node_id.clone(),
+                                    output: Err(e),
+                                    sub_failures: 0,
+                                })
+                                .await;
+                            return;
+                        }
                     }
                 } else {
-                    // Single sub-result or empty — save as the original node
-                    let analysis = sub_results.into_iter().find(|v| !v.is_null()).unwrap_or(Value::Null);
-                    let decorated = decorate_step_output(analysis.clone(), &node_id, chunk_index);
-                    let output_json = serde_json::to_string(&decorated)?;
-                    send_save_step(
-                        writer_tx, &ctx.slug, &step.name, chunk_index, depth, &node_id,
-                        &output_json, &dispatch_ctx.config.primary_model, 0.0,
-                    ).await;
-
-                    if saves_node {
-                        let node = build_node_from_output(&analysis, &node_id, &ctx.slug, depth, Some(chunk_index))?;
-                        let topics_json = serde_json::to_string(analysis.get("topics").unwrap_or(&serde_json::json!([])))?;
-                        send_save_node(writer_tx, node, Some(topics_json)).await;
-                        *done += 1;
-                        send_progress(progress_tx, *done, total).await;
-                        let label = analysis.get("headline").and_then(|v| v.as_str()).map(|s| s.to_string());
-                        try_send_layer_event(layer_tx, LayerEvent::NodeCompleted {
-                            depth, step_name: step.name.clone(), node_id: node_id.clone(), label,
-                        });
-                    }
-                    outputs[index] = decorated;
-                }
-                continue;
-            }
-        }
-
-        let system_prompt = build_system_prompt(step, &resolved_input, &item_ctx)?;
-
-        pending.push(ForEachPendingWork {
-            index,
-            item: item.clone(),
-            chunk_index,
-            depth,
-            node_id,
-            resolved_input,
-            system_prompt,
-        });
-    }
-
-    if pending.is_empty() {
-        return Ok((outputs, failures));
-    }
-
-    let semaphore = Arc::new(Semaphore::new(step.concurrency.max(1)));
-    let (result_tx, mut result_rx) =
-        mpsc::channel::<ForEachTaskOutcome>((step.concurrency.max(1) * 2).max(2));
-    let mut handles = Vec::new();
-
-    for work in pending {
-        let semaphore = semaphore.clone();
-        let result_tx = result_tx.clone();
-        let step_owned = step.clone();
-        let defaults_owned = defaults.clone();
-        let dispatch_ctx_owned = dispatch_ctx.clone();
-        let error_strategy_owned = error_strategy.clone();
-        let writer_tx = writer_tx.clone();
-        let reader = reader.clone();
-        let ctx_snapshot = ctx_snapshot.clone();
-        let layer_tx_clone = layer_tx.clone();
-
-        let handle = tokio::spawn(async move {
-            let sem_t0 = Instant::now();
-            let _permit = semaphore
-                .acquire_owned()
+                    enrich_group_item_input(&enriched_item, &item_ctx)
+                };
+                let resolved_input = apply_header_lines(resolved_input);
+                let resolved_input = match enrich_for_each_step_input(
+                    &step_work,
+                    resolved_input,
+                    &enriched_item,
+                    &item_ctx,
+                    &reader_work,
+                )
                 .await
-                .expect("for_each semaphore should remain open");
-            let sem_wait = sem_t0.elapsed().as_secs_f64();
-            if sem_wait > 1.0 {
-                info!("[CHAIN] [{}] {} waited {:.1}s for semaphore permit", step_owned.name, work.node_id, sem_wait);
-            }
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let _ = result_tx_work
+                            .send(ForEachTaskOutcome {
+                                index,
+                                node_id: node_id.clone(),
+                                output: Err(e),
+                                sub_failures: 0,
+                            })
+                            .await;
+                        return;
+                    }
+                };
 
-            let output = execute_for_each_work_item(
-                &step_owned,
-                &work,
-                ctx_snapshot.as_ref(),
-                &dispatch_ctx_owned,
-                &defaults_owned,
-                &error_strategy_owned,
-                saves_node,
-                &writer_tx,
-                &reader,
-                layer_tx_clone,
-            )
-            .await;
+                // ── Oversized chunk splitting (inside work task) ────────────
+                if let Some(max_tokens) = step_work.max_input_tokens {
+                    let est_tokens = estimate_tokens_for_item(&resolved_input);
+                    if est_tokens > max_tokens {
+                        let strategy = step_work.split_strategy.as_deref().unwrap_or("sections");
+                        let overlap = step_work.split_overlap_tokens.unwrap_or(500);
+                        let sub_chunks = split_chunk(&resolved_input, max_tokens, strategy, overlap);
+                        let num_sub = sub_chunks.len();
 
-            let _ = result_tx
-                .send(ForEachTaskOutcome {
-                    index: work.index,
-                    node_id: work.node_id.clone(),
-                    output,
-                })
+                        info!(
+                            "[CHAIN] [{}] {node_id}: oversized ({est_tokens} tokens > {max_tokens}), splitting into {num_sub} sub-chunks via \"{strategy}\"",
+                            step_work.name
+                        );
+
+                        let mut sub_results: Vec<Value> = Vec::with_capacity(num_sub);
+                        let mut sub_fail_count: i32 = 0;
+                        for (sub_idx, sub_item) in sub_chunks.iter().enumerate() {
+                            let sub_system_prompt = match (|| -> Result<String> {
+                                let part_header = format!(
+                                    "This is part {} of {} from document: {}",
+                                    sub_idx + 1,
+                                    num_sub,
+                                    sub_item.get("_split_source").and_then(|v| v.as_str()).unwrap_or("unknown"),
+                                );
+                                let base = build_system_prompt(&step_work, sub_item, &item_ctx)?;
+                                Ok(format!("{base}\n\n{part_header}"))
+                            })() {
+                                Ok(p) => p,
+                                Err(e) => {
+                                    let _ = result_tx_work
+                                        .send(ForEachTaskOutcome {
+                                            index,
+                                            node_id: node_id.clone(),
+                                            output: Err(e),
+                                            sub_failures: sub_fail_count,
+                                        })
+                                        .await;
+                                    return;
+                                }
+                            };
+                            let sub_fallback_key = format!("{}-{index}-sub{sub_idx}", step_work.name);
+
+                            match dispatch_with_retry(
+                                &step_work, sub_item, &sub_system_prompt, &defaults_work,
+                                &dispatch_ctx_work, &error_strategy_work, &sub_fallback_key,
+                            )
+                            .await
+                            {
+                                Ok(sub_output) => sub_results.push(sub_output),
+                                Err(e) => match &error_strategy_work {
+                                    ErrorStrategy::Abort | ErrorStrategy::Retry(_) => {
+                                        let _ = result_tx_work
+                                            .send(ForEachTaskOutcome {
+                                                index,
+                                                node_id: node_id.clone(),
+                                                output: Err(anyhow!("forEach abort at index {index} sub-chunk {sub_idx}: {e}")),
+                                                sub_failures: sub_fail_count,
+                                            })
+                                            .await;
+                                        return;
+                                    }
+                                    _ => {
+                                        warn!("[CHAIN] [{}] {node_id} sub-chunk {sub_idx} FAILED (skip): {e}", step_work.name);
+                                        sub_results.push(Value::Null);
+                                    }
+                                },
+                            }
+                        }
+
+                        let should_merge = step_work.split_merge.unwrap_or(true);
+                        if should_merge && sub_results.len() > 1 {
+                            let merge_input = serde_json::json!({
+                                "sub_chunk_extractions": sub_results.iter().filter(|v| !v.is_null()).cloned().collect::<Vec<Value>>(),
+                                "original_source": resolved_input.get("headline").or_else(|| resolved_input.get("title")).or_else(|| resolved_input.get("file_path")).cloned().unwrap_or(Value::String("unknown".to_string())),
+                                "total_parts": num_sub,
+                            });
+                            let merge_fallback_key = format!("{}-{index}-merge", step_work.name);
+                            let merge_prompt = if let Some(ref mi) = step_work.merge_instruction {
+                                match resolve_prompt_template(mi, &serde_json::json!({})) {
+                                    Ok(p) => p,
+                                    Err(e) => {
+                                        warn!("[CHAIN] [{}] merge_instruction resolve failed ({e}), using default", step_work.name);
+                                        SPLIT_MERGE_DEFAULT_PROMPT.to_string()
+                                    }
+                                }
+                            } else {
+                                SPLIT_MERGE_DEFAULT_PROMPT.to_string()
+                            };
+                            let analysis = match dispatch_with_retry(
+                                &step_work, &merge_input, &merge_prompt, &defaults_work,
+                                &dispatch_ctx_work, &error_strategy_work, &merge_fallback_key,
+                            )
+                            .await
+                            {
+                                Ok(merged) => merged,
+                                Err(e) => {
+                                    warn!("[CHAIN] [{}] {node_id}: merge failed ({e}), using first sub-result", step_work.name);
+                                    sub_results.into_iter().find(|v| !v.is_null()).unwrap_or(Value::Null)
+                                }
+                            };
+
+                            let decorated = decorate_step_output(analysis.clone(), &node_id, chunk_index);
+                            let output_json = match serde_json::to_string(&decorated) {
+                                Ok(j) => j,
+                                Err(e) => {
+                                    let _ = result_tx_work
+                                        .send(ForEachTaskOutcome {
+                                            index,
+                                            node_id: node_id.clone(),
+                                            output: Err(anyhow::Error::from(e)),
+                                            sub_failures: sub_fail_count,
+                                        })
+                                        .await;
+                                    return;
+                                }
+                            };
+                            send_save_step(
+                                &writer_tx_work, &ctx_snap_work.slug, &step_work.name, chunk_index, depth, &node_id,
+                                &output_json, &dispatch_ctx_work.config.primary_model, 0.0,
+                            ).await;
+
+                            if saves_node {
+                                match build_node_from_output(&analysis, &node_id, &ctx_snap_work.slug, depth, Some(chunk_index)) {
+                                    Ok(node) => {
+                                        let topics_json = serde_json::to_string(analysis.get("topics").unwrap_or(&serde_json::json!([]))).unwrap_or_default();
+                                        send_save_node(&writer_tx_work, node, Some(topics_json)).await;
+                                    }
+                                    Err(e) => {
+                                        warn!("[CHAIN] [{}] {node_id}: build_node_from_output failed: {e}", step_work.name);
+                                    }
+                                }
+                            }
+
+                            let _ = result_tx_work
+                                .send(ForEachTaskOutcome {
+                                    index,
+                                    node_id: node_id.clone(),
+                                    output: Ok(decorated),
+                                    sub_failures: sub_fail_count,
+                                })
+                                .await;
+                        } else if !should_merge && sub_results.len() > 1 {
+                            // split_merge: false — save each sub-result as its own node
+                            let mut first_decorated: Option<Value> = None;
+                            for (sub_idx, sub_output) in sub_results.into_iter().enumerate() {
+                                if sub_output.is_null() {
+                                    sub_fail_count += 1;
+                                    continue;
+                                }
+                                let sub_node_id = format!("{node_id}s{sub_idx}");
+                                let decorated = decorate_step_output(sub_output.clone(), &sub_node_id, chunk_index);
+                                let output_json = match serde_json::to_string(&decorated) {
+                                    Ok(j) => j,
+                                    Err(_) => continue,
+                                };
+                                send_save_step(
+                                    &writer_tx_work, &ctx_snap_work.slug, &step_work.name, chunk_index, depth, &sub_node_id,
+                                    &output_json, &dispatch_ctx_work.config.primary_model, 0.0,
+                                ).await;
+
+                                if saves_node {
+                                    if let Ok(node) = build_node_from_output(
+                                        &sub_output, &sub_node_id, &ctx_snap_work.slug, depth, Some(chunk_index),
+                                    ) {
+                                        let topics_json = serde_json::to_string(
+                                            sub_output.get("topics").unwrap_or(&serde_json::json!([])),
+                                        ).unwrap_or_default();
+                                        send_save_node(&writer_tx_work, node, Some(topics_json)).await;
+                                    }
+                                }
+                                if first_decorated.is_none() {
+                                    first_decorated = Some(decorated);
+                                }
+                            }
+                            let out_val = first_decorated.unwrap_or(Value::Null);
+                            let _ = result_tx_work
+                                .send(ForEachTaskOutcome {
+                                    index,
+                                    node_id: node_id.clone(),
+                                    output: Ok(out_val),
+                                    sub_failures: sub_fail_count,
+                                })
+                                .await;
+                        } else {
+                            // Single sub-result or empty — save as the original node
+                            let analysis = sub_results.into_iter().find(|v| !v.is_null()).unwrap_or(Value::Null);
+                            let decorated = decorate_step_output(analysis.clone(), &node_id, chunk_index);
+                            let output_json = match serde_json::to_string(&decorated) {
+                                Ok(j) => j,
+                                Err(e) => {
+                                    let _ = result_tx_work
+                                        .send(ForEachTaskOutcome {
+                                            index,
+                                            node_id: node_id.clone(),
+                                            output: Err(anyhow::Error::from(e)),
+                                            sub_failures: sub_fail_count,
+                                        })
+                                        .await;
+                                    return;
+                                }
+                            };
+                            send_save_step(
+                                &writer_tx_work, &ctx_snap_work.slug, &step_work.name, chunk_index, depth, &node_id,
+                                &output_json, &dispatch_ctx_work.config.primary_model, 0.0,
+                            ).await;
+
+                            if saves_node {
+                                match build_node_from_output(&analysis, &node_id, &ctx_snap_work.slug, depth, Some(chunk_index)) {
+                                    Ok(node) => {
+                                        let topics_json = serde_json::to_string(analysis.get("topics").unwrap_or(&serde_json::json!([]))).unwrap_or_default();
+                                        send_save_node(&writer_tx_work, node, Some(topics_json)).await;
+                                    }
+                                    Err(e) => {
+                                        warn!("[CHAIN] [{}] {node_id}: build_node_from_output failed: {e}", step_work.name);
+                                    }
+                                }
+                            }
+                            let _ = result_tx_work
+                                .send(ForEachTaskOutcome {
+                                    index,
+                                    node_id: node_id.clone(),
+                                    output: Ok(decorated),
+                                    sub_failures: sub_fail_count,
+                                })
+                                .await;
+                        }
+                        return; // oversized path done
+                    }
+                }
+
+                // ── Normal (non-oversized) path ─────────────────────────────
+                let system_prompt = match build_system_prompt(&step_work, &resolved_input, &item_ctx) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        let _ = result_tx_work
+                            .send(ForEachTaskOutcome {
+                                index,
+                                node_id: node_id.clone(),
+                                output: Err(e),
+                                sub_failures: 0,
+                            })
+                            .await;
+                        return;
+                    }
+                };
+
+                let work = ForEachPendingWork {
+                    index,
+                    item: item_owned,
+                    chunk_index,
+                    depth,
+                    node_id: node_id.clone(),
+                    resolved_input,
+                    system_prompt,
+                };
+
+                let output = execute_for_each_work_item(
+                    &step_work,
+                    &work,
+                    ctx_snap_work.as_ref(),
+                    &dispatch_ctx_work,
+                    &defaults_work,
+                    &error_strategy_work,
+                    saves_node,
+                    &writer_tx_work,
+                    &reader_work,
+                    None, // layer events handled by collector
+                )
                 .await;
-        });
-        handles.push(handle);
-    }
-    drop(result_tx);
 
-    let mut remaining = handles.len();
-    while remaining > 0 {
-        if cancel.is_cancelled() {
-            info!("[CHAIN] [{}] cancelling concurrent forEach work", step.name);
-            for handle in &handles {
-                handle.abort();
-            }
-            break;
+                let _ = result_tx_work
+                    .send(ForEachTaskOutcome {
+                        index,
+                        node_id: work.node_id,
+                        output,
+                        sub_failures: 0,
+                    })
+                    .await;
+            });
+            work_handles.push(work_handle);
         }
 
-        let Some(result) = result_rx.recv().await else {
-            break;
+        // Drop our copy of result_tx so collector sees channel close
+        drop(result_tx_producer);
+
+        // Await all work task handles — log panics, ignore cancellations
+        for handle in work_handles {
+            match handle.await {
+                Ok(()) => {}
+                Err(e) if e.is_cancelled() => {}
+                Err(e) if e.is_panic() => {
+                    warn!("[CHAIN] forEach work task panicked: {e}");
+                }
+                Err(e) => {
+                    warn!("[CHAIN] forEach work task error: {e}");
+                }
+            }
+        }
+    });
+
+    // ── Collector loop (runs concurrently with producer) ────────────────
+    loop {
+        let result = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                info!("[CHAIN] [{}] cancelling concurrent forEach (collector)", step.name);
+                break;
+            }
+            msg = result_rx.recv() => {
+                match msg {
+                    Some(r) => r,
+                    None => break, // channel closed — producer and all tasks done
+                }
+            }
         };
-        remaining -= 1;
+
+        // Accumulate sub_failures from oversized split paths
+        failures += result.sub_failures;
 
         match result.output {
             Ok(ref output) => {
@@ -6252,7 +6600,7 @@ async fn execute_for_each_concurrent(
                 outputs[result.index] = output.clone();
                 if saves_node {
                     try_send_layer_event(layer_tx, LayerEvent::NodeCompleted {
-                        depth: step.depth.unwrap_or(0),
+                        depth,
                         step_name: step.name.clone(),
                         node_id: result.node_id.clone(),
                         label,
@@ -6261,11 +6609,13 @@ async fn execute_for_each_concurrent(
             }
             Err(e) => match error_strategy {
                 ErrorStrategy::Abort | ErrorStrategy::Retry(_) => {
-                    for handle in &handles {
-                        handle.abort();
-                    }
-                    for handle in handles {
-                        let _ = handle.await;
+                    // Signal producer + work tasks to stop
+                    cancel.cancel();
+                    // Await producer to finish (it will see cancel and break)
+                    match producer_handle.await {
+                        Ok(()) => {}
+                        Err(e) if e.is_cancelled() => {}
+                        Err(e) => { warn!("[CHAIN] producer task error on abort: {e}"); }
                     }
                     return Err(anyhow!("forEach abort at index {}: {e}", result.index));
                 }
@@ -6277,7 +6627,7 @@ async fn execute_for_each_concurrent(
                     failures += 1;
                     if saves_node {
                         try_send_layer_event(layer_tx, LayerEvent::NodeFailed {
-                            depth: step.depth.unwrap_or(0),
+                            depth,
                             step_name: step.name.clone(),
                             node_id: result.node_id.clone(),
                         });
@@ -6292,8 +6642,16 @@ async fn execute_for_each_concurrent(
         }
     }
 
-    for handle in handles {
-        let _ = handle.await;
+    // ── Await producer JoinHandle — propagate panics/errors ─────────────
+    match producer_handle.await {
+        Ok(()) => {}
+        Err(e) if e.is_cancelled() => {}
+        Err(e) if e.is_panic() => {
+            std::panic::resume_unwind(e.into_panic());
+        }
+        Err(e) => {
+            return Err(anyhow!("forEach producer task failed: {e}"));
+        }
     }
 
     Ok((outputs, failures))
@@ -8393,8 +8751,8 @@ fn build_expression_env(state: &ExecutionState) -> Value {
         map.insert(key.clone(), Value::String(val.clone()));
     }
 
-    // Special variables
-    map.insert("chunks".to_string(), Value::Array(state.chunks.clone()));
+    // INVARIANT: env map chunks are stubs (index only). Content access requires forEach hydration.
+    map.insert("chunks".to_string(), Value::Array(state.chunks.stubs()));
     map.insert(
         "has_prior_build".to_string(),
         Value::Bool(state.has_prior_build),
@@ -8457,7 +8815,7 @@ fn update_ir_top_level_alias(
 
 fn build_chain_context_from_execution_state(state: &ExecutionState) -> ChainContext {
     let mut ctx = ChainContext::new(&state.slug, &state.content_type, state.chunks.clone());
-    ctx.step_outputs = state.step_outputs.clone();
+    ctx.step_outputs = Arc::new(state.step_outputs.clone());
     ctx.current_item = state.current_item.clone();
     ctx.current_index = state.current_index;
     ctx.accumulators = state.accumulators.clone();
@@ -9422,23 +9780,20 @@ pub async fn execute_plan(
     })
     .await?;
 
+    // Align with legacy executor: question pipelines can proceed with 0 chunks
     if num_chunks == 0 {
-        return Err(anyhow!("No chunks found for slug '{slug}'"));
+        let ct = plan.source_content_type.as_deref().unwrap_or("code");
+        if ct != "question" {
+            return Err(anyhow!("No chunks found for slug '{slug}'"));
+        }
+        warn!(slug, "No chunks found — steps requiring $chunks will be skipped or fail");
     }
 
-    let chunks: Vec<Value> = {
-        let mut items = Vec::new();
-        for i in 0..num_chunks {
-            let s = slug.to_string();
-            let content = db_read(&state.reader, move |conn| db::get_chunk(conn, &s, i))
-                .await?
-                .unwrap_or_default();
-            items.push(serde_json::json!({
-                "index": i,
-                "content": content,
-            }));
-        }
-        items
+    // Lazy chunk provider — loads content on-demand, not upfront.
+    let chunks = ChunkProvider {
+        count: num_chunks,
+        slug: slug.to_string(),
+        reader: state.reader.clone(),
     };
 
     // ── 2. Check prior build ─────────────────────────────────────────────
@@ -9476,6 +9831,7 @@ pub async fn execute_plan(
     );
 
     // ── 5. Build dispatch context ────────────────────────────────────────
+    let ir_build_id = format!("ir-{}", uuid::Uuid::new_v4().to_string().split('-').next().unwrap_or("0"));
     let dispatch_ctx = chain_dispatch::StepContext {
         db_reader: state.reader.clone(),
         db_writer: state.writer.clone(),
@@ -9483,6 +9839,15 @@ pub async fn execute_plan(
         config: llm_config.clone(),
         tier1: state.operational.tier1.clone(),
         ops: (*state.operational).clone(),
+        audit: Some(super::llm::AuditContext {
+            conn: state.writer.clone(),
+            slug: slug.to_string(),
+            build_id: ir_build_id,
+            node_id: None,
+            step_name: String::new(),
+            call_purpose: String::new(),
+            depth: None,
+        }),
     };
 
     exec_state.send_progress().await;
@@ -9904,9 +10269,14 @@ async fn execute_ir_parallel_foreach(
             continue;
         }
 
+        // Hydrate chunk stub with content if needed (lazy loading for large corpora)
+        // IR path uses env_map for resolution, so enriched item must go into env_map
+        let mut enriched_item = item.clone();
+        hydrate_chunk_stub(&mut enriched_item, &exec_state.chunks).await?;
+
         // Build resolved input with $item and $index
         let mut item_state_outputs = exec_state.step_outputs.clone();
-        item_state_outputs.insert("item".to_string(), item.clone());
+        item_state_outputs.insert("item".to_string(), enriched_item.clone());
         item_state_outputs.insert(
             "index".to_string(),
             Value::Number(serde_json::Number::from(i as u64)),
@@ -9916,9 +10286,10 @@ async fn execute_ir_parallel_foreach(
         for (k, v) in &item_state_outputs {
             env_map.insert(k.clone(), v.clone());
         }
+        // INVARIANT: env map chunks are stubs (index only). Content access requires forEach hydration.
         env_map.insert(
             "chunks".to_string(),
-            Value::Array(exec_state.chunks.clone()),
+            Value::Array(exec_state.chunks.stubs()),
         );
         env_map.insert(
             "has_prior_build".to_string(),
@@ -9927,7 +10298,7 @@ async fn execute_ir_parallel_foreach(
         let env_value = Value::Object(env_map);
         let resolved_input = apply_header_lines(resolve_refs_in_value(&step.input, &env_value));
         let mut ctx_for_input = build_chain_context_from_execution_state(exec_state);
-        ctx_for_input.current_item = Some(item.clone());
+        ctx_for_input.current_item = Some(enriched_item.clone());
         ctx_for_input.current_index = Some(i);
         let resolved_input =
             prepare_ir_resolved_input(step, resolved_input, Some(item), &ctx_for_input);
@@ -10197,8 +10568,12 @@ async fn execute_ir_sequential_foreach(
             continue;
         }
 
+        // Hydrate chunk stub with content if needed (lazy loading for large corpora)
+        let mut enriched_item = item.clone();
+        hydrate_chunk_stub(&mut enriched_item, &exec_state.chunks).await?;
+
         // Set current item/index for expression resolution
-        exec_state.current_item = Some(item.clone());
+        exec_state.current_item = Some(enriched_item.clone());
         exec_state.current_index = Some(i);
 
         // Resolve inputs with $item, $index, and accumulators in scope
@@ -10206,7 +10581,7 @@ async fn execute_ir_sequential_foreach(
         let resolved_input = apply_header_lines(resolve_ir_inputs(&step.input, exec_state));
         let ctx_for_input = build_chain_context_from_execution_state(exec_state);
         let resolved_input =
-            prepare_ir_resolved_input(step, resolved_input, Some(item), &ctx_for_input);
+            prepare_ir_resolved_input(step, resolved_input, Some(&enriched_item), &ctx_for_input);
 
         // Build system prompt — use async context builder when step has loader-based context entries
         let system_prompt = if step.context.iter().any(|c| c.loader.is_some()) {
@@ -10373,7 +10748,8 @@ fn resolve_foreach_collection(
         for (key, value) in &item_state_outputs {
             env_map.insert(key.clone(), value.clone());
         }
-        env_map.insert("chunks".to_string(), Value::Array(state.chunks.clone()));
+        // INVARIANT: env map chunks are stubs (index only). Content access requires forEach hydration.
+        env_map.insert("chunks".to_string(), Value::Array(state.chunks.stubs()));
         env_map.insert(
             "has_prior_build".to_string(),
             Value::Bool(state.has_prior_build),
@@ -11148,6 +11524,24 @@ mod tests {
     }
 
     #[test]
+    fn test_estimate_tokens_uses_documented_len_over_four_heuristic() {
+        assert_eq!(estimate_tokens(""), 0);
+        assert_eq!(estimate_tokens("abcd"), 1);
+        assert_eq!(estimate_tokens("abcde"), 2);
+        assert_eq!(estimate_tokens(&"x".repeat(200_001)), 50_001);
+    }
+
+    #[test]
+    fn test_estimate_tokens_for_item_uses_serialized_json_size() {
+        let item = json!({
+            "index": 0,
+            "content": "abcdefghi"
+        });
+        let serialized = serde_json::to_string(&item).unwrap();
+        assert_eq!(estimate_tokens_for_item(&item), serialized.len().div_ceil(4));
+    }
+
+    #[test]
     fn test_estimate_total_uses_dynamic_for_each_counts() {
         let chain = ChainDefinition {
             schema_version: 1,
@@ -11183,11 +11577,11 @@ mod tests {
             post_build: vec![],
         };
 
-        let mut ctx = ChainContext::new("slug", "code", vec![]);
+        let mut ctx = ChainContext::new("slug", "code", ChunkProvider::empty());
         // 112 chunks for l0_code_extract + 1 setup step (thread_clustering) = 113
         assert_eq!(estimate_total(&chain, &ctx, 112), 113);
 
-        ctx.step_outputs.insert(
+        Arc::make_mut(&mut ctx.step_outputs).insert(
             "thread_clustering".to_string(),
             json!({
                 "threads": vec![json!({}); 10]
@@ -11200,8 +11594,8 @@ mod tests {
 
     #[test]
     fn test_resolve_authoritative_child_ids_maps_headlines_back_to_l0_ids() {
-        let mut ctx = ChainContext::new("slug", "code", vec![]);
-        ctx.step_outputs.insert(
+        let mut ctx = ChainContext::new("slug", "code", ChunkProvider::empty());
+        Arc::make_mut(&mut ctx.step_outputs).insert(
             "l0_code_extract".to_string(),
             json!([
                 {
@@ -11239,8 +11633,8 @@ mod tests {
 
     #[test]
     fn test_resolve_authoritative_child_ids_uses_topic_index_to_break_headline_ties() {
-        let mut ctx = ChainContext::new("slug", "code", vec![]);
-        ctx.step_outputs.insert(
+        let mut ctx = ChainContext::new("slug", "code", ChunkProvider::empty());
+        Arc::make_mut(&mut ctx.step_outputs).insert(
             "l0_code_extract".to_string(),
             json!([
                 {
@@ -11278,15 +11672,15 @@ mod tests {
 
     #[test]
     fn test_enrich_group_item_input_hydrates_child_analyses() {
-        let mut ctx = ChainContext::new("slug", "code", vec![]);
-        ctx.step_outputs.insert(
+        let mut ctx = ChainContext::new("slug", "code", ChunkProvider::empty());
+        Arc::make_mut(&mut ctx.step_outputs).insert(
             "forward_pass".to_string(),
             json!([
                 {"running_context": "ignore me"},
                 {"running_context": "ignore me too"}
             ]),
         );
-        ctx.step_outputs.insert(
+        Arc::make_mut(&mut ctx.step_outputs).insert(
             "l0_code_extract".to_string(),
             json!([
                 {
@@ -11829,10 +12223,11 @@ mod tests {
     #[test]
     fn test_resolve_ir_inputs_chunks() {
         let mut state = make_ir_test_state();
-        state.chunks = vec![json!({"index": 0, "content": "hello"})];
+        state.chunks = ChunkProvider::test(vec![json!({"content": "hello"})]);
         let input = json!({"data": "$chunks"});
         let resolved = resolve_ir_inputs(&input, &state);
-        assert_eq!(resolved["data"], json!([{"index": 0, "content": "hello"}]));
+        // With lazy loading, $chunks resolves to stubs (index only, no content)
+        assert_eq!(resolved["data"], json!([{"index": 0}]));
     }
 
     // ── Truthiness tests ────────────────────────────────────────────────
@@ -11904,10 +12299,10 @@ mod tests {
     #[test]
     fn test_resolve_foreach_collection_chunks() {
         let mut state = make_ir_test_state();
-        state.chunks = vec![
-            json!({"index": 0, "content": "a"}),
-            json!({"index": 1, "content": "b"}),
-        ];
+        state.chunks = ChunkProvider::test(vec![
+            json!({"content": "a"}),
+            json!({"content": "b"}),
+        ]);
 
         let mut step = ir_test_step("extract");
         step.iteration = Some(IterationDirective {
@@ -12009,7 +12404,7 @@ mod tests {
             slug: "test-slug".to_string(),
             content_type: "code".to_string(),
             chain_id: None,
-            chunks: vec![],
+            chunks: ChunkProvider::empty(),
             step_outputs: std::collections::HashMap::new(),
             accumulators: std::collections::HashMap::new(),
             current_item: None,
@@ -12720,7 +13115,7 @@ mod tests {
                 }
             ]
         });
-        let ctx = ChainContext::new("slug", "code", vec![]);
+        let ctx = ChainContext::new("slug", "code", ChunkProvider::empty());
 
         let prepared = prepare_ir_resolved_input(&step, input.clone(), None, &ctx);
 

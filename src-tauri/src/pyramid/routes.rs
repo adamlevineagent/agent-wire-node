@@ -2151,6 +2151,14 @@ async fn handle_build(
                             layer.status = "complete".into();
                         }
                     }
+                    LayerEvent::NodeStarted { depth, step_name, node_id, .. } => {
+                        // Track in-flight nodes: add as "pending" status
+                        if let Some(layer) = st.layers.iter_mut().find(|l| l.depth == depth && l.step_name == step_name) {
+                            if let Some(ref mut nodes) = layer.nodes {
+                                nodes.push(NodeStatus { node_id, status: "pending".into(), label: None });
+                            }
+                        }
+                    }
                     LayerEvent::StepStarted { step_name } => {
                         st.current_step = Some(step_name);
                     }
@@ -3346,6 +3354,213 @@ pub fn enqueue_full_l0_sweep(conn: &Connection, slug: &str) -> (i64, i64, i64) {
     (file_paths.len() as i64, enqueued, already_pending)
 }
 
+/// Full L0 sweep with reconciliation: enqueues mutations for tracked files AND
+/// discovers new/deleted files by scanning source directories on disk.
+/// Returns (tracked_files, enqueued, already_pending, reconcile_new, reconcile_changed, reconcile_deleted).
+pub fn enqueue_full_l0_sweep_with_reconciliation(
+    conn: &Connection,
+    slug: &str,
+    source_paths: &[String],
+    ingested_extensions: &[String],
+    content_type: &str,
+) -> (i64, i64, i64, i64, i64, i64) {
+    // First: reconcile disk vs DB (discovers new files, hash changes, deletions)
+    let (r_new, r_changed, r_deleted, _r_unchanged) =
+        reconcile_source_files(conn, slug, source_paths, ingested_extensions, content_type);
+
+    // Then: sweep all tracked files (for files that reconciliation found unchanged
+    // but that the user wants force-checked)
+    let (tracked, enqueued, already_pending) = enqueue_full_l0_sweep(conn, slug);
+
+    (tracked, enqueued, already_pending, r_new, r_changed, r_deleted)
+}
+
+/// Recursively collect files from a directory, filtering by extension.
+fn collect_files_recursive(
+    dir: &std::path::Path,
+    ingested_extensions: &[String],
+    content_type: &str,
+    out: &mut std::collections::HashSet<String>,
+) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let fname = entry.file_name().to_string_lossy().to_string();
+
+        // Skip hidden files/dirs
+        if fname.starts_with('.') {
+            continue;
+        }
+
+        if path.is_dir() {
+            collect_files_recursive(&path, ingested_extensions, content_type, out);
+        } else if path.is_file() {
+            let ext = path
+                .extension()
+                .map(|e| format!(".{}", e.to_string_lossy().to_lowercase()))
+                .unwrap_or_default();
+
+            let dominated = if !ingested_extensions.is_empty() {
+                ingested_extensions.iter().any(|ie| ie == &ext)
+            } else {
+                match content_type {
+                    "document" => ext == ".md" || ext == ".txt" || ext == ".pdf",
+                    "code" => !ext.is_empty(),
+                    _ => !ext.is_empty(),
+                }
+            };
+
+            if dominated {
+                out.insert(path.to_string_lossy().to_string());
+            }
+        }
+    }
+}
+
+/// Reconcile source files on disk against pyramid_file_hashes.
+///
+/// Walks `source_paths` directories, discovers files matching `ingested_extensions`,
+/// and compares against the DB. Writes pending mutations for:
+/// - New files on disk not in pyramid_file_hashes → `new_file`
+/// - Files with changed SHA-256 hashes → `file_change`
+/// - Files in pyramid_file_hashes missing from disk → `deleted_file`
+///
+/// Returns (new_count, changed_count, deleted_count, unchanged_count).
+pub fn reconcile_source_files(
+    conn: &Connection,
+    slug: &str,
+    source_paths: &[String],
+    ingested_extensions: &[String],
+    content_type: &str,
+) -> (i64, i64, i64, i64) {
+    use std::collections::HashSet;
+    use std::path::Path;
+
+    // Collect all files on disk from source directories
+    let mut disk_files: HashSet<String> = HashSet::new();
+    for source_path in source_paths {
+        let path = Path::new(source_path);
+        if !path.is_dir() {
+            continue;
+        }
+        collect_files_recursive(path, ingested_extensions, content_type, &mut disk_files);
+    }
+
+    // Get tracked files from DB
+    let tracked: HashSet<String> = db::get_tracked_paths(conn, slug).unwrap_or_default();
+
+    // Get file hashes for comparison
+    let tracked_hashes: std::collections::HashMap<String, String> = {
+        let mut map = std::collections::HashMap::new();
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT file_path, hash FROM pyramid_file_hashes WHERE slug = ?1",
+        ) {
+            if let Ok(rows) = stmt.query_map(rusqlite::params![slug], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            }) {
+                for row in rows.flatten() {
+                    map.insert(row.0, row.1);
+                }
+            }
+        }
+        map
+    };
+
+    let mut new_count: i64 = 0;
+    let mut changed_count: i64 = 0;
+    let mut deleted_count: i64 = 0;
+    let mut unchanged_count: i64 = 0;
+
+    // Check each file on disk against DB
+    for file_path in &disk_files {
+        // Skip if already has an unprocessed mutation
+        let already_pending: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pyramid_pending_mutations
+                 WHERE slug = ?1 AND layer = 0 AND processed = 0 AND target_ref = ?2",
+                rusqlite::params![slug, file_path],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        if already_pending > 0 {
+            continue;
+        }
+
+        if let Some(db_hash) = tracked_hashes.get(file_path) {
+            // File is tracked — check if hash changed
+            match super::watcher::compute_file_hash(file_path) {
+                Ok(disk_hash) => {
+                    if disk_hash != *db_hash {
+                        let _ = super::watcher::write_mutation(
+                            conn,
+                            slug,
+                            0,
+                            "file_change",
+                            file_path,
+                            Some("startup reconciliation: hash changed"),
+                        );
+                        changed_count += 1;
+                    } else {
+                        unchanged_count += 1;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        slug,
+                        file = file_path,
+                        error = %e,
+                        "Failed to hash file during reconciliation"
+                    );
+                }
+            }
+        } else {
+            // File is new — not in pyramid_file_hashes
+            let _ = super::watcher::write_mutation(
+                conn,
+                slug,
+                0,
+                "new_file",
+                file_path,
+                Some("startup reconciliation: new file"),
+            );
+            new_count += 1;
+        }
+    }
+
+    // Check for deleted files (in DB but not on disk)
+    for tracked_path in &tracked {
+        if !disk_files.contains(tracked_path) {
+            // Skip if already has an unprocessed mutation
+            let already_pending: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pyramid_pending_mutations
+                     WHERE slug = ?1 AND layer = 0 AND processed = 0 AND target_ref = ?2",
+                    rusqlite::params![slug, tracked_path],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0);
+            if already_pending > 0 {
+                continue;
+            }
+
+            let _ = super::watcher::write_mutation(
+                conn,
+                slug,
+                0,
+                "deleted_file",
+                tracked_path,
+                Some("startup reconciliation: file missing"),
+            );
+            deleted_count += 1;
+        }
+    }
+
+    (new_count, changed_count, deleted_count, unchanged_count)
+}
+
 /// POST /pyramid/:slug/auto-update/breaker/resume
 async fn handle_breaker_resume(
     slug_name: String,
@@ -3684,9 +3899,28 @@ async fn handle_auto_update_l0_sweep(
     slug_name: String,
     state: Arc<PyramidState>,
 ) -> Result<warp::reply::Response, warp::Rejection> {
-    let (tracked_files, enqueued, already_pending) = {
+    // Get slug info for reconciliation
+    let (source_paths, content_type) = {
+        let conn = state.reader.lock().await;
+        match slug::get_slug(&conn, &slug_name) {
+            Ok(Some(info)) => {
+                let paths: Vec<String> = serde_json::from_str(&info.source_path)
+                    .unwrap_or_else(|_| vec![info.source_path.clone()]);
+                (paths, info.content_type.as_str().to_string())
+            }
+            _ => (Vec::new(), String::new()),
+        }
+    };
+    let ingested_extensions: Vec<String> = {
+        let conn = state.reader.lock().await;
+        db::get_ingested_extensions(&conn, &slug_name).unwrap_or_default()
+    };
+
+    let (tracked_files, enqueued, already_pending, r_new, r_changed, r_deleted) = {
         let conn = state.writer.lock().await;
-        enqueue_full_l0_sweep(&conn, &slug_name)
+        enqueue_full_l0_sweep_with_reconciliation(
+            &conn, &slug_name, &source_paths, &ingested_extensions, &content_type,
+        )
     };
 
     let engine_data = {
@@ -3735,6 +3969,11 @@ async fn handle_auto_update_l0_sweep(
         "tracked_files": tracked_files,
         "enqueued": enqueued,
         "already_pending": already_pending,
+        "reconciliation": {
+            "new_files": r_new,
+            "changed_files": r_changed,
+            "deleted_files": r_deleted,
+        },
     })))
 }
 
@@ -4237,6 +4476,13 @@ async fn handle_question_build(
                     LayerEvent::LayerCompleted { depth, step_name } => {
                         if let Some(layer) = state.layers.iter_mut().find(|l| l.depth == depth && l.step_name == step_name) {
                             layer.status = "complete".into();
+                        }
+                    }
+                    LayerEvent::NodeStarted { depth, step_name, node_id, .. } => {
+                        if let Some(layer) = state.layers.iter_mut().find(|l| l.depth == depth && l.step_name == step_name) {
+                            if let Some(ref mut nodes) = layer.nodes {
+                                nodes.push(NodeStatus { node_id, status: "pending".into(), label: None });
+                            }
                         }
                     }
                     LayerEvent::StepStarted { step_name } => {

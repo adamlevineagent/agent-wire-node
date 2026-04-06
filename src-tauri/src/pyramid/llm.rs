@@ -19,6 +19,14 @@ use super::types::TokenUsage;
 static RATE_LIMITER: LazyLock<TokioMutex<VecDeque<std::time::Instant>>> =
     LazyLock::new(|| TokioMutex::new(VecDeque::new()));
 
+/// Shared HTTP client — reuses TCP connections and TLS sessions across all LLM calls.
+static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    reqwest::Client::builder()
+        .pool_max_idle_per_host(8)
+        .build()
+        .expect("failed to build shared reqwest::Client")
+});
+
 /// Wait until we have capacity in the sliding window before making an LLM call.
 /// Parameters come from Tier1Config (llm_rate_limit_max_requests, llm_rate_limit_window_secs).
 async fn rate_limit_wait(max_requests: usize, window_secs: f64) {
@@ -118,7 +126,7 @@ impl Default for LlmConfig {
             retry_base_sleep_secs: 1,
             timeout_chars_per_increment: 100_000,
             timeout_increment_secs: 60,
-            rate_limit_max_requests: 4,
+            rate_limit_max_requests: 20,
             rate_limit_window_secs: 5.0,
             llm_debug_logging: false,
         }
@@ -146,17 +154,27 @@ fn resolve_context_limit(model: &str, config: &LlmConfig) -> usize {
 
 /// Estimate token count for pre-flight model selection using tiktoken cl100k_base.
 /// Falls back to len/4 if the tokenizer fails to initialize.
-fn estimate_tokens_llm(system_prompt: &str, user_prompt: &str) -> usize {
-    use std::sync::OnceLock;
-    static BPE: OnceLock<Option<tiktoken_rs::CoreBPE>> = OnceLock::new();
-    let bpe = BPE.get_or_init(|| tiktoken_rs::cl100k_base().ok());
-    match bpe {
-        Some(encoder) => {
-            encoder.encode_with_special_tokens(system_prompt).len()
-                + encoder.encode_with_special_tokens(user_prompt).len()
+///
+/// Runs on the blocking thread pool (8MB stack) via spawn_blocking because
+/// tiktoken's fancy-regex engine is recursive and overflows the 2MB async
+/// worker thread stack on large inputs (observed at 699+ doc prompts).
+async fn estimate_tokens_llm(system_prompt: &str, user_prompt: &str) -> usize {
+    let sys = system_prompt.to_string();
+    let usr = user_prompt.to_string();
+    tokio::task::spawn_blocking(move || {
+        use std::sync::OnceLock;
+        static BPE: OnceLock<Option<tiktoken_rs::CoreBPE>> = OnceLock::new();
+        let bpe = BPE.get_or_init(|| tiktoken_rs::cl100k_base().ok());
+        match bpe {
+            Some(encoder) => {
+                encoder.encode_with_special_tokens(&sys).len()
+                    + encoder.encode_with_special_tokens(&usr).len()
+            }
+            None => (sys.len() + usr.len()) / 4,
         }
-        None => (system_prompt.len() + user_prompt.len()) / 4,
-    }
+    })
+    .await
+    .unwrap_or_else(|_| (system_prompt.len() + user_prompt.len()) / 4)
 }
 
 /// Short model name for logging (part after the slash).
@@ -275,7 +293,7 @@ pub async fn call_model_unified_with_options(
 ) -> Result<LlmResponse> {
     // Model selection based on INPUT size only — max_tokens (output budget) is
     // irrelevant to whether the prompt fits in the model's context window.
-    let est_input_tokens = estimate_tokens_llm(system_prompt, user_prompt);
+    let est_input_tokens = estimate_tokens_llm(system_prompt, user_prompt).await;
 
     let mut use_model = if est_input_tokens > config.fallback_1_context_limit {
         info!("[fallback->{}]", short_name(&config.fallback_model_2));
@@ -287,7 +305,7 @@ pub async fn call_model_unified_with_options(
         config.primary_model.clone()
     };
 
-    let client = reqwest::Client::new();
+    let client = &*HTTP_CLIENT;
     let url = "https://openrouter.ai/api/v1/chat/completions";
 
     // Scale timeout with prompt size: base + increment_secs per chars_per_increment, capped at max
@@ -648,6 +666,126 @@ pub async fn call_model_structured(
     )
     .await?;
     Ok(resp.content)
+}
+
+// ── Audited LLM Call (Live Pyramid Theatre) ─────────────────────────────────
+
+use rusqlite::Connection;
+use std::sync::Arc;
+use tokio::sync::Mutex as TokioMutexSync;
+
+/// Context for recording LLM calls to the audit trail. Thread through build
+/// pipelines to capture prompt/response for the Inspector modal.
+#[derive(Debug, Clone)]
+pub struct AuditContext {
+    pub conn: Arc<TokioMutexSync<Connection>>,
+    pub slug: String,
+    pub build_id: String,
+    pub node_id: Option<String>,
+    pub step_name: String,
+    pub call_purpose: String,
+    pub depth: Option<i64>,
+}
+
+impl AuditContext {
+    /// Create a child context for a different node/purpose while sharing the connection.
+    pub fn for_node(&self, node_id: &str, call_purpose: &str, depth: i64) -> Self {
+        Self {
+            conn: Arc::clone(&self.conn),
+            slug: self.slug.clone(),
+            build_id: self.build_id.clone(),
+            node_id: Some(node_id.to_string()),
+            step_name: self.step_name.clone(),
+            call_purpose: call_purpose.to_string(),
+            depth: Some(depth),
+        }
+    }
+
+    pub fn with_step(&self, step_name: &str) -> Self {
+        Self {
+            conn: Arc::clone(&self.conn),
+            slug: self.slug.clone(),
+            build_id: self.build_id.clone(),
+            node_id: self.node_id.clone(),
+            step_name: step_name.to_string(),
+            call_purpose: self.call_purpose.clone(),
+            depth: self.depth,
+        }
+    }
+}
+
+/// Audited LLM call: wraps `call_model_unified` with pre/post audit row writes.
+///
+/// 1. Inserts a pending audit row BEFORE the call
+/// 2. Calls `call_model_unified`
+/// 3. Updates the row with response + metrics AFTER
+///
+/// Returns `(LlmResponse, audit_row_id)`.
+pub async fn call_model_audited(
+    config: &LlmConfig,
+    system_prompt: &str,
+    user_prompt: &str,
+    temperature: f32,
+    max_tokens: usize,
+    response_format: Option<&serde_json::Value>,
+    audit: &AuditContext,
+) -> Result<(LlmResponse, i64)> {
+    use super::db;
+
+    // Insert pending row (async lock on tokio mutex)
+    let audit_id = {
+        let conn = audit.conn.lock().await;
+        db::insert_llm_audit_pending(
+            &conn,
+            &audit.slug,
+            &audit.build_id,
+            audit.node_id.as_deref(),
+            &audit.step_name,
+            &audit.call_purpose,
+            audit.depth,
+            &config.primary_model,
+            system_prompt,
+            user_prompt,
+        )?
+    };
+
+    let start = std::time::Instant::now();
+
+    // Actual LLM call
+    let result = call_model_unified(
+        config,
+        system_prompt,
+        user_prompt,
+        temperature,
+        max_tokens,
+        response_format,
+    )
+    .await;
+
+    let latency_ms = start.elapsed().as_millis() as i64;
+
+    match result {
+        Ok(resp) => {
+            let conn = audit.conn.lock().await;
+            let _ = db::complete_llm_audit(
+                &conn,
+                audit_id,
+                &resp.content,
+                true,
+                resp.usage.prompt_tokens,
+                resp.usage.completion_tokens,
+                latency_ms,
+                resp.generation_id.as_deref(),
+            );
+            Ok((resp, audit_id))
+        }
+        Err(e) => {
+            let conn = audit.conn.lock().await;
+            let _ = db::fail_llm_audit(&conn, audit_id, &e.to_string());
+            drop(conn);
+            Err(e)
+        }
+    }
 }
 
 // ── JSON extraction ──────────────────────────────────────────────────────────

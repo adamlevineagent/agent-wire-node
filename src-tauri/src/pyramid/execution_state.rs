@@ -22,6 +22,7 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, warn};
 
+use super::chain_executor::ChunkProvider;
 use super::db;
 use super::execution_plan::{AccumulatorConfig, Step, StorageKind};
 use super::types::{BuildProgress, PyramidNode};
@@ -92,8 +93,8 @@ pub struct ExecutionState {
     pub chain_id: Option<String>,
 
     // ── data ────────────────────────────────────────────────────────────
-    /// Loaded chunk data (from pyramid_chunks).
-    pub chunks: Vec<Value>,
+    /// Lazy chunk provider — loads content on-demand from SQLite.
+    pub chunks: ChunkProvider,
     /// Step outputs keyed by step ID.  Downstream steps resolve `$ref`
     /// expressions against this map.
     pub step_outputs: HashMap<String, Value>,
@@ -136,7 +137,7 @@ impl ExecutionState {
         slug: String,
         content_type: String,
         chain_id: Option<String>,
-        chunks: Vec<Value>,
+        chunks: ChunkProvider,
         has_prior_build: bool,
         total_estimated_nodes: u32,
         cancel: CancellationToken,
@@ -952,7 +953,7 @@ mod tests {
             "test".to_string(),
             "code".to_string(),
             Some("code-default".to_string()),
-            vec![],
+            ChunkProvider::empty(),
             false,
             10,
             cancel.clone(),
@@ -995,7 +996,7 @@ mod tests {
             "test".to_string(),
             "code".to_string(),
             None,
-            vec![],
+            ChunkProvider::empty(),
             false,
             0,
             cancel,
@@ -1030,7 +1031,7 @@ mod tests {
             "test".to_string(),
             "code".to_string(),
             None,
-            vec![],
+            ChunkProvider::empty(),
             false,
             0,
             cancel,
@@ -1067,7 +1068,7 @@ mod tests {
             "test".to_string(),
             "code".to_string(),
             None,
-            vec![],
+            ChunkProvider::empty(),
             false,
             0,
             cancel,

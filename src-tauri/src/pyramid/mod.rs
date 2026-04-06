@@ -166,7 +166,7 @@ fn default_llm_timeout_increment_secs() -> u64 {
     60
 }
 fn default_llm_rate_limit_max_requests() -> usize {
-    4
+    20
 }
 fn default_llm_rate_limit_window_secs() -> f64 {
     5.0

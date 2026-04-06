@@ -772,6 +772,44 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
         [],
     );
 
+    // ── Live Pyramid Theatre: LLM audit trail ──────────────────────────────
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS pyramid_llm_audit (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            slug TEXT NOT NULL,
+            build_id TEXT NOT NULL,
+            node_id TEXT,
+            step_name TEXT NOT NULL,
+            call_purpose TEXT NOT NULL,
+            depth INTEGER,
+            model TEXT NOT NULL,
+            system_prompt TEXT NOT NULL,
+            user_prompt TEXT NOT NULL,
+            raw_response TEXT,
+            parsed_ok INTEGER DEFAULT 0,
+            prompt_tokens INTEGER DEFAULT 0,
+            completion_tokens INTEGER DEFAULT 0,
+            latency_ms INTEGER,
+            generation_id TEXT,
+            status TEXT NOT NULL DEFAULT 'pending',
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            completed_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_llm_audit_slug_build ON pyramid_llm_audit(slug, build_id);
+        CREATE INDEX IF NOT EXISTS idx_llm_audit_node ON pyramid_llm_audit(slug, node_id);
+
+        -- Prompt deduplication: system prompts repeat across nodes in a build.
+        -- Store unique prompts by hash, audit rows reference the hash.
+        CREATE TABLE IF NOT EXISTS pyramid_prompt_store (
+            hash TEXT PRIMARY KEY,
+            content TEXT NOT NULL,
+            char_count INTEGER NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        ",
+    )?;
+
     // ── Schema Prep Migration for Wire Online push ──────────────────────────
     migrate_online_push_columns(conn)?;
 
@@ -1517,6 +1555,21 @@ pub fn get_chunk(conn: &Connection, slug: &str, chunk_index: i64) -> Result<Opti
 
     match result {
         Ok(content) => Ok(Some(content)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Load just the first 200 bytes of a chunk's content (for file path header extraction).
+/// Avoids loading full 50KB+ content when only the `## FILE: path` header is needed.
+pub fn get_chunk_header(conn: &Connection, slug: &str, chunk_index: i64) -> Result<Option<String>> {
+    let result = conn.query_row(
+        "SELECT SUBSTR(content, 1, 200) FROM pyramid_chunks WHERE slug = ?1 AND chunk_index = ?2",
+        rusqlite::params![slug, chunk_index],
+        |row| row.get::<_, String>(0),
+    );
+    match result {
+        Ok(header) => Ok(Some(header)),
         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
         Err(e) => Err(e.into()),
     }
@@ -3376,6 +3429,238 @@ pub fn insert_cost_log(
     Ok(())
 }
 
+// ── LLM Audit Trail CRUD (Live Pyramid Theatre) ────────────────────────────
+
+/// Insert a pending audit row BEFORE an LLM call. Returns the row id.
+///
+/// System prompts are deduplicated via `pyramid_prompt_store` — the audit row
+/// stores a hash reference instead of the full text when the prompt already
+/// exists. This saves significant space since system prompts repeat across
+/// every node in a build.
+pub fn insert_llm_audit_pending(
+    conn: &Connection,
+    slug: &str,
+    build_id: &str,
+    node_id: Option<&str>,
+    step_name: &str,
+    call_purpose: &str,
+    depth: Option<i64>,
+    model: &str,
+    system_prompt: &str,
+    user_prompt: &str,
+) -> Result<i64> {
+    // Deduplicate system prompt via hash
+    let sys_hash = prompt_hash(system_prompt);
+    let _ = conn.execute(
+        "INSERT OR IGNORE INTO pyramid_prompt_store (hash, content, char_count)
+         VALUES (?1, ?2, ?3)",
+        rusqlite::params![sys_hash, system_prompt, system_prompt.len() as i64],
+    );
+
+    // Store hash reference as system_prompt in audit row
+    let sys_ref = format!("@@hash:{}", sys_hash);
+    conn.execute(
+        "INSERT INTO pyramid_llm_audit
+         (slug, build_id, node_id, step_name, call_purpose, depth, model,
+          system_prompt, user_prompt, status)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'pending')",
+        rusqlite::params![
+            slug, build_id, node_id, step_name, call_purpose, depth,
+            model, sys_ref, user_prompt,
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// SHA-256 hash of a prompt string, returned as hex.
+fn prompt_hash(text: &str) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    text.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+/// Complete an audit row AFTER the LLM call returns.
+pub fn complete_llm_audit(
+    conn: &Connection,
+    audit_id: i64,
+    raw_response: &str,
+    parsed_ok: bool,
+    prompt_tokens: i64,
+    completion_tokens: i64,
+    latency_ms: i64,
+    generation_id: Option<&str>,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE pyramid_llm_audit SET
+         raw_response = ?1, parsed_ok = ?2,
+         prompt_tokens = ?3, completion_tokens = ?4,
+         latency_ms = ?5, generation_id = ?6,
+         status = 'complete', completed_at = datetime('now')
+         WHERE id = ?7",
+        rusqlite::params![
+            raw_response, parsed_ok as i32,
+            prompt_tokens, completion_tokens,
+            latency_ms, generation_id, audit_id,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Mark an audit row as failed (LLM error).
+pub fn fail_llm_audit(
+    conn: &Connection,
+    audit_id: i64,
+    error_message: &str,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE pyramid_llm_audit SET
+         raw_response = ?1, status = 'failed', completed_at = datetime('now')
+         WHERE id = ?2",
+        rusqlite::params![error_message, audit_id],
+    )?;
+    Ok(())
+}
+
+/// Get all audit records for a specific node in a build.
+/// Hash-referenced system prompts are resolved to full text.
+pub fn get_node_audit_records(
+    conn: &Connection,
+    slug: &str,
+    node_id: &str,
+) -> Result<Vec<LlmAuditRecord>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, slug, build_id, node_id, step_name, call_purpose, depth, model,
+                system_prompt, user_prompt, raw_response, parsed_ok,
+                prompt_tokens, completion_tokens, latency_ms, generation_id,
+                status, created_at, completed_at
+         FROM pyramid_llm_audit
+         WHERE slug = ?1 AND node_id = ?2
+         ORDER BY id ASC",
+    )?;
+    let mut rows: Vec<LlmAuditRecord> = stmt
+        .query_map(rusqlite::params![slug, node_id], parse_llm_audit_row)?
+        .filter_map(|r| r.ok())
+        .collect();
+    resolve_prompt_hashes(conn, &mut rows);
+    Ok(rows)
+}
+
+/// Get a single audit record by id.
+/// Hash-referenced system prompts are resolved to full text.
+pub fn get_llm_audit_by_id(
+    conn: &Connection,
+    audit_id: i64,
+) -> Result<Option<LlmAuditRecord>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, slug, build_id, node_id, step_name, call_purpose, depth, model,
+                system_prompt, user_prompt, raw_response, parsed_ok,
+                prompt_tokens, completion_tokens, latency_ms, generation_id,
+                status, created_at, completed_at
+         FROM pyramid_llm_audit WHERE id = ?1",
+    )?;
+    let mut rows: Vec<LlmAuditRecord> = stmt
+        .query_map(rusqlite::params![audit_id], parse_llm_audit_row)?
+        .filter_map(|r| r.ok())
+        .collect();
+    resolve_prompt_hashes(conn, &mut rows);
+    Ok(rows.into_iter().next())
+}
+
+/// Get all live nodes for a build (for the Theatre's spatial view).
+/// Returns nodes with parent_id for tree construction.
+pub fn get_build_live_nodes(
+    conn: &Connection,
+    slug: &str,
+    _build_id: &str,
+) -> Result<Vec<LiveNodeInfo>> {
+    let mut stmt = conn.prepare(
+        "SELECT n.id, n.depth, n.headline, n.parent_id, n.children,
+                CASE WHEN n.superseded_by IS NOT NULL THEN 'superseded'
+                     WHEN n.distilled = '' THEN 'pending'
+                     ELSE 'complete' END AS status
+         FROM pyramid_nodes n
+         WHERE n.slug = ?1 AND n.build_version > 0
+         ORDER BY n.depth ASC, n.id ASC",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![slug], |row| {
+            let children_json: String = row.get::<_, Option<String>>(4)?.unwrap_or_default();
+            let children: Vec<String> = serde_json::from_str(&children_json).unwrap_or_default();
+            Ok(LiveNodeInfo {
+                node_id: row.get(0)?,
+                depth: row.get(1)?,
+                headline: row.get(2)?,
+                parent_id: row.get::<_, Option<String>>(3)?,
+                children,
+                status: row.get(5)?,
+            })
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(rows)
+}
+
+/// Delete audit records for all builds EXCEPT the latest for each slug.
+pub fn cleanup_old_audit_records(conn: &Connection, slug: &str) -> Result<i64> {
+    let latest_build_id: Option<String> = conn
+        .query_row(
+            "SELECT build_id FROM pyramid_llm_audit WHERE slug = ?1
+             ORDER BY id DESC LIMIT 1",
+            rusqlite::params![slug],
+            |row| row.get(0),
+        )
+        .ok();
+    let deleted = match latest_build_id {
+        Some(bid) => conn.execute(
+            "DELETE FROM pyramid_llm_audit WHERE slug = ?1 AND build_id != ?2",
+            rusqlite::params![slug, bid],
+        )?,
+        None => 0,
+    };
+    Ok(deleted as i64)
+}
+
+fn parse_llm_audit_row(row: &rusqlite::Row) -> rusqlite::Result<LlmAuditRecord> {
+    Ok(LlmAuditRecord {
+        id: row.get(0)?,
+        slug: row.get(1)?,
+        build_id: row.get(2)?,
+        node_id: row.get(3)?,
+        step_name: row.get(4)?,
+        call_purpose: row.get(5)?,
+        depth: row.get(6)?,
+        model: row.get(7)?,
+        system_prompt: row.get(8)?, // may be "@@hash:..." — resolved at read time
+        user_prompt: row.get(9)?,
+        raw_response: row.get(10)?,
+        parsed_ok: row.get::<_, i32>(11)? != 0,
+        prompt_tokens: row.get(12)?,
+        completion_tokens: row.get(13)?,
+        latency_ms: row.get(14)?,
+        generation_id: row.get(15)?,
+        status: row.get(16)?,
+        created_at: row.get(17)?,
+        completed_at: row.get(18)?,
+    })
+}
+
+/// Resolve hash references in audit records (system_prompt "@@hash:..." → full text).
+fn resolve_prompt_hashes(conn: &Connection, records: &mut [LlmAuditRecord]) {
+    for record in records.iter_mut() {
+        if let Some(hash) = record.system_prompt.strip_prefix("@@hash:") {
+            if let Ok(content) = conn.query_row(
+                "SELECT content FROM pyramid_prompt_store WHERE hash = ?1",
+                rusqlite::params![hash],
+                |row| row.get::<_, String>(0),
+            ) {
+                record.system_prompt = content;
+            }
+        }
+    }
+}
+
 /// Get cost summary for a slug within an optional time window.
 /// Note: The actual column in pyramid_cost_log is `estimated_cost`, not `cost_usd`.
 pub fn get_cost_summary(
@@ -4277,6 +4562,43 @@ pub fn mark_gap_resolved(
         rusqlite::params![slug, question_id, description],
     )?;
     Ok(())
+}
+
+// ── Sequential Node ID Generation ────────────────────────────────────────────
+
+/// Generate the next sequential node ID for a given slug and depth.
+///
+/// Scans existing node IDs matching the pattern `L{depth}-{NNN}` (and variants
+/// like `L0-TNNN`) to find the highest numeric suffix, then returns the next.
+/// This avoids UUID-based IDs which LLMs cannot faithfully reproduce during
+/// pre-mapping and evidence answering.
+///
+/// The `prefix` parameter allows callers to use a sub-prefix (e.g. "T" for
+/// targeted extractions), producing IDs like `L0-T042`. Pass "" for standard
+/// sequential IDs like `L1-003`.
+pub fn next_sequential_node_id(
+    conn: &Connection,
+    slug: &str,
+    depth: i64,
+    prefix: &str,
+) -> String {
+    let pattern = format!("L{}-{}%", depth, prefix);
+    let max_idx: i64 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(CAST(SUBSTR(id, ?1) AS INTEGER)), -1)
+             FROM pyramid_nodes
+             WHERE slug = ?2 AND depth = ?3 AND id LIKE ?4",
+            rusqlite::params![
+                // offset into the id string: skip "L{depth}-{prefix}"
+                format!("L{}-{}", depth, prefix).len() + 1,
+                slug,
+                depth,
+                pattern,
+            ],
+            |row| row.get(0),
+        )
+        .unwrap_or(-1);
+    format!("L{}-{}{:03}", depth, prefix, max_idx + 1)
 }
 
 // ── Evidence Set Queries ────────────────────────────────────────────────────

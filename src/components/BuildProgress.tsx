@@ -1,8 +1,8 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 
-// Re-export PyramidBuildViz as BuildProgress so all existing imports get the new viz
-export { PyramidBuildViz as BuildProgress } from './PyramidBuildViz';
+// Re-export PyramidTheatre as BuildProgress so all existing imports get the new viz
+export { PyramidTheatre as BuildProgress } from './PyramidTheatre';
 
 interface BuildStatus {
     slug: string;
@@ -19,7 +19,7 @@ interface BuildProgressProps {
     onRetry?: (slug: string) => void;
 }
 
-/** @deprecated Use PyramidBuildViz instead */
+/** @deprecated Use PyramidTheatre instead */
 export function BuildProgressLegacy({ slug, onComplete, onClose, onRetry }: BuildProgressProps) {
     const [status, setStatus] = useState<BuildStatus | null>(null);
     const [error, setError] = useState<string | null>(null);

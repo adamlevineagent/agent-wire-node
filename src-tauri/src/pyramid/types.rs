@@ -314,6 +314,14 @@ pub enum LayerEvent {
         step_name: String,
         estimated_nodes: i64,
     },
+    /// Emitted when an individual node starts LLM processing (before the call).
+    NodeStarted {
+        depth: i64,
+        step_name: String,
+        node_id: String,
+        /// Row id in pyramid_llm_audit (for in-flight prompt viewing).
+        audit_id: Option<i64>,
+    },
     NodeCompleted {
         depth: i64,
         step_name: String,
@@ -336,6 +344,44 @@ pub enum LayerEvent {
         elapsed_secs: f64,
         message: String,
     },
+}
+
+// ── Live Pyramid Theatre Types ──────────────────────────────────────────────
+
+/// Full LLM audit record for the Inspector modal.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LlmAuditRecord {
+    pub id: i64,
+    pub slug: String,
+    pub build_id: String,
+    pub node_id: Option<String>,
+    pub step_name: String,
+    pub call_purpose: String,
+    pub depth: Option<i64>,
+    pub model: String,
+    pub system_prompt: String,
+    pub user_prompt: String,
+    pub raw_response: Option<String>,
+    pub parsed_ok: bool,
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
+    pub latency_ms: Option<i64>,
+    pub generation_id: Option<String>,
+    pub status: String,
+    pub created_at: String,
+    pub completed_at: Option<String>,
+}
+
+/// Lightweight node info for the Theatre's live spatial view.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LiveNodeInfo {
+    pub node_id: String,
+    pub depth: i64,
+    pub headline: String,
+    pub parent_id: Option<String>,
+    pub children: Vec<String>,
+    /// "complete" | "pending" | "superseded"
+    pub status: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

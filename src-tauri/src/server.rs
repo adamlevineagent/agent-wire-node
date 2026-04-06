@@ -207,6 +207,51 @@ pub async fn init_stale_engines(pyramid_state: &Arc<pyramid::PyramidState>) {
             continue;
         }
 
+        // Get slug info early — needed for both reconciliation and watcher
+        let (source_paths, content_type_str): (Vec<String>, String) = {
+            let conn = pyramid_state.reader.lock().await;
+            match pyramid::slug::get_slug(&conn, &slug) {
+                Ok(Some(info)) => {
+                    let paths = serde_json::from_str(&info.source_path)
+                        .unwrap_or_else(|_| vec![info.source_path.clone()]);
+                    (paths, info.content_type.as_str().to_string())
+                }
+                _ => (Vec::new(), String::new()),
+            }
+        };
+
+        // Get ingested extensions for reconciliation
+        let ingested_extensions: Vec<String> = {
+            let conn = pyramid_state.reader.lock().await;
+            pyramid::db::get_ingested_extensions(&conn, &slug).unwrap_or_default()
+        };
+
+        // Startup reconciliation: compare files on disk vs pyramid_file_hashes.
+        // Discovers new files, hash changes, and deletions that happened while app was closed.
+        if !source_paths.is_empty() {
+            let conn = pyramid_state.writer.lock().await;
+            let (r_new, r_changed, r_deleted, r_unchanged) =
+                pyramid::routes::reconcile_source_files(
+                    &conn,
+                    &slug,
+                    &source_paths,
+                    &ingested_extensions,
+                    &content_type_str,
+                );
+            if r_new > 0 || r_changed > 0 || r_deleted > 0 {
+                tracing::info!(
+                    "Startup reconciliation for '{}': {} new, {} changed, {} deleted, {} unchanged",
+                    slug, r_new, r_changed, r_deleted, r_unchanged
+                );
+                engine.notify_mutation(0);
+            } else {
+                tracing::info!(
+                    "Startup reconciliation for '{}': all {} files unchanged",
+                    slug, r_unchanged
+                );
+            }
+        }
+
         // Check for unprocessed WAL entries and feed them into the engine's layer timers
         {
             let conn = pyramid_state.reader.lock().await;
@@ -236,17 +281,6 @@ pub async fn init_stale_engines(pyramid_state: &Arc<pyramid::PyramidState>) {
         engine.start_poll_loop();
 
         engines.insert(slug.clone(), engine);
-
-        // Create and start file watcher
-        let source_paths: Vec<String> = {
-            let conn = pyramid_state.reader.lock().await;
-            // Get source paths from slug info
-            match pyramid::slug::get_slug(&conn, &slug) {
-                Ok(Some(info)) => serde_json::from_str(&info.source_path)
-                    .unwrap_or_else(|_| vec![info.source_path.clone()]),
-                _ => Vec::new(),
-            }
-        };
 
         if !source_paths.is_empty() {
             let mut watcher = PyramidFileWatcher::new(&slug, source_paths, &pyramid_state.operational.tier2);

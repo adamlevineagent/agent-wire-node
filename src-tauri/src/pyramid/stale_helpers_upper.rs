@@ -12,7 +12,6 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use rusqlite::Connection;
 use tracing::{error, info, warn};
-use uuid::Uuid;
 
 use super::config_helper::{config_for_model, estimate_cost};
 use super::llm::{call_model_with_usage, extract_json};
@@ -1439,7 +1438,6 @@ pub async fn execute_supersession(
     api_key: &str,
     model: &str,
 ) -> Result<String> {
-    let new_node_id = format!("N-{}", Uuid::new_v4());
     let requested_node_id = node_id.to_string();
     let resolved_node_id = tokio::task::spawn_blocking({
         let db = db_path.to_string();
@@ -1492,11 +1490,11 @@ pub async fn execute_supersession(
         self_prompt: String,
     }
 
-    let node_data = tokio::task::spawn_blocking({
+    let (node_data, new_node_id) = tokio::task::spawn_blocking({
         let db = db.clone();
         let nid = nid.clone();
         let s = s.clone();
-        move || -> Result<NodeData> {
+        move || -> Result<(NodeData, String)> {
             let conn = super::db::open_pyramid_connection(Path::new(&db)).context("Failed to open DB for supersession")?;
 
             let (headline, distilled, depth, parent_id, children_json, topics, corrections, decisions, terms, dead_ends, self_prompt): (
@@ -1566,7 +1564,10 @@ pub async fn execute_supersession(
                 })
             });
 
-            Ok(NodeData {
+            // Generate sequential node ID (not UUID) for LLM-friendly pyramid IDs
+            let new_nid = super::db::next_sequential_node_id(&conn, &s, depth, "S");
+
+            Ok((NodeData {
                 headline,
                 distilled,
                 depth,
@@ -1583,7 +1584,7 @@ pub async fn execute_supersession(
                 terms,
                 dead_ends,
                 self_prompt,
-            })
+            }, new_nid))
         }
     })
     .await??;

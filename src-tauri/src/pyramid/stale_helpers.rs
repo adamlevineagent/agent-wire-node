@@ -16,7 +16,7 @@ use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 use similar::{ChangeTag, TextDiff};
 use tracing::{info, warn};
-use uuid::Uuid;
+
 
 use super::config_helper::{config_for_model, estimate_cost};
 use super::llm::{call_model_with_usage, extract_json};
@@ -423,8 +423,8 @@ pub async fn dispatch_new_file_ingest(batch: Vec<PendingMutation>, db_path: &str
             // Compute hash
             let hash = compute_hash(content.as_bytes());
 
-            // Create a new L0 node for this file
-            let node_id = format!("L0-{}", Uuid::new_v4());
+            // Create a new L0 node for this file (sequential ID, not UUID)
+            let node_id = super::db::next_sequential_node_id(&conn, &slug_c, 0, "");
 
             // Truncate content for distilled field (first ~200 lines as summary placeholder)
             let distilled_lines: Vec<&str> = content.lines().take(200).collect();
@@ -548,7 +548,7 @@ pub async fn dispatch_tombstone(batch: Vec<PendingMutation>, db_path: &str) -> R
             let tombstone_headline = tombstone_headline(file_path);
 
             // Create tombstone node
-            let tombstone_id = format!("TOMB-{}", Uuid::new_v4());
+            let tombstone_id = super::db::next_sequential_node_id(&conn, &slug_c, 0, "TOMB");
 
             conn.execute(
                 "INSERT INTO pyramid_nodes
@@ -767,8 +767,8 @@ Output JSON only:
                 .unwrap_or_default();
 
             if let Some(old_node_id) = old_node_ids.first() {
-                // Create a rename note node
-                let new_node_id = format!("L0-{}", Uuid::new_v4());
+                // Create a rename note node (sequential ID, not UUID)
+                let new_node_id = super::db::next_sequential_node_id(&conn, &slug_c, 0, "");
                 let rename_note = format!(
                     "File renamed: {} -> {}. Reason: {}",
                     old_path_c, new_path_c, result_c.reason
@@ -874,7 +874,7 @@ Output JSON only:
                 );
                 let tombstone_headline = tombstone_headline(&old_path_c);
 
-                let tombstone_id = format!("TOMB-{}", Uuid::new_v4());
+                let tombstone_id = super::db::next_sequential_node_id(&conn, &slug_c, 0, "TOMB");
 
                 conn.execute(
                     "INSERT INTO pyramid_nodes
@@ -919,7 +919,7 @@ Output JSON only:
             let new_content = read_file_content(&new_path_c).unwrap_or_default();
             if !new_content.is_empty() {
                 let hash = compute_hash(new_content.as_bytes());
-                let new_node_id = format!("L0-{}", Uuid::new_v4());
+                let new_node_id = super::db::next_sequential_node_id(&conn, &slug_c, 0, "");
 
                 let distilled_lines: Vec<&str> = new_content.lines().take(200).collect();
                 let distilled = format!(
@@ -1168,7 +1168,7 @@ Output JSON only:
                 )
                 .ok();
 
-            let node_id = existing_id.unwrap_or_else(|| format!("ES-{}", Uuid::new_v4()));
+            let node_id = existing_id.unwrap_or_else(|| super::db::next_sequential_node_id(&conn, &s, 0, "ES"));
 
             conn.execute(
                 "INSERT OR REPLACE INTO pyramid_nodes

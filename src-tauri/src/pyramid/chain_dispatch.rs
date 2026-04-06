@@ -16,7 +16,7 @@ use tracing::{info, warn};
 use super::chain_engine::{ChainDefaults, ChainStep};
 use super::execution_plan::{ModelRequirements, Step, StepOperation};
 use super::expression::ValueEnv;
-use super::llm::{self, LlmConfig, LlmResponse};
+use super::llm::{self, AuditContext, LlmConfig, LlmResponse};
 use super::naming::headline_from_analysis;
 use super::transform_runtime;
 use super::types::{Correction, Decision, PyramidNode, Term, Topic};
@@ -35,6 +35,9 @@ pub struct StepContext {
     pub tier1: Tier1Config,
     /// Full operational config for tier 2/3 values needed during dispatch.
     pub ops: OperationalConfig,
+    /// Optional audit context for Theatre LLM audit trail.
+    /// When present, all LLM calls in dispatch are recorded.
+    pub audit: Option<AuditContext>,
 }
 
 // ── Top-level dispatcher ────────────────────────────────────────────────────
@@ -187,14 +190,19 @@ async fn dispatch_llm(
     }
 
     // Standard path: call model, parse JSON, retry at temp 0.1 on failure
-    let response = llm::call_model(
-        config_ref,
-        system_prompt,
-        &user_prompt,
-        temperature,
-        max_tokens,
-    )
-    .await?;
+    let response = if let Some(ref audit) = ctx.audit {
+        let audit = AuditContext {
+            step_name: step.name.clone(),
+            call_purpose: "chain_dispatch".to_string(),
+            ..audit.clone()
+        };
+        let (resp, _) = llm::call_model_audited(
+            config_ref, system_prompt, &user_prompt, temperature, max_tokens, None, &audit,
+        ).await?;
+        resp.content
+    } else {
+        llm::call_model(config_ref, system_prompt, &user_prompt, temperature, max_tokens).await?
+    };
 
     match llm::extract_json(&response) {
         Ok(json) => {
@@ -795,16 +803,21 @@ pub async fn dispatch_ir_llm(
     );
 
     // Standard path: call model, parse JSON, retry at temp 0.1 on failure
-    let response = llm::call_model_unified_with_options(
-        config_ref,
-        system_prompt,
-        &user_prompt,
-        temperature,
-        max_tokens,
-        None,
-        llm_options,
-    )
-    .await?;
+    let response = if let Some(ref audit) = ctx.audit {
+        let audit = AuditContext {
+            step_name: step.id.clone(),
+            call_purpose: "ir_dispatch".to_string(),
+            ..audit.clone()
+        };
+        let (resp, _) = llm::call_model_audited(
+            config_ref, system_prompt, &user_prompt, temperature, max_tokens, None, &audit,
+        ).await?;
+        resp
+    } else {
+        llm::call_model_unified_with_options(
+            config_ref, system_prompt, &user_prompt, temperature, max_tokens, None, llm_options,
+        ).await?
+    };
 
     match llm::extract_json(&response.content) {
         Ok(json) => {
@@ -923,6 +936,7 @@ mod tests {
             config: LlmConfig::default(),
             tier1: Tier1Config::default(),
             ops: OperationalConfig::default(),
+            audit: None,
         };
         let result = dispatch_mechanical("nonexistent", &serde_json::json!({}), &ctx);
         assert!(result.is_err());
@@ -941,6 +955,7 @@ mod tests {
             config: LlmConfig::default(),
             tier1: Tier1Config::default(),
             ops: OperationalConfig::default(),
+            audit: None,
         };
         let input = serde_json::json!({"files": ["main.rs"]});
         let result = dispatch_mechanical("extract_import_graph", &input, &ctx).unwrap();
@@ -1183,6 +1198,7 @@ mod tests {
             config: LlmConfig::default(),
             tier1: Tier1Config::default(),
             ops: OperationalConfig::default(),
+            audit: None,
         };
         let mut step = ir_step("mech_step", StepOperation::Mechanical);
         step.rust_function = Some("extract_import_graph".into());
@@ -1202,6 +1218,7 @@ mod tests {
             config: LlmConfig::default(),
             tier1: Tier1Config::default(),
             ops: OperationalConfig::default(),
+            audit: None,
         };
         let step = ir_step("no_fn", StepOperation::Mechanical);
         // rust_function is None
@@ -1222,6 +1239,7 @@ mod tests {
             config: LlmConfig::default(),
             tier1: Tier1Config::default(),
             ops: OperationalConfig::default(),
+            audit: None,
         };
         let mut step = ir_step("bad_fn", StepOperation::Mechanical);
         step.rust_function = Some("nonexistent_fn".into());
@@ -1242,6 +1260,7 @@ mod tests {
             config: LlmConfig::default(),
             tier1: Tier1Config::default(),
             ops: OperationalConfig::default(),
+            audit: None,
         };
         let mut step = ir_step("count_step", StepOperation::Transform);
         step.transform = Some(TransformSpec {
@@ -1264,6 +1283,7 @@ mod tests {
             config: LlmConfig::default(),
             tier1: Tier1Config::default(),
             ops: OperationalConfig::default(),
+            audit: None,
         };
         let mut step = ir_step("coalesce_step", StepOperation::Transform);
         step.transform = Some(TransformSpec {
@@ -1290,6 +1310,7 @@ mod tests {
             config: LlmConfig::default(),
             tier1: Tier1Config::default(),
             ops: OperationalConfig::default(),
+            audit: None,
         };
         let step = ir_step("bad_transform", StepOperation::Transform);
         // transform is None
@@ -1310,6 +1331,7 @@ mod tests {
             config: LlmConfig::default(),
             tier1: Tier1Config::default(),
             ops: OperationalConfig::default(),
+            audit: None,
         };
         let step = ir_step("wire_step", StepOperation::Wire);
         let result = dispatch_ir_step(&step, &serde_json::json!({}), "", &ctx).await;
@@ -1326,6 +1348,7 @@ mod tests {
             config: LlmConfig::default(),
             tier1: Tier1Config::default(),
             ops: OperationalConfig::default(),
+            audit: None,
         };
         let step = ir_step("task_step", StepOperation::Task);
         let result = dispatch_ir_step(&step, &serde_json::json!({}), "", &ctx).await;
@@ -1342,6 +1365,7 @@ mod tests {
             config: LlmConfig::default(),
             tier1: Tier1Config::default(),
             ops: OperationalConfig::default(),
+            audit: None,
         };
         let step = ir_step("game_step", StepOperation::Game);
         let result = dispatch_ir_step(&step, &serde_json::json!({}), "", &ctx).await;
@@ -1358,6 +1382,7 @@ mod tests {
             config: LlmConfig::default(),
             tier1: Tier1Config::default(),
             ops: OperationalConfig::default(),
+            audit: None,
         };
         let mut step = ir_step("mech", StepOperation::Mechanical);
         step.rust_function = Some("extract_mechanical_metadata".into());

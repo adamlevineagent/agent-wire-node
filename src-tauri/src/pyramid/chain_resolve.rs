@@ -10,8 +10,10 @@ use anyhow::{bail, Context, Result};
 use regex::Regex;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 use tracing::warn;
+
+use super::chain_executor::ChunkProvider;
 
 static REF_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\$([a-zA-Z_][a-zA-Z0-9_.]*(?:\[[^\]]*\])*)").unwrap()
@@ -26,9 +28,13 @@ static TEMPLATE_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
 #[derive(Clone)]
 pub struct ChainContext {
     /// Step outputs keyed by step name.
-    pub step_outputs: HashMap<String, Value>,
-    /// The content chunks being processed.
-    pub chunks: Vec<Value>,
+    /// Wrapped in Arc so that ChainContext::clone() is cheap (ref-count bump, not deep copy).
+    /// Mutation sites use Arc::make_mut (cow-clone only when shared).
+    pub step_outputs: Arc<HashMap<String, Value>>,
+    /// Lazy chunk provider — loads content on-demand from SQLite.
+    /// INVARIANT: Only stubs()/len() are called from sync ChainContext methods.
+    /// Async methods (load_content, load_header) are called from the executor.
+    pub chunks: ChunkProvider,
     /// Slug of the pyramid being built.
     pub slug: String,
     /// Content type (conversation, code, document).
@@ -59,9 +65,9 @@ pub struct ChainContext {
 
 impl ChainContext {
     /// Create a new context with the basic build parameters.
-    pub fn new(slug: &str, content_type: &str, chunks: Vec<Value>) -> Self {
+    pub fn new(slug: &str, content_type: &str, chunks: ChunkProvider) -> Self {
         Self {
-            step_outputs: HashMap::new(),
+            step_outputs: Arc::new(HashMap::new()),
             chunks,
             slug: slug.to_string(),
             content_type: content_type.to_string(),
@@ -91,10 +97,10 @@ impl ChainContext {
 
         // ── Built-in scalars ────────────────────────────────────────
         if path == "chunks" {
-            return Ok(Value::Array(self.chunks.clone()));
+            return Ok(Value::Array(self.chunks.stubs()));
         }
         if path == "chunks_reversed" {
-            let mut reversed = self.chunks.clone();
+            let mut reversed = self.chunks.stubs();
             reversed.reverse();
             return Ok(Value::Array(reversed));
         }
@@ -498,18 +504,15 @@ mod tests {
     use serde_json::json;
 
     fn test_context() -> ChainContext {
+        use super::super::chain_executor::ChunkProvider;
         let mut ctx = ChainContext::new(
             "my-slug",
             "conversation",
-            vec![
-                json!({"text": "chunk0"}),
-                json!({"text": "chunk1"}),
-                json!({"text": "chunk2"}),
-            ],
+            ChunkProvider::with_count(3),
         );
 
         // Add a step output
-        ctx.step_outputs.insert(
+        Arc::make_mut(&mut ctx.step_outputs).insert(
             "forward_pass".to_string(),
             json!({
                 "output": {
@@ -558,8 +561,10 @@ mod tests {
         let ctx = test_context();
         let val = ctx.resolve_ref("$chunks_reversed").unwrap();
         let arr = val.as_array().unwrap();
-        assert_eq!(arr[0], json!({"text": "chunk2"}));
-        assert_eq!(arr[2], json!({"text": "chunk0"}));
+        assert_eq!(arr.len(), 3);
+        // ChunkProvider stubs are {"index": N}, reversed = [2, 1, 0]
+        assert_eq!(arr[0], json!({"index": 2}));
+        assert_eq!(arr[2], json!({"index": 0}));
     }
 
     #[test]
