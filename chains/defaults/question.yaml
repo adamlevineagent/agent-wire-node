@@ -49,8 +49,14 @@ steps:
     instruction: "$prompts/question/question_web.md"
     input:
       nodes: "$source_extract"
-    compact_inputs: true
     max_input_tokens: 80000
+    batch_size: 50
+    concurrency: 4
+    dehydrate:
+      - drop: orientation
+      - drop: topics
+      - drop: entities
+    compact_inputs: true
     response_schema: &web_schema
       type: object
       properties:

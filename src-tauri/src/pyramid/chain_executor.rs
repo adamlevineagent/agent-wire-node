@@ -1689,61 +1689,59 @@ fn merge_web_entities(
     merged
 }
 
-fn build_webbing_input(
-    nodes: &[PyramidNode],
-    depth: i64,
-    resolved_input: &Value,
+/// Build a single node's webbing payload (compact or full).
+fn build_webbing_node_payload(
+    node: &PyramidNode,
+    supplemental_ctx: Option<&SupplementalWebNodeContext>,
     compact_inputs: bool,
 ) -> Value {
-    let supplemental = supplemental_web_context_by_key(resolved_input);
-    let node_payloads: Vec<Value> = nodes
+    let topic_payloads: Vec<Value> = node
+        .topics
         .iter()
-        .map(|node| {
-            let supplemental_ctx = supplemental
-                .get(&node.id)
-                .or_else(|| supplemental.get(&node.headline));
-            let topic_payloads: Vec<Value> = node
-                .topics
-                .iter()
-                .map(|topic| {
-                    serde_json::json!({
-                        "name": topic.name.clone(),
-                        "current": truncate_for_webbing(&topic.current, 240),
-                        "entities": topic.entities.clone(),
-                    })
-                })
-                .collect();
-
-            if compact_inputs {
-                let mut payload = serde_json::Map::new();
-                payload.insert("node_id".to_string(), Value::String(node.id.clone()));
-                payload.insert("headline".to_string(), Value::String(node.headline.clone()));
-                if let Some(source_path) = supplemental_ctx.and_then(|ctx| ctx.source_path.clone())
-                {
-                    payload.insert("source_path".to_string(), Value::String(source_path));
-                }
-                payload.insert(
-                    "entities".to_string(),
-                    Value::Array(
-                        merge_web_entities(node, supplemental_ctx, 16)
-                            .into_iter()
-                            .map(Value::String)
-                            .collect(),
-                    ),
-                );
-                Value::Object(payload)
-            } else {
-                serde_json::json!({
-                    "node_id": node.id.clone(),
-                    "headline": node.headline.clone(),
-                    "orientation": truncate_for_webbing(&node.distilled, 1200),
-                    "topics": topic_payloads,
-                    "entities": merge_web_entities(node, supplemental_ctx, 24),
-                })
-            }
+        .map(|topic| {
+            serde_json::json!({
+                "name": topic.name.clone(),
+                "current": truncate_for_webbing(&topic.current, 240),
+                "entities": topic.entities.clone(),
+            })
         })
         .collect();
 
+    if compact_inputs {
+        let mut payload = serde_json::Map::new();
+        payload.insert("node_id".to_string(), Value::String(node.id.clone()));
+        payload.insert("headline".to_string(), Value::String(node.headline.clone()));
+        if let Some(source_path) = supplemental_ctx.and_then(|ctx| ctx.source_path.clone()) {
+            payload.insert("source_path".to_string(), Value::String(source_path));
+        }
+        payload.insert(
+            "entities".to_string(),
+            Value::Array(
+                merge_web_entities(node, supplemental_ctx, 16)
+                    .into_iter()
+                    .map(Value::String)
+                    .collect(),
+            ),
+        );
+        Value::Object(payload)
+    } else {
+        serde_json::json!({
+            "node_id": node.id.clone(),
+            "headline": node.headline.clone(),
+            "orientation": truncate_for_webbing(&node.distilled, 1200),
+            "topics": topic_payloads,
+            "entities": merge_web_entities(node, supplemental_ctx, 24),
+        })
+    }
+}
+
+/// Wrap pre-built node payloads in the `{depth, node_count, nodes: [...]}` envelope.
+fn wrap_webbing_envelope(
+    node_payloads: Vec<Value>,
+    depth: i64,
+    resolved_input: &Value,
+) -> Value {
+    let node_count = node_payloads.len();
     let mut payload = serde_json::Map::new();
     payload.insert(
         "depth".to_string(),
@@ -1751,7 +1749,7 @@ fn build_webbing_input(
     );
     payload.insert(
         "node_count".to_string(),
-        Value::Number(serde_json::Number::from(nodes.len() as u64)),
+        Value::Number(serde_json::Number::from(node_count as u64)),
     );
     payload.insert("nodes".to_string(), Value::Array(node_payloads));
 
@@ -1764,6 +1762,25 @@ fn build_webbing_input(
     }
 
     Value::Object(payload)
+}
+
+fn build_webbing_input(
+    nodes: &[PyramidNode],
+    depth: i64,
+    resolved_input: &Value,
+    compact_inputs: bool,
+) -> Value {
+    let supplemental = supplemental_web_context_by_key(resolved_input);
+    let payloads: Vec<Value> = nodes
+        .iter()
+        .map(|node| {
+            let ctx = supplemental
+                .get(&node.id)
+                .or_else(|| supplemental.get(&node.headline));
+            build_webbing_node_payload(node, ctx, compact_inputs)
+        })
+        .collect();
+    wrap_webbing_envelope(payloads, depth, resolved_input)
 }
 
 fn extract_explicit_web_node_ids(resolved_input: &Value) -> Vec<String> {
@@ -8306,6 +8323,234 @@ async fn dispatch_group(
 
 // ── Web step execution ──────────────────────────────────────────────────────
 
+/// Hierarchical token-aware webbing with concurrent batch dispatch.
+///
+/// 1. Builds per-node payloads and estimates total envelope tokens.
+/// 2. If everything fits in one call, dispatches directly (fast path).
+/// 3. Otherwise, packs nodes into batches via `batch_items_by_tokens` and
+///    dispatches them concurrently (bounded by `step.concurrency`).
+/// 4. After intra-batch dispatch, runs a cross-batch merge pass with
+///    `compact_inputs=true` to discover inter-batch edges. Skipped when
+///    compact_inputs was already true (prevents infinite recursion).
+/// 5. Deduplicates cross-batch edges against intra-batch edges by (source, target).
+async fn web_nodes_batched(
+    nodes: &[PyramidNode],
+    depth: i64,
+    resolved_input: &Value,
+    step: &ChainStep,
+    ctx: &ChainContext,
+    defaults: &super::chain_engine::ChainDefaults,
+    dispatch_ctx: &chain_dispatch::StepContext,
+    error_strategy: &ErrorStrategy,
+    max_tokens: usize,
+) -> Result<Vec<PendingWebEdge>> {
+    // ── Build per-node payloads ─────────────────────────────────────────
+    let supplemental = supplemental_web_context_by_key(resolved_input);
+    let node_payloads: Vec<Value> = nodes
+        .iter()
+        .map(|node| {
+            let sup_ctx = supplemental
+                .get(&node.id)
+                .or_else(|| supplemental.get(&node.headline));
+            build_webbing_node_payload(node, sup_ctx, step.compact_inputs)
+        })
+        .collect();
+
+    // ── Fast path: single dispatch ──────────────────────────────────────
+    let full_envelope = wrap_webbing_envelope(node_payloads.clone(), depth, resolved_input);
+    let est_tokens = estimate_tokens_for_item(&full_envelope);
+
+    if est_tokens <= max_tokens {
+        let system_prompt = build_system_prompt(step, &full_envelope, ctx)?;
+        let fallback_key = format!("{}-d{depth}", step.name);
+        let analysis = dispatch_with_retry(
+            step, &full_envelope, &system_prompt, defaults,
+            dispatch_ctx, error_strategy, &fallback_key,
+        )
+        .await?;
+        return Ok(parse_web_edges(&step.name, &analysis, nodes));
+    }
+
+    // ── Batch packing ───────────────────────────────────────────────────
+    info!(
+        "[CHAIN] [{}] webbing: {} nodes ({} tokens > {}), splitting into batches",
+        step.name, nodes.len(), est_tokens, max_tokens
+    );
+
+    let dehydrate_steps = step.dehydrate.as_deref();
+    let batches = batch_items_by_tokens(
+        node_payloads,
+        max_tokens,
+        step.batch_size,
+        dehydrate_steps,
+    );
+
+    // Pre-compute batch offsets into the original `nodes` slice.
+    // Each batch is a Value::Array of node payloads — its len maps 1:1 to
+    // consecutive nodes in the input slice.
+    let mut batch_offsets: Vec<(usize, usize)> = Vec::with_capacity(batches.len());
+    let mut offset = 0;
+    for batch in &batches {
+        let len = batch.as_array().map_or(0, |a| a.len());
+        batch_offsets.push((offset, len));
+        offset += len;
+    }
+
+    let batch_count = batches.len();
+    info!(
+        "[CHAIN] [{}] packed into {} batches (concurrency={})",
+        step.name, batch_count, step.concurrency.max(1)
+    );
+
+    if batch_count <= 1 {
+        // Single batch after packing — dispatch without concurrency overhead
+        let batch_items = batches.into_iter().next().unwrap_or(Value::Array(Vec::new()));
+        let items = match batch_items {
+            Value::Array(v) => v,
+            other => vec![other],
+        };
+        let envelope = wrap_webbing_envelope(items, depth, resolved_input);
+        let system_prompt = build_system_prompt(step, &envelope, ctx)?;
+        let fallback_key = format!("{}-d{depth}-b0", step.name);
+        let analysis = dispatch_with_retry(
+            step, &envelope, &system_prompt, defaults,
+            dispatch_ctx, error_strategy, &fallback_key,
+        )
+        .await?;
+        return Ok(parse_web_edges(&step.name, &analysis, nodes));
+    }
+
+    // ── Concurrent batch dispatch ───────────────────────────────────────
+    let semaphore = Arc::new(Semaphore::new(step.concurrency.max(1)));
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<(usize, Result<Value>)>(batch_count);
+
+    for (batch_idx, batch_value) in batches.into_iter().enumerate() {
+        let items = match batch_value {
+            Value::Array(v) => v,
+            other => vec![other],
+        };
+        let envelope = wrap_webbing_envelope(items, depth, resolved_input);
+        let system_prompt = build_system_prompt(step, &envelope, ctx)?;
+        let fallback_key = format!("{}-d{depth}-b{batch_idx}", step.name);
+
+        let (_boff, blen) = batch_offsets[batch_idx];
+        info!(
+            "  [CHAIN] [{}] batch {}: {} nodes (~{} tokens)",
+            step.name, batch_idx, blen, estimate_tokens_for_item(&envelope)
+        );
+
+        let sem = semaphore.clone();
+        let tx = tx.clone();
+        let step_c = step.clone();
+        let defaults_c = defaults.clone();
+        let dispatch_ctx_c = dispatch_ctx.clone();
+        let error_strategy_c = error_strategy.clone();
+
+        tokio::spawn(async move {
+            let _permit = sem.acquire().await;
+            let result = dispatch_with_retry(
+                &step_c, &envelope, &system_prompt, &defaults_c,
+                &dispatch_ctx_c, &error_strategy_c, &fallback_key,
+            )
+            .await;
+            let _ = tx.send((batch_idx, result)).await;
+        });
+    }
+    // Drop our sender so rx completes when all tasks finish
+    drop(tx);
+
+    // ── Collect results ─────────────────────────────────────────────────
+    let mut intra_edges = Vec::new();
+    let mut batch_failures = 0usize;
+    while let Some((batch_idx, result)) = rx.recv().await {
+        let (boff, blen) = batch_offsets[batch_idx];
+        let batch_nodes = &nodes[boff..boff + blen];
+        match result {
+            Ok(analysis) => {
+                let mut edges = parse_web_edges(&step.name, &analysis, batch_nodes);
+                intra_edges.append(&mut edges);
+            }
+            Err(e) => {
+                batch_failures += 1;
+                warn!("  [CHAIN] [{}] batch {} failed: {e}", step.name, batch_idx);
+                if matches!(error_strategy, ErrorStrategy::Abort | ErrorStrategy::Retry(_)) {
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    info!(
+        "[CHAIN] [{}] intra-batch dispatch complete: {} edges, {} failures",
+        step.name, intra_edges.len(), batch_failures
+    );
+
+    // ── Cross-batch merge pass ──────────────────────────────────────────
+    // Skip if compact_inputs is already true (would produce identical payload
+    // and recurse infinitely).
+    if !step.compact_inputs {
+        info!(
+            "[CHAIN] [{}] merge pass: finding cross-batch edges across {} batches ({} intra-edges found)",
+            step.name, batch_count, intra_edges.len()
+        );
+
+        let mut merge_step = step.clone();
+        merge_step.compact_inputs = true;
+
+        // Recursive call via Box::pin to avoid async recursion issues
+        let cross_edges = Box::pin(web_nodes_batched(
+            nodes, depth, resolved_input, &merge_step, ctx, defaults,
+            dispatch_ctx, error_strategy, max_tokens,
+        ))
+        .await;
+
+        match cross_edges {
+            Ok(mut merge_edges) => {
+                // Deduplicate: keep merge-pass edges not already in intra-batch set
+                let existing_pairs: HashSet<(String, String)> = intra_edges
+                    .iter()
+                    .map(|e| {
+                        let (a, b) = if e.source_node_id <= e.target_node_id {
+                            (e.source_node_id.clone(), e.target_node_id.clone())
+                        } else {
+                            (e.target_node_id.clone(), e.source_node_id.clone())
+                        };
+                        (a, b)
+                    })
+                    .collect();
+
+                merge_edges.retain(|e| {
+                    let (a, b) = if e.source_node_id <= e.target_node_id {
+                        (e.source_node_id.clone(), e.target_node_id.clone())
+                    } else {
+                        (e.target_node_id.clone(), e.source_node_id.clone())
+                    };
+                    !existing_pairs.contains(&(a, b))
+                });
+
+                info!(
+                    "[CHAIN] [{}] merge pass found {} new cross-batch edges",
+                    step.name, merge_edges.len()
+                );
+                intra_edges.append(&mut merge_edges);
+            }
+            Err(e) => {
+                warn!(
+                    "[CHAIN] [{}] merge pass failed ({e}), keeping {} intra-batch edges only",
+                    step.name, intra_edges.len()
+                );
+            }
+        }
+    } else {
+        info!(
+            "[CHAIN] [{}] already compact, skipping merge pass ({} intra-batch edges)",
+            step.name, intra_edges.len()
+        );
+    }
+
+    Ok(intra_edges)
+}
+
 async fn execute_web_step(
     step: &ChainStep,
     ctx: &mut ChainContext,
@@ -8365,85 +8610,12 @@ async fn execute_web_step(
     }
 
     let normalized_edges = if nodes.len() >= 2 {
-        // Token-aware batched webbing: if the full payload exceeds max_input_tokens,
-        // split nodes into batches, web each batch, and merge all edges.
         let max_tokens = step.max_input_tokens.unwrap_or(80_000);
-        let full_input = build_webbing_input(&nodes, depth, &resolved_input, step.compact_inputs);
-        let est_tokens = estimate_tokens_for_item(&full_input);
-
-        if est_tokens <= max_tokens {
-            // Fits in one call — dispatch as-is
-            let system_prompt = build_system_prompt(step, &full_input, ctx)?;
-            let fallback_key = format!("{}-d{depth}", step.name);
-            let analysis = dispatch_with_retry(
-                step, &full_input, &system_prompt, defaults,
-                dispatch_ctx, error_strategy, &fallback_key,
-            )
-            .await?;
-            parse_web_edges(&step.name, &analysis, &nodes)
-        } else {
-            // Split nodes into batches that fit within token budget
-            info!(
-                "[CHAIN] [{}] webbing input oversized ({} tokens > {}), splitting {} nodes into batches",
-                step.name, est_tokens, max_tokens, nodes.len()
-            );
-            let mut all_edges = Vec::new();
-            let mut batch_start = 0;
-            let mut batch_idx = 0;
-
-            while batch_start < nodes.len() {
-                // Greedy packing: add nodes until we exceed the budget
-                let mut batch_end = batch_start + 1;
-                while batch_end < nodes.len() {
-                    let candidate = build_webbing_input(
-                        &nodes[batch_start..batch_end + 1], depth, &resolved_input, step.compact_inputs,
-                    );
-                    if estimate_tokens_for_item(&candidate) > max_tokens && batch_end > batch_start + 1 {
-                        break;
-                    }
-                    batch_end += 1;
-                }
-
-                let batch_nodes = &nodes[batch_start..batch_end];
-                let batch_input = build_webbing_input(batch_nodes, depth, &resolved_input, step.compact_inputs);
-                let batch_system_prompt = build_system_prompt(step, &batch_input, ctx)?;
-                let fallback_key = format!("{}-d{depth}-b{batch_idx}", step.name);
-
-                info!(
-                    "[CHAIN] [{}] webbing batch {}: nodes {}-{} ({} nodes, ~{} tokens)",
-                    step.name, batch_idx, batch_start, batch_end - 1,
-                    batch_nodes.len(), estimate_tokens_for_item(&batch_input)
-                );
-
-                match dispatch_with_retry(
-                    step, &batch_input, &batch_system_prompt, defaults,
-                    dispatch_ctx, error_strategy, &fallback_key,
-                )
-                .await
-                {
-                    Ok(analysis) => {
-                        let mut batch_edges = parse_web_edges(&step.name, &analysis, batch_nodes);
-                        all_edges.append(&mut batch_edges);
-                    }
-                    Err(e) => {
-                        warn!("[CHAIN] [{}] webbing batch {} failed: {e}", step.name, batch_idx);
-                        if matches!(error_strategy, ErrorStrategy::Abort | ErrorStrategy::Retry(_)) {
-                            return Err(e);
-                        }
-                        // skip strategy: continue with remaining batches
-                    }
-                }
-
-                batch_start = batch_end;
-                batch_idx += 1;
-            }
-
-            info!(
-                "[CHAIN] [{}] webbing complete: {} batches, {} total edges",
-                step.name, batch_idx, all_edges.len()
-            );
-            all_edges
-        }
+        web_nodes_batched(
+            &nodes, depth, &resolved_input, step, ctx, defaults,
+            dispatch_ctx, error_strategy, max_tokens,
+        )
+        .await?
     } else {
         Vec::new()
     };
