@@ -4265,9 +4265,29 @@ async fn pyramid_question_build(
     from_depth: Option<i64>,
     characterization: Option<wire_node_lib::pyramid::types::CharacterizationResult>,
 ) -> Result<serde_json::Value, String> {
-    let granularity = granularity.unwrap_or(3);
-    let max_depth = max_depth.unwrap_or(3);
-    let from_depth = from_depth.unwrap_or(0);
+    pyramid_question_build_inner(
+        &state,
+        slug,
+        question,
+        granularity.unwrap_or(3),
+        max_depth.unwrap_or(3),
+        from_depth.unwrap_or(0),
+        characterization,
+    )
+    .await
+}
+
+/// Shared inner implementation for question builds — callable from both
+/// the Tauri IPC command and the rebuild path.
+async fn pyramid_question_build_inner(
+    state: &SharedState,
+    slug: String,
+    question: String,
+    granularity: u32,
+    max_depth: u32,
+    from_depth: i64,
+    characterization: Option<wire_node_lib::pyramid::types::CharacterizationResult>,
+) -> Result<serde_json::Value, String> {
 
     if question.trim().is_empty() {
         return Err("question cannot be empty".to_string());
@@ -4506,14 +4526,13 @@ async fn pyramid_rebuild(
         "pyramid_rebuild: re-triggering question build from stored params"
     );
 
-    // Delegate to pyramid_question_build with the stored question and defaults
-    pyramid_question_build(
-        state,
+    pyramid_question_build_inner(
+        &state,
         slug,
         question,
-        None, // granularity: default 3
-        None, // max_depth: default 3
-        None, // from_depth: default 0
+        3,  // granularity default
+        3,  // max_depth default
+        0,  // from_depth default
         None, // characterization: auto
     )
     .await
