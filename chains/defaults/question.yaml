@@ -182,6 +182,13 @@ steps:
   - name: l1_webbing
     primitive: web
     instruction: "$prompts/question/question_web.md"
+    max_input_tokens: 80000
+    batch_size: 50
+    concurrency: 4
+    dehydrate:
+      - drop: orientation
+      - drop: topics
+      - drop: entities
     compact_inputs: true
     response_schema: *web_schema
     depth: 1
@@ -193,6 +200,13 @@ steps:
   - name: l2_webbing
     primitive: web
     instruction: "$prompts/question/question_web.md"
+    max_input_tokens: 80000
+    batch_size: 50
+    concurrency: 4
+    dehydrate:
+      - drop: orientation
+      - drop: topics
+      - drop: entities
     compact_inputs: true
     response_schema: *web_schema
     depth: 2
