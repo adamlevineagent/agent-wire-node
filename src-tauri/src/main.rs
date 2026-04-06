@@ -6010,6 +6010,17 @@ async fn pyramid_cost_summary(
     pyramid_db::get_cost_summary(&conn, &slug, window.as_deref()).map_err(|e| e.to_string())
 }
 
+// ── WS-3: Evidence Density ──────────────────────────────────────────────────
+
+#[tauri::command]
+async fn pyramid_evidence_density(
+    state: tauri::State<'_, SharedState>,
+    slug: String,
+) -> Result<serde_json::Value, String> {
+    let conn = state.pyramid.reader.lock().await;
+    pyramid_db::get_evidence_density(&conn, &slug).map_err(|e| e.to_string())
+}
+
 // ── Live Pyramid Theatre: Audit IPC Commands ────────────────────────────────
 
 #[tauri::command]
@@ -7273,6 +7284,7 @@ fn main() {
             pyramid_auto_update_status,
             pyramid_stale_log,
             pyramid_cost_summary,
+            pyramid_evidence_density,
             pyramid_build_live_nodes,
             pyramid_node_audit,
             pyramid_audit_by_id,

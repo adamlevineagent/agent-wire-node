@@ -811,7 +811,7 @@ pub async fn drain_and_dispatch(
             // supersession so nodes get updated before propagating to L1.
             let mut results = results;
             for result in &mut results {
-                if result.stale {
+                if result.stale == 1 {
                     // result.target_id is a file path for L0 file_change mutations.
                     // Resolve it to node IDs via pyramid_file_hashes.
                     let db_resolve = db.clone();
@@ -854,7 +854,7 @@ pub async fn drain_and_dispatch(
                     // Propagate to targeted L0 nodes from the same source files
                     let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
                     for result in &results {
-                        if !result.stale || layer != 0 {
+                        if result.stale != 1 || layer != 0 {
                             continue;
                         }
                         // Resolve file path → canonical node IDs
@@ -965,7 +965,7 @@ pub async fn drain_and_dispatch(
             // For confirmed stale results, execute supersession
             let mut results = results;
             for result in &mut results {
-                if result.stale {
+                if result.stale == 1 {
                     if let Err(e) = stale_helpers_upper::execute_supersession(
                         &result.target_id, &db, &s, &key, &mdl,
                     ).await {
@@ -1363,7 +1363,7 @@ fn log_stale_results(
                 batch_id,
                 layer,
                 result.target_id,
-                result.stale as i32,
+                result.stale,
                 result.reason,
                 result.checker_index,
                 result.checker_batch_size,
@@ -1408,7 +1408,7 @@ fn propagate_confirmed_stales(
     // Propagation always follows evidence KEEP links through the evidence DAG.
 
     for result in results {
-        if !result.stale {
+        if result.stale != 1 {
             debug!(
                 slug = %slug,
                 target = %result.target_id,

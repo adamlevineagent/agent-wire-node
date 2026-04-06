@@ -11254,7 +11254,7 @@ body {
 .dadbear-panel {
     padding: 20px;
     height: 100%;
-    overflow: hidden;
+    overflow-y: auto;
     display: flex;
     flex-direction: column;
 }
@@ -11263,9 +11263,7 @@ body {
     display: flex;
     flex-direction: row;
     gap: 16px;
-    flex: 1;
-    min-height: 0;
-    overflow: hidden;
+    min-height: 500px;
 }
 
 .dadbear-left-col {
@@ -11856,6 +11854,11 @@ body {
 .stale-badge.stale-renamed {
     background: rgba(167, 139, 250, 0.15);
     color: #a78bfa;
+}
+
+.stale-badge.stale-skipped {
+    background: rgba(156, 163, 175, 0.15);
+    color: #9ca3af;
 }
 
 /* ── Cost Section ───────────────────────────────────────────────── */
@@ -12467,6 +12470,137 @@ body {
 .copy-btn.copied {
     color: var(--accent-green);
     border-color: var(--accent-green);
+}
+
+/* ── Bottom Section (stale log + cost + contributions) ────────────── */
+
+.dadbear-bottom-section {
+    display: grid;
+    grid-template-columns: 2fr 2fr 1fr;
+    gap: 16px;
+    margin-top: 16px;
+    min-height: 0;
+}
+
+.dadbear-bottom-stale,
+.dadbear-bottom-cost,
+.dadbear-bottom-contributions {
+    max-height: 400px;
+    overflow-y: auto;
+}
+
+/* ── Evidence Density Card ────────────────────────────────────────── */
+
+.dadbear-evidence-density {
+    background: var(--bg-card);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-md);
+    padding: 16px;
+    backdrop-filter: blur(12px);
+}
+
+.dadbear-evidence-density-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 12px;
+}
+
+.dadbear-evidence-density-header h3 {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-primary);
+    margin: 0;
+}
+
+.dadbear-evidence-layer-row {
+    display: flex;
+    gap: 12px;
+    flex-wrap: wrap;
+    margin-bottom: 10px;
+    font-size: 12px;
+}
+
+.dadbear-evidence-layer-item {
+    color: var(--text-secondary);
+    font-family: 'SF Mono', monospace;
+    font-size: 11px;
+    background: var(--glass);
+    padding: 2px 8px;
+    border-radius: 4px;
+    border: 1px solid var(--glass-border);
+}
+
+.dadbear-evidence-top-nodes {
+    max-height: 200px;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.dadbear-evidence-node-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 6px;
+    border-radius: 4px;
+    font-size: 12px;
+    transition: background var(--transition);
+}
+
+.dadbear-evidence-node-item.clickable {
+    cursor: pointer;
+}
+
+.dadbear-evidence-node-item.clickable:hover {
+    background: rgba(255, 255, 255, 0.04);
+}
+
+.dadbear-evidence-node-headline {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text-secondary);
+    font-size: 11px;
+}
+
+.dadbear-depth-badge {
+    font-size: 10px;
+    font-weight: 600;
+    padding: 1px 5px;
+    border-radius: 4px;
+    flex-shrink: 0;
+}
+
+.dadbear-depth-badge.depth-0 {
+    background: rgba(34, 211, 238, 0.12);
+    color: var(--accent-cyan);
+}
+
+.dadbear-depth-badge.depth-1 {
+    background: rgba(96, 165, 250, 0.12);
+    color: #60a5fa;
+}
+
+.dadbear-depth-badge.depth-2 {
+    background: rgba(167, 139, 250, 0.12);
+    color: #a78bfa;
+}
+
+.dadbear-depth-badge.depth-3 {
+    background: rgba(240, 192, 64, 0.12);
+    color: var(--accent-warm);
+}
+
+.dadbear-evidence-link-count {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--accent-cyan);
+    min-width: 20px;
+    text-align: right;
+    font-variant-numeric: tabular-nums;
 }
 
 /* ═══════════════════════════════════════════════════════════════════

@@ -731,7 +731,8 @@ pub struct StaleCheckResult {
     pub batch_id: String,
     pub layer: i32,
     pub target_id: String,
-    pub stale: bool,
+    /// Integer stale value: 0=no, 1=yes, 2=new, 3=deleted, 4=renamed, 5=skipped
+    pub stale: i32,
     pub reason: String,
     pub checker_index: i32,
     pub checker_batch_size: i32,

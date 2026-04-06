@@ -583,7 +583,7 @@ pub async fn dispatch_node_stale_check(
                     batch_id: m.batch_id.clone().unwrap_or_default(),
                     layer: m.layer,
                     target_id: skipped.node_id,
-                    stale: false,
+                    stale: 5, // skipped — node didn't map to a live thread
                     reason: skipped.reason,
                     checker_index: skipped.source_index as i32,
                     checker_batch_size: batch_size,
@@ -691,7 +691,7 @@ pub async fn dispatch_node_stale_check(
                 batch_id: m.batch_id.clone().unwrap_or_default(),
                 layer: m.layer,
                 target_id,
-                stale: nr.stale,
+                stale: if nr.stale { 1 } else { 0 },
                 reason: nr.reason.clone(),
                 checker_index: i as i32,
                 checker_batch_size: batch_size,
@@ -711,7 +711,7 @@ pub async fn dispatch_node_stale_check(
             batch_id: m.batch_id.clone().unwrap_or_default(),
             layer: m.layer,
             target_id: skipped.node_id,
-            stale: false,
+            stale: 5, // skipped — node didn't map to a live thread
             reason: skipped.reason,
             checker_index: skipped.source_index as i32,
             checker_batch_size: batch_size,
@@ -724,7 +724,7 @@ pub async fn dispatch_node_stale_check(
 
     info!(
         count = results.len(),
-        stale_count = results.iter().filter(|r| r.stale).count(),
+        stale_count = results.iter().filter(|r| r.stale == 1).count(),
         "dispatch_node_stale_check completed"
     );
 
@@ -1251,7 +1251,7 @@ pub async fn dispatch_edge_stale_check(
                     batch_id: mutation.batch_id.clone().unwrap_or_default(),
                     layer: mutation.layer,
                     target_id: edge_id_str.clone(),
-                    stale: false,
+                    stale: 0,
                     reason: "Edge not found".to_string(),
                     checker_index: idx as i32,
                     checker_batch_size: batch_size,
@@ -1402,7 +1402,7 @@ pub async fn dispatch_edge_stale_check(
             batch_id: mutation.batch_id.clone().unwrap_or_default(),
             layer: mutation.layer,
             target_id: edge_id_str.clone(),
-            stale: is_stale,
+            stale: if is_stale { 1 } else { 0 },
             reason,
             checker_index: idx as i32,
             checker_batch_size: batch_size,
@@ -1415,7 +1415,7 @@ pub async fn dispatch_edge_stale_check(
 
     info!(
         count = results.len(),
-        stale_count = results.iter().filter(|r| r.stale).count(),
+        stale_count = results.iter().filter(|r| r.stale == 1).count(),
         "dispatch_edge_stale_check completed"
     );
 

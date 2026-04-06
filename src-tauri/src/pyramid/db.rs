@@ -958,6 +958,19 @@ fn migrate_online_push_columns(conn: &Connection) -> Result<()> {
         ",
     )?;
 
+    // ── WS-2: faq_synthesis_pass column on pyramid_annotations ──
+    // Tracks which FAQ synthesis pass processed each annotation.
+    // NULL = unprocessed, 'ACUTE' = acute FAQ path, 'PASS-{uuid}' = passive pass.
+    let _ = conn.execute(
+        "ALTER TABLE pyramid_annotations ADD COLUMN faq_synthesis_pass TEXT DEFAULT NULL",
+        [],
+    );
+    // Backfill: existing annotations with question_context were created by the acute FAQ path.
+    let _ = conn.execute(
+        "UPDATE pyramid_annotations SET faq_synthesis_pass = 'ACUTE' WHERE question_context IS NOT NULL AND faq_synthesis_pass IS NULL",
+        [],
+    );
+
     Ok(())
 }
 
@@ -3345,6 +3358,7 @@ pub fn get_stale_log(
             "new" | "2" => 2,
             "deleted" | "3" => 3,
             "renamed" | "4" => 4,
+            "skipped" | "5" => 5,
             _ => 0,
         };
         param_vals.push(Box::new(stale_val));
@@ -3377,6 +3391,7 @@ pub fn get_stale_log(
                     2 => "new",
                     3 => "deleted",
                     4 => "renamed",
+                    5 => "skipped",
                     _ => "unknown",
                 },
                 "reason": row.get::<_, String>(6)?,
@@ -6543,4 +6558,66 @@ mod tests {
             .unwrap();
         assert_eq!(handle_link.weight, Some(0.9));
     }
+}
+
+// ── WS-3: Evidence Density Statistics ───────────────────────────────────────
+
+/// Returns evidence link density statistics for a pyramid slug.
+///
+/// Queries `live_pyramid_evidence` (excludes superseded links) joined to
+/// `live_pyramid_nodes` for depth/headline metadata. Returns a JSON object
+/// with `per_layer` (KEEP link counts grouped by target node depth) and
+/// `top_nodes` (top 50 nodes by inbound KEEP links).
+pub fn get_evidence_density(conn: &Connection, slug: &str) -> Result<serde_json::Value> {
+    // Per layer: count KEEP links grouped by target node's depth
+    let mut layer_stmt = conn.prepare(
+        "SELECT pn.depth, COUNT(*) as keep_count
+         FROM live_pyramid_evidence pe
+         JOIN live_pyramid_nodes pn ON pe.target_node_id = pn.id AND pe.slug = pn.slug
+         WHERE pe.slug = ?1
+         GROUP BY pn.depth
+         ORDER BY pn.depth ASC",
+    )?;
+    let per_layer: Vec<serde_json::Value> = layer_stmt
+        .query_map(rusqlite::params![slug], |row| {
+            let depth: i64 = row.get(0)?;
+            let keep_count: i64 = row.get(1)?;
+            Ok(serde_json::json!({
+                "layer": depth,
+                "keep_count": keep_count,
+            }))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    // Top nodes by inbound KEEP links
+    let mut top_stmt = conn.prepare(
+        "SELECT pe.target_node_id, pn.headline, pn.depth, COUNT(*) as inbound_links
+         FROM live_pyramid_evidence pe
+         JOIN live_pyramid_nodes pn ON pe.target_node_id = pn.id AND pe.slug = pn.slug
+         WHERE pe.slug = ?1
+         GROUP BY pe.target_node_id
+         ORDER BY inbound_links DESC
+         LIMIT 50",
+    )?;
+    let top_nodes: Vec<serde_json::Value> = top_stmt
+        .query_map(rusqlite::params![slug], |row| {
+            let node_id: String = row.get(0)?;
+            let headline: String = row.get(1)?;
+            let depth: i64 = row.get(2)?;
+            let inbound_links: i64 = row.get(3)?;
+            Ok(serde_json::json!({
+                "node_id": node_id,
+                "headline": headline,
+                "depth": depth,
+                "inbound_links": inbound_links,
+            }))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    Ok(serde_json::json!({
+        "per_layer": per_layer,
+        "top_nodes": top_nodes,
+    }))
 }

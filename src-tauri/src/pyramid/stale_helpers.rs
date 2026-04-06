@@ -244,7 +244,7 @@ pub async fn dispatch_file_stale_check(
                 batch_id: batch_id.clone(),
                 layer: m.layer,
                 target_id: m.target_ref.clone(),
-                stale: true,
+                stale: 1,
                 reason: "File unreadable or missing from pyramid — marked stale by default"
                     .to_string(),
                 checker_index: i as i32,
@@ -337,9 +337,9 @@ Output JSON only. Array of objects, one per file:
             .or_else(|| file_results.get(i));
 
         let (stale, reason) = match file_result {
-            Some(fr) => (fr.stale, fr.reason.clone()),
+            Some(fr) => (if fr.stale { 1 } else { 0 }, fr.reason.clone()),
             None => (
-                true,
+                1,
                 "LLM response did not include this file — marked stale by default".to_string(),
             ),
         };
@@ -1071,7 +1071,7 @@ pub async fn dispatch_evidence_set_apex_synthesis(
                 batch_id: batch_id.clone(),
                 layer: m.layer,
                 target_id: self_prompt.clone(),
-                stale: false,
+                stale: 0,
                 reason: "Evidence set has <= 1 member, no apex synthesis needed".to_string(),
                 checker_index: i as i32,
                 checker_batch_size: batch_size,
@@ -1213,7 +1213,7 @@ Output JSON only:
             batch_id: batch_id.clone(),
             layer: m.layer,
             target_id: apex_node_id,
-            stale: true,
+            stale: 1,
             reason: format!(
                 "Evidence set apex synthesized from {} members for question: {}",
                 members.len(),
@@ -1335,7 +1335,7 @@ pub async fn dispatch_targeted_l0_stale_check(
                     batch_id: batch_id.clone(),
                     layer: m.layer,
                     target_id: node_id.clone(),
-                    stale: true,
+                    stale: 1,
                     reason: "Targeted L0 node not found, superseded, or source file missing"
                         .to_string(),
                     checker_index: i as i32,
@@ -1433,7 +1433,7 @@ Output JSON only:
             batch_id: batch_id.clone(),
             layer: m.layer,
             target_id: node_id.clone(),
-            stale: !still_valid,
+            stale: if still_valid { 0 } else { 1 },
             reason,
             checker_index: i as i32,
             checker_batch_size: batch_size,

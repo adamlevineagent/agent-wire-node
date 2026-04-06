@@ -82,6 +82,11 @@ interface ContributionsData {
     lastContributionAt: string | null;
 }
 
+interface EvidenceDensity {
+    per_layer: { layer: number; keep_count: number }[];
+    top_nodes: { node_id: string; headline: string; depth: number; inbound_links: number }[];
+}
+
 interface DADBEARPanelProps {
     slug: string;
     contentType?: string;
@@ -136,6 +141,10 @@ export function DADBEARPanel({ slug, contentType, referencingSlugs, onBack, onNa
 
     // Node counts (independent of DADBEAR)
     const [nodeCounts, setNodeCounts] = useState<Record<number, number> | null>(null);
+
+    // Evidence density (loaded once on mount, manual refresh)
+    const [evidenceDensity, setEvidenceDensity] = useState<EvidenceDensity | null>(null);
+    const [evidenceLoading, setEvidenceLoading] = useState(false);
 
     // Loading
     const [loading, setLoading] = useState(true);
@@ -223,6 +232,18 @@ export function DADBEARPanel({ slug, contentType, referencingSlugs, onBack, onNa
         }
     }, [slug]);
 
+    const loadEvidenceDensity = useCallback(async () => {
+        setEvidenceLoading(true);
+        try {
+            const data = await invoke<EvidenceDensity>('pyramid_evidence_density', { slug });
+            setEvidenceDensity(data);
+        } catch {
+            setEvidenceDensity(null);
+        } finally {
+            setEvidenceLoading(false);
+        }
+    }, [slug]);
+
     useEffect(() => {
         setLoading(true);
         Promise.all([loadConfig(), loadStatus(), loadStaleLog(), loadCost(), loadContributions()])
@@ -261,6 +282,12 @@ export function DADBEARPanel({ slug, contentType, referencingSlugs, onBack, onNa
             }).catch(() => {});
         });
     }, [slug]);
+
+    // ── Evidence density (load once on mount, NOT polled) ────────────
+
+    useEffect(() => {
+        loadEvidenceDensity();
+    }, [loadEvidenceDensity]);
 
     // ── Polling (10s interval, skip if in-flight) ───────────────────
 
@@ -625,7 +652,7 @@ Last check: ${lastCheckStr}
                 </div>
             )}
 
-            {/* ── Body: 2-column layout ─────────────────────────────── */}
+            {/* ── Body: 2-column top + full-width bottom ──────────── */}
             <div className="dadbear-body-layout">
                 {/* ── Left column: pyramid visualization ──────────────── */}
                 <div className="dadbear-left-col">
@@ -639,7 +666,7 @@ Last check: ${lastCheckStr}
                     />
                 </div>
 
-                {/* ── Right column: all monitoring panels ─────────────── */}
+                {/* ── Right column: status + evidence density + config ── */}
                 <div className="dadbear-right-col">
                     {/* ── Status + Controls Section ──────────────────── */}
                     <div className="dadbear-status-section">
@@ -649,17 +676,7 @@ Last check: ${lastCheckStr}
                             {statusInfo.text}
                         </div>
 
-                        {nodeCounts && (
-                            <div className="dadbear-node-counts" style={{
-                                display: 'flex', gap: '12px', marginTop: '8px', fontSize: '13px', opacity: 0.8
-                            }}>
-                                {[3, 2, 1, 0].filter(d => nodeCounts[d]).map(d => (
-                                    <span key={d} style={{ fontFamily: 'monospace' }}>
-                                        L{d}: {nodeCounts[d]}
-                                    </span>
-                                ))}
-                            </div>
-                        )}
+                        {/* Node counts now shown in bar chart labels below */}
 
                         {statusError && !status && contentType !== 'question' && contentType !== 'conversation' && (
                             <button
@@ -701,13 +718,16 @@ Last check: ${lastCheckStr}
                         {status && (
                             <div className="dadbear-bar-chart">
                                 {[0, 1, 2, 3].map(layer => {
-                                    const count = status.pending_mutations_by_layer[String(layer)] ?? 0;
-                                    const heightPct = (count / maxPending) * 100;
+                                    const pending = status.pending_mutations_by_layer[String(layer)] ?? 0;
+                                    const total = nodeCounts?.[layer] ?? 0;
+                                    const heightPct = (pending / maxPending) * 100;
                                     return (
                                         <div key={layer} className="dadbear-bar-column">
                                             <div className="dadbear-bar-fill" style={{ height: `${heightPct}%` }} />
                                             <span className="dadbear-bar-label">L{layer}</span>
-                                            <span className="dadbear-bar-count">{count}</span>
+                                            <span className="dadbear-bar-count">
+                                                {pending > 0 ? `${pending}/${total}` : String(total)}
+                                            </span>
                                         </div>
                                     );
                                 })}
@@ -767,6 +787,54 @@ Last check: ${lastCheckStr}
                                 )}
                             </div>
                         </div>
+                    </div>
+
+                    {/* ── Evidence Density ───────────────────────────── */}
+                    <div className="dadbear-evidence-density">
+                        <div className="dadbear-evidence-density-header">
+                            <h3>Evidence Density</h3>
+                            <button
+                                className="dadbear-action-btn"
+                                onClick={loadEvidenceDensity}
+                                disabled={evidenceLoading}
+                            >
+                                {evidenceLoading ? 'Loading...' : 'Refresh'}
+                            </button>
+                        </div>
+
+                        {evidenceDensity ? (
+                            <>
+                                <div className="dadbear-evidence-layer-row">
+                                    {evidenceDensity.per_layer.map(pl => (
+                                        <span key={pl.layer} className="dadbear-evidence-layer-item">
+                                            L{pl.layer}{'\u2192'}L{pl.layer + 1}: {pl.keep_count}
+                                        </span>
+                                    ))}
+                                </div>
+
+                                <div className="dadbear-evidence-top-nodes">
+                                    {evidenceDensity.top_nodes.length === 0 ? (
+                                        <div className="contribution-empty">No evidence links yet</div>
+                                    ) : evidenceDensity.top_nodes.map(node => (
+                                        <div
+                                            key={node.node_id}
+                                            className={`dadbear-evidence-node-item${onNavigateToSlug ? ' clickable' : ''}`}
+                                            onClick={onNavigateToSlug ? () => onNavigateToSlug(slug, node.node_id) : undefined}
+                                        >
+                                            <span className="dadbear-evidence-node-headline" title={node.headline}>
+                                                {node.headline.length > 40 ? node.headline.slice(0, 40) + '...' : node.headline}
+                                            </span>
+                                            <span className={`dadbear-depth-badge depth-${node.depth}`}>L{node.depth}</span>
+                                            <span className="dadbear-evidence-link-count">{node.inbound_links}</span>
+                                        </div>
+                                    ))}
+                                </div>
+                            </>
+                        ) : (
+                            <div className="contribution-empty">
+                                {evidenceLoading ? 'Loading evidence density...' : 'No data available'}
+                            </div>
+                        )}
                     </div>
 
                     {/* ── Config Section ─────────────────────────────── */}
@@ -831,190 +899,6 @@ Last check: ${lastCheckStr}
                         </button>
                     </div>
 
-                    {/* ── Stale Log Section ──────────────────────────── */}
-                    <div className="dadbear-log-section">
-                        <h3>Stale Check Log</h3>
-
-                        <div className="dadbear-log-filters">
-                            <select value={logLayerFilter} onChange={(e) => setLogLayerFilter(e.target.value)}>
-                                <option value="all">All Layers</option>
-                                <option value="0">L0</option>
-                                <option value="1">L1</option>
-                                <option value="2">L2</option>
-                                <option value="3">L3</option>
-                            </select>
-                            <select value={logStaleFilter} onChange={(e) => setLogStaleFilter(e.target.value)}>
-                                <option value="all">All Results</option>
-                                <option value="yes">Stale Only</option>
-                                <option value="no">Not Stale</option>
-                            </select>
-                        </div>
-
-                        <table className="stale-log-table">
-                            <thead>
-                                <tr>
-                                    <th>Layer</th>
-                                    <th>Target</th>
-                                    <th>Stale</th>
-                                    <th>Reason</th>
-                                    <th>Cost</th>
-                                    <th>Time</th>
-                                </tr>
-                            </thead>
-                            <tbody>
-                                {staleLog.length === 0 ? (
-                                    <tr>
-                                        <td colSpan={6} style={{ textAlign: 'center', color: 'var(--text-muted)', padding: 20 }}>
-                                            No stale checks recorded yet
-                                        </td>
-                                    </tr>
-                                ) : staleLog.map(entry => (
-                                    <tr key={entry.id}>
-                                        <td>L{entry.layer}</td>
-                                        <td title={entry.target_id}>
-                                            {entry.target_id.length > 20
-                                                ? entry.target_id.slice(0, 20) + '...'
-                                                : entry.target_id}
-                                        </td>
-                                        <td>
-                                            <span className={`stale-badge ${
-                                                entry.stale === 'yes' ? 'stale-yes'
-                                                : entry.stale === 'new' ? 'stale-new'
-                                                : entry.stale === 'deleted' ? 'stale-deleted'
-                                                : entry.stale === 'renamed' ? 'stale-renamed'
-                                                : 'stale-no'
-                                            }`}>
-                                                {entry.stale === 'yes' ? 'Yes'
-                                                : entry.stale === 'new' ? 'New'
-                                                : entry.stale === 'deleted' ? 'Del'
-                                                : entry.stale === 'renamed' ? 'Ren'
-                                                : 'No'}
-                                            </span>
-                                        </td>
-                                        <td title={entry.reason}>
-                                            {entry.reason.length > 40
-                                                ? entry.reason.slice(0, 40) + '...'
-                                                : entry.reason}
-                                        </td>
-                                        <td>{entry.cost_usd != null ? `$${entry.cost_usd.toFixed(4)}` : '-'}</td>
-                                        <td>{formatDate(entry.checked_at)}</td>
-                                    </tr>
-                                ))}
-                            </tbody>
-                        </table>
-                    </div>
-
-                    {/* ── Cost Section ───────────────────────────────── */}
-                    <div className="dadbear-cost-section">
-                        <h3>Cost Observatory</h3>
-
-                        <div className="dadbear-cost-window">
-                            {['all', '24h', '7d', '30d'].map(w => (
-                                <button
-                                    key={w}
-                                    className={costWindow === w ? 'active' : ''}
-                                    onClick={() => setCostWindow(w)}
-                                >
-                                    {w === 'all' ? 'All' : w}
-                                </button>
-                            ))}
-                        </div>
-
-                        {cost && (
-                            <>
-                                <div className="dadbear-cost-total">
-                                    ${cost.total_spend.toFixed(4)}
-                                </div>
-                                <div className="dadbear-cost-calls">
-                                    {cost.total_calls} API call{cost.total_calls !== 1 ? 's' : ''}
-                                </div>
-
-                                {cost.by_check_type.length > 0 && (
-                                    <div className="dadbear-cost-breakdown">
-                                        {cost.by_check_type.map(ct => (
-                                            <div key={ct.check_type} className="dadbear-cost-row">
-                                                <span className="dadbear-cost-row-label">{ct.check_type}</span>
-                                                <span className="dadbear-cost-row-value">
-                                                    ${ct.spend.toFixed(4)} ({ct.calls})
-                                                </span>
-                                            </div>
-                                        ))}
-                                    </div>
-                                )}
-                            </>
-                        )}
-                    </div>
-
-                    {/* ── Knowledge Contributions ────────────────────── */}
-                    <div className="dadbear-contributions">
-                        <h3>Knowledge Contributions</h3>
-                        {contributions ? (
-                            <>
-                                <div className="contribution-stats">
-                                    <div className="contribution-stat-row">
-                                        <span>\uD83D\uDCDD {contributions.totalAnnotations} annotation{contributions.totalAnnotations !== 1 ? 's' : ''} from {contributions.uniqueAuthors} agent{contributions.uniqueAuthors !== 1 ? 's' : ''}</span>
-                                    </div>
-                                    <div className="contribution-stat-row">
-                                        <span>\uD83D\uDCDA {contributions.totalFaqs} FAQ entr{contributions.totalFaqs !== 1 ? 'ies' : 'y'} (flat mode)</span>
-                                    </div>
-                                    {contributions.lastAuthor && (
-                                        <div className="contribution-stat-row">
-                                            <span>\uD83D\uDD04 Last contribution: {formatTimeAgo(contributions.lastContributionAt)} by <span className="contribution-author-badge">{contributions.lastAuthor}</span></span>
-                                        </div>
-                                    )}
-                                </div>
-                                {contributions.annotations.length > 0 && (
-                                    <div className="contribution-recent">
-                                        <div className="contribution-recent-label">Recent:</div>
-                                        {contributions.annotations.map(a => (
-                                            <div key={a.id} className="contribution-item">
-                                                <span className="contribution-author-badge">{a.author}</span>
-                                                <span className="contribution-content" title={a.content}>
-                                                    {a.content.length > 60 ? a.content.slice(0, 60) + '...' : a.content}
-                                                </span>
-                                            </div>
-                                        ))}
-                                    </div>
-                                )}
-                            </>
-                        ) : (
-                            <div className="contribution-empty">No contributions yet</div>
-                        )}
-                    </div>
-
-                    {/* ── Recent Calls ───────────────────────────────── */}
-                    {cost && cost.recent_calls.length > 0 && (
-                        <div className="dadbear-log-section">
-                            <h3>Recent API Calls</h3>
-                            <table className="stale-log-table">
-                                <thead>
-                                    <tr>
-                                        <th>Operation</th>
-                                        <th>Model</th>
-                                        <th>Tokens</th>
-                                        <th>Cost</th>
-                                        <th>Source</th>
-                                        <th>Time</th>
-                                    </tr>
-                                </thead>
-                                <tbody>
-                                    {cost.recent_calls.map(call => (
-                                        <tr key={call.id}>
-                                            <td>{call.operation}</td>
-                                            <td title={call.model}>
-                                                {call.model.length > 20 ? '...' + call.model.slice(-18) : call.model}
-                                            </td>
-                                            <td>{call.input_tokens + call.output_tokens}</td>
-                                            <td>${call.cost_usd.toFixed(4)}</td>
-                                            <td>{call.source}</td>
-                                            <td>{formatDate(call.created_at)}</td>
-                                        </tr>
-                                    ))}
-                                </tbody>
-                            </table>
-                        </div>
-                    )}
-
                     {/* ── Agent Instructions ─────────────────────────── */}
                     <div className="agent-onboarding-card">
                         <div className="agent-onboarding-header" onClick={() => setAgentInstructionsOpen(!agentInstructionsOpen)}>
@@ -1035,6 +919,191 @@ Last check: ${lastCheckStr}
                             </div>
                         )}
                     </div>
+                </div>
+            </div>
+
+            {/* ── Full-width bottom section: stale log + cost + contributions ── */}
+            <div className="dadbear-bottom-section">
+                {/* ── Stale Log ──────────────────────────────────────── */}
+                <div className="dadbear-log-section dadbear-bottom-stale">
+                    <h3>Stale Check Log</h3>
+
+                    <div className="dadbear-log-filters">
+                        <select value={logLayerFilter} onChange={(e) => setLogLayerFilter(e.target.value)}>
+                            <option value="all">All Layers</option>
+                            <option value="0">L0</option>
+                            <option value="1">L1</option>
+                            <option value="2">L2</option>
+                            <option value="3">L3</option>
+                        </select>
+                        <select value={logStaleFilter} onChange={(e) => setLogStaleFilter(e.target.value)}>
+                            <option value="all">All Results</option>
+                            <option value="yes">Stale Only</option>
+                            <option value="no">Not Stale</option>
+                        </select>
+                    </div>
+
+                    <table className="stale-log-table">
+                        <thead>
+                            <tr>
+                                <th>Layer</th>
+                                <th>Target</th>
+                                <th>Stale</th>
+                                <th>Reason</th>
+                                <th>Cost</th>
+                                <th>Time</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {staleLog.length === 0 ? (
+                                <tr>
+                                    <td colSpan={6} style={{ textAlign: 'center', color: 'var(--text-muted)', padding: 20 }}>
+                                        No stale checks recorded yet
+                                    </td>
+                                </tr>
+                            ) : staleLog.map(entry => (
+                                <tr key={entry.id}>
+                                    <td>L{entry.layer}</td>
+                                    <td title={entry.target_id}>
+                                        {entry.target_id.length > 20
+                                            ? entry.target_id.slice(0, 20) + '...'
+                                            : entry.target_id}
+                                    </td>
+                                    <td>
+                                        <span className={`stale-badge ${
+                                            entry.stale === 'yes' ? 'stale-yes'
+                                            : entry.stale === 'new' ? 'stale-new'
+                                            : entry.stale === 'deleted' ? 'stale-deleted'
+                                            : entry.stale === 'renamed' ? 'stale-renamed'
+                                            : entry.stale === 'skipped' ? 'stale-skipped'
+                                            : 'stale-no'
+                                        }`}>
+                                            {entry.stale === 'yes' ? 'Yes'
+                                            : entry.stale === 'new' ? 'New'
+                                            : entry.stale === 'deleted' ? 'Del'
+                                            : entry.stale === 'renamed' ? 'Ren'
+                                            : entry.stale === 'skipped' ? 'Skip'
+                                            : 'No'}
+                                        </span>
+                                    </td>
+                                    <td title={entry.reason}>
+                                        {entry.reason.length > 40
+                                            ? entry.reason.slice(0, 40) + '...'
+                                            : entry.reason}
+                                    </td>
+                                    <td>{entry.cost_usd != null ? `$${entry.cost_usd.toFixed(4)}` : '-'}</td>
+                                    <td>{formatDate(entry.checked_at)}</td>
+                                </tr>
+                            ))}
+                        </tbody>
+                    </table>
+                </div>
+
+                {/* ── Cost Observatory ────────────────────────────────── */}
+                <div className="dadbear-cost-section dadbear-bottom-cost">
+                    <h3>Cost Observatory</h3>
+
+                    <div className="dadbear-cost-window">
+                        {['all', '24h', '7d', '30d'].map(w => (
+                            <button
+                                key={w}
+                                className={costWindow === w ? 'active' : ''}
+                                onClick={() => setCostWindow(w)}
+                            >
+                                {w === 'all' ? 'All' : w}
+                            </button>
+                        ))}
+                    </div>
+
+                    {cost && (
+                        <>
+                            <div className="dadbear-cost-total">
+                                ${cost.total_spend.toFixed(4)}
+                            </div>
+                            <div className="dadbear-cost-calls">
+                                {cost.total_calls} API call{cost.total_calls !== 1 ? 's' : ''}
+                            </div>
+
+                            {cost.by_check_type.length > 0 && (
+                                <div className="dadbear-cost-breakdown">
+                                    {cost.by_check_type.map(ct => (
+                                        <div key={ct.check_type} className="dadbear-cost-row">
+                                            <span className="dadbear-cost-row-label">{ct.check_type}</span>
+                                            <span className="dadbear-cost-row-value">
+                                                ${ct.spend.toFixed(4)} ({ct.calls})
+                                            </span>
+                                        </div>
+                                    ))}
+                                </div>
+                            )}
+
+                            {/* Recent API Calls inline */}
+                            {cost.recent_calls.length > 0 && (
+                                <div style={{ marginTop: 12 }}>
+                                    <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-muted)', marginBottom: 6, textTransform: 'uppercase', letterSpacing: '0.5px' }}>Recent Calls</div>
+                                    <table className="stale-log-table">
+                                        <thead>
+                                            <tr>
+                                                <th>Op</th>
+                                                <th>Model</th>
+                                                <th>Cost</th>
+                                                <th>Time</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody>
+                                            {cost.recent_calls.slice(0, 5).map(call => (
+                                                <tr key={call.id}>
+                                                    <td>{call.operation}</td>
+                                                    <td title={call.model}>
+                                                        {call.model.length > 15 ? '...' + call.model.slice(-13) : call.model}
+                                                    </td>
+                                                    <td>${call.cost_usd.toFixed(4)}</td>
+                                                    <td>{formatDate(call.created_at)}</td>
+                                                </tr>
+                                            ))}
+                                        </tbody>
+                                    </table>
+                                </div>
+                            )}
+                        </>
+                    )}
+                </div>
+
+                {/* ── Knowledge Contributions ─────────────────────────── */}
+                <div className="dadbear-contributions dadbear-bottom-contributions">
+                    <h3>Contributions</h3>
+                    {contributions ? (
+                        <>
+                            <div className="contribution-stats">
+                                <div className="contribution-stat-row">
+                                    <span>{contributions.totalAnnotations} annotation{contributions.totalAnnotations !== 1 ? 's' : ''} / {contributions.uniqueAuthors} agent{contributions.uniqueAuthors !== 1 ? 's' : ''}</span>
+                                </div>
+                                <div className="contribution-stat-row">
+                                    <span>{contributions.totalFaqs} FAQ{contributions.totalFaqs !== 1 ? 's' : ''}</span>
+                                </div>
+                                {contributions.lastAuthor && (
+                                    <div className="contribution-stat-row">
+                                        <span>Last: {formatTimeAgo(contributions.lastContributionAt)} by <span className="contribution-author-badge">{contributions.lastAuthor}</span></span>
+                                    </div>
+                                )}
+                            </div>
+                            {contributions.annotations.length > 0 && (
+                                <div className="contribution-recent">
+                                    <div className="contribution-recent-label">Recent:</div>
+                                    {contributions.annotations.map(a => (
+                                        <div key={a.id} className="contribution-item">
+                                            <span className="contribution-author-badge">{a.author}</span>
+                                            <span className="contribution-content" title={a.content}>
+                                                {a.content.length > 60 ? a.content.slice(0, 60) + '...' : a.content}
+                                            </span>
+                                        </div>
+                                    ))}
+                                </div>
+                            )}
+                        </>
+                    ) : (
+                        <div className="contribution-empty">No contributions yet</div>
+                    )}
                 </div>
             </div>
         </div>
