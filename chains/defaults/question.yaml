@@ -49,6 +49,7 @@ steps:
     instruction: "$prompts/question/question_web.md"
     input:
       nodes: "$source_extract"
+    compact_inputs: true
     response_schema: &web_schema
       type: object
       properties:
