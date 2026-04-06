@@ -172,8 +172,23 @@ export function LivePyramidStage({ nodes, currentStep, isActive, onNodeClick }: 
         // Clear
         ctx.clearRect(0, 0, width, height);
 
-        // Build lookup for edges
+        // Build lookup for edges. For summary rects (L0 grouped into rects of 10),
+        // the spatial node's children array contains the node IDs IT represents.
+        // Build a reverse index: any child node_id → the spatial rect that owns it.
         const nodeMap = new Map(spatial.map(n => [n.id, n]));
+        const ownerMap = new Map<string, SpatialNode>();
+        for (const n of spatial) {
+            if (n.children && n.children.length > 0) {
+                for (const childId of n.children) {
+                    // Only map L0 children owned by summary rects at depth 0.
+                    // L1+ nodes' children arrays are evidence links (handled below),
+                    // not group ownership — don't map those.
+                    if (n.depth === 0) {
+                        ownerMap.set(childId, n);
+                    }
+                }
+            }
+        }
 
         // Draw edges: use parentId (mechanical) AND children arrays (evidence-based).
         // Question pyramids store L0→L1 connections in children[], not parent_id.
@@ -196,10 +211,13 @@ export function LivePyramidStage({ nodes, currentStep, isActive, onNodeClick }: 
                     }
                 }
             }
-            // Children-based edges (L1→L0 via children array)
-            if (node.children) {
+            // Children-based edges (L1→L0 via children array).
+            // For L1+ nodes, children[] lists L0 evidence node IDs. When L0 is in
+            // summary-rect mode, resolve each child to its owning rect via ownerMap,
+            // then direct lookup via nodeMap as a fallback.
+            if (node.depth > 0 && node.children) {
                 for (const childId of node.children) {
-                    const child = nodeMap.get(childId);
+                    const child = ownerMap.get(childId) ?? nodeMap.get(childId);
                     if (child) {
                         const edgeKey = `${child.id}-${node.id}`;
                         if (!drawnEdges.has(edgeKey)) {
