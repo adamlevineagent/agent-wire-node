@@ -4788,7 +4788,22 @@ async fn execute_evidence_loop(
             }
         };
 
-        // Step b: Answer questions
+        // Step b: Answer questions (with per-question progress ticks)
+        let (answer_tick_tx, mut answer_tick_rx) = mpsc::channel::<()>(64);
+
+        // Spawn progress drain: fires send_progress for each answered question
+        let progress_tx_clone = progress_tx.clone();
+        let done_before = *done;
+        let total_snap = total;
+        let tick_drain = tokio::spawn(async move {
+            let mut tick_count: i64 = 0;
+            while answer_tick_rx.recv().await.is_some() {
+                tick_count += 1;
+                send_progress(&progress_tx_clone, done_before + tick_count, total_snap).await;
+            }
+            tick_count
+        });
+
         let batch_result = match super::evidence_answering::answer_questions(
             &layer_qs,
             &candidate_map,
@@ -4802,6 +4817,7 @@ async fn execute_evidence_loop(
             source_content_type.as_deref(),
             &state.operational,
             Some(&audit_ctx),
+            Some(&answer_tick_tx),
         )
         .await
         {
@@ -4810,9 +4826,15 @@ async fn execute_evidence_loop(
                 warn!(slug, layer, error = %e, "answer_questions failed");
                 build_error =
                     Some(format!("Answer failed at layer {}: {}", layer, e));
+                drop(answer_tick_tx);
+                let _ = tick_drain.await;
                 break;
             }
         };
+        drop(answer_tick_tx);
+        let ticks = tick_drain.await.unwrap_or(0);
+        // Sync done counter with actual ticks received
+        *done = done_before + ticks;
 
         let mut answered = batch_result.answered;
         let failed = batch_result.failed;
@@ -4911,7 +4933,7 @@ async fn execute_evidence_loop(
 
         total_nodes += layer_node_count;
         layers_completed = layer;
-        *done += layer_node_count as i64;
+        // done already incremented per-question via answer tick drain
 
         // Step e: Update build progress
         {

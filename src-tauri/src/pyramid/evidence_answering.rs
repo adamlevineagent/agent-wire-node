@@ -574,6 +574,7 @@ pub async fn answer_questions(
     source_content_type: Option<&str>,
     ops: &OperationalConfig,
     audit: Option<&AuditContext>,
+    on_answer: Option<&tokio::sync::mpsc::Sender<()>>,
 ) -> Result<AnswerBatchResult> {
     if questions.is_empty() {
         return Ok(AnswerBatchResult {
@@ -690,6 +691,9 @@ pub async fn answer_questions(
                 total_evidence += answered.evidence.len();
                 total_missing += answered.missing.len();
                 answered_nodes.push(answered);
+                if let Some(tx) = on_answer {
+                    let _ = tx.send(()).await;
+                }
             }
             Err(e) => {
                 warn!(question_id = %q_id, error = %e, "Failed to answer question — recording as gap report");
