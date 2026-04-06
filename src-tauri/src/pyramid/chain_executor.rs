@@ -1206,14 +1206,6 @@ async fn hydrate_skipped_step_output(
     ctx: &ChainContext,
     reader: &Arc<Mutex<Connection>>,
 ) -> Result<Option<Value>> {
-    // step_only steps don't persist their outputs for hydration — they run and
-    // feed the next step in memory. On sentinel skip, return None (no output
-    // to hydrate). Downstream steps that actually need the output will re-read
-    // from DB state via cross_build_input steps.
-    if step.save_as.as_deref() == Some("step_only") {
-        return Ok(None);
-    }
-
     if let Some(for_each_ref) = step.for_each.as_deref() {
         let resolved_ref = normalize_context_ref(for_each_ref);
         let items = match ctx.resolve_ref(&resolved_ref)? {
@@ -4134,8 +4126,13 @@ pub async fn execute_chain_from(
                 if !output.is_null() {
                     Arc::make_mut(&mut ctx.step_outputs).insert(step.name.clone(), output);
                 }
-                // Write step-level sentinel so restarts skip this step
-                {
+                // Write step-level sentinel so restarts skip this step.
+                // Exception: step_only steps are in-memory pipeline plumbing that
+                // don't persist their output. Sentineling them causes hydration
+                // failures on rebuild because the "output" was never saved.
+                // These steps must re-run on rebuild — they're cheap relative to
+                // the LLM work already done, and downstream steps need their outputs.
+                if step.save_as.as_deref() != Some("step_only") {
                     let writer = state.writer.clone();
                     let slug_s = slug.to_string();
                     let step_name = step.name.clone();
