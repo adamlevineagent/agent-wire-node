@@ -484,8 +484,8 @@ pub fn validate_chain(def: &ChainDefinition) -> ValidationResult {
         if step.concurrency == 0 {
             errors.push(format!("{}: concurrency must be >= 1", prefix));
         }
-        if step.concurrency > 1 && step.for_each.is_none() {
-            errors.push(format!("{}: concurrency > 1 requires for_each", prefix));
+        if step.concurrency > 1 && step.for_each.is_none() && step.primitive != "web" {
+            errors.push(format!("{}: concurrency > 1 requires for_each (or web primitive)", prefix));
         }
         if step.sequential && step.concurrency > 1 {
             errors.push(format!(

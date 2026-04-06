@@ -136,9 +136,11 @@ pub async fn init_stale_engines(pyramid_state: &Arc<pyramid::PyramidState>) {
     let configs: Vec<AutoUpdateConfig> = {
         let conn = pyramid_state.reader.lock().await;
         let mut stmt = match conn.prepare(
-            "SELECT slug, auto_update, debounce_minutes, min_changed_files,
-                    runaway_threshold, breaker_tripped, breaker_tripped_at, frozen, frozen_at
-             FROM pyramid_auto_update_config WHERE auto_update = 1",
+            "SELECT c.slug, c.auto_update, c.debounce_minutes, c.min_changed_files,
+                    c.runaway_threshold, c.breaker_tripped, c.breaker_tripped_at, c.frozen, c.frozen_at
+             FROM pyramid_auto_update_config c
+             JOIN pyramid_slugs s ON s.slug = c.slug
+             WHERE c.auto_update = 1 AND s.archived_at IS NULL",
         ) {
             Ok(s) => s,
             Err(e) => {

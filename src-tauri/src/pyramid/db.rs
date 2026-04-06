@@ -1426,6 +1426,11 @@ pub fn archive_slug(conn: &Connection, slug: &str) -> Result<()> {
         "UPDATE pyramid_slugs SET archived_at = datetime('now') WHERE slug = ?1",
         rusqlite::params![slug],
     )?;
+    // Disable DADBEAR for archived slugs — prevents stale engine from monitoring them
+    conn.execute(
+        "UPDATE pyramid_auto_update_config SET auto_update = 0, frozen = 1, frozen_at = datetime('now') WHERE slug = ?1",
+        rusqlite::params![slug],
+    )?;
     Ok(())
 }
 
