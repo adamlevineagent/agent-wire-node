@@ -3390,12 +3390,19 @@ fn collect_files_recursive(
         let path = entry.path();
         let fname = entry.file_name().to_string_lossy().to_string();
 
-        // Skip hidden files/dirs
+        // Skip hidden files/dirs and well-known non-source directories
         if fname.starts_with('.') {
             continue;
         }
 
         if path.is_dir() {
+            // Skip build artifacts, dependencies, and other non-source directories
+            match fname.as_str() {
+                "node_modules" | "target" | "dist" | "build" | ".next" | "__pycache__"
+                | "venv" | ".venv" | "vendor" | "Pods" | ".gradle" | "out" | "bin"
+                | ".lab.bak" | ".claude" => continue,
+                _ => {}
+            }
             collect_files_recursive(&path, ingested_extensions, content_type, out);
         } else if path.is_file() {
             let ext = path

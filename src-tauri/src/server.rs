@@ -352,8 +352,16 @@ pub async fn start_server(
         partner,
     };
 
-    // Phase 7: Initialize stale engines for auto-update pyramids
-    init_stale_engines(&state.pyramid).await;
+    // Phase 7: Initialize stale engines for auto-update pyramids (background)
+    // Runs file reconciliation and engine setup AFTER the HTTP server is ready,
+    // so startup isn't blocked by scanning large codebases.
+    {
+        let bg_state = state.pyramid.clone();
+        tokio::spawn(async move {
+            init_stale_engines(&bg_state).await;
+            tracing::info!("DADBEAR background initialization complete");
+        });
+    }
 
     // S2: CORS tightening — restrict to known origins instead of allow_any_origin.
     // These are Tauri's default dev port and common localhost variants.
