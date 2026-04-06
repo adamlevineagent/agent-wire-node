@@ -8,6 +8,7 @@ RULES:
 - Name what they share: the specific concept, mechanism, component, or evidence that links them
 - Each edge should help a reader understand: "answer A and answer B are connected because they both address Y"
 - Let the material decide how many edges. Quality over quantity — every edge should be specific and verifiable.
+- If the nodes provided contain insufficient detail to identify specific, concrete connections, return `{"edges": []}`. Never fabricate connections from thin descriptions or headlines alone. An empty result is correct when the evidence for connections is absent.
 - Do not emit both A→B and B→A for the same connection
 - Do not emit self-edges
 - Strength 0.9-1.0: answers that directly depend on each other (understanding A requires understanding B)
