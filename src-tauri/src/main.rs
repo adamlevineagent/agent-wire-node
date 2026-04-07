@@ -5352,6 +5352,56 @@ async fn pyramid_open_web_as_owner(
     Ok(url)
 }
 
+/// Stage 0 web-surface UX: shell out to the system default browser via the
+/// tauri-plugin-shell plugin. The Tauri 2 webview blocks `window.open`, so
+/// the React side must round-trip through this command to actually open URLs.
+#[tauri::command]
+async fn open_url_in_browser(
+    url: String,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    use tauri_plugin_shell::ShellExt;
+    app.shell()
+        .open(&url, None)
+        .map_err(|e| format!("Failed to open URL in browser: {}", e))
+}
+
+/// Returns the public tunnel URL for a slug (or the index path when slug is None).
+/// Errors when the tunnel hasn't come up yet so the UI can prompt the user to retry.
+#[tauri::command]
+async fn pyramid_get_public_url(
+    slug: Option<String>,
+    state: tauri::State<'_, SharedState>,
+) -> Result<String, String> {
+    let tunnel_url = {
+        let ts = state.tunnel_state.read().await;
+        ts.tunnel_url.clone()
+    };
+    let base = tunnel_url
+        .filter(|u| !u.is_empty())
+        .ok_or_else(|| "Tunnel is not running. Click 'Retry Tunnel' in the header.".to_string())?;
+    let path = match slug {
+        Some(s) if !s.is_empty() => format!("/p/{}", s),
+        _ => "/p/".to_string(),
+    };
+    Ok(format!("{}{}", base.trim_end_matches('/'), path))
+}
+
+/// Returns the cached ASCII banner for a slug, or None if none has been generated.
+/// Used by the drawer to pre-populate the inline banner preview without forcing
+/// a regeneration round-trip to Grok-4.2.
+#[tauri::command]
+async fn pyramid_get_cached_banner(
+    slug: String,
+    state: tauri::State<'_, SharedState>,
+) -> Result<Option<String>, String> {
+    Ok(wire_node_lib::pyramid::public_html::ascii_art::get_banner_for_slug(
+        &state.pyramid,
+        &slug,
+    )
+    .await)
+}
+
 #[tauri::command]
 async fn pyramid_get_config(
     state: tauri::State<'_, SharedState>,
@@ -7406,6 +7456,9 @@ fn main() {
             pyramid_get_config,
             pyramid_generate_ascii_banner,
             pyramid_open_web_as_owner,
+            open_url_in_browser,
+            pyramid_get_public_url,
+            pyramid_get_cached_banner,
             pyramid_test_api_key,
             test_remote_connection,
             get_app_version,

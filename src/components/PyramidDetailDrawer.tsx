@@ -87,6 +87,13 @@ export function PyramidDetailDrawer({
     // Scroll-to-top ref
     const drawerRef = useRef<HTMLDivElement>(null);
 
+    // Stage 0 web-surface UX state
+    const [openOwnerError, setOpenOwnerError] = useState<string | null>(null);
+    const [viewWebError, setViewWebError] = useState<string | null>(null);
+    const [bannerArt, setBannerArt] = useState<string | null>(null);
+    const [generatingBanner, setGeneratingBanner] = useState(false);
+    const [bannerError, setBannerError] = useState<string | null>(null);
+
     // Publishing state for this drawer's publish button
     const [localPublishing, setLocalPublishing] = useState(false);
     const [localPublishResult, setLocalPublishResult] = useState<{
@@ -124,7 +131,23 @@ export function PyramidDetailDrawer({
         setAbsorptionSaved(false);
         setAccessTierOpen(false);
         setAbsorptionOpen(false);
+        setOpenOwnerError(null);
+        setViewWebError(null);
+        setBannerArt(null);
+        setBannerError(null);
+        setGeneratingBanner(false);
         drawerRef.current?.scrollTo(0, 0);
+
+        // Pre-populate cached banner if one exists
+        invoke<string | null>("pyramid_get_cached_banner", { slug: slug.slug })
+            .then((art) => {
+                if (cancelled) return;
+                if (art) setBannerArt(art);
+            })
+            .catch((err) => {
+                if (cancelled) return;
+                console.error("Failed to fetch cached banner:", err);
+            });
 
         // Fetch access tier
         invoke<AccessTierInfo>("pyramid_get_access_tier", { slug: slug.slug })
@@ -750,50 +773,115 @@ export function PyramidDetailDrawer({
                     </button>
                 )}
 
-                {/* Post-agents-retro: open public web surface as the local operator */}
+                {/* Stage 0 web-surface UX: View on Web (public, headline button) */}
                 {slug.node_count > 0 && (
-                    <button
-                        className="folder-publish-btn"
-                        onClick={async () => {
-                            try {
-                                const url = await invoke<string>(
-                                    "pyramid_open_web_as_owner",
-                                    { slug: slug.slug }
-                                );
-                                window.open(url, "_blank");
-                            } catch (e) {
-                                alert(`Owner-mode open failed: ${e}\n\nMake sure the Cloudflare tunnel is running.`);
-                            }
-                        }}
-                        style={{ width: "100%" }}
-                        title="Open this pyramid in your browser as the operator (full ask + ASCII-art access). Requires the tunnel to be running."
-                    >
-                        Open as Owner (Web)
-                    </button>
+                    <>
+                        <button
+                            className="folder-publish-btn"
+                            onClick={async () => {
+                                setViewWebError(null);
+                                try {
+                                    const url = await invoke<string>(
+                                        "pyramid_get_public_url",
+                                        { slug: slug.slug }
+                                    );
+                                    await invoke("open_url_in_browser", { url });
+                                } catch (e) {
+                                    setViewWebError(String(e));
+                                }
+                            }}
+                            style={{ width: "100%", fontWeight: 700 }}
+                            title="Open this pyramid's public web page in your browser"
+                        >
+                            View on Web →
+                        </button>
+                        {viewWebError && (
+                            <div style={{ fontSize: 11, color: "#ef4444", padding: "2px 4px" }}>
+                                {viewWebError}
+                            </div>
+                        )}
+                    </>
                 )}
 
-                {/* Post-agents-retro: generate Grok-4.2 ASCII banner shown atop /p/{slug} */}
+                {/* Open as Owner — uses owner-mode bridge for full ask access */}
                 {slug.node_count > 0 && (
-                    <button
-                        className="folder-publish-btn"
-                        onClick={async () => {
-                            try {
-                                const art = await invoke<string>(
-                                    "pyramid_generate_ascii_banner",
-                                    { slug: slug.slug }
-                                );
-                                alert(
-                                    `Banner generated for ${slug.slug}:\n\n${art.slice(0, 400)}${art.length > 400 ? "\n…" : ""}`
-                                );
-                            } catch (e) {
-                                alert(`Banner generation failed: ${e}`);
-                            }
-                        }}
-                        style={{ width: "100%" }}
-                        title="Generate (or refresh) the Grok-4.2 ASCII art banner shown atop the pyramid's web page"
-                    >
-                        Generate Banner
-                    </button>
+                    <>
+                        <button
+                            className="folder-publish-btn"
+                            onClick={async () => {
+                                setOpenOwnerError(null);
+                                try {
+                                    const url = await invoke<string>(
+                                        "pyramid_open_web_as_owner",
+                                        { slug: slug.slug }
+                                    );
+                                    await invoke("open_url_in_browser", { url });
+                                } catch (e) {
+                                    setOpenOwnerError(String(e));
+                                }
+                            }}
+                            style={{ width: "100%" }}
+                            title="Open the page logged in as the local operator (full ask access)"
+                        >
+                            Open as Owner
+                        </button>
+                        {openOwnerError && (
+                            <div style={{ fontSize: 11, color: "#ef4444", padding: "2px 4px" }}>
+                                {openOwnerError}
+                            </div>
+                        )}
+                    </>
+                )}
+
+                {/* Generate Banner with inline preview */}
+                {slug.node_count > 0 && (
+                    <>
+                        <div style={{ display: "flex", gap: 6 }}>
+                            <button
+                                className="folder-publish-btn"
+                                onClick={async () => {
+                                    setBannerError(null);
+                                    setGeneratingBanner(true);
+                                    try {
+                                        const art = await invoke<string>(
+                                            "pyramid_generate_ascii_banner",
+                                            { slug: slug.slug }
+                                        );
+                                        setBannerArt(art);
+                                    } catch (e) {
+                                        setBannerError(String(e));
+                                    } finally {
+                                        setGeneratingBanner(false);
+                                    }
+                                }}
+                                disabled={generatingBanner}
+                                style={{ flex: 1 }}
+                                title="Generate (or refresh) the Grok-4.2 ASCII art banner shown atop the pyramid's web page"
+                            >
+                                {generatingBanner ? "Generating..." : bannerArt ? "Regenerate Banner" : "Generate Banner"}
+                            </button>
+                        </div>
+                        {bannerArt && (
+                            <pre style={{
+                                fontSize: 9,
+                                lineHeight: 1.1,
+                                background: "#0a0e0a",
+                                color: "#50fa7b",
+                                padding: 8,
+                                overflow: "auto",
+                                maxHeight: 200,
+                                fontFamily: "monospace",
+                                whiteSpace: "pre",
+                                margin: 0,
+                                borderRadius: 4,
+                            }}>{bannerArt}</pre>
+                        )}
+                        {bannerError && (
+                            <div style={{ fontSize: 11, color: "#ef4444", padding: "2px 4px" }}>
+                                {bannerError}
+                            </div>
+                        )}
+                    </>
                 )}
 
                 <button

@@ -19,6 +19,32 @@ export function AppShell({ onLogout }: AppShellProps) {
     const [installing, setInstalling] = useState(false);
     const [syncing, setSyncing] = useState(false);
     const [retryingTunnel, setRetryingTunnel] = useState(false);
+    const [urlCopied, setUrlCopied] = useState(false);
+
+    const tunnelUrl = state.tunnelStatus?.tunnel_url ?? null;
+    const tunnelConnected = state.tunnelStatus?.status === 'Connected';
+
+    const handleOpenTunnelUrl = useCallback(async () => {
+        if (!tunnelUrl) return;
+        const fullUrl = tunnelUrl.replace(/\/$/, '') + '/p/';
+        try {
+            await invoke('open_url_in_browser', { url: fullUrl });
+        } catch (e) {
+            console.error('Failed to open URL:', e);
+        }
+    }, [tunnelUrl]);
+
+    const handleCopyTunnelUrl = useCallback(async () => {
+        if (!tunnelUrl) return;
+        const fullUrl = tunnelUrl.replace(/\/$/, '') + '/p/';
+        try {
+            await navigator.clipboard.writeText(fullUrl);
+            setUrlCopied(true);
+            setTimeout(() => setUrlCopied(false), 2000);
+        } catch (e) {
+            console.error('Failed to copy URL:', e);
+        }
+    }, [tunnelUrl]);
 
     // Fetch app version on mount
     useEffect(() => {
@@ -231,6 +257,35 @@ export function AppShell({ onLogout }: AppShellProps) {
                         >
                             {syncing ? 'Syncing...' : 'Sync'}
                         </button>
+                        {tunnelUrl && (
+                            <>
+                                <button
+                                    className="sync-btn"
+                                    onClick={handleOpenTunnelUrl}
+                                    title="Open your public web surface"
+                                    style={{ fontFamily: 'monospace', maxWidth: 320, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+                                >
+                                    {tunnelUrl.replace(/^https?:\/\//, '')}/p/
+                                </button>
+                                <button
+                                    className="sync-btn"
+                                    onClick={handleCopyTunnelUrl}
+                                    title="Copy public URL to clipboard"
+                                    style={{ minWidth: 32 }}
+                                >
+                                    {urlCopied ? 'Copied!' : '\u{1F4CB}'}
+                                </button>
+                            </>
+                        )}
+                        {tunnelConnected && !tunnelUrl && (
+                            <span
+                                className="sync-btn"
+                                style={{ color: '#eab308', cursor: 'default' }}
+                                title="Tunnel reports Connected but no URL is set"
+                            >
+                                tunnel up, no URL
+                            </span>
+                        )}
                         {state.tunnelStatus?.status !== 'Connected' && (
                             <button
                                 className="sync-btn"
