@@ -6396,6 +6396,7 @@ dependencies = [
  "dashmap",
  "dirs",
  "ed25519-dalek",
+ "futures-util",
  "hex",
  "ignore",
  "jsonwebtoken",

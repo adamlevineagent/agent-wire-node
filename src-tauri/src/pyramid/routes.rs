@@ -2102,8 +2102,16 @@ async fn handle_build(
             })
         };
 
-        // Create progress channel — forward updates into the build status
-        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel::<BuildProgress>(64);
+        // Create progress channel — forward updates into the build status,
+        // and tee onto build_event_bus so the public web surface can subscribe
+        // per-slug. The desktop UI consumer keeps reading from progress_rx.
+        let (progress_tx, raw_progress_rx) =
+            tokio::sync::mpsc::channel::<BuildProgress>(64);
+        let mut progress_rx = crate::pyramid::event_bus::tee_build_progress_to_bus(
+            &build_state.build_event_bus,
+            slug_name.clone(),
+            raw_progress_rx,
+        );
         let progress_status = build_status.clone();
         let progress_start = start;
         let progress_handle = tokio::spawn(async move {
@@ -4617,7 +4625,13 @@ async fn handle_question_build(
     tokio::spawn(async move {
         let start = std::time::Instant::now();
 
-        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel::<BuildProgress>(64);
+        let (progress_tx, raw_progress_rx) =
+            tokio::sync::mpsc::channel::<BuildProgress>(64);
+        let mut progress_rx = crate::pyramid::event_bus::tee_build_progress_to_bus(
+            &build_state.build_event_bus,
+            slug_name.clone(),
+            raw_progress_rx,
+        );
         let progress_status = build_status.clone();
         let progress_start = start;
         let progress_handle = tokio::spawn(async move {

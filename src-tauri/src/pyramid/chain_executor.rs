@@ -14102,6 +14102,7 @@ mod tests {
             build_event_bus: Arc::new(crate::pyramid::event_bus::BuildEventBus::new()),
             supabase_url: None,
             supabase_anon_key: None,
+            csrf_secret: [0u8; 32],
         };
 
         let chain = make_integration_code_chain();
@@ -14175,6 +14176,7 @@ mod tests {
             build_event_bus: Arc::new(crate::pyramid::event_bus::BuildEventBus::new()),
             supabase_url: None,
             supabase_anon_key: None,
+            csrf_secret: [0u8; 32],
         };
 
         let chain = make_integration_code_chain();
@@ -14268,6 +14270,7 @@ mod tests {
             build_event_bus: Arc::new(crate::pyramid::event_bus::BuildEventBus::new()),
             supabase_url: None,
             supabase_anon_key: None,
+            csrf_secret: [0u8; 32],
         };
 
         assert!(!pyramid_state
@@ -14325,6 +14328,7 @@ mod tests {
             build_event_bus: Arc::new(crate::pyramid::event_bus::BuildEventBus::new()),
             supabase_url: None,
             supabase_anon_key: None,
+            csrf_secret: [0u8; 32],
         };
 
         let chain = make_integration_code_chain();

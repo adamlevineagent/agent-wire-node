@@ -3583,8 +3583,16 @@ async fn pyramid_build(
             })
         };
 
-        // Create progress channel
-        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel::<BuildProgress>(64);
+        // Create progress channel — tee'd onto build_event_bus so the public
+        // web surface can subscribe per-slug while the desktop UI continues to
+        // drain `progress_rx` exactly as before.
+        let (progress_tx, raw_progress_rx) =
+            tokio::sync::mpsc::channel::<BuildProgress>(64);
+        let mut progress_rx = wire_node_lib::pyramid::event_bus::tee_build_progress_to_bus(
+            &pyramid_state.build_event_bus,
+            slug.clone(),
+            raw_progress_rx,
+        );
         let progress_status = build_status.clone();
         let progress_start = start;
         let progress_handle = tokio::spawn(async move {
@@ -4351,7 +4359,13 @@ async fn pyramid_question_build_inner(
     let question_build_handle = tokio::spawn(async move {
         let start = std::time::Instant::now();
 
-        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel::<BuildProgress>(64);
+        let (progress_tx, raw_progress_rx) =
+            tokio::sync::mpsc::channel::<BuildProgress>(64);
+        let mut progress_rx = wire_node_lib::pyramid::event_bus::tee_build_progress_to_bus(
+            &pyramid_state.build_event_bus,
+            build_slug.clone(),
+            raw_progress_rx,
+        );
         let progress_status = build_status.clone();
         let progress_start = start;
         let progress_handle = tokio::spawn(async move {
@@ -5620,6 +5634,7 @@ async fn pyramid_vine_integrity(
         build_event_bus: state.pyramid.build_event_bus.clone(),
         supabase_url: state.pyramid.supabase_url.clone(),
         supabase_anon_key: state.pyramid.supabase_anon_key.clone(),
+        csrf_secret: state.pyramid.csrf_secret,
     });
 
     let summary = vine::run_integrity_check(&pyramid_state, &slug)
@@ -5667,6 +5682,7 @@ async fn pyramid_vine_rebuild_upper(
         build_event_bus: state.pyramid.build_event_bus.clone(),
         supabase_url: state.pyramid.supabase_url.clone(),
         supabase_anon_key: state.pyramid.supabase_anon_key.clone(),
+        csrf_secret: state.pyramid.csrf_secret,
     });
 
     let cancel = tokio_util::sync::CancellationToken::new();
@@ -6486,8 +6502,16 @@ fn main() {
         build_event_bus: Arc::new(
             wire_node_lib::pyramid::event_bus::BuildEventBus::new(),
         ),
-        supabase_url: None,
-        supabase_anon_key: None,
+        supabase_url: Some(config.supabase_url.clone()),
+        supabase_anon_key: Some(config.supabase_anon_key.clone()),
+        csrf_secret: {
+            let a = *uuid::Uuid::new_v4().as_bytes();
+            let b = *uuid::Uuid::new_v4().as_bytes();
+            let mut s = [0u8; 32];
+            s[..16].copy_from_slice(&a);
+            s[16..].copy_from_slice(&b);
+            s
+        },
     });
 
     // Load persisted event subscriptions into the in-memory event bus
@@ -6503,6 +6527,9 @@ fn main() {
         pyramid_db_path,
         pyramid_config.use_ir_executor
     );
+
+    // WS-E: spawn the web_sessions sweeper (idempotent OnceLock guard).
+    wire_node_lib::pyramid::public_html::web_sessions::spawn_sweeper(pyramid_state.clone());
 
     // Initialize partner (Dennis) state with its own pyramid reader and partner.db
     let partner_db_path = config.data_dir().join("partner.db");

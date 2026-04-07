@@ -1,24 +1,56 @@
-//! Public HTML surface for the pyramid web UI (Phase 0.5 skeleton).
+//! Public HTML surface for the pyramid web UI (post-agents-retro web).
 //!
-//! This module is the mount point for the post-agents-retro public web
-//! surface. Phase 0.5 lands only a placeholder `routes()` that rejects
-//! every request with `not_found`, so the parallel Phase 1 workstreams
-//! (WS-A..F) can build against a stable module anchor without any
-//! user-visible behavior change.
+//! WS-C owns this assembly file. Each Phase-1 sibling workstream contributes
+//! its own filter function:
+//!   - WS-A `auth`           — auth filter helpers (used by other WS, no
+//!                             standalone routes)
+//!   - WS-B `routes_ws`      — `GET /p/{slug}/_ws` build-event stream
+//!   - WS-C `routes_read`    — `GET /p/`, `/p/{slug}`, `/p/{slug}/{node_id}`
+//!   - WS-D `routes_assets`  — `GET /p/_assets/{file}`, robots.txt, favicon
+//!   - WS-E `routes_login`   — `_login`, `_verify`, `_logout`
+//!   - WS-F `rate_limit`     — middleware (no standalone routes)
+//!
+//! Order matters per A9/B11: literal `_*` and reserved subpaths must match
+//! BEFORE the catchall `/p/{slug}/{node_id}` (which lives inside
+//! `routes_read`). The chain order below puts the literal-prefix filters
+//! (assets, login, ws) ahead of the read routes for that reason.
+
+pub mod auth;
+pub mod rate_limit;
+pub mod render;
+pub mod reserved;
+pub mod routes_assets;
+pub mod routes_login;
+pub mod routes_read;
+pub mod routes_ws;
+pub mod web_sessions;
+// pub mod routes_ask; // WS-H (Phase 2)
+// pub mod ascii_art;  // WS-L (Phase 3)
 
 use crate::pyramid::PyramidState;
 use std::sync::Arc;
-use warp::{Filter, Rejection};
+use warp::Filter;
 
-/// Placeholder route filter. Matches the `(Response,)` shape used by the
-/// rest of `pyramid_routes()` in `routes.rs` so it can be chained with
-/// `.or(...).unify().boxed()`.
+/// Public-surface route filter. Mounted by `pyramid_routes()` in `routes.rs`
+/// at the `// === public_html mount point ===` anchor (single-edit rule per
+/// A5). Returns `(Response,)` so the caller can chain it with
+/// `.or().unify().boxed()`.
 pub fn routes(
-    _state: Arc<PyramidState>,
+    state: Arc<PyramidState>,
 ) -> warp::filters::BoxedFilter<(warp::reply::Response,)> {
-    warp::any()
-        .and_then(|| async {
-            Err::<warp::reply::Response, Rejection>(warp::reject::not_found())
-        })
+    let assets = routes_assets::asset_routes(state.clone());
+    let login = routes_login::login_routes(state.clone());
+    let ws = routes_ws::ws_route(state.clone());
+    let read = routes_read::read_routes(state.clone());
+
+    // Literal-prefix matches first, catchall last. Each `.or()` is followed
+    // by `.unify()` to keep the tuple shape `(Response,)` flat.
+    assets
+        .or(login)
+        .unify()
+        .or(ws)
+        .unify()
+        .or(read)
+        .unify()
         .boxed()
 }

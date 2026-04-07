@@ -539,12 +539,20 @@ pub async fn run_build_pipeline(
     slug: &str,
     content_type: ContentType,
     cancel: &CancellationToken,
+    bus: Option<&super::event_bus::BuildEventBus>,
 ) -> Result<i32> {
     // Use shared writer drain helper (single implementation, not duplicated)
     let (write_tx, writer_handle) = spawn_write_drain(writer);
 
-    // Create progress channel (vine doesn't need HTTP status, just log)
-    let (progress_tx, mut progress_rx) = mpsc::channel::<BuildProgress>(64);
+    // Create progress channel. When a BuildEventBus is supplied, tee onto the
+    // bus so the public web surface (post-agents-retro WS) can subscribe
+    // per-slug. The downstream debug-log consumer is unaffected.
+    let (progress_tx, raw_progress_rx) = mpsc::channel::<BuildProgress>(64);
+    let mut progress_rx = if let Some(bus) = bus {
+        super::event_bus::tee_build_progress_to_bus(bus, slug.to_string(), raw_progress_rx)
+    } else {
+        raw_progress_rx
+    };
     let slug_for_progress = slug.to_string();
     let progress_handle = tokio::spawn(async move {
         while let Some(prog) = progress_rx.recv().await {
@@ -882,6 +890,7 @@ pub async fn build_bunch(
         &bunch_slug,
         ContentType::Conversation,
         cancel,
+        Some(&state.build_event_bus),
     )
     .await?;
 

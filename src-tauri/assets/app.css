@@ -1,0 +1,650 @@
+/* ============================================================
+ * agent-wire-node :: post-agents-retro public web surface
+ * Workstream WS-D — pure CSS, no frameworks, no @import.
+ * Phosphor terminal aesthetic per docs/plans/post-agents-retro-web-refined.md §Aesthetic.
+ * ============================================================ */
+
+/* ---------- @font-face ----------
+ * The CSS file itself is content-hashed, so it cannot embed its own
+ * hash for the font URLs. The asset route resolves both hashed
+ * (immutable cache) and unhashed (no-cache) names to the same bytes,
+ * so we reference the unhashed paths here. The HTML page (WS-J)
+ * should still link the CSS via its hashed path.
+ * -------------------------------- */
+@font-face {
+    font-family: "JetBrains Mono";
+    font-style: normal;
+    font-weight: 400;
+    font-display: swap;
+    src: url("/p/_assets/JetBrainsMono-Regular.woff2") format("woff2");
+}
+@font-face {
+    font-family: "JetBrains Mono";
+    font-style: normal;
+    font-weight: 700;
+    font-display: swap;
+    src: url("/p/_assets/JetBrainsMono-Bold.woff2") format("woff2");
+}
+
+/* ---------- Color tokens ---------- */
+:root {
+    --bg:    #0a0e0a;   /* near-black phosphor */
+    --bg-1:  #0d130d;   /* slightly lighter panel */
+    --fg:    #c8d6c8;   /* warm phosphor green-grey */
+    --dim:   #6b7d6b;   /* muted */
+    --hot:   #50fa7b;   /* verified-fresh accent */
+    --warn:  #f5c542;   /* stale */
+    --gap:   #ff5577;   /* gap / unknown */
+    --link:  #88ccff;   /* cross-references */
+    --rule:  #1f2a1f;   /* border lines */
+    --focus: #50fa7b;
+    --shadow: 0 0 0 1px var(--rule);
+}
+
+/* ---------- Reset ---------- */
+*,
+*::before,
+*::after {
+    box-sizing: border-box;
+}
+
+html,
+body {
+    margin: 0;
+    padding: 0;
+    background: var(--bg);
+    color: var(--fg);
+}
+
+html {
+    -webkit-text-size-adjust: 100%;
+    text-size-adjust: 100%;
+}
+
+body {
+    font-family: "JetBrains Mono", "Berkeley Mono", "IBM Plex Mono",
+        ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 14px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+}
+
+main,
+.page {
+    max-width: 90ch;
+    margin: 0 auto;
+    padding: 2rem 1.25rem 4rem;
+}
+
+/* ---------- Selection / focus ---------- */
+::selection {
+    background: var(--hot);
+    color: var(--bg);
+}
+
+:focus {
+    outline: none;
+}
+
+:focus-visible {
+    outline: 1px dashed var(--hot);
+    outline-offset: 2px;
+}
+
+/* ---------- Headings & text ---------- */
+h1, h2, h3, h4, h5, h6 {
+    font-weight: 700;
+    color: var(--fg);
+    margin: 1.2em 0 0.5em;
+    letter-spacing: 0.01em;
+}
+
+h1 {
+    font-size: 1.6em;
+    text-transform: uppercase;
+    border-bottom: 1px solid var(--rule);
+    padding-bottom: 0.4em;
+}
+
+h2 {
+    font-size: 1.25em;
+    color: var(--hot);
+}
+
+h3 {
+    font-size: 1.1em;
+    color: var(--fg);
+}
+
+p {
+    margin: 0.6em 0;
+}
+
+a,
+a:visited {
+    color: var(--link);
+    text-decoration: none;
+    border-bottom: 1px dotted var(--link);
+}
+
+a:hover,
+a:focus-visible {
+    color: var(--hot);
+    border-bottom-color: var(--hot);
+}
+
+small,
+.muted {
+    color: var(--dim);
+}
+
+strong {
+    color: var(--fg);
+    font-weight: 700;
+}
+
+em {
+    color: var(--hot);
+    font-style: normal;
+}
+
+code,
+kbd,
+samp {
+    font-family: inherit;
+    color: var(--hot);
+    background: var(--bg-1);
+    padding: 0 0.25em;
+    border-radius: 1px;
+}
+
+pre {
+    font-family: inherit;
+    background: var(--bg-1);
+    color: var(--fg);
+    padding: 0.75rem 1rem;
+    overflow-x: auto;
+    border: 1px solid var(--rule);
+    line-height: 1.4;
+    white-space: pre;
+}
+
+hr {
+    border: 0;
+    border-top: 1px dashed var(--rule);
+    margin: 2em 0;
+}
+
+/* ---------- ASCII banner ---------- */
+pre.banner {
+    color: var(--hot);
+    border: none;
+    background: transparent;
+    padding: 0;
+    margin: 1em 0 0.25em;
+    font-size: 0.85em;
+    line-height: 1.05;
+    text-shadow: 0 0 6px rgba(80, 250, 123, 0.18);
+}
+
+/* ============================================================
+ * Node blocks — staleness border encoding
+ * Each <article class="node node--{state}"> gets a 3px left border
+ * in the state color, plus a CSS-painted character indicator
+ * sitting in the gutter via ::before.
+ * Encoding (per §Aesthetic):
+ *   │  verified, fresh, sourced       (--hot)
+ *   ┊  stale (source changed)          (--warn)
+ *   ╎  inferred, no direct source      (--dim)
+ *   ░  gap, not yet expanded           (--gap)
+ * ============================================================ */
+.node {
+    position: relative;
+    margin: 1.25em 0;
+    padding: 0.6em 0.8em 0.6em 1.6em;
+    border-left: 3px solid var(--rule);
+    background: linear-gradient(
+        90deg,
+        rgba(255, 255, 255, 0.012) 0%,
+        transparent 60%
+    );
+}
+
+.node::before {
+    position: absolute;
+    left: 0.45em;
+    top: 0.55em;
+    font-family: inherit;
+    font-size: 1em;
+    line-height: 1.5;
+    color: var(--dim);
+    content: "│";
+}
+
+.node--verified {
+    border-left-color: var(--hot);
+}
+.node--verified::before {
+    content: "│";
+    color: var(--hot);
+    text-shadow: 0 0 4px rgba(80, 250, 123, 0.4);
+}
+
+.node--stale {
+    border-left-color: var(--warn);
+    border-left-style: dashed;
+}
+.node--stale::before {
+    content: "┊";
+    color: var(--warn);
+}
+
+.node--inferred {
+    border-left-color: var(--dim);
+    border-left-style: dotted;
+}
+.node--inferred::before {
+    content: "╎";
+    color: var(--dim);
+}
+
+.node--gap {
+    border-left-color: var(--gap);
+    background: repeating-linear-gradient(
+        135deg,
+        transparent 0 6px,
+        rgba(255, 85, 119, 0.04) 6px 12px
+    );
+}
+.node--gap::before {
+    content: "░";
+    color: var(--gap);
+}
+
+.node > h2,
+.node > h3 {
+    margin-top: 0;
+}
+
+/* ---------- Provenance footer on each node ---------- */
+.node > .prov,
+footer.prov {
+    margin-top: 0.6em;
+    font-size: 0.85em;
+    color: var(--dim);
+    border-top: 1px dotted var(--rule);
+    padding-top: 0.35em;
+    letter-spacing: 0.02em;
+}
+
+footer.prov span + span::before {
+    content: " • ";
+    color: var(--rule);
+}
+
+/* ============================================================
+ * Table-of-contents tree connectors — ├─ / └─
+ * <ul class="toc"> with each <li> getting a connector via ::before.
+ * The last child uses └─ via :last-child.
+ * ============================================================ */
+ul.toc {
+    list-style: none;
+    margin: 0.5em 0 1.5em;
+    padding: 0 0 0 0.25em;
+    color: var(--fg);
+}
+
+ul.toc li {
+    position: relative;
+    padding: 0.1em 0 0.1em 2.4em;
+}
+
+ul.toc li::before {
+    position: absolute;
+    left: 0;
+    top: 0.1em;
+    color: var(--dim);
+    content: "├─";
+    white-space: pre;
+}
+
+ul.toc li:last-child::before {
+    content: "└─";
+}
+
+ul.toc li ul.toc {
+    margin: 0.1em 0 0.1em 0;
+    padding-left: 0.25em;
+}
+
+ul.toc a {
+    border-bottom: none;
+    color: var(--fg);
+}
+
+ul.toc a:hover {
+    color: var(--hot);
+}
+
+/* ---------- Generic lists ---------- */
+ul:not(.toc),
+ol {
+    padding-left: 1.5em;
+    margin: 0.5em 0;
+}
+
+ul:not(.toc) li::marker {
+    color: var(--dim);
+}
+
+/* ============================================================
+ * Box-drawing panels — optional polish.
+ * <section class="panel"> draws a single-line box around its
+ * content using border + corner pseudos.
+ * ============================================================ */
+.panel {
+    position: relative;
+    border: 1px solid var(--rule);
+    padding: 1em 1.25em;
+    margin: 1.5em 0;
+    background: var(--bg-1);
+}
+
+.panel::before,
+.panel::after {
+    position: absolute;
+    color: var(--dim);
+    font-family: inherit;
+    line-height: 1;
+    pointer-events: none;
+}
+
+.panel::before {
+    content: "┌                                                                            ┐";
+    top: -0.55em;
+    left: -1px;
+    right: -1px;
+    overflow: hidden;
+    white-space: nowrap;
+    background: var(--bg);
+    padding: 0 0.25em;
+}
+
+.panel::after {
+    content: "└                                                                            ┘";
+    bottom: -0.55em;
+    left: -1px;
+    right: -1px;
+    overflow: hidden;
+    white-space: nowrap;
+    background: var(--bg);
+    padding: 0 0.25em;
+}
+
+.panel > :first-child {
+    margin-top: 0;
+}
+.panel > :last-child {
+    margin-bottom: 0;
+}
+
+/* ============================================================
+ * Question box / forms
+ * <form class="ask"> with a dark monospace input and glowing focus.
+ * ============================================================ */
+form.ask,
+form.login {
+    margin: 2em 0 1em;
+    border: 1px solid var(--rule);
+    background: var(--bg-1);
+    padding: 0.85em 1em;
+    position: relative;
+}
+
+form.ask label,
+form.login label {
+    display: block;
+    color: var(--dim);
+    font-size: 0.85em;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    margin-bottom: 0.4em;
+}
+
+form.ask label::before,
+form.login label::before {
+    content: "> ";
+    color: var(--hot);
+}
+
+input[type="text"],
+input[type="email"],
+input[type="search"],
+input[type="password"],
+textarea {
+    display: block;
+    width: 100%;
+    background: var(--bg);
+    color: var(--fg);
+    border: 1px solid var(--rule);
+    padding: 0.5em 0.7em;
+    font: inherit;
+    line-height: 1.4;
+    caret-color: var(--hot);
+}
+
+input[type="text"]:focus,
+input[type="email"]:focus,
+input[type="search"]:focus,
+input[type="password"]:focus,
+textarea:focus {
+    border-color: var(--hot);
+    box-shadow: 0 0 0 1px var(--hot), 0 0 12px rgba(80, 250, 123, 0.25);
+}
+
+textarea {
+    resize: vertical;
+    min-height: 4em;
+}
+
+button,
+input[type="submit"] {
+    margin-top: 0.6em;
+    background: var(--bg);
+    color: var(--hot);
+    border: 1px solid var(--hot);
+    padding: 0.4em 1em;
+    font: inherit;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    cursor: pointer;
+    transition: background 80ms linear, color 80ms linear;
+}
+
+button:hover,
+input[type="submit"]:hover,
+button:focus-visible,
+input[type="submit"]:focus-visible {
+    background: var(--hot);
+    color: var(--bg);
+}
+
+button:disabled,
+input[type="submit"]:disabled {
+    color: var(--dim);
+    border-color: var(--rule);
+    cursor: not-allowed;
+    background: transparent;
+}
+
+/* ---------- Header / nav strip ---------- */
+header.site {
+    border-bottom: 1px solid var(--rule);
+    padding: 0.5em 0;
+    margin-bottom: 1.5em;
+    color: var(--dim);
+    font-size: 0.9em;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.75em 1.25em;
+    align-items: baseline;
+}
+
+header.site .brand {
+    color: var(--hot);
+    font-weight: 700;
+    letter-spacing: 0.05em;
+}
+
+header.site nav a {
+    border-bottom: none;
+    color: var(--fg);
+}
+
+header.site nav a:hover {
+    color: var(--hot);
+}
+
+/* ---------- Footer ---------- */
+footer.site {
+    margin-top: 3em;
+    padding-top: 1em;
+    border-top: 1px dashed var(--rule);
+    color: var(--dim);
+    font-size: 0.8em;
+}
+
+/* ============================================================
+ * Empty states
+ * ============================================================ */
+.empty {
+    margin: 2em 0;
+    padding: 1.5em 1em;
+    text-align: center;
+    color: var(--gap);
+    border: 1px dashed var(--rule);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+}
+
+.empty.search {
+    color: var(--warn);
+}
+
+.empty .hint {
+    display: block;
+    margin-top: 0.5em;
+    color: var(--dim);
+    font-size: 0.85em;
+    text-transform: none;
+    letter-spacing: normal;
+}
+
+/* ---------- 404 ---------- */
+.error-404 {
+    margin: 4em auto;
+    text-align: center;
+}
+
+.error-404 h1 {
+    color: var(--gap);
+    border: none;
+    font-size: 2em;
+}
+
+.error-404 a {
+    color: var(--hot);
+    border-bottom-color: var(--hot);
+}
+
+/* ---------- Caret blink for terminal feel ---------- */
+.cursor::after {
+    content: "█";
+    color: var(--hot);
+    margin-left: 0.1em;
+    animation: blink 1.05s steps(2, start) infinite;
+}
+
+@keyframes blink {
+    to {
+        visibility: hidden;
+    }
+}
+
+/* ============================================================
+ * Responsive
+ * ============================================================ */
+@media (max-width: 720px) {
+    body {
+        font-size: 13px;
+    }
+    main,
+    .page {
+        padding: 1.25rem 0.85rem 3rem;
+    }
+    h1 {
+        font-size: 1.35em;
+    }
+    .node {
+        padding-left: 1.4em;
+    }
+    .panel::before,
+    .panel::after {
+        display: none;
+    }
+}
+
+@media (max-width: 480px) {
+    body {
+        font-size: 12.5px;
+    }
+    header.site {
+        font-size: 0.85em;
+    }
+    ul.toc li {
+        padding-left: 2em;
+    }
+}
+
+/* ---------- Reduced motion ---------- */
+@media (prefers-reduced-motion: reduce) {
+    .cursor::after {
+        animation: none;
+    }
+    * {
+        transition: none !important;
+    }
+}
+
+/* ---------- Print ---------- */
+@media print {
+    :root {
+        --bg: #ffffff;
+        --bg-1: #ffffff;
+        --fg: #111111;
+        --dim: #555555;
+        --hot: #006600;
+        --warn: #886600;
+        --gap: #aa0033;
+        --link: #003388;
+        --rule: #cccccc;
+    }
+    body {
+        background: #fff;
+        color: #111;
+    }
+    .node {
+        page-break-inside: avoid;
+    }
+    form.ask,
+    form.login,
+    .cursor::after {
+        display: none;
+    }
+}
+
+/* ============================================================
+ * end app.css
+ * ============================================================ */

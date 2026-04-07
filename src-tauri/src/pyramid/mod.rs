@@ -619,6 +619,11 @@ pub struct PyramidState {
     /// Supabase anon key for the public web auth flow. `None` until
     /// WS-E lands config loading.
     pub supabase_anon_key: Option<String>,
+    /// HMAC secret for CSRF nonce generation/verification on the public
+    /// web surface (post-agents-retro WS-A). Generated at startup; rotated
+    /// on process restart. Per-request nonces bind cookie session token +
+    /// slug + 5-minute time window.
+    pub csrf_secret: [u8; 32],
 }
 
 impl PyramidState {
@@ -661,6 +666,7 @@ impl PyramidState {
             build_event_bus: self.build_event_bus.clone(),
             supabase_url: self.supabase_url.clone(),
             supabase_anon_key: self.supabase_anon_key.clone(),
+            csrf_secret: self.csrf_secret,
         }))
     }
 }
