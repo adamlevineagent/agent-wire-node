@@ -786,19 +786,42 @@ pub async fn start_server(
         state.auth.clone(),    // Sprint 3: wire agent token for remote query proxy
     );
 
+    // Post-agents-retro /p/ HTML web surface — mounted separately so it can
+    // get a permissive CORS filter. The strict desktop-API allowlist above
+    // would reject same-tunnel form POSTs (the browser sends an Origin header
+    // for any cross-method navigation, including same-origin POSTs).
+    let public_html_routes = pyramid::routes::public_html_routes(
+        state.pyramid.clone(),
+        state.jwt_public_key.clone(),
+    );
+    let public_cors = warp::cors()
+        .allow_any_origin()
+        .allow_methods(vec!["GET", "POST", "OPTIONS"])
+        .allow_headers(vec![
+            "Content-Type",
+            "Cookie",
+            "Accept",
+            "Accept-Language",
+            "Origin",
+            "Referer",
+            "User-Agent",
+        ]);
+    let public_html_with_cors = public_html_routes.with(public_cors);
+
     // Partner (Dennis) routes
     let partner_routes = partner::routes::partner_routes(state.partner.clone());
 
     let routes = preflight
-        .or(pyramid_routes)
-        .or(partner_routes)
-        .or(auth_callback
-            .or(auth_complete)
-            .or(health)
-            .or(tunnel_debug)
-            .or(documents)
-            .or(stats))
-        .with(cors);
+        .or(public_html_with_cors)
+        .or(pyramid_routes
+            .or(partner_routes)
+            .or(auth_callback
+                .or(auth_complete)
+                .or(health)
+                .or(tunnel_debug)
+                .or(documents)
+                .or(stats))
+            .with(cors));
 
     tracing::info!("Wire Node HTTP server starting on 127.0.0.1:{}", port);
     warp::serve(routes).run(([127, 0, 0, 1], port)).await;

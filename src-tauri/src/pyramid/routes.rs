@@ -1521,9 +1521,21 @@ pub fn pyramid_routes(
     let r_new2 = session_register.or(sessions_list).unify().boxed();
     let top16 = top15.or(r_new1).unify().boxed();
     let top17 = top16.or(r_new2).unify().boxed();
-    // === public_html mount point (added by Phase 0.5 skeleton; do NOT modify above this) ===
-    let public_html = crate::pyramid::public_html::routes(state.clone(), jwt_public_key.clone());
-    top17.or(public_html).unify().boxed()
+    // public_html is now mounted separately at the server level so it can
+    // get a permissive CORS filter (the desktop API allowlist would block
+    // form POSTs from the tunnel host).
+    top17
+}
+
+/// Mount the post-agents-retro `/p/` web surface routes. These are
+/// served at the server top level (not under pyramid_routes) so they
+/// can be wrapped in a permissive CORS filter — the desktop API
+/// allowlist would otherwise reject same-tunnel form POSTs.
+pub fn public_html_routes(
+    state: Arc<PyramidState>,
+    jwt_public_key: Arc<tokio::sync::RwLock<String>>,
+) -> warp::filters::BoxedFilter<(warp::reply::Response,)> {
+    crate::pyramid::public_html::routes(state, jwt_public_key)
 }
 
 // ── Route handlers ──────────────────────────────────────────────────
