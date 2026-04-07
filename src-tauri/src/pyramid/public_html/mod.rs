@@ -16,15 +16,16 @@
 //! (assets, login, ws) ahead of the read routes for that reason.
 
 pub mod auth;
+pub mod etag;
 pub mod rate_limit;
 pub mod render;
 pub mod reserved;
 pub mod routes_assets;
 pub mod routes_login;
 pub mod routes_read;
+pub mod routes_ask;
 pub mod routes_ws;
 pub mod web_sessions;
-// pub mod routes_ask; // WS-H (Phase 2)
 // pub mod ascii_art;  // WS-L (Phase 3)
 
 use crate::pyramid::PyramidState;
@@ -37,18 +38,23 @@ use warp::Filter;
 /// `.or().unify().boxed()`.
 pub fn routes(
     state: Arc<PyramidState>,
+    jwt_public_key: Arc<tokio::sync::RwLock<String>>,
 ) -> warp::filters::BoxedFilter<(warp::reply::Response,)> {
     let assets = routes_assets::asset_routes(state.clone());
     let login = routes_login::login_routes(state.clone());
     let ws = routes_ws::ws_route(state.clone());
+    let ask = routes_ask::ask_routes(state.clone(), jwt_public_key.clone());
     let read = routes_read::read_routes(state.clone());
 
     // Literal-prefix matches first, catchall last. Each `.or()` is followed
-    // by `.unify()` to keep the tuple shape `(Response,)` flat.
+    // by `.unify()` to keep the tuple shape `(Response,)` flat. `_ask` is a
+    // literal segment and must precede the catchall `read_routes`.
     assets
         .or(login)
         .unify()
         .or(ws)
+        .unify()
+        .or(ask)
         .unify()
         .or(read)
         .unify()

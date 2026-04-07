@@ -64,6 +64,17 @@ pub const APP_CSS_URL: &str = "/p/_assets/app.css";
 /// - `"no-store"` for cookie-issuing pages (login, verify)
 /// - `"no-cache, must-revalidate"` for ordinary read pages (default)
 pub fn page(title: &str, body: &str, cache_control: &str) -> warp::reply::Response {
+    page_with_etag(title, body, cache_control, None)
+}
+
+/// Like `page()`, but also emits an `ETag` header when `etag` is `Some`.
+/// Used by WS-I for conditional GETs on the `/p/...` HTML routes.
+pub fn page_with_etag(
+    title: &str,
+    body: &str,
+    cache_control: &str,
+    etag: Option<&str>,
+) -> warp::reply::Response {
     let html = format!(
         "<!doctype html>\n\
          <html lang=\"en\">\n\
@@ -85,10 +96,14 @@ pub fn page(title: &str, body: &str, cache_control: &str) -> warp::reply::Respon
         body = body,
     );
 
-    Response::builder()
+    let mut builder = Response::builder()
         .status(200)
         .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
-        .header(header::CACHE_CONTROL, cache_control)
+        .header(header::CACHE_CONTROL, cache_control);
+    if let Some(tag) = etag {
+        builder = builder.header("etag", tag);
+    }
+    builder
         // CSP per A12. WS-D may relax img-src for the favicon if needed.
         .header(
             "content-security-policy",

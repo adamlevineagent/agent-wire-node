@@ -1512,7 +1512,7 @@ pub fn pyramid_routes(
     let top16 = top15.or(r_new1).unify().boxed();
     let top17 = top16.or(r_new2).unify().boxed();
     // === public_html mount point (added by Phase 0.5 skeleton; do NOT modify above this) ===
-    let public_html = crate::pyramid::public_html::routes(state.clone());
+    let public_html = crate::pyramid::public_html::routes(state.clone(), jwt_public_key.clone());
     top17.or(public_html).unify().boxed()
 }
 
