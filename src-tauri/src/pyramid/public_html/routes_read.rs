@@ -1133,7 +1133,7 @@ async fn handle_pyramid_home(
         body.push_str(&details_section(
             "Topic structure",
             toc_nodes.len(),
-            true,
+            false,
             &inner,
         ));
     }
