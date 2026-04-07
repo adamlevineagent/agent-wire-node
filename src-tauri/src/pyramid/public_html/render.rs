@@ -178,6 +178,44 @@ pub fn node_state_class(node: &PyramidNode) -> &'static str {
     "verified"
 }
 
+/// Render a `<details>` collapsible section with a labeled summary and a
+/// count badge. Used by the read handlers to expose API-level richness
+/// without overwhelming the page. `body` MUST already be HTML-safe.
+///
+/// If `count == 0`, the body is replaced with the standard "no entries"
+/// empty-state placeholder so the visitor still sees the surface exists.
+pub fn details_section(label: &str, count: usize, open: bool, body: &str) -> String {
+    let open_attr = if open { " open" } else { "" };
+    let inner = if count == 0 {
+        "<em class=\"empty\">no entries</em>".to_string()
+    } else {
+        body.to_string()
+    };
+    format!(
+        "<details class=\"section\"{open}><summary>{label} ({count})</summary>\n{inner}\n</details>\n",
+        open = open_attr,
+        label = esc(label),
+        count = count,
+        inner = inner,
+    )
+}
+
+/// Truncate a string at `max_chars` characters (not bytes), appending an
+/// ellipsis when cut.
+pub fn truncate_chars(s: &str, max_chars: usize) -> String {
+    let mut count = 0;
+    let mut out = String::new();
+    for ch in s.chars() {
+        if count >= max_chars {
+            out.push('…');
+            return out;
+        }
+        out.push(ch);
+        count += 1;
+    }
+    out
+}
+
 /// Render the per-node provenance footer (Pillar 14).
 ///
 /// `wire_handle`: when `Some` and non-empty, render as the published Wire

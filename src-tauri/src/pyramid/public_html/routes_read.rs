@@ -21,7 +21,8 @@ use crate::pyramid::public_html::etag::{
     etag_for_node, etag_for_pyramid, matches_inm, not_modified,
 };
 use crate::pyramid::public_html::render::{
-    esc, node_state_class, page, page_with_etag, prov_footer, status_page,
+    details_section, esc, node_state_class, page, page_with_etag, prov_footer, status_page,
+    truncate_chars,
 };
 use crate::pyramid::public_html::reserved::is_reserved_subpath;
 use crate::pyramid::types::PyramidNode;
@@ -398,14 +399,15 @@ async fn handle_index(state: Arc<PyramidState>) -> warp::reply::Response {
     // the anonymous index. The desktop UI / operator surfaces have their own
     // listings; this one is anti-enumeration.
     let mut items = String::new();
+    let mut total_pyramids = 0usize;
+    let mut total_nodes = 0i64;
+    let mut total_questions = 0usize;
     for info in &slugs {
-        // Phase A: hide question pyramids from the public index — they
-        // are only reachable via their source's "Questions asked" section
-        // or a direct URL.
         if matches!(
             info.content_type,
             crate::pyramid::types::ContentType::Question
         ) {
+            total_questions += 1;
             continue;
         }
         let tier = db::get_access_tier(&conn, &info.slug)
@@ -414,16 +416,23 @@ async fn handle_index(state: Arc<PyramidState>) -> warp::reply::Response {
         if tier != "public" {
             continue;
         }
-        // Try to read the apex headline (depth = max_depth) for a nicer card.
         let apex_headline = apex_headline_for(&conn, &info.slug, info.max_depth);
+        total_pyramids += 1;
+        total_nodes += info.node_count;
         items.push_str(&format!(
-            "<li class=\"slug-card\">\
-               <a href=\"/p/{slug_attr}\"><strong>{slug_text}</strong></a>\
+            "<li class=\"pyramid-card\">\
+               <a href=\"/p/{slug_attr}\"><strong>{slug_text}</strong></a> \
+               <span class=\"term-pill\">{ct}</span>\
                <div class=\"apex\">{headline}</div>\
+               <p class=\"sub\">{nc} nodes \u{2022} max_depth={md} \u{2022} built {lb}</p>\
              </li>\n",
             slug_attr = esc(&info.slug),
             slug_text = esc(&info.slug),
+            ct = esc(info.content_type.as_str()),
             headline = esc(&apex_headline.unwrap_or_else(|| "(empty pyramid)".to_string())),
+            nc = info.node_count,
+            md = info.max_depth,
+            lb = esc(info.last_built_at.as_deref().unwrap_or("never")),
         ));
     }
 
@@ -434,10 +443,26 @@ async fn handle_index(state: Arc<PyramidState>) -> warp::reply::Response {
          <p class=\"empty\">No public pyramids on this node yet.</p>\n"
             .to_string()
     } else {
+        let summary = format!(
+            "<p class=\"sub\">{p} public pyramids \u{2022} {n} total nodes \u{2022} {q} question pyramids built so far</p>\n",
+            p = total_pyramids,
+            n = total_nodes,
+            q = total_questions,
+        );
+        let about = details_section(
+            "About this Wire Node",
+            1,
+            false,
+            "<p>Wire Node serves Knowledge Pyramids built from local source material. \
+             Each pyramid is a hierarchical distillation: leaves are direct evidence, \
+             apex nodes are layered synthesis. Use the question form on any pyramid \
+             to ask a question and have a question pyramid built on demand.</p>",
+        );
         format!(
             "<h1>WIRE NODE</h1>\n\
-             <p class=\"sub\">Public pyramids on this node:</p>\n\
-             <ul class=\"slug-list\">\n{items}</ul>\n"
+             {summary}\
+             <ul class=\"slug-list\">\n{items}</ul>\n\
+             {about}"
         )
     };
 
@@ -524,6 +549,47 @@ async fn handle_pyramid_home(
         None
     };
 
+    // Gather all the rich data via db::* helpers in one connection lock.
+    let (
+        all_nodes,
+        glossary_terms,
+        entities_list,
+        faq_nodes,
+        threads_list,
+        web_edges_list,
+        questions_list,
+        slug_refs,
+        annotations_total,
+    ) = {
+        let conn2 = state.reader.lock().await;
+        let all_nodes = db::get_all_live_nodes(&conn2, &slug).unwrap_or_default();
+        // Glossary: dedupe shallow->deep so deepest definition wins.
+        let mut sorted = all_nodes.clone();
+        sorted.sort_by_key(|n| n.depth);
+        let mut by_lower: HashMap<String, (String, String)> = HashMap::new();
+        for n in &sorted {
+            for t in &n.terms {
+                let lower = t.term.trim().to_lowercase();
+                if !lower.is_empty() {
+                    by_lower.insert(lower, (t.term.clone(), t.definition.clone()));
+                }
+            }
+        }
+        let mut gloss: Vec<(String, String)> = by_lower.into_values().collect();
+        gloss.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+
+        let entities = crate::pyramid::query::entities(&conn2, &slug).unwrap_or_default();
+        let faq = db::get_faq_nodes(&conn2, &slug).unwrap_or_default();
+        let threads = db::get_threads(&conn2, &slug).unwrap_or_default();
+        let web_edges = db::get_web_edges(&conn2, &slug).unwrap_or_default();
+        let questions = db::get_questions_referencing(&conn2, &slug).unwrap_or_default();
+        let refs = db::get_slug_references(&conn2, &slug).unwrap_or_default();
+        let ann_total = db::get_all_annotations(&conn2, &slug)
+            .map(|v| v.len())
+            .unwrap_or(0);
+        (all_nodes, gloss, entities, faq, threads, web_edges, questions, refs, ann_total)
+    };
+
     let mut body = String::new();
     body.push_str(&format!("<h1>{}</h1>\n", esc(&slug)));
     if let Some(ref a) = apex {
@@ -542,45 +608,206 @@ async fn handle_pyramid_home(
         body.push_str("<p class=\"empty\">ASK SOMETHING TO BEGIN</p>\n");
     }
 
-    if !toc_nodes.is_empty() {
-        body.push_str("<nav class=\"toc\"><h3>Topics</h3><ul>\n");
+    // ── Topic structure (open by default) ──────────────────────────────
+    {
+        let mut inner = String::from("<ul class=\"toc\">\n");
         for child in &toc_nodes {
-            body.push_str(&format!(
-                "<li><a href=\"/p/{slug}/{nid}\">{headline}</a></li>\n",
+            let preview = truncate_chars(child.distilled.trim(), 200);
+            inner.push_str(&format!(
+                "<li><a href=\"/p/{slug}/{nid}\"><strong>{headline}</strong></a>\
+                 <p class=\"sub\">{preview}</p></li>\n",
                 slug = esc(&slug),
                 nid = esc(&child.id),
                 headline = esc(&child.headline),
+                preview = esc(&preview),
             ));
         }
-        body.push_str("</ul></nav>\n");
+        inner.push_str("</ul>");
+        body.push_str(&details_section(
+            "Topic structure",
+            toc_nodes.len(),
+            true,
+            &inner,
+        ));
     }
 
-    // Phase A: "Questions asked" — list question pyramids that reference
-    // this source pyramid. Hidden if there are none.
+    // ── Glossary ───────────────────────────────────────────────────────
     {
-        let conn2 = state.reader.lock().await;
-        let questions = db::get_questions_referencing(&conn2, &slug).unwrap_or_default();
-        body.push_str("<section class=\"questions-asked\">\n");
-        body.push_str("<h2>Questions asked of this pyramid</h2>\n");
-        if questions.is_empty() {
-            body.push_str("<p class=\"empty\">No questions yet. Ask one below.</p>\n");
-        } else {
-            body.push_str("<ul>\n");
-            for q in &questions {
+        let mut inner = String::from("<dl class=\"glossary\">\n");
+        for (term, def) in &glossary_terms {
+            inner.push_str(&format!(
+                "<dt>{}</dt><dd>{}</dd>\n",
+                esc(term),
+                esc(def),
+            ));
+        }
+        inner.push_str(&format!(
+            "</dl>\n<p class=\"sub\"><a href=\"/p/{}/glossary\">full glossary &rarr;</a></p>",
+            esc(&slug)
+        ));
+        body.push_str(&details_section(
+            "Glossary terms",
+            glossary_terms.len(),
+            false,
+            &inner,
+        ));
+    }
+
+    // ── Entities ───────────────────────────────────────────────────────
+    {
+        let mut inner = String::from("<ul class=\"entity-list\">\n");
+        for e in &entities_list {
+            inner.push_str(&format!(
+                "<li class=\"term-pill\"><span class=\"term-name\">{}</span> \
+                 <span class=\"sub\">×{}</span></li>\n",
+                esc(&e.name),
+                e.nodes.len(),
+            ));
+        }
+        inner.push_str("</ul>");
+        body.push_str(&details_section(
+            "Entities",
+            entities_list.len(),
+            false,
+            &inner,
+        ));
+    }
+
+    // ── FAQ ────────────────────────────────────────────────────────────
+    {
+        let mut inner = String::new();
+        for f in &faq_nodes {
+            inner.push_str(&format!(
+                "<div class=\"faq-entry\">\
+                  <div class=\"faq-question\">{q}</div>\
+                  <div class=\"faq-answer\">{a}</div>\
+                  <div class=\"faq-meta\">hits: {hits} \u{2022} updated {updated}</div>\
+                 </div>\n",
+                q = esc(&f.question),
+                a = esc(&f.answer),
+                hits = f.hit_count,
+                updated = esc(&f.updated_at),
+            ));
+        }
+        body.push_str(&details_section("FAQ entries", faq_nodes.len(), false, &inner));
+    }
+
+    // ── Threads ────────────────────────────────────────────────────────
+    {
+        let mut inner = String::from("<ul>\n");
+        for t in &threads_list {
+            inner.push_str(&format!(
+                "<li><a href=\"/p/{slug}/{cid}\"><strong>{name}</strong></a> \
+                 <span class=\"sub\">depth={d} deltas={dc}</span></li>\n",
+                slug = esc(&slug),
+                cid = esc(&t.current_canonical_id),
+                name = esc(&t.thread_name),
+                d = t.depth,
+                dc = t.delta_count,
+            ));
+        }
+        inner.push_str("</ul>");
+        body.push_str(&details_section("Threads", threads_list.len(), false, &inner));
+    }
+
+    // ── Web edges (thread relationships) ───────────────────────────────
+    {
+        let mut inner = String::from("<ul>\n");
+        for e in &web_edges_list {
+            inner.push_str(&format!(
+                "<li class=\"web-edge\"><span class=\"sub\">{a}</span> \
+                 &harr; <span class=\"sub\">{b}</span> \
+                 <span class=\"edge-target\">{rel}</span> \
+                 <span class=\"sub\">(rel={r:.2})</span></li>\n",
+                a = esc(&e.thread_a_id),
+                b = esc(&e.thread_b_id),
+                rel = esc(&e.relationship),
+                r = e.relevance,
+            ));
+        }
+        inner.push_str("</ul>");
+        body.push_str(&details_section(
+            "Web edges (thread relationships)",
+            web_edges_list.len(),
+            false,
+            &inner,
+        ));
+    }
+
+    // ── Questions asked ────────────────────────────────────────────────
+    {
+        let mut inner = String::from("<ul>\n");
+        {
+            let conn2 = state.reader.lock().await;
+            for q in &questions_list {
                 let label = humanize_question_label(&conn2, &q.slug, q.max_depth);
-                body.push_str(&format!(
+                inner.push_str(&format!(
                     "<li><a href=\"/p/{src}/q/{qslug}\">{label}</a> \
-                       <span class=\"question-meta\">asked {when}</span></li>\n",
+                       <span class=\"sub\">asked {when}</span></li>\n",
                     src = esc(&slug),
                     qslug = esc(&q.slug),
                     label = esc(&label),
                     when = esc(&q.created_at),
                 ));
             }
-            body.push_str("</ul>\n");
         }
-        body.push_str("</section>\n");
-        drop(conn2);
+        inner.push_str("</ul>");
+        body.push_str(&details_section(
+            "Questions asked",
+            questions_list.len(),
+            false,
+            &inner,
+        ));
+    }
+
+    // ── Pyramid metadata ───────────────────────────────────────────────
+    {
+        let inner = format!(
+            "<dl class=\"meta\">\
+              <dt>content_type</dt><dd>{ct}</dd>\
+              <dt>source_path</dt><dd>{sp}</dd>\
+              <dt>node_count</dt><dd>{nc} (live: {live})</dd>\
+              <dt>max_depth</dt><dd>{md}</dd>\
+              <dt>last_built_at</dt><dd>{lb}</dd>\
+              <dt>created_at</dt><dd>{ca}</dd>\
+              <dt>updated_at</dt><dd>{ua}</dd>\
+              <dt>annotations</dt><dd>{at}</dd>\
+              <dt>tree links</dt><dd>\
+                <a href=\"/p/{s}/tree\">tree</a> \u{2022} \
+                <a href=\"/p/{s}/folio\">folio</a> \u{2022} \
+                <a href=\"/p/{s}/search\">search</a></dd>\
+             </dl>",
+            ct = esc(info.content_type.as_str()),
+            sp = esc(&info.source_path),
+            nc = info.node_count,
+            live = all_nodes.len(),
+            md = info.max_depth,
+            lb = esc(info.last_built_at.as_deref().unwrap_or("(never)")),
+            ca = esc(&info.created_at),
+            ua = esc(&pyramid_updated_at),
+            at = annotations_total,
+            s = esc(&slug),
+        );
+        body.push_str(&details_section("Pyramid metadata", 1, false, &inner));
+    }
+
+    // ── Referenced pyramids ────────────────────────────────────────────
+    {
+        let mut inner = String::from("<ul>\n");
+        for r in &slug_refs {
+            inner.push_str(&format!(
+                "<li><a href=\"/p/{r}\">{rt}</a></li>\n",
+                r = esc(r),
+                rt = esc(r),
+            ));
+        }
+        inner.push_str("</ul>");
+        body.push_str(&details_section(
+            "Referenced pyramids",
+            slug_refs.len(),
+            false,
+            &inner,
+        ));
     }
 
     // Real CSRF nonce bound to (session token, slug, current 5-min window).
@@ -673,80 +900,224 @@ async fn handle_single_node(
 
     drop(conn);
 
+    // Gather rich data via db helpers in one lock.
+    let (annotations, wire_handle, questions, all_for_parent) = {
+        let conn2 = state.reader.lock().await;
+        let ann = db::get_annotations(&conn2, &slug, &node_id).unwrap_or_default();
+        let wh = db::get_wire_handle_path(&conn2, &slug, &node.id)
+            .ok()
+            .flatten()
+            .filter(|s| !s.is_empty());
+        let q = db::get_questions_referencing(&conn2, &slug).unwrap_or_default();
+        // For parent path: scan all live nodes for one whose children include node.id
+        let all = db::get_all_live_nodes(&conn2, &slug).unwrap_or_default();
+        (ann, wh, q, all)
+    };
+
     let title = format!("{} — {}", node.headline, slug);
     let mut body = String::new();
     body.push_str(&format!(
-        "<nav class=\"crumbs\"><a href=\"/p/{slug}\">{slug_text}</a></nav>\n",
+        "<nav class=\"crumbs\"><a href=\"/p/{slug}\">{slug_text}</a> / {nid}</nav>\n",
         slug = esc(&slug),
         slug_text = esc(&slug),
+        nid = esc(&node.id),
     ));
     body.push_str(&format!(
         "<article class=\"node node--{state}\">\n\
            <h1>{headline}</h1>\n\
-           <p class=\"distilled\">{distilled}</p>\n",
+           <p class=\"sub\">depth={d} \u{2022} state={state}</p>\n\
+           <p class=\"distilled\">{distilled}</p>\n\
+         </article>\n",
         state = node_state_class(&node),
         headline = esc(&node.headline),
         distilled = esc(&node.distilled),
+        d = node.depth,
     ));
 
-    if !node.terms.is_empty() {
-        body.push_str("<section class=\"terms\"><h3>Terms</h3><dl>\n");
+    // ── Topics (open by default) ───────────────────────────────────────
+    {
+        let mut inner = String::new();
+        for t in &node.topics {
+            inner.push_str(&format!(
+                "<div class=\"topic\"><strong>{}</strong>: {}",
+                esc(&t.name),
+                esc(&t.current),
+            ));
+            if !t.entities.is_empty() {
+                inner.push_str("<br><span class=\"sub\">entities: ");
+                for (i, e) in t.entities.iter().enumerate() {
+                    if i > 0 {
+                        inner.push_str(", ");
+                    }
+                    inner.push_str(&format!(
+                        "<span class=\"term-pill\">{}</span>",
+                        esc(e)
+                    ));
+                }
+                inner.push_str("</span>");
+            }
+            if !t.corrections.is_empty() {
+                inner.push_str("<br><span class=\"sub\">corrections: ");
+                inner.push_str(&format!("{}", t.corrections.len()));
+                inner.push_str("</span>");
+            }
+            if !t.decisions.is_empty() {
+                inner.push_str("<br><span class=\"sub\">decisions: ");
+                inner.push_str(&format!("{}", t.decisions.len()));
+                inner.push_str("</span>");
+            }
+            inner.push_str("</div>\n");
+        }
+        body.push_str(&details_section("Topics", node.topics.len(), true, &inner));
+    }
+
+    // ── Children ───────────────────────────────────────────────────────
+    {
+        let mut inner = String::from("<ul>\n");
+        for c in &child_nodes {
+            inner.push_str(&format!(
+                "<li><a href=\"/p/{slug}/{nid}\"><strong>{headline}</strong></a> \
+                 <span class=\"sub\">{id}</span></li>\n",
+                slug = esc(&slug),
+                nid = esc(&c.id),
+                headline = esc(&c.headline),
+                id = esc(&c.id),
+            ));
+        }
+        inner.push_str("</ul>");
+        body.push_str(&details_section("Children", child_nodes.len(), false, &inner));
+    }
+
+    // ── Parent path ────────────────────────────────────────────────────
+    {
+        let parents: Vec<&PyramidNode> = all_for_parent
+            .iter()
+            .filter(|p| p.children.iter().any(|c| c == &node.id))
+            .collect();
+        let mut inner = String::from("<ul>\n");
+        for p in &parents {
+            inner.push_str(&format!(
+                "<li><a href=\"/p/{slug}/{nid}\">{headline}</a> \
+                 <span class=\"sub\">depth={d}</span></li>\n",
+                slug = esc(&slug),
+                nid = esc(&p.id),
+                headline = esc(&p.headline),
+                d = p.depth,
+            ));
+        }
+        inner.push_str("</ul>");
+        body.push_str(&details_section("Parent path", parents.len(), false, &inner));
+    }
+
+    // ── Terms ──────────────────────────────────────────────────────────
+    {
+        let mut inner = String::from("<dl>\n");
         for t in &node.terms {
-            body.push_str(&format!(
+            inner.push_str(&format!(
                 "<dt>{}</dt><dd>{}</dd>\n",
                 esc(&t.term),
                 esc(&t.definition),
             ));
         }
-        body.push_str("</dl></section>\n");
+        inner.push_str("</dl>");
+        body.push_str(&details_section("Terms", node.terms.len(), false, &inner));
     }
 
-    if !child_nodes.is_empty() {
-        body.push_str("<nav class=\"children\"><h3>Children</h3><ul>\n");
-        for c in &child_nodes {
-            body.push_str(&format!(
-                "<li><a href=\"/p/{slug}/{nid}\">{headline}</a></li>\n",
-                slug = esc(&slug),
-                nid = esc(&c.id),
-                headline = esc(&c.headline),
+    // ── Corrections ────────────────────────────────────────────────────
+    {
+        let mut inner = String::new();
+        for c in &node.corrections {
+            inner.push_str(&format!(
+                "<div class=\"correction\"><span class=\"sub\">wrong:</span> {} <br>\
+                 <span class=\"sub\">right:</span> {} <br>\
+                 <span class=\"sub\">who:</span> {}</div>\n",
+                esc(&c.wrong),
+                esc(&c.right),
+                esc(&c.who),
             ));
         }
-        body.push_str("</ul></nav>\n");
+        body.push_str(&details_section(
+            "Corrections",
+            node.corrections.len(),
+            false,
+            &inner,
+        ));
     }
 
-    // Cross-pyramid web edges: V2 scope (not rendered in V1).
-
-    // P1-6: prefer Wire handle path when this node has been published.
-    let wire_handle = {
-        let conn2 = state.reader.lock().await;
-        db::get_wire_handle_path(&conn2, &slug, &node.id)
-            .ok()
-            .flatten()
-            .filter(|s| !s.is_empty())
-    };
-    body.push_str(&prov_footer(&node, wire_handle.as_deref()));
-    body.push_str("\n</article>\n");
-
-    // Phase A: "Questions asked" of the parent pyramid.
+    // ── Annotations ────────────────────────────────────────────────────
     {
-        let conn3 = state.reader.lock().await;
-        let questions = db::get_questions_referencing(&conn3, &slug).unwrap_or_default();
-        if !questions.is_empty() {
-            body.push_str("<section class=\"questions-asked\">\n");
-            body.push_str("<h2>Questions asked of this pyramid</h2>\n<ul>\n");
+        let mut inner = String::from("<ul>\n");
+        for a in &annotations {
+            inner.push_str(&format!(
+                "<li><span class=\"sub\">[{at}] {who} {when}</span><br>{c}</li>\n",
+                at = esc(a.annotation_type.as_str()),
+                who = esc(&a.author),
+                when = esc(&a.created_at),
+                c = esc(&a.content),
+            ));
+        }
+        inner.push_str("</ul>");
+        body.push_str(&details_section(
+            "Annotations",
+            annotations.len(),
+            false,
+            &inner,
+        ));
+    }
+
+    // ── Provenance & metadata ──────────────────────────────────────────
+    {
+        let handle = wire_handle
+            .clone()
+            .unwrap_or_else(|| format!("local:{}", node.id));
+        let inner = format!(
+            "<dl class=\"meta\">\
+              <dt>handle path</dt><dd>{}/{}/{}</dd>\
+              <dt>wire path</dt><dd>{}</dd>\
+              <dt>build_id</dt><dd>{}</dd>\
+              <dt>superseded_by</dt><dd>{}</dd>\
+              <dt>parent_id</dt><dd>{}</dd>\
+              <dt>self_prompt</dt><dd>{}</dd>\
+              <dt>created_at</dt><dd>{}</dd>\
+             </dl>",
+            esc(&slug),
+            node.depth,
+            esc(&node.id),
+            esc(&handle),
+            esc(node.build_id.as_deref().unwrap_or("(none)")),
+            esc(node.superseded_by.as_deref().unwrap_or("(none)")),
+            esc(node.parent_id.as_deref().unwrap_or("(none)")),
+            esc(&node.self_prompt),
+            esc(&node.created_at),
+        );
+        body.push_str(&details_section("Provenance & metadata", 1, false, &inner));
+        body.push_str(&prov_footer(&node, wire_handle.as_deref()));
+    }
+
+    // ── Questions referencing this node ────────────────────────────────
+    {
+        let mut inner = String::from("<ul>\n");
+        {
+            let conn3 = state.reader.lock().await;
             for q in &questions {
                 let label = humanize_question_label(&conn3, &q.slug, q.max_depth);
-                body.push_str(&format!(
+                inner.push_str(&format!(
                     "<li><a href=\"/p/{src}/q/{qslug}\">{label}</a> \
-                       <span class=\"question-meta\">asked {when}</span></li>\n",
+                       <span class=\"sub\">asked {when}</span></li>\n",
                     src = esc(&slug),
                     qslug = esc(&q.slug),
                     label = esc(&label),
                     when = esc(&q.created_at),
                 ));
             }
-            body.push_str("</ul>\n</section>\n");
         }
+        inner.push_str("</ul>");
+        body.push_str(&details_section(
+            "Questions referencing this pyramid",
+            questions.len(),
+            false,
+            &inner,
+        ));
     }
 
     let banner = crate::pyramid::public_html::ascii_art::get_banner_for_slug(&state, &slug).await;
@@ -925,6 +1296,54 @@ async fn handle_question_view(
         },
     ));
 
+    // ── Question metadata + decomposition tree ─────────────────────────
+    {
+        let (tree_json, build_id) = {
+            let conn = state.reader.lock().await;
+            let tj = db::get_question_tree(&conn, &question_slug).ok().flatten();
+            let bid = db::get_current_build_id(&conn, &question_slug).ok().flatten();
+            (tj, bid)
+        };
+        if let Some(json) = tree_json.as_ref() {
+            let pretty = serde_json::to_string_pretty(json)
+                .unwrap_or_else(|_| "(invalid tree)".to_string());
+            let inner = format!("<pre class=\"tree-json\">{}</pre>", esc(&pretty));
+            body.push_str(&details_section(
+                "Question decomposition tree",
+                1,
+                false,
+                &inner,
+            ));
+        } else {
+            body.push_str(&details_section(
+                "Question decomposition tree",
+                0,
+                false,
+                "",
+            ));
+        }
+        let meta = format!(
+            "<dl class=\"meta\">\
+              <dt>slug</dt><dd>{}</dd>\
+              <dt>source</dt><dd><a href=\"/p/{}\">{}</a></dd>\
+              <dt>max_depth</dt><dd>{}</dd>\
+              <dt>node_count</dt><dd>{}</dd>\
+              <dt>build_id</dt><dd>{}</dd>\
+              <dt>created_at</dt><dd>{}</dd>\
+              <dt>question</dt><dd>{}</dd>\
+             </dl>",
+            esc(&question_slug),
+            esc(&source_slug),
+            esc(&source_slug),
+            question_info.max_depth,
+            question_info.node_count,
+            esc(build_id.as_deref().unwrap_or("(none)")),
+            esc(&question_info.created_at),
+            esc(&question_text),
+        );
+        body.push_str(&details_section("This question's metadata", 1, false, &meta));
+    }
+
     // Inline the answer fragment if the apex is actually synthesized.
     // If render returns None (no nodes yet, or apex placeholder still
     // empty), keep the empty placeholder so the JS poll-loop fills it
@@ -968,29 +1387,45 @@ async fn render_question_answer_fragment(
 ) -> Option<String> {
     let conn = state.reader.lock().await;
 
-    // Robust apex lookup: pull every live node for this question pyramid
-    // and pick the one with the highest depth. The slug-stats max_depth
-    // column lags writes, so trusting it produces empty fragments during
-    // the window between "nodes inserted" and "stats updated".
+    // Pull every live node for this question pyramid. The slug-stats
+    // max_depth column lags writes, so trusting it produces empty
+    // fragments during the window between "nodes inserted" and "stats
+    // updated". Use a real query.
     let all = db::get_all_live_nodes(&conn, question_slug).unwrap_or_default();
     if all.is_empty() {
         drop(conn);
         return None;
     }
-    let apex = all
-        .iter()
-        .max_by_key(|n| n.depth)?
-        .clone();
+
+    // Apex = the highest-depth node. The decomposition tree is rooted
+    // here and fans out downward to the leaf sub-answers.
+    let max_depth = all.iter().map(|n| n.depth).max().unwrap_or(0);
+    let apex = all.iter().find(|n| n.depth == max_depth)?.clone();
 
     // If the apex hasn't been synthesized yet (placeholder row with empty
     // headline AND empty distilled), treat as still-building. The leaf
     // sub-answers may be present but the layered synthesis isn't done.
-    let headline_trim = apex.headline.trim();
-    let distilled_trim = apex.distilled.trim();
-    if headline_trim.is_empty() && distilled_trim.is_empty() {
+    let apex_headline_trim = apex.headline.trim();
+    let apex_distilled_trim = apex.distilled.trim();
+    if apex_headline_trim.is_empty() && apex_distilled_trim.is_empty() {
         drop(conn);
         return None;
     }
+
+    // Sub-answers: every node BELOW the apex, sorted by (depth desc, id).
+    // We render them after the apex so the visitor can drill into the
+    // decomposition that produced the synthesized answer at the top.
+    let mut sub_answers: Vec<_> = all
+        .iter()
+        .filter(|n| n.id != apex.id)
+        .filter(|n| {
+            // Only show nodes that have actual content. Skip empty
+            // placeholders left by mid-build crashes.
+            !n.headline.trim().is_empty() || !n.distilled.trim().is_empty()
+        })
+        .cloned()
+        .collect();
+    sub_answers.sort_by(|a, b| b.depth.cmp(&a.depth).then(a.id.cmp(&b.id)));
 
     // Cited source nodes: scan the apex distilled text for any node IDs
     // from the source pyramid that appear verbatim.
@@ -1005,20 +1440,22 @@ async fn render_question_answer_fragment(
     drop(conn);
 
     let mut out = String::new();
+
+    // ── Apex (synthesized answer) ──────────────────────────────────────
     out.push_str(&format!(
-        "<article class=\"node node--{state}\">\n\
+        "<article class=\"node node--{state} answer-apex\">\n\
            <h2>{headline}</h2>\n\
            <p class=\"distilled\">{distilled}</p>\n",
         state = node_state_class(&apex),
-        headline = if headline_trim.is_empty() {
+        headline = if apex_headline_trim.is_empty() {
             esc("(no headline)")
         } else {
-            esc(headline_trim)
+            esc(apex_headline_trim)
         },
-        distilled = if distilled_trim.is_empty() {
+        distilled = if apex_distilled_trim.is_empty() {
             esc("(synthesizing…)")
         } else {
-            esc(distilled_trim)
+            esc(apex_distilled_trim)
         },
     ));
     if !cited.is_empty() {
@@ -1040,6 +1477,110 @@ async fn render_question_answer_fragment(
         nid = esc(&apex.id),
     ));
     out.push_str("</article>\n");
+
+    // ── Decomposition (sub-question answers) ──────────────────────────
+    // Render every sub-answer node beneath the apex so the visitor can
+    // see what the build actually decomposed and synthesized. Each is a
+    // collapsible <details> so the page stays scannable for big trees.
+    if !sub_answers.is_empty() {
+        out.push_str(&format!(
+            "<section class=\"decomposition\">\n\
+               <h3>Decomposition ({n} sub-answers)</h3>\n",
+            n = sub_answers.len(),
+        ));
+        // Group by depth so the layered structure is visible at a glance.
+        let mut last_depth: Option<i64> = None;
+        for n in &sub_answers {
+            if last_depth != Some(n.depth) {
+                if last_depth.is_some() {
+                    out.push_str("</div>\n");
+                }
+                let layer_desc = if n.depth == 0 {
+                    "L0: Direct evidence from source nodes"
+                } else if n.depth == 1 {
+                    "L1: Layered synthesis answers"
+                } else {
+                    "Synthesis layer"
+                };
+                out.push_str(&format!(
+                    "<div class=\"decomp-layer\" data-depth=\"{d}\">\n\
+                       <h4 class=\"decomp-layer-label\">L{d}</h4>\n\
+                       <p class=\"sub\">{desc}</p>\n",
+                    d = n.depth,
+                    desc = esc(layer_desc),
+                ));
+                last_depth = Some(n.depth);
+            }
+            let hl = n.headline.trim();
+            let ds = n.distilled.trim();
+            // Open the first layer by default, leave the rest collapsed.
+            let open_attr = if last_depth == Some(max_depth - 1) {
+                " open"
+            } else {
+                ""
+            };
+            let mut extras = String::new();
+            if !n.topics.is_empty() {
+                extras.push_str(&format!(
+                    "<p class=\"sub\">topics ({}):</p><ul>",
+                    n.topics.len()
+                ));
+                for t in &n.topics {
+                    extras.push_str(&format!(
+                        "<li><strong>{}</strong>: {}</li>",
+                        esc(&t.name),
+                        esc(&t.current),
+                    ));
+                }
+                extras.push_str("</ul>");
+            }
+            if !n.terms.is_empty() {
+                extras.push_str(&format!(
+                    "<p class=\"sub\">terms ({}):</p><dl>",
+                    n.terms.len()
+                ));
+                for t in &n.terms {
+                    extras.push_str(&format!(
+                        "<dt>{}</dt><dd>{}</dd>",
+                        esc(&t.term),
+                        esc(&t.definition),
+                    ));
+                }
+                extras.push_str("</dl>");
+            }
+            if !n.corrections.is_empty() {
+                extras.push_str(&format!(
+                    "<p class=\"sub\">corrections: {}</p>",
+                    n.corrections.len()
+                ));
+            }
+            out.push_str(&format!(
+                "<details class=\"sub-answer\"{open}>\n\
+                   <summary>\n\
+                     <span class=\"sub-id\">{id}</span>\n\
+                     <span class=\"sub-headline\">{headline}</span>\n\
+                   </summary>\n\
+                   <div class=\"sub-body\">\n\
+                     <p class=\"distilled\">{distilled}</p>\n\
+                     {extras}\n\
+                     <footer class=\"prov\">{qslug}/{depth}/{id}</footer>\n\
+                   </div>\n\
+                 </details>\n",
+                open = open_attr,
+                id = esc(&n.id),
+                headline = if hl.is_empty() { esc("(no headline)") } else { esc(hl) },
+                distilled = if ds.is_empty() { esc("(no content)") } else { esc(ds) },
+                extras = extras,
+                qslug = esc(question_slug),
+                depth = n.depth,
+            ));
+        }
+        if last_depth.is_some() {
+            out.push_str("</div>\n");
+        }
+        out.push_str("</section>\n");
+    }
+
     Some(out)
 }
 
@@ -1174,12 +1715,34 @@ async fn handle_search(
     drop(conn);
 
     let total = hits.len();
-    let shown = hits.iter().take(SEARCH_RESULT_CAP);
+    let shown: Vec<_> = hits.iter().take(SEARCH_RESULT_CAP).cloned().collect();
 
     body.push_str(&format!(
         "<h1>results for <q>{qe}</q></h1>\n",
         qe = esc(&q),
     ));
+
+    // Tokenize the query the same way the search does (very rough — for
+    // display only) so the visitor sees what was actually matched.
+    let tokens: Vec<String> = q
+        .split_whitespace()
+        .filter(|t| t.len() > 2)
+        .map(|t| t.to_lowercase())
+        .collect();
+    {
+        let inner = format!(
+            "<dl class=\"meta\">\
+              <dt>query</dt><dd>{}</dd>\
+              <dt>slug</dt><dd>{}</dd>\
+              <dt>tokenized</dt><dd>{}</dd>\
+              <dt>matching</dt><dd>OR-match across headline, distilled, terms (stop-words removed)</dd>\
+             </dl>",
+            esc(&q),
+            esc(&slug),
+            esc(&tokens.join(" ")),
+        );
+        body.push_str(&details_section("Search settings", 1, false, &inner));
+    }
 
     if total == 0 {
         body.push_str("<p class=\"empty\">No matches.</p>\n");
@@ -1193,21 +1756,53 @@ async fn handle_search(
         } else {
             body.push_str(&format!("<p class=\"sub\">{total} match(es)</p>\n"));
         }
+        // Pre-load full distilled bodies for the "more" expandables.
+        let full_nodes: HashMap<String, PyramidNode> = {
+            let conn2 = state.reader.lock().await;
+            db::get_all_live_nodes(&conn2, &slug)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|n| (n.id.clone(), n))
+                .collect()
+        };
         body.push_str("<ul class=\"search-results\">\n");
-        for hit in shown {
+        for hit in &shown {
+            // Highlight the snippet by wrapping each token (case-insensitive) in <mark>.
+            let snippet_marked = mark_tokens(&hit.snippet, &tokens);
+            let depth_label = format!("L{}", hit.depth);
+            let full = full_nodes
+                .get(&hit.node_id)
+                .map(|n| n.distilled.as_str())
+                .unwrap_or("");
             body.push_str(&format!(
                 "<li><article class=\"search-result\">\
-                   <a href=\"/p/{slug}/{nid}\"><strong>{headline}</strong></a>\
+                   <a href=\"/p/{slug}/{nid}\"><strong>{headline}</strong></a> \
+                   <span class=\"sub\">[{dl}] score={score:.2}</span>\
                    <p class=\"snippet\">{snippet}</p>\
+                   <details><summary>more</summary><p class=\"distilled\">{full}</p></details>\
                  </article></li>\n",
                 slug = esc(&slug),
                 nid = esc(&hit.node_id),
                 headline = esc(&hit.headline),
-                snippet = esc(&hit.snippet),
+                dl = depth_label,
+                score = hit.score,
+                snippet = snippet_marked,
+                full = esc(full),
             ));
         }
         body.push_str("</ul>\n");
     }
+
+    // ── How search works ──────────────────────────────────────────────
+    body.push_str(&details_section(
+        "How search works",
+        1,
+        false,
+        "<p>This is a simple OR-match keyword search across node headlines, \
+         distilled text, and terms. Stop-words are removed and tokens shorter \
+         than 3 characters are ignored. For richer answers that synthesize \
+         across the pyramid, use the question form on the pyramid home page.</p>",
+    ));
 
     let banner = crate::pyramid::public_html::ascii_art::get_banner_for_slug(&state, &slug).await;
     page_with_etag(
@@ -1289,7 +1884,6 @@ async fn handle_tree(
         );
     }
 
-    body.push_str("<ul class=\"toc\">\n");
     let mut truncated = false;
     for root in &roots {
         if rendered >= TREE_NODE_CAP {
@@ -1304,9 +1898,9 @@ async fn handle_tree(
             &mut body,
             &mut rendered,
             &mut truncated,
+            true,
         );
     }
-    body.push_str("</ul>\n");
 
     if truncated || total_in_window > TREE_NODE_CAP {
         body.push_str(&format!(
@@ -1335,6 +1929,7 @@ fn render_tree_node(
     body: &mut String,
     rendered: &mut usize,
     truncated: &mut bool,
+    is_root: bool,
 ) {
     if *rendered >= TREE_NODE_CAP {
         *truncated = true;
@@ -1342,15 +1937,25 @@ fn render_tree_node(
     }
     *rendered += 1;
 
+    let preview = truncate_chars(node.distilled.trim(), 80);
+    let full = truncate_chars(node.distilled.trim(), 400);
+    let open_attr = if is_root { " open" } else { "" };
     body.push_str(&format!(
-        "<li class=\"node--{state}\"><a href=\"/p/{slug}/{nid}\">{headline}</a>",
+        "<details class=\"tree-node node--{state}\"{open}>\n\
+           <summary><span class=\"sub\">{nid}</span> \
+                    <a href=\"/p/{slug}/{nid_link}\"><strong>{headline}</strong></a> \
+                    <span class=\"sub\">{preview}</span></summary>\n\
+           <div class=\"tree-body\"><p class=\"distilled\">{full}</p></div>\n",
         state = node_state_class(node),
-        slug = esc(slug),
+        open = open_attr,
         nid = esc(&node.id),
+        slug = esc(slug),
+        nid_link = esc(&node.id),
         headline = esc(&node.headline),
+        preview = esc(&preview),
+        full = esc(&full),
     ));
 
-    // Recurse into children that are inside the depth window.
     let child_nodes: Vec<&PyramidNode> = node
         .children
         .iter()
@@ -1359,17 +1964,15 @@ fn render_tree_node(
         .collect();
 
     if !child_nodes.is_empty() && *rendered < TREE_NODE_CAP {
-        body.push_str("<ul>\n");
         for c in child_nodes {
             if *rendered >= TREE_NODE_CAP {
                 *truncated = true;
                 break;
             }
-            render_tree_node(c, by_id, slug, min_depth, body, rendered, truncated);
+            render_tree_node(c, by_id, slug, min_depth, body, rendered, truncated, false);
         }
-        body.push_str("</ul>\n");
     }
-    body.push_str("</li>\n");
+    body.push_str("</details>\n");
 }
 
 async fn handle_glossary(
@@ -1394,23 +1997,30 @@ async fn handle_glossary(
     };
     drop(conn);
 
-    // Collect terms. Prefer the deepest (most distilled) node's definition
-    // when duplicates appear. Sort nodes by depth DESC so last-write-wins ==
-    // shallowest; we flip that by iterating shallow->deep and overwriting.
+    // Collect terms. Track which node_ids each term came from so we can
+    // show provenance under each definition.
     let mut sorted_nodes = all;
     sorted_nodes.sort_by_key(|n| n.depth);
-    let mut by_lower: HashMap<String, (String, String)> = HashMap::new(); // lower -> (term, def)
+    // lower -> (term, def, sources)
+    let mut by_lower: HashMap<String, (String, String, Vec<String>)> = HashMap::new();
     for n in &sorted_nodes {
         for t in &n.terms {
             let lower = t.term.trim().to_lowercase();
             if lower.is_empty() {
                 continue;
             }
-            by_lower.insert(lower, (t.term.clone(), t.definition.clone()));
+            let entry = by_lower.entry(lower).or_insert_with(|| {
+                (t.term.clone(), t.definition.clone(), Vec::new())
+            });
+            entry.0 = t.term.clone();
+            entry.1 = t.definition.clone();
+            if !entry.2.contains(&n.id) {
+                entry.2.push(n.id.clone());
+            }
         }
     }
 
-    let mut entries: Vec<(String, String)> = by_lower.into_values().collect();
+    let mut entries: Vec<(String, String, Vec<String>)> = by_lower.into_values().collect();
     entries.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
 
     let mut body = String::new();
@@ -1424,13 +2034,56 @@ async fn handle_glossary(
     if entries.is_empty() {
         body.push_str("<p class=\"empty\">this pyramid has no terms yet.</p>\n");
     } else {
+        // Build letter index: which letters actually have entries
+        let mut letters: HashSet<char> = HashSet::new();
+        for (term, _, _) in &entries {
+            if let Some(c) = term.chars().next() {
+                letters.insert(c.to_ascii_uppercase());
+            }
+        }
+        let mut sorted_letters: Vec<char> = letters.into_iter().collect();
+        sorted_letters.sort();
+        body.push_str("<nav class=\"glossary-letter-nav\">");
+        for l in &sorted_letters {
+            body.push_str(&format!("<a href=\"#g-{l}\">{l}</a>", l = l));
+        }
+        body.push_str("</nav>\n");
+
+        // Group by first letter
+        let mut current_letter: Option<char> = None;
         body.push_str("<dl class=\"glossary\">\n");
-        for (term, def) in &entries {
+        for (term, def, sources) in &entries {
+            let first = term
+                .chars()
+                .next()
+                .map(|c| c.to_ascii_uppercase())
+                .unwrap_or('?');
+            if Some(first) != current_letter {
+                body.push_str(&format!(
+                    "</dl>\n<h2 id=\"g-{l}\">{l}</h2>\n<dl class=\"glossary\">\n",
+                    l = first,
+                ));
+                current_letter = Some(first);
+            }
             body.push_str(&format!(
-                "<dt>{}</dt><dd>{}</dd>\n",
+                "<dt>{}</dt><dd>{}<br><small>used in: ",
                 esc(term),
                 esc(def),
             ));
+            for (i, sid) in sources.iter().take(5).enumerate() {
+                if i > 0 {
+                    body.push_str(", ");
+                }
+                body.push_str(&format!(
+                    "<a href=\"/p/{slug}/{sid}\">{sid}</a>",
+                    slug = esc(&slug),
+                    sid = esc(sid),
+                ));
+            }
+            if sources.len() > 5 {
+                body.push_str(&format!(" +{} more", sources.len() - 5));
+            }
+            body.push_str("</small></dd>\n");
         }
         body.push_str("</dl>\n");
     }
@@ -1528,6 +2181,64 @@ async fn handle_folio(
             );
         }
     };
+
+    // Pre-walk: collect every node we'll render so we can build a TOC.
+    let mut toc_ids: Vec<(String, String, i64)> = Vec::new();
+    {
+        let mut seen_pre: HashSet<String> = HashSet::new();
+        let mut stack: Vec<&PyramidNode> = vec![&apex];
+        while let Some(n) = stack.pop() {
+            if !seen_pre.insert(n.id.clone()) {
+                continue;
+            }
+            toc_ids.push((n.id.clone(), n.headline.clone(), n.depth));
+            if toc_ids.len() >= FOLIO_NODE_CAP {
+                break;
+            }
+            if n.depth > min_allowed_depth {
+                for cid in &n.children {
+                    if let Some(c) = by_id.get(cid) {
+                        stack.push(c);
+                    }
+                }
+            }
+        }
+    }
+
+    // Folio metadata + TOC at top.
+    {
+        let meta = format!(
+            "<dl class=\"meta\">\
+              <dt>depth</dt><dd>{d}</dd>\
+              <dt>nodes rendered</dt><dd>{n}</dd>\
+              <dt>content_type</dt><dd>{ct}</dd>\
+              <dt>last_built_at</dt><dd>{lb}</dd>\
+             </dl>",
+            d = depth,
+            n = toc_ids.len(),
+            ct = esc(info.content_type.as_str()),
+            lb = esc(info.last_built_at.as_deref().unwrap_or("(never)")),
+        );
+        body.push_str(&details_section("Folio metadata", 1, true, &meta));
+    }
+    {
+        let mut toc_inner = String::from("<ul class=\"folio-toc\">\n");
+        for (id, hl, d) in &toc_ids {
+            toc_inner.push_str(&format!(
+                "<li><a href=\"#{id}\">{hl}</a> <span class=\"sub\">L{d}</span></li>\n",
+                id = esc(id),
+                hl = esc(hl),
+                d = d,
+            ));
+        }
+        toc_inner.push_str("</ul>");
+        body.push_str(&details_section(
+            "Folio table of contents",
+            toc_ids.len(),
+            false,
+            &toc_inner,
+        ));
+    }
 
     let mut rendered: usize = 0;
     let mut truncated = false;
@@ -1635,6 +2346,63 @@ fn render_folio_node(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// HTML-escape `text` and wrap any case-insensitive occurrence of any
+/// `tokens` element in `<mark>...</mark>`. Used by search to highlight
+/// matched query words in result snippets. Both the text and tokens are
+/// escaped before insertion so this is XSS-safe.
+fn mark_tokens(text: &str, tokens: &[String]) -> String {
+    if tokens.is_empty() {
+        return esc(text);
+    }
+    let lower = text.to_lowercase();
+    // Build a list of (start, end) byte ranges to highlight, scanning each token.
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    for tok in tokens {
+        if tok.is_empty() {
+            continue;
+        }
+        let mut start = 0;
+        while let Some(pos) = lower[start..].find(tok.as_str()) {
+            let s = start + pos;
+            let e = s + tok.len();
+            ranges.push((s, e));
+            start = e;
+        }
+    }
+    if ranges.is_empty() {
+        return esc(text);
+    }
+    // Sort + merge overlaps.
+    ranges.sort_by_key(|r| r.0);
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (s, e) in ranges {
+        if let Some(last) = merged.last_mut() {
+            if s <= last.1 {
+                if e > last.1 {
+                    last.1 = e;
+                }
+                continue;
+            }
+        }
+        merged.push((s, e));
+    }
+    let mut out = String::new();
+    let mut cursor = 0;
+    for (s, e) in merged {
+        if s > cursor {
+            out.push_str(&esc(&text[cursor..s]));
+        }
+        out.push_str("<mark>");
+        out.push_str(&esc(&text[s..e]));
+        out.push_str("</mark>");
+        cursor = e;
+    }
+    if cursor < text.len() {
+        out.push_str(&esc(&text[cursor..]));
+    }
+    out
+}
 
 /// Best-effort apex headline lookup for the index card. Returns None when
 /// the pyramid has no nodes yet.

@@ -671,3 +671,163 @@ footer.site {
     color: var(--dim, #666);
     font-size: 0.9em;
 }
+
+/* ============================================================
+ * API-richness enrichment pass — collapsible details, cards,
+ * pills, marks, print rules. Appended (not rewritten) so the
+ * existing retro phosphor theme stays intact.
+ * ============================================================ */
+
+details.section,
+details.tree-node,
+details.sub-answer {
+  margin: 0.5em 0;
+  border-left: 2px solid var(--rule);
+  padding-left: 0.75em;
+}
+details > summary {
+  cursor: pointer;
+  list-style: none;
+  padding: 0.25em 0;
+  user-select: none;
+  color: var(--fg);
+}
+details > summary::-webkit-details-marker { display: none; }
+details > summary::before {
+  content: '▶ ';
+  display: inline-block;
+  color: var(--dim);
+}
+details[open] > summary::before {
+  content: '▼ ';
+}
+details > summary:hover { color: var(--hot); }
+details em.empty { color: var(--dim); font-style: italic; }
+
+dl.meta dt {
+  color: var(--dim);
+  font-size: 0.85em;
+  margin-top: 0.4em;
+}
+dl.meta dd {
+  margin: 0 0 0.2em 1em;
+}
+
+.term-pill {
+  display: inline-block;
+  padding: 0.1em 0.5em;
+  margin: 0.15em;
+  background: var(--rule);
+  border-radius: 2px;
+  font-size: 0.85em;
+}
+.term-pill .term-name { color: var(--hot); }
+
+.entity-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3em;
+  list-style: none;
+  padding: 0;
+}
+
+.faq-entry {
+  margin: 0.75em 0;
+  padding: 0.5em 0.75em;
+  background: rgba(80, 250, 123, 0.04);
+  border-left: 2px solid var(--hot);
+}
+.faq-entry .faq-question { font-weight: bold; color: var(--hot); }
+.faq-entry .faq-answer { margin-top: 0.5em; }
+.faq-entry .faq-meta { font-size: 0.8em; color: var(--dim); margin-top: 0.4em; }
+
+.web-edge {
+  display: block;
+  padding: 0.25em 0;
+}
+.web-edge .edge-target { color: var(--link); }
+
+.glossary-letter-nav {
+  display: flex;
+  gap: 0.5em;
+  flex-wrap: wrap;
+  padding: 0.5em 0;
+  border-bottom: 1px solid var(--rule);
+  margin-bottom: 1em;
+}
+.glossary-letter-nav a {
+  padding: 0.2em 0.4em;
+  text-decoration: none;
+  color: var(--link);
+}
+.glossary-letter-nav a:hover {
+  background: var(--hot);
+  color: var(--bg);
+}
+
+.pyramid-card {
+  padding: 0.75em;
+  margin: 0.5em 0;
+  border: 1px solid var(--rule);
+  list-style: none;
+}
+.pyramid-card:hover { border-color: var(--hot); }
+.pyramid-card .apex { color: var(--fg); margin: 0.3em 0; }
+
+.sub-answer summary .sub-id {
+  color: var(--dim);
+  margin-right: 0.5em;
+}
+.sub-answer summary .sub-headline { color: var(--fg); }
+.sub-answer .sub-body {
+  padding-left: 1em;
+  padding-top: 0.5em;
+}
+
+.tree-node summary {
+  font-size: 0.95em;
+}
+.tree-node .tree-body {
+  padding-left: 1em;
+  margin-bottom: 0.4em;
+}
+
+mark {
+  background: var(--hot);
+  color: var(--bg);
+  padding: 0 2px;
+}
+
+pre.tree-json {
+  background: var(--bg-1);
+  padding: 0.75em;
+  overflow-x: auto;
+  font-size: 0.85em;
+  color: var(--fg);
+  border-left: 2px solid var(--rule);
+}
+
+.folio-toc {
+  list-style: none;
+  padding: 0;
+}
+.folio-toc li {
+  padding: 0.15em 0;
+}
+
+.search-result details {
+  margin-top: 0.4em;
+  border: none;
+  padding-left: 0;
+}
+.search-result details summary {
+  color: var(--dim);
+  font-size: 0.85em;
+}
+
+@media print {
+  .crumbs, footer.prov, form, nav.glossary-letter-nav { display: none !important; }
+  details { border: none !important; padding: 0 !important; }
+  details > summary::before { content: '' !important; }
+  details:not([open]) > *:not(summary) { display: block !important; }
+}
