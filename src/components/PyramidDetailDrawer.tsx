@@ -749,6 +749,53 @@ export function PyramidDetailDrawer({
                         Open in Vibesmithy
                     </button>
                 )}
+
+                {/* Post-agents-retro: open public web surface as the local operator */}
+                {slug.node_count > 0 && (
+                    <button
+                        className="folder-publish-btn"
+                        onClick={async () => {
+                            try {
+                                const url = await invoke<string>(
+                                    "pyramid_open_web_as_owner",
+                                    { slug: slug.slug }
+                                );
+                                window.open(url, "_blank");
+                            } catch (e) {
+                                alert(`Owner-mode open failed: ${e}\n\nMake sure the Cloudflare tunnel is running.`);
+                            }
+                        }}
+                        style={{ width: "100%" }}
+                        title="Open this pyramid in your browser as the operator (full ask + ASCII-art access). Requires the tunnel to be running."
+                    >
+                        Open as Owner (Web)
+                    </button>
+                )}
+
+                {/* Post-agents-retro: generate Grok-4.2 ASCII banner shown atop /p/{slug} */}
+                {slug.node_count > 0 && (
+                    <button
+                        className="folder-publish-btn"
+                        onClick={async () => {
+                            try {
+                                const art = await invoke<string>(
+                                    "pyramid_generate_ascii_banner",
+                                    { slug: slug.slug }
+                                );
+                                alert(
+                                    `Banner generated for ${slug.slug}:\n\n${art.slice(0, 400)}${art.length > 400 ? "\n…" : ""}`
+                                );
+                            } catch (e) {
+                                alert(`Banner generation failed: ${e}`);
+                            }
+                        }}
+                        style={{ width: "100%" }}
+                        title="Generate (or refresh) the Grok-4.2 ASCII art banner shown atop the pyramid's web page"
+                    >
+                        Generate Banner
+                    </button>
+                )}
+
                 <button
                     className="folder-publish-btn"
                     onClick={() => onRebuild(slug.slug)}
