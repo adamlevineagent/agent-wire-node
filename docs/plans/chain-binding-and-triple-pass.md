@@ -263,15 +263,65 @@ Needed:
 - Runner: when `zip_steps` is present, build the input for each iteration as `{forward_view: ..., reverse_view: ...}` keyed by the listed step names
 - The combine prompt receives both views as named fields it can reference (`{{forward_view}}`, `{{reverse_view}}` or as JSON object fields)
 
-### Sub-phase 3b — Hardcode temporal fields at the schema-generation site
+### Sub-phase 3b — Make schema-field injection driven by chain config (not by Rust deciding)
 
-This is the fix for Run 4's load-bearing failure. Don't trust the meta-prompt.
+This is the fix for Run 4's load-bearing failure. The principle: **the chain YAML decides what structural fields the L0 schema must contain; the Rust executor enforces what the chain says.** Rust never makes the call about whether a pyramid is "temporal" — the chain config does, by declaring it.
 
-In `extraction_schema.rs::generate_synthesis_prompts` (or wherever the topic_schema gets built/persisted), when the characterize result identifies the source as sequential/transcript:
-- Inject `{name: "speaker", description: "PLAYFUL or CONDUCTOR", required: true}` into the topic_schema
-- Inject `{name: "at", description: "ISO timestamp from chunk marker", required: true}` into the topic_schema
-- These are added in Rust before the schema is written to the build state, so the L0 extractor LLM sees them as required fields it must populate
-- The temporal-aware directive in `extraction_schema.md` then becomes belt-and-suspenders rather than load-bearing
+This keeps the entire decision composable. A new pipeline that wants `{location, mood, weather}` fields instead of `{speaker, at}` writes those into its YAML and gets them, with no Rust changes.
+
+**Schema additions to the chain YAML DSL:**
+
+Add an optional `enforce_topic_fields:` block to the L0-shaped step in any question YAML:
+
+```yaml
+  - ask: "..."
+    creates: L0 nodes
+    enforce_topic_fields:
+      - name: speaker
+        description: "Speaker label exactly as written in the chunk marker"
+        required: true
+      - name: at
+        description: "ISO timestamp from the chunk marker for the moment this finding was first introduced"
+        required: true
+```
+
+The list is arbitrary — any number of fields, any names, any descriptions. The chain author decides.
+
+**Optionally**, declare the same at the registry level so all chains in a binding inherit a baseline:
+
+```yaml
+  conversation-chronological:
+    questions: chains/questions/conversation-chronological.yaml
+    prompts:   chains/prompts/question-conversation-chronological/
+    description: "Triple-pass chronological conversation pyramid"
+    enforce_topic_fields:
+      - name: speaker
+      - name: at
+```
+
+Step-level declarations override registry-level for the same field name.
+
+**What Rust does (the enforcement, not the decision):**
+
+In `extraction_schema.rs` at the schema-generation site (`generate_synthesis_prompts` or wherever the `topic_schema` is materialized):
+
+1. Read the resolved chain binding's `enforce_topic_fields` list (registry-level + step-level merged)
+2. If the list is empty, do nothing — the LLM-generated schema is used as-is, exactly like today
+3. If the list is non-empty, after the LLM produces its `topic_schema`, **append (or upsert)** every field from `enforce_topic_fields` into it before writing the schema to the build state
+4. The enforced fields go through to the L0 extractor LLM as required fields it must populate, alongside any LLM-generated ones
+
+The temporal-aware directive in `prompts/question*/extraction_schema.md` stays as belt-and-suspenders prose for the LLM (it'll see why those fields exist), but the field presence no longer depends on the LLM remembering. Two layers: the chain config makes the structural guarantee, the prose makes the semantic intent clear.
+
+**Why this is composable, not hardcoded:**
+
+- Rust contains zero references to "speaker", "at", "timestamp", "PLAYFUL", "CONDUCTOR", "transcript", "conversation", or "temporal". It only knows how to read an `enforce_topic_fields` list and append the entries to a topic_schema.
+- The conversation-chronological pipeline declares its own temporal field set in YAML.
+- A future "meeting-with-emotion-tracking" pipeline can declare `{speaker, at, emotion, energy_level}` in its own YAML, and the same Rust code path enforces it.
+- A code or document pipeline declares no enforced fields and behaves exactly as today.
+- Removing the temporal capture from a pipeline is a YAML edit, not a Rust change.
+- Promoting `conversation-chronological` to the default `conversation` binding is a one-line registry edit; the temporal field enforcement comes with it because it's declared in the chain config, not in Rust.
+
+This is the bar set by the composability test in our prior conversation: forking `conversation-chronological` into `meeting-five-pass` requires zero Rust changes. With this design, that holds.
 
 ### Sub-phase 3c — Author the matching prompts directory
 
@@ -363,7 +413,7 @@ Phase 2 and Phase 3 can run in parallel after Phase 1 lands, if we want. Realist
 
 ## Open questions
 
-- Should `chains/registry.yaml` support per-binding `temporal: true` flags so the schema-generation site knows when to inject speaker/at, or should that be inferred from the characterize result alone? **Recommendation:** characterize-driven, with a registry override available for cases where characterize misclassifies.
+- ~~Should `chains/registry.yaml` support per-binding `temporal: true` flags so the schema-generation site knows when to inject speaker/at, or should that be inferred from the characterize result alone?~~ **Resolved in 3b above**: neither. The chain YAML declares its own `enforce_topic_fields` list (or inherits one from the registry binding), and Rust enforces what the chain says. The `temporal` concept never leaks into Rust at all.
 
 - Should the `conversation-chronological` content_type be a real first-class type (added to the `ContentType` enum in Rust) or a virtual content_type that only exists in the registry? **Recommendation:** first-class. Keeps the slug-creation flow honest and lets the desktop UI offer it as a wizard option.
 
