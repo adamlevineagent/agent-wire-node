@@ -381,8 +381,8 @@ impl Default for Tier2Config {
             llm_base_timeout_secs: 120,
             llm_max_timeout_secs: 600,
             chunk_target_lines: 100,
-            max_headline_chars: 72,
-            max_headline_words: 8,
+            max_headline_chars: usize::MAX,
+            max_headline_words: usize::MAX,
             teaser_max_chars: 200,
             // Index = granularity (1-5), value = (min, max) hint range
             // Index 0 = default fallback
