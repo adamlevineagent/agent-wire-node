@@ -28,6 +28,13 @@ pub const WIRE_SESSION_COOKIE: &str = "wire_session";
 const ANON_SESSION_MAX_AGE: u64 = 3_600; // 1 hour
 const WIRE_SESSION_MAX_AGE: u64 = 604_800; // 7 days
 
+/// Synthetic supabase_user_id prefix used by owner-mode sessions.
+/// `web_sessions` rows whose `supabase_user_id` starts with this prefix
+/// are recognized by `with_public_or_session_auth` as the local operator
+/// (full LocalOperator privileges, billing-exempt). Created via the
+/// `pyramid_open_web_as_owner` Tauri IPC command.
+pub const LOCAL_OPERATOR_SENTINEL_PREFIX: &str = "__local_operator__:";
+
 // ── PublicAuthSource (A4 + B9 + C5) ─────────────────────────────────────
 
 /// Identity that resolved a request to the public `/p/` surface.
@@ -308,6 +315,18 @@ pub fn with_public_or_session_auth(
                             .flatten()
                         };
                         if let Some(sess) = session_opt {
+                            // Owner-mode sentinel: web_sessions rows minted by
+                            // the desktop app's "Open as owner" Tauri command
+                            // carry a synthetic supabase_user_id prefixed with
+                            // `__local_operator__:`. They map to LocalOperator
+                            // (full operator privileges, billing-exempt).
+                            // See pyramid_open_web_as_owner in main.rs.
+                            if sess
+                                .supabase_user_id
+                                .starts_with(LOCAL_OPERATOR_SENTINEL_PREFIX)
+                            {
+                                return Ok(PublicAuthSource::LocalOperator);
+                            }
                             let anon_tok = read_cookie(&headers, ANON_SESSION_COOKIE)
                                 .unwrap_or_default();
                             return Ok(PublicAuthSource::WebSession {
@@ -362,10 +381,10 @@ pub async fn enforce_public_tier(
     slug: &str,
     auth: &PublicAuthSource,
 ) -> Result<(), TierRejection> {
-    let tier = {
+    let (tier, allowed_circles_json) = {
         let conn = state.reader.lock().await;
         match crate::pyramid::db::get_access_tier(&conn, slug) {
-            Ok((t, _price, _circles)) => t,
+            Ok((t, _price, circles)) => (t, circles),
             Err(_) => return Err(TierRejection::Unknown),
         }
     };
@@ -378,9 +397,33 @@ pub async fn enforce_public_tier(
         },
         "circle-scoped" => match auth {
             PublicAuthSource::LocalOperator => Ok(()),
-            PublicAuthSource::WireOperator { .. } => {
-                // TODO(B9): tighten to circle_id membership match.
-                Ok(())
+            PublicAuthSource::WireOperator { circle_id, .. } => {
+                // Membership match: parse the JSON list of allowed circle
+                // UUIDs from `pyramid_slugs.allowed_circles`. If the list is
+                // unset (NULL/empty/parse-fail), allow any WireOperator —
+                // operators reading their own pyramids without an explicit
+                // circle restriction shouldn't be locked out. If the list is
+                // present and non-empty, the operator's circle_id must match
+                // (case-insensitive) one of the entries.
+                let entries: Vec<String> = allowed_circles_json
+                    .as_deref()
+                    .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
+                    .unwrap_or_default();
+                if entries.is_empty() {
+                    return Ok(());
+                }
+                let op_circle = circle_id.as_deref().unwrap_or("").to_ascii_lowercase();
+                if op_circle.is_empty() {
+                    return Err(TierRejection::NotInCircle);
+                }
+                let hit = entries
+                    .iter()
+                    .any(|c| c.trim().to_ascii_lowercase() == op_circle);
+                if hit {
+                    Ok(())
+                } else {
+                    Err(TierRejection::NotInCircle)
+                }
             }
             _ => Err(TierRejection::NotInCircle),
         },

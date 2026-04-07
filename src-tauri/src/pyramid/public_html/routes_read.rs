@@ -12,7 +12,10 @@
 //! Phase 0.5 skeleton without WS-A's helper.
 
 use crate::pyramid::db;
-use crate::pyramid::public_html::auth::{enforce_public_tier, PublicAuthSource};
+use crate::pyramid::public_html::auth::{
+    csrf_nonce, enforce_public_tier, issue_anon_session_cookie, read_cookie, ANON_SESSION_COOKIE,
+    PublicAuthSource, WIRE_SESSION_COOKIE,
+};
 use crate::pyramid::public_html::rate_limit;
 use crate::pyramid::public_html::etag::{
     etag_for_node, etag_for_pyramid, matches_inm, not_modified,
@@ -37,26 +40,71 @@ const FOLIO_NODE_CAP: usize = 500;
 const FOLIO_DEPTH_DEFAULT: i64 = 2;
 const FOLIO_DEPTH_MAX: i64 = 4;
 
-/// Anonymous auth source for rate-limit + tier checks. WS-G's read-adjacent
-/// routes run without a real auth filter (WS-A's `with_public_or_session_auth`
-/// isn't composed into `read_routes` yet), so we construct an Anonymous
-/// principal keyed by an empty client_key — same pattern as WS-B/WS-E.
-fn anon_principal() -> PublicAuthSource {
+/// Resolve the public auth identity for an incoming read. Mirrors
+/// `routes_ask::resolve_auth` and `auth::with_public_or_session_auth`. Used
+/// by `gate()` so per-IP rate limits are keyed on a real client identifier
+/// (P1-4: previously every anonymous reader shared a single empty bucket).
+async fn resolve_auth(
+    headers: &warp::http::HeaderMap,
+    peer: Option<std::net::SocketAddr>,
+    state: &PyramidState,
+    jwt_public_key: &Arc<tokio::sync::RwLock<String>>,
+) -> PublicAuthSource {
+    use crate::http_utils::ct_eq;
+    if let Some(h) = headers.get("authorization").and_then(|h| h.to_str().ok()) {
+        if let Some(token) = h.strip_prefix("Bearer ") {
+            let local = { state.config.read().await.auth_token.clone() };
+            if !local.is_empty() && ct_eq(token, &local) {
+                return PublicAuthSource::LocalOperator;
+            }
+            if token.matches('.').count() == 2 {
+                let pk_str = jwt_public_key.read().await;
+                if !pk_str.is_empty() {
+                    if let Ok(claims) = crate::server::verify_pyramid_query_jwt(token, &pk_str) {
+                        let operator_id = claims.operator_id.unwrap_or_default();
+                        let circle_id = claims.circle_id;
+                        return PublicAuthSource::WireOperator {
+                            operator_id,
+                            circle_id,
+                        };
+                    }
+                }
+            }
+        }
+    }
+    if let Some(wire_tok) = read_cookie(headers, WIRE_SESSION_COOKIE) {
+        if !wire_tok.is_empty() {
+            let sess_opt = {
+                let conn = state.reader.lock().await;
+                crate::pyramid::public_html::web_sessions::lookup(&conn, &wire_tok)
+                    .ok()
+                    .flatten()
+            };
+            if let Some(sess) = sess_opt {
+                let anon_tok = read_cookie(headers, ANON_SESSION_COOKIE).unwrap_or_default();
+                return PublicAuthSource::WebSession {
+                    user_id: sess.supabase_user_id,
+                    email: sess.email,
+                    anon_session_token: anon_tok,
+                };
+            }
+        }
+    }
     PublicAuthSource::Anonymous {
-        client_key: String::new(),
+        client_key: crate::pyramid::public_html::auth::client_key(headers, peer),
     }
 }
 
 async fn gate(
     state: &Arc<PyramidState>,
     slug: &str,
+    auth: &PublicAuthSource,
 ) -> Result<(), warp::reply::Response> {
-    let auth = anon_principal();
-    if enforce_public_tier(state, slug, &auth).await.is_err() {
+    if enforce_public_tier(state, slug, auth).await.is_err() {
         return Err(not_found_page());
     }
     let rl = rate_limit::global();
-    if let Err(e) = rate_limit::check_for_reads(&rl, &auth).await {
+    if let Err(e) = rate_limit::check_for_reads(&rl, auth).await {
         return Err(rate_limited_page(e.retry_after));
     }
     Ok(())
@@ -76,21 +124,30 @@ fn rate_limited_page(retry_after: u64) -> warp::reply::Response {
     resp
 }
 
-// Placeholder CSRF nonce until WS-A's `csrf_nonce` lands. The ask form needs
-// *some* hidden field so WS-H can wire CSRF verification later without
-// re-rendering the home template.
-const CSRF_PLACEHOLDER: &str = "phase1_placeholder";
+/// Resolve the session token to bind a CSRF nonce against. Mirrors
+/// `routes_ask::csrf_session_token` exactly: prefer wire_session, fall back
+/// to anon_session, fall back to empty string. The verifier in routes_ask
+/// uses the same selection — it MUST stay in sync.
+fn csrf_session_token_for_form(headers: &warp::http::HeaderMap) -> String {
+    if let Some(t) = read_cookie(headers, WIRE_SESSION_COOKIE) {
+        if !t.is_empty() {
+            return t;
+        }
+    }
+    read_cookie(headers, ANON_SESSION_COOKIE).unwrap_or_default()
+}
 
 // ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
 
-/// Build the boxed filter chain for the WS-C read routes. The signature
-/// matches the placeholder mount in `mod.rs` and the eventual real
-/// `public_html::routes()` assembly: a single `Arc<PyramidState>` in,
-/// `(warp::reply::Response,)` out.
+/// Build the boxed filter chain for the WS-C read routes. Each handler
+/// resolves auth inline via `resolve_auth(headers, peer, state, jwt_pk)`
+/// (P1-4) so per-IP rate limits key on real client identifiers, not a
+/// single shared empty bucket.
 pub fn read_routes(
     state: Arc<PyramidState>,
+    jwt_public_key: Arc<tokio::sync::RwLock<String>>,
 ) -> BoxedFilter<(warp::reply::Response,)> {
     let state_idx = state.clone();
     let index = warp::path("p")
@@ -102,77 +159,134 @@ pub fn read_routes(
         });
 
     let state_home = state.clone();
+    let jwt_home = jwt_public_key.clone();
     let pyramid_home = warp::path("p")
         .and(warp::path::param::<String>())
         .and(warp::path::end())
         .and(warp::get())
+        .and(warp::filters::addr::remote())
         .and(warp::header::headers_cloned())
-        .and_then(move |slug: String, headers: warp::http::HeaderMap| {
-            let state = state_home.clone();
-            async move {
-                Ok::<_, Rejection>(handle_pyramid_home(state, slug, headers).await)
-            }
-        });
+        .and_then(
+            move |slug: String,
+                  peer: Option<std::net::SocketAddr>,
+                  headers: warp::http::HeaderMap| {
+                let state = state_home.clone();
+                let jwt_pk = jwt_home.clone();
+                async move {
+                    Ok::<_, Rejection>(
+                        handle_pyramid_home(state, jwt_pk, slug, peer, headers).await,
+                    )
+                }
+            },
+        );
 
     let state_search = state.clone();
+    let jwt_search = jwt_public_key.clone();
     let search = warp::path("p")
         .and(warp::path::param::<String>())
         .and(warp::path("search"))
         .and(warp::path::end())
         .and(warp::get())
+        .and(warp::filters::addr::remote())
+        .and(warp::header::headers_cloned())
         .and(warp::query::<HashMap<String, String>>())
-        .and_then(move |slug: String, q: HashMap<String, String>| {
-            let state = state_search.clone();
-            async move { Ok::<_, Rejection>(handle_search(state, slug, q).await) }
-        });
+        .and_then(
+            move |slug: String,
+                  peer: Option<std::net::SocketAddr>,
+                  headers: warp::http::HeaderMap,
+                  q: HashMap<String, String>| {
+                let state = state_search.clone();
+                let jwt_pk = jwt_search.clone();
+                async move {
+                    Ok::<_, Rejection>(handle_search(state, jwt_pk, slug, peer, headers, q).await)
+                }
+            },
+        );
 
     let state_tree = state.clone();
+    let jwt_tree = jwt_public_key.clone();
     let tree = warp::path("p")
         .and(warp::path::param::<String>())
         .and(warp::path("tree"))
         .and(warp::path::end())
         .and(warp::get())
-        .and_then(move |slug: String| {
-            let state = state_tree.clone();
-            async move { Ok::<_, Rejection>(handle_tree(state, slug).await) }
-        });
+        .and(warp::filters::addr::remote())
+        .and(warp::header::headers_cloned())
+        .and_then(
+            move |slug: String,
+                  peer: Option<std::net::SocketAddr>,
+                  headers: warp::http::HeaderMap| {
+                let state = state_tree.clone();
+                let jwt_pk = jwt_tree.clone();
+                async move {
+                    Ok::<_, Rejection>(handle_tree(state, jwt_pk, slug, peer, headers).await)
+                }
+            },
+        );
 
     let state_glossary = state.clone();
+    let jwt_glossary = jwt_public_key.clone();
     let glossary = warp::path("p")
         .and(warp::path::param::<String>())
         .and(warp::path("glossary"))
         .and(warp::path::end())
         .and(warp::get())
-        .and_then(move |slug: String| {
-            let state = state_glossary.clone();
-            async move { Ok::<_, Rejection>(handle_glossary(state, slug).await) }
-        });
+        .and(warp::filters::addr::remote())
+        .and(warp::header::headers_cloned())
+        .and_then(
+            move |slug: String,
+                  peer: Option<std::net::SocketAddr>,
+                  headers: warp::http::HeaderMap| {
+                let state = state_glossary.clone();
+                let jwt_pk = jwt_glossary.clone();
+                async move {
+                    Ok::<_, Rejection>(handle_glossary(state, jwt_pk, slug, peer, headers).await)
+                }
+            },
+        );
 
     let state_folio = state.clone();
+    let jwt_folio = jwt_public_key.clone();
     let folio = warp::path("p")
         .and(warp::path::param::<String>())
         .and(warp::path("folio"))
         .and(warp::path::end())
         .and(warp::get())
+        .and(warp::filters::addr::remote())
+        .and(warp::header::headers_cloned())
         .and(warp::query::<HashMap<String, String>>())
-        .and_then(move |slug: String, q: HashMap<String, String>| {
-            let state = state_folio.clone();
-            async move { Ok::<_, Rejection>(handle_folio(state, slug, q).await) }
-        });
+        .and_then(
+            move |slug: String,
+                  peer: Option<std::net::SocketAddr>,
+                  headers: warp::http::HeaderMap,
+                  q: HashMap<String, String>| {
+                let state = state_folio.clone();
+                let jwt_pk = jwt_folio.clone();
+                async move {
+                    Ok::<_, Rejection>(handle_folio(state, jwt_pk, slug, peer, headers, q).await)
+                }
+            },
+        );
 
     let state_node = state.clone();
+    let jwt_node = jwt_public_key.clone();
     let single_node = warp::path("p")
         .and(warp::path::param::<String>())
         .and(warp::path::param::<String>())
         .and(warp::path::end())
         .and(warp::get())
+        .and(warp::filters::addr::remote())
         .and(warp::header::headers_cloned())
         .and_then(
-            move |slug: String, node_id: String, headers: warp::http::HeaderMap| {
+            move |slug: String,
+                  node_id: String,
+                  peer: Option<std::net::SocketAddr>,
+                  headers: warp::http::HeaderMap| {
                 let state = state_node.clone();
+                let jwt_pk = jwt_node.clone();
                 async move {
                     Ok::<_, Rejection>(
-                        handle_single_node(state, slug, node_id, headers).await,
+                        handle_single_node(state, jwt_pk, slug, node_id, peer, headers).await,
                     )
                 }
             },
@@ -200,22 +314,8 @@ pub fn read_routes(
 // Tier check (inlined fallback for Phase 1; WS-A replaces this)
 // ---------------------------------------------------------------------------
 
-/// Anonymous tier gate: return `Some(404 page)` if the slug is not public.
-/// Per the v3 plan, anonymous access to non-public pyramids returns 404
-/// (anti-enumeration), not 401/403. WS-A's `enforce_public_tier` will
-/// supersede this once cookies and operator tokens are wired.
-async fn check_anon_tier(state: &PyramidState, slug: &str) -> Option<warp::reply::Response> {
-    let conn = state.reader.lock().await;
-    let (tier, _price, _circles) = match db::get_access_tier(&conn, slug) {
-        Ok(v) => v,
-        Err(_) => return Some(not_found_page()),
-    };
-    if tier == "public" {
-        None
-    } else {
-        Some(not_found_page())
-    }
-}
+// (Removed `check_anon_tier`: superseded by `gate()` which calls
+// `enforce_public_tier` with the resolved auth identity. P1-4.)
 
 // ---------------------------------------------------------------------------
 // Handlers
@@ -271,14 +371,17 @@ async fn handle_index(state: Arc<PyramidState>) -> warp::reply::Response {
 
 async fn handle_pyramid_home(
     state: Arc<PyramidState>,
+    jwt_public_key: Arc<tokio::sync::RwLock<String>>,
     slug: String,
+    peer: Option<std::net::SocketAddr>,
     headers: warp::http::HeaderMap,
 ) -> warp::reply::Response {
     if slug.starts_with('_') {
         return not_found_page();
     }
-    if let Some(deny) = check_anon_tier(&state, &slug).await {
-        return deny;
+    let auth = resolve_auth(&headers, peer, &state, &jwt_public_key).await;
+    if let Err(resp) = gate(&state, &slug, &auth).await {
+        return resp;
     }
 
     let conn = state.reader.lock().await;
@@ -335,6 +438,17 @@ async fn handle_pyramid_home(
 
     let title = format!("{} — Wire Node", slug);
 
+    // Lookup apex's wire handle path (if published) for prov footer.
+    let apex_wire_handle: Option<String> = if let Some(ref a) = apex {
+        let conn2 = state.reader.lock().await;
+        db::get_wire_handle_path(&conn2, &slug, &a.id)
+            .ok()
+            .flatten()
+            .filter(|s| !s.is_empty())
+    } else {
+        None
+    };
+
     let mut body = String::new();
     body.push_str(&format!("<h1>{}</h1>\n", esc(&slug)));
     if let Some(ref a) = apex {
@@ -347,7 +461,7 @@ async fn handle_pyramid_home(
             state = node_state_class(a),
             headline = esc(&a.headline),
             distilled = esc(&a.distilled),
-            prov = prov_footer(a),
+            prov = prov_footer(a, apex_wire_handle.as_deref()),
         ));
     } else {
         body.push_str("<p class=\"empty\">ASK SOMETHING TO BEGIN</p>\n");
@@ -366,47 +480,65 @@ async fn handle_pyramid_home(
         body.push_str("</ul></nav>\n");
     }
 
-    // Question form pinned to the bottom. CSRF placeholder until WS-A lands.
+    // Real CSRF nonce bound to (session token, slug, current 5-min window).
+    // If the visitor has no anon_session cookie yet, mint one and pipe its
+    // Set-Cookie header through with the response. The verifier in
+    // routes_ask::handle_ask_post uses the EXACT same csrf_session_token
+    // selection (wire_session → anon_session → empty), so the nonce we
+    // issue here will round-trip cleanly.
+    let mut set_anon_cookie: Option<String> = None;
+    let mut sess_tok = csrf_session_token_for_form(&headers);
+    if sess_tok.is_empty() {
+        let (tok, header) = issue_anon_session_cookie();
+        sess_tok = tok;
+        set_anon_cookie = Some(header);
+    }
+    let real_nonce = csrf_nonce(&state.csrf_secret, &sess_tok, &slug);
+
     body.push_str(&format!(
         "<form class=\"ask\" action=\"/p/{slug}/_ask\" method=\"post\">\n\
            <label for=\"q\">Ask the pyramid:</label>\n\
-           <input id=\"q\" name=\"q\" type=\"text\" autocomplete=\"off\" required>\n\
+           <input id=\"q\" name=\"question\" type=\"text\" autocomplete=\"off\" required>\n\
            <input type=\"hidden\" name=\"csrf\" value=\"{csrf}\">\n\
            <button type=\"submit\">ASK</button>\n\
          </form>\n",
         slug = esc(&slug),
-        csrf = esc(CSRF_PLACEHOLDER),
+        csrf = esc(&real_nonce),
     ));
 
-    let banner = crate::pyramid::public_html::ascii_art::get_banner_for_slug(&state, &slug);
-    page_with_etag(
+    let banner = crate::pyramid::public_html::ascii_art::get_banner_for_slug(&state, &slug).await;
+    let mut resp = page_with_etag(
         &title,
         &body,
         "no-cache, must-revalidate",
         Some(&etag),
         banner.as_deref(),
-    )
+    );
+    if let Some(cookie) = set_anon_cookie {
+        if let Ok(hv) = warp::http::HeaderValue::from_str(&cookie) {
+            resp.headers_mut().append(warp::http::header::SET_COOKIE, hv);
+        }
+    }
+    resp
 }
 
 async fn handle_single_node(
     state: Arc<PyramidState>,
+    jwt_public_key: Arc<tokio::sync::RwLock<String>>,
     slug: String,
     node_id: String,
+    peer: Option<std::net::SocketAddr>,
     headers: warp::http::HeaderMap,
 ) -> warp::reply::Response {
     if slug.starts_with('_') {
         return not_found_page();
     }
-    // Reserved subpath check FIRST. The dedicated handlers for
-    // tree/search/glossary/folio/_login/_ws/etc. live in other workstreams
-    // and will be mounted earlier in the chain — but if for any reason this
-    // catchall fires for one of those keywords, we 404 instead of trying to
-    // load it as a node id.
     if is_reserved_subpath(&node_id) {
         return not_found_page();
     }
-    if let Some(deny) = check_anon_tier(&state, &slug).await {
-        return deny;
+    let auth = resolve_auth(&headers, peer, &state, &jwt_public_key).await;
+    if let Err(resp) = gate(&state, &slug, &auth).await {
+        return resp;
     }
 
     let conn = state.reader.lock().await;
@@ -479,15 +611,20 @@ async fn handle_single_node(
         body.push_str("</ul></nav>\n");
     }
 
-    // Cross-pyramid web edges: deferred to WS-G — render an empty placeholder
-    // so the visual layout matches the eventual full template. WS-G replaces
-    // this with the real query against `webbing.rs`.
-    body.push_str("<!-- TODO(WS-G): cross-pyramid web edges -->\n");
+    // Cross-pyramid web edges: V2 scope (not rendered in V1).
 
-    body.push_str(&prov_footer(&node));
+    // P1-6: prefer Wire handle path when this node has been published.
+    let wire_handle = {
+        let conn2 = state.reader.lock().await;
+        db::get_wire_handle_path(&conn2, &slug, &node.id)
+            .ok()
+            .flatten()
+            .filter(|s| !s.is_empty())
+    };
+    body.push_str(&prov_footer(&node, wire_handle.as_deref()));
     body.push_str("\n</article>\n");
 
-    let banner = crate::pyramid::public_html::ascii_art::get_banner_for_slug(&state, &slug);
+    let banner = crate::pyramid::public_html::ascii_art::get_banner_for_slug(&state, &slug).await;
     page_with_etag(
         &title,
         &body,
@@ -503,13 +640,17 @@ async fn handle_single_node(
 
 async fn handle_search(
     state: Arc<PyramidState>,
+    jwt_public_key: Arc<tokio::sync::RwLock<String>>,
     slug: String,
+    peer: Option<std::net::SocketAddr>,
+    headers: warp::http::HeaderMap,
     query: HashMap<String, String>,
 ) -> warp::reply::Response {
     if slug.starts_with('_') {
         return not_found_page();
     }
-    if let Err(resp) = gate(&state, &slug).await {
+    let auth = resolve_auth(&headers, peer, &state, &jwt_public_key).await;
+    if let Err(resp) = gate(&state, &slug, &auth).await {
         return resp;
     }
 
@@ -535,7 +676,15 @@ async fn handle_search(
 
     if q.is_empty() {
         body.push_str("<p class=\"empty\">Type a query above to search this pyramid.</p>\n");
-        return page(&title, &body, "no-cache, must-revalidate");
+        let banner =
+            crate::pyramid::public_html::ascii_art::get_banner_for_slug(&state, &slug).await;
+        return page_with_etag(
+            &title,
+            &body,
+            "no-cache, must-revalidate",
+            None,
+            banner.as_deref(),
+        );
     }
 
     let conn = state.reader.lock().await;
@@ -581,17 +730,28 @@ async fn handle_search(
         body.push_str("</ul>\n");
     }
 
-    page(&title, &body, "no-cache, must-revalidate")
+    let banner = crate::pyramid::public_html::ascii_art::get_banner_for_slug(&state, &slug).await;
+    page_with_etag(
+        &title,
+        &body,
+        "no-cache, must-revalidate",
+        None,
+        banner.as_deref(),
+    )
 }
 
 async fn handle_tree(
     state: Arc<PyramidState>,
+    jwt_public_key: Arc<tokio::sync::RwLock<String>>,
     slug: String,
+    peer: Option<std::net::SocketAddr>,
+    headers: warp::http::HeaderMap,
 ) -> warp::reply::Response {
     if slug.starts_with('_') {
         return not_found_page();
     }
-    if let Err(resp) = gate(&state, &slug).await {
+    let auth = resolve_auth(&headers, peer, &state, &jwt_public_key).await;
+    if let Err(resp) = gate(&state, &slug, &auth).await {
         return resp;
     }
 
@@ -639,10 +799,14 @@ async fn handle_tree(
 
     if roots.is_empty() {
         body.push_str("<p class=\"empty\">This pyramid has no nodes.</p>\n");
-        return page(
+        let banner =
+            crate::pyramid::public_html::ascii_art::get_banner_for_slug(&state, &slug).await;
+        return page_with_etag(
             &format!("{} — tree", slug),
             &body,
             "no-cache, must-revalidate",
+            None,
+            banner.as_deref(),
         );
     }
 
@@ -674,10 +838,13 @@ async fn handle_tree(
         ));
     }
 
-    page(
+    let banner = crate::pyramid::public_html::ascii_art::get_banner_for_slug(&state, &slug).await;
+    page_with_etag(
         &format!("{} — tree", slug),
         &body,
         "no-cache, must-revalidate",
+        None,
+        banner.as_deref(),
     )
 }
 
@@ -728,12 +895,16 @@ fn render_tree_node(
 
 async fn handle_glossary(
     state: Arc<PyramidState>,
+    jwt_public_key: Arc<tokio::sync::RwLock<String>>,
     slug: String,
+    peer: Option<std::net::SocketAddr>,
+    headers: warp::http::HeaderMap,
 ) -> warp::reply::Response {
     if slug.starts_with('_') {
         return not_found_page();
     }
-    if let Err(resp) = gate(&state, &slug).await {
+    let auth = resolve_auth(&headers, peer, &state, &jwt_public_key).await;
+    if let Err(resp) = gate(&state, &slug, &auth).await {
         return resp;
     }
 
@@ -785,22 +956,29 @@ async fn handle_glossary(
         body.push_str("</dl>\n");
     }
 
-    page(
+    let banner = crate::pyramid::public_html::ascii_art::get_banner_for_slug(&state, &slug).await;
+    page_with_etag(
         &format!("{} — glossary", slug),
         &body,
         "no-cache, must-revalidate",
+        None,
+        banner.as_deref(),
     )
 }
 
 async fn handle_folio(
     state: Arc<PyramidState>,
+    jwt_public_key: Arc<tokio::sync::RwLock<String>>,
     slug: String,
+    peer: Option<std::net::SocketAddr>,
+    headers: warp::http::HeaderMap,
     query: HashMap<String, String>,
 ) -> warp::reply::Response {
     if slug.starts_with('_') {
         return not_found_page();
     }
-    if let Err(resp) = gate(&state, &slug).await {
+    let auth = resolve_auth(&headers, peer, &state, &jwt_public_key).await;
+    if let Err(resp) = gate(&state, &slug, &auth).await {
         return resp;
     }
 
@@ -860,10 +1038,14 @@ async fn handle_folio(
         Some(n) => n,
         None => {
             body.push_str("<p class=\"empty\">This pyramid has no nodes.</p>\n");
-            return page(
+            let banner =
+                crate::pyramid::public_html::ascii_art::get_banner_for_slug(&state, &slug).await;
+            return page_with_etag(
                 &format!("{} — folio", slug),
                 &body,
                 "no-cache, must-revalidate",
+                None,
+                banner.as_deref(),
             );
         }
     };
@@ -889,10 +1071,13 @@ async fn handle_folio(
         ));
     }
 
-    page(
+    let banner = crate::pyramid::public_html::ascii_art::get_banner_for_slug(&state, &slug).await;
+    page_with_etag(
         &format!("{} — folio", slug),
         &body,
         "no-cache, must-revalidate",
+        None,
+        banner.as_deref(),
     )
 }
 
@@ -938,7 +1123,10 @@ fn render_folio_node(
         body.push_str("</ul>\n");
     }
 
-    body.push_str(&prov_footer(node));
+    // P1-6: render-only prov footer for folio uses local: fallback (avoiding
+    // an async DB hop inside this sync recursive helper). The dedicated node
+    // page exposes the resolved Wire handle path.
+    body.push_str(&prov_footer(node, None));
     body.push_str("\n</article>\n");
 
     if node.depth > min_allowed_depth {

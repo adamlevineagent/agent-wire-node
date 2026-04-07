@@ -24,7 +24,8 @@
 //! `/navigate` endpoint.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use warp::filters::BoxedFilter;
 use warp::http::StatusCode;
@@ -136,6 +137,41 @@ pub fn make_commit_token(
     question: &str,
 ) -> String {
     commit_token_at(secret, user_id, slug, question, epoch_minute_div5())
+}
+
+// ── One-shot commit-token consumption (P1-12) ───────────────────────────
+//
+// A commit_token is HMAC-bound to a 5–10 minute window, so the same operator
+// could replay the second-step POST and trigger absorption_rate_limit charges
+// repeatedly. We add a process-local consumed-set keyed on the token; the
+// first successful commit inserts the token, subsequent commits with the
+// same value are rejected. Entries are GC'd after 15 minutes (token TTL is
+// at most ~10 minutes; the GC just bounds memory).
+
+const COMMIT_TOKEN_TTL: Duration = Duration::from_secs(15 * 60);
+
+static CONSUMED_TOKENS: OnceLock<StdMutex<HashMap<String, Instant>>> = OnceLock::new();
+
+fn consumed_tokens() -> &'static StdMutex<HashMap<String, Instant>> {
+    CONSUMED_TOKENS.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+/// Try to mark a commit_token as consumed. Returns `true` if this is the
+/// first time we've seen it (callers should proceed); `false` if it was
+/// already consumed (callers should reject as a replay).
+fn mark_token_consumed(token: &str) -> bool {
+    let now = Instant::now();
+    let mut map = match consumed_tokens().lock() {
+        Ok(m) => m,
+        Err(p) => p.into_inner(),
+    };
+    // Lazy GC: drop expired entries while we hold the lock.
+    map.retain(|_, ts| now.duration_since(*ts) < COMMIT_TOKEN_TTL);
+    if map.contains_key(token) {
+        return false;
+    }
+    map.insert(token.to_string(), now);
+    true
 }
 
 /// Constant-time verification accepting the current OR previous 5-minute
@@ -611,6 +647,15 @@ async fn handle_ask_post(
     if !verify_commit_token(&state.csrf_secret, &commit_token, &op_id, &slug, &question) {
         return Ok(bad_request_page(
             "Commit token expired or does not match this question — please ask again.",
+        ));
+    }
+
+    // P1-12: one-shot consumption. Reject token replay within the
+    // 5-10 minute HMAC window so the same preview cannot be re-submitted
+    // multiple times to charge absorption_rate_limit repeatedly.
+    if !mark_token_consumed(&commit_token) {
+        return Ok(bad_request_page(
+            "This preview was already submitted — re-ask to get a fresh preview.",
         ));
     }
 

@@ -648,3 +648,26 @@ footer.site {
 /* ============================================================
  * end app.css
  * ============================================================ */
+
+/* ---------- Login (WS-E) ---------- */
+.login-form input[type="email"],
+.login-form input[type="text"] {
+    font-size: 1em;
+    padding: 0.5em;
+    width: 100%;
+    box-sizing: border-box;
+    margin: 0.25em 0 1em;
+}
+.login-form button {
+    font-size: 1em;
+    padding: 0.6em 1.2em;
+    cursor: pointer;
+}
+.login-error {
+    color: var(--gap, #a00);
+    margin: 1em 0;
+}
+.login-muted {
+    color: var(--dim, #666);
+    font-size: 0.9em;
+}

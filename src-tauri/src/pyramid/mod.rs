@@ -129,6 +129,9 @@ pub struct PyramidConfig {
     /// Effectful plans (builds, writes, costs) always show preview regardless.
     #[serde(default)]
     pub auto_execute: bool,
+    /// Custom semantic aliases mapping an arbitrary `model_tier` string to a model.
+    #[serde(default)]
+    pub model_aliases: HashMap<String, String>,
 }
 
 fn default_primary_model() -> String {
@@ -487,6 +490,7 @@ impl Default for PyramidConfig {
             absorption_rate_limit_per_operator: default_absorption_rate_limit(),
             absorption_daily_spend_cap: default_absorption_daily_cap(),
             auto_execute: false,
+            model_aliases: HashMap::new(),
         }
     }
 }
@@ -512,6 +516,41 @@ impl PyramidConfig {
         Ok(())
     }
 
+    /// Load a profile JSON file and apply it over the current config.
+    pub fn apply_profile(&mut self, profile_name: &str, data_dir: &Path) -> anyhow::Result<()> {
+        let profiles_dir = data_dir.join("profiles");
+        let profile_path = profiles_dir.join(format!("{}.json", profile_name));
+        
+        if !profile_path.exists() {
+            return Err(anyhow::anyhow!("Profile '{}' not found at {:?}", profile_name, profile_path));
+        }
+
+        let contents = std::fs::read_to_string(&profile_path)?;
+        let patch: serde_json::Value = serde_json::from_str(&contents)?;
+
+        // Recursive deep merge
+        fn merge(a: &mut serde_json::Value, b: serde_json::Value) {
+            match (a, b) {
+                (serde_json::Value::Object(a_obj), serde_json::Value::Object(b_obj)) => {
+                    for (k, v) in b_obj {
+                        if a_obj.contains_key(&k) {
+                            merge(a_obj.get_mut(&k).unwrap(), v);
+                        } else {
+                            a_obj.insert(k, v);
+                        }
+                    }
+                }
+                (a, b) => *a = b,
+            }
+        }
+
+        let mut current_json = serde_json::to_value(&*self)?;
+        merge(&mut current_json, patch);
+        
+        *self = serde_json::from_value(current_json)?;
+        Ok(())
+    }
+
     /// Convert to an LlmConfig for use with the build pipeline.
     pub fn to_llm_config(&self) -> LlmConfig {
         LlmConfig {
@@ -532,6 +571,7 @@ impl PyramidConfig {
             rate_limit_max_requests: self.operational.tier1.llm_rate_limit_max_requests,
             rate_limit_window_secs: self.operational.tier1.llm_rate_limit_window_secs,
             llm_debug_logging: self.operational.tier1.llm_debug_logging,
+            model_aliases: self.model_aliases.clone(),
         }
     }
 }

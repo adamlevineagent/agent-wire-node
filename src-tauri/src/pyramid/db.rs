@@ -1550,8 +1550,22 @@ pub fn update_slug_stats(conn: &Connection, slug: &str) -> Result<()> {
         "UPDATE pyramid_slugs SET
             node_count = (SELECT COUNT(*) FROM live_pyramid_nodes WHERE slug = ?1),
             max_depth = COALESCE((SELECT MAX(depth) FROM live_pyramid_nodes WHERE slug = ?1), 0),
-            last_built_at = datetime('now')
+            last_built_at = datetime('now'),
+            updated_at = datetime('now')
          WHERE slug = ?1",
+        rusqlite::params![slug],
+    )?;
+    Ok(())
+}
+
+/// Bump `pyramid_slugs.updated_at` for cache-busting purposes (the public web
+/// surface ETags pyramid pages on this column). Best-effort: failures are
+/// non-fatal — the cache just stays slightly fresh longer than necessary.
+/// Call from any site that mutates a slug's visible content (banner replace,
+/// access tier change, absorption mode change, contribution writes, etc.).
+pub fn touch_slug(conn: &Connection, slug: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE pyramid_slugs SET updated_at = datetime('now') WHERE slug = ?1",
         rusqlite::params![slug],
     )?;
     Ok(())
@@ -5025,7 +5039,7 @@ pub fn set_absorption_mode(
     chain_id: Option<&str>,
 ) -> Result<()> {
     conn.execute(
-        "UPDATE pyramid_slugs SET absorption_mode = ?1, absorption_chain_id = ?2 WHERE slug = ?3",
+        "UPDATE pyramid_slugs SET absorption_mode = ?1, absorption_chain_id = ?2, updated_at = datetime('now') WHERE slug = ?3",
         rusqlite::params![mode, chain_id, slug],
     )?;
     Ok(())
@@ -5070,7 +5084,7 @@ pub fn set_access_tier(
     circles: Option<&str>,
 ) -> Result<()> {
     conn.execute(
-        "UPDATE pyramid_slugs SET access_tier = ?1, access_price = ?2, allowed_circles = ?3 WHERE slug = ?4",
+        "UPDATE pyramid_slugs SET access_tier = ?1, access_price = ?2, allowed_circles = ?3, updated_at = datetime('now') WHERE slug = ?4",
         rusqlite::params![tier, price, circles, slug],
     )?;
     Ok(())
@@ -6334,6 +6348,31 @@ mod tests {
         assert_eq!(info.node_count, 4);
         assert_eq!(info.max_depth, 1);
         assert!(info.last_built_at.is_some());
+    }
+
+    #[test]
+    fn test_touch_slug_bumps_updated_at() {
+        let conn = test_conn();
+        create_slug(&conn, "s", &ContentType::Code, "").unwrap();
+
+        let read_updated = |c: &Connection| -> String {
+            c.query_row(
+                "SELECT updated_at FROM pyramid_slugs WHERE slug = ?1",
+                rusqlite::params!["s"],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap()
+        };
+
+        let before = read_updated(&conn);
+        // sqlite datetime('now') has 1-second resolution; sleep just over 1s.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        touch_slug(&conn, "s").unwrap();
+        let after = read_updated(&conn);
+        assert_ne!(
+            before, after,
+            "touch_slug must bump pyramid_slugs.updated_at"
+        );
     }
 
     #[test]

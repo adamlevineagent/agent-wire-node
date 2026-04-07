@@ -453,6 +453,15 @@ Arguments:
 
 Shows which agents have been exploring, when they were last active,
 and how many actions they took.`,
+
+  "config-profile": `config-profile — Apply a backend config profile
+
+Usage: pyramid-cli config-profile <name>
+
+Arguments:
+  <name>      Profile name (e.g., 'blended' applies profiles/blended.json)
+
+Applies model and context limits from the specified JSON profile.`,
 };
 
 // ── Auth ─────────────────────────────────────────────────────────────────────
@@ -558,6 +567,12 @@ async function run(): Promise<void> {
   }
 
   switch (command) {
+    case "config-profile": {
+      const name = requireArg(1, "name");
+      output(await pf(`/pyramid/config/profile/${enc(name)}`, { method: "POST" }));
+      break;
+    }
+
     case "health": {
       output(await pf("/health"));
       break;

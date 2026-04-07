@@ -45,9 +45,9 @@ pub fn routes(
 ) -> warp::filters::BoxedFilter<(warp::reply::Response,)> {
     let assets = routes_assets::asset_routes(state.clone());
     let login = routes_login::login_routes(state.clone());
-    let ws = routes_ws::ws_route(state.clone());
+    let ws = routes_ws::ws_route(state.clone(), jwt_public_key.clone());
     let ask = routes_ask::ask_routes(state.clone(), jwt_public_key.clone());
-    let read = routes_read::read_routes(state.clone());
+    let read = routes_read::read_routes(state.clone(), jwt_public_key.clone());
 
     // Literal-prefix matches first, catchall last. Each `.or()` is followed
     // by `.unify()` to keep the tuple shape `(Response,)` flat. `_ask` is a

@@ -7,7 +7,7 @@ version: "2.0.0"
 author: "wire-node"
 
 defaults:
-  model_tier: mid
+  model_tier: synth_heavy
   temperature: 0.3
   on_error: "retry(2)"
 
@@ -41,6 +41,7 @@ steps:
     on_error: "retry(3)"
     on_parse_error: "heal"
     heal_instruction: "$prompts/shared/heal_json.md"
+    model_tier: extractor
 
   # ── Phase 2: L0 webbing (first question only) ──────────────────────
   # Build corpus structure map before decomposition. Token-aware
@@ -85,7 +86,7 @@ steps:
       additionalProperties: false
     depth: 0
     save_as: web_edges
-    model_tier: mid
+    model_tier: web
     temperature: 0.2
     on_error: "skip"
     when: "$load_prior_state.l0_count == 0"
@@ -203,7 +204,7 @@ steps:
     response_schema: *web_schema
     depth: 1
     save_as: web_edges
-    model_tier: mid
+    model_tier: web
     temperature: 0.2
     on_error: "skip"
 
@@ -221,7 +222,7 @@ steps:
     response_schema: *web_schema
     depth: 2
     save_as: web_edges
-    model_tier: mid
+    model_tier: web
     temperature: 0.2
     on_error: "skip"
 

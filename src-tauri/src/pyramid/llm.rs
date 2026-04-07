@@ -107,6 +107,8 @@ pub struct LlmConfig {
     pub rate_limit_window_secs: f64,
     /// When true, log full LLM response bodies for failed/truncated calls to the debug log file.
     pub llm_debug_logging: bool,
+    /// Custom aliases mapping a "model_tier" string to a specific model.
+    pub model_aliases: std::collections::HashMap<String, String>,
 }
 
 impl Default for LlmConfig {
@@ -129,6 +131,7 @@ impl Default for LlmConfig {
             rate_limit_max_requests: 20,
             rate_limit_window_secs: 5.0,
             llm_debug_logging: false,
+            model_aliases: std::collections::HashMap::new(),
         }
     }
 }

@@ -22,7 +22,11 @@
 //! frame (matching [`TaggedKind::Resync`]) and continues forwarding events.
 
 use crate::pyramid::event_bus::{TaggedBuildEvent, TaggedKind};
-use crate::pyramid::public_html::auth::{enforce_public_tier, PublicAuthSource};
+use crate::pyramid::public_html::auth::{
+    client_key, enforce_public_tier, read_cookie, PublicAuthSource, ANON_SESSION_COOKIE,
+    WIRE_SESSION_COOKIE,
+};
+use crate::pyramid::public_html::rate_limit;
 use crate::pyramid::PyramidState;
 use futures_util::sink::SinkExt;
 use futures_util::stream::{SplitSink, StreamExt};
@@ -42,6 +46,7 @@ use warp::Filter;
 /// `.and(WS-A::enforce_public_tier)` once that filter lands.
 pub fn ws_route(
     state: Arc<PyramidState>,
+    jwt_public_key: Arc<tokio::sync::RwLock<String>>,
 ) -> warp::filters::BoxedFilter<(warp::reply::Response,)> {
     warp::get()
         .and(warp::path("p"))
@@ -49,23 +54,36 @@ pub fn ws_route(
         .and(warp::path("_ws"))
         .and(warp::path::end())
         .and(warp::ws())
+        .and(warp::filters::addr::remote())
+        .and(warp::header::headers_cloned())
         .and(with_state(state))
+        .and(warp::any().map(move || jwt_public_key.clone()))
         .and_then(
-            |slug: String, ws: warp::ws::Ws, state: Arc<PyramidState>| async move {
-                // Public-tier gate (Pillar 25, verification criterion 15):
-                // priced/embargoed/circle-scoped slugs must NOT leak build
-                // progress to anonymous WS clients. Until WS-A's
-                // `with_public_or_session_auth` is composed in by WS-C, we
-                // hard-gate every WS upgrade as Anonymous — which is the
-                // strictest path through `enforce_public_tier` and matches
-                // the actual identity of every browser-initiated WS handshake
-                // (no Authorization header on the upgrade).
-                let anon = PublicAuthSource::Anonymous {
-                    client_key: String::new(),
-                };
-                if enforce_public_tier(&state, &slug, &anon).await.is_err() {
+            |slug: String,
+             ws: warp::ws::Ws,
+             peer: Option<std::net::SocketAddr>,
+             headers: warp::http::HeaderMap,
+             state: Arc<PyramidState>,
+             jwt_pk: Arc<tokio::sync::RwLock<String>>| async move {
+                // Resolve auth — at minimum we want a real client_key for
+                // Anonymous so per-IP rate limits are not a single global
+                // bucket. WebSocket upgrades carry the same cookies as a
+                // regular GET, so wire_session / anon_session both apply.
+                let auth = resolve_auth(&headers, peer, &state, &jwt_pk).await;
+                if enforce_public_tier(&state, &slug, &auth).await.is_err() {
                     let resp = warp::http::Response::builder()
                         .status(StatusCode::NOT_FOUND)
+                        .body(warp::hyper::Body::empty())
+                        .unwrap();
+                    return Ok::<_, warp::Rejection>(resp);
+                }
+                // P1-9: rate-limit the WS upgrade itself. Otherwise a
+                // malicious client can open thousands of connections.
+                let rl = rate_limit::global();
+                if let Err(e) = rate_limit::check_for_reads(&rl, &auth).await {
+                    let resp = warp::http::Response::builder()
+                        .status(StatusCode::TOO_MANY_REQUESTS)
+                        .header("Retry-After", e.retry_after.to_string())
                         .body(warp::hyper::Body::empty())
                         .unwrap();
                     return Ok::<_, warp::Rejection>(resp);
@@ -75,6 +93,57 @@ pub fn ws_route(
             },
         )
         .boxed()
+}
+
+async fn resolve_auth(
+    headers: &warp::http::HeaderMap,
+    peer: Option<std::net::SocketAddr>,
+    state: &PyramidState,
+    jwt_public_key: &Arc<tokio::sync::RwLock<String>>,
+) -> PublicAuthSource {
+    use crate::http_utils::ct_eq;
+    if let Some(h) = headers.get("authorization").and_then(|h| h.to_str().ok()) {
+        if let Some(token) = h.strip_prefix("Bearer ") {
+            let local = { state.config.read().await.auth_token.clone() };
+            if !local.is_empty() && ct_eq(token, &local) {
+                return PublicAuthSource::LocalOperator;
+            }
+            if token.matches('.').count() == 2 {
+                let pk_str = jwt_public_key.read().await;
+                if !pk_str.is_empty() {
+                    if let Ok(claims) = crate::server::verify_pyramid_query_jwt(token, &pk_str) {
+                        let operator_id = claims.operator_id.unwrap_or_default();
+                        let circle_id = claims.circle_id;
+                        return PublicAuthSource::WireOperator {
+                            operator_id,
+                            circle_id,
+                        };
+                    }
+                }
+            }
+        }
+    }
+    if let Some(wire_tok) = read_cookie(headers, WIRE_SESSION_COOKIE) {
+        if !wire_tok.is_empty() {
+            let sess_opt = {
+                let conn = state.reader.lock().await;
+                crate::pyramid::public_html::web_sessions::lookup(&conn, &wire_tok)
+                    .ok()
+                    .flatten()
+            };
+            if let Some(sess) = sess_opt {
+                let anon_tok = read_cookie(headers, ANON_SESSION_COOKIE).unwrap_or_default();
+                return PublicAuthSource::WebSession {
+                    user_id: sess.supabase_user_id,
+                    email: sess.email,
+                    anon_session_token: anon_tok,
+                };
+            }
+        }
+    }
+    PublicAuthSource::Anonymous {
+        client_key: client_key(headers, peer),
+    }
 }
 
 fn with_state(
@@ -101,6 +170,13 @@ async fn handle_ws(socket: WebSocket, slug: String, state: Arc<PyramidState>) {
     let mut pending_progress: Option<TaggedKind> = None;
     let mut pending_v2: Option<TaggedKind> = None;
     let mut flush_deadline: Option<tokio::time::Instant> = None;
+
+    // P1-7: heartbeat. cloudflared kills idle WS at ~100s — send a ping
+    // every 30s so the tunnel stays open even when no events flow.
+    let mut ping_ticker = tokio::time::interval(Duration::from_secs(30));
+    ping_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Skip the immediate first tick so we don't ping a freshly-opened socket.
+    ping_ticker.tick().await;
 
     loop {
         // Compute the next flush time. If nothing pending, wait indefinitely
@@ -167,7 +243,14 @@ async fn handle_ws(socket: WebSocket, slug: String, state: Arc<PyramidState>) {
                 }
             }
 
-            // 3) Coalesce window elapsed — flush whatever's pending.
+            // 3) Heartbeat tick — send a ping to keep cloudflared alive.
+            _ = ping_ticker.tick() => {
+                if ws_tx.send(Message::ping(Vec::new())).await.is_err() {
+                    break;
+                }
+            }
+
+            // 4) Coalesce window elapsed — flush whatever's pending.
             _ = tokio::time::sleep_until(sleep_until), if flush_deadline.is_some() => {
                 if let Some(kind) = pending_progress.take() {
                     let payload = TaggedBuildEvent { slug: slug.clone(), kind };

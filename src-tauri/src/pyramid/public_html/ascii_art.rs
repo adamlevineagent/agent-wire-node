@@ -286,13 +286,18 @@ pub fn insert_with_supersession(
     }
 
     tx.commit()?;
+
+    // Best-effort cache bust: bump pyramid_slugs.updated_at so the public
+    // /p/ ETag turns over and the new banner becomes visible immediately.
+    let _ = crate::pyramid::db::touch_slug(conn, slug);
+
     Ok(new_id)
 }
 
-/// Non-blocking fetch of the current banner (for render.rs / future endpoint).
-/// Returns None if the reader lock would block or no banner exists.
-pub fn get_banner_for_slug(state: &PyramidState, slug: &str) -> Option<String> {
-    let conn = state.reader.try_lock().ok()?;
+/// Async fetch of the current banner. Awaits the reader lock so the banner
+/// stays visible during concurrent reads (was previously try_lock → flicker).
+pub async fn get_banner_for_slug(state: &PyramidState, slug: &str) -> Option<String> {
+    let conn = state.reader.lock().await;
     lookup_head(&conn, slug, "banner")
         .ok()
         .flatten()

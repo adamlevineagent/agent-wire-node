@@ -354,7 +354,13 @@ pub struct ValidationResult {
 }
 
 const VALID_CONTENT_TYPES: &[&str] = &["conversation", "code", "document", "question"];
-const VALID_MODEL_TIERS: &[&str] = &["low", "mid", "high", "max"];
+// Includes the legacy numeric tiers (low/mid/high/max) plus the semantic
+// aliases used by the LLM-profile system (extractor/synth_heavy/web).
+// See docs/semantic_aliasing_audit_results.md for the rationale.
+const VALID_MODEL_TIERS: &[&str] = &[
+    "low", "mid", "high", "max",
+    "extractor", "synth_heavy", "web",
+];
 
 /// Validate a chain definition, returning errors and warnings.
 pub fn validate_chain(def: &ChainDefinition) -> ValidationResult {

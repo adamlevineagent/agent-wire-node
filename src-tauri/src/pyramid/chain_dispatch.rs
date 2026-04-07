@@ -83,11 +83,18 @@ fn resolve_model(step: &ChainStep, defaults: &ChainDefaults, config: &LlmConfig)
             return model.clone();
         }
     }
-    // Map tier to actual model
+    // Map tier or alias to actual model
     let tier = step
         .model_tier
         .as_deref()
         .unwrap_or(defaults.model_tier.as_str());
+        
+    // 1. Check custom aliases first
+    if let Some(model) = config.model_aliases.get(tier) {
+        return model.clone();
+    }
+    
+    // 2. Fall back to standard legacy tiers
     match tier {
         "low" | "mid" => config.primary_model.clone(),
         "high" => config.fallback_model_1.clone(),
@@ -557,6 +564,11 @@ pub fn resolve_ir_model(reqs: &ModelRequirements, config: &LlmConfig) -> String 
     }
     // Map tier to actual model
     let tier = reqs.tier.as_deref().unwrap_or("mid");
+    
+    if let Some(model) = config.model_aliases.get(tier) {
+        return model.clone();
+    }
+    
     match tier {
         "low" | "mid" => config.primary_model.clone(),
         "high" => config.fallback_model_1.clone(),
@@ -589,6 +601,12 @@ fn resolve_ir_context_limit(
         return tier1.high_tier_context_limit;
     }
     let tier = reqs.tier.as_deref().unwrap_or("mid");
+    
+    // If it's explicitly overridden by an alias, use the high limit
+    if config.model_aliases.contains_key(tier) {
+        return tier1.high_tier_context_limit;
+    }
+    
     match tier {
         "low" | "mid" => config.primary_context_limit,
         "high" => tier1.high_tier_context_limit,
@@ -618,6 +636,12 @@ fn resolve_context_limit(
         .model_tier
         .as_deref()
         .unwrap_or(defaults.model_tier.as_str());
+        
+    // If it's explicitly overridden by an alias, use the high limit
+    if config.model_aliases.contains_key(tier) {
+        return tier1.high_tier_context_limit;
+    }
+        
     match tier {
         "low" | "mid" => config.primary_context_limit,
         "high" => tier1.high_tier_context_limit,

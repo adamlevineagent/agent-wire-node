@@ -839,6 +839,16 @@ pub fn pyramid_routes(
         .and(warp::body::json())
         .and_then(handle_config));
 
+    // POST /pyramid/config/profile/:name
+    let config_profile_route = route!(prefix
+        .and(warp::path("config"))
+        .and(warp::path("profile"))
+        .and(warp::path::param::<String>())
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_config_profile));
+
     // REMOTE-SAFE: GET /pyramid/:slug/threads — read-only, dual auth
     let threads = route!(prefix
         .and(warp::path::param::<String>())
@@ -1372,7 +1382,7 @@ pub fn pyramid_routes(
     let r5 = drill.or(search).unify().boxed();
     let r6 = entities.or(resolved).unify().boxed();
     let r7 = corrections.or(terms).unify().boxed();
-    let r8 = ingest_route.or(config_route).unify().boxed();
+    let r8 = ingest_route.or(config_route).unify().or(config_profile_route).unify().boxed();
     let r9 = threads.or(archive_slug_route).unify().boxed();
     let r31 = purge_slug_route.or(slug_references_route).unify().boxed();
     let r10 = annotate.or(annotations).unify().boxed();
@@ -2465,6 +2475,47 @@ async fn handle_config(
         "fallback_model_2": config.fallback_model_2,
         "use_ir_executor": state.use_ir_executor.load(std::sync::atomic::Ordering::Relaxed),
     })))
+}
+
+async fn handle_config_profile(
+    profile_name: String,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let mut config_lock = state.config.write().await;
+    
+    if let Some(ref data_dir) = state.data_dir {
+        let mut pyramid_config = super::PyramidConfig::load(data_dir);
+        
+        if let Err(e) = pyramid_config.apply_profile(&profile_name, data_dir) {
+            tracing::error!("Failed to apply profile '{}': {}", profile_name, e);
+            return Ok(json_error(
+                warp::http::StatusCode::BAD_REQUEST,
+                &format!("Failed to apply profile: {e}"),
+            ));
+        }
+        
+        if let Err(e) = pyramid_config.save(data_dir) {
+            tracing::error!("Failed to save config after applying profile: {e}");
+            return Ok(json_error(
+                warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Failed to save config: {e}"),
+            ));
+        }
+        
+        // Update the running LlmConfig
+        *config_lock = pyramid_config.to_llm_config();
+        
+        Ok(json_ok(&serde_json::json!({
+            "status": "profile_applied",
+            "profile": profile_name,
+            "pyramid_config": pyramid_config
+        })))
+    } else {
+        Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "Missing data_dir in PyramidState",
+        ))
+    }
 }
 
 async fn handle_archive_slug(

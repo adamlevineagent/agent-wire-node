@@ -5273,6 +5273,85 @@ async fn pyramid_generate_ascii_banner(
     .await
 }
 
+/// Owner-mode bridge: mint a one-time `web_sessions` row whose
+/// supabase_user_id carries the local-operator sentinel, then return a
+/// tunnel URL that consumes the token, sets the wire_session cookie, and
+/// redirects to the requested pyramid. The auth filter recognizes the
+/// sentinel and grants LocalOperator privileges (full operator access,
+/// billing-exempt) to every subsequent request.
+///
+/// The desktop app's "Open as owner" button invokes this command, then
+/// shells out to the returned URL via tauri::api::shell::open. Tokens
+/// expire after 60 seconds (one-time consume + short TTL).
+#[tauri::command]
+async fn pyramid_open_web_as_owner(
+    slug: Option<String>,
+    state: tauri::State<'_, SharedState>,
+) -> Result<String, String> {
+    use wire_node_lib::pyramid::public_html::auth::LOCAL_OPERATOR_SENTINEL_PREFIX;
+    use wire_node_lib::pyramid::public_html::web_sessions;
+
+    // Determine tunnel URL: read from tunnel_state (set by tunnel.rs at start).
+    let tunnel_url = {
+        let ts = state.tunnel_state.read().await;
+        ts.tunnel_url.clone()
+    };
+    let base = match tunnel_url {
+        Some(u) if !u.is_empty() => u,
+        _ => {
+            return Err(
+                "No tunnel URL is set. Make sure the Cloudflare tunnel is running."
+                    .to_string(),
+            );
+        }
+    };
+
+    // Build the owner-mode supabase_user_id sentinel (operator email if known,
+    // else a synthetic id). Email is purely informational on this row.
+    let (operator_email, operator_id_part) = {
+        let auth = state.auth.read().await;
+        let email = auth
+            .email
+            .clone()
+            .unwrap_or_else(|| "owner@local".to_string());
+        let id = auth
+            .operator_id
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        (email, id)
+    };
+    let sentinel_user_id = format!("{}{}", LOCAL_OPERATOR_SENTINEL_PREFIX, operator_id_part);
+
+    // Insert a 60-second TTL row into web_sessions; the returned token IS
+    // the cookie value the bridge will set.
+    let token = {
+        let conn = state.pyramid.writer.lock().await;
+        web_sessions::create(&conn, &sentinel_user_id, &operator_email, 60)
+            .map_err(|e| format!("failed to mint owner session: {}", e))?
+    };
+
+    let return_slug = slug
+        .filter(|s| {
+            !s.is_empty()
+                && !s.starts_with('_')
+                && s.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        })
+        .unwrap_or_default();
+
+    let url = if return_slug.is_empty() {
+        format!("{}/p/_owner_login?token={}", base.trim_end_matches('/'), token)
+    } else {
+        format!(
+            "{}/p/_owner_login?token={}&return={}",
+            base.trim_end_matches('/'),
+            token,
+            return_slug
+        )
+    };
+    Ok(url)
+}
+
 #[tauri::command]
 async fn pyramid_get_config(
     state: tauri::State<'_, SharedState>,
@@ -7326,6 +7405,7 @@ fn main() {
             pyramid_delete_slug,
             pyramid_get_config,
             pyramid_generate_ascii_banner,
+            pyramid_open_web_as_owner,
             pyramid_test_api_key,
             test_remote_connection,
             get_app_version,

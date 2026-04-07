@@ -538,6 +538,50 @@ export function PyramidPublicationStatus() {
                                             {unpinningSlug === p.slug ? "Unpinning..." : "Unpin"}
                                         </button>
                                     )}
+
+                                    {/* Post-agents-retro: open public web surface as owner */}
+                                    {!p.pinned && (
+                                        <button
+                                            className="folder-publish-btn"
+                                            onClick={async () => {
+                                                try {
+                                                    const url = await invoke<string>(
+                                                        "pyramid_open_web_as_owner",
+                                                        { slug: p.slug }
+                                                    );
+                                                    window.open(url, "_blank");
+                                                } catch (e) {
+                                                    alert(`Owner-mode open failed: ${e}`);
+                                                }
+                                            }}
+                                            title="Open this pyramid in your browser as the operator (full ask + ASCII-art access)"
+                                        >
+                                            Open as Owner
+                                        </button>
+                                    )}
+
+                                    {/* Post-agents-retro: generate Grok-4.2 ASCII banner */}
+                                    {!p.pinned && (
+                                        <button
+                                            className="folder-publish-btn"
+                                            onClick={async () => {
+                                                try {
+                                                    const art = await invoke<string>(
+                                                        "pyramid_generate_ascii_banner",
+                                                        { slug: p.slug }
+                                                    );
+                                                    alert(
+                                                        `Banner generated for ${p.slug}:\n\n${art.slice(0, 200)}${art.length > 200 ? "\n…" : ""}`
+                                                    );
+                                                } catch (e) {
+                                                    alert(`Banner generation failed: ${e}`);
+                                                }
+                                            }}
+                                            title="Generate (or refresh) the Grok-4.2 ASCII art banner shown atop the pyramid's web page"
+                                        >
+                                            Generate Banner
+                                        </button>
+                                    )}
                                 </div>
                             </div>
 

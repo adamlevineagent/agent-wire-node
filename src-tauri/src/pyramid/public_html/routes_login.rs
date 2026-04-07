@@ -18,7 +18,8 @@ use std::sync::Arc;
 
 use warp::Filter;
 use warp::filters::BoxedFilter;
-use warp::http::{Response, StatusCode, header};
+use warp::http::{StatusCode, header};
+use warp::reply::Response as WarpResponse;
 
 use crate::pyramid::PyramidState;
 use crate::pyramid::public_html::auth::{
@@ -27,6 +28,7 @@ use crate::pyramid::public_html::auth::{
     verify_csrf,
 };
 use crate::pyramid::public_html::rate_limit;
+use crate::pyramid::public_html::render::{esc, page_with_etag};
 use crate::pyramid::public_html::web_sessions;
 
 /// Validate that a slug only contains characters safe for both DB lookup and
@@ -44,94 +46,69 @@ fn slug_is_safe(slug: &str) -> bool {
         .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
-fn bad_slug_page() -> Response<String> {
-    let body = page(
+/// Build a login-page response using `render::page_with_etag` so the global
+/// CSP, nosniff, and referrer-policy headers are applied uniformly. All
+/// cookie-issuing pages use `no-store`.
+fn login_page(title: &str, inner: &str, status: StatusCode) -> WarpResponse {
+    let mut resp = page_with_etag(title, inner, "no-store", None, None);
+    *resp.status_mut() = status;
+    resp
+}
+
+fn bad_slug_page() -> WarpResponse {
+    login_page(
         "Not found",
         "<h1>Not found</h1><p>Unknown pyramid.</p>",
-    );
-    html_response(StatusCode::NOT_FOUND, body)
-}
-
-fn rate_limited_page(retry_after: u64) -> Response<String> {
-    let body = page(
-        "Slow down",
-        &format!(
-            "<h1>Slow down</h1><p class=\"err\">Too many login attempts. \
-             Try again in {}s.</p>",
-            retry_after
-        ),
-    );
-    Response::builder()
-        .status(StatusCode::TOO_MANY_REQUESTS)
-        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
-        .header("Retry-After", retry_after.to_string())
-        .body(body)
-        .unwrap()
-}
-
-// ── small HTML helpers ──────────────────────────────────────────────────
-
-fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#39;")
-}
-
-fn html_response(status: StatusCode, body: String) -> Response<String> {
-    Response::builder()
-        .status(status)
-        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
-        .body(body)
-        .unwrap()
-}
-
-fn page(title: &str, inner: &str) -> String {
-    format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\">\
-         <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
-         <title>{title}</title>\
-         <style>body{{font-family:system-ui,sans-serif;max-width:480px;margin:4em auto;padding:0 1em;color:#222}}\
-         h1{{font-size:1.4em}}input{{font-size:1em;padding:.5em;width:100%;box-sizing:border-box;margin:.25em 0 1em}}\
-         button{{font-size:1em;padding:.6em 1.2em;cursor:pointer}}\
-         .err{{color:#a00;margin:1em 0}}.muted{{color:#666;font-size:.9em}}</style>\
-         </head><body>{inner}</body></html>",
-        title = html_escape(title),
-        inner = inner,
+        StatusCode::NOT_FOUND,
     )
 }
 
-fn not_configured_page() -> Response<String> {
-    let body = page(
+fn rate_limited_page(retry_after: u64) -> WarpResponse {
+    let body = format!(
+        "<h1>Slow down</h1><p class=\"login-error\">Too many login attempts. \
+         Try again in {}s.</p>",
+        retry_after
+    );
+    let mut resp = login_page("Slow down", &body, StatusCode::TOO_MANY_REQUESTS);
+    if let Ok(hv) = warp::http::HeaderValue::from_str(&retry_after.to_string()) {
+        resp.headers_mut().insert("retry-after", hv);
+    }
+    resp
+}
+
+fn not_configured_page() -> WarpResponse {
+    login_page(
         "Login unavailable",
         "<h1>Login unavailable</h1>\
          <p>OTP login is not configured on this node — contact the operator.</p>",
-    );
-    html_response(StatusCode::SERVICE_UNAVAILABLE, body)
+        StatusCode::SERVICE_UNAVAILABLE,
+    )
 }
 
-fn error_page(slug: &str, message: &str) -> Response<String> {
-    let body = page(
-        "Login error",
-        &format!(
-            "<h1>Login error</h1><p class=\"err\">{}</p>\
-             <p><a href=\"/p/{}/_login\">Try again</a></p>",
-            html_escape(message),
-            html_escape(slug),
-        ),
+fn error_page(slug: &str, message: &str) -> WarpResponse {
+    let body = format!(
+        "<h1>Login error</h1><p class=\"login-error\">{}</p>\
+         <p><a href=\"/p/{}/_login\">Try again</a></p>",
+        esc(message),
+        esc(slug),
     );
-    html_response(StatusCode::BAD_REQUEST, body)
+    login_page("Login error", &body, StatusCode::BAD_REQUEST)
 }
 
-fn redirect_to(slug: &str, set_cookie: Option<String>) -> Response<String> {
-    let mut b = Response::builder()
+fn redirect_to(slug: &str, set_cookie: Option<String>) -> WarpResponse {
+    let mut b = warp::http::Response::builder()
         .status(StatusCode::SEE_OTHER)
         .header(header::LOCATION, format!("/p/{}", slug));
     if let Some(c) = set_cookie {
         b = b.header(header::SET_COOKIE, c);
     }
-    b.body(String::new()).unwrap()
+    b.body(warp::hyper::Body::empty()).unwrap()
+}
+
+fn attach_set_cookie(resp: &mut WarpResponse, cookie: &str) {
+    if let Ok(hv) = warp::http::HeaderValue::from_str(cookie) {
+        resp.headers_mut().append(header::SET_COOKIE, hv);
+    }
 }
 
 // ── Identity / cookie helpers ────────────────────────────────────────────
@@ -158,32 +135,31 @@ fn supabase_creds(state: &PyramidState) -> Option<(String, String)> {
 
 fn email_form_html(slug: &str, csrf: &str, error: Option<&str>) -> String {
     let err_block = error
-        .map(|e| format!("<p class=\"err\">{}</p>", html_escape(e)))
+        .map(|e| format!("<p class=\"login-error\">{}</p>", esc(e)))
         .unwrap_or_default();
-    let inner = format!(
+    format!(
         "<h1>Sign in</h1>\
          {err_block}\
-         <form method=\"post\" action=\"/p/{slug}/_login\">\
+         <form class=\"login-form\" method=\"post\" action=\"/p/{slug}/_login\">\
            <input type=\"hidden\" name=\"csrf\" value=\"{csrf}\">\
            <label>Email<input type=\"email\" name=\"email\" required autofocus></label>\
            <button type=\"submit\">Send code</button>\
          </form>\
-         <p class=\"muted\">We will email you a 6-digit code.</p>",
-        slug = html_escape(slug),
-        csrf = html_escape(csrf),
-    );
-    page("Sign in", &inner)
+         <p class=\"login-muted\">We will email you a 6-digit code.</p>",
+        slug = esc(slug),
+        csrf = esc(csrf),
+    )
 }
 
 fn otp_form_html(slug: &str, email: &str, csrf: &str, error: Option<&str>) -> String {
     let err_block = error
-        .map(|e| format!("<p class=\"err\">{}</p>", html_escape(e)))
+        .map(|e| format!("<p class=\"login-error\">{}</p>", esc(e)))
         .unwrap_or_default();
-    let inner = format!(
+    format!(
         "<h1>Enter code</h1>\
-         <p class=\"muted\">Code sent to {email}.</p>\
+         <p class=\"login-muted\">Code sent to {email}.</p>\
          {err_block}\
-         <form method=\"post\" action=\"/p/{slug}/_verify\">\
+         <form class=\"login-form\" method=\"post\" action=\"/p/{slug}/_verify\">\
            <input type=\"hidden\" name=\"csrf\" value=\"{csrf}\">\
            <input type=\"hidden\" name=\"email\" value=\"{email}\">\
            <label>6-digit code<input type=\"text\" name=\"otp\" inputmode=\"numeric\" \
@@ -191,11 +167,10 @@ fn otp_form_html(slug: &str, email: &str, csrf: &str, error: Option<&str>) -> St
            <button type=\"submit\">Verify</button>\
          </form>\
          <p><a href=\"/p/{slug}/_login\">Use a different email</a></p>",
-        slug = html_escape(slug),
-        email = html_escape(email),
-        csrf = html_escape(csrf),
-    );
-    page("Enter code", &inner)
+        slug = esc(slug),
+        email = esc(email),
+        csrf = esc(csrf),
+    )
 }
 
 // ── Handlers ────────────────────────────────────────────────────────────
@@ -204,7 +179,7 @@ async fn handle_login_get(
     slug: String,
     headers: warp::http::HeaderMap,
     state: Arc<PyramidState>,
-) -> Result<Response<String>, warp::Rejection> {
+) -> Result<WarpResponse, warp::Rejection> {
     if !slug_is_safe(&slug) {
         return Ok(bad_slug_page());
     }
@@ -214,10 +189,9 @@ async fn handle_login_get(
     let (anon_tok, set_cookie) = ensure_anon_session(&headers);
     let nonce = csrf_nonce(&state.csrf_secret, &anon_tok, &slug);
     let body = email_form_html(&slug, &nonce, None);
-    let mut resp = html_response(StatusCode::OK, body);
+    let mut resp = login_page("Sign in", &body, StatusCode::OK);
     if let Some(c) = set_cookie {
-        resp.headers_mut()
-            .insert(header::SET_COOKIE, c.parse().unwrap());
+        attach_set_cookie(&mut resp, &c);
     }
     Ok(resp)
 }
@@ -228,7 +202,7 @@ async fn handle_login_post(
     headers: warp::http::HeaderMap,
     form: HashMap<String, String>,
     state: Arc<PyramidState>,
-) -> Result<Response<String>, warp::Rejection> {
+) -> Result<WarpResponse, warp::Rejection> {
     if !slug_is_safe(&slug) {
         return Ok(bad_slug_page());
     }
@@ -254,10 +228,9 @@ async fn handle_login_post(
     if email.is_empty() || !email.contains('@') {
         let nonce = csrf_nonce(&state.csrf_secret, &anon_tok, &slug);
         let body = email_form_html(&slug, &nonce, Some("Please enter a valid email."));
-        let mut resp = html_response(StatusCode::OK, body);
+        let mut resp = login_page("Sign in", &body, StatusCode::OK);
         if let Some(c) = set_cookie {
-            resp.headers_mut()
-                .insert(header::SET_COOKIE, c.parse().unwrap());
+            attach_set_cookie(&mut resp, &c);
         }
         return Ok(resp);
     }
@@ -271,10 +244,9 @@ async fn handle_login_post(
         Ok(()) => {
             let nonce = csrf_nonce(&state.csrf_secret, &anon_tok, &slug);
             let body = otp_form_html(&slug, email, &nonce, None);
-            let mut resp = html_response(StatusCode::OK, body);
+            let mut resp = login_page("Enter code", &body, StatusCode::OK);
             if let Some(c) = set_cookie {
-                resp.headers_mut()
-                    .insert(header::SET_COOKIE, c.parse().unwrap());
+                attach_set_cookie(&mut resp, &c);
             }
             Ok(resp)
         }
@@ -293,7 +265,7 @@ async fn handle_verify_post(
     headers: warp::http::HeaderMap,
     form: HashMap<String, String>,
     state: Arc<PyramidState>,
-) -> Result<Response<String>, warp::Rejection> {
+) -> Result<WarpResponse, warp::Rejection> {
     if !slug_is_safe(&slug) {
         return Ok(bad_slug_page());
     }
@@ -349,7 +321,7 @@ async fn handle_logout_post(
     headers: warp::http::HeaderMap,
     form: HashMap<String, String>,
     state: Arc<PyramidState>,
-) -> Result<Response<String>, warp::Rejection> {
+) -> Result<WarpResponse, warp::Rejection> {
     if !slug_is_safe(&slug) {
         return Ok(bad_slug_page());
     }
@@ -379,8 +351,7 @@ pub fn login_routes(state: Arc<PyramidState>) -> BoxedFilter<(warp::reply::Respo
         .and(warp::get())
         .and(warp::header::headers_cloned())
         .and(with_state(state.clone()))
-        .and_then(handle_login_get)
-        .map(|r: Response<String>| r.map(|b| b.into()));
+        .and_then(handle_login_get);
 
     let login_post = warp::path!("p" / String / "_login")
         .and(warp::post())
@@ -389,8 +360,7 @@ pub fn login_routes(state: Arc<PyramidState>) -> BoxedFilter<(warp::reply::Respo
         .and(warp::body::content_length_limit(FORM_BODY_LIMIT))
         .and(warp::body::form::<HashMap<String, String>>())
         .and(with_state(state.clone()))
-        .and_then(handle_login_post)
-        .map(|r: Response<String>| r.map(|b| b.into()));
+        .and_then(handle_login_post);
 
     let verify_post = warp::path!("p" / String / "_verify")
         .and(warp::post())
@@ -398,17 +368,25 @@ pub fn login_routes(state: Arc<PyramidState>) -> BoxedFilter<(warp::reply::Respo
         .and(warp::body::content_length_limit(FORM_BODY_LIMIT))
         .and(warp::body::form::<HashMap<String, String>>())
         .and(with_state(state.clone()))
-        .and_then(handle_verify_post)
-        .map(|r: Response<String>| r.map(|b| b.into()));
+        .and_then(handle_verify_post);
 
     let logout_post = warp::path!("p" / String / "_logout")
         .and(warp::post())
         .and(warp::header::headers_cloned())
         .and(warp::body::content_length_limit(FORM_BODY_LIMIT))
         .and(warp::body::form::<HashMap<String, String>>())
+        .and(with_state(state.clone()))
+        .and_then(handle_logout_post);
+
+    // Owner-mode bridge: GET /p/_owner_login?token=<one-time>&return=<slug>
+    // Mints the wire_session cookie from a pre-existing web_sessions row
+    // (created by the desktop app's pyramid_open_web_as_owner Tauri IPC).
+    // Per A9 the /_ namespace is reserved so this never collides with a slug.
+    let owner_login = warp::path!("p" / "_owner_login")
+        .and(warp::get())
+        .and(warp::query::<HashMap<String, String>>())
         .and(with_state(state))
-        .and_then(handle_logout_post)
-        .map(|r: Response<String>| r.map(|b| b.into()));
+        .and_then(handle_owner_login);
 
     login_get
         .or(login_post)
@@ -417,5 +395,75 @@ pub fn login_routes(state: Arc<PyramidState>) -> BoxedFilter<(warp::reply::Respo
         .unify()
         .or(logout_post)
         .unify()
+        .or(owner_login)
+        .unify()
         .boxed()
+}
+
+/// GET /p/_owner_login?token=<hex>&return=<slug>
+///
+/// One-time consume of an owner-mode bridge token. The desktop app
+/// has already inserted a row into `web_sessions` with this token,
+/// supabase_user_id prefixed with `__local_operator__:`. We just need
+/// to set the wire_session cookie pointing at that row and 302 the
+/// browser to the requested slug. The auth filter then recognizes the
+/// sentinel and treats every subsequent request as LocalOperator.
+async fn handle_owner_login(
+    params: HashMap<String, String>,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    use crate::pyramid::public_html::auth::{
+        issue_wire_session_cookie, LOCAL_OPERATOR_SENTINEL_PREFIX,
+    };
+    use crate::pyramid::public_html::web_sessions;
+
+    let token = match params.get("token").map(|s| s.as_str()).unwrap_or("") {
+        "" => return Ok(error_page("_owner", "missing token")),
+        t => t.to_string(),
+    };
+    let return_slug = params
+        .get("return")
+        .and_then(|s| {
+            if s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+                && !s.is_empty()
+                && !s.starts_with('_')
+            {
+                Some(s.clone())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_default();
+
+    // Verify the token exists in web_sessions and carries the owner sentinel.
+    let session_opt = {
+        let conn = state.reader.lock().await;
+        web_sessions::lookup(&conn, &token).ok().flatten()
+    };
+    let sess = match session_opt {
+        Some(s) if s.supabase_user_id.starts_with(LOCAL_OPERATOR_SENTINEL_PREFIX) => s,
+        _ => return Ok(error_page("_owner", "invalid or expired owner token")),
+    };
+    let _ = sess; // sentinel-only check; cookie value is the token itself
+
+    // Set wire_session cookie + 302 to the target page.
+    let target = if return_slug.is_empty() {
+        "/p/".to_string()
+    } else {
+        format!("/p/{}", return_slug)
+    };
+    let cookie = issue_wire_session_cookie(&token);
+    let mut resp = warp::reply::Response::new(warp::hyper::Body::empty());
+    *resp.status_mut() = warp::http::StatusCode::FOUND;
+    resp.headers_mut().insert(
+        "location",
+        warp::http::HeaderValue::from_str(&target).unwrap_or_else(|_| {
+            warp::http::HeaderValue::from_static("/p/")
+        }),
+    );
+    if let Ok(v) = warp::http::HeaderValue::from_str(&cookie) {
+        resp.headers_mut().append("set-cookie", v);
+    }
+    Ok(resp)
 }

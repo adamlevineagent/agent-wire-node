@@ -178,14 +178,18 @@ pub fn node_state_class(node: &PyramidNode) -> &'static str {
     "verified"
 }
 
-/// Render the per-node provenance footer (Pillar 14). For V1 we always emit
-/// the `local:<id>` form — WS-G/H will look up the `wire_publish` mapping and
-/// substitute the real `{handle}/{epoch-day}/{sequence}` path when the node
-/// has been published. The footer is plain text inside a `<footer>` element
-/// with class `prov` so the stylesheet can dim it.
-pub fn prov_footer(node: &PyramidNode) -> String {
+/// Render the per-node provenance footer (Pillar 14).
+///
+/// `wire_handle`: when `Some` and non-empty, render as the published Wire
+/// handle path. Otherwise fall back to `local:<id>` so unpublished nodes
+/// still display a stable identifier. Per Pillar 14, handle-paths ARE the
+/// human interface — when present, prefer them.
+pub fn prov_footer(node: &PyramidNode, wire_handle: Option<&str>) -> String {
     let depth = node.depth;
-    let path = format!("local:{}", node.id);
+    let path = match wire_handle {
+        Some(h) if !h.is_empty() => h.to_string(),
+        _ => format!("local:{}", node.id),
+    };
     format!(
         "<footer class=\"prov\">depth={depth} \u{2022} path={path}</footer>",
         depth = depth,
