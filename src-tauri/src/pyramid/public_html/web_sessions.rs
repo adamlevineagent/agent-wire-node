@@ -106,12 +106,16 @@ static SWEEPER_STARTED: OnceLock<()> = OnceLock::new();
 /// Spawn a background task that sweeps expired sessions every hour.
 ///
 /// Idempotent: only the first call has any effect, even if called from
-/// multiple init paths.
+/// multiple init paths. Safe to call from sync OR async context — if no
+/// tokio runtime is currently active (e.g., called from `main()` before
+/// Tauri starts its runtime), the spawn is deferred to a one-shot
+/// background OS thread that hosts a single-thread runtime just for the
+/// sweeper. This avoids panicking on `tokio::spawn` outside a runtime.
 pub fn spawn_sweeper(state: Arc<crate::pyramid::PyramidState>) {
     if SWEEPER_STARTED.set(()).is_err() {
         return;
     }
-    tokio::spawn(async move {
+    let task = move || async move {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(3600));
         // First tick fires immediately — skip it so we don't sweep an empty
         // table at boot.
@@ -129,7 +133,38 @@ pub fn spawn_sweeper(state: Arc<crate::pyramid::PyramidState>) {
                 }
             }
         }
-    });
+    };
+
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        // We're inside a tokio runtime — spawn directly on it.
+        handle.spawn(task());
+    } else {
+        // No runtime yet (called from sync init in main()). Defer the
+        // spawn to a dedicated OS thread that owns its own runtime. The
+        // sweeper is purely a background task; running it on a sidecar
+        // runtime is fine because it never needs to interact with Tauri's
+        // main runtime — it only touches the SQLite writer mutex on
+        // PyramidState (which is `Arc`/`Send`).
+        std::thread::Builder::new()
+            .name("web_sessions-sweeper".to_string())
+            .spawn(move || {
+                let rt = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        tracing::warn!(
+                            "web_sessions sweeper: failed to build sidecar runtime: {}",
+                            e
+                        );
+                        return;
+                    }
+                };
+                rt.block_on(task());
+            })
+            .ok();
+    }
 }
 
 #[cfg(test)]
