@@ -1,0 +1,71 @@
+# Conversation Question Pyramid
+# Designed for: chat transcripts, meeting recordings, interview logs
+# Goal: A reader visits the apex + 4 nodes and knows what was discussed,
+#        what was decided, what changed during the conversation, and
+#        what the final state is on every topic
+
+type: conversation
+version: 3.0
+
+defaults:
+  model: inception/mercury-2
+  temperature: 0.3
+  retry: 2
+
+questions:
+
+  # ── Layer 0: What was said in each chunk? ────────────────────────
+  - ask: "What topics were discussed in this chunk of conversation? What claims were made, what decisions were reached, what questions were asked? Preserve the chronological order — earlier statements may be revised later."
+    about: each chunk individually
+    creates: L0 nodes
+    prompt: prompts/conversation/extract.md
+    parallel: 8
+    retry: 3
+    sequential_context:
+      mode: accumulate
+      max_chars: 8000
+      carry: summary of prior chunks so far
+
+  # ── Layer 0→1 bridge: What topics were discussed? ────────────────
+  - ask: "Looking at all chunks together, what are the 6-12 distinct topics that were discussed throughout this conversation? Topics that appear in multiple chunks belong together — they are the same ongoing discussion."
+    about: all L0 topics at once
+    creates: L1 thread assignments
+    prompt: prompts/conversation/cluster.md
+    model: qwen/qwen3.5-flash-02-23
+    constraints:
+      min_groups: 4
+      max_groups: 12
+    retry: 3
+
+  # ── Layer 1: What is the final state of each topic? ──────────────
+  - ask: "Synthesize the full arc of this topic across the conversation. What was the starting position? What changed? What was the final conclusion? Later statements override earlier ones — the LAST thing said about a subject is the current truth. Note every decision, correction, and open question."
+    about: each L1 thread's assigned L0 nodes, ordered chronologically
+    creates: L1 nodes
+    prompt: prompts/conversation/thread.md
+    parallel: 5
+    retry: 2
+
+  # ── Layer 1 webbing: How do topics connect? ──────────────────────
+  - ask: "Which topics influenced each other during the conversation? Where did a decision in one topic change the direction of another? Where are there unresolved tensions between topics?"
+    about: all L1 nodes at once
+    creates: web edges between L1 nodes
+    prompt: prompts/conversation/web.md
+
+  # ── Layer 1→2 bridge: What are the major themes? ─────────────────
+  - ask: "What are the 2-4 major themes of this conversation? A theme is a high-level area that groups related topics — 'architecture decisions', 'business model', 'implementation planning', 'open questions'."
+    about: all L1 nodes at once
+    creates: L2 nodes
+    context:
+      - L1 web edges
+      - sibling headlines
+    prompt: prompts/conversation/recluster.md
+    model: qwen/qwen3.5-flash-02-23
+    retry: 3
+
+  # ── Apex ─────────────────────────────────────────────────────────
+  - ask: "What was this conversation about, what was decided, what changed during it, and what is the final state of understanding on all topics?"
+    about: all top-level nodes at once
+    creates: apex
+    context:
+      - L1 web edges
+    prompt: prompts/conversation/distill.md

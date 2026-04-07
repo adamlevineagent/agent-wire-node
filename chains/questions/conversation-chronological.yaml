@@ -1,0 +1,130 @@
+# Conversation Question Pyramid — Chronological / Triple-Pass variant
+#
+# A drop-in alternative to chains/questions/conversation.yaml that preserves
+# the question-pipeline DSL but replaces the single forward-only L0 extract
+# with the old triple-pass approach from conversationarchived.yaml:
+#
+#   1. Forward pass  — earliest→latest, accumulates summary of past chunks
+#   2. Reverse pass  — latest→earliest, accumulates summary of future chunks
+#   3. Combine       — fuses forward + reverse views of each chunk into L0
+#
+# Why: a single forward-only pass loses the "what came next" context that
+# matters for narrative material like a Claude Code session, an interview,
+# or a meeting. Combining forward and reverse views gives every L0 node
+# both its before- and after-state, which lets the L1 thread synthesis
+# write a real chronology instead of an unordered topic dump.
+#
+# Domain-neutral: this chain assumes the source is a single sequential
+# transcript ("session"), not a coding workflow. Default questions are
+# written for any conversational content — work or otherwise.
+#
+# ⚠️  EXECUTOR SUPPORT REQUIRED — currently un-shippable until landed
+#     - sequential_context.mode: "reverse"   (loader rejects today)
+#     - input.zip_steps: [forward_pass, reverse_pass]   (no equivalent today)
+#     - the ability to mark step output as `step_only` (not persisted as a
+#       node) for the forward + reverse intermediates
+#
+#     The shape below is what the YAML *should* look like once those
+#     features land. Until then this file is a design artifact / spec.
+
+type: conversation
+version: 4.0-chronological
+status: design-spec   # not yet executable — see executor-support note above
+
+defaults:
+  model: inception/mercury-2
+  temperature: 0.3
+  retry: 2
+
+questions:
+
+  # ── L0a: Forward pass — what is happening right now, given what came before?
+  - ask: "Read this chunk in light of everything that came before it. What is happening here? What is being said, asked, attempted, decided, felt, or noticed? What is the speaker(s) building on from earlier? Stay literal and chronological — do not speculate about what will happen next."
+    about: each chunk individually
+    creates: forward_view  # intermediate, not a persisted node
+    prompt: prompts/conversation-chronological/forward.md
+    sequential_context:
+      mode: accumulate
+      direction: forward          # NEW — explicit direction
+      max_chars: 1500
+      trim_to: 1200
+      trim_side: start
+      carry: "running summary of everything that has happened in the session so far"
+    save_as: step_only            # NEW — do not write as a node
+    retry: 3
+
+  # ── L0b: Reverse pass — what is happening right now, given what comes after?
+  - ask: "Read this chunk in light of everything that comes after it. Knowing how things will unfold, what is the significance of what's happening here? What turns out to matter? What gets revised, abandoned, or vindicated later? Stay grounded in what is actually said in this chunk — annotate it with future-knowledge, do not rewrite it."
+    about: each chunk individually, processed in reverse order
+    creates: reverse_view         # intermediate, not a persisted node
+    prompt: prompts/conversation-chronological/reverse.md
+    sequential_context:
+      mode: accumulate
+      direction: reverse          # NEW — process latest→earliest
+      max_chars: 1500
+      trim_to: 1200
+      trim_side: end
+      carry: "running summary of everything that happens in the session after this point"
+    save_as: step_only
+    retry: 3
+
+  # ── L0c: Combine forward + reverse → real L0 nodes ─────────────────
+  - ask: "You have two readings of the same chunk: one written knowing only the past, one written knowing only the future. Fuse them into a single faithful record of what this chunk contained. Preserve every concrete claim, decision, question, feeling, and turn of phrase. The fused record should read chronologically from inside the chunk, with brief annotations from the future-view marking which moments turned out to matter."
+    about: each chunk individually
+    creates: L0 nodes
+    prompt: prompts/conversation-chronological/combine.md
+    input:
+      zip_steps:                  # NEW — combine outputs of two prior steps
+        - forward_view
+        - step: reverse_view
+          reverse: true           # zip back-to-front so chunk N pairs with chunk N
+    parallel: 8
+    retry: 3
+
+  # ── L0→L1 bridge: cluster L0 nodes into ongoing topics ─────────────
+  # Unchanged from the standard conversation chain — clustering is the
+  # same regardless of how L0 was built.
+  - ask: "Looking at all chunks together, what are the 6-12 distinct topics, threads, or subjects that ran through this session? A topic that surfaces in multiple chunks is the same ongoing thread — group them. Topics here can be anything: a recurring question, a feeling, a decision being chewed on, a person being discussed, a problem being worked on. Do not assume the session is about any particular domain."
+    about: all L0 topics at once
+    creates: L1 thread assignments
+    prompt: prompts/conversation/cluster.md
+    model: qwen/qwen3.5-flash-02-23
+    constraints:
+      min_groups: 4
+      max_groups: 12
+    retry: 3
+
+  # ── L1: chronological synthesis per thread ─────────────────────────
+  # Same as the standard chain BUT explicitly chronological — each thread
+  # gets a beginning/middle/end arc, not a flat summary.
+  - ask: "Tell the story of this thread across the session in chronological order. Where did it start? What changed it? What was the turning point, if any? Where did it end up? Quote real moments — what was actually said, asked, decided, or felt at each beat. Later beats override earlier ones — the LAST state of the thread is its current truth, but the path matters too."
+    about: each L1 thread's assigned L0 nodes, ordered chronologically
+    creates: L1 nodes
+    prompt: prompts/conversation/thread.md
+    parallel: 5
+    retry: 2
+
+  # ── L1 webbing — how threads influenced each other ─────────────────
+  - ask: "Which threads in this session influenced or were influenced by other threads? Where did a moment in one thread cause a shift in another? Where did threads run in parallel without touching? Where are they in tension?"
+    about: all L1 nodes at once
+    creates: web edges between L1 nodes
+    prompt: prompts/conversation/web.md
+
+  # ── L1→L2 bridge: macro shape of the session ───────────────────────
+  - ask: "Step back from the threads and name the 2-4 macro shapes of this session. A macro shape is the kind of thing the session was doing at that level — 'wrestling with X', 'working through Y', 'rebuilding mental model around Z'. Do not assume any particular domain; let the actual content drive the labels."
+    about: all L1 nodes at once
+    creates: L2 nodes
+    context:
+      - L1 web edges
+      - sibling headlines
+    prompt: prompts/conversation/recluster.md
+    model: qwen/qwen3.5-flash-02-23
+    retry: 3
+
+  # ── Apex ───────────────────────────────────────────────────────────
+  - ask: "Tell the story of this session in chronological order: what was attempted, what was learned, what was decided, what changed, and where things ended up. A reader who reads only this paragraph should know what the session was, what happened in roughly what order, and what the final state of every major thread is. Stay grounded in what was actually said — do not invent."
+    about: all top-level nodes at once
+    creates: apex
+    context:
+      - L1 web edges
+    prompt: prompts/conversation/distill.md
