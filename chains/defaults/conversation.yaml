@@ -1,7 +1,19 @@
+# ⚠ DEPRECATED — DO NOT USE FOR NEW BUILDS ⚠
+#
+# As of 2026-04-07 the Wire Node uses `question.yaml` as the canonical
+# build pipeline for ALL content types. The default chain router
+# (chain_registry::default_chain_id) returns `question-pipeline`
+# regardless of content type. This file is retained for explicit
+# opt-in via pyramid_chain_assignments and for parity tests.
+#
+# DO NOT add new builds to this chain. DO NOT update its prompts.
+# Improve question.yaml instead.
+#
+# ────────────────────────────────────────────────────────────────────
 schema_version: 1
 id: conversation-default
-name: Conversation Pipeline
-description: "Question-driven conversation analysis. Temporal-aware L0 extraction → web → decompose → evidence → gaps."
+name: Conversation Pipeline (LEGACY)
+description: "DEPRECATED. Question-driven conversation analysis. Temporal-aware L0 extraction → web → decompose → evidence → gaps."
 content_type: conversation
 version: "1.0.0"
 author: "wire-node"

@@ -77,12 +77,23 @@ pub fn list_assignments(conn: &Connection) -> Result<Vec<(String, String, Option
 }
 
 /// Get the default chain ID for a content type.
-pub fn default_chain_id(content_type: &str) -> &'static str {
-    match content_type {
-        "conversation" => "conversation-default",
-        "code" => "code-default",
-        "document" => "document-default",
-        "question" => "question-pipeline",
-        _ => "conversation-default",
-    }
+///
+/// **CANONICAL: every content type routes to `question-pipeline`** — the
+/// question.yaml chain is the only supported build pipeline going forward.
+/// The legacy `code-default`, `document-default`, and `conversation-default`
+/// chains and their associated prompts (chains/prompts/code/*,
+/// chains/prompts/document/*, chains/prompts/conversation/*) are
+/// **DEPRECATED**. Their `code_recluster.md` + `code_distill.md` upper-layer
+/// synthesis was producing mechanical 1:1 relabels at higher depths because
+/// the prompts collapse without genuine abstraction. The question pipeline's
+/// decompose → answer flow handles all content types correctly via
+/// `effective_l0_slug` and `effective_source_path` resolution in
+/// `run_decomposed_build`.
+///
+/// Operators with an explicit slug-specific assignment in
+/// `pyramid_chain_assignments` still get their assigned chain — this only
+/// affects builds that rely on the default. To use a legacy chain, the
+/// operator must explicitly opt in via the assignment table.
+pub fn default_chain_id(_content_type: &str) -> &'static str {
+    "question-pipeline"
 }

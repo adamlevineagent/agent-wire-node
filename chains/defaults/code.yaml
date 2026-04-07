@@ -1,4 +1,24 @@
-# Code Pipeline Chain Definition v3.0.0 — Semantic Grouping
+# ⚠ DEPRECATED — DO NOT USE FOR NEW BUILDS ⚠
+#
+# As of 2026-04-07 the Wire Node uses `question.yaml` as the canonical
+# build pipeline for ALL content types (code, document, conversation,
+# question). The default chain router (chain_registry::default_chain_id)
+# now returns `question-pipeline` regardless of content type.
+#
+# Why deprecated: the upper_layer_synthesis step in this chain uses
+# `code_recluster.md` + `code_distill.md` which produce mechanical
+# 1:1 relabels at higher depths instead of genuine abstraction.
+#
+# This file is retained for:
+#   1. Operators who explicitly opt in via pyramid_chain_assignments
+#   2. Migration / parity tests
+#   3. Historical reference
+#
+# DO NOT add new builds to this chain. DO NOT update its prompts.
+# If you need richer code pyramid behavior, improve question.yaml.
+#
+# ────────────────────────────────────────────────────────────────────
+# Code Pipeline Chain Definition v3.0.0 — Semantic Grouping (LEGACY)
 #
 # Pipeline:
 #   1. L0 code extraction (per-file, parallel — nodes visible immediately)
