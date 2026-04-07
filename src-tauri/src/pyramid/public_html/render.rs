@@ -75,6 +75,19 @@ pub fn page_with_etag(
     cache_control: &str,
     etag: Option<&str>,
 ) -> warp::reply::Response {
+    // WS-J: progressive-enhancement canvas overlay client. Loaded with
+    // `defer`; the page is fully functional without JS. The CSP already
+    // permits `script-src 'self'` so no inline script is needed.
+    // WS-L will populate `data-banner` once the ascii_art module is wired
+    // in; for now we emit it empty so the client doesn't draw a banner.
+    let client_js_url = crate::pyramid::public_html::routes_assets::hashed_path("client.js")
+        .unwrap_or("/p/_assets/client.js");
+    // WS-K: WebSocket client + live build animation. Loaded AFTER client.js
+    // so it can override `window.__wireCanvasUpdate`.
+    let client_ws_js_url = crate::pyramid::public_html::routes_assets::hashed_path("client_ws.js")
+        .unwrap_or("/p/_assets/client_ws.js");
+    let css_url =
+        crate::pyramid::public_html::routes_assets::hashed_path("app.css").unwrap_or(APP_CSS_URL);
     let html = format!(
         "<!doctype html>\n\
          <html lang=\"en\">\n\
@@ -85,15 +98,19 @@ pub fn page_with_etag(
          <link rel=\"stylesheet\" href=\"{css}\">\n\
          <link rel=\"icon\" href=\"/favicon.ico\">\n\
          </head>\n\
-         <body>\n\
+         <body data-banner=\"\" aria-live=\"polite\">\n\
          <main class=\"page\">\n\
          {body}\n\
          </main>\n\
+         <script src=\"{client_js}\" defer></script>\n\
+         <script src=\"{client_ws_js}\" defer></script>\n\
          </body>\n\
          </html>\n",
         title = esc(title),
-        css = APP_CSS_URL,
+        css = css_url,
         body = body,
+        client_js = client_js_url,
+        client_ws_js = client_ws_js_url,
     );
 
     let mut builder = Response::builder()

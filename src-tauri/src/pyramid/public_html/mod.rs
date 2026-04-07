@@ -26,7 +26,7 @@ pub mod routes_read;
 pub mod routes_ask;
 pub mod routes_ws;
 pub mod web_sessions;
-// pub mod ascii_art;  // WS-L (Phase 3)
+pub mod ascii_art; // WS-L (Phase 3)
 
 use crate::pyramid::PyramidState;
 use std::sync::Arc;

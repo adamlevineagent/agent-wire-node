@@ -5259,6 +5259,20 @@ async fn partner_session_new(
     serde_json::to_value(&session).map_err(|e| e.to_string())
 }
 
+/// WS-L: generate (or return cached) ASCII banner art for the given slug.
+/// Operator-triggered only per A11 — never lazy on anonymous web requests.
+#[tauri::command]
+async fn pyramid_generate_ascii_banner(
+    slug: String,
+    state: tauri::State<'_, SharedState>,
+) -> Result<String, String> {
+    wire_node_lib::pyramid::public_html::ascii_art::generate_banner_for_slug(
+        state.pyramid.clone(),
+        &slug,
+    )
+    .await
+}
+
 #[tauri::command]
 async fn pyramid_get_config(
     state: tauri::State<'_, SharedState>,
@@ -7311,6 +7325,7 @@ fn main() {
             pyramid_create_slug,
             pyramid_delete_slug,
             pyramid_get_config,
+            pyramid_generate_ascii_banner,
             pyramid_test_api_key,
             test_remote_connection,
             get_app_version,

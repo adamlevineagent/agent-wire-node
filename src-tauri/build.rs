@@ -12,6 +12,11 @@ fn main() {
     // (logical_name, on-disk relative path, mime type)
     let assets = [
         ("app.css", "assets/app.css", "text/css; charset=utf-8"),
+        (
+            "client.js",
+            "assets/client.js",
+            "application/javascript; charset=utf-8",
+        ),
         ("robots.txt", "assets/robots.txt", "text/plain; charset=utf-8"),
         ("favicon.ico", "assets/favicon.ico", "image/x-icon"),
         (
@@ -23,6 +28,11 @@ fn main() {
             "JetBrainsMono-Bold.woff2",
             "assets/fonts/JetBrainsMono-Bold.woff2",
             "font/woff2",
+        ),
+        (
+            "client_ws.js",
+            "assets/client_ws.js",
+            "application/javascript; charset=utf-8",
         ),
     ];
 

@@ -856,6 +856,130 @@ pub fn extract_json(text: &str) -> Result<Value> {
     ))
 }
 
+// ── Direct (non-cascading) entry point ─────────────────────────────────────
+
+/// Call a specific OpenRouter model directly, bypassing the default 3-tier cascade.
+///
+/// Used for ASCII-art generation (WS-L) where the cascade would always pick
+/// Mercury-2, which empirically fails at this task. The caller pins a specific
+/// model_id (e.g. `x-ai/grok-4.20-beta`) and receives the raw content string.
+///
+/// Unlike `call_model_unified`, this function:
+///   * Never cascades on HTTP 400 / context-exceeded.
+///   * Takes no `temperature` / `response_format` (art generation is freeform).
+///   * Uses a fixed conservative timeout (`base_timeout_secs`).
+///
+/// Retries on transient errors (`retryable_status_codes`, network, null content)
+/// up to `config.max_retries`, same as the unified path.
+pub async fn call_model_direct(
+    config: &LlmConfig,
+    model_id: &str,
+    system_prompt: &str,
+    user_prompt: &str,
+    max_tokens: u32,
+) -> Result<String> {
+    let client = &*HTTP_CLIENT;
+    let url = "https://openrouter.ai/api/v1/chat/completions";
+    let timeout = std::time::Duration::from_secs(config.base_timeout_secs);
+
+    for attempt in 0..config.max_retries {
+        let body = serde_json::json!({
+            "model": model_id,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            "max_tokens": max_tokens
+        });
+
+        rate_limit_wait(config.rate_limit_max_requests, config.rate_limit_window_secs).await;
+
+        let resp = client
+            .post(url)
+            .header("Authorization", format!("Bearer {}", config.api_key))
+            .header("Content-Type", "application/json")
+            .header("HTTP-Referer", "https://newsbleach.com")
+            .header("X-Title", "Wire Pyramid Engine")
+            .timeout(timeout)
+            .json(&body)
+            .send()
+            .await;
+
+        let resp = match resp {
+            Ok(r) => r,
+            Err(e) => {
+                if attempt + 1 < config.max_retries {
+                    info!("  [direct:{}] request error ({}), retry {}...", short_name(model_id), e, attempt + 1);
+                    tokio::time::sleep(std::time::Duration::from_secs(config.retry_base_sleep_secs)).await;
+                    continue;
+                }
+                return Err(anyhow!("call_model_direct({}) request failed: {}", model_id, e));
+            }
+        };
+
+        let status = resp.status().as_u16();
+        if config.retryable_status_codes.contains(&status) {
+            let wait = config.retry_base_sleep_secs * 2u64.pow(attempt + 1);
+            info!("  [direct:{}] HTTP {}, waiting {}s...", short_name(model_id), status, wait);
+            tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+            continue;
+        }
+        if !resp.status().is_success() {
+            let body_text = resp.text().await.unwrap_or_default();
+            if attempt + 1 < config.max_retries {
+                info!("  [direct:{}] HTTP {}, retry {}...", short_name(model_id), status, attempt + 1);
+                tokio::time::sleep(std::time::Duration::from_secs(config.retry_base_sleep_secs)).await;
+                continue;
+            }
+            return Err(anyhow!("HTTP {} after {} attempts: {}", status, config.max_retries, body_text));
+        }
+
+        let body_text = match resp.text().await {
+            Ok(t) => t,
+            Err(e) => {
+                if attempt + 1 < config.max_retries {
+                    tokio::time::sleep(std::time::Duration::from_secs(config.retry_base_sleep_secs)).await;
+                    continue;
+                }
+                return Err(anyhow!("Failed to read response: {}", e));
+            }
+        };
+
+        let data: Value = match parse_openrouter_response_body(&body_text) {
+            Ok(v) => v,
+            Err(e) => {
+                if attempt + 1 < config.max_retries {
+                    warn!("[direct:{}] parse error, retry {}: {}", short_name(model_id), attempt + 1, e);
+                    tokio::time::sleep(std::time::Duration::from_secs(config.retry_base_sleep_secs)).await;
+                    continue;
+                }
+                return Err(anyhow!("parse failed after {} attempts: {}", config.max_retries, e));
+            }
+        };
+
+        let content = data
+            .get("choices")
+            .and_then(|c| c.get(0))
+            .and_then(|c| c.get("message"))
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_str());
+
+        match content {
+            Some(text) => return Ok(text.to_string()),
+            None => {
+                if attempt + 1 < config.max_retries {
+                    info!("  [direct:{}] null content, retry {}...", short_name(model_id), attempt + 1);
+                    tokio::time::sleep(std::time::Duration::from_secs(config.retry_base_sleep_secs)).await;
+                    continue;
+                }
+                return Err(anyhow!("null content after {} attempts", config.max_retries));
+            }
+        }
+    }
+
+    Err(anyhow!("call_model_direct({}): max retries exceeded", model_id))
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
