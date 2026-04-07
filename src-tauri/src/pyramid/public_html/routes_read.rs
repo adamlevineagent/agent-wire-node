@@ -891,30 +891,49 @@ async fn handle_pyramid_home(
         return not_modified(&etag);
     }
 
-    // Apex node = the highest-depth (most distilled) live node.
-    let apex_nodes = match db::get_nodes_at_depth(&conn, &slug, info.max_depth) {
-        Ok(v) => v,
-        Err(e) => return error_500(&format!("get_nodes_at_depth failed: {e}")),
-    };
-    let apex = apex_nodes.into_iter().next();
+    // CRITICAL: do not trust info.max_depth — it's the cached stats column
+    // on pyramid_slugs which lags writes (the question pipeline doesn't
+    // always call update_slug_stats, and even when it does the value can
+    // be 0 right after a fresh build). Query live_pyramid_nodes for the
+    // truth instead. Same defensive pattern as render_question_answer_fragment.
+    let all_live = db::get_all_live_nodes(&conn, &slug).unwrap_or_default();
+    let true_max_depth = all_live.iter().map(|n| n.depth).max().unwrap_or(0);
 
-    // Children of apex (depth-1 topics) form the table of contents.
-    let depth_minus_one = if info.max_depth > 0 { info.max_depth - 1 } else { 0 };
-    let toc_nodes = if let Some(ref a) = apex {
+    // Apex node = the highest-depth (most distilled) live node. If multiple
+    // nodes share the max depth, prefer the one whose id is smallest (L_max-000)
+    // since that's how the build pipeline numbers the canonical apex.
+    let mut apex_candidates: Vec<&PyramidNode> = all_live
+        .iter()
+        .filter(|n| n.depth == true_max_depth)
+        .collect();
+    apex_candidates.sort_by(|a, b| a.id.cmp(&b.id));
+    let apex = apex_candidates.first().cloned().cloned();
+
+    // Children of apex (depth_max-1 layer) form the table of contents.
+    let depth_minus_one = if true_max_depth > 0 { true_max_depth - 1 } else { 0 };
+    let toc_nodes: Vec<PyramidNode> = if let Some(ref a) = apex {
         // Prefer apex.children for ordering; fall back to depth scan.
-        let mut found = Vec::new();
+        let mut found: Vec<PyramidNode> = Vec::new();
         for child_id in &a.children {
-            if let Ok(Some(n)) = db::get_node(&conn, &slug, child_id) {
-                found.push(n);
+            if let Some(n) = all_live.iter().find(|m| m.id == *child_id) {
+                found.push(n.clone());
             }
         }
         if found.is_empty() {
-            db::get_nodes_at_depth(&conn, &slug, depth_minus_one).unwrap_or_default()
+            all_live
+                .iter()
+                .filter(|n| n.depth == depth_minus_one)
+                .cloned()
+                .collect()
         } else {
             found
         }
     } else {
-        db::get_nodes_at_depth(&conn, &slug, depth_minus_one).unwrap_or_default()
+        all_live
+            .iter()
+            .filter(|n| n.depth == depth_minus_one)
+            .cloned()
+            .collect()
     };
 
     drop(conn);
@@ -975,13 +994,17 @@ async fn handle_pyramid_home(
 
     let mut body = String::new();
     body.push_str(&format!("<h1>{}</h1>\n", esc(&slug)));
+
+    // ── Apex (always visible at top, best foot forward) ───────────────
     if let Some(ref a) = apex {
         body.push_str(&format!(
-            "<article class=\"node node--{state}\">\n\
-               <h2>{headline}</h2>\n\
+            "<article class=\"node node--{state} answer-apex\">\n\
+               <h2><a href=\"/p/{slug}/{nid}\">{headline}</a></h2>\n\
                <p class=\"distilled\">{distilled}</p>\n\
                {prov}\n\
              </article>\n",
+            slug = esc(&slug),
+            nid = esc(&a.id),
             state = node_state_class(a),
             headline = esc(&a.headline),
             distilled = esc(&a.distilled),
@@ -989,6 +1012,107 @@ async fn handle_pyramid_home(
         ));
     } else {
         body.push_str("<p class=\"empty\">ASK SOMETHING TO BEGIN</p>\n");
+    }
+
+    // ── Layered drill-down: walk every intermediate layer top-down ────
+    // Lead with the apex (already rendered above), then show each layer
+    // beneath it as an expandable section. The first layer under apex
+    // (depth_max - 1) opens by default since it's the next-best summary.
+    // Lower layers are collapsed. L0 leaves are pushed to the very bottom
+    // in their own collapsed section so the page doesn't drown in
+    // hundreds of raw extracts.
+    if true_max_depth >= 2 {
+        // Layers between apex and L1 (exclusive on both ends already, since
+        // apex is at true_max_depth and L0 gets its own section).
+        for d in (1..true_max_depth).rev() {
+            let nodes_at: Vec<&PyramidNode> = all_live
+                .iter()
+                .filter(|n| n.depth == d)
+                .collect();
+            if nodes_at.is_empty() {
+                continue;
+            }
+            let label = format!("Layer L{} ({} nodes)", d, nodes_at.len());
+            // Open the immediate-next-down layer by default; collapse the rest.
+            let open_default = d == true_max_depth - 1;
+
+            let mut inner = String::from("<ul class=\"layer-list\">\n");
+            // Sort by id within the layer for stable ordering.
+            let mut sorted: Vec<&PyramidNode> = nodes_at;
+            sorted.sort_by(|a, b| a.id.cmp(&b.id));
+            for n in &sorted {
+                let preview = truncate_chars(n.distilled.trim(), 280);
+                inner.push_str(&format!(
+                    "<li class=\"layer-item\">\n\
+                       <h4><a href=\"/p/{slug}/{nid}\">{nid_text}</a> \u{2014} \
+                           <a href=\"/p/{slug}/{nid}\">{headline}</a></h4>\n\
+                       <p class=\"sub\">{preview}</p>\n\
+                     </li>\n",
+                    slug = esc(&slug),
+                    nid = esc(&n.id),
+                    nid_text = esc(&n.id),
+                    headline = esc(&n.headline),
+                    preview = esc(&preview),
+                ));
+            }
+            inner.push_str("</ul>");
+            // Use the existing details_section helper but inline the open
+            // attribute since details_section's open arg is the third param.
+            body.push_str(&format!(
+                "<details class=\"section layer-section\"{maybe_open}>\n\
+                   <summary>{label}</summary>\n\
+                   {inner}\n\
+                 </details>\n",
+                maybe_open = if open_default { " open" } else { "" },
+                label = esc(&label),
+                inner = inner,
+            ));
+        }
+    }
+
+    // ── L0 leaves (collapsed at the bottom) ───────────────────────────
+    // Evidence rows are useful for verification but overwhelming for
+    // first-read. They live in their own closed details so the page
+    // stays scannable. Cap rendered count to keep DOM size reasonable.
+    {
+        let mut leaves: Vec<&PyramidNode> = all_live.iter().filter(|n| n.depth == 0).collect();
+        if !leaves.is_empty() {
+            leaves.sort_by(|a, b| a.id.cmp(&b.id));
+            const LEAF_CAP: usize = 200;
+            let truncated = leaves.len() > LEAF_CAP;
+            let shown = leaves.iter().take(LEAF_CAP);
+            let mut inner = String::from("<ul class=\"leaf-list\">\n");
+            for n in shown {
+                let preview = truncate_chars(n.distilled.trim(), 180);
+                inner.push_str(&format!(
+                    "<li class=\"leaf-item\">\n\
+                       <a href=\"/p/{slug}/{nid}\"><strong>{nid_text}</strong></a>\
+                       \u{2003}<span class=\"sub\">{headline}</span>\n\
+                       <p class=\"sub\">{preview}</p>\n\
+                     </li>\n",
+                    slug = esc(&slug),
+                    nid = esc(&n.id),
+                    nid_text = esc(&n.id),
+                    headline = esc(&n.headline),
+                    preview = esc(&preview),
+                ));
+            }
+            if truncated {
+                inner.push_str(&format!(
+                    "<li class=\"sub\">\u{2026} {} more leaves not shown. Use the search or tree views.</li>\n",
+                    leaves.len() - LEAF_CAP,
+                ));
+            }
+            inner.push_str("</ul>");
+            body.push_str(&format!(
+                "<details class=\"section leaf-section\">\n\
+                   <summary>Evidence (L0, {} leaves)</summary>\n\
+                   {}\n\
+                 </details>\n",
+                leaves.len(),
+                inner,
+            ));
+        }
     }
 
     // ── Topic structure (open by default) ──────────────────────────────
