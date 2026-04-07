@@ -2059,7 +2059,24 @@ fn scope_for_depth(depth: u32) -> (String, String) {
 /// Returns a summary of file names, extensions, and directory structure.
 pub fn build_folder_map(source_path: &str) -> Option<String> {
     let path = std::path::Path::new(source_path);
-    if !path.exists() || !path.is_dir() {
+    if !path.exists() {
+        return None;
+    }
+    // Single-file sources (e.g. a conversation .jsonl, a single document) get
+    // a one-line map. Without this, conversation pyramids hard-fail in
+    // characterize because their source is a file, not a directory.
+    if path.is_file() {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| source_path.to_string());
+        let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        return Some(format!(
+            "Source file: {}\nName: {}\nSize: {} bytes",
+            source_path, name, size
+        ));
+    }
+    if !path.is_dir() {
         return None;
     }
 
