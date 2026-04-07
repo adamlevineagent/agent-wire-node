@@ -64,16 +64,19 @@ pub const APP_CSS_URL: &str = "/p/_assets/app.css";
 /// - `"no-store"` for cookie-issuing pages (login, verify)
 /// - `"no-cache, must-revalidate"` for ordinary read pages (default)
 pub fn page(title: &str, body: &str, cache_control: &str) -> warp::reply::Response {
-    page_with_etag(title, body, cache_control, None)
+    page_with_etag(title, body, cache_control, None, None)
 }
 
-/// Like `page()`, but also emits an `ETag` header when `etag` is `Some`.
-/// Used by WS-I for conditional GETs on the `/p/...` HTML routes.
+/// Like `page()`, but also emits an `ETag` header when `etag` is `Some`,
+/// and embeds an ASCII-art banner into `<body data-banner>` when `banner` is
+/// `Some`. Used by WS-I for conditional GETs on the `/p/...` HTML routes;
+/// the `banner` arg is the WS-L hook (pyramid pages only).
 pub fn page_with_etag(
     title: &str,
     body: &str,
     cache_control: &str,
     etag: Option<&str>,
+    banner: Option<&str>,
 ) -> warp::reply::Response {
     // WS-J: progressive-enhancement canvas overlay client. Loaded with
     // `defer`; the page is fully functional without JS. The CSP already
@@ -98,7 +101,7 @@ pub fn page_with_etag(
          <link rel=\"stylesheet\" href=\"{css}\">\n\
          <link rel=\"icon\" href=\"/favicon.ico\">\n\
          </head>\n\
-         <body data-banner=\"\" aria-live=\"polite\">\n\
+         <body data-banner=\"{banner}\" aria-live=\"polite\">\n\
          <main class=\"page\">\n\
          {body}\n\
          </main>\n\
@@ -111,6 +114,7 @@ pub fn page_with_etag(
         body = body,
         client_js = client_js_url,
         client_ws_js = client_ws_js_url,
+        banner = banner.map(esc).unwrap_or_default(),
     );
 
     let mut builder = Response::builder()

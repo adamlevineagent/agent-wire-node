@@ -28,6 +28,9 @@ pub mod routes_ws;
 pub mod web_sessions;
 pub mod ascii_art; // WS-L (Phase 3)
 
+#[cfg(test)]
+mod integration_tests; // Phase 4
+
 use crate::pyramid::PyramidState;
 use std::sync::Arc;
 use warp::Filter;

@@ -117,9 +117,17 @@ pub async fn generate_banner_for_slug(
     // 5. prompt — Pillar 37: medium constraint ("rendering target is 72 wide"),
     // not a quota ("produce exactly N lines").
     let system_prompt = "You are an ASCII art generator. The rendering target is a 72-column-wide monospace character grid (like an old terminal or BBS). Use box-drawing characters (┌─┐│└─┘╔═╗║╚═╝), block elements (░▒▓█), and tree connectors (├─└─). Generate art that captures the subject matter thematically. Output ONLY the ASCII art — no explanations, no markdown fences, no commentary.";
+    // Sanitize headline before embedding in the quoted prompt context.
+    // Strips quotes, backslashes, and newlines that could escape the quotes
+    // and inject instructions; caps length at 200 chars.
+    let safe_headline: String = apex_headline
+        .chars()
+        .filter(|c| !matches!(c, '"' | '\\' | '\n' | '\r'))
+        .take(200)
+        .collect();
     let user_prompt = format!(
         "Generate a thematic ASCII banner for a knowledge pyramid about: \"{}\"\n\nThe banner sits at the top of the pyramid's web page. It should evoke the subject matter visually while staying within 72 columns wide. Aim for something striking, not generic.",
-        apex_headline
+        safe_headline
     );
 
     // 6. call Grok 4.2 directly

@@ -378,7 +378,14 @@ async fn handle_pyramid_home(
         csrf = esc(CSRF_PLACEHOLDER),
     ));
 
-    page_with_etag(&title, &body, "no-cache, must-revalidate", Some(&etag))
+    let banner = crate::pyramid::public_html::ascii_art::get_banner_for_slug(&state, &slug);
+    page_with_etag(
+        &title,
+        &body,
+        "no-cache, must-revalidate",
+        Some(&etag),
+        banner.as_deref(),
+    )
 }
 
 async fn handle_single_node(
@@ -480,7 +487,14 @@ async fn handle_single_node(
     body.push_str(&prov_footer(&node));
     body.push_str("\n</article>\n");
 
-    page_with_etag(&title, &body, "no-cache, must-revalidate", Some(&etag))
+    let banner = crate::pyramid::public_html::ascii_art::get_banner_for_slug(&state, &slug);
+    page_with_etag(
+        &title,
+        &body,
+        "no-cache, must-revalidate",
+        Some(&etag),
+        banner.as_deref(),
+    )
 }
 
 // ---------------------------------------------------------------------------
