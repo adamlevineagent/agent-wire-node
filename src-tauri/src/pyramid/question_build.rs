@@ -242,6 +242,23 @@ pub async fn spawn_question_build(
         let _ = progress_handle.await;
         let _ = layer_drain_handle.await;
 
+        // Bump pyramid_slugs stats so node_count, max_depth, and updated_at
+        // reflect what the build just wrote. Without this the slug row
+        // stays at node_count=0 / max_depth=0 forever, which causes the
+        // public web surface to think the question is empty even when 8
+        // synthesized nodes are sitting in pyramid_nodes. Best-effort: a
+        // failure here is logged but doesn't fail the build.
+        {
+            let conn = pyramid_state.writer.lock().await;
+            if let Err(e) = crate::pyramid::db::update_slug_stats(&conn, &build_slug) {
+                tracing::warn!(
+                    slug = %build_slug,
+                    error = %e,
+                    "failed to update_slug_stats after question build",
+                );
+            }
+        }
+
         {
             let mut s = build_status.write().await;
             if cancel.is_cancelled() {

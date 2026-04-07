@@ -878,7 +878,18 @@ async fn handle_question_view(
 
     // If the build is complete (or there are nodes already), inline the
     // answer fragment server-side so the page works without JS.
-    let has_nodes = question_info.node_count > 0;
+    //
+    // CRITICAL: question_info.node_count is the cached stat on pyramid_slugs
+    // which question builds do NOT update — it stays at 0 forever even after
+    // the build writes 8 nodes. Trust a live COUNT(*) of pyramid_nodes
+    // instead. (See db.rs:142 — live_pyramid_nodes is the canonical view.)
+    let has_nodes = {
+        let conn = state.reader.lock().await;
+        match db::get_all_live_nodes(&conn, &question_slug) {
+            Ok(nodes) => !nodes.is_empty(),
+            Err(_) => false,
+        }
+    };
 
     let mut body = String::new();
     body.push_str(&format!(
@@ -914,10 +925,15 @@ async fn handle_question_view(
         },
     ));
 
-    // Inline the answer fragment if available so the page works without JS.
+    // Inline the answer fragment if the apex is actually synthesized.
+    // If render returns None (no nodes yet, or apex placeholder still
+    // empty), keep the empty placeholder so the JS poll-loop fills it
+    // in once the build catches up.
     if has_nodes {
-        let frag = render_question_answer_fragment(&state, &source_slug, &question_slug).await;
-        body.push_str(&format!("<div id=\"answer\">{}</div>\n", frag));
+        match render_question_answer_fragment(&state, &source_slug, &question_slug).await {
+            Some(frag) => body.push_str(&format!("<div id=\"answer\">{}</div>\n", frag)),
+            None => body.push_str("<div id=\"answer\" class=\"empty\"></div>\n"),
+        }
     } else {
         body.push_str("<div id=\"answer\" class=\"empty\"></div>\n");
     }
@@ -941,26 +957,43 @@ async fn handle_question_view(
 /// Render the answer fragment HTML for a question pyramid (no doctype, no
 /// head). Caller decides whether to wrap it in a full page or return it as
 /// the response body.
+/// Render the answer fragment for a question pyramid. Returns None when
+/// no usable apex node exists yet (build still in progress, even if the
+/// slug row was created). Caller maps None to a 202 "still building"
+/// response so the client retries instead of typewritering empty HTML.
 async fn render_question_answer_fragment(
     state: &Arc<PyramidState>,
     source_slug: &str,
     question_slug: &str,
-) -> String {
+) -> Option<String> {
     let conn = state.reader.lock().await;
-    let info = match db::get_slug(&conn, question_slug) {
-        Ok(Some(s)) => s,
-        _ => return "<p class=\"empty\">No answer yet.</p>".to_string(),
-    };
-    let apex_nodes = db::get_nodes_at_depth(&conn, question_slug, info.max_depth)
-        .unwrap_or_default();
-    let apex = match apex_nodes.into_iter().next() {
-        Some(n) => n,
-        None => return "<p class=\"empty\">No answer yet.</p>".to_string(),
-    };
 
-    // Cited source nodes: scan the apex distilled text for any node IDs from
-    // the source pyramid that appear verbatim. (Best-effort: question
-    // builds reference source nodes by ID in their distillations.)
+    // Robust apex lookup: pull every live node for this question pyramid
+    // and pick the one with the highest depth. The slug-stats max_depth
+    // column lags writes, so trusting it produces empty fragments during
+    // the window between "nodes inserted" and "stats updated".
+    let all = db::get_all_live_nodes(&conn, question_slug).unwrap_or_default();
+    if all.is_empty() {
+        drop(conn);
+        return None;
+    }
+    let apex = all
+        .iter()
+        .max_by_key(|n| n.depth)?
+        .clone();
+
+    // If the apex hasn't been synthesized yet (placeholder row with empty
+    // headline AND empty distilled), treat as still-building. The leaf
+    // sub-answers may be present but the layered synthesis isn't done.
+    let headline_trim = apex.headline.trim();
+    let distilled_trim = apex.distilled.trim();
+    if headline_trim.is_empty() && distilled_trim.is_empty() {
+        drop(conn);
+        return None;
+    }
+
+    // Cited source nodes: scan the apex distilled text for any node IDs
+    // from the source pyramid that appear verbatim.
     let source_nodes =
         db::get_all_live_nodes(&conn, source_slug).unwrap_or_default();
     let mut cited: Vec<(String, String)> = Vec::new();
@@ -977,8 +1010,16 @@ async fn render_question_answer_fragment(
            <h2>{headline}</h2>\n\
            <p class=\"distilled\">{distilled}</p>\n",
         state = node_state_class(&apex),
-        headline = esc(&apex.headline),
-        distilled = esc(&apex.distilled),
+        headline = if headline_trim.is_empty() {
+            esc("(no headline)")
+        } else {
+            esc(headline_trim)
+        },
+        distilled = if distilled_trim.is_empty() {
+            esc("(synthesizing…)")
+        } else {
+            esc(distilled_trim)
+        },
     ));
     if !cited.is_empty() {
         out.push_str("<section class=\"cites\"><h3>Cited from</h3><ul>\n");
@@ -999,7 +1040,7 @@ async fn render_question_answer_fragment(
         nid = esc(&apex.id),
     ));
     out.push_str("</article>\n");
-    out
+    Some(out)
 }
 
 async fn handle_question_fragment(
@@ -1018,6 +1059,10 @@ async fn handle_question_fragment(
         };
 
     // Still building? 202 + a tiny placeholder.
+    //
+    // CRITICAL: question_info.node_count is the cached stat on pyramid_slugs
+    // and never gets updated by question builds (it stays at 0 forever).
+    // Use a real COUNT(*) of pyramid_nodes via get_all_live_nodes instead.
     let is_building = {
         let active = state.active_build.read().await;
         if let Some(handle) = active.get(&question_slug) {
@@ -1027,7 +1072,13 @@ async fn handle_question_fragment(
             false
         }
     };
-    if is_building && question_info.node_count == 0 {
+    let live_node_count = {
+        let conn = state.reader.lock().await;
+        db::get_all_live_nodes(&conn, &question_slug)
+            .map(|v| v.len())
+            .unwrap_or(0)
+    };
+    if is_building && live_node_count == 0 {
         let body = "<p class=\"sub\">still building, retry in 2s</p>";
         let resp = warp::http::Response::builder()
             .status(202)
@@ -1038,14 +1089,28 @@ async fn handle_question_fragment(
         return resp.into_response();
     }
 
-    let frag = render_question_answer_fragment(&state, &source_slug, &question_slug).await;
-    warp::http::Response::builder()
-        .status(200)
-        .header(warp::http::header::CONTENT_TYPE, "text/html; charset=utf-8")
-        .header(warp::http::header::CACHE_CONTROL, "no-store")
-        .body(frag)
-        .unwrap()
-        .into_response()
+    // If the apex isn't synthesized yet (no nodes, or placeholder row
+    // with empty headline+distilled), return a 202 so the client retries
+    // instead of locking in empty content.
+    match render_question_answer_fragment(&state, &source_slug, &question_slug).await {
+        Some(frag) => warp::http::Response::builder()
+            .status(200)
+            .header(warp::http::header::CONTENT_TYPE, "text/html; charset=utf-8")
+            .header(warp::http::header::CACHE_CONTROL, "no-store")
+            .body(frag)
+            .unwrap()
+            .into_response(),
+        None => {
+            let body = "<p class=\"sub\">apex not synthesized yet, retry in 2s</p>";
+            warp::http::Response::builder()
+                .status(202)
+                .header(warp::http::header::CONTENT_TYPE, "text/html; charset=utf-8")
+                .header(warp::http::header::CACHE_CONTROL, "no-store")
+                .body(body.to_string())
+                .unwrap()
+                .into_response()
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -202,17 +202,22 @@
   }
 
   function typewriter(el, html, speedMs) {
-    // Walk text content character-by-character. We set innerHTML once with
-    // the trusted server-rendered HTML, then hide all text nodes by storing
-    // their values and revealing them progressively.
-    el.innerHTML = html;
+    // Note: caller has already set el.innerHTML so the answer is visible
+    // immediately. Walk text content character-by-character to "reveal"
+    // it progressively for the visual effect. If we can't find any text
+    // nodes the answer still shows because innerHTML is set.
     var walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, null, false);
     var textNodes = [];
     var node;
     while ((node = walker.nextNode())) {
-      textNodes.push({ node: node, full: node.nodeValue });
-      node.nodeValue = '';
+      // Only animate non-trivial text. Skip pure-whitespace nodes so
+      // the layout doesn't flash.
+      if (node.nodeValue && node.nodeValue.trim().length > 0) {
+        textNodes.push({ node: node, full: node.nodeValue });
+        node.nodeValue = '';
+      }
     }
+    if (textNodes.length === 0) return; // nothing to animate; innerHTML is enough
     var nodeIdx = 0;
     var charIdx = 0;
     var last = 0;
@@ -245,24 +250,49 @@
   function fetchAnswer() {
     if (fetched) return;
     fetched = true;
-    setLabel('answer ready');
+    setLabel('synthesizing answer...');
     var url = '/p/' + encodeURIComponent(src) + '/q/' + encodeURIComponent(qslug) + '/answer.fragment';
     fetch(url, { credentials: 'same-origin' })
       .then(function (r) {
         if (r.status === 202) {
-          // Still building — try again shortly.
+          // Still building — try again shortly. Don't claim done yet.
           fetched = false;
+          setLabel('still synthesizing...');
           setTimeout(fetchAnswer, 2000);
+          return null;
+        }
+        if (!r.ok) {
+          // Hard failure (404/500) — retry in case it was a transient race.
+          fetched = false;
+          setLabel('fetch error ' + r.status + ', retrying...');
+          setTimeout(fetchAnswer, 3000);
           return null;
         }
         return r.text();
       })
       .then(function (html) {
         if (html == null) return;
+        // Defensive: make sure we got real content. The Rust side may
+        // return a tiny stub if the apex has empty fields.
+        var stripped = html.replace(/<[^>]*>/g, '').trim();
+        if (stripped.length === 0) {
+          fetched = false;
+          setLabel('still synthesizing...');
+          setTimeout(fetchAnswer, 2000);
+          return;
+        }
+        setLabel('answer ready');
+        // Render the fragment immediately. The typewriter is purely a
+        // visual flourish — if it has zero text nodes to walk, the answer
+        // is still in the DOM via innerHTML.
+        answer.innerHTML = html;
         typewriter(answer, html, 16);
       })
-      .catch(function () {
+      .catch(function (err) {
         fetched = false;
+        setLabel('fetch error, retrying...');
+        if (typeof console !== 'undefined') console.warn('[wire] fetch failed:', err);
+        setTimeout(fetchAnswer, 3000);
       });
   }
 
