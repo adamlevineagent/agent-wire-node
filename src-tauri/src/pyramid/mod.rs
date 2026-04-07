@@ -25,7 +25,9 @@ pub mod crystallization;
 pub mod db;
 pub mod defaults_adapter;
 pub mod delta;
+pub mod event_bus;
 pub mod event_chain;
+pub mod public_html;
 pub mod evidence_answering;
 pub mod execution_plan;
 pub mod execution_state;
@@ -352,6 +354,14 @@ pub struct Tier2Config {
     pub rate_limit_daily_window_secs: u64,
     #[serde(default = "default_gap_resolution_max_files")]
     pub gap_resolution_max_files: usize,
+    /// Token budget for evidence context in answer_single_question.
+    /// When candidates exceed this, batching + dehydration kicks in.
+    #[serde(default = "default_answer_prompt_budget")]
+    pub answer_prompt_budget: usize,
+}
+
+fn default_answer_prompt_budget() -> usize {
+    100_000
 }
 
 impl Default for Tier2Config {
@@ -389,6 +399,7 @@ impl Default for Tier2Config {
             rate_limit_hourly_window_secs: default_rate_limit_hourly_window_secs(),
             rate_limit_daily_window_secs: default_rate_limit_daily_window_secs(),
             gap_resolution_max_files: default_gap_resolution_max_files(),
+            answer_prompt_budget: default_answer_prompt_budget(),
         }
     }
 }
@@ -597,6 +608,17 @@ pub struct PyramidState {
     /// WS-ONLINE-G: Combined per-operator hourly rate limit + global daily spend cap.
     /// Single mutex eliminates the TOCTOU race between the two checks.
     pub absorption_gate: Arc<Mutex<AbsorptionGate>>,
+    /// Post-agents-retro web surface: broadcast bus for tagged build
+    /// progress events. Named `build_event_bus` to avoid collision with
+    /// the pre-existing `event_bus: Arc<LocalEventBus>` used for chain
+    /// cascades. Phase 1 WS-B will wire producer sites.
+    pub build_event_bus: Arc<crate::pyramid::event_bus::BuildEventBus>,
+    /// Supabase project URL for the public web auth flow. `None` until
+    /// WS-E lands config loading.
+    pub supabase_url: Option<String>,
+    /// Supabase anon key for the public web auth flow. `None` until
+    /// WS-E lands config loading.
+    pub supabase_anon_key: Option<String>,
 }
 
 impl PyramidState {
@@ -636,6 +658,9 @@ impl PyramidState {
             chains_dir: self.chains_dir.clone(),
             remote_query_rate_limiter: self.remote_query_rate_limiter.clone(),
             absorption_gate: self.absorption_gate.clone(),
+            build_event_bus: self.build_event_bus.clone(),
+            supabase_url: self.supabase_url.clone(),
+            supabase_anon_key: self.supabase_anon_key.clone(),
         }))
     }
 }

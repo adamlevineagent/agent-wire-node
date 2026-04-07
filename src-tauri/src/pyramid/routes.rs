@@ -1511,7 +1511,9 @@ pub fn pyramid_routes(
     let r_new2 = session_register.or(sessions_list).unify().boxed();
     let top16 = top15.or(r_new1).unify().boxed();
     let top17 = top16.or(r_new2).unify().boxed();
-    top17
+    // === public_html mount point (added by Phase 0.5 skeleton; do NOT modify above this) ===
+    let public_html = crate::pyramid::public_html::routes(state.clone());
+    top17.or(public_html).unify().boxed()
 }
 
 // ── Route handlers ──────────────────────────────────────────────────

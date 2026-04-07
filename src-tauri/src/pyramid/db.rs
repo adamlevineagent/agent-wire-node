@@ -813,6 +813,47 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
     // ── Schema Prep Migration for Wire Online push ──────────────────────────
     migrate_online_push_columns(conn)?;
 
+    // ── Phase 0.5: post-agents-retro web surface skeleton ──────────────────
+    // (a) web_sessions — v3.3 A2 + B14
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS web_sessions (
+            token TEXT PRIMARY KEY,
+            supabase_user_id TEXT NOT NULL,
+            email TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            expires_at TEXT NOT NULL,
+            last_seen_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_web_sessions_expires ON web_sessions(expires_at);
+        ",
+    )?;
+
+    // (b) pyramid_ascii_art — v3.3 C1 supersession-aware
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS pyramid_ascii_art (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            slug TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            source_hash TEXT NOT NULL,
+            art_text TEXT NOT NULL,
+            model TEXT NOT NULL,
+            superseded_by INTEGER REFERENCES pyramid_ascii_art(id),
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_ascii_art_slug_kind_head
+            ON pyramid_ascii_art(slug, kind) WHERE superseded_by IS NULL;
+        ",
+    )?;
+
+    // (c) pyramid_slugs.updated_at — add if absent (idempotent; ignores
+    // duplicate-column error on existing DBs).
+    let _ = conn.execute(
+        "ALTER TABLE pyramid_slugs ADD COLUMN updated_at TEXT NOT NULL DEFAULT (datetime('now'))",
+        [],
+    );
+
     Ok(())
 }
 

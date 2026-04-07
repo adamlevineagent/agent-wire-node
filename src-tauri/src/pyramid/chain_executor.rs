@@ -14099,6 +14099,9 @@ mod tests {
             chains_dir: std::path::PathBuf::from("chains"),
             remote_query_rate_limiter: Arc::new(Mutex::new(HashMap::new())),
             absorption_gate: Arc::new(Mutex::new(crate::pyramid::AbsorptionGate::new())),
+            build_event_bus: Arc::new(crate::pyramid::event_bus::BuildEventBus::new()),
+            supabase_url: None,
+            supabase_anon_key: None,
         };
 
         let chain = make_integration_code_chain();
@@ -14169,6 +14172,9 @@ mod tests {
             chains_dir: std::path::PathBuf::from("chains"),
             remote_query_rate_limiter: Arc::new(Mutex::new(HashMap::new())),
             absorption_gate: Arc::new(Mutex::new(crate::pyramid::AbsorptionGate::new())),
+            build_event_bus: Arc::new(crate::pyramid::event_bus::BuildEventBus::new()),
+            supabase_url: None,
+            supabase_anon_key: None,
         };
 
         let chain = make_integration_code_chain();
@@ -14259,6 +14265,9 @@ mod tests {
             chains_dir: std::path::PathBuf::from("chains"),
             remote_query_rate_limiter: Arc::new(Mutex::new(HashMap::new())),
             absorption_gate: Arc::new(Mutex::new(crate::pyramid::AbsorptionGate::new())),
+            build_event_bus: Arc::new(crate::pyramid::event_bus::BuildEventBus::new()),
+            supabase_url: None,
+            supabase_anon_key: None,
         };
 
         assert!(!pyramid_state
@@ -14313,6 +14322,9 @@ mod tests {
             chains_dir: std::path::PathBuf::from("chains"),
             remote_query_rate_limiter: Arc::new(Mutex::new(HashMap::new())),
             absorption_gate: Arc::new(Mutex::new(crate::pyramid::AbsorptionGate::new())),
+            build_event_bus: Arc::new(crate::pyramid::event_bus::BuildEventBus::new()),
+            supabase_url: None,
+            supabase_anon_key: None,
         };
 
         let chain = make_integration_code_chain();

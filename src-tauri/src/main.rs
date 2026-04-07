@@ -5617,6 +5617,9 @@ async fn pyramid_vine_integrity(
         chains_dir: state.pyramid.chains_dir.clone(),
         remote_query_rate_limiter: state.pyramid.remote_query_rate_limiter.clone(),
         absorption_gate: state.pyramid.absorption_gate.clone(),
+        build_event_bus: state.pyramid.build_event_bus.clone(),
+        supabase_url: state.pyramid.supabase_url.clone(),
+        supabase_anon_key: state.pyramid.supabase_anon_key.clone(),
     });
 
     let summary = vine::run_integrity_check(&pyramid_state, &slug)
@@ -5661,6 +5664,9 @@ async fn pyramid_vine_rebuild_upper(
         chains_dir: state.pyramid.chains_dir.clone(),
         remote_query_rate_limiter: state.pyramid.remote_query_rate_limiter.clone(),
         absorption_gate: state.pyramid.absorption_gate.clone(),
+        build_event_bus: state.pyramid.build_event_bus.clone(),
+        supabase_url: state.pyramid.supabase_url.clone(),
+        supabase_anon_key: state.pyramid.supabase_anon_key.clone(),
     });
 
     let cancel = tokio_util::sync::CancellationToken::new();
@@ -6477,6 +6483,11 @@ fn main() {
         absorption_gate: Arc::new(tokio::sync::Mutex::new(
             wire_node_lib::pyramid::AbsorptionGate::new(),
         )),
+        build_event_bus: Arc::new(
+            wire_node_lib::pyramid::event_bus::BuildEventBus::new(),
+        ),
+        supabase_url: None,
+        supabase_anon_key: None,
     });
 
     // Load persisted event subscriptions into the in-memory event bus
