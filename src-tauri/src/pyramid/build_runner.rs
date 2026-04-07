@@ -230,6 +230,52 @@ pub async fn run_build_from(
         .await;
     }
 
+    // ── Conversation dispatch ──────────────────────────────────────────
+    // Conversations use the question pipeline with a default apex question.
+    // The conversation.yaml chain provides conversation-tuned extraction
+    // while reusing the full question decomposition → evidence → gap pipeline.
+    if content_type == ContentType::Conversation {
+        // Check for stored question tree first (re-build case)
+        let (apex_question, stored_granularity, stored_max_depth) = {
+            let conn = state.reader.lock().await;
+            match db::get_question_tree(&conn, slug_name)? {
+                Some(tree_json) => {
+                    let tree: question_decomposition::QuestionTree =
+                        serde_json::from_value(tree_json)?;
+                    (
+                        tree.config.apex_question.clone(),
+                        tree.config.granularity,
+                        tree.config.max_depth,
+                    )
+                }
+                None => {
+                    // First build — use default conversation question
+                    (
+                        "What happened during this conversation? What was discussed, \
+                         what decisions were made, how did the discussion evolve, \
+                         and what are the key takeaways?".to_string(),
+                        3u32,  // balanced granularity
+                        3u32,  // reasonable depth for conversations
+                    )
+                }
+            }
+        };
+
+        return Box::pin(run_decomposed_build(
+            state,
+            slug_name,
+            &apex_question,
+            stored_granularity,
+            stored_max_depth,
+            from_depth,
+            None,
+            cancel,
+            progress_tx,
+            layer_tx,
+        ))
+        .await;
+    }
+
     // ── 2. Check feature flags ───────────────────────────────────────────
     let use_ir = state.use_ir_executor.load(Ordering::Relaxed);
     let use_chain = state.use_chain_engine.load(Ordering::Relaxed);
@@ -753,15 +799,17 @@ pub async fn run_decomposed_build(
         }
     };
 
-    // ── 4. Load question pipeline chain ────────────────────────────
+    // ── 4. Load pipeline chain (content-type aware) ──────────────────
     let chains_dir = state.chains_dir.clone();
+    let default_chain_id = chain_registry::default_chain_id(ct_str);
     let all_chains = chain_loader::discover_chains(&chains_dir)?;
     let meta = all_chains
         .iter()
-        .find(|m| m.id == "question-pipeline")
+        .find(|m| m.id == default_chain_id)
         .ok_or_else(|| {
             anyhow!(
-                "question-pipeline chain not found in chains directory ({})",
+                "'{}' chain not found in chains directory ({})",
+                default_chain_id,
                 chains_dir.display()
             )
         })?;

@@ -24,6 +24,8 @@ steps:
   - name: source_extract
     primitive: extract
     instruction: "$prompts/question/source_extract.md"
+    instruction_map:
+      content_type:conversation: "$prompts/conversation/source_extract_v2.md"
     for_each: "$chunks"
     when: "$load_prior_state.l0_count == 0"
     dispatch_order: "largest_first"
