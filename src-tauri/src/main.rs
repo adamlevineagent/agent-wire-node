@@ -5231,6 +5231,83 @@ async fn pyramid_get_config(
     }))
 }
 
+/// List every model profile available to apply. Walks data_dir/profiles/
+/// and the legacy ~/.gemini/wire-node/profiles/ fallback. Returns sorted
+/// profile names (without `.json`).
+#[tauri::command]
+async fn pyramid_list_profiles(
+    state: tauri::State<'_, SharedState>,
+) -> Result<Vec<String>, String> {
+    let data_dir = state
+        .pyramid
+        .data_dir
+        .clone()
+        .ok_or_else(|| "data_dir not configured".to_string())?;
+    Ok(wire_node_lib::pyramid::PyramidConfig::list_profiles(&data_dir))
+}
+
+/// Apply a model profile by name. Mutates the in-memory PyramidConfig +
+/// LLM config so subsequent builds use the new model selection. The
+/// change is in-memory only — profiles are layered overrides, not
+/// persisted as the new defaults. (To persist, the operator edits the
+/// pyramid_config.json directly.)
+#[tauri::command]
+async fn pyramid_apply_profile(
+    state: tauri::State<'_, SharedState>,
+    profile: String,
+) -> Result<(), String> {
+    let data_dir = state
+        .pyramid
+        .data_dir
+        .clone()
+        .ok_or_else(|| "data_dir not configured".to_string())?;
+
+    // Load the on-disk pyramid_config.json, apply the profile patch in
+    // memory, then update the live LlmConfig that the build pipeline
+    // reads. We don't write the merged config back to disk — profiles
+    // are non-destructive overlays.
+    let config_path = data_dir.join("pyramid_config.json");
+    let mut pyramid_config: wire_node_lib::pyramid::PyramidConfig =
+        if config_path.exists() {
+            std::fs::read_to_string(&config_path)
+                .map_err(|e| format!("read pyramid_config.json: {}", e))
+                .and_then(|s| {
+                    serde_json::from_str(&s)
+                        .map_err(|e| format!("parse pyramid_config.json: {}", e))
+                })?
+        } else {
+            wire_node_lib::pyramid::PyramidConfig::default()
+        };
+
+    pyramid_config
+        .apply_profile(&profile, &data_dir)
+        .map_err(|e| e.to_string())?;
+
+    // Push the new LlmConfig into the running state so the next build
+    // sees it. The api_key + auth_token come from the live config, not
+    // the profile (profiles only override model selection + tier params).
+    let new_llm = pyramid_config.to_llm_config();
+    let mut live = state.pyramid.config.write().await;
+    let preserved_api_key = live.api_key.clone();
+    let preserved_auth_token = live.auth_token.clone();
+    *live = new_llm;
+    if live.api_key.is_empty() {
+        live.api_key = preserved_api_key;
+    }
+    if live.auth_token.is_empty() {
+        live.auth_token = preserved_auth_token;
+    }
+
+    tracing::info!(
+        profile = %profile,
+        primary = %live.primary_model,
+        fallback_1 = %live.fallback_model_1,
+        fallback_2 = %live.fallback_model_2,
+        "applied model profile",
+    );
+    Ok(())
+}
+
 /// Test an OpenRouter API key server-side so the key never touches the renderer.
 #[tauri::command]
 async fn pyramid_test_api_key(state: tauri::State<'_, SharedState>) -> Result<String, String> {
@@ -7261,6 +7338,8 @@ fn main() {
             pyramid_create_slug,
             pyramid_delete_slug,
             pyramid_get_config,
+            pyramid_list_profiles,
+            pyramid_apply_profile,
             pyramid_generate_ascii_banner,
             pyramid_open_web_as_owner,
             open_url_in_browser,

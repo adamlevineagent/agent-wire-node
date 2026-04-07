@@ -105,6 +105,17 @@ pub fn page_with_etag(
          <main class=\"page\">\n\
          {body}\n\
          </main>\n\
+         <footer class=\"site-footer\">\n\
+           <details class=\"section for-agents-footer\">\n\
+             <summary>For AI agents</summary>\n\
+             <p>This is a Wire Node serving Knowledge Pyramids.\n\
+                For agent onboarding, the route list, and the live pyramid\n\
+                catalog, fetch:</p>\n\
+             <pre><code>curl -H \"Accept: text/markdown\" \
+                {help_link}</code></pre>\n\
+             <p>Or visit <a href=\"/help\">/help</a>.</p>\n\
+           </details>\n\
+         </footer>\n\
          <script src=\"{client_js}\" defer></script>\n\
          <script src=\"{client_ws_js}\" defer></script>\n\
          </body>\n\
@@ -115,6 +126,7 @@ pub fn page_with_etag(
         client_js = client_js_url,
         client_ws_js = client_ws_js_url,
         banner = banner.map(esc).unwrap_or_default(),
+        help_link = "/help",
     );
 
     let mut builder = Response::builder()

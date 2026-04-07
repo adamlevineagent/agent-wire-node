@@ -1,4 +1,4 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-dialog';
 import { BuildProgress } from './BuildProgress';
@@ -45,6 +45,25 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
     const [creating, setCreating] = useState(false);
     const [apexQuestion, setApexQuestion] = useState('');
     const [error, setError] = useState<string | null>(null);
+    // Model profile selector — populated lazily from pyramid_list_profiles.
+    // Empty string means "use the operator's current default".
+    const [profiles, setProfiles] = useState<string[]>([]);
+    const [selectedProfile, setSelectedProfile] = useState<string>('');
+    const [profilesError, setProfilesError] = useState<string | null>(null);
+
+    useEffect(() => {
+        let cancelled = false;
+        invoke<string[]>('pyramid_list_profiles')
+            .then(list => {
+                if (cancelled) return;
+                setProfiles(list);
+            })
+            .catch(err => {
+                if (cancelled) return;
+                setProfilesError(String(err));
+            });
+        return () => { cancelled = true; };
+    }, []);
 
     const handlePickDirectory = useCallback(async () => {
         try {
@@ -262,6 +281,19 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
             await invoke('pyramid_ingest', { slug });
 
             if (andBuild) {
+                // Apply the selected model profile (if any) BEFORE the build
+                // starts so the build pipeline picks up the new model selection.
+                // Empty string = use current default; don't apply.
+                if (selectedProfile && selectedProfile.trim()) {
+                    try {
+                        await invoke('pyramid_apply_profile', { profile: selectedProfile });
+                    } catch (e) {
+                        setError(`Failed to apply profile "${selectedProfile}": ${e}`);
+                        setCreating(false);
+                        return;
+                    }
+                }
+
                 // Start question build (modern pipeline)
                 await invoke('pyramid_question_build', {
                     slug,
@@ -278,7 +310,7 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
         } finally {
             setCreating(false);
         }
-    }, [paths, contentType, slug, apexQuestion, onComplete]);
+    }, [paths, contentType, slug, apexQuestion, selectedProfile, onComplete]);
 
     const allIgnores = [
         ...DEFAULT_IGNORES,
@@ -597,6 +629,49 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
                         placeholder="e.g. What are the key systems and architecture of this codebase?"
                         style={{ width: '100%', resize: 'vertical', fontFamily: 'inherit' }}
                     />
+
+                    {/* Model profile selector — applies a layered override to
+                        the LLM config so this build uses a different model
+                        cascade. Empty value = use the operator's current
+                        default. Profiles are loaded from
+                        ~/Library/Application Support/wire-node/profiles/
+                        (with ~/.gemini/wire-node/profiles/ as a fallback). */}
+                    <div style={{ marginTop: '16px' }}>
+                        <label className="field-label" style={{ display: 'block', marginBottom: '4px' }}>
+                            Model profile:
+                        </label>
+                        {profilesError ? (
+                            <p className="hint" style={{ color: '#ef4444', margin: 0 }}>
+                                Could not load profiles: {profilesError}
+                            </p>
+                        ) : profiles.length === 0 ? (
+                            <p className="hint" style={{ margin: 0 }}>
+                                No profiles found. Drop JSON profile files into
+                                <code style={{ marginLeft: '4px' }}>~/Library/Application Support/wire-node/profiles/</code>
+                                and refresh.
+                            </p>
+                        ) : (
+                            <>
+                                <select
+                                    className="input"
+                                    value={selectedProfile}
+                                    onChange={(e) => setSelectedProfile(e.target.value)}
+                                    style={{ width: '100%' }}
+                                >
+                                    <option value="">(use current default)</option>
+                                    {profiles.map(p => (
+                                        <option key={p} value={p}>{p}</option>
+                                    ))}
+                                </select>
+                                <p className="hint" style={{ marginTop: '4px', fontSize: '0.85em', opacity: 0.7 }}>
+                                    Profiles are layered overrides on the LLM cascade. Selecting one applies it
+                                    in-memory before this build starts and stays active for subsequent builds
+                                    until you change it again. Edit profile JSON files on disk to add new options.
+                                </p>
+                            </>
+                        )}
+                    </div>
+
                     <div style={{ marginTop: '12px', display: 'flex', gap: '8px' }}>
                         <button className="btn btn-ghost" onClick={() => {
                             if (contentType === 'conversation') setStep('content-type');

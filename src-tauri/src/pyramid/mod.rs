@@ -519,9 +519,27 @@ impl PyramidConfig {
 
     /// Load a profile JSON file and apply it over the current config.
     pub fn apply_profile(&mut self, profile_name: &str, data_dir: &Path) -> anyhow::Result<()> {
-        let profiles_dir = data_dir.join("profiles");
-        let profile_path = profiles_dir.join(format!("{}.json", profile_name));
-        
+        // Look in two places: the canonical data_dir/profiles/, and the
+        // legacy ~/.gemini/wire-node/profiles/ location which is where the
+        // semantic-aliasing side-quest dropped them on the operator's
+        // machine. The canonical location is preferred; the legacy
+        // location is a fallback so existing profile sets keep working
+        // until the operator copies them over.
+        let canonical = data_dir.join("profiles").join(format!("{}.json", profile_name));
+        let legacy = dirs::home_dir()
+            .map(|h| h.join(".gemini").join("wire-node").join("profiles").join(format!("{}.json", profile_name)));
+        let profile_path = if canonical.exists() {
+            canonical
+        } else if let Some(legacy_path) = legacy.filter(|p| p.exists()) {
+            legacy_path
+        } else {
+            return Err(anyhow::anyhow!(
+                "Profile '{}' not found at {:?} (also checked ~/.gemini/wire-node/profiles/)",
+                profile_name,
+                canonical
+            ));
+        };
+
         if !profile_path.exists() {
             return Err(anyhow::anyhow!("Profile '{}' not found at {:?}", profile_name, profile_path));
         }
@@ -550,6 +568,32 @@ impl PyramidConfig {
         
         *self = serde_json::from_value(current_json)?;
         Ok(())
+    }
+
+    /// List every profile available to apply. Walks both the canonical
+    /// data_dir/profiles/ directory and the legacy ~/.gemini/wire-node/
+    /// profiles/ location, merges by name (canonical wins on conflict),
+    /// and returns a sorted list of profile names (without the .json
+    /// extension).
+    pub fn list_profiles(data_dir: &Path) -> Vec<String> {
+        let mut names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut walk = |dir: &Path| {
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().and_then(|s| s.to_str()) == Some("json") {
+                        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                            names.insert(stem.to_string());
+                        }
+                    }
+                }
+            }
+        };
+        walk(&data_dir.join("profiles"));
+        if let Some(home) = dirs::home_dir() {
+            walk(&home.join(".gemini").join("wire-node").join("profiles"));
+        }
+        names.into_iter().collect()
     }
 
     /// Convert to an LlmConfig for use with the build pipeline.
