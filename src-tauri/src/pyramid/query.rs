@@ -795,19 +795,32 @@ mod tests {
 /// Cross-slug support: when the slug has references, searches across all
 /// referenced slugs + self in a single query. Results are tagged with source_slug.
 pub fn search(conn: &Connection, slug: &str, term: &str) -> Result<Vec<SearchHit>> {
-    // Split query into individual words for AND-matching.
-    // Each word must appear in at least one searchable field.
-    // This allows "stale engine" to match nodes where "stale" is in distilled
-    // and "engine" is in topics, rather than requiring the exact phrase.
-    let words: Vec<String> = term
+    // Tokenize, lowercase, drop short noise + stop words. The remaining
+    // tokens drive an OR-match across searchable fields; the score is
+    // computed below from the count of matched words and the depth.
+    const STOP_WORDS: &[&str] = &[
+        "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "has", "have", "how",
+        "i", "in", "is", "it", "its", "of", "on", "or", "that", "the", "this", "to", "was",
+        "what", "when", "where", "which", "who", "why", "will", "with", "you", "your", "do",
+        "does", "did", "can", "could", "would", "should", "may", "might", "must", "shall",
+        "but", "if", "then", "than", "so", "no", "not", "any", "all", "some", "such",
+    ];
+    let mut words: Vec<String> = term
         .to_lowercase()
         .split_whitespace()
-        .filter(|w| w.len() > 1) // skip single-char noise
+        .filter(|w| w.len() > 2)
+        .filter(|w| !STOP_WORDS.contains(w))
         .map(|w| w.to_string())
         .collect();
 
     if words.is_empty() {
-        return Ok(Vec::new());
+        // Fallback: every word was a stop word or too short — search the
+        // raw trimmed term as a single token so the user still gets hits.
+        let raw = term.trim().to_lowercase();
+        if raw.is_empty() {
+            return Ok(Vec::new());
+        }
+        words = vec![raw];
     }
 
     // Gather all slugs to search: self + referenced slugs
@@ -848,9 +861,9 @@ pub fn search(conn: &Connection, slug: &str, term: &str) -> Result<Vec<SearchHit
 
     let sql = format!(
         "SELECT id, slug, depth, headline, distilled, topics, corrections, terms FROM live_pyramid_nodes \
-         WHERE {} AND {} ORDER BY depth DESC",
+         WHERE {} AND ({}) ORDER BY depth DESC",
         slug_in_clause,
-        conditions.join(" AND ")
+        conditions.join(" OR ")
     );
 
     let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();

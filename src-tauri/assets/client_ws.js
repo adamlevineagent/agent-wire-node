@@ -176,3 +176,141 @@
   }
 })();
 // === end WS-K === //
+
+// === Phase A: question pyramid live answer === //
+// Activates only on /p/{src}/q/{qslug} pages, identified by the presence of
+// a #build-status[data-qslug] element. Connects to the question pyramid's WS,
+// watches for terminal progress, then fetches and typewriters the answer
+// fragment into #answer.
+(function () {
+  'use strict';
+  if (typeof window === 'undefined' || typeof WebSocket === 'undefined') return;
+
+  var status = document.getElementById('build-status');
+  var answer = document.getElementById('answer');
+  if (!status || !answer) return;
+  var src = status.getAttribute('data-source');
+  var qslug = status.getAttribute('data-qslug');
+  var building = status.getAttribute('data-building') === '1';
+  if (!src || !qslug) return;
+
+  var fetched = false;
+
+  function setLabel(text) {
+    var p = status.querySelector('p');
+    if (p) p.textContent = text;
+  }
+
+  function typewriter(el, html, speedMs) {
+    // Walk text content character-by-character. We set innerHTML once with
+    // the trusted server-rendered HTML, then hide all text nodes by storing
+    // their values and revealing them progressively.
+    el.innerHTML = html;
+    var walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, null, false);
+    var textNodes = [];
+    var node;
+    while ((node = walker.nextNode())) {
+      textNodes.push({ node: node, full: node.nodeValue });
+      node.nodeValue = '';
+    }
+    var nodeIdx = 0;
+    var charIdx = 0;
+    var last = 0;
+    function step(ts) {
+      if (!last) last = ts;
+      var dt = ts - last;
+      if (dt < speedMs) {
+        requestAnimationFrame(step);
+        return;
+      }
+      last = ts;
+      // Reveal ~3 chars per frame for a snappy effect.
+      for (var k = 0; k < 3; k++) {
+        if (nodeIdx >= textNodes.length) return;
+        var entry = textNodes[nodeIdx];
+        if (charIdx >= entry.full.length) {
+          entry.node.nodeValue = entry.full;
+          nodeIdx++;
+          charIdx = 0;
+          continue;
+        }
+        charIdx++;
+        entry.node.nodeValue = entry.full.slice(0, charIdx);
+      }
+      requestAnimationFrame(step);
+    }
+    requestAnimationFrame(step);
+  }
+
+  function fetchAnswer() {
+    if (fetched) return;
+    fetched = true;
+    setLabel('answer ready');
+    var url = '/p/' + encodeURIComponent(src) + '/q/' + encodeURIComponent(qslug) + '/answer.fragment';
+    fetch(url, { credentials: 'same-origin' })
+      .then(function (r) {
+        if (r.status === 202) {
+          // Still building — try again shortly.
+          fetched = false;
+          setTimeout(fetchAnswer, 2000);
+          return null;
+        }
+        return r.text();
+      })
+      .then(function (html) {
+        if (html == null) return;
+        typewriter(answer, html, 16);
+      })
+      .catch(function () {
+        fetched = false;
+      });
+  }
+
+  // If the page already rendered the answer server-side, do nothing.
+  if (!building && answer.children.length > 0) return;
+
+  // If the build is not active, just fetch once.
+  if (!building) {
+    fetchAnswer();
+    return;
+  }
+
+  // Open WS to the question pyramid's stream.
+  var proto = (location.protocol === 'https:') ? 'wss:' : 'ws:';
+  var wsUrl = proto + '//' + location.host + '/p/' + encodeURIComponent(src) + '/q/' + encodeURIComponent(qslug) + '/_ws';
+  var sock;
+  try {
+    sock = new WebSocket(wsUrl);
+  } catch (e) {
+    setTimeout(fetchAnswer, 2000);
+    return;
+  }
+  setLabel('connecting...');
+  sock.addEventListener('open', function () { setLabel('building answer...'); });
+  sock.addEventListener('message', function (ev) {
+    var msg;
+    try { msg = JSON.parse(ev.data); } catch (e) { return; }
+    if (!msg || !msg.kind) return;
+    var k = msg.kind;
+    if (k.type === 'progress' && typeof k.done === 'number' && typeof k.total === 'number') {
+      if (k.total > 0 && k.done >= k.total) {
+        // Build done — give the writer a tick to flush, then fetch.
+        setTimeout(fetchAnswer, 500);
+      } else {
+        setLabel('building answer... ' + k.done + '/' + k.total);
+      }
+    } else if (k.type === 'v2_snapshot' && k.current_step) {
+      setLabel('step: ' + k.current_step);
+    }
+  });
+  sock.addEventListener('close', function () {
+    // Whether or not the build finished, try to fetch the fragment after
+    // the close — handles the race where the WS closes before we see the
+    // final progress event.
+    setTimeout(fetchAnswer, 500);
+  });
+  sock.addEventListener('error', function () {
+    setTimeout(fetchAnswer, 2000);
+  });
+})();
+// === end Phase A === //

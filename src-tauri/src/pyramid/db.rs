@@ -1464,6 +1464,42 @@ pub fn get_slug_referrers(conn: &Connection, slug: &str) -> Result<Vec<String>> 
     Ok(rows.filter_map(|r| r.ok()).collect())
 }
 
+/// Return all question pyramids that reference `source_slug`. Used by the
+/// public web surface to render the "Questions asked" section on a source
+/// pyramid's home page. Newest first.
+pub fn get_questions_referencing(
+    conn: &Connection,
+    source_slug: &str,
+) -> Result<Vec<SlugInfo>> {
+    let mut stmt = conn.prepare(
+        "SELECT s.slug, s.content_type, s.source_path, s.node_count, s.max_depth,
+                s.last_built_at, s.created_at, s.archived_at
+         FROM pyramid_slugs s
+         JOIN pyramid_slug_references r ON r.slug = s.slug
+         WHERE r.referenced_slug = ?1
+           AND s.content_type = 'question'
+           AND s.archived_at IS NULL
+         ORDER BY s.created_at DESC",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![source_slug], |row| {
+        let ct_str: String = row.get(1)?;
+        let content_type = ContentType::from_str(&ct_str).unwrap_or(ContentType::Question);
+        Ok(SlugInfo {
+            slug: row.get(0)?,
+            content_type,
+            source_path: row.get(2)?,
+            node_count: row.get(3)?,
+            max_depth: row.get(4)?,
+            last_built_at: row.get(5)?,
+            created_at: row.get(6)?,
+            archived_at: row.get(7)?,
+            referenced_slugs: Vec::new(),
+            referencing_slugs: Vec::new(),
+        })
+    })?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
 /// Returns true if any other slug references this one.
 pub fn has_slug_referrers(conn: &Connection, slug: &str) -> Result<bool> {
     let count: i64 = conn.query_row(

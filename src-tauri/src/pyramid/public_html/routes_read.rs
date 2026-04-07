@@ -29,7 +29,7 @@ use crate::pyramid::PyramidState;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use warp::filters::BoxedFilter;
-use warp::{Filter, Rejection};
+use warp::{Filter, Rejection, Reply};
 
 // WS-G caps (plan v3.2 §Verification).
 const SEARCH_QUERY_MAX: usize = 256;
@@ -268,6 +268,66 @@ pub fn read_routes(
             },
         );
 
+    let state_qview = state.clone();
+    let jwt_qview = jwt_public_key.clone();
+    let question_view = warp::path("p")
+        .and(warp::path::param::<String>())
+        .and(warp::path("q"))
+        .and(warp::path::param::<String>())
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::filters::addr::remote())
+        .and(warp::header::headers_cloned())
+        .and_then(
+            move |source: String,
+                  question_slug: String,
+                  peer: Option<std::net::SocketAddr>,
+                  headers: warp::http::HeaderMap| {
+                let state = state_qview.clone();
+                let jwt_pk = jwt_qview.clone();
+                async move {
+                    Ok::<_, Rejection>(
+                        handle_question_view(state, jwt_pk, source, question_slug, peer, headers)
+                            .await,
+                    )
+                }
+            },
+        );
+
+    let state_qfrag = state.clone();
+    let jwt_qfrag = jwt_public_key.clone();
+    let question_fragment = warp::path("p")
+        .and(warp::path::param::<String>())
+        .and(warp::path("q"))
+        .and(warp::path::param::<String>())
+        .and(warp::path("answer.fragment"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::filters::addr::remote())
+        .and(warp::header::headers_cloned())
+        .and_then(
+            move |source: String,
+                  question_slug: String,
+                  peer: Option<std::net::SocketAddr>,
+                  headers: warp::http::HeaderMap| {
+                let state = state_qfrag.clone();
+                let jwt_pk = jwt_qfrag.clone();
+                async move {
+                    Ok::<_, Rejection>(
+                        handle_question_fragment(
+                            state,
+                            jwt_pk,
+                            source,
+                            question_slug,
+                            peer,
+                            headers,
+                        )
+                        .await,
+                    )
+                }
+            },
+        );
+
     let state_node = state.clone();
     let jwt_node = jwt_public_key.clone();
     let single_node = warp::path("p")
@@ -292,8 +352,10 @@ pub fn read_routes(
             },
         );
 
-    // Literal sub-paths (search/tree/glossary/folio) MUST be ordered before
-    // the `{slug}/{node_id}` catchall so they win the match.
+    // Literal sub-paths (search/tree/glossary/folio/question) MUST be
+    // ordered before the `{slug}/{node_id}` catchall so they win the
+    // match. The question.fragment route MUST precede question_view (more
+    // specific path).
     index
         .or(pyramid_home)
         .unify()
@@ -304,6 +366,10 @@ pub fn read_routes(
         .or(glossary)
         .unify()
         .or(folio)
+        .unify()
+        .or(question_fragment)
+        .unify()
+        .or(question_view)
         .unify()
         .or(single_node)
         .unify()
@@ -333,6 +399,15 @@ async fn handle_index(state: Arc<PyramidState>) -> warp::reply::Response {
     // listings; this one is anti-enumeration.
     let mut items = String::new();
     for info in &slugs {
+        // Phase A: hide question pyramids from the public index — they
+        // are only reachable via their source's "Questions asked" section
+        // or a direct URL.
+        if matches!(
+            info.content_type,
+            crate::pyramid::types::ContentType::Question
+        ) {
+            continue;
+        }
         let tier = db::get_access_tier(&conn, &info.slug)
             .map(|(t, _, _)| t)
             .unwrap_or_else(|_| "public".to_string());
@@ -480,6 +555,34 @@ async fn handle_pyramid_home(
         body.push_str("</ul></nav>\n");
     }
 
+    // Phase A: "Questions asked" — list question pyramids that reference
+    // this source pyramid. Hidden if there are none.
+    {
+        let conn2 = state.reader.lock().await;
+        let questions = db::get_questions_referencing(&conn2, &slug).unwrap_or_default();
+        body.push_str("<section class=\"questions-asked\">\n");
+        body.push_str("<h2>Questions asked of this pyramid</h2>\n");
+        if questions.is_empty() {
+            body.push_str("<p class=\"empty\">No questions yet. Ask one below.</p>\n");
+        } else {
+            body.push_str("<ul>\n");
+            for q in &questions {
+                let label = humanize_question_label(&conn2, &q.slug, q.max_depth);
+                body.push_str(&format!(
+                    "<li><a href=\"/p/{src}/q/{qslug}\">{label}</a> \
+                       <span class=\"question-meta\">asked {when}</span></li>\n",
+                    src = esc(&slug),
+                    qslug = esc(&q.slug),
+                    label = esc(&label),
+                    when = esc(&q.created_at),
+                ));
+            }
+            body.push_str("</ul>\n");
+        }
+        body.push_str("</section>\n");
+        drop(conn2);
+    }
+
     // Real CSRF nonce bound to (session token, slug, current 5-min window).
     // If the visitor has no anon_session cookie yet, mint one and pipe its
     // Set-Cookie header through with the response. The verifier in
@@ -624,6 +727,28 @@ async fn handle_single_node(
     body.push_str(&prov_footer(&node, wire_handle.as_deref()));
     body.push_str("\n</article>\n");
 
+    // Phase A: "Questions asked" of the parent pyramid.
+    {
+        let conn3 = state.reader.lock().await;
+        let questions = db::get_questions_referencing(&conn3, &slug).unwrap_or_default();
+        if !questions.is_empty() {
+            body.push_str("<section class=\"questions-asked\">\n");
+            body.push_str("<h2>Questions asked of this pyramid</h2>\n<ul>\n");
+            for q in &questions {
+                let label = humanize_question_label(&conn3, &q.slug, q.max_depth);
+                body.push_str(&format!(
+                    "<li><a href=\"/p/{src}/q/{qslug}\">{label}</a> \
+                       <span class=\"question-meta\">asked {when}</span></li>\n",
+                    src = esc(&slug),
+                    qslug = esc(&q.slug),
+                    label = esc(&label),
+                    when = esc(&q.created_at),
+                ));
+            }
+            body.push_str("</ul>\n</section>\n");
+        }
+    }
+
     let banner = crate::pyramid::public_html::ascii_art::get_banner_for_slug(&state, &slug).await;
     page_with_etag(
         &title,
@@ -632,6 +757,295 @@ async fn handle_single_node(
         Some(&etag),
         banner.as_deref(),
     )
+}
+
+// ---------------------------------------------------------------------------
+// Phase A: question-pyramid live view + answer fragment
+// ---------------------------------------------------------------------------
+
+/// Render the friendly label for a question pyramid in a "Questions asked"
+/// list. Prefers the apex headline; falls back to the slug with hyphens
+/// turned into spaces.
+fn humanize_question_label(conn: &rusqlite::Connection, slug: &str, max_depth: i64) -> String {
+    if let Some(headline) = apex_headline_for(conn, slug, max_depth) {
+        if !headline.trim().is_empty() {
+            return headline;
+        }
+    }
+    slug.replace('-', " ")
+}
+
+/// Validate the source-pyramid <-> question-pyramid relationship and the
+/// visitor's tier access. Returns the source `SlugInfo` and question
+/// `SlugInfo` on success, or a 404 response on any failure.
+async fn validate_question_pair(
+    state: &Arc<PyramidState>,
+    source_slug: &str,
+    question_slug: &str,
+    auth: &PublicAuthSource,
+) -> Result<(crate::pyramid::types::SlugInfo, crate::pyramid::types::SlugInfo), warp::reply::Response>
+{
+    if !is_safe_slug(source_slug) || !is_safe_slug(question_slug) {
+        return Err(not_found_page());
+    }
+    // Tier check is governed by the SOURCE pyramid.
+    if let Err(resp) = gate(state, source_slug, auth).await {
+        return Err(resp);
+    }
+    let conn = state.reader.lock().await;
+    let source_info = match db::get_slug(&conn, source_slug) {
+        Ok(Some(s)) => s,
+        _ => return Err(not_found_page()),
+    };
+    let question_info = match db::get_slug(&conn, question_slug) {
+        Ok(Some(s)) => s,
+        _ => return Err(not_found_page()),
+    };
+    // It must actually be a question pyramid.
+    if !matches!(
+        question_info.content_type,
+        crate::pyramid::types::ContentType::Question
+    ) {
+        return Err(not_found_page());
+    }
+    // It must reference the source slug (prevents URL guessing).
+    let refs = db::get_slug_references(&conn, question_slug).unwrap_or_default();
+    if !refs.iter().any(|s| s == source_slug) {
+        return Err(not_found_page());
+    }
+    drop(conn);
+    Ok((source_info, question_info))
+}
+
+fn is_safe_slug(slug: &str) -> bool {
+    if slug.is_empty() || slug.len() > 128 || slug.starts_with('_') || slug.starts_with('.') {
+        return false;
+    }
+    slug.chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+async fn handle_question_view(
+    state: Arc<PyramidState>,
+    jwt_public_key: Arc<tokio::sync::RwLock<String>>,
+    source_slug: String,
+    question_slug: String,
+    peer: Option<std::net::SocketAddr>,
+    headers: warp::http::HeaderMap,
+) -> warp::reply::Response {
+    let auth = resolve_auth(&headers, peer, &state, &jwt_public_key).await;
+    let (_source_info, question_info) =
+        match validate_question_pair(&state, &source_slug, &question_slug, &auth).await {
+            Ok(p) => p,
+            Err(resp) => return resp,
+        };
+
+    // Try to recover the original question text from the most recent build
+    // record; otherwise humanize the slug.
+    let question_text = {
+        let conn = state.reader.lock().await;
+        conn.query_row(
+            "SELECT question FROM pyramid_builds \
+             WHERE slug = ?1 AND question IS NOT NULL AND question != '' \
+             ORDER BY rowid DESC LIMIT 1",
+            rusqlite::params![&question_slug],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+        .unwrap_or_else(|| question_slug.replace('-', " "))
+    };
+
+    // Truncate the question text for the breadcrumb.
+    let crumb_text: String = if question_text.chars().count() > 60 {
+        let cut: String = question_text.chars().take(60).collect();
+        format!("{}…", cut)
+    } else {
+        question_text.clone()
+    };
+
+    let title = format!("{} — {}", crumb_text, source_slug);
+
+    // Determine if a build is in progress for this question pyramid.
+    let is_building = {
+        let active = state.active_build.read().await;
+        if let Some(handle) = active.get(&question_slug) {
+            let s = handle.status.read().await;
+            !s.is_terminal()
+        } else {
+            false
+        }
+    };
+
+    // If the build is complete (or there are nodes already), inline the
+    // answer fragment server-side so the page works without JS.
+    let has_nodes = question_info.node_count > 0;
+
+    let mut body = String::new();
+    body.push_str(&format!(
+        "<nav class=\"crumbs\"><a href=\"/p/\">/p/</a> &rsaquo; \
+         <a href=\"/p/{src}\">{src_text}</a> &rsaquo; q &rsaquo; \
+         <span>{crumb}</span></nav>\n",
+        src = esc(&source_slug),
+        src_text = esc(&source_slug),
+        crumb = esc(&crumb_text),
+    ));
+    body.push_str(&format!(
+        "<h1>Question on <code>{src}</code></h1>\n\
+         <blockquote class=\"question\">{q}</blockquote>\n",
+        src = esc(&source_slug),
+        q = esc(&question_text),
+    ));
+
+    body.push_str(&format!(
+        "<div id=\"build-status\" class=\"build-status\" \
+            data-source=\"{src}\" data-qslug=\"{qslug}\" \
+            data-building=\"{building}\">\n\
+           <p class=\"sub\">{label}</p>\n\
+         </div>\n",
+        src = esc(&source_slug),
+        qslug = esc(&question_slug),
+        building = if is_building { "1" } else { "0" },
+        label = if is_building {
+            "building answer..."
+        } else if has_nodes {
+            "answer ready"
+        } else {
+            "build pending"
+        },
+    ));
+
+    // Inline the answer fragment if available so the page works without JS.
+    if has_nodes {
+        let frag = render_question_answer_fragment(&state, &source_slug, &question_slug).await;
+        body.push_str(&format!("<div id=\"answer\">{}</div>\n", frag));
+    } else {
+        body.push_str("<div id=\"answer\" class=\"empty\"></div>\n");
+    }
+
+    // Non-JS fallback: meta refresh every 3s while the build is running.
+    if is_building {
+        body.push_str(
+            "<noscript><meta http-equiv=\"refresh\" content=\"3\"></noscript>\n",
+        );
+    }
+
+    body.push_str(&format!(
+        "<p><a href=\"/p/{src}\">&larr; Back to {src_text}</a></p>\n",
+        src = esc(&source_slug),
+        src_text = esc(&source_slug),
+    ));
+
+    page(&title, &body, "no-cache, must-revalidate")
+}
+
+/// Render the answer fragment HTML for a question pyramid (no doctype, no
+/// head). Caller decides whether to wrap it in a full page or return it as
+/// the response body.
+async fn render_question_answer_fragment(
+    state: &Arc<PyramidState>,
+    source_slug: &str,
+    question_slug: &str,
+) -> String {
+    let conn = state.reader.lock().await;
+    let info = match db::get_slug(&conn, question_slug) {
+        Ok(Some(s)) => s,
+        _ => return "<p class=\"empty\">No answer yet.</p>".to_string(),
+    };
+    let apex_nodes = db::get_nodes_at_depth(&conn, question_slug, info.max_depth)
+        .unwrap_or_default();
+    let apex = match apex_nodes.into_iter().next() {
+        Some(n) => n,
+        None => return "<p class=\"empty\">No answer yet.</p>".to_string(),
+    };
+
+    // Cited source nodes: scan the apex distilled text for any node IDs from
+    // the source pyramid that appear verbatim. (Best-effort: question
+    // builds reference source nodes by ID in their distillations.)
+    let source_nodes =
+        db::get_all_live_nodes(&conn, source_slug).unwrap_or_default();
+    let mut cited: Vec<(String, String)> = Vec::new();
+    for sn in &source_nodes {
+        if !sn.id.is_empty() && apex.distilled.contains(&sn.id) {
+            cited.push((sn.id.clone(), sn.headline.clone()));
+        }
+    }
+    drop(conn);
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "<article class=\"node node--{state}\">\n\
+           <h2>{headline}</h2>\n\
+           <p class=\"distilled\">{distilled}</p>\n",
+        state = node_state_class(&apex),
+        headline = esc(&apex.headline),
+        distilled = esc(&apex.distilled),
+    ));
+    if !cited.is_empty() {
+        out.push_str("<section class=\"cites\"><h3>Cited from</h3><ul>\n");
+        for (nid, hl) in &cited {
+            out.push_str(&format!(
+                "<li><a href=\"/p/{src}/{nid}\">{hl}</a></li>\n",
+                src = esc(source_slug),
+                nid = esc(nid),
+                hl = esc(hl),
+            ));
+        }
+        out.push_str("</ul></section>\n");
+    }
+    out.push_str(&format!(
+        "<footer class=\"prov\">{qslug}/{depth}/{nid}</footer>\n",
+        qslug = esc(question_slug),
+        depth = apex.depth,
+        nid = esc(&apex.id),
+    ));
+    out.push_str("</article>\n");
+    out
+}
+
+async fn handle_question_fragment(
+    state: Arc<PyramidState>,
+    jwt_public_key: Arc<tokio::sync::RwLock<String>>,
+    source_slug: String,
+    question_slug: String,
+    peer: Option<std::net::SocketAddr>,
+    headers: warp::http::HeaderMap,
+) -> warp::reply::Response {
+    let auth = resolve_auth(&headers, peer, &state, &jwt_public_key).await;
+    let (_source_info, question_info) =
+        match validate_question_pair(&state, &source_slug, &question_slug, &auth).await {
+            Ok(p) => p,
+            Err(resp) => return resp,
+        };
+
+    // Still building? 202 + a tiny placeholder.
+    let is_building = {
+        let active = state.active_build.read().await;
+        if let Some(handle) = active.get(&question_slug) {
+            let s = handle.status.read().await;
+            !s.is_terminal()
+        } else {
+            false
+        }
+    };
+    if is_building && question_info.node_count == 0 {
+        let body = "<p class=\"sub\">still building, retry in 2s</p>";
+        let resp = warp::http::Response::builder()
+            .status(202)
+            .header(warp::http::header::CONTENT_TYPE, "text/html; charset=utf-8")
+            .header(warp::http::header::CACHE_CONTROL, "no-store")
+            .body(body.to_string())
+            .unwrap();
+        return resp.into_response();
+    }
+
+    let frag = render_question_answer_fragment(&state, &source_slug, &question_slug).await;
+    warp::http::Response::builder()
+        .status(200)
+        .header(warp::http::header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .header(warp::http::header::CACHE_CONTROL, "no-store")
+        .body(frag)
+        .unwrap()
+        .into_response()
 }
 
 // ---------------------------------------------------------------------------

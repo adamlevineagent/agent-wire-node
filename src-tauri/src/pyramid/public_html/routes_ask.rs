@@ -32,6 +32,7 @@ use warp::http::StatusCode;
 use warp::{Filter, Rejection};
 
 use crate::http_utils::ct_eq;
+use crate::pyramid::types::ContentType;
 use crate::pyramid::PyramidState;
 use crate::pyramid::public_html::auth::{
     ANON_SESSION_COOKIE, PublicAuthSource, WIRE_SESSION_COOKIE, csrf_nonce, enforce_public_tier,
@@ -374,6 +375,7 @@ fn render_preview_page(
     page("Preview — Wire Node", &body, "no-store")
 }
 
+#[allow(dead_code)]
 fn render_answer_page(
     slug: &str,
     question: &str,
@@ -406,6 +408,7 @@ fn render_answer_page(
     page("Answer — Wire Node", &body, "no-store")
 }
 
+#[allow(dead_code)]
 fn render_no_results_page(slug: &str, question: &str) -> warp::reply::Response {
     let body = format!(
         "<h1>No relevant nodes</h1>\n\
@@ -418,14 +421,17 @@ fn render_no_results_page(slug: &str, question: &str) -> warp::reply::Response {
     page("No results — Wire Node", &body, "no-store")
 }
 
-// ── Core synthesis (replicates handle_navigate's pipeline) ──────────────
+// ── Core synthesis (legacy — kept for reference; question-pyramid path
+//    bypasses inline synthesis entirely). ───────────────────────────────
 
+#[allow(dead_code)]
 struct SynthesisOutput {
     answer: String,
     cited_nodes: Vec<String>,
     is_empty: bool,
 }
 
+#[allow(dead_code)]
 async fn run_synthesis(
     state: &PyramidState,
     slug: &str,
@@ -538,6 +544,161 @@ fn estimated_cost_credits(candidate_count: usize) -> u64 {
     base.max(1)
 }
 
+// ── Question-pyramid slug minting + redirect ────────────────────────────
+
+/// Default question-pyramid build cost estimate (paid mode), used for the
+/// rate-limit pre-check. Reflects roughly `10 * granularity * max_depth`
+/// for the V1 defaults (granularity=3, max_depth=2).
+const QUESTION_BUILD_COST_CREDITS: u64 = 60;
+
+/// Default decomposed-build parameters for web-surface-initiated question
+/// pyramids. The desktop UI can override these via the IPC path; the public
+/// surface keeps them locked.
+const QB_GRANULARITY: u32 = 3;
+const QB_MAX_DEPTH: u32 = 2;
+const QB_FROM_DEPTH: i64 = 0;
+
+/// Truncate a kebab-case string to at most `max_chars`, preferring to cut
+/// at the last hyphen so we don't slice a word in half. Returns the
+/// truncated string (always non-empty if input was non-empty).
+fn truncate_kebab(input: &str, max_chars: usize) -> String {
+    if input.len() <= max_chars {
+        return input.to_string();
+    }
+    let head = &input[..max_chars];
+    if let Some(last_hyphen) = head.rfind('-') {
+        if last_hyphen > 0 {
+            return head[..last_hyphen].to_string();
+        }
+    }
+    head.to_string()
+}
+
+/// Mint a unique question-pyramid slug from the question text. Probes
+/// `{base}`, `{base}-1`, ..., `{base}-99`. If all collide, appends a
+/// 6-char random hex suffix instead.
+fn mint_question_slug(conn: &rusqlite::Connection, question: &str) -> String {
+    let raw = crate::pyramid::slug::slugify(question);
+    let trimmed = truncate_kebab(&raw, 60);
+    let base = if trimmed.trim_matches('-').is_empty() {
+        "question".to_string()
+    } else {
+        trimmed.trim_matches('-').to_string()
+    };
+
+    // Try the base name first.
+    if crate::pyramid::db::get_slug(conn, &base)
+        .ok()
+        .flatten()
+        .is_none()
+    {
+        return base;
+    }
+
+    // Probe `-1`..`-99`.
+    for i in 1..=99u32 {
+        let candidate = format!("{base}-{i}");
+        if crate::pyramid::db::get_slug(conn, &candidate)
+            .ok()
+            .flatten()
+            .is_none()
+        {
+            return candidate;
+        }
+    }
+
+    // Fallback: append a 6-char random hex suffix.
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let suffix = format!("{:06x}", nanos & 0xff_ff_ff);
+    format!("{base}-{suffix}")
+}
+
+/// Build a 302 redirect response to the question-pyramid live page.
+fn redirect_to_question(source_slug: &str, question_slug: &str) -> warp::reply::Response {
+    let target = format!("/p/{}/q/{}", source_slug, question_slug);
+    let mut resp = warp::reply::Response::new(warp::hyper::Body::empty());
+    *resp.status_mut() = StatusCode::FOUND;
+    if let Ok(hv) = warp::http::HeaderValue::from_str(&target) {
+        resp.headers_mut().insert("location", hv);
+    }
+    resp
+}
+
+/// Mint slug, persist source reference, and spawn the background build.
+/// Returns a 302 to the live answer page on success, or an error response.
+async fn create_question_pyramid_and_redirect(
+    state: &Arc<PyramidState>,
+    source_slug: &str,
+    question: &str,
+) -> warp::reply::Response {
+    // Step 1: mint a unique slug under the writer connection so collision
+    // probing + insert happen atomically (well, serialized — sqlite writer
+    // mutex on PyramidState ensures only one minter at a time).
+    let writer = state.writer.lock().await;
+    let question_slug = mint_question_slug(&writer, question);
+
+    // Step 2: create the slug row.
+    if let Err(e) = crate::pyramid::db::create_slug(
+        &writer,
+        &question_slug,
+        &ContentType::Question,
+        "",
+    ) {
+        let body = format!(
+            "<h1>Failed to create question pyramid</h1>\n<p class=\"err\">{}</p>\n",
+            esc(&e.to_string())
+        );
+        return status_page(500, "Error — Wire Node", &body);
+    }
+
+    // Step 3: link the source. If this fails we leave the orphaned slug
+    // (sweeper concern) — log a warning and proceed.
+    if let Err(e) = crate::pyramid::db::save_slug_references(
+        &writer,
+        &question_slug,
+        &[source_slug.to_string()],
+    ) {
+        tracing::warn!(
+            question_slug = %question_slug,
+            source_slug = %source_slug,
+            error = %e,
+            "save_slug_references failed for question pyramid; slug persists with no source link"
+        );
+    }
+    drop(writer);
+
+    // Step 4: spawn the background build. Don't await — return the redirect
+    // immediately so the browser can start streaming WS events.
+    let state_for_build = state.clone();
+    let qslug = question_slug.clone();
+    let q = question.to_string();
+    tokio::spawn(async move {
+        if let Err(e) = crate::pyramid::question_build::spawn_question_build(
+            &state_for_build,
+            qslug.clone(),
+            q,
+            QB_GRANULARITY,
+            QB_MAX_DEPTH,
+            QB_FROM_DEPTH,
+            None,
+        )
+        .await
+        {
+            tracing::error!(
+                question_slug = %qslug,
+                error = %e,
+                "spawn_question_build failed from web surface"
+            );
+        }
+    });
+
+    redirect_to_question(source_slug, &question_slug)
+}
+
 // ── Main handler ────────────────────────────────────────────────────────
 
 async fn handle_ask_post(
@@ -615,9 +776,9 @@ async fn handle_ask_post(
         _ => None,
     };
 
-    // ── Open mode → direct synthesis (no preview, no commit token). ────
+    // ── Open mode → mint a question pyramid + redirect to live page. ──
     if !is_paid_mode {
-        return Ok(synthesize_and_render(&state, &slug, &question).await);
+        return Ok(create_question_pyramid_and_redirect(&state, &slug, &question).await);
     }
 
     // ── Paid mode + operator identity → preview-or-commit ──────────────
@@ -659,20 +820,18 @@ async fn handle_ask_post(
         ));
     }
 
-    // Re-check the absorption rate limit with the estimated cost, using the
-    // REAL operator_id (Pillar 13). Anonymous/WebSession never reach here.
-    let candidate_count_for_cost = {
-        let conn = state.reader.lock().await;
-        crate::pyramid::query::search(&conn, &slug, &question)
-            .map(|v| v.len().min(TOP_K).max(1))
-            .unwrap_or(1)
-    };
-    let cost = estimated_cost_credits(candidate_count_for_cost);
-    if let Err(e) =
-        crate::pyramid::build_runner::check_absorption_rate_limit(&state, &slug, &op_id, cost)
-            .await
+    // Re-check the absorption rate limit with the question-build cost,
+    // using the REAL operator_id (Pillar 13). Anonymous/WebSession never
+    // reach here. Reject BEFORE we mint a slug so we don't leak orphaned
+    // empty pyramids on rate-limit denial.
+    if let Err(e) = crate::pyramid::build_runner::check_absorption_rate_limit(
+        &state,
+        &slug,
+        &op_id,
+        QUESTION_BUILD_COST_CREDITS,
+    )
+    .await
     {
-        // Surface as 429 with the error message in the body.
         let body = format!(
             "<h1>429</h1>\n<p class=\"err\">{msg}</p>\n<p><a href=\"/p/{slug}\">Back</a></p>\n",
             msg = esc(&e.to_string()),
@@ -681,9 +840,10 @@ async fn handle_ask_post(
         return Ok(status_page(429, "Rate limited — Wire Node", &body));
     }
 
-    Ok(synthesize_and_render(&state, &slug, &question).await)
+    Ok(create_question_pyramid_and_redirect(&state, &slug, &question).await)
 }
 
+#[allow(dead_code)]
 async fn synthesize_and_render(
     state: &PyramidState,
     slug: &str,

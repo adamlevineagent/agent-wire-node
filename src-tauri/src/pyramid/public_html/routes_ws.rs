@@ -48,7 +48,56 @@ pub fn ws_route(
     state: Arc<PyramidState>,
     jwt_public_key: Arc<tokio::sync::RwLock<String>>,
 ) -> warp::filters::BoxedFilter<(warp::reply::Response,)> {
-    warp::get()
+    let state_q = state.clone();
+    let jwt_pk_q = jwt_public_key.clone();
+    // Phase A: question-pyramid live stream at /p/{src}/q/{qslug}/_ws.
+    // Same auth/tier check (gated on the SOURCE pyramid), but the WS
+    // subscription filters on the question pyramid's slug.
+    let question_ws = warp::get()
+        .and(warp::path("p"))
+        .and(warp::path::param::<String>())
+        .and(warp::path("q"))
+        .and(warp::path::param::<String>())
+        .and(warp::path("_ws"))
+        .and(warp::path::end())
+        .and(warp::ws())
+        .and(warp::filters::addr::remote())
+        .and(warp::header::headers_cloned())
+        .and(with_state(state_q))
+        .and(warp::any().map(move || jwt_pk_q.clone()))
+        .and_then(
+            |source_slug: String,
+             question_slug: String,
+             ws: warp::ws::Ws,
+             peer: Option<std::net::SocketAddr>,
+             headers: warp::http::HeaderMap,
+             state: Arc<PyramidState>,
+             jwt_pk: Arc<tokio::sync::RwLock<String>>| async move {
+                let auth = resolve_auth(&headers, peer, &state, &jwt_pk).await;
+                // Tier check: SOURCE pyramid governs visibility for V1.
+                if enforce_public_tier(&state, &source_slug, &auth).await.is_err() {
+                    let resp = warp::http::Response::builder()
+                        .status(StatusCode::NOT_FOUND)
+                        .body(warp::hyper::Body::empty())
+                        .unwrap();
+                    return Ok::<_, warp::Rejection>(resp);
+                }
+                let rl = rate_limit::global();
+                if let Err(e) = rate_limit::check_for_reads(&rl, &auth).await {
+                    let resp = warp::http::Response::builder()
+                        .status(StatusCode::TOO_MANY_REQUESTS)
+                        .header("Retry-After", e.retry_after.to_string())
+                        .body(warp::hyper::Body::empty())
+                        .unwrap();
+                    return Ok::<_, warp::Rejection>(resp);
+                }
+                let response =
+                    ws.on_upgrade(move |socket| handle_ws(socket, question_slug, state));
+                Ok(warp::reply::Reply::into_response(response))
+            },
+        );
+
+    let main_ws = warp::get()
         .and(warp::path("p"))
         .and(warp::path::param::<String>())
         .and(warp::path("_ws"))
@@ -91,8 +140,10 @@ pub fn ws_route(
                 let response = ws.on_upgrade(move |socket| handle_ws(socket, slug, state));
                 Ok(warp::reply::Reply::into_response(response))
             },
-        )
-        .boxed()
+        );
+
+    // More-specific question_ws path goes first.
+    question_ws.or(main_ws).unify().boxed()
 }
 
 async fn resolve_auth(

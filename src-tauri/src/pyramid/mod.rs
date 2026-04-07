@@ -28,6 +28,7 @@ pub mod delta;
 pub mod event_bus;
 pub mod event_chain;
 pub mod public_html;
+pub mod question_build;
 pub mod evidence_answering;
 pub mod execution_plan;
 pub mod execution_state;
