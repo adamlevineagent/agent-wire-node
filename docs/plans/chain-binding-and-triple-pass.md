@@ -1,5 +1,11 @@
 # Plan: Config-Driven Chain Binding + Triple-Pass Conversation Pipeline
 
+> **STATUS: PLAN INVALIDATED — DO NOT IMPLEMENT.** A 2-stage 4-auditor conductor audit pass on 2026-04-07 found that this plan targets the wrong DSL, proposes building features that already exist, and would break on a fresh install. The most consequential finding: **a working forward/reverse/combine chronological conversation pipeline ALREADY EXISTS at `src-tauri/src/pyramid/build.rs:684+` (`build_conversation`)** — it is just unreachable because `build_runner.rs:237` routes Conversation directly to `run_decomposed_build` and never reaches the legacy path. The right work is to fix the dispatch and possibly recover the existing implementation, not to build a new one.
+>
+> The original plan body is preserved below for historical context. A new plan must be written from the audit findings. See `docs/plans/chain-binding-and-triple-pass.audit.md` for the full audit synthesis with cross-referenced findings.
+
+---
+
 Status: planning. Carries forward workstreams A, B, C from `docs/conversation-pyramid-testing-state.md`.
 
 ## Goals
