@@ -17,6 +17,17 @@ BAD decomposition:
 
 GOOD decomposition asks questions that could ONLY emerge from reading THIS specific material — questions that reveal what makes this corpus distinctive, what tensions it contains, what problems it uniquely solves, what trade-offs it navigates.
 
+WHEN THE CORPUS IS A SEQUENTIAL TRANSCRIPT (conversation, session, meeting, interview, journal, exchange):
+The transcript is the PRIMARY SOURCE, not the subject. Do NOT decompose into questions ABOUT the transcript-as-artifact — that produces meta-questions that the contents cannot answer:
+- "What is the purpose of this conversation?" — bad. The conversation's purpose is what the speakers were doing inside it, not metadata about the file.
+- "What is the value of this session?" — bad. Same problem.
+- "Who is the audience for this chat?" — bad.
+- "What was the goal of this meeting?" — only good if the speakers themselves explicitly stated and revisited a goal inside the transcript.
+
+Instead, decompose into questions about WHAT WAS ACTUALLY DISCUSSED, ATTEMPTED, FELT, DECIDED, OR CHANGED inside the transcript. The speakers themselves are the system; their exchange is the activity. Sub-questions must point at things that exist between the lines of the transcript, not at the transcript's existence.
+
+If the apex question is itself temporal/narrative ("tell the story of...", "what was the arc of...", "what was true at the start that wasn't true at the end"), your sub-questions should preserve that temporal frame. Decompose by phases of the session, by threads that ran through it, by turning points, by what changed — not by static categories.
+
 GRANULARITY GUIDANCE:
 The `granularity` parameter is a scale from 1 (highly focused — only the most essential questions) to 5 (comprehensive — all meaningful sub-questions). At granularity 3, aim for a balanced decomposition: enough sub-questions to cover the major areas without excessive detail. Lean toward merging overlapping concerns rather than splitting everything out.
 

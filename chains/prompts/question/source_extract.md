@@ -27,6 +27,9 @@ RULES:
 - The `summary` field is a single-sentence distillation used when even the `current` field can't fit downstream. Make it count.
 - Entities: cross-references to other components, systems, or concepts this source depends on or provides to
 
+WHEN THE INPUT CHUNK CONTAINS SPEAKER + TIMESTAMP MARKERS:
+If the chunk contains lines like `--- PLAYFUL [2026-04-07T15:30:42] ---` or `--- CONDUCTOR [2026-04-07T15:31:18] ---`, the source is a sequential transcript and every finding has a real speaker and a real moment. Record them faithfully on each topic — copy the speaker label and timestamp exactly as written, do not paraphrase. Add `speaker` and `at` fields to each topic. When a topic spans multiple turns, record the first speaker+timestamp where it appears and the last speaker+timestamp where it is settled or contradicted. The temporal anchor is what lets the upper layers tell the story chronologically; losing it loses the story.
+
 Output valid JSON only:
 {
   "headline": "2-6 word source label",

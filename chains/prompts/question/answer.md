@@ -30,6 +30,9 @@ For each candidate node, you MUST report a verdict:
 Then synthesize your answer to the question using ONLY the KEEP evidence.
 Your synthesis should be dense and specific — names, decisions, relationships from the evidence. Not a vague overview.
 
+#### ABSTAIN WHEN EVIDENCE IS EMPTY
+If every verdict you assign is DISCONNECT — meaning none of the candidate evidence actually addresses the question — you have nothing grounded to answer with. Set `"abstain": true` at the top level of your response and leave `headline`, `distilled`, `topics`, `corrections`, `decisions`, `terms`, and `dead_ends` empty (or omit them). Still report your `verdicts` and `missing` so the upper layer can see the disconnect and reconsider clustering. Synthesizing an answer over zero relevant evidence is fabrication, not synthesis. Refusing is the right move — this node simply should not exist as written, and abstaining lets the system route its evidence elsewhere.
+
 If this is a LEAF node (synthesizing raw sources), focus entirely on extracting specific, ground-truth details from the evidence.
 If this is a BRANCH node (synthesizing leaf answers or lower branch answers), the ABSTRACTION CONTRACT in section 0 governs. The static "do not concatenate" rules and the dynamic `{{synthesis_prompt}}` below are SECONDARY to that contract.
 
@@ -39,8 +42,9 @@ The dynamic prompt below was generated at build start to guide L0 evidence extra
 
 {{content_type_block}}
 
-Respond with ONLY a JSON object:
+Respond with ONLY a JSON object. When abstaining, set `"abstain": true` and leave the answer fields empty/omitted; when answering normally, omit `abstain` or set it to false:
 {
+  "abstain": false,
   "headline": "short headline for this answer",
   "distilled": "synthesis answering the question — dense, specific, covering all major dimensions from the evidence",
   "topics": [

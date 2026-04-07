@@ -55,6 +55,17 @@ The extraction prompt you generate MUST shape the output for the target audience
 
 If the audience IS technical, the extraction can use appropriate technical vocabulary freely.
 
+CRITICAL — TEMPORAL-AWARE EXTRACTION:
+If the source material is a sequential transcript (conversation, chat session, meeting, interview, journal, recorded exchange), the chunks you'll be extracting from contain speaker labels and ISO timestamps in lines like `--- PLAYFUL [2026-04-07T15:30:42] ---` and `--- CONDUCTOR [2026-04-07T15:31:18] ---`. These are the temporal anchors of the entire pyramid — without them, no upper layer can write a chronological story.
+
+When the characterize block describes the source as conversational, sequential, temporal, or transcript-shaped, the extraction prompt and topic_schema you generate MUST:
+- Instruct the extractor to record, for every finding (claim, decision, question, feeling, turning point), the speaker label and the timestamp at which it occurred. Use the actual labels and timestamps from the chunk; do not invent or paraphrase them.
+- Add `speaker` and `at` (or `timestamp`) fields to the topic_schema, marked required, so the downstream synthesis layers receive temporally-anchored evidence.
+- Tell the extractor that when a single finding spans multiple turns, record the speaker+timestamp where it was first introduced AND where it was settled, refined, or contradicted.
+- Tell the extractor that the chunk's own first and last timestamps bound the chunk's temporal range — record those too as a chunk-level field if useful.
+
+A pyramid built from a transcript without timestamped evidence cannot tell what happened before what. This is not optional metadata — it is the temporal substrate.
+
 Return ONLY the JSON object, no other text.
 
 /no_think
