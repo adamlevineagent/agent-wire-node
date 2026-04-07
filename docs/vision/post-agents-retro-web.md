@@ -132,14 +132,20 @@ Border characters encode provenance: `│` solid = sourced and verified, `┊` d
 
 ### ASCII Art via LLM Text Generation
 
-Mercury-2 (`inception/mercury-2`) is a text LLM used throughout the codebase for synthesis, question compilation, and evidence answering. It generates ASCII art as **text output** — not image-diffusion-level generation, but reliable for structural and decorative character art:
+> **Tested finding (2026-04-06):** Mercury-2 produces basic box-drawing but fails at
+> ambitious scene art. **Grok 4.2** (`x-ai/grok-4.20-beta`, already `fallback_model_2`
+> in the LLM cascade) produces genuinely good ASCII art — waterfalls with dissolving
+> data structures, watchtowers overlooking graph landscapes, circuit board topologies.
+> **Route art generation directly to Grok 4.2, bypassing the default model cascade.**
+
+Art elements generated per-pyramid from the knowledge itself:
 
 - **Pyramid banners** — Thematic ASCII art generated from the apex headline. A pyramid about "Runtime Services" gets different art than one about "Cryptographic Protocols."
 - **Topic dividers** — Contextual decorations per topic section, not repeated `═══════`.
 - **Structural diagrams** — Architecture and flow diagrams rendered as ASCII box art, generated from the actual system structure described in the nodes.
 - **Synthesis noise** — When content materializes, the "noise" characters that resolve into final text are thematically relevant, not random.
 
-Box-drawing characters (`┌─┐│└─┘`, `╔═╗║╚═╝`), block elements (`░▒▓█`), and tree connectors (`├─`, `└─`) are high-reliability targets for LLM text generation. Scene illustrations use reference-guided prompting for consistency. For higher-fidelity ASCII art, fine-tuned models like SVE-ASCII exist but are not yet integrated.
+Box-drawing characters (`┌─┐│└─┘`, `╔═╗║╚═╝`), block elements (`░▒▓█`), and tree connectors (`├─`, `└─`) are high-reliability targets for LLM text generation across all models. For ambitious scene art (landing pages, waterfalls, cathedrals), Grok 4.2 is the only tested model that delivers. For higher-fidelity ASCII art, fine-tuned models like SVE-ASCII exist but are not yet integrated.
 
 Text flows AROUND these art elements via Pretext's `layoutNextLine()` with variable widths — like a magazine layout, but in character cells, at 60fps.
 

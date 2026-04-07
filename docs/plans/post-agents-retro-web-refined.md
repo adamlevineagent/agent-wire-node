@@ -845,5 +845,117 @@ HTML routes that issue `anon_session` cookies use `Cache-Control: no-store` (not
 
 ---
 
-*Refined v3.1: 2026-04-06*
-*Source: handoff-post-agents-retro-web.md + round-1 (4 auditors) + round-2 discovery + round-3 informed*
+---
+
+## v3.3 Patches (Wire Pillar Conformance + ASCII Model Pivot)
+
+These fixes resolve 3 pillar violations found by `wire-rules` against v3.2, plus fold in the user's tested finding that **Grok 4.2 (`x-ai/grok-4.20-beta`)** produces dramatically better ASCII art than Mercury-2.
+
+### C1. ASCII art supersession (Pillars 1, 5)
+The v2 plan had `pyramid_ascii_art` overwrite on apex change. That destroys intelligence-produced contributions. Fix:
+```sql
+CREATE TABLE IF NOT EXISTS pyramid_ascii_art (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    slug TEXT NOT NULL,
+    kind TEXT NOT NULL,                  -- 'banner' | 'topic-divider' | 'structural-diagram' | 'hero'
+    source_hash TEXT NOT NULL,           -- hash of the apex headline / topic title / source structure
+    art_text TEXT NOT NULL,
+    model TEXT NOT NULL,                 -- 'x-ai/grok-4.20-beta' | etc
+    superseded_by INTEGER REFERENCES pyramid_ascii_art(id),  -- chain to the new generation
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_ascii_art_slug_kind_head
+  ON pyramid_ascii_art(slug, kind) WHERE superseded_by IS NULL;
+```
+WS-L generation never UPDATEs. It INSERTs a new row, then sets `superseded_by` on the previous head row in a transaction. Reads use the index to find the head (`superseded_by IS NULL`). Every banner Mercury-2 / Grok-4.2 ever generated is preserved.
+
+### C2. Per-IP rate limit exempts authenticated principals (Pillar 8)
+WS-F middleware adds a single condition:
+```rust
+fn should_apply_ip_limit(auth: &PublicAuthSource) -> bool {
+    matches!(auth, PublicAuthSource::Anonymous { .. } | PublicAuthSource::WebSession { .. })
+}
+```
+`WireOperator` and `LocalOperator` skip the per-IP buckets entirely. They are governed by the existing operator-keyed limiter in `with_dual_auth` and the deflationary credit physics. Layering a second governor was a Pillar 8 violation. Anonymous and WebSession still get all 3 buckets (256/min reads, 16/min `_ask`, 3/min `_login`, plus 10/hour per target email).
+
+### C3. Preview-then-commit for paid asks (Pillar 23)
+`POST /p/{slug}/_ask` becomes a two-step flow when the pyramid is in `absorb-all` (or `absorb-selective` once V2 lands):
+
+**Step 1 — Preview** (no `commit_token` in body):
+1. CSRF check.
+2. Run cheap candidate search (top 5 nodes via FTS, no LLM).
+3. Estimate cost: read `chains/<absorption_chain_id>` if present for an estimator, else use a default `(model_input_tokens, model_output_cap, credit_per_token)` table → integer credits.
+4. Render an HTML preview page showing:
+   - The question (escaped, in a `<blockquote>`)
+   - The 5 candidate nodes with snippets
+   - Estimated cost in credits
+   - The model that will be used
+   - A `<form>` with hidden inputs `commit_token=<HMAC>`, `question=<original>`, `csrf=<nonce>` and a "ASK FOR REAL — costs N credits" submit button
+5. The `commit_token` is `HMAC-SHA256(server_secret, format!("{user_id}:{slug}:{question_hash}:{epoch_minute/5}"))` — short-lived, bound to the exact question and user.
+
+**Step 2 — Commit** (POST with `commit_token`):
+1. CSRF check + `commit_token` verification (constant time, current + previous 5-min window).
+2. `check_absorption_rate_limit(state, slug, operator_id, estimated_cost)`.
+3. Run real synthesis (existing `query::search` + LLM call).
+4. Render answer HTML.
+
+**Free mode (`open` and Anonymous-on-public)** skips Step 1 entirely — no preview is necessary because no surprise cost. The handler branches on `(mode, principal)`:
+- `open` + any → straight to Step 2 (no `commit_token` needed)
+- `absorb-all` + WireOperator/LocalOperator → preview→commit flow
+- `absorb-all` + Anonymous/WebSession → "Wire operator token required" page (per B2)
+
+WS-H scope updated: includes both step handlers, the preview HTML template, and the `commit_token` HMAC helper.
+
+### C4. ASCII art generation uses Grok 4.2 directly (NOT Mercury-2)
+The original handoff and vision docs were updated 2026-04-06 with a head-to-head test result: **Mercury-2 produces broken pyramid art, fails width constraints, lacks spatial reasoning**. **Grok 4.2 (`x-ai/grok-4.20-beta`) produces genuinely good ASCII art** — waterfalls with dissolving data structures, watchtowers, circuit-board topologies, multi-layer composition, respects width constraints.
+
+**Grok 4.2 is already configured as `fallback_model_2` in `llm.rs`** but the cascade would always pick Mercury-2 first because the prompts are short. We bypass the cascade for art generation.
+
+WS-L contract updated:
+```rust
+// In public_html/ascii_art.rs
+const ASCII_ART_MODEL: &str = "x-ai/grok-4.20-beta";
+
+pub async fn generate_banner(state: &PyramidState, slug: &str, apex_headline: &str) -> Result<String> {
+    // Direct call — bypasses default cascade
+    let prompt = build_banner_prompt(apex_headline);  // see below
+    let result = call_model_direct(state, ASCII_ART_MODEL, &prompt).await?;
+    validate_ascii(&result)?;  // post-hoc QA, not output prescription
+    Ok(result)
+}
+```
+Plus a new helper `call_model_direct(state, model, prompt) -> Result<String>` in `llm.rs` that skips the cascade and calls a specific model. This is a 30-line addition to llm.rs (single new public function); existing `call_model_unified` is untouched.
+
+**Prompt framing (Pillar 37 conformant):** the prompt describes the medium constraint ("the rendering target is 72 columns wide; use box-drawing characters, block elements, and tree connectors") and the goal ("generate a thematic banner that captures the apex headline's subject matter"). It does NOT prescribe line counts or specific content. Validation is post-hoc: max line width ≤ 72, character whitelist enforced, fallback to a static template if Grok output fails validation.
+
+**Art kinds for V1:**
+- `banner` — per-pyramid hero art at the top of `/p/{slug}` (apex-headline themed)
+- `topic-divider` — between major sections (topic-name themed)
+- `structural-diagram` — generated lazily from notable nodes' content (deferred to V2 polish if budget runs)
+- `hero` — landing page art for `/p/`
+
+WS-L Phase 3 dependency: `null` — fully parallel.
+
+### C5. WebSession identity is NOT a Wire pseudo-ID (Pillar 13 explicit note)
+Adding to the WS-A and WS-H contracts as a hard rule:
+
+> `web_sessions.supabase_user_id` is a Supabase identity, NOT a Wire pseudo-ID. It MUST NEVER be passed to any function that takes `operator_id`, `circle_id`, or any Wire-side identity slot. Any code path that synthesizes a Wire identity from a WebSession is a Pillar 13 violation. The B2 rule (WebSession cannot use absorb-all) is enforced at the route-handler boundary, not by clever adapter functions.
+
+A unit test in WS-M asserts: passing a `PublicAuthSource::WebSession` into the `_ask` handler with `mode=absorb-all` returns the "Wire operator token required" page, never a synthesis call.
+
+### C6. Handle paths in node footers (Pillar 14 clarification)
+The `<footer class="prov">` block per the v2 aesthetic spec MUST render the Wire handle path when the node has been published to Wire (look up via the existing `wire_publish` mapping table). Format: `{handle}/{epoch-day}/{sequence}` per Pillar 14. For local-only unpublished nodes, fall back to the internal `node_id` but display it with a `local:` prefix to make the distinction visible:
+```
+version: 3 • src=2 • conf=0.87 • path=adamlevine/19847/12     ← Wire-published node
+version: 3 • src=2 • conf=0.87 • path=local:L0-077            ← local-only node
+```
+WS-C contract updated.
+
+### C7. Plan complete — proceed to Phase 0.5
+
+All audit findings and pillar violations are addressed. v3.3 is the final plan.
+
+---
+
+*Refined v3.3: 2026-04-06*
+*Source: v3.2 + wire-rules pillar check + Grok-4.2 ASCII art finding*

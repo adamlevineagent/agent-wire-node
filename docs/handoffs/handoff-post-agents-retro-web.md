@@ -138,12 +138,29 @@ This is where the "magical" experience lives.
 bundled JS as a static asset. The HTML pages include a `<script>` tag that loads
 the bundle — if it loads, the canvas layer activates. If not, the HTML stands alone.
 
-**Mercury-2 ASCII art:** The pyramid's text LLM (`inception/mercury-2`, available via
-OpenRouter, unlimited and free) generates ASCII art as text output. Use it to generate:
+**ASCII art generation — MODEL MATTERS:** We tested Mercury-2 and Grok 4.2 head-to-head
+on ASCII art prompts. Results:
+
+- **Mercury-2** (`inception/mercury-2`): Produces basic box-drawing borders and simple
+  fills. Fails at ambitious scene art — pyramids collapse, spatial reasoning breaks down,
+  72-char width constraints aren't respected. **Not suitable for the artistic ASCII elements.**
+- **Grok 4.2** (`x-ai/grok-4.20-beta`): Produces genuinely good ASCII art — waterfalls
+  with dissolving data structures, watchtowers with graph landscapes, circuit board
+  topologies. Handles box-drawing characters, block elements, and multi-layer composition
+  well. **Use this for all ASCII art generation.**
+
+Grok 4.2 is already configured as `fallback_model_2` in `llm.rs`. For art generation,
+**call it directly** — don't go through the default cascade (which starts with Mercury-2
+and only escalates based on context window size). The art prompts are tiny; the cascade
+would always pick Mercury-2, which is the wrong model for this task.
+
+Art to generate:
 - Per-pyramid thematic banners from the apex headline
-- Contextual topic dividers
+- Contextual topic dividers (not generic `═══════` lines)
 - Structural diagrams from system descriptions in nodes
-These can be generated at build time or lazily on first page render and cached.
+- Landing page hero art (the first thing visitors see)
+
+These can be generated at build time or lazily on first page render and cached in the DB.
 
 ### WebSocket Streaming
 
