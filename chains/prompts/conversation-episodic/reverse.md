@@ -17,7 +17,7 @@ Output valid JSON only (no markdown fences, no extra text):
   "turning_points": ["specific moments in this chunk that turned out to set the direction of the rest of the session"],
   "later_revised": [{"said_here": "what was said in this chunk", "replaced_by": "what it became later in the session"}],
   "dead_ends": ["things said in this chunk that never came back, were dropped, or were forgotten"],
-  "running_context": "1-3 sentences: looking backward from the end of the session, what about THIS chunk matters?"
+  "running_context": "Brief rolling summary: looking backward from the end of the session, what about THIS chunk matters?"
 }
 
 /no_think

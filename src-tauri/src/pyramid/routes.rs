@@ -15,12 +15,15 @@ use super::build::WriteOp;
 use super::chain_proposal;
 use super::chain_publish;
 use super::characterize;
+use super::collapse;
 use super::db;
 use super::delta;
 use super::faq;
 use super::ingest;
 use super::manifest;
 use super::meta;
+use super::multi_chain_overlay;
+use super::preview;
 use super::primer;
 use super::publication;
 use super::query;
@@ -703,6 +706,13 @@ struct RemotePaymentRequired {
     total: i64,
     slug: String,
     serving_node_id: String,
+}
+
+// ── WS-MULTI-CHAIN-OVERLAY: Request body for overlay creation ────────────
+#[derive(Deserialize)]
+struct OverlayCreateBody {
+    new_slug: String,
+    chain_id: String,
 }
 
 pub fn pyramid_routes(
@@ -2230,10 +2240,159 @@ pub fn pyramid_routes(
     let mf = mf_a.or(manifest_exec).unify().boxed();
     let top28 = top27.or(mf).unify().boxed();
 
+    // ── WS-MULTI-CHAIN-OVERLAY: Chain overlay management routes ──────────
+
+    // POST /pyramid/:slug/overlays — create a new overlay
+    let overlay_create = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("overlays"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(warp::body::json::<OverlayCreateBody>())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_overlay_create));
+
+    // GET /pyramid/:slug/overlays — list overlays for source
+    let overlay_list = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("overlays"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_overlay_list));
+
+    // DELETE /pyramid/:slug/overlays/:overlay_slug — remove an overlay
+    let overlay_remove = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("overlays"))
+        .and(warp::path::param::<String>())
+        .and(warp::path::end())
+        .and(warp::delete())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_overlay_remove));
+
+    // GET /pyramid/:slug/overlay-source — get the source slug for an overlay
+    let overlay_source = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("overlay-source"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_overlay_source));
+
+    // More-specific paths first: remove (overlays/:overlay_slug) before list/create (overlays)
+    let ov_a = overlay_remove.or(overlay_create).unify().boxed();
+    let ov_b = overlay_list.or(overlay_source).unify().boxed();
+    let ov = ov_a.or(ov_b).unify().boxed();
+    let top29 = top28.or(ov).unify().boxed();
+
+    // ── WS-COLLAPSE-EXTEND: Delta chain collapse routes ───────────────────
+
+    // POST /pyramid/:slug/collapse/:node_id — collapse specific node
+    let collapse_single = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("collapse"))
+        .and(warp::path::param::<String>())
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(warp::body::json::<CollapseNodeBody>())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_collapse_single));
+
+    // POST /pyramid/:slug/collapse/bulk — collapse all eligible nodes
+    let collapse_bulk = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("collapse"))
+        .and(warp::path("bulk"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(warp::body::json::<CollapseBulkBody>())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_collapse_bulk));
+
+    // GET /pyramid/:slug/collapse/candidates — list nodes eligible for collapse
+    let collapse_candidates = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("collapse"))
+        .and(warp::path("candidates"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_collapse_candidates));
+
+    // GET /pyramid/:slug/collapse/log — collapse history
+    let collapse_log = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("collapse"))
+        .and(warp::path("log"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_collapse_log));
+
+    // Longer literal paths first (bulk, candidates, log), then :node_id param
+    let col_a = collapse_bulk.or(collapse_candidates).unify().boxed();
+    let col_b = col_a.or(collapse_log).unify().boxed();
+    let col = col_b.or(collapse_single).unify().boxed();
+    let top30 = top29.or(col).unify().boxed();
+
+    // ── WS-PREVIEW (Phase 3): Preview-then-commit for new pyramid creation ──
+
+    // POST /pyramid/:slug/preview — generate a build preview
+    let preview_generate = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("preview"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(warp::body::json::<PreviewRequestBody>())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_preview_generate));
+
+    // POST /pyramid/:slug/preview/commit — commit after preview (triggers DADBEAR)
+    let preview_commit = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("preview"))
+        .and(warp::path("commit"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(warp::body::json::<PreviewCommitBody>())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_preview_commit));
+
+    // commit (more-specific path) before generate
+    let pv = preview_commit.or(preview_generate).unify().boxed();
+    let top31 = top30.or(pv).unify().boxed();
+
+    // ── WS-QUESTION-RETRIEVE (Phase 3): Read-time question retrieval ──────
+
+    // GET :slug/question/:question_id — poll demand-gen enhanced results (more-specific first)
+    let question_retrieve_poll = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("question"))
+        .and(warp::path::param::<String>())
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_question_retrieve_poll));
+
+    // POST :slug/question — submit question for retrieval
+    let question_retrieve_submit = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("question"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(warp::body::json::<QuestionRetrieveBody>())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_question_retrieve));
+
+    // More-specific path (with question_id param) before bare /question
+    let qr = question_retrieve_poll.or(question_retrieve_submit).unify().boxed();
+    let top32 = top31.or(qr).unify().boxed();
+
     // public_html is now mounted separately at the server level so it can
     // get a permissive CORS filter (the desktop API allowlist would block
     // form POSTs from the tunnel host).
-    top28
+    top32
 }
 
 /// Mount the post-agents-retro `/p/` web surface routes. These are
@@ -8775,5 +8934,462 @@ async fn handle_manifest_log(
             warp::http::StatusCode::INTERNAL_SERVER_ERROR,
             &format!("Failed to read manifest log: {e}"),
         )),
+    }
+}
+
+// ── WS-MULTI-CHAIN-OVERLAY handlers ─────────────────────────────────────────
+
+/// POST /pyramid/:slug/overlays — create a new overlay build
+async fn handle_overlay_create(
+    slug: String,
+    body: OverlayCreateBody,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let conn = state.writer.lock().await;
+    match multi_chain_overlay::create_overlay_build(&conn, &slug, &body.new_slug, &body.chain_id) {
+        Ok(()) => Ok(json_ok(&serde_json::json!({
+            "source_slug": slug,
+            "overlay_slug": body.new_slug,
+            "chain_id": body.chain_id,
+            "status": "registered"
+        }))),
+        Err(e) => {
+            let status = if e.to_string().contains("does not exist")
+                || e.to_string().contains("mismatch")
+                || e.to_string().contains("Cannot create overlay")
+            {
+                warp::http::StatusCode::BAD_REQUEST
+            } else {
+                warp::http::StatusCode::INTERNAL_SERVER_ERROR
+            };
+            Ok(json_error(status, &e.to_string()))
+        }
+    }
+}
+
+/// GET /pyramid/:slug/overlays — list overlays for source
+async fn handle_overlay_list(
+    slug: String,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let conn = state.reader.lock().await;
+    match multi_chain_overlay::get_overlays_for_source(&conn, &slug) {
+        Ok(overlays) => Ok(json_ok(&overlays)),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to list overlays: {e}"),
+        )),
+    }
+}
+
+/// DELETE /pyramid/:slug/overlays/:overlay_slug — remove an overlay
+async fn handle_overlay_remove(
+    slug: String,
+    overlay_slug: String,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let conn = state.writer.lock().await;
+    match multi_chain_overlay::remove_chain_overlay(&conn, &slug, &overlay_slug) {
+        Ok(true) => Ok(json_ok(&serde_json::json!({
+            "source_slug": slug,
+            "overlay_slug": overlay_slug,
+            "status": "removed"
+        }))),
+        Ok(false) => Ok(json_error(
+            warp::http::StatusCode::NOT_FOUND,
+            &format!("No active overlay '{}' found for source '{}'", overlay_slug, slug),
+        )),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to remove overlay: {e}"),
+        )),
+    }
+}
+
+/// GET /pyramid/:slug/overlay-source — get the source slug for an overlay
+async fn handle_overlay_source(
+    slug: String,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let conn = state.reader.lock().await;
+    match multi_chain_overlay::get_source_for_overlay(&conn, &slug) {
+        Ok(Some(source)) => Ok(json_ok(&serde_json::json!({
+            "overlay_slug": slug,
+            "source_slug": source
+        }))),
+        Ok(None) => Ok(json_error(
+            warp::http::StatusCode::NOT_FOUND,
+            &format!("'{}' is not registered as an overlay", slug),
+        )),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to get overlay source: {e}"),
+        )),
+    }
+}
+
+// ── WS-COLLAPSE-EXTEND: Collapse route handlers ────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct CollapseNodeBody {
+    #[serde(default = "default_preserve_history")]
+    preserve_history: bool,
+}
+
+fn default_preserve_history() -> bool {
+    true
+}
+
+#[derive(Debug, Deserialize)]
+struct CollapseBulkBody {
+    #[serde(default = "default_min_versions")]
+    min_versions: i32,
+}
+
+fn default_min_versions() -> i32 {
+    10
+}
+
+/// POST /pyramid/:slug/collapse/:node_id — collapse specific node's delta chain
+async fn handle_collapse_single(
+    slug_name: String,
+    node_id: String,
+    body: CollapseNodeBody,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let _write_guard = super::lock_manager::LockManager::global()
+        .write(&slug_name)
+        .await;
+
+    let result = {
+        let conn = state.writer.lock().await;
+        collapse::collapse_node_delta_chain(&conn, &slug_name, &node_id, body.preserve_history)
+    };
+
+    match result {
+        Ok(cr) => Ok(json_ok(&cr)),
+        Err(e) => {
+            let msg = e.to_string();
+            let status_code = if msg.contains("not found") {
+                warp::http::StatusCode::NOT_FOUND
+            } else {
+                warp::http::StatusCode::INTERNAL_SERVER_ERROR
+            };
+            Ok(json_error(status_code, &msg))
+        }
+    }
+}
+
+/// POST /pyramid/:slug/collapse/bulk — collapse all eligible nodes
+async fn handle_collapse_bulk(
+    slug_name: String,
+    body: CollapseBulkBody,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let _write_guard = super::lock_manager::LockManager::global()
+        .write(&slug_name)
+        .await;
+
+    let result = {
+        let conn = state.writer.lock().await;
+        collapse::collapse_stale_delta_chains(&conn, &slug_name, body.min_versions)
+    };
+
+    match result {
+        Ok(results) => Ok(json_ok(&serde_json::json!({
+            "collapsed_count": results.len(),
+            "results": results,
+        }))),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
+    }
+}
+
+/// GET /pyramid/:slug/collapse/candidates — list nodes eligible for auto-collapse
+async fn handle_collapse_candidates(
+    slug_name: String,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let conn = state.reader.lock().await;
+    match collapse::should_auto_collapse(&conn, &slug_name) {
+        Ok(candidates) => Ok(json_ok(&serde_json::json!({
+            "slug": slug_name,
+            "candidates": candidates,
+            "count": candidates.len(),
+        }))),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
+    }
+}
+
+/// GET /pyramid/:slug/collapse/log — collapse history
+async fn handle_collapse_log(
+    slug_name: String,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let conn = state.reader.lock().await;
+    match collapse::get_collapse_log(&conn, &slug_name, 100) {
+        Ok(log) => Ok(json_ok(&serde_json::json!({
+            "slug": slug_name,
+            "entries": log,
+            "count": log.len(),
+        }))),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
+    }
+}
+
+// ── WS-PREVIEW (Phase 3): Preview-then-commit handlers ──────────────────────
+
+/// Request body for POST /pyramid/:slug/preview
+#[derive(Debug, Deserialize)]
+struct PreviewRequestBody {
+    source_path: String,
+    content_type: String,
+    chain_id: String,
+}
+
+/// Request body for POST /pyramid/:slug/preview/commit
+#[derive(Debug, Deserialize)]
+struct PreviewCommitBody {
+    source_path: String,
+    content_type: String,
+    chain_id: String,
+    /// Optional: override default scan interval (seconds).
+    #[serde(default = "default_preview_scan_interval")]
+    scan_interval_secs: u64,
+    /// Optional: override default debounce (seconds).
+    #[serde(default = "default_preview_debounce")]
+    debounce_secs: u64,
+    /// Optional: override default session timeout (seconds).
+    #[serde(default = "default_preview_session_timeout")]
+    session_timeout_secs: u64,
+}
+
+fn default_preview_scan_interval() -> u64 { 10 }
+fn default_preview_debounce() -> u64 { 30 }
+fn default_preview_session_timeout() -> u64 { 1800 }
+
+/// POST /pyramid/:slug/preview — generate a build preview.
+///
+/// Scans the source directory, loads the chain definition, consults the cost
+/// model, and returns a BuildPreview with estimated cost, time, scope, and
+/// warnings. The operator reviews this before committing.
+async fn handle_preview_generate(
+    slug_name: String,
+    body: PreviewRequestBody,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let conn = state.reader.lock().await;
+    let chains_dir = state.chains_dir.clone();
+
+    match preview::generate_build_preview(
+        &conn,
+        &body.source_path,
+        &body.content_type,
+        &body.chain_id,
+        &chains_dir,
+    ) {
+        Ok(preview_result) => Ok(json_ok(&preview_result)),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::BAD_REQUEST,
+            &e.to_string(),
+        )),
+    }
+}
+
+/// POST /pyramid/:slug/preview/commit — commit after preview, triggers DADBEAR.
+///
+/// Creates a DADBEAR watch config for the source path so that DADBEAR will
+/// begin scanning and building the pyramid. This is the "go" button after the
+/// operator reviews the preview.
+async fn handle_preview_commit(
+    slug_name: String,
+    body: PreviewCommitBody,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    // Validate content type
+    if ContentType::from_str(&body.content_type).is_none() {
+        return Ok(json_error(
+            warp::http::StatusCode::BAD_REQUEST,
+            &format!(
+                "Invalid content_type: {}. Must be one of: code, conversation, document",
+                body.content_type
+            ),
+        ));
+    }
+
+    let config = super::types::DadbearWatchConfig {
+        id: 0,
+        slug: slug_name.clone(),
+        source_path: body.source_path.clone(),
+        content_type: body.content_type.clone(),
+        scan_interval_secs: body.scan_interval_secs,
+        debounce_secs: body.debounce_secs,
+        session_timeout_secs: body.session_timeout_secs,
+        batch_size: 1,
+        enabled: true,
+        created_at: String::new(),
+        updated_at: String::new(),
+    };
+
+    let _lock = super::lock_manager::LockManager::global()
+        .write(&slug_name)
+        .await;
+    let conn = state.writer.lock().await;
+
+    match db::save_dadbear_config(&conn, &config) {
+        Ok(_id) => Ok(json_ok(&serde_json::json!({
+            "slug": slug_name,
+            "source_path": body.source_path,
+            "content_type": body.content_type,
+            "chain_id": body.chain_id,
+            "status": "committed",
+            "message": "DADBEAR watch config created — build will begin on next scan cycle",
+        }))),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
+    }
+}
+
+// ── WS-QUESTION-RETRIEVE (Phase 3): Read-time question retrieval handlers ────
+
+/// Request body for POST /pyramid/:slug/question
+#[derive(Debug, Deserialize)]
+struct QuestionRetrieveBody {
+    question: String,
+    #[serde(default)]
+    allow_demand_gen: bool,
+}
+
+/// POST /pyramid/:slug/question — submit a question for retrieval.
+///
+/// Returns 200 with QuestionRetrieveResult if answerable synchronously.
+/// Returns 202 with partial result + job_ids if demand_gen triggered.
+async fn handle_question_retrieve(
+    slug: String,
+    body: QuestionRetrieveBody,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    if body.question.trim().is_empty() {
+        return Ok(json_error(
+            warp::http::StatusCode::BAD_REQUEST,
+            "question cannot be empty",
+        ));
+    }
+
+    match super::question_retrieve::question_retrieve(
+        &state,
+        &slug,
+        &body.question,
+        body.allow_demand_gen,
+    )
+    .await
+    {
+        Ok(result) => {
+            if result.demand_gen_job_ids.is_empty() {
+                // Fully answered synchronously — return 200
+                Ok(json_ok(&result))
+            } else {
+                // Demand-gen triggered — return 202 with partial result
+                Ok(warp::reply::with_status(
+                    warp::reply::json(&result),
+                    warp::http::StatusCode::ACCEPTED,
+                )
+                .into_response())
+            }
+        }
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
+    }
+}
+
+/// GET /pyramid/:slug/question/:question_id — poll for demand-gen enhanced results.
+///
+/// question_id is the demand-gen job_id. Returns the job status + result
+/// when available. If the job is complete, re-runs retrieval to include
+/// the newly generated evidence.
+async fn handle_question_retrieve_poll(
+    slug: String,
+    question_id: String,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    // Look up the demand-gen job
+    let job = {
+        let conn = state.reader.lock().await;
+        match super::db::get_demand_gen_job(&conn, &question_id) {
+            Ok(Some(job)) => {
+                if job.slug != slug {
+                    return Ok(json_error(
+                        warp::http::StatusCode::NOT_FOUND,
+                        &format!("Job {question_id} belongs to slug '{}', not '{slug}'", job.slug),
+                    ));
+                }
+                job
+            }
+            Ok(None) => {
+                return Ok(json_error(
+                    warp::http::StatusCode::NOT_FOUND,
+                    &format!("No demand-gen job found with ID: {question_id}"),
+                ));
+            }
+            Err(e) => {
+                return Ok(json_error(
+                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    &e.to_string(),
+                ));
+            }
+        }
+    };
+
+    match job.status.as_str() {
+        "complete" => {
+            // Re-run retrieval to include newly generated evidence
+            match super::question_retrieve::question_retrieve(
+                &state,
+                &slug,
+                &job.question,
+                false, // don't re-trigger demand-gen
+            )
+            .await
+            {
+                Ok(result) => Ok(json_ok(&serde_json::json!({
+                    "job_id": question_id,
+                    "status": "complete",
+                    "result": result,
+                    "generated_node_ids": job.result_node_ids,
+                }))),
+                Err(e) => Ok(json_error(
+                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    &e.to_string(),
+                )),
+            }
+        }
+        "failed" => {
+            Ok(json_ok(&serde_json::json!({
+                "job_id": question_id,
+                "status": "failed",
+                "error": job.error_message,
+            })))
+        }
+        _ => {
+            // Still queued or running
+            Ok(json_ok(&serde_json::json!({
+                "job_id": question_id,
+                "status": job.status,
+                "question": job.question,
+                "sub_questions": job.sub_questions,
+            })))
+        }
     }
 }

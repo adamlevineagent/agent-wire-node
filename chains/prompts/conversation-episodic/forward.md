@@ -12,11 +12,11 @@ RULES:
 
 Output valid JSON only (no markdown fences, no extra text):
 {
-  "distilled": "Dense, faithful record of what happened in this chunk. Preserve every concrete detail. Target: 10-20% of input length.",
+  "distilled": "Dense, faithful record of what happened in this chunk. Preserve every concrete detail. Length is whatever the content demands — sparse chunks produce short output, dense chunks produce long output.",
   "decisions": [{"decided": "what was chosen, agreed to, or settled", "context": "what was happening when it was decided"}],
   "questions_raised": ["open questions, things asked but not yet answered"],
   "feelings_or_reactions": ["any expressed feeling, mood, frustration, relief, confusion — by whom and toward what"],
-  "running_context": "1-3 sentences: looking forward from here, what does the session now know, want, or feel that it didn't before this chunk?"
+  "running_context": "Brief rolling summary: looking forward from here, what does the session now know, want, or feel that it didn't before this chunk?"
 }
 
 /no_think

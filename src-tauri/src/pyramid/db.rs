@@ -658,6 +658,9 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
     // ── Wire publication ID mapping table (P4.3) ──────────────────────────────
     super::wire_publish::init_id_map_table(conn)?;
 
+    // ── WS-MULTI-CHAIN-OVERLAY: Chain overlay tracking table ─────────────────
+    super::multi_chain_overlay::init_overlay_table(conn)?;
+
     // ── Phase 1: Question Pyramid Evidence System tables ─────────────────────
 
     conn.execute_batch(
@@ -1216,6 +1219,25 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
             ON pyramid_chain_proposals(chain_id);
         CREATE INDEX IF NOT EXISTS idx_chain_proposal_status
             ON pyramid_chain_proposals(status);
+        ",
+    )?;
+
+    // ── WS-COLLAPSE-EXTEND: collapse tracking table ──────────────────────────
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS pyramid_collapse_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            slug TEXT NOT NULL,
+            node_id TEXT NOT NULL,
+            versions_before INTEGER NOT NULL,
+            versions_after INTEGER NOT NULL,
+            preserved BOOLEAN NOT NULL DEFAULT 1,
+            collapsed_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_collapse_log_slug
+            ON pyramid_collapse_log(slug);
+        CREATE INDEX IF NOT EXISTS idx_collapse_log_slug_node
+            ON pyramid_collapse_log(slug, node_id);
         ",
     )?;
 
