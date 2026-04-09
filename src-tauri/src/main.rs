@@ -6612,22 +6612,28 @@ fn main() {
         pyramid_config.use_ir_executor
     );
 
-    // Start DADBEAR extend loop if any enabled watch configs exist
+    // Start DADBEAR extend loop if any enabled watch configs exist.
+    // Deferred via tauri::async_runtime::spawn because Tauri's setup() callback
+    // runs before the Tokio runtime is fully available for tokio::spawn.
     {
-        let reader = pyramid_state.reader.blocking_lock();
-        let has_configs = wire_node_lib::pyramid::db::get_enabled_dadbear_configs(&reader)
-            .map(|c| !c.is_empty())
-            .unwrap_or(false);
-        if has_configs {
-            let db_path_str = pyramid_db_path.to_string_lossy().to_string();
-            let bus = pyramid_state.build_event_bus.clone();
-            let handle = wire_node_lib::pyramid::dadbear_extend::start_dadbear_extend_loop(
-                db_path_str, bus,
-            );
-            let mut dh = pyramid_state.dadbear_handle.blocking_lock();
-            *dh = Some(handle);
-            tracing::info!("DADBEAR extend loop started on app launch (existing configs found)");
-        }
+        let ps = pyramid_state.clone();
+        let db_path_str = pyramid_db_path.to_string_lossy().to_string();
+        tauri::async_runtime::spawn(async move {
+            let reader = ps.reader.lock().await;
+            let has_configs = wire_node_lib::pyramid::db::get_enabled_dadbear_configs(&reader)
+                .map(|c| !c.is_empty())
+                .unwrap_or(false);
+            drop(reader);
+            if has_configs {
+                let bus = ps.build_event_bus.clone();
+                let handle = wire_node_lib::pyramid::dadbear_extend::start_dadbear_extend_loop(
+                    db_path_str, bus,
+                );
+                let mut dh = ps.dadbear_handle.lock().await;
+                *dh = Some(handle);
+                tracing::info!("DADBEAR extend loop started on app launch (existing configs found)");
+            }
+        });
     }
 
     // WS-E: spawn the web_sessions sweeper (idempotent OnceLock guard).
