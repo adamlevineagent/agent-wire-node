@@ -176,7 +176,6 @@ steps:
   # Skipped when evidence_mode != "deep".
   - name: evidence_loop
     primitive: evidence_loop
-    when: '$evidence_mode == "deep"'
     input:
       question_tree: "$decomposed_tree"
       extraction_schema: "$extraction_schema"
@@ -187,7 +186,6 @@ steps:
 
   - name: gap_processing
     primitive: process_gaps
-    when: '$evidence_mode == "deep"'
     input:
       evidence_loop: "$evidence_loop"
       load_prior_state: "$refresh_state"

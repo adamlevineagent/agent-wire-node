@@ -96,8 +96,15 @@ pub fn list_assignments(conn: &Connection) -> Result<Vec<(String, String, Option
 /// `pyramid_chain_assignments` still get their assigned chain — this only
 /// affects builds that rely on the default.
 pub fn default_chain_id(content_type: &str) -> &'static str {
-    match content_type {
-        "conversation" => "conversation-episodic",
+    default_chain_id_for_mode(content_type, "deep")
+}
+
+/// Get the default chain ID for a content type and evidence mode.
+/// "fast" mode uses a stripped-down chain that skips evidence grounding.
+pub fn default_chain_id_for_mode(content_type: &str, evidence_mode: &str) -> &'static str {
+    match (content_type, evidence_mode) {
+        ("conversation", "fast") => "conversation-episodic-fast",
+        ("conversation", _) => "conversation-episodic",
         _ => "question-pipeline",
     }
 }

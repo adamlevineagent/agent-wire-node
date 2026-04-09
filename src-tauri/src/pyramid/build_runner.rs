@@ -835,7 +835,7 @@ pub async fn run_decomposed_build(
 
     // ── 4. Load pipeline chain (content-type aware) ──────────────────
     let chains_dir = state.chains_dir.clone();
-    let default_chain_id = chain_registry::default_chain_id(ct_str);
+    let default_chain_id = chain_registry::default_chain_id_for_mode(ct_str, evidence_mode);
     let all_chains = chain_loader::discover_chains(&chains_dir)?;
     let meta = all_chains
         .iter()
