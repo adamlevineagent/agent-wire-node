@@ -125,6 +125,16 @@ impl ChainContext {
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("Unresolved reference: $item (no active forEach)"));
         }
+        // $item.<field> dot-path navigation into the current forEach item
+        if path.starts_with("item.") {
+            let item = self
+                .current_item
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Unresolved reference: $item (no active forEach)"))?;
+            let field_path = &path[5..]; // strip "item."
+            return navigate_json_path(item, field_path)
+                .with_context(|| format!("Unresolved reference: $item.{}", field_path));
+        }
         if path == "index" {
             return self
                 .current_index
