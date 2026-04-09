@@ -1373,3 +1373,52 @@ pub struct ChangeSet {
     /// Files that are unchanged.
     pub unchanged_count: usize,
 }
+
+// ── WS-PRIMER (§15 / Part III): Leftmost-slope primer types ──────────────────
+
+/// The full primer context for a pyramid slug, containing the leftmost-slope
+/// nodes and the canonical vocabulary extracted from the apex. This is the
+/// artifact that rides in every extraction prompt during bedrock builds and
+/// serves as the agent's initial cognitive substrate at session cold-start.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrimerContext {
+    pub slug: String,
+    pub slope_nodes: Vec<PrimerNode>,
+    pub canonical_vocabulary: CanonicalVocabulary,
+    pub total_tokens_estimate: usize,
+}
+
+/// A single node projected from the leftmost slope. Carries the headline,
+/// distilled narrative, and key vocabulary dimensions (topics, decisions,
+/// entities) at the resolution appropriate for that layer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrimerNode {
+    pub node_id: String,
+    pub depth: i64,
+    pub headline: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub distilled: Option<String>,
+    #[serde(default)]
+    pub topics: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub decisions: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub entities: Vec<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_range: Option<String>,
+}
+
+/// The canonical identity catalog extracted from the apex node. This is the
+/// running vocabulary that propagates forward into new bedrock builds via
+/// the primer — the "index of thinkable thoughts" (plan §1.2).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CanonicalVocabulary {
+    #[serde(default)]
+    pub topics: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub entities: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub decisions: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub terms: Vec<serde_json::Value>,
+}

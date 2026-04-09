@@ -43,6 +43,7 @@ pub mod lock_manager;
 pub mod meta;
 pub mod naming;
 pub mod parity;
+pub mod primer;
 pub mod publication;
 pub mod query;
 pub mod question_compiler;

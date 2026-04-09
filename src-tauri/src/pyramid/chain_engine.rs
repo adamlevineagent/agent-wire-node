@@ -265,6 +265,17 @@ pub struct ChainStep {
     /// Named break_loop because "break" is a Rust keyword.
     #[serde(default, rename = "break")]
     pub break_loop: Option<bool>,
+    /// WS-CHAIN-INVOKE: chain ID to invoke as a sub-chain.
+    /// When set, this step loads the referenced chain and executes it as a child,
+    /// inheriting the parent's slug, content_type, and step outputs.
+    /// Depth limit: 8 levels of nesting (tracked via ChainContext.invoke_depth).
+    #[serde(default)]
+    pub invoke_chain: Option<String>,
+    /// WS-CHAIN-INVOKE: optional context block to merge into the child chain's
+    /// initial_params when invoke_chain is set. Allows the parent to pass
+    /// data (e.g., question, source_slug) to the child chain.
+    #[serde(default)]
+    pub invoke_context: Option<serde_json::Value>,
 }
 
 impl Default for ChainStep {
@@ -325,6 +336,8 @@ impl Default for ChainStep {
             mode: None,
             until: None,
             break_loop: None,
+            invoke_chain: None,
+            invoke_context: None,
         }
     }
 }
@@ -438,7 +451,7 @@ pub fn validate_chain(def: &ChainDefinition) -> ValidationResult {
             ));
         }
 
-        // LLM steps (non-mechanical, non-orchestration, non-recipe) must have instruction
+        // LLM steps (non-mechanical, non-orchestration, non-recipe, non-invoke_chain) must have instruction
         let orchestration = matches!(
             step.primitive.as_str(),
             "container" | "loop" | "gate" | "split"
@@ -447,8 +460,33 @@ pub fn validate_chain(def: &ChainDefinition) -> ValidationResult {
             step.primitive.as_str(),
             "cross_build_input" | "evidence_loop" | "process_gaps" | "recursive_decompose"
         );
-        if !step.mechanical && !orchestration && !recipe && step.instruction.is_none() && step.instruction_from.is_none() {
+        let is_invoke = step.invoke_chain.is_some();
+        if !step.mechanical && !orchestration && !recipe && !is_invoke && step.instruction.is_none() && step.instruction_from.is_none() {
             errors.push(format!("{}: LLM step must specify instruction or instruction_from", prefix));
+        }
+
+        // WS-CHAIN-INVOKE: validate invoke_chain step
+        if let Some(ref chain_id) = step.invoke_chain {
+            if chain_id.is_empty() {
+                errors.push(format!("{}: invoke_chain must be a non-empty chain ID", prefix));
+            }
+            // invoke_context must be an object (if present)
+            if let Some(ref ctx_val) = step.invoke_context {
+                if !ctx_val.is_object() {
+                    errors.push(format!(
+                        "{}: invoke_context must be a JSON object, got {}",
+                        prefix,
+                        match ctx_val {
+                            serde_json::Value::Array(_) => "array",
+                            serde_json::Value::String(_) => "string",
+                            serde_json::Value::Number(_) => "number",
+                            serde_json::Value::Bool(_) => "bool",
+                            serde_json::Value::Null => "null",
+                            _ => "unknown",
+                        }
+                    ));
+                }
+            }
         }
 
         // dehydrate and item_fields are mutually exclusive
@@ -728,5 +766,76 @@ mod tests {
             .errors
             .iter()
             .any(|e| e.contains("sequential steps cannot use concurrency > 1")));
+    }
+
+    // ── WS-CHAIN-INVOKE tests ──────────────────────────────────────────
+
+    #[test]
+    fn invoke_chain_yaml_parses_correctly() {
+        let yaml = r#"
+schema_version: 1
+id: "parent-chain"
+name: "Parent Chain"
+description: "Tests invoke_chain parsing"
+content_type: "conversation"
+version: "0.1.0"
+author: "test"
+defaults:
+  model_tier: "mid"
+  temperature: 0.3
+  on_error: "retry(2)"
+steps:
+  - name: "escalate"
+    primitive: "synthesize"
+    invoke_chain: "child-chain-id"
+    invoke_context:
+      question: "What is the meaning of life?"
+      source_slug: "my-slug"
+"#;
+        let def: ChainDefinition = serde_yaml::from_str(yaml).expect("YAML should parse");
+        assert_eq!(def.steps.len(), 1);
+        let step = &def.steps[0];
+        assert_eq!(step.invoke_chain.as_deref(), Some("child-chain-id"));
+        assert!(step.invoke_context.is_some());
+        let ctx = step.invoke_context.as_ref().unwrap();
+        assert_eq!(
+            ctx.get("question").and_then(|v| v.as_str()),
+            Some("What is the meaning of life?")
+        );
+        assert_eq!(
+            ctx.get("source_slug").and_then(|v| v.as_str()),
+            Some("my-slug")
+        );
+    }
+
+    #[test]
+    fn invoke_chain_step_validates_without_instruction() {
+        // An invoke_chain step should not require an instruction field
+        let mut chain = minimal_chain();
+        chain.steps[0].instruction = None;
+        chain.steps[0].invoke_chain = Some("child-chain".into());
+        let result = validate_chain(&chain);
+        assert!(result.valid, "errors: {:?}", result.errors);
+    }
+
+    #[test]
+    fn invoke_chain_empty_id_fails_validation() {
+        let mut chain = minimal_chain();
+        chain.steps[0].instruction = None;
+        chain.steps[0].invoke_chain = Some(String::new());
+        let result = validate_chain(&chain);
+        assert!(!result.valid);
+        assert!(result.errors.iter().any(|e| e.contains("invoke_chain must be a non-empty chain ID")));
+    }
+
+    #[test]
+    fn invoke_chain_non_object_context_fails_validation() {
+        let mut chain = minimal_chain();
+        chain.steps[0].instruction = None;
+        chain.steps[0].invoke_chain = Some("child-chain".into());
+        chain.steps[0].invoke_context = Some(serde_json::json!("not an object"));
+        let result = validate_chain(&chain);
+        assert!(!result.valid);
+        assert!(result.errors.iter().any(|e| e.contains("invoke_context must be a JSON object")));
     }
 }

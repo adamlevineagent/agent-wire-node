@@ -18,6 +18,7 @@ use super::delta;
 use super::faq;
 use super::ingest;
 use super::meta;
+use super::primer;
 use super::publication;
 use super::query;
 use super::slug;
@@ -377,6 +378,14 @@ struct ConfigBody {
 #[derive(Deserialize)]
 struct UsageQuery {
     limit: Option<i64>,
+}
+
+/// WS-PRIMER: Query parameters for primer endpoints.
+#[derive(Deserialize)]
+struct PrimerQuery {
+    /// Optional token budget — when specified, apex-facing slope nodes are
+    /// dehydrated first to fit within this budget.
+    token_budget: Option<usize>,
 }
 
 // ── Phase 5 & 6: Auto-update request/response types ─────────────────
@@ -1635,10 +1644,52 @@ pub fn pyramid_routes(
     let ig = ig_a.or(ingest_mark_stale).unify().boxed();
     let top19 = top18.or(ig).unify().boxed();
 
+    // ── WS-IMMUTABILITY-ENFORCE: Promote provisional node to canonical ──
+
+    // POST /pyramid/:slug/nodes/:node_id/promote — promotes a provisional node
+    let promote_node = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("nodes"))
+        .and(warp::path::param::<String>())
+        .and(warp::path("promote"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_promote_node));
+
+    let top20 = top19.or(promote_node).unify().boxed();
+
+    // ── WS-PRIMER: Primer context routes ──
+
+    // GET /pyramid/:slug/primer — returns PrimerContext JSON
+    let primer_json = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("primer"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::query::<PrimerQuery>())
+        .and(with_slug_read_auth(state.clone(), jwt_public_key.clone()))
+        .and_then(handle_primer));
+
+    // GET /pyramid/:slug/primer/formatted — returns formatted text for prompt inclusion
+    let primer_formatted = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("primer"))
+        .and(warp::path("formatted"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::query::<PrimerQuery>())
+        .and(with_slug_read_auth(state.clone(), jwt_public_key.clone()))
+        .and_then(handle_primer_formatted));
+
+    // primer/formatted must come before primer (longer literal path first)
+    let pr = primer_formatted.or(primer_json).unify().boxed();
+    let top21 = top20.or(pr).unify().boxed();
+
     // public_html is now mounted separately at the server level so it can
     // get a permissive CORS filter (the desktop API allowlist would block
     // form POSTs from the tunnel host).
-    top19
+    top21
 }
 
 /// Mount the post-agents-retro `/p/` web surface routes. These are
@@ -6826,4 +6877,113 @@ async fn handle_ingest_mark_stale(
         "marked_stale": marked,
         "errors": errors,
     })))
+}
+
+// ── WS-IMMUTABILITY-ENFORCE ────────────────────────────────────────────
+
+/// POST /pyramid/:slug/nodes/:node_id/promote — promote a provisional node
+/// to canonical status. After promotion, bedrock nodes (depth <= 1) become
+/// permanently immutable.
+async fn handle_promote_node(
+    slug_name: String,
+    node_id: String,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    // WS-CONCURRENCY: serialize with any in-flight builder / delta / write.
+    let _lock = super::lock_manager::LockManager::global()
+        .write(&slug_name)
+        .await;
+
+    let conn = state.writer.lock().await;
+
+    // Verify the node exists before attempting promotion.
+    match db::get_node(&conn, &slug_name, &node_id) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return Ok(json_error(
+                warp::http::StatusCode::NOT_FOUND,
+                &format!("node '{node_id}' not found for slug '{slug_name}'"),
+            ));
+        }
+        Err(e) => {
+            return Ok(json_error(
+                warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                &e.to_string(),
+            ));
+        }
+    }
+
+    match db::promote_provisional_node(&conn, &slug_name, &node_id) {
+        Ok(true) => Ok(json_ok(&serde_json::json!({
+            "promoted": true,
+        }))),
+        Ok(false) => Ok(json_ok(&serde_json::json!({
+            "promoted": false,
+            "reason": "not provisional",
+        }))),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
+    }
+}
+
+// ── WS-PRIMER: Primer handlers ──────────────────────────────────────────────
+
+/// GET /pyramid/:slug/primer — returns PrimerContext as JSON
+async fn handle_primer(
+    slug_name: String,
+    query: PrimerQuery,
+    (state, _auth_source): (Arc<PyramidState>, AuthSource),
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let conn = state.reader.lock().await;
+
+    match primer::build_primer(&conn, &slug_name, query.token_budget) {
+        Ok(primer_ctx) => {
+            if primer_ctx.slope_nodes.is_empty() {
+                Ok(json_error(
+                    warp::http::StatusCode::NOT_FOUND,
+                    &format!("No pyramid data found for slug '{slug_name}'"),
+                ))
+            } else {
+                Ok(json_ok(&primer_ctx))
+            }
+        }
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
+    }
+}
+
+/// GET /pyramid/:slug/primer/formatted — returns formatted primer text for prompt inclusion
+async fn handle_primer_formatted(
+    slug_name: String,
+    query: PrimerQuery,
+    (state, _auth_source): (Arc<PyramidState>, AuthSource),
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let conn = state.reader.lock().await;
+
+    match primer::build_primer(&conn, &slug_name, query.token_budget) {
+        Ok(primer_ctx) => {
+            if primer_ctx.slope_nodes.is_empty() {
+                Ok(json_error(
+                    warp::http::StatusCode::NOT_FOUND,
+                    &format!("No pyramid data found for slug '{slug_name}'"),
+                ))
+            } else {
+                let formatted = primer::format_primer_for_prompt(&primer_ctx);
+                Ok(warp::reply::with_header(
+                    warp::reply::with_status(formatted, warp::http::StatusCode::OK),
+                    "content-type",
+                    "text/plain; charset=utf-8",
+                )
+                .into_response())
+            }
+        }
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
+    }
 }

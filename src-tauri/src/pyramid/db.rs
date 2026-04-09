@@ -2092,17 +2092,25 @@ pub fn save_node(conn: &Connection, node: &PyramidNode, topics_json: Option<&str
         .unwrap_or(false);
 
     if row_exists {
-        let is_provisional: bool = conn
+        let (is_provisional, existing_depth): (bool, i64) = conn
             .query_row(
-                "SELECT COALESCE(provisional, 0) FROM pyramid_nodes WHERE slug = ?1 AND id = ?2",
+                "SELECT COALESCE(provisional, 0), depth FROM pyramid_nodes WHERE slug = ?1 AND id = ?2",
                 rusqlite::params![node.slug, node.id],
-                |r| r.get::<_, i64>(0),
-            )
-            .unwrap_or(0)
-            != 0;
+                |r| Ok((r.get::<_, i64>(0)? != 0, r.get::<_, i64>(1)?)),
+            )?;
         if is_provisional {
             mutate_provisional_node(conn, &node.slug, &node.id, node)?;
         } else {
+            // WS-IMMUTABILITY-ENFORCE: bedrock L0/L1 nodes (depth <= 1) are
+            // permanently immutable once written canonically. Only provisional
+            // nodes at these depths may be mutated (handled above).
+            if existing_depth <= 1 {
+                return Err(anyhow::anyhow!(
+                    "Cannot mutate immutable bedrock node {} at depth {}",
+                    node.id,
+                    existing_depth
+                ));
+            }
             // Default rebuild phase/reason. Callers that need a different
             // reason (delta, collapse, promotion, agent_writeback,
             // stale_refresh) should invoke apply_supersession directly.
@@ -2206,6 +2214,27 @@ pub fn apply_supersession(
     supersession_reason: &str,
     _requesting_chain_id: &str,
 ) -> Result<i64> {
+    // WS-IMMUTABILITY-ENFORCE: bedrock L0/L1 nodes (depth <= 1) are permanently
+    // immutable once written canonically. Reject any supersession attempt on
+    // a canonical bedrock node. Provisional nodes at these depths are handled
+    // by mutate_provisional_node, not this function.
+    {
+        let (existing_depth, is_provisional): (i64, bool) = conn
+            .query_row(
+                "SELECT depth, COALESCE(provisional, 0) FROM pyramid_nodes WHERE slug = ?1 AND id = ?2",
+                rusqlite::params![slug, node_id],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)? != 0)),
+            )
+            .map_err(|e| anyhow::anyhow!("apply_supersession: lookup failed for ({slug}, {node_id}): {e}"))?;
+        if existing_depth <= 1 && !is_provisional {
+            return Err(anyhow::anyhow!(
+                "Cannot mutate immutable bedrock node {} at depth {}",
+                node_id,
+                existing_depth
+            ));
+        }
+    }
+
     let savepoint_name = "apply_supersession_sp";
     conn.execute_batch(&format!("SAVEPOINT {savepoint_name};"))?;
 
@@ -2422,6 +2451,25 @@ pub fn mutate_provisional_node(
         ],
     )?;
     Ok(updated)
+}
+
+/// WS-IMMUTABILITY-ENFORCE: Promote a provisional node to canonical status.
+///
+/// Sets `provisional = 0` on the node. After promotion, the node becomes
+/// permanently immutable if it is at depth <= 1 (bedrock L0/L1 freeze).
+///
+/// Returns `true` if the node was provisional and got promoted, `false` if
+/// the node was not provisional (already canonical or does not exist).
+///
+/// Does NOT emit events — WS-EVENTS owns event emission. The caller is
+/// responsible for emitting `ProvisionalNodePromoted` after a successful
+/// promotion.
+pub fn promote_provisional_node(conn: &Connection, slug: &str, node_id: &str) -> Result<bool> {
+    let updated = conn.execute(
+        "UPDATE pyramid_nodes SET provisional = 0 WHERE slug = ?1 AND id = ?2 AND provisional = 1",
+        rusqlite::params![slug, node_id],
+    )?;
+    Ok(updated > 0)
 }
 
 /// Get a single node by slug and node ID.
@@ -6976,10 +7024,13 @@ mod tests {
         let conn = test_conn();
         create_slug(&conn, "s", &ContentType::Code, "").unwrap();
 
+        // WS-IMMUTABILITY-ENFORCE: use depth >= 2 so the upsert path
+        // (apply_supersession) is exercised without hitting the bedrock
+        // immutability guard that rejects canonical L0/L1 updates.
         let mut node = PyramidNode {
             id: "n1".to_string(),
             slug: "s".to_string(),
-            depth: 0,
+            depth: 2,
             chunk_index: Some(0),
             headline: "Versioned Node".to_string(),
             distilled: "Version 1".to_string(),
@@ -7006,7 +7057,7 @@ mod tests {
         assert_eq!(got.distilled, "Version 2");
 
         // Should still be 1 node, not 2
-        assert_eq!(count_nodes_at_depth(&conn, "s", 0).unwrap(), 1);
+        assert_eq!(count_nodes_at_depth(&conn, "s", 2).unwrap(), 1);
     }
 
     /// WS-ONLINE-S3: delete_web_edges_for_depth is now a no-op (build_id scoping).
@@ -7244,10 +7295,13 @@ mod tests {
         create_slug(&conn, "vt", &ContentType::Code, "").unwrap();
 
         // Write v1 via save_node (first write — INSERT path).
+        // WS-IMMUTABILITY-ENFORCE: use depth >= 2 so the versioning round-trip
+        // (save_node -> apply_supersession) is exercised without hitting the
+        // bedrock immutability guard that rejects canonical L0/L1 updates.
         let mut node = PyramidNode {
             id: "n-1".to_string(),
             slug: "vt".to_string(),
-            depth: 0,
+            depth: 2,
             headline: "initial".to_string(),
             distilled: "first version".to_string(),
             time_range: Some(TimeRange {
@@ -7369,6 +7423,185 @@ mod tests {
         assert_eq!(prov.headline, "provisional change");
         // current_version must NOT change for provisional mutations.
         assert_eq!(prov.current_version, 3);
+    }
+
+    // ── WS-IMMUTABILITY-ENFORCE tests ───────────────────────────────────
+
+    /// Test 1: Save a canonical L0 node, then attempt to update it via
+    /// save_node — should fail with immutability error.
+    #[test]
+    fn test_immutability_canonical_l0_rejects_update() {
+        let conn = test_conn();
+        create_slug(&conn, "s", &ContentType::Code, "").unwrap();
+
+        let node = PyramidNode {
+            id: "imm-l0".to_string(),
+            slug: "s".to_string(),
+            depth: 0,
+            headline: "Bedrock L0".to_string(),
+            distilled: "original".to_string(),
+            ..Default::default()
+        };
+        // First write succeeds (INSERT path).
+        save_node(&conn, &node, None).unwrap();
+
+        // Second write should fail — canonical L0 is immutable.
+        let mut updated = node.clone();
+        updated.distilled = "mutated".to_string();
+        let err = save_node(&conn, &updated, None);
+        assert!(err.is_err(), "Expected immutability error for canonical L0 update");
+        let msg = err.unwrap_err().to_string();
+        assert!(
+            msg.contains("Cannot mutate immutable bedrock node"),
+            "Error should mention immutability: {msg}"
+        );
+
+        // Verify the original content is untouched.
+        let got = get_node(&conn, "s", "imm-l0").unwrap().unwrap();
+        assert_eq!(got.distilled, "original");
+    }
+
+    /// Test 2: Save a provisional L0 node, update it via mutate_provisional_node
+    /// — should succeed.
+    #[test]
+    fn test_immutability_provisional_l0_allows_mutation() {
+        let conn = test_conn();
+        create_slug(&conn, "s", &ContentType::Code, "").unwrap();
+
+        let node = PyramidNode {
+            id: "prov-l0".to_string(),
+            slug: "s".to_string(),
+            depth: 0,
+            headline: "Provisional L0".to_string(),
+            distilled: "original".to_string(),
+            provisional: true,
+            ..Default::default()
+        };
+        save_node(&conn, &node, None).unwrap();
+
+        // Update via mutate_provisional_node should succeed.
+        let mut updated = node.clone();
+        updated.distilled = "mutated via provisional".to_string();
+        let changed = mutate_provisional_node(&conn, "s", "prov-l0", &updated).unwrap();
+        assert_eq!(changed, 1, "Provisional node mutation should succeed");
+
+        let got = get_node(&conn, "s", "prov-l0").unwrap().unwrap();
+        assert_eq!(got.distilled, "mutated via provisional");
+
+        // Update via save_node should also succeed (routes through mutate_provisional_node).
+        let mut updated2 = node.clone();
+        updated2.distilled = "mutated again".to_string();
+        save_node(&conn, &updated2, None).unwrap();
+
+        let got2 = get_node(&conn, "s", "prov-l0").unwrap().unwrap();
+        assert_eq!(got2.distilled, "mutated again");
+    }
+
+    /// Test 3: Promote a provisional L0 node, then attempt to update it —
+    /// should fail with immutability error.
+    #[test]
+    fn test_immutability_promoted_l0_rejects_update() {
+        let conn = test_conn();
+        create_slug(&conn, "s", &ContentType::Code, "").unwrap();
+
+        let node = PyramidNode {
+            id: "prom-l0".to_string(),
+            slug: "s".to_string(),
+            depth: 0,
+            headline: "Provisional L0".to_string(),
+            distilled: "original".to_string(),
+            provisional: true,
+            ..Default::default()
+        };
+        save_node(&conn, &node, None).unwrap();
+
+        // Promote: provisional -> canonical.
+        let promoted = promote_provisional_node(&conn, "s", "prom-l0").unwrap();
+        assert!(promoted, "Node should have been promoted");
+
+        // Verify it's no longer provisional.
+        let got = get_node(&conn, "s", "prom-l0").unwrap().unwrap();
+        assert!(!got.provisional, "Node should be canonical after promotion");
+
+        // Attempt to update via save_node — should fail.
+        let mut updated = node.clone();
+        updated.distilled = "mutated after promotion".to_string();
+        updated.provisional = false; // reflect the promoted state
+        let err = save_node(&conn, &updated, None);
+        assert!(err.is_err(), "Expected immutability error after promotion");
+        let msg = err.unwrap_err().to_string();
+        assert!(
+            msg.contains("Cannot mutate immutable bedrock node"),
+            "Error should mention immutability: {msg}"
+        );
+
+        // Attempt to update via apply_supersession — should also fail.
+        let err2 = apply_supersession(&conn, "s", "prom-l0", &updated, "rebuild", "rebuild", "");
+        assert!(err2.is_err(), "apply_supersession should also reject immutable bedrock");
+    }
+
+    /// Test 4: Save an L2 node, update via apply_supersession — should succeed.
+    #[test]
+    fn test_immutability_l2_allows_supersession() {
+        let conn = test_conn();
+        create_slug(&conn, "s", &ContentType::Code, "").unwrap();
+
+        let node = PyramidNode {
+            id: "l2-node".to_string(),
+            slug: "s".to_string(),
+            depth: 2,
+            headline: "L2 Node".to_string(),
+            distilled: "original L2".to_string(),
+            ..Default::default()
+        };
+        save_node(&conn, &node, None).unwrap();
+
+        // Update via apply_supersession — L2 is mutable.
+        let mut updated = node.clone();
+        updated.distilled = "superseded L2".to_string();
+        let new_version = apply_supersession(
+            &conn, "s", "l2-node", &updated, "delta", "delta", "test-chain",
+        )
+        .unwrap();
+        assert_eq!(new_version, 2, "L2 supersession should bump version");
+
+        let got = get_node(&conn, "s", "l2-node").unwrap().unwrap();
+        assert_eq!(got.distilled, "superseded L2");
+
+        // Also test via save_node (routes through apply_supersession for non-provisional).
+        let mut updated2 = node.clone();
+        updated2.distilled = "superseded L2 again".to_string();
+        save_node(&conn, &updated2, None).unwrap();
+
+        let got2 = get_node(&conn, "s", "l2-node").unwrap().unwrap();
+        assert_eq!(got2.distilled, "superseded L2 again");
+    }
+
+    /// Test 5: Promote a non-provisional node — should return false.
+    #[test]
+    fn test_promote_non_provisional_returns_false() {
+        let conn = test_conn();
+        create_slug(&conn, "s", &ContentType::Code, "").unwrap();
+
+        // Save a canonical (non-provisional) node.
+        let node = PyramidNode {
+            id: "canon-l0".to_string(),
+            slug: "s".to_string(),
+            depth: 0,
+            headline: "Canonical L0".to_string(),
+            distilled: "already canonical".to_string(),
+            provisional: false,
+            ..Default::default()
+        };
+        save_node(&conn, &node, None).unwrap();
+
+        // Attempt promotion on a non-provisional node.
+        let result = promote_provisional_node(&conn, "s", "canon-l0").unwrap();
+        assert!(!result, "Promoting a non-provisional node should return false");
+
+        // Also test promoting a non-existent node.
+        let result2 = promote_provisional_node(&conn, "s", "does-not-exist").unwrap();
+        assert!(!result2, "Promoting a non-existent node should return false");
     }
 }
 

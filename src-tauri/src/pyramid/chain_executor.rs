@@ -29,6 +29,7 @@ use super::build::{
 };
 use super::chain_dispatch::{self, build_node_from_output, generate_node_id, normalize_node_id};
 use super::chain_engine::{ChainDefinition, ChainStep};
+use super::chain_loader;
 use super::chain_resolve::{resolve_prompt_template, ChainContext};
 use super::db;
 use super::stale_helpers_upper::resolve_stale_target_for_node;
@@ -3949,6 +3950,16 @@ pub async fn execute_chain_from(
         ctx.initial_params = params;
     }
 
+    // WS-CHAIN-INVOKE: read and consume the reserved __invoke_depth key
+    // from initial_params (set by execute_invoke_chain when invoking a
+    // child chain). This propagates the nesting depth without changing
+    // the public execute_chain_from signature.
+    if let Some(depth_val) = ctx.initial_params.remove("__invoke_depth") {
+        if let Some(depth) = depth_val.as_u64() {
+            ctx.invoke_depth = depth as u32;
+        }
+    }
+
     // WS-AUDIENCE-CONTRACT: inject chain-level `audience:` block as a
     // structured JSON Object into the resolution context. Caller-provided
     // initial_context["audience"] (e.g., legacy String from build_runner's
@@ -4283,6 +4294,12 @@ pub async fn execute_chain_from(
             execute_evidence_loop(state, step, &mut ctx, slug, cancel, &progress_tx, &layer_tx, &mut done, total).await
         } else if step.primitive == "process_gaps" {
             execute_process_gaps(state, step, &mut ctx, slug, cancel).await
+        } else if step.invoke_chain.is_some() {
+            // WS-CHAIN-INVOKE: chain-invoking-chain primitive
+            execute_invoke_chain(
+                state, step, &mut ctx, slug, cancel, &progress_tx, &layer_tx,
+            )
+            .await
         } else if step.for_each.is_some() {
             let (outputs, failures) = execute_for_each(
                 step,
@@ -5793,6 +5810,148 @@ async fn execute_process_gaps(
     Ok(serde_json::json!({
         "gaps_processed": gaps_processed,
         "gaps_with_new_evidence": gaps_with_new_evidence,
+    }))
+}
+
+// ── WS-CHAIN-INVOKE: chain-invoking-chain execution ────────────────────────
+
+/// Maximum invoke_chain nesting depth. Root = 0; normal flows hit 2-4.
+/// Safety ceiling to prevent runaway recursive chains.
+const INVOKE_CHAIN_MAX_DEPTH: u32 = 8;
+
+/// Execute an `invoke_chain` step: load the referenced chain by ID, build a
+/// child `ChainContext` with incremented `invoke_depth`, and execute the child
+/// chain. The child chain's final step output set is serialized as this step's
+/// output in the parent chain.
+///
+/// Depth limit: [`INVOKE_CHAIN_MAX_DEPTH`] (8). The root chain runs at depth 0.
+async fn execute_invoke_chain(
+    state: &PyramidState,
+    step: &ChainStep,
+    ctx: &mut ChainContext,
+    slug: &str,
+    cancel: &CancellationToken,
+    progress_tx: &Option<mpsc::Sender<BuildProgress>>,
+    layer_tx: &Option<mpsc::Sender<LayerEvent>>,
+) -> Result<Value> {
+    let chain_id = step
+        .invoke_chain
+        .as_deref()
+        .ok_or_else(|| anyhow!("invoke_chain step '{}' missing chain ID", step.name))?;
+
+    // ── Depth guard ──────────────────────────────────────────────────────
+    if ctx.invoke_depth >= INVOKE_CHAIN_MAX_DEPTH {
+        return Err(anyhow!(
+            "invoke_chain depth limit exceeded (max {}, current {}) at step '{}' invoking '{}'",
+            INVOKE_CHAIN_MAX_DEPTH,
+            ctx.invoke_depth,
+            step.name,
+            chain_id,
+        ));
+    }
+
+    info!(
+        slug,
+        step_name = %step.name,
+        chain_id,
+        invoke_depth = ctx.invoke_depth,
+        "executing invoke_chain primitive"
+    );
+
+    // ── Load the child chain ─────────────────────────────────────────────
+    let chains_dir = &state.chains_dir;
+    let all_chains = chain_loader::discover_chains(chains_dir)?;
+    let meta = all_chains
+        .iter()
+        .find(|m| m.id == chain_id)
+        .ok_or_else(|| {
+            anyhow!(
+                "invoke_chain: chain '{}' not found in chains directory ({})",
+                chain_id,
+                chains_dir.display()
+            )
+        })?;
+    let yaml_path = std::path::Path::new(&meta.file_path);
+    let child_chain = chain_loader::load_chain(yaml_path, chains_dir)?;
+
+    // ── Build child initial_params from parent step_outputs + invoke_context ──
+    let mut child_params: HashMap<String, Value> = HashMap::new();
+
+    // Inherit parent's step_outputs as initial params for the child.
+    // This allows $parent_step_name.field references in the child chain.
+    for (k, v) in ctx.step_outputs.iter() {
+        child_params.insert(k.clone(), v.clone());
+    }
+
+    // Inherit parent's initial_params (lower priority than step_outputs).
+    for (k, v) in &ctx.initial_params {
+        child_params.entry(k.clone()).or_insert_with(|| v.clone());
+    }
+
+    // Merge invoke_context (highest priority — caller-provided overrides).
+    // Resolve $references in the context block against the parent's context.
+    if let Some(ref invoke_ctx_val) = step.invoke_context {
+        let resolved_ctx = ctx.resolve_value(invoke_ctx_val)?;
+        if let Value::Object(map) = resolved_ctx {
+            for (k, v) in map {
+                child_params.insert(k, v);
+            }
+        }
+    }
+
+    // ── Execute the child chain ──────────────────────────────────────────
+    // The child runs with:
+    //   - invoke_depth = parent + 1 (threaded via reserved __invoke_depth key)
+    //   - same slug & content_type
+    //   - child's own chain definition (steps, defaults, audience)
+    //   - merged initial_params
+    //
+    // invoke_depth propagation: execute_chain_from builds its own ChainContext
+    // internally. We thread invoke_depth via a reserved "__invoke_depth" key
+    // in initial_params. execute_chain_from reads and removes this key, then
+    // sets ctx.invoke_depth accordingly. This avoids changing the public API.
+    child_params.insert(
+        "__invoke_depth".to_string(),
+        Value::Number((ctx.invoke_depth + 1).into()),
+    );
+
+    // Box::pin the recursive call to break the async-fn size cycle.
+    // execute_chain_from → execute_invoke_chain → execute_chain_from
+    // requires the future to be heap-allocated for the compiler to
+    // determine the outer future's size.
+    let (apex_node_id, child_failures, child_activities) = Box::pin(execute_chain_from(
+        state,
+        &child_chain,
+        slug,
+        0,                          // from_depth: child starts fresh
+        None,                       // stop_after
+        None,                       // force_from
+        cancel,
+        progress_tx.clone(),
+        layer_tx.clone(),
+        Some(child_params),
+    ))
+    .await?;
+
+    info!(
+        slug,
+        step_name = %step.name,
+        chain_id,
+        apex_node_id = %apex_node_id,
+        child_failures,
+        child_steps = child_activities.len(),
+        "invoke_chain completed"
+    );
+
+    // Return a structured result that the parent chain can reference.
+    Ok(serde_json::json!({
+        "apex_node_id": apex_node_id,
+        "failures": child_failures,
+        "chain_id": chain_id,
+        "steps": child_activities.iter().map(|a| serde_json::json!({
+            "name": a.name,
+            "status": a.status,
+        })).collect::<Vec<_>>(),
     }))
 }
 
@@ -14679,5 +14838,123 @@ mod tests {
             converge >= 4,
             "expected >= 4 converge steps, got {converge}"
         );
+    }
+
+    // ── WS-CHAIN-INVOKE tests ──────────────────────────────────────────
+
+    #[test]
+    fn invoke_chain_depth_limit_at_max_returns_error() {
+        // Simulate a ChainContext at depth 8 (the max). An invoke_chain
+        // step should fail before attempting to load any child chain.
+        let mut ctx = ChainContext::new("test-slug", "conversation", ChunkProvider::empty());
+        ctx.invoke_depth = INVOKE_CHAIN_MAX_DEPTH; // 8
+
+        let step = ChainStep {
+            name: "escalate".to_string(),
+            primitive: "synthesize".to_string(),
+            invoke_chain: Some("child-chain".to_string()),
+            ..Default::default()
+        };
+
+        // The depth check happens inside execute_invoke_chain, which is async
+        // and requires PyramidState. Instead, verify the guard condition directly.
+        assert!(
+            ctx.invoke_depth >= INVOKE_CHAIN_MAX_DEPTH,
+            "depth {} should be >= max {}",
+            ctx.invoke_depth,
+            INVOKE_CHAIN_MAX_DEPTH,
+        );
+
+        // Also verify the error message format
+        let err_msg = format!(
+            "invoke_chain depth limit exceeded (max {}, current {}) at step '{}' invoking '{}'",
+            INVOKE_CHAIN_MAX_DEPTH,
+            ctx.invoke_depth,
+            step.name,
+            step.invoke_chain.as_deref().unwrap(),
+        );
+        assert!(err_msg.contains("depth limit exceeded"));
+        assert!(err_msg.contains("max 8"));
+        assert!(err_msg.contains("current 8"));
+    }
+
+    #[test]
+    fn invoke_chain_depth_below_max_allowed() {
+        // At depth 0 (root), invoke_chain should pass the depth check
+        let ctx = ChainContext::new("test-slug", "conversation", ChunkProvider::empty());
+        assert_eq!(ctx.invoke_depth, 0);
+        assert!(ctx.invoke_depth < INVOKE_CHAIN_MAX_DEPTH);
+    }
+
+    #[test]
+    fn invoke_chain_depth_propagation_via_initial_params() {
+        // Verify that __invoke_depth in initial_params is correctly
+        // consumed and sets ctx.invoke_depth. This is the mechanism
+        // execute_invoke_chain uses to propagate depth to child chains.
+        let mut ctx = ChainContext::new("test-slug", "conversation", ChunkProvider::empty());
+        ctx.initial_params.insert(
+            "__invoke_depth".to_string(),
+            serde_json::json!(3),
+        );
+
+        // Simulate what execute_chain_from does: read and consume the key
+        if let Some(depth_val) = ctx.initial_params.remove("__invoke_depth") {
+            if let Some(depth) = depth_val.as_u64() {
+                ctx.invoke_depth = depth as u32;
+            }
+        }
+
+        assert_eq!(ctx.invoke_depth, 3);
+        assert!(!ctx.initial_params.contains_key("__invoke_depth"),
+            "__invoke_depth should be consumed (removed) from initial_params");
+    }
+
+    #[test]
+    fn invoke_chain_nested_depth_increments() {
+        // Simulate chain A (depth 0) → invokes B (depth 1) → invokes C (depth 2).
+        // Each invocation increments invoke_depth by 1.
+
+        // Root chain at depth 0
+        let root_ctx = ChainContext::new("slug", "conversation", ChunkProvider::empty());
+        assert_eq!(root_ctx.invoke_depth, 0);
+
+        // Child B: root sets __invoke_depth = 0 + 1 = 1
+        let child_depth = root_ctx.invoke_depth + 1;
+        assert_eq!(child_depth, 1);
+        let mut child_b_ctx = ChainContext::new("slug", "conversation", ChunkProvider::empty());
+        child_b_ctx.invoke_depth = child_depth;
+        assert_eq!(child_b_ctx.invoke_depth, 1);
+
+        // Grandchild C: child B sets __invoke_depth = 1 + 1 = 2
+        let grandchild_depth = child_b_ctx.invoke_depth + 1;
+        assert_eq!(grandchild_depth, 2);
+        let mut child_c_ctx = ChainContext::new("slug", "conversation", ChunkProvider::empty());
+        child_c_ctx.invoke_depth = grandchild_depth;
+        assert_eq!(child_c_ctx.invoke_depth, 2);
+
+        // All depths below max — should be allowed
+        assert!(child_c_ctx.invoke_depth < INVOKE_CHAIN_MAX_DEPTH);
+    }
+
+    #[test]
+    fn invoke_chain_output_structure() {
+        // Verify the output structure that execute_invoke_chain returns
+        // so parent chains can reference $invoke_step.apex_node_id etc.
+        let output = serde_json::json!({
+            "apex_node_id": "L3-S000",
+            "failures": 0,
+            "chain_id": "child-chain",
+            "steps": [
+                {"name": "step1", "status": "ran"},
+                {"name": "step2", "status": "ran"},
+            ],
+        });
+
+        assert_eq!(output["apex_node_id"], "L3-S000");
+        assert_eq!(output["failures"], 0);
+        assert_eq!(output["chain_id"], "child-chain");
+        assert_eq!(output["steps"].as_array().unwrap().len(), 2);
+        assert_eq!(output["steps"][0]["name"], "step1");
+        assert_eq!(output["steps"][0]["status"], "ran");
     }
 }

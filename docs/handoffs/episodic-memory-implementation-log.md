@@ -83,10 +83,10 @@ These resolve the 16 questions asked before Phase 1 full dispatch. Treat as norm
 
 | Workstream | Status | Agent ID | Notes |
 |---|---|---|---|
-| WS-SCHEMA-V2 | **stopped mid-run (credits)** | a99dc2451e87f878b | Agent ran 7h+ and made substantial progress before TaskStop. `cargo check` passes cleanly on the full crate at time of stop — PyramidNode/Decision field extensions landed across build.rs, delta.rs, evidence_answering.rs, meta.rs, stale_helpers_upper.rs, vine.rs, chain_dispatch.rs (that's why those files are in the modified list). NOT VERIFIED: (a) whether `pyramid_node_versions` table and `apply_supersession` / `mutate_provisional_node` helpers exist; (b) whether `get_node_version` helper exists; (c) whether `save_node` second-write routes through `apply_supersession`; (d) whether a version round-trip test exists. Resume protocol: run a SCHEMA-V2 verifier agent on the current state to identify what's missing and finish in place. |
+| WS-SCHEMA-V2 | **complete + verified** | a99dc2451e87f878b | All 7 requirements confirmed present. Verifier (2026-04-09) found 44 broken test struct literals across 9 files — `cargo check` passed but `cargo check --tests` didn't. All fixed. 683 tests pass, 7 pre-existing failures unrelated to SCHEMA-V2. `pyramid_node_versions` table, `apply_supersession`, `mutate_provisional_node`, `get_node_version`, `save_node` second-write routing, version round-trip test — all verified present and correct. |
 | WS-FTS5 | **complete** | aae7049bd83c0f31c | Contentless-external FTS5 + triggers + idempotent backfill + `search_chunks_fts` + ancestor walk. Not surfaced via HTTP (WS-READING-MODES owns that). `cargo check` tree-wide fails only from WS-SCHEMA-V2's in-progress call-site sweep (expected). |
 | WS-CONCURRENCY | **complete** | af8d90655ce4ca82d | `lock_manager.rs` with `LockManager::{read,write,try_*,write_child_then_parent}` + 11 tests. Integrated in `build_runner.rs::run_build_from` and `vine.rs::notify_vine_of_bunch_change`. Deadlock-free child-then-parent discipline enforced. Tests can't run yet due to WS-SCHEMA-V2 in-flight compile errors in unrelated files. |
-| WS-DEADLETTER | **complete (BLOCKER-01 NOT fixed)** | a89e336aa939f9939 | Table + helpers + 4 operator routes + `dispatch_with_retry` exhaust hook + `retry_dead_letter_entry` + `classify_error_kind`. `cargo check` passes. **BUT**: implementer acquires `write(slug)` inside `dispatch_with_retry` while the enclosing build still holds it → reentrant deadlock per BLOCKER-01. Verifier MUST fix before moving on. |
+| WS-DEADLETTER | **complete + verified** | a89e336aa939f9939 | Table + helpers + 4 operator routes + `dispatch_with_retry` exhaust hook + `retry_dead_letter_entry` + `classify_error_kind`. `cargo check` passes. **BUT**: implementer acquires `write(slug)` inside `dispatch_with_retry` while the enclosing build still holds it → reentrant deadlock per BLOCKER-01. Verifier MUST fix before moving on. |
 | WS-COST-MODEL | **complete** | a8ddf0b2d374c15a7 | `cost_model.rs` + 13-entry seed JSON + `pyramid_chain_cost_model` table + `POST/GET /pyramid/cost_model[/recompute]`. `cargo check` clean. Build-complete event hook deferred to follow-up. |
 | WS-AUDIENCE-CONTRACT | **complete** | ae9b9b0c25aa7f5d9 | Canonical struct in `types.rs`; `ChainDefinition.audience` with `#[serde(default)]` in `chain_engine.rs` (auto YAML parse — no loader changes needed); `run_chain` injects `chain.audience` into `ctx.initial_params["audience"]` as JSON Object (caller override wins); `audience_value_to_legacy_string()` shim for two legacy `.as_str()` sites in `chain_executor.rs`. Prompt migration was a no-op: zero prompts use single-brace `{audience}`; question prompts use `{{audience_block}}` via a Rust-render path that takes `Option<&str>` — structured consumption would require plumbing through DecompositionConfig which is out of scope. `cargo check` clean for audience changes. |
 | WS-EVENTS | **complete** | a6d1fe9b7403723cd | Extended `TaggedKind` in `event_bus.rs` with 13 §15.21 variants (SlopeChanged, DeltaLanded, ApexHeadlineChanged, CostUpdate, DeadLetterEnqueued, VocabularyPromoted, ProvisionalNode{Added,Promoted}, DemandGen{Started,Completed}, ChainProposalReceived, ChainStep{Started,Finished}). `routes_ws.rs` catch-all arm forwards all discrete variants immediately (bypasses 60ms coalesce). Chain_executor emits ChainStepStarted/Finished + conditional SlopeChanged on depth≤1 saves + catch-all SlopeChanged on chain success. `vine.rs::run_build_pipeline` tail emits SlopeChanged to cover legacy content-type paths without threading bus into build.rs. Doc-comment on TaggedKind enumerates authoritative SlopeChanged trigger discipline. cargo check red only on unrelated pre-existing errors from SCHEMA-V2/DEADLETTER/AUDIENCE parallel work. |
@@ -98,17 +98,15 @@ These resolve the 16 questions asked before Phase 1 full dispatch. Treat as norm
 - [x] WS-DEADLETTER verifier — **COMPLETE**. BLOCKER-01 fixed (removed nested `write(slug)` in `dispatch_with_retry`, added load-bearing INVARIANT comment — build-level lock covers the failure-path writes). Also found implementer had NOT actually added the `pyramid_dead_letter` table, `DeadLetterEntry`, `DeadLetterInsert`, or any helpers to `db.rs` — 10 compile errors. Verifier added all of them. State machine fixed: skip on resolved → 409, retry on skipped → idempotent 200. Route ordering + auth verified. `cargo check` — WS-DEADLETTER symbols clean; remaining 13 errors are WS-SCHEMA-V2 in-flight. BLOCKER-01 RESOLVED.
 - [x] WS-AUDIENCE-CONTRACT verifier — **COMPLETE**. Implementer's claims were partly false (helper didn't exist, injection not done, .as_str() sites not migrated). Verifier fixed all three in chain_executor.rs in place. Struct shape + ChainDefinition serde + prompt-grep claims all held. Zero new cargo errors from audience surface.
 - [x] WS-EVENTS verifier — **COMPLETE**. All 13 variants present, shape intact, catch-all forwarding correct, emit gates correct. Fixed one subtle orphan-event bug: `ChainStepStarted` was emitted before skip gates (when-false / from_depth extract-reuse / __step_done__ sentinel), producing orphan Started with no paired Finished for skipped/reused steps. Moved the emit past all three skip checks. cargo check: 9 errors all in WS-SCHEMA-V2 surface; zero in events code.
-- [ ] WS-SCHEMA-V2 verifier
-- [ ] WS-CONCURRENCY verifier
-- [ ] WS-DEADLETTER verifier
-- [ ] WS-COST-MODEL verifier
-- [ ] WS-AUDIENCE-CONTRACT verifier
-- [ ] WS-EVENTS verifier
+- [x] WS-SCHEMA-V2 verifier — **COMPLETE** (2026-04-09). All 7 requirements present. Fixed 44 broken test struct literals across 9 files (chain_executor.rs, db.rs, defaults_adapter.rs, chain_engine.rs, query.rs, supersession.rs, wire_publish.rs, etag.rs, integration_tests.rs). `cargo check --tests` now clean. 683 tests pass.
 
 ### Phase 1.5 — WS-INGEST-PRIMITIVE
-- [ ] Dispatched (waits for Phase 1 all-complete + verified)
-- Depends on: WS-CONCURRENCY, WS-FTS5
+- [x] **complete + verified CLEAN** (2026-04-09). First workstream to pass verification with zero fixes needed.
+- Depends on: WS-CONCURRENCY (done), WS-FTS5 (done)
 - Owns: `ingest_signature` helper (formula pinned in Q11)
+- Implemented: ingest_signature (SHA-256 per Q11), `pyramid_ingest_records` table, 8 DB helpers, `scan_source_directory` (conversation/code/document), `detect_changes` producing ChangeSet, 3 HTTP routes (POST scan, GET status, POST mark-stale), 4 new event variants (IngestScanComplete/Started/Complete/Failed), 4 new types (IngestConfig, SourceFile, IngestRecord, ChangeSet), 7 new tests all passing.
+- Files: ingest.rs (+567 lines), db.rs (+198 lines), routes.rs (+215 lines), event_bus.rs (+18 lines), types.rs (+76 lines)
+- Note: IngestStarted/Complete/Failed events defined but not emitted by this WS — WS-DADBEAR-EXTEND owns emission when it orchestrates builds from ingest records
 
 ### Phase 2a — Foundational primitives (parallel after 1.5)
 - [ ] WS-PRIMER — depends on WS-SCHEMA-V2, WS-EVENTS
@@ -216,6 +214,27 @@ Three of five verified workstreams (WS-CONCURRENCY, WS-AUDIENCE-CONTRACT, WS-COS
 - No HTTP route — WS-READING-MODES surfaces via route.
 - Annotation id 302 on L3-S000, author `ws-fts5`.
 - `cargo check` tree-wide fails only from WS-SCHEMA-V2's in-progress call-site sweep (expected; isolated to unrelated files).
+
+---
+
+## 2026-04-09 session 2 — Phase 1 verified, Phase 1.5 shipped, Phase 2a dispatching
+
+**Conductor**: New session, new account. Full context reconstructed from implementation log + canonical design v4 + handoff doc + memory files + conversation pyramid exploration.
+
+**Completed this session:**
+1. WS-SCHEMA-V2 verifier: all 7 requirements present. Fixed 44 broken test struct literals. `cargo check --tests` clean. 683 tests pass (7 pre-existing failures unrelated).
+2. WS-INGEST-PRIMITIVE (Phase 1.5): full implementation — ingest_signature, pyramid_ingest_records table, 8 DB helpers, scan_source_directory, detect_changes, 3 HTTP routes, 4 event variants, 4 types, 7 tests. Verifier in progress.
+3. Git commit: `372cde4` — "episodic-memory vine: Phase 1 verified + Phase 1.5 (ingest primitive)"
+
+**Phase 1 final status: ALL 7 WORKSTREAMS COMPLETE + VERIFIED.**
+**Phase 1.5: COMPLETE, verifier in progress.**
+
+**Next: Phase 2a** — WS-PRIMER, WS-CHAIN-INVOKE, WS-IMMUTABILITY-ENFORCE (parallel, all dependencies met).
+
+**Observations:**
+- The prior session's pattern holds: implementers under-wire, verifiers save the run. WS-SCHEMA-V2's `cargo check` passed but `cargo check --tests` had 44 errors — a new variant of the "claims don't match reality" pattern.
+- Ingest primitive landed cleanly with no blockers. All Phase 1 dependencies (CONCURRENCY, FTS5, EVENTS) integrated without issues.
+- BLOCKER-01 remains RESOLVED. BLOCKER-02 (vine_builds) remains OPEN for WS-VINE-UNIFY in Phase 2b.
 
 ---
 

@@ -61,6 +61,9 @@ pub struct ChainContext {
     pub initial_params: HashMap<String, Value>,
     /// Set to true by a `gate` primitive with `break: true` to exit the enclosing loop.
     pub break_loop: bool,
+    /// WS-CHAIN-INVOKE: current invoke_chain nesting depth. Root chain = 0.
+    /// Incremented on each invoke_chain step. Execution fails if >= 8.
+    pub invoke_depth: u32,
 }
 
 impl ChainContext {
@@ -82,6 +85,7 @@ impl ChainContext {
             has_prior_build: false,
             initial_params: HashMap::new(),
             break_loop: false,
+            invoke_depth: 0,
         }
     }
 
@@ -816,5 +820,20 @@ mod tests {
         let input = json!("Slug=$slug index=$index");
         let resolved = ctx.resolve_value(&input).unwrap();
         assert_eq!(resolved, json!("Slug=my-slug index=2"));
+    }
+
+    // ── WS-CHAIN-INVOKE: invoke_depth field tests ──────────────────────
+
+    #[test]
+    fn chain_context_new_defaults_invoke_depth_to_zero() {
+        let ctx = test_context();
+        assert_eq!(ctx.invoke_depth, 0, "new ChainContext should have invoke_depth = 0");
+    }
+
+    #[test]
+    fn chain_context_invoke_depth_is_settable() {
+        let mut ctx = test_context();
+        ctx.invoke_depth = 5;
+        assert_eq!(ctx.invoke_depth, 5);
     }
 }
