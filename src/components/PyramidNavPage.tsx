@@ -337,37 +337,36 @@ export function PyramidNavPage({ initialSlug, onBack }: PyramidNavPageProps) {
         setReadingLoading(true);
         setReadingData(null);
 
-        const endpointMap: Record<ReadingMode, string> = {
-            memoir: 'apex',
-            walk: 'tree',
-            thread: 'threads',
-            decisions: 'vine/decisions',
-            speaker: 'vine/entities',
-            search: 'search',
-        };
-
-        const endpoint = endpointMap[readingMode];
-        if (!endpoint) {
-            setReadingLoading(false);
-            return;
-        }
-
-        // Use IPC for tree/apex, HTTP for the rest
+        // Use IPC for tree/apex, reading mode HTTP endpoints for the rest
         if (readingMode === 'memoir') {
             invoke<any>('pyramid_apex', { slug: selectedSlug })
                 .then(setReadingData)
                 .catch(() => setReadingData(null))
                 .finally(() => setReadingLoading(false));
         } else if (readingMode === 'walk') {
-            // Tree already loaded
             setReadingData(tree);
             setReadingLoading(false);
-        } else {
-            fetch(`${PYRAMID_API_BASE}/pyramid/${selectedSlug}/${endpoint}`)
+        } else if (readingMode === 'decisions') {
+            fetch(`${PYRAMID_API_BASE}/pyramid/${selectedSlug}/reading/decisions`, {})
                 .then(r => r.ok ? r.json() : Promise.reject(`HTTP ${r.status}`))
                 .then(setReadingData)
                 .catch(() => setReadingData(null))
                 .finally(() => setReadingLoading(false));
+        } else if (readingMode === 'speaker') {
+            fetch(`${PYRAMID_API_BASE}/pyramid/${selectedSlug}/reading/speaker?role=human`, {})
+                .then(r => r.ok ? r.json() : Promise.reject(`HTTP ${r.status}`))
+                .then(setReadingData)
+                .catch(() => setReadingData(null))
+                .finally(() => setReadingLoading(false));
+        } else if (readingMode === 'thread') {
+            // Thread needs an identity — use the first topic from vocabulary or a default
+            fetch(`${PYRAMID_API_BASE}/pyramid/${selectedSlug}/reading/thread?identity=*`, {})
+                .then(r => r.ok ? r.json() : Promise.reject(`HTTP ${r.status}`))
+                .then(setReadingData)
+                .catch(() => setReadingData(null))
+                .finally(() => setReadingLoading(false));
+        } else {
+            setReadingLoading(false);
         }
     }, [selectedSlug, readingMode]);
 
@@ -890,36 +889,29 @@ function ThreadView({
     loading: boolean;
     onNodeClick: (nodeId: string) => void;
 }) {
-    if (loading) return <div className="pnav-loading-small">Loading threads...</div>;
+    if (loading) return <div className="pnav-loading-small">Loading thread...</div>;
     if (!data) return <div className="pnav-empty-content">No thread data available.</div>;
 
-    const threads = Array.isArray(data) ? data : (data?.threads ?? []);
+    const mentions = Array.isArray(data) ? data : (data?.mentions ?? []);
 
-    if (threads.length === 0) return <div className="pnav-empty-content">No threads found.</div>;
+    if (mentions.length === 0) return <div className="pnav-empty-content">No mentions found for this identity.</div>;
 
     return (
         <div className="pnav-threads">
-            {threads.map((t: any, i: number) => (
-                <div key={i} className="pnav-thread-item">
+            {data?.identity && <div className="pnav-decisions-count">Thread: {data.identity} ({mentions.length} mentions)</div>}
+            {mentions.map((m: any, i: number) => (
+                <div key={i} className="pnav-thread-item" onClick={() => m.node_id && onNodeClick(m.node_id)} style={{ cursor: m.node_id ? 'pointer' : 'default' }}>
                     <div className="pnav-thread-header">
                         <span className="pnav-thread-name">
-                            {t.thread_id ?? t.name ?? t.canonical_name ?? `Thread ${i + 1}`}
+                            {m.headline ?? m.node_id ?? `Mention ${i + 1}`}
                         </span>
-                        {t.lifecycle && (
-                            <span className={`pnav-thread-lifecycle pnav-lifecycle-${t.lifecycle}`}>
-                                {t.lifecycle}
+                        {m.depth != null && (
+                            <span className={`pnav-thread-lifecycle pnav-lifecycle-active`}>
+                                L{m.depth}
                             </span>
                         )}
                     </div>
-                    {t.canonical_node_id && (
-                        <button
-                            className="btn btn-ghost btn-small"
-                            onClick={() => onNodeClick(t.canonical_node_id)}
-                        >
-                            View node
-                        </button>
-                    )}
-                    {t.description && <p className="pnav-thread-desc">{t.description}</p>}
+                    {m.matched_field && <span className="pnav-thread-desc">matched: {m.matched_field}</span>}
                 </div>
             ))}
         </div>
@@ -938,6 +930,7 @@ function DecisionsView({ data, loading }: { data: any; loading: boolean }) {
 
     return (
         <div className="pnav-decisions-list">
+            <div className="pnav-decisions-count">{data?.total_count ?? decisions.length} decisions</div>
             {decisions.map((d: any, i: number) => (
                 <div key={i} className="pnav-decision-card">
                     <div className="pnav-decision-card-header">
@@ -945,14 +938,12 @@ function DecisionsView({ data, loading }: { data: any; loading: boolean }) {
                             {d.stance ?? 'open'}
                         </span>
                         <span className="pnav-decision-question">
-                            {d.question ?? d.name ?? d.description ?? `Decision ${i + 1}`}
+                            {d.decided ?? d.question ?? d.name ?? `Decision ${i + 1}`}
                         </span>
                     </div>
-                    {d.answer && <p className="pnav-decision-answer">{d.answer}</p>}
-                    {d.evolution_chain && d.evolution_chain.length > 0 && (
-                        <div className="pnav-decision-evolution">
-                            Evolution: {d.evolution_chain.join(' \u2192 ')}
-                        </div>
+                    {d.why && <p className="pnav-decision-answer">{d.why}</p>}
+                    {d.source_node_id && (
+                        <div className="pnav-decision-source">from {d.source_node_id} (depth {d.source_depth ?? '?'})</div>
                     )}
                 </div>
             ))}
@@ -963,28 +954,29 @@ function DecisionsView({ data, loading }: { data: any; loading: boolean }) {
 // ── Speaker View ───────────────────────────────────────────────────────
 
 function SpeakerView({ data, loading }: { data: any; loading: boolean }) {
-    if (loading) return <div className="pnav-loading-small">Loading entities...</div>;
-    if (!data) return <div className="pnav-empty-content">No entity data available.</div>;
+    if (loading) return <div className="pnav-loading-small">Loading speaker quotes...</div>;
+    if (!data) return <div className="pnav-empty-content">No speaker data available.</div>;
 
-    const entities = Array.isArray(data) ? data : (data?.entities ?? []);
+    const quotes = Array.isArray(data) ? data : (data?.quotes ?? []);
 
-    if (entities.length === 0) return <div className="pnav-empty-content">No entities found.</div>;
+    if (quotes.length === 0) return <div className="pnav-empty-content">No quotes found for this speaker role. The episodic chain may not have extracted key_quotes with speaker_role from this conversation.</div>;
 
     return (
         <div className="pnav-entities-list">
-            {entities.map((e: any, i: number) => (
+            <div className="pnav-decisions-count">{data?.total_count ?? quotes.length} quotes ({data?.role ?? 'human'})</div>
+            {quotes.map((q: any, i: number) => (
                 <div key={i} className="pnav-entity-card">
                     <div className="pnav-entity-name">
-                        {e.canonical_name ?? e.name ?? `Entity ${i + 1}`}
+                        {q.text ?? q.quote ?? `Quote ${i + 1}`}
                     </div>
-                    {e.aliases && e.aliases.length > 0 && (
+                    {q.importance != null && q.importance > 0 && (
                         <div className="pnav-entity-aliases">
-                            Aliases: {e.aliases.join(', ')}
+                            Importance: {q.importance.toFixed(2)}
                         </div>
                     )}
-                    {e.bunch_refs && e.bunch_refs.length > 0 && (
+                    {q.source_node_id && (
                         <div className="pnav-entity-refs">
-                            Appears in {e.bunch_refs.length} conversation{e.bunch_refs.length !== 1 ? 's' : ''}
+                            from {q.source_node_id}
                         </div>
                     )}
                 </div>
