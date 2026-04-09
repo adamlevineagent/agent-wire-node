@@ -768,9 +768,9 @@ function VocabCategoryGroup({ category, entries }: { category: string; entries: 
                     {entries.slice(0, 20).map((v, i) => (
                         <div key={i} className={`pnav-vocab-entry${v.liveness === 'live' ? '' : ' pnav-vocab-mooted'}`}>
                             <span className="pnav-vocab-name">{v.name}</span>
-                            {v.importance > 0 && (
+                            {(v.importance ?? 0) > 0 && (
                                 <span className="pnav-vocab-importance">
-                                    {'*'.repeat(Math.min(3, Math.ceil(v.importance * 3)))}
+                                    {'*'.repeat(Math.min(3, Math.ceil((v.importance ?? 0) * 3)))}
                                 </span>
                             )}
                         </div>
