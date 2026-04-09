@@ -1686,10 +1686,63 @@ pub fn pyramid_routes(
     let pr = primer_formatted.or(primer_json).unify().boxed();
     let top21 = top20.or(pr).unify().boxed();
 
+    // ── WS-PROVISIONAL: Provisional session lifecycle routes ──
+
+    // POST /pyramid/:slug/provisional/session — create a new provisional session
+    let prov_create = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("provisional"))
+        .and(warp::path("session"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(with_auth_state(state.clone()))
+        .and(warp::body::json())
+        .and_then(handle_provisional_create));
+
+    // GET /pyramid/:slug/provisional/sessions — list active provisional sessions
+    let prov_list = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("provisional"))
+        .and(warp::path("sessions"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_provisional_list));
+
+    // GET /pyramid/:slug/provisional/session/:session_id — get session details
+    let prov_get = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("provisional"))
+        .and(warp::path("session"))
+        .and(warp::path::param::<String>())
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_provisional_get));
+
+    // POST /pyramid/:slug/provisional/session/:session_id/promote — promote session
+    let prov_promote = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("provisional"))
+        .and(warp::path("session"))
+        .and(warp::path::param::<String>())
+        .and(warp::path("promote"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(with_auth_state(state.clone()))
+        .and(warp::body::json())
+        .and_then(handle_provisional_promote));
+
+    // Order: promote (longer path) before get, then create before list
+    let prov_a = prov_promote.or(prov_get).unify().boxed();
+    let prov_b = prov_create.or(prov_list).unify().boxed();
+    let prov = prov_a.or(prov_b).unify().boxed();
+    let top22 = top21.or(prov).unify().boxed();
+
     // public_html is now mounted separately at the server level so it can
     // get a permissive CORS filter (the desktop API allowlist would block
     // form POSTs from the tunnel host).
-    top21
+    top22
 }
 
 /// Mount the post-agents-retro `/p/` web surface routes. These are
@@ -6981,6 +7034,106 @@ async fn handle_primer_formatted(
                 .into_response())
             }
         }
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
+    }
+}
+
+// ── WS-PROVISIONAL: Provisional session handlers ──────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct ProvisionalCreateBody {
+    source_path: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProvisionalPromoteBody {
+    build_id: String,
+}
+
+/// POST /pyramid/:slug/provisional/session — create a new provisional session
+async fn handle_provisional_create(
+    slug_name: String,
+    state: Arc<PyramidState>,
+    body: ProvisionalCreateBody,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let session_id = uuid::Uuid::new_v4().to_string();
+
+    let conn = state.writer.lock().await;
+    match db::create_provisional_session(&conn, &slug_name, &body.source_path, &session_id) {
+        Ok(()) => Ok(json_ok(&serde_json::json!({
+            "session_id": session_id,
+            "slug": slug_name,
+            "source_path": body.source_path,
+            "status": "active",
+        }))),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
+    }
+}
+
+/// GET /pyramid/:slug/provisional/sessions — list active provisional sessions
+async fn handle_provisional_list(
+    slug_name: String,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let conn = state.reader.lock().await;
+    match db::get_active_provisional_sessions(&conn, &slug_name) {
+        Ok(sessions) => Ok(json_ok(&serde_json::json!({
+            "sessions": sessions,
+        }))),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
+    }
+}
+
+/// GET /pyramid/:slug/provisional/session/:session_id — get session details
+async fn handle_provisional_get(
+    _slug_name: String,
+    session_id: String,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let conn = state.reader.lock().await;
+    match db::get_provisional_session(&conn, &session_id) {
+        Ok(Some(session)) => Ok(json_ok(&session)),
+        Ok(None) => Ok(json_error(
+            warp::http::StatusCode::NOT_FOUND,
+            &format!("Provisional session '{}' not found", session_id),
+        )),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
+    }
+}
+
+/// POST /pyramid/:slug/provisional/session/:session_id/promote — promote all nodes
+async fn handle_provisional_promote(
+    slug_name: String,
+    session_id: String,
+    state: Arc<PyramidState>,
+    body: ProvisionalPromoteBody,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    // WS-CONCURRENCY: serialize with any in-flight builder / delta / write.
+    let _lock = super::lock_manager::LockManager::global()
+        .write(&slug_name)
+        .await;
+
+    let conn = state.writer.lock().await;
+
+    let bus = &state.build_event_bus;
+    match db::promote_session(&conn, &session_id, &body.build_id, Some(bus)) {
+        Ok(count) => Ok(json_ok(&serde_json::json!({
+            "promoted_count": count,
+            "session_id": session_id,
+            "canonical_build_id": body.build_id,
+        }))),
         Err(e) => Ok(json_error(
             warp::http::StatusCode::INTERNAL_SERVER_ERROR,
             &e.to_string(),

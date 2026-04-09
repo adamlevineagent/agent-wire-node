@@ -1044,6 +1044,31 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
         ",
     )?;
 
+    // WS-PROVISIONAL (Phase 2b): Live-session provisional node lifecycle.
+    // Tracks which provisional nodes were created in each live session so they
+    // can be batch-promoted when the canonical build completes.
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS pyramid_provisional_sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            slug TEXT NOT NULL,
+            source_path TEXT NOT NULL,
+            session_id TEXT NOT NULL UNIQUE,
+            status TEXT NOT NULL DEFAULT 'active',
+            provisional_node_ids TEXT,
+            canonical_build_id TEXT,
+            file_mtime TEXT,
+            last_chunk_processed INTEGER DEFAULT 0,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_prov_sessions_slug_status
+            ON pyramid_provisional_sessions(slug, status);
+        CREATE INDEX IF NOT EXISTS idx_prov_sessions_session_id
+            ON pyramid_provisional_sessions(session_id);
+        ",
+    )?;
+
     Ok(())
 }
 
@@ -7603,6 +7628,227 @@ mod tests {
         let result2 = promote_provisional_node(&conn, "s", "does-not-exist").unwrap();
         assert!(!result2, "Promoting a non-existent node should return false");
     }
+
+    // ── WS-PROVISIONAL (Phase 2b): Provisional session lifecycle tests ──────
+
+    /// Test 1: Create session, add provisional nodes, verify they're queryable.
+    #[test]
+    fn test_provisional_session_create_and_query() {
+        let conn = test_conn();
+        create_slug(&conn, "ps", &ContentType::Conversation, "/tmp/chat.jsonl").unwrap();
+
+        let sid = "test-session-001";
+        create_provisional_session(&conn, "ps", "/tmp/chat.jsonl", sid).unwrap();
+
+        // Session should be active
+        let session = get_provisional_session(&conn, sid).unwrap().unwrap();
+        assert_eq!(session.status, "active");
+        assert_eq!(session.slug, "ps");
+        assert_eq!(session.source_path, "/tmp/chat.jsonl");
+        assert!(session.provisional_node_ids.is_empty());
+
+        // Add two provisional nodes to the session
+        add_provisional_node_to_session(&conn, sid, "prov-n1").unwrap();
+        add_provisional_node_to_session(&conn, sid, "prov-n2").unwrap();
+
+        let node_ids = get_provisional_nodes_for_session(&conn, sid).unwrap();
+        assert_eq!(node_ids, vec!["prov-n1", "prov-n2"]);
+
+        // List active sessions
+        let active = get_active_provisional_sessions(&conn, "ps").unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].session_id, sid);
+        assert_eq!(active[0].provisional_node_ids, vec!["prov-n1", "prov-n2"]);
+    }
+
+    /// Test 2: Promote session — all nodes become non-provisional.
+    #[test]
+    fn test_provisional_session_promote_all_nodes() {
+        let conn = test_conn();
+        create_slug(&conn, "ps2", &ContentType::Conversation, "/tmp/chat.jsonl").unwrap();
+
+        let sid = "test-session-002";
+        create_provisional_session(&conn, "ps2", "/tmp/chat.jsonl", sid).unwrap();
+
+        // Create two provisional nodes via standard save_node path
+        let node1 = PyramidNode {
+            id: "prov-a".to_string(),
+            slug: "ps2".to_string(),
+            depth: 0,
+            headline: "Provisional Node A".to_string(),
+            distilled: "content a".to_string(),
+            provisional: true,
+            ..Default::default()
+        };
+        save_node(&conn, &node1, None).unwrap();
+        add_provisional_node_to_session(&conn, sid, "prov-a").unwrap();
+
+        let node2 = PyramidNode {
+            id: "prov-b".to_string(),
+            slug: "ps2".to_string(),
+            depth: 0,
+            headline: "Provisional Node B".to_string(),
+            distilled: "content b".to_string(),
+            provisional: true,
+            ..Default::default()
+        };
+        save_node(&conn, &node2, None).unwrap();
+        add_provisional_node_to_session(&conn, sid, "prov-b").unwrap();
+
+        // Verify nodes are provisional
+        let loaded_a = get_node(&conn, "ps2", "prov-a").unwrap().unwrap();
+        assert!(loaded_a.provisional, "Node A should be provisional");
+        let loaded_b = get_node(&conn, "ps2", "prov-b").unwrap().unwrap();
+        assert!(loaded_b.provisional, "Node B should be provisional");
+
+        // Promote the session
+        let count = promote_session(&conn, sid, "build-canonical-001", None).unwrap();
+        assert_eq!(count, 2, "Should have promoted 2 nodes");
+
+        // Verify nodes are now canonical (provisional=false)
+        let after_a = get_node(&conn, "ps2", "prov-a").unwrap().unwrap();
+        assert!(!after_a.provisional, "Node A should be canonical after promotion");
+        let after_b = get_node(&conn, "ps2", "prov-b").unwrap().unwrap();
+        assert!(!after_b.provisional, "Node B should be canonical after promotion");
+
+        // Verify session status
+        let session = get_provisional_session(&conn, sid).unwrap().unwrap();
+        assert_eq!(session.status, "promoted");
+        assert_eq!(session.canonical_build_id, Some("build-canonical-001".to_string()));
+    }
+
+    /// Test 3: Promoted provisional nodes reject subsequent mutations (immutability).
+    #[test]
+    fn test_promoted_provisional_rejects_mutation() {
+        let conn = test_conn();
+        create_slug(&conn, "ps3", &ContentType::Conversation, "").unwrap();
+
+        let sid = "test-session-003";
+        create_provisional_session(&conn, "ps3", "/tmp/chat.jsonl", sid).unwrap();
+
+        // Create and save a provisional L0 node
+        let node = PyramidNode {
+            id: "prom-mut".to_string(),
+            slug: "ps3".to_string(),
+            depth: 0,
+            headline: "Provisional L0".to_string(),
+            distilled: "original content".to_string(),
+            provisional: true,
+            ..Default::default()
+        };
+        save_node(&conn, &node, None).unwrap();
+        add_provisional_node_to_session(&conn, sid, "prom-mut").unwrap();
+
+        // While provisional: mutation should work (via mutate_provisional_node)
+        let mut updated = node.clone();
+        updated.distilled = "mutated while provisional".to_string();
+        save_node(&conn, &updated, None).unwrap();
+        let got = get_node(&conn, "ps3", "prom-mut").unwrap().unwrap();
+        assert_eq!(got.distilled, "mutated while provisional");
+
+        // Promote the session
+        promote_session(&conn, sid, "build-001", None).unwrap();
+
+        // After promotion: mutation should fail (immutability guard)
+        let mut post_promote = node.clone();
+        post_promote.distilled = "should fail".to_string();
+        post_promote.provisional = false;
+        let err = save_node(&conn, &post_promote, None);
+        assert!(
+            err.is_err(),
+            "Mutation of promoted L0 should fail with immutability error"
+        );
+        let msg = err.unwrap_err().to_string();
+        assert!(
+            msg.contains("Cannot mutate immutable bedrock node"),
+            "Expected immutability error, got: {msg}"
+        );
+    }
+
+    /// Test 4: Promote already-promoted session is idempotent.
+    #[test]
+    fn test_promote_already_promoted_is_idempotent() {
+        let conn = test_conn();
+        create_slug(&conn, "ps4", &ContentType::Conversation, "").unwrap();
+
+        let sid = "test-session-004";
+        create_provisional_session(&conn, "ps4", "/tmp/chat.jsonl", sid).unwrap();
+
+        // Create one provisional node
+        let node = PyramidNode {
+            id: "prov-idem".to_string(),
+            slug: "ps4".to_string(),
+            depth: 0,
+            headline: "Idem Node".to_string(),
+            distilled: "idempotent test".to_string(),
+            provisional: true,
+            ..Default::default()
+        };
+        save_node(&conn, &node, None).unwrap();
+        add_provisional_node_to_session(&conn, sid, "prov-idem").unwrap();
+
+        // First promotion
+        let count1 = promote_session(&conn, sid, "build-idem-001", None).unwrap();
+        assert_eq!(count1, 1, "First promotion should promote 1 node");
+
+        // Second promotion — should return 0 (idempotent)
+        let count2 = promote_session(&conn, sid, "build-idem-002", None).unwrap();
+        assert_eq!(count2, 0, "Second promotion should be idempotent (0 nodes)");
+
+        // Session should still be in promoted state with the original build_id
+        let session = get_provisional_session(&conn, sid).unwrap().unwrap();
+        assert_eq!(session.status, "promoted");
+        assert_eq!(
+            session.canonical_build_id,
+            Some("build-idem-001".to_string()),
+            "canonical_build_id should not change on idempotent re-promote"
+        );
+    }
+
+    /// Test 5: save_provisional_node creates node with provisional=true and
+    /// tracks it in the session.
+    #[test]
+    fn test_save_provisional_node_convenience() {
+        let conn = test_conn();
+        create_slug(&conn, "ps5", &ContentType::Conversation, "").unwrap();
+
+        let sid = "test-session-005";
+        create_provisional_session(&conn, "ps5", "/tmp/chat.jsonl", sid).unwrap();
+
+        let node = PyramidNode {
+            id: "spn-1".to_string(),
+            slug: "ps5".to_string(),
+            depth: 0,
+            headline: "Convenience Node".to_string(),
+            distilled: "via save_provisional_node".to_string(),
+            provisional: true,
+            ..Default::default()
+        };
+
+        // Use the convenience function (no event bus for unit tests)
+        save_provisional_node(&conn, &node, sid, None).unwrap();
+
+        // Verify node was saved as provisional
+        let loaded = get_node(&conn, "ps5", "spn-1").unwrap().unwrap();
+        assert!(loaded.provisional, "Node should be provisional");
+        assert_eq!(loaded.headline, "Convenience Node");
+
+        // Verify it was tracked in the session
+        let tracked = get_provisional_nodes_for_session(&conn, sid).unwrap();
+        assert_eq!(tracked, vec!["spn-1"]);
+
+        // Verify calling with provisional=false errors
+        let bad_node = PyramidNode {
+            id: "spn-bad".to_string(),
+            slug: "ps5".to_string(),
+            depth: 0,
+            headline: "Bad Node".to_string(),
+            provisional: false,
+            ..Default::default()
+        };
+        let err = save_provisional_node(&conn, &bad_node, sid, None);
+        assert!(err.is_err(), "save_provisional_node should reject non-provisional node");
+    }
 }
 
 // ── WS-3: Evidence Density Statistics ───────────────────────────────────────
@@ -7993,4 +8239,301 @@ pub fn get_ingest_records_for_slug(conn: &Connection, slug: &str) -> Result<Vec<
         records.push(row?);
     }
     Ok(records)
+}
+
+// ── WS-PROVISIONAL (Phase 2b): Provisional session DB helpers ───────────────
+
+/// Create a new provisional session for a slug + source file.
+pub fn create_provisional_session(
+    conn: &Connection,
+    slug: &str,
+    source_path: &str,
+    session_id: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO pyramid_provisional_sessions (slug, source_path, session_id, status)
+         VALUES (?1, ?2, ?3, 'active')",
+        rusqlite::params![slug, source_path, session_id],
+    )?;
+    Ok(())
+}
+
+/// Get all active provisional sessions for a slug.
+pub fn get_active_provisional_sessions(
+    conn: &Connection,
+    slug: &str,
+) -> Result<Vec<ProvisionalSession>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, slug, source_path, session_id, status, provisional_node_ids,
+                canonical_build_id, file_mtime, last_chunk_processed, created_at, updated_at
+         FROM pyramid_provisional_sessions
+         WHERE slug = ?1 AND status = 'active'
+         ORDER BY created_at ASC",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![slug], parse_provisional_session)?;
+    let mut sessions = Vec::new();
+    for row in rows {
+        sessions.push(row?);
+    }
+    Ok(sessions)
+}
+
+/// Get a specific provisional session by session_id.
+pub fn get_provisional_session(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Option<ProvisionalSession>> {
+    let result = conn
+        .query_row(
+            "SELECT id, slug, source_path, session_id, status, provisional_node_ids,
+                    canonical_build_id, file_mtime, last_chunk_processed, created_at, updated_at
+             FROM pyramid_provisional_sessions
+             WHERE session_id = ?1",
+            rusqlite::params![session_id],
+            parse_provisional_session,
+        )
+        .optional()?;
+    Ok(result)
+}
+
+/// Append a node ID to the provisional session's node list.
+pub fn add_provisional_node_to_session(
+    conn: &Connection,
+    session_id: &str,
+    node_id: &str,
+) -> Result<()> {
+    // Read current list, append, write back
+    let current_json: Option<String> = conn
+        .query_row(
+            "SELECT provisional_node_ids FROM pyramid_provisional_sessions WHERE session_id = ?1",
+            rusqlite::params![session_id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten();
+
+    let mut ids: Vec<String> = current_json
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
+    ids.push(node_id.to_string());
+    let new_json = serde_json::to_string(&ids)?;
+
+    conn.execute(
+        "UPDATE pyramid_provisional_sessions
+         SET provisional_node_ids = ?2, updated_at = datetime('now')
+         WHERE session_id = ?1",
+        rusqlite::params![session_id, new_json],
+    )?;
+    Ok(())
+}
+
+/// Mark a provisional session as 'promoting' (transition from 'active').
+pub fn mark_session_promoting(conn: &Connection, session_id: &str) -> Result<()> {
+    let updated = conn.execute(
+        "UPDATE pyramid_provisional_sessions
+         SET status = 'promoting', updated_at = datetime('now')
+         WHERE session_id = ?1 AND status = 'active'",
+        rusqlite::params![session_id],
+    )?;
+    if updated == 0 {
+        return Err(anyhow::anyhow!(
+            "Session '{}' is not in 'active' status or does not exist",
+            session_id
+        ));
+    }
+    Ok(())
+}
+
+/// Mark a provisional session as 'promoted' and record the canonical build_id.
+pub fn mark_session_promoted(
+    conn: &Connection,
+    session_id: &str,
+    canonical_build_id: &str,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE pyramid_provisional_sessions
+         SET status = 'promoted', canonical_build_id = ?2, updated_at = datetime('now')
+         WHERE session_id = ?1",
+        rusqlite::params![session_id, canonical_build_id],
+    )?;
+    Ok(())
+}
+
+/// Mark a provisional session as 'failed' with an error description.
+pub fn mark_session_failed(
+    conn: &Connection,
+    session_id: &str,
+    error_msg: &str,
+) -> Result<()> {
+    // Store the error in the canonical_build_id field (repurposed for error
+    // text when status is 'failed') to avoid adding another column. The
+    // canonical_build_id is meaningless for failed sessions.
+    conn.execute(
+        "UPDATE pyramid_provisional_sessions
+         SET status = 'failed', canonical_build_id = ?2, updated_at = datetime('now')
+         WHERE session_id = ?1",
+        rusqlite::params![session_id, error_msg],
+    )?;
+    Ok(())
+}
+
+/// Get all provisional node IDs for a session.
+pub fn get_provisional_nodes_for_session(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Vec<String>> {
+    let json: Option<String> = conn
+        .query_row(
+            "SELECT provisional_node_ids FROM pyramid_provisional_sessions WHERE session_id = ?1",
+            rusqlite::params![session_id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten();
+
+    let ids: Vec<String> = json
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
+    Ok(ids)
+}
+
+/// WS-PROVISIONAL: Convenience function that creates a provisional PyramidNode,
+/// saves it to the DB, adds it to the session tracking, and optionally emits
+/// a `ProvisionalNodeAdded` event.
+pub fn save_provisional_node(
+    conn: &Connection,
+    node: &PyramidNode,
+    session_id: &str,
+    bus: Option<&crate::pyramid::event_bus::BuildEventBus>,
+) -> Result<()> {
+    // Sanity: the node must be marked provisional
+    if !node.provisional {
+        return Err(anyhow::anyhow!(
+            "save_provisional_node called with non-provisional node '{}'",
+            node.id
+        ));
+    }
+
+    // Save via the standard path (which will INSERT since it's new, with provisional=1)
+    save_node(conn, node, None)?;
+
+    // Track in the session
+    add_provisional_node_to_session(conn, session_id, &node.id)?;
+
+    // Emit event
+    if let Some(bus) = bus {
+        let _ = bus.tx.send(crate::pyramid::event_bus::TaggedBuildEvent {
+            slug: node.slug.clone(),
+            kind: crate::pyramid::event_bus::TaggedKind::ProvisionalNodeAdded {
+                node_id: node.id.clone(),
+            },
+        });
+    }
+
+    Ok(())
+}
+
+/// WS-PROVISIONAL: Promote all provisional nodes in a session to canonical.
+///
+/// 1. Gets all provisional node IDs for the session
+/// 2. Marks session as "promoting"
+/// 3. For each node: calls `promote_provisional_node`
+/// 4. Emits `ProvisionalPromoted` for each promoted node
+/// 5. Marks session as "promoted" with the canonical build_id
+/// 6. Returns count of promoted nodes
+///
+/// If the session is already promoted, returns 0 (idempotent).
+pub fn promote_session(
+    conn: &Connection,
+    session_id: &str,
+    canonical_build_id: &str,
+    bus: Option<&crate::pyramid::event_bus::BuildEventBus>,
+) -> Result<usize> {
+    // Check session status first for idempotency
+    let session = get_provisional_session(conn, session_id)?
+        .ok_or_else(|| anyhow::anyhow!("Provisional session '{}' not found", session_id))?;
+
+    if session.status == "promoted" {
+        // Already promoted — idempotent success
+        return Ok(0);
+    }
+
+    let node_ids = get_provisional_nodes_for_session(conn, session_id)?;
+
+    // Transition to promoting (only from active)
+    if session.status == "active" {
+        mark_session_promoting(conn, session_id)?;
+    }
+
+    let slug = &session.slug;
+    let mut promoted_count = 0;
+    // Track which layers were promoted for SlopeChanged (WS-EVENTS §15.21 trigger #3)
+    let mut affected_layers: Vec<i64> = Vec::new();
+
+    for node_id in &node_ids {
+        let was_provisional = promote_provisional_node(conn, slug, node_id)?;
+        if was_provisional {
+            promoted_count += 1;
+
+            // Look up node depth for SlopeChanged trigger discipline
+            if let Ok(Some(node)) = get_node(conn, slug, node_id) {
+                if node.depth <= 1 && !affected_layers.contains(&node.depth) {
+                    affected_layers.push(node.depth);
+                }
+            }
+
+            // Emit ProvisionalPromoted event
+            if let Some(bus) = bus {
+                let _ = bus.tx.send(crate::pyramid::event_bus::TaggedBuildEvent {
+                    slug: slug.clone(),
+                    kind: crate::pyramid::event_bus::TaggedKind::ProvisionalPromoted {
+                        provisional_id: node_id.clone(),
+                        canonical_id: node_id.clone(),
+                    },
+                });
+            }
+        }
+    }
+
+    // WS-EVENTS §15.21 trigger #3: emit SlopeChanged when bedrock nodes promoted
+    if !affected_layers.is_empty() {
+        if let Some(bus) = bus {
+            let _ = bus.tx.send(crate::pyramid::event_bus::TaggedBuildEvent {
+                slug: slug.clone(),
+                kind: crate::pyramid::event_bus::TaggedKind::SlopeChanged {
+                    affected_layers,
+                },
+            });
+        }
+    }
+
+    // Mark session as promoted
+    mark_session_promoted(conn, session_id, canonical_build_id)?;
+
+    Ok(promoted_count)
+}
+
+/// Parse a row from `pyramid_provisional_sessions` into a `ProvisionalSession`.
+fn parse_provisional_session(row: &rusqlite::Row) -> rusqlite::Result<ProvisionalSession> {
+    let node_ids_json: Option<String> = row.get("provisional_node_ids")?;
+    let node_ids: Vec<String> = node_ids_json
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
+
+    Ok(ProvisionalSession {
+        id: row.get("id")?,
+        slug: row.get("slug")?,
+        source_path: row.get("source_path")?,
+        session_id: row.get("session_id")?,
+        status: row.get("status")?,
+        provisional_node_ids: node_ids,
+        canonical_build_id: row.get("canonical_build_id")?,
+        file_mtime: row.get("file_mtime")?,
+        last_chunk_processed: row.get("last_chunk_processed")?,
+        created_at: row.get("created_at")?,
+        updated_at: row.get("updated_at")?,
+    })
 }

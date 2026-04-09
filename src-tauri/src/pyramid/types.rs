@@ -1422,3 +1422,34 @@ pub struct CanonicalVocabulary {
     #[serde(default)]
     pub terms: Vec<serde_json::Value>,
 }
+
+// ── WS-PROVISIONAL (Phase 2b): Provisional session lifecycle ────────────────
+
+/// Tracks a live-session provisional processing session. As a conversation
+/// runs, chunks past the debounce line are processed into provisional pyramid
+/// nodes. The session tracks which nodes were created provisionally so they
+/// can be batch-promoted when the canonical build completes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProvisionalSession {
+    pub id: i64,
+    pub slug: String,
+    pub source_path: String,
+    /// UUID identifying this provisional session.
+    pub session_id: String,
+    /// One of: active, promoting, promoted, failed
+    pub status: String,
+    /// Node IDs created as provisional during this session.
+    #[serde(default)]
+    pub provisional_node_ids: Vec<String>,
+    /// build_id of the canonical build that replaced these provisional nodes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_build_id: Option<String>,
+    /// Last observed file mtime for session boundary detection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_mtime: Option<String>,
+    /// Index of the last chunk processed in this session.
+    #[serde(default)]
+    pub last_chunk_processed: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}

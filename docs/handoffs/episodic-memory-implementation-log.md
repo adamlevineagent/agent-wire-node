@@ -109,12 +109,12 @@ These resolve the 16 questions asked before Phase 1 full dispatch. Treat as norm
 - Note: IngestStarted/Complete/Failed events defined but not emitted by this WS — WS-DADBEAR-EXTEND owns emission when it orchestrates builds from ingest records
 
 ### Phase 2a — Foundational primitives (parallel after 1.5)
-- [ ] WS-PRIMER — depends on WS-SCHEMA-V2, WS-EVENTS
-- [ ] WS-CHAIN-INVOKE — depends on WS-CONCURRENCY
-- [ ] WS-IMMUTABILITY-ENFORCE — depends on WS-SCHEMA-V2
+- [x] WS-PRIMER — **complete + verified clean** (2026-04-09). New `primer.rs` (~430 lines). `get_leftmost_slope` (3 child-discovery paths), `build_primer` (vocabulary extraction + dehydration), `format_primer_for_prompt` (markdown renderer). 2 HTTP routes (`GET /primer`, `GET /primer/formatted`). 3 new types (PrimerContext, PrimerNode, CanonicalVocabulary). 4 tests. Verifier fix: removed unused import.
+- [x] WS-CHAIN-INVOKE — **complete + verified clean** (2026-04-09). `invoke_depth` on ChainContext, `invoke_chain` + `invoke_context` on ChainStep, `execute_invoke_chain` with depth limit 8, `Box::pin` async recursion, `__invoke_depth` depth propagation. 11 tests. Zero verifier fixes.
+- [x] WS-IMMUTABILITY-ENFORCE — **complete + verified** (2026-04-09). Immutability guards in `save_node` + `apply_supersession` (reject canonical L0/L1). `promote_provisional_node` helper. `POST /nodes/:node_id/promote` route. 5 tests. Verifier fixed 2 pre-existing tests (depth 0→2).
 
 ### Phase 2b — Parallel after 2a
-- [ ] WS-PROVISIONAL — depends on SCHEMA-V2 + CONCURRENCY + EVENTS + IMMUTABILITY-ENFORCE
+- [x] WS-PROVISIONAL — **complete** (2026-04-08). Depends on SCHEMA-V2 + CONCURRENCY + EVENTS + IMMUTABILITY-ENFORCE (all complete).
 - [ ] WS-DADBEAR-EXTEND — depends on CHAIN-INVOKE + PROVISIONAL + EVENTS
 - [ ] WS-VINE-UNIFY — depends on CHAIN-INVOKE + DADBEAR-EXTEND (NOTE: do NOT modify `vine.rs` per Q2)
 
@@ -229,7 +229,25 @@ Three of five verified workstreams (WS-CONCURRENCY, WS-AUDIENCE-CONTRACT, WS-COS
 **Phase 1 final status: ALL 7 WORKSTREAMS COMPLETE + VERIFIED.**
 **Phase 1.5: COMPLETE, verifier in progress.**
 
-**Next: Phase 2a** — WS-PRIMER, WS-CHAIN-INVOKE, WS-IMMUTABILITY-ENFORCE (parallel, all dependencies met).
+**Phase 2a: ALL 3 WORKSTREAMS COMPLETE + VERIFIED.**
+- WS-PRIMER: verified clean (1 unused import removed)
+- WS-CHAIN-INVOKE: verified clean (zero fixes)
+- WS-IMMUTABILITY-ENFORCE: verified (2 pre-existing tests updated)
+- Git commit: `d4172f3` — "episodic-memory vine: Phase 2a complete"
+
+**Next: Phase 2b** — WS-DADBEAR-EXTEND, WS-VINE-UNIFY (WS-PROVISIONAL now complete).
+
+### WS-PROVISIONAL — complete (2026-04-08)
+- Files: `types.rs` (+30 lines: `ProvisionalSession` struct), `db.rs` (+280 lines: `pyramid_provisional_sessions` table + 10 helpers + `save_provisional_node` + `promote_session` + `parse_provisional_session`), `routes.rs` (+130 lines: 4 HTTP routes + 2 body types + 4 handlers)
+- New table: `pyramid_provisional_sessions` (id, slug, source_path, session_id UNIQUE, status, provisional_node_ids JSON, canonical_build_id, file_mtime, last_chunk_processed, created_at, updated_at)
+- DB helpers: `create_provisional_session`, `get_active_provisional_sessions`, `get_provisional_session`, `add_provisional_node_to_session`, `mark_session_promoting`, `mark_session_promoted`, `mark_session_failed`, `get_provisional_nodes_for_session`
+- Convenience functions: `save_provisional_node` (saves node + tracks in session + emits ProvisionalNodeAdded), `promote_session` (promotes all nodes + emits ProvisionalPromoted per node + idempotent on re-promote)
+- HTTP routes: `POST /pyramid/:slug/provisional/session` (create), `GET /pyramid/:slug/provisional/sessions` (list active), `GET /pyramid/:slug/provisional/session/:session_id` (details), `POST /pyramid/:slug/provisional/session/:session_id/promote` (promote with build_id body)
+- 5 tests: create+query, promote-all-nodes, promoted-rejects-mutation, idempotent-re-promote, save_provisional_node-convenience. All pass.
+- WS-CONCURRENCY: promote route acquires `LockManager::global().write(slug)`.
+- Friction log: `/tmp/friction-ws-provisional.md`
+- Flagged for WS-DADBEAR-EXTEND: needs `update_session_mtime` and `update_session_chunk_progress` helpers to drive the live processing loop (not in this WS scope).
+- Flagged for WS-RECOVERY-OPS: `mark_session_failed` reuses `canonical_build_id` column for error storage; may want dedicated `error_message TEXT` column.
 
 **Observations:**
 - The prior session's pattern holds: implementers under-wire, verifiers save the run. WS-SCHEMA-V2's `cargo check` passed but `cargo check --tests` had 44 errors — a new variant of the "claims don't match reality" pattern.
