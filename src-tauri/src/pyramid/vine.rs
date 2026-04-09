@@ -862,6 +862,7 @@ pub async fn build_bunch(
     vine_slug: &str,
     bunch: &BunchDiscovery,
     bunch_index: i64,
+    evidence_mode: &str,
     cancel: &CancellationToken,
 ) -> Result<VineBunch> {
     let bunch_slug = format!("{vine_slug}--bunch-{bunch_index:03}");
@@ -973,12 +974,13 @@ pub async fn build_bunch(
 
     let (progress_tx, _progress_rx) = mpsc::channel::<BuildProgress>(64);
 
-    let result = super::build_runner::run_build_from(
+    let result = super::build_runner::run_build_from_with_evidence_mode(
         &build_state,
         &bunch_slug,
         0,
         None,
         None,
+        evidence_mode,
         cancel,
         Some(progress_tx),
         &write_tx,
@@ -1089,6 +1091,7 @@ pub async fn build_all_bunches(
     state: &PyramidState,
     vine_slug: &str,
     jsonl_dirs: &[PathBuf],
+    evidence_mode: &str,
     cancel: &CancellationToken,
 ) -> Result<Vec<VineBunch>> {
     // Step 1: Discover conversations
@@ -1196,7 +1199,7 @@ pub async fn build_all_bunches(
                 info!("Retrying bunch {i}/{total} (attempt {attempt}/{max_retries})...");
             }
 
-            match build_bunch(state, vine_slug, discovery, i as i64, cancel).await {
+            match build_bunch(state, vine_slug, discovery, i as i64, evidence_mode, cancel).await {
                 Ok(bunch) => {
                     built_bunches.push(bunch);
                     succeeded = true;
@@ -1801,6 +1804,7 @@ pub async fn build_vine(
     state: &PyramidState,
     vine_slug: &str,
     jsonl_dirs: &[PathBuf],
+    evidence_mode: &str,
     cancel: &CancellationToken,
 ) -> Result<String> {
     let dir_display: Vec<String> = jsonl_dirs.iter().map(|d| d.display().to_string()).collect();
@@ -1810,7 +1814,7 @@ pub async fn build_vine(
     );
 
     // Phase 2: Build all bunches
-    let bunches = build_all_bunches(state, vine_slug, jsonl_dirs, cancel).await?;
+    let bunches = build_all_bunches(state, vine_slug, jsonl_dirs, evidence_mode, cancel).await?;
     if bunches.is_empty() {
         return Err(anyhow!("No bunches were built successfully"));
     }
@@ -3284,7 +3288,7 @@ impl VineJSONLWatcher {
                                     continue;
                                 }
                             };
-                            if let Err(e) = build_bunch(&state, &vine_slug, &discovery, bunch.bunch_index, &cancel).await {
+                            if let Err(e) = build_bunch(&state, &vine_slug, &discovery, bunch.bunch_index, "deep", &cancel).await {
                                 error!("VineJSONLWatcher: rebuild bunch failed: {e}");
                                 continue;
                             }
@@ -3311,7 +3315,7 @@ impl VineJSONLWatcher {
                             }
 
                             let next_index = existing_bunches.len() as i64;
-                            match build_bunch(&state, &vine_slug, &discovery, next_index, &cancel).await {
+                            match build_bunch(&state, &vine_slug, &discovery, next_index, "deep", &cancel).await {
                                 Ok(_vine_bunch) => {
                                     info!("VineJSONLWatcher: built new bunch {next_index} for vine '{vine_slug}'");
                                     // Trigger L1+ rebuild to incorporate the new bunch

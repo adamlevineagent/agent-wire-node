@@ -167,12 +167,34 @@ pub async fn run_build(
 }
 
 /// Run a build from a specific depth, reusing nodes below that depth.
+/// Defaults to evidence_mode "deep" (full evidence loop + gap processing).
 pub async fn run_build_from(
     state: &PyramidState,
     slug_name: &str,
     from_depth: i64,
     stop_after: Option<&str>,
     force_from: Option<&str>,
+    cancel: &CancellationToken,
+    progress_tx: Option<mpsc::Sender<BuildProgress>>,
+    write_tx: &mpsc::Sender<WriteOp>,
+    layer_tx: Option<mpsc::Sender<LayerEvent>>,
+) -> Result<(String, i32, Vec<super::types::StepActivity>)> {
+    run_build_from_with_evidence_mode(
+        state, slug_name, from_depth, stop_after, force_from,
+        "deep", cancel, progress_tx, write_tx, layer_tx,
+    ).await
+}
+
+/// Run a build from a specific depth with explicit evidence_mode control.
+/// "deep" = full evidence loop + gap processing (default behavior).
+/// "fast" = skip evidence loop, defer to query-time demand-gen.
+pub async fn run_build_from_with_evidence_mode(
+    state: &PyramidState,
+    slug_name: &str,
+    from_depth: i64,
+    stop_after: Option<&str>,
+    force_from: Option<&str>,
+    evidence_mode: &str,
     cancel: &CancellationToken,
     progress_tx: Option<mpsc::Sender<BuildProgress>>,
     write_tx: &mpsc::Sender<WriteOp>,
@@ -232,7 +254,7 @@ pub async fn run_build_from(
             stored_max_depth,
             from_depth,
             None, // re-characterize from cross-slug nodes
-            "deep",
+            evidence_mode,
             cancel,
             progress_tx,
             layer_tx,
@@ -279,7 +301,7 @@ pub async fn run_build_from(
             stored_max_depth,
             from_depth,
             None,
-            "deep",
+            evidence_mode,
             cancel,
             progress_tx,
             layer_tx,

@@ -5531,7 +5531,7 @@ async fn pyramid_vine_build(
     let vine_builds = state.pyramid.vine_builds.clone();
 
     let vine_build_handle = tokio::spawn(async move {
-        let result = vine::build_vine(&pyramid_state, &slug_for_task, &dirs, &cancel).await;
+        let result = vine::build_vine(&pyramid_state, &slug_for_task, &dirs, "deep", &cancel).await;
         let mut builds = vine_builds.lock().await;
         if let Some(handle) = builds.get_mut(&slug_for_task) {
             match result {

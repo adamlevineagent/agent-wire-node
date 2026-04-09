@@ -406,6 +406,8 @@ struct FaqMatchQuery {
 struct VineBuildBody {
     vine_slug: String,
     jsonl_dirs: Vec<String>,
+    #[serde(default = "default_evidence_mode")]
+    evidence_mode: String,
 }
 
 #[derive(Deserialize)]
@@ -5448,10 +5450,11 @@ async fn handle_vine_build(
     let state_clone = state.clone();
     let slug_clone = vine_slug.clone();
     let cancel_clone = cancel.clone();
+    let evidence_mode = body.evidence_mode.clone();
 
     tokio::spawn(async move {
         let (final_status, error_msg) =
-            match vine::build_vine(&state_clone, &slug_clone, &jsonl_dirs, &cancel_clone).await {
+            match vine::build_vine(&state_clone, &slug_clone, &jsonl_dirs, &evidence_mode, &cancel_clone).await {
                 Ok(apex_id) => {
                     tracing::info!("Vine build complete for '{}': apex={}", slug_clone, apex_id);
                     // Post-vine-build: refresh vocabulary catalog from apex
