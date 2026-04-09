@@ -504,7 +504,12 @@ struct QuestionBuildBody {
     /// automatic characterization and uses this directly.
     #[serde(default)]
     characterization: Option<CharacterizationResult>,
+    /// "deep" (default) runs full evidence loop + gap processing.
+    /// "fast" skips evidence loop — defers to query-time demand-gen.
+    #[serde(default = "default_evidence_mode")]
+    evidence_mode: String,
 }
+fn default_evidence_mode() -> String { "deep".to_string() }
 
 #[derive(Deserialize)]
 struct CharacterizeBody {
@@ -5823,6 +5828,7 @@ async fn handle_question_build(
     let max_depth = body.max_depth;
     let from_depth_for_build = from_depth;
     let characterization = body.characterization.clone();
+    let evidence_mode = body.evidence_mode.clone();
     let response_slug = slug_name.clone();
 
     tokio::spawn(async move {
@@ -5910,7 +5916,7 @@ async fn handle_question_build(
             max_depth,
             from_depth_for_build,
             characterization,
-            "deep",
+            &evidence_mode,
             &cancel,
             Some(progress_tx.clone()),
             Some(layer_tx.clone()),
