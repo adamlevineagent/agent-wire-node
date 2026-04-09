@@ -800,6 +800,7 @@ mod tests {
                 },
             ],
             post_build: vec![],
+            audience: Default::default(),
         }
     }
 
@@ -920,6 +921,7 @@ mod tests {
                 },
             ],
             post_build: vec![],
+            audience: Default::default(),
         }
     }
 
@@ -938,6 +940,7 @@ mod tests {
             defaults: make_defaults(),
             steps: vec![make_chain_step("step1", "compress")],
             post_build: vec![],
+            audience: Default::default(),
         };
         let result = compile_defaults(&chain);
         assert!(result.is_err());
@@ -1360,6 +1363,7 @@ mod tests {
                 s
             }],
             post_build: vec![],
+            audience: Default::default(),
         };
 
         let plan = compile_defaults(&chain).unwrap();
@@ -1393,6 +1397,7 @@ mod tests {
                 s
             }],
             post_build: vec![],
+            audience: Default::default(),
         };
 
         let plan = compile_defaults(&chain).unwrap();

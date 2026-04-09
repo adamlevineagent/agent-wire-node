@@ -5,6 +5,7 @@
 // using the pyramid_slugs / pyramid_batches / pyramid_chunks schema.
 
 use anyhow::{Context, Result};
+use chrono::Utc;
 use rusqlite::Connection;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -12,7 +13,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use super::db;
-use super::types::ContentType;
+use super::types::{ChangeSet, ContentType, IngestConfig, IngestRecord, SourceFile};
 
 /// Metadata about files ingested during a build, used for post-build seeding.
 #[derive(Debug, Clone)]
@@ -708,6 +709,275 @@ pub fn ingest_docs(conn: &Connection, slug: &str, dir_path: &Path) -> Result<Ing
     })
 }
 
+// ── WS-INGEST-PRIMITIVE: Ingest signature, scanning, change detection ───────
+
+/// Compute the `ingest_signature` that uniquely identifies how a source was
+/// chunked. Formula locked in knowledge-transfer Q11:
+///
+///  - conversation: sha256("conversation:" + chunk_target_lines + ":" + chunk_target_tokens)
+///  - code: sha256("code:" + sorted(code_extensions) + ":" + sorted(skip_dirs) + ":" + sorted(config_files) + ":" + chunk_target_lines + ":" + chunk_target_tokens)
+///  - document: sha256("document:" + sorted(doc_extensions) + ":" + chunk_target_lines + ":" + chunk_target_tokens)
+///  - vocabulary / question: unique per-slug (use slug itself)
+///
+/// Consumed by WS-MULTI-CHAIN-OVERLAY to detect whether two pyramids share
+/// the same chunking.
+pub fn ingest_signature(content_type: &ContentType, config: &IngestConfig) -> String {
+    match content_type {
+        ContentType::Conversation => {
+            let input = format!(
+                "conversation:{}:{}",
+                config.chunk_target_lines, config.chunk_target_tokens
+            );
+            sha256_hex(input.as_bytes())
+        }
+        ContentType::Code => {
+            let mut exts = config.code_extensions.clone();
+            exts.sort();
+            let mut dirs = config.skip_dirs.clone();
+            dirs.sort();
+            let mut cfgs = config.config_files.clone();
+            cfgs.sort();
+            let input = format!(
+                "code:{}:{}:{}:{}:{}",
+                exts.join(","),
+                dirs.join(","),
+                cfgs.join(","),
+                config.chunk_target_lines,
+                config.chunk_target_tokens
+            );
+            sha256_hex(input.as_bytes())
+        }
+        ContentType::Document => {
+            let mut exts = config.doc_extensions.clone();
+            exts.sort();
+            let input = format!(
+                "document:{}:{}:{}",
+                exts.join(","),
+                config.chunk_target_lines,
+                config.chunk_target_tokens
+            );
+            sha256_hex(input.as_bytes())
+        }
+        ContentType::Vine | ContentType::Question => {
+            // Unique per-slug; callers should pass slug as the signature.
+            // Return a sentinel — actual slug-based signature is handled
+            // at the call site where the slug is known.
+            "slug-unique".to_string()
+        }
+    }
+}
+
+/// Build a default `IngestConfig` from the current Tier2Config defaults and
+/// the hardcoded extension/directory sets in this module.
+pub fn default_ingest_config() -> IngestConfig {
+    let t2 = super::Tier2Config::default();
+    IngestConfig {
+        chunk_target_lines: t2.chunk_target_lines,
+        chunk_target_tokens: 0, // Not yet used; kept for forward compat with Q11 formula
+        code_extensions: {
+            let mut v: Vec<String> = code_extensions().into_iter().map(|s| s.to_string()).collect();
+            v.sort();
+            v
+        },
+        skip_dirs: {
+            let mut v: Vec<String> = skip_dirs().into_iter().map(|s| s.to_string()).collect();
+            v.sort();
+            v
+        },
+        config_files: {
+            let mut v: Vec<String> = config_files().into_iter().map(|s| s.to_string()).collect();
+            v.sort();
+            v
+        },
+        doc_extensions: {
+            let mut v: Vec<String> = doc_extensions().into_iter().map(|s| s.to_string()).collect();
+            v.sort();
+            v
+        },
+    }
+}
+
+/// Scan a directory for ingestible files based on content type.
+///
+/// For conversation: scans for `.jsonl` files.
+/// For code: scans for source files matching configured extensions + config files.
+/// For document: scans for document files matching configured extensions.
+pub fn scan_source_directory(path: &str, content_type: &ContentType) -> Result<Vec<SourceFile>> {
+    let dir = Path::new(path);
+    if !dir.exists() {
+        anyhow::bail!("Source directory does not exist: {}", path);
+    }
+    if !dir.is_dir() {
+        anyhow::bail!("Source path is not a directory: {}", path);
+    }
+
+    let mut results = Vec::new();
+
+    match content_type {
+        ContentType::Conversation => {
+            // Scan for .jsonl files (non-recursive — conversations are flat)
+            let entries = std::fs::read_dir(dir)
+                .with_context(|| format!("Failed to read directory: {}", path))?;
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.is_file() {
+                    if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
+                        if ext == "jsonl" {
+                            if let Some(sf) = source_file_from_path(&p) {
+                                results.push(sf);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        ContentType::Code => {
+            let skip = skip_dirs();
+            let code_exts = code_extensions();
+            let config_fnames = config_files();
+            let all_files = walk_dir(dir, &skip, true);
+            for (abs_path, _rel_path) in &all_files {
+                let fname = abs_path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                if fname.starts_with('.') {
+                    continue;
+                }
+                let ext = abs_path
+                    .extension()
+                    .map(|e| format!(".{}", e.to_string_lossy().to_lowercase()))
+                    .unwrap_or_default();
+                let is_config = config_fnames.contains(fname.as_str());
+                let is_code = code_exts.contains(ext.as_str());
+                if !is_code && !is_config {
+                    continue;
+                }
+                if let Some(sf) = source_file_from_path(abs_path) {
+                    results.push(sf);
+                }
+            }
+        }
+        ContentType::Document => {
+            let doc_exts = doc_extensions();
+            let empty_skip: HashSet<&str> = HashSet::new();
+            let all_files = walk_dir(dir, &empty_skip, true);
+            for (abs_path, _rel_path) in &all_files {
+                let ext = abs_path
+                    .extension()
+                    .map(|e| format!(".{}", e.to_string_lossy().to_lowercase()))
+                    .unwrap_or_default();
+                if !doc_exts.contains(ext.as_str()) {
+                    continue;
+                }
+                if let Some(sf) = source_file_from_path(abs_path) {
+                    results.push(sf);
+                }
+            }
+        }
+        ContentType::Vine | ContentType::Question => {
+            // Vine/Question types don't have file-based scanning
+            tracing::warn!(
+                "scan_source_directory called for {:?} — no file scanning for this type",
+                content_type
+            );
+        }
+    }
+
+    results.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(results)
+}
+
+/// Build a `SourceFile` from a filesystem path, reading mtime and computing hash.
+fn source_file_from_path(p: &Path) -> Option<SourceFile> {
+    let metadata = std::fs::metadata(p).ok()?;
+    let mtime = metadata
+        .modified()
+        .ok()
+        .map(|t| {
+            let dt: chrono::DateTime<Utc> = t.into();
+            dt.to_rfc3339()
+        })
+        .unwrap_or_default();
+    let raw_bytes = std::fs::read(p).ok()?;
+    let file_hash = sha256_hex(&raw_bytes);
+    let size = metadata.len();
+    Some(SourceFile {
+        path: p.to_string_lossy().to_string(),
+        mtime,
+        file_hash,
+        size,
+    })
+}
+
+/// Compare current scan results against existing ingest records to detect
+/// new, modified, and deleted files.
+pub fn detect_changes(
+    conn: &Connection,
+    slug: &str,
+    sig: &str,
+    current_files: &[SourceFile],
+) -> Result<ChangeSet> {
+    let existing_records = db::get_ingest_records_for_slug(conn, slug)?;
+
+    // Build a lookup from (source_path, ingest_signature) -> record
+    let mut existing_map: std::collections::HashMap<String, &IngestRecord> =
+        std::collections::HashMap::new();
+    for rec in &existing_records {
+        if rec.ingest_signature == sig {
+            existing_map.insert(rec.source_path.clone(), rec);
+        }
+    }
+
+    let mut new_files = Vec::new();
+    let mut modified_files = Vec::new();
+    let mut unchanged_count: usize = 0;
+
+    // Track which existing paths we've seen in the current scan
+    let mut seen_paths: HashSet<String> = HashSet::new();
+
+    for sf in current_files {
+        seen_paths.insert(sf.path.clone());
+        match existing_map.get(&sf.path) {
+            None => {
+                new_files.push(sf.clone());
+            }
+            Some(rec) => {
+                // Check if hash or mtime changed
+                let hash_changed = rec
+                    .file_hash
+                    .as_ref()
+                    .map(|h| h != &sf.file_hash)
+                    .unwrap_or(true);
+                let mtime_changed = rec
+                    .file_mtime
+                    .as_ref()
+                    .map(|m| m != &sf.mtime)
+                    .unwrap_or(true);
+                if hash_changed || mtime_changed {
+                    modified_files.push(sf.clone());
+                } else {
+                    unchanged_count += 1;
+                }
+            }
+        }
+    }
+
+    // Deleted = existing records whose paths aren't in current scan
+    let deleted_paths: Vec<String> = existing_map
+        .keys()
+        .filter(|p| !seen_paths.contains(p.as_str()))
+        .cloned()
+        .collect();
+
+    Ok(ChangeSet {
+        new_files,
+        modified_files,
+        deleted_paths,
+        unchanged_count,
+    })
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -817,5 +1087,300 @@ mod tests {
         assert!(!dirs.contains("pyramid-prototype"));
         assert!(!dirs.contains("agentwire"));
         assert!(!dirs.contains("agentspace"));
+    }
+
+    // ── WS-INGEST-PRIMITIVE tests ───────────────────────────────────────
+
+    #[test]
+    fn test_ingest_signature_deterministic() {
+        let config = default_ingest_config();
+        let sig1 = ingest_signature(&ContentType::Code, &config);
+        let sig2 = ingest_signature(&ContentType::Code, &config);
+        assert_eq!(sig1, sig2, "Same config should produce same signature");
+        // Should be a valid hex SHA-256 (64 chars)
+        assert_eq!(sig1.len(), 64);
+    }
+
+    #[test]
+    fn test_ingest_signature_differs_by_content_type() {
+        let config = default_ingest_config();
+        let sig_conv = ingest_signature(&ContentType::Conversation, &config);
+        let sig_code = ingest_signature(&ContentType::Code, &config);
+        let sig_doc = ingest_signature(&ContentType::Document, &config);
+        assert_ne!(sig_conv, sig_code);
+        assert_ne!(sig_conv, sig_doc);
+        assert_ne!(sig_code, sig_doc);
+    }
+
+    #[test]
+    fn test_ingest_signature_differs_by_config() {
+        let mut config1 = default_ingest_config();
+        let mut config2 = default_ingest_config();
+        config2.chunk_target_lines = 200; // different from default 100
+        let sig1 = ingest_signature(&ContentType::Conversation, &config1);
+        let sig2 = ingest_signature(&ContentType::Conversation, &config2);
+        assert_ne!(sig1, sig2, "Different chunk_target_lines should produce different signatures");
+
+        // Also test code with different extensions
+        config1.code_extensions = vec![".rs".to_string()];
+        config2.code_extensions = vec![".rs".to_string(), ".py".to_string()];
+        config2.chunk_target_lines = config1.chunk_target_lines; // same lines
+        let sig3 = ingest_signature(&ContentType::Code, &config1);
+        let sig4 = ingest_signature(&ContentType::Code, &config2);
+        assert_ne!(sig3, sig4, "Different extensions should produce different signatures");
+    }
+
+    #[test]
+    fn test_ingest_signature_vine_question_slug_unique() {
+        let config = default_ingest_config();
+        let sig_vine = ingest_signature(&ContentType::Vine, &config);
+        let sig_question = ingest_signature(&ContentType::Question, &config);
+        assert_eq!(sig_vine, "slug-unique");
+        assert_eq!(sig_question, "slug-unique");
+    }
+
+    #[test]
+    fn test_ingest_record_roundtrip() {
+        // Create an in-memory DB and initialize schema
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        db::init_pyramid_db(&conn).unwrap();
+
+        let sig = ingest_signature(&ContentType::Code, &default_ingest_config());
+
+        // Create a slug first (FK not enforced on ingest_records, but let's
+        // be thorough)
+        db::create_slug(&conn, "test-slug", &ContentType::Code, "/src").unwrap();
+
+        // Save a record
+        let record = IngestRecord {
+            id: 0,
+            slug: "test-slug".to_string(),
+            source_path: "/src/main.rs".to_string(),
+            content_type: "code".to_string(),
+            ingest_signature: sig.clone(),
+            file_hash: Some("abc123".to_string()),
+            file_mtime: Some("2026-04-08T10:00:00Z".to_string()),
+            status: "pending".to_string(),
+            build_id: None,
+            error_message: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        let row_id = db::save_ingest_record(&conn, &record).unwrap();
+        assert!(row_id > 0);
+
+        // Get it back
+        let fetched = db::get_ingest_record(&conn, "test-slug", "/src/main.rs", &sig)
+            .unwrap()
+            .expect("record should exist");
+        assert_eq!(fetched.slug, "test-slug");
+        assert_eq!(fetched.source_path, "/src/main.rs");
+        assert_eq!(fetched.status, "pending");
+        assert_eq!(fetched.file_hash, Some("abc123".to_string()));
+        assert_eq!(fetched.ingest_signature, sig);
+
+        // Mark processing
+        db::mark_ingest_processing(&conn, fetched.id).unwrap();
+        let updated = db::get_ingest_record(&conn, "test-slug", "/src/main.rs", &sig)
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.status, "processing");
+
+        // Mark complete
+        db::mark_ingest_complete(&conn, fetched.id, "build-001").unwrap();
+        let completed = db::get_ingest_record(&conn, "test-slug", "/src/main.rs", &sig)
+            .unwrap()
+            .unwrap();
+        assert_eq!(completed.status, "complete");
+        assert_eq!(completed.build_id, Some("build-001".to_string()));
+
+        // Get all for slug
+        let all = db::get_ingest_records_for_slug(&conn, "test-slug").unwrap();
+        assert_eq!(all.len(), 1);
+
+        // Upsert — update existing record
+        let updated_record = IngestRecord {
+            id: 0,
+            slug: "test-slug".to_string(),
+            source_path: "/src/main.rs".to_string(),
+            content_type: "code".to_string(),
+            ingest_signature: sig.clone(),
+            file_hash: Some("def456".to_string()),
+            file_mtime: Some("2026-04-08T11:00:00Z".to_string()),
+            status: "pending".to_string(),
+            build_id: None,
+            error_message: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        db::save_ingest_record(&conn, &updated_record).unwrap();
+        let upserted = db::get_ingest_record(&conn, "test-slug", "/src/main.rs", &sig)
+            .unwrap()
+            .unwrap();
+        assert_eq!(upserted.file_hash, Some("def456".to_string()));
+        assert_eq!(upserted.status, "pending"); // status reset by upsert
+
+        // Mark stale
+        db::mark_ingest_stale(&conn, "test-slug", "/src/main.rs").unwrap();
+        let staled = db::get_ingest_record(&conn, "test-slug", "/src/main.rs", &sig)
+            .unwrap()
+            .unwrap();
+        assert_eq!(staled.status, "stale");
+
+        // Mark failed
+        let record2 = IngestRecord {
+            id: 0,
+            slug: "test-slug".to_string(),
+            source_path: "/src/lib.rs".to_string(),
+            content_type: "code".to_string(),
+            ingest_signature: sig.clone(),
+            file_hash: Some("ghi789".to_string()),
+            file_mtime: Some("2026-04-08T10:00:00Z".to_string()),
+            status: "pending".to_string(),
+            build_id: None,
+            error_message: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        let id2 = db::save_ingest_record(&conn, &record2).unwrap();
+        // id2 might be 0 on upsert when ON CONFLICT fires; get from DB
+        let rec2 = db::get_ingest_record(&conn, "test-slug", "/src/lib.rs", &sig)
+            .unwrap()
+            .unwrap();
+        db::mark_ingest_failed(&conn, rec2.id, "LLM timeout").unwrap();
+        let failed = db::get_ingest_record(&conn, "test-slug", "/src/lib.rs", &sig)
+            .unwrap()
+            .unwrap();
+        assert_eq!(failed.status, "failed");
+        assert_eq!(failed.error_message, Some("LLM timeout".to_string()));
+
+        // get_pending_ingests — lib.rs is failed, main.rs is stale, neither pending
+        let pending = db::get_pending_ingests(&conn, "test-slug").unwrap();
+        assert_eq!(pending.len(), 0);
+
+        // Save another as pending and verify it shows up
+        let record3 = IngestRecord {
+            id: 0,
+            slug: "test-slug".to_string(),
+            source_path: "/src/mod.rs".to_string(),
+            content_type: "code".to_string(),
+            ingest_signature: sig.clone(),
+            file_hash: Some("jkl012".to_string()),
+            file_mtime: None,
+            status: "pending".to_string(),
+            build_id: None,
+            error_message: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        db::save_ingest_record(&conn, &record3).unwrap();
+        let pending2 = db::get_pending_ingests(&conn, "test-slug").unwrap();
+        assert_eq!(pending2.len(), 1);
+        assert_eq!(pending2[0].source_path, "/src/mod.rs");
+    }
+
+    #[test]
+    fn test_detect_changes() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        db::init_pyramid_db(&conn).unwrap();
+        db::create_slug(&conn, "test-slug", &ContentType::Code, "/src").unwrap();
+
+        let sig = ingest_signature(&ContentType::Code, &default_ingest_config());
+
+        // Insert an existing record for file_a
+        let existing = IngestRecord {
+            id: 0,
+            slug: "test-slug".to_string(),
+            source_path: "/src/file_a.rs".to_string(),
+            content_type: "code".to_string(),
+            ingest_signature: sig.clone(),
+            file_hash: Some("hash_a".to_string()),
+            file_mtime: Some("2026-04-08T10:00:00Z".to_string()),
+            status: "complete".to_string(),
+            build_id: Some("build-001".to_string()),
+            error_message: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        db::save_ingest_record(&conn, &existing).unwrap();
+
+        // Also insert a record for file_b (will be "deleted")
+        let existing_b = IngestRecord {
+            id: 0,
+            slug: "test-slug".to_string(),
+            source_path: "/src/file_b.rs".to_string(),
+            content_type: "code".to_string(),
+            ingest_signature: sig.clone(),
+            file_hash: Some("hash_b".to_string()),
+            file_mtime: Some("2026-04-08T09:00:00Z".to_string()),
+            status: "complete".to_string(),
+            build_id: Some("build-001".to_string()),
+            error_message: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        db::save_ingest_record(&conn, &existing_b).unwrap();
+
+        // Current scan has: file_a (modified), file_c (new), no file_b (deleted)
+        let current_files = vec![
+            SourceFile {
+                path: "/src/file_a.rs".to_string(),
+                mtime: "2026-04-08T11:00:00Z".to_string(), // different mtime
+                file_hash: "hash_a_v2".to_string(),         // different hash
+                size: 100,
+            },
+            SourceFile {
+                path: "/src/file_c.rs".to_string(),
+                mtime: "2026-04-08T10:30:00Z".to_string(),
+                file_hash: "hash_c".to_string(),
+                size: 200,
+            },
+        ];
+
+        let changes = detect_changes(&conn, "test-slug", &sig, &current_files).unwrap();
+        assert_eq!(changes.new_files.len(), 1, "file_c is new");
+        assert_eq!(changes.new_files[0].path, "/src/file_c.rs");
+        assert_eq!(changes.modified_files.len(), 1, "file_a is modified");
+        assert_eq!(changes.modified_files[0].path, "/src/file_a.rs");
+        assert_eq!(changes.deleted_paths.len(), 1, "file_b is deleted");
+        assert_eq!(changes.deleted_paths[0], "/src/file_b.rs");
+        assert_eq!(changes.unchanged_count, 0);
+    }
+
+    #[test]
+    fn test_scan_source_directory_conversation() {
+        // Create a temp dir with a .jsonl file
+        let tmp = std::env::temp_dir().join("test_ingest_scan_conv");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("session.jsonl"), "{}").unwrap();
+        std::fs::write(tmp.join("notes.txt"), "not a jsonl").unwrap();
+
+        let files = scan_source_directory(
+            tmp.to_str().unwrap(),
+            &ContentType::Conversation,
+        )
+        .unwrap();
+
+        assert_eq!(files.len(), 1);
+        assert!(files[0].path.ends_with("session.jsonl"));
+        assert_eq!(files[0].file_hash.len(), 64); // SHA-256 hex
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_default_ingest_config() {
+        let config = default_ingest_config();
+        assert_eq!(config.chunk_target_lines, 100);
+        assert_eq!(config.chunk_target_tokens, 0);
+        assert!(!config.code_extensions.is_empty());
+        assert!(!config.skip_dirs.is_empty());
+        assert!(!config.config_files.is_empty());
+        assert!(!config.doc_extensions.is_empty());
+        // Should be sorted
+        let mut sorted_exts = config.code_extensions.clone();
+        sorted_exts.sort();
+        assert_eq!(config.code_extensions, sorted_exts);
     }
 }

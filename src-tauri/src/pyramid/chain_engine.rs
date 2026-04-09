@@ -603,6 +603,7 @@ mod tests {
                 ..Default::default()
             }],
             post_build: vec![],
+            audience: Default::default(),
         }
     }
 

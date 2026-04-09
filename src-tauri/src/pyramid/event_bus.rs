@@ -53,6 +53,24 @@ pub enum TaggedKind {
     DemandGenCompleted { job_id: String, new_node_ids: Vec<String> },
     ChainProposalReceived { chain_id: String, proposal_id: i64 },
 
+    // ── WS-INGEST-PRIMITIVE (Phase 1.5): ingest lifecycle events ──
+    IngestScanComplete {
+        new_count: usize,
+        modified_count: usize,
+        deleted_count: usize,
+    },
+    IngestStarted {
+        source_path: String,
+    },
+    IngestComplete {
+        source_path: String,
+        build_id: String,
+    },
+    IngestFailed {
+        source_path: String,
+        error: String,
+    },
+
     // ── WS-EVENTS step-level introspection (load-bearing for nav page) ──
     ChainStepStarted {
         step_name: String,

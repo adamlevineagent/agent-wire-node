@@ -1017,6 +1017,33 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
         ",
     )?;
 
+    // WS-INGEST-PRIMITIVE (Phase 1.5): Track what has been ingested, when,
+    // with what signature, and what state it's in. DADBEAR uses this to
+    // detect, debounce, and trigger pyramid construction from source files.
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS pyramid_ingest_records (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            slug TEXT NOT NULL,
+            source_path TEXT NOT NULL,
+            content_type TEXT NOT NULL,
+            ingest_signature TEXT NOT NULL,
+            file_hash TEXT,
+            file_mtime TEXT,
+            status TEXT NOT NULL DEFAULT 'pending',
+            build_id TEXT,
+            error_message TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(slug, source_path, ingest_signature)
+        );
+        CREATE INDEX IF NOT EXISTS idx_ingest_records_slug_status
+            ON pyramid_ingest_records(slug, status);
+        CREATE INDEX IF NOT EXISTS idx_ingest_records_slug_sig
+            ON pyramid_ingest_records(slug, ingest_signature);
+        ",
+    )?;
+
     Ok(())
 }
 
@@ -1981,7 +2008,7 @@ pub fn node_from_row(row: &rusqlite::Row) -> rusqlite::Result<PyramidNode> {
                 .flatten();
             let end = row.get::<_, Option<String>>("time_range_end").ok().flatten();
             if start.is_some() || end.is_some() {
-                Some(super::types::TimeRange { start, end })
+                Some(TimeRange { start, end })
             } else {
                 None
             }
@@ -6529,6 +6556,7 @@ pub fn set_gap_confidence(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pyramid::query::get_node_version as query_get_node_version;
 
     fn test_conn() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -6606,6 +6634,7 @@ mod tests {
                     decided: "Use JWT".to_string(),
                     why: "Standard".to_string(),
                     rejected: String::new(),
+                    ..Default::default()
                 }],
                 extra: serde_json::Map::new(),
             }],
@@ -6622,6 +6651,7 @@ mod tests {
             superseded_by: None,
             build_id: None,
             created_at: String::new(),
+            ..Default::default()
         };
 
         save_node(&conn, &node, None).unwrap();
@@ -6660,6 +6690,7 @@ mod tests {
                 superseded_by: None,
                 build_id: None,
                 created_at: String::new(),
+                ..Default::default()
             };
             save_node(&conn, &node, None).unwrap();
         }
@@ -6696,6 +6727,7 @@ mod tests {
             superseded_by: None,
             build_id: None,
             created_at: String::new(),
+            ..Default::default()
         };
         let second = PyramidNode {
             id: "C-L0-001".to_string(),
@@ -6715,6 +6747,7 @@ mod tests {
             superseded_by: None,
             build_id: None,
             created_at: String::new(),
+            ..Default::default()
         };
 
         save_node(&conn, &first, None).unwrap();
@@ -6754,6 +6787,7 @@ mod tests {
                 superseded_by: None,
                 build_id: None,
                 created_at: String::new(),
+                ..Default::default()
             };
             save_node(&conn, &node, None).unwrap();
         }
@@ -6878,6 +6912,7 @@ mod tests {
                 superseded_by: None,
                 build_id: None,
                 created_at: String::new(),
+                ..Default::default()
             };
             save_node(&conn, &node, None).unwrap();
         }
@@ -6899,6 +6934,7 @@ mod tests {
             superseded_by: None,
             build_id: None,
             created_at: String::new(),
+            ..Default::default()
         };
         save_node(&conn, &apex, None).unwrap();
 
@@ -6958,6 +6994,7 @@ mod tests {
             superseded_by: None,
             build_id: None,
             created_at: String::new(),
+            ..Default::default()
         };
         save_node(&conn, &node, None).unwrap();
 
@@ -6999,6 +7036,7 @@ mod tests {
                 superseded_by: None,
                 build_id: None,
                 created_at: String::new(),
+                ..Default::default()
             };
             save_node(&conn, &node, None).unwrap();
 
@@ -7212,30 +7250,30 @@ mod tests {
             depth: 0,
             headline: "initial".to_string(),
             distilled: "first version".to_string(),
-            time_range: Some(super::types::TimeRange {
+            time_range: Some(TimeRange {
                 start: Some("2026-04-08T00:00:00Z".to_string()),
                 end: Some("2026-04-08T01:00:00Z".to_string()),
             }),
             weight: 0.75,
-            narrative: super::types::NarrativeMultiZoom {
-                levels: vec![super::types::NarrativeLevel {
+            narrative: NarrativeMultiZoom {
+                levels: vec![NarrativeLevel {
                     zoom: 0,
                     text: "zoom-0 narrative".to_string(),
                 }],
             },
-            entities: vec![super::types::Entity {
+            entities: vec![Entity {
                 name: "Alice".to_string(),
                 role: "person".to_string(),
                 importance: 0.9,
                 liveness: "live".to_string(),
             }],
-            key_quotes: vec![super::types::KeyQuote {
+            key_quotes: vec![KeyQuote {
                 text: "hello".to_string(),
                 speaker_role: "human".to_string(),
                 importance: 0.5,
                 chunk_ref: None,
             }],
-            transitions: super::types::Transitions {
+            transitions: Transitions {
                 prior: "start".to_string(),
                 next: "next".to_string(),
             },
@@ -7275,7 +7313,7 @@ mod tests {
         assert_eq!(live.current_version, 2);
 
         // pyramid_node_versions holds the prior snapshot at version 1.
-        let prior = super::query::get_node_version(&conn, "vt", "n-1", 1)
+        let prior = query_get_node_version(&conn, "vt", "n-1", 1)
             .unwrap()
             .expect("version 1 snapshot missing");
         assert_eq!(prior.headline, "initial");
@@ -7284,7 +7322,7 @@ mod tests {
         assert_eq!(prior.current_version, 1);
 
         // Non-existent version returns None.
-        assert!(super::query::get_node_version(&conn, "vt", "n-1", 42)
+        assert!(query_get_node_version(&conn, "vt", "n-1", 42)
             .unwrap()
             .is_none());
 
@@ -7302,11 +7340,11 @@ mod tests {
         assert_eq!(live3.current_version, 3);
 
         // Version 2 now holds the "second" snapshot; version 1 is unchanged.
-        let v1 = super::query::get_node_version(&conn, "vt", "n-1", 1)
+        let v1 = query_get_node_version(&conn, "vt", "n-1", 1)
             .unwrap()
             .unwrap();
         assert_eq!(v1.headline, "initial");
-        let v2 = super::query::get_node_version(&conn, "vt", "n-1", 2)
+        let v2 = query_get_node_version(&conn, "vt", "n-1", 2)
             .unwrap()
             .unwrap();
         assert_eq!(v2.headline, "second");
@@ -7584,4 +7622,142 @@ pub fn bump_dead_letter_retry(conn: &Connection, slug: &str, id: i64) -> Result<
         rusqlite::params![slug, id],
     )?;
     Ok(())
+}
+
+// ── WS-INGEST-PRIMITIVE: Ingest record CRUD ─────────────────────────────────
+
+/// Column list for SELECT queries on pyramid_ingest_records.
+const INGEST_RECORD_COLUMNS: &str =
+    "id, slug, source_path, content_type, ingest_signature, file_hash, file_mtime, status, build_id, error_message, created_at, updated_at";
+
+/// Parse a row from `pyramid_ingest_records` into an `IngestRecord`.
+fn parse_ingest_record(row: &rusqlite::Row) -> rusqlite::Result<IngestRecord> {
+    Ok(IngestRecord {
+        id: row.get(0)?,
+        slug: row.get(1)?,
+        source_path: row.get(2)?,
+        content_type: row.get(3)?,
+        ingest_signature: row.get(4)?,
+        file_hash: row.get(5)?,
+        file_mtime: row.get(6)?,
+        status: row.get(7)?,
+        build_id: row.get(8)?,
+        error_message: row.get(9)?,
+        created_at: row.get(10)?,
+        updated_at: row.get(11)?,
+    })
+}
+
+/// Insert or update (upsert) an ingest record. On conflict (slug, source_path,
+/// ingest_signature), updates the mutable fields.
+pub fn save_ingest_record(conn: &Connection, record: &IngestRecord) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO pyramid_ingest_records
+            (slug, source_path, content_type, ingest_signature, file_hash, file_mtime, status, build_id, error_message)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+         ON CONFLICT(slug, source_path, ingest_signature) DO UPDATE SET
+            file_hash = excluded.file_hash,
+            file_mtime = excluded.file_mtime,
+            status = excluded.status,
+            build_id = excluded.build_id,
+            error_message = excluded.error_message,
+            updated_at = datetime('now')",
+        rusqlite::params![
+            record.slug,
+            record.source_path,
+            record.content_type,
+            record.ingest_signature,
+            record.file_hash,
+            record.file_mtime,
+            record.status,
+            record.build_id,
+            record.error_message,
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// Get a specific ingest record by (slug, source_path, ingest_signature).
+pub fn get_ingest_record(
+    conn: &Connection,
+    slug: &str,
+    source_path: &str,
+    sig: &str,
+) -> Result<Option<IngestRecord>> {
+    let sql = format!(
+        "SELECT {INGEST_RECORD_COLUMNS} FROM pyramid_ingest_records
+         WHERE slug = ?1 AND source_path = ?2 AND ingest_signature = ?3"
+    );
+    let result = conn
+        .query_row(&sql, rusqlite::params![slug, source_path, sig], parse_ingest_record)
+        .optional()?;
+    Ok(result)
+}
+
+/// Get all pending ingest records for a slug.
+pub fn get_pending_ingests(conn: &Connection, slug: &str) -> Result<Vec<IngestRecord>> {
+    let sql = format!(
+        "SELECT {INGEST_RECORD_COLUMNS} FROM pyramid_ingest_records
+         WHERE slug = ?1 AND status = 'pending'
+         ORDER BY created_at ASC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params![slug], parse_ingest_record)?;
+    let mut records = Vec::new();
+    for row in rows {
+        records.push(row?);
+    }
+    Ok(records)
+}
+
+/// Mark an ingest record as 'processing'.
+pub fn mark_ingest_processing(conn: &Connection, id: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE pyramid_ingest_records SET status = 'processing', updated_at = datetime('now') WHERE id = ?1",
+        rusqlite::params![id],
+    )?;
+    Ok(())
+}
+
+/// Mark an ingest record as 'complete' and link it to a build.
+pub fn mark_ingest_complete(conn: &Connection, id: i64, build_id: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE pyramid_ingest_records SET status = 'complete', build_id = ?2, error_message = NULL, updated_at = datetime('now') WHERE id = ?1",
+        rusqlite::params![id, build_id],
+    )?;
+    Ok(())
+}
+
+/// Mark an ingest record as 'failed' with an error message.
+pub fn mark_ingest_failed(conn: &Connection, id: i64, error: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE pyramid_ingest_records SET status = 'failed', error_message = ?2, updated_at = datetime('now') WHERE id = ?1",
+        rusqlite::params![id, error],
+    )?;
+    Ok(())
+}
+
+/// Mark all ingest records for a given slug + source_path as 'stale'.
+pub fn mark_ingest_stale(conn: &Connection, slug: &str, source_path: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE pyramid_ingest_records SET status = 'stale', updated_at = datetime('now') WHERE slug = ?1 AND source_path = ?2",
+        rusqlite::params![slug, source_path],
+    )?;
+    Ok(())
+}
+
+/// Get all ingest records for a slug (all statuses, all signatures).
+pub fn get_ingest_records_for_slug(conn: &Connection, slug: &str) -> Result<Vec<IngestRecord>> {
+    let sql = format!(
+        "SELECT {INGEST_RECORD_COLUMNS} FROM pyramid_ingest_records
+         WHERE slug = ?1
+         ORDER BY source_path ASC, created_at ASC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params![slug], parse_ingest_record)?;
+    let mut records = Vec::new();
+    for row in rows {
+        records.push(row?);
+    }
+    Ok(records)
 }

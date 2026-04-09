@@ -884,6 +884,7 @@ mod tests {
                 decided: "use X".to_string(),
                 why: "because Y".to_string(),
                 rejected: "Z".to_string(),
+                ..Default::default()
             }],
             terms: vec![Term {
                 term: "foo".to_string(),
@@ -896,6 +897,7 @@ mod tests {
             superseded_by: None,
             build_id: None,
             created_at: "2026-03-25T00:00:00Z".to_string(),
+            ..Default::default()
         }
     }
 

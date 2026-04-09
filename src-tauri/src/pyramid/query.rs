@@ -797,6 +797,7 @@ mod tests {
             superseded_by: None,
             build_id: None,
             created_at: "2025-01-01T00:00:00Z".to_string(),
+            ..Default::default()
         }
     }
 

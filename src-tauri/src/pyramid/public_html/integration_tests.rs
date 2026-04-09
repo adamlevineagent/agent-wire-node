@@ -54,6 +54,7 @@ fn fixture_node(id: &str, headline: &str, distilled: &str) -> PyramidNode {
         superseded_by: None,
         build_id: None,
         created_at: String::new(),
+        ..Default::default()
     }
 }
 

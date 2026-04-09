@@ -1297,3 +1297,79 @@ pub struct AffectedNode {
     /// Trace path from the source node to this node: [L0-id, L1-id, ...].
     pub path_from_source: Vec<String>,
 }
+
+// ── WS-INGEST-PRIMITIVE (§15 / Phase 1.5) ─────────────────────────────────
+
+/// Configuration parameters that affect how a source is chunked. Used to
+/// compute the `ingest_signature` that uniquely identifies a chunking
+/// configuration for multi-chain overlay detection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IngestConfig {
+    /// Target lines per chunk (from Tier2Config::chunk_target_lines).
+    pub chunk_target_lines: usize,
+    /// Target tokens per chunk. Currently unused (always 0) but the
+    /// ingest_signature formula from the plan includes it for forward compat.
+    #[serde(default)]
+    pub chunk_target_tokens: usize,
+    /// Code file extensions to include (code content type only).
+    #[serde(default)]
+    pub code_extensions: Vec<String>,
+    /// Directories to skip during scanning (code content type only).
+    #[serde(default)]
+    pub skip_dirs: Vec<String>,
+    /// Config file names to include (code content type only).
+    #[serde(default)]
+    pub config_files: Vec<String>,
+    /// Document file extensions (document content type only).
+    #[serde(default)]
+    pub doc_extensions: Vec<String>,
+}
+
+/// A single file discovered during source directory scanning.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SourceFile {
+    /// Absolute path to the file.
+    pub path: String,
+    /// ISO8601 modification time.
+    pub mtime: String,
+    /// SHA-256 content hash.
+    pub file_hash: String,
+    /// File size in bytes.
+    pub size: u64,
+}
+
+/// Persistent record of an ingested source file, tracked in
+/// `pyramid_ingest_records`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IngestRecord {
+    pub id: i64,
+    pub slug: String,
+    pub source_path: String,
+    pub content_type: String,
+    pub ingest_signature: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_mtime: Option<String>,
+    /// One of: pending, processing, complete, failed, stale
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Result of comparing current source files against existing ingest records.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChangeSet {
+    /// Files not yet recorded in ingest records.
+    pub new_files: Vec<SourceFile>,
+    /// Files whose hash or mtime changed since last ingest.
+    pub modified_files: Vec<SourceFile>,
+    /// Source paths in ingest records whose files no longer exist on disk.
+    pub deleted_paths: Vec<String>,
+    /// Files that are unchanged.
+    pub unchanged_count: usize,
+}

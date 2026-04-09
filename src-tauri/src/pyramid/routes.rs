@@ -1598,10 +1598,47 @@ pub fn pyramid_routes(
     let dl = dl_a.or(dl_b).unify().boxed();
     let top18 = top17.or(dl).unify().boxed();
 
+    // ── WS-INGEST-PRIMITIVE: Ingest scan, status, mark-stale ──
+
+    // POST /pyramid/:slug/ingest/scan — scan source directory, return change set
+    let ingest_scan = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("ingest"))
+        .and(warp::path("scan"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_ingest_scan));
+
+    // GET /pyramid/:slug/ingest/status — return all ingest records for slug
+    let ingest_status = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("ingest"))
+        .and(warp::path("status"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_ingest_status));
+
+    // POST /pyramid/:slug/ingest/mark-stale — mark specific source paths as stale
+    let ingest_mark_stale = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("ingest"))
+        .and(warp::path("mark-stale"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(warp::body::json())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_ingest_mark_stale));
+
+    let ig_a = ingest_scan.or(ingest_status).unify().boxed();
+    let ig = ig_a.or(ingest_mark_stale).unify().boxed();
+    let top19 = top18.or(ig).unify().boxed();
+
     // public_html is now mounted separately at the server level so it can
     // get a permissive CORS filter (the desktop API allowlist would block
     // form POSTs from the tunnel host).
-    top18
+    top19
 }
 
 /// Mount the post-agents-retro `/p/` web surface routes. These are
@@ -6613,4 +6650,180 @@ async fn handle_dead_letter_retry(
             ))
         }
     }
+}
+
+// ── WS-INGEST-PRIMITIVE: Ingest route handlers ─────────────────────────────
+
+/// POST /pyramid/:slug/ingest/scan — scan source directory, compare against
+/// existing ingest records, upsert new/modified records as 'pending', and
+/// return the ChangeSet. Emits `IngestScanComplete` event.
+async fn handle_ingest_scan(
+    slug_name: String,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    // Look up slug info to get source_path and content_type
+    let (source_path, content_type_str) = {
+        let conn = state.reader.lock().await;
+        match db::get_slug(&conn, &slug_name) {
+            Ok(Some(info)) => (info.source_path.clone(), info.content_type.as_str().to_string()),
+            Ok(None) => {
+                return Ok(json_error(
+                    warp::http::StatusCode::NOT_FOUND,
+                    &format!("Slug '{}' not found", slug_name),
+                ))
+            }
+            Err(e) => {
+                return Ok(json_error(
+                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    &e.to_string(),
+                ))
+            }
+        }
+    };
+
+    let content_type = match ContentType::from_str(&content_type_str) {
+        Some(ct) => ct,
+        None => {
+            return Ok(json_error(
+                warp::http::StatusCode::BAD_REQUEST,
+                &format!("Unknown content type: {}", content_type_str),
+            ))
+        }
+    };
+
+    // Scan for source files
+    let current_files = match ingest::scan_source_directory(&source_path, &content_type) {
+        Ok(files) => files,
+        Err(e) => {
+            return Ok(json_error(
+                warp::http::StatusCode::BAD_REQUEST,
+                &format!("Scan failed: {}", e),
+            ))
+        }
+    };
+
+    // Compute ingest signature
+    let config = ingest::default_ingest_config();
+    let sig = ingest::ingest_signature(&content_type, &config);
+
+    // Detect changes
+    let change_set = {
+        let conn = state.reader.lock().await;
+        match ingest::detect_changes(&conn, &slug_name, &sig, &current_files) {
+            Ok(cs) => cs,
+            Err(e) => {
+                return Ok(json_error(
+                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("Change detection failed: {}", e),
+                ))
+            }
+        }
+    };
+
+    // Upsert ingest records for new + modified files as 'pending'
+    {
+        let _lock = super::lock_manager::LockManager::global()
+            .write(&slug_name)
+            .await;
+        let conn = state.writer.lock().await;
+        let all_pending: Vec<&super::types::SourceFile> = change_set
+            .new_files
+            .iter()
+            .chain(change_set.modified_files.iter())
+            .collect();
+        for sf in &all_pending {
+            let record = super::types::IngestRecord {
+                id: 0, // auto-assigned by DB
+                slug: slug_name.clone(),
+                source_path: sf.path.clone(),
+                content_type: content_type_str.clone(),
+                ingest_signature: sig.clone(),
+                file_hash: Some(sf.file_hash.clone()),
+                file_mtime: Some(sf.mtime.clone()),
+                status: "pending".to_string(),
+                build_id: None,
+                error_message: None,
+                created_at: String::new(), // DB default
+                updated_at: String::new(), // DB default
+            };
+            if let Err(e) = db::save_ingest_record(&conn, &record) {
+                tracing::warn!("Failed to save ingest record for {}: {}", sf.path, e);
+            }
+        }
+
+        // Mark deleted paths as stale
+        for path in &change_set.deleted_paths {
+            if let Err(e) = db::mark_ingest_stale(&conn, &slug_name, path) {
+                tracing::warn!("Failed to mark stale for {}: {}", path, e);
+            }
+        }
+    }
+
+    // Emit event
+    let _ = state.build_event_bus.tx.send(
+        super::event_bus::TaggedBuildEvent {
+            slug: slug_name.clone(),
+            kind: super::event_bus::TaggedKind::IngestScanComplete {
+                new_count: change_set.new_files.len(),
+                modified_count: change_set.modified_files.len(),
+                deleted_count: change_set.deleted_paths.len(),
+            },
+        },
+    );
+
+    Ok(json_ok(&serde_json::json!({
+        "slug": slug_name,
+        "ingest_signature": sig,
+        "change_set": change_set,
+    })))
+}
+
+/// GET /pyramid/:slug/ingest/status — return all ingest records for the slug.
+async fn handle_ingest_status(
+    slug_name: String,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let conn = state.reader.lock().await;
+    match db::get_ingest_records_for_slug(&conn, &slug_name) {
+        Ok(records) => Ok(json_ok(&serde_json::json!({
+            "slug": slug_name,
+            "records": records,
+            "total": records.len(),
+        }))),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
+    }
+}
+
+/// Request body for POST /pyramid/:slug/ingest/mark-stale
+#[derive(Debug, Deserialize)]
+struct IngestMarkStaleBody {
+    source_paths: Vec<String>,
+}
+
+/// POST /pyramid/:slug/ingest/mark-stale — mark specific source paths as stale.
+async fn handle_ingest_mark_stale(
+    slug_name: String,
+    body: IngestMarkStaleBody,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let _lock = super::lock_manager::LockManager::global()
+        .write(&slug_name)
+        .await;
+    let conn = state.writer.lock().await;
+    let mut marked = 0usize;
+    let mut errors = Vec::new();
+    for path in &body.source_paths {
+        match db::mark_ingest_stale(&conn, &slug_name, path) {
+            Ok(()) => marked += 1,
+            Err(e) => errors.push(format!("{}: {}", path, e)),
+        }
+    }
+    Ok(json_ok(&serde_json::json!({
+        "slug": slug_name,
+        "marked_stale": marked,
+        "errors": errors,
+    })))
 }

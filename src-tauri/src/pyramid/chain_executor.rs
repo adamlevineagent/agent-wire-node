@@ -12206,6 +12206,7 @@ mod tests {
                 },
             ],
             post_build: vec![],
+            audience: Default::default(),
         };
 
         let mut ctx = ChainContext::new("slug", "code", ChunkProvider::empty());
@@ -12418,6 +12419,7 @@ mod tests {
                 superseded_by: None,
                 build_id: None,
                 created_at: String::new(),
+                ..Default::default()
             },
             PyramidNode {
                 id: "L1-001".to_string(),
@@ -12437,6 +12439,7 @@ mod tests {
                 superseded_by: None,
                 build_id: None,
                 created_at: String::new(),
+                ..Default::default()
             },
         ];
 
@@ -12488,6 +12491,7 @@ mod tests {
                 superseded_by: None,
                 build_id: None,
                 created_at: String::new(),
+                ..Default::default()
             },
             PyramidNode {
                 id: "L1-001".to_string(),
@@ -12507,6 +12511,7 @@ mod tests {
                 superseded_by: None,
                 build_id: None,
                 created_at: String::new(),
+                ..Default::default()
             },
         ];
         let target_nodes = vec![
@@ -12528,6 +12533,7 @@ mod tests {
                 superseded_by: None,
                 build_id: None,
                 created_at: String::new(),
+                ..Default::default()
             },
             PyramidNode {
                 id: "L2-001".to_string(),
@@ -12547,6 +12553,7 @@ mod tests {
                 superseded_by: None,
                 build_id: None,
                 created_at: String::new(),
+                ..Default::default()
             },
         ];
         let mut partial_current_nodes = current_nodes.clone();
@@ -13142,6 +13149,7 @@ mod tests {
             superseded_by: None,
             build_id: None,
             created_at: String::new(),
+            ..Default::default()
         };
         let l1 = crate::pyramid::types::PyramidNode {
             id: "L1-000".to_string(),
@@ -13161,6 +13169,7 @@ mod tests {
             superseded_by: None,
             build_id: None,
             created_at: String::new(),
+            ..Default::default()
         };
 
         crate::pyramid::db::save_node(&conn, &l0, None).unwrap();
@@ -14097,6 +14106,7 @@ mod tests {
                 },
             ],
             post_build: vec![],
+            audience: Default::default(),
         }
     }
 
@@ -14182,6 +14192,7 @@ mod tests {
                 },
             ],
             post_build: vec![],
+            audience: Default::default(),
         }
     }
 
