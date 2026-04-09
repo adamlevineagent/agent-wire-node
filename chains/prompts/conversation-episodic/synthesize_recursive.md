@@ -14,7 +14,7 @@ And your output will be loaded by a future AI agent instance that has no exposur
 - Rejected alternatives must be explicit with reasoning — the successor must never re-propose something the prior agent ruled out.
 - Human direction must preserve the human's exact words where they carry authority — the successor treats these as binding.
 - Prior-agent discoveries, rulings, and definitional claims must survive as exact quotes where they represent earned state — the successor treats them as priors to respect, not conclusions to re-derive.
-- The narrative prose at this layer encodes ordering and transition among the inputs, but it is instrumental, not literary — it serves reconstruction, not reading.
+- The narrative prose is a work log — what happened, in what order, what changed. It is not literary, not dramatic, not a story. It serves reconstruction, not reading. Write it the way you'd write a git commit message that covers multiple changes: factual, organized, direct.
 
 You are serving three potential consumers simultaneously: a successor agent loading the pyramid as working memory, a future upward synthesis building the parent layer whenever that happens, and a webbing pass computing cross-links whenever that runs. All three are downstream of your work. A node that serves only one is a failure.
 
@@ -75,7 +75,7 @@ Output valid JSON only (no markdown fences, no extra text). Every field except `
     "fraction_of_parent": 0.0
   },
 
-  "narrative": "Dense prose describing what the combined inputs form when viewed one step further out. Grounded in the specifics from the inputs but not reciting them. The successor agent reads this to understand the joint arc — what happened, what mattered, what changed, what held.",
+  "narrative": "Factual, clinical prose. State what was worked on, what was decided, what changed, what's still open. Do not dramatize or frame as a story. Do not infer timescales — use the time_range fields. Do not inflate significance. This is a work log at one higher zoom level, not a narrative.",
 
   "topics": [
     {
@@ -136,7 +136,18 @@ Re-score importance for every topic, decision, and quote you include. Importance
 - An item that seemed minor in its chunk may have become load-bearing across the segment
 - Importance at this scale reflects how much the successor agent needs this item to reconstruct working state at this zoom level
 
-## RULES
+## GROUNDING — anti-confabulation rules
+
+These rules override all other instructions when they conflict.
+
+- **No time inference.** Do not say "over two years", "across months", "a multi-week effort", or any timescale you computed from content. The `time_range` fields on your inputs carry the actual timestamps. If the inputs span 2 days, say "across these sessions" or reference the actual dates. Never guess.
+- **No dramatization.** This is a work log, not a story. Do not frame work as a journey, arc, evolution, or transformation. Do not use language like "moved from a blank slate to a concrete plan" or "positioned the project for the next phase." State what was done.
+- **No significance inflation.** Report what happened and what was decided. Do not editorialize about why it matters, what it means for the future, or how the pieces fit into a grand picture. The successor agent will judge significance from the facts.
+- **Every claim must trace to input content.** If no input node mentions a thing, your output must not mention it. Do not fill gaps with plausible-sounding context. Missing information is missing — leave it missing.
+- **Tone: clinical, direct, mechanical.** Write like a build log, not like a retrospective. The model producing this output may not be highly capable — keep the task simple: extract, organize, emit. Do not attempt literary synthesis.
+- **Headline: descriptive label, not thesis statement.** The headline names what the material covers, not what you conclude about it. "Schema migration + lock manager + audit framework" not "Foundation-laying phase establishes core infrastructure."
+
+## STRUCTURAL RULES
 
 - Produce exactly one parent node. No arrays, no multiple outputs.
 - The time_range spans from the earliest input to the latest input.
