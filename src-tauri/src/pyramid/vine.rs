@@ -889,33 +889,112 @@ pub async fn build_bunch(
         .map_err(|e| anyhow!("Ingest task panicked: {e}"))??;
     }
 
-    // Step 3: Build pyramid via shared pipeline helper
-    // Use a build-scoped reader so the build doesn't block CLI/frontend queries.
-    let reader = if let Some(data_dir) = state.data_dir.as_ref() {
-        let build_conn = db::open_pyramid_connection(&data_dir.join("pyramid.db"))?;
-        Arc::new(Mutex::new(build_conn))
-    } else {
-        state.reader.clone()
-    };
-    let writer = state.writer.clone();
-    let llm_config = {
-        let cfg = state.config.read().await;
-        cfg.clone()
+    // Step 3: Build pyramid via chain executor (uses conversation-episodic chain).
+    // run_build_from dispatches through the chain engine, producing episodic-quality
+    // bedrocks with the full schema (decisions, quotes, transitions, narrative).
+    let build_state = match state.with_build_reader() {
+        Ok(s) => s,
+        Err(_) => std::sync::Arc::new(PyramidState {
+            reader: state.reader.clone(),
+            writer: state.writer.clone(),
+            config: state.config.clone(),
+            active_build: state.active_build.clone(),
+            data_dir: state.data_dir.clone(),
+            stale_engines: state.stale_engines.clone(),
+            file_watchers: state.file_watchers.clone(),
+            vine_builds: state.vine_builds.clone(),
+            use_chain_engine: std::sync::atomic::AtomicBool::new(
+                state.use_chain_engine.load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            use_ir_executor: std::sync::atomic::AtomicBool::new(
+                state.use_ir_executor.load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            event_bus: state.event_bus.clone(),
+            operational: state.operational.clone(),
+            chains_dir: state.chains_dir.clone(),
+            remote_query_rate_limiter: state.remote_query_rate_limiter.clone(),
+            absorption_gate: state.absorption_gate.clone(),
+            build_event_bus: state.build_event_bus.clone(),
+            supabase_url: state.supabase_url.clone(),
+            supabase_anon_key: state.supabase_anon_key.clone(),
+            csrf_secret: state.csrf_secret,
+            dadbear_handle: state.dadbear_handle.clone(),
+        }),
     };
 
-    let failures = run_build_pipeline(
-        reader.clone(),
-        writer.clone(),
-        &llm_config,
+    let (write_tx, mut write_rx) = mpsc::channel::<build::WriteOp>(256);
+    let write_writer = state.writer.clone();
+    let writer_handle = tokio::spawn(async move {
+        while let Some(op) = write_rx.recv().await {
+            let conn = write_writer.lock().await;
+            let result = match op {
+                build::WriteOp::SaveNode { ref node, ref topics_json } => {
+                    db::save_node(&conn, node, topics_json.as_deref())
+                }
+                build::WriteOp::SaveStep { ref slug, ref step_type, chunk_index, depth, ref node_id, ref output_json, ref model, elapsed } => {
+                    db::save_step(&conn, slug, step_type, chunk_index, depth, node_id, output_json, model, elapsed)
+                }
+                build::WriteOp::UpdateParent { ref slug, ref node_id, ref parent_id } => {
+                    db::update_parent(&conn, slug, node_id, parent_id)
+                }
+                build::WriteOp::UpdateStats { ref slug } => {
+                    db::update_slug_stats(&conn, slug)
+                }
+                build::WriteOp::UpdateFileHash { ref slug, ref file_path, ref node_id } => {
+                    db::append_node_id_to_file_hash(&conn, slug, file_path, node_id)
+                }
+                build::WriteOp::Flush { done } => {
+                    let _ = done.send(());
+                    Ok(())
+                }
+            };
+            if let Err(e) = result {
+                tracing::error!("Vine bunch WriteOp failed: {e}");
+            }
+        }
+    });
+
+    let (progress_tx, _progress_rx) = mpsc::channel::<BuildProgress>(64);
+
+    let result = super::build_runner::run_build_from(
+        &build_state,
         &bunch_slug,
-        ContentType::Conversation,
+        0,
+        None,
+        None,
         cancel,
-        Some(&state.build_event_bus),
+        Some(progress_tx),
+        &write_tx,
+        None,
     )
-    .await?;
+    .await;
 
-    if failures > 0 {
-        warn!("Bunch '{bunch_slug}' completed with {failures} node failure(s)");
+    drop(write_tx);
+    let _ = writer_handle.await;
+
+    match &result {
+        Ok((_build_id, node_count, _activities)) => {
+            info!("Bunch '{bunch_slug}' built via chain executor: {node_count} nodes");
+        }
+        Err(e) => {
+            warn!("Bunch '{bunch_slug}' chain build failed, falling back to legacy: {e}");
+            // Fallback to legacy pipeline if chain executor fails
+            let reader = if let Some(data_dir) = state.data_dir.as_ref() {
+                let build_conn = db::open_pyramid_connection(&data_dir.join("pyramid.db"))?;
+                Arc::new(Mutex::new(build_conn))
+            } else {
+                state.reader.clone()
+            };
+            let writer = state.writer.clone();
+            let llm_config = {
+                let cfg = state.config.read().await;
+                cfg.clone()
+            };
+            run_build_pipeline(
+                reader, writer, &llm_config, &bunch_slug,
+                ContentType::Conversation, cancel, Some(&state.build_event_bus),
+            ).await?;
+        }
     }
 
     // Step 4: Read apex + penultimate layer
