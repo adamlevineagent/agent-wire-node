@@ -865,7 +865,23 @@ pub async fn build_bunch(
     evidence_mode: &str,
     cancel: &CancellationToken,
 ) -> Result<VineBunch> {
-    let bunch_slug = format!("{vine_slug}--bunch-{bunch_index:03}");
+    // Find a non-colliding bunch slug — increment index if the slug already has chunks
+    let bunch_slug = {
+        let conn = state.reader.lock().await;
+        let mut idx = bunch_index;
+        loop {
+            let candidate = format!("{vine_slug}--bunch-{idx:03}");
+            let has_chunks = conn.query_row(
+                "SELECT COUNT(*) FROM pyramid_chunks WHERE slug = ?1",
+                rusqlite::params![candidate],
+                |row| row.get::<_, i64>(0),
+            ).unwrap_or(0);
+            if has_chunks == 0 {
+                break candidate;
+            }
+            idx += 1;
+        }
+    };
     let jsonl_path = bunch.jsonl_path.clone();
     let session_id = bunch.session_id.clone();
 
