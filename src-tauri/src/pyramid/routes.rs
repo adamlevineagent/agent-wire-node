@@ -3235,6 +3235,44 @@ async fn handle_build(
                             done: s.progress.total,
                             total: s.progress.total,
                         };
+
+                        // ── Post-build hooks: vocab refresh + DADBEAR config ──
+                        {
+                            let conn = build_state.writer.lock().await;
+                            // Auto-refresh vocabulary catalog from apex
+                            match super::vocabulary::refresh_vocabulary(&conn, &slug_name) {
+                                Ok((_, count)) => tracing::info!("Post-build: vocabulary refreshed for '{}' ({} entries)", slug_name, count),
+                                Err(e) => tracing::warn!("Post-build: vocabulary refresh failed for '{}': {}", slug_name, e),
+                            }
+                            // Auto-create DADBEAR watch config for conversation slugs
+                            if let Ok(Some(info)) = slug::get_slug(&conn, &slug_name) {
+                                if info.content_type == super::types::ContentType::Conversation {
+                                    let source_dir = std::path::Path::new(&info.source_path);
+                                    let watch_dir = if source_dir.is_file() {
+                                        source_dir.parent().unwrap_or(source_dir).to_string_lossy().to_string()
+                                    } else {
+                                        info.source_path.clone()
+                                    };
+                                    let dadbear_cfg = super::types::DadbearWatchConfig {
+                                        id: 0,
+                                        slug: slug_name.clone(),
+                                        source_path: watch_dir.clone(),
+                                        content_type: "conversation".to_string(),
+                                        scan_interval_secs: 10,
+                                        debounce_secs: 30,
+                                        session_timeout_secs: 1800,
+                                        batch_size: 1,
+                                        enabled: true,
+                                        created_at: String::new(),
+                                        updated_at: String::new(),
+                                    };
+                                    match db::save_dadbear_config(&conn, &dadbear_cfg) {
+                                        Ok(_) => tracing::info!("Post-build: DADBEAR config created for '{}' → '{}'", slug_name, watch_dir),
+                                        Err(e) => tracing::warn!("Post-build: DADBEAR config failed for '{}': {}", slug_name, e),
+                                    }
+                                }
+                            }
+                        }
                     }
                     Err(ref e) => {
                         s.status = "failed".to_string();
