@@ -1,0 +1,133 @@
+{
+  "version": 1,
+  "_notes": [
+    "WS-COST-MODEL seed (episodic-memory-vine-canonical-v4 §15.17, §16.1).",
+    "Heuristic values used until pyramid_llm_audit contains observations.",
+    "Arithmetic target (per plan): ~8k input + ~1.5k output per extraction call,",
+    "~20 calls per conversation in fast mode (~$0.20),",
+    "~50 calls per conversation in deep mode (~$0.80).",
+    "Per-token rates default to pyramid_config.json Tier1 defaults ($0.19/M input,",
+    "$0.75/M output) unless input_price_per_million/output_price_per_million is set.",
+    "Any row inserted here is marked is_heuristic=1 and is overwritten by audit-derived",
+    "observations the first time a build touches the corresponding (chain_phase, model) pair."
+  ],
+  "entries": [
+    {
+      "chain_phase": "forward_pass",
+      "model": "default",
+      "avg_input_tokens": 8000,
+      "avg_output_tokens": 1500,
+      "calls_per_conversation": 20,
+      "input_price_per_million": 1.25,
+      "output_price_per_million": 5.00
+    },
+    {
+      "chain_phase": "reverse_pass",
+      "model": "default",
+      "avg_input_tokens": 8000,
+      "avg_output_tokens": 1500,
+      "calls_per_conversation": 20,
+      "input_price_per_million": 1.25,
+      "output_price_per_million": 5.00
+    },
+    {
+      "chain_phase": "combine_l0",
+      "model": "default",
+      "avg_input_tokens": 12000,
+      "avg_output_tokens": 2000,
+      "calls_per_conversation": 5,
+      "input_price_per_million": 1.25,
+      "output_price_per_million": 5.00
+    },
+    {
+      "chain_phase": "decompose",
+      "model": "default",
+      "avg_input_tokens": 6000,
+      "avg_output_tokens": 1500,
+      "calls_per_conversation": 4,
+      "input_price_per_million": 1.25,
+      "output_price_per_million": 5.00
+    },
+    {
+      "chain_phase": "decompose_delta",
+      "model": "default",
+      "avg_input_tokens": 6000,
+      "avg_output_tokens": 1500,
+      "calls_per_conversation": 3,
+      "input_price_per_million": 1.25,
+      "output_price_per_million": 5.00
+    },
+    {
+      "chain_phase": "extraction_schema",
+      "model": "default",
+      "avg_input_tokens": 8000,
+      "avg_output_tokens": 1500,
+      "calls_per_conversation": 20,
+      "input_price_per_million": 1.25,
+      "output_price_per_million": 5.00
+    },
+    {
+      "chain_phase": "extraction_schema",
+      "model": "deep",
+      "avg_input_tokens": 8000,
+      "avg_output_tokens": 1500,
+      "calls_per_conversation": 50,
+      "input_price_per_million": 1.25,
+      "output_price_per_million": 5.00
+    },
+    {
+      "chain_phase": "evidence_loop",
+      "model": "default",
+      "avg_input_tokens": 10000,
+      "avg_output_tokens": 1200,
+      "calls_per_conversation": 15,
+      "input_price_per_million": 1.25,
+      "output_price_per_million": 5.00
+    },
+    {
+      "chain_phase": "gap_processing",
+      "model": "default",
+      "avg_input_tokens": 6000,
+      "avg_output_tokens": 1000,
+      "calls_per_conversation": 6,
+      "input_price_per_million": 1.25,
+      "output_price_per_million": 5.00
+    },
+    {
+      "chain_phase": "l0_webbing",
+      "model": "default",
+      "avg_input_tokens": 5000,
+      "avg_output_tokens": 1000,
+      "calls_per_conversation": 8,
+      "input_price_per_million": 1.25,
+      "output_price_per_million": 5.00
+    },
+    {
+      "chain_phase": "l1_webbing",
+      "model": "default",
+      "avg_input_tokens": 5000,
+      "avg_output_tokens": 1000,
+      "calls_per_conversation": 6,
+      "input_price_per_million": 1.25,
+      "output_price_per_million": 5.00
+    },
+    {
+      "chain_phase": "l2_webbing",
+      "model": "default",
+      "avg_input_tokens": 5000,
+      "avg_output_tokens": 1000,
+      "calls_per_conversation": 4,
+      "input_price_per_million": 1.25,
+      "output_price_per_million": 5.00
+    },
+    {
+      "chain_phase": "enhance_question",
+      "model": "default",
+      "avg_input_tokens": 3000,
+      "avg_output_tokens": 800,
+      "calls_per_conversation": 2,
+      "input_price_per_million": 1.25,
+      "output_price_per_million": 5.00
+    }
+  ]
+}

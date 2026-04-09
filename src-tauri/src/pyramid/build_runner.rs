@@ -178,6 +178,15 @@ pub async fn run_build_from(
     write_tx: &mpsc::Sender<WriteOp>,
     layer_tx: Option<mpsc::Sender<LayerEvent>>,
 ) -> Result<(String, i32, Vec<super::types::StepActivity>)> {
+    // ── 0. WS-CONCURRENCY (§15.16 races 1/3/7): serialize builds on the
+    // same slug. Two builds, demand-gen vs build, and demand-gen vs
+    // stale-refresh all contend for this write lock. Acquire BEFORE any
+    // DB work; the guard is held across the entire build and released on
+    // drop / cancellation / panic.
+    let _slug_write_guard = super::lock_manager::LockManager::global()
+        .write(slug_name)
+        .await;
+
     // ── 1. Determine content type ────────────────────────────────────────
     let content_type = {
         let conn = state.reader.lock().await;

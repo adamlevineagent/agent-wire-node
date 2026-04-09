@@ -817,6 +817,7 @@ async fn answer_single_question(
                 superseded_by: None,
                 build_id: None,
                 created_at: chrono::Utc::now().to_rfc3339(),
+                ..Default::default()
             },
             evidence: vec![],
             missing: vec![format!(
@@ -1108,6 +1109,7 @@ Respond with ONLY a JSON object:
             decided: d.decided,
             why: d.why,
             rejected: d.rejected.unwrap_or_default(),
+            ..Default::default()
         })
         .collect();
 
@@ -1195,6 +1197,7 @@ Respond with ONLY a JSON object:
         superseded_by: None,
         build_id: None,
         created_at: chrono::Utc::now().to_rfc3339(),
+        ..Default::default()
     };
 
     let missing = raw.missing.unwrap_or_default();
@@ -1763,6 +1766,7 @@ Respond with ONLY a JSON object:
                 superseded_by: None,
                 build_id: Some(build_id.to_string()),
                 created_at: chrono::Utc::now().to_rfc3339(),
+                ..Default::default()
             };
 
             all_nodes.push(node);

@@ -5,7 +5,7 @@
 // JSON strings and parsed/serialized via serde_json on read/write.
 
 use anyhow::{Context, Result};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use std::collections::HashMap;
 
 use super::naming::{clean_headline, headline_for_node};
@@ -475,6 +475,113 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
         [],
     );
 
+    // ── WS-SCHEMA-V2 (§15.2, §15.7): PyramidNode schema v2 + per-contribution
+    //    supersession chain via an append-only pyramid_node_versions table.
+    //
+    //    All column additions are nullable-or-defaulted so existing pyramids
+    //    load unchanged. Append NEW migrations BELOW this block so later
+    //    Phase 1 workstreams (FTS5, DEADLETTER, COST-MODEL) can also append
+    //    without conflict.
+    let _ = conn.execute(
+        "ALTER TABLE pyramid_nodes ADD COLUMN time_range_start TEXT",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE pyramid_nodes ADD COLUMN time_range_end TEXT",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE pyramid_nodes ADD COLUMN weight REAL DEFAULT 1.0",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE pyramid_nodes ADD COLUMN provisional INTEGER DEFAULT 0",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE pyramid_nodes ADD COLUMN promoted_from TEXT",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE pyramid_nodes ADD COLUMN narrative_json TEXT",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE pyramid_nodes ADD COLUMN entities_json TEXT",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE pyramid_nodes ADD COLUMN key_quotes_json TEXT",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE pyramid_nodes ADD COLUMN transitions_json TEXT",
+        [],
+    );
+    // Per-contribution version chain pointer. Distinct from the legacy
+    // `build_version` column (build-sweep counter). See §15.7 "build_version
+    // vs current_version".
+    let _ = conn.execute(
+        "ALTER TABLE pyramid_nodes ADD COLUMN current_version INTEGER NOT NULL DEFAULT 1",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE pyramid_nodes ADD COLUMN current_version_chain_phase TEXT",
+        [],
+    );
+
+    let _ = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pyramid_nodes_provisional \
+             ON pyramid_nodes(slug, provisional)",
+        [],
+    );
+    let _ = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pyramid_nodes_time_range \
+             ON pyramid_nodes(slug, time_range_start)",
+        [],
+    );
+
+    // Append-only per-contribution version history. See §15.7. The FK is on
+    // slug only — node-level FK would complicate the snapshot-then-update
+    // transaction and isn't needed because we write via a SAVEPOINT.
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS pyramid_node_versions (
+            slug TEXT NOT NULL REFERENCES pyramid_slugs(slug) ON DELETE CASCADE,
+            node_id TEXT NOT NULL,
+            version INTEGER NOT NULL,
+            headline TEXT NOT NULL DEFAULT '',
+            distilled TEXT NOT NULL DEFAULT '',
+            topics TEXT,
+            corrections TEXT,
+            decisions TEXT,
+            terms TEXT,
+            dead_ends TEXT,
+            self_prompt TEXT,
+            children TEXT,
+            parent_id TEXT,
+            time_range_start TEXT,
+            time_range_end TEXT,
+            weight REAL,
+            narrative_json TEXT,
+            entities_json TEXT,
+            key_quotes_json TEXT,
+            transitions_json TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            chain_phase TEXT,
+            build_id TEXT,
+            superseded_by_version INTEGER,
+            supersession_reason TEXT,
+            PRIMARY KEY (slug, node_id, version)
+        );
+        CREATE INDEX IF NOT EXISTS idx_node_versions_node
+            ON pyramid_node_versions(slug, node_id, version DESC);
+        CREATE INDEX IF NOT EXISTS idx_node_versions_build
+            ON pyramid_node_versions(slug, build_id);
+        ",
+    )?;
+    // ── end WS-SCHEMA-V2 migration block ──────────────────────────────────
+
     // ── Compensating DELETE triggers for FK CASCADE on existing DBs ──
     // (SQLite cannot ALTER FK constraints, so these triggers handle cascading
     //  deletes for tables created before CASCADE was added)
@@ -853,6 +960,62 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
         "ALTER TABLE pyramid_slugs ADD COLUMN updated_at TEXT NOT NULL DEFAULT (datetime('now'))",
         [],
     );
+
+    // WS-COST-MODEL: transparency + preview-gate cost estimation per chain phase.
+    // Cold-start seeding + observation-based recompute are handled by
+    // `pyramid::cost_model::{apply_seed, recompute_from_audit}`. This block only
+    // ensures the table exists.
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS pyramid_chain_cost_model (
+            chain_phase TEXT NOT NULL,
+            model TEXT NOT NULL,
+            avg_input_tokens REAL NOT NULL DEFAULT 0,
+            avg_output_tokens REAL NOT NULL DEFAULT 0,
+            calls_per_conversation REAL NOT NULL DEFAULT 0,
+            usd_per_call REAL NOT NULL DEFAULT 0,
+            usd_per_conversation REAL NOT NULL DEFAULT 0,
+            is_heuristic INTEGER NOT NULL DEFAULT 1,
+            sample_count INTEGER NOT NULL DEFAULT 0,
+            updated_at INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (chain_phase, model)
+        );
+        CREATE INDEX IF NOT EXISTS idx_chain_cost_model_phase
+            ON pyramid_chain_cost_model(chain_phase);
+        ",
+    )?;
+
+    // WS-DEADLETTER (§15.18): persistent record of chain steps that
+    // exhausted retries. Operator surface via HTTP routes. `status` is a
+    // simple state machine: 'open' -> 'resolved' | 'skipped' (terminal).
+    // Snapshots (step_snapshot, system_prompt, defaults_snapshot,
+    // input_snapshot) let us re-dispatch without reloading chain YAML.
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS pyramid_dead_letter (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            slug TEXT NOT NULL,
+            chain_id TEXT,
+            step_name TEXT NOT NULL,
+            step_primitive TEXT NOT NULL,
+            chunk_index INTEGER,
+            input_snapshot TEXT,
+            step_snapshot TEXT,
+            system_prompt TEXT,
+            defaults_snapshot TEXT,
+            error_text TEXT NOT NULL,
+            error_kind TEXT NOT NULL,
+            retry_count INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'open',
+            note TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            last_seen_at TEXT NOT NULL DEFAULT (datetime('now')),
+            resolved_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_dead_letter_slug_status
+            ON pyramid_dead_letter(slug, status);
+        ",
+    )?;
 
     Ok(())
 }
@@ -1805,12 +1968,81 @@ pub fn node_from_row(row: &rusqlite::Row) -> rusqlite::Result<PyramidNode> {
             .unwrap_or(None),
         build_id: row.get::<_, Option<String>>("build_id").unwrap_or(None),
         created_at: row.get::<_, String>("created_at").unwrap_or_default(),
+
+        // ── WS-SCHEMA-V2 (§15.2) new columns ──
+        // All reads are tolerant: if the SELECT list doesn't include a column
+        // (e.g. `get_node_summary` which uses a hand-written list), or the
+        // JSON is NULL, we fall back to Default so existing pyramids and
+        // lightweight queries round-trip cleanly.
+        time_range: {
+            let start = row
+                .get::<_, Option<String>>("time_range_start")
+                .ok()
+                .flatten();
+            let end = row.get::<_, Option<String>>("time_range_end").ok().flatten();
+            if start.is_some() || end.is_some() {
+                Some(super::types::TimeRange { start, end })
+            } else {
+                None
+            }
+        },
+        weight: row
+            .get::<_, Option<f64>>("weight")
+            .ok()
+            .flatten()
+            .unwrap_or(0.0),
+        provisional: row
+            .get::<_, Option<i64>>("provisional")
+            .ok()
+            .flatten()
+            .map(|v| v != 0)
+            .unwrap_or(false),
+        promoted_from: row
+            .get::<_, Option<String>>("promoted_from")
+            .ok()
+            .flatten(),
+        narrative: row
+            .get::<_, Option<String>>("narrative_json")
+            .ok()
+            .flatten()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default(),
+        entities: row
+            .get::<_, Option<String>>("entities_json")
+            .ok()
+            .flatten()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default(),
+        key_quotes: row
+            .get::<_, Option<String>>("key_quotes_json")
+            .ok()
+            .flatten()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default(),
+        transitions: row
+            .get::<_, Option<String>>("transitions_json")
+            .ok()
+            .flatten()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default(),
+        current_version: row
+            .get::<_, Option<i64>>("current_version")
+            .ok()
+            .flatten()
+            .unwrap_or(1),
+        current_version_chain_phase: row
+            .get::<_, Option<String>>("current_version_chain_phase")
+            .ok()
+            .flatten(),
     })
 }
 
 const NODE_SELECT_COLS: &str =
     "id, slug, depth, chunk_index, headline, distilled, topics, corrections, decisions, \
-     terms, dead_ends, self_prompt, children, parent_id, superseded_by, build_id, created_at";
+     terms, dead_ends, self_prompt, children, parent_id, superseded_by, build_id, created_at, \
+     time_range_start, time_range_end, weight, provisional, promoted_from, \
+     narrative_json, entities_json, key_quotes_json, transitions_json, \
+     current_version, current_version_chain_phase";
 
 /// Save (upsert) a PyramidNode. Serializes all Vec fields to JSON strings.
 ///
@@ -1818,6 +2050,41 @@ const NODE_SELECT_COLS: &str =
 /// string (useful when the build pipeline already has the raw JSON). If None,
 /// topics are serialized from `node.topics`.
 pub fn save_node(conn: &Connection, node: &PyramidNode, topics_json: Option<&str>) -> Result<()> {
+    // WS-SCHEMA-V2 (§15.7 "Unified write path"): if a row already exists for
+    // (slug, id), route the write through apply_supersession so the prior
+    // content is snapshotted into pyramid_node_versions before the UPDATE.
+    // Only the first write of a (slug, id) pair takes the bare INSERT path
+    // below. Provisional rows mutate in place via mutate_provisional_node.
+    let row_exists: bool = conn
+        .query_row(
+            "SELECT 1 FROM pyramid_nodes WHERE slug = ?1 AND id = ?2",
+            rusqlite::params![node.slug, node.id],
+            |_| Ok(true),
+        )
+        .optional()?
+        .unwrap_or(false);
+
+    if row_exists {
+        let is_provisional: bool = conn
+            .query_row(
+                "SELECT COALESCE(provisional, 0) FROM pyramid_nodes WHERE slug = ?1 AND id = ?2",
+                rusqlite::params![node.slug, node.id],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap_or(0)
+            != 0;
+        if is_provisional {
+            mutate_provisional_node(conn, &node.slug, &node.id, node)?;
+        } else {
+            // Default rebuild phase/reason. Callers that need a different
+            // reason (delta, collapse, promotion, agent_writeback,
+            // stale_refresh) should invoke apply_supersession directly.
+            apply_supersession(conn, &node.slug, &node.id, node, "rebuild", "rebuild", "")?;
+        }
+        return Ok(());
+    }
+
+    // First write: plain INSERT path.
     let topics = match topics_json {
         Some(s) => s.to_string(),
         None => serde_json::to_string(&node.topics)?,
@@ -1829,27 +2096,26 @@ pub fn save_node(conn: &Connection, node: &PyramidNode, topics_json: Option<&str
     let children = serde_json::to_string(&node.children)?;
     let headline = clean_headline(&node.headline).unwrap_or_else(|| headline_for_node(node, None));
 
+    let (time_range_start, time_range_end) = match &node.time_range {
+        Some(tr) => (tr.start.clone(), tr.end.clone()),
+        None => (None, None),
+    };
+    let narrative_json = serde_json::to_string(&node.narrative)?;
+    let entities_json = serde_json::to_string(&node.entities)?;
+    let key_quotes_json = serde_json::to_string(&node.key_quotes)?;
+    let transitions_json = serde_json::to_string(&node.transitions)?;
+    let provisional_i: i64 = if node.provisional { 1 } else { 0 };
+    let weight = if node.weight == 0.0 { 1.0 } else { node.weight };
+
     conn.execute(
         "INSERT INTO pyramid_nodes
             (id, slug, depth, chunk_index, headline, distilled, topics, corrections, decisions,
-             terms, dead_ends, self_prompt, children, parent_id, superseded_by, build_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
-         ON CONFLICT(slug, id) DO UPDATE SET
-            depth = excluded.depth,
-            chunk_index = excluded.chunk_index,
-            headline = excluded.headline,
-            distilled = excluded.distilled,
-            topics = excluded.topics,
-            corrections = excluded.corrections,
-            decisions = excluded.decisions,
-            terms = excluded.terms,
-            dead_ends = excluded.dead_ends,
-            self_prompt = excluded.self_prompt,
-            children = excluded.children,
-            parent_id = excluded.parent_id,
-            superseded_by = excluded.superseded_by,
-            build_id = excluded.build_id,
-            build_version = build_version + 1",
+             terms, dead_ends, self_prompt, children, parent_id, superseded_by, build_id,
+             time_range_start, time_range_end, weight, provisional, promoted_from,
+             narrative_json, entities_json, key_quotes_json, transitions_json,
+             current_version, current_version_chain_phase)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
+                 ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)",
         rusqlite::params![
             node.id,
             node.slug,
@@ -1867,10 +2133,268 @@ pub fn save_node(conn: &Connection, node: &PyramidNode, topics_json: Option<&str
             node.parent_id,
             node.superseded_by,
             node.build_id,
+            time_range_start,
+            time_range_end,
+            weight,
+            provisional_i,
+            node.promoted_from,
+            narrative_json,
+            entities_json,
+            key_quotes_json,
+            transitions_json,
+            1_i64,
+            node.current_version_chain_phase,
         ],
     )?;
 
     Ok(())
+}
+
+/// WS-SCHEMA-V2 (§15.7): Apply a per-contribution supersession.
+///
+/// Snapshots the CURRENT row of `pyramid_nodes(slug, id)` into
+/// `pyramid_node_versions` at its current version, then UPDATEs the live row
+/// in place with the new content and bumps `current_version`. Runs inside a
+/// single SAVEPOINT so the snapshot+update is atomic and nests safely inside
+/// an outer transaction.
+///
+/// Distinct from the legacy `supersede_node` (per-build-sweep tombstoning).
+/// Both coexist: this helper is per-contribution; the legacy one is per-build.
+///
+/// `supersession_reason` is one of: "delta" | "collapse" | "rebuild" |
+/// "promotion" | "agent_writeback" | "stale_refresh".
+///
+/// Bedrock immutability enforcement (§15.7) is a per-chain policy applied
+/// by callers (composition delta) based on chain configuration before
+/// invoking this helper. The helper itself is the mechanical snapshot-then-
+/// update primitive.
+///
+/// Returns the NEW current_version number assigned to the live row.
+pub fn apply_supersession(
+    conn: &Connection,
+    slug: &str,
+    node_id: &str,
+    new_node: &PyramidNode,
+    chain_phase: &str,
+    supersession_reason: &str,
+    _requesting_chain_id: &str,
+) -> Result<i64> {
+    let savepoint_name = "apply_supersession_sp";
+    conn.execute_batch(&format!("SAVEPOINT {savepoint_name};"))?;
+
+    let result: Result<i64> = (|| {
+        // 1. Snapshot the current row into pyramid_node_versions, using its
+        //    existing current_version as the snapshot version number.
+        let snapshot_rows = conn.execute(
+            "INSERT INTO pyramid_node_versions (
+                slug, node_id, version,
+                headline, distilled, topics, corrections, decisions,
+                terms, dead_ends, self_prompt, children, parent_id,
+                time_range_start, time_range_end, weight,
+                narrative_json, entities_json, key_quotes_json, transitions_json,
+                chain_phase, build_id, supersession_reason
+             )
+             SELECT
+                slug, id, COALESCE(current_version, 1),
+                headline, distilled, topics, corrections, decisions,
+                terms, dead_ends, self_prompt, children, parent_id,
+                time_range_start, time_range_end, weight,
+                narrative_json, entities_json, key_quotes_json, transitions_json,
+                COALESCE(current_version_chain_phase, ''), build_id, ?3
+             FROM pyramid_nodes
+             WHERE slug = ?1 AND id = ?2",
+            rusqlite::params![slug, node_id, supersession_reason],
+        )?;
+        if snapshot_rows == 0 {
+            return Err(anyhow::anyhow!(
+                "apply_supersession: no row for ({slug}, {node_id})"
+            ));
+        }
+
+        // 2. Serialize new content for the UPDATE.
+        let topics = serde_json::to_string(&new_node.topics)?;
+        let corrections = serde_json::to_string(&new_node.corrections)?;
+        let decisions = serde_json::to_string(&new_node.decisions)?;
+        let terms = serde_json::to_string(&new_node.terms)?;
+        let dead_ends = serde_json::to_string(&new_node.dead_ends)?;
+        let children = serde_json::to_string(&new_node.children)?;
+        let headline = clean_headline(&new_node.headline)
+            .unwrap_or_else(|| headline_for_node(new_node, None));
+        let (time_range_start, time_range_end) = match &new_node.time_range {
+            Some(tr) => (tr.start.clone(), tr.end.clone()),
+            None => (None, None),
+        };
+        let narrative_json = serde_json::to_string(&new_node.narrative)?;
+        let entities_json = serde_json::to_string(&new_node.entities)?;
+        let key_quotes_json = serde_json::to_string(&new_node.key_quotes)?;
+        let transitions_json = serde_json::to_string(&new_node.transitions)?;
+        let weight = if new_node.weight == 0.0 { 1.0 } else { new_node.weight };
+
+        // 3. UPDATE the live row. Clears the legacy `superseded_by` tombstone
+        //    so a previously build-swept row doesn't ghost out of
+        //    live_pyramid_nodes after this write.
+        let updated = conn.execute(
+            "UPDATE pyramid_nodes SET
+                depth = ?3,
+                chunk_index = ?4,
+                headline = ?5,
+                distilled = ?6,
+                topics = ?7,
+                corrections = ?8,
+                decisions = ?9,
+                terms = ?10,
+                dead_ends = ?11,
+                self_prompt = ?12,
+                children = ?13,
+                parent_id = ?14,
+                build_id = COALESCE(?15, build_id),
+                time_range_start = ?16,
+                time_range_end = ?17,
+                weight = ?18,
+                promoted_from = COALESCE(?19, promoted_from),
+                narrative_json = ?20,
+                entities_json = ?21,
+                key_quotes_json = ?22,
+                transitions_json = ?23,
+                current_version = COALESCE(current_version, 1) + 1,
+                current_version_chain_phase = ?24,
+                superseded_by = NULL,
+                build_version = build_version + 1
+             WHERE slug = ?1 AND id = ?2",
+            rusqlite::params![
+                slug,
+                node_id,
+                new_node.depth,
+                new_node.chunk_index,
+                headline,
+                new_node.distilled,
+                topics,
+                corrections,
+                decisions,
+                terms,
+                dead_ends,
+                new_node.self_prompt,
+                children,
+                new_node.parent_id,
+                new_node.build_id,
+                time_range_start,
+                time_range_end,
+                weight,
+                new_node.promoted_from,
+                narrative_json,
+                entities_json,
+                key_quotes_json,
+                transitions_json,
+                chain_phase,
+            ],
+        )?;
+        if updated == 0 {
+            return Err(anyhow::anyhow!(
+                "apply_supersession: UPDATE matched 0 rows for ({slug}, {node_id})"
+            ));
+        }
+
+        // 4. Return the new current_version.
+        let new_version: i64 = conn.query_row(
+            "SELECT current_version FROM pyramid_nodes WHERE slug = ?1 AND id = ?2",
+            rusqlite::params![slug, node_id],
+            |r| r.get(0),
+        )?;
+        Ok(new_version)
+    })();
+
+    match result {
+        Ok(v) => {
+            conn.execute_batch(&format!("RELEASE SAVEPOINT {savepoint_name};"))?;
+            Ok(v)
+        }
+        Err(e) => {
+            let _ = conn.execute_batch(&format!(
+                "ROLLBACK TO SAVEPOINT {savepoint_name}; RELEASE SAVEPOINT {savepoint_name};"
+            ));
+            Err(e)
+        }
+    }
+}
+
+/// WS-SCHEMA-V2 (§15.7): Mutate a provisional node in place WITHOUT writing
+/// to the versions table. Provisional history isn't durable — only the
+/// promotion-to-canonical transition is versioned, via `apply_supersession`
+/// with `supersession_reason = "promotion"`.
+///
+/// Returns the number of rows updated (0 if the target row isn't
+/// provisional, 1 on success).
+pub fn mutate_provisional_node(
+    conn: &Connection,
+    slug: &str,
+    node_id: &str,
+    new_node: &PyramidNode,
+) -> Result<usize> {
+    let topics = serde_json::to_string(&new_node.topics)?;
+    let corrections = serde_json::to_string(&new_node.corrections)?;
+    let decisions = serde_json::to_string(&new_node.decisions)?;
+    let terms = serde_json::to_string(&new_node.terms)?;
+    let dead_ends = serde_json::to_string(&new_node.dead_ends)?;
+    let children = serde_json::to_string(&new_node.children)?;
+    let headline = clean_headline(&new_node.headline)
+        .unwrap_or_else(|| headline_for_node(new_node, None));
+    let (time_range_start, time_range_end) = match &new_node.time_range {
+        Some(tr) => (tr.start.clone(), tr.end.clone()),
+        None => (None, None),
+    };
+    let narrative_json = serde_json::to_string(&new_node.narrative)?;
+    let entities_json = serde_json::to_string(&new_node.entities)?;
+    let key_quotes_json = serde_json::to_string(&new_node.key_quotes)?;
+    let transitions_json = serde_json::to_string(&new_node.transitions)?;
+    let weight = if new_node.weight == 0.0 { 1.0 } else { new_node.weight };
+
+    let updated = conn.execute(
+        "UPDATE pyramid_nodes SET
+            depth = ?3,
+            chunk_index = ?4,
+            headline = ?5,
+            distilled = ?6,
+            topics = ?7,
+            corrections = ?8,
+            decisions = ?9,
+            terms = ?10,
+            dead_ends = ?11,
+            self_prompt = ?12,
+            children = ?13,
+            parent_id = ?14,
+            time_range_start = ?15,
+            time_range_end = ?16,
+            weight = ?17,
+            narrative_json = ?18,
+            entities_json = ?19,
+            key_quotes_json = ?20,
+            transitions_json = ?21
+         WHERE slug = ?1 AND id = ?2 AND provisional = 1",
+        rusqlite::params![
+            slug,
+            node_id,
+            new_node.depth,
+            new_node.chunk_index,
+            headline,
+            new_node.distilled,
+            topics,
+            corrections,
+            decisions,
+            terms,
+            dead_ends,
+            new_node.self_prompt,
+            children,
+            new_node.parent_id,
+            time_range_start,
+            time_range_end,
+            weight,
+            narrative_json,
+            entities_json,
+            key_quotes_json,
+            transitions_json,
+        ],
+    )?;
+    Ok(updated)
 }
 
 /// Get a single node by slug and node ID.
@@ -6674,6 +7198,140 @@ mod tests {
             .unwrap();
         assert_eq!(handle_link.weight, Some(0.9));
     }
+
+    // ── WS-SCHEMA-V2 integration test ───────────────────────────────────
+    #[test]
+    fn ws_schema_v2_versioning_round_trip() {
+        let conn = test_conn();
+        create_slug(&conn, "vt", &ContentType::Code, "").unwrap();
+
+        // Write v1 via save_node (first write — INSERT path).
+        let mut node = PyramidNode {
+            id: "n-1".to_string(),
+            slug: "vt".to_string(),
+            depth: 0,
+            headline: "initial".to_string(),
+            distilled: "first version".to_string(),
+            time_range: Some(super::types::TimeRange {
+                start: Some("2026-04-08T00:00:00Z".to_string()),
+                end: Some("2026-04-08T01:00:00Z".to_string()),
+            }),
+            weight: 0.75,
+            narrative: super::types::NarrativeMultiZoom {
+                levels: vec![super::types::NarrativeLevel {
+                    zoom: 0,
+                    text: "zoom-0 narrative".to_string(),
+                }],
+            },
+            entities: vec![super::types::Entity {
+                name: "Alice".to_string(),
+                role: "person".to_string(),
+                importance: 0.9,
+                liveness: "live".to_string(),
+            }],
+            key_quotes: vec![super::types::KeyQuote {
+                text: "hello".to_string(),
+                speaker_role: "human".to_string(),
+                importance: 0.5,
+                chunk_ref: None,
+            }],
+            transitions: super::types::Transitions {
+                prior: "start".to_string(),
+                next: "next".to_string(),
+            },
+            current_version: 1,
+            ..Default::default()
+        };
+        save_node(&conn, &node, None).unwrap();
+
+        // Round-trip read: every new field survives INSERT + SELECT.
+        let loaded = get_node(&conn, "vt", "n-1").unwrap().unwrap();
+        assert_eq!(loaded.headline, "initial");
+        assert_eq!(loaded.distilled, "first version");
+        assert_eq!(loaded.current_version, 1);
+        assert_eq!(loaded.weight, 0.75);
+        assert!(loaded.time_range.is_some());
+        assert_eq!(
+            loaded.time_range.as_ref().unwrap().start.as_deref(),
+            Some("2026-04-08T00:00:00Z")
+        );
+        assert_eq!(loaded.narrative.levels.len(), 1);
+        assert_eq!(loaded.narrative.levels[0].text, "zoom-0 narrative");
+        assert_eq!(loaded.entities.len(), 1);
+        assert_eq!(loaded.entities[0].name, "Alice");
+        assert_eq!(loaded.key_quotes.len(), 1);
+        assert_eq!(loaded.transitions.prior, "start");
+
+        // Second write via save_node routes through apply_supersession.
+        node.headline = "second".to_string();
+        node.distilled = "second version".to_string();
+        node.narrative.levels[0].text = "zoom-0 revised".to_string();
+        save_node(&conn, &node, None).unwrap();
+
+        // Live row is the new content, current_version bumped.
+        let live = get_node(&conn, "vt", "n-1").unwrap().unwrap();
+        assert_eq!(live.headline, "second");
+        assert_eq!(live.distilled, "second version");
+        assert_eq!(live.current_version, 2);
+
+        // pyramid_node_versions holds the prior snapshot at version 1.
+        let prior = super::query::get_node_version(&conn, "vt", "n-1", 1)
+            .unwrap()
+            .expect("version 1 snapshot missing");
+        assert_eq!(prior.headline, "initial");
+        assert_eq!(prior.distilled, "first version");
+        assert_eq!(prior.narrative.levels[0].text, "zoom-0 narrative");
+        assert_eq!(prior.current_version, 1);
+
+        // Non-existent version returns None.
+        assert!(super::query::get_node_version(&conn, "vt", "n-1", 42)
+            .unwrap()
+            .is_none());
+
+        // Third write: apply_supersession directly with a custom reason.
+        let mut v3 = node.clone();
+        v3.headline = "third".to_string();
+        let new_version = apply_supersession(
+            &conn, "vt", "n-1", &v3, "delta", "delta", "test-chain",
+        )
+        .unwrap();
+        assert_eq!(new_version, 3);
+
+        let live3 = get_node(&conn, "vt", "n-1").unwrap().unwrap();
+        assert_eq!(live3.headline, "third");
+        assert_eq!(live3.current_version, 3);
+
+        // Version 2 now holds the "second" snapshot; version 1 is unchanged.
+        let v1 = super::query::get_node_version(&conn, "vt", "n-1", 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(v1.headline, "initial");
+        let v2 = super::query::get_node_version(&conn, "vt", "n-1", 2)
+            .unwrap()
+            .unwrap();
+        assert_eq!(v2.headline, "second");
+
+        // mutate_provisional_node is a no-op on a canonical (provisional=0) row.
+        let mut m = v3.clone();
+        m.headline = "provisional change".to_string();
+        let changed = mutate_provisional_node(&conn, "vt", "n-1", &m).unwrap();
+        assert_eq!(changed, 0);
+        let still = get_node(&conn, "vt", "n-1").unwrap().unwrap();
+        assert_eq!(still.headline, "third"); // untouched
+
+        // Flip the row to provisional and verify mutate_provisional_node works.
+        conn.execute(
+            "UPDATE pyramid_nodes SET provisional = 1 WHERE slug = ?1 AND id = ?2",
+            rusqlite::params!["vt", "n-1"],
+        )
+        .unwrap();
+        let changed2 = mutate_provisional_node(&conn, "vt", "n-1", &m).unwrap();
+        assert_eq!(changed2, 1);
+        let prov = get_node(&conn, "vt", "n-1").unwrap().unwrap();
+        assert_eq!(prov.headline, "provisional change");
+        // current_version must NOT change for provisional mutations.
+        assert_eq!(prov.current_version, 3);
+    }
 }
 
 // ── WS-3: Evidence Density Statistics ───────────────────────────────────────
@@ -6736,4 +7394,194 @@ pub fn get_evidence_density(conn: &Connection, slug: &str) -> Result<serde_json:
         "per_layer": per_layer,
         "top_nodes": top_nodes,
     }))
+}
+
+// ── WS-DEADLETTER (§15.18) ─────────────────────────────────────────────
+//
+// Persistent queue of chain steps whose retry budget was exhausted. Helpers
+// in this block do NOT acquire the per-slug write lock — callers must hold
+// the lock (build_runner::run_build_from already holds it for in-build
+// inserts; routes.rs handlers take it for operator-initiated skip/retry).
+// This reflects the reentrancy constraint of tokio::sync::RwLock.
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DeadLetterEntry {
+    pub id: i64,
+    pub slug: String,
+    pub chain_id: Option<String>,
+    pub step_name: String,
+    pub step_primitive: String,
+    pub chunk_index: Option<i64>,
+    pub input_snapshot: Option<String>,
+    pub step_snapshot: Option<String>,
+    pub system_prompt: Option<String>,
+    pub defaults_snapshot: Option<String>,
+    pub error_text: String,
+    pub error_kind: String,
+    pub retry_count: i64,
+    pub status: String,
+    pub note: Option<String>,
+    pub created_at: String,
+    pub last_seen_at: String,
+    pub resolved_at: Option<String>,
+}
+
+/// Input payload for `insert_dead_letter`. Borrowing form so callers can
+/// hand over already-computed snapshots without cloning.
+#[derive(Debug)]
+pub struct DeadLetterInsert<'a> {
+    pub slug: &'a str,
+    pub chain_id: Option<&'a str>,
+    pub step_name: &'a str,
+    pub step_primitive: &'a str,
+    pub chunk_index: Option<i64>,
+    pub input_snapshot: Option<&'a str>,
+    pub step_snapshot: Option<&'a str>,
+    pub system_prompt: Option<&'a str>,
+    pub defaults_snapshot: Option<&'a str>,
+    pub error_text: &'a str,
+    pub error_kind: &'a str,
+    pub retry_count: i64,
+}
+
+fn map_dead_letter_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeadLetterEntry> {
+    Ok(DeadLetterEntry {
+        id: row.get(0)?,
+        slug: row.get(1)?,
+        chain_id: row.get(2)?,
+        step_name: row.get(3)?,
+        step_primitive: row.get(4)?,
+        chunk_index: row.get(5)?,
+        input_snapshot: row.get(6)?,
+        step_snapshot: row.get(7)?,
+        system_prompt: row.get(8)?,
+        defaults_snapshot: row.get(9)?,
+        error_text: row.get(10)?,
+        error_kind: row.get(11)?,
+        retry_count: row.get(12)?,
+        status: row.get(13)?,
+        note: row.get(14)?,
+        created_at: row.get(15)?,
+        last_seen_at: row.get(16)?,
+        resolved_at: row.get(17)?,
+    })
+}
+
+const DEAD_LETTER_COLUMNS: &str = "id, slug, chain_id, step_name, step_primitive, \
+    chunk_index, input_snapshot, step_snapshot, system_prompt, defaults_snapshot, \
+    error_text, error_kind, retry_count, status, note, created_at, last_seen_at, \
+    resolved_at";
+
+/// Insert a new dead-letter row. Returns the new row id. Caller holds the
+/// per-slug lock (see block comment above).
+pub fn insert_dead_letter(conn: &Connection, e: &DeadLetterInsert<'_>) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO pyramid_dead_letter (
+            slug, chain_id, step_name, step_primitive, chunk_index,
+            input_snapshot, step_snapshot, system_prompt, defaults_snapshot,
+            error_text, error_kind, retry_count
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        rusqlite::params![
+            e.slug,
+            e.chain_id,
+            e.step_name,
+            e.step_primitive,
+            e.chunk_index,
+            e.input_snapshot,
+            e.step_snapshot,
+            e.system_prompt,
+            e.defaults_snapshot,
+            e.error_text,
+            e.error_kind,
+            e.retry_count,
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// List dead-letter entries for a slug. `status_filter = None` returns all
+/// statuses; otherwise filters to the given status (e.g. "open").
+pub fn list_dead_letter(
+    conn: &Connection,
+    slug: &str,
+    status_filter: Option<&str>,
+) -> Result<Vec<DeadLetterEntry>> {
+    let sql = if status_filter.is_some() {
+        format!(
+            "SELECT {DEAD_LETTER_COLUMNS} FROM pyramid_dead_letter \
+             WHERE slug = ?1 AND status = ?2 ORDER BY id DESC"
+        )
+    } else {
+        format!(
+            "SELECT {DEAD_LETTER_COLUMNS} FROM pyramid_dead_letter \
+             WHERE slug = ?1 ORDER BY id DESC"
+        )
+    };
+    let mut stmt = conn.prepare(&sql)?;
+    let rows: Vec<DeadLetterEntry> = if let Some(status) = status_filter {
+        stmt.query_map(rusqlite::params![slug, status], map_dead_letter_row)?
+            .filter_map(|r| r.ok())
+            .collect()
+    } else {
+        stmt.query_map(rusqlite::params![slug], map_dead_letter_row)?
+            .filter_map(|r| r.ok())
+            .collect()
+    };
+    Ok(rows)
+}
+
+/// Fetch a single dead-letter entry by `(slug, id)`. Slug is part of the key
+/// so a malicious/buggy caller can't inspect another slug's entries.
+pub fn get_dead_letter(
+    conn: &Connection,
+    slug: &str,
+    id: i64,
+) -> Result<Option<DeadLetterEntry>> {
+    let sql = format!(
+        "SELECT {DEAD_LETTER_COLUMNS} FROM pyramid_dead_letter \
+         WHERE slug = ?1 AND id = ?2"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query(rusqlite::params![slug, id])?;
+    match rows.next()? {
+        Some(row) => Ok(Some(map_dead_letter_row(row)?)),
+        None => Ok(None),
+    }
+}
+
+/// Transition a dead-letter entry to a new status. `resolved` and `skipped`
+/// both update `resolved_at` to now. Caller is responsible for the state
+/// machine guard (no transitions out of terminal states) — this helper
+/// performs the write unconditionally.
+pub fn update_dead_letter_status(
+    conn: &Connection,
+    slug: &str,
+    id: i64,
+    new_status: &str,
+    note: Option<&str>,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE pyramid_dead_letter
+         SET status = ?3,
+             note = COALESCE(?4, note),
+             resolved_at = datetime('now'),
+             last_seen_at = datetime('now')
+         WHERE slug = ?1 AND id = ?2",
+        rusqlite::params![slug, id, new_status, note],
+    )?;
+    Ok(())
+}
+
+/// Increment `retry_count` and refresh `last_seen_at` before an operator
+/// re-dispatch attempt, so we record the attempt even if the process dies
+/// mid-retry.
+pub fn bump_dead_letter_retry(conn: &Connection, slug: &str, id: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE pyramid_dead_letter
+         SET retry_count = retry_count + 1,
+             last_seen_at = datetime('now')
+         WHERE slug = ?1 AND id = ?2",
+        rusqlite::params![slug, id],
+    )?;
+    Ok(())
 }

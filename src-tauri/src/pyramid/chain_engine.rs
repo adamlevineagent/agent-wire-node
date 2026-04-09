@@ -99,6 +99,11 @@ pub struct ChainDefinition {
     pub steps: Vec<ChainStep>,
     #[serde(default)]
     pub post_build: Vec<PostBuildRef>,
+    /// WS-AUDIENCE-CONTRACT: optional top-level audience block. When absent,
+    /// `Audience::default()` is used. Propagated into the resolution context
+    /// as a structured JSON object at `$audience` / `audience` key.
+    #[serde(default)]
+    pub audience: super::types::Audience,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

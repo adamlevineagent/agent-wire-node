@@ -64,7 +64,7 @@ impl ContentType {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PyramidNode {
     pub id: String,
     pub slug: String,
@@ -84,6 +84,92 @@ pub struct PyramidNode {
     #[serde(default)]
     pub build_id: Option<String>,
     pub created_at: String,
+
+    // ── WS-SCHEMA-V2 (§15.2): new canonical fields for episodic memory ──
+    #[serde(default)]
+    pub time_range: Option<TimeRange>,
+    #[serde(default)]
+    pub weight: f64,
+    #[serde(default)]
+    pub provisional: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub promoted_from: Option<String>,
+    #[serde(default)]
+    pub narrative: NarrativeMultiZoom,
+    #[serde(default)]
+    pub entities: Vec<Entity>,
+    #[serde(default)]
+    pub key_quotes: Vec<KeyQuote>,
+    #[serde(default)]
+    pub transitions: Transitions,
+
+    // ── WS-SCHEMA-V2 (§15.7): per-contribution supersession chain ──
+    /// Current version number in `pyramid_node_versions`. Starts at 1 on
+    /// first write; `apply_supersession` increments on every subsequent
+    /// canonical write. Distinct from legacy `build_version` (build sweeps).
+    #[serde(default = "default_current_version")]
+    pub current_version: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_version_chain_phase: Option<String>,
+}
+
+fn default_current_version() -> i64 {
+    1
+}
+
+/// WS-SCHEMA-V2 (§15.2): time anchor for a node (ISO timestamps).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TimeRange {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end: Option<String>,
+}
+
+/// WS-SCHEMA-V2 (§15.2): multi-zoom narrative. Each level is a complete
+/// narrative at a given zoom-out from the inputs.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NarrativeMultiZoom {
+    #[serde(default)]
+    pub levels: Vec<NarrativeLevel>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NarrativeLevel {
+    #[serde(default)]
+    pub zoom: i64,
+    #[serde(default)]
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Entity {
+    pub name: String,
+    #[serde(default)]
+    pub role: String,
+    #[serde(default)]
+    pub importance: f64,
+    #[serde(default)]
+    pub liveness: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct KeyQuote {
+    pub text: String,
+    #[serde(default)]
+    pub speaker_role: String,
+    #[serde(default)]
+    pub importance: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunk_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Transitions {
+    #[serde(default)]
+    pub prior: String,
+    #[serde(default)]
+    pub next: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -114,12 +200,29 @@ pub struct Correction {
     pub who: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Decision {
     pub decided: String,
     pub why: String,
     #[serde(default)]
     pub rejected: String,
+    /// WS-SCHEMA-V2 (§15.2): stance enum. One of:
+    /// "committed" | "ruled_out" | "open" | "done" | "deferred" |
+    /// "superseded" | "conditional" | "other".
+    #[serde(default = "default_stance")]
+    pub stance: String,
+    /// WS-SCHEMA-V2 (§15.2): importance, 0..1.
+    #[serde(default)]
+    pub importance: f64,
+    /// WS-SCHEMA-V2 (§15.2): related decisions/topics by canonical name.
+    /// Renamed from `ties_to` to avoid collision with the plan-wide
+    /// `ties_to → cross_refs` rename for cross-pyramid edges.
+    #[serde(default)]
+    pub related: Vec<String>,
+}
+
+fn default_stance() -> String {
+    "open".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -225,6 +328,30 @@ pub struct StepActivity {
     pub elapsed_seconds: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub items: Option<i64>,
+}
+
+/// Canonical Audience contract (WS-AUDIENCE-CONTRACT, episodic-memory-vine
+/// plan §15.1 / §16.1). Parsed from a top-level `audience:` block in chain
+/// YAML and propagated into the chain resolution context as a structured
+/// JSON object so step inputs and prompt templates can reference
+/// `audience.role`, `audience.voice_hints`, etc. Field names are pinned by
+/// the plan author and MUST NOT be renamed or reshaped. All fields are
+/// optional at the YAML level — chains without an `audience:` block fall
+/// back to `Audience::default()`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Audience {
+    #[serde(default)]
+    pub role: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub goals: Vec<String>,
+    #[serde(default)]
+    pub expertise: String,
+    #[serde(default)]
+    pub voice_hints: Vec<String>,
+    #[serde(default)]
+    pub notes: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

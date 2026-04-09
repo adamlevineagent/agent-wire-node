@@ -8,12 +8,76 @@ pub struct TaggedBuildEvent {
     pub kind: TaggedKind,
 }
 
+/// Event kinds broadcast on the build event bus.
+///
+/// ## SlopeChanged trigger discipline (WS-EVENTS / v4 §15.21)
+///
+/// `SlopeChanged` is the cache-invalidation signal that WS-PRIMER and the
+/// episodic-memory navigation page subscribe to. It MUST fire whenever the
+/// leftmost slope of a pyramid changes. Required trigger points:
+///
+/// 1. A new L0 node lands (chain step at depth 0 saves a node, DADBEAR
+///    ingest writes a new L0 chunk-node, vine bunch build completes).
+/// 2. A node at depth 0 or 1 is mutated in place (edit via `save_node`'s
+///    second-write path or `apply_supersession` on a depth-0-or-1 row).
+/// 3. A provisional node is promoted to canonical at depth 0 or 1
+///    (WS-PROVISIONAL: emit `ProvisionalPromoted` AND `SlopeChanged`).
+/// 4. A chain-driven rebuild completes (chain_executor emits a final
+///    `SlopeChanged` on normal termination as a catch-all).
+/// 5. Supersession cascade touches a depth-0 or depth-1 row (delta landing
+///    in `delta.rs`, apex rebuild in `build.rs`).
+///
+/// `affected_layers` lists the depth levels mutated (empty = "unknown
+/// extent, revalidate everything").
+///
+/// IMPORTANT: Keep the outer `TaggedBuildEvent { slug, kind }` shape.
+/// Add new variants HERE, not on a parallel enum.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TaggedKind {
+    // ── Existing ──────────────────────────────────────────────────────
     Progress { done: i64, total: i64 },
     V2Snapshot(BuildProgressV2),
     Resync,
+
+    // ── Episodic memory v4 §15.21 ─────────────────────────────────────
+    SlopeChanged { affected_layers: Vec<i64> },
+    DeltaLanded { depth: i64, node_id: String },
+    ApexHeadlineChanged { new_headline: String },
+    CostUpdate { cost_so_far_usd: f64, estimate_usd: f64 },
+    DeadLetterEnqueued { dead_letter_id: i64 },
+    VocabularyPromoted { vocabulary_pyramid_slug: String },
+    ProvisionalNodeAdded { node_id: String },
+    ProvisionalPromoted { provisional_id: String, canonical_id: String },
+    DemandGenStarted { sub_question: String, job_id: String },
+    DemandGenCompleted { job_id: String, new_node_ids: Vec<String> },
+    ChainProposalReceived { chain_id: String, proposal_id: i64 },
+
+    // ── WS-EVENTS step-level introspection (load-bearing for nav page) ──
+    ChainStepStarted {
+        step_name: String,
+        step_idx: usize,
+        primitive: String,
+        depth: i64,
+    },
+    ChainStepFinished {
+        step_name: String,
+        step_idx: usize,
+        status: String,
+        elapsed_seconds: f64,
+    },
+}
+
+impl TaggedKind {
+    /// True for discrete, low-frequency events that should bypass the
+    /// WebSocket coalesce buffer. Progress / V2Snapshot are high-frequency
+    /// and still coalesced.
+    pub fn is_discrete(&self) -> bool {
+        !matches!(
+            self,
+            TaggedKind::Progress { .. } | TaggedKind::V2Snapshot(_)
+        )
+    }
 }
 
 pub struct BuildEventBus {

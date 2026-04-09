@@ -38,6 +38,61 @@ use super::PyramidState;
 const CODE_THREAD_SPLIT_PROMPT: &str =
     include_str!("../../../chains/prompts/code/code_thread_split.md");
 
+// ── WS-AUDIENCE-CONTRACT helpers ────────────────────────────────────────────
+
+/// Coerce an `audience` JSON value (either the canonical `Audience` Object or
+/// a legacy bare String) into a compact single-line description string for
+/// downstream primitives that still consume `Option<&str>`
+/// (e.g., `question_decomposition::DecompositionConfig.audience`).
+///
+/// - `Value::String(s)` → returned as-is.
+/// - `Value::Object`    → rendered as "role — description | goals: …
+///   | voice: … | expertise: … | notes: …", skipping empty fields.
+/// - Anything else (null, arrays, numbers) → `None`.
+fn audience_value_to_legacy_string(v: &Value) -> Option<String> {
+    match v {
+        Value::String(s) => {
+            let t = s.trim();
+            if t.is_empty() {
+                None
+            } else {
+                Some(t.to_string())
+            }
+        }
+        Value::Object(_) => {
+            let a: super::types::Audience = serde_json::from_value(v.clone()).ok()?;
+            let mut parts: Vec<String> = Vec::new();
+            let head = match (a.role.trim(), a.description.trim()) {
+                ("", "") => String::new(),
+                (r, "") => r.to_string(),
+                ("", d) => d.to_string(),
+                (r, d) => format!("{r} — {d}"),
+            };
+            if !head.is_empty() {
+                parts.push(head);
+            }
+            if !a.goals.is_empty() {
+                parts.push(format!("goals: {}", a.goals.join(", ")));
+            }
+            if !a.voice_hints.is_empty() {
+                parts.push(format!("voice: {}", a.voice_hints.join(", ")));
+            }
+            if !a.expertise.trim().is_empty() {
+                parts.push(format!("expertise: {}", a.expertise.trim()));
+            }
+            if !a.notes.trim().is_empty() {
+                parts.push(format!("notes: {}", a.notes.trim()));
+            }
+            if parts.is_empty() {
+                None
+            } else {
+                Some(parts.join(" | "))
+            }
+        }
+        _ => None,
+    }
+}
+
 // ── Error strategy ──────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq)]
@@ -3581,7 +3636,160 @@ async fn dispatch_with_retry(
         }
     }
 
-    Err(last_err.unwrap_or_else(|| anyhow!("dispatch failed for {fallback_key}")))
+    let final_err = last_err.unwrap_or_else(|| anyhow!("dispatch failed for {fallback_key}"));
+
+    // ── WS-DEADLETTER (§15.18): persist permanent failures ──
+    // Retry budget exhausted. Snapshot enough of the step's state that an
+    // operator can later retry the exact same dispatch via the HTTP
+    // endpoint.
+    //
+    // INVARIANT: dead-letter writes from the executor failure path are
+    // already covered by the build-level per-slug write lock held by
+    // `build_runner::run_build_from` (acquired at the top of the build and
+    // held for the entire duration). `tokio::sync::RwLock` is NOT reentrant,
+    // so we MUST NOT call `LockManager::global().write(&slug).await` here —
+    // doing so would deadlock every time a step exhausts retries inside an
+    // active build. The DB writer's own `Mutex<Connection>` still serializes
+    // the SQLite write against any other writer that may legitimately be
+    // running without the slug lock. Operator-initiated retries (via the
+    // HTTP route) take the slug lock in the route handler, not here.
+    let err_text = format!("{final_err:#}");
+    let err_kind = classify_error_kind(&err_text);
+    let step_snapshot = serde_json::to_string(step).ok();
+    let defaults_snapshot = serde_json::to_string(defaults).ok();
+    let input_snapshot = serde_json::to_string(resolved_input).ok();
+    let chunk_index = resolved_input
+        .get("chunk_index")
+        .and_then(|v| v.as_i64())
+        .or_else(|| resolved_input.get("index").and_then(|v| v.as_i64()));
+
+    let slug = dispatch_ctx.slug.clone();
+    let step_name = step.name.clone();
+    let step_primitive = step.primitive.clone();
+    let writer = dispatch_ctx.db_writer.clone();
+
+    // NO lock acquisition here — see INVARIANT comment above.
+    let insert_result: anyhow::Result<i64> = {
+        let conn = writer.lock().await;
+        db::insert_dead_letter(
+            &conn,
+            &db::DeadLetterInsert {
+                slug: &slug,
+                chain_id: None,
+                step_name: &step_name,
+                step_primitive: &step_primitive,
+                chunk_index,
+                input_snapshot: input_snapshot.as_deref(),
+                step_snapshot: step_snapshot.as_deref(),
+                system_prompt: Some(system_prompt),
+                defaults_snapshot: defaults_snapshot.as_deref(),
+                error_text: &err_text,
+                error_kind: &err_kind,
+                retry_count: max_attempts as i64,
+            },
+        )
+    };
+    match insert_result {
+        Ok(id) => warn!(
+            "[CHAIN] dead-letter entry {id} created for {fallback_key} (slug={slug}, step={step_name}, kind={err_kind})"
+        ),
+        Err(e) => error!(
+            "[CHAIN] FAILED to write dead-letter for {fallback_key} (slug={slug}): {e:#}"
+        ),
+    }
+
+    Err(final_err)
+}
+
+/// Classify a dispatch error message into the dead-letter `error_kind`
+/// vocabulary from §15.18.
+fn classify_error_kind(msg: &str) -> String {
+    let lower = msg.to_ascii_lowercase();
+    if lower.contains("timeout") || lower.contains("timed out") {
+        "llm_timeout".into()
+    } else if lower.contains("rate limit")
+        || lower.contains("429")
+        || lower.contains("too many requests")
+    {
+        "rate_limit".into()
+    } else if lower.contains("parse")
+        || lower.contains("expected value")
+        || lower.contains("json")
+    {
+        "parse_error".into()
+    } else if lower.contains("schema")
+        || lower.contains("validation")
+        || lower.contains("missing field")
+    {
+        "schema_violation".into()
+    } else if lower.contains("chain") {
+        "chain_error".into()
+    } else {
+        "other".into()
+    }
+}
+
+/// Re-dispatch a previously dead-lettered step from its stored snapshot.
+/// Returns Ok on success (caller transitions entry to `resolved`) or Err on
+/// failure (caller keeps entry `open`).
+///
+/// Entry point for `POST /pyramid/{slug}/dead_letter/{id}/retry`. Does NOT
+/// acquire the per-slug lock — the routes handler holds it across the full
+/// retry operation.
+pub async fn retry_dead_letter_entry(
+    state: &PyramidState,
+    entry: &db::DeadLetterEntry,
+) -> Result<Value> {
+    let step_json = entry
+        .step_snapshot
+        .as_deref()
+        .ok_or_else(|| anyhow!("dead-letter entry {} missing step_snapshot", entry.id))?;
+    let defaults_json = entry
+        .defaults_snapshot
+        .as_deref()
+        .ok_or_else(|| anyhow!("dead-letter entry {} missing defaults_snapshot", entry.id))?;
+    let input_json = entry
+        .input_snapshot
+        .as_deref()
+        .ok_or_else(|| anyhow!("dead-letter entry {} missing input_snapshot", entry.id))?;
+
+    let step: ChainStep = serde_json::from_str(step_json)
+        .map_err(|e| anyhow!("dead-letter step deserialize failed: {e}"))?;
+    let defaults: super::chain_engine::ChainDefaults = serde_json::from_str(defaults_json)
+        .map_err(|e| anyhow!("dead-letter defaults deserialize failed: {e}"))?;
+    let resolved_input: Value = serde_json::from_str(input_json)
+        .map_err(|e| anyhow!("dead-letter input deserialize failed: {e}"))?;
+    let system_prompt = entry.system_prompt.clone().unwrap_or_default();
+
+    let llm_config = state.config.read().await.clone();
+    let dispatch_ctx = chain_dispatch::StepContext {
+        db_reader: state.reader.clone(),
+        db_writer: state.writer.clone(),
+        slug: entry.slug.clone(),
+        config: llm_config,
+        tier1: state.operational.tier1.clone(),
+        ops: (*state.operational).clone(),
+        audit: None,
+    };
+
+    match chain_dispatch::dispatch_step(
+        &step,
+        &resolved_input,
+        &system_prompt,
+        &defaults,
+        &dispatch_ctx,
+    )
+    .await
+    {
+        Ok(v) => match validate_step_output(&step, &v) {
+            Ok(()) => {
+                info!("[CHAIN] dead-letter {} retry succeeded", entry.id);
+                Ok(v)
+            }
+            Err(e) => Err(anyhow!("retry validation failed: {e}")),
+        },
+        Err(e) => Err(e),
+    }
 }
 
 /// Carry a node up to a higher depth (copy without LLM call).
@@ -3741,6 +3949,18 @@ pub async fn execute_chain_from(
         ctx.initial_params = params;
     }
 
+    // WS-AUDIENCE-CONTRACT: inject chain-level `audience:` block as a
+    // structured JSON Object into the resolution context. Caller-provided
+    // initial_context["audience"] (e.g., legacy String from build_runner's
+    // characterization) takes precedence — we only inject when the caller
+    // did not already set it.
+    if !ctx.initial_params.contains_key("audience") {
+        if let Ok(audience_val) = serde_json::to_value(&chain.audience) {
+            ctx.initial_params
+                .insert("audience".to_string(), audience_val);
+        }
+    }
+
     let mut total = estimate_total(chain, &ctx, num_chunks);
     let mut done: i64 = 0;
     let mut total_failures: i32 = 0;
@@ -3896,6 +4116,21 @@ pub async fn execute_chain_from(
             total,
         );
         try_send_layer_event(&layer_tx, LayerEvent::StepStarted { step_name: step.name.clone() });
+
+        // WS-EVENTS §15.21: ChainStepStarted — emitted after all skip/reuse/sentinel
+        // paths have been ruled out, so every Started is paired with a Finished
+        // (on success) or with a dead-letter enqueue (on failure).
+        let _ = state.build_event_bus.tx.send(
+            crate::pyramid::event_bus::TaggedBuildEvent {
+                slug: slug.to_string(),
+                kind: crate::pyramid::event_bus::TaggedKind::ChainStepStarted {
+                    step_name: step.name.clone(),
+                    step_idx,
+                    primitive: step.primitive.clone(),
+                    depth: step.depth.unwrap_or(0),
+                },
+            },
+        );
 
         let step_result = if step.mechanical {
             execute_mechanical(step, &mut ctx, &dispatch_ctx, &chain.defaults).await
@@ -4155,12 +4390,44 @@ pub async fn execute_chain_from(
                 }
                 total = estimate_total(chain, &ctx, num_chunks).max(done);
                 send_progress(&progress_tx, done, total).await;
+                let step_elapsed = step_start.elapsed().as_secs_f64();
                 step_activities.push(super::types::StepActivity {
                     name: step.name.clone(),
                     status: "ran".into(),
-                    elapsed_seconds: Some(step_start.elapsed().as_secs_f64()),
+                    elapsed_seconds: Some(step_elapsed),
                     items: Some(done),
                 });
+
+                // WS-EVENTS §15.21: ChainStepFinished (success path)
+                let _ = state.build_event_bus.tx.send(
+                    crate::pyramid::event_bus::TaggedBuildEvent {
+                        slug: slug.to_string(),
+                        kind: crate::pyramid::event_bus::TaggedKind::ChainStepFinished {
+                            step_name: step.name.clone(),
+                            step_idx,
+                            status: "ran".into(),
+                            elapsed_seconds: step_elapsed,
+                        },
+                    },
+                );
+
+                // WS-EVENTS §15.21: SlopeChanged — depth-0/1 node-saving
+                // step mutated the leftmost slope. WS-PRIMER cache must
+                // invalidate. See trigger discipline on TaggedKind.
+                if saves_node {
+                    let step_depth = step.depth.unwrap_or(0);
+                    if step_depth <= 1 {
+                        let _ = state.build_event_bus.tx.send(
+                            crate::pyramid::event_bus::TaggedBuildEvent {
+                                slug: slug.to_string(),
+                                kind: crate::pyramid::event_bus::TaggedKind::SlopeChanged {
+                                    affected_layers: vec![step_depth],
+                                },
+                            },
+                        );
+                    }
+                }
+
                 if stop_after == Some(step.name.as_str()) {
                     info!("[CHAIN] stop_after reached: halting after step \"{}\"", step.name);
                     for remaining in &chain.steps[step_idx + 1..] {
@@ -4234,6 +4501,20 @@ pub async fn execute_chain_from(
         "Chain '{}' complete for slug '{}': apex={}, failures={}",
         chain.name, slug, apex_node_id, total_failures
     );
+
+    // WS-EVENTS §15.21: final SlopeChanged catch-all. Guarantees WS-PRIMER
+    // cache invalidates on every completed chain, even if per-step emits
+    // were suppressed. Empty affected_layers = revalidate everything.
+    if !cancel.is_cancelled() {
+        let _ = state.build_event_bus.tx.send(
+            crate::pyramid::event_bus::TaggedBuildEvent {
+                slug: slug.to_string(),
+                kind: crate::pyramid::event_bus::TaggedKind::SlopeChanged {
+                    affected_layers: Vec::new(),
+                },
+            },
+        );
+    }
 
     Ok((apex_node_id, total_failures, step_activities))
 }
@@ -4372,10 +4653,15 @@ async fn execute_recursive_decompose(
         })
         .unwrap_or_default();
 
-    let audience = resolved_input.get("audience")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .or_else(|| ctx.resolve_ref("$audience").ok().and_then(|v| v.as_str().map(|s| s.to_string())));
+    let audience = resolved_input
+        .get("audience")
+        .and_then(audience_value_to_legacy_string)
+        .or_else(|| {
+            ctx.resolve_ref("$audience")
+                .ok()
+                .as_ref()
+                .and_then(audience_value_to_legacy_string)
+        });
 
     let config = super::question_decomposition::DecompositionConfig {
         apex_question: apex_question.clone(),
@@ -4546,12 +4832,15 @@ async fn execute_evidence_loop(
     let mut tree: super::question_decomposition::QuestionTree =
         serde_json::from_value(tree_val)?;
 
-    // Attach audience from initial params or characterize step
+    // Attach audience from initial params or characterize step.
+    // WS-AUDIENCE-CONTRACT: `$audience` may now resolve to a structured
+    // Object; coerce to the legacy string form for the existing tree field.
     if tree.audience.is_none() {
         tree.audience = ctx
             .resolve_ref("$audience")
             .ok()
-            .and_then(|v| v.as_str().map(|s| s.to_string()));
+            .as_ref()
+            .and_then(audience_value_to_legacy_string);
     }
 
     // Get layer questions from the tree
@@ -5102,6 +5391,7 @@ async fn execute_evidence_loop(
                     superseded_by: None,
                     build_id: Some(build_id.clone()),
                     created_at: chrono::Utc::now().to_rfc3339(),
+                    ..Default::default()
                 };
 
                 // Save the apex node

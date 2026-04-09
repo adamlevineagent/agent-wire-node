@@ -1676,6 +1676,7 @@ pub async fn execute_supersession(
                     superseded_by: None,
                     build_id: None,
                     created_at: String::new(),
+                    ..Default::default()
                 },
                 node_data.source_file_path.as_deref(),
             )

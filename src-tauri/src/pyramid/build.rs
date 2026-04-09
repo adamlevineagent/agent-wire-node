@@ -486,6 +486,7 @@ fn flatten_analysis(
                             .and_then(|v| v.as_str())
                             .unwrap_or("")
                             .into(),
+                        ..Default::default()
                     });
                 }
             }
@@ -559,6 +560,7 @@ pub(crate) fn node_from_analysis(
         superseded_by: None,
         build_id: None,
         created_at: String::new(),
+        ..Default::default()
     }
 }
 
@@ -3358,6 +3360,7 @@ mod tests {
             superseded_by: None,
             build_id: None,
             created_at: String::new(),
+            ..Default::default()
         }
     }
 

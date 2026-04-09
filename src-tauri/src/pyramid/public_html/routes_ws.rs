@@ -276,6 +276,17 @@ async fn handle_ws(socket: WebSocket, slug: String, state: Arc<PyramidState>) {
                                 flush_deadline = None;
                                 continue;
                             }
+                            // WS-EVENTS §15.21: all new discrete variants
+                            // bypass coalescing. They are low-frequency
+                            // state transitions and subscribers (WS-PRIMER,
+                            // nav page) need prompt delivery.
+                            other_kind => {
+                                let payload = TaggedBuildEvent { slug: slug.clone(), kind: other_kind };
+                                if !send_event(&mut ws_tx, &payload).await {
+                                    break;
+                                }
+                                continue;
+                            }
                         }
                         if flush_deadline.is_none() {
                             flush_deadline = Some(tokio::time::Instant::now() + COALESCE_WINDOW);

@@ -46,6 +46,113 @@ pub struct TermWithSource {
 /// Delegate to the canonical node_from_row in db.rs.
 use super::db::node_from_row as row_to_node;
 
+/// WS-SCHEMA-V2 (§15.7): fetch a specific historical version of a node from
+/// `pyramid_node_versions`. Returns `Ok(None)` if no such version exists.
+///
+/// To fetch the current canonical state, call `db::get_node` — the versions
+/// table never holds the live tip row, only prior snapshots.
+pub fn get_node_version(
+    conn: &Connection,
+    slug: &str,
+    node_id: &str,
+    version: i64,
+) -> Result<Option<PyramidNode>> {
+    let sql = "SELECT slug, node_id, version, headline, distilled,
+                      topics, corrections, decisions, terms, dead_ends,
+                      self_prompt, children, parent_id,
+                      time_range_start, time_range_end, weight,
+                      narrative_json, entities_json, key_quotes_json, transitions_json,
+                      chain_phase, build_id, supersession_reason, created_at
+               FROM pyramid_node_versions
+               WHERE slug = ?1 AND node_id = ?2 AND version = ?3";
+    let mut stmt = conn.prepare(sql)?;
+    let result = stmt.query_row(rusqlite::params![slug, node_id, version], |row| {
+        let topics_json: String = row
+            .get::<_, Option<String>>("topics")?
+            .unwrap_or_default();
+        let corrections_json: String = row
+            .get::<_, Option<String>>("corrections")?
+            .unwrap_or_default();
+        let decisions_json: String = row
+            .get::<_, Option<String>>("decisions")?
+            .unwrap_or_default();
+        let terms_json: String = row
+            .get::<_, Option<String>>("terms")?
+            .unwrap_or_default();
+        let dead_ends_json: String = row
+            .get::<_, Option<String>>("dead_ends")?
+            .unwrap_or_default();
+        let children_json: String = row
+            .get::<_, Option<String>>("children")?
+            .unwrap_or_default();
+
+        let narrative: NarrativeMultiZoom = row
+            .get::<_, Option<String>>("narrative_json")?
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        let entities: Vec<Entity> = row
+            .get::<_, Option<String>>("entities_json")?
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        let key_quotes: Vec<KeyQuote> = row
+            .get::<_, Option<String>>("key_quotes_json")?
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        let transitions: Transitions = row
+            .get::<_, Option<String>>("transitions_json")?
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+
+        let start = row.get::<_, Option<String>>("time_range_start")?;
+        let end = row.get::<_, Option<String>>("time_range_end")?;
+        let time_range = if start.is_some() || end.is_some() {
+            Some(TimeRange { start, end })
+        } else {
+            None
+        };
+
+        Ok(PyramidNode {
+            id: row.get::<_, String>("node_id")?,
+            slug: row.get::<_, String>("slug")?,
+            depth: 0, // depth isn't snapshotted — callers query the live row
+            chunk_index: None,
+            headline: row.get::<_, String>("headline").unwrap_or_default(),
+            distilled: row.get::<_, String>("distilled").unwrap_or_default(),
+            topics: serde_json::from_str(&topics_json).unwrap_or_default(),
+            corrections: serde_json::from_str(&corrections_json).unwrap_or_default(),
+            decisions: serde_json::from_str(&decisions_json).unwrap_or_default(),
+            terms: serde_json::from_str(&terms_json).unwrap_or_default(),
+            dead_ends: serde_json::from_str(&dead_ends_json).unwrap_or_default(),
+            self_prompt: row
+                .get::<_, Option<String>>("self_prompt")?
+                .unwrap_or_default(),
+            children: serde_json::from_str(&children_json).unwrap_or_default(),
+            parent_id: row.get::<_, Option<String>>("parent_id")?,
+            superseded_by: None,
+            build_id: row.get::<_, Option<String>>("build_id")?,
+            created_at: row
+                .get::<_, Option<String>>("created_at")?
+                .unwrap_or_default(),
+            time_range,
+            weight: row.get::<_, Option<f64>>("weight")?.unwrap_or(1.0),
+            provisional: false,
+            promoted_from: None,
+            narrative,
+            entities,
+            key_quotes,
+            transitions,
+            current_version: row.get::<_, i64>("version")?,
+            current_version_chain_phase: row.get::<_, Option<String>>("chain_phase")?,
+        })
+    });
+
+    match result {
+        Ok(n) => Ok(Some(n)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// Collect all corrections from a node — from both top-level `corrections`
 /// and from `topics[].corrections`.
 fn collect_corrections(node: &PyramidNode) -> Vec<&Correction> {

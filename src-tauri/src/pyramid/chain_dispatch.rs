@@ -397,6 +397,7 @@ pub fn build_node_from_output(
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .into(),
+                ..Default::default()
             });
         }
     }
@@ -427,6 +428,7 @@ pub fn build_node_from_output(
                             .and_then(|v| v.as_str())
                             .unwrap_or("")
                             .into(),
+                        ..Default::default()
                     });
                 }
             }
@@ -473,6 +475,7 @@ pub fn build_node_from_output(
         superseded_by: None,
         build_id: None,
         created_at: String::new(),
+        ..Default::default()
     })
 }
 

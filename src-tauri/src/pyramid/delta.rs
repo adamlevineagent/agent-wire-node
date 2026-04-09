@@ -745,6 +745,7 @@ Output valid JSON matching this schema:
         superseded_by: None,
         build_id: None,
         created_at: now_ts(),
+        ..Default::default()
     };
 
     let elapsed = start.elapsed().as_secs_f64();

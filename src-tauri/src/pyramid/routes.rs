@@ -1346,6 +1346,25 @@ pub fn pyramid_routes(
         .and(with_auth_state(state.clone()))
         .and_then(handle_chain_import));
 
+    // WS-COST-MODEL: POST /pyramid/cost_model/recompute — must be before the bare
+    // GET /pyramid/cost_model so Warp matches the longer path first, and both
+    // must be before slug-parameterized routes (see h_cost wiring below).
+    let cost_model_recompute = route!(prefix
+        .and(warp::path("cost_model"))
+        .and(warp::path("recompute"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_cost_model_recompute));
+
+    // WS-COST-MODEL: GET /pyramid/cost_model — list all cost-model rows.
+    let cost_model_list = route!(prefix
+        .and(warp::path("cost_model"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_cost_model_list));
+
     // LOCAL-ONLY: POST /pyramid/remote-query — Vibesmithy proxy for remote pyramid queries.
     // Authenticated via local auth_token ONLY (never Wire JWT — this is the local node proxying).
     // Rate limited: 60 queries/minute per tunnel_url to prevent accidental credit drain.
@@ -1439,11 +1458,16 @@ pub fn pyramid_routes(
     // Chain import route (P4.2) — literal "chain" path must be before slug-parameterized routes
     let h8 = chain_import;
 
+    // WS-COST-MODEL: literal "cost_model" path group; /recompute first so POST
+    // beats the bare GET during filter rejection unification.
+    let h_cost = cost_model_recompute.or(cost_model_list).unify().boxed();
+
     // CRITICAL: Vine routes (h6, h7), chain import (h8), and remote-query with literal path segments
     // MUST come BEFORE slug-parameterized routes, otherwise "vine"/"chain"/"remote-query" gets
     // captured as a :slug param.
     let top = h6.or(h7).unify().boxed(); // Vine routes first (literal paths)
     let top = top.or(h8).unify().boxed(); // Chain import (literal paths)
+    let top = top.or(h_cost).unify().boxed(); // WS-COST-MODEL cost_model endpoints (literal paths)
     let top = top.or(remote_query_route).unify().boxed(); // WS-ONLINE-V: Remote query proxy (literal path)
     let top2 = top.or(h1).unify().boxed(); // Then everything else
     let top3 = top2.or(h2).unify().boxed();
@@ -1521,10 +1545,63 @@ pub fn pyramid_routes(
     let r_new2 = session_register.or(sessions_list).unify().boxed();
     let top16 = top15.or(r_new1).unify().boxed();
     let top17 = top16.or(r_new2).unify().boxed();
+
+    // ── WS-DEADLETTER (§15.18): dead-letter queue operator surface ──
+    // GET  /pyramid/:slug/dead_letter           — list entries
+    // GET  /pyramid/:slug/dead_letter/:id       — inspect full entry
+    // POST /pyramid/:slug/dead_letter/:id/retry — re-fire the failed step
+    // POST /pyramid/:slug/dead_letter/:id/skip  — mark skipped (idempotent)
+    // All four go through with_auth_state (bearer token, local-only).
+    // The more-specific :id/retry and :id/skip paths are declared BEFORE the
+    // list and :id routes so warp's filter chain matches them first.
+    let dead_letter_retry = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("dead_letter"))
+        .and(warp::path::param::<i64>())
+        .and(warp::path("retry"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_dead_letter_retry));
+
+    let dead_letter_skip = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("dead_letter"))
+        .and(warp::path::param::<i64>())
+        .and(warp::path("skip"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(with_auth_state(state.clone()))
+        .and(warp::body::json::<DeadLetterSkipBody>())
+        .and_then(handle_dead_letter_skip));
+
+    let dead_letter_get = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("dead_letter"))
+        .and(warp::path::param::<i64>())
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_dead_letter_get));
+
+    let dead_letter_list = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("dead_letter"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::query::<std::collections::HashMap<String, String>>())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_dead_letter_list));
+
+    let dl_a = dead_letter_retry.or(dead_letter_skip).unify().boxed();
+    let dl_b = dead_letter_get.or(dead_letter_list).unify().boxed();
+    let dl = dl_a.or(dl_b).unify().boxed();
+    let top18 = top17.or(dl).unify().boxed();
+
     // public_html is now mounted separately at the server level so it can
     // get a permissive CORS filter (the desktop API allowlist would block
     // form POSTs from the tunnel host).
-    top17
+    top18
 }
 
 /// Mount the post-agents-retro `/p/` web surface routes. These are
@@ -4151,6 +4228,95 @@ async fn handle_cost(
     })))
 }
 
+// ── WS-COST-MODEL: cost transparency endpoints ──────────────────────────────
+//
+// GET  /pyramid/cost_model              — list all (chain_phase, model) rows
+// POST /pyramid/cost_model/recompute    — recompute observed rows from pyramid_llm_audit
+//
+// Literal "cost_model" path must be registered BEFORE slug-parameterized routes
+// so Warp does not bind "cost_model" as a :slug.
+
+/// Resolve the (input, output) per-million-token prices from PyramidConfig.
+/// TODO(cost-cache): PyramidConfig::load is disk I/O; acceptable for these two
+/// admin endpoints but should be cached if lookup ever moves onto a hot path.
+fn resolve_default_prices(state: &Arc<PyramidState>) -> (f64, f64) {
+    if let Some(ref data_dir) = state.data_dir {
+        let cfg = super::PyramidConfig::load(data_dir);
+        (
+            cfg.operational.tier1.default_input_price_per_million,
+            cfg.operational.tier1.default_output_price_per_million,
+        )
+    } else {
+        (0.19, 0.75)
+    }
+}
+
+/// Apply the seed JSON (cold-start) from `chains/defaults/pyramid_chain_cost_model_seed.json`.
+/// Idempotent: `apply_seed` only inserts rows for (chain_phase, model) pairs that
+/// don't already exist.
+fn seed_cost_model_if_needed(
+    conn: &rusqlite::Connection,
+    in_price: f64,
+    out_price: f64,
+) -> usize {
+    let candidates = [
+        std::path::PathBuf::from("chains/defaults/pyramid_chain_cost_model_seed.json"),
+        std::path::PathBuf::from("../chains/defaults/pyramid_chain_cost_model_seed.json"),
+    ];
+    let seed = candidates
+        .iter()
+        .find(|p| p.exists())
+        .map(|p| super::cost_model::load_seed(p))
+        .unwrap_or(super::cost_model::CostModelSeed {
+            version: 1,
+            entries: Vec::new(),
+        });
+    super::cost_model::apply_seed(conn, &seed, in_price, out_price).unwrap_or(0)
+}
+
+/// GET /pyramid/cost_model — list every cost-model row grouped by chain_phase.
+/// Cold-start: applies the heuristic seed before reading (idempotent).
+async fn handle_cost_model_list(
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let (in_price, out_price) = resolve_default_prices(&state);
+    let writer = state.writer.lock().await;
+    let _ = seed_cost_model_if_needed(&writer, in_price, out_price);
+    match super::cost_model::list_all(&writer) {
+        Ok(grouped) => Ok(json_ok(&serde_json::json!({
+            "ok": true,
+            "input_price_per_million": in_price,
+            "output_price_per_million": out_price,
+            "phases": grouped,
+        }))),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("cost_model list failed: {}", e),
+        )),
+    }
+}
+
+/// POST /pyramid/cost_model/recompute — rebuild observed rows from `pyramid_llm_audit`.
+/// Seed rows for untouched (phase, model) pairs are preserved (no DELETE).
+async fn handle_cost_model_recompute(
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let (in_price, out_price) = resolve_default_prices(&state);
+    let writer = state.writer.lock().await;
+    let seeded = seed_cost_model_if_needed(&writer, in_price, out_price);
+    match super::cost_model::recompute_from_audit(&writer, in_price, out_price) {
+        Ok(upserted) => Ok(json_ok(&serde_json::json!({
+            "ok": true,
+            "seeded": seeded,
+            "upserted": upserted,
+        }))),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("cost_model recompute failed: {}", e),
+        )),
+    }
+}
+
 /// POST /pyramid/:slug/auto-update/l0-sweep
 ///
 /// Enqueue every tracked L0 file for a fresh stale check, then immediately
@@ -6227,5 +6393,224 @@ async fn handle_sessions_list(
             warp::http::StatusCode::INTERNAL_SERVER_ERROR,
             &e.to_string(),
         )),
+    }
+}
+
+// ── WS-DEADLETTER (§15.18): operator surface ──────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct DeadLetterSkipBody {
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+/// GET /pyramid/:slug/dead_letter[?status=open|skipped|resolved|all]
+///
+/// Lists dead-letter entries for a slug. Default filter is `open`. Read-only
+/// and safe to hit while a build is running — acquires only a read lock on
+/// the shared reader connection.
+async fn handle_dead_letter_list(
+    slug_name: String,
+    q: std::collections::HashMap<String, String>,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let status_filter: Option<&str> = match q.get("status").map(|s| s.as_str()) {
+        Some("all") | Some("") => None,
+        Some(other) => Some(other),
+        None => Some("open"),
+    };
+    let conn = state.reader.lock().await;
+    match db::list_dead_letter(&conn, &slug_name, status_filter) {
+        Ok(entries) => Ok(json_ok(&serde_json::json!({
+            "slug": slug_name,
+            "count": entries.len(),
+            "entries": entries,
+        }))),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
+    }
+}
+
+/// GET /pyramid/:slug/dead_letter/:id — full entry including snapshots.
+async fn handle_dead_letter_get(
+    slug_name: String,
+    id: i64,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let conn = state.reader.lock().await;
+    match db::get_dead_letter(&conn, &slug_name, id) {
+        Ok(Some(entry)) => Ok(json_ok(&entry)),
+        Ok(None) => Ok(json_error(
+            warp::http::StatusCode::NOT_FOUND,
+            &format!("dead-letter entry {id} not found for slug '{slug_name}'"),
+        )),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
+    }
+}
+
+/// POST /pyramid/:slug/dead_letter/:id/skip — idempotent; marks the entry
+/// `status='skipped'` and stores an optional operator note.
+async fn handle_dead_letter_skip(
+    slug_name: String,
+    id: i64,
+    state: Arc<PyramidState>,
+    body: DeadLetterSkipBody,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    // WS-CONCURRENCY lock: serialize with any in-flight builder / delta /
+    // dead-letter write on this slug.
+    let _lock = super::lock_manager::LockManager::global()
+        .write(&slug_name)
+        .await;
+
+    let conn = state.writer.lock().await;
+    // Verify the entry exists AND belongs to this slug before updating, so
+    // the response is 404 rather than a silent no-op UPDATE.
+    let existing = match db::get_dead_letter(&conn, &slug_name, id) {
+        Ok(Some(e)) => e,
+        Ok(None) => {
+            return Ok(json_error(
+                warp::http::StatusCode::NOT_FOUND,
+                &format!("dead-letter entry {id} not found for slug '{slug_name}'"),
+            ));
+        }
+        Err(e) => {
+            return Ok(json_error(
+                warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                &e.to_string(),
+            ));
+        }
+    };
+    // State machine: `resolved` and `skipped` are terminal. Skipping an
+    // already-skipped entry is an idempotent no-op (do not overwrite the
+    // existing note). Skipping a resolved entry is rejected — we must not
+    // transition out of a terminal state.
+    if existing.status == "skipped" {
+        return Ok(json_ok(&serde_json::json!({
+            "slug": slug_name,
+            "id": id,
+            "status": "skipped",
+            "message": "already skipped",
+        })));
+    }
+    if existing.status == "resolved" {
+        return Ok(json_error(
+            warp::http::StatusCode::CONFLICT,
+            &format!("dead-letter entry {id} is resolved; cannot skip"),
+        ));
+    }
+    match db::update_dead_letter_status(&conn, &slug_name, id, "skipped", body.note.as_deref()) {
+        Ok(()) => Ok(json_ok(&serde_json::json!({
+            "slug": slug_name,
+            "id": id,
+            "status": "skipped",
+        }))),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
+    }
+}
+
+/// POST /pyramid/:slug/dead_letter/:id/retry — re-fire the failed step with
+/// the original input. On success the entry transitions to `resolved`; on
+/// failure the entry stays `open` (retry_count is bumped) and the fresh
+/// error is surfaced to the operator.
+async fn handle_dead_letter_retry(
+    slug_name: String,
+    id: i64,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    // WS-CONCURRENCY lock held for the entire retry operation: lookup →
+    // bump retry_count → dispatch → status transition.
+    let _lock = super::lock_manager::LockManager::global()
+        .write(&slug_name)
+        .await;
+
+    // 1. Load the entry from its own short-lived reader borrow.
+    let entry = {
+        let conn = state.reader.lock().await;
+        match db::get_dead_letter(&conn, &slug_name, id) {
+            Ok(Some(e)) => e,
+            Ok(None) => {
+                return Ok(json_error(
+                    warp::http::StatusCode::NOT_FOUND,
+                    &format!("dead-letter entry {id} not found for slug '{slug_name}'"),
+                ));
+            }
+            Err(e) => {
+                return Ok(json_error(
+                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    &e.to_string(),
+                ));
+            }
+        }
+    };
+
+    // State machine: `resolved` and `skipped` are terminal. Retry is an
+    // idempotent no-op against either terminal state.
+    if entry.status == "resolved" {
+        return Ok(json_ok(&serde_json::json!({
+            "slug": slug_name,
+            "id": id,
+            "status": "resolved",
+            "message": "already resolved",
+        })));
+    }
+    if entry.status == "skipped" {
+        return Ok(json_ok(&serde_json::json!({
+            "slug": slug_name,
+            "id": id,
+            "status": "skipped",
+            "message": "already skipped",
+        })));
+    }
+
+    // 2. Bump retry_count and last_seen_at BEFORE dispatching so that a
+    //    panic or process crash during re-dispatch still records the attempt.
+    {
+        let conn = state.writer.lock().await;
+        if let Err(e) = db::bump_dead_letter_retry(&conn, &slug_name, id) {
+            return Ok(json_error(
+                warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                &e.to_string(),
+            ));
+        }
+    }
+
+    // 3. Re-dispatch the step from its stored snapshot. This does NOT
+    //    acquire any lock itself — we already hold the write guard above.
+    let retry_result = super::chain_executor::retry_dead_letter_entry(&state, &entry).await;
+
+    // 4. Transition the entry based on the dispatch outcome.
+    match retry_result {
+        Ok(output) => {
+            let conn = state.writer.lock().await;
+            if let Err(e) =
+                db::update_dead_letter_status(&conn, &slug_name, id, "resolved", None)
+            {
+                return Ok(json_error(
+                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    &e.to_string(),
+                ));
+            }
+            Ok(json_ok(&serde_json::json!({
+                "slug": slug_name,
+                "id": id,
+                "status": "resolved",
+                "output": output,
+            })))
+        }
+        Err(e) => {
+            // Entry remains `open`. Report the fresh failure to the caller.
+            Ok(json_error(
+                warp::http::StatusCode::BAD_GATEWAY,
+                &format!("retry failed: {e:#}"),
+            ))
+        }
     }
 }

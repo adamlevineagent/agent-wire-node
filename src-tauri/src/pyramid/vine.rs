@@ -469,6 +469,7 @@ pub fn assemble_vine_l0(
             superseded_by: None,
             build_id: None,
             created_at: String::new(), // db fills this
+            ..Default::default()
         };
 
         db::save_node(
@@ -507,6 +508,7 @@ pub fn assemble_vine_l0(
                     superseded_by: None,
                     build_id: None,
                     created_at: String::new(),
+                    ..Default::default()
                 };
 
                 db::save_node(
@@ -590,6 +592,24 @@ pub async fn run_build_pipeline(
     drop(progress_tx);
     let _ = writer_handle.await;
     let _ = progress_handle.await;
+
+    // WS-EVENTS §15.21: SlopeChanged catch-all at legacy build-pipeline
+    // completion. `build::build_conversation` / `build_code` / `build_docs`
+    // don't have the bus threaded through yet (intentionally unrefactored
+    // per WS-EVENTS scope — brief forbids restructuring those call sites),
+    // so we emit once here on success to guarantee WS-PRIMER subscribers
+    // see a cache-invalidation edge after every successful legacy build.
+    // Empty `affected_layers` = "revalidate everything".
+    if result.is_ok() {
+        if let Some(bus) = bus {
+            let _ = bus.tx.send(super::event_bus::TaggedBuildEvent {
+                slug: slug.to_string(),
+                kind: super::event_bus::TaggedKind::SlopeChanged {
+                    affected_layers: Vec::new(),
+                },
+            });
+        }
+    }
 
     result
 }
@@ -2725,6 +2745,16 @@ pub async fn notify_vine_of_bunch_change(
         return Ok(false);
     }
 
+    // WS-CONCURRENCY (§15.16 race 2): composition delta while a child
+    // rebuild lands. We mutate BOTH the bunch (child) and the vine (parent)
+    // below — supersede L0 nodes, update vine_bunches, reassemble. Acquire
+    // both write locks in the single process-wide deadlock-free order
+    // (child → parent) via write_child_then_parent. Guards drop at end of
+    // scope (end of function) releasing the locks.
+    let (_bunch_guard, _vine_guard) = super::lock_manager::LockManager::global()
+        .write_child_then_parent(&bunch.bunch_slug, vine_slug)
+        .await;
+
     info!(
         "Bunch '{}' has changed — updating vine L0 nodes",
         bunch.bunch_slug
@@ -2844,6 +2874,7 @@ pub async fn notify_vine_of_bunch_change(
             superseded_by: None,
             build_id: None,
             created_at: String::new(),
+            ..Default::default()
         };
         db::save_node(
             &conn,
@@ -2880,6 +2911,7 @@ pub async fn notify_vine_of_bunch_change(
                     superseded_by: None,
                     build_id: None,
                     created_at: String::new(),
+                    ..Default::default()
                 };
                 db::save_node(
                     &conn,
