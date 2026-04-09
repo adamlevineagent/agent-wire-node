@@ -96,13 +96,11 @@ interface DrillResult {
 }
 
 interface VocabEntry {
-    canonical_name: string;
-    category: string;
-    importance: number;
-    live: boolean;
-    aliases?: string[];
-    first_seen?: string;
-    last_seen?: string;
+    name: string;
+    category: string | null;
+    importance: number | null;
+    liveness: string;
+    detail?: any;
 }
 
 interface DadbearWatchConfig {
@@ -233,6 +231,16 @@ export function PyramidNavPage({ initialSlug, onBack }: PyramidNavPageProps) {
     // ── Error state ────────────────────────────────────────────────────
     const [error, setError] = useState<string | null>(null);
 
+    // ── Auth token for HTTP fetches ───────────────────────────────────
+    const [authToken, setAuthToken] = useState('');
+    useEffect(() => {
+        invoke<string>('pyramid_get_auth_token').then(setAuthToken).catch(() => {});
+    }, []);
+    const authHeaders = useMemo(() => {
+        if (!authToken) return {};
+        return { 'Authorization': `Bearer ${authToken}` } as Record<string, string>;
+    }, [authToken]);
+
     // ─── Fetch slug list ───────────────────────────────────────────────
 
     const fetchSlugs = useCallback(async () => {
@@ -280,15 +288,22 @@ export function PyramidNavPage({ initialSlug, onBack }: PyramidNavPageProps) {
     // ─── Fetch vocabulary when slug changes ────────────────────────────
 
     useEffect(() => {
-        if (!selectedSlug) return;
+        if (!selectedSlug || !authToken) return;
         setVocabLoading(true);
         setVocabulary([]);
 
-        fetch(`${PYRAMID_API_BASE}/pyramid/${selectedSlug}/vocabulary`)
+        fetch(`${PYRAMID_API_BASE}/pyramid/${selectedSlug}/vocabulary`, { headers: authHeaders })
             .then(r => r.ok ? r.json() : Promise.reject(`HTTP ${r.status}`))
             .then(data => {
-                // The vocabulary endpoint may return { entries: [...] } or an array
-                const entries = Array.isArray(data) ? data : (data?.entries ?? data?.vocabulary ?? []);
+                // Backend returns VocabularyCatalog: { topics, entities, decisions, terms, practices }
+                // Flatten all categories into a single array
+                const entries: VocabEntry[] = [
+                    ...(data?.topics || []),
+                    ...(data?.entities || []),
+                    ...(data?.decisions || []),
+                    ...(data?.terms || []),
+                    ...(data?.practices || []),
+                ];
                 setVocabulary(entries);
             })
             .catch(() => {
@@ -296,7 +311,7 @@ export function PyramidNavPage({ initialSlug, onBack }: PyramidNavPageProps) {
                 setVocabulary([]);
             })
             .finally(() => setVocabLoading(false));
-    }, [selectedSlug]);
+    }, [selectedSlug, authToken, authHeaders]);
 
     // ─── Fetch DADBEAR status when slug changes ────────────────────────
 
@@ -309,26 +324,28 @@ export function PyramidNavPage({ initialSlug, onBack }: PyramidNavPageProps) {
             .catch(() => setAutoUpdateStatus(null));
 
         // DADBEAR watch status (via HTTP)
-        fetch(`${PYRAMID_API_BASE}/pyramid/${selectedSlug}/dadbear/status`)
-            .then(r => r.ok ? r.json() : Promise.reject(`HTTP ${r.status}`))
-            .then(setDadbearStatus)
-            .catch(() => setDadbearStatus(null));
+        if (authToken) {
+            fetch(`${PYRAMID_API_BASE}/pyramid/${selectedSlug}/dadbear/status`, { headers: authHeaders })
+                .then(r => r.ok ? r.json() : Promise.reject(`HTTP ${r.status}`))
+                .then(setDadbearStatus)
+                .catch(() => setDadbearStatus(null));
 
-        // Recovery status (via HTTP)
-        fetch(`${PYRAMID_API_BASE}/pyramid/${selectedSlug}/recovery/status`)
-            .then(r => r.ok ? r.json() : Promise.reject(`HTTP ${r.status}`))
-            .then(setRecoveryStatus)
-            .catch(() => setRecoveryStatus(null));
+            // Recovery status (via HTTP)
+            fetch(`${PYRAMID_API_BASE}/pyramid/${selectedSlug}/recovery/status`, { headers: authHeaders })
+                .then(r => r.ok ? r.json() : Promise.reject(`HTTP ${r.status}`))
+                .then(setRecoveryStatus)
+                .catch(() => setRecoveryStatus(null));
 
-        // Vine bedrocks (via HTTP)
-        fetch(`${PYRAMID_API_BASE}/pyramid/${selectedSlug}/vine/bedrocks`)
-            .then(r => r.ok ? r.json() : Promise.reject(`HTTP ${r.status}`))
-            .then(data => {
-                const items = Array.isArray(data) ? data : (data?.bedrocks ?? []);
-                setBedrocks(items);
-            })
-            .catch(() => setBedrocks([]));
-    }, [selectedSlug]);
+            // Vine bedrocks (via HTTP)
+            fetch(`${PYRAMID_API_BASE}/pyramid/${selectedSlug}/vine/bedrocks`, { headers: authHeaders })
+                .then(r => r.ok ? r.json() : Promise.reject(`HTTP ${r.status}`))
+                .then(data => {
+                    const items = Array.isArray(data) ? data : (data?.bedrocks ?? []);
+                    setBedrocks(items);
+                })
+                .catch(() => setBedrocks([]));
+        }
+    }, [selectedSlug, authToken, authHeaders]);
 
     // ─── Fetch reading mode data ───────────────────────────────────────
 
@@ -346,21 +363,23 @@ export function PyramidNavPage({ initialSlug, onBack }: PyramidNavPageProps) {
         } else if (readingMode === 'walk') {
             setReadingData(tree);
             setReadingLoading(false);
+        } else if (!authToken) {
+            // HTTP reading modes need auth — wait for token
+            setReadingLoading(false);
         } else if (readingMode === 'decisions') {
-            fetch(`${PYRAMID_API_BASE}/pyramid/${selectedSlug}/reading/decisions`, {})
+            fetch(`${PYRAMID_API_BASE}/pyramid/${selectedSlug}/reading/decisions`, { headers: authHeaders })
                 .then(r => r.ok ? r.json() : Promise.reject(`HTTP ${r.status}`))
                 .then(setReadingData)
                 .catch(() => setReadingData(null))
                 .finally(() => setReadingLoading(false));
         } else if (readingMode === 'speaker') {
-            fetch(`${PYRAMID_API_BASE}/pyramid/${selectedSlug}/reading/speaker?role=human`, {})
+            fetch(`${PYRAMID_API_BASE}/pyramid/${selectedSlug}/reading/speaker?role=human`, { headers: authHeaders })
                 .then(r => r.ok ? r.json() : Promise.reject(`HTTP ${r.status}`))
                 .then(setReadingData)
                 .catch(() => setReadingData(null))
                 .finally(() => setReadingLoading(false));
         } else if (readingMode === 'thread') {
-            // Thread needs an identity — use the first topic from vocabulary or a default
-            fetch(`${PYRAMID_API_BASE}/pyramid/${selectedSlug}/reading/thread?identity=*`, {})
+            fetch(`${PYRAMID_API_BASE}/pyramid/${selectedSlug}/reading/thread?identity=*`, { headers: authHeaders })
                 .then(r => r.ok ? r.json() : Promise.reject(`HTTP ${r.status}`))
                 .then(setReadingData)
                 .catch(() => setReadingData(null))
@@ -368,7 +387,7 @@ export function PyramidNavPage({ initialSlug, onBack }: PyramidNavPageProps) {
         } else {
             setReadingLoading(false);
         }
-    }, [selectedSlug, readingMode]);
+    }, [selectedSlug, readingMode, authToken, authHeaders]);
 
     // ─── Node drill ────────────────────────────────────────────────────
 
@@ -400,7 +419,7 @@ export function PyramidNavPage({ initialSlug, onBack }: PyramidNavPageProps) {
 
         try {
             // Use the search endpoint as the primary question mechanism
-            const r = await fetch(`${PYRAMID_API_BASE}/pyramid/${selectedSlug}/search?q=${encodeURIComponent(question.trim())}`);
+            const r = await fetch(`${PYRAMID_API_BASE}/pyramid/${selectedSlug}/search?q=${encodeURIComponent(question.trim())}`, { headers: authHeaders });
             if (r.ok) {
                 const data = await r.json();
                 setQuestionResult(data);
@@ -412,7 +431,7 @@ export function PyramidNavPage({ initialSlug, onBack }: PyramidNavPageProps) {
         } finally {
             setQuestionLoading(false);
         }
-    }, [selectedSlug, question]);
+    }, [selectedSlug, question, authHeaders]);
 
     // ─── Search ────────────────────────────────────────────────────────
 
@@ -422,7 +441,7 @@ export function PyramidNavPage({ initialSlug, onBack }: PyramidNavPageProps) {
         setSearchResults([]);
 
         try {
-            const r = await fetch(`${PYRAMID_API_BASE}/pyramid/${selectedSlug}/search?q=${encodeURIComponent(searchQuery.trim())}`);
+            const r = await fetch(`${PYRAMID_API_BASE}/pyramid/${selectedSlug}/search?q=${encodeURIComponent(searchQuery.trim())}`, { headers: authHeaders });
             if (r.ok) {
                 const data = await r.json();
                 setSearchResults(Array.isArray(data) ? data : (data?.results ?? data?.hits ?? [data]));
@@ -733,7 +752,7 @@ export function PyramidNavPage({ initialSlug, onBack }: PyramidNavPageProps) {
 function VocabCategoryGroup({ category, entries }: { category: string; entries: VocabEntry[] }) {
     const [expanded, setExpanded] = useState(true);
     const label = category.charAt(0).toUpperCase() + category.slice(1);
-    const liveCount = entries.filter(e => e.live).length;
+    const liveCount = entries.filter(e => e.liveness === 'live').length;
 
     return (
         <div className="pnav-vocab-category">
@@ -747,8 +766,8 @@ function VocabCategoryGroup({ category, entries }: { category: string; entries: 
             {expanded && (
                 <div className="pnav-vocab-entries">
                     {entries.slice(0, 20).map((v, i) => (
-                        <div key={i} className={`pnav-vocab-entry${v.live ? '' : ' pnav-vocab-mooted'}`}>
-                            <span className="pnav-vocab-name">{v.canonical_name}</span>
+                        <div key={i} className={`pnav-vocab-entry${v.liveness === 'live' ? '' : ' pnav-vocab-mooted'}`}>
+                            <span className="pnav-vocab-name">{v.name}</span>
                             {v.importance > 0 && (
                                 <span className="pnav-vocab-importance">
                                     {'*'.repeat(Math.min(3, Math.ceil(v.importance * 3)))}
@@ -774,17 +793,26 @@ function MemoirView({ data, loading }: { data: any; loading: boolean }) {
     const summary = data.summary ?? data.distilled ?? data.headline ?? '';
     const headline = data.headline ?? data.id ?? 'Apex';
 
+    // Narrative multi-zoom: prefer the deepest zoom level's prose
+    const narrativeText = data.narrative?.levels?.[0]?.text ?? '';
+
     return (
         <div className="pnav-memoir">
             <h3 className="pnav-memoir-headline">{headline}</h3>
-            {summary && <p className="pnav-memoir-summary">{summary}</p>}
+            {narrativeText ? (
+                <div className="pnav-memoir-narrative">
+                    <p>{narrativeText}</p>
+                </div>
+            ) : summary ? (
+                <p className="pnav-memoir-summary">{summary}</p>
+            ) : null}
             {data.topics && data.topics.length > 0 && (
                 <div className="pnav-memoir-topics">
                     <h5>Key Topics</h5>
                     <div className="pnav-tag-list">
                         {data.topics.map((t: any, i: number) => (
                             <span key={i} className="pnav-tag pnav-tag-topic">
-                                {typeof t === 'string' ? t : t.name ?? t.canonical_name ?? JSON.stringify(t)}
+                                {typeof t === 'string' ? t : t.name ?? JSON.stringify(t)}
                             </span>
                         ))}
                     </div>
@@ -799,7 +827,7 @@ function MemoirView({ data, loading }: { data: any; loading: boolean }) {
                                 {d.stance ?? 'open'}
                             </span>
                             <span className="pnav-decision-text">
-                                {typeof d === 'string' ? d : d.question ?? d.name ?? d.description ?? JSON.stringify(d)}
+                                {typeof d === 'string' ? d : d.decided ?? d.question ?? d.name ?? JSON.stringify(d)}
                             </span>
                         </div>
                     ))}
@@ -911,7 +939,7 @@ function ThreadView({
                             </span>
                         )}
                     </div>
-                    {m.matched_field && <span className="pnav-thread-desc">matched: {m.matched_field}</span>}
+                    {m.matched_text && <span className="pnav-thread-desc">matched: {m.matched_text}</span>}
                 </div>
             ))}
         </div>
@@ -1024,7 +1052,7 @@ function SearchModeView({
             {results.length > 0 && (
                 <div className="pnav-search-results">
                     {results.map((r: any, i: number) => (
-                        <div key={i} className="pnav-search-result" onClick={() => r.id && onNodeClick(r.id)}>
+                        <div key={i} className="pnav-search-result" onClick={() => (r.node_id ?? r.id) && onNodeClick(r.node_id ?? r.id)}>
                             <div className="pnav-search-result-headline">
                                 {r.headline ?? r.title ?? r.id ?? `Result ${i + 1}`}
                             </div>
@@ -1049,7 +1077,7 @@ function QuestionResultView({ data, onNodeClick }: { data: any; onNodeClick: (no
     return (
         <div className="pnav-question-results">
             {results.map((r: any, i: number) => (
-                <div key={i} className="pnav-question-result-item" onClick={() => r.id && onNodeClick(r.id)}>
+                <div key={i} className="pnav-question-result-item" onClick={() => (r.node_id ?? r.id) && onNodeClick(r.node_id ?? r.id)}>
                     <div className="pnav-question-result-headline">
                         {r.headline ?? r.title ?? r.id ?? `Result ${i + 1}`}
                     </div>
@@ -1164,7 +1192,7 @@ function NodeDetailView({
                                 <span className={`pnav-decision-stance pnav-stance-${d.stance ?? 'open'}`}>
                                     {d.stance ?? 'open'}
                                 </span>
-                                <span>{d.question ?? d.name ?? JSON.stringify(d)}</span>
+                                <span>{d.decided ?? d.question ?? d.name ?? JSON.stringify(d)}</span>
                             </div>
                         ))}
                     </div>

@@ -25,12 +25,17 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use super::build;
+use super::chain_dispatch;
 use super::db;
 use super::ingest;
 use super::llm::{self, LlmConfig};
 use super::query;
 use super::types::*;
 use super::PyramidState;
+
+/// Episodic synthesis prompt — loaded at compile time from the canonical source.
+const SYNTHESIZE_RECURSIVE_PROMPT: &str =
+    include_str!("../../../chains/prompts/conversation-episodic/synthesize_recursive.md");
 
 // ── Writer Drain Helper ──────────────────────────────────────────────────────
 
@@ -469,6 +474,12 @@ pub fn assemble_vine_l0(
             superseded_by: None,
             build_id: None,
             created_at: String::new(), // db fills this
+            narrative: apex.narrative.clone(),
+            entities: apex.entities.clone(),
+            key_quotes: apex.key_quotes.clone(),
+            transitions: apex.transitions.clone(),
+            time_range: apex.time_range.clone(),
+            weight: apex.weight,
             ..Default::default()
         };
 
@@ -508,6 +519,12 @@ pub fn assemble_vine_l0(
                     superseded_by: None,
                     build_id: None,
                     created_at: String::new(),
+                    narrative: pn.narrative.clone(),
+                    entities: pn.entities.clone(),
+                    key_quotes: pn.key_quotes.clone(),
+                    transitions: pn.transitions.clone(),
+                    time_range: pn.time_range.clone(),
+                    weight: pn.weight,
                     ..Default::default()
                 };
 
@@ -1358,43 +1375,31 @@ pub async fn build_vine_l1(
             continue;
         }
 
-        // Build topic inventory for THREAD_NARRATIVE_PROMPT
-        let mut topic_entries = Vec::new();
+        // Build episodic node payloads for synthesize_recursive.md
+        let mut node_payloads = Vec::new();
         for (order, node) in l0_nodes.iter().enumerate() {
-            for (_ti, topic) in node.topics.iter().enumerate() {
-                let mut entry = serde_json::json!({
-                    "source_node": node.id,
-                    "order": order,
-                    "name": topic.name,
-                    "current": topic.current,
-                    "entities": topic.entities,
-                    "corrections": topic.corrections,
-                    "decisions": topic.decisions,
-                });
-                // Mark later nodes as authoritative
-                if order >= l0_nodes.len().saturating_sub(2) {
-                    entry["authority"] = serde_json::json!("[LATE — AUTHORITATIVE]");
-                }
-                topic_entries.push(entry);
-            }
+            let mut payload = build::episodic_child_payload_json(node);
+            payload["input_order"] = serde_json::json!(order);
+            node_payloads.push(payload);
         }
 
         let user_prompt = format!(
-            "## THREAD: {cluster_name}\n\n{}",
-            serde_json::to_string_pretty(&topic_entries)?
+            "## CLUSTER: {cluster_name}\n## INPUT NODES ({} nodes)\n{}",
+            node_payloads.len(),
+            serde_json::to_string_pretty(&node_payloads)?
         );
 
         info!(
-            "  L1-{cluster_idx:03}: '{cluster_name}' ({} nodes, {} topics)",
+            "  L1-{cluster_idx:03}: '{cluster_name}' ({} nodes, {} payloads)",
             l0_nodes.len(),
-            topic_entries.len()
+            node_payloads.len()
         );
 
         let t0 = Instant::now();
 
         match build::call_and_parse(
             &llm_config,
-            build::THREAD_NARRATIVE_PROMPT,
+            SYNTHESIZE_RECURSIVE_PROMPT,
             &user_prompt,
             &format!("vine-l1-{cluster_idx}"),
         )
@@ -1421,14 +1426,22 @@ pub async fn build_vine_l1(
                 .await;
 
                 let children: Vec<String> = l0_nodes.iter().map(|n| n.id.clone()).collect();
-                let node = build::node_from_analysis(
+                let mut node = match chain_dispatch::build_node_from_output(
                     &analysis,
                     &l1_id,
                     vine_slug,
                     1,
                     None,
-                    children.clone(),
-                );
+                ) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        error!("build_node_from_output failed for vine L1 '{l1_id}': {e}");
+                        continue;
+                    }
+                };
+                node.children = children.clone();
+                // Backfill distilled from narrative for downstream consumers
+                node.distilled = node.narrative.levels.first().map(|l| l.text.clone()).unwrap_or_default();
                 build::send_save_node(&write_tx, node, Some(topics_json)).await;
 
                 // Set parent pointers on L0 nodes
@@ -1532,8 +1545,8 @@ pub async fn build_vine_upper(
                 let left = &current_nodes[i];
                 let right = &current_nodes[i + 1];
 
-                let left_payload = build::child_payload_json(left);
-                let right_payload = build::child_payload_json(right);
+                let left_payload = build::episodic_child_payload_json(left);
+                let right_payload = build::episodic_child_payload_json(right);
 
                 let user_prompt = format!(
                     "## SIBLING A (earlier)\n{}\n\n## SIBLING B (later)\n{}",
@@ -1549,7 +1562,7 @@ pub async fn build_vine_upper(
                 for attempt in 0..3 {
                     match build::call_and_parse(
                         &llm_config,
-                        build::DISTILL_PROMPT,
+                        SYNTHESIZE_RECURSIVE_PROMPT,
                         &user_prompt,
                         &format!("vine-synth-d{next_depth}-{pair_idx}"),
                     )
@@ -1595,14 +1608,33 @@ pub async fn build_vine_upper(
                     )
                     .await;
 
-                    let node = build::node_from_analysis(
+                    let mut node = match chain_dispatch::build_node_from_output(
                         &analysis,
                         &node_id,
                         vine_slug,
                         next_depth,
                         None,
-                        vec![left.id.clone(), right.id.clone()],
-                    );
+                    ) {
+                        Ok(n) => n,
+                        Err(e) => {
+                            error!("  build_node_from_output failed for {node_id}: {e}");
+                            failures += 1;
+                            let mut fallback = current_nodes[i].clone();
+                            fallback.id = node_id.clone();
+                            fallback.depth = next_depth;
+                            fallback.chunk_index = None;
+                            fallback.children = vec![left.id.clone(), right.id.clone()];
+                            build::send_save_node(&write_tx, fallback, None).await;
+                            build::send_update_parent(&write_tx, vine_slug, &left.id, &node_id).await;
+                            build::send_update_parent(&write_tx, vine_slug, &right.id, &node_id).await;
+                            i += 2;
+                            pair_idx += 1;
+                            continue;
+                        }
+                    };
+                    node.children = vec![left.id.clone(), right.id.clone()];
+                    // Backfill distilled from narrative for downstream consumers
+                    node.distilled = node.narrative.levels.first().map(|l| l.text.clone()).unwrap_or_default();
                     build::send_save_node(&write_tx, node, Some(topics_json)).await;
                     build::send_update_parent(&write_tx, vine_slug, &left.id, &node_id).await;
                     build::send_update_parent(&write_tx, vine_slug, &right.id, &node_id).await;
@@ -1681,16 +1713,28 @@ pub async fn build_vine_upper(
                 }
             }
 
+            // Merge episodic fields from the best top node (first non-empty)
+            let best = top_nodes.first().unwrap(); // top_nodes.len() > 1 guaranteed
+            let truncated_headline = if combined_headline.chars().count() > 200 {
+                format!("{}...", combined_headline.chars().take(197).collect::<String>())
+            } else {
+                combined_headline
+            };
+
             let apex_node = PyramidNode {
                 id: forced_id.clone(),
                 slug: vine_slug.to_string(),
                 depth: apex_depth,
-                headline: if combined_headline.len() > 200 {
-                    format!("{}...", &combined_headline[..197])
-                } else { combined_headline },
+                headline: truncated_headline,
                 distilled: combined_distilled,
                 topics: merged_topics,
                 children,
+                narrative: best.narrative.clone(),
+                entities: best.entities.clone(),
+                key_quotes: best.key_quotes.clone(),
+                transitions: best.transitions.clone(),
+                time_range: best.time_range.clone(),
+                weight: top_nodes.iter().map(|n| n.weight).sum(),
                 ..Default::default()
             };
             build::send_save_node(&write_tx, apex_node, None).await;
@@ -3013,6 +3057,12 @@ pub async fn notify_vine_of_bunch_change(
             superseded_by: None,
             build_id: None,
             created_at: String::new(),
+            narrative: apex_node.narrative.clone(),
+            entities: apex_node.entities.clone(),
+            key_quotes: apex_node.key_quotes.clone(),
+            transitions: apex_node.transitions.clone(),
+            time_range: apex_node.time_range.clone(),
+            weight: apex_node.weight,
             ..Default::default()
         };
         db::save_node(
@@ -3050,6 +3100,12 @@ pub async fn notify_vine_of_bunch_change(
                     superseded_by: None,
                     build_id: None,
                     created_at: String::new(),
+                    narrative: pn.narrative.clone(),
+                    entities: pn.entities.clone(),
+                    key_quotes: pn.key_quotes.clone(),
+                    transitions: pn.transitions.clone(),
+                    time_range: pn.time_range.clone(),
+                    weight: pn.weight,
                     ..Default::default()
                 };
                 db::save_node(

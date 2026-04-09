@@ -5438,6 +5438,20 @@ async fn handle_vine_build(
             match vine::build_vine(&state_clone, &slug_clone, &jsonl_dirs, &cancel_clone).await {
                 Ok(apex_id) => {
                     tracing::info!("Vine build complete for '{}': apex={}", slug_clone, apex_id);
+                    // Post-vine-build: refresh vocabulary catalog from apex
+                    {
+                        let conn = state_clone.writer.lock().await;
+                        match super::vocabulary::refresh_vocabulary(&conn, &slug_clone) {
+                            Ok((_, count)) => tracing::info!(
+                                "Post-vine-build: vocabulary refreshed for '{}' ({} entries)",
+                                slug_clone, count
+                            ),
+                            Err(e) => tracing::warn!(
+                                "Post-vine-build: vocabulary refresh failed for '{}': {}",
+                                slug_clone, e
+                            ),
+                        }
+                    }
                     ("complete".to_string(), None)
                 }
                 Err(e) => {

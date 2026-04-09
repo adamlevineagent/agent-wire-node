@@ -157,6 +157,8 @@ pub struct Entity {
 pub struct KeyQuote {
     pub text: String,
     #[serde(default)]
+    pub speaker: String,
+    #[serde(default)]
     pub speaker_role: String,
     #[serde(default)]
     pub importance: f64,

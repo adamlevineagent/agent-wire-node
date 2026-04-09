@@ -537,6 +537,11 @@ pub fn build_node_from_output(
                         .and_then(|t| t.as_str())?;
                     Some(super::types::KeyQuote {
                         text: text.to_string(),
+                        speaker: q
+                            .get("speaker")
+                            .and_then(|s| s.as_str())
+                            .unwrap_or("")
+                            .to_string(),
                         speaker_role: q
                             .get("speaker_role")
                             .and_then(|r| r.as_str())

@@ -2840,6 +2840,53 @@ pub(crate) fn child_payload_json(node: &PyramidNode) -> Value {
     }
 }
 
+/// Episodic-aware child payload for vine synthesis with synthesize_recursive.md.
+/// Includes narrative, entities, key_quotes, transitions, time_range, weight —
+/// the fields that child_payload_json strips but the episodic prompt expects.
+pub(crate) fn episodic_child_payload_json(node: &PyramidNode) -> Value {
+    // Narrative: prefer multi-zoom level 0, fallback to distilled
+    let narrative_text = node
+        .narrative
+        .levels
+        .first()
+        .map(|l| l.text.as_str())
+        .filter(|t| !t.is_empty())
+        .unwrap_or(&node.distilled);
+
+    let mut payload = serde_json::json!({
+        "headline": node.headline,
+        "topics": node.topics,
+        "narrative": narrative_text,
+    });
+
+    if let Some(ref tr) = node.time_range {
+        payload["time_range"] = serde_json::to_value(tr).unwrap_or_default();
+    }
+
+    // Weight as object shape matching synthesize_recursive.md contract
+    if node.weight > 0.0 {
+        payload["weight"] = serde_json::json!({"tokens": node.weight, "turns": 0, "fraction_of_parent": 0.0});
+    }
+
+    if !node.decisions.is_empty() {
+        payload["decisions"] = serde_json::to_value(&node.decisions).unwrap_or_default();
+    }
+
+    if !node.entities.is_empty() {
+        payload["entities"] = serde_json::to_value(&node.entities).unwrap_or_default();
+    }
+
+    if !node.key_quotes.is_empty() {
+        payload["key_quotes"] = serde_json::to_value(&node.key_quotes).unwrap_or_default();
+    }
+
+    if !node.transitions.prior.is_empty() || !node.transitions.next.is_empty() {
+        payload["transitions"] = serde_json::to_value(&node.transitions).unwrap_or_default();
+    }
+
+    payload
+}
+
 /// Compact version of child_payload_json for upper-layer synthesis.
 /// Preserves topics (needed for synthesis quality) but truncates verbose text:
 /// - `distilled` capped to `max_distilled_chars`

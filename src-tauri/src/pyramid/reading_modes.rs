@@ -118,6 +118,7 @@ pub fn reading_walk(
 /// Searches all live nodes for mentions in topics[], entities[], or decisions[].
 /// Results are ordered chronologically (by chunk_index ASC within each depth).
 pub fn reading_thread(conn: &Connection, slug: &str, identity: &str) -> Result<ThreadView> {
+    let show_all = identity.is_empty() || identity == "*";
     let identity_lower = identity.to_lowercase();
     let all_nodes = db::get_all_live_nodes(conn, slug)?;
 
@@ -126,7 +127,7 @@ pub fn reading_thread(conn: &Connection, slug: &str, identity: &str) -> Result<T
     for node in &all_nodes {
         // Check topics
         for topic in &node.topics {
-            if topic.name.to_lowercase().contains(&identity_lower) {
+            if show_all || topic.name.to_lowercase().contains(&identity_lower) {
                 let importance = topic
                     .extra
                     .get("importance")
@@ -147,7 +148,7 @@ pub fn reading_thread(conn: &Connection, slug: &str, identity: &str) -> Result<T
 
         // Check entities
         for entity in &node.entities {
-            if entity.name.to_lowercase().contains(&identity_lower) {
+            if show_all || entity.name.to_lowercase().contains(&identity_lower) {
                 mentions.push(ThreadMention {
                     node_id: node.id.clone(),
                     depth: node.depth,
@@ -163,7 +164,7 @@ pub fn reading_thread(conn: &Connection, slug: &str, identity: &str) -> Result<T
 
         // Check decisions
         for decision in &node.decisions {
-            if decision.decided.to_lowercase().contains(&identity_lower) {
+            if show_all || decision.decided.to_lowercase().contains(&identity_lower) {
                 mentions.push(ThreadMention {
                     node_id: node.id.clone(),
                     depth: node.depth,

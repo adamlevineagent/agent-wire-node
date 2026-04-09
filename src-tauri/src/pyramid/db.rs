@@ -7544,6 +7544,7 @@ mod tests {
             }],
             key_quotes: vec![KeyQuote {
                 text: "hello".to_string(),
+                speaker: "Adam".to_string(),
                 speaker_role: "human".to_string(),
                 importance: 0.5,
                 chunk_ref: None,

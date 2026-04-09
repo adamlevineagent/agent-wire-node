@@ -5285,6 +5285,15 @@ async fn pyramid_get_config(
     }))
 }
 
+/// Return the pyramid auth token for use in frontend HTTP fetch calls.
+#[tauri::command]
+async fn pyramid_get_auth_token(
+    state: tauri::State<'_, SharedState>,
+) -> Result<String, String> {
+    let config = state.pyramid.config.read().await;
+    Ok(config.auth_token.clone())
+}
+
 /// List every model profile available to apply. Walks data_dir/profiles/
 /// and the legacy ~/.gemini/wire-node/profiles/ fallback. Returns sorted
 /// profile names (without `.json`).
@@ -7419,6 +7428,7 @@ fn main() {
             pyramid_create_slug,
             pyramid_delete_slug,
             pyramid_get_config,
+            pyramid_get_auth_token,
             pyramid_list_profiles,
             pyramid_apply_profile,
             pyramid_generate_ascii_banner,
