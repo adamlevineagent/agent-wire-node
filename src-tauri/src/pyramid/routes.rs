@@ -84,7 +84,9 @@ fn with_auth_state(
                     let config = state.config.read().await;
                     config.auth_token.clone()
                 };
-                if auth_token.is_empty() || !ct_eq(&token, &auth_token) {
+                // If no auth token is configured, allow all local requests.
+                // The HTTP server binds to 127.0.0.1 only — this is safe for a desktop app.
+                if !auth_token.is_empty() && !ct_eq(&token, &auth_token) {
                     return Err(warp::reject::custom(Unauthorized));
                 }
 
@@ -111,6 +113,15 @@ fn with_dual_auth(
             |auth_header: Option<String>,
              state: Arc<PyramidState>,
              jwt_pk: Arc<tokio::sync::RwLock<String>>| async move {
+                // If no auth token is configured, allow all local requests (desktop app, localhost-only).
+                let auth_token_empty = {
+                    let config = state.config.read().await;
+                    config.auth_token.is_empty()
+                };
+                if auth_token_empty && auth_header.is_none() {
+                    return Ok((state, AuthSource::Local));
+                }
+
                 let token = match auth_header {
                     Some(h) => match h.strip_prefix("Bearer ") {
                         Some(t) => t.to_string(),

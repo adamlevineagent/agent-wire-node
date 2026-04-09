@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect } from 'react';
+import { useState, useCallback, useEffect, useMemo } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-dialog';
 import { BuildProgress } from './BuildProgress';
@@ -133,6 +133,17 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
     const [profiles, setProfiles] = useState<string[]>([]);
     const [selectedProfile, setSelectedProfile] = useState<string>('');
     const [profilesError, setProfilesError] = useState<string | null>(null);
+
+    // Auth token for HTTP fetches
+    const [authToken, setAuthToken] = useState('');
+    useEffect(() => {
+        invoke<string>('pyramid_get_auth_token').then(setAuthToken).catch(() => {});
+    }, []);
+    const authHeaders = useMemo(() => {
+        const h: Record<string, string> = { 'Content-Type': 'application/json' };
+        if (authToken) h['Authorization'] = `Bearer ${authToken}`;
+        return h;
+    }, [authToken]);
 
     useEffect(() => {
         let cancelled = false;
@@ -371,7 +382,7 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
             const chainId = getEffectiveChainId();
             const response = await fetch(`${PYRAMID_API_BASE}/pyramid/${slug}/preview`, {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
+                headers: authHeaders,
                 body: JSON.stringify({
                     source_path: sourcePath,
                     content_type: contentType,
@@ -421,7 +432,7 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
             // Commit via the preview/commit endpoint — this creates DADBEAR config
             const commitResponse = await fetch(`${PYRAMID_API_BASE}/pyramid/${slug}/preview/commit`, {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
+                headers: authHeaders,
                 body: JSON.stringify({
                     source_path: sourcePath,
                     content_type: contentType,
@@ -445,7 +456,7 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
                     try {
                         await fetch(`${PYRAMID_API_BASE}/pyramid/${slug}/dadbear/watch`, {
                             method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
+                            headers: authHeaders,
                             body: JSON.stringify({
                                 source_path: watchPath,
                                 content_type: 'conversation',
