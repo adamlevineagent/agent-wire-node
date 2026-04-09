@@ -1097,6 +1097,31 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
         ",
     )?;
 
+    // ── WS-DEMAND-GEN (Phase 3): Demand-driven L0 generation job tracking ──────
+    // Tracks async demand-gen jobs fired when retrieval encounters questions
+    // whose answers don't exist in the pyramid.
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS pyramid_demand_gen_jobs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id TEXT NOT NULL UNIQUE,
+            slug TEXT NOT NULL,
+            question TEXT NOT NULL,
+            sub_questions TEXT,
+            status TEXT NOT NULL DEFAULT 'queued',
+            result_node_ids TEXT,
+            error_message TEXT,
+            requested_at TEXT NOT NULL DEFAULT (datetime('now')),
+            started_at TEXT,
+            completed_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_demand_gen_slug_status
+            ON pyramid_demand_gen_jobs(slug, status);
+        CREATE INDEX IF NOT EXISTS idx_demand_gen_job_id
+            ON pyramid_demand_gen_jobs(job_id);
+        ",
+    )?;
+
     // ── WS-VINE-UNIFY (Phase 2b): Vine composition table ──────────────────────
     // Tracks which bedrock pyramids compose each vine pyramid, their ordering,
     // and the current apex reference for each bedrock.
@@ -1117,6 +1142,33 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
             ON pyramid_vine_compositions(vine_slug, status);
         CREATE INDEX IF NOT EXISTS idx_vine_comp_bedrock
             ON pyramid_vine_compositions(bedrock_slug);
+        ",
+    )?;
+
+    // ── WS-CHAIN-PUBLISH (Phase 3): Chain publication metadata ──────────────────
+    // Tracks chain configurations published to the Wire contribution graph.
+    // Supports versioning, fork lineage, and Wire publication state.
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS pyramid_chain_publications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chain_id TEXT NOT NULL,
+            version INTEGER NOT NULL DEFAULT 1,
+            wire_handle_path TEXT,
+            wire_uuid TEXT,
+            published_at TEXT,
+            description TEXT,
+            author TEXT,
+            forked_from TEXT,
+            status TEXT NOT NULL DEFAULT 'local',
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(chain_id, version)
+        );
+        CREATE INDEX IF NOT EXISTS idx_chain_pub_chain_id
+            ON pyramid_chain_publications(chain_id);
+        CREATE INDEX IF NOT EXISTS idx_chain_pub_status
+            ON pyramid_chain_publications(chain_id, status);
         ",
     )?;
 
@@ -8867,6 +8919,146 @@ pub fn get_vines_for_bedrock(conn: &Connection, bedrock_slug: &str) -> Result<Ve
     Ok(rows)
 }
 
+// ── WS-DEMAND-GEN (Phase 3): Demand generation job DB helpers ────────────────
+
+use super::types::DemandGenJob;
+
+fn map_demand_gen_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DemandGenJob> {
+    let sub_q_json: Option<String> = row.get(4)?;
+    let result_json: Option<String> = row.get(6)?;
+    Ok(DemandGenJob {
+        id: row.get(0)?,
+        job_id: row.get(1)?,
+        slug: row.get(2)?,
+        question: row.get(3)?,
+        sub_questions: sub_q_json
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default(),
+        status: row.get(5)?,
+        result_node_ids: result_json
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default(),
+        error_message: row.get(7)?,
+        requested_at: row.get(8)?,
+        started_at: row.get(9)?,
+        completed_at: row.get(10)?,
+    })
+}
+
+const DEMAND_GEN_COLUMNS: &str =
+    "id, job_id, slug, question, sub_questions, status, result_node_ids, error_message, requested_at, started_at, completed_at";
+
+/// Insert a new demand-gen job. The caller must provide the `job_id` (UUID)
+/// and the `question`. Sub-questions are optional at creation time and can
+/// be populated when the executor decomposes the question.
+pub fn create_demand_gen_job(conn: &Connection, job: &DemandGenJob) -> Result<()> {
+    let sub_q = serde_json::to_string(&job.sub_questions)?;
+    conn.execute(
+        "INSERT INTO pyramid_demand_gen_jobs (job_id, slug, question, sub_questions, status, requested_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![
+            job.job_id,
+            job.slug,
+            job.question,
+            sub_q,
+            job.status,
+            job.requested_at,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Fetch a single demand-gen job by job_id.
+pub fn get_demand_gen_job(conn: &Connection, job_id: &str) -> Result<Option<DemandGenJob>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {DEMAND_GEN_COLUMNS} FROM pyramid_demand_gen_jobs WHERE job_id = ?1"
+    ))?;
+    let mut rows = stmt.query_map(rusqlite::params![job_id], map_demand_gen_row)?;
+    match rows.next() {
+        Some(Ok(job)) => Ok(Some(job)),
+        Some(Err(e)) => Err(e.into()),
+        None => Ok(None),
+    }
+}
+
+/// Transition a demand-gen job to "running" and set started_at.
+pub fn mark_demand_gen_running(conn: &Connection, job_id: &str) -> Result<()> {
+    let count = conn.execute(
+        "UPDATE pyramid_demand_gen_jobs
+         SET status = 'running', started_at = datetime('now')
+         WHERE job_id = ?1 AND status = 'queued'",
+        rusqlite::params![job_id],
+    )?;
+    if count == 0 {
+        return Err(anyhow::anyhow!(
+            "demand-gen job {job_id} not found or not in queued state"
+        ));
+    }
+    Ok(())
+}
+
+/// Mark a demand-gen job complete with the generated node IDs.
+pub fn mark_demand_gen_complete(conn: &Connection, job_id: &str, node_ids: &[String]) -> Result<()> {
+    let ids_json = serde_json::to_string(node_ids)?;
+    let count = conn.execute(
+        "UPDATE pyramid_demand_gen_jobs
+         SET status = 'complete', result_node_ids = ?1, completed_at = datetime('now')
+         WHERE job_id = ?2 AND status = 'running'",
+        rusqlite::params![ids_json, job_id],
+    )?;
+    if count == 0 {
+        return Err(anyhow::anyhow!(
+            "demand-gen job {job_id} not found or not in running state"
+        ));
+    }
+    Ok(())
+}
+
+/// Mark a demand-gen job as failed with an error message.
+pub fn mark_demand_gen_failed(conn: &Connection, job_id: &str, error: &str) -> Result<()> {
+    let count = conn.execute(
+        "UPDATE pyramid_demand_gen_jobs
+         SET status = 'failed', error_message = ?1, completed_at = datetime('now')
+         WHERE job_id = ?2 AND (status = 'queued' OR status = 'running')",
+        rusqlite::params![error, job_id],
+    )?;
+    if count == 0 {
+        return Err(anyhow::anyhow!(
+            "demand-gen job {job_id} not found or already in terminal state"
+        ));
+    }
+    Ok(())
+}
+
+/// List pending (queued or running) demand-gen jobs for a slug.
+pub fn get_pending_demand_gen_jobs(conn: &Connection, slug: &str) -> Result<Vec<DemandGenJob>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {DEMAND_GEN_COLUMNS} FROM pyramid_demand_gen_jobs
+         WHERE slug = ?1 AND status IN ('queued', 'running')
+         ORDER BY requested_at ASC"
+    ))?;
+    let rows = stmt
+        .query_map(rusqlite::params![slug], map_demand_gen_row)?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(rows)
+}
+
+/// List recent demand-gen jobs for a slug (all statuses, most recent first).
+pub fn list_demand_gen_jobs(conn: &Connection, slug: &str, limit: i64) -> Result<Vec<DemandGenJob>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {DEMAND_GEN_COLUMNS} FROM pyramid_demand_gen_jobs
+         WHERE slug = ?1
+         ORDER BY requested_at DESC
+         LIMIT ?2"
+    ))?;
+    let rows = stmt
+        .query_map(rusqlite::params![slug, limit], map_demand_gen_row)?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(rows)
+}
+
 /// Compact positions for active bedrocks in a vine after a removal.
 /// Reassigns positions 0, 1, 2, ... in current order.
 pub fn reorder_vine_bedrocks(conn: &Connection, vine_slug: &str) -> Result<()> {
@@ -8890,5 +9082,180 @@ pub fn reorder_vine_bedrocks(conn: &Connection, vine_slug: &str) -> Result<()> {
             rusqlite::params![new_pos as i32, row_id],
         )?;
     }
+    Ok(())
+}
+
+// ── WS-CHAIN-PUBLISH: Chain publication DB helpers ─────────────────────────────
+
+/// Column list for SELECT queries on pyramid_chain_publications.
+const CHAIN_PUB_COLUMNS: &str =
+    "id, chain_id, version, wire_handle_path, wire_uuid, published_at, description, author, forked_from, status, created_at, updated_at";
+
+/// Parse a row from `pyramid_chain_publications` into a `ChainPublication`.
+fn map_chain_publication_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<super::types::ChainPublication> {
+    Ok(super::types::ChainPublication {
+        id: row.get(0)?,
+        chain_id: row.get(1)?,
+        version: row.get(2)?,
+        wire_handle_path: row.get(3)?,
+        wire_uuid: row.get(4)?,
+        published_at: row.get(5)?,
+        description: row.get(6)?,
+        author: row.get(7)?,
+        forked_from: row.get(8)?,
+        status: row.get(9)?,
+        created_at: row.get(10)?,
+        updated_at: row.get(11)?,
+    })
+}
+
+/// Save (insert or update) a chain publication record.
+pub fn save_chain_publication(conn: &Connection, pub_record: &super::types::ChainPublication) -> Result<()> {
+    conn.execute(
+        "INSERT INTO pyramid_chain_publications
+            (chain_id, version, wire_handle_path, wire_uuid, published_at, description, author, forked_from, status)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+         ON CONFLICT(chain_id, version) DO UPDATE SET
+            wire_handle_path = excluded.wire_handle_path,
+            wire_uuid = excluded.wire_uuid,
+            published_at = excluded.published_at,
+            description = excluded.description,
+            author = excluded.author,
+            forked_from = excluded.forked_from,
+            status = excluded.status,
+            updated_at = datetime('now')",
+        rusqlite::params![
+            pub_record.chain_id,
+            pub_record.version,
+            pub_record.wire_handle_path,
+            pub_record.wire_uuid,
+            pub_record.published_at,
+            pub_record.description,
+            pub_record.author,
+            pub_record.forked_from,
+            pub_record.status,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Get the latest chain publication for a given chain_id (highest version).
+pub fn get_chain_publication(conn: &Connection, chain_id: &str) -> Result<Option<super::types::ChainPublication>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {CHAIN_PUB_COLUMNS} FROM pyramid_chain_publications
+         WHERE chain_id = ?1
+         ORDER BY version DESC
+         LIMIT 1"
+    ))?;
+    let mut rows = stmt.query_map(rusqlite::params![chain_id], map_chain_publication_row)?;
+    match rows.next() {
+        Some(Ok(record)) => Ok(Some(record)),
+        Some(Err(e)) => Err(e.into()),
+        None => Ok(None),
+    }
+}
+
+/// Get a specific version of a chain publication.
+pub fn get_chain_publication_by_version(
+    conn: &Connection,
+    chain_id: &str,
+    version: i32,
+) -> Result<Option<super::types::ChainPublication>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {CHAIN_PUB_COLUMNS} FROM pyramid_chain_publications
+         WHERE chain_id = ?1 AND version = ?2"
+    ))?;
+    let mut rows = stmt.query_map(rusqlite::params![chain_id, version], map_chain_publication_row)?;
+    match rows.next() {
+        Some(Ok(record)) => Ok(Some(record)),
+        Some(Err(e)) => Err(e.into()),
+        None => Ok(None),
+    }
+}
+
+/// List all chain publications (latest version per chain_id).
+pub fn list_chain_publications(conn: &Connection) -> Result<Vec<super::types::ChainPublication>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {CHAIN_PUB_COLUMNS} FROM pyramid_chain_publications cp1
+         WHERE version = (
+             SELECT MAX(version) FROM pyramid_chain_publications cp2
+             WHERE cp2.chain_id = cp1.chain_id
+         )
+         ORDER BY chain_id ASC"
+    ))?;
+    let rows = stmt.query_map([], map_chain_publication_row)?;
+    let collected = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(collected)
+}
+
+/// Mark a chain as published, recording the Wire handle-path and UUID.
+pub fn mark_chain_published(
+    conn: &Connection,
+    chain_id: &str,
+    wire_handle_path: &str,
+    wire_uuid: &str,
+) -> Result<()> {
+    let affected = conn.execute(
+        "UPDATE pyramid_chain_publications
+         SET wire_handle_path = ?2,
+             wire_uuid = ?3,
+             published_at = datetime('now'),
+             status = 'published',
+             updated_at = datetime('now')
+         WHERE chain_id = ?1 AND version = (
+             SELECT MAX(version) FROM pyramid_chain_publications WHERE chain_id = ?1
+         )",
+        rusqlite::params![chain_id, wire_handle_path, wire_uuid],
+    )?;
+    if affected == 0 {
+        anyhow::bail!("no chain publication found for chain_id '{}'", chain_id);
+    }
+    Ok(())
+}
+
+/// Increment the version for a chain and return the new version number.
+/// Creates a new row by copying the latest version's metadata with
+/// version = max + 1 and status = 'local'.
+pub fn increment_chain_version(conn: &Connection, chain_id: &str) -> Result<i32> {
+    let current = get_chain_publication(conn, chain_id)?;
+    match current {
+        Some(pub_record) => {
+            let new_version = pub_record.version + 1;
+            conn.execute(
+                "INSERT INTO pyramid_chain_publications
+                    (chain_id, version, description, author, forked_from, status)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'local')",
+                rusqlite::params![
+                    chain_id,
+                    new_version,
+                    pub_record.description,
+                    pub_record.author,
+                    pub_record.forked_from,
+                ],
+            )?;
+            Ok(new_version)
+        }
+        None => {
+            anyhow::bail!("no chain publication found for chain_id '{}'", chain_id);
+        }
+    }
+}
+
+/// Create a fork record: inserts a new chain publication for `new_chain_id`
+/// with version 1, `forked_from` pointing to the source, and status 'local'.
+pub fn fork_chain_publication(
+    conn: &Connection,
+    source_chain_id: &str,
+    new_chain_id: &str,
+    author: &str,
+) -> Result<()> {
+    let source = get_chain_publication(conn, source_chain_id)?;
+    let description = source.as_ref().and_then(|s| s.description.clone());
+    conn.execute(
+        "INSERT INTO pyramid_chain_publications
+            (chain_id, version, description, author, forked_from, status)
+         VALUES (?1, 1, ?2, ?3, ?4, 'local')",
+        rusqlite::params![new_chain_id, description, author, source_chain_id],
+    )?;
     Ok(())
 }

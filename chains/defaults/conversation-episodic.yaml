@@ -1,0 +1,340 @@
+schema_version: 1
+id: conversation-episodic
+name: "Conversation — Episodic Memory"
+description: "Episodic memory chain: forward + reverse + combine triple-pass L0 producing the unified episodic schema, chronological phase decomposition, evidence grounding, and recursive pair-adjacent synthesis to apex. The agent's externalized persistent brain."
+content_type: conversation
+version: "1.0.0"
+author: "wire-node"
+
+audience:
+  role: "successor AI agent"
+  description: "The successor AI agent loading this pyramid at session boot to recover working state, or the active agent hydrating nodes during in-session work. The human has biological memory and does not need this pyramid; it exists solely to give the agent continuity."
+  goals:
+    - "Recover current state: active work, lifecycle position, blockers"
+    - "Know binding commitments from prior instances"
+    - "Know rejected alternatives with reasoning, to avoid re-proposing"
+    - "Know open questions and deferred items"
+    - "Know human direction as authoritative, exact-worded instruction"
+    - "Know prior-agent discoveries and rulings as earned priors"
+  expertise: "technical"
+  voice_hints:
+    - "Dense and action-primed, not literary"
+    - "Preserve human quotes as authoritative direction"
+    - "Preserve agent commitments, discoveries, rulings as earned state"
+    - "Paraphrase agent exposition into narrative prose"
+
+defaults:
+  model_tier: synth_heavy
+  temperature: 0.3
+  on_error: "retry(2)"
+
+steps:
+  # ── Phase 0: Load prior state ───────────────────────────────────────
+  - name: load_prior_state
+    primitive: cross_build_input
+    save_as: step_only
+
+  # ── Phase 1A: FORWARD pass (intermediate, step_only) ───────────────
+  # Sequentially walks chunks earliest -> latest. Each chunk sees a
+  # rolling running_context summarizing everything earlier in the
+  # session, and rewrites it to fold in the current chunk. This is the
+  # "lived experience" reading.
+  #
+  # Reused from conversation-chronological without modification.
+  - name: forward_pass
+    primitive: extract
+    instruction: "$prompts/conversation-episodic/forward.md"
+    for_each: "$chunks"
+    sequential: true
+    accumulate:
+      running_context:
+        from: "$item.output.running_context"
+        init: ""
+        max_chars: 4000
+    input:
+      chunk: "$item.content"
+      chunk_index: "$item.index"
+      running_context: "$running_context"
+    node_id_pattern: "FWD-{index:03}"
+    depth: 0
+    save_as: step_only
+    max_input_tokens: 80000
+    split_strategy: "lines"
+    split_overlap_tokens: 500
+    split_merge: true
+    merge_instruction: "$prompts/shared/merge_sub_chunks.md"
+    on_error: "retry(3)"
+    on_parse_error: "heal"
+    heal_instruction: "$prompts/shared/heal_json.md"
+    model_tier: extractor
+
+  # ── Phase 1B: REVERSE pass (intermediate, step_only) ───────────────
+  # Sequentially walks chunks latest -> earliest using for_each_reverse.
+  # Each chunk sees a rolling running_context summarizing what happens
+  # AFTER it. This is the hindsight reading.
+  #
+  # Items keep their original `index` field through reversal so the
+  # zip_steps lookup in combine_l0 (with reverse: true) finds the
+  # correct pair, and resume keys remain stable.
+  #
+  # Reused from conversation-chronological without modification.
+  - name: reverse_pass
+    primitive: extract
+    instruction: "$prompts/conversation-episodic/reverse.md"
+    for_each: "$chunks"
+    for_each_reverse: true
+    sequential: true
+    accumulate:
+      running_context:
+        from: "$item.output.running_context"
+        init: ""
+        max_chars: 4000
+    input:
+      chunk: "$item.content"
+      chunk_index: "$item.index"
+      running_context: "$running_context"
+    node_id_pattern: "REV-{index:03}"
+    depth: 0
+    save_as: step_only
+    max_input_tokens: 80000
+    split_strategy: "lines"
+    split_overlap_tokens: 500
+    split_merge: true
+    merge_instruction: "$prompts/shared/merge_sub_chunks.md"
+    on_error: "retry(3)"
+    on_parse_error: "heal"
+    heal_instruction: "$prompts/shared/heal_json.md"
+    model_tier: extractor
+
+  # ── Phase 1C: COMBINE -> L0 nodes (the actual episodic L0) ─────────
+  # Fuses forward + reverse intermediate views into unified episodic
+  # memory nodes with the full schema: headline, time_range, weight,
+  # narrative, topics[], entities[], decisions[], key_quotes[],
+  # transitions. This is where the episodic chain diverges from
+  # conversation-chronological.
+  #
+  # Sequential per chain-binding-v2.6 section 8.3: zip_steps reads
+  # ctx.current_index. Combined is cheap relative to forward/reverse.
+  #
+  # `when` gate: if L0 already exists, the prior run completed combine.
+  - name: combine_l0
+    primitive: extract
+    instruction: "$prompts/conversation-episodic/combine_l0.md"
+    for_each: "$chunks"
+    sequential: true
+    when: "$load_prior_state.l0_count == 0"
+    input:
+      chunk: "$item.content"
+      chunk_index: "$item.index"
+      zip_steps:
+        - forward_pass
+        - step: reverse_pass
+          reverse: true
+    node_id_pattern: "Q-L0-{index:03}"
+    depth: 0
+    save_as: node
+    max_input_tokens: 120000
+    split_strategy: "lines"
+    split_overlap_tokens: 500
+    split_merge: true
+    merge_instruction: "$prompts/shared/merge_sub_chunks.md"
+    on_error: "retry(3)"
+    on_parse_error: "heal"
+    heal_instruction: "$prompts/shared/heal_json.md"
+    model_tier: extractor
+
+  # ── Phase 2: L0 webbing ────────────────────────────────────────────
+  # Cross-links L0 nodes by topics, entities, and decisions for graph
+  # navigation. Dehydrates heavy fields to fit within batch budget.
+  - name: l0_webbing
+    primitive: web
+    instruction: "$prompts/question/question_web.md"
+    input:
+      nodes: "$combine_l0"
+    max_input_tokens: 80000
+    batch_size: 50
+    concurrency: 4
+    dehydrate:
+      - drop: narrative
+      - drop: key_quotes
+      - drop: transitions
+    compact_inputs: true
+    response_schema: &web_schema
+      type: object
+      properties:
+        edges:
+          type: array
+          items:
+            type: object
+            properties:
+              source:
+                type: string
+              target:
+                type: string
+              relationship:
+                type: string
+              shared_resources:
+                type: array
+                items:
+                  type: string
+              strength:
+                type: number
+            required: ["source", "target", "relationship", "shared_resources", "strength"]
+            additionalProperties: false
+      required: ["edges"]
+      additionalProperties: false
+    depth: 0
+    save_as: web_edges
+    model_tier: web
+    temperature: 0.2
+    on_error: "skip"
+    when: "$load_prior_state.l0_count == 0"
+
+  # ── Phase 3: Refresh state after extraction ─────────────────────────
+  - name: refresh_state
+    primitive: cross_build_input
+    save_as: step_only
+
+  # ── Phase 4: Chronological phase decomposition ─────────────────────
+  # Cuts the session into natural phases based on topic shifts,
+  # decision-state changes, pace changes, and speaker-dynamic shifts.
+  # Produces N sub-questions of the form "What happened during [phase]?"
+  # where N follows the session's natural structure.
+  - name: enhance_question
+    primitive: extract
+    instruction: "$prompts/question/enhance_question.md"
+    input:
+      apex_question: "$apex_question"
+      corpus_context: "$refresh_state.l0_summary"
+      characterization: "$characterize"
+    max_input_tokens: 80000
+    save_as: step_only
+
+  - name: decompose
+    primitive: recursive_decompose
+    instruction: "$prompts/conversation-episodic/chronological_decompose.md"
+    when: "$load_prior_state.has_overlay == false"
+    input:
+      apex_question: "$apex_question"
+      granularity: "$granularity"
+      max_depth: "$max_depth"
+      characterize: "$characterize"
+      audience: "$audience"
+      l0_summary: "$refresh_state.l0_summary"
+    max_input_tokens: 80000
+    save_as: step_only
+
+  - name: decompose_delta
+    primitive: recursive_decompose
+    mode: delta
+    instruction: "$prompts/question/decompose_delta.md"
+    when: "$load_prior_state.has_overlay == true"
+    input:
+      apex_question: "$apex_question"
+      granularity: "$granularity"
+      max_depth: "$max_depth"
+      characterize: "$characterize"
+      audience: "$audience"
+      existing_tree: "$load_prior_state.question_tree"
+      existing_answers: "$load_prior_state.overlay_answers"
+      evidence_sets: "$load_prior_state.evidence_sets"
+      gaps: "$load_prior_state.unresolved_gaps"
+      l0_summary: "$refresh_state.l0_summary"
+    max_input_tokens: 80000
+    dehydrate:
+      - drop: evidence_sets
+      - drop: gaps
+      - drop: existing_answers
+    save_as: step_only
+
+  - name: extraction_schema
+    primitive: extract
+    instruction: "$prompts/question/extraction_schema.md"
+    input:
+      question_tree: "$decomposed_tree"
+      characterize: "$characterize"
+      audience: "$audience"
+    max_input_tokens: 80000
+    save_as: step_only
+
+  # ── Phase 5: Evidence answering ─────────────────────────────────────
+  # Grounds each phase's narrative in specific L0 nodes via
+  # KEEP/MISSING/DISCONNECT verdicts. Produces L1 segment nodes with
+  # citation provenance.
+  - name: evidence_loop
+    primitive: evidence_loop
+    input:
+      question_tree: "$decomposed_tree"
+      extraction_schema: "$extraction_schema"
+      load_prior_state: "$refresh_state"
+      reused_question_ids: "$reused_question_ids"
+      build_id: "$build_id"
+    save_as: step_only
+
+  - name: gap_processing
+    primitive: process_gaps
+    input:
+      evidence_loop: "$evidence_loop"
+      load_prior_state: "$refresh_state"
+    save_as: step_only
+
+  # ── Phase 6: L1 webbing ────────────────────────────────────────────
+  - name: l1_webbing
+    primitive: web
+    instruction: "$prompts/question/question_web.md"
+    max_input_tokens: 80000
+    batch_size: 50
+    concurrency: 4
+    dehydrate:
+      - drop: narrative
+      - drop: key_quotes
+      - drop: transitions
+    compact_inputs: true
+    response_schema: *web_schema
+    depth: 1
+    save_as: web_edges
+    model_tier: web
+    temperature: 0.2
+    on_error: "skip"
+
+  # ── Phase 7: Recursive pair-adjacent synthesis L1->L2 ──────────────
+  # Uses the single recursive synthesis prompt. Dehydration cascade
+  # drops low-priority fields from inputs under budget pressure.
+  - name: recursive_synthesis
+    primitive: synthesize
+    instruction: "$prompts/conversation-episodic/synthesize_recursive.md"
+    recursive_pair: true
+    depth: 1
+    save_as: node
+    node_id_pattern: "EM-L{depth}-{index:03}"
+    max_input_tokens: 80000
+    dehydrate:
+      - drop: annotations
+      - drop: transitions
+      - drop: key_quotes
+    model_tier: synth_heavy
+    temperature: 0.3
+    on_error: "retry(2)"
+    on_parse_error: "heal"
+    heal_instruction: "$prompts/shared/heal_json.md"
+
+  # ── Phase 8: L2 webbing ────────────────────────────────────────────
+  - name: l2_webbing
+    primitive: web
+    instruction: "$prompts/question/question_web.md"
+    max_input_tokens: 80000
+    batch_size: 50
+    concurrency: 4
+    dehydrate:
+      - drop: narrative
+      - drop: key_quotes
+      - drop: transitions
+    compact_inputs: true
+    response_schema: *web_schema
+    depth: 2
+    save_as: web_edges
+    model_tier: web
+    temperature: 0.2
+    on_error: "skip"
+
+post_build: []

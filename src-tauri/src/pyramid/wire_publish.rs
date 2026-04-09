@@ -495,8 +495,8 @@ impl PyramidPublisher {
         self.post_contribution(&payload).await
     }
 
-    /// Post a contribution to the Wire API and return its UUID.
-    async fn post_contribution(
+    /// Post a contribution to the Wire API and return its (UUID, Option<handle_path>).
+    pub async fn post_contribution(
         &self,
         payload: &serde_json::Value,
     ) -> Result<(String, Option<String>)> {

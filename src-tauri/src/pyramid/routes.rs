@@ -12,6 +12,7 @@ use warp::Filter;
 use warp::Reply;
 
 use super::build::WriteOp;
+use super::chain_publish;
 use super::characterize;
 use super::db;
 use super::delta;
@@ -1471,12 +1472,57 @@ pub fn pyramid_routes(
     // beats the bare GET during filter rejection unification.
     let h_cost = cost_model_recompute.or(cost_model_list).unify().boxed();
 
+    // ── WS-CHAIN-PUBLISH (Phase 3): Chain publication routes ──────────
+    // POST /pyramid/chains/:chain_id/publish — publish a chain to Wire
+    let chain_publish_route = route!(prefix
+        .and(warp::path("chains"))
+        .and(warp::path::param::<String>())
+        .and(warp::path("publish"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_chain_publish));
+
+    // POST /pyramid/chains/:chain_id/fork — fork a chain
+    let chain_fork_route = route!(prefix
+        .and(warp::path("chains"))
+        .and(warp::path::param::<String>())
+        .and(warp::path("fork"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(warp::body::json::<ChainForkBody>())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_chain_fork));
+
+    // GET /pyramid/chains/:chain_id — get publication details (more specific, before list)
+    let chain_get_route = route!(prefix
+        .and(warp::path("chains"))
+        .and(warp::path::param::<String>())
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_chain_get));
+
+    // GET /pyramid/chains — list all chain publications
+    let chain_list_route = route!(prefix
+        .and(warp::path("chains"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_chain_list));
+
+    // Longer paths first: publish, fork (3 segments), then get (2 segments), then list (1 segment)
+    let cp_a = chain_publish_route.or(chain_fork_route).unify().boxed();
+    let cp_b = cp_a.or(chain_get_route).unify().boxed();
+    let h_chain_pub = cp_b.or(chain_list_route).unify().boxed();
+
     // CRITICAL: Vine routes (h6, h7), chain import (h8), and remote-query with literal path segments
     // MUST come BEFORE slug-parameterized routes, otherwise "vine"/"chain"/"remote-query" gets
     // captured as a :slug param.
     let top = h6.or(h7).unify().boxed(); // Vine routes first (literal paths)
     let top = top.or(h8).unify().boxed(); // Chain import (literal paths)
     let top = top.or(h_cost).unify().boxed(); // WS-COST-MODEL cost_model endpoints (literal paths)
+    let top = top.or(h_chain_pub).unify().boxed(); // WS-CHAIN-PUBLISH chain publication (literal paths)
     let top = top.or(remote_query_route).unify().boxed(); // WS-ONLINE-V: Remote query proxy (literal path)
     let top2 = top.or(h1).unify().boxed(); // Then everything else
     let top3 = top2.or(h2).unify().boxed();
@@ -1849,10 +1895,52 @@ pub fn pyramid_routes(
     let vc = vc_a.or(vc_b).unify().boxed();
     let top24 = top23.or(vc).unify().boxed();
 
+    // ── WS-DEMAND-GEN (Phase 3): Demand-driven L0 generation ──────────
+    // POST /pyramid/:slug/demand-gen          — create a demand-gen job (returns 202)
+    // GET  /pyramid/:slug/demand-gen/:job_id  — poll job status
+    // GET  /pyramid/:slug/demand-gen          — list recent demand-gen jobs
+
+    // GET :slug/demand-gen/:job_id — poll status (more specific path first)
+    let demand_gen_get = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("demand-gen"))
+        .and(warp::path::param::<String>())
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_demand_gen_get));
+
+    // POST :slug/demand-gen — create job
+    let demand_gen_create = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("demand-gen"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(warp::body::json::<DemandGenCreateBody>())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_demand_gen_create));
+
+    // GET :slug/demand-gen — list recent jobs
+    let demand_gen_list = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("demand-gen"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::query::<DemandGenListQuery>())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_demand_gen_list));
+
+    // More-specific (with job_id param) before less-specific (list/create).
+    // POST and GET on the same path are distinguished by method, but the
+    // param-bearing GET must precede the bare-path routes.
+    let dg_a = demand_gen_get.or(demand_gen_create).unify().boxed();
+    let dg = dg_a.or(demand_gen_list).unify().boxed();
+    let top25 = top24.or(dg).unify().boxed();
+
     // public_html is now mounted separately at the server level so it can
     // get a permissive CORS filter (the desktop API allowlist would block
     // form POSTs from the tunnel host).
-    top24
+    top25
 }
 
 /// Mount the post-agents-retro `/p/` web surface routes. These are
@@ -7592,4 +7680,216 @@ async fn handle_vine_trigger_delta(
         "triggered_vines": triggered,
         "errors": errors,
     })))
+}
+
+// ── WS-DEMAND-GEN (Phase 3): Demand-driven L0 generation handlers ──────────
+
+/// Request body for POST /pyramid/:slug/demand-gen
+#[derive(Debug, Deserialize)]
+struct DemandGenCreateBody {
+    question: String,
+    #[serde(default)]
+    sub_questions: Vec<String>,
+}
+
+/// Query parameters for GET /pyramid/:slug/demand-gen (list)
+#[derive(Debug, Deserialize)]
+struct DemandGenListQuery {
+    #[serde(default = "default_demand_gen_limit")]
+    limit: i64,
+}
+
+fn default_demand_gen_limit() -> i64 {
+    50
+}
+
+/// POST /pyramid/:slug/demand-gen — create a demand-gen job.
+/// Returns 202 Accepted with `{job_id}` and fires async execution.
+async fn handle_demand_gen_create(
+    slug: String,
+    body: DemandGenCreateBody,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let job_id = uuid::Uuid::new_v4().to_string();
+    let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+
+    let job = super::types::DemandGenJob {
+        id: 0,
+        job_id: job_id.clone(),
+        slug: slug.clone(),
+        question: body.question.clone(),
+        sub_questions: body.sub_questions,
+        status: "queued".to_string(),
+        result_node_ids: vec![],
+        error_message: None,
+        requested_at: now,
+        started_at: None,
+        completed_at: None,
+    };
+
+    // Insert into DB
+    {
+        let conn = state.writer.lock().await;
+        if let Err(e) = super::db::create_demand_gen_job(&conn, &job) {
+            return Ok(json_error(
+                warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Failed to create demand-gen job: {e}"),
+            ));
+        }
+    }
+
+    // Fire async execution via tokio::spawn — HTTP handler returns 202 immediately
+    super::demand_gen::spawn_demand_gen(state.clone(), slug, job_id.clone());
+
+    Ok(warp::reply::with_status(
+        warp::reply::json(&serde_json::json!({
+            "job_id": job_id,
+            "status": "queued",
+        })),
+        warp::http::StatusCode::ACCEPTED,
+    )
+    .into_response())
+}
+
+/// GET /pyramid/:slug/demand-gen/:job_id — poll job status.
+async fn handle_demand_gen_get(
+    slug: String,
+    job_id: String,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let conn = state.reader.lock().await;
+    match super::db::get_demand_gen_job(&conn, &job_id) {
+        Ok(Some(job)) => {
+            if job.slug != slug {
+                return Ok(json_error(
+                    warp::http::StatusCode::NOT_FOUND,
+                    &format!("demand-gen job {job_id} not found for slug {slug}"),
+                ));
+            }
+            Ok(json_ok(&job))
+        }
+        Ok(None) => Ok(json_error(
+            warp::http::StatusCode::NOT_FOUND,
+            &format!("demand-gen job {job_id} not found"),
+        )),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
+    }
+}
+
+/// GET /pyramid/:slug/demand-gen — list recent demand-gen jobs for a slug.
+async fn handle_demand_gen_list(
+    slug: String,
+    query: DemandGenListQuery,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let conn = state.reader.lock().await;
+    match super::db::list_demand_gen_jobs(&conn, &slug, query.limit) {
+        Ok(jobs) => Ok(json_ok(&serde_json::json!({
+            "slug": slug,
+            "jobs": jobs,
+            "count": jobs.len(),
+        }))),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
+    }
+}
+
+// ── WS-CHAIN-PUBLISH: Chain publication handlers ────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct ChainForkBody {
+    new_chain_id: String,
+    author: String,
+}
+
+/// POST /pyramid/chains/:chain_id/publish — publish a chain configuration to Wire.
+async fn handle_chain_publish(
+    chain_id: String,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    match chain_publish::publish_chain_to_wire(&state, &chain_id).await {
+        Ok(pub_record) => Ok(json_ok(&pub_record)),
+        Err(e) => {
+            let msg = e.to_string();
+            let status = if msg.contains("not found") {
+                warp::http::StatusCode::NOT_FOUND
+            } else {
+                warp::http::StatusCode::INTERNAL_SERVER_ERROR
+            };
+            Ok(json_error(status, &msg))
+        }
+    }
+}
+
+/// GET /pyramid/chains — list all chain publications.
+async fn handle_chain_list(
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let conn = state.reader.lock().await;
+    match db::list_chain_publications(&conn) {
+        Ok(pubs) => Ok(json_ok(&serde_json::json!({
+            "chains": pubs,
+            "count": pubs.len(),
+        }))),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
+    }
+}
+
+/// GET /pyramid/chains/:chain_id — get publication details for a specific chain.
+async fn handle_chain_get(
+    chain_id: String,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let conn = state.reader.lock().await;
+    match db::get_chain_publication(&conn, &chain_id) {
+        Ok(Some(pub_record)) => Ok(json_ok(&pub_record)),
+        Ok(None) => Ok(json_error(
+            warp::http::StatusCode::NOT_FOUND,
+            &format!("no publication record for chain '{}'", chain_id),
+        )),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
+    }
+}
+
+/// POST /pyramid/chains/:chain_id/fork — fork a chain to a new ID.
+async fn handle_chain_fork(
+    chain_id: String,
+    body: ChainForkBody,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let chains_dir = state.chains_dir.clone();
+    let conn = state.writer.lock().await;
+    match chain_publish::fork_chain(
+        &chains_dir,
+        &chain_id,
+        &body.new_chain_id,
+        &body.author,
+        &conn,
+    ) {
+        Ok(new_path) => Ok(json_ok(&serde_json::json!({
+            "forked_from": chain_id,
+            "new_chain_id": body.new_chain_id,
+            "path": new_path,
+        }))),
+        Err(e) => {
+            let msg = e.to_string();
+            let status = if msg.contains("not found") {
+                warp::http::StatusCode::NOT_FOUND
+            } else {
+                warp::http::StatusCode::INTERNAL_SERVER_ERROR
+            };
+            Ok(json_error(status, &msg))
+        }
+    }
 }

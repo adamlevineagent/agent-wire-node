@@ -449,6 +449,182 @@ pub fn build_node_from_output(
     // Headline via shared naming utility
     let headline = headline_from_analysis(output, node_id);
 
+    // ── WS-SCHEMA-V2: extract episodic memory fields from LLM output ────
+    // These fields are produced by the episodic chain's combine_l0.md and
+    // synthesize_recursive.md prompts. Backward-compatible: all fields
+    // default to empty/zero when absent from the LLM output (retro chain
+    // and question pipeline don't produce them).
+
+    // time_range: {start, end} ISO-8601 timestamps
+    let time_range = output.get("time_range").and_then(|tr| {
+        let start = tr.get("start").and_then(|s| s.as_str()).map(String::from);
+        let end = tr.get("end").and_then(|s| s.as_str()).map(String::from);
+        if start.is_some() || end.is_some() {
+            Some(super::types::TimeRange { start, end })
+        } else {
+            None
+        }
+    });
+
+    // weight: numeric or {tokens, turns, fraction_of_parent} object
+    let weight = output
+        .get("weight")
+        .and_then(|w| {
+            if let Some(n) = w.as_f64() {
+                Some(n)
+            } else if let Some(obj) = w.as_object() {
+                // Sum tokens as the primary weight signal
+                obj.get("tokens").and_then(|t| t.as_f64())
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0.0);
+
+    // narrative: string → wrap as single-level NarrativeMultiZoom at zoom 0
+    let narrative = output
+        .get("narrative")
+        .and_then(|n| n.as_str())
+        .map(|text| super::types::NarrativeMultiZoom {
+            levels: vec![super::types::NarrativeLevel {
+                zoom: 0,
+                text: text.to_string(),
+            }],
+        })
+        .unwrap_or_default();
+
+    // entities: [{name, role, importance, ...}]
+    let entities: Vec<super::types::Entity> = output
+        .get("entities")
+        .and_then(|e| e.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|e| {
+                    let name = e.get("name").and_then(|n| n.as_str())?;
+                    Some(super::types::Entity {
+                        name: name.to_string(),
+                        role: e
+                            .get("role")
+                            .and_then(|r| r.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        importance: e
+                            .get("importance")
+                            .and_then(|i| i.as_f64())
+                            .unwrap_or(0.0),
+                        liveness: e
+                            .get("liveness")
+                            .and_then(|l| l.as_str())
+                            .unwrap_or("live")
+                            .to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // key_quotes: [{quote/text, speaker_role, importance, ...}]
+    let key_quotes: Vec<super::types::KeyQuote> = output
+        .get("key_quotes")
+        .and_then(|q| q.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|q| {
+                    // Accept both "quote" and "text" field names
+                    let text = q
+                        .get("quote")
+                        .or_else(|| q.get("text"))
+                        .and_then(|t| t.as_str())?;
+                    Some(super::types::KeyQuote {
+                        text: text.to_string(),
+                        speaker_role: q
+                            .get("speaker_role")
+                            .and_then(|r| r.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        importance: q
+                            .get("importance")
+                            .and_then(|i| i.as_f64())
+                            .unwrap_or(0.0),
+                        chunk_ref: q
+                            .get("at")
+                            .or_else(|| q.get("chunk_ref"))
+                            .and_then(|c| c.as_str())
+                            .map(String::from),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // transitions: {from_prior/prior, into_next/next}
+    let transitions = output
+        .get("transitions")
+        .map(|t| super::types::Transitions {
+            prior: t
+                .get("from_prior")
+                .or_else(|| t.get("prior"))
+                .and_then(|p| p.as_str())
+                .unwrap_or("")
+                .to_string(),
+            next: t
+                .get("into_next")
+                .or_else(|| t.get("next"))
+                .and_then(|n| n.as_str())
+                .unwrap_or("")
+                .to_string(),
+        })
+        .unwrap_or_default();
+
+    // Extract top-level decisions with stance and importance (episodic schema)
+    // Merge with the decisions already extracted above
+    if let Some(decs) = output.get("decisions").and_then(|d| d.as_array()) {
+        // Only re-extract if we haven't already — check if the existing
+        // decisions lack stance info (legacy extraction path)
+        let has_stance = decisions.iter().any(|d| !d.stance.is_empty() && d.stance != "other");
+        if !has_stance {
+            decisions.clear();
+            for d in decs {
+                decisions.push(Decision {
+                    decided: d
+                        .get("decided")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .into(),
+                    why: d.get("why").and_then(|v| v.as_str()).unwrap_or("").into(),
+                    rejected: d
+                        .get("rejected")
+                        .or_else(|| d.get("alternatives"))
+                        .and_then(|v| {
+                            if let Some(s) = v.as_str() {
+                                Some(s.to_string())
+                            } else if let Some(arr) = v.as_array() {
+                                Some(
+                                    arr.iter()
+                                        .filter_map(|a| a.as_str())
+                                        .collect::<Vec<_>>()
+                                        .join(", "),
+                                )
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or_default(),
+                    stance: d
+                        .get("stance")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("other")
+                        .to_string(),
+                    importance: d
+                        .get("importance")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0),
+                    ..Default::default()
+                });
+            }
+        }
+    }
+
     Ok(PyramidNode {
         id: node_id.to_string(),
         slug: slug.to_string(),
@@ -475,6 +651,12 @@ pub fn build_node_from_output(
         superseded_by: None,
         build_id: None,
         created_at: String::new(),
+        time_range,
+        weight,
+        narrative,
+        entities,
+        key_quotes,
+        transitions,
         ..Default::default()
     })
 }

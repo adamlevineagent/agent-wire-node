@@ -115,8 +115,8 @@ These resolve the 16 questions asked before Phase 1 full dispatch. Treat as norm
 
 ### Phase 2b — Parallel after 2a
 - [x] WS-PROVISIONAL — **complete + verified** (2026-04-09). Session table, 7 DB helpers, save_provisional_node, promote_session, 4 HTTP routes, 5 tests. Verifier added missing SlopeChanged emission on promote. Git: `244869a`.
-- [ ] WS-DADBEAR-EXTEND — depends on CHAIN-INVOKE + PROVISIONAL + EVENTS
-- [x] WS-VINE-UNIFY — **complete** (2026-04-08). New `vine_composition.rs` module, `pyramid_vine_compositions` table, 6 DB helpers, `VineComposition` type, `notify_vine_of_bedrock_completion` (LockManager child-then-parent, DeltaLanded + SlopeChanged events), 4 HTTP routes (add-bedrock, list bedrocks, remove bedrock, trigger-delta), 5 tests all passing. BLOCKER-02 resolved (field already existed). `vine.rs` NOT modified per Q2.
+- [x] WS-DADBEAR-EXTEND — **complete + verified** (2026-04-09). New `dadbear_extend.rs` (~540 lines). Tick loop, ingest dispatcher (stub for WS-EM-CHAIN), session timeout promotion, 9 DB helpers, pyramid_dadbear_config table, 5 HTTP routes, DadbearWatchConfig/Status types, update_session_mtime/chunk_progress helpers. 5 tests. Verifier fix: removed dead ConfigTicker.config_id field. Git: `b78169e`.
+- [x] WS-VINE-UNIFY — **complete + verified clean** (2026-04-09). New `vine_composition.rs`, `pyramid_vine_compositions` table, 6 DB helpers, `VineComposition` type, `notify_vine_of_bedrock_completion` (LockManager child-then-parent, DeltaLanded + SlopeChanged events), 4 HTTP routes, 5 tests. BLOCKER-02 resolved. vine.rs NOT modified per Q2. Zero verifier fixes. Git: `b78169e`.
 
 ### Phase 3 — Parallel after 2b (mostly)
 - [ ] WS-EM-CHAIN — depends on SCHEMA-V2 + AUDIENCE-CONTRACT + PRIMER + CHAIN-INVOKE + VINE-UNIFY

@@ -208,6 +208,8 @@ pub fn ensure_default_chains(
         chains_dir.join("defaults"),
         chains_dir.join("variants"),
         chains_dir.join("prompts").join("conversation"),
+        chains_dir.join("prompts").join("conversation-chronological"),
+        chains_dir.join("prompts").join("conversation-episodic"),
         chains_dir.join("prompts").join("code"),
         chains_dir.join("prompts").join("document"),
         chains_dir.join("prompts").join("question"),

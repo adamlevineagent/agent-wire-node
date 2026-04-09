@@ -1490,6 +1490,32 @@ pub struct DadbearWatchStatus {
     pub last_scan_at: Option<String>,
 }
 
+// ── WS-DEMAND-GEN (Phase 3): Demand-driven L0 generation job tracking ────────
+
+/// A demand-generation job that tracks async generation of evidence-grounded
+/// L0 nodes in response to questions whose answers don't exist in the pyramid.
+/// Stored in `pyramid_demand_gen_jobs`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DemandGenJob {
+    pub id: i64,
+    pub job_id: String,
+    pub slug: String,
+    pub question: String,
+    #[serde(default)]
+    pub sub_questions: Vec<String>,
+    /// One of: "queued", "running", "complete", "failed"
+    pub status: String,
+    #[serde(default)]
+    pub result_node_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+    pub requested_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<String>,
+}
+
 // ── WS-VINE-UNIFY (Phase 2b): Vine composition tracking ──────────────────────
 
 /// A row from `pyramid_vine_compositions` tracking the relationship between
@@ -1505,6 +1531,33 @@ pub struct VineComposition {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bedrock_apex_node_id: Option<String>,
     /// active, stale, or removed.
+    pub status: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+// ── WS-CHAIN-PUBLISH (Phase 3): Chain publication tracking ─────────────────────
+
+/// A row from `pyramid_chain_publications` tracking the publication state of
+/// a chain configuration to the Wire contribution graph.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChainPublication {
+    pub id: i64,
+    pub chain_id: String,
+    pub version: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wire_handle_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wire_uuid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub published_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forked_from: Option<String>,
+    /// local, published, or deprecated.
     pub status: String,
     pub created_at: String,
     pub updated_at: String,

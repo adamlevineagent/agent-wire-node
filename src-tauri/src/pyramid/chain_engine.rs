@@ -838,4 +838,109 @@ steps:
         assert!(!result.valid);
         assert!(result.errors.iter().any(|e| e.contains("invoke_context must be a JSON object")));
     }
+
+    #[test]
+    fn conversation_episodic_yaml_parses_and_validates() {
+        let yaml = include_str!("../../../chains/defaults/conversation-episodic.yaml");
+        let def: ChainDefinition = serde_yaml::from_str(yaml)
+            .expect("conversation-episodic.yaml should parse as valid YAML");
+
+        assert_eq!(def.id, "conversation-episodic");
+        assert_eq!(def.content_type, "conversation");
+
+        let result = validate_chain(&def);
+        assert!(
+            result.valid,
+            "conversation-episodic.yaml validation errors: {:?}",
+            result.errors
+        );
+
+        // Verify audience block is populated
+        assert_eq!(def.audience.role, "successor AI agent");
+        assert!(!def.audience.goals.is_empty());
+
+        // Verify key steps exist
+        let step_names: Vec<&str> = def.steps.iter().map(|s| s.name.as_str()).collect();
+        assert!(step_names.contains(&"forward_pass"), "missing forward_pass step");
+        assert!(step_names.contains(&"reverse_pass"), "missing reverse_pass step");
+        assert!(step_names.contains(&"combine_l0"), "missing combine_l0 step");
+        assert!(step_names.contains(&"l0_webbing"), "missing l0_webbing step");
+        assert!(step_names.contains(&"decompose"), "missing decompose step");
+        assert!(step_names.contains(&"evidence_loop"), "missing evidence_loop step");
+        assert!(step_names.contains(&"recursive_synthesis"), "missing recursive_synthesis step");
+    }
+
+    #[test]
+    fn conversation_episodic_recursive_synthesis_step_is_recursive_pair() {
+        let yaml = include_str!("../../../chains/defaults/conversation-episodic.yaml");
+        let def: ChainDefinition = serde_yaml::from_str(yaml).unwrap();
+
+        let synth_step = def.steps.iter().find(|s| s.name == "recursive_synthesis")
+            .expect("recursive_synthesis step should exist");
+
+        assert!(synth_step.recursive_pair, "recursive_synthesis should have recursive_pair: true");
+        assert_eq!(synth_step.depth, Some(1), "recursive_synthesis should start at depth 1");
+        assert_eq!(synth_step.save_as.as_deref(), Some("node"));
+    }
+
+    #[test]
+    fn chain_registry_returns_episodic_for_conversation() {
+        assert_eq!(
+            super::super::chain_registry::default_chain_id("conversation"),
+            "conversation-episodic"
+        );
+        // Other content types still get question-pipeline
+        assert_eq!(
+            super::super::chain_registry::default_chain_id("code"),
+            "question-pipeline"
+        );
+        assert_eq!(
+            super::super::chain_registry::default_chain_id("document"),
+            "question-pipeline"
+        );
+    }
+
+    #[test]
+    fn episodic_prompt_files_exist_and_contain_required_sections() {
+        // synthesize_recursive.md is the load-bearing prompt
+        let synth = include_str!("../../../chains/prompts/conversation-episodic/synthesize_recursive.md");
+        assert!(synth.contains("episodic memory pyramid"), "synthesize_recursive must reference episodic memory");
+        assert!(synth.contains("successor"), "synthesize_recursive must reference successor agent");
+        assert!(synth.contains("zoom") || synth.contains("ZOOM"), "synthesize_recursive must reference zoom level");
+        assert!(synth.contains("speaker_role"), "synthesize_recursive must reference speaker_role for quote asymmetry");
+        assert!(synth.contains("human") && synth.contains("agent"), "synthesize_recursive must reference both human and agent roles");
+        assert!(synth.contains("dehydrat"), "synthesize_recursive must be dehydration-aware");
+        // The prompt should not instruct the model to produce content AT specific
+        // layer numbers (e.g., "your L1 output should..."). It may mention them
+        // in negative instructions ("do not reference L0 or L1 in your output").
+        // Check that L0/L1/L2 don't appear outside of negative instructions.
+        let lines_with_layer_refs: Vec<&str> = synth.lines()
+            .filter(|line| line.contains("L0") || line.contains("L1") || line.contains("L2"))
+            .filter(|line| {
+                // Allow lines that are negative instructions (telling model NOT to use layer refs)
+                !line.to_lowercase().contains("do not") && !line.to_lowercase().contains("not reference")
+            })
+            .collect();
+        assert!(
+            lines_with_layer_refs.is_empty(),
+            "synthesize_recursive should not use absolute layer numbers except in negative instructions. Found: {:?}",
+            lines_with_layer_refs
+        );
+
+        // combine_l0.md
+        let combine = include_str!("../../../chains/prompts/conversation-episodic/combine_l0.md");
+        assert!(combine.contains("episodic memory"), "combine_l0 must reference episodic memory");
+        assert!(combine.contains("speaker_role"), "combine_l0 must include speaker_role");
+        assert!(combine.contains("stance"), "combine_l0 must include stance vocabulary");
+
+        // chronological_decompose.md
+        let decompose = include_str!("../../../chains/prompts/conversation-episodic/chronological_decompose.md");
+        assert!(decompose.contains("phase"), "chronological_decompose must reference phases");
+        assert!(decompose.contains("Topic shift") || decompose.contains("topic shift"),
+            "chronological_decompose must reference topic shift signal");
+
+        // forward.md and reverse.md exist
+        let _forward = include_str!("../../../chains/prompts/conversation-episodic/forward.md");
+        let _reverse = include_str!("../../../chains/prompts/conversation-episodic/reverse.md");
+    }
 }
