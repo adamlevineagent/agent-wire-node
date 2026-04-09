@@ -1122,6 +1122,27 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
         ",
     )?;
 
+    // ── WS-MANIFEST-API (Phase 3): Manifest provenance log ──────────────────────
+    // Tracks every manifest execution for audit and metrics. Each entry records
+    // the full set of operations and their results, keyed by provenance_id.
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS pyramid_manifest_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            provenance_id TEXT NOT NULL UNIQUE,
+            slug TEXT NOT NULL,
+            session_id TEXT,
+            operations TEXT NOT NULL,
+            results TEXT,
+            executed_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_manifest_log_slug
+            ON pyramid_manifest_log(slug, executed_at);
+        CREATE INDEX IF NOT EXISTS idx_manifest_log_provenance
+            ON pyramid_manifest_log(provenance_id);
+        ",
+    )?;
+
     // ── WS-VINE-UNIFY (Phase 2b): Vine composition table ──────────────────────
     // Tracks which bedrock pyramids compose each vine pyramid, their ordering,
     // and the current apex reference for each bedrock.
@@ -1169,6 +1190,32 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
             ON pyramid_chain_publications(chain_id);
         CREATE INDEX IF NOT EXISTS idx_chain_pub_status
             ON pyramid_chain_publications(chain_id, status);
+        ",
+    )?;
+
+    // ── WS-CHAIN-PROPOSAL (Phase 3): Agent-proposed chain updates ─────────────
+    // Agents propose updates to chain configurations based on what they learn
+    // during sessions. Proposals surface to the operator for review.
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS pyramid_chain_proposals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            proposal_id TEXT NOT NULL UNIQUE,
+            chain_id TEXT NOT NULL,
+            proposer TEXT NOT NULL,
+            proposal_type TEXT NOT NULL,
+            description TEXT NOT NULL,
+            reasoning TEXT NOT NULL,
+            patch TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            operator_notes TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            reviewed_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_chain_proposal_chain_id
+            ON pyramid_chain_proposals(chain_id);
+        CREATE INDEX IF NOT EXISTS idx_chain_proposal_status
+            ON pyramid_chain_proposals(status);
         ",
     )?;
 
@@ -1329,6 +1376,30 @@ fn migrate_online_push_columns(conn: &Connection) -> Result<()> {
         "UPDATE pyramid_annotations SET faq_synthesis_pass = 'ACUTE' WHERE question_context IS NOT NULL AND faq_synthesis_pass IS NULL",
         [],
     );
+
+    // ── WS-VOCAB (Phase 3): Vocabulary catalog persistence ────────────────────
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS pyramid_vocabulary_catalog (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            slug TEXT NOT NULL,
+            entry_name TEXT NOT NULL,
+            entry_type TEXT NOT NULL CHECK(entry_type IN ('topic', 'entity', 'decision', 'term', 'practice')),
+            category TEXT,
+            importance REAL,
+            liveness TEXT NOT NULL DEFAULT 'live',
+            detail TEXT,
+            source_node_id TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(slug, entry_name, entry_type)
+        );
+        CREATE INDEX IF NOT EXISTS idx_vocab_catalog_slug ON pyramid_vocabulary_catalog(slug);
+        CREATE INDEX IF NOT EXISTS idx_vocab_catalog_type ON pyramid_vocabulary_catalog(slug, entry_type);
+        CREATE INDEX IF NOT EXISTS idx_vocab_catalog_liveness ON pyramid_vocabulary_catalog(slug, liveness);
+        CREATE INDEX IF NOT EXISTS idx_vocab_catalog_updated ON pyramid_vocabulary_catalog(slug, updated_at);
+        ",
+    )?;
 
     Ok(())
 }
@@ -9257,5 +9328,171 @@ pub fn fork_chain_publication(
          VALUES (?1, 1, ?2, ?3, ?4, 'local')",
         rusqlite::params![new_chain_id, description, author, source_chain_id],
     )?;
+    Ok(())
+}
+
+// ── WS-CHAIN-PROPOSAL: Chain proposal DB helpers ─────────────────────────────
+
+/// Column list for SELECT queries on pyramid_chain_proposals.
+const CHAIN_PROPOSAL_COLUMNS: &str =
+    "id, proposal_id, chain_id, proposer, proposal_type, description, reasoning, patch, status, operator_notes, created_at, reviewed_at";
+
+/// Parse a row from `pyramid_chain_proposals` into a `ChainProposal`.
+fn map_chain_proposal_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<super::types::ChainProposal> {
+    let patch_str: String = row.get(7)?;
+    let patch: serde_json::Value = serde_json::from_str(&patch_str)
+        .unwrap_or(serde_json::Value::Null);
+    Ok(super::types::ChainProposal {
+        id: row.get(0)?,
+        proposal_id: row.get(1)?,
+        chain_id: row.get(2)?,
+        proposer: row.get(3)?,
+        proposal_type: row.get(4)?,
+        description: row.get(5)?,
+        reasoning: row.get(6)?,
+        patch,
+        status: row.get(8)?,
+        operator_notes: row.get(9)?,
+        created_at: row.get(10)?,
+        reviewed_at: row.get(11)?,
+    })
+}
+
+/// Insert a new chain proposal. Returns the database row ID.
+pub fn create_chain_proposal(conn: &Connection, proposal: &super::types::ChainProposal) -> Result<i64> {
+    let patch_str = serde_json::to_string(&proposal.patch)
+        .unwrap_or_else(|_| "{}".to_string());
+    conn.execute(
+        "INSERT INTO pyramid_chain_proposals
+            (proposal_id, chain_id, proposer, proposal_type, description, reasoning, patch, status)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        rusqlite::params![
+            proposal.proposal_id,
+            proposal.chain_id,
+            proposal.proposer,
+            proposal.proposal_type,
+            proposal.description,
+            proposal.reasoning,
+            patch_str,
+            proposal.status,
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// Get a single chain proposal by its text proposal_id.
+pub fn get_chain_proposal(conn: &Connection, proposal_id: &str) -> Result<Option<super::types::ChainProposal>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {CHAIN_PROPOSAL_COLUMNS} FROM pyramid_chain_proposals
+         WHERE proposal_id = ?1"
+    ))?;
+    let mut rows = stmt.query_map(rusqlite::params![proposal_id], map_chain_proposal_row)?;
+    match rows.next() {
+        Some(Ok(record)) => Ok(Some(record)),
+        Some(Err(e)) => Err(e.into()),
+        None => Ok(None),
+    }
+}
+
+/// List chain proposals with optional filters on chain_id and status.
+pub fn list_chain_proposals(
+    conn: &Connection,
+    chain_id: Option<&str>,
+    status: Option<&str>,
+) -> Result<Vec<super::types::ChainProposal>> {
+    let mut where_clauses = Vec::new();
+    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+    let mut idx = 1;
+
+    if let Some(cid) = chain_id {
+        where_clauses.push(format!("chain_id = ?{idx}"));
+        params.push(Box::new(cid.to_string()));
+        idx += 1;
+    }
+    if let Some(st) = status {
+        where_clauses.push(format!("status = ?{idx}"));
+        params.push(Box::new(st.to_string()));
+    }
+
+    let where_sql = if where_clauses.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", where_clauses.join(" AND "))
+    };
+
+    let sql = format!(
+        "SELECT {CHAIN_PROPOSAL_COLUMNS} FROM pyramid_chain_proposals{where_sql} ORDER BY created_at DESC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+    let rows = stmt.query_map(param_refs.as_slice(), map_chain_proposal_row)?;
+    let collected = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(collected)
+}
+
+/// Accept a chain proposal: set status to 'accepted' and reviewed_at to now.
+pub fn accept_chain_proposal(conn: &Connection, proposal_id: &str, operator_notes: Option<&str>) -> Result<()> {
+    let affected = conn.execute(
+        "UPDATE pyramid_chain_proposals
+         SET status = 'accepted', operator_notes = ?2, reviewed_at = datetime('now')
+         WHERE proposal_id = ?1 AND status = 'pending'",
+        rusqlite::params![proposal_id, operator_notes],
+    )?;
+    if affected == 0 {
+        // Check if it exists at all
+        let exists: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM pyramid_chain_proposals WHERE proposal_id = ?1",
+            rusqlite::params![proposal_id],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            anyhow::bail!("chain proposal '{}' not found", proposal_id);
+        }
+        // Already reviewed — not an error, but nothing changed
+    }
+    Ok(())
+}
+
+/// Reject a chain proposal: set status to 'rejected' and reviewed_at to now.
+/// Idempotent: re-rejecting an already-rejected proposal is a no-op success.
+pub fn reject_chain_proposal(conn: &Connection, proposal_id: &str, operator_notes: Option<&str>) -> Result<()> {
+    let affected = conn.execute(
+        "UPDATE pyramid_chain_proposals
+         SET status = 'rejected', operator_notes = COALESCE(?2, operator_notes), reviewed_at = COALESCE(reviewed_at, datetime('now'))
+         WHERE proposal_id = ?1 AND status IN ('pending', 'rejected')",
+        rusqlite::params![proposal_id, operator_notes],
+    )?;
+    if affected == 0 {
+        let exists: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM pyramid_chain_proposals WHERE proposal_id = ?1",
+            rusqlite::params![proposal_id],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            anyhow::bail!("chain proposal '{}' not found", proposal_id);
+        }
+        // Already in a non-pending/non-rejected state — accepted or deferred; no-op
+    }
+    Ok(())
+}
+
+/// Defer a chain proposal: set status to 'deferred' and reviewed_at to now.
+pub fn defer_chain_proposal(conn: &Connection, proposal_id: &str, operator_notes: Option<&str>) -> Result<()> {
+    let affected = conn.execute(
+        "UPDATE pyramid_chain_proposals
+         SET status = 'deferred', operator_notes = ?2, reviewed_at = datetime('now')
+         WHERE proposal_id = ?1 AND status = 'pending'",
+        rusqlite::params![proposal_id, operator_notes],
+    )?;
+    if affected == 0 {
+        let exists: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM pyramid_chain_proposals WHERE proposal_id = ?1",
+            rusqlite::params![proposal_id],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            anyhow::bail!("chain proposal '{}' not found", proposal_id);
+        }
+    }
     Ok(())
 }

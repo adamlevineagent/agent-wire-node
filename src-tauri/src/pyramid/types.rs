@@ -1562,3 +1562,156 @@ pub struct ChainPublication {
     pub created_at: String,
     pub updated_at: String,
 }
+
+// ── WS-CHAIN-PROPOSAL (Phase 3): Agent-proposed chain updates ────────────────
+
+/// A row from `pyramid_chain_proposals` tracking an agent-proposed update to a
+/// chain configuration. Proposals accumulate as contributions and surface to the
+/// operator for review — closing the learning loop so the substrate improves how
+/// content gets processed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChainProposal {
+    pub id: i64,
+    pub proposal_id: String,
+    pub chain_id: String,
+    pub proposer: String,
+    pub proposal_type: String,
+    pub description: String,
+    pub reasoning: String,
+    pub patch: serde_json::Value,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator_notes: Option<String>,
+    pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewed_at: Option<String>,
+}
+
+// ── WS-VOCAB (Phase 3): Vocabulary catalog types ─────────────────────────────
+
+/// A vocabulary catalog extracted from a pyramid's apex node. Contains all
+/// canonical identities (topics, entities, decisions, terms, practices) with
+/// their importance, liveness, and category information.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VocabularyCatalog {
+    pub slug: String,
+    pub topics: Vec<VocabEntry>,
+    pub entities: Vec<VocabEntry>,
+    pub decisions: Vec<VocabEntry>,
+    pub terms: Vec<VocabEntry>,
+    pub practices: Vec<VocabEntry>,
+    pub total_entries: usize,
+    pub extracted_at: String,
+}
+
+/// A single entry in the vocabulary catalog — a canonical identity extracted
+/// from the pyramid apex's structured fields.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VocabEntry {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub importance: Option<f64>,
+    /// "live" or "mooted" — tracks whether this identity is still active
+    /// or has been superseded by a different canonical form.
+    pub liveness: String,
+    /// Full original entry data from the apex node, preserved for drill queries.
+    #[serde(default)]
+    pub detail: serde_json::Value,
+}
+
+/// Result of a reverse vocabulary query: the matched identity plus its
+/// category context and neighboring identities in the same category.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VocabReverseResult {
+    pub entry: VocabEntry,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    pub neighbors: Vec<VocabEntry>,
+}
+
+// ── WS-MANIFEST-API (Phase 3): Context manifest for agent cognition steering ──
+
+/// A single manifest operation that an agent emits between turns to steer
+/// its Brain Map. The runtime harness executes these against the pyramid
+/// graph before the next turn.
+///
+/// See plan §9.2: "Between turns, the agent emits a structured context
+/// manifest as part of its response — invisible to the human user,
+/// machine-readable, consumed by the runtime harness."
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "op")]
+pub enum ManifestOperation {
+    /// Pull a specific node into the Brain Map at a given abstraction level.
+    Hydrate {
+        node_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        abstraction_level: Option<String>,
+    },
+    /// Drop a Brain Map node's richer content, retaining vocabulary floor only
+    /// (headline + topics + entity names, no detail).
+    Dehydrate { node_id: String },
+    /// Replace a stretch of dialogue turns with a synthesis node (placeholder —
+    /// actual buffer compression is runtime-side).
+    Compress { buffer_range: (usize, usize) },
+    /// Request async helper to produce a missing mid-level synthesis node.
+    Densify { missing_node_id: String },
+    /// Pull in nodes related to a seed via ties_to / web edges.
+    Colocate { seed_node_id: String },
+    /// Speculatively pre-stage nodes the agent anticipates needing next turn.
+    Lookahead { node_ids: Vec<String> },
+    /// Flag a node as possibly stale and request async verification.
+    Investigation { node_id: String },
+    /// Fire a question against a pyramid; answer flows into Brain Map or
+    /// triggers demand-driven generation.
+    Ask {
+        pyramid_slug: String,
+        question: String,
+    },
+    /// Propose an update to a chain configuration based on session learning.
+    ProposeChainUpdate {
+        chain_id: String,
+        patch: serde_json::Value,
+    },
+}
+
+/// Result of executing a batch of manifest operations.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManifestResult {
+    /// Number of operations that were executed (including failures).
+    pub operations_executed: usize,
+    /// Per-operation results in the same order as the input operations.
+    pub results: Vec<ManifestOpResult>,
+    /// UUID for the audit trail — correlates with pyramid_manifest_log.
+    pub provenance_id: String,
+}
+
+/// Result of a single manifest operation execution.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManifestOpResult {
+    /// Operation type name (e.g. "Hydrate", "Dehydrate").
+    pub op: String,
+    /// Whether the operation completed successfully.
+    pub success: bool,
+    /// Nodes returned by this operation (hydrated content, colocated neighbors, etc.).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nodes_returned: Vec<serde_json::Value>,
+    /// Error message if the operation failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Payload returned by the cold-start endpoint for a new agent session.
+/// Contains the primer (leftmost slope + canonical vocabulary) plus
+/// the initial Brain Map nodes for immediate cognition.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ColdStartPayload {
+    /// The primer context (slope nodes + canonical vocabulary).
+    pub primer: PrimerContext,
+    /// Initial Brain Map nodes — the slope nodes as full JSON for direct
+    /// inclusion in the agent's context window.
+    pub brain_map_initial: Vec<serde_json::Value>,
+    /// Session ID for correlating subsequent manifest calls.
+    pub session_id: String,
+}

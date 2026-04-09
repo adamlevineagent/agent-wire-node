@@ -12,12 +12,14 @@ use warp::Filter;
 use warp::Reply;
 
 use super::build::WriteOp;
+use super::chain_proposal;
 use super::chain_publish;
 use super::characterize;
 use super::db;
 use super::delta;
 use super::faq;
 use super::ingest;
+use super::manifest;
 use super::meta;
 use super::primer;
 use super::publication;
@@ -28,6 +30,8 @@ use super::staleness_bridge;
 use super::types::CharacterizationResult;
 use super::types::*;
 use super::vine;
+use super::vocabulary;
+use super::recovery;
 use super::webbing;
 use super::wire_import;
 use super::wire_publish;
@@ -349,6 +353,28 @@ struct AnnotateBody {
     content: String,
     question_context: Option<String>,
     author: Option<String>,
+}
+
+// ── WS-VOCAB query parameter structs ────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct VocabRecognizeQuery {
+    term: String,
+}
+
+#[derive(Deserialize)]
+struct VocabDrillQuery {
+    category: String,
+}
+
+#[derive(Deserialize)]
+struct VocabReverseQuery {
+    identity: String,
+}
+
+#[derive(Deserialize)]
+struct VocabDiffQuery {
+    since: String,
 }
 
 #[derive(Deserialize)]
@@ -1516,6 +1542,74 @@ pub fn pyramid_routes(
     let cp_b = cp_a.or(chain_get_route).unify().boxed();
     let h_chain_pub = cp_b.or(chain_list_route).unify().boxed();
 
+    // ── WS-CHAIN-PROPOSAL (Phase 3): Chain proposal routes ──────────────
+    // POST /pyramid/chain-proposals/:proposal_id/accept — accept a proposal
+    let chain_proposal_accept = route!(prefix
+        .and(warp::path("chain-proposals"))
+        .and(warp::path::param::<String>())
+        .and(warp::path("accept"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(warp::body::json::<ChainProposalReviewBody>())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_chain_proposal_accept));
+
+    // POST /pyramid/chain-proposals/:proposal_id/reject — reject a proposal
+    let chain_proposal_reject = route!(prefix
+        .and(warp::path("chain-proposals"))
+        .and(warp::path::param::<String>())
+        .and(warp::path("reject"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(warp::body::json::<ChainProposalReviewBody>())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_chain_proposal_reject));
+
+    // POST /pyramid/chain-proposals/:proposal_id/defer — defer a proposal
+    let chain_proposal_defer = route!(prefix
+        .and(warp::path("chain-proposals"))
+        .and(warp::path::param::<String>())
+        .and(warp::path("defer"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(warp::body::json::<ChainProposalReviewBody>())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_chain_proposal_defer));
+
+    // GET /pyramid/chain-proposals/:proposal_id — get proposal details
+    let chain_proposal_get = route!(prefix
+        .and(warp::path("chain-proposals"))
+        .and(warp::path::param::<String>())
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_chain_proposal_get));
+
+    // POST /pyramid/chain-proposals — submit a new proposal
+    let chain_proposal_submit = route!(prefix
+        .and(warp::path("chain-proposals"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(warp::body::json::<ChainProposalSubmitBody>())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_chain_proposal_submit));
+
+    // GET /pyramid/chain-proposals — list proposals (query: ?chain_id=X&status=pending)
+    let chain_proposal_list = route!(prefix
+        .and(warp::path("chain-proposals"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::query::<std::collections::HashMap<String, String>>())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_chain_proposal_list));
+
+    // Longest paths first: accept/reject/defer (3 segments), then get (2), then submit+list (1)
+    let cpr_a = chain_proposal_accept.or(chain_proposal_reject).unify().boxed();
+    let cpr_b = cpr_a.or(chain_proposal_defer).unify().boxed();
+    let cpr_c = cpr_b.or(chain_proposal_get).unify().boxed();
+    let cpr_d = cpr_c.or(chain_proposal_submit).unify().boxed();
+    let h_chain_proposal = cpr_d.or(chain_proposal_list).unify().boxed();
+
     // CRITICAL: Vine routes (h6, h7), chain import (h8), and remote-query with literal path segments
     // MUST come BEFORE slug-parameterized routes, otherwise "vine"/"chain"/"remote-query" gets
     // captured as a :slug param.
@@ -1523,6 +1617,7 @@ pub fn pyramid_routes(
     let top = top.or(h8).unify().boxed(); // Chain import (literal paths)
     let top = top.or(h_cost).unify().boxed(); // WS-COST-MODEL cost_model endpoints (literal paths)
     let top = top.or(h_chain_pub).unify().boxed(); // WS-CHAIN-PUBLISH chain publication (literal paths)
+    let top = top.or(h_chain_proposal).unify().boxed(); // WS-CHAIN-PROPOSAL chain proposals (literal paths)
     let top = top.or(remote_query_route).unify().boxed(); // WS-ONLINE-V: Remote query proxy (literal path)
     let top2 = top.or(h1).unify().boxed(); // Then everything else
     let top3 = top2.or(h2).unify().boxed();
@@ -1937,10 +2032,208 @@ pub fn pyramid_routes(
     let dg = dg_a.or(demand_gen_list).unify().boxed();
     let top25 = top24.or(dg).unify().boxed();
 
+    // ── WS-RECOVERY-OPS: Recovery operations surface ──
+
+    // POST /pyramid/:slug/recovery/rerun-build  — body: {build_id}
+    let recovery_rerun = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("recovery"))
+        .and(warp::path("rerun-build"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(warp::body::json::<RecoveryRerunBody>())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_recovery_rerun));
+
+    // POST /pyramid/:slug/recovery/reingest     — body: {source_path}
+    let recovery_reingest = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("recovery"))
+        .and(warp::path("reingest"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(warp::body::json::<RecoveryReingestBody>())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_recovery_reingest));
+
+    // POST /pyramid/:slug/recovery/force-delta  — body: {bedrock_slug}
+    let recovery_force_delta = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("recovery"))
+        .and(warp::path("force-delta"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(warp::body::json::<RecoveryForceDeltaBody>())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_recovery_force_delta));
+
+    // POST /pyramid/:slug/recovery/collapse     — body: {node_id}
+    let recovery_collapse = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("recovery"))
+        .and(warp::path("collapse"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(warp::body::json::<RecoveryCollapseBody>())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_recovery_collapse));
+
+    // POST /pyramid/:slug/recovery/promote      — body: {session_id}
+    let recovery_promote = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("recovery"))
+        .and(warp::path("promote"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(warp::body::json::<RecoveryPromoteBody>())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_recovery_promote));
+
+    // POST /pyramid/:slug/recovery/rebuild-deps
+    let recovery_rebuild_deps = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("recovery"))
+        .and(warp::path("rebuild-deps"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_recovery_rebuild_deps));
+
+    // GET /pyramid/:slug/recovery/status        — aggregated health view
+    let recovery_status = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("recovery"))
+        .and(warp::path("status"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_recovery_status));
+
+    // Combine: longer literal paths first, then shorter
+    let rec_a = recovery_rerun.or(recovery_reingest).unify().boxed();
+    let rec_b = recovery_force_delta.or(recovery_collapse).unify().boxed();
+    let rec_c = recovery_promote.or(recovery_rebuild_deps).unify().boxed();
+    let rec_d = rec_a.or(rec_b).unify().boxed();
+    let rec_e = rec_c.or(recovery_status).unify().boxed();
+    let rec = rec_d.or(rec_e).unify().boxed();
+    let top26 = top25.or(rec).unify().boxed();
+
+    // ── WS-VOCAB (Phase 3): Vocabulary catalog routes ──
+
+    // GET /pyramid/:slug/vocabulary — full catalog
+    let vocab_full = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("vocabulary"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_vocab_full));
+
+    // GET /pyramid/:slug/vocabulary/recognize?term=X — recognition query
+    let vocab_recognize = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("vocabulary"))
+        .and(warp::path("recognize"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::query::<VocabRecognizeQuery>())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_vocab_recognize));
+
+    // GET /pyramid/:slug/vocabulary/drill?category=X — drill query
+    let vocab_drill = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("vocabulary"))
+        .and(warp::path("drill"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::query::<VocabDrillQuery>())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_vocab_drill));
+
+    // GET /pyramid/:slug/vocabulary/reverse?identity=X — reverse query
+    let vocab_reverse = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("vocabulary"))
+        .and(warp::path("reverse"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::query::<VocabReverseQuery>())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_vocab_reverse));
+
+    // GET /pyramid/:slug/vocabulary/diff?since=X — diff query
+    let vocab_diff = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("vocabulary"))
+        .and(warp::path("diff"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::query::<VocabDiffQuery>())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_vocab_diff));
+
+    // POST /pyramid/:slug/vocabulary/refresh — re-extract from current apex
+    let vocab_refresh = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("vocabulary"))
+        .and(warp::path("refresh"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_vocab_refresh));
+
+    // More-specific paths (recognize, drill, reverse, diff, refresh) must come
+    // before the bare /vocabulary endpoint to avoid premature matching.
+    let vc_a = vocab_recognize.or(vocab_drill).unify().boxed();
+    let vc_b = vocab_reverse.or(vocab_diff).unify().boxed();
+    let vc_c = vocab_refresh.or(vocab_full).unify().boxed();
+    let vc_d = vc_a.or(vc_b).unify().boxed();
+    let vocab = vc_d.or(vc_c).unify().boxed();
+    let top27 = top26.or(vocab).unify().boxed();
+
+    // ── WS-MANIFEST-API (Phase 3): Manifest execution + cold start ──
+
+    // GET /pyramid/:slug/manifest/cold-start — cold start payload for new agent session
+    let manifest_cold_start = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("manifest"))
+        .and(warp::path("cold-start"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_manifest_cold_start));
+
+    // GET /pyramid/:slug/manifest/log — recent manifest provenance log
+    let manifest_log = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("manifest"))
+        .and(warp::path("log"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::query::<ManifestLogQuery>())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_manifest_log));
+
+    // POST /pyramid/:slug/manifest — execute manifest operations
+    let manifest_exec = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("manifest"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(warp::body::json::<ManifestExecBody>())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_manifest_exec));
+
+    // More-specific paths (cold-start, log) before bare /manifest
+    let mf_a = manifest_cold_start.or(manifest_log).unify().boxed();
+    let mf = mf_a.or(manifest_exec).unify().boxed();
+    let top28 = top27.or(mf).unify().boxed();
+
     // public_html is now mounted separately at the server level so it can
     // get a permissive CORS filter (the desktop API allowlist would block
     // form POSTs from the tunnel host).
-    top25
+    top28
 }
 
 /// Mount the post-agents-retro `/p/` web surface routes. These are
@@ -7891,5 +8184,596 @@ async fn handle_chain_fork(
             };
             Ok(json_error(status, &msg))
         }
+    }
+}
+
+// ── WS-CHAIN-PROPOSAL: Chain proposal request bodies and handlers ────────────
+
+#[derive(Debug, Deserialize)]
+struct ChainProposalSubmitBody {
+    chain_id: String,
+    proposer: String,
+    proposal_type: String,
+    description: String,
+    reasoning: String,
+    patch: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChainProposalReviewBody {
+    #[serde(default)]
+    operator_notes: Option<String>,
+}
+
+/// POST /pyramid/chain-proposals — submit a new chain proposal.
+async fn handle_chain_proposal_submit(
+    body: ChainProposalSubmitBody,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let conn = state.writer.lock().await;
+    match chain_proposal::submit_chain_proposal(
+        &conn,
+        &body.chain_id,
+        &body.proposer,
+        &body.proposal_type,
+        &body.description,
+        &body.reasoning,
+        &body.patch,
+        Some(&state.build_event_bus),
+    ) {
+        Ok(proposal_id) => Ok(json_ok(&serde_json::json!({
+            "proposal_id": proposal_id,
+            "status": "pending",
+        }))),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
+    }
+}
+
+/// GET /pyramid/chain-proposals — list proposals with optional filters.
+async fn handle_chain_proposal_list(
+    query: std::collections::HashMap<String, String>,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let conn = state.reader.lock().await;
+    let chain_id = query.get("chain_id").map(|s| s.as_str());
+    let status = query.get("status").map(|s| s.as_str());
+    match db::list_chain_proposals(&conn, chain_id, status) {
+        Ok(proposals) => Ok(json_ok(&serde_json::json!({
+            "proposals": proposals,
+            "count": proposals.len(),
+        }))),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
+    }
+}
+
+/// GET /pyramid/chain-proposals/:proposal_id — get proposal details.
+async fn handle_chain_proposal_get(
+    proposal_id: String,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let conn = state.reader.lock().await;
+    match db::get_chain_proposal(&conn, &proposal_id) {
+        Ok(Some(proposal)) => Ok(json_ok(&proposal)),
+        Ok(None) => Ok(json_error(
+            warp::http::StatusCode::NOT_FOUND,
+            &format!("chain proposal '{}' not found", proposal_id),
+        )),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
+    }
+}
+
+/// POST /pyramid/chain-proposals/:proposal_id/accept — accept and optionally apply a proposal.
+async fn handle_chain_proposal_accept(
+    proposal_id: String,
+    body: ChainProposalReviewBody,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let conn = state.writer.lock().await;
+    if let Err(e) = db::accept_chain_proposal(&conn, &proposal_id, body.operator_notes.as_deref()) {
+        let msg = e.to_string();
+        let status = if msg.contains("not found") {
+            warp::http::StatusCode::NOT_FOUND
+        } else {
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR
+        };
+        return Ok(json_error(status, &msg));
+    }
+
+    // Try to apply the patch to the chain YAML on disk
+    let mut apply_result = serde_json::json!(null);
+    if let Ok(Some(proposal)) = db::get_chain_proposal(&conn, &proposal_id) {
+        let chains_dir = state.chains_dir.to_string_lossy().to_string();
+        match chain_proposal::apply_accepted_proposal(&proposal, &chains_dir) {
+            Ok(()) => {
+                apply_result = serde_json::json!({"applied": true});
+            }
+            Err(e) => {
+                // Proposal is accepted but patch failed to apply — report but don't fail
+                tracing::warn!(
+                    proposal_id = %proposal_id,
+                    error = %e,
+                    "chain proposal accepted but patch failed to apply"
+                );
+                apply_result = serde_json::json!({
+                    "applied": false,
+                    "apply_error": e.to_string(),
+                });
+            }
+        }
+    }
+
+    Ok(json_ok(&serde_json::json!({
+        "proposal_id": proposal_id,
+        "status": "accepted",
+        "patch_result": apply_result,
+    })))
+}
+
+/// POST /pyramid/chain-proposals/:proposal_id/reject — reject a proposal.
+async fn handle_chain_proposal_reject(
+    proposal_id: String,
+    body: ChainProposalReviewBody,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let conn = state.writer.lock().await;
+    if let Err(e) = db::reject_chain_proposal(&conn, &proposal_id, body.operator_notes.as_deref()) {
+        let msg = e.to_string();
+        let status = if msg.contains("not found") {
+            warp::http::StatusCode::NOT_FOUND
+        } else {
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR
+        };
+        return Ok(json_error(status, &msg));
+    }
+    Ok(json_ok(&serde_json::json!({
+        "proposal_id": proposal_id,
+        "status": "rejected",
+    })))
+}
+
+/// POST /pyramid/chain-proposals/:proposal_id/defer — defer a proposal.
+async fn handle_chain_proposal_defer(
+    proposal_id: String,
+    body: ChainProposalReviewBody,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let conn = state.writer.lock().await;
+    if let Err(e) = db::defer_chain_proposal(&conn, &proposal_id, body.operator_notes.as_deref()) {
+        let msg = e.to_string();
+        let status = if msg.contains("not found") {
+            warp::http::StatusCode::NOT_FOUND
+        } else {
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR
+        };
+        return Ok(json_error(status, &msg));
+    }
+    Ok(json_ok(&serde_json::json!({
+        "proposal_id": proposal_id,
+        "status": "deferred",
+    })))
+}
+
+// ── WS-RECOVERY-OPS: Recovery request bodies and handlers ────────────────────
+
+#[derive(Debug, Deserialize)]
+struct RecoveryRerunBody {
+    build_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RecoveryReingestBody {
+    source_path: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RecoveryForceDeltaBody {
+    bedrock_slug: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RecoveryCollapseBody {
+    node_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RecoveryPromoteBody {
+    session_id: String,
+}
+
+/// POST /pyramid/:slug/recovery/rerun-build — re-fire a fresh build
+async fn handle_recovery_rerun(
+    slug_name: String,
+    body: RecoveryRerunBody,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    match recovery::recovery_rerun_build(&state, &slug_name, &body.build_id).await {
+        Ok(new_build_id) => Ok(json_ok(&serde_json::json!({
+            "status": "dispatched",
+            "new_build_id": new_build_id,
+            "message": "Build dispatched. Use GET /pyramid/{slug}/build/status to track progress."
+        }))),
+        Err(e) => {
+            let msg = e.to_string();
+            let status_code = if msg.contains("not found") {
+                warp::http::StatusCode::NOT_FOUND
+            } else {
+                warp::http::StatusCode::INTERNAL_SERVER_ERROR
+            };
+            Ok(json_error(status_code, &msg))
+        }
+    }
+}
+
+/// POST /pyramid/:slug/recovery/reingest — re-ingest from source
+async fn handle_recovery_reingest(
+    slug_name: String,
+    body: RecoveryReingestBody,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    match recovery::recovery_reingest(&state, &slug_name, &body.source_path).await {
+        Ok(sig) => Ok(json_ok(&serde_json::json!({
+            "status": "pending",
+            "ingest_signature": sig,
+            "message": "Source marked stale and new ingest record created. DADBEAR will pick it up."
+        }))),
+        Err(e) => {
+            let msg = e.to_string();
+            let status_code = if msg.contains("not found") {
+                warp::http::StatusCode::NOT_FOUND
+            } else {
+                warp::http::StatusCode::INTERNAL_SERVER_ERROR
+            };
+            Ok(json_error(status_code, &msg))
+        }
+    }
+}
+
+/// POST /pyramid/:slug/recovery/force-delta — force composition delta propagation
+async fn handle_recovery_force_delta(
+    slug_name: String,
+    body: RecoveryForceDeltaBody,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    // Force delta needs the write lock on the vine slug
+    let _write_guard = super::lock_manager::LockManager::global()
+        .write(&slug_name)
+        .await;
+
+    let result = {
+        let conn = state.writer.lock().await;
+        recovery::recovery_force_delta(&conn, &slug_name, &body.bedrock_slug)
+    };
+
+    match result {
+        Ok(()) => {
+            // Emit a DeltaLanded event so DADBEAR picks up the propagation
+            let event = super::event_bus::TaggedBuildEvent {
+                slug: slug_name.clone(),
+                kind: super::event_bus::TaggedKind::DeltaLanded {
+                    depth: 0,
+                    node_id: "recovery-force".to_string(),
+                },
+            };
+            let _ = state.build_event_bus.tx.send(event);
+
+            Ok(json_ok(&serde_json::json!({
+                "status": "ok",
+                "message": "Delta forced. DADBEAR will propagate the composition update."
+            })))
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            let status_code = if msg.contains("No active composition") || msg.contains("has no apex") {
+                warp::http::StatusCode::NOT_FOUND
+            } else {
+                warp::http::StatusCode::INTERNAL_SERVER_ERROR
+            };
+            Ok(json_error(status_code, &msg))
+        }
+    }
+}
+
+/// POST /pyramid/:slug/recovery/collapse — collapse delta chain for a node
+async fn handle_recovery_collapse(
+    slug_name: String,
+    body: RecoveryCollapseBody,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let _write_guard = super::lock_manager::LockManager::global()
+        .write(&slug_name)
+        .await;
+
+    let result = {
+        let conn = state.writer.lock().await;
+        recovery::recovery_collapse_delta_chain(&conn, &slug_name, &body.node_id)
+    };
+
+    match result {
+        Ok(new_version) => Ok(json_ok(&serde_json::json!({
+            "status": "collapsed",
+            "new_version": new_version,
+            "node_id": body.node_id,
+        }))),
+        Err(e) => {
+            let msg = e.to_string();
+            let status_code = if msg.contains("not found") {
+                warp::http::StatusCode::NOT_FOUND
+            } else {
+                warp::http::StatusCode::INTERNAL_SERVER_ERROR
+            };
+            Ok(json_error(status_code, &msg))
+        }
+    }
+}
+
+/// POST /pyramid/:slug/recovery/promote — promote provisional session
+async fn handle_recovery_promote(
+    slug_name: String,
+    body: RecoveryPromoteBody,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let _write_guard = super::lock_manager::LockManager::global()
+        .write(&slug_name)
+        .await;
+
+    let result = {
+        let conn = state.writer.lock().await;
+        recovery::recovery_promote_provisional(&conn, &slug_name, &body.session_id)
+    };
+
+    match result {
+        Ok(count) => Ok(json_ok(&serde_json::json!({
+            "status": "promoted",
+            "promoted_count": count,
+            "session_id": body.session_id,
+        }))),
+        Err(e) => {
+            let msg = e.to_string();
+            let status_code = if msg.contains("not found") {
+                warp::http::StatusCode::NOT_FOUND
+            } else if msg.contains("belongs to slug") {
+                warp::http::StatusCode::BAD_REQUEST
+            } else {
+                warp::http::StatusCode::INTERNAL_SERVER_ERROR
+            };
+            Ok(json_error(status_code, &msg))
+        }
+    }
+}
+
+/// POST /pyramid/:slug/recovery/rebuild-deps — reconcile dependency graph
+async fn handle_recovery_rebuild_deps(
+    slug_name: String,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let _write_guard = super::lock_manager::LockManager::global()
+        .write(&slug_name)
+        .await;
+
+    let result = {
+        let conn = state.writer.lock().await;
+        recovery::recovery_rebuild_deps(&conn, &slug_name)
+    };
+
+    match result {
+        Ok(fixed_count) => Ok(json_ok(&serde_json::json!({
+            "status": "ok",
+            "fixed_count": fixed_count,
+        }))),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
+    }
+}
+
+/// GET /pyramid/:slug/recovery/status — aggregated health view
+async fn handle_recovery_status(
+    slug_name: String,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let conn = state.reader.lock().await;
+    match recovery::recovery_status(&conn, &slug_name) {
+        Ok(status) => Ok(json_ok(&status)),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
+    }
+}
+
+// ── WS-VOCAB (Phase 3): Vocabulary catalog handlers ────────────────────────
+
+/// GET /pyramid/:slug/vocabulary — full catalog (from persistence table)
+async fn handle_vocab_full(
+    slug_name: String,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let conn = state.reader.lock().await;
+    match vocabulary::load_vocabulary_catalog(&conn, &slug_name) {
+        Ok(catalog) => Ok(json_ok(&catalog)),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
+    }
+}
+
+/// GET /pyramid/:slug/vocabulary/recognize?term=X — recognition query
+async fn handle_vocab_recognize(
+    slug_name: String,
+    query: VocabRecognizeQuery,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let conn = state.reader.lock().await;
+    match vocabulary::vocab_recognition_query(&conn, &slug_name, &query.term) {
+        Ok(results) => Ok(json_ok(&results)),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
+    }
+}
+
+/// GET /pyramid/:slug/vocabulary/drill?category=X — drill query
+async fn handle_vocab_drill(
+    slug_name: String,
+    query: VocabDrillQuery,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let conn = state.reader.lock().await;
+    match vocabulary::vocab_drill_query(&conn, &slug_name, &query.category) {
+        Ok(results) => Ok(json_ok(&results)),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
+    }
+}
+
+/// GET /pyramid/:slug/vocabulary/reverse?identity=X — reverse query
+async fn handle_vocab_reverse(
+    slug_name: String,
+    query: VocabReverseQuery,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let conn = state.reader.lock().await;
+    match vocabulary::vocab_reverse_query(&conn, &slug_name, &query.identity) {
+        Ok(result) => Ok(json_ok(&result)),
+        Err(e) => {
+            // 404 for not-found identities, 500 for everything else
+            let msg = e.to_string();
+            if msg.contains("not found in vocabulary") {
+                Ok(json_error(warp::http::StatusCode::NOT_FOUND, &msg))
+            } else {
+                Ok(json_error(
+                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    &msg,
+                ))
+            }
+        }
+    }
+}
+
+/// GET /pyramid/:slug/vocabulary/diff?since=X — diff query
+async fn handle_vocab_diff(
+    slug_name: String,
+    query: VocabDiffQuery,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let conn = state.reader.lock().await;
+    match vocabulary::vocab_diff_query(&conn, &slug_name, &query.since) {
+        Ok(results) => Ok(json_ok(&results)),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
+    }
+}
+
+/// POST /pyramid/:slug/vocabulary/refresh — re-extract from current apex
+async fn handle_vocab_refresh(
+    slug_name: String,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let conn = state.writer.lock().await;
+    match vocabulary::refresh_vocabulary(&conn, &slug_name) {
+        Ok((catalog, count)) => Ok(json_ok(&serde_json::json!({
+            "catalog": catalog,
+            "entries_persisted": count,
+        }))),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
+    }
+}
+
+// ── WS-MANIFEST-API handlers ──────────────────────────────────────────────
+
+/// Request body for POST /pyramid/:slug/manifest
+#[derive(Debug, Deserialize)]
+struct ManifestExecBody {
+    operations: Vec<ManifestOperation>,
+    #[serde(default)]
+    session_id: Option<String>,
+}
+
+/// Query parameters for GET /pyramid/:slug/manifest/log
+#[derive(Debug, Deserialize)]
+struct ManifestLogQuery {
+    #[serde(default = "default_manifest_log_limit")]
+    limit: i64,
+}
+
+fn default_manifest_log_limit() -> i64 {
+    50
+}
+
+/// POST /pyramid/:slug/manifest — execute manifest operations
+async fn handle_manifest_exec(
+    slug: String,
+    body: ManifestExecBody,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    if body.operations.is_empty() {
+        return Ok(json_error(
+            warp::http::StatusCode::BAD_REQUEST,
+            "No operations provided",
+        ));
+    }
+
+    match manifest::execute_manifest(
+        &state,
+        &slug,
+        body.operations,
+        body.session_id.as_deref(),
+    )
+    .await
+    {
+        Ok(result) => Ok(json_ok(&result)),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Manifest execution failed: {e}"),
+        )),
+    }
+}
+
+/// GET /pyramid/:slug/manifest/cold-start — cold start payload for new agent session
+async fn handle_manifest_cold_start(
+    slug: String,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    match manifest::cold_start(&state, &slug).await {
+        Ok(payload) => Ok(json_ok(&payload)),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Cold start failed: {e}"),
+        )),
+    }
+}
+
+/// GET /pyramid/:slug/manifest/log — recent manifest provenance log
+async fn handle_manifest_log(
+    slug: String,
+    query: ManifestLogQuery,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let conn = state.reader.lock().await;
+    match manifest::get_manifest_log(&conn, &slug, query.limit) {
+        Ok(logs) => Ok(json_ok(&logs)),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to read manifest log: {e}"),
+        )),
     }
 }
