@@ -1643,6 +1643,58 @@ pub async fn build_vine_upper(
         depth = next_depth;
     }
 
+    // If the loop ended with multiple nodes at top depth (synthesis failures prevented
+    // convergence), force a single apex by merging all top-depth nodes mechanically.
+    if apex_id.is_empty() {
+        let top_nodes = {
+            let conn = state.reader.lock().await;
+            db::get_nodes_at_depth(&conn, vine_slug, depth)?
+        };
+        if top_nodes.len() > 1 {
+            let apex_depth = depth + 1;
+            let forced_id = format!("L{apex_depth}-000");
+            info!("Forcing apex: merging {} L{depth} nodes into {forced_id}", top_nodes.len());
+
+            let combined_headline = top_nodes.iter()
+                .map(|n| n.headline.as_str())
+                .collect::<Vec<_>>()
+                .join(" / ");
+            let combined_distilled = top_nodes.iter()
+                .filter_map(|n| if n.distilled.is_empty() { None } else { Some(n.distilled.as_str()) })
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            let children: Vec<String> = top_nodes.iter().map(|n| n.id.clone()).collect();
+            let mut merged_topics = Vec::new();
+            for n in &top_nodes {
+                for t in &n.topics {
+                    if !merged_topics.iter().any(|mt: &super::types::Topic| mt.name == t.name) {
+                        merged_topics.push(t.clone());
+                    }
+                }
+            }
+
+            let apex_node = PyramidNode {
+                id: forced_id.clone(),
+                slug: vine_slug.to_string(),
+                depth: apex_depth,
+                headline: if combined_headline.len() > 200 {
+                    format!("{}...", &combined_headline[..197])
+                } else { combined_headline },
+                distilled: combined_distilled,
+                topics: merged_topics,
+                children,
+                ..Default::default()
+            };
+            build::send_save_node(&write_tx, apex_node, None).await;
+            for n in &top_nodes {
+                build::send_update_parent(&write_tx, vine_slug, &n.id, &forced_id).await;
+            }
+            apex_id = forced_id;
+        } else if let Some(node) = top_nodes.first() {
+            apex_id = node.id.clone();
+        }
+    }
+
     drop(write_tx);
     let _ = writer_handle.await;
 
