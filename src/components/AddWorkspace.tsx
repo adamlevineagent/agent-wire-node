@@ -11,7 +11,7 @@ interface AddWorkspaceProps {
     onCancel: () => void;
 }
 
-type Step = 'directory' | 'content-type' | 'vine-dirs' | 'configure' | 'question' | 'confirm' | 'building';
+type Step = 'directory' | 'content-type' | 'conversation-preset' | 'vine-dirs' | 'configure' | 'question' | 'preview' | 'confirm' | 'building';
 
 const PYRAMID_API_BASE = 'http://localhost:8765';
 
@@ -27,6 +27,49 @@ const DEFAULT_IGNORES = [
     '.DS_Store', '.env', 'vendor', 'pkg',
 ];
 
+/** Chain preset for conversation pyramids */
+type ConversationPreset = 'episodic' | 'retro';
+
+const CONVERSATION_PRESETS: Record<ConversationPreset, {
+    label: string;
+    chainId: string;
+    description: string;
+}> = {
+    episodic: {
+        label: 'Episodic Memory',
+        chainId: 'conversation-episodic',
+        description: 'Builds a cognitive substrate for AI agent continuity. Forward + reverse temporal passes extract decisions, vocabulary, and commitments. The resulting pyramid serves as persistent memory that agents load at session boot.',
+    },
+    retro: {
+        label: 'Retro / Meta-Learning',
+        chainId: 'conversation-chronological',
+        description: 'Chronological analysis optimized for human review. Extracts themes, turning points, corrections, and lessons learned. Use this for retrospectives, post-mortems, and pattern discovery across sessions.',
+    },
+};
+
+/** Shape returned by the preview HTTP endpoint */
+interface BuildPreviewResult {
+    source_path: string;
+    content_type: string;
+    chain_id: string;
+    file_count: number;
+    estimated_total_tokens: number;
+    estimated_pyramids: number;
+    estimated_layers: number;
+    estimated_nodes: number;
+    estimated_cost_dollars: number;
+    estimated_time_seconds: number;
+    estimated_disk_bytes: number;
+    warnings: PreviewWarning[];
+    generated_at: string;
+}
+
+interface PreviewWarning {
+    level: 'info' | 'warning' | 'error';
+    file_path?: string;
+    message: string;
+}
+
 function slugify(name: string): string {
     return name
         .toLowerCase()
@@ -35,18 +78,58 @@ function slugify(name: string): string {
         .slice(0, 64);
 }
 
+/** Format seconds into a human-friendly string like "~2-3 hours" or "~45 minutes" */
+function formatEstimatedTime(seconds: number): string {
+    if (seconds < 60) return `~${seconds} seconds`;
+    const minutes = Math.round(seconds / 60);
+    if (minutes < 60) return `~${minutes} minutes`;
+    const hours = seconds / 3600;
+    const low = Math.floor(hours);
+    const high = Math.ceil(hours);
+    if (low === high) return `~${low} hour${low !== 1 ? 's' : ''}`;
+    return `~${low}-${high} hours`;
+}
+
+/** Format bytes into human-readable size */
+function formatBytes(bytes: number): string {
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+    return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+
+/** Format USD cost */
+function formatCost(dollars: number): string {
+    if (dollars < 0.01) return '<$0.01';
+    return `~$${dollars.toFixed(2)}`;
+}
+
+/** Determine file extension label from content type */
+function fileTypeLabel(contentType: string): string {
+    switch (contentType) {
+        case 'conversation': return '.jsonl files';
+        case 'code': return 'source files';
+        case 'document': return 'document files';
+        default: return 'files';
+    }
+}
+
 export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
     const [step, setStep] = useState<Step>('directory');
     const [paths, setPaths] = useState<string[]>([]);
     const [contentType, setContentType] = useState<'code' | 'document' | 'conversation' | 'vine' | null>(null);
+    const [conversationPreset, setConversationPreset] = useState<ConversationPreset>('episodic');
     const [vinePastePath, setVinePastePath] = useState('');
     const [customIgnores, setCustomIgnores] = useState('');
     const [slug, setSlug] = useState('');
     const [creating, setCreating] = useState(false);
     const [apexQuestion, setApexQuestion] = useState('');
     const [error, setError] = useState<string | null>(null);
-    // Model profile selector — populated lazily from pyramid_list_profiles.
-    // Empty string means "use the operator's current default".
+    // Preview state
+    const [previewLoading, setPreviewLoading] = useState(false);
+    const [previewResult, setPreviewResult] = useState<BuildPreviewResult | null>(null);
+    const [committing, setCommitting] = useState(false);
+    // Model profile selector
     const [profiles, setProfiles] = useState<string[]>([]);
     const [selectedProfile, setSelectedProfile] = useState<string>('');
     const [profilesError, setProfilesError] = useState<string | null>(null);
@@ -65,6 +148,15 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
         return () => { cancelled = true; };
     }, []);
 
+    /** Resolve the effective chain ID for the current configuration */
+    const getEffectiveChainId = useCallback((): string => {
+        if (contentType === 'conversation') {
+            return CONVERSATION_PRESETS[conversationPreset].chainId;
+        }
+        // For code/document, the default chain is resolved server-side
+        return 'question-pipeline';
+    }, [contentType, conversationPreset]);
+
     const handlePickDirectory = useCallback(async () => {
         try {
             const selected = await open({
@@ -74,10 +166,8 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
             if (selected) {
                 const newPath = selected as string;
                 setPaths(prev => {
-                    // Don't add duplicates
                     if (prev.includes(newPath)) return prev;
                     const updated = [...prev, newPath];
-                    // Auto-generate slug from the first directory name
                     if (updated.length === 1) {
                         const parts = newPath.split('/');
                         const folderName = parts[parts.length - 1] || parts[parts.length - 2] || 'workspace';
@@ -113,13 +203,11 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
     const handleRemovePath = useCallback((index: number) => {
         setPaths(prev => {
             const updated = prev.filter((_, i) => i !== index);
-            // If we removed the first path, update the slug from the new first path
             if (index === 0 && updated.length > 0) {
                 const parts = updated[0].split('/');
                 const folderName = parts[parts.length - 1] || parts[parts.length - 2] || 'workspace';
                 setSlug(slugify(folderName));
             }
-            // If no paths left, go back to directory step
             if (updated.length === 0) {
                 setStep('directory');
                 setSlug('');
@@ -130,7 +218,6 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
 
     const handlePickConversation = useCallback(async () => {
         try {
-            // Default to Claude Code projects directory
             const homeDir = await invoke<string>('get_home_dir').catch(() => '');
             const claudeDir = homeDir ? `${homeDir}/.claude/projects` : undefined;
 
@@ -144,14 +231,13 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
                 const filePath = selected as string;
                 addPathAndAutoSlug(filePath);
                 setContentType('conversation');
-                setStep('question');  // Skip configure for conversations (no ignore patterns needed)
+                setStep('conversation-preset');
             }
         } catch (err) {
             setError(String(err));
         }
     }, []);
 
-    // Helper to add a path and auto-generate slug from it
     const addPathAndAutoSlug = useCallback((newPath: string) => {
         setPaths(prev => {
             if (prev.includes(newPath)) return prev;
@@ -169,15 +255,13 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
         setContentType(type);
         setApexQuestion(DEFAULT_QUESTIONS[type] || '');
         if (type === 'vine') {
-            // Go to vine directory selection step
-            // Clear paths from step 1 since vine uses its own directory list
             setPaths([]);
             setSlug('');
             setStep('vine-dirs');
         } else if (type === 'conversation') {
-            // If path already pasted and it's a .jsonl, skip picker
+            // Conversation: go to preset selector first
             if (paths.length > 0 && paths[0].endsWith('.jsonl')) {
-                setStep('question');
+                setStep('conversation-preset');
             } else {
                 handlePickConversation();
             }
@@ -235,7 +319,6 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
         setError(null);
 
         try {
-            // Create the slug via Tauri so it appears in the dashboard
             const sourcePath = paths.join(';');
             await invoke('pyramid_create_slug', {
                 slug,
@@ -243,7 +326,6 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
                 sourcePath,
             });
 
-            // Kick off vine build via Tauri command
             await invoke('pyramid_vine_build', {
                 vineSlug: slug,
                 jsonlDirs: paths,
@@ -261,29 +343,154 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
         setStep('question');
     }, []);
 
+    // ── Preview-then-commit flow ──────────────────────────────────────────
+
+    /** Generate a preview by calling the HTTP endpoint */
+    const handlePreview = useCallback(async () => {
+        if (paths.length === 0 || !contentType || !slug) return;
+        setPreviewLoading(true);
+        setPreviewResult(null);
+        setError(null);
+
+        try {
+            // Ensure the slug exists before previewing
+            const sourcePath = paths.length === 1 ? paths[0] : JSON.stringify(paths);
+
+            // Create slug if it doesn't exist yet (preview needs it)
+            try {
+                await invoke('pyramid_create_slug', {
+                    slug,
+                    contentType,
+                    sourcePath,
+                });
+            } catch (_e) {
+                // Slug may already exist — that's fine
+            }
+
+            // Call the preview HTTP endpoint
+            const chainId = getEffectiveChainId();
+            const response = await fetch(`${PYRAMID_API_BASE}/pyramid/${slug}/preview`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    source_path: sourcePath,
+                    content_type: contentType,
+                    chain_id: chainId,
+                }),
+            });
+
+            if (!response.ok) {
+                const errBody = await response.text();
+                throw new Error(`Preview failed (${response.status}): ${errBody}`);
+            }
+
+            const result = await response.json() as BuildPreviewResult;
+            setPreviewResult(result);
+            setStep('preview');
+        } catch (err) {
+            setError(String(err));
+        } finally {
+            setPreviewLoading(false);
+        }
+    }, [paths, contentType, slug, getEffectiveChainId]);
+
+    /** Commit after preview — creates DADBEAR config and starts background processing */
+    const handleCommit = useCallback(async () => {
+        if (!previewResult || !slug || !contentType) return;
+        setCommitting(true);
+        setError(null);
+
+        try {
+            const sourcePath = paths.length === 1 ? paths[0] : JSON.stringify(paths);
+            const chainId = getEffectiveChainId();
+
+            // Apply model profile if selected
+            if (selectedProfile && selectedProfile.trim()) {
+                try {
+                    await invoke('pyramid_apply_profile', { profile: selectedProfile });
+                } catch (e) {
+                    setError(`Failed to apply profile "${selectedProfile}": ${e}`);
+                    setCommitting(false);
+                    return;
+                }
+            }
+
+            // Ingest the content
+            await invoke('pyramid_ingest', { slug });
+
+            // Commit via the preview/commit endpoint — this creates DADBEAR config
+            const commitResponse = await fetch(`${PYRAMID_API_BASE}/pyramid/${slug}/preview/commit`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    source_path: sourcePath,
+                    content_type: contentType,
+                    chain_id: chainId,
+                }),
+            });
+
+            if (!commitResponse.ok) {
+                const errBody = await commitResponse.text();
+                throw new Error(`Commit failed (${commitResponse.status}): ${errBody}`);
+            }
+
+            // For conversation pyramids, also set up a DADBEAR watch on the source folder
+            if (contentType === 'conversation') {
+                // Determine the folder to watch (parent directory of the file, or the path itself)
+                const watchPath = sourcePath.endsWith('.jsonl')
+                    ? sourcePath.substring(0, sourcePath.lastIndexOf('/'))
+                    : sourcePath;
+
+                if (watchPath) {
+                    try {
+                        await fetch(`${PYRAMID_API_BASE}/pyramid/${slug}/dadbear/watch`, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({
+                                source_path: watchPath,
+                                content_type: 'conversation',
+                            }),
+                        });
+                    } catch (_e) {
+                        // Non-fatal: DADBEAR watch is nice-to-have at this stage
+                    }
+                }
+            }
+
+            // Start the build
+            await invoke('pyramid_question_build', {
+                slug,
+                question: apexQuestion,
+                granularity: 3,
+                maxDepth: 3,
+            });
+
+            setStep('building');
+        } catch (err) {
+            setError(String(err));
+        } finally {
+            setCommitting(false);
+        }
+    }, [previewResult, slug, contentType, paths, getEffectiveChainId, selectedProfile, apexQuestion]);
+
+    /** Legacy create flow for non-conversation types (code, document) */
     const handleCreate = useCallback(async (andBuild: boolean) => {
         if (paths.length === 0 || !contentType || !slug) return;
         setCreating(true);
         setError(null);
 
         try {
-            // Single path as plain string; multiple paths as JSON array
             const sourcePath = paths.length === 1 ? paths[0] : JSON.stringify(paths);
 
-            // Create the slug
             await invoke('pyramid_create_slug', {
                 slug,
                 contentType,
                 sourcePath,
             });
 
-            // Ingest content
             await invoke('pyramid_ingest', { slug });
 
             if (andBuild) {
-                // Apply the selected model profile (if any) BEFORE the build
-                // starts so the build pipeline picks up the new model selection.
-                // Empty string = use current default; don't apply.
                 if (selectedProfile && selectedProfile.trim()) {
                     try {
                         await invoke('pyramid_apply_profile', { profile: selectedProfile });
@@ -294,7 +501,6 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
                     }
                 }
 
-                // Start question build (modern pipeline)
                 await invoke('pyramid_question_build', {
                     slug,
                     question: apexQuestion,
@@ -317,21 +523,35 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
         ...customIgnores.split('\n').map(s => s.trim()).filter(Boolean),
     ];
 
+    // Compute step sequence for the step indicator
+    const getStepSequence = (): Step[] => {
+        if (contentType === 'vine') {
+            return ['directory', 'content-type', 'vine-dirs', 'confirm'];
+        }
+        if (contentType === 'conversation') {
+            return ['directory', 'content-type', 'conversation-preset', 'question', 'preview'];
+        }
+        return ['directory', 'content-type', 'configure', 'question', 'confirm'];
+    };
+
+    const stepLabels: Record<Step, string> = {
+        'directory': 'Source',
+        'content-type': 'Type',
+        'conversation-preset': 'Preset',
+        'vine-dirs': 'Folders',
+        'configure': 'Configure',
+        'question': 'Question',
+        'preview': 'Preview',
+        'confirm': 'Confirm',
+        'building': 'Building',
+    };
+
     return (
         <div className="add-workspace-panel">
             {/* Step indicator */}
             <div className="workspace-steps">
-                {(contentType === 'vine'
-                    ? (['directory', 'content-type', 'vine-dirs', 'confirm'] as Step[])
-                    : contentType === 'conversation'
-                    ? (['directory', 'content-type', 'question', 'confirm'] as Step[])
-                    : (['directory', 'content-type', 'configure', 'question', 'confirm'] as Step[])
-                ).map((s, i) => {
-                    const stepOrder = contentType === 'vine'
-                        ? ['directory', 'content-type', 'vine-dirs', 'confirm']
-                        : contentType === 'conversation'
-                        ? ['directory', 'content-type', 'question', 'confirm']
-                        : ['directory', 'content-type', 'configure', 'question', 'confirm'];
+                {getStepSequence().map((s, i) => {
+                    const stepOrder = getStepSequence();
                     const currentIndex = stepOrder.indexOf(step);
                     return (
                         <div
@@ -341,9 +561,7 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
                             }`}
                         >
                             <span className="step-number">{i + 1}</span>
-                            <span className="step-label">
-                                {s === 'directory' ? (contentType === 'vine' ? 'Source' : 'Directories') : s === 'content-type' ? 'Type' : s === 'vine-dirs' ? 'Folders' : s === 'configure' ? 'Configure' : s === 'question' ? 'Question' : 'Confirm'}
-                            </span>
+                            <span className="step-label">{stepLabels[s]}</span>
                         </div>
                     );
                 })}
@@ -424,7 +642,6 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
                 <div className="workspace-step-content">
                     <h2>Choose Content Type</h2>
 
-                    {/* Show selected directories */}
                     <div className="selected-paths">
                         {paths.map((p, i) => (
                             <div key={p} className="selected-path-row">
@@ -508,6 +725,54 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
                     <div className="step-nav">
                         <button className="btn btn-ghost" onClick={() => setStep('directory')}>
                             Back
+                        </button>
+                    </div>
+                </div>
+            )}
+
+            {/* Step 2b: Conversation Preset */}
+            {step === 'conversation-preset' && (
+                <div className="workspace-step-content">
+                    <h2>Conversation Chain Preset</h2>
+                    <p className="step-description">
+                        Choose how this conversation should be processed. Episodic Memory is
+                        the default for building agent memory that persists across sessions.
+                    </p>
+
+                    <div className="content-type-cards">
+                        {(Object.entries(CONVERSATION_PRESETS) as [ConversationPreset, typeof CONVERSATION_PRESETS[ConversationPreset]][]).map(
+                            ([key, preset]) => (
+                                <button
+                                    key={key}
+                                    className={`content-type-card ${conversationPreset === key ? 'selected' : ''}`}
+                                    onClick={() => setConversationPreset(key)}
+                                >
+                                    <div className="content-type-icon">
+                                        {key === 'episodic' ? '\u{1F9E0}' : '\u{1F50D}'}
+                                    </div>
+                                    <div className="content-type-name">{preset.label}</div>
+                                    <div className="content-type-desc">{preset.description}</div>
+                                    {key === 'episodic' && (
+                                        <div className="preset-default-badge">Default</div>
+                                    )}
+                                </button>
+                            ),
+                        )}
+                    </div>
+
+                    <div className="content-type-notice">
+                        Chain: <code>{CONVERSATION_PRESETS[conversationPreset].chainId}</code>
+                        {' '}&mdash; both presets use forward + reverse temporal passes.
+                        Episodic Memory optimizes for agent consumption; Retro optimizes for
+                        human review and pattern discovery.
+                    </div>
+
+                    <div className="step-nav">
+                        <button className="btn btn-ghost" onClick={() => setStep('content-type')}>
+                            Back
+                        </button>
+                        <button className="btn btn-primary" onClick={() => setStep('question')}>
+                            Next
                         </button>
                     </div>
                 </div>
@@ -630,12 +895,7 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
                         style={{ width: '100%', resize: 'vertical', fontFamily: 'inherit' }}
                     />
 
-                    {/* Model profile selector — applies a layered override to
-                        the LLM config so this build uses a different model
-                        cascade. Empty value = use the operator's current
-                        default. Profiles are loaded from
-                        ~/Library/Application Support/wire-node/profiles/
-                        (with ~/.gemini/wire-node/profiles/ as a fallback). */}
+                    {/* Model profile selector */}
                     <div style={{ marginTop: '16px' }}>
                         <label className="field-label" style={{ display: 'block', marginBottom: '4px' }}>
                             Model profile:
@@ -672,25 +932,165 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
                         )}
                     </div>
 
+                    {/* Slug field — shown here for conversation preset flow since
+                        it skips the confirm step and goes straight to preview */}
+                    {contentType === 'conversation' && (
+                        <div style={{ marginTop: '16px' }}>
+                            <label className="field-label" style={{ display: 'block', marginBottom: '4px' }}>
+                                Slug name:
+                            </label>
+                            <input
+                                type="text"
+                                className="slug-input"
+                                value={slug}
+                                onChange={(e) => setSlug(slugify(e.target.value))}
+                                placeholder="my-project"
+                            />
+                        </div>
+                    )}
+
                     <div style={{ marginTop: '12px', display: 'flex', gap: '8px' }}>
                         <button className="btn btn-ghost" onClick={() => {
-                            if (contentType === 'conversation') setStep('content-type');
+                            if (contentType === 'conversation') setStep('conversation-preset');
                             else setStep('configure');
                         }}>
                             Back
                         </button>
+                        {contentType === 'conversation' ? (
+                            <button
+                                className="btn btn-primary"
+                                onClick={handlePreview}
+                                disabled={!apexQuestion.trim() || !slug || previewLoading}
+                            >
+                                {previewLoading ? 'Scanning...' : 'Preview'}
+                            </button>
+                        ) : (
+                            <button
+                                className="btn btn-primary"
+                                onClick={() => setStep('confirm')}
+                                disabled={!apexQuestion.trim()}
+                            >
+                                Next
+                            </button>
+                        )}
+                    </div>
+                </div>
+            )}
+
+            {/* Step: Preview (conversation flow) */}
+            {step === 'preview' && previewResult && (
+                <div className="workspace-step-content">
+                    <h2>Build Preview</h2>
+
+                    <div className="preview-display">
+                        <div className="preview-header">
+                            Preview for <span className="preview-slug">&ldquo;{slug}&rdquo;</span>
+                        </div>
+                        <div className="preview-divider" />
+
+                        <div className="preview-grid">
+                            <div className="preview-row">
+                                <span className="preview-label">Source</span>
+                                <span className="preview-value preview-path">
+                                    {previewResult.source_path}
+                                </span>
+                            </div>
+                            <div className="preview-row">
+                                <span className="preview-label">Files found</span>
+                                <span className="preview-value">
+                                    {previewResult.file_count} {fileTypeLabel(previewResult.content_type)}
+                                </span>
+                            </div>
+                            <div className="preview-row">
+                                <span className="preview-label">Chain</span>
+                                <span className="preview-value">
+                                    <code>{previewResult.chain_id}</code>
+                                    {' '}({CONVERSATION_PRESETS[conversationPreset]?.label || 'Custom'})
+                                </span>
+                            </div>
+                            <div className="preview-row">
+                                <span className="preview-label">Estimated cost</span>
+                                <span className="preview-value preview-cost">
+                                    {formatCost(previewResult.estimated_cost_dollars)}
+                                </span>
+                            </div>
+                            <div className="preview-row">
+                                <span className="preview-label">Estimated time</span>
+                                <span className="preview-value">
+                                    {formatEstimatedTime(previewResult.estimated_time_seconds)}
+                                </span>
+                            </div>
+                            <div className="preview-row">
+                                <span className="preview-label">Structure</span>
+                                <span className="preview-value">
+                                    {previewResult.estimated_pyramids} pyramid{previewResult.estimated_pyramids !== 1 ? 's' : ''}
+                                    {' / '}{previewResult.estimated_layers} layer{previewResult.estimated_layers !== 1 ? 's' : ''}
+                                    {' / '}{previewResult.estimated_nodes} node{previewResult.estimated_nodes !== 1 ? 's' : ''}
+                                </span>
+                            </div>
+                            <div className="preview-row">
+                                <span className="preview-label">Disk usage</span>
+                                <span className="preview-value">
+                                    ~{formatBytes(previewResult.estimated_disk_bytes)}
+                                </span>
+                            </div>
+                        </div>
+
+                        {previewResult.warnings.length > 0 && (
+                            <div className="preview-warnings">
+                                {previewResult.warnings.map((w, i) => (
+                                    <div
+                                        key={i}
+                                        className={`preview-warning preview-warning-${w.level}`}
+                                    >
+                                        <span className="preview-warning-icon">
+                                            {w.level === 'error' ? '\u{26D4}' : w.level === 'warning' ? '\u{26A0}' : '\u{2139}'}
+                                        </span>
+                                        <span className="preview-warning-text">
+                                            {w.message}
+                                            {w.file_path && (
+                                                <span className="preview-warning-path"> ({w.file_path})</span>
+                                            )}
+                                        </span>
+                                    </div>
+                                ))}
+                            </div>
+                        )}
+
+                        {previewResult.warnings.length === 0 && (
+                            <div className="preview-no-warnings">
+                                No warnings
+                            </div>
+                        )}
+                    </div>
+
+                    <div className="preview-note">
+                        DADBEAR will begin processing on the next scan cycle after commit.
+                        You can close this wizard and check progress on the dashboard.
+                    </div>
+
+                    <div className="step-nav">
+                        <button
+                            className="btn btn-ghost"
+                            onClick={() => {
+                                setPreviewResult(null);
+                                setStep('question');
+                            }}
+                        >
+                            Back
+                        </button>
                         <button
                             className="btn btn-primary"
-                            onClick={() => setStep('confirm')}
-                            disabled={!apexQuestion.trim()}
+                            onClick={handleCommit}
+                            disabled={committing || previewResult.warnings.some(w => w.level === 'error')}
                         >
-                            Next
+                            {committing ? 'Committing...' : 'Commit \u2014 Begin Building'}
                         </button>
                     </div>
                 </div>
             )}
 
-            {/* Step 4: Name & Confirm */}
+            {/* Step 4: Name & Confirm (non-conversation types) */}
             {step === 'confirm' && (
                 <div className="workspace-step-content">
                     <h2>Name &amp; Confirm</h2>

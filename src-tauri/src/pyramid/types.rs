@@ -1831,3 +1831,137 @@ pub struct PreviewWarning {
     /// Human-readable description of the warning.
     pub message: String,
 }
+
+// ── WS-READING-MODES (Phase 4): Six reading mode view types ───────────────
+
+/// Memoir: apex top-to-bottom, dense prose at whole-arc scale.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoirView {
+    pub slug: String,
+    pub headline: String,
+    pub distilled: String,
+    pub narrative: NarrativeMultiZoom,
+    pub topics: Vec<Topic>,
+    pub decisions: Vec<Decision>,
+    pub terms: Vec<Term>,
+}
+
+/// Walk: paginated nodes at a specified layer, chronological order.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WalkView {
+    pub slug: String,
+    pub layer: i64,
+    pub nodes: Vec<WalkNode>,
+    pub total_count: i64,
+    pub offset: usize,
+}
+
+/// A single node in a Walk view (lightweight projection).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WalkNode {
+    pub id: String,
+    pub chunk_index: Option<i64>,
+    pub headline: String,
+    pub distilled: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_range: Option<TimeRange>,
+    pub weight: f64,
+    pub topic_names: Vec<String>,
+}
+
+/// Thread: follow a canonical identity across non-adjacent nodes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreadView {
+    pub slug: String,
+    pub identity: String,
+    pub mentions: Vec<ThreadMention>,
+}
+
+/// A single mention of an identity across the pyramid.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreadMention {
+    pub node_id: String,
+    pub depth: i64,
+    pub headline: String,
+    /// "topic", "entity", or "decision"
+    pub mention_type: String,
+    /// The matched name/decided text for context.
+    pub matched_text: String,
+    #[serde(default)]
+    pub importance: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_range: Option<TimeRange>,
+}
+
+/// Decisions Ledger: aggregated decisions across the corpus.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DecisionsView {
+    pub slug: String,
+    pub decisions: Vec<DecisionEntry>,
+    pub total_count: usize,
+}
+
+/// A single decision entry with source provenance.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DecisionEntry {
+    pub decided: String,
+    pub why: String,
+    pub stance: String,
+    pub importance: f64,
+    #[serde(default)]
+    pub related: Vec<String>,
+    /// Node this decision was extracted from.
+    pub source_node_id: String,
+    pub source_headline: String,
+    pub source_depth: i64,
+}
+
+/// Speaker: filter to one speaker role's contributions via key_quotes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpeakerView {
+    pub slug: String,
+    pub role: String,
+    pub quotes: Vec<SpeakerQuote>,
+    pub total_count: usize,
+}
+
+/// A single quote attributed to a speaker role.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpeakerQuote {
+    pub text: String,
+    pub speaker_role: String,
+    pub importance: f64,
+    /// Node this quote was extracted from.
+    pub source_node_id: String,
+    pub source_headline: String,
+    pub source_depth: i64,
+}
+
+/// Search: FTS/LIKE search with ancestor node chain.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchReadingView {
+    pub slug: String,
+    pub query: String,
+    pub results: Vec<SearchReadingHit>,
+    pub total_count: usize,
+}
+
+/// A single search hit with ancestry trail (L0 -> L1 -> ... -> apex).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchReadingHit {
+    pub node_id: String,
+    pub depth: i64,
+    pub headline: String,
+    pub snippet: String,
+    pub score: f64,
+    /// Ancestor chain from this node up to apex: [(node_id, depth, headline), ...]
+    pub ancestors: Vec<AncestorNode>,
+}
+
+/// Lightweight ancestor node reference for search ancestry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AncestorNode {
+    pub node_id: String,
+    pub depth: i64,
+    pub headline: String,
+}

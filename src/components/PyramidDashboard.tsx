@@ -8,6 +8,7 @@ import { VineBuildProgress } from './VineBuildProgress';
 import { DADBEARPanel } from './DADBEARPanel';
 import { FAQDirectory } from './FAQDirectory';
 import { VineViewer } from './VineViewer';
+import { PyramidNavPage } from './PyramidNavPage';
 import PyramidToolbar from './PyramidToolbar';
 import { PyramidRow } from './PyramidRow';
 import { PyramidDetailDrawer } from './PyramidDetailDrawer';
@@ -35,7 +36,7 @@ interface DadbearStatus {
     breaker_tripped: boolean;
 }
 
-type View = 'list' | 'add' | 'building' | 'dadbear' | 'faq' | 'vine' | 'asking';
+type View = 'list' | 'add' | 'building' | 'dadbear' | 'faq' | 'vine' | 'asking' | 'nav';
 
 // ─── Component ──────────────────────────────────────────────────────────────
 
@@ -515,6 +516,19 @@ Always include the "Generalized understanding:" section — this triggers FAQ ge
         );
     }
 
+    if (view === 'nav') {
+        return (
+            <PyramidNavPage
+                initialSlug={selectedSlug ?? undefined}
+                onBack={() => {
+                    setSelectedSlug(null);
+                    setView('list');
+                    fetchData();
+                }}
+            />
+        );
+    }
+
     if (view === 'asking' && askingSlug) {
         // Build a SlugInfo-compatible array for AskQuestion (exclude archived)
         const allSlugsForAsking = enrichedSlugs
@@ -599,9 +613,14 @@ Always include the "Generalized understanding:" section — this triggers FAQ ge
         <div className="pyramid-dashboard">
             <div className="pyramid-dashboard-header">
                 <h2>Workspaces</h2>
-                <button className="btn btn-primary" onClick={() => setView('add')}>
-                    + Add Workspace
-                </button>
+                <div className="pyramid-dashboard-header-actions">
+                    <button className="btn btn-ghost" onClick={() => setView('nav')}>
+                        Navigate Pyramids
+                    </button>
+                    <button className="btn btn-primary" onClick={() => setView('add')}>
+                        + Add Workspace
+                    </button>
+                </div>
             </div>
 
             {error && (
@@ -737,6 +756,10 @@ Always include the "Generalized understanding:" section — this triggers FAQ ge
                         onAskQuestion={(slug) => {
                             setAskingSlug(slug);
                             setView('asking');
+                        }}
+                        onOpenNav={(slug) => {
+                            setSelectedSlug(slug);
+                            setView('nav');
                         }}
                         onOpenVibesmithy={handleOpenVibesmithy}
                         publishingSlug={publishingSlug}

@@ -172,7 +172,7 @@ export interface CatalogEntry {
   related?: string[];
 }
 
-export const TOOL_CATALOG_VERSION = "0.3.0";
+export const TOOL_CATALOG_VERSION = "0.4.0";
 
 export const TOOL_CATALOG_CATEGORIES: Record<string, string> = {
   core: "System health and pyramid listing",
@@ -184,6 +184,13 @@ export const TOOL_CATALOG_CATEGORIES: Record<string, string> = {
   vine: "Vine conversation system commands",
   annotation: "Read and write annotations on pyramid nodes",
   coordination: "Multi-agent session tracking and coordination",
+  primer: "Primer and slope — onboarding summaries and structural overviews",
+  reading: "Reading modes — memoir, walk, thread, decisions, speaker, search",
+  manifest: "Manifest and runtime — cold-start bundles and manifest operations",
+  vocabulary: "Vocabulary — terms, recognition, and diffs",
+  recovery: "Recovery — pyramid recovery status",
+  "demand-gen": "Demand generation — job status tracking",
+  preview: "Preview — dry-run content processing",
 };
 
 export const TOOL_CATALOG: CatalogEntry[] = [
@@ -496,6 +503,213 @@ export const TOOL_CATALOG: CatalogEntry[] = [
     cli: "vine-integrity", mcp: "", category: "vine",
     description: "Run integrity check on a vine, return validation results.",
     args: [{ name: "slug", type: "string", required: true, description: "Vine slug" }],
+  },
+
+  // ── Primer/Slope ──
+  {
+    cli: "slope", mcp: "pyramid_slope", category: "primer",
+    description: "Display slope nodes from the primer. Shows the structural gradient of the pyramid.",
+    args: [{ name: "slug", type: "string", required: true, description: "Pyramid slug identifier" }],
+    examples: ["pyramid-cli slope my-pyramid"],
+    related: ["primer", "apex"],
+  },
+  {
+    cli: "primer", mcp: "pyramid_primer", category: "primer",
+    description: "Display formatted primer for onboarding. Optional token budget to control output size.",
+    args: [{ name: "slug", type: "string", required: true, description: "Pyramid slug identifier" }],
+    flags: [{ name: "budget", type: "number", description: "Token budget for formatted output" }],
+    examples: ["pyramid-cli primer my-pyramid", "pyramid-cli primer my-pyramid --budget 2000"],
+    related: ["slope", "apex", "handoff"],
+  },
+
+  // ── Reading Modes ──
+  {
+    cli: "memoir", mcp: "pyramid_memoir", category: "reading",
+    description: "Memoir reading mode — narrative summary of the pyramid's episodic content.",
+    args: [{ name: "slug", type: "string", required: true, description: "Pyramid slug identifier" }],
+    examples: ["pyramid-cli memoir my-pyramid"],
+    related: ["walk", "thread", "decisions"],
+  },
+  {
+    cli: "walk", mcp: "pyramid_walk", category: "reading",
+    description: "Walk reading mode — step through pyramid content layer by layer with direction and limit controls.",
+    args: [{ name: "slug", type: "string", required: true, description: "Pyramid slug identifier" }],
+    flags: [
+      { name: "layer", type: "number", description: "Layer number to walk" },
+      { name: "direction", type: "string", description: "newest or oldest", default: "newest" },
+      { name: "limit", type: "number", description: "Max entries to return" },
+    ],
+    examples: ["pyramid-cli walk my-pyramid", "pyramid-cli walk my-pyramid --layer 1 --direction oldest --limit 10"],
+    related: ["memoir", "thread", "drill"],
+  },
+  {
+    cli: "thread", mcp: "pyramid_thread", category: "reading",
+    description: "Thread reading mode — follow a specific identity's contributions through the pyramid.",
+    args: [
+      { name: "slug", type: "string", required: true, description: "Pyramid slug identifier" },
+      { name: "identity", type: "string", required: true, description: "Identity to trace" },
+    ],
+    examples: ["pyramid-cli thread my-pyramid adam"],
+    related: ["memoir", "walk", "speaker"],
+  },
+  {
+    cli: "decisions", mcp: "pyramid_decisions", category: "reading",
+    description: "Decisions reading mode — extract decision points from the pyramid, optionally filtered by stance.",
+    args: [{ name: "slug", type: "string", required: true, description: "Pyramid slug identifier" }],
+    flags: [{ name: "stance", type: "string", description: "Filter by decision stance" }],
+    examples: ["pyramid-cli decisions my-pyramid", "pyramid-cli decisions my-pyramid --stance approved"],
+    related: ["memoir", "walk"],
+  },
+  {
+    cli: "speaker", mcp: "pyramid_speaker", category: "reading",
+    description: "Speaker reading mode — view contributions by a specific role/speaker.",
+    args: [
+      { name: "slug", type: "string", required: true, description: "Pyramid slug identifier" },
+      { name: "role", type: "string", required: true, description: "Speaker role to filter by" },
+    ],
+    examples: ["pyramid-cli speaker my-pyramid engineer"],
+    related: ["thread", "memoir"],
+  },
+  {
+    cli: "reading-search", mcp: "pyramid_reading_search", category: "reading",
+    description: "Reading search mode — search within reading content by query.",
+    args: [
+      { name: "slug", type: "string", required: true, description: "Pyramid slug identifier" },
+      { name: "query", type: "string", required: true, description: "Search query" },
+    ],
+    examples: ["pyramid-cli reading-search my-pyramid \"architecture decision\""],
+    related: ["search", "memoir"],
+  },
+
+  // ── Manifest/Runtime ──
+  {
+    cli: "cold-start", mcp: "pyramid_cold_start", category: "manifest",
+    description: "Get the cold-start manifest bundle for a pyramid. Everything an agent needs to bootstrap.",
+    args: [{ name: "slug", type: "string", required: true, description: "Pyramid slug identifier" }],
+    examples: ["pyramid-cli cold-start my-pyramid"],
+    related: ["manifest", "primer", "handoff"],
+  },
+  {
+    cli: "manifest", mcp: "pyramid_manifest", category: "manifest",
+    description: "Execute manifest operations against a pyramid. POST a JSON array of operations.",
+    args: [
+      { name: "slug", type: "string", required: true, description: "Pyramid slug identifier" },
+      { name: "operations", type: "string", required: true, description: "JSON array of manifest operations" },
+    ],
+    examples: ["pyramid-cli manifest my-pyramid '[{\"op\":\"read\",\"path\":\"apex\"}]'"],
+    related: ["cold-start"],
+  },
+
+  // ── Vocabulary ──
+  {
+    cli: "vocab", mcp: "pyramid_vocab", category: "vocabulary",
+    description: "Get the full vocabulary for a pyramid — all recognized terms and definitions.",
+    args: [{ name: "slug", type: "string", required: true, description: "Pyramid slug identifier" }],
+    examples: ["pyramid-cli vocab my-pyramid"],
+    related: ["vocab-recognize", "vocab-diff", "terms"],
+  },
+  {
+    cli: "vocab-recognize", mcp: "pyramid_vocab_recognize", category: "vocabulary",
+    description: "Check if a term is recognized in the pyramid vocabulary.",
+    args: [
+      { name: "slug", type: "string", required: true, description: "Pyramid slug identifier" },
+      { name: "term", type: "string", required: true, description: "Term to look up" },
+    ],
+    examples: ["pyramid-cli vocab-recognize my-pyramid \"action chain\""],
+    related: ["vocab", "terms"],
+  },
+  {
+    cli: "vocab-diff", mcp: "pyramid_vocab_diff", category: "vocabulary",
+    description: "Get vocabulary changes since a given timestamp or build ID.",
+    args: [
+      { name: "slug", type: "string", required: true, description: "Pyramid slug identifier" },
+      { name: "since", type: "string", required: true, description: "Timestamp or build ID to diff from" },
+    ],
+    examples: ["pyramid-cli vocab-diff my-pyramid 2026-04-01T00:00:00Z"],
+    related: ["vocab", "diff"],
+  },
+
+  // ── DADBEAR (new endpoints) ──
+  {
+    cli: "dadbear-status", mcp: "pyramid_dadbear_status_v2", category: "operations",
+    description: "DADBEAR status (v2) — detailed auto-update status with breaker state and timing.",
+    args: [{ name: "slug", type: "string", required: true, description: "Pyramid slug identifier" }],
+    examples: ["pyramid-cli dadbear-status my-pyramid"],
+    related: ["dadbear-trigger", "dadbear"],
+  },
+  {
+    cli: "dadbear-trigger", mcp: "pyramid_dadbear_trigger", category: "operations",
+    description: "Manually trigger a DADBEAR auto-update check for a pyramid.",
+    args: [{ name: "slug", type: "string", required: true, description: "Pyramid slug identifier" }],
+    examples: ["pyramid-cli dadbear-trigger my-pyramid"],
+    related: ["dadbear-status", "dadbear"],
+  },
+
+  // ── Vine Composition ──
+  {
+    cli: "vine-bedrocks", mcp: "pyramid_vine_bedrocks", category: "vine",
+    description: "List bedrock slugs composed into this vine.",
+    args: [{ name: "slug", type: "string", required: true, description: "Vine slug" }],
+    examples: ["pyramid-cli vine-bedrocks my-vine"],
+    related: ["vine-add", "vine-bunches"],
+  },
+  {
+    cli: "vine-add", mcp: "pyramid_vine_add_bedrock", category: "vine",
+    description: "Add a bedrock slug to a vine composition.",
+    args: [
+      { name: "slug", type: "string", required: true, description: "Vine slug" },
+      { name: "bedrock_slug", type: "string", required: true, description: "Bedrock slug to add" },
+    ],
+    examples: ["pyramid-cli vine-add my-vine source-pyramid"],
+    related: ["vine-bedrocks"],
+  },
+
+  // ── Preview ──
+  {
+    cli: "preview", mcp: "pyramid_preview", category: "preview",
+    description: "Dry-run content processing: preview how a source file would be processed without committing.",
+    args: [
+      { name: "slug", type: "string", required: true, description: "Pyramid slug identifier" },
+      { name: "source_path", type: "string", required: true, description: "Path to source file" },
+      { name: "content_type", type: "string", required: true, description: "Content type (e.g. markdown, code)" },
+    ],
+    flags: [{ name: "chain", type: "string", description: "Chain to use for processing" }],
+    examples: ["pyramid-cli preview my-pyramid ./doc.md markdown", "pyramid-cli preview my-pyramid ./doc.md markdown --chain custom-chain"],
+    related: ["cold-start"],
+  },
+
+  // ── Recovery ──
+  {
+    cli: "recovery-status", mcp: "pyramid_recovery_status", category: "recovery",
+    description: "Get recovery status for a pyramid — whether recovery is needed and current state.",
+    args: [{ name: "slug", type: "string", required: true, description: "Pyramid slug identifier" }],
+    examples: ["pyramid-cli recovery-status my-pyramid"],
+    related: ["dadbear-status"],
+  },
+
+  // ── Question (new) ──
+  {
+    cli: "ask", mcp: "pyramid_ask", category: "question",
+    description: "Ask a question against a pyramid. Optionally trigger demand generation for unanswered questions.",
+    args: [
+      { name: "slug", type: "string", required: true, description: "Pyramid slug identifier" },
+      { name: "question", type: "string", required: true, description: "Question to ask" },
+    ],
+    flags: [{ name: "demand-gen", type: "boolean", description: "Trigger demand generation if question cannot be answered" }],
+    examples: ["pyramid-cli ask my-pyramid \"How does X work?\"", "pyramid-cli ask my-pyramid \"How does X work?\" --demand-gen"],
+    related: ["navigate", "faq", "demand-gen-status"],
+  },
+
+  // ── Demand Gen ──
+  {
+    cli: "demand-gen-status", mcp: "pyramid_demand_gen_status", category: "demand-gen",
+    description: "Check the status of a demand generation job.",
+    args: [
+      { name: "slug", type: "string", required: true, description: "Pyramid slug identifier" },
+      { name: "job_id", type: "string", required: true, description: "Demand generation job ID" },
+    ],
+    examples: ["pyramid-cli demand-gen-status my-pyramid job-abc123"],
+    related: ["ask"],
   },
 
   // ── Coordination ──

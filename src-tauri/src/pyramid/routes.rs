@@ -27,6 +27,7 @@ use super::preview;
 use super::primer;
 use super::publication;
 use super::query;
+use super::reading_modes;
 use super::slug;
 use super::stale_engine;
 use super::staleness_bridge;
@@ -417,6 +418,49 @@ struct PrimerQuery {
     /// dehydrated first to fit within this budget.
     token_budget: Option<usize>,
 }
+
+// ── WS-READING-MODES (Phase 4): Query parameter structs ──────────────
+
+#[derive(Deserialize)]
+struct ReadingWalkQuery {
+    #[serde(default = "default_walk_layer")]
+    layer: i64,
+    #[serde(default = "default_walk_direction")]
+    direction: String,
+    #[serde(default)]
+    offset: usize,
+    #[serde(default = "default_walk_limit")]
+    limit: usize,
+}
+
+fn default_walk_layer() -> i64 { 1 }
+fn default_walk_direction() -> String { "newest".to_string() }
+fn default_walk_limit() -> usize { 20 }
+
+#[derive(Deserialize)]
+struct ReadingThreadQuery {
+    identity: String,
+}
+
+#[derive(Deserialize)]
+struct ReadingDecisionsQuery {
+    #[serde(default)]
+    stance: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ReadingSpeakerQuery {
+    role: String,
+}
+
+#[derive(Deserialize)]
+struct ReadingSearchQuery {
+    q: String,
+    #[serde(default = "default_search_limit")]
+    limit: usize,
+}
+
+fn default_search_limit() -> usize { 20 }
 
 // ── Phase 5 & 6: Auto-update request/response types ─────────────────
 
@@ -2389,10 +2433,86 @@ pub fn pyramid_routes(
     let qr = question_retrieve_poll.or(question_retrieve_submit).unify().boxed();
     let top32 = top31.or(qr).unify().boxed();
 
+    // ── WS-READING-MODES (Phase 4): Six reading mode routes ──────────────
+    // All under GET /pyramid/:slug/reading/<mode>
+
+    // GET /pyramid/:slug/reading/memoir
+    let reading_memoir = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("reading"))
+        .and(warp::path("memoir"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(with_slug_read_auth(state.clone(), jwt_public_key.clone()))
+        .and_then(handle_reading_memoir));
+
+    // GET /pyramid/:slug/reading/walk?layer=1&direction=newest&offset=0&limit=20
+    let reading_walk = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("reading"))
+        .and(warp::path("walk"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::query::<ReadingWalkQuery>())
+        .and(with_slug_read_auth(state.clone(), jwt_public_key.clone()))
+        .and_then(handle_reading_walk));
+
+    // GET /pyramid/:slug/reading/thread?identity=X
+    let reading_thread = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("reading"))
+        .and(warp::path("thread"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::query::<ReadingThreadQuery>())
+        .and(with_slug_read_auth(state.clone(), jwt_public_key.clone()))
+        .and_then(handle_reading_thread));
+
+    // GET /pyramid/:slug/reading/decisions?stance=committed
+    let reading_decisions = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("reading"))
+        .and(warp::path("decisions"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::query::<ReadingDecisionsQuery>())
+        .and(with_slug_read_auth(state.clone(), jwt_public_key.clone()))
+        .and_then(handle_reading_decisions));
+
+    // GET /pyramid/:slug/reading/speaker?role=human
+    let reading_speaker = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("reading"))
+        .and(warp::path("speaker"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::query::<ReadingSpeakerQuery>())
+        .and(with_slug_read_auth(state.clone(), jwt_public_key.clone()))
+        .and_then(handle_reading_speaker));
+
+    // GET /pyramid/:slug/reading/search?q=X&limit=20
+    let reading_search = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("reading"))
+        .and(warp::path("search"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::query::<ReadingSearchQuery>())
+        .and(with_slug_read_auth(state.clone(), jwt_public_key.clone()))
+        .and_then(handle_reading_search));
+
+    // Combine reading mode routes
+    let rm_a = reading_memoir.or(reading_walk).unify().boxed();
+    let rm_b = reading_thread.or(reading_decisions).unify().boxed();
+    let rm_c = reading_speaker.or(reading_search).unify().boxed();
+    let rm_d = rm_a.or(rm_b).unify().boxed();
+    let rm = rm_d.or(rm_c).unify().boxed();
+    let top33 = top32.or(rm).unify().boxed();
+
     // public_html is now mounted separately at the server level so it can
     // get a permissive CORS filter (the desktop API allowlist would block
     // form POSTs from the tunnel host).
-    top32
+    top33
 }
 
 /// Mount the post-agents-retro `/p/` web surface routes. These are
@@ -9391,5 +9511,109 @@ async fn handle_question_retrieve_poll(
                 "sub_questions": job.sub_questions,
             })))
         }
+    }
+}
+
+// ── WS-READING-MODES (Phase 4): Reading mode handlers ────────────────────
+
+async fn handle_reading_memoir(
+    slug_name: String,
+    (_state, _auth_source): (Arc<PyramidState>, AuthSource),
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let state = _state;
+    let conn = state.reader.lock().await;
+    match reading_modes::reading_memoir(&conn, &slug_name) {
+        Ok(view) => Ok(json_ok(&view)),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
+    }
+}
+
+async fn handle_reading_walk(
+    slug_name: String,
+    params: ReadingWalkQuery,
+    (_state, _auth_source): (Arc<PyramidState>, AuthSource),
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let state = _state;
+    let conn = state.reader.lock().await;
+    match reading_modes::reading_walk(
+        &conn,
+        &slug_name,
+        params.layer,
+        &params.direction,
+        params.offset,
+        params.limit,
+    ) {
+        Ok(view) => Ok(json_ok(&view)),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
+    }
+}
+
+async fn handle_reading_thread(
+    slug_name: String,
+    params: ReadingThreadQuery,
+    (_state, _auth_source): (Arc<PyramidState>, AuthSource),
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let state = _state;
+    let conn = state.reader.lock().await;
+    match reading_modes::reading_thread(&conn, &slug_name, &params.identity) {
+        Ok(view) => Ok(json_ok(&view)),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
+    }
+}
+
+async fn handle_reading_decisions(
+    slug_name: String,
+    params: ReadingDecisionsQuery,
+    (_state, _auth_source): (Arc<PyramidState>, AuthSource),
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let state = _state;
+    let conn = state.reader.lock().await;
+    match reading_modes::reading_decisions(&conn, &slug_name, params.stance.as_deref()) {
+        Ok(view) => Ok(json_ok(&view)),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
+    }
+}
+
+async fn handle_reading_speaker(
+    slug_name: String,
+    params: ReadingSpeakerQuery,
+    (_state, _auth_source): (Arc<PyramidState>, AuthSource),
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let state = _state;
+    let conn = state.reader.lock().await;
+    match reading_modes::reading_speaker(&conn, &slug_name, &params.role) {
+        Ok(view) => Ok(json_ok(&view)),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
+    }
+}
+
+async fn handle_reading_search(
+    slug_name: String,
+    params: ReadingSearchQuery,
+    (_state, _auth_source): (Arc<PyramidState>, AuthSource),
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let state = _state;
+    let conn = state.reader.lock().await;
+    match reading_modes::reading_search(&conn, &slug_name, &params.q, params.limit) {
+        Ok(view) => Ok(json_ok(&view)),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
     }
 }

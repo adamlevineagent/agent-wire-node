@@ -55,6 +55,7 @@ pub mod primer;
 pub mod publication;
 pub mod query;
 pub mod question_compiler;
+pub mod reading_modes;
 pub mod question_decomposition;
 pub mod question_loader;
 pub mod question_retrieve;

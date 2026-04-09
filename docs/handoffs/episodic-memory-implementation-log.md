@@ -118,18 +118,18 @@ These resolve the 16 questions asked before Phase 1 full dispatch. Treat as norm
 - [x] WS-DADBEAR-EXTEND — **complete + verified** (2026-04-09). New `dadbear_extend.rs` (~540 lines). Tick loop, ingest dispatcher (stub for WS-EM-CHAIN), session timeout promotion, 9 DB helpers, pyramid_dadbear_config table, 5 HTTP routes, DadbearWatchConfig/Status types, update_session_mtime/chunk_progress helpers. 5 tests. Verifier fix: removed dead ConfigTicker.config_id field. Git: `b78169e`.
 - [x] WS-VINE-UNIFY — **complete + verified clean** (2026-04-09). New `vine_composition.rs`, `pyramid_vine_compositions` table, 6 DB helpers, `VineComposition` type, `notify_vine_of_bedrock_completion` (LockManager child-then-parent, DeltaLanded + SlopeChanged events), 4 HTTP routes, 5 tests. BLOCKER-02 resolved. vine.rs NOT modified per Q2. Zero verifier fixes. Git: `b78169e`.
 
-### Phase 3 — Parallel after 2b (mostly)
-- [ ] WS-EM-CHAIN — depends on SCHEMA-V2 + AUDIENCE-CONTRACT + PRIMER + CHAIN-INVOKE + VINE-UNIFY
-- [ ] WS-VOCAB — depends on SCHEMA-V2 + EM-CHAIN + CHAIN-INVOKE
-- [ ] WS-QUESTION-RETRIEVE — depends on EM-CHAIN + VOCAB
-- [ ] WS-DEMAND-GEN — depends on CHAIN-INVOKE + CONCURRENCY + COST-MODEL
-- [ ] WS-PREVIEW — depends on COST-MODEL + EM-CHAIN
-- [ ] WS-MANIFEST-API — depends on EM-CHAIN + PRIMER + CHAIN-INVOKE
-- [ ] WS-CHAIN-PUBLISH (MUST land before WS-CHAIN-PROPOSAL; sequenced)
-- [ ] WS-CHAIN-PROPOSAL — after WS-CHAIN-PUBLISH
-- [ ] WS-MULTI-CHAIN-OVERLAY — depends on EM-CHAIN + VINE-UNIFY (consumes `ingest_signature`)
-- [ ] WS-COLLAPSE-EXTEND — depends on SCHEMA-V2 + EM-CHAIN
-- [ ] WS-RECOVERY-OPS — depends on DEADLETTER + PROVISIONAL
+### Phase 3 — ALL 11 WORKSTREAMS COMPLETE (2026-04-09)
+- [x] WS-EM-CHAIN — conversation-episodic.yaml + 5 prompts + chain_dispatch + chain_registry. Git: `33c2b9a`.
+- [x] WS-VOCAB — vocabulary.rs, 4 query types, persistence table, 6 routes. Git: `f2fc2f4`.
+- [x] WS-QUESTION-RETRIEVE — question_retrieve.rs, mechanical decomp, cross-pyramid escalation, 8 tests. Git: `e9ca2ac`.
+- [x] WS-DEMAND-GEN — **verified clean**. demand_gen.rs, async jobs + 202 polling, 4 tests. Git: `33c2b9a`.
+- [x] WS-PREVIEW — preview.rs, cost/scope estimates, preview-then-commit, 4 tests. Git: `e9ca2ac`.
+- [x] WS-MANIFEST-API — manifest.rs, 9 operations, cold start, provenance log, 9 tests. Git: `f2fc2f4`.
+- [x] WS-CHAIN-PUBLISH — **verified clean**. chain_publish.rs, Wire publication + fork, 4 tests. Git: `33c2b9a`.
+- [x] WS-CHAIN-PROPOSAL — chain_proposal.rs, submit/review/apply, deep_merge, 6 tests. Git: `f2fc2f4`.
+- [x] WS-MULTI-CHAIN-OVERLAY — multi_chain_overlay.rs, signature matching, soft-delete, 4 tests. Git: `e9ca2ac`.
+- [x] WS-COLLAPSE-EXTEND — collapse.rs, enhanced collapse + bulk + auto-collapse, 4 tests. Git: `e9ca2ac`.
+- [x] WS-RECOVERY-OPS — recovery.rs, 6 ops + status aggregation, 7 routes, 4 tests. Git: `f2fc2f4`.
 
 ### Phase 4 — Frontend + CLI + wizard
 - [ ] WS-NAV-PAGE

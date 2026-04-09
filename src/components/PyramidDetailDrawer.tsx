@@ -28,6 +28,7 @@ interface PyramidDetailDrawerProps {
     onOpenVine?: (slug: string) => void;
     onAskQuestion?: (slug: string) => void;
     onOpenVibesmithy?: (slug: string) => void;
+    onOpenNav?: (slug: string) => void;
     publishingSlug: string | null;
     lastPublishResult: Record<string, { success: boolean; message: string; wireUuid?: string }>;
 }
@@ -47,6 +48,7 @@ export function PyramidDetailDrawer({
     onOpenVine,
     onAskQuestion,
     onOpenVibesmithy,
+    onOpenNav,
     publishingSlug,
     lastPublishResult,
 }: PyramidDetailDrawerProps) {
@@ -763,6 +765,16 @@ export function PyramidDetailDrawer({
                         Ask Question
                     </button>
                 )}
+                {onOpenNav && slug.node_count > 0 && (
+                    <button
+                        className="folder-publish-btn"
+                        onClick={() => onOpenNav(slug.slug)}
+                        style={{ width: "100%" }}
+                    >
+                        Navigate Pyramid
+                    </button>
+                )}
+
                 {onOpenVibesmithy && slug.node_count > 0 && (
                     <button
                         className="folder-publish-btn"

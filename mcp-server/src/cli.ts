@@ -462,6 +462,202 @@ Arguments:
   <name>      Profile name (e.g., 'blended' applies profiles/blended.json)
 
 Applies model and context limits from the specified JSON profile.`,
+
+  // ── Episodic Memory Vine commands ──
+
+  slope: `slope — Display slope nodes from the primer
+
+Usage: pyramid-cli slope <slug>
+
+Arguments:
+  <slug>      Pyramid slug
+
+Returns slope nodes showing the structural gradient of the pyramid.`,
+
+  primer: `primer — Display formatted primer for onboarding
+
+Usage: pyramid-cli primer <slug> [--budget N]
+
+Arguments:
+  <slug>      Pyramid slug
+
+Options:
+  --budget <N>   Token budget for formatted output`,
+
+  memoir: `memoir — Memoir reading mode
+
+Usage: pyramid-cli memoir <slug>
+
+Arguments:
+  <slug>      Pyramid slug
+
+Returns a narrative summary of the pyramid's episodic content.`,
+
+  walk: `walk — Walk reading mode
+
+Usage: pyramid-cli walk <slug> [--layer N] [--direction newest|oldest] [--limit N]
+
+Arguments:
+  <slug>      Pyramid slug
+
+Options:
+  --layer <N>         Layer number to walk
+  --direction <dir>   newest or oldest (default: newest)
+  --limit <N>         Max entries to return`,
+
+  thread: `thread — Thread reading mode
+
+Usage: pyramid-cli thread <slug> <identity>
+
+Arguments:
+  <slug>        Pyramid slug
+  <identity>    Identity to trace through the pyramid`,
+
+  decisions: `decisions — Decisions reading mode
+
+Usage: pyramid-cli decisions <slug> [--stance X]
+
+Arguments:
+  <slug>      Pyramid slug
+
+Options:
+  --stance <X>   Filter by decision stance`,
+
+  speaker: `speaker — Speaker reading mode
+
+Usage: pyramid-cli speaker <slug> <role>
+
+Arguments:
+  <slug>      Pyramid slug
+  <role>      Speaker role to filter by`,
+
+  "reading-search": `reading-search — Reading search mode
+
+Usage: pyramid-cli reading-search <slug> <query>
+
+Arguments:
+  <slug>      Pyramid slug
+  <query>     Search query within reading content`,
+
+  "cold-start": `cold-start — Get cold-start manifest bundle
+
+Usage: pyramid-cli cold-start <slug>
+
+Arguments:
+  <slug>      Pyramid slug
+
+Returns everything an agent needs to bootstrap from this pyramid.`,
+
+  manifest: `manifest — Execute manifest operations
+
+Usage: pyramid-cli manifest <slug> <operations-json>
+
+Arguments:
+  <slug>              Pyramid slug
+  <operations-json>   JSON array of manifest operations
+
+Example:
+  pyramid-cli manifest my-pyramid '[{"op":"read","path":"apex"}]'`,
+
+  vocab: `vocab — Get full vocabulary
+
+Usage: pyramid-cli vocab <slug>
+
+Arguments:
+  <slug>      Pyramid slug
+
+Returns all recognized terms and definitions for the pyramid.`,
+
+  "vocab-recognize": `vocab-recognize — Check if a term is recognized
+
+Usage: pyramid-cli vocab-recognize <slug> <term>
+
+Arguments:
+  <slug>      Pyramid slug
+  <term>      Term to look up`,
+
+  "vocab-diff": `vocab-diff — Vocabulary changes since a point in time
+
+Usage: pyramid-cli vocab-diff <slug> <since>
+
+Arguments:
+  <slug>      Pyramid slug
+  <since>     Timestamp or build ID to diff from`,
+
+  "dadbear-status": `dadbear-status — DADBEAR status (v2)
+
+Usage: pyramid-cli dadbear-status <slug>
+
+Arguments:
+  <slug>      Pyramid slug
+
+Returns detailed auto-update status with breaker state and timing.`,
+
+  "dadbear-trigger": `dadbear-trigger — Trigger DADBEAR auto-update
+
+Usage: pyramid-cli dadbear-trigger <slug>
+
+Arguments:
+  <slug>      Pyramid slug
+
+Manually triggers a DADBEAR auto-update check.`,
+
+  "vine-bedrocks": `vine-bedrocks — List bedrock slugs in vine
+
+Usage: pyramid-cli vine-bedrocks <slug>
+
+Arguments:
+  <slug>      Vine slug
+
+Lists all bedrock slugs composed into this vine.`,
+
+  "vine-add": `vine-add — Add bedrock to vine
+
+Usage: pyramid-cli vine-add <slug> <bedrock-slug>
+
+Arguments:
+  <slug>            Vine slug
+  <bedrock-slug>    Bedrock slug to add`,
+
+  preview: `preview — Dry-run content processing
+
+Usage: pyramid-cli preview <slug> <source-path> <content-type> [--chain X]
+
+Arguments:
+  <slug>            Pyramid slug
+  <source-path>     Path to source file
+  <content-type>    Content type (e.g. markdown, code)
+
+Options:
+  --chain <X>       Chain to use for processing`,
+
+  "recovery-status": `recovery-status — Recovery status
+
+Usage: pyramid-cli recovery-status <slug>
+
+Arguments:
+  <slug>      Pyramid slug
+
+Returns whether recovery is needed and current recovery state.`,
+
+  ask: `ask — Ask a question against a pyramid
+
+Usage: pyramid-cli ask <slug> "<question>" [--demand-gen]
+
+Arguments:
+  <slug>        Pyramid slug
+  <question>    Question to ask
+
+Options:
+  --demand-gen  Trigger demand generation if question cannot be answered`,
+
+  "demand-gen-status": `demand-gen-status — Check demand generation job status
+
+Usage: pyramid-cli demand-gen-status <slug> <job-id>
+
+Arguments:
+  <slug>      Pyramid slug
+  <job-id>    Demand generation job ID`,
 };
 
 // ── Auth ─────────────────────────────────────────────────────────────────────
@@ -1282,6 +1478,169 @@ async function run(): Promise<void> {
       break;
     }
 
+    // ── Episodic Memory Vine Commands ──────────────────────────────
+
+    case "slope": {
+      const slug = requireArg(1, "slug");
+      output(await pf(`/pyramid/${enc(slug)}/primer`), slug);
+      break;
+    }
+
+    case "primer": {
+      const slug = requireArg(1, "slug");
+      const budget = flags.budget;
+      const path = budget
+        ? `/pyramid/${enc(slug)}/primer/formatted?budget=${enc(budget)}`
+        : `/pyramid/${enc(slug)}/primer/formatted`;
+      output(await pf(path), slug);
+      break;
+    }
+
+    case "memoir": {
+      const slug = requireArg(1, "slug");
+      output(await pf(`/pyramid/${enc(slug)}/reading/memoir`), slug);
+      break;
+    }
+
+    case "walk": {
+      const slug = requireArg(1, "slug");
+      const params: string[] = [];
+      if (flags.layer) params.push(`layer=${enc(flags.layer)}`);
+      if (flags.direction) params.push(`direction=${enc(flags.direction)}`);
+      if (flags.limit) params.push(`limit=${enc(flags.limit)}`);
+      const qs = params.length > 0 ? `?${params.join("&")}` : "";
+      output(await pf(`/pyramid/${enc(slug)}/reading/walk${qs}`), slug);
+      break;
+    }
+
+    case "thread": {
+      const slug = requireArg(1, "slug");
+      const identity = requireArg(2, "identity");
+      output(await pf(`/pyramid/${enc(slug)}/reading/thread?identity=${enc(identity)}`), slug);
+      break;
+    }
+
+    case "decisions": {
+      const slug = requireArg(1, "slug");
+      const stance = flags.stance;
+      const path = stance
+        ? `/pyramid/${enc(slug)}/reading/decisions?stance=${enc(stance)}`
+        : `/pyramid/${enc(slug)}/reading/decisions`;
+      output(await pf(path), slug);
+      break;
+    }
+
+    case "speaker": {
+      const slug = requireArg(1, "slug");
+      const role = requireArg(2, "role");
+      output(await pf(`/pyramid/${enc(slug)}/reading/speaker?role=${enc(role)}`), slug);
+      break;
+    }
+
+    case "reading-search": {
+      const slug = requireArg(1, "slug");
+      const query = requireArg(2, "query");
+      output(await pf(`/pyramid/${enc(slug)}/reading/search?q=${enc(query)}`), slug);
+      break;
+    }
+
+    case "cold-start": {
+      const slug = requireArg(1, "slug");
+      output(await pf(`/pyramid/${enc(slug)}/manifest/cold-start`), slug);
+      break;
+    }
+
+    case "manifest": {
+      const slug = requireArg(1, "slug");
+      const opsJson = requireArg(2, "operations-json");
+      let operations: unknown;
+      try {
+        operations = JSON.parse(opsJson);
+      } catch {
+        process.stderr.write("Error: operations must be valid JSON\n");
+        process.exit(1);
+      }
+      output(await pf(`/pyramid/${enc(slug)}/manifest`, { method: "POST", body: operations }), slug);
+      break;
+    }
+
+    case "vocab": {
+      const slug = requireArg(1, "slug");
+      output(await pf(`/pyramid/${enc(slug)}/vocabulary`), slug);
+      break;
+    }
+
+    case "vocab-recognize": {
+      const slug = requireArg(1, "slug");
+      const term = requireArg(2, "term");
+      output(await pf(`/pyramid/${enc(slug)}/vocabulary/recognize?term=${enc(term)}`), slug);
+      break;
+    }
+
+    case "vocab-diff": {
+      const slug = requireArg(1, "slug");
+      const since = requireArg(2, "since");
+      output(await pf(`/pyramid/${enc(slug)}/vocabulary/diff?since=${enc(since)}`), slug);
+      break;
+    }
+
+    case "dadbear-status": {
+      const slug = requireArg(1, "slug");
+      output(await pf(`/pyramid/${enc(slug)}/dadbear/status`), slug);
+      break;
+    }
+
+    case "dadbear-trigger": {
+      const slug = requireArg(1, "slug");
+      output(await pf(`/pyramid/${enc(slug)}/dadbear/trigger`, { method: "POST" }), slug);
+      break;
+    }
+
+    case "vine-bedrocks": {
+      const slug = requireArg(1, "slug");
+      output(await pf(`/pyramid/${enc(slug)}/vine/bedrocks`), slug);
+      break;
+    }
+
+    case "vine-add": {
+      const slug = requireArg(1, "slug");
+      const bedrockSlug = requireArg(2, "bedrock-slug");
+      output(await pf(`/pyramid/${enc(slug)}/vine/add-bedrock`, { method: "POST", body: { bedrock_slug: bedrockSlug } }), slug);
+      break;
+    }
+
+    case "preview": {
+      const slug = requireArg(1, "slug");
+      const sourcePath = requireArg(2, "source-path");
+      const contentType = requireArg(3, "content-type");
+      const body: Record<string, string> = { source_path: sourcePath, content_type: contentType };
+      if (flags.chain) body.chain = flags.chain;
+      output(await pf(`/pyramid/${enc(slug)}/preview`, { method: "POST", body }), slug);
+      break;
+    }
+
+    case "recovery-status": {
+      const slug = requireArg(1, "slug");
+      output(await pf(`/pyramid/${enc(slug)}/recovery/status`), slug);
+      break;
+    }
+
+    case "ask": {
+      const slug = requireArg(1, "slug");
+      const question = requireArg(2, "question");
+      const body: Record<string, unknown> = { question };
+      if (flags["demand-gen"] === "true") body.demand_gen = true;
+      output(await pf(`/pyramid/${enc(slug)}/question`, { method: "POST", body }), slug);
+      break;
+    }
+
+    case "demand-gen-status": {
+      const slug = requireArg(1, "slug");
+      const jobId = requireArg(2, "job-id");
+      output(await pf(`/pyramid/${enc(slug)}/demand-gen/${enc(jobId)}`), slug);
+      break;
+    }
+
     default: {
       process.stderr.write(`Unknown command: ${command}\n\n`);
       printUsage();
@@ -1315,6 +1674,27 @@ Question Pyramid Commands:
   references <slug>                     Show what a slug references and who references it
   composed <slug>                       Get composed view across slug + referenced slugs
 
+Primer/Slope Commands:
+  slope <slug>                         Display slope nodes from primer
+  primer <slug> [--budget N]           Formatted primer for onboarding
+
+Reading Mode Commands:
+  memoir <slug>                        Memoir reading mode (narrative summary)
+  walk <slug> [--layer N] [--direction newest|oldest] [--limit N]  Walk through content
+  thread <slug> <identity>             Follow an identity's contributions
+  decisions <slug> [--stance X]        Extract decision points
+  speaker <slug> <role>                View contributions by speaker role
+  reading-search <slug> <query>        Search within reading content
+
+Manifest/Runtime Commands:
+  cold-start <slug>                    Get cold-start manifest bundle
+  manifest <slug> <operations-json>    Execute manifest operations (POST)
+
+Vocabulary Commands:
+  vocab <slug>                         Get full vocabulary
+  vocab-recognize <slug> <term>        Check if a term is recognized
+  vocab-diff <slug> <since>            Vocabulary changes since a point in time
+
 Vine Commands:
   vine-build <slug> <dir1> [dir2...]   Build vine from JSONL directories
   vine-bunches <slug>                  List all bunches with metadata
@@ -1325,6 +1705,14 @@ Vine Commands:
   vine-drill <slug>                    Directory-wired drill (navigation structure)
   vine-rebuild-upper <slug>            Force rebuild L2+ layers
   vine-integrity <slug>                Run integrity check, return results
+  vine-bedrocks <slug>                 List bedrock slugs in vine
+  vine-add <slug> <bedrock-slug>       Add bedrock slug to vine
+
+Preview Commands:
+  preview <slug> <source-path> <content-type> [--chain X]  Dry-run content processing
+
+Recovery Commands:
+  recovery-status <slug>               Get recovery status
 
 Analysis Commands:
   entities <slug>                 Entity index
@@ -1337,7 +1725,9 @@ Analysis Commands:
 
 Operations Commands:
   tree <slug>                     Structural overview
-  dadbear <slug>                  DADBEAR auto-update status
+  dadbear <slug>                  DADBEAR auto-update status (legacy)
+  dadbear-status <slug>           DADBEAR status (v2, detailed)
+  dadbear-trigger <slug>          Trigger DADBEAR auto-update check
   cost <slug> [--build ID]        Build cost report
   stale-log <slug> [--limit N]    Staleness history
   usage <slug> [--limit N]        Access patterns (default limit=100)
@@ -1347,6 +1737,10 @@ Composite Commands:
   handoff <slug>                  Composite handoff block (apex + FAQ + annotations + DADBEAR)
   compare <slug1> <slug2>         Cross-pyramid comparison (terms, children, decisions)
   navigate <slug> "<question>"    One-shot question answering with provenance
+
+Question Commands:
+  ask <slug> "<question>" [--demand-gen]  Ask a question (optionally trigger demand gen)
+  demand-gen-status <slug> <job-id>       Check demand generation job status
 
 Agent Coordination:
   react <slug> <annotation_id> up|down  Vote on an annotation
@@ -1376,6 +1770,12 @@ Examples:
   pyramid-cli compare slug-one slug-two
   pyramid-cli vine-build my-vine /path/to/jsonl-dir1 /path/to/jsonl-dir2
   pyramid-cli vine-bunches my-vine
+  pyramid-cli primer <your-slug>
+  pyramid-cli memoir <your-slug>
+  pyramid-cli walk <your-slug> --layer 1 --direction oldest --limit 10
+  pyramid-cli cold-start <your-slug>
+  pyramid-cli vocab <your-slug>
+  pyramid-cli ask <your-slug> "How does the stale engine work?" --demand-gen
 `);
 }
 
