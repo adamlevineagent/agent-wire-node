@@ -1640,12 +1640,20 @@ pub async fn build_vine_upper(
             pair_idx += 1;
         }
 
+        // Flush: wait for the writer to commit all nodes at this depth before
+        // reading them back in the next iteration. Without this, the reader
+        // (separate WAL connection) may see 0 nodes, causing premature apex
+        // declaration. Same fix as chain_executor.rs::execute_recursive_pair.
+        build::flush_writes(&write_tx).await;
+
         depth = next_depth;
     }
 
     // If the loop ended with multiple nodes at top depth (synthesis failures prevented
     // convergence), force a single apex by merging all top-depth nodes mechanically.
     if apex_id.is_empty() {
+        // Flush before reading — same WAL visibility issue as the main loop
+        build::flush_writes(&write_tx).await;
         let top_nodes = {
             let conn = state.reader.lock().await;
             db::get_nodes_at_depth(&conn, vine_slug, depth)?
