@@ -50,6 +50,7 @@ pub fn evaluate_path_against_value(root: &Value, path: &str) -> Result<Value> {
 enum Expr {
     Number(f64),
     Boolean(bool),
+    String(String),
     Reference(ReferenceExpr),
     FunctionCall {
         name: String,
@@ -62,17 +63,55 @@ enum Expr {
     },
 }
 
+/// Check if a JSON Value is truthy (used by when-clause evaluation and boolean comparison).
+pub fn value_is_truthy(val: &Value) -> bool {
+    match val {
+        Value::Bool(b) => *b,
+        Value::Null => false,
+        Value::Number(n) => n.as_f64().map(|f| f != 0.0).unwrap_or(false),
+        Value::String(s) => !s.is_empty() && s != "false",
+        Value::Array(a) => !a.is_empty(),
+        Value::Object(o) => !o.is_empty(),
+    }
+}
+
 impl Expr {
     fn evaluate<E: ExpressionEnv>(&self, env: &E) -> Result<Value> {
         match self {
             Expr::Number(value) => number_value(*value),
             Expr::Boolean(value) => Ok(Value::Bool(*value)),
+            Expr::String(s) => Ok(Value::String(s.clone())),
             Expr::Reference(reference) => reference.evaluate(env),
             Expr::FunctionCall { name, args } => evaluate_function(name, args, env),
             Expr::Binary { left, op, right } => {
+                let lhs = left.evaluate(env)?;
+                let rhs = right.evaluate(env)?;
                 if op.is_comparison() {
-                    let lhs = coerce_number(&left.evaluate(env)?)?;
-                    let rhs = coerce_number(&right.evaluate(env)?)?;
+                    // String comparison: either side is a string
+                    if lhs.is_string() || rhs.is_string() {
+                        let ls = lhs.as_str().unwrap_or_default();
+                        let rs = rhs.as_str().unwrap_or_default();
+                        let result = match op {
+                            BinaryOp::Eq => ls == rs,
+                            BinaryOp::Neq => ls != rs,
+                            _ => bail!("ordered comparison (>, <, >=, <=) not supported for strings"),
+                        };
+                        return Ok(Value::Bool(result));
+                    }
+                    // Boolean comparison: either side is a bool
+                    if lhs.is_boolean() || rhs.is_boolean() {
+                        let lb = value_is_truthy(&lhs);
+                        let rb = value_is_truthy(&rhs);
+                        let result = match op {
+                            BinaryOp::Eq => lb == rb,
+                            BinaryOp::Neq => lb != rb,
+                            _ => bail!("ordered comparison (>, <, >=, <=) not supported for booleans"),
+                        };
+                        return Ok(Value::Bool(result));
+                    }
+                    // Numeric comparison (existing behavior)
+                    let lhs = coerce_number(&lhs)?;
+                    let rhs = coerce_number(&rhs)?;
                     let result = match op {
                         BinaryOp::Gt => lhs > rhs,
                         BinaryOp::Gte => lhs >= rhs,
@@ -84,6 +123,8 @@ impl Expr {
                     };
                     Ok(Value::Bool(result))
                 } else {
+                    let lhs = coerce_number(&lhs)?;
+                    let rhs = coerce_number(&rhs)?;
                     let lhs = coerce_number(&left.evaluate(env)?)?;
                     let rhs = coerce_number(&right.evaluate(env)?)?;
                     let result = match op {
@@ -424,6 +465,10 @@ impl<'a> Parser<'a> {
         if self.peek() == Some('$') {
             return self.parse_reference();
         }
+        // String literals: "..." or '...'
+        if matches!(self.peek(), Some('"') | Some('\'')) {
+            return self.parse_string_literal();
+        }
         // Check for identifier (function call or boolean literal)
         if matches!(self.peek(), Some(ch) if ch.is_ascii_alphabetic() || ch == '_') {
             let saved = self.cursor;
@@ -459,6 +504,20 @@ impl<'a> Parser<'a> {
             }
         }
         self.parse_number()
+    }
+
+    fn parse_string_literal(&mut self) -> Result<Expr> {
+        let quote = self.peek().unwrap();
+        self.cursor += 1; // consume opening quote
+        let start = self.cursor;
+        while self.cursor < self.input.len() && self.input.as_bytes()[self.cursor] as char != quote {
+            self.cursor += 1;
+        }
+        let s = self.input[start..self.cursor].to_string();
+        if !self.consume(quote) {
+            bail!("unterminated string literal");
+        }
+        Ok(Expr::String(s))
     }
 
     fn parse_reference(&mut self) -> Result<Expr> {

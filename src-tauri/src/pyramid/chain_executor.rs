@@ -3058,114 +3058,61 @@ fn evaluate_when(when: Option<&str>, ctx: &ChainContext) -> bool {
         None => return true,
     };
 
-    // Simple ref check: $has_prior_build → resolve and check truthiness
+    if expr.is_empty() {
+        return true;
+    }
+
+    // Simple ref check (fast path): $has_prior_build → resolve and check truthiness
     if expr.starts_with('$') && !expr.contains(' ') {
         match ctx.resolve_ref(expr) {
-            Ok(val) => {
-                return match val {
-                    Value::Bool(b) => b,
-                    Value::Null => false,
-                    Value::Number(n) => n.as_f64().map(|f| f != 0.0).unwrap_or(false),
-                    Value::String(s) => !s.is_empty() && s != "false",
-                    Value::Array(a) => !a.is_empty(),
-                    Value::Object(o) => !o.is_empty(),
-                };
-            }
+            Ok(val) => return super::expression::value_is_truthy(&val),
             Err(_) => return false,
         }
     }
 
-    // count($ref) — resolves the inner ref, gets array length, then optionally compares.
-    // Handles: "count($extract_parts) > 1", "count($items) == 0", bare "count($items)" (truthy if > 0)
-    if expr.starts_with("count(") {
-        if let Some(close_paren) = expr.find(')') {
-            let inner_ref = expr[6..close_paren].trim();
-            let count_val = match ctx.resolve_ref(inner_ref) {
-                Ok(Value::Array(arr)) => arr.len() as f64,
-                Ok(_) => 1.0, // non-array resolved value counts as 1
-                Err(_) => 0.0,
-            };
-
-            let remainder = expr[close_paren + 1..].trim();
-            if remainder.is_empty() {
-                // Bare count($ref) — truthy if > 0
-                return count_val > 0.0;
-            }
-
-            // Check for comparison operator after count(...)
-            for op in &[" > ", " >= ", " < ", " <= ", " == ", " != "] {
-                if let Some(op_start) = remainder.find(op.trim_start()) {
-                    if op_start == 0 || remainder[..op_start].trim().is_empty() {
-                        let rhs_str = remainder[op_start + op.trim_start().len()..].trim();
-                        let rhs = rhs_str.parse::<f64>().unwrap_or(0.0);
-                        return match *op {
-                            " > " => count_val > rhs,
-                            " >= " => count_val >= rhs,
-                            " < " => count_val < rhs,
-                            " <= " => count_val <= rhs,
-                            " == " => (count_val - rhs).abs() < f64::EPSILON,
-                            " != " => (count_val - rhs).abs() >= f64::EPSILON,
-                            _ => true,
-                        };
-                    }
-                }
-            }
-
-            warn!("count() expression with unparseable comparison: '{expr}', defaulting to true");
-            return true;
+    // Delegate all complex expressions to the expression engine.
+    // Build a Value environment from ChainContext's step_outputs + initial_params.
+    let env_value = build_legacy_expression_env(ctx);
+    let env = super::expression::ValueEnv::new(&env_value);
+    match super::expression::evaluate_expression(expr, &env) {
+        Ok(val) => super::expression::value_is_truthy(&val),
+        Err(e) => {
+            warn!("when expression '{}' evaluation failed: {}, skipping step (defaulting to false)", expr, e);
+            false
         }
     }
+}
 
-    // Comparison: $var > N, $var == N, $var == true, etc.
-    for op in &[" > ", " >= ", " < ", " <= ", " == ", " != "] {
-        if let Some(pos) = expr.find(op) {
-            let lhs_expr = expr[..pos].trim();
-            let rhs_str = expr[pos + op.len()..].trim();
+/// Build a JSON Value environment from ChainContext for expression evaluation.
+fn build_legacy_expression_env(ctx: &ChainContext) -> Value {
+    let mut map = serde_json::Map::new();
 
-            // String-based boolean comparison: $ref == true / $ref == false
-            if (*op == " == " || *op == " != ") && (rhs_str == "true" || rhs_str == "false") {
-                let rhs_bool = rhs_str == "true";
-                let lhs_bool = match ctx.resolve_ref(lhs_expr) {
-                    Ok(Value::Bool(b)) => b,
-                    Ok(Value::String(s)) => s == "true",
-                    Ok(Value::Null) => false,
-                    Ok(Value::Number(n)) => n.as_f64().map(|f| f != 0.0).unwrap_or(false),
-                    Ok(_) => false,
-                    Err(_e) => {
-                        warn!("when condition '{}': unresolved ref '{}', skipping step", expr, lhs_expr);
-                        return false;
-                    }
-                };
-                return if *op == " == " {
-                    lhs_bool == rhs_bool
-                } else {
-                    lhs_bool != rhs_bool
-                };
-            }
-
-            let lhs = match ctx.resolve_ref(lhs_expr) {
-                Ok(v) => v.as_f64().unwrap_or(0.0),
-                Err(_) => {
-                    warn!("when condition '{}': unresolved ref '{}', skipping step", expr, lhs_expr);
-                    return false;
-                }
-            };
-            let rhs = rhs_str.parse::<f64>().unwrap_or(0.0);
-
-            return match *op {
-                " > " => lhs > rhs,
-                " >= " => lhs >= rhs,
-                " < " => lhs < rhs,
-                " <= " => lhs <= rhs,
-                " == " => (lhs - rhs).abs() < f64::EPSILON,
-                " != " => (lhs - rhs).abs() >= f64::EPSILON,
-                _ => true,
-            };
-        }
+    // Step outputs
+    for (key, val) in ctx.step_outputs.as_ref() {
+        map.insert(key.clone(), val.clone());
     }
 
-    warn!("Unknown when expression: '{expr}', skipping step (defaulting to false)");
-    false
+    // Initial params (evidence_mode, apex_question, etc.)
+    for (key, val) in &ctx.initial_params {
+        map.insert(key.clone(), val.clone());
+    }
+
+    // Accumulators as string values
+    for (key, val) in &ctx.accumulators {
+        map.insert(key.clone(), Value::String(val.clone()));
+    }
+
+    // Special context variables
+    map.insert("has_prior_build".to_string(), Value::Bool(ctx.has_prior_build));
+
+    if let Some(ref item) = ctx.current_item {
+        map.insert("item".to_string(), item.clone());
+    }
+    if let Some(idx) = ctx.current_index {
+        map.insert("index".to_string(), Value::Number(serde_json::Number::from(idx as u64)));
+    }
+
+    Value::Object(map)
 }
 
 // ── Sub-chain execution primitives ─────────────────────────────────────────
@@ -4985,6 +4932,25 @@ async fn execute_evidence_loop(
         info!(slug, "fresh path — all prior L1+ nodes superseded");
     }
 
+    // ── 3b. Check evidence_mode — skip LLM-heavy work in fast/skip mode ──
+    let evidence_mode_val = resolved_input.get("mode")
+        .cloned()
+        .or_else(|| ctx.resolve_ref("$evidence_mode").ok())
+        .unwrap_or(Value::String("deep".to_string()));
+    let evidence_mode = evidence_mode_val.as_str().unwrap_or("deep");
+
+    if evidence_mode == "skip" || evidence_mode == "fast" {
+        info!(slug, evidence_mode, "evidence_mode is '{}' — overlay cleanup done, skipping LLM evidence grounding", evidence_mode);
+        return Ok(serde_json::json!({
+            "build_id": build_id,
+            "evidence_mode": evidence_mode,
+            "skipped_evidence": true,
+            "total_nodes": 0,
+            "layers_completed": 0,
+            "max_layer": max_layer,
+        }));
+    }
+
     // ── 4. Load L0 nodes ────────────────────────────────────────────────
     let l0_nodes = if is_cross_slug {
         let conn_guard = state.reader.lock().await;
@@ -5525,8 +5491,13 @@ async fn execute_process_gaps(
         .get("error")
         .and_then(|v| v.as_str().map(|s| s.to_string()));
 
-    // Skip gap processing if evidence loop had errors or was cancelled
-    if evidence_error.is_some() || cancel.is_cancelled() {
+    // Skip gap processing if evidence loop was skipped (fast/skip mode), had errors, or was cancelled
+    let evidence_skipped = evidence_result
+        .get("skipped_evidence")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+        || evidence_result.get("skipped").and_then(|v| v.as_bool()).unwrap_or(false);
+    if evidence_skipped || evidence_error.is_some() || cancel.is_cancelled() {
         info!(
             slug,
             "skipping gap processing (evidence loop had errors or cancelled)"
@@ -9737,14 +9708,7 @@ async fn override_ir_node_children(
 
 /// Check truthiness of a JSON value (matches legacy evaluate_when behavior).
 fn value_is_truthy(val: &Value) -> bool {
-    match val {
-        Value::Bool(b) => *b,
-        Value::Null => false,
-        Value::Number(n) => n.as_f64().map(|f| f != 0.0).unwrap_or(false),
-        Value::String(s) => !s.is_empty() && s != "false",
-        Value::Array(a) => !a.is_empty(),
-        Value::Object(o) => !o.is_empty(),
-    }
+    super::expression::value_is_truthy(val)
 }
 
 fn compact_ir_inventory_node_id(item: &serde_json::Map<String, Value>) -> Option<String> {

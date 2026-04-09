@@ -5910,6 +5910,7 @@ async fn handle_question_build(
             max_depth,
             from_depth_for_build,
             characterization,
+            "deep",
             &cancel,
             Some(progress_tx.clone()),
             Some(layer_tx.clone()),

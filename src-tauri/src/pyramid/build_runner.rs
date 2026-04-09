@@ -232,6 +232,7 @@ pub async fn run_build_from(
             stored_max_depth,
             from_depth,
             None, // re-characterize from cross-slug nodes
+            "deep",
             cancel,
             progress_tx,
             layer_tx,
@@ -278,6 +279,7 @@ pub async fn run_build_from(
             stored_max_depth,
             from_depth,
             None,
+            "deep",
             cancel,
             progress_tx,
             layer_tx,
@@ -716,6 +718,7 @@ pub async fn run_decomposed_build(
     max_depth: u32,
     from_depth: i64,
     characterization: Option<CharacterizationResult>,
+    evidence_mode: &str,
     cancel: &CancellationToken,
     progress_tx: Option<mpsc::Sender<BuildProgress>>,
     layer_tx: Option<mpsc::Sender<LayerEvent>>,
@@ -850,6 +853,7 @@ pub async fn run_decomposed_build(
     )));
     initial_context.insert("is_cross_slug".to_string(), serde_json::json!(is_cross_slug));
     initial_context.insert("referenced_slugs".to_string(), serde_json::json!(referenced_slugs));
+    initial_context.insert("evidence_mode".to_string(), serde_json::json!(evidence_mode));
 
     // ── 6. Generate build_id and record build start ─────────────────
     // Create a build_id up front so that if the chain fails BEFORE

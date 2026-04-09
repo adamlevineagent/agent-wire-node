@@ -231,6 +231,7 @@ pub async fn spawn_question_build(
             max_depth,
             from_depth,
             characterization,
+            "deep",
             &cancel,
             Some(progress_tx.clone()),
             Some(layer_tx.clone()),
