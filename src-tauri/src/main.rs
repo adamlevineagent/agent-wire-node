@@ -3234,10 +3234,64 @@ async fn post_build_seed(
         .map_err(|e| format!("Spawn blocking failed: {e}"))??;
     }
 
+    // ── Vocabulary refresh: populate canonical identity catalog from apex ──
+    {
+        let conn = pyramid_state.writer.lock().await;
+        match wire_node_lib::pyramid::vocabulary::refresh_vocabulary(&conn, slug) {
+            Ok((_, count)) => tracing::info!("Post-build: refreshed vocabulary for '{}' ({} entries)", slug, count),
+            Err(e) => tracing::warn!("Post-build: vocabulary refresh failed for '{}': {}", slug, e),
+        }
+    }
+
     tracing::info!("Post-build seeding complete for slug='{}'", slug);
 
-    // Skip engine + watcher for conversations and vines (no file watching)
+    // ── Conversations/Vines: create DADBEAR watch config + start loop ──
     if matches!(content_type, ContentType::Conversation | ContentType::Vine) {
+        // Auto-create DADBEAR watch config for conversation source folder
+        if !source_paths.is_empty() {
+            let conn = pyramid_state.writer.lock().await;
+            for path_str in &source_paths {
+                let source_dir = std::path::Path::new(path_str);
+                // Use the parent directory if source_path is a file
+                let watch_dir = if source_dir.is_file() {
+                    source_dir.parent().unwrap_or(source_dir).to_string_lossy().to_string()
+                } else {
+                    path_str.clone()
+                };
+                let config = wire_node_lib::pyramid::types::DadbearWatchConfig {
+                    id: 0,
+                    slug: slug.to_string(),
+                    source_path: watch_dir.clone(),
+                    content_type: format!("{:?}", content_type).to_lowercase(),
+                    scan_interval_secs: 10,
+                    debounce_secs: 30,
+                    session_timeout_secs: 1800,
+                    batch_size: 1,
+                    enabled: true,
+                    created_at: String::new(),
+                    updated_at: String::new(),
+                };
+                match wire_node_lib::pyramid::db::save_dadbear_config(&conn, &config) {
+                    Ok(_) => tracing::info!("Post-build: DADBEAR watch config created for '{}' → '{}'", slug, watch_dir),
+                    Err(e) => tracing::warn!("Post-build: DADBEAR config creation failed for '{}': {}", slug, e),
+                }
+            }
+        }
+
+        // Start the DADBEAR extend loop if not already running
+        {
+            let mut dadbear = pyramid_state.dadbear_handle.lock().await;
+            if dadbear.is_none() {
+                let db_path_clone = db_path.clone();
+                let bus = pyramid_state.build_event_bus.clone();
+                let handle = wire_node_lib::pyramid::dadbear_extend::start_dadbear_extend_loop(
+                    db_path_clone, bus,
+                );
+                *dadbear = Some(handle);
+                tracing::info!("Post-build: DADBEAR extend loop started");
+            }
+        }
+
         return Ok(());
     }
 
@@ -5662,6 +5716,7 @@ async fn pyramid_vine_integrity(
         supabase_url: state.pyramid.supabase_url.clone(),
         supabase_anon_key: state.pyramid.supabase_anon_key.clone(),
         csrf_secret: state.pyramid.csrf_secret,
+        dadbear_handle: state.pyramid.dadbear_handle.clone(),
     });
 
     let summary = vine::run_integrity_check(&pyramid_state, &slug)
@@ -5710,6 +5765,7 @@ async fn pyramid_vine_rebuild_upper(
         supabase_url: state.pyramid.supabase_url.clone(),
         supabase_anon_key: state.pyramid.supabase_anon_key.clone(),
         csrf_secret: state.pyramid.csrf_secret,
+        dadbear_handle: state.pyramid.dadbear_handle.clone(),
     });
 
     let cancel = tokio_util::sync::CancellationToken::new();
@@ -6539,6 +6595,7 @@ fn main() {
             s[16..].copy_from_slice(&b);
             s
         },
+        dadbear_handle: Arc::new(tokio::sync::Mutex::new(None)),
     });
 
     // Load persisted event subscriptions into the in-memory event bus
@@ -6554,6 +6611,24 @@ fn main() {
         pyramid_db_path,
         pyramid_config.use_ir_executor
     );
+
+    // Start DADBEAR extend loop if any enabled watch configs exist
+    {
+        let reader = pyramid_state.reader.blocking_lock();
+        let has_configs = wire_node_lib::pyramid::db::get_enabled_dadbear_configs(&reader)
+            .map(|c| !c.is_empty())
+            .unwrap_or(false);
+        if has_configs {
+            let db_path_str = pyramid_db_path.to_string_lossy().to_string();
+            let bus = pyramid_state.build_event_bus.clone();
+            let handle = wire_node_lib::pyramid::dadbear_extend::start_dadbear_extend_loop(
+                db_path_str, bus,
+            );
+            let mut dh = pyramid_state.dadbear_handle.blocking_lock();
+            *dh = Some(handle);
+            tracing::info!("DADBEAR extend loop started on app launch (existing configs found)");
+        }
+    }
 
     // WS-E: spawn the web_sessions sweeper (idempotent OnceLock guard).
     wire_node_lib::pyramid::public_html::web_sessions::spawn_sweeper(pyramid_state.clone());

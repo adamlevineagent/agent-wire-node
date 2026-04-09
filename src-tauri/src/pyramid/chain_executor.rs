@@ -14563,6 +14563,7 @@ mod tests {
             supabase_url: None,
             supabase_anon_key: None,
             csrf_secret: [0u8; 32],
+            dadbear_handle: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
         };
 
         let chain = make_integration_code_chain();
@@ -14637,6 +14638,7 @@ mod tests {
             supabase_url: None,
             supabase_anon_key: None,
             csrf_secret: [0u8; 32],
+            dadbear_handle: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
         };
 
         let chain = make_integration_code_chain();
@@ -14731,6 +14733,7 @@ mod tests {
             supabase_url: None,
             supabase_anon_key: None,
             csrf_secret: [0u8; 32],
+            dadbear_handle: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
         };
 
         assert!(!pyramid_state
@@ -14789,6 +14792,7 @@ mod tests {
             supabase_url: None,
             supabase_anon_key: None,
             csrf_secret: [0u8; 32],
+            dadbear_handle: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
         };
 
         let chain = make_integration_code_chain();

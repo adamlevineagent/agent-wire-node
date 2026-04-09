@@ -725,6 +725,9 @@ pub struct PyramidState {
     /// on process restart. Per-request nonces bind cookie session token +
     /// slug + 5-minute time window.
     pub csrf_secret: [u8; 32],
+    /// DADBEAR extend loop handle for conversation/vine lifecycle management.
+    /// Started on first conversation build; dropped on app exit.
+    pub dadbear_handle: Arc<Mutex<Option<crate::pyramid::dadbear_extend::DadbearExtendHandle>>>,
 }
 
 impl PyramidState {
@@ -768,6 +771,7 @@ impl PyramidState {
             supabase_url: self.supabase_url.clone(),
             supabase_anon_key: self.supabase_anon_key.clone(),
             csrf_secret: self.csrf_secret,
+            dadbear_handle: self.dadbear_handle.clone(),
         }))
     }
 }
