@@ -235,7 +235,39 @@ Three of five verified workstreams (WS-CONCURRENCY, WS-AUDIENCE-CONTRACT, WS-COS
 - WS-IMMUTABILITY-ENFORCE: verified (2 pre-existing tests updated)
 - Git commit: `d4172f3` — "episodic-memory vine: Phase 2a complete"
 
-**Next: Phase 2b** — WS-DADBEAR-EXTEND, WS-VINE-UNIFY (WS-PROVISIONAL now complete).
+**Phase 2b: ALL 3 WORKSTREAMS COMPLETE + VERIFIED.**
+- WS-PROVISIONAL: verified (verifier added missing SlopeChanged). Git: `244869a`.
+- WS-DADBEAR-EXTEND: verified (dead code cleanup). Git: `b78169e`.
+- WS-VINE-UNIFY: verified clean. BLOCKER-02 resolved. Git: `b78169e`.
+
+**Phase 3: ALL 11 WORKSTREAMS COMPLETE.**
+- Batch 1 (EM-CHAIN + DEMAND-GEN + CHAIN-PUBLISH): Git `33c2b9a`.
+- Batch 2 (VOCAB + MANIFEST-API + CHAIN-PROPOSAL + RECOVERY-OPS): Git `f2fc2f4`.
+- Batch 3 (QUESTION-RETRIEVE + PREVIEW + MULTI-CHAIN-OVERLAY + COLLAPSE-EXTEND): Git `e9ca2ac`.
+
+**Phase 4: ALL 4 WORKSTREAMS COMPLETE.**
+- READING-MODES + CLI-PARITY + WIZARD + NAV-PAGE: Git `7cda181`.
+
+**Phase 5: VALIDATION RUN COMPLETE.**
+- 3 conversation pyramids built with episodic chain (0 failures):
+  - episodic-vine-test-1: 17 nodes, depth 3, 629s
+  - episodic-vine-test-2: 1 node, depth 0 (single-chunk file), 592s
+  - episodic-vine-test-3: 33 nodes, depth 3, 919s
+- Vine composition created (episodic-vine-test-meta) linking all 3 bedrocks
+- Cross-bedrock decision aggregation verified via SQL
+- Temporal arc visible: session 1 (self-archaeology) → session 2 (Phase 1 impl) → session 3 (CLI skill build)
+- Episodic schema fields present: decisions, topics, terms, narrative
+
+**Full test suite: 785 pass, 7 pre-existing failures, 0 new regressions.**
+
+**Bootstrap prep for 100+ conversation run:**
+- Script: `scripts/bootstrap-episodic-vine.sh`
+- Chain synced to runtime: `~/Library/Application Support/wire-node/chains/defaults/conversation-episodic.yaml`
+- 5 prompts synced to runtime
+- ~438 main conversations available across all projects (>50KB each)
+- Important: running server binary is v0.2.0 (pre-changes). New HTTP routes (vine composition, reading modes, etc.) require a rebuild via `cargo tauri build` or `cargo run`.
+
+**Total: 29 workstreams shipped, 10 git commits, ~15,000+ lines added.**
 
 ### WS-PROVISIONAL — complete (2026-04-08)
 - Files: `types.rs` (+30 lines: `ProvisionalSession` struct), `db.rs` (+280 lines: `pyramid_provisional_sessions` table + 10 helpers + `save_provisional_node` + `promote_session` + `parse_provisional_session`), `routes.rs` (+130 lines: 4 HTTP routes + 2 body types + 4 handlers)
