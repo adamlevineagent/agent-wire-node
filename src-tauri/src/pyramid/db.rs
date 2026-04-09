@@ -1069,6 +1069,57 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
         ",
     )?;
 
+    // WS-DADBEAR-EXTEND (Phase 2b): DADBEAR source folder watch configuration.
+    // Each row is a watched source path for a pyramid slug. DADBEAR's tick loop
+    // iterates over enabled configs, scans their source directories, and dispatches
+    // ingest records through the build pipeline.
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS pyramid_dadbear_config (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            slug TEXT NOT NULL,
+            source_path TEXT NOT NULL,
+            content_type TEXT NOT NULL CHECK(content_type IN ('code', 'conversation', 'document')),
+            scan_interval_secs INTEGER NOT NULL DEFAULT 10,
+            debounce_secs INTEGER NOT NULL DEFAULT 30,
+            session_timeout_secs INTEGER NOT NULL DEFAULT 1800,
+            batch_size INTEGER NOT NULL DEFAULT 1,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            last_scan_at TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(slug, source_path)
+        );
+        CREATE INDEX IF NOT EXISTS idx_dadbear_config_slug
+            ON pyramid_dadbear_config(slug);
+        CREATE INDEX IF NOT EXISTS idx_dadbear_config_enabled
+            ON pyramid_dadbear_config(slug, enabled);
+        ",
+    )?;
+
+    // ── WS-VINE-UNIFY (Phase 2b): Vine composition table ──────────────────────
+    // Tracks which bedrock pyramids compose each vine pyramid, their ordering,
+    // and the current apex reference for each bedrock.
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS pyramid_vine_compositions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            vine_slug TEXT NOT NULL,
+            bedrock_slug TEXT NOT NULL,
+            position INTEGER NOT NULL,
+            bedrock_apex_node_id TEXT,
+            status TEXT NOT NULL DEFAULT 'active',
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(vine_slug, bedrock_slug)
+        );
+        CREATE INDEX IF NOT EXISTS idx_vine_comp_vine
+            ON pyramid_vine_compositions(vine_slug, status);
+        CREATE INDEX IF NOT EXISTS idx_vine_comp_bedrock
+            ON pyramid_vine_compositions(bedrock_slug);
+        ",
+    )?;
+
     Ok(())
 }
 
@@ -8536,4 +8587,308 @@ fn parse_provisional_session(row: &rusqlite::Row) -> rusqlite::Result<Provisiona
         created_at: row.get("created_at")?,
         updated_at: row.get("updated_at")?,
     })
+}
+
+// ── WS-DADBEAR-EXTEND: Session helper updates flagged by WS-PROVISIONAL ──────
+
+/// Update the file_mtime on a provisional session. Called by the DADBEAR tick
+/// loop when it observes a new mtime for the watched source file.
+pub fn update_session_mtime(conn: &Connection, session_id: &str, mtime: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE pyramid_provisional_sessions
+         SET file_mtime = ?2, updated_at = datetime('now')
+         WHERE session_id = ?1",
+        rusqlite::params![session_id, mtime],
+    )?;
+    Ok(())
+}
+
+/// Update the last_chunk_processed index on a provisional session. Called after
+/// a provisional build processes through chunk N so the next tick picks up from
+/// chunk N+1.
+pub fn update_session_chunk_progress(
+    conn: &Connection,
+    session_id: &str,
+    chunk_index: i64,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE pyramid_provisional_sessions
+         SET last_chunk_processed = ?2, updated_at = datetime('now')
+         WHERE session_id = ?1",
+        rusqlite::params![session_id, chunk_index],
+    )?;
+    Ok(())
+}
+
+// ── WS-DADBEAR-EXTEND: DADBEAR watch config CRUD ─────────────────────────────
+
+/// Column list for SELECT queries on pyramid_dadbear_config.
+/// Note: last_scan_at (col 9) is read but not stored on DadbearWatchConfig;
+/// it's accessed separately by the status endpoint.
+const DADBEAR_CONFIG_COLUMNS: &str =
+    "id, slug, source_path, content_type, scan_interval_secs, debounce_secs, session_timeout_secs, batch_size, enabled, last_scan_at, created_at, updated_at";
+
+/// Parse a row from `pyramid_dadbear_config` into a `DadbearWatchConfig`.
+fn parse_dadbear_config(row: &rusqlite::Row) -> rusqlite::Result<DadbearWatchConfig> {
+    // Column 9 (last_scan_at) is intentionally skipped — it's not on the struct.
+    // The status endpoint reads it via a separate query.
+    let _last_scan_at: Option<String> = row.get(9)?;
+    Ok(DadbearWatchConfig {
+        id: row.get(0)?,
+        slug: row.get(1)?,
+        source_path: row.get(2)?,
+        content_type: row.get(3)?,
+        scan_interval_secs: row.get::<_, i64>(4)? as u64,
+        debounce_secs: row.get::<_, i64>(5)? as u64,
+        session_timeout_secs: row.get::<_, i64>(6)? as u64,
+        batch_size: row.get::<_, i32>(7)? as u32,
+        enabled: row.get::<_, i32>(8)? != 0,
+        created_at: row.get(10)?,
+        updated_at: row.get(11)?,
+    })
+}
+
+/// Insert or update a DADBEAR watch config. Upserts on (slug, source_path).
+pub fn save_dadbear_config(conn: &Connection, config: &DadbearWatchConfig) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO pyramid_dadbear_config
+            (slug, source_path, content_type, scan_interval_secs, debounce_secs,
+             session_timeout_secs, batch_size, enabled)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+         ON CONFLICT(slug, source_path) DO UPDATE SET
+            content_type = excluded.content_type,
+            scan_interval_secs = excluded.scan_interval_secs,
+            debounce_secs = excluded.debounce_secs,
+            session_timeout_secs = excluded.session_timeout_secs,
+            batch_size = excluded.batch_size,
+            enabled = excluded.enabled,
+            updated_at = datetime('now')",
+        rusqlite::params![
+            config.slug,
+            config.source_path,
+            config.content_type,
+            config.scan_interval_secs as i64,
+            config.debounce_secs as i64,
+            config.session_timeout_secs as i64,
+            config.batch_size as i32,
+            config.enabled as i32,
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// Get all DADBEAR watch configs for a slug.
+pub fn get_dadbear_configs(conn: &Connection, slug: &str) -> Result<Vec<DadbearWatchConfig>> {
+    let sql = format!(
+        "SELECT {DADBEAR_CONFIG_COLUMNS} FROM pyramid_dadbear_config
+         WHERE slug = ?1 ORDER BY source_path ASC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params![slug], parse_dadbear_config)?;
+    let mut configs = Vec::new();
+    for row in rows {
+        configs.push(row?);
+    }
+    Ok(configs)
+}
+
+/// Get all enabled DADBEAR watch configs (across all slugs).
+pub fn get_enabled_dadbear_configs(conn: &Connection) -> Result<Vec<DadbearWatchConfig>> {
+    let sql = format!(
+        "SELECT {DADBEAR_CONFIG_COLUMNS} FROM pyramid_dadbear_config
+         WHERE enabled = 1 ORDER BY slug ASC, source_path ASC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([], parse_dadbear_config)?;
+    let mut configs = Vec::new();
+    for row in rows {
+        configs.push(row?);
+    }
+    Ok(configs)
+}
+
+/// Enable DADBEAR for all watch configs of a slug.
+pub fn enable_dadbear_for_slug(conn: &Connection, slug: &str) -> Result<usize> {
+    let count = conn.execute(
+        "UPDATE pyramid_dadbear_config SET enabled = 1, updated_at = datetime('now') WHERE slug = ?1",
+        rusqlite::params![slug],
+    )?;
+    Ok(count)
+}
+
+/// Disable DADBEAR for all watch configs of a slug.
+pub fn disable_dadbear_for_slug(conn: &Connection, slug: &str) -> Result<usize> {
+    let count = conn.execute(
+        "UPDATE pyramid_dadbear_config SET enabled = 0, updated_at = datetime('now') WHERE slug = ?1",
+        rusqlite::params![slug],
+    )?;
+    Ok(count)
+}
+
+/// Update the last_scan_at timestamp for a DADBEAR config row.
+pub fn touch_dadbear_last_scan(conn: &Connection, config_id: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE pyramid_dadbear_config SET last_scan_at = datetime('now'), updated_at = datetime('now') WHERE id = ?1",
+        rusqlite::params![config_id],
+    )?;
+    Ok(())
+}
+
+/// Get a specific DADBEAR config by (slug, source_path).
+pub fn get_dadbear_config(
+    conn: &Connection,
+    slug: &str,
+    source_path: &str,
+) -> Result<Option<DadbearWatchConfig>> {
+    let sql = format!(
+        "SELECT {DADBEAR_CONFIG_COLUMNS} FROM pyramid_dadbear_config
+         WHERE slug = ?1 AND source_path = ?2"
+    );
+    let result = conn
+        .query_row(&sql, rusqlite::params![slug, source_path], parse_dadbear_config)
+        .optional()?;
+    Ok(result)
+}
+
+/// Delete a specific DADBEAR config by (slug, source_path).
+pub fn delete_dadbear_config(conn: &Connection, slug: &str, source_path: &str) -> Result<bool> {
+    let count = conn.execute(
+        "DELETE FROM pyramid_dadbear_config WHERE slug = ?1 AND source_path = ?2",
+        rusqlite::params![slug, source_path],
+    )?;
+    Ok(count > 0)
+}
+
+// ── WS-VINE-UNIFY: Vine composition DB helpers ────────────────────────────────
+
+/// Column list for SELECT queries on pyramid_vine_compositions.
+const VINE_COMP_COLUMNS: &str =
+    "id, vine_slug, bedrock_slug, position, bedrock_apex_node_id, status, created_at, updated_at";
+
+/// Parse a row from `pyramid_vine_compositions` into a `VineComposition`.
+fn parse_vine_composition(row: &rusqlite::Row<'_>) -> rusqlite::Result<VineComposition> {
+    Ok(VineComposition {
+        id: row.get(0)?,
+        vine_slug: row.get(1)?,
+        bedrock_slug: row.get(2)?,
+        position: row.get(3)?,
+        bedrock_apex_node_id: row.get(4)?,
+        status: row.get(5)?,
+        created_at: row.get(6)?,
+        updated_at: row.get(7)?,
+    })
+}
+
+/// Add a bedrock pyramid to a vine at a given position. Inserts or updates
+/// on conflict (reactivates a previously removed bedrock).
+pub fn add_bedrock_to_vine(
+    conn: &Connection,
+    vine_slug: &str,
+    bedrock_slug: &str,
+    position: i32,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO pyramid_vine_compositions (vine_slug, bedrock_slug, position, status)
+         VALUES (?1, ?2, ?3, 'active')
+         ON CONFLICT(vine_slug, bedrock_slug) DO UPDATE SET
+            position = excluded.position,
+            status = 'active',
+            updated_at = datetime('now')",
+        rusqlite::params![vine_slug, bedrock_slug, position],
+    )?;
+    Ok(())
+}
+
+/// Get all bedrocks for a vine, ordered by position ascending. Only returns
+/// active entries by default.
+pub fn get_vine_bedrocks(conn: &Connection, vine_slug: &str) -> Result<Vec<VineComposition>> {
+    let sql = format!(
+        "SELECT {VINE_COMP_COLUMNS} FROM pyramid_vine_compositions
+         WHERE vine_slug = ?1 AND status = 'active'
+         ORDER BY position ASC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map(rusqlite::params![vine_slug], parse_vine_composition)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Update the bedrock_apex_node_id for a specific bedrock within a vine.
+pub fn update_bedrock_apex(
+    conn: &Connection,
+    vine_slug: &str,
+    bedrock_slug: &str,
+    apex_node_id: &str,
+) -> Result<()> {
+    let count = conn.execute(
+        "UPDATE pyramid_vine_compositions
+         SET bedrock_apex_node_id = ?3, updated_at = datetime('now')
+         WHERE vine_slug = ?1 AND bedrock_slug = ?2",
+        rusqlite::params![vine_slug, bedrock_slug, apex_node_id],
+    )?;
+    if count == 0 {
+        return Err(anyhow::anyhow!(
+            "No vine composition found for vine={vine_slug}, bedrock={bedrock_slug}"
+        ));
+    }
+    Ok(())
+}
+
+/// Soft-remove a bedrock from a vine (sets status = 'removed').
+pub fn remove_bedrock_from_vine(
+    conn: &Connection,
+    vine_slug: &str,
+    bedrock_slug: &str,
+) -> Result<()> {
+    let count = conn.execute(
+        "UPDATE pyramid_vine_compositions
+         SET status = 'removed', updated_at = datetime('now')
+         WHERE vine_slug = ?1 AND bedrock_slug = ?2",
+        rusqlite::params![vine_slug, bedrock_slug],
+    )?;
+    if count == 0 {
+        return Err(anyhow::anyhow!(
+            "No vine composition found for vine={vine_slug}, bedrock={bedrock_slug}"
+        ));
+    }
+    Ok(())
+}
+
+/// Get all vine slugs that include a given bedrock (active compositions only).
+pub fn get_vines_for_bedrock(conn: &Connection, bedrock_slug: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT vine_slug FROM pyramid_vine_compositions
+         WHERE bedrock_slug = ?1 AND status = 'active'",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![bedrock_slug], |row| row.get(0))?
+        .collect::<rusqlite::Result<Vec<String>>>()?;
+    Ok(rows)
+}
+
+/// Compact positions for active bedrocks in a vine after a removal.
+/// Reassigns positions 0, 1, 2, ... in current order.
+pub fn reorder_vine_bedrocks(conn: &Connection, vine_slug: &str) -> Result<()> {
+    // Read current active bedrocks in position order
+    let bedrocks: Vec<(i64, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT id, bedrock_slug FROM pyramid_vine_compositions
+             WHERE vine_slug = ?1 AND status = 'active'
+             ORDER BY position ASC",
+        )?;
+        let mapped = stmt.query_map(rusqlite::params![vine_slug], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let collected = mapped.collect::<rusqlite::Result<Vec<_>>>()?;
+        collected
+    };
+    // Reassign sequential positions
+    for (new_pos, (row_id, _)) in bedrocks.iter().enumerate() {
+        conn.execute(
+            "UPDATE pyramid_vine_compositions SET position = ?1, updated_at = datetime('now') WHERE id = ?2",
+            rusqlite::params![new_pos as i32, row_id],
+        )?;
+    }
+    Ok(())
 }

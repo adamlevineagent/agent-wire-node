@@ -1453,3 +1453,59 @@ pub struct ProvisionalSession {
     pub created_at: String,
     pub updated_at: String,
 }
+
+// ── WS-DADBEAR-EXTEND (Phase 2b): DADBEAR watch configuration ───────────────
+
+/// Configuration for DADBEAR's source folder watcher. Each row represents
+/// a watched source path for a given pyramid slug. Stored in
+/// `pyramid_dadbear_config`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DadbearWatchConfig {
+    pub id: i64,
+    pub slug: String,
+    /// Absolute path to the source directory to watch.
+    pub source_path: String,
+    /// Content type of files in this directory (code, conversation, document).
+    pub content_type: String,
+    /// How often (in seconds) DADBEAR scans this source path. Default: 10.
+    pub scan_interval_secs: u64,
+    /// Seconds a file must be stable before provisional build fires. Default: 30.
+    pub debounce_secs: u64,
+    /// Seconds of inactivity on a conversation file before session promotion. Default: 1800 (30 min).
+    pub session_timeout_secs: u64,
+    /// How many pending ingest records to dispatch per tick. Default: 1.
+    pub batch_size: u32,
+    /// Whether this watch config is active.
+    pub enabled: bool,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Status snapshot for a DADBEAR watch config, returned by the status endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DadbearWatchStatus {
+    pub config: DadbearWatchConfig,
+    pub pending_ingests: usize,
+    pub active_sessions: usize,
+    pub last_scan_at: Option<String>,
+}
+
+// ── WS-VINE-UNIFY (Phase 2b): Vine composition tracking ──────────────────────
+
+/// A row from `pyramid_vine_compositions` tracking the relationship between
+/// a vine pyramid and one of its bedrock pyramids.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VineComposition {
+    pub id: i64,
+    pub vine_slug: String,
+    pub bedrock_slug: String,
+    /// Ordering of bedrocks in the vine (0 = leftmost / most recent).
+    pub position: i32,
+    /// Current apex node ID of the bedrock pyramid, updated after each build.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bedrock_apex_node_id: Option<String>,
+    /// active, stale, or removed.
+    pub status: String,
+    pub created_at: String,
+    pub updated_at: String,
+}

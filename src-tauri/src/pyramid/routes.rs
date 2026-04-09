@@ -1739,10 +1739,120 @@ pub fn pyramid_routes(
     let prov = prov_a.or(prov_b).unify().boxed();
     let top22 = top21.or(prov).unify().boxed();
 
+    // ── WS-DADBEAR-EXTEND: DADBEAR watch config management ──
+
+    // POST /pyramid/:slug/dadbear/watch — add/update a watch config
+    let dadbear_watch = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("dadbear"))
+        .and(warp::path("watch"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(warp::body::json())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_dadbear_watch));
+
+    // GET /pyramid/:slug/dadbear/status — current watch configs + scan status
+    let dadbear_status = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("dadbear"))
+        .and(warp::path("status"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_dadbear_status));
+
+    // POST /pyramid/:slug/dadbear/enable — enable DADBEAR for a slug
+    let dadbear_enable = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("dadbear"))
+        .and(warp::path("enable"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_dadbear_enable));
+
+    // POST /pyramid/:slug/dadbear/disable — disable DADBEAR for a slug
+    let dadbear_disable = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("dadbear"))
+        .and(warp::path("disable"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_dadbear_disable));
+
+    // POST /pyramid/:slug/dadbear/trigger — manually trigger a scan+dispatch cycle
+    let dadbear_trigger = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("dadbear"))
+        .and(warp::path("trigger"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_dadbear_trigger));
+
+    // Combine: more-specific paths first
+    let dbd_a = dadbear_watch.or(dadbear_status).unify().boxed();
+    let dbd_b = dadbear_enable.or(dadbear_disable).unify().boxed();
+    let dbd_c = dbd_b.or(dadbear_trigger).unify().boxed();
+    let dbd = dbd_a.or(dbd_c).unify().boxed();
+    let top23 = top22.or(dbd).unify().boxed();
+
+    // ── WS-VINE-UNIFY: Vine composition management ──
+
+    // POST /pyramid/:slug/vine/add-bedrock — add a bedrock to this vine
+    let vine_add_bedrock = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("vine"))
+        .and(warp::path("add-bedrock"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(warp::body::json::<VineAddBedrockBody>())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_vine_add_bedrock));
+
+    // GET /pyramid/:slug/vine/bedrocks — list bedrocks in this vine
+    let vine_bedrocks = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("vine"))
+        .and(warp::path("bedrocks"))
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_vine_bedrocks));
+
+    // DELETE /pyramid/:slug/vine/bedrock/:bedrock_slug — remove bedrock from vine
+    let vine_remove_bedrock = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("vine"))
+        .and(warp::path("bedrock"))
+        .and(warp::path::param::<String>())
+        .and(warp::path::end())
+        .and(warp::delete())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_vine_remove_bedrock));
+
+    // POST /pyramid/:slug/vine/trigger-delta — manually trigger composition delta
+    let vine_trigger_delta = route!(prefix
+        .and(warp::path::param::<String>())
+        .and(warp::path("vine"))
+        .and(warp::path("trigger-delta"))
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(with_auth_state(state.clone()))
+        .and_then(handle_vine_trigger_delta));
+
+    // Longer paths first: add-bedrock, trigger-delta, remove (bedrock/:slug), then bedrocks
+    let vc_a = vine_add_bedrock.or(vine_trigger_delta).unify().boxed();
+    let vc_b = vine_remove_bedrock.or(vine_bedrocks).unify().boxed();
+    let vc = vc_a.or(vc_b).unify().boxed();
+    let top24 = top23.or(vc).unify().boxed();
+
     // public_html is now mounted separately at the server level so it can
     // get a permissive CORS filter (the desktop API allowlist would block
     // form POSTs from the tunnel host).
-    top22
+    top24
 }
 
 /// Mount the post-agents-retro `/p/` web surface routes. These are
@@ -7139,4 +7249,347 @@ async fn handle_provisional_promote(
             &e.to_string(),
         )),
     }
+}
+
+// ── WS-DADBEAR-EXTEND: DADBEAR management routes ─────────────────────────────
+
+/// Request body for POST /pyramid/:slug/dadbear/watch
+#[derive(Debug, Deserialize)]
+struct DadbearWatchBody {
+    source_path: String,
+    content_type: String,
+    #[serde(default = "default_scan_interval")]
+    scan_interval_secs: u64,
+    #[serde(default = "default_debounce")]
+    debounce_secs: u64,
+    #[serde(default = "default_session_timeout")]
+    session_timeout_secs: u64,
+    #[serde(default = "default_batch_size")]
+    batch_size: u32,
+    #[serde(default = "default_enabled")]
+    enabled: bool,
+}
+
+fn default_scan_interval() -> u64 { 10 }
+fn default_debounce() -> u64 { 30 }
+fn default_session_timeout() -> u64 { 1800 }
+fn default_batch_size() -> u32 { 1 }
+fn default_enabled() -> bool { true }
+
+/// POST /pyramid/:slug/dadbear/watch — add or update a DADBEAR watch config.
+async fn handle_dadbear_watch(
+    slug_name: String,
+    body: DadbearWatchBody,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    // Validate content type
+    if ContentType::from_str(&body.content_type).is_none() {
+        return Ok(json_error(
+            warp::http::StatusCode::BAD_REQUEST,
+            &format!("Invalid content_type: {}. Must be one of: code, conversation, document", body.content_type),
+        ));
+    }
+
+    let config = super::types::DadbearWatchConfig {
+        id: 0,
+        slug: slug_name.clone(),
+        source_path: body.source_path.clone(),
+        content_type: body.content_type.clone(),
+        scan_interval_secs: body.scan_interval_secs,
+        debounce_secs: body.debounce_secs,
+        session_timeout_secs: body.session_timeout_secs,
+        batch_size: body.batch_size,
+        enabled: body.enabled,
+        created_at: String::new(),
+        updated_at: String::new(),
+    };
+
+    let _lock = super::lock_manager::LockManager::global()
+        .write(&slug_name)
+        .await;
+    let conn = state.writer.lock().await;
+
+    match db::save_dadbear_config(&conn, &config) {
+        Ok(_id) => Ok(json_ok(&serde_json::json!({
+            "slug": slug_name,
+            "source_path": body.source_path,
+            "status": "saved",
+        }))),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
+    }
+}
+
+/// GET /pyramid/:slug/dadbear/status — current watch configs + scan status.
+async fn handle_dadbear_status(
+    slug_name: String,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let db_path = match &state.data_dir {
+        Some(d) => d.join("pyramid.db").to_str().unwrap_or_default().to_string(),
+        None => {
+            return Ok(json_error(
+                warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "data_dir not configured",
+            ))
+        }
+    };
+
+    match super::dadbear_extend::get_status_for_slug(&db_path, &slug_name) {
+        Ok(statuses) => Ok(json_ok(&serde_json::json!({
+            "slug": slug_name,
+            "watch_configs": statuses,
+        }))),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
+    }
+}
+
+/// POST /pyramid/:slug/dadbear/enable — enable DADBEAR for a slug.
+async fn handle_dadbear_enable(
+    slug_name: String,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let _lock = super::lock_manager::LockManager::global()
+        .write(&slug_name)
+        .await;
+    let conn = state.writer.lock().await;
+
+    match db::enable_dadbear_for_slug(&conn, &slug_name) {
+        Ok(count) => Ok(json_ok(&serde_json::json!({
+            "slug": slug_name,
+            "enabled_configs": count,
+        }))),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
+    }
+}
+
+/// POST /pyramid/:slug/dadbear/disable — disable DADBEAR for a slug.
+async fn handle_dadbear_disable(
+    slug_name: String,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let _lock = super::lock_manager::LockManager::global()
+        .write(&slug_name)
+        .await;
+    let conn = state.writer.lock().await;
+
+    match db::disable_dadbear_for_slug(&conn, &slug_name) {
+        Ok(count) => Ok(json_ok(&serde_json::json!({
+            "slug": slug_name,
+            "disabled_configs": count,
+        }))),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
+    }
+}
+
+/// POST /pyramid/:slug/dadbear/trigger — manually trigger a scan+dispatch cycle.
+async fn handle_dadbear_trigger(
+    slug_name: String,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let db_path = match &state.data_dir {
+        Some(d) => d.join("pyramid.db").to_str().unwrap_or_default().to_string(),
+        None => {
+            return Ok(json_error(
+                warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "data_dir not configured",
+            ))
+        }
+    };
+
+    match super::dadbear_extend::trigger_for_slug(&db_path, &slug_name, &state.build_event_bus)
+        .await
+    {
+        Ok(result) => Ok(json_ok(&result)),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
+    }
+}
+
+// ── WS-VINE-UNIFY: Vine composition route handlers ────────────────────────────
+
+/// Request body for POST /pyramid/:slug/vine/add-bedrock
+#[derive(Debug, Deserialize)]
+struct VineAddBedrockBody {
+    bedrock_slug: String,
+    #[serde(default)]
+    position: Option<i32>,
+}
+
+/// POST /pyramid/:slug/vine/add-bedrock — register a bedrock in this vine.
+/// If position is omitted, appends as the next position after the current max.
+async fn handle_vine_add_bedrock(
+    vine_slug: String,
+    body: VineAddBedrockBody,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    if body.bedrock_slug.is_empty() {
+        return Ok(json_error(
+            warp::http::StatusCode::BAD_REQUEST,
+            "bedrock_slug is required",
+        ));
+    }
+    if body.bedrock_slug == vine_slug {
+        return Ok(json_error(
+            warp::http::StatusCode::BAD_REQUEST,
+            "A pyramid cannot be a bedrock of itself",
+        ));
+    }
+
+    let _lock = super::lock_manager::LockManager::global()
+        .write(&vine_slug)
+        .await;
+
+    let position = match body.position {
+        Some(p) => p,
+        None => {
+            // Auto-assign: one past the current max position
+            let conn = state.reader.lock().await;
+            let bedrocks = db::get_vine_bedrocks(&conn, &vine_slug)
+                .unwrap_or_default();
+            bedrocks.iter().map(|b| b.position).max().unwrap_or(-1) + 1
+        }
+    };
+
+    let conn = state.writer.lock().await;
+    match db::add_bedrock_to_vine(&conn, &vine_slug, &body.bedrock_slug, position) {
+        Ok(()) => Ok(json_ok(&serde_json::json!({
+            "vine_slug": vine_slug,
+            "bedrock_slug": body.bedrock_slug,
+            "position": position,
+            "status": "active",
+        }))),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
+    }
+}
+
+/// GET /pyramid/:slug/vine/bedrocks — list all active bedrocks in this vine.
+async fn handle_vine_bedrocks(
+    vine_slug: String,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let conn = state.reader.lock().await;
+    match db::get_vine_bedrocks(&conn, &vine_slug) {
+        Ok(bedrocks) => Ok(json_ok(&bedrocks)),
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &e.to_string(),
+        )),
+    }
+}
+
+/// DELETE /pyramid/:slug/vine/bedrock/:bedrock_slug — remove a bedrock from a vine.
+async fn handle_vine_remove_bedrock(
+    vine_slug: String,
+    bedrock_slug: String,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let _lock = super::lock_manager::LockManager::global()
+        .write(&vine_slug)
+        .await;
+
+    let conn = state.writer.lock().await;
+    match db::remove_bedrock_from_vine(&conn, &vine_slug, &bedrock_slug) {
+        Ok(()) => {
+            // Compact positions after removal
+            let _ = db::reorder_vine_bedrocks(&conn, &vine_slug);
+            Ok(json_ok(&serde_json::json!({
+                "vine_slug": vine_slug,
+                "bedrock_slug": bedrock_slug,
+                "status": "removed",
+            })))
+        }
+        Err(e) => Ok(json_error(
+            warp::http::StatusCode::NOT_FOUND,
+            &e.to_string(),
+        )),
+    }
+}
+
+/// POST /pyramid/:slug/vine/trigger-delta — manually trigger composition delta
+/// for all bedrocks in this vine. Reads each bedrock's current apex and fires
+/// notify_vine_of_bedrock_completion for each.
+async fn handle_vine_trigger_delta(
+    vine_slug: String,
+    state: Arc<PyramidState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    use super::vine_composition;
+
+    // Get all bedrocks for this vine
+    let bedrocks = {
+        let conn = state.reader.lock().await;
+        match db::get_vine_bedrocks(&conn, &vine_slug) {
+            Ok(b) => b,
+            Err(e) => {
+                return Ok(json_error(
+                    warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    &e.to_string(),
+                ))
+            }
+        }
+    };
+
+    if bedrocks.is_empty() {
+        return Ok(json_ok(&serde_json::json!({
+            "vine_slug": vine_slug,
+            "triggered": 0,
+            "message": "No active bedrocks in this vine",
+        })));
+    }
+
+    let mut triggered = Vec::new();
+    let mut errors = Vec::new();
+
+    for bedrock in &bedrocks {
+        // Look up the current apex of the bedrock pyramid
+        let apex = {
+            let conn = state.reader.lock().await;
+            query::get_apex(&conn, &bedrock.bedrock_slug)
+        };
+
+        match apex {
+            Ok(Some(apex_node)) => {
+                match vine_composition::notify_vine_of_bedrock_completion(
+                    &state,
+                    &bedrock.bedrock_slug,
+                    "manual-trigger",
+                    &apex_node.id,
+                )
+                .await
+                {
+                    Ok(notified) => triggered.extend(notified),
+                    Err(e) => errors.push(format!("{}: {}", bedrock.bedrock_slug, e)),
+                }
+            }
+            Ok(None) => {
+                errors.push(format!("{}: no apex node found", bedrock.bedrock_slug));
+            }
+            Err(e) => {
+                errors.push(format!("{}: {}", bedrock.bedrock_slug, e));
+            }
+        }
+    }
+
+    Ok(json_ok(&serde_json::json!({
+        "vine_slug": vine_slug,
+        "triggered": triggered.len(),
+        "triggered_vines": triggered,
+        "errors": errors,
+    })))
 }

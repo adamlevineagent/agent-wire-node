@@ -114,9 +114,9 @@ These resolve the 16 questions asked before Phase 1 full dispatch. Treat as norm
 - [x] WS-IMMUTABILITY-ENFORCE — **complete + verified** (2026-04-09). Immutability guards in `save_node` + `apply_supersession` (reject canonical L0/L1). `promote_provisional_node` helper. `POST /nodes/:node_id/promote` route. 5 tests. Verifier fixed 2 pre-existing tests (depth 0→2).
 
 ### Phase 2b — Parallel after 2a
-- [x] WS-PROVISIONAL — **complete** (2026-04-08). Depends on SCHEMA-V2 + CONCURRENCY + EVENTS + IMMUTABILITY-ENFORCE (all complete).
+- [x] WS-PROVISIONAL — **complete + verified** (2026-04-09). Session table, 7 DB helpers, save_provisional_node, promote_session, 4 HTTP routes, 5 tests. Verifier added missing SlopeChanged emission on promote. Git: `244869a`.
 - [ ] WS-DADBEAR-EXTEND — depends on CHAIN-INVOKE + PROVISIONAL + EVENTS
-- [ ] WS-VINE-UNIFY — depends on CHAIN-INVOKE + DADBEAR-EXTEND (NOTE: do NOT modify `vine.rs` per Q2)
+- [x] WS-VINE-UNIFY — **complete** (2026-04-08). New `vine_composition.rs` module, `pyramid_vine_compositions` table, 6 DB helpers, `VineComposition` type, `notify_vine_of_bedrock_completion` (LockManager child-then-parent, DeltaLanded + SlopeChanged events), 4 HTTP routes (add-bedrock, list bedrocks, remove bedrock, trigger-delta), 5 tests all passing. BLOCKER-02 resolved (field already existed). `vine.rs` NOT modified per Q2.
 
 ### Phase 3 — Parallel after 2b (mostly)
 - [ ] WS-EM-CHAIN — depends on SCHEMA-V2 + AUDIENCE-CONTRACT + PRIMER + CHAIN-INVOKE + VINE-UNIFY
@@ -162,7 +162,7 @@ Three of five verified workstreams (WS-CONCURRENCY, WS-AUDIENCE-CONTRACT, WS-COS
 
 ### BLOCKER-02: `PyramidState.vine_builds: HashMap` does not exist
 - **Found by**: WS-CONCURRENCY verifier
-- **Status**: FLAGGED — outside WS-CONCURRENCY scope
+- **Status**: **RESOLVED by WS-VINE-UNIFY** (2026-04-08). The field `vine_builds: Arc<Mutex<HashMap<String, VineBuildHandle>>>` already exists at mod.rs:679, is cloned in `with_build_reader` at line 740, and is used by the legacy vine build handlers in routes.rs. The WS-CONCURRENCY verifier was apparently working from a stale view when they flagged it. The new composition mechanism (WS-VINE-UNIFY) uses `LockManager` + the `pyramid_vine_compositions` table rather than in-memory `VineBuildHandle` tracking, so this field is irrelevant to the new path.
 - **Description**: WS-CONCURRENCY implementer cited this field as the reason for not adding a parent-wide vine lock at `build_vine`. The field doesn't exist. A concurrency gap may exist on the whole-vine build path.
 - **Owner**: WS-VINE-UNIFY or whoever touches vine builds next. Flag for that workstream's dispatch.
 
