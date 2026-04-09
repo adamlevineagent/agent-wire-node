@@ -55,6 +55,7 @@ pub const VALID_PRIMITIVES: &[&str] = &[
     "gate",
     // Recipe primitives
     "recursive_decompose",
+    "build_lifecycle",
     "evidence_loop",
     "cross_build_input",
     "process_gaps",
@@ -458,7 +459,7 @@ pub fn validate_chain(def: &ChainDefinition) -> ValidationResult {
         );
         let recipe = matches!(
             step.primitive.as_str(),
-            "cross_build_input" | "evidence_loop" | "process_gaps" | "recursive_decompose"
+            "build_lifecycle" | "cross_build_input" | "evidence_loop" | "process_gaps" | "recursive_decompose"
         );
         let is_invoke = step.invoke_chain.is_some();
         if !step.mechanical && !orchestration && !recipe && !is_invoke && step.instruction.is_none() && step.instruction_from.is_none() {

@@ -4237,6 +4237,8 @@ pub async fn execute_chain_from(
             execute_cross_build_input(state, step, &mut ctx, slug).await
         } else if step.primitive == "recursive_decompose" {
             execute_recursive_decompose(state, step, &mut ctx, slug, cancel).await
+        } else if step.primitive == "build_lifecycle" {
+            execute_build_lifecycle(state, step, &mut ctx, slug).await
         } else if step.primitive == "evidence_loop" {
             execute_evidence_loop(state, step, &mut ctx, slug, cancel, &progress_tx, &layer_tx, &mut done, total).await
         } else if step.primitive == "process_gaps" {
@@ -4751,7 +4753,85 @@ async fn execute_recursive_decompose(
     Ok(tree_json)
 }
 
-// ── Recipe primitives: evidence_loop, process_gaps ───────────────────────────
+// ── Recipe primitives: build_lifecycle, evidence_loop, process_gaps ───────────
+
+/// Pre-evidence lifecycle: supersede old L1+ overlay nodes so downstream
+/// steps (evidence_loop, webbing, synthesis) work against a clean slate.
+/// Runs unconditionally — evidence_mode does not affect this.
+async fn execute_build_lifecycle(
+    state: &PyramidState,
+    step: &ChainStep,
+    ctx: &mut ChainContext,
+    slug: &str,
+) -> Result<Value> {
+    let resolved_input = ctx.resolve_value(
+        step.input.as_ref().unwrap_or(&serde_json::json!({})),
+    )?;
+
+    let load_prior_state_val = resolved_input.get("load_prior_state")
+        .cloned()
+        .or_else(|| ctx.resolve_ref("$load_prior_state").ok())
+        .unwrap_or(serde_json::json!({}));
+
+    let build_id = resolved_input.get("build_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| ctx.resolve_ref("$build_id").ok().and_then(|v| v.as_str().map(|s| s.to_string())))
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let has_overlay = load_prior_state_val.get("has_overlay")
+        .and_then(|v| v.as_bool())
+        .or_else(|| ctx.resolve_ref("$load_prior_state.has_overlay").ok().and_then(|v| v.as_bool()))
+        .unwrap_or(false);
+
+    if has_overlay {
+        // Delta path: supersede existing overlay apex nodes
+        let existing_answers_val = load_prior_state_val.get("overlay_answers")
+            .cloned()
+            .or_else(|| ctx.resolve_ref("$load_prior_state.overlay_answers").ok())
+            .unwrap_or(Value::Array(vec![]));
+        let existing_answers: Vec<super::types::PyramidNode> =
+            serde_json::from_value(existing_answers_val)?;
+        let max_overlay_depth = existing_answers.iter().map(|n| n.depth).max().unwrap_or(0);
+        if max_overlay_depth > 0 {
+            let conn = state.writer.clone();
+            let slug_owned = slug.to_string();
+            let overlay_build_id = build_id.clone();
+            let depth_threshold = max_overlay_depth;
+            tokio::task::spawn_blocking(move || {
+                let c = conn.blocking_lock();
+                c.execute(
+                    "UPDATE pyramid_nodes SET superseded_by = ?3
+                     WHERE slug = ?1 AND depth >= ?2 AND build_id LIKE 'qb-%' AND superseded_by IS NULL",
+                    rusqlite::params![slug_owned, depth_threshold, overlay_build_id],
+                )?;
+                Ok::<(), anyhow::Error>(())
+            })
+            .await
+            .map_err(|e| anyhow!("Delta overlay cleanup panicked: {e}"))??;
+        }
+        info!(slug, "build_lifecycle: delta path — old apex superseded");
+    } else {
+        // Fresh path: supersede all prior L1+ overlay nodes
+        let conn = state.writer.clone();
+        let slug_owned = slug.to_string();
+        let overlay_build_id = build_id.clone();
+        tokio::task::spawn_blocking(move || {
+            let c = conn.blocking_lock();
+            db::supersede_nodes_above(&c, &slug_owned, 0, &overlay_build_id)?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .map_err(|e| anyhow!("Overlay cleanup panicked: {e}"))??;
+        info!(slug, "build_lifecycle: fresh path — all prior L1+ nodes superseded");
+    }
+
+    Ok(serde_json::json!({
+        "build_id": build_id,
+        "has_overlay": has_overlay,
+        "cleanup_complete": true,
+    }))
+}
 
 /// Orchestrate per-layer evidence answering for a question pyramid.
 /// Wraps the evidence loop from build_runner.rs: pre-map, answer, persist, reconcile per layer.
@@ -4884,72 +4964,13 @@ async fn execute_evidence_loop(
         .map_err(|e| anyhow!("Build start save panicked: {e}"))??;
     }
 
-    // ── 3. Overlay cleanup ──────────────────────────────────────────────
+    // ── 3. Overlay cleanup: now handled by build_lifecycle primitive ────
+    // (runs unconditionally before evidence_loop in the chain YAML)
+    // Read has_overlay flag (still needed for delta vs fresh logic in evidence answering)
     let has_overlay = load_prior_state_val.get("has_overlay")
         .and_then(|v| v.as_bool())
         .or_else(|| ctx.resolve_ref("$load_prior_state.has_overlay").ok().and_then(|v| v.as_bool()))
         .unwrap_or(false);
-
-    if has_overlay {
-        // Delta path: supersede existing overlay apex nodes
-        let existing_answers_val = load_prior_state_val.get("overlay_answers")
-            .cloned()
-            .or_else(|| ctx.resolve_ref("$load_prior_state.overlay_answers").ok())
-            .unwrap_or(Value::Array(vec![]));
-        let existing_answers: Vec<super::types::PyramidNode> =
-            serde_json::from_value(existing_answers_val)?;
-        let max_overlay_depth = existing_answers.iter().map(|n| n.depth).max().unwrap_or(0);
-        if max_overlay_depth > 0 {
-            let conn = state.writer.clone();
-            let slug_owned = slug.to_string();
-            let overlay_build_id = build_id.clone();
-            let depth_threshold = max_overlay_depth;
-            tokio::task::spawn_blocking(move || {
-                let c = conn.blocking_lock();
-                c.execute(
-                    "UPDATE pyramid_nodes SET superseded_by = ?3
-                     WHERE slug = ?1 AND depth >= ?2 AND build_id LIKE 'qb-%' AND superseded_by IS NULL",
-                    rusqlite::params![slug_owned, depth_threshold, overlay_build_id],
-                )?;
-                Ok::<(), anyhow::Error>(())
-            })
-            .await
-            .map_err(|e| anyhow!("Delta overlay cleanup panicked: {e}"))??;
-        }
-        info!(slug, "delta path — old apex superseded, shared answers preserved");
-    } else {
-        // Fresh path: supersede all prior L1+ overlay nodes
-        let conn = state.writer.clone();
-        let slug_owned = slug.to_string();
-        let overlay_build_id = build_id.clone();
-        tokio::task::spawn_blocking(move || {
-            let c = conn.blocking_lock();
-            db::supersede_nodes_above(&c, &slug_owned, 0, &overlay_build_id)?;
-            Ok::<(), anyhow::Error>(())
-        })
-        .await
-        .map_err(|e| anyhow!("Overlay cleanup panicked: {e}"))??;
-        info!(slug, "fresh path — all prior L1+ nodes superseded");
-    }
-
-    // ── 3b. Check evidence_mode — skip LLM-heavy work in fast/skip mode ──
-    let evidence_mode_val = resolved_input.get("mode")
-        .cloned()
-        .or_else(|| ctx.resolve_ref("$evidence_mode").ok())
-        .unwrap_or(Value::String("deep".to_string()));
-    let evidence_mode = evidence_mode_val.as_str().unwrap_or("deep");
-
-    if evidence_mode == "skip" || evidence_mode == "fast" {
-        info!(slug, evidence_mode, "evidence_mode is '{}' — overlay cleanup done, skipping LLM evidence grounding", evidence_mode);
-        return Ok(serde_json::json!({
-            "build_id": build_id,
-            "evidence_mode": evidence_mode,
-            "skipped_evidence": true,
-            "total_nodes": 0,
-            "layers_completed": 0,
-            "max_layer": max_layer,
-        }));
-    }
 
     // ── 4. Load L0 nodes ────────────────────────────────────────────────
     let l0_nodes = if is_cross_slug {

@@ -1,9 +1,9 @@
 schema_version: 1
-id: question-pipeline
-name: Question Pipeline
-description: "Extract-first question-driven knowledge pyramid. Generic L0 → web → decompose → evidence → gaps."
-content_type: question
-version: "2.0.0"
+id: conversation-chronological
+name: "Conversation — Chronological L0 + Question Pipeline"
+description: "Question pipeline with L0 extraction expanded into forward + reverse + combine multi-pass for chronological conversation sources."
+content_type: conversation
+version: "1.0.0"
 author: "wire-node"
 
 defaults:
@@ -17,24 +17,36 @@ steps:
     primitive: cross_build_input
     save_as: step_only
 
-  # ── Phase 1: Generic L0 extraction (first question only) ───────────
-  # Content-type neutral. Same dehydration-friendly schema as document
-  # pipeline. Produces headline / orientation / topics[summary, current,
-  # entities] — multiple summary levels for downstream dehydration.
-  - name: source_extract
+  # ── Phase 1A: FORWARD pass (intermediate, step_only) ───────────────
+  # Sequentially walks chunks earliest → latest. Each chunk sees a
+  # rolling running_context summarizing everything earlier in the
+  # session, and rewrites it to fold in the current chunk. This is the
+  # "lived experience" reading.
+  #
+  # NO `when: l0_count == 0` gate (per chain-binding-v2.6 §9.2): if a
+  # prior run crashed mid-combine, l0_count is still 0 but
+  # ctx.step_outputs is empty on resume. Always re-running forward_pass
+  # guarantees combine_l0 has non-empty inputs. Hash-based invalidation
+  # in pyramid_pipeline_steps still short-circuits unchanged chunks.
+  - name: forward_pass
     primitive: extract
-    instruction: "$prompts/question/source_extract.md"
-    instruction_map:
-      content_type:conversation: "$prompts/conversation/source_extract_v2.md"
+    instruction: "$prompts/conversation-chronological/forward.md"
     for_each: "$chunks"
-    when: "$load_prior_state.l0_count == 0"
-    dispatch_order: "largest_first"
-    concurrency: 10
-    node_id_pattern: "Q-L0-{index:03}"
+    sequential: true
+    accumulate:
+      running_context:
+        from: "$item.output.running_context"
+        init: ""
+        max_chars: 4000
+    input:
+      chunk: "$item.content"
+      chunk_index: "$item.index"
+      running_context: "$running_context"
+    node_id_pattern: "FWD-{index:03}"
     depth: 0
-    save_as: node
+    save_as: step_only
     max_input_tokens: 80000
-    split_strategy: "sections"
+    split_strategy: "lines"
     split_overlap_tokens: 500
     split_merge: true
     merge_instruction: "$prompts/shared/merge_sub_chunks.md"
@@ -43,15 +55,97 @@ steps:
     heal_instruction: "$prompts/shared/heal_json.md"
     model_tier: extractor
 
-  # ── Phase 2: L0 webbing (first question only) ──────────────────────
-  # Build corpus structure map before decomposition. Token-aware
-  # dehydration only strips fields when content exceeds the budget.
-  # Web edges inform decompose about thematic boundaries in the corpus.
+  # ── Phase 1B: REVERSE pass (intermediate, step_only) ───────────────
+  # Sequentially walks chunks latest → earliest using for_each_reverse.
+  # Each chunk sees a rolling running_context summarizing what happens
+  # AFTER it. This is the hindsight reading: what turned out to matter,
+  # what got revised, what dead-ended.
+  #
+  # Items keep their original `index` field through reversal so the
+  # zip_steps lookup in combine_l0 (with reverse: true) finds the
+  # correct pair, and resume keys remain stable.
+  - name: reverse_pass
+    primitive: extract
+    instruction: "$prompts/conversation-chronological/reverse.md"
+    for_each: "$chunks"
+    for_each_reverse: true
+    sequential: true
+    accumulate:
+      running_context:
+        from: "$item.output.running_context"
+        init: ""
+        max_chars: 4000
+    input:
+      chunk: "$item.content"
+      chunk_index: "$item.index"
+      running_context: "$running_context"
+    node_id_pattern: "REV-{index:03}"
+    depth: 0
+    save_as: step_only
+    max_input_tokens: 80000
+    split_strategy: "lines"
+    split_overlap_tokens: 500
+    split_merge: true
+    merge_instruction: "$prompts/shared/merge_sub_chunks.md"
+    on_error: "retry(3)"
+    on_parse_error: "heal"
+    heal_instruction: "$prompts/shared/heal_json.md"
+    model_tier: extractor
+
+  # ── Phase 1C: COMBINE → L0 nodes (the actual L0 step) ──────────────
+  # Sequential per chain-binding-v2.6 §8.3: zip_steps reads
+  # ctx.current_index, which the sequential for_each loop sets per
+  # iteration. Concurrent dispatch is not yet verified to propagate
+  # per-task current_index, and combine is cheap relative to forward/
+  # reverse, so sequential is the safe choice.
+  #
+  # Output schema MUST match the question pipeline L0 contract emitted
+  # by chains/prompts/question/source_extract.md (headline / orientation
+  # / topics[name, summary, current, entities, corrections, decisions])
+  # so downstream l0_webbing, decompose, and evidence_loop can consume
+  # the nodes. The combine prompt folds the chronological signals
+  # (turning points, dead ends, fate, corrections) into topic fields
+  # without breaking the schema.
+  #
+  # `when` gate IS correct on combine_l0: if L0 already exists, the
+  # prior run completed combine and there's nothing to do.
+  #
+  # node_id_pattern matches question.yaml's source_extract pattern so
+  # downstream phases find these nodes by the same naming convention.
+  - name: combine_l0
+    primitive: extract
+    instruction: "$prompts/conversation-chronological/combine.md"
+    for_each: "$chunks"
+    sequential: true
+    when: "$load_prior_state.l0_count == 0"
+    input:
+      chunk: "$item.content"
+      chunk_index: "$item.index"
+      zip_steps:
+        - forward_pass
+        - step: reverse_pass
+          reverse: true
+    node_id_pattern: "Q-L0-{index:03}"
+    depth: 0
+    save_as: node
+    max_input_tokens: 120000
+    split_strategy: "lines"
+    split_overlap_tokens: 500
+    split_merge: true
+    merge_instruction: "$prompts/shared/merge_sub_chunks.md"
+    on_error: "retry(3)"
+    on_parse_error: "heal"
+    heal_instruction: "$prompts/shared/heal_json.md"
+    model_tier: extractor
+
+  # ── Phase 2: L0 webbing ────────────────────────────────────────────
+  # Identical to question.yaml except input reads $combine_l0 instead
+  # of $source_extract.
   - name: l0_webbing
     primitive: web
     instruction: "$prompts/question/question_web.md"
     input:
-      nodes: "$source_extract"
+      nodes: "$combine_l0"
     max_input_tokens: 80000
     batch_size: 50
     concurrency: 4
@@ -92,18 +186,11 @@ steps:
     when: "$load_prior_state.l0_count == 0"
 
   # ── Phase 3: Refresh state after extraction ─────────────────────────
-  # Re-runs cross_build_input to pick up L0 nodes and web edges created
-  # by source_extract + l0_webbing. Provides populated l0_summary for
-  # enhance and decompose. Always runs (cheap DB read, not LLM call).
   - name: refresh_state
     primitive: cross_build_input
     save_as: step_only
 
   # ── Phase 4: Question-driven decomposition ──────────────────────────
-  # Now informed by real L0 content (via refresh_state.l0_summary and
-  # L0 nodes in DB). Decompose sees actual extracted content, not just
-  # $characterize. Cannot ask about absent topics.
-
   - name: enhance_question
     primitive: extract
     instruction: "$prompts/question/enhance_question.md"
@@ -151,9 +238,6 @@ steps:
       - drop: existing_answers
     save_as: step_only
 
-  # Both decompose and decompose_delta write to $decomposed_tree (canonical alias).
-  # Downstream steps use $decomposed_tree so they work regardless of which path ran.
-
   - name: extraction_schema
     primitive: extract
     instruction: "$prompts/question/extraction_schema.md"
@@ -173,7 +257,6 @@ steps:
     save_as: step_only
 
   # ── Phase 5: Evidence answering ─────────────────────────────────────
-  # Skipped when evidence_mode != "deep".
   - name: evidence_loop
     primitive: evidence_loop
     when: '$evidence_mode == "deep"'
@@ -194,9 +277,6 @@ steps:
     save_as: step_only
 
   # ── Phase 6: Cross-cutting webbing ──────────────────────────────────
-  # Web sibling answer nodes at each depth level. Finds connections
-  # the question tree hierarchy misses.
-
   - name: l1_webbing
     primitive: web
     instruction: "$prompts/question/question_web.md"

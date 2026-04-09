@@ -168,9 +168,18 @@ steps:
     max_input_tokens: 80000
     save_as: step_only
 
+  # ── Phase 4b: Build lifecycle (overlay cleanup) ─────────────────────
+  - name: build_lifecycle
+    primitive: build_lifecycle
+    input:
+      build_id: "$build_id"
+      load_prior_state: "$refresh_state"
+    save_as: step_only
+
   # ── Phase 5: Evidence answering ─────────────────────────────────────
   - name: evidence_loop
     primitive: evidence_loop
+    when: '$evidence_mode == "deep"'
     input:
       question_tree: "$decomposed_tree"
       extraction_schema: "$extraction_schema"
@@ -181,6 +190,7 @@ steps:
 
   - name: gap_processing
     primitive: process_gaps
+    when: '$evidence_mode == "deep"'
     input:
       evidence_loop: "$evidence_loop"
       load_prior_state: "$refresh_state"

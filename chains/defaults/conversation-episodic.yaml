@@ -257,12 +257,21 @@ steps:
     max_input_tokens: 80000
     save_as: step_only
 
+  # ── Phase 4b: Build lifecycle (overlay cleanup) ─────────────────────
+  # Supersedes old L1+ nodes before evidence/synthesis. Runs unconditionally.
+  - name: build_lifecycle
+    primitive: build_lifecycle
+    input:
+      build_id: "$build_id"
+      load_prior_state: "$refresh_state"
+    save_as: step_only
+
   # ── Phase 5: Evidence answering ─────────────────────────────────────
   # Grounds each phase's narrative in specific L0 nodes via
-  # KEEP/MISSING/DISCONNECT verdicts. Produces L1 segment nodes with
-  # citation provenance.
+  # KEEP/MISSING/DISCONNECT verdicts. Skipped when evidence_mode != "deep".
   - name: evidence_loop
     primitive: evidence_loop
+    when: '$evidence_mode == "deep"'
     input:
       question_tree: "$decomposed_tree"
       extraction_schema: "$extraction_schema"
@@ -273,6 +282,7 @@ steps:
 
   - name: gap_processing
     primitive: process_gaps
+    when: '$evidence_mode == "deep"'
     input:
       evidence_loop: "$evidence_loop"
       load_prior_state: "$refresh_state"
