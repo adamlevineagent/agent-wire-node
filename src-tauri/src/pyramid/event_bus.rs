@@ -84,6 +84,28 @@ pub enum TaggedKind {
         status: String,
         elapsed_seconds: f64,
     },
+
+    // ── Phase 4: Config Contribution Foundation ──────────────────────────
+    /// Emitted by `config_contributions::sync_config_to_operational()`
+    /// after a contribution successfully lands in its operational table.
+    /// Consumed by Phase 13's build viz expansion. Phase 4 just emits it;
+    /// no consumer exists yet.
+    ///
+    /// Outer `slug` on the `TaggedBuildEvent` envelope is the
+    /// contribution's slug (empty string for global configs — the outer
+    /// envelope requires a String, so global configs use "").
+    ConfigSynced {
+        /// Pyramid slug the contribution scopes to, or `None` for
+        /// global configs.
+        slug: Option<String>,
+        /// `schema_type` discriminator — one of the 14 Phase 4 types.
+        schema_type: String,
+        /// Contribution UUID that was activated.
+        contribution_id: String,
+        /// Prior active contribution_id for this (slug, schema_type),
+        /// if any. `None` on v1.
+        prior_contribution_id: Option<String>,
+    },
 }
 
 impl TaggedKind {
