@@ -932,6 +932,89 @@ fields:
         assert_eq!(cost, 0.0);
     }
 
+    /// Wanderer guard: the shipped `chains/schemas/dadbear.schema.yaml`
+    /// must have the same field names as the real `DadbearPolicyYaml`
+    /// struct in `db.rs`. If someone renames a field in one place and
+    /// not the other, the renderer will show empty editors for
+    /// non-matching fields when Phase 10 wires it to a live policy.
+    /// This test pins the contract by parsing the seed file and
+    /// checking every expected key is present.
+    #[test]
+    fn test_seed_dadbear_annotation_matches_real_policy_fields() {
+        let seed_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("crate parent must exist")
+            .join("chains/schemas/dadbear.schema.yaml");
+        let body = std::fs::read_to_string(&seed_path)
+            .expect("seed dadbear annotation should exist");
+        let parsed: SchemaAnnotation = serde_yaml::from_str(&body)
+            .expect("seed dadbear annotation should parse");
+        assert_eq!(parsed.applies_to.as_deref(), Some("dadbear_policy"));
+        // Every field name below must exist in `DadbearPolicyYaml` in
+        // `pyramid::db`. Keep this list in sync if the struct changes.
+        let expected: &[&str] = &[
+            "source_path",
+            "content_type",
+            "scan_interval_secs",
+            "debounce_secs",
+            "session_timeout_secs",
+            "batch_size",
+            "enabled",
+        ];
+        for key in expected {
+            assert!(
+                parsed.fields.contains_key(*key),
+                "dadbear annotation is missing field `{key}` that exists on DadbearPolicyYaml"
+            );
+        }
+        // No stale fields that DadbearPolicyYaml doesn't have.
+        let allowed: std::collections::HashSet<&str> = expected.iter().copied().collect();
+        for key in parsed.fields.keys() {
+            assert!(
+                allowed.contains(key.as_str()),
+                "dadbear annotation has unknown field `{key}` not present on DadbearPolicyYaml"
+            );
+        }
+    }
+
+    /// Wanderer guard: the shipped `chains/schemas/chain-step.schema.yaml`
+    /// must have field names that match the real `ChainStep` struct in
+    /// `chain_engine.rs`. This test loads the seed file and checks
+    /// every rendered field name is a real chain step property.
+    #[test]
+    fn test_seed_chain_step_annotation_fields_exist_on_chain_step() {
+        let seed_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("crate parent must exist")
+            .join("chains/schemas/chain-step.schema.yaml");
+        let body = std::fs::read_to_string(&seed_path)
+            .expect("seed chain-step annotation should exist");
+        let parsed: SchemaAnnotation = serde_yaml::from_str(&body)
+            .expect("seed chain-step annotation should parse");
+        assert_eq!(parsed.applies_to.as_deref(), Some("chain_step_config"));
+        // Field names that must correspond to real `ChainStep` fields.
+        let real_chain_step_fields: std::collections::HashSet<&str> = [
+            "model_tier",
+            "temperature",
+            "concurrency",
+            "on_error",
+            "max_input_tokens",
+            "batch_size",
+            "split_strategy",
+            "dehydrate",
+            "compact_inputs",
+        ]
+        .iter()
+        .copied()
+        .collect();
+        for key in parsed.fields.keys() {
+            assert!(
+                real_chain_step_fields.contains(key.as_str()),
+                "chain-step annotation has field `{key}` not present on ChainStep struct"
+            );
+        }
+    }
+
     #[test]
     fn test_annotation_serializes_preserving_optional_fields() {
         // Round-trip: parse from YAML, serialize to JSON, verify the

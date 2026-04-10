@@ -104,10 +104,8 @@ fields:
 
   dehydrate:
     label: "Dehydration Rules"
-    help: "Fields to drop from inputs when they exceed the token budget."
-    widget: list
-    item_widget: select
-    item_options_from: node_fields
+    help: "Fields to drop from inputs when they exceed the token budget. Each rule is a `drop: path.to.field` object. Phase 8 displays the current rules read-only; structured editing lands in Phase 10 when the renderer supports lists of composite objects."
+    widget: readonly
     visibility: advanced
     group: "Token Budget"
     order: 13

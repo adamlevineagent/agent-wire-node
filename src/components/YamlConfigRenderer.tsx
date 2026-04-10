@@ -61,6 +61,13 @@ function readPath(root: Record<string, unknown> | undefined, path: string): unkn
 /**
  * Loose equality used for the "inherits from default" indicator.
  * Scalars compare by value; arrays/objects compare by JSON.
+ *
+ * Note: the indicator caller must also guard against the "both
+ * undefined" case — `valuesEqual(undefined, undefined)` returns
+ * `true` here (intentionally, for scalar semantics), but the
+ * caller should NOT render "← default" when neither a current
+ * value nor a resolvable default actually exists. See
+ * `shouldShowInheritanceIndicator` below.
  */
 function valuesEqual(a: unknown, b: unknown): boolean {
   if (a === b) return true;
@@ -73,6 +80,27 @@ function valuesEqual(a: unknown, b: unknown): boolean {
     }
   }
   return false;
+}
+
+/**
+ * Guard the "← default" label against the false-positive case
+ * where both the current value and the resolved default are
+ * `undefined`. `valuesEqual(undefined, undefined) === true` but
+ * showing "← default" when no default exists is misleading: it
+ * implies the field is correctly inheriting when in fact nothing
+ * is being inherited. The indicator only renders when:
+ *   1. `inherits_from` is declared on the annotation, AND
+ *   2. the resolved default is defined (something to inherit from), AND
+ *   3. the current value equals the resolved default.
+ */
+function shouldShowInheritanceIndicator(
+  annotation: FieldAnnotation,
+  value: unknown,
+  resolvedDefault: unknown,
+): boolean {
+  if (annotation.inherits_from == null) return false;
+  if (resolvedDefault === undefined) return false;
+  return valuesEqual(value, resolvedDefault);
 }
 
 /**
@@ -208,8 +236,11 @@ function FieldRow({
   const Widget = pickWidget(annotation.widget);
   const disabled =
     readOnly || annotation.read_only === true || annotation.widget === "readonly";
-  const inheritsFromDefault =
-    annotation.inherits_from != null && valuesEqual(value, resolvedDefault);
+  const inheritsFromDefault = shouldShowInheritanceIndicator(
+    annotation,
+    value,
+    resolvedDefault,
+  );
 
   return (
     <div

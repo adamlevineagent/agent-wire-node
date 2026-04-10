@@ -1004,3 +1004,131 @@ Single commit on `phase-7-cache-warming-import` with message `phase-7: wanderer 
 
 ---
 
+## Phase 8 wanderer pass — 2026-04-10
+
+**Branch:** `phase-8-yaml-to-ui-renderer`
+**Commit:** `24f1091 phase-8: yaml-to-ui renderer` (implementer) + wanderer fix commit below
+
+Phase 8 shipped the `YamlConfigRenderer` primitive — the first pure-frontend phase of the initiative. No production caller mounts it yet (that's Phase 10), so the wanderer question is not "does it run in production?" but "will Phase 10 break on first real-data wiring?" Four distinct bugs found.
+
+### Finding A — MEDIUM: seed `chain-step.schema.yaml` described `dehydrate` with the wrong shape (FIXED)
+
+**What:** The Phase 8 seed annotation file described `dehydrate` as a `list` widget with `item_widget: select` and `item_options_from: node_fields`. The real `ChainStep.dehydrate` field in `chain_engine.rs` is `Option<Vec<DehydrateStep>>` where `DehydrateStep { drop: String }` — a list of OBJECTS each containing a `drop: path.to.field` key, NOT a list of scalar strings.
+
+Grep on real chain YAMLs confirmed the shape in production:
+```yaml
+dehydrate:
+  - drop: "topics.current"
+  - drop: "topics.entities"
+  - drop: "topics.summary"
+  - drop: "topics"
+```
+
+(see `chains/defaults/document.yaml`).
+
+**Phase 10 impact:** When ToolsMode wires `YamlConfigRenderer` to a real chain step, the `ListWidget` iterates each item via `String(item)` — an object becomes `"[object Object]"`. The nested `<select>` then renders the stringified object as the current value and finds no matching option (since `node_fields` options are scalar strings like `"headline"` / `"distilled"`). The user would see a broken list of garbled entries they cannot edit. Worse, the `item_options_from: node_fields` list has only top-level fields — real dehydrate rules commonly reference sub-paths (`topics.current`). The annotation is structurally unfit for the real data even with the object-vs-string fix.
+
+**Fix:** Replaced the `dehydrate` field annotation with `widget: readonly` and a help text note that Phase 10 is responsible for the structured editor. This shows the current rules as compact JSON so users can see what's there without being able to (incorrectly) edit them. Phase 10 will need to add either (a) a new composite widget that understands lists of objects, or (b) an expanded schema annotation shape that declares nested `fields:` sub-maps per list item. Both are out of Phase 8 scope.
+
+### Finding B — MEDIUM: seed `dadbear.schema.yaml` had mostly-wrong field names (FIXED)
+
+**What:** The Phase 8 seed DADBEAR annotation defined four fields: `enabled`, `scan_interval_secs`, `max_concurrent_ingests`, `content_type`. The real `DadbearPolicyYaml` struct in `pyramid/db.rs` has seven fields: `source_path`, `content_type`, `scan_interval_secs`, `debounce_secs`, `session_timeout_secs`, `batch_size`, `enabled`.
+
+Mismatches:
+- `max_concurrent_ingests` does NOT exist on `DadbearPolicyYaml` (closest field: `batch_size`, described in the struct as "pending ingests per tick")
+- Missing: `source_path` (REQUIRED in real YAML), `debounce_secs`, `session_timeout_secs`, `batch_size`
+
+**Phase 10 impact:** When ToolsMode wires the renderer to a real DADBEAR config, `max_concurrent_ingests` would show as an empty editor (no such key in the real YAML). The four missing fields would be invisible entirely — the user would edit four config values and hit Accept, but `source_path` / `debounce_secs` / `session_timeout_secs` / `batch_size` would silently retain their prior values because the renderer never surfaced them.
+
+**Fix:** Rewrote `chains/schemas/dadbear.schema.yaml` to match `DadbearPolicyYaml` 1:1. Added `source_path` (text, basic), `debounce_secs` (number, advanced), `session_timeout_secs` (number, advanced), `batch_size` (number, advanced). Dropped `max_concurrent_ingests` entirely. Added new Rust test `test_seed_dadbear_annotation_matches_real_policy_fields` that parses the seed file and asserts every field key is a real `DadbearPolicyYaml` property + no stale unknowns. Also added `test_seed_chain_step_annotation_fields_exist_on_chain_step` to lock in the chain-step annotation against `ChainStep` drift.
+
+### Finding C — LOW/CORRECTNESS: inheritance indicator shows "← default" when both value and default are undefined (FIXED)
+
+**What:** `YamlConfigRenderer.FieldRow` uses `valuesEqual(value, resolvedDefault)` to decide whether to show `← {inherits_from} default`. `valuesEqual(undefined, undefined) === true`, so when a field has `inherits_from: defaults.xxx` set, the current value is missing, AND the resolved default (via `readPath(defaults, "defaults.xxx")`) is also `undefined`, the indicator renders — implying the field is inheriting when in fact there is nothing to inherit from.
+
+Phase 10 will typically pass a real `defaults` object, but edge cases surface this: rendering a chain step in isolation without its parent defaults block, rendering during the loading window before defaults resolve, rendering a simpler config type (DADBEAR policy) where `inherits_from` is never set but a bug elsewhere could generate it. The indicator is a correctness signal; showing it wrongly erodes user trust.
+
+The implementer's own log entry (Phase 8, Scope decisions, "Inherited-from-default indicator compares current vs resolved default, not vs 'absent'") acknowledged the behavior and reasoned "no override means we use the default" — but that argument only holds when the default actually exists. When both are undefined, nothing is being inherited.
+
+**Fix:** Added `shouldShowInheritanceIndicator(annotation, value, resolvedDefault)` helper next to `valuesEqual`. Guards against the false positive by requiring `resolvedDefault !== undefined` before running the equality check. `FieldRow` now calls the helper instead of the bare `valuesEqual`. The fix is narrow and preserves the original semantics in all other cases — if the resolved default is present (even as `null` or an empty string), the equality check still runs.
+
+### Finding D — LOW/PERFORMANCE: cost-estimate effect refetches on every keystroke (FIXED)
+
+**What:** `useYamlRendererSources` runs a second `useEffect` for `show_cost: true` fields with deps `[schema, costFieldPaths, values, optionSources]`. The `values` entry in the deps array triggers the effect on every prop update — including keystrokes in unrelated fields (e.g. user types a number in `temperature`, cost effect refires and makes a fresh IPC round trip for every cost-annotated path). The pattern produces N IPC roundtrips per keystroke where N is the number of cost-annotated fields.
+
+Not a correctness bug but a real footgun once the renderer is wired in Phase 10 — the default schema has `show_cost: true` on `model_tier`, so every keystroke in `temperature` / `concurrency` / `max_input_tokens` / etc. fires an `invoke('yaml_renderer_estimate_cost', ...)`. The user sees a visible delay on fast-typed inputs.
+
+**Fix:** Extracted a memoized `costPathValues` string that serializes only the values at the cost-annotated paths (e.g. `"model_tier=synth_heavy"`). The cost effect now depends on `costPathValues` instead of the full `values` object, so it only re-runs when a cost-annotated field's value actually changes. Unrelated keystrokes are silent.
+
+### Finding E — INFORMATIONAL: `model_selector` widget silently hides a set value during the option-resolution loading window
+
+**What:** When `optionSources.tier_registry` hasn't resolved yet (Tauri IPC roundtrip in flight), `ModelSelectorWidget` renders with an empty options list. If the parent already passed `value="synth_heavy"`, the native `<select>` doesn't find a matching `<option>` and either shows nothing or picks the first empty option. When the options arrive, React re-renders and the real value appears.
+
+**Verdict:** Not fixed. This is a Phase 10 concern — the parent component is responsible for the loading state (e.g. wrap in a `loading` spinner until `useYamlRendererSources.loading === false`). Phase 8's hook already exposes a `loading` field; Phase 10 just has to use it.
+
+### Finding F — INFORMATIONAL: `condition` field is on the type but not evaluated
+
+**What:** Both Rust `FieldAnnotation` and TypeScript `FieldAnnotation` carry a `condition` string property. The renderer does not evaluate it. The implementer documented this explicitly as deferred to Phase 10. If someone ships a schema annotation with a `condition` field (e.g. `"split_strategy != null"`), the field will ALWAYS render regardless of the expression's truth value — effectively a silent "always show" override of whatever the schema author intended.
+
+**Verdict:** Not fixed. Documented as Phase 10 scope. The friction is that Phase 10 MUST implement this before any schema annotation uses `condition` — otherwise a seed with conditional fields ships broken. Adding a spec note or renderer warning ("condition evaluation is not implemented") would be nice-to-have but feels out of Phase 8 scope.
+
+### What I did not fix
+
+- **Finding E** — loading state is Phase 10's responsibility (the hook already exposes `loading`).
+- **Finding F** — `condition` evaluation is explicitly deferred to Phase 10.
+- **`valuesEqual` JSON.stringify key-order brittleness** — low-severity correctness issue where `{a:1, b:2}` and `{b:2, a:1}` JSON-serialize to different strings and compare as unequal. Unlikely to surface with server-serialized defaults (serde produces deterministic key order) but worth noting. No fix — the risk is narrow and object defaults are rare in practice.
+- **`list`/`group`/`code` widget advanced features** — Phase 3 (per spec) deferred features are acceptable per the workstream brief. The widgets exist as minimum viable implementations.
+
+### End-to-end scenario traces (post-fix)
+
+**(a) Phase 10 loads `chain-step.schema.yaml` annotation and renders it with real chain step values.**
+
+1. Phase 10 calls `invoke('pyramid_get_schema_annotation', { schemaType: 'chain_step_config' })` → Rust returns `SchemaAnnotation` JSON via `load_schema_annotation_for` (direct slug lookup hits `slug = "chain_step_config"`, body deserializes into `SchemaAnnotation`).
+2. Tauri v2 serde handles camelCase→snake_case auto-conversion on the arg side; response is already snake_case JSON and TS types match 1:1.
+3. Phase 10 loads the real chain step YAML (e.g. `source_extract` step from `document.yaml`) and passes it as `values`.
+4. Phase 10 calls `useYamlRendererSources(schema, values)` → the hook walks the annotation's `options_from` / `item_options_from` (now just `tier_registry` since the list widget was removed from `dehydrate`), calls `yaml_renderer_resolve_options` once per unique source, caches results.
+5. Phase 10 mounts `YamlConfigRenderer` with `{ schema, values, optionSources, costEstimates }`.
+6. Renderer sorts the annotation's fields by `(order, key)`, splits by visibility, groups by `group`. Basic fields render inline, Advanced fields sit under a collapsed `▶ Advanced` section.
+7. `model_tier` select renders with `tier_registry` options; `temperature` slider renders 0.3; `concurrency` number renders 10; `on_error` static select renders "retry(3)"; `max_input_tokens` renders 50000 with "tokens" suffix under Token Budget group; `batch_size` renders 20; `split_strategy` shows "sections"; `dehydrate` now shows read-only compact JSON `[{"drop":"topics.current"},...]` (post-fix); `compact_inputs` toggle renders false.
+8. Cost badge on `model_tier` shows the tier's estimated USD-per-call from the pricing_json lookup.
+9. No crashes. All fields visible. `dehydrate` is read-only which is correct-but-limited for Phase 8 per the fix.
+
+**(b) User edits a model_tier field via the select widget.**
+
+1. User clicks the `model_tier` dropdown. `ModelSelectorWidget` renders the `tier_registry` options from `optionSources`, each with a rich `meta.provider_id`/`meta.model_id` badge and context window label.
+2. User picks `fast_extract`. The native `<select>` fires `onChange(e)`, the widget calls `onChange(e.target.value)`.
+3. `FieldRow`'s wrapped callback invokes `onChange("model_tier", "fast_extract")` on the renderer's parent.
+4. Parent updates its `values` state.
+5. React re-renders; `YamlConfigRenderer` receives new `values`.
+6. `useYamlRendererSources`'s cost effect runs — post-fix, the dep is `costPathValues` which now changes (the model_tier value changed), so the effect fires. It reads the new tier's meta from the cached `tier_registry` options, calls `yaml_renderer_estimate_cost` with the new `(provider_id, model_id)` pair, sets the new cost on `costEstimates.model_tier`.
+7. FieldRow shows the new cost badge, updated inheritance indicator (if `fast_extract` matches `defaults.model_tier` the `← default` label appears; otherwise it disappears).
+8. No crashes. Post-fix: editing an unrelated field like `temperature` no longer triggers the cost effect, since `costPathValues` is unchanged.
+
+**(c) User clicks Notes and provides a refinement note.**
+
+1. User clicks the "Notes" button in the action bar. `setNotesOpen(true)`.
+2. Inline textarea appears with placeholder text and a "Submit Notes" button (disabled while the textarea is empty).
+3. User types "Use cheaper model for source_extract, bump batch size for merges". `setNotesText` updates on every keystroke.
+4. Submit button enables.
+5. User clicks "Submit Notes". The handler calls `onNotes("Use cheaper model for source_extract, bump batch size for merges")`, then clears the textarea and closes the notes section.
+6. Phase 9 will own the LLM round trip — the renderer just emits the note via `onNotes`. Phase 8 is correctly passive here.
+
+### Commit
+
+Single wanderer-fix commit on `phase-8-yaml-to-ui-renderer` with message `phase-8: wanderer fix — inheritance + schema + cost effect`. Files modified:
+
+- `chains/schemas/chain-step.schema.yaml` — `dehydrate` widget → `readonly`
+- `chains/schemas/dadbear.schema.yaml` — rewrite to match `DadbearPolicyYaml`
+- `src/components/YamlConfigRenderer.tsx` — add `shouldShowInheritanceIndicator` guard
+- `src/hooks/useYamlRendererSources.ts` — memoize `costPathValues`, decouple cost effect from full `values`
+- `src-tauri/src/pyramid/yaml_renderer.rs` — two new seed-file lock-in tests
+
+### Verification after fix
+
+- `cargo test --lib "pyramid::yaml_renderer"` — **14/14 passing** (12 pre-existing + 2 new lock-in tests)
+- `cargo test --lib "pyramid::wire_migration"` — **12/12 passing** (unchanged; migration does not care about annotation field correctness, only YAML parseability)
+- `npx tsc --noEmit` — clean, no new TypeScript errors
+- `cargo check --lib` — clean
+
+---
+

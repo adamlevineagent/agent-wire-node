@@ -114,6 +114,23 @@ export function useYamlRendererSources(
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [schema, JSON.stringify(uniqueSources)]);
 
+  // Extract only the tier-path values that cost estimation actually
+  // reads. This avoids re-running the cost effect on every unrelated
+  // field edit — the earlier implementation depended on the full
+  // `values` object, so a keystroke in any field triggered a fresh
+  // IPC roundtrip per cost-annotated path. Now we build a stable
+  // lookup string from the values that matter, and the effect only
+  // re-runs when one of those specific tier values changes.
+  const costPathValues = useMemo(() => {
+    if (costFieldPaths.length === 0) return "";
+    const parts: string[] = [];
+    for (const path of costFieldPaths) {
+      const raw = readPath(values, path);
+      parts.push(`${path}=${typeof raw === "string" ? raw : ""}`);
+    }
+    return parts.join("|");
+  }, [costFieldPaths, values]);
+
   // Fetch cost estimates for every field that wants one. For Phase 8
   // the cost pair comes from the currently-selected tier — we look up
   // the tier option in `optionSources.tier_registry` to find the
@@ -164,7 +181,13 @@ export function useYamlRendererSources(
     return () => {
       cancelled = true;
     };
-  }, [schema, costFieldPaths, values, optionSources]);
+    // `costPathValues` is a stable serialization of only the tier
+    // values the effect uses — far cheaper to diff than the full
+    // `values` object. `optionSources` is the output of the prior
+    // effect; depending on it is correct because tier metadata is
+    // what the cost lookup consumes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [schema, costFieldPaths, costPathValues, optionSources]);
 
   return { optionSources, costEstimates, loading, error };
 }
