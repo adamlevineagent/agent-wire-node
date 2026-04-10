@@ -966,7 +966,7 @@ type CreateAction =
     | { type: "annotation-success"; annotation: SchemaAnnotation | null }
     | { type: "change-field"; path: string; value: unknown }
     | { type: "refine-start" }
-    | { type: "refine-success"; response: RefineConfigResponse }
+    | { type: "refine-success"; response: RefineConfigResponse; note: string }
     | { type: "refine-error"; error: string }
     | { type: "accept-start" }
     | { type: "accept-success"; response: AcceptConfigResponse }
@@ -1049,6 +1049,11 @@ function createReducer(state: CreateState, action: CreateAction): CreateState {
                 rawYaml: action.response.yaml_content,
                 values,
                 version: action.response.version,
+                // The refined version's provenance is the refinement
+                // note the user just submitted — NOT the original
+                // intent. Mirror the backend's supersession chain so
+                // the renderer's version info shows the right note.
+                triggeringNote: action.note,
                 error: null,
             };
         }
@@ -1213,7 +1218,7 @@ function CreatePanel({ seed, onSeedConsumed }: CreatePanelProps) {
                         note: trimmed,
                     },
                 );
-                dispatch({ type: "refine-success", response });
+                dispatch({ type: "refine-success", response, note: trimmed });
             } catch (err) {
                 dispatch({ type: "refine-error", error: String(err) });
             }

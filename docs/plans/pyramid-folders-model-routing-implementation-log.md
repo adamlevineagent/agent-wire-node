@@ -1697,3 +1697,25 @@ Phase 10 is ready for the conductor's verifier pass and a wanderer run. Recommen
 
 Wanderer prompt suggestion: "Does a fresh Wire Node dev-build boot → open ToolsMode → see the three tabs with My Configs populated from bundled defaults → click Create → pick evidence_policy → enter an intent → receive a generated YAML → see it render through YamlConfigRenderer with editable fields → submit a refinement note → get a refined version back → click Accept → see the accepted state → switch back to My Tools → see the version bumped — without any TypeScript errors, without the renderer crashing on missing schema annotations, without draft contributions accumulating unexpectedly, and with the Publish preview modal working for the accepted contribution?"
 
+### Verifier pass — 2026-04-10
+
+**Verifier:** Conductor verifier (pre-pushing, post-implementation audit)
+**Status:** awaiting-verification → verified-with-fix
+
+Verified the implementation end-to-end by auditing the React wiring, TypeScript types, and the Rust IPC signatures they bind against. Ran `npm run build` (clean, 715.26 kB / 189.31 kB gzip) and `cargo test --lib pyramid` (1048 passed, 7 pre-existing failures — no regression). Both match the counts in the implementer entry above.
+
+**Fix applied:** `refine-success` reducer was preserving `state.triggeringNote` across refinements, so the renderer's version info kept showing the original intent string instead of the most recent refinement note. Trace: `generate-success` set `triggeringNote: state.intent`, but `refine-success` did not update it even though the refinement note IS the new version's provenance per the Notes Capture Lifecycle. The user sees v2 but the note still reads "Keep costs low..." from the original intent — the Phase 4 supersession chain in the DB correctly stores the new note, the UI state just didn't pick it up. Additionally, `handleAccept` sends `state.triggeringNote` to the backend as the accept call's `triggering_note` argument, so the bug also meant the accepted contribution's stored note was the old intent rather than the final refinement reason.
+
+**Patch:** extended the `refine-success` action type with `note: string`, updated the reducer to set `triggeringNote: action.note`, updated `handleRefine` to dispatch the trimmed note alongside the response. Zero-LOC impact on the rest of the flow. Clean build.
+
+**Files touched in fix:**
+- `src/components/modes/ToolsMode.tsx` — 3-line fix (action type + reducer case + handler dispatch)
+- `docs/plans/pyramid-folders-model-routing-implementation-log.md` — this verifier entry
+
+**Verifier verification:**
+- ✅ `npm run build` — clean, no new TypeScript errors.
+- ✅ `cargo test --lib pyramid` — 1048 passed, same 7 pre-existing failures.
+- ✅ `git diff src-tauri/` — empty. Zero Rust changes.
+
+Phase 10 status: `verified-with-fix`. Ready for conductor's next stage.
+
