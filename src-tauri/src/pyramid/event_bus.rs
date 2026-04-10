@@ -106,6 +106,41 @@ pub enum TaggedKind {
         /// if any. `None` on v1.
         prior_contribution_id: Option<String>,
     },
+
+    // ── Phase 6: LLM Output Cache ─────────────────────────────────────
+    /// Emitted when `call_model_unified_with_options_and_ctx` finds a
+    /// valid cache entry for the current call and returns it without
+    /// hitting the wire. Phase 13's build viz consumes this to render
+    /// the step as "cached" instantly.
+    CacheHit {
+        slug: String,
+        step_name: String,
+        cache_key: String,
+        chunk_index: Option<i64>,
+        depth: i64,
+    },
+    /// Emitted when the cache lookup found no row for the current cache
+    /// key — the call continues through the normal HTTP path. Optional
+    /// telemetry; Phase 13's build viz may render it as a grey dot.
+    CacheMiss {
+        slug: String,
+        step_name: String,
+        cache_key: String,
+        chunk_index: Option<i64>,
+        depth: i64,
+    },
+    /// Emitted when `verify_cache_hit` returned anything other than
+    /// `Valid` — the stale row has been deleted and the call falls
+    /// through to HTTP. The `reason` field carries the mismatch tag
+    /// (`mismatch_inputs` / `mismatch_prompt` / `mismatch_model` /
+    /// `corrupted_output`) so the oversight page can surface the
+    /// failure mode.
+    CacheHitVerificationFailed {
+        slug: String,
+        step_name: String,
+        cache_key: String,
+        reason: String,
+    },
 }
 
 impl TaggedKind {
