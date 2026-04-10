@@ -72,8 +72,8 @@ use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
 
 use super::config_contributions::{
-    create_config_contribution_with_metadata, load_contribution_by_id,
-    sync_config_to_operational,
+    create_config_contribution_with_metadata, load_active_config_contribution,
+    load_contribution_by_id, sync_config_to_operational,
 };
 use super::db;
 use super::event_bus::BuildEventBus;
@@ -705,12 +705,42 @@ pub fn import_pyramid(
 /// chain stay coherent. Direct INSERT into `pyramid_dadbear_config`
 /// would create a row with NULL `contribution_id` and break the
 /// invariant.
+///
+/// Idempotent on re-import (the resume path): if an active
+/// `dadbear_policy` contribution already exists for `target_slug`, this
+/// function re-syncs it through `sync_config_to_operational` (so the
+/// operational row's `contribution_id` FK is reasserted) but does NOT
+/// create a duplicate active contribution. Creating two `status=active`
+/// rows for the same `(slug, schema_type)` pair would silently
+/// desynchronize the audit trail from the operational row and produce
+/// the dangling-active-contribution class of bug the wanderers' "every
+/// data path is a contribution" pattern was designed to prevent.
 fn enable_dadbear_via_contribution(
     conn: &Connection,
     bus: &Arc<BuildEventBus>,
     target_slug: &str,
     source_path: &str,
 ) -> Result<()> {
+    // Resume idempotency: if an active dadbear_policy contribution
+    // already exists for this slug (e.g. a prior import landed it and
+    // the user is re-running the import to resume after a crash), don't
+    // create a duplicate. Re-sync the existing one through the
+    // dispatcher so the operational row's contribution_id FK is
+    // reasserted, then return.
+    if let Some(existing) =
+        load_active_config_contribution(conn, "dadbear_policy", Some(target_slug))?
+    {
+        debug!(
+            target_slug,
+            contribution_id = existing.contribution_id,
+            "active dadbear_policy contribution already exists for slug; \
+             re-syncing through dispatcher instead of creating a duplicate"
+        );
+        sync_config_to_operational(conn, bus, &existing)
+            .map_err(|e| anyhow!("sync_config_to_operational failed during re-sync: {e}"))?;
+        return Ok(());
+    }
+
     // Build the YAML directly. We use the canonical key set so the
     // `db::DadbearPolicyYaml` deserializer parses it without needing
     // any extra fields. `content_type` is required by the operational
@@ -760,6 +790,116 @@ fn enable_dadbear_via_contribution(
         contribution_id, "DADBEAR auto-enabled via Phase 4 contribution path"
     );
     Ok(())
+}
+
+// ─── Cancel: roll back partial import state + cache rows ────────────────────
+
+/// Result returned from `cancel_pyramid_import` so the IPC handler can
+/// distinguish "had nothing to cancel" from "rolled back N cache rows".
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ImportCancelReport {
+    /// Whether an import state row existed for the target slug at cancel
+    /// time. `false` for an idempotent cancel of a slug that was never
+    /// imported.
+    pub state_row_existed: bool,
+    /// Number of cache rows deleted from `pyramid_step_cache` during the
+    /// rollback. Counts only rows whose `build_id` matches the import's
+    /// synthetic `import:{wire_pyramid_id}` prefix — rows written by
+    /// later builds or local LLM calls are NOT touched.
+    pub cache_rows_rolled_back: u64,
+}
+
+/// Cancel an in-flight or completed pyramid import for `target_slug`.
+///
+/// Per `docs/specs/cache-warming-and-import.md` "Cleanup" section
+/// (~line 345):
+///
+/// > "On explicit user cancel, the row is deleted along with any
+/// > partially inserted cache entries and the target slug's DB rows."
+///
+/// This function implements the cache-rollback half of that contract.
+/// It deletes:
+///   1. Every cache row in `pyramid_step_cache` for `target_slug` whose
+///      `build_id` starts with the synthetic `import:` prefix the import
+///      path stamps. Locally-built rows (build_id from chain executor or
+///      local rerolls) are NOT touched.
+///   2. The `pyramid_import_state` row for the target slug.
+///
+/// What this function INTENTIONALLY does NOT touch:
+///   - DADBEAR contributions: the contribution is `Canon` maturity and
+///     deleting it directly would bypass the contribution path. The
+///     user can disable DADBEAR through the existing oversight UI which
+///     creates a properly-superseded contribution.
+///   - Pyramid node / evidence / chunk rows: Phase 7's import does not
+///     populate these. Phase 10's frontend wizard owns slug creation
+///     and is responsible for cleaning up its own rows.
+///   - Cache rows from prior local builds: filtering by `build_id LIKE
+///     'import:%'` keeps the rollback narrowly scoped to the import's
+///     own writes. A cache row that the importer skipped (because the
+///     local user had already written one at the same content-addressable
+///     key, e.g. via a force-fresh reroll) is preserved.
+///
+/// Idempotent: cancelling a slug with no import state and no imported
+/// cache rows is a no-op that returns `ImportCancelReport { state_row_existed:
+/// false, cache_rows_rolled_back: 0 }`.
+pub fn cancel_pyramid_import(
+    conn: &Connection,
+    target_slug: &str,
+) -> Result<ImportCancelReport> {
+    // Resolve the wire_pyramid_id from the import state row so we know
+    // which build_id prefix to filter on. If there's no state row, we
+    // still attempt to delete any cache rows that look like imports
+    // for this slug — this handles the case where a previous cancel
+    // deleted the state row but the cache rollback failed mid-way.
+    let state = db::load_import_state(conn, target_slug)?;
+    let state_row_existed = state.is_some();
+
+    // Collect every distinct build_id under this slug that starts with
+    // the `import:` prefix. There may be more than one if the user has
+    // re-imported the slug from different source pyramids over time
+    // (theoretical — `import_pyramid` refuses different wire_pyramid_ids
+    // for the same slug — but defensive cleanup is cheap).
+    let mut import_build_ids: Vec<String> = Vec::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT build_id FROM pyramid_step_cache
+             WHERE slug = ?1 AND build_id LIKE 'import:%'",
+        )?;
+        let iter = stmt.query_map(rusqlite::params![target_slug], |row| {
+            row.get::<_, String>(0)
+        })?;
+        for r in iter {
+            import_build_ids.push(r?);
+        }
+    }
+
+    // Delete all rows under those build_ids. Going through a single
+    // statement keeps the rollback atomic per build_id.
+    let mut total_deleted: u64 = 0;
+    for build_id in &import_build_ids {
+        let n = conn.execute(
+            "DELETE FROM pyramid_step_cache
+             WHERE slug = ?1 AND build_id = ?2",
+            rusqlite::params![target_slug, build_id],
+        )?;
+        total_deleted += n as u64;
+    }
+
+    // Drop the import state row last so the rollback is observable.
+    db::delete_import_state(conn, target_slug)?;
+
+    info!(
+        target_slug,
+        state_row_existed,
+        cache_rows_rolled_back = total_deleted,
+        import_build_ids = ?import_build_ids,
+        "pyramid import cancelled"
+    );
+
+    Ok(ImportCancelReport {
+        state_row_existed,
+        cache_rows_rolled_back: total_deleted,
+    })
 }
 
 /// Best-effort YAML string escape — wraps the value in double quotes if
@@ -1410,6 +1550,262 @@ mod tests {
             )
             .unwrap();
         assert_eq!(row_count, 5);
+    }
+
+    /// Wanderer regression: `cancel_pyramid_import` MUST roll back the
+    /// cache rows the import wrote, not just delete the import state row.
+    /// The spec's "Cleanup" section (~line 345) is explicit: "On explicit
+    /// user cancel, the row is deleted along with any partially inserted
+    /// cache entries and the target slug's DB rows."
+    ///
+    /// The first Phase 7 implementation only deleted the state row; this
+    /// test pins the corrected behavior.
+    #[test]
+    fn test_cancel_pyramid_import_rolls_back_cache_rows() {
+        let conn = mem_conn();
+        let bus = make_bus();
+        let dir = TempDir::new().unwrap();
+        let l0a_path = dir.path().join("a.txt");
+        let l0b_path = dir.path().join("b.txt");
+        let l0c_path = dir.path().join("c.txt");
+        let l0a_hash = write_and_hash(&l0a_path, "alpha");
+        let l0b_hash = write_and_hash(&l0b_path, "beta");
+        let l0c_hash = write_and_hash(&l0c_path, "gamma");
+
+        let manifest = build_mixed_manifest(
+            "a.txt", &l0a_hash, "b.txt", &l0b_hash, "c.txt", &l0c_hash,
+        );
+
+        // Land an import (5 cache rows + state row + dadbear contribution).
+        let _ = import_pyramid(
+            &conn,
+            &bus,
+            "wire:test-pyramid",
+            "test-import",
+            dir.path().to_str().unwrap(),
+            &manifest,
+        )
+        .unwrap();
+
+        let cache_count_before: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pyramid_step_cache WHERE slug = 'test-import'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cache_count_before, 5, "import should land 5 cache rows");
+
+        // Cancel must roll back ALL 5 cache rows (since they were all
+        // imported with build_id = 'import:wire:test-pyramid') AND the
+        // import state row.
+        let report = cancel_pyramid_import(&conn, "test-import").unwrap();
+        assert_eq!(report.cache_rows_rolled_back, 5);
+        assert!(report.state_row_existed);
+
+        let cache_count_after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pyramid_step_cache WHERE slug = 'test-import'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            cache_count_after, 0,
+            "cancel should have rolled back every imported cache row, got {cache_count_after}"
+        );
+
+        // The import state row is gone.
+        let state = db::load_import_state(&conn, "test-import").unwrap();
+        assert!(
+            state.is_none(),
+            "import state row should be deleted on cancel"
+        );
+
+        // Idempotent re-cancel: no state row, no imported cache rows,
+        // returns a zero-counter report without erroring.
+        let again = cancel_pyramid_import(&conn, "test-import").unwrap();
+        assert_eq!(again.cache_rows_rolled_back, 0);
+        assert!(!again.state_row_existed);
+    }
+
+    /// Wanderer regression: cancel must NOT touch cache rows that were
+    /// written by local LLM calls or other (non-import) build paths.
+    /// Locally-built rows have a build_id that does NOT start with
+    /// `import:`, and the rollback's `LIKE 'import:%'` filter must
+    /// preserve them.
+    #[test]
+    fn test_cancel_pyramid_import_preserves_non_import_cache_rows() {
+        let conn = mem_conn();
+        let bus = make_bus();
+        let dir = TempDir::new().unwrap();
+        let l0a_path = dir.path().join("a.txt");
+        let l0b_path = dir.path().join("b.txt");
+        let l0c_path = dir.path().join("c.txt");
+        let l0a_hash = write_and_hash(&l0a_path, "alpha");
+        let l0b_hash = write_and_hash(&l0b_path, "beta");
+        let l0c_hash = write_and_hash(&l0c_path, "gamma");
+
+        let manifest = build_mixed_manifest(
+            "a.txt", &l0a_hash, "b.txt", &l0b_hash, "c.txt", &l0c_hash,
+        );
+
+        // Land an import.
+        let _ = import_pyramid(
+            &conn,
+            &bus,
+            "wire:test-pyramid",
+            "test-import",
+            dir.path().to_str().unwrap(),
+            &manifest,
+        )
+        .unwrap();
+
+        // Plant a separate "locally-built" cache row with a different
+        // build_id (simulating a fresh chain executor write).
+        let local_entry = CacheEntry {
+            slug: "test-import".into(),
+            build_id: "local-build-7".into(),
+            step_name: "local_step".into(),
+            chunk_index: 99,
+            depth: 0,
+            cache_key: "local-content-addressable-key-1".into(),
+            inputs_hash: "local-inputs".into(),
+            prompt_hash: "local-prompt".into(),
+            model_id: "openrouter/local-model".into(),
+            output_json: "{\"local\":true}".into(),
+            token_usage_json: None,
+            cost_usd: None,
+            latency_ms: None,
+            force_fresh: false,
+            supersedes_cache_id: None,
+        };
+        db::store_cache(&conn, &local_entry).unwrap();
+
+        let cache_count_before: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pyramid_step_cache WHERE slug = 'test-import'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cache_count_before, 6, "5 imported + 1 locally built");
+
+        // Cancel.
+        let report = cancel_pyramid_import(&conn, "test-import").unwrap();
+        assert_eq!(report.cache_rows_rolled_back, 5, "5 imported rows rolled back");
+
+        // The locally-built row survives.
+        let cache_count_after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pyramid_step_cache WHERE slug = 'test-import'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            cache_count_after, 1,
+            "exactly 1 row should survive (the local-build-7 row); got {cache_count_after}"
+        );
+        let surviving_build_id: String = conn
+            .query_row(
+                "SELECT build_id FROM pyramid_step_cache WHERE slug = 'test-import' LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(surviving_build_id, "local-build-7");
+    }
+
+    /// Wanderer regression: re-running `import_pyramid` for the same slug
+    /// (the spec's "resume" path) MUST NOT create duplicate active
+    /// `dadbear_policy` contribution rows. The first import path lands an
+    /// active contribution + a synced operational row; the second import
+    /// must either supersede the first (preserving the contribution chain)
+    /// or skip the contribution-create entirely. Creating a SECOND
+    /// status='active' row for the same `(slug, schema_type)` violates
+    /// the contributions table invariant and silently desynchronizes the
+    /// audit trail from the operational row.
+    ///
+    /// This test pins the invariant directly: import twice, count active
+    /// `dadbear_policy` rows for the slug. There must be exactly one.
+    #[test]
+    fn test_import_pyramid_resume_does_not_duplicate_dadbear_contributions() {
+        let conn = mem_conn();
+        let bus = make_bus();
+        let dir = TempDir::new().unwrap();
+        let l0a_path = dir.path().join("a.txt");
+        let l0b_path = dir.path().join("b.txt");
+        let l0c_path = dir.path().join("c.txt");
+        let l0a_hash = write_and_hash(&l0a_path, "alpha");
+        let l0b_hash = write_and_hash(&l0b_path, "beta");
+        let l0c_hash = write_and_hash(&l0c_path, "gamma");
+
+        let manifest = build_mixed_manifest(
+            "a.txt", &l0a_hash, "b.txt", &l0b_hash, "c.txt", &l0c_hash,
+        );
+
+        // First import lands one active dadbear_policy contribution + one
+        // synced pyramid_dadbear_config row.
+        let _ = import_pyramid(
+            &conn,
+            &bus,
+            "wire:test-pyramid",
+            "test-import",
+            dir.path().to_str().unwrap(),
+            &manifest,
+        )
+        .unwrap();
+
+        let active_after_first: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pyramid_config_contributions
+                 WHERE slug = 'test-import' AND schema_type = 'dadbear_policy'
+                   AND status = 'active'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(active_after_first, 1, "first import should land exactly 1 active contribution");
+
+        // Second import (same slug + same wire_pyramid_id → resume path).
+        let _ = import_pyramid(
+            &conn,
+            &bus,
+            "wire:test-pyramid",
+            "test-import",
+            dir.path().to_str().unwrap(),
+            &manifest,
+        )
+        .unwrap();
+
+        let active_after_second: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pyramid_config_contributions
+                 WHERE slug = 'test-import' AND schema_type = 'dadbear_policy'
+                   AND status = 'active'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            active_after_second, 1,
+            "re-import (resume) must NOT create duplicate active dadbear_policy contributions; \
+             expected 1, got {active_after_second}. The contribution path must check for an \
+             existing active row and either supersede it or skip the create."
+        );
+
+        // The operational row must still exist with a contribution_id FK
+        // that matches the (still-)active contribution.
+        let dadbear_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pyramid_dadbear_config
+                 WHERE slug = 'test-import' AND contribution_id IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(dadbear_count, 1);
     }
 
     #[test]

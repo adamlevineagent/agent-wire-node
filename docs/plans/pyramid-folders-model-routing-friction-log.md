@@ -804,3 +804,203 @@ Also fixed: two test fixtures in `chain_dispatch.rs` (`test_dispatch_ir_mechanic
 
 ---
 
+## Phase 7 wanderer pass — 2026-04-10
+
+**Context:** Joined `phase-7-cache-warming-import` after `51eff38` (implementer commit) + `566f3f4` (verifier fix for `INSERT OR IGNORE`) to trace end-to-end execution with fresh eyes. Phase 4's wanderer caught `sync_config_to_operational` being dead code; Phase 5's wanderer caught `PromptCache` being dead code; Phase 6's wanderer caught the cache being unreachable from `dispatch_ir_llm`. Looking for the same class of bug: "the helper exists, the test in isolation passes, but the production wiring is wrong or absent."
+
+### Finding A — BLOCKING (FIXED): re-import creates duplicate active dadbear_policy contributions
+
+**What it is:** The implementer's `enable_dadbear_via_contribution` calls `create_config_contribution_with_metadata("dadbear_policy", Some(slug), ..., "active", ...)` unconditionally on every import. The contributions table has no UNIQUE constraint preventing two `status='active'` rows for the same `(slug, schema_type)`, so a second call lands a SECOND active contribution. The `sync_config_to_operational` dispatcher then overwrites `pyramid_dadbear_config.contribution_id` with the new contribution_id, leaving the prior active contribution row dangling — still `status='active'` but no operational row points at it. `load_active_config_contribution` returns the most recent (`ORDER BY created_at DESC LIMIT 1`) so subsequent reads still work, but the audit trail and supersession chain are silently broken.
+
+The implementer's `test_import_pyramid_resume_same_pyramid_succeeds` test was the closest existing coverage; it asserted the cache row count was unchanged after the second import but did NOT count active dadbear_policy contribution rows. The bug slipped through because the contributions table doesn't enforce the invariant at the schema level — it has to be enforced at the call site.
+
+This is the same class of bug Phase 4's wanderer caught: a downstream invariant ("there is at most one active contribution per schema_type+slug at any time") that nobody enforces from the ingress point because the schema doesn't require it. Phase 4's wanderer flagged six bypass paths in the friction log under "non-blocking, deferred"; Phase 7's import path was almost a SEVENTH bypass — except the bypass was self-inflicted by the resume idempotency model rather than legacy behavior.
+
+**Detection method:** Wrote a wanderer regression test (`test_import_pyramid_resume_does_not_duplicate_dadbear_contributions`) that:
+1. Calls `import_pyramid` once → counts active `dadbear_policy` rows for the slug → asserts 1.
+2. Calls `import_pyramid` again with the same slug + same wire_pyramid_id (the spec's "resume" path) → counts active rows → asserts 1.
+
+The test FAILED against the as-shipped Phase 7 code with `expected 1, got 2` confirming the bug. With the fix in place, the test passes.
+
+**What I did about it:** Modified `enable_dadbear_via_contribution` to first check `load_active_config_contribution(conn, "dadbear_policy", Some(target_slug))` and, if an active row already exists, re-sync it through `sync_config_to_operational` instead of creating a fresh contribution. This is the "check before insert" pattern Phase 4's wanderer fix applied to its 4 IPC handlers, adapted for the Phase 7 import path. The re-sync re-asserts the operational row's `contribution_id` FK so it stays consistent with the active contribution. Re-import is now genuinely idempotent: the contributions table sees one active row regardless of how many times the slug is imported.
+
+**Lesson:** The "everything is contribution" pattern needs the same defensive check at every callsite that creates an active row. The contributions table doesn't enforce single-active-per-slug, so it has to be enforced by the writer. Phase 4's wanderer caught this for IPC handlers; Phase 7's wanderer caught it for the import path. Phase 9/10/11 implementers should grep for `create_config_contribution_with_metadata.*"active"` in any new code path and confirm there's a check-before-insert wrapper, or the bug pattern will recur.
+
+### Finding B — BLOCKING (FIXED): cancel does not roll back partial cache rows
+
+**What it is:** The spec at `docs/specs/cache-warming-and-import.md` "Cleanup" section ~line 345 is explicit:
+
+> "On explicit user cancel, the row is deleted along with any partially inserted cache entries and the target slug's DB rows."
+
+The implementer's `pyramid_import_cancel` IPC handler in `main.rs` only called `db::delete_import_state`, with a comment that explicitly contradicted the spec:
+
+```rust
+//   pyramid_import_cancel(target_slug)
+//     Deletes the in-flight import state row. Does NOT touch the
+//     populated cache — idempotent cache rows remain valid even if the
+//     user cancels mid-way (they're still content-addressable).
+```
+
+The implementer's reasoning ("cache rows are content-addressable, so they don't need cleanup") was wrong: even if the rows are valid, leaving them behind contradicts the user's "cancel" intent. A user who cancels mid-import expects the slug to return to its pre-import state. Having cache rows linger means a subsequent import of a DIFFERENT pyramid into the same slug would observe unexpected hit rates from the cancelled prior import (since the cache rows are slug-scoped, not pyramid-id-scoped). It also means "cancel" leaves a long tail of orphaned data on disk that the user has no UI to clean up.
+
+The impl log's "Spec adherence" section claims `✅` against every spec contract, including "IPC contract". The cancel deviation was not flagged as a deferred concern.
+
+**Detection method:** Read the spec's "Cleanup" section and the IPC handler comment side-by-side. The handler's stated behavior literally contradicts the spec text. The implementer's `ImportCancelResponse` struct also only had a `cancelled: bool` field — the spec's IPC contract section listed `partial_rollback: bool` as part of the response, which the response struct didn't include. Two corroborating tells.
+
+**What I did about it:** Added a proper `cancel_pyramid_import` function to `pyramid_import.rs` that:
+
+1. Loads the import state row to confirm it exists (recorded in the report so the IPC handler can distinguish "cancelled in-flight import" from "no-op cancel of a slug never imported").
+2. Queries `pyramid_step_cache` for distinct `build_id` values starting with `import:` for the target slug.
+3. Deletes every cache row matching those build_ids.
+4. Deletes the import state row.
+
+The cancel filter is **build_id-scoped** (`WHERE build_id LIKE 'import:%'`), NOT slug-wide — this preserves any cache rows that local LLM calls or rerolls wrote between import attempts. A regression test (`test_cancel_pyramid_import_preserves_non_import_cache_rows`) plants a "local-build-7" row alongside the imported rows, calls cancel, and asserts the local row survives.
+
+The IPC handler now returns `ImportCancelResponse { cancelled, state_row_existed, cache_rows_rolled_back }` so the frontend can confirm both the deletion count and whether the cancel was a no-op.
+
+**What I did NOT touch:** the DADBEAR contribution that the import created. Deleting a contribution from outside the contribution path bypasses the pattern, and Phase 4's wanderer findings explicitly flagged direct contribution writes as the anti-pattern. The user can disable DADBEAR through the existing oversight UI which creates a properly-superseded contribution. Documented in the function header.
+
+### Finding C — INFORMATIONAL: progress polling is binary (0% then 100%), not incremental
+
+**What it is:** The spec at line 405 says "`pyramid_import_progress` is polled by the frontend during the import" with a weighted progress formula:
+
+```
+progress = (nodes_processed / nodes_total) * 0.5 + (cache_entries_validated / cache_entries_total) * 0.5
+```
+
+The implementation initializes `nodes_processed` and `cache_entries_validated` to 0 in `create_import_state`, then bumps them to `nodes_total` / `cache_entries_total` in a SINGLE `db::update_import_state` call AFTER `populate_from_import` finishes. There is no incremental update inside `populate_from_import` — the loop runs all three passes and only writes the counters at the end.
+
+In production, this means:
+- Frontend polls `pyramid_import_progress` every 500ms.
+- For the entire duration of the populate pass (could be seconds for a 100+-L0 pyramid), the response shows `status="validating_sources"`, `progress=0.0`.
+- A single tick later, the response shows `status="populating_cache"`, `progress=1.0`.
+- Then `status="complete"`.
+
+The user sees a stuck "0% — validating sources" for the import duration, then a flash to 100%. Functionally the import works; the progress IPC is just non-functional for its stated purpose.
+
+**Severity:** Informational — the import is correct, the IPC just doesn't surface useful data. Phase 10's wizard will need this fixed before the import-progress UI is meaningful.
+
+**What I did about it:** Did NOT fix in this wanderer pass. The fix requires plumbing periodic `db::update_import_state` calls into the inner loops of `populate_from_import` (probably every N nodes), which is invasive enough that it deserves its own focused pass with the Phase 10 wizard's polling cadence in view. Flagged here so Phase 10 implementer (or a Phase 7.5 follow-up) knows the IPC plumbing exists but reports stale data.
+
+### Finding D — INFORMATIONAL: content_type defaults to 'document' regardless of source pyramid type
+
+**What it is:** `enable_dadbear_via_contribution` hardcodes `content_type: document` in the YAML it builds. The `pyramid_dadbear_config.content_type` column has a CHECK constraint `IN ('code', 'conversation', 'document')`. If the imported pyramid is actually a `code` pyramid or a `conversation` pyramid, the imported DADBEAR config will mis-classify it and DADBEAR's tick loop will use document-flavored heuristics for code/conversation files.
+
+The implementer documented this in a code comment:
+
+```rust
+// `content_type` is required by the operational table but not part of
+// the spec's auto-enable shape — we default to `document` since the
+// manifest doesn't carry the source's declared content type. Phase 10's
+// wizard can override.
+```
+
+The cache manifest format in the spec (~line 151) doesn't carry a top-level `content_type` field. The source pyramid's content_type IS knowable to the publisher (it lives on `pyramid_slugs.content_type`) but the publisher's `build_cache_manifest` doesn't currently emit it. Phase 10's wizard could ask the user, but for an auto-enable post-import, the right fix is for the manifest to carry the source pyramid's content_type and for the importer to use it.
+
+**Severity:** Informational — the workaround is for the user to manually fix the dadbear config after import. Not a Phase 7 blocker but a quality-of-import issue.
+
+**What I did about it:** Did NOT fix. The fix requires:
+1. Adding `content_type` to the `CacheManifest` struct (additive — backwards compatible).
+2. Updating `build_cache_manifest` to populate it from `pyramid_slugs.content_type`.
+3. Updating `enable_dadbear_via_contribution` to read it from the manifest instead of hardcoding `"document"`.
+
+That's a 3-file change that's worth doing in a focused follow-up rather than a wanderer fix-pass. Flagged for the Phase 7.5 / Phase 10 implementer.
+
+### Finding E — INFORMATIONAL: import state row is left behind on populate failure with no GC
+
+**What it is:** When `populate_from_import` returns an error mid-import, the importer updates the state row to `status='failed'` with the error message and leaves it behind. The spec's resume contract says a subsequent call with the same slug + same wire_pyramid_id picks up where it left off. But there's no garbage collector for `failed` state rows that the user never retries — they accumulate indefinitely as silent debt.
+
+A `pyramid_import_state` with `status='failed'` for slug X also blocks importing a different pyramid into slug X (the `wire_pyramid_id != existing.wire_pyramid_id` check refuses). The user has to call `pyramid_import_cancel` first.
+
+**Severity:** Low. Modest debt accumulation, manual resolution path exists. Worth a Phase 10 implementer being aware of.
+
+**What I did about it:** Did NOT fix. The fix is either (a) auto-cancel `failed` state rows older than N days on app launch, or (b) a "List failed imports" admin UI in Phase 10. Defer to the planner.
+
+### Finding F — INFORMATIONAL: import does not create the pyramid_slugs row
+
+**What it is:** `import_pyramid` writes to `pyramid_step_cache`, `pyramid_dadbear_config`, and `pyramid_config_contributions` for the target slug, but does NOT create the `pyramid_slugs` row itself. The test fixture creates it manually (`mem_conn` inserts a slug row before each test). In production, if a user calls `pyramid_import_pyramid` for a slug that doesn't already exist in `pyramid_slugs`, the cache rows / dadbear / contribution rows all land successfully (no FK enforcement to `pyramid_slugs`), but DADBEAR's tick loop will operate on a slug that doesn't appear in the slug list. Whether that produces a usable build state depends on what other parts of the system assume `pyramid_slugs` is canonical.
+
+The implementer's intention (per scope decisions in the impl log) is that Phase 10's frontend wizard creates the slug row before calling the import IPC. That's a valid scope boundary, but the IPC contract should document it explicitly so a future caller (testing harness, CLI tool, scripted import) doesn't trip over the implicit precondition.
+
+**Severity:** Low. Phase 10 will fix this by construction. Worth a doc note on the IPC handler.
+
+**What I did about it:** Did NOT fix. Adding a `pyramid_slugs` row inside `import_pyramid` would require choosing a `content_type` (which suffers from Finding D's same problem) and a `source_path` (which the import does have). This is the kind of "import wizard sets up the slug, IPC fills in the cache" split the implementer described in the impl log; hardcoding a default content_type at the IPC entry point would conflict with Phase 10's wizard. Flagged here for Phase 10.
+
+### What I did fix
+
+Both blocking findings (A, B) plus 3 new tests:
+
+1. `enable_dadbear_via_contribution` now checks for an existing active dadbear_policy contribution and re-syncs it instead of creating a duplicate.
+2. New `cancel_pyramid_import` function in `pyramid_import.rs` rolls back imported cache rows + state row, scoped by `build_id LIKE 'import:%'` to preserve local writes.
+3. `pyramid_import_cancel` IPC handler in `main.rs` calls the new function and returns `state_row_existed` + `cache_rows_rolled_back` in the response.
+4. `ImportCancelResponse` struct extended with the two new fields per the spec's IPC contract.
+
+Tests added:
+- `test_import_pyramid_resume_does_not_duplicate_dadbear_contributions` — repros the duplicate-contribution bug, then validates the fix.
+- `test_cancel_pyramid_import_rolls_back_cache_rows` — pins the rollback contract.
+- `test_cancel_pyramid_import_preserves_non_import_cache_rows` — pins the build_id-scoped filter (locally-built rows survive).
+
+### Verification after fix
+
+- `cargo check --lib` — clean, same 3 pre-existing warnings.
+- `cargo build` (binary) — clean, only the pre-existing tauri-plugin-shell deprecation warning.
+- `cargo test --lib pyramid::pyramid_import` — **18/18 passing** (15 original + 3 new wanderer tests).
+- `cargo test --lib pyramid` — **992 passed, 7 failed** (same 7 pre-existing failures: `test_evidence_pk_cross_slug_coexistence`, `real_yaml_thread_clustering_preserves_response_schema`, 5× `staleness::tests::*`). Phase 7 verifier ended at 989; wanderer added 3 → 992. Zero regressions.
+
+### End-to-end trace
+
+**Scenario A — happy path import with matching L0 sources:**
+1. Frontend (or test) calls `pyramid_import_pyramid` with a manifest covering 3 L0s + 2 upper-layer nodes.
+2. `import_pyramid` validates inputs, creates `pyramid_import_state` row with `status='downloading_manifest'`.
+3. Updates state to `status='validating_sources'` with `nodes_total=5`, `cache_entries_total=5`.
+4. Calls `populate_from_import` → Pass 1 hashes 3 L0 source files, all match → inserts 3 cache rows. Pass 2 BFS finds nothing stale (frontier is empty) → no propagation. Pass 3 inserts 2 upper-layer cache rows.
+5. Updates state to `status='populating_cache'` with `nodes_processed=5`, `cache_entries_validated=5`, `cache_entries_inserted=5`.
+6. Calls `enable_dadbear_via_contribution` → no existing active dadbear_policy contribution → creates new one with `source='import'`, maturity=`Canon`. `sync_config_to_operational` upserts `pyramid_dadbear_config` with the contribution_id FK.
+7. Updates state to `status='complete'`.
+8. Returns `ImportReport { cache_entries_valid: 5, cache_entries_stale: 0, nodes_needing_rebuild: 0, nodes_with_valid_cache: 5 }`.
+
+**Result:** End-to-end works. Cache rows land, contribution lands, operational row lands with FK populated. ✅
+
+**Scenario B — cancel mid-import (after fix):**
+1. Test calls `import_pyramid` with the same manifest → 5 cache rows + state row + dadbear contribution all land.
+2. User clicks Cancel in the frontend → `pyramid_import_cancel` IPC fires → `cancel_pyramid_import` runs.
+3. Function loads import state row (exists) → finds `build_id='import:wire:test-pyramid'` in cache → deletes 5 rows under that build_id → deletes import state row.
+4. Returns `ImportCancelReport { state_row_existed: true, cache_rows_rolled_back: 5 }`.
+
+**Result (POST-FIX):** All 5 imported cache rows are gone. State row is gone. DADBEAR contribution + operational row are intentionally left intact (they'll be cleaned via the DADBEAR oversight UI per the contribution path). ✅
+
+**Result (PRE-FIX):** State row deleted. **5 cache rows orphaned.** ❌
+
+**Scenario C — DADBEAR auto-enable after a successful import (after fix):**
+1. `enable_dadbear_via_contribution` checks `load_active_config_contribution("dadbear_policy", "test-import")`.
+2. First call: returns None → builds canonical YAML with `content_type=document`, `source_path={local_root}`, `enabled=true` → calls `create_config_contribution_with_metadata("dadbear_policy", Some("test-import"), ..., source="import", maturity=Canon)`.
+3. Re-loads the contribution → calls `sync_config_to_operational` → dispatcher's `dadbear_policy` branch parses the YAML into `DadbearPolicyYaml` → calls `db::upsert_dadbear_policy` → INSERT INTO `pyramid_dadbear_config` with `contribution_id` = new contribution_id. Triggers `dadbear_reload` event.
+4. Second call (resume): `load_active_config_contribution` returns the existing row → re-syncs through dispatcher → no new contribution → idempotent.
+
+**Result (POST-FIX):** Exactly one active dadbear_policy contribution per slug regardless of resume count. Operational row's contribution_id matches. ✅
+
+**Result (PRE-FIX):** Two active contributions on second import. Operational row's FK points at the newer one; older one is dangling-active. ❌
+
+### Commit
+
+Single commit on `phase-7-cache-warming-import` with message `phase-7: wanderer fix — duplicate contribution + cancel rollback`. 3 files modified, 3 new tests, all passing. No deviation from scope (the cancel fix is implementing what the spec already specified; the duplicate-contribution fix is closing the same loophole Phase 4's wanderer closed for IPC handlers).
+
+### Post-fix re-trace summary
+
+| Path | Pre-fix | Post-fix |
+|------|---------|----------|
+| Single import → cache | ✅ works | ✅ works |
+| Re-import (resume) → cache idempotency | ✅ works (verifier fix) | ✅ works |
+| Re-import → contribution count | ❌ duplicates | ✅ singleton |
+| Cancel mid-import → state row | ✅ deleted | ✅ deleted |
+| Cancel mid-import → cache rows | ❌ orphaned | ✅ rolled back |
+| Cancel preserves local rerolls | n/a (cancel didn't touch cache) | ✅ build_id-scoped |
+| DADBEAR contribution → operational row FK | ✅ works | ✅ works |
+| Manifest version > 1 → loud reject | ✅ works | ✅ works |
+| `derived_from` cycles in BFS | ✅ HashSet visited gate handles it | ✅ unchanged |
+| `derived_from` dangling refs | ✅ silently skipped | ✅ unchanged |
+| Privacy gate: `export_cache_manifest` opt-in | ✅ default OFF, no production callers | ✅ unchanged |
+| `store_cache` vs `store_cache_if_absent` | ✅ verifier fix correct, only `llm.rs` uses `store_cache` for fresh writes | ✅ unchanged |
+
+---
+

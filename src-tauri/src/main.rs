@@ -7255,9 +7255,10 @@ async fn pyramid_publish_to_wire(
 //     (nodes_processed, cache_entries_validated).
 //
 //   pyramid_import_cancel(target_slug)
-//     Deletes the in-flight import state row. Does NOT touch the
-//     populated cache — idempotent cache rows remain valid even if the
-//     user cancels mid-way (they're still content-addressable).
+//     Rolls back the import: deletes any cache rows the import wrote
+//     (filtered by `build_id LIKE 'import:%'`) and the in-flight state
+//     row. Idempotent — cancelling a slug that was never imported is a
+//     no-op. Per spec "Cleanup" section ~line 345.
 //
 // The manifest is supplied by the caller rather than downloaded here.
 // Phase 10's ImportPyramidWizard will own the manifest download via
@@ -7285,6 +7286,13 @@ struct ImportProgressResponse {
 #[derive(serde::Serialize)]
 struct ImportCancelResponse {
     cancelled: bool,
+    /// Whether any partial state existed for the slug at cancel time.
+    /// `false` is an idempotent no-op cancel.
+    state_row_existed: bool,
+    /// Number of `pyramid_step_cache` rows the rollback deleted. Counts
+    /// only rows whose `build_id` matches the import's synthetic
+    /// `import:` prefix — locally-built rows are not touched.
+    cache_rows_rolled_back: u64,
 }
 
 #[tauri::command]
@@ -7370,9 +7378,16 @@ async fn pyramid_import_cancel(
     target_slug: String,
 ) -> Result<ImportCancelResponse, String> {
     let writer = state.pyramid.writer.lock().await;
-    wire_node_lib::pyramid::db::delete_import_state(&writer, &target_slug)
-        .map_err(|e| e.to_string())?;
-    Ok(ImportCancelResponse { cancelled: true })
+    let report = wire_node_lib::pyramid::pyramid_import::cancel_pyramid_import(
+        &writer,
+        &target_slug,
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(ImportCancelResponse {
+        cancelled: true,
+        state_row_existed: report.state_row_existed,
+        cache_rows_rolled_back: report.cache_rows_rolled_back,
+    })
 }
 
 // --- App Setup --------------------------------------------------------------
