@@ -487,6 +487,13 @@ pub async fn call_model_unified_with_options_and_ctx(
     // any of that.
     let (provider_impl, secret, provider_type) = build_call_provider(config)?;
 
+    // Phase 11 wanderer fix: provider_id used for the health hook. The
+    // seeded registry row's `id` matches the provider_type tag on the
+    // default install (`"openrouter"`), so using the type string here
+    // resolves against the correct row in `pyramid_providers` for both
+    // the registry and transitional fallback paths in `build_call_provider`.
+    let health_provider_id = provider_type.as_str().to_string();
+
     // Model selection based on INPUT size only — max_tokens (output budget) is
     // irrelevant to whether the prompt fits in the model's context window.
     let est_input_tokens = estimate_tokens_llm(system_prompt, user_prompt).await;
@@ -573,6 +580,15 @@ pub async fn call_model_unified_with_options_and_ctx(
                     tokio::time::sleep(std::time::Duration::from_secs(config.retry_base_sleep_secs)).await;
                     continue;
                 }
+                // Phase 11 wanderer fix: feed the provider health state
+                // machine so the oversight page reflects the outage.
+                // Connection failure is a single-occurrence `down`
+                // signal per `provider_health::record_provider_error`.
+                maybe_record_provider_error(
+                    ctx,
+                    &health_provider_id,
+                    super::provider_health::ProviderErrorKind::ConnectionFailure,
+                );
                 return Err(anyhow!(
                     "Request failed after {} attempts (timeout={}s): {}",
                     config.max_retries,
@@ -642,6 +658,18 @@ pub async fn call_model_unified_with_options_and_ctx(
         if config.retryable_status_codes.contains(&status) {
             let wait = config.retry_base_sleep_secs * 2u64.pow(attempt + 1);
             info!("  HTTP {}, waiting {}s...", status, wait);
+            // Phase 11 wanderer fix: feed the provider health state
+            // machine on every 5xx observation, even when the call is
+            // about to retry. The state machine itself handles the
+            // threshold-based degrade decision so individual blips
+            // don't flap the health flag.
+            if status >= 500 {
+                maybe_record_provider_error(
+                    ctx,
+                    &health_provider_id,
+                    super::provider_health::ProviderErrorKind::Http5xx,
+                );
+            }
             tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
             continue;
         }
@@ -653,6 +681,17 @@ pub async fn call_model_unified_with_options_and_ctx(
                 info!("  HTTP {}, retry {}...", status, attempt + 1);
                 tokio::time::sleep(std::time::Duration::from_secs(config.retry_base_sleep_secs)).await;
                 continue;
+            }
+            // Phase 11 wanderer fix: record the terminal 5xx so the
+            // health state machine sees it. Non-5xx final errors
+            // (401/403/404) are NOT fed into the health hook — they
+            // indicate auth/config mistakes, not provider failure.
+            if status >= 500 {
+                maybe_record_provider_error(
+                    ctx,
+                    &health_provider_id,
+                    super::provider_health::ProviderErrorKind::Http5xx,
+                );
             }
             return Err(anyhow!("HTTP {} after {} attempts: {}", status, config.max_retries, body_text));
         }

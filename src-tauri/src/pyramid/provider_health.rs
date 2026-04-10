@@ -149,26 +149,44 @@ pub fn record_provider_error(
             format!("connection failure ({provider_id})"),
         ),
         ProviderErrorKind::Http5xx => {
-            // Decision is based on recent discrepancies too — if
-            // we're seeing both HTTP 5xx AND cost discrepancies the
-            // provider is degraded regardless.
-            let recent = db::count_recent_cost_discrepancies(
+            // Phase 11 wanderer fix: HTTP 5xx requires a rolling-
+            // window count to match spec. The previous implementation
+            // called `count_recent_cost_discrepancies` (wrong signal)
+            // and degraded on every 5xx unconditionally; single blips
+            // would flip the oversight flag and noise-fatigue the
+            // operator. Spec: degrade only after `provider_degrade_count`
+            // (default 3) HTTP 5xx observations inside
+            // `provider_degrade_window_secs` (default 600).
+            //
+            // The event log is a small append-only table
+            // (`pyramid_provider_error_log`) written here and read by
+            // the count query on the next observation. The table is
+            // rolled over implicitly by the window filter — stale
+            // rows beyond the window are ignored by the count query.
+            // A periodic trim is not required today because the row
+            // volume is small (bounded by attempted requests), but
+            // Phase 15 can add a sweep if the table grows large in
+            // practice.
+            db::record_provider_error_event(conn, provider_id, "http_5xx")?;
+            let recent = db::count_recent_provider_errors(
                 conn,
                 provider_id,
+                "http_5xx",
                 policy.provider_degrade_window_secs,
             )?;
             if recent >= policy.provider_degrade_count {
                 (
                     ProviderHealth::Degraded,
                     format!(
-                        "HTTP 5xx with {recent} recent cost discrepancies"
+                        "{recent} HTTP 5xx in the last {}s",
+                        policy.provider_degrade_window_secs
                     ),
                 )
             } else {
-                (
-                    ProviderHealth::Degraded,
-                    "HTTP 5xx from upstream".to_string(),
-                )
+                // Below the threshold — do not degrade yet. The
+                // observation is logged for the next count but the
+                // operator is not paged about a transient blip.
+                return Ok(());
             }
         }
         ProviderErrorKind::CostDiscrepancy => {
@@ -283,7 +301,10 @@ mod tests {
     }
 
     #[test]
-    fn single_5xx_degrades_immediately() {
+    fn single_5xx_below_threshold_does_not_degrade() {
+        // Phase 11 wanderer fix: spec requires 3+ HTTP 5xx in the
+        // rolling window before degrading. A single blip is recorded
+        // but does not flip provider_health.
         let conn = mem_conn_with_provider();
         let policy = CostReconciliationPolicy::default();
         record_provider_error(
@@ -295,7 +316,45 @@ mod tests {
         )
         .unwrap();
         let (health, _, _, _) = db::get_provider_health(&conn, "openrouter").unwrap().unwrap();
+        assert_eq!(
+            health, "healthy",
+            "single 5xx should not flip the provider health flag"
+        );
+        // The observation should still be persisted for the rolling
+        // window count on the next occurrence.
+        let recent = db::count_recent_provider_errors(&conn, "openrouter", "http_5xx", 600)
+            .unwrap();
+        assert_eq!(recent, 1);
+    }
+
+    #[test]
+    fn three_5xx_in_window_degrades() {
+        // Phase 11 wanderer fix: once the rolling window crosses the
+        // spec's degrade threshold (default 3) the provider flips to
+        // 'degraded'.
+        let conn = mem_conn_with_provider();
+        let policy = CostReconciliationPolicy::default();
+        for _ in 0..3 {
+            record_provider_error(
+                &conn,
+                "openrouter",
+                ProviderErrorKind::Http5xx,
+                &policy,
+                None,
+            )
+            .unwrap();
+        }
+        let (health, reason, _, _) = db::get_provider_health(&conn, "openrouter")
+            .unwrap()
+            .unwrap();
         assert_eq!(health, "degraded");
+        assert!(
+            reason
+                .as_deref()
+                .map(|r| r.contains("HTTP 5xx"))
+                .unwrap_or(false),
+            "degrade reason should mention HTTP 5xx, got {reason:?}"
+        );
     }
 
     #[test]

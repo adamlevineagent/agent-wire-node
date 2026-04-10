@@ -533,6 +533,29 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
         ",
     )?;
 
+    // Phase 11 wanderer fix: provider error log for the state
+    // machine's threshold-based HTTP 5xx degrade. Each observation of a
+    // provider-side error is recorded here so `record_provider_error`
+    // can count recent occurrences within the policy window and only
+    // flip the provider health flag when the spec's 3-in-window
+    // threshold is crossed. Without this table the state machine
+    // degrades on the first 5xx, which is strictly more aggressive
+    // than the spec permits. Cost discrepancies continue to use
+    // `pyramid_cost_log.reconciliation_status = 'discrepancy'` as
+    // their counter surface — this table is HTTP-specific.
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS pyramid_provider_error_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            provider_id TEXT NOT NULL,
+            error_kind TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_provider_error_log_recent
+            ON pyramid_provider_error_log(provider_id, error_kind, created_at);
+        ",
+    )?;
+
     let _ = conn.execute(
         "ALTER TABLE pyramid_faq_nodes ADD COLUMN match_triggers TEXT DEFAULT '[]'",
         [],
@@ -12572,6 +12595,50 @@ pub fn count_recent_cost_discrepancies(
                AND reconciliation_status = 'discrepancy'
                AND created_at > datetime('now', ?2)",
             rusqlite::params![provider_id, modifier],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    Ok(count)
+}
+
+/// Phase 11 wanderer fix: record a single provider error observation
+/// into the rolling event log. Called by `provider_health::
+/// record_provider_error` for HTTP 5xx events before the threshold
+/// check runs. Connection failures and cost discrepancies continue to
+/// use their own single-occurrence / cost_log-based paths and do NOT
+/// write here — we only record errors whose spec behavior depends on
+/// a rolling count.
+pub fn record_provider_error_event(
+    conn: &Connection,
+    provider_id: &str,
+    error_kind: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO pyramid_provider_error_log (provider_id, error_kind)
+         VALUES (?1, ?2)",
+        rusqlite::params![provider_id, error_kind],
+    )?;
+    Ok(())
+}
+
+/// Phase 11 wanderer fix: count recent provider error events of a
+/// given kind within a rolling window. Used by the HTTP 5xx degrade
+/// threshold so the state machine only flips `provider_health` after
+/// the spec's 3-in-window signal, not on the first occurrence.
+pub fn count_recent_provider_errors(
+    conn: &Connection,
+    provider_id: &str,
+    error_kind: &str,
+    window_secs: i64,
+) -> Result<i64> {
+    let modifier = format!("-{} seconds", window_secs.max(0));
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pyramid_provider_error_log
+             WHERE provider_id = ?1
+               AND error_kind = ?2
+               AND created_at > datetime('now', ?3)",
+            rusqlite::params![provider_id, error_kind, modifier],
             |r| r.get(0),
         )
         .unwrap_or(0);
