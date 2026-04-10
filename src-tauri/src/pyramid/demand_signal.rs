@@ -90,23 +90,39 @@ pub fn record_demand_signal(
         }
     }
 
-    // Phase 12 verifier fix: on-demand reactivation of deferred
-    // questions. After the signal is recorded, check whether any
-    // deferred question with `check_interval IN ('never','on_demand')`
-    // targets the leaf node. For each, re-run triage against the
-    // current policy — if it now returns `Answer`, remove the
-    // deferred row so the next build picks up the question.
-    let pending = list_on_demand_deferred_for_node(conn, slug, node_id).unwrap_or_default();
+    // Phase 12 wanderer fix: on-demand reactivation of deferred
+    // questions, slug-scoped.
+    //
+    // The original spec text said "query `pyramid_deferred_questions`
+    // for `(slug, node_id)` rows where `check_interval IN ('never',
+    // 'on_demand')`". That mapping is impossible with the current
+    // schema: a deferred question's `question_id` column is a
+    // `q-{sha256}` hash (`make_question_id` in
+    // question_decomposition.rs) while the drill signal's `node_id`
+    // is the answered pyramid node's `L{layer}-{seq}` id. The two
+    // ID spaces never overlap and the prior `list_deferred_by_question_target`
+    // join returned zero rows for every real drill event — the
+    // reactivation hook was dead code.
+    //
+    // Correct semantics inside the schema we have: "ANY demand
+    // signal arriving on the slug is 'demand arriving' for every
+    // slug-scoped `on_demand`/`never` deferred question". The
+    // triage DSL then decides which ones to reactivate. This
+    // matches the spec's intent ("demand drives re-check") while
+    // staying sound in the only ID space we have at both sides of
+    // the join. When the pyramid grows a persistent q-hash → L-id
+    // map (Phase 13+), the tighter per-node reactivation can return.
+    let pending = db::list_on_demand_deferred_for_slug(conn, slug).unwrap_or_default();
     if !pending.is_empty() {
         use super::triage::{resolve_decision, TriageDecision, TriageFacts};
         use super::types::LayerQuestion;
-        for (qid, qjson) in pending {
-            let question: LayerQuestion = match serde_json::from_str(&qjson) {
+        for row in pending {
+            let question: LayerQuestion = match serde_json::from_str(&row.question_json) {
                 Ok(q) => q,
                 Err(_) => continue,
             };
             // has_demand_signals is true by construction — we just
-            // recorded one.
+            // recorded one within the triage window on this slug.
             let facts = TriageFacts {
                 question: &question,
                 target_node_distilled: None,
@@ -119,7 +135,7 @@ pub fn record_demand_signal(
             };
             match resolve_decision(policy, &facts) {
                 Ok(TriageDecision::Answer { .. }) => {
-                    let _ = db::remove_deferred(conn, slug, &qid);
+                    let _ = db::remove_deferred(conn, slug, &row.question_id);
                 }
                 _ => {
                     // Still deferred or skipped — leave as-is.
@@ -139,6 +155,13 @@ pub fn record_demand_signal(
 /// Returns the list of (question_id, question_json) pairs so the
 /// caller can fetch the full question payloads without exposing the
 /// DeferredQuestion row shape.
+///
+/// Phase 12 wanderer note: retained as a stable helper for any
+/// future caller that has a real q-hash to match against. The
+/// `record_demand_signal` reactivation hook no longer uses this
+/// helper — it switched to `db::list_on_demand_deferred_for_slug`
+/// (slug-scoped) because the drill event's `node_id` can never be
+/// a `q-{sha256}` hash.
 pub fn list_on_demand_deferred_for_node(
     conn: &Connection,
     slug: &str,
@@ -345,5 +368,120 @@ mod tests {
             (parent_total - 1.5).abs() < 1e-9,
             "each leaf signal propagates to parent with 0.5 weight → 3×0.5 = 1.5"
         );
+    }
+
+    /// Phase 12 wanderer fix: `sum_slug_demand_weight` aggregates
+    /// across the entire slug regardless of which node the signal
+    /// landed on. This is the helper the triage DSL's
+    /// `has_demand_signals` condition now uses, because the
+    /// previous per-node path couldn't join a q-hash question_id
+    /// to an L{}-{} drill node_id.
+    #[test]
+    fn test_sum_slug_demand_weight_aggregates_across_nodes() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_pyramid_db(&conn).unwrap();
+
+        // Drop signals on three distinct nodes on the same slug.
+        // factor 0.0 → no propagation, each node gets exactly one row.
+        let policy = make_policy(0.0, 0.0, 100);
+        record_demand_signal(&conn, "s", "L1-001", "agent_query", Some("user"), &policy)
+            .unwrap();
+        record_demand_signal(&conn, "s", "L1-002", "agent_query", Some("user"), &policy)
+            .unwrap();
+        record_demand_signal(&conn, "s", "L2-003", "agent_query", Some("user"), &policy)
+            .unwrap();
+
+        // Per-node lookup against a q-hash question id returns
+        // zero (the old broken path).
+        let per_node_miss = db::sum_demand_weight(
+            &conn,
+            "s",
+            "q-abc123456789",
+            "agent_query",
+            "-1 day",
+        )
+        .unwrap();
+        assert!(per_node_miss < 1e-9, "per-node lookup on q-hash can never match");
+
+        // Slug-level aggregation picks up all three signals.
+        let slug_total =
+            db::sum_slug_demand_weight(&conn, "s", "agent_query", "-1 day").unwrap();
+        assert!(
+            (slug_total - 3.0).abs() < 1e-9,
+            "slug aggregate counts all three drill events"
+        );
+
+        // Different slug gets zero.
+        let other_slug =
+            db::sum_slug_demand_weight(&conn, "other", "agent_query", "-1 day").unwrap();
+        assert!(other_slug < 1e-9, "slug filter is respected");
+
+        // Different signal type gets zero.
+        let wrong_type =
+            db::sum_slug_demand_weight(&conn, "s", "user_drill", "-1 day").unwrap();
+        assert!(wrong_type < 1e-9, "signal_type filter is respected");
+    }
+
+    /// Phase 12 wanderer fix: `list_on_demand_deferred_for_slug`
+    /// returns every deferred row for a slug whose check_interval
+    /// is `never` or `on_demand`, regardless of question_id. This
+    /// replaces the broken `list_deferred_by_question_target` join
+    /// used by the original reactivation hook.
+    #[test]
+    fn test_list_on_demand_deferred_for_slug() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_pyramid_db(&conn).unwrap();
+
+        // Seed a contribution row so FK-like wiring stays happy.
+        conn.execute(
+            "INSERT INTO pyramid_config_contributions
+                (contribution_id, slug, schema_type, yaml_content, status)
+             VALUES ('c-pol', 's', 'evidence_policy', '', 'active')",
+            [],
+        )
+        .unwrap();
+
+        // Three deferred rows: two on_demand/never, one 7d.
+        db::defer_question(
+            &conn,
+            "s",
+            "q-h1",
+            r#"{"question_id":"q-h1","question_text":"?","layer":1,"about":"","creates":""}"#,
+            "on_demand",
+            Some("waiting for drill"),
+            Some("c-pol"),
+        )
+        .unwrap();
+        db::defer_question(
+            &conn,
+            "s",
+            "q-h2",
+            r#"{"question_id":"q-h2","question_text":"?","layer":1,"about":"","creates":""}"#,
+            "never",
+            None,
+            None,
+        )
+        .unwrap();
+        db::defer_question(
+            &conn,
+            "s",
+            "q-h3",
+            r#"{"question_id":"q-h3","question_text":"?","layer":1,"about":"","creates":""}"#,
+            "7d",
+            None,
+            None,
+        )
+        .unwrap();
+
+        let rows = db::list_on_demand_deferred_for_slug(&conn, "s").unwrap();
+        let ids: Vec<String> = rows.into_iter().map(|r| r.question_id).collect();
+        assert_eq!(
+            ids.len(),
+            2,
+            "only on_demand + never rows are returned"
+        );
+        assert!(ids.contains(&"q-h1".to_string()));
+        assert!(ids.contains(&"q-h2".to_string()));
+        assert!(!ids.contains(&"q-h3".to_string()));
     }
 }

@@ -3111,40 +3111,48 @@ async fn pyramid_reevaluate_deferred_questions(
             still_deferred: 0,
             skipped: 0,
         };
+        // Phase 12 wanderer fix: evaluate has_demand_signals once at
+        // slug granularity, not per-question. Per-node aggregation
+        // by question.question_id never matched because question_id
+        // is a q-{sha256} hash while demand signals land on
+        // L{layer}-{seq} node ids. See
+        // evidence_answering::run_triage_gate for the matching fix
+        // and rationale.
+        let slug_has_demand_signals = policy.demand_signals.iter().any(|rule| {
+            let w = rule.window.trim();
+            let window = if w.starts_with('-') || w.contains(' ') {
+                w.to_string()
+            } else {
+                let (num_part, unit_part): (String, String) =
+                    w.chars().partition(|c| c.is_ascii_digit());
+                let n: i64 = num_part.parse().unwrap_or(14);
+                let (n, unit) = match unit_part.as_str() {
+                    "d" => (n, "days"),
+                    "h" => (n, "hours"),
+                    "w" => (n * 7, "days"),
+                    "m" => (n, "minutes"),
+                    _ => (n, "days"),
+                };
+                format!("-{} {}", n, unit)
+            };
+            db::sum_slug_demand_weight(&conn, &slug, &rule.r#type, &window)
+                .unwrap_or(0.0)
+                >= rule.threshold
+        });
+
         for row in deferred {
             result.evaluated += 1;
             let question: LayerQuestion = match serde_json::from_str(&row.question_json) {
                 Ok(q) => q,
                 Err(_) => continue,
             };
-            let has_demand_signals = policy.demand_signals.iter().any(|rule| {
-                let w = rule.window.trim();
-                let window = if w.starts_with('-') || w.contains(' ') {
-                    w.to_string()
-                } else {
-                    let (num_part, unit_part): (String, String) =
-                        w.chars().partition(|c| c.is_ascii_digit());
-                    let n: i64 = num_part.parse().unwrap_or(14);
-                    let (n, unit) = match unit_part.as_str() {
-                        "d" => (n, "days"),
-                        "h" => (n, "hours"),
-                        "w" => (n * 7, "days"),
-                        "m" => (n, "minutes"),
-                        _ => (n, "days"),
-                    };
-                    format!("-{} {}", n, unit)
-                };
-                db::sum_demand_weight(&conn, &slug, &question.question_id, &rule.r#type, &window)
-                    .unwrap_or(0.0)
-                    >= rule.threshold
-            });
             let facts = TriageFacts {
                 question: &question,
                 target_node_distilled: None,
                 target_node_depth: Some(question.layer),
                 is_first_build: false,
                 is_stale_check: true,
-                has_demand_signals,
+                has_demand_signals: slug_has_demand_signals,
                 evidence_question_trivial: None,
                 evidence_question_high_value: None,
             };

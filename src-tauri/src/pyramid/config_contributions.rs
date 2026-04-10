@@ -908,32 +908,81 @@ fn trigger_dadbear_reload(_bus: &Arc<BuildEventBus>, slug: Option<&str>) {
 /// `trivial` as true will not match either; default-answer fallback
 /// applies).
 fn reevaluate_deferred_questions(conn: &Connection, slug: Option<&str>) -> Result<()> {
+    // Phase 12 wanderer fix: a global evidence_policy supersession
+    // (contribution with `slug = NULL`) previously fell through
+    // `list_all_deferred(conn, "")` and never matched any rows — the
+    // global-policy re-evaluation path was silently dead. Walk every
+    // distinct slug with deferred questions in that case, and
+    // re-evaluate per-slug so the global policy actually lands.
+    if slug.is_none() {
+        match db::list_slugs_with_deferred_questions(conn) {
+            Ok(slugs) => {
+                for s in slugs {
+                    // Recurse per-slug. Any individual slug error
+                    // gets logged inside and doesn't abort the outer
+                    // supersession handler.
+                    let _ = reevaluate_deferred_questions_for_slug(conn, &s);
+                }
+                return Ok(());
+            }
+            Err(e) => {
+                debug!(
+                    error = %e,
+                    "reevaluate_deferred_questions: failed to list slugs with deferred rows (global policy path)"
+                );
+                return Ok(());
+            }
+        }
+    }
+    reevaluate_deferred_questions_for_slug(conn, slug.unwrap())
+}
+
+/// Per-slug worker for `reevaluate_deferred_questions`. Loads the
+/// active policy for the slug, lists its deferred rows, and
+/// re-triages each against the new policy. Answer → remove, Defer →
+/// update next_check_at, Skip → remove.
+fn reevaluate_deferred_questions_for_slug(
+    conn: &Connection,
+    slug: &str,
+) -> Result<()> {
     use crate::pyramid::triage::{resolve_decision, TriageDecision, TriageFacts};
     use crate::pyramid::types::LayerQuestion;
 
-    let slug_str = slug.unwrap_or("");
-    let policy = match db::load_active_evidence_policy(conn, slug) {
+    let policy = match db::load_active_evidence_policy(conn, Some(slug)) {
         Ok(p) => p,
         Err(e) => {
             debug!(
                 error = %e,
-                "reevaluate_deferred_questions: failed to load policy, skipping"
+                slug,
+                "reevaluate_deferred_questions_for_slug: failed to load policy, skipping"
             );
             return Ok(());
         }
     };
 
-    // Load all deferred questions for this slug.
-    let deferred = match db::list_all_deferred(conn, slug_str) {
+    let deferred = match db::list_all_deferred(conn, slug) {
         Ok(v) => v,
         Err(e) => {
             debug!(
                 error = %e,
-                "reevaluate_deferred_questions: failed to list deferred, skipping"
+                slug,
+                "reevaluate_deferred_questions_for_slug: failed to list deferred, skipping"
             );
             return Ok(());
         }
     };
+
+    // Phase 12 wanderer fix: evaluate has_demand_signals at slug
+    // granularity. Per-node aggregation by question.question_id
+    // never matched because question_id is a q-{sha256} hash while
+    // demand signals land on L{layer}-{seq} node ids. See
+    // evidence_answering::run_triage_gate for the matching fix
+    // and rationale.
+    let slug_has_demand_signals = policy.demand_signals.iter().any(|rule| {
+        let window = normalize_window_modifier(&rule.window);
+        let sum = db::sum_slug_demand_weight(conn, slug, &rule.r#type, &window).unwrap_or(0.0);
+        sum >= rule.threshold
+    });
 
     let mut evaluated = 0usize;
     let mut activated = 0usize;
@@ -942,28 +991,10 @@ fn reevaluate_deferred_questions(conn: &Connection, slug: Option<&str>) -> Resul
 
     for row in deferred {
         evaluated += 1;
-        // Parse the stored question payload back into a
-        // LayerQuestion. If it fails we just leave the deferred row
-        // alone.
         let question: LayerQuestion = match serde_json::from_str(&row.question_json) {
             Ok(q) => q,
             Err(_) => continue,
         };
-
-        // has_demand_signals eval: only check if any policy signal
-        // rule exceeds its threshold for this node.
-        let has_demand_signals = policy.demand_signals.iter().any(|rule| {
-            let window = normalize_window_modifier(&rule.window);
-            let sum = db::sum_demand_weight(
-                conn,
-                &row.slug,
-                &question.question_id,
-                &rule.r#type,
-                &window,
-            )
-            .unwrap_or(0.0);
-            sum >= rule.threshold
-        });
 
         let facts = TriageFacts {
             question: &question,
@@ -971,7 +1002,7 @@ fn reevaluate_deferred_questions(conn: &Connection, slug: Option<&str>) -> Resul
             target_node_depth: Some(question.layer),
             is_first_build: false,
             is_stale_check: true, // re-evaluation is maintenance
-            has_demand_signals,
+            has_demand_signals: slug_has_demand_signals,
             evidence_question_trivial: None,
             evidence_question_high_value: None,
         };
@@ -1006,12 +1037,12 @@ fn reevaluate_deferred_questions(conn: &Connection, slug: Option<&str>) -> Resul
     }
 
     debug!(
-        slug = ?slug,
+        slug,
         evaluated,
         activated,
         still_deferred,
         skipped,
-        "reevaluate_deferred_questions: Phase 12 complete"
+        "reevaluate_deferred_questions_for_slug: Phase 12 complete"
     );
 
     Ok(())

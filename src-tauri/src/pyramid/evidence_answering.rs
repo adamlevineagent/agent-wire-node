@@ -1985,18 +1985,32 @@ pub fn run_triage_gate(
 
     let mut answer_bucket: Vec<LayerQuestion> = Vec::new();
 
+    // Phase 12 wanderer fix: `has_demand_signals` is evaluated
+    // ONCE per triage pass, at slug granularity, not per-question.
+    //
+    // The per-node `sum_demand_weight(slug, node_id, ...)` can't be
+    // used here because `LayerQuestion.question_id` is a `q-{sha256}`
+    // hash (`make_question_id` in question_decomposition.rs), while
+    // demand signals land on `pyramid_demand_signals.node_id` under
+    // the pyramid node's `L{layer}-{seq}` id that `answer_single_question`
+    // assigns at answering time. The two ID spaces never meet, so
+    // the previous per-question lookup always returned 0.0 and
+    // `has_demand_signals` was effectively dead.
+    //
+    // Per-slug aggregation matches the spec's intent ("drive re-check
+    // by demand") while staying correct in the only ID space the
+    // demand signals actually live in. The spatial precision the
+    // spec implies will come back in Phase 13+ when a persistent
+    // q-hash → node-id map is added.
+    let slug_has_demand_signals = policy.demand_signals.iter().any(|rule| {
+        let window = normalize_window(&rule.window);
+        let sum =
+            db::sum_slug_demand_weight(&conn, slug, &rule.r#type, &window).unwrap_or(0.0);
+        sum >= rule.threshold
+    });
+
     for question in questions {
-        // has_demand_signals: check if any signal type's summed
-        // weight exceeds its threshold in the configured window.
-        // LayerQuestion has no direct node_id; use question_id as
-        // the proxy (demand signals land on nodes by id).
-        let has_demand_signals = policy.demand_signals.iter().any(|rule| {
-            let window = normalize_window(&rule.window);
-            let sum =
-                db::sum_demand_weight(&conn, slug, &question.question_id, &rule.r#type, &window)
-                    .unwrap_or(0.0);
-            sum >= rule.threshold
-        });
+        let has_demand_signals = slug_has_demand_signals;
 
         let facts = super::triage::TriageFacts {
             question,

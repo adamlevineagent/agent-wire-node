@@ -2351,3 +2351,71 @@ Wanderer prompt suggestion: "Does the Phase 12 retrofit sweep actually make the 
 
 `verifier-pass-applied` — Phase 12 is now shippable. The retrofit sweep is no longer dead code. The triage gate runs on every production build. On-demand reactivation works. Re-evaluation on policy supersession works. The test suite matches the pre-Phase-12 baseline (1099 new passing + same 7 pre-existing failures).
 
+### Wanderer pass (2026-04-10)
+
+**Status:** two structural bugs fixed in place; phase is now actually shippable end-to-end. The verifier's fix corrected cache plumbing dead-code, but left an ID-space mismatch threading through the triage gate, the DADBEAR scanner, both re-evaluation paths, and the on-demand reactivation hook. A second bug silently dropped global evidence_policy supersessions. Both are fixed.
+
+#### Bug #1 — ID-space mismatch: `question.question_id` is a q-hash, not a node_id
+
+The triage DSL's `has_demand_signals` condition and the `record_demand_signal` on-demand reactivation hook both tried to join `pyramid_demand_signals.node_id` against `LayerQuestion.question_id`. These live in different ID spaces and never meet:
+
+- `LayerQuestion.question_id` is a `q-{sha256_hex_first_12}` hash built by `question_decomposition::make_question_id(question, about, depth)` (src-tauri/src/pyramid/question_decomposition.rs:183-190). It's assigned at decomposition time, before any answer exists.
+- `pyramid_demand_signals.node_id` holds the answered pyramid node's `L{layer}-{seq:03}` id assigned by `answer_single_question` at line 652 of evidence_answering.rs. It only exists after the question has been answered.
+- `pyramid_nodes` has no column that back-references to the q-hash question that produced a given L-id. There is no persistent mapping between the two ID spaces anywhere in the schema.
+
+Consequences before this fix:
+- `evidence_answering::run_triage_gate` at line 1996 called `db::sum_demand_weight(&conn, slug, &question.question_id, ...)` which always returned 0.0. The `has_demand_signals` flag was effectively dead. The spec's canonical `"stale_check AND has_demand_signals → answer"` rule could never match in practice.
+- `stale_engine` deferred scanner (src-tauri/src/pyramid/stale_engine.rs:333), `config_contributions::reevaluate_deferred_questions` (:960), and `main.rs::pyramid_reevaluate_deferred_questions` (:3137) all had the same broken per-question lookup.
+- `demand_signal::record_demand_signal`'s on-demand reactivation hook called `list_deferred_by_question_target(conn, slug, node_id)` which used `WHERE question_id = ?2` with `?2 = drill_node_id`. The drill handler passed the L-id (e.g. `L1-003`) while deferred rows store q-hashes (e.g. `q-ab12cd34ef56`). The join returned zero rows on every real drill event — the verifier's "fix" from the earlier pass only corrected the column name, not the fundamental ID-space mismatch. The reactivation hook was dead code.
+
+**Fix:** switch all four sites to slug-level demand signal aggregation.
+
+- Added `db::sum_slug_demand_weight(conn, slug, signal_type, window_modifier)` that drops the `node_id` filter and sums across the entire slug. This matches the spec's intent ("demand drives re-check") while staying sound in the only ID space the demand signals actually live in. Per-slug aggregation loses spatial precision, but spatial precision is unimplementable without a persistent q-hash → node-id map (Phase 13+ scope). src-tauri/src/pyramid/db.rs (new helper after `sum_demand_weight`).
+- Added `db::list_on_demand_deferred_for_slug(conn, slug)` that returns every deferred row on the slug whose `check_interval IN ('never', 'on_demand')`, dropping the broken per-question join. src-tauri/src/pyramid/db.rs.
+- `evidence_answering::run_triage_gate` now computes `has_demand_signals` once per triage pass using `sum_slug_demand_weight`, then applies that single boolean to every question in the batch. src-tauri/src/pyramid/evidence_answering.rs (in `run_triage_gate`).
+- `stale_engine` DADBEAR scanner pre-computes `slug_has_demand_signals` once at the top of the expired-rows loop via `sum_slug_demand_weight`, then reuses the value per question. src-tauri/src/pyramid/stale_engine.rs (deferred-question scanner block).
+- `config_contributions::reevaluate_deferred_questions_for_slug` pre-computes the slug-level value once at the top and threads it through every per-question `TriageFacts`. src-tauri/src/pyramid/config_contributions.rs.
+- `main.rs::pyramid_reevaluate_deferred_questions` IPC handler does the same. src-tauri/src/main.rs.
+- `demand_signal::record_demand_signal`'s reactivation hook now iterates `list_on_demand_deferred_for_slug(conn, slug)` instead of the broken per-node helper. Every `never`/`on_demand` row on the slug is re-triaged against the current policy with `has_demand_signals=true`; rows whose decision flips to `Answer` are removed. src-tauri/src/pyramid/demand_signal.rs (in `record_demand_signal`).
+
+The stale `list_on_demand_deferred_for_node` helper is retained for any future caller that actually has a q-hash to match against, but the comment now warns that the drill-event path can never use it.
+
+#### Bug #2 — Global evidence_policy supersession silently dropped
+
+`config_contributions::reevaluate_deferred_questions(conn, slug)` wrote `let slug_str = slug.unwrap_or("");` then called `list_all_deferred(conn, slug_str)`. For a **global** evidence_policy contribution (`contribution.slug = NULL`), the caller passes `slug = None` (src-tauri/src/pyramid/config_contributions.rs:669), which meant the query ran with `WHERE slug = ''` and never matched any real deferred row. Every global-policy supersession silently re-evaluated zero rows — the spec's Part 2 §"Re-evaluation on Policy Change" path was half-dead.
+
+**Fix:** when `slug.is_none()`, iterate every distinct slug with deferred rows via a new `db::list_slugs_with_deferred_questions(conn)` helper and recurse per-slug. The per-slug worker was extracted into `reevaluate_deferred_questions_for_slug(conn, slug)` so both the supersession path and any future direct caller have a stable entry point. Per-slug work does its own per-slug policy load via `load_active_evidence_policy(conn, Some(slug))` so per-slug overrides still win when they exist.
+
+#### Files touched
+
+- src-tauri/src/pyramid/db.rs — added `sum_slug_demand_weight`, `list_slugs_with_deferred_questions`, `list_on_demand_deferred_for_slug` helpers
+- src-tauri/src/pyramid/evidence_answering.rs — `run_triage_gate` switched to slug-level demand aggregation
+- src-tauri/src/pyramid/stale_engine.rs — DADBEAR scanner switched to slug-level demand aggregation
+- src-tauri/src/pyramid/config_contributions.rs — split `reevaluate_deferred_questions` into global-slug dispatcher + per-slug worker; slug-level demand aggregation
+- src-tauri/src/main.rs — IPC handler switched to slug-level demand aggregation
+- src-tauri/src/pyramid/demand_signal.rs — `record_demand_signal` reactivation hook switched to slug-scoped query; 2 new tests added
+- docs/plans/pyramid-folders-model-routing-implementation-log.md — this wanderer pass entry
+
+#### Questions verified clean (no bugs found)
+
+1. **Q1 — triage gate reachability**: traced `chain_executor::execute_chain_from` → `execute_evidence_loop` → `llm_config_with_cache` (chain_executor.rs:4881-4888) → `answer_questions` (chain_executor.rs:5205) → `run_triage_gate` (evidence_answering.rs:439). Cache_access is populated at every production entry point (execute_chain_from, execute_plan, execute_evidence_loop, execute_recursive_decompose, execute_process_gaps, build_runner's 3 dispatch points, vine.rs's 6 dispatch points, partner warm_pass, and the 5 HTTP/IPC handlers). The verifier's fix is complete.
+2. **Q4 — DADBEAR scanner**: `list_expired_deferred` correctly excludes `never`/`on_demand` (db.rs:12108). Scanner opens its own connection via `open_pyramid_connection(Path::new(&db))` inside `spawn_blocking`, so it doesn't hold the writer mutex.
+3. **Q5 — cache retrofit reaches cache**: spot-checked 5 paths end-to-end (evidence_answering::answer_single_question, faq::process_annotation_match_path, meta::timeline_forward, stale_helpers::check_file_stale, stale_helpers_upper::dispatch_node_stale_check). All build a StepContext with non-empty `resolved_model_id` and `prompt_hash`, and route through `call_model_{_unified,_with_usage,_}_and_ctx`. The `cache_is_usable()` gate fires correctly.
+4. **Q6 — wiring gaps**: grepped for every `state.config.read().await.clone()` in the pyramid crate. Only 3 sites do a bare config clone without going through `llm_config_with_cache`: (a) `chain_executor::retry_dead_letter_entry` — documented intentional cache-skip on retries, (b) `public_html/ascii_art.rs::ascii_handler` — intentional diagnostic bypass, (c) `main.rs::get_config` — wrong type (WireNodeConfig, not LlmConfig). No production LLM path drops cache_access.
+5. **Q7 — is_first_build lookup**: `conn.query_row("SELECT COUNT(*) FROM pyramid_nodes WHERE slug = ?1 AND depth = 0", ...)` at evidence_answering.rs:1977-1984 is a single atomic SELECT; no TOCTOU. Depth-0 filter correctly matches the spec's "no prior nodes at this depth". Unmapped rows return `c == 0` → `true`; any SQLite error defaults to `false` (fail-safe toward "not first build" which makes the canonical `first_build` rule simply not match — safer than a spurious match).
+6. **Q8 — DSL evaluator vocabulary**: traced every spec predicate (`first_build`, `stale_check`, `has_demand_signals`, `no_demand_signals`, `evidence_question_trivial`, `evidence_question_high_value`, `depth == N`) + operators (`AND`, `OR`, `NOT`, `(`, `)`). Recursive-descent grammar is `parse_or → parse_and → parse_not → parse_atom`, with correct C-style precedence (`NOT > AND > OR`). `depth ==` is handled specially in `parse_atom`; bare numbers on the wrong side of `==` error cleanly. Trivial/high_value predicates default to `false` when the flags aren't populated — safe fallback that matches deviation #1 in the implementer's entry. Unknown rule actions fall through to Answer in `rule_to_decision` (swallowed `TagForLog` trait is a cosmetic no-op, not a bug).
+7. **Q9 — deferred questions data integrity**: `defer_question` uses `INSERT ... ON CONFLICT(slug, question_id) DO UPDATE` — double-defer is impossible. SQLite's writer lock serializes `remove_deferred` vs `update_deferred_next_check`, so the race window is zero. The `UNIQUE(slug, question_id)` constraint at db.rs:1702 is enforced at schema level.
+8. **Q10 — retrofit step metadata**: spot-checked 3 sites (`faq::process_annotation` match at faq.rs:92, `meta::timeline_forward`+`timeline_backward` at meta.rs:67,125, `stale_helpers::check_file_stale` at stale_helpers.rs:295). Each site sets distinct `(step_name, primitive, depth, chunk_index)`. Cache key is `(inputs_hash, prompt_hash, model_id)` per `compute_cache_key` — step_name is not in the key, so two sites with identical content correctly share the cache row (the cache is semantically a "same content → same output" store).
+9. **Q11 — block_in_place runtime-flavor wrap**: both the probe path (llm.rs:1028-1064) and the store path (llm.rs:1240-1265) dispatch on `tokio::runtime::Handle::try_current()` → `runtime_flavor()`. MultiThread → `block_in_place(body)`; CurrentThread (or no handle) → run body inline. DB open + single SELECT is sub-millisecond, so inline execution on the scheduler thread is acceptable. On the Tauri production runtime (MultiThread), `block_in_place` donates the current worker thread to the blocking call — safe.
+
+#### Re-ran verification criteria
+
+1. **`cargo check --lib`**: 3 pre-existing warnings only (same as baseline). No new warnings.
+2. **`cargo test --lib pyramid`**: **1101 passing / 7 failing** (vs 1099/7 baseline). Delta: +2 new tests (`test_sum_slug_demand_weight_aggregates_across_nodes`, `test_list_on_demand_deferred_for_slug`), same 7 pre-existing failures (`test_evidence_pk_cross_slug_coexistence`, `real_yaml_thread_clustering_preserves_response_schema`, 5× `staleness::tests::*`).
+3. **End-to-end reachability re-traced**: `chain_executor::execute_chain_from` → `llm_config_with_cache(slug, chain_build_id)` → `clone_with_cache_access` → `LlmConfig.cache_access = Some(CacheAccess {...})` → `execute_evidence_loop` (also mints its own `evidence_build_id`) → `answer_questions` → `llm_config.cache_access.as_ref()` returns `Some` → spawn_blocking runs `run_triage_gate(&db_path, slug, questions)` → `sum_slug_demand_weight` actually aggregates signals → DSL evaluates against meaningful facts → `resolve_decision` dispatches Answer/Defer/Skip → `defer_question` upserts into `pyramid_deferred_questions` on Defer → the surviving subset flows to `answer_single_question` → `call_model_unified_and_ctx` with a populated StepContext → cache reachable. End-to-end confirmed.
+4. **Global-policy supersession**: `config_contributions::sync_config_to_operational`'s `evidence_policy` branch calls `reevaluate_deferred_questions(conn, contribution.slug.as_deref())`. When the supersession is a global contribution (`contribution.slug = None`), the new dispatcher walks `list_slugs_with_deferred_questions` and recurses per-slug. Each per-slug recurse loads that slug's active policy (which may be the global one or a per-slug override) via `load_active_evidence_policy(conn, Some(slug))`. End-to-end confirmed.
+
+#### Status
+
+`wanderer-pass-applied` — Phase 12 is now functionally complete. The triage gate's `has_demand_signals` condition actually evaluates meaningful facts instead of always-false. Drill events on pyramid nodes actually reactivate `on_demand`/`never` deferred questions. Global evidence_policy supersessions actually re-evaluate deferred rows across every affected slug. The test count is 1101/7 (+2 over the verifier pass, same 7 pre-existing failures).
+

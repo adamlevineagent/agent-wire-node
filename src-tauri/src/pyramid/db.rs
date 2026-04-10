@@ -11951,6 +11951,98 @@ pub fn sum_demand_weight(
     Ok(total.unwrap_or(0.0))
 }
 
+/// Phase 12 wanderer fix: sum the weights of demand signals of a
+/// given type across an ENTIRE slug within a time window. This is
+/// the helper the triage DSL's `has_demand_signals` condition uses —
+/// the per-node variant (`sum_demand_weight`) can't be used for
+/// deferred evidence questions because a `LayerQuestion.question_id`
+/// is a `q-{sha256}` hash, not the L{layer}-{seq} id that demand
+/// signals are recorded under. The two ID spaces never meet.
+///
+/// Aggregating per-slug matches the spec's intent ("drive re-check
+/// by demand") while staying correct in the only ID space we
+/// actually have at both sides of the join. When the pyramid grows
+/// a persistent q-hash → node-id map (Phase 13+), the per-node
+/// variant can be brought back for spatial precision.
+///
+/// Returns 0.0 if no signals match (not an error).
+pub fn sum_slug_demand_weight(
+    conn: &Connection,
+    slug: &str,
+    signal_type: &str,
+    window_modifier: &str,
+) -> Result<f64> {
+    let total: Option<f64> = conn
+        .query_row(
+            "SELECT SUM(weight) FROM pyramid_demand_signals
+             WHERE slug = ?1 AND signal_type = ?2
+               AND created_at > datetime('now', ?3)",
+            rusqlite::params![slug, signal_type, window_modifier],
+            |r| r.get(0),
+        )
+        .ok();
+    Ok(total.unwrap_or(0.0))
+}
+
+/// Phase 12 wanderer fix: list every distinct slug that has at
+/// least one row in `pyramid_deferred_questions`. Used by the
+/// global-policy re-evaluation path so a supersession of a global
+/// `evidence_policy` (contribution with `slug = NULL`) can walk
+/// every affected slug instead of silently matching zero rows on
+/// `slug = ''`.
+pub fn list_slugs_with_deferred_questions(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT slug FROM pyramid_deferred_questions ORDER BY slug ASC",
+    )?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// Phase 12 wanderer fix: list every deferred row for a slug with
+/// `check_interval IN ('never', 'on_demand')`. Used by the
+/// `record_demand_signal` on-demand reactivation hook. The previous
+/// `list_deferred_by_question_target` helper tried to join by
+/// question_id = node_id which never matches (q-hash vs L{}-{}),
+/// so the reactivation hook was a no-op. This helper drops the
+/// node_id filter and returns all slug-level `on_demand`/`never`
+/// rows — the demand signal handler then re-triages each with
+/// `has_demand_signals=true` and reactivates the ones whose
+/// decision flips to Answer.
+pub fn list_on_demand_deferred_for_slug(
+    conn: &Connection,
+    slug: &str,
+) -> Result<Vec<DeferredQuestion>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, slug, question_id, question_json, deferred_at, next_check_at,
+                check_interval, triage_reason, contribution_id
+         FROM pyramid_deferred_questions
+         WHERE slug = ?1 AND check_interval IN ('never', 'on_demand')
+         ORDER BY deferred_at ASC",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![slug], |r| {
+        Ok(DeferredQuestion {
+            id: r.get(0)?,
+            slug: r.get(1)?,
+            question_id: r.get(2)?,
+            question_json: r.get(3)?,
+            deferred_at: r.get(4)?,
+            next_check_at: r.get(5)?,
+            check_interval: r.get(6)?,
+            triage_reason: r.get(7)?,
+            contribution_id: r.get(8)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
 /// Walk `pyramid_evidence` to find every parent node (target_node_id)
 /// linked via a KEEP edge from the given node_id. Used by the demand
 /// signal propagation BFS.
