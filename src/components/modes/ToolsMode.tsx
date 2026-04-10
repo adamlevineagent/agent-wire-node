@@ -386,6 +386,15 @@ function MyToolsPanel({ onEdit }: MyToolsPanelProps) {
         bumpRefresh();
     }, [bumpRefresh]);
 
+    // Fired by PublishPreviewModal after a successful publish. Closes
+    // the detail drawer (if any) so its stale ConfigContribution row —
+    // still showing `wire_contribution_id: null` from before the write
+    // — is cleared. The next View click refetches the fresh row and
+    // the "Published" badge lights up correctly.
+    const handlePublishSuccess = useCallback(() => {
+        setDetailContribution(null);
+    }, []);
+
     // Merge local planner tools with Wire-published tools (existing).
     const legacyTools: Array<WireTool & { usageCount?: number }> = [
         ...LOCAL_TOOLS.map((t) => ({
@@ -534,6 +543,7 @@ function MyToolsPanel({ onEdit }: MyToolsPanelProps) {
                     contributionId={publishContributionId}
                     schemaType={publishSchemaType}
                     onClose={publishClose}
+                    onPublished={handlePublishSuccess}
                 />
             )}
         </div>

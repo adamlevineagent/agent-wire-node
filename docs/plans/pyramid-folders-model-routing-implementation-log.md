@@ -1719,3 +1719,39 @@ Verified the implementation end-to-end by auditing the React wiring, TypeScript 
 
 Phase 10 status: `verified-with-fix`. Ready for conductor's next stage.
 
+### Wanderer pass — 2026-04-10
+
+**Wanderer:** Conductor wanderer (fresh-eyes end-to-end trace, no punch list)
+**Status:** verified-with-fix → wanderer-verified-with-fix
+
+Traced the full Phase 10 state machine + IPC contract end-to-end for three scenarios (generate→refine→accept→drawer→publish, accept-without-refinement, My Tools with pre-existing active config → drawer → version history click-through). Read every call site for all 13 IPC commands the Phase 10 UI binds against (`pyramid_config_schemas`, `pyramid_active_config`, `pyramid_active_config_contribution`, `pyramid_pending_proposals`, `pyramid_accept_proposal`, `pyramid_reject_proposal`, `pyramid_config_versions`, `pyramid_get_schema_annotation`, `pyramid_generate_config`, `pyramid_refine_config`, `pyramid_accept_config`, `pyramid_dry_run_publish`, `pyramid_publish_to_wire`). Verified the camelCase→snake_case Tauri v2 auto-conversion works for every argument (validated against an existing known-good call pattern at `useYamlRendererSources.ts:161`).
+
+**Three bugs found and fixed (all React-layer, zero Rust changes):**
+
+1. **HIGH/UX — `ContributionDetailDrawer` version history rendered reversed.** The backend `load_config_version_history` returns `oldest-to-newest` (explicit `chain.reverse()` at `config_contributions.rs:421`, asserted in the Rust test at `config_contributions.rs:1130`). The drawer was written assuming newest-first: `versions[0]` was labeled v{length} when it was actually v1, the default version selected on tab-switch was the OLDEST (not the active contribution the drawer opened with), and every `versions.length - i` offset was flipped. Fix: reverse the array at fetch time so `versions[0]` is the newest throughout the component — makes all the other indexing math correct by the existing code.
+
+2. **MEDIUM/UX — `PublishPreviewModal` could be dismissed mid-publish, creating ghost publishes.** The Confirm button was correctly `disabled={publishing}`, but the overlay backdrop click, Escape key handler, and `✕` header close button were NOT gated. User could dismiss the modal during the 2-10s publish round-trip; the publish would still complete on the backend but the user never saw the success confirmation. Fix: added a `safeClose` callback that short-circuits when `publishing === true`, wired all three close triggers to it, and marked the `✕` button `disabled={publishing}` for visual consistency.
+
+3. **LOW/UX — `ContributionDetailDrawer` stayed open with stale data after a successful publish from its footer button.** The `publishClose` path in `MyToolsPanel` called `bumpRefresh()` (which refetches schemas + proposals) but didn't clear `detailContribution`, so the drawer kept showing the pre-publish `ConfigContribution` row with `wire_contribution_id: null` — and the drawer's "Published" badge stayed false until the user closed and reopened the drawer. Fix: added `handlePublishSuccess` callback wired to `PublishPreviewModal.onPublished`, which unmounts the drawer so the next View refetches fresh state.
+
+**Non-blocking concerns flagged (not fixed, need dedicated follow-up):**
+- **Draft accumulation:** `handleAccept` always passes `yaml: state.values`, so the direct-YAML branch of `pyramid_accept_config` is always hit. The alternate "promote latest draft" branch is never reached from the Phase 10 UI. Draft rows created by `pyramid_generate_config` and `pyramid_refine_config` are never promoted or cleaned up — they accumulate as stranded `status='draft'` rows in `pyramid_config_contributions`. Not a correctness bug (the accepted contribution is functionally correct), but a cleanup pass is warranted in a later phase.
+- **YAML round-trip fidelity:** `handleRefine` serializes `state.values` via `yaml.dump({lineWidth: -1, noRefs: true})` before sending to the backend — key ordering and comment preservation are not guaranteed, so the YAML the refinement LLM sees may differ in layout from the original. Not a correctness bug (semantic content is preserved), but a minor wart.
+- **Accept path stores re-serialized YAML:** The Rust `accept_config_draft` does `serde_yaml::to_string(&other)` on the JS object, so the stored `yaml_content` differs textually from the LLM output. Same layout-vs-semantics concern.
+
+**Files touched:**
+- `src/components/ContributionDetailDrawer.tsx` — reverse versions at fetch; comments updated.
+- `src/components/PublishPreviewModal.tsx` — add `safeClose`, wire overlay/Escape/`✕` to it, disable `✕` during publish.
+- `src/components/modes/ToolsMode.tsx` — add `handlePublishSuccess` callback, wire to `PublishPreviewModal.onPublished`.
+- `docs/plans/pyramid-folders-model-routing-friction-log.md` — detailed entry for all three findings + non-blockers.
+
+**Wanderer verification:**
+- ✅ `npx tsc --noEmit` — clean.
+- ✅ `npm run build` — clean (131 modules, 715.48 kB / 189.39 kB gzip).
+- ✅ `cargo check --all-targets` — clean (warnings only, no new).
+- ✅ Zero Rust changes.
+
+**End-to-end verdict:** Phase 10 works end-to-end with the three UI fixes applied. The non-blocking draft-accumulation concern should get its own cleanup pass in a later phase but does not block Phase 10.
+
+Phase 10 status: `wanderer-verified-with-fix`. Ready for the next initiative phase.
+

@@ -116,6 +116,15 @@ export function ContributionDetailDrawer({
     }, [contribution?.schema_type]);
 
     // Lazily fetch version history the first time the user opens the tab.
+    //
+    // The Phase 4 `load_config_version_history` helper returns the chain
+    // OLDEST-TO-NEWEST (`chain.reverse()` at the end of the walk — see
+    // `config_contributions.rs` ~line 421). The drawer wants the newest
+    // row first (the active contribution is what the user opened, so we
+    // land on it by default and label it "latest"). Flip the array once
+    // here so `versions[0]` IS the newest row through the rest of the
+    // component — keeping the display order natural and making the
+    // "v{total - i}" numbering below read correctly (v{total} at the top).
     useEffect(() => {
         if (!contribution || tab !== "history" || versions.length > 0) return;
         let cancelled = false;
@@ -127,7 +136,8 @@ export function ContributionDetailDrawer({
         })
             .then((rows) => {
                 if (cancelled) return;
-                setVersions(rows);
+                // Backend returns oldest-to-newest; we want newest-first.
+                setVersions([...rows].reverse());
             })
             .catch((err) => {
                 if (cancelled) return;
@@ -149,8 +159,10 @@ export function ContributionDetailDrawer({
                 contribution
             );
         }
-        // Default to the first version (latest chronologically — versions
-        // are returned in chain order by the Phase 9 IPC).
+        // Default to the first row (newest chronologically after the
+        // reverse above). This is the active contribution the drawer
+        // was opened with — the user lands on its YAML immediately
+        // rather than on the oldest superseded ancestor.
         return versions[0] ?? contribution;
     }, [contribution, tab, selectedVersionId, versions]);
 

@@ -64,14 +64,22 @@ export function PublishPreviewModal({
         return () => { cancelled = true; };
     }, [contributionId]);
 
-    // Escape key closes the modal.
+    // Block close while a publish is in flight — the backend write is
+    // past the point of no return, and closing mid-flight creates a
+    // ghost publish the user never sees confirmation for.
+    const safeClose = useCallback(() => {
+        if (publishing) return;
+        onClose();
+    }, [publishing, onClose]);
+
+    // Escape key closes the modal (unless publishing).
     useEffect(() => {
         const handleKey = (e: KeyboardEvent) => {
-            if (e.key === "Escape") onClose();
+            if (e.key === "Escape") safeClose();
         };
         document.addEventListener("keydown", handleKey);
         return () => document.removeEventListener("keydown", handleKey);
-    }, [onClose]);
+    }, [safeClose]);
 
     const handleConfirm = useCallback(async () => {
         setPublishing(true);
@@ -93,7 +101,7 @@ export function PublishPreviewModal({
     return (
         <div
             className="fleet-token-modal-overlay"
-            onClick={onClose}
+            onClick={safeClose}
             role="dialog"
             aria-modal="true"
             aria-label="Publish to Wire preview"
@@ -135,8 +143,9 @@ export function PublishPreviewModal({
                     <button
                         type="button"
                         className="btn btn-ghost btn-small"
-                        onClick={onClose}
-                        title="Close"
+                        onClick={safeClose}
+                        disabled={publishing}
+                        title={publishing ? "Publishing… can't close" : "Close"}
                         style={{ padding: "2px 10px" }}
                     >
                         ✕
