@@ -2268,3 +2268,86 @@ Phase 12 is ready for the conductor's verifier + wanderer passes. Recommended au
 
 Wanderer prompt suggestion: "Does the Phase 12 retrofit sweep actually make the cache reachable end-to-end for an ordinary question-driven build? Pick any retrofitted call site from the table and trace: does the caller attach a `CacheAccess` to the `LlmConfig`? If yes, does the Phase 12 retrofit code build a StepContext with non-empty `resolved_model_id` and `prompt_hash`? If yes, does `cache_is_usable` return true? If yes, does the cache read/write path actually fire? If no at any step, the retrofit is a dead-code trap — grep harder and report back."
 
+### Verifier pass (2026-04-10)
+
+**Status:** fixes applied; phase is now shippable. The original Phase 12 implementation had several blocking issues. Verifier pass fixed them in place.
+
+#### Blocking bugs fixed
+
+1. **Dead `cache_access` retrofit (Phase 4/6 failure mode repeated).** The implementer introduced `LlmConfig.cache_access` + `clone_with_cache_access` + `make_step_ctx_from_llm_config` as the retrofit mechanism for every non-chain call site (~42 sites in faq/delta/meta/webbing/supersession/characterize/question_decomposition/extraction_schema/build/evidence_answering). But NO production code path EVER called `clone_with_cache_access` — every one of those 42 retrofit sites read `llm_config.cache_access`, found `None`, built `answer_ctx = None`, and routed through the legacy path. The entire Phase 12 retrofit sweep was dead code. Worse, **the triage gate itself** (`run_triage_gate` called from `evidence_answering::answer_questions`) was gated on `llm_config.cache_access.is_some()`, so the central Phase 12 feature — evidence triage — NEVER ran on any production build. The original log even flagged this as "wanderer focus area" item #4 above instead of fixing it, which the workstream prompt explicitly rejected as insufficient.
+
+   Fix: added `PyramidState::llm_config_with_cache(slug, build_id)` and `PyramidState::attach_cache_access(cfg, slug, build_id)` helpers (`src-tauri/src/pyramid/mod.rs:821-876`) that mint a fresh `CacheAccess` from `state.data_dir + state.build_event_bus` and attach it via `clone_with_cache_access`. Wired into every production dispatch point:
+   - `chain_executor::execute_chain_from` (src-tauri/src/pyramid/chain_executor.rs:3797-3810)
+   - `chain_executor::execute_recursive_decompose` (src-tauri/src/pyramid/chain_executor.rs:4607-4613)
+   - `chain_executor::execute_evidence_loop` (src-tauri/src/pyramid/chain_executor.rs:4881-4888)
+   - `chain_executor::execute_process_gaps` (src-tauri/src/pyramid/chain_executor.rs:5520-5527)
+   - `chain_executor::execute_plan` (src-tauri/src/pyramid/chain_executor.rs:10578-10588)
+   - `build_runner::run_legacy_build` (src-tauri/src/pyramid/build_runner.rs:663-671)
+   - `build_runner` question-build and decompose-preview (src-tauri/src/pyramid/build_runner.rs:790-799, 1046-1052)
+   - `main.rs` DADBEAR stale-engine construction (src-tauri/src/main.rs:3434-3444, 6099-6109)
+   - `server.rs` per-slug stale-engine loop (src-tauri/src/server.rs:261-275)
+   - `main.rs` IPC: `pyramid_characterize` (src-tauri/src/main.rs:4622-4627), `pyramid_meta_run` (4664-4673), `pyramid_faq_directory` (6604-6614)
+   - `routes.rs`: `handle_meta_run` (src-tauri/src/pyramid/routes.rs:4063-4070), `handle_match_faq` (4119-4128), `handle_faq_directory` (4149-4158), `handle_characterize` (5776-5781), `process_annotation_hook` caller (3817-3828)
+   - `vine.rs`: 5 dispatch sites across fallback pipeline, L1 clustering, upper-layer, ERA detection, transition classification, entity resolution
+   - `partner/conversation.rs::warm_pass` spawn (src-tauri/src/partner/conversation.rs:624-638)
+
+   Dead-letter retry path in `chain_executor::retry_dead_letter_entry` intentionally leaves `cache_access` off — failed attempts must not be cache hits on retry (existing `cache_base: None` comment there remains correct).
+
+2. **`list_deferred_by_question_target` JSON LIKE pattern always returned zero rows.** The helper at `src-tauri/src/pyramid/db.rs:12168` matched on `"target_node_id":"..."`, but `LayerQuestion` has no `target_node_id` field — the serialized payload only has `question_id`, `question_text`, `layer`, `about`, `creates`. The query silently returned an empty list. Combined with the next bug, this meant on-demand reactivation was completely broken.
+
+   Fix: match on the `question_id` column directly (plus a payload LIKE as belt-and-suspenders). This works because `question_decomposition::extract_layer_questions` sets `question_id = node.id`, so the question id IS the target node id by convention.
+
+3. **`record_demand_signal` never called `list_on_demand_deferred_for_node`.** The spec (Part 2 §7) requires demand-signal recording to also on-demand-reactivate deferred questions: "query `pyramid_deferred_questions` for `(slug, node_id)` rows where `check_interval IN ('never', 'on_demand')`. For each match, re-run triage." The implementer defined the helper `list_on_demand_deferred_for_node` but never invoked it from `record_demand_signal`. Dead code.
+
+   Fix: added the reactivation hook at `src-tauri/src/pyramid/demand_signal.rs` after the propagation BFS completes. For each deferred row on the leaf node, re-runs triage with `has_demand_signals=true` and removes the deferred row if the new decision is `Answer`.
+
+4. **`is_first_build` hardcoded to `false` in triage gate.** The spec's canonical example policy uses `"first_build AND depth == 0"` as its primary answer rule. The implementer hardcoded `is_first_build: false` in `run_triage_gate`, so this rule could never match on fresh builds. Default-to-answer kept correctness, but the DSL signal was effectively dead.
+
+   Fix: compute `is_first_build` once per triage pass from `SELECT COUNT(*) FROM pyramid_nodes WHERE slug=? AND depth=0` — true iff zero L0 nodes exist (src-tauri/src/pyramid/evidence_answering.rs in `run_triage_gate`).
+
+5. **Test regression: `tokio::task::block_in_place` panics on `#[tokio::test]`'s default current_thread runtime.** Once `cache_access` was actually populated in production, the dadbear_extend integration tests (`test_fire_ingest_chain_chunks_conversation_before_dispatch`, `test_fire_ingest_chain_second_dispatch_no_chunk_collision`) started reaching the cache probe code path, which calls `tokio::task::block_in_place` unconditionally. That helper panics on current_thread runtimes with `can call blocking only when running on the multi-threaded runtime`.
+
+   Fix: wrapped the 4 `block_in_place` call sites in `try_cache_lookup_or_key` (probe + 2× verification-failure delete) and `try_cache_store` (store) with a runtime-flavor check. On MultiThread runtimes we still use `block_in_place`; on CurrentThread or when no runtime handle exists, the sync closure runs inline. The DB open + single SELECT are sub-millisecond so running inline on a scheduler thread is fine for tests and for the narrow app-startup window (src-tauri/src/pyramid/llm.rs:1028-1065, 1097-1125, 1128-1158, 1216-1283).
+
+#### Non-blocking cleanups (not applied)
+
+- `triage.rs::rule_to_decision` has a vestigial `TagForLog` trait whose implementation is a no-op. Not a bug, just dead code; leaving for a future simplification pass.
+- `main.rs::pyramid_reevaluate_deferred_questions` is a near-duplicate of `config_contributions::reevaluate_deferred_questions`. The two could share a helper, but the IPC path uses `block_in_place` + the writer lock while the supersession path runs inside a larger DB transaction. Sharing would require extracting a connection-generic helper; deferred.
+
+#### Re-ran verification criteria
+
+1. **`cargo check --lib` clean.** 3 pre-existing warnings only (deprecated `get_keep_evidence_for_target` at routes.rs:6463, 2× `LayerCollectResult` private-type warnings at publication.rs:207,324). No new warnings.
+2. **`cargo test --lib pyramid`:** 1099 passing, 7 failing. The 7 failures match the expected pre-existing set exactly: `test_evidence_pk_cross_slug_coexistence`, `real_yaml_thread_clustering_preserves_response_schema`, and 5× `staleness::tests::*`. The 2 previously-failing dadbear_extend tests now pass.
+3. **Retrofit ratio grep:**
+   - `_and_ctx` variants in `src-tauri/src/pyramid/*.rs` (non-llm.rs production): 57 sites (build.rs:3, chain_dispatch:9, characterize:1, delta:4, evidence_answering:4, extraction_schema:2, faq:7, generative_config:3, meta:4, question_decomposition:3, stale_helpers:5, stale_helpers_upper:8, supersession:1, triage:1, webbing:1, event_bus:1, step_context:1)
+   - Legacy `call_model_unified_with_options(`: 2 in llm.rs only (internal wrapper delegation), 0 in production call sites
+   - Legacy `call_model_with_usage(`: 1 in llm.rs only (legacy shim definition)
+   - Legacy `llm::call_model(`: 0 occurrences
+   - Legacy `call_model_unified(`: 5 in llm.rs (internal wrapper definitions) + 2 in routes.rs (intentional bypass: semantic search / keyword rewrite)
+4. **DSL evaluator correctness:** traced `NOT first_build OR stale_check` with first_build=true, stale_check=false → parse_or→parse_and→parse_not→NOT→parse_atom(first_build)=true→NOT=false; parse_and returns false; parse_or sees OR→parse_and→parse_not→parse_atom(stale_check)=false; final false || false = false. Matches test assertion. Precedence: NOT > AND > OR (C-style), correct. Parenthesization respected in parse_atom's LParen arm.
+5. **Propagation correctness:** `demand_signal.rs::record_demand_signal` uses a `HashSet<String>` visited set (line ~40), depth cap (`depth > max_depth`), floor cap (`weight < floor`), factor=0.0 short-circuit. Each `insert_demand_signal` row writes `Some(&source_leaf)` as `source_node_id`, which is captured from the initial `node_id` before the loop. Tests cover floor, max_depth, cycle, source_node_id invariance, factor-zero degenerate case, and multi-signal aggregation.
+6. **Re-evaluation path:** `config_contributions::reevaluate_deferred_questions` is no longer a stub — it loads the active `EvidencePolicy`, iterates `list_all_deferred`, re-runs `resolve_decision` for each, and handles Answer/Defer/Skip. Invoked from `sync_config_to_operational`'s `evidence_policy` branch at config_contributions.rs:669.
+7. **DADBEAR scanner:** `stale_engine.rs:278-383` queries `list_expired_deferred(&conn, &s)`, loads the active policy, and re-triages each expired row against `TriageFacts { is_stale_check: true }`. Answer/Defer/Skip outcomes all mapped correctly.
+8. **IPC registration:** `pyramid_reevaluate_deferred_questions` is registered in `invoke_handler!` at main.rs:9104.
+9. **Cache access plumbing:** Traced `chain_executor::execute_chain_from` → `llm_config_with_cache(slug, chain_build_id)` → `clone_with_cache_access` → `LlmConfig.cache_access = Some(CacheAccess { ... })` → passed to `evidence_answering::answer_questions` → `llm_config.cache_access.as_ref()` returns `Some` → `run_triage_gate` runs → cache-aware StepContext built → `call_model_unified_and_ctx` reaches the cache path. End-to-end reachability confirmed.
+
+#### Files touched by the verifier pass
+
+- src-tauri/src/pyramid/mod.rs — added `llm_config_with_cache` + `attach_cache_access` helpers on PyramidState
+- src-tauri/src/pyramid/chain_executor.rs — 5 dispatch-point attachment points
+- src-tauri/src/pyramid/build_runner.rs — 3 dispatch-point attachment points
+- src-tauri/src/pyramid/routes.rs — 5 HTTP handler attachment points
+- src-tauri/src/pyramid/vine.rs — 5 vine dispatch attachment points
+- src-tauri/src/pyramid/demand_signal.rs — on-demand reactivation hook in `record_demand_signal`
+- src-tauri/src/pyramid/evidence_answering.rs — `is_first_build` computed from DB in `run_triage_gate`
+- src-tauri/src/pyramid/db.rs — `list_deferred_by_question_target` query fix
+- src-tauri/src/pyramid/llm.rs — runtime-flavor-aware `block_in_place` wrapping (4 sites)
+- src-tauri/src/main.rs — 3 IPC handler + 1 stale-engine attachment point
+- src-tauri/src/server.rs — stale-engine per-slug attachment point
+- src-tauri/src/partner/conversation.rs — warm_pass spawn attachment point
+- docs/plans/pyramid-folders-model-routing-implementation-log.md — this verifier pass entry
+
+#### Status
+
+`verifier-pass-applied` — Phase 12 is now shippable. The retrofit sweep is no longer dead code. The triage gate runs on every production build. On-demand reactivation works. Re-evaluation on policy supersession works. The test suite matches the pre-Phase-12 baseline (1099 new passing + same 7 pre-existing failures).
+

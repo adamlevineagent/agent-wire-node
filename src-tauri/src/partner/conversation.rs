@@ -627,7 +627,12 @@ pub async fn handle_message(
                 // calls. PartnerLlmConfig only carries (api_key, partner_model)
                 // and would lose both runtime handles if we built a fresh
                 // LlmConfig from it.
-                let spawned_config = state.pyramid.config.read().await.clone();
+                // Phase 12 verifier fix: attach cache_access so delta/faq
+                // retrofit sites reach the step cache.
+                let spawned_config = state
+                    .pyramid
+                    .llm_config_with_cache(&slug, &format!("partner-warm-{}", slug))
+                    .await;
                 let model = llm_config.partner_model.clone();
                 let collapse_model = state
                     .pyramid

@@ -27,6 +27,11 @@ use super::db::{self, DemandSignalAttenuationYaml, EvidencePolicy};
 ///
 /// This function is synchronous (DB-bound). Callers that want
 /// fire-and-forget behavior should wrap it in `tokio::task::spawn_blocking`.
+///
+/// After propagation, Phase 12 reactivates any `"never"`/`"on_demand"`
+/// deferred questions on `node_id` whose triage now returns `Answer`
+/// against the current policy — this is the demand-driven reactivation
+/// path from the spec's §7.
 pub fn record_demand_signal(
     conn: &Connection,
     slug: &str,
@@ -81,6 +86,44 @@ pub fn record_demand_signal(
         for parent_id in parents {
             if !visited.contains(&parent_id) {
                 queue.push_back((parent_id, next_weight, next_depth));
+            }
+        }
+    }
+
+    // Phase 12 verifier fix: on-demand reactivation of deferred
+    // questions. After the signal is recorded, check whether any
+    // deferred question with `check_interval IN ('never','on_demand')`
+    // targets the leaf node. For each, re-run triage against the
+    // current policy — if it now returns `Answer`, remove the
+    // deferred row so the next build picks up the question.
+    let pending = list_on_demand_deferred_for_node(conn, slug, node_id).unwrap_or_default();
+    if !pending.is_empty() {
+        use super::triage::{resolve_decision, TriageDecision, TriageFacts};
+        use super::types::LayerQuestion;
+        for (qid, qjson) in pending {
+            let question: LayerQuestion = match serde_json::from_str(&qjson) {
+                Ok(q) => q,
+                Err(_) => continue,
+            };
+            // has_demand_signals is true by construction — we just
+            // recorded one.
+            let facts = TriageFacts {
+                question: &question,
+                target_node_distilled: None,
+                target_node_depth: Some(question.layer),
+                is_first_build: false,
+                is_stale_check: false,
+                has_demand_signals: true,
+                evidence_question_trivial: None,
+                evidence_question_high_value: None,
+            };
+            match resolve_decision(policy, &facts) {
+                Ok(TriageDecision::Answer { .. }) => {
+                    let _ = db::remove_deferred(conn, slug, &qid);
+                }
+                _ => {
+                    // Still deferred or skipped — leave as-is.
+                }
             }
         }
     }

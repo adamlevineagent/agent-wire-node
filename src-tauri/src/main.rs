@@ -3431,9 +3431,15 @@ async fn post_build_seed(
     // credential_store) so PyramidStaleEngine carries the registry path
     // through every dispatched helper, instead of pulling raw api_key/model
     // strings that drop both runtime handles.
+    // Phase 12 verifier fix: attach cache_access so stale-path helpers
+    // that use make_step_ctx_from_llm_config (e.g. faq::run_faq_category_meta_pass
+    // dispatched from drain_and_dispatch) reach the step cache.
     let (base_config, model) = {
         let cfg = pyramid_state.config.read().await;
-        (cfg.clone(), cfg.primary_model.clone())
+        let base_id = format!("stale-{}", slug);
+        let with_cache = pyramid_state.attach_cache_access(cfg.clone(), slug, &base_id);
+        let model = cfg.primary_model.clone();
+        (with_cache, model)
     };
 
     let config = {
@@ -4613,7 +4619,12 @@ async fn pyramid_characterize(
         }
     };
 
-    let llm_config = state.pyramid.config.read().await.clone();
+    // Phase 12 verifier fix: attach cache_access so characterize retrofit
+    // reaches the step cache.
+    let llm_config = state
+        .pyramid
+        .llm_config_with_cache(&slug, &format!("characterize-{}", slug))
+        .await;
 
     match wire_node_lib::pyramid::characterize::characterize(
         &resolved_source_path,
@@ -4658,7 +4669,12 @@ async fn pyramid_meta_run(
     // Phase 3 fix pass: clone the live LlmConfig (with provider_registry +
     // credential_store) instead of pulling raw api_key/model strings, so
     // run_all_meta_passes stays on the registry path.
-    let base_config = state.pyramid.config.read().await.clone();
+    // Phase 12 verifier fix: attach cache_access so meta retrofit sites
+    // reach the step cache.
+    let base_config = state
+        .pyramid
+        .llm_config_with_cache(&slug, &format!("meta-{}", slug))
+        .await;
     let model = base_config.primary_model.clone();
 
     let reader = state.pyramid.reader.clone();
@@ -6093,9 +6109,16 @@ async fn pyramid_auto_update_config_init(
             // Phase 3 fix pass: clone the live LlmConfig (with provider_registry +
             // credential_store) so PyramidStaleEngine carries the registry path
             // through every dispatched helper.
+            // Phase 12 verifier fix: attach cache_access so stale helpers
+            // (faq, etc.) that read llm_config.cache_access reach the cache.
             let (base_config, model) = {
                 let cfg = state.pyramid.config.read().await;
-                (cfg.clone(), cfg.primary_model.clone())
+                let stale_build_id = format!("stale-{}", slug);
+                let with_cache = state
+                    .pyramid
+                    .attach_cache_access(cfg.clone(), &slug, &stale_build_id);
+                let model = cfg.primary_model.clone();
+                (with_cache, model)
             };
 
             let mut engine = wire_node_lib::pyramid::stale_engine::PyramidStaleEngine::new(
@@ -6580,7 +6603,12 @@ async fn pyramid_faq_directory(
 ) -> Result<serde_json::Value, String> {
     // Phase 3 fix pass: clone the live LlmConfig (with provider_registry +
     // credential_store) so faq::get_faq_directory stays on the registry path.
-    let base_config = state.pyramid.config.read().await.clone();
+    // Phase 12 verifier fix: attach cache_access so faq retrofit sites
+    // reach the step cache.
+    let base_config = state
+        .pyramid
+        .llm_config_with_cache(&slug, &format!("faq-dir-{}", slug))
+        .await;
     let model = base_config.primary_model.clone();
 
     let directory = pyramid_faq::get_faq_directory(

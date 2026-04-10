@@ -12170,30 +12170,43 @@ pub fn list_deferred_by_question_target(
     slug: &str,
     target_node_id: &str,
 ) -> Result<Vec<DeferredQuestion>> {
-    // The question_json payload encodes the target_node_id as
-    // `target_node_id` under the LayerQuestion shape. We do a JSON
-    // LIKE match since SQLite doesn't have full JSONPath indexing.
-    let pattern = format!("%\"target_node_id\":\"{}\"%", target_node_id);
+    // Phase 12 verifier fix: the `LayerQuestion` type does not carry
+    // an explicit `target_node_id` field — evidence questions are
+    // identified by their `question_id`, which by convention is
+    // derived from (and matches) the target node id in the question
+    // compiler's output (see `question_decomposition::extract_layer_questions`).
+    // Match on `question_id` column directly, with a belt-and-suspenders
+    // JSON LIKE on the `question_id` payload field in case the
+    // column and payload diverge (which they shouldn't).
+    //
+    // The previous implementation matched on `"target_node_id":"..."`
+    // which never appears in the serialized LayerQuestion — so the
+    // query always returned zero rows and the on-demand reactivation
+    // hook in `demand_signal::record_demand_signal` was dead.
+    let payload_pattern = format!("%\"question_id\":\"{}\"%", target_node_id);
     let mut stmt = conn.prepare(
         "SELECT id, slug, question_id, question_json, deferred_at, next_check_at,
                 check_interval, triage_reason, contribution_id
          FROM pyramid_deferred_questions
-         WHERE slug = ?1 AND question_json LIKE ?2
+         WHERE slug = ?1 AND (question_id = ?2 OR question_json LIKE ?3)
          ORDER BY deferred_at ASC",
     )?;
-    let rows = stmt.query_map(rusqlite::params![slug, pattern], |r| {
-        Ok(DeferredQuestion {
-            id: r.get(0)?,
-            slug: r.get(1)?,
-            question_id: r.get(2)?,
-            question_json: r.get(3)?,
-            deferred_at: r.get(4)?,
-            next_check_at: r.get(5)?,
-            check_interval: r.get(6)?,
-            triage_reason: r.get(7)?,
-            contribution_id: r.get(8)?,
-        })
-    })?;
+    let rows = stmt.query_map(
+        rusqlite::params![slug, target_node_id, payload_pattern],
+        |r| {
+            Ok(DeferredQuestion {
+                id: r.get(0)?,
+                slug: r.get(1)?,
+                question_id: r.get(2)?,
+                question_json: r.get(3)?,
+                deferred_at: r.get(4)?,
+                next_check_at: r.get(5)?,
+                check_interval: r.get(6)?,
+                triage_reason: r.get(7)?,
+                contribution_id: r.get(8)?,
+            })
+        },
+    )?;
     let mut out = Vec::new();
     for row in rows {
         out.push(row?);

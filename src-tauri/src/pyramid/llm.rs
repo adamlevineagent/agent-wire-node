@@ -1028,10 +1028,40 @@ fn try_cache_lookup_or_key(
     // Open an ephemeral connection for the cache read. We deliberately
     // go outside the writer mutex — the cache is content-addressable
     // and SELECT is always safe.
-    let probe = tokio::task::block_in_place(|| {
+    //
+    // Phase 12 verifier fix: `tokio::task::block_in_place` panics on a
+    // current_thread runtime. `#[tokio::test]` uses current_thread by
+    // default, and several legacy integration tests (dadbear_extend,
+    // etc.) do not mark themselves multi_thread. Previously this path
+    // was only hit when the caller supplied a cache-aware ctx, which
+    // in practice meant only the Phase 6 chain_executor dispatch
+    // paths — and those tests did NOT hit `block_in_place` because
+    // they short-circuited earlier. Phase 12 broadens the set of
+    // dispatch sites that populate cache_access so this path is now
+    // reachable from dadbear_extend's integration tests.
+    //
+    // If we're on a current_thread runtime, run the probe synchronously
+    // (the DB open + SELECT are both fast and blocking is already what
+    // we're doing — `block_in_place` just tells the scheduler it's OK
+    // to block its worker). Falling through to the sync path is
+    // equivalent for correctness and works on either runtime flavor.
+    let probe_body = || -> Result<Option<super::step_context::CachedStepOutput>> {
         let conn = super::db::open_pyramid_connection(std::path::Path::new(&sc.db_path))?;
         super::db::check_cache(&conn, &sc.slug, &lookup.cache_key)
-    });
+    };
+    let probe = match tokio::runtime::Handle::try_current() {
+        Ok(h) => match h.runtime_flavor() {
+            tokio::runtime::RuntimeFlavor::MultiThread => {
+                tokio::task::block_in_place(probe_body)
+            }
+            // CurrentThread (incl. the default `#[tokio::test]`): run
+            // the blocking probe inline. The DB open + SELECT are
+            // sub-millisecond; running them on the scheduler thread is
+            // fine for tests and for the narrow app-startup window.
+            _ => probe_body(),
+        },
+        Err(_) => probe_body(),
+    };
 
     match probe {
         Ok(Some(cached)) => {
@@ -1071,12 +1101,22 @@ fn try_cache_lookup_or_key(
                              unusable: {}",
                             e
                         );
-                        let _ = tokio::task::block_in_place(|| {
+                        // Phase 12 verifier fix: runtime-flavor-aware delete.
+                        let delete_body = || -> Result<()> {
                             let conn = super::db::open_pyramid_connection(std::path::Path::new(
                                 &sc.db_path,
                             ))?;
                             super::db::delete_cache_entry(&conn, &sc.slug, &lookup.cache_key)
-                        });
+                        };
+                        let _ = match tokio::runtime::Handle::try_current() {
+                            Ok(h) => match h.runtime_flavor() {
+                                tokio::runtime::RuntimeFlavor::MultiThread => {
+                                    tokio::task::block_in_place(delete_body)
+                                }
+                                _ => delete_body(),
+                            },
+                            Err(_) => delete_body(),
+                        };
                         emit_cache_event(
                             sc,
                             TaggedKind::CacheHitVerificationFailed {
@@ -1096,12 +1136,22 @@ fn try_cache_lookup_or_key(
                          cache_key={}",
                         reason, sc.slug, lookup.cache_key
                     );
-                    let _ = tokio::task::block_in_place(|| {
+                    // Phase 12 verifier fix: runtime-flavor-aware delete.
+                    let delete_body = || -> Result<()> {
                         let conn = super::db::open_pyramid_connection(std::path::Path::new(
                             &sc.db_path,
                         ))?;
                         super::db::delete_cache_entry(&conn, &sc.slug, &lookup.cache_key)
-                    });
+                    };
+                    let _ = match tokio::runtime::Handle::try_current() {
+                        Ok(h) => match h.runtime_flavor() {
+                            tokio::runtime::RuntimeFlavor::MultiThread => {
+                                tokio::task::block_in_place(delete_body)
+                            }
+                            _ => delete_body(),
+                        },
+                        Err(_) => delete_body(),
+                    };
                     emit_cache_event(
                         sc,
                         TaggedKind::CacheHitVerificationFailed {
@@ -1187,7 +1237,10 @@ fn try_cache_store(
     let slug_for_write = sc.slug.clone();
     let cache_key_for_write = lookup.cache_key.clone();
     let force_fresh = sc.force_fresh;
-    let store_result = tokio::task::block_in_place(move || -> Result<()> {
+    // Phase 12 verifier fix: runtime-flavor-aware wrapper so tests on
+    // current_thread runtime don't panic. See the matching comment in
+    // `try_cache_lookup_or_key`.
+    let store_body = move || -> Result<()> {
         let conn = super::db::open_pyramid_connection(std::path::Path::new(&db_path))?;
         if force_fresh {
             super::db::supersede_cache_entry(
@@ -1200,7 +1253,16 @@ fn try_cache_store(
             super::db::store_cache(&conn, &entry)?;
         }
         Ok(())
-    });
+    };
+    let store_result = match tokio::runtime::Handle::try_current() {
+        Ok(h) => match h.runtime_flavor() {
+            tokio::runtime::RuntimeFlavor::MultiThread => {
+                tokio::task::block_in_place(store_body)
+            }
+            _ => store_body(),
+        },
+        Err(_) => store_body(),
+    };
     if let Err(e) = store_result {
         warn!(
             "[LLM-CACHE] store failed for slug={} cache_key={}: {}",

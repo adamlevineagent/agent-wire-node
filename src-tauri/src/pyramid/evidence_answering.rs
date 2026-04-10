@@ -1970,6 +1970,19 @@ pub fn run_triage_gate(
         });
     }
 
+    // Phase 12 verifier fix: compute `is_first_build` from DB state
+    // once per-call so the spec's canonical "first_build AND depth == 0"
+    // rule matches on fresh builds. `is_first_build == true` when no
+    // L0 nodes exist for this slug yet.
+    let is_first_build = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pyramid_nodes WHERE slug = ?1 AND depth = 0",
+            rusqlite::params![slug],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|c| c == 0)
+        .unwrap_or(false);
+
     let mut answer_bucket: Vec<LayerQuestion> = Vec::new();
 
     for question in questions {
@@ -1989,7 +2002,7 @@ pub fn run_triage_gate(
             question,
             target_node_distilled: None,
             target_node_depth: Some(question.layer),
-            is_first_build: false,
+            is_first_build,
             is_stale_check: false,
             has_demand_signals,
             evidence_question_trivial: None,

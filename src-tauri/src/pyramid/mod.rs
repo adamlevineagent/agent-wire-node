@@ -819,6 +819,71 @@ pub struct PyramidState {
 }
 
 impl PyramidState {
+    /// Phase 12 verifier fix: return an LlmConfig clone with the
+    /// content-addressable cache plumbing attached.
+    ///
+    /// Every production build/maintenance entry point that hands an
+    /// `LlmConfig` to a retrofit module (faq, delta, meta, webbing,
+    /// supersession, characterize, question_decomposition,
+    /// extraction_schema, build, evidence_answering) MUST call this
+    /// helper instead of `state.config.read().await.clone()` so that
+    /// `make_step_ctx_from_llm_config` at the call site finds a
+    /// populated `cache_access` and routes through the cache. Without
+    /// this, every retrofit site falls back to the legacy non-cache
+    /// path and the Phase 12 sweep is dead code.
+    ///
+    /// Tests and the pre-DB-init boot window pass `data_dir: None`;
+    /// in that case this returns the plain `LlmConfig` and the cache
+    /// is cleanly bypassed (same behavior as Phase 6's `cache_base`
+    /// `Option` path in chain_dispatch).
+    pub async fn llm_config_with_cache(&self, slug: &str, build_id: &str) -> LlmConfig {
+        let cfg = self.config.read().await.clone();
+        match self.data_dir.as_ref() {
+            Some(dir) => {
+                let db_path: std::sync::Arc<str> = dir
+                    .join("pyramid.db")
+                    .to_string_lossy()
+                    .to_string()
+                    .into();
+                cfg.clone_with_cache_access(
+                    slug.to_string(),
+                    build_id.to_string(),
+                    db_path,
+                    Some(self.build_event_bus.clone()),
+                )
+            }
+            None => cfg,
+        }
+    }
+
+    /// Phase 12 verifier fix: non-async variant for synchronous call
+    /// sites (stale_engine drain loops, routes.rs HTTP handlers that
+    /// already hold a read-locked config). Takes the pre-cloned
+    /// `LlmConfig` and the build_id + slug from the caller's scope.
+    pub fn attach_cache_access(
+        &self,
+        cfg: LlmConfig,
+        slug: &str,
+        build_id: &str,
+    ) -> LlmConfig {
+        match self.data_dir.as_ref() {
+            Some(dir) => {
+                let db_path: std::sync::Arc<str> = dir
+                    .join("pyramid.db")
+                    .to_string_lossy()
+                    .to_string()
+                    .into();
+                cfg.clone_with_cache_access(
+                    slug.to_string(),
+                    build_id.to_string(),
+                    db_path,
+                    Some(self.build_event_bus.clone()),
+                )
+            }
+            None => cfg,
+        }
+    }
+
     /// Create a build-scoped copy of this state with its own reader connection.
     ///
     /// The build's reader won't compete with CLI/frontend queries for the shared
