@@ -168,7 +168,7 @@ steps:
     primitive: build_lifecycle
     input:
       build_id: "$build_id"
-      load_prior_state: "$refresh_state"
+      load_prior_state: "$load_prior_state"
     save_as: step_only
 
   # ── Phase 4: Recursive synthesis L0 → apex ─────────────────────────
