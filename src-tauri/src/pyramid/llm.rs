@@ -160,6 +160,44 @@ pub struct LlmConfig {
     /// reference can resolve `${VAR_NAME}` substitutions without
     /// touching the database.
     pub credential_store: Option<Arc<CredentialStore>>,
+    /// Phase 12: optional cache plumbing shared across every LLM call
+    /// that uses this config. When `Some`, the Phase 12 retrofit sweep
+    /// can construct a StepContext inline at each call site using
+    /// `cache_access.db_path` + `cache_access.bus` without requiring
+    /// additional parameters. Unset in unit tests and in call sites
+    /// that intentionally bypass the cache (e.g. diagnostics, ASCII art,
+    /// semantic search).
+    pub cache_access: Option<CacheAccess>,
+}
+
+/// Phase 12: cache plumbing that lives on an LlmConfig so every call
+/// site holding `&LlmConfig` has the pieces it needs to construct a
+/// cache-usable StepContext without additional parameters.
+///
+/// `slug` scopes the cache row (one slug per build); `build_id`
+/// stamps the provenance column; `db_path` is the on-disk SQLite
+/// file the cache reads and writes go through; `bus` is the tagged
+/// build event bus for `CacheHit` / `CacheMiss` emission.
+///
+/// Cloned via Arc internally so attaching to every derived config is
+/// cheap (two Arc bumps — bus + db_path are held as Arc<str>).
+#[derive(Clone)]
+pub struct CacheAccess {
+    pub slug: String,
+    pub build_id: String,
+    pub db_path: Arc<str>,
+    pub bus: Option<Arc<super::event_bus::BuildEventBus>>,
+}
+
+impl std::fmt::Debug for CacheAccess {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CacheAccess")
+            .field("slug", &self.slug)
+            .field("build_id", &self.build_id)
+            .field("db_path", &self.db_path)
+            .field("bus", &self.bus.as_ref().map(|_| "<bus>"))
+            .finish()
+    }
 }
 
 // `LlmConfig` carries secrets in `api_key` + `auth_token`. Derive-on
@@ -197,6 +235,7 @@ impl std::fmt::Debug for LlmConfig {
                 "credential_store",
                 &self.credential_store.as_ref().map(|_| "<store>"),
             )
+            .field("cache_access", &self.cache_access)
             .finish()
     }
 }
@@ -224,6 +263,7 @@ impl Default for LlmConfig {
             model_aliases: std::collections::HashMap::new(),
             provider_registry: None,
             credential_store: None,
+            cache_access: None,
         }
     }
 }
@@ -242,6 +282,28 @@ impl LlmConfig {
     /// `.credentials` file. `clone_with_model_override` preserves both
     /// runtime handles by construction so the maintenance subsystem
     /// stays on the registry path.
+    /// Phase 12: clone this config with cache plumbing attached so
+    /// every LLM call that uses the returned config flows through
+    /// the content-addressable cache. `db_path` is the SQLite file
+    /// the cache reads/writes go through; `bus` is the tagged build
+    /// event bus; `slug` + `build_id` are stamped on every cache row.
+    pub fn clone_with_cache_access(
+        &self,
+        slug: impl Into<String>,
+        build_id: impl Into<String>,
+        db_path: impl Into<Arc<str>>,
+        bus: Option<Arc<super::event_bus::BuildEventBus>>,
+    ) -> Self {
+        let mut cloned = self.clone();
+        cloned.cache_access = Some(CacheAccess {
+            slug: slug.into(),
+            build_id: build_id.into(),
+            db_path: db_path.into(),
+            bus,
+        });
+        cloned
+    }
+
     pub fn clone_with_model_override(&self, model: &str) -> Self {
         let mut cloned = self.clone();
         cloned.primary_model = model.to_string();
@@ -1173,6 +1235,32 @@ pub async fn call_model(
     Ok(resp.content)
 }
 
+/// Phase 12 retrofit wrapper: `call_model` with a StepContext threaded
+/// through the cache-aware path. When `ctx` is Some and cache-usable,
+/// the call becomes cache-reachable (lookup before HTTP, store after).
+/// When `ctx` is None, behavior is identical to `call_model`.
+pub async fn call_model_and_ctx(
+    config: &LlmConfig,
+    ctx: Option<&StepContext>,
+    system_prompt: &str,
+    user_prompt: &str,
+    temperature: f32,
+    max_tokens: usize,
+) -> Result<String> {
+    let resp = call_model_unified_with_options_and_ctx(
+        config,
+        ctx,
+        system_prompt,
+        user_prompt,
+        temperature,
+        max_tokens,
+        None,
+        LlmCallOptions::default(),
+    )
+    .await?;
+    Ok(resp.content)
+}
+
 /// Call OpenRouter with automatic model cascade and retry logic.
 /// Same as `call_model()` but also returns token usage from the API response.
 ///
@@ -1194,6 +1282,57 @@ pub async fn call_model_with_usage(
     )
     .await?;
     Ok((resp.content, resp.usage))
+}
+
+/// Phase 12 retrofit wrapper: `call_model_with_usage` with a StepContext
+/// threaded through the cache-aware path. On a cache hit the stored
+/// usage (when available in the row's `token_usage_json`) is returned
+/// to the caller; otherwise behaves exactly like `call_model_with_usage`.
+pub async fn call_model_with_usage_and_ctx(
+    config: &LlmConfig,
+    ctx: Option<&StepContext>,
+    system_prompt: &str,
+    user_prompt: &str,
+    temperature: f32,
+    max_tokens: usize,
+) -> Result<(String, TokenUsage)> {
+    let resp = call_model_unified_with_options_and_ctx(
+        config,
+        ctx,
+        system_prompt,
+        user_prompt,
+        temperature,
+        max_tokens,
+        None,
+        LlmCallOptions::default(),
+    )
+    .await?;
+    Ok((resp.content, resp.usage))
+}
+
+/// Phase 12 retrofit wrapper: `call_model_unified` with a StepContext
+/// threaded through the cache-aware path. Equivalent to
+/// `call_model_unified_with_options_and_ctx` with default options.
+pub async fn call_model_unified_and_ctx(
+    config: &LlmConfig,
+    ctx: Option<&StepContext>,
+    system_prompt: &str,
+    user_prompt: &str,
+    temperature: f32,
+    max_tokens: usize,
+    response_format: Option<&serde_json::Value>,
+) -> Result<LlmResponse> {
+    call_model_unified_with_options_and_ctx(
+        config,
+        ctx,
+        system_prompt,
+        user_prompt,
+        temperature,
+        max_tokens,
+        response_format,
+        LlmCallOptions::default(),
+    )
+    .await
 }
 
 // ── Registry-aware call path (Phase 3) ─────────────────────────────────────
@@ -1474,6 +1613,41 @@ pub async fn call_model_structured(
         temperature,
         max_tokens,
         Some(&response_format),
+    )
+    .await?;
+    Ok(resp.content)
+}
+
+/// Phase 12 retrofit wrapper: `call_model_structured` with a
+/// StepContext threaded through the cache-aware path.
+#[allow(clippy::too_many_arguments)]
+pub async fn call_model_structured_and_ctx(
+    config: &LlmConfig,
+    ctx: Option<&StepContext>,
+    system_prompt: &str,
+    user_prompt: &str,
+    temperature: f32,
+    max_tokens: usize,
+    response_schema: &serde_json::Value,
+    schema_name: &str,
+) -> Result<String> {
+    let response_format = serde_json::json!({
+        "type": "json_schema",
+        "json_schema": {
+            "name": schema_name,
+            "strict": true,
+            "schema": response_schema
+        }
+    });
+    let resp = call_model_unified_with_options_and_ctx(
+        config,
+        ctx,
+        system_prompt,
+        user_prompt,
+        temperature,
+        max_tokens,
+        Some(&response_format),
+        LlmCallOptions::default(),
     )
     .await?;
     Ok(resp.content)

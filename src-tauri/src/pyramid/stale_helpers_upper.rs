@@ -14,7 +14,8 @@ use rusqlite::Connection;
 use tracing::{error, info, warn};
 
 use super::config_helper::estimate_cost;
-use super::llm::{call_model_with_usage, extract_json, LlmConfig};
+use super::llm::{call_model_with_usage_and_ctx, extract_json, LlmConfig};
+use super::step_context::{compute_prompt_hash, StepContext};
 use super::naming::{clean_headline, headline_for_node};
 use super::stale_engine::batch_items;
 use super::types::{
@@ -594,8 +595,26 @@ pub async fn dispatch_node_stale_check(
     // Call LLM via the live config (preserves Phase 3 provider_registry +
     // credential_store) with the model overridden to the per-call slug.
     let config = base_config.clone_with_model_override(model);
-    let (response, usage) =
-        call_model_with_usage(&config, system_prompt, &user_prompt, 0.1, 2048).await?;
+    let ctx = StepContext::new(
+        batch[0].slug.clone(),
+        format!("stale-node-batch-{}", batch[0].slug),
+        "node_stale_check",
+        "stale_check",
+        batch[0].layer as i64,
+        None,
+        db_path.to_string(),
+    )
+    .with_model_resolution("stale_local", model.to_string())
+    .with_prompt_hash(compute_prompt_hash(system_prompt));
+    let (response, usage) = call_model_with_usage_and_ctx(
+        &config,
+        Some(&ctx),
+        system_prompt,
+        &user_prompt,
+        0.1,
+        2048,
+    )
+    .await?;
 
     // Log cost to pyramid_cost_log
     {
@@ -901,8 +920,26 @@ pub async fn dispatch_connection_check(
         // Call LLM via the live config (preserves Phase 3 provider_registry +
         // credential_store) with the model overridden to the per-call slug.
         let config = base_config.clone_with_model_override(model);
-        let (response, conn_usage) =
-            call_model_with_usage(&config, system_prompt, &user_prompt, 0.1, 2048).await?;
+        let ctx = StepContext::new(
+            slug.to_string(),
+            format!("stale-connection-check-{}", slug),
+            "connection_stale_check",
+            "stale_check",
+            old_depth as i64,
+            None,
+            db_path.to_string(),
+        )
+        .with_model_resolution("stale_local", model.to_string())
+        .with_prompt_hash(compute_prompt_hash(system_prompt));
+        let (response, conn_usage) = call_model_with_usage_and_ctx(
+            &config,
+            Some(&ctx),
+            system_prompt,
+            &user_prompt,
+            0.1,
+            2048,
+        )
+        .await?;
 
         // Log cost to pyramid_cost_log
         {
@@ -1240,8 +1277,26 @@ pub async fn dispatch_edge_stale_check(
         // Call LLM via the live config (preserves Phase 3 provider_registry +
         // credential_store) with the model overridden to the per-call slug.
         let config = base_config.clone_with_model_override(model);
-        let (response, usage) =
-            call_model_with_usage(&config, system_prompt, &user_prompt, 0.1, 1024).await?;
+        let ctx = StepContext::new(
+            mutation.slug.clone(),
+            format!("stale-edge-check-{}", mutation.slug),
+            "edge_stale_check",
+            "stale_check",
+            mutation.layer as i64,
+            None,
+            db_path.to_string(),
+        )
+        .with_model_resolution("stale_local", model.to_string())
+        .with_prompt_hash(compute_prompt_hash(system_prompt));
+        let (response, usage) = call_model_with_usage_and_ctx(
+            &config,
+            Some(&ctx),
+            system_prompt,
+            &user_prompt,
+            0.1,
+            1024,
+        )
+        .await?;
 
         // Log cost to pyramid_cost_log
         {
@@ -1286,8 +1341,26 @@ pub async fn dispatch_edge_stale_check(
                 truncate_str(&edge_data.new_content, 300),
             );
 
-            let (re_eval_response, _) =
-                call_model_with_usage(&config, system_prompt, &re_eval_prompt, 0.3, 512).await?;
+            let re_eval_ctx = StepContext::new(
+                mutation.slug.clone(),
+                format!("stale-edge-reeval-{}", mutation.slug),
+                "edge_stale_reeval",
+                "stale_check",
+                mutation.layer as i64,
+                None,
+                db_path.to_string(),
+            )
+            .with_model_resolution("stale_local", model.to_string())
+            .with_prompt_hash(compute_prompt_hash(system_prompt));
+            let (re_eval_response, _) = call_model_with_usage_and_ctx(
+                &config,
+                Some(&re_eval_ctx),
+                system_prompt,
+                &re_eval_prompt,
+                0.3,
+                512,
+            )
+            .await?;
 
             let re_eval_json = extract_json(&re_eval_response)?;
             let new_relationship = re_eval_json
@@ -2926,8 +2999,26 @@ async fn execute_supersession_identity_change(
     // Phase 3 fix pass: clone the live config (preserves provider_registry +
     // credential_store) instead of building a fresh `config_for_model`.
     let config = base_config.clone_with_model_override(model);
-    let (supersession_response, supersession_usage) =
-        call_model_with_usage(&config, system_prompt, &user_prompt, 0.2, 4096).await?;
+    let supersession_ctx = StepContext::new(
+        slug.to_string(),
+        format!("supersession-apply-{}", slug),
+        "supersession_apply",
+        "supersession",
+        node_data.depth,
+        None,
+        db_path.to_string(),
+    )
+    .with_model_resolution("stale_local", model.to_string())
+    .with_prompt_hash(compute_prompt_hash(system_prompt));
+    let (supersession_response, supersession_usage) = call_model_with_usage_and_ctx(
+        &config,
+        Some(&supersession_ctx),
+        system_prompt,
+        &user_prompt,
+        0.2,
+        4096,
+    )
+    .await?;
     let supersession_json = extract_json(&supersession_response).ok();
     let new_headline = supersession_json
         .as_ref()

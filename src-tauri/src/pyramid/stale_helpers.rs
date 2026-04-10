@@ -19,7 +19,8 @@ use tracing::{info, warn};
 
 
 use super::config_helper::estimate_cost;
-use super::llm::{call_model_with_usage, extract_json, LlmConfig};
+use super::llm::{call_model_with_usage_and_ctx, extract_json, LlmConfig};
+use super::step_context::{compute_prompt_hash, StepContext};
 use super::naming::{headline_from_path, tombstone_headline};
 use super::stale_helpers_upper::{
     resolve_evidence_targets_for_node_ids, resolve_live_canonical_node_id,
@@ -291,8 +292,26 @@ Output JSON only. Array of objects, one per file:
     // Call LLM via the live config (preserves Phase 3 provider_registry +
     // credential_store) with the model overridden to the per-call slug.
     let config = base_config.clone_with_model_override(model);
-    let (response, usage) =
-        call_model_with_usage(&config, system_prompt, &user_prompt, 0.1, 1024).await?;
+    let ctx = StepContext::new(
+        slug.clone(),
+        format!("stale-file-check-{}", slug),
+        "file_stale_check",
+        "stale_check",
+        0,
+        None,
+        db_path.to_string(),
+    )
+    .with_model_resolution("stale_local", model.to_string())
+    .with_prompt_hash(compute_prompt_hash(system_prompt));
+    let (response, usage) = call_model_with_usage_and_ctx(
+        &config,
+        Some(&ctx),
+        system_prompt,
+        &user_prompt,
+        0.1,
+        1024,
+    )
+    .await?;
 
     let total_tokens = usage.prompt_tokens + usage.completion_tokens;
     let cost_usd = estimate_cost(&usage);
@@ -788,8 +807,26 @@ Output JSON only:
     // Call LLM via the live config (preserves Phase 3 provider_registry +
     // credential_store) with the model overridden to the per-call slug.
     let config = base_config.clone_with_model_override(model);
-    let (response, usage) =
-        call_model_with_usage(&config, system_prompt, &user_prompt, 0.1, 256).await?;
+    let ctx = StepContext::new(
+        slug.clone(),
+        format!("stale-rename-check-{}", slug),
+        "rename_check",
+        "stale_check",
+        0,
+        None,
+        db_path.to_string(),
+    )
+    .with_model_resolution("stale_local", model.to_string())
+    .with_prompt_hash(compute_prompt_hash(system_prompt));
+    let (response, usage) = call_model_with_usage_and_ctx(
+        &config,
+        Some(&ctx),
+        system_prompt,
+        &user_prompt,
+        0.1,
+        256,
+    )
+    .await?;
 
     let cost_usd = estimate_cost(&usage);
     info!(
@@ -1183,8 +1220,26 @@ Output JSON only:
         // Call LLM via the live config (preserves Phase 3 provider_registry +
         // credential_store) with the model overridden to the per-call slug.
         let config = base_config.clone_with_model_override(model);
-        let (response, usage) =
-            call_model_with_usage(&config, system_prompt, &user_prompt, 0.2, 1024).await?;
+        let ctx = StepContext::new(
+            slug.clone(),
+            format!("stale-evidence-apex-{}", slug),
+            "evidence_apex_synthesis",
+            "stale_check",
+            0,
+            None,
+            db_path.to_string(),
+        )
+        .with_model_resolution("stale_local", model.to_string())
+        .with_prompt_hash(compute_prompt_hash(system_prompt));
+        let (response, usage) = call_model_with_usage_and_ctx(
+            &config,
+            Some(&ctx),
+            system_prompt,
+            &user_prompt,
+            0.2,
+            1024,
+        )
+        .await?;
 
         let cost_usd = estimate_cost(&usage);
         let total_tokens = usage.prompt_tokens + usage.completion_tokens;
@@ -1442,8 +1497,26 @@ Output JSON only:
         // Call LLM via the live config (preserves Phase 3 provider_registry +
         // credential_store) with the model overridden to the per-call slug.
         let config = base_config.clone_with_model_override(model);
-        let (response, usage) =
-            call_model_with_usage(&config, system_prompt, &user_prompt, 0.1, 256).await?;
+        let ctx = StepContext::new(
+            slug.clone(),
+            format!("stale-targeted-l0-{}", slug),
+            "targeted_l0_stale_check",
+            "stale_check",
+            0,
+            None,
+            db_path.to_string(),
+        )
+        .with_model_resolution("stale_local", model.to_string())
+        .with_prompt_hash(compute_prompt_hash(system_prompt));
+        let (response, usage) = call_model_with_usage_and_ctx(
+            &config,
+            Some(&ctx),
+            system_prompt,
+            &user_prompt,
+            0.1,
+            256,
+        )
+        .await?;
 
         let cost_usd = estimate_cost(&usage);
         let total_tokens = usage.prompt_tokens + usage.completion_tokens;

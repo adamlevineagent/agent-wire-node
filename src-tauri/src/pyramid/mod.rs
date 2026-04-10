@@ -38,6 +38,8 @@ pub mod db;
 pub mod defaults_adapter;
 pub mod demand_gen;
 pub mod delta;
+pub mod demand_signal;
+pub mod triage;
 pub mod event_bus;
 pub mod event_chain;
 pub mod public_html;
@@ -659,6 +661,7 @@ impl PyramidConfig {
             model_aliases: self.model_aliases.clone(),
             provider_registry: None,
             credential_store: None,
+            cache_access: None,
         }
     }
 

@@ -25,6 +25,7 @@ use tracing::{info, warn};
 use super::db;
 use super::llm::{self, LlmConfig};
 use super::question_yaml::{Question, QuestionDefaults, QuestionSet};
+use super::step_context::make_step_ctx_from_llm_config;
 
 // ── Configuration ─────────────────────────────────────────────────────────────
 
@@ -344,8 +345,24 @@ Return ONLY the JSON object."#
             .unwrap_or("(no additional context)")
     );
 
-    let response =
-        llm::call_model_unified(llm_config, &system_prompt, &user_prompt, 0.3, 4096, None).await?;
+    let cache_ctx = make_step_ctx_from_llm_config(
+        llm_config,
+        "question_delta_decompose",
+        "question_decompose",
+        0,
+        None,
+        &system_prompt,
+    );
+    let response = llm::call_model_unified_and_ctx(
+        llm_config,
+        cache_ctx.as_ref(),
+        &system_prompt,
+        &user_prompt,
+        0.3,
+        4096,
+        None,
+    )
+    .await?;
 
     let json_value = llm::extract_json(&response.content)?;
 
@@ -1245,8 +1262,17 @@ What are the genuinely distinct sub-questions needed to answer this? Only create
     for attempt in 0..2u32 {
         let temp = if attempt == 0 { temperature } else { 0.1 };
 
-        let response = llm::call_model_unified(
+        let cache_ctx = make_step_ctx_from_llm_config(
             llm_config,
+            "question_decompose_layer",
+            "question_decompose",
+            depth as i64,
+            None,
+            &system_prompt,
+        );
+        let response = llm::call_model_unified_and_ctx(
+            llm_config,
+            cache_ctx.as_ref(),
             &system_prompt,
             &user_prompt,
             temp,
@@ -1938,8 +1964,24 @@ The merges array can be empty if no questions overlap. Return ONLY the JSON obje
          Which should be merged? Which branches are specific enough to be leaves?"
     );
 
-    let response =
-        llm::call_model_unified(llm_config, &system_prompt, &user_prompt, 0.1, 2048, None).await?;
+    let cache_ctx = make_step_ctx_from_llm_config(
+        llm_config,
+        "question_sibling_review",
+        "question_decompose",
+        0,
+        None,
+        &system_prompt,
+    );
+    let response = llm::call_model_unified_and_ctx(
+        llm_config,
+        cache_ctx.as_ref(),
+        &system_prompt,
+        &user_prompt,
+        0.1,
+        2048,
+        None,
+    )
+    .await?;
 
     let review: serde_json::Value = match llm::extract_json(&response.content) {
         Ok(v) => v,

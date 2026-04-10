@@ -888,14 +888,155 @@ fn trigger_dadbear_reload(_bus: &Arc<BuildEventBus>, slug: Option<&str>) {
     );
 }
 
-/// Phase 11: re-evaluate deferred questions after an evidence_policy
-/// contribution lands. See `evidence-triage-and-dadbear.md`.
-fn reevaluate_deferred_questions(_conn: &Connection, slug: Option<&str>) -> Result<()> {
+/// Phase 12: re-evaluate deferred questions after an evidence_policy
+/// contribution lands. See `evidence-triage-and-dadbear.md` Part 2
+/// §Re-evaluation on Policy Change.
+///
+/// For each deferred question whose `slug` matches (or any slug if
+/// `slug` is `None`), re-run the triage DSL against the new policy:
+///  * Answer  → remove_deferred + log (caller doesn't get a pending
+///    marker in Phase 12 — the next build picks it up naturally).
+///  * Defer   → update_deferred_next_check with the new interval.
+///  * Skip    → remove_deferred.
+///
+/// The full flow is synchronous because it's called inside the
+/// `sync_config_to_operational` DB write window. LLM classification
+/// is deliberately NOT run here — triage rules that depend on
+/// `evidence_question_trivial` / `evidence_question_high_value` will
+/// evaluate those as false, which is the safe fallback (rules that
+/// match `high_value` as true will not match; rules matching
+/// `trivial` as true will not match either; default-answer fallback
+/// applies).
+fn reevaluate_deferred_questions(conn: &Connection, slug: Option<&str>) -> Result<()> {
+    use crate::pyramid::triage::{resolve_decision, TriageDecision, TriageFacts};
+    use crate::pyramid::types::LayerQuestion;
+
+    let slug_str = slug.unwrap_or("");
+    let policy = match db::load_active_evidence_policy(conn, slug) {
+        Ok(p) => p,
+        Err(e) => {
+            debug!(
+                error = %e,
+                "reevaluate_deferred_questions: failed to load policy, skipping"
+            );
+            return Ok(());
+        }
+    };
+
+    // Load all deferred questions for this slug.
+    let deferred = match db::list_all_deferred(conn, slug_str) {
+        Ok(v) => v,
+        Err(e) => {
+            debug!(
+                error = %e,
+                "reevaluate_deferred_questions: failed to list deferred, skipping"
+            );
+            return Ok(());
+        }
+    };
+
+    let mut evaluated = 0usize;
+    let mut activated = 0usize;
+    let mut still_deferred = 0usize;
+    let mut skipped = 0usize;
+
+    for row in deferred {
+        evaluated += 1;
+        // Parse the stored question payload back into a
+        // LayerQuestion. If it fails we just leave the deferred row
+        // alone.
+        let question: LayerQuestion = match serde_json::from_str(&row.question_json) {
+            Ok(q) => q,
+            Err(_) => continue,
+        };
+
+        // has_demand_signals eval: only check if any policy signal
+        // rule exceeds its threshold for this node.
+        let has_demand_signals = policy.demand_signals.iter().any(|rule| {
+            let window = normalize_window_modifier(&rule.window);
+            let sum = db::sum_demand_weight(
+                conn,
+                &row.slug,
+                &question.question_id,
+                &rule.r#type,
+                &window,
+            )
+            .unwrap_or(0.0);
+            sum >= rule.threshold
+        });
+
+        let facts = TriageFacts {
+            question: &question,
+            target_node_distilled: None,
+            target_node_depth: Some(question.layer),
+            is_first_build: false,
+            is_stale_check: true, // re-evaluation is maintenance
+            has_demand_signals,
+            evidence_question_trivial: None,
+            evidence_question_high_value: None,
+        };
+
+        let decision = match resolve_decision(&policy, &facts) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+
+        match decision {
+            TriageDecision::Answer { .. } => {
+                if db::remove_deferred(conn, &row.slug, &question.question_id).is_ok() {
+                    activated += 1;
+                }
+            }
+            TriageDecision::Defer { check_interval, .. } => {
+                let _ = db::update_deferred_next_check(
+                    conn,
+                    &row.slug,
+                    &question.question_id,
+                    &check_interval,
+                    policy.contribution_id.as_deref(),
+                );
+                still_deferred += 1;
+            }
+            TriageDecision::Skip { .. } => {
+                if db::remove_deferred(conn, &row.slug, &question.question_id).is_ok() {
+                    skipped += 1;
+                }
+            }
+        }
+    }
+
     debug!(
         slug = ?slug,
-        "reevaluate_deferred_questions: Phase 4 stub (Phase 11 wires this up)"
+        evaluated,
+        activated,
+        still_deferred,
+        skipped,
+        "reevaluate_deferred_questions: Phase 12 complete"
     );
+
     Ok(())
+}
+
+/// Convert a short-form window ("7d", "14d", "1h") or already-formatted
+/// SQLite modifier ("-7 days") into a valid SQLite datetime modifier.
+fn normalize_window_modifier(window: &str) -> String {
+    let w = window.trim();
+    if w.starts_with('-') || w.contains(' ') {
+        return w.to_string();
+    }
+    let (num_part, unit_part): (String, String) = w
+        .chars()
+        .partition(|c| c.is_ascii_digit());
+    let n: i64 = num_part.parse().unwrap_or(14);
+    let unit = match unit_part.as_str() {
+        "d" => "days",
+        "h" => "hours",
+        "w" => "days",
+        "m" => "minutes",
+        _ => "days",
+    };
+    let n = if unit_part == "w" { n * 7 } else { n };
+    format!("-{} {}", n, unit)
 }
 
 /// Phase 9: write the custom chain bundle (chain YAML + prompt files)

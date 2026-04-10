@@ -3047,10 +3047,141 @@ async fn pyramid_drill(
     slug: String,
     node_id: String,
 ) -> Result<DrillResult, String> {
-    let conn = state.pyramid.reader.lock().await;
-    pyramid_query::drill(&conn, &slug, &node_id)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "Node not found".to_string())
+    let result = {
+        let conn = state.pyramid.reader.lock().await;
+        pyramid_query::drill(&conn, &slug, &node_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "Node not found".to_string())?
+    };
+
+    // Phase 12: fire-and-forget user_drill demand signal recording.
+    // The IPC drill is always user-initiated (desktop UI), so we
+    // always record `user_drill` with source "user".
+    let writer = state.pyramid.writer.clone();
+    let slug_for_signal = slug.clone();
+    let node_for_signal = node_id.clone();
+    tokio::spawn(async move {
+        let conn = writer.lock().await;
+        let policy = match wire_node_lib::pyramid::db::load_active_evidence_policy(
+            &conn,
+            Some(&slug_for_signal),
+        ) {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let _ = wire_node_lib::pyramid::demand_signal::record_demand_signal(
+            &conn,
+            &slug_for_signal,
+            &node_for_signal,
+            "user_drill",
+            Some("user"),
+            &policy,
+        );
+    });
+
+    Ok(result)
+}
+
+/// Phase 12: Re-evaluate all deferred evidence questions against the
+/// current active evidence_policy. Called by the ToolsMode policy
+/// editor after a supersession, or manually by the user via the
+/// "Apply to all deferred" button.
+#[tauri::command]
+async fn pyramid_reevaluate_deferred_questions(
+    state: tauri::State<'_, SharedState>,
+    slug: String,
+) -> Result<ReevaluateDeferredResult, String> {
+    use wire_node_lib::pyramid::db;
+    use wire_node_lib::pyramid::triage::{resolve_decision, TriageDecision, TriageFacts};
+    use wire_node_lib::pyramid::types::LayerQuestion;
+
+    let writer = state.pyramid.writer.clone();
+    // Acquire the writer lock OUTSIDE the spawn_blocking (async),
+    // then hold it across the sync block by passing the locked guard
+    // through an owned path. Simpler: do the whole thing in the async
+    // context by using a blocking-safe DB path read instead.
+    let conn = writer.lock().await;
+    let result = tokio::task::block_in_place(move || -> Result<ReevaluateDeferredResult, String> {
+        let policy = db::load_active_evidence_policy(&conn, Some(&slug))
+            .map_err(|e| format!("load policy: {e}"))?;
+        let deferred = db::list_all_deferred(&conn, &slug).map_err(|e| e.to_string())?;
+        let mut result = ReevaluateDeferredResult {
+            evaluated: 0,
+            activated: 0,
+            still_deferred: 0,
+            skipped: 0,
+        };
+        for row in deferred {
+            result.evaluated += 1;
+            let question: LayerQuestion = match serde_json::from_str(&row.question_json) {
+                Ok(q) => q,
+                Err(_) => continue,
+            };
+            let has_demand_signals = policy.demand_signals.iter().any(|rule| {
+                let w = rule.window.trim();
+                let window = if w.starts_with('-') || w.contains(' ') {
+                    w.to_string()
+                } else {
+                    let (num_part, unit_part): (String, String) =
+                        w.chars().partition(|c| c.is_ascii_digit());
+                    let n: i64 = num_part.parse().unwrap_or(14);
+                    let (n, unit) = match unit_part.as_str() {
+                        "d" => (n, "days"),
+                        "h" => (n, "hours"),
+                        "w" => (n * 7, "days"),
+                        "m" => (n, "minutes"),
+                        _ => (n, "days"),
+                    };
+                    format!("-{} {}", n, unit)
+                };
+                db::sum_demand_weight(&conn, &slug, &question.question_id, &rule.r#type, &window)
+                    .unwrap_or(0.0)
+                    >= rule.threshold
+            });
+            let facts = TriageFacts {
+                question: &question,
+                target_node_distilled: None,
+                target_node_depth: Some(question.layer),
+                is_first_build: false,
+                is_stale_check: true,
+                has_demand_signals,
+                evidence_question_trivial: None,
+                evidence_question_high_value: None,
+            };
+            match resolve_decision(&policy, &facts).map_err(|e| e.to_string())? {
+                TriageDecision::Answer { .. } => {
+                    if db::remove_deferred(&conn, &slug, &question.question_id).is_ok() {
+                        result.activated += 1;
+                    }
+                }
+                TriageDecision::Defer { check_interval, .. } => {
+                    let _ = db::update_deferred_next_check(
+                        &conn,
+                        &slug,
+                        &question.question_id,
+                        &check_interval,
+                        policy.contribution_id.as_deref(),
+                    );
+                    result.still_deferred += 1;
+                }
+                TriageDecision::Skip { .. } => {
+                    if db::remove_deferred(&conn, &slug, &question.question_id).is_ok() {
+                        result.skipped += 1;
+                    }
+                }
+            }
+        }
+        Ok(result)
+    });
+    result
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct ReevaluateDeferredResult {
+    evaluated: u64,
+    activated: u64,
+    still_deferred: u64,
+    skipped: u64,
 }
 
 #[tauri::command]
@@ -8942,6 +9073,7 @@ fn main() {
             pyramid_node,
             pyramid_tree,
             pyramid_drill,
+            pyramid_reevaluate_deferred_questions,
             pyramid_list_question_overlays,
             pyramid_search,
             pyramid_get_references,

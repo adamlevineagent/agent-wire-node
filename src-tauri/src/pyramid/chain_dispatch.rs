@@ -280,8 +280,36 @@ async fn dispatch_llm(
             "[CHAIN] step '{}' → using structured output (schema: {})",
             step.name, schema_name
         );
-        let response = llm::call_model_structured(
+        // Phase 12: route through the cache-aware structured variant
+        // when the dispatch context carries cache_base. See dispatch_ir_llm
+        // for the fix-pass retrofit pattern that mirrors this.
+        let struct_ctx = ctx.cache_base.as_ref().map(|cb| {
+            let prompt_hash = cb.get_or_compute_prompt_hash(
+                step.instruction.as_deref().unwrap_or(&step.name),
+                || system_prompt.to_string(),
+            );
+            let mut c = CacheStepContext::new(
+                ctx.slug.clone(),
+                cb.build_id.clone(),
+                format!("{}_structured", step.name),
+                "chain_llm_structured",
+                0,
+                None,
+                cb.db_path.clone(),
+            )
+            .with_model_resolution(
+                step.model_tier.clone().unwrap_or_else(|| "mid".to_string()),
+                resolved_model.clone(),
+            )
+            .with_prompt_hash(prompt_hash);
+            if let Some(bus) = &cb.bus {
+                c = c.with_bus(bus.clone());
+            }
+            c
+        });
+        let response = llm::call_model_structured_and_ctx(
             config_ref,
+            struct_ctx.as_ref(),
             system_prompt,
             &user_prompt,
             temperature,
@@ -299,7 +327,39 @@ async fn dispatch_llm(
                     let heal_instruction = step.heal_instruction.as_deref().unwrap_or("Fix the JSON.");
                     let heal_sys = format!("{}\n\n{}", system_prompt, heal_instruction);
                     let heal_user = format!("Target Schema:\n{}\n\nMalformed Response:\n{}\n\nError:\n{}", serde_json::to_string_pretty(schema).unwrap_or_default(), response, e);
-                    let retry_resp = llm::call_model(config_ref, &heal_sys, &heal_user, 0.1, max_tokens).await?;
+                    // Phase 12: heal path inherits the cache plumbing
+                    // but with a different step_name so it gets its
+                    // own cache row.
+                    let heal_ctx = ctx.cache_base.as_ref().map(|cb| {
+                        let prompt_hash = compute_prompt_hash(&heal_sys);
+                        let mut c = CacheStepContext::new(
+                            ctx.slug.clone(),
+                            cb.build_id.clone(),
+                            format!("{}_heal", step.name),
+                            "chain_llm_heal",
+                            0,
+                            None,
+                            cb.db_path.clone(),
+                        )
+                        .with_model_resolution(
+                            step.model_tier.clone().unwrap_or_else(|| "mid".to_string()),
+                            resolved_model.clone(),
+                        )
+                        .with_prompt_hash(prompt_hash);
+                        if let Some(bus) = &cb.bus {
+                            c = c.with_bus(bus.clone());
+                        }
+                        c
+                    });
+                    let retry_resp = llm::call_model_and_ctx(
+                        config_ref,
+                        heal_ctx.as_ref(),
+                        &heal_sys,
+                        &heal_user,
+                        0.1,
+                        max_tokens,
+                    )
+                    .await?;
                     return llm::extract_json(&retry_resp).map_err(|he| anyhow!("Step '{}': JSON parse failed after self-healing: {}", step.name, he));
                 } else {
                     return Err(anyhow!("Step '{}': structured output JSON parse failed: {}", step.name, e));
@@ -307,6 +367,35 @@ async fn dispatch_llm(
             }
         }
     }
+
+    // Phase 12 retrofit: construct a cache-usable StepContext when the
+    // dispatch context's cache_base is populated (production chain
+    // executor always does). This turns the legacy v2 chain path into
+    // a cache-reachable path.
+    let dispatch_cache_ctx = ctx.cache_base.as_ref().map(|cb| {
+        let prompt_hash = cb.get_or_compute_prompt_hash(
+            step.instruction.as_deref().unwrap_or(&step.name),
+            || system_prompt.to_string(),
+        );
+        let mut c = CacheStepContext::new(
+            ctx.slug.clone(),
+            cb.build_id.clone(),
+            step.name.clone(),
+            "chain_llm",
+            0,
+            None,
+            cb.db_path.clone(),
+        )
+        .with_model_resolution(
+            step.model_tier.clone().unwrap_or_else(|| "mid".to_string()),
+            resolved_model.clone(),
+        )
+        .with_prompt_hash(prompt_hash);
+        if let Some(bus) = &cb.bus {
+            c = c.with_bus(bus.clone());
+        }
+        c
+    });
 
     // Standard path: call model, parse JSON, retry at temp 0.1 on failure
     let response = if let Some(ref audit) = ctx.audit {
@@ -320,7 +409,15 @@ async fn dispatch_llm(
         ).await?;
         resp.content
     } else {
-        llm::call_model(config_ref, system_prompt, &user_prompt, temperature, max_tokens).await?
+        llm::call_model_and_ctx(
+            config_ref,
+            dispatch_cache_ctx.as_ref(),
+            system_prompt,
+            &user_prompt,
+            temperature,
+            max_tokens,
+        )
+        .await?
     };
 
     match llm::extract_json(&response) {
@@ -335,7 +432,36 @@ async fn dispatch_llm(
                 let heal_instruction = step.heal_instruction.as_deref().unwrap_or("Fix the JSON.");
                 let heal_sys = format!("{}\n\n{}", system_prompt, heal_instruction);
                 let heal_user = format!("Malformed Response:\n{}\n\nError:\n{}", response, _first_err);
-                let retry_resp = llm::call_model(config_ref, &heal_sys, &heal_user, 0.1, max_tokens).await?;
+                let heal_ctx = ctx.cache_base.as_ref().map(|cb| {
+                    let prompt_hash = compute_prompt_hash(&heal_sys);
+                    let mut c = CacheStepContext::new(
+                        ctx.slug.clone(),
+                        cb.build_id.clone(),
+                        format!("{}_heal_standard", step.name),
+                        "chain_llm_heal",
+                        0,
+                        None,
+                        cb.db_path.clone(),
+                    )
+                    .with_model_resolution(
+                        step.model_tier.clone().unwrap_or_else(|| "mid".to_string()),
+                        resolved_model.clone(),
+                    )
+                    .with_prompt_hash(prompt_hash);
+                    if let Some(bus) = &cb.bus {
+                        c = c.with_bus(bus.clone());
+                    }
+                    c
+                });
+                let retry_resp = llm::call_model_and_ctx(
+                    config_ref,
+                    heal_ctx.as_ref(),
+                    &heal_sys,
+                    &heal_user,
+                    0.1,
+                    max_tokens,
+                )
+                .await?;
                 return llm::extract_json(&retry_resp).map_err(|he| anyhow!("Step '{}': JSON parse failed after self-healing: {}", step.name, he));
             } else {
                 // JSON-retry guarantee: retry at temperature 0.1
@@ -343,8 +469,41 @@ async fn dispatch_llm(
                     "[CHAIN] step '{}' → JSON parse failed, retrying at temp 0.1",
                     step.name
                 );
-                let retry_response =
-                    llm::call_model(config_ref, system_prompt, &user_prompt, 0.1, max_tokens).await?;
+                // Same cache ctx, different step_name so cache rows
+                // are distinct for retry variants.
+                let retry_ctx = ctx.cache_base.as_ref().map(|cb| {
+                    let prompt_hash = cb.get_or_compute_prompt_hash(
+                        step.instruction.as_deref().unwrap_or(&step.name),
+                        || system_prompt.to_string(),
+                    );
+                    let mut c = CacheStepContext::new(
+                        ctx.slug.clone(),
+                        cb.build_id.clone(),
+                        format!("{}_retry_temp01", step.name),
+                        "chain_llm_retry",
+                        0,
+                        None,
+                        cb.db_path.clone(),
+                    )
+                    .with_model_resolution(
+                        step.model_tier.clone().unwrap_or_else(|| "mid".to_string()),
+                        resolved_model.clone(),
+                    )
+                    .with_prompt_hash(prompt_hash);
+                    if let Some(bus) = &cb.bus {
+                        c = c.with_bus(bus.clone());
+                    }
+                    c
+                });
+                let retry_response = llm::call_model_and_ctx(
+                    config_ref,
+                    retry_ctx.as_ref(),
+                    system_prompt,
+                    &user_prompt,
+                    0.1,
+                    max_tokens,
+                )
+                .await?;
 
                 llm::extract_json(&retry_response).map_err(|e| {
                     anyhow!(

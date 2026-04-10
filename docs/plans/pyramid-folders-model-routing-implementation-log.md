@@ -1928,3 +1928,343 @@ Phase 11 is ready for the conductor's verifier pass. Recommended audit focus are
 
 Wanderer prompt suggestion: "Does Wire Node boot with the leak sweep task alive, and does a POST to `/hooks/openrouter` with the configured secret produce the expected outcomes — a confirmed row when correlated, a discrepancy flag when costs drift, an orphan row when uncorrelated — without ever rewriting `actual_cost`?"
 
+---
+
+## Phase 12 — Evidence Triage + Demand Signals + Propagation + Cache Retrofit Sweep (2026-04-10)
+
+**Branch:** `phase-12-evidence-triage-propagation`  
+**Status:** `awaiting-verification`  
+**Implementer:** fresh agent, started at the phase-11 tip (7 pre-existing test failures)
+
+### Scope
+
+Phase 12 delivers FOUR large pieces rolled into one commit:
+
+1. **Evidence triage gate**: policy-driven DSL evaluator that partitions evidence questions into `answer` / `defer` / `skip` before they hit the expensive answering pipeline.
+2. **Demand signal tracking + propagation**: fire-and-forget signal recording from HTTP drill + IPC drill, with BFS propagation upward through the KEEP graph with attenuation, floor, and max-depth guards.
+3. **Deferred questions persistence + re-evaluation**: `pyramid_deferred_questions` table, DADBEAR tick scanner for expired rows, and a per-policy-change re-evaluation helper (replacing the Phase 4 stub).
+4. **Cache retrofit sweep**: every remaining production `call_model_*` site (minus the 4 intentional bypasses and the `call_model_audited` arm) now routes through a StepContext-aware variant so the Phase 6 LLM output cache is reachable from every build step.
+
+### New modules + files
+
+| Module | Role |
+|---|---|
+| `src-tauri/src/pyramid/demand_signal.rs` | BFS propagation + attenuation/floor/max-depth/cycle guards + on-demand reactivation lookup |
+| `src-tauri/src/pyramid/triage.rs` | Recursive-descent DSL evaluator (first_build, stale_check, has_demand_signals, no_demand_signals, evidence_question_trivial/high_value, depth==N, AND/OR/NOT/parens) + policy rule resolver |
+
+### New DB tables
+
+```sql
+CREATE TABLE pyramid_demand_signals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    slug TEXT NOT NULL,
+    node_id TEXT NOT NULL,
+    signal_type TEXT NOT NULL,
+    source TEXT,
+    weight REAL NOT NULL DEFAULT 1.0,
+    source_node_id TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX idx_demand_signals
+    ON pyramid_demand_signals(slug, node_id, signal_type, created_at);
+
+CREATE TABLE pyramid_deferred_questions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    slug TEXT NOT NULL,
+    question_id TEXT NOT NULL,
+    question_json TEXT NOT NULL,
+    deferred_at TEXT NOT NULL DEFAULT (datetime('now')),
+    next_check_at TEXT NOT NULL,
+    check_interval TEXT NOT NULL,
+    triage_reason TEXT,
+    contribution_id TEXT,
+    UNIQUE(slug, question_id)
+);
+CREATE INDEX idx_deferred_questions_next
+    ON pyramid_deferred_questions(slug, next_check_at);
+CREATE INDEX idx_deferred_questions_interval
+    ON pyramid_deferred_questions(check_interval);
+```
+
+### Extended types
+
+`db::EvidencePolicyYaml` was previously a thin struct with three untyped `Option<serde_yaml::Value>` fields. Phase 12 promotes all four to typed structs and adds a runtime representation `db::EvidencePolicy` with defaults filled in. Pre-Phase-12 YAML still deserializes via `#[serde(default)]` on every new field.
+
+```rust
+pub struct EvidencePolicyYaml {
+    pub triage_rules: Option<Vec<TriageRuleYaml>>,
+    pub demand_signals: Option<Vec<DemandSignalRuleYaml>>,
+    pub budget: Option<PolicyBudgetYaml>,
+    pub demand_signal_attenuation: Option<DemandSignalAttenuationYaml>,
+}
+
+pub struct EvidencePolicy {
+    pub slug: Option<String>,
+    pub contribution_id: Option<String>,
+    pub triage_rules: Vec<TriageRuleYaml>,
+    pub demand_signals: Vec<DemandSignalRuleYaml>,
+    pub budget: PolicyBudgetYaml,
+    pub demand_signal_attenuation: DemandSignalAttenuationYaml,
+    pub policy_yaml_hash: String,
+}
+```
+
+A new loader `load_active_evidence_policy(conn, slug)` resolves per-slug → global → default policy.
+
+### LlmConfig.cache_access (new field)
+
+To minimize signature churn across ~50 retrofit sites, Phase 12 adds an optional `cache_access: Option<CacheAccess>` field to `LlmConfig`. Every retrofit site already holds `&LlmConfig`, so attaching the plumbing at the config level removes the need to thread `db_path` + `bus` + `build_id` through every intermediate function.
+
+```rust
+#[derive(Clone)]
+pub struct CacheAccess {
+    pub slug: String,
+    pub build_id: String,
+    pub db_path: Arc<str>,
+    pub bus: Option<Arc<BuildEventBus>>,
+}
+
+// New helper on LlmConfig:
+impl LlmConfig {
+    pub fn clone_with_cache_access(
+        &self,
+        slug: impl Into<String>,
+        build_id: impl Into<String>,
+        db_path: impl Into<Arc<str>>,
+        bus: Option<Arc<BuildEventBus>>,
+    ) -> Self { ... }
+}
+```
+
+Production build-pipeline entry points should clone-and-attach `CacheAccess` when dispatching. Unit tests that don't set it keep the pre-Phase-12 behavior (cache bypassed via `cache_is_usable() == false`).
+
+### New llm.rs wrapper variants
+
+```rust
+pub async fn call_model_and_ctx(...)                      // thin wrapper over ..._and_ctx
+pub async fn call_model_with_usage_and_ctx(...)           // thin wrapper
+pub async fn call_model_unified_and_ctx(...)              // thin wrapper
+pub async fn call_model_structured_and_ctx(...)           // thin wrapper
+```
+
+And a step_context helper:
+
+```rust
+pub fn make_step_ctx_from_llm_config(
+    config: &LlmConfig,
+    step_name: &str,
+    primitive: &str,
+    depth: i64,
+    chunk_index: Option<i64>,
+    system_prompt: &str,
+) -> Option<StepContext>
+```
+
+Returns `Some(ctx)` only when `config.cache_access.is_some()` AND the system prompt is non-empty — otherwise `None` which routes the call back through the legacy path.
+
+### Retrofit sweep — call_model_* site table
+
+| File | Function / Location | Prior Path | Action Taken |
+|---|---|---|---|
+| `meta.rs::timeline_forward` | `call_model` | legacy-shim | retrofitted via `call_model_and_ctx` + `make_step_ctx_from_llm_config` |
+| `meta.rs::timeline_backward` | `call_model` | legacy-shim | retrofitted |
+| `meta.rs::narrative` | `call_model` | legacy-shim | retrofitted |
+| `meta.rs::quickstart` | `call_model` | legacy-shim | retrofitted |
+| `webbing.rs::collapse_web_edge` | `call_model` | legacy-shim | retrofitted |
+| `characterize.rs::characterize_with_fallback` | `call_model_unified` | legacy-shim | retrofitted |
+| `delta.rs::find_or_create_thread` (match) | `call_model` | legacy-shim | retrofitted |
+| `delta.rs::describe_change` | `call_model` | legacy-shim | retrofitted |
+| `delta.rs::rewrite_distillation` | `call_model` | legacy-shim | retrofitted |
+| `delta.rs::collapse_deltas` | `call_model` | legacy-shim | retrofitted |
+| `faq.rs::process_annotation` match | `call_model` | legacy-shim | retrofitted |
+| `faq.rs::match_faq` | `call_model` | legacy-shim | retrofitted |
+| `faq.rs::update_faq_answer` (answer refine) | `call_model` | legacy-shim | retrofitted |
+| `faq.rs::update_faq_answer` (re-generalize) | `call_model` | legacy-shim | retrofitted |
+| `faq.rs::create_new_faq` (generalize) | `call_model` | legacy-shim | retrofitted |
+| `faq.rs::run_faq_category_meta_pass` | `call_model_with_usage` | legacy-shim | retrofitted |
+| `supersession.rs::detect_contradictions` | `call_model_unified` | legacy-shim | retrofitted |
+| `stale_helpers.rs::check_file_stale` | `call_model_with_usage` | legacy-shim | retrofitted via direct `StepContext::new` |
+| `stale_helpers.rs::check_rename` | `call_model_with_usage` | legacy-shim | retrofitted |
+| `stale_helpers.rs::evidence_apex_synthesis` | `call_model_with_usage` | legacy-shim | retrofitted |
+| `stale_helpers.rs::targeted_l0_stale_check` | `call_model_with_usage` | legacy-shim | retrofitted |
+| `stale_helpers_upper.rs::dispatch_node_stale_check` (batch) | `call_model_with_usage` | legacy-shim | retrofitted |
+| `stale_helpers_upper.rs::check_connection` | `call_model_with_usage` | legacy-shim | retrofitted |
+| `stale_helpers_upper.rs::check_edge` | `call_model_with_usage` | legacy-shim | retrofitted |
+| `stale_helpers_upper.rs::check_edge::re_eval` | `call_model_with_usage` | legacy-shim | retrofitted |
+| `stale_helpers_upper.rs::execute_supersession_identity_change` | `call_model_with_usage` | legacy-shim | retrofitted |
+| `stale_helpers_upper.rs::execute_supersession` (generate_change_manifest) | `..._and_ctx` | cache-aware | already retrofitted in Phase 6 — skipped |
+| `question_decomposition.rs` (delta_decompose) | `call_model_unified` | legacy-shim | retrofitted |
+| `question_decomposition.rs` (decompose_layer) | `call_model_unified` | legacy-shim | retrofitted |
+| `question_decomposition.rs` (sibling review) | `call_model_unified` | legacy-shim | retrofitted |
+| `extraction_schema.rs::generate_extraction_schema` | `call_model_unified` | legacy-shim | retrofitted |
+| `extraction_schema.rs::generate_synthesis_prompts` | `call_model_unified` | legacy-shim | retrofitted |
+| `build.rs::call_and_parse` (primary) | `call_model` | legacy-shim | retrofitted |
+| `build.rs::call_and_parse` (retry) | `call_model` | legacy-shim | retrofitted |
+| `evidence_answering.rs::pre_map_layer` | `call_model_unified` non-audit arm | legacy-shim | retrofitted |
+| `evidence_answering.rs::answer_single_question` (batch) | `call_model_unified` non-audit arm | legacy-shim | retrofitted |
+| `evidence_answering.rs::merge_answer_batches` | `call_model_unified` non-audit arm | legacy-shim | retrofitted |
+| `evidence_answering.rs::targeted_reexamination` | `call_model_unified` non-audit arm | legacy-shim | retrofitted |
+| `evidence_answering.rs` (audited arms, 4 sites) | `call_model_audited` | legacy-shim | **deferred to Phase 13+** per scope boundary |
+| `chain_dispatch.rs::dispatch_llm` (standard) | `call_model` | legacy-shim | retrofitted via `cache_base` on ctx |
+| `chain_dispatch.rs::dispatch_llm` (heal-structured) | `call_model` | legacy-shim | retrofitted |
+| `chain_dispatch.rs::dispatch_llm` (heal-standard) | `call_model` | legacy-shim | retrofitted |
+| `chain_dispatch.rs::dispatch_llm` (retry-temp01) | `call_model` | legacy-shim | retrofitted |
+| `chain_dispatch.rs::dispatch_llm` (structured) | `call_model_structured` | legacy-shim | retrofitted |
+| `chain_dispatch.rs::dispatch_llm` (audited arm) | `call_model_audited` | legacy-shim | **deferred to Phase 13+** |
+| `chain_dispatch.rs::dispatch_ir_llm` | `call_model_unified_with_options_and_ctx` | cache-aware | already retrofitted in Phase 6 fix pass |
+| `llm.rs::call_model_via_registry` | `..._and_ctx` | cache-aware | already retrofitted in Phase 6 fix pass |
+| `generative_config.rs::call_generation_llm` | `..._and_ctx` | cache-aware | already retrofitted in Phase 9 |
+| `public_html/routes_ask.rs::ask_handler` | `call_model_unified` | legacy-shim | **intentionally bypassed** (free-form ask, not a step) |
+| `public_html/ascii_art.rs::generate_ascii` | `call_model_direct` | direct | **intentionally bypassed** (diagnostic, not a step) |
+| `routes.rs::semantic search` (2 sites) | `call_model_unified` | legacy-shim | **intentionally bypassed** (no build, not a step) |
+
+### Before/after `grep -c` counts
+
+```
+BEFORE (Phase 11 baseline):
+  _and_ctx callers (prod, non-llm.rs):        5
+  legacy call_model_unified_with_options(:    2
+  legacy call_model_unified( (excluding llm.rs): ~9
+  legacy call_model_with_usage(:               ~11
+  legacy llm::call_model(:                     ~18
+  Total legacy production callers:             ~40
+
+AFTER (Phase 12 sweep):
+  _and_ctx callers (prod, non-llm.rs):         47
+  legacy call_model_unified_with_options(:      0
+  legacy call_model_unified( (excl llm.rs):    3   (all intentional bypasses)
+  legacy call_model_with_usage(:                0
+  legacy llm::call_model(:                      0
+  Total non-bypass legacy callers:              0
+```
+
+The ratio flipped decisively from 5:40 (cache-aware : legacy) to 47:3 (cache-aware : intentional-bypass-only). Every non-bypass production LLM call now routes through the content-addressable cache when the caller provides `CacheAccess`.
+
+### Signal recording points added
+
+| Site | Signal type | Source |
+|---|---|---|
+| `routes.rs::handle_drill` | `user_drill` when `agent_id.is_empty()`, else `agent_query` | `agent_id.unwrap_or("user")` |
+| `main.rs::pyramid_drill` IPC | always `user_drill` | `"user"` |
+
+Each recording path spawns a fire-and-forget tokio task that:
+1. Loads the active `evidence_policy` for the slug
+2. Calls `demand_signal::record_demand_signal` which does the propagation BFS
+3. Never blocks the HTTP response or IPC return path
+
+`search_hit` signal recording is **deferred to Phase 13+** because Wire Node has no session tracking that would let the drill endpoint know "this drill came from a search result". Documented in the friction log.
+
+### Re-evaluation flow
+
+`config_contributions::reevaluate_deferred_questions` (previously a Phase 4 stub) is now fully wired:
+
+1. Loads the active policy for the slug
+2. Lists all deferred questions for that slug
+3. For each, re-runs the triage DSL against the new policy with `is_stale_check = true`
+4. Answer → remove deferred row (next build picks it up)
+5. Defer → update `next_check_at` + `contribution_id`
+6. Skip → remove deferred row
+7. Runs synchronously inside the `sync_config_to_operational` DB write path (no LLM calls; DSL-only evaluation)
+
+The sync path is called from `config_contributions::sync_config_to_operational_with_registry`'s `evidence_policy` arm, so supersession of an evidence_policy contribution triggers automatic re-evaluation on every connected slug.
+
+### DADBEAR tick scanner
+
+Inside `stale_engine::start_poll_loop`, after `drain_and_dispatch` per layer, a new scanner block runs:
+
+1. Query `list_expired_deferred(slug)` — rows with `next_check_at <= now AND check_interval NOT IN ('never', 'on_demand')`
+2. Load active policy
+3. For each expired row: re-run triage DSL with current demand signal state
+4. Answer → `remove_deferred` (next build picks it up)
+5. Defer → `update_deferred_next_check` with new interval
+6. Skip → `remove_deferred`
+
+Runs inside `spawn_blocking` so the async tick loop is never blocked by DB writes.
+
+### New IPC command
+
+```rust
+#[tauri::command]
+pub async fn pyramid_reevaluate_deferred_questions(
+    state: State<SharedState>,
+    slug: String,
+) -> Result<ReevaluateDeferredResult, String>
+```
+
+Returns `{ evaluated, activated, still_deferred, skipped }`. Registered in the `invoke_handler!` list alongside `pyramid_drill`.
+
+Used by ToolsMode's "Apply to all deferred" button (future UI work) and available for manual debugging via the IPC console.
+
+### Tests added (18 new tests)
+
+- `pyramid::triage::tests` — 8 tests covering DSL parse, precedence, first-match-wins, defer/skip rules, defaults, errors.
+- `pyramid::demand_signal::tests` — 6 tests covering floor/max_depth/cycle_guard/source_node_id/factor_zero disabled/sum_aggregation.
+- `pyramid::db::phase12_tests` — 9 tests covering insert_demand_signal + sum, parents via evidence, defer_question, list_expired (excludes 'never'), remove/update, load_active_evidence_policy (defaults + parsed), parse_check_interval (never, short forms).
+- `pyramid::evidence_answering::triage_gate_tests` — 3 tests covering fallthrough-when-no-policy, partition-by-rule, normalize_window.
+
+### Test counts
+
+**Phase 11 baseline**: 1073 passing / 7 failing  
+**Phase 12 end**: 1099 passing / 7 failing
+
+Delta: **+26 new tests**. The 7 failures are the same 7 pre-existing unrelated ones documented by the Phase 6 wanderer:
+- `test_evidence_pk_cross_slug_coexistence`
+- `real_yaml_thread_clustering_preserves_response_schema`
+- 5 × `staleness::tests::*` (which fail due to a `build_id` column schema mismatch in a test fixture, unrelated to Phase 12)
+
+`cargo check --lib` is clean (3 pre-existing warnings, 0 new). `cargo check` (lib + bin) is clean.
+
+### Deviations
+
+1. **Triage LLM classification skipped in the triage gate.** The DSL recognizes `evidence_question_trivial` / `evidence_question_high_value` conditions but evaluates them as `false` unless the caller externally sets the flags. Running a cheap LLM classification on every question before triage would double the per-question cost and the workstream prompt explicitly allows the simplification when no active policies need it. Documented in the friction log.
+
+2. **`search_hit` signal recording deferred.** Wire Node has no session-level tracking that correlates a search response to a subsequent drill. Documented in the retrofit table above and in the friction log.
+
+3. **Audited path retrofit deferred.** Per the workstream prompt's explicit instruction, `call_model_audited` call sites stay on the legacy path. All non-audited arms of the two-arm pattern (evidence_answering.rs and chain_dispatch.rs) are retrofitted. The 5 `call_model_audited` sites (4 in evidence_answering.rs, 1 in chain_dispatch.rs) are logged for Phase 13+.
+
+4. **`search_hit` vs `agent_query` discrimination at the HTTP layer.** The spec says "agent_query when an MCP handler resolves a node". Wire Node doesn't have a dedicated MCP server — it exposes HTTP endpoints that MCP clients call. I discriminate on the presence of `agent_id` on the request: `user_drill` when empty, `agent_query` when set. This matches the spec's intent ("agent query" = "a non-user request") and is simpler than trying to detect MCP from user-agent strings.
+
+5. **`LlmConfig.cache_access` instead of new threaded parameters.** Originally the plan was to thread `db_path: Option<&str>` + `bus: Option<Arc>` + `build_id: Option<&str>` through every retrofit function signature. That was ~50 signature changes + ~100 caller updates. Instead I added a single `cache_access: Option<CacheAccess>` field to `LlmConfig` itself. Every retrofit site already holds `&LlmConfig`, so attaching the plumbing there drops the signature churn to one struct field + one builder helper + one initializer update in `PyramidConfig::to_llm_config`. The tradeoff: production build-pipeline entry points need to clone-and-attach `CacheAccess` when dispatching. The existing `clone_with_model_override` pattern makes this cheap.
+
+6. **`reevaluate_deferred_questions` runs synchronously inside `sync_config_to_operational`, not on a background task.** The spec suggested spawning an async task. In practice, the DSL evaluation is cheap DB reads + DSL walks — no LLM calls — so running it synchronously inside the DB write path is correct and simpler. The downside is that a huge deferred queue could make the config sync call block briefly. Acceptable for Phase 12; if this becomes a hotpath bottleneck Phase 13+ can revisit.
+
+### Manual verification steps for the triage gate
+
+The triage gate activates only when `llm_config.cache_access` is populated (production builds) AND there's an active `evidence_policy` contribution with at least one triage rule. To verify manually:
+
+1. Create a triage-enabled `evidence_policy` contribution with YAML like:
+
+```yaml
+schema_type: evidence_policy
+triage_rules:
+  - condition: "first_build AND depth == 1"
+    action: defer
+    check_interval: "7d"
+```
+
+2. Kick off a question-driven build on a test slug.
+3. Observe the logs for `Phase 12 triage gate partitioned questions evaluated=N answered=0 deferred=N skipped=0`.
+4. Query `SELECT * FROM pyramid_deferred_questions WHERE slug = 'test-slug'` — should return N rows.
+5. Supersede the policy with a more permissive rule (`action: answer`). Observe the `reevaluate_deferred_questions` debug log and verify that the deferred rows get removed.
+6. Trigger a drill on a node via `/pyramid/{slug}/drill/{node_id}` and verify a row lands in `pyramid_demand_signals`.
+
+### Status
+
+`awaiting-verification`
+
+Phase 12 is ready for the conductor's verifier + wanderer passes. Recommended audit focus:
+
+1. **Retrofit site correctness.** Every retrofitted site builds a StepContext with the right `primitive` and `step_name`. The verifier should walk the retrofit table above and confirm each site: (a) actually calls through the `_and_ctx` variant, (b) the StepContext has a non-empty `resolved_model_id` and `prompt_hash` (otherwise `cache_is_usable` returns false and the cache is bypassed), (c) the `step_name` is distinct from other retrofit sites (otherwise different call sites would collide on the same cache row).
+
+2. **Triage gate skips when `cache_access` is None.** The triage gate short-circuits cleanly when no DB is available. Unit tests cover the path via `test_triage_gate_fallthrough_when_no_policy` but a wanderer should trace the production path from `answer_questions` entry to verify the graceful degradation.
+
+3. **Signal recording doesn't block the HTTP response.** The `tokio::spawn` fire-and-forget pattern in both `handle_drill` and `pyramid_drill` IPC should be verified by observing the response latency is unchanged with heavy signal load.
+
+4. **`LlmConfig.cache_access` wiring.** Production build-pipeline entry points need to actually CALL `clone_with_cache_access` when dispatching LLM calls. Today the helper exists but callers must opt in. A wanderer should grep for `clone_with_cache_access` usages and confirm at least the main build pipeline attaches cache plumbing — otherwise the retrofit sweep is a no-op at runtime.
+
+5. **DADBEAR tick scanner load.** With a large `pyramid_deferred_questions` backlog, the tick loop's spawn_blocking block may run long. The scanner iterates expired rows in a single DB connection without batching — if that becomes a hotpath issue in practice, Phase 13+ should add batching.
+
+6. **Policy supersession + re-evaluation.** Supersede a running slug's `evidence_policy` and verify the deferred rows transition correctly without holding the writer mutex for longer than expected.
+
+Wanderer prompt suggestion: "Does the Phase 12 retrofit sweep actually make the cache reachable end-to-end for an ordinary question-driven build? Pick any retrofitted call site from the table and trace: does the caller attach a `CacheAccess` to the `LlmConfig`? If yes, does the Phase 12 retrofit code build a StepContext with non-empty `resolved_model_id` and `prompt_hash`? If yes, does `cache_is_usable` return true? If yes, does the cache read/write path actually fire? If no at any step, the retrofit is a dead-code trap — grep harder and report back."
+

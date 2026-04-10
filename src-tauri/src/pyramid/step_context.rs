@@ -38,6 +38,7 @@ use std::sync::Arc;
 use sha2::{Digest, Sha256};
 
 use super::event_bus::BuildEventBus;
+use super::llm::LlmConfig;
 
 /// Compute a hex-encoded SHA-256 digest of the given bytes.
 ///
@@ -388,6 +389,122 @@ impl StepContext {
             .unwrap_or(false)
             && !self.prompt_hash.is_empty()
     }
+}
+
+/// Phase 12 convenience constructor for retrofit call sites that have
+/// a slug + some notion of step identity but no upstream ChainContext.
+///
+/// Computes the prompt hash on-the-fly from `prompt_template_body` (or
+/// from the concatenated system+user prompt if no template is
+/// available), stamps the resolved model id, and attaches the bus.
+///
+/// `build_id` is used only for telemetry/provenance on the cache row —
+/// the cache KEY is content-addressable (inputs_hash + prompt_hash +
+/// model_id) so cache hit/miss behavior is the same across build_ids.
+/// For call sites without a real build (e.g. DADBEAR maintenance),
+/// pass `None` and a synthetic id like `<slug>-maintenance-<op>` is
+/// generated.
+#[allow(clippy::too_many_arguments)]
+pub fn make_step_context_from_slug(
+    slug: &str,
+    build_id: Option<&str>,
+    step_name: &str,
+    primitive: &str,
+    depth: i64,
+    chunk_index: Option<i64>,
+    db_path: &str,
+    bus: Option<Arc<BuildEventBus>>,
+    model_tier: &str,
+    resolved_model_id: &str,
+    prompt_template_body: Option<&str>,
+    fallback_system_prompt: Option<&str>,
+    fallback_user_prompt: Option<&str>,
+) -> StepContext {
+    let build_id = build_id
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| format!("{}-{}", slug, step_name));
+    let prompt_hash = match prompt_template_body {
+        Some(body) if !body.is_empty() => compute_prompt_hash(body),
+        _ => {
+            // Derive a stable prompt_hash from the fallback prompts if
+            // present; otherwise leave empty (the call will bypass the
+            // cache via `cache_is_usable`). This is intentional — a site
+            // with no stable prompt body can't participate in the
+            // cache.
+            match (fallback_system_prompt, fallback_user_prompt) {
+                (Some(sys), Some(_)) if !sys.is_empty() => {
+                    // Hash the system prompt alone as a proxy for the
+                    // template. Not ideal — inputs will double-count —
+                    // but deterministic for the same system prompt.
+                    compute_prompt_hash(sys)
+                }
+                _ => String::new(),
+            }
+        }
+    };
+
+    let mut ctx = StepContext::new(
+        slug.to_string(),
+        build_id,
+        step_name.to_string(),
+        primitive.to_string(),
+        depth,
+        chunk_index,
+        db_path.to_string(),
+    );
+    if !resolved_model_id.is_empty() {
+        ctx = ctx.with_model_resolution(model_tier.to_string(), resolved_model_id.to_string());
+    }
+    if !prompt_hash.is_empty() {
+        ctx = ctx.with_prompt_hash(prompt_hash);
+    }
+    if let Some(bus) = bus {
+        ctx = ctx.with_bus(bus);
+    }
+    ctx
+}
+
+/// Phase 12 retrofit helper: construct a cache-usable StepContext
+/// from an LlmConfig that carries cache plumbing (see
+/// `LlmConfig::cache_access`) plus a step identity and the system
+/// prompt body. Returns `None` if the config has no cache_access
+/// (the caller then bypasses the cache naturally).
+///
+/// The `resolved_model_id` is taken from `config.primary_model` —
+/// this is the simplest consistent choice since every retrofit site
+/// that calls `call_model` implicitly uses whatever model the config
+/// routes to. For sites that use `call_model_via_registry` or
+/// `call_model_unified_with_options_and_ctx` with an explicit
+/// tier, the direct construction path (`StepContext::new` +
+/// `with_model_resolution`) remains available.
+pub fn make_step_ctx_from_llm_config(
+    config: &LlmConfig,
+    step_name: &str,
+    primitive: &str,
+    depth: i64,
+    chunk_index: Option<i64>,
+    system_prompt: &str,
+) -> Option<StepContext> {
+    let cache = config.cache_access.as_ref()?;
+    if system_prompt.is_empty() {
+        return None;
+    }
+    let prompt_hash = compute_prompt_hash(system_prompt);
+    let mut ctx = StepContext::new(
+        cache.slug.clone(),
+        cache.build_id.clone(),
+        step_name.to_string(),
+        primitive.to_string(),
+        depth,
+        chunk_index,
+        cache.db_path.to_string(),
+    )
+    .with_model_resolution("primary", config.primary_model.clone())
+    .with_prompt_hash(prompt_hash);
+    if let Some(bus) = &cache.bus {
+        ctx = ctx.with_bus(bus.clone());
+    }
+    Some(ctx)
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────

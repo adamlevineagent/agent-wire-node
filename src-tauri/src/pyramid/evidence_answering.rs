@@ -27,6 +27,7 @@ use rusqlite;
 use super::db;
 use super::llm::{self, AuditContext, LlmConfig};
 use super::question_decomposition::render_prompt_template;
+use super::step_context::{compute_prompt_hash, StepContext};
 use super::types::{
     AnswerBatchResult, AnsweredNode, CandidateMap, EvidenceLink, EvidenceSet, EvidenceVerdict,
     FailedQuestion, LayerQuestion, PyramidNode,
@@ -288,8 +289,29 @@ Every question_id from the input MUST appear as a key in the mappings, even if i
             ).await?;
             resp
         } else {
-            llm::call_model_unified(
-                llm_config, &system_prompt, &user_prompt,
+            // Phase 12 retrofit: construct a cache-usable StepContext
+            // from the llm_config's cache_access. When cache_access is
+            // None (unit tests), this returns None and the call falls
+            // back to the legacy path.
+            let pre_map_ctx = llm_config.cache_access.as_ref().map(|ca| {
+                let mut c = StepContext::new(
+                    ca.slug.clone(),
+                    ca.build_id.clone(),
+                    format!("evidence_pre_map_{}", batch_idx),
+                    "evidence_pre_map",
+                    0,
+                    Some(batch_idx as i64),
+                    ca.db_path.to_string(),
+                )
+                .with_model_resolution("fast_extract", llm_config.primary_model.clone())
+                .with_prompt_hash(compute_prompt_hash(&system_prompt));
+                if let Some(bus) = &ca.bus {
+                    c = c.with_bus(bus.clone());
+                }
+                c
+            });
+            llm::call_model_unified_and_ctx(
+                llm_config, pre_map_ctx.as_ref(), &system_prompt, &user_prompt,
                 ops.tier1.pre_map_temperature, ops.tier1.pre_map_max_tokens,
                 None,
             ).await?
@@ -390,6 +412,67 @@ pub async fn answer_questions(
             failed: Vec::new(),
         });
     }
+
+    // ── Phase 12: Triage gate ───────────────────────────────────────
+    //
+    // Before dispatching questions to the expensive answering path,
+    // run each question through the triage DSL against the active
+    // evidence_policy. Questions with no policy fall through as
+    // "Answer" (the default). Questions with a matching "defer" rule
+    // go to pyramid_deferred_questions; questions with a matching
+    // "skip" rule are dropped.
+    //
+    // The triage gate activates only when llm_config.cache_access is
+    // populated (i.e. we have a db_path to read the policy from).
+    // Unit tests that don't set cache_access keep the pre-Phase-12
+    // behavior.
+    let (triaged_questions, triage_stats) = if let Some(ca) = llm_config.cache_access.as_ref() {
+        let db_path = ca.db_path.to_string();
+        let slug_for_triage = slug.to_string();
+        let questions_for_triage: Vec<LayerQuestion> = questions.to_vec();
+        // Run the triage pass in spawn_blocking since it opens a DB
+        // connection. This is a fast synchronous DB read + DSL
+        // evaluation — no LLM call in the MVP (triage LLM
+        // classification is deferred per the workstream prompt's
+        // "make most load-bearing reasonable call" guidance).
+        let triage_result = tokio::task::spawn_blocking(move || {
+            run_triage_gate(&db_path, &slug_for_triage, &questions_for_triage)
+        })
+        .await
+        .map_err(|e| anyhow!("triage gate join error: {}", e))??;
+        (triage_result.answer_questions, triage_result.stats)
+    } else {
+        // No cache_access → triage disabled; all questions answered.
+        (
+            questions.to_vec(),
+            TriageStats {
+                evaluated: questions.len(),
+                answered: questions.len(),
+                deferred: 0,
+                skipped: 0,
+            },
+        )
+    };
+
+    info!(
+        evaluated = triage_stats.evaluated,
+        answered = triage_stats.answered,
+        deferred = triage_stats.deferred,
+        skipped = triage_stats.skipped,
+        "Phase 12 triage gate partitioned questions"
+    );
+
+    if triaged_questions.is_empty() {
+        return Ok(AnswerBatchResult {
+            answered: Vec::new(),
+            failed: Vec::new(),
+        });
+    }
+    // Replace the `questions` binding with the triaged subset so the
+    // downstream parallel-answering loop only runs on the `Answer`
+    // bucket. `questions` shadows the original slice with a
+    // `Vec<LayerQuestion>`.
+    let questions: &[LayerQuestion] = &triaged_questions;
 
     // Build a lookup map for all nodes by ORIGINAL ID
     let node_map: HashMap<&str, &PyramidNode> =
@@ -805,8 +888,28 @@ Respond with ONLY a JSON object:
             ).await?;
             resp
         } else {
-            llm::call_model_unified(
-                llm_config, &system_prompt, &user_prompt,
+            // Phase 12 retrofit: construct a cache-usable StepContext
+            // from llm_config.cache_access (populated by the build
+            // pipeline via clone_with_cache_access).
+            let answer_ctx = llm_config.cache_access.as_ref().map(|ca| {
+                let mut c = StepContext::new(
+                    ca.slug.clone(),
+                    ca.build_id.clone(),
+                    format!("evidence_answer_batch_{}", batch_idx),
+                    "evidence_answer",
+                    question.layer as i64,
+                    Some(batch_idx as i64),
+                    ca.db_path.to_string(),
+                )
+                .with_model_resolution("fast_extract", llm_config.primary_model.clone())
+                .with_prompt_hash(compute_prompt_hash(&system_prompt));
+                if let Some(bus) = &ca.bus {
+                    c = c.with_bus(bus.clone());
+                }
+                c
+            });
+            llm::call_model_unified_and_ctx(
+                llm_config, answer_ctx.as_ref(), &system_prompt, &user_prompt,
                 answer_temperature, answer_max_tokens,
                 None,
             ).await?
@@ -1258,8 +1361,26 @@ Respond with ONLY a JSON object:
         ).await?;
         resp
     } else {
-        llm::call_model_unified(
-            llm_config, &merge_system, &merge_user,
+        // Phase 12 retrofit
+        let merge_ctx = llm_config.cache_access.as_ref().map(|ca| {
+            let mut c = StepContext::new(
+                ca.slug.clone(),
+                ca.build_id.clone(),
+                "evidence_answer_merge",
+                "evidence_answer_merge",
+                question.layer as i64,
+                None,
+                ca.db_path.to_string(),
+            )
+            .with_model_resolution("fast_extract", llm_config.primary_model.clone())
+            .with_prompt_hash(compute_prompt_hash(&merge_system));
+            if let Some(bus) = &ca.bus {
+                c = c.with_bus(bus.clone());
+            }
+            c
+        });
+        llm::call_model_unified_and_ctx(
+            llm_config, merge_ctx.as_ref(), &merge_system, &merge_user,
             answer_temperature, answer_max_tokens,
             None,
         ).await?
@@ -1466,8 +1587,26 @@ Respond with ONLY a JSON object:
                 }
             }
         } else {
-            match llm::call_model_unified(
-                llm_config, &system_prompt, &user_prompt,
+            // Phase 12 retrofit
+            let target_ctx = llm_config.cache_access.as_ref().map(|ca| {
+                let mut c = StepContext::new(
+                    ca.slug.clone(),
+                    ca.build_id.clone(),
+                    "targeted_reexamination",
+                    "evidence_answer",
+                    0,
+                    None,
+                    ca.db_path.to_string(),
+                )
+                .with_model_resolution("fast_extract", llm_config.primary_model.clone())
+                .with_prompt_hash(compute_prompt_hash(&system_prompt));
+                if let Some(bus) = &ca.bus {
+                    c = c.with_bus(bus.clone());
+                }
+                c
+            });
+            match llm::call_model_unified_and_ctx(
+                llm_config, target_ctx.as_ref(), &system_prompt, &user_prompt,
                 ops.tier1.answer_temperature, ops.tier1.answer_max_tokens,
                 None,
             ).await {
@@ -1748,5 +1887,300 @@ mod tests {
         let weight_none: Option<f64> = None;
         let clamped_none = weight_none.unwrap_or(0.5).clamp(0.0, 1.0);
         assert_eq!(clamped_none, 0.5);
+    }
+}
+
+// ── Phase 12 Triage Gate ──────────────────────────────────────────────────
+
+/// Statistics returned by the triage gate.
+#[derive(Debug, Clone, Default)]
+pub struct TriageStats {
+    pub evaluated: usize,
+    pub answered: usize,
+    pub deferred: usize,
+    pub skipped: usize,
+}
+
+/// Result of running the triage gate over a batch of questions.
+pub struct TriageGateResult {
+    pub answer_questions: Vec<LayerQuestion>,
+    pub stats: TriageStats,
+}
+
+/// Phase 12: Open a connection, load the active evidence_policy,
+/// evaluate each question through the triage DSL, and partition
+/// questions into three buckets. The Answer bucket is returned to
+/// the caller; Defer questions are persisted to
+/// `pyramid_deferred_questions`; Skip questions are dropped and
+/// logged.
+///
+/// This runs inside `spawn_blocking` — no async code, no LLM calls
+/// (triage LLM classification is Phase 13 scope per the workstream
+/// prompt's most-load-bearing-reasonable-call guidance).
+pub fn run_triage_gate(
+    db_path: &str,
+    slug: &str,
+    questions: &[LayerQuestion],
+) -> Result<TriageGateResult> {
+    use super::triage::{resolve_decision, TriageDecision};
+    use std::path::Path;
+
+    let mut stats = TriageStats {
+        evaluated: questions.len(),
+        ..Default::default()
+    };
+
+    // Load policy.
+    let conn = match db::open_pyramid_connection(Path::new(db_path)) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(
+                error = %e,
+                "triage gate: failed to open DB connection, falling back to answer-all"
+            );
+            stats.answered = questions.len();
+            return Ok(TriageGateResult {
+                answer_questions: questions.to_vec(),
+                stats,
+            });
+        }
+    };
+
+    let policy = match db::load_active_evidence_policy(&conn, Some(slug)) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(
+                error = %e,
+                "triage gate: failed to load evidence policy, falling back to answer-all"
+            );
+            stats.answered = questions.len();
+            return Ok(TriageGateResult {
+                answer_questions: questions.to_vec(),
+                stats,
+            });
+        }
+    };
+
+    // If no rules are configured, skip the gate entirely.
+    if policy.triage_rules.is_empty() {
+        stats.answered = questions.len();
+        return Ok(TriageGateResult {
+            answer_questions: questions.to_vec(),
+            stats,
+        });
+    }
+
+    let mut answer_bucket: Vec<LayerQuestion> = Vec::new();
+
+    for question in questions {
+        // has_demand_signals: check if any signal type's summed
+        // weight exceeds its threshold in the configured window.
+        // LayerQuestion has no direct node_id; use question_id as
+        // the proxy (demand signals land on nodes by id).
+        let has_demand_signals = policy.demand_signals.iter().any(|rule| {
+            let window = normalize_window(&rule.window);
+            let sum =
+                db::sum_demand_weight(&conn, slug, &question.question_id, &rule.r#type, &window)
+                    .unwrap_or(0.0);
+            sum >= rule.threshold
+        });
+
+        let facts = super::triage::TriageFacts {
+            question,
+            target_node_distilled: None,
+            target_node_depth: Some(question.layer),
+            is_first_build: false,
+            is_stale_check: false,
+            has_demand_signals,
+            evidence_question_trivial: None,
+            evidence_question_high_value: None,
+        };
+
+        let decision = match resolve_decision(&policy, &facts) {
+            Ok(d) => d,
+            Err(e) => {
+                warn!(
+                    question_id = %question.question_id,
+                    error = %e,
+                    "triage DSL evaluation failed; defaulting to Answer"
+                );
+                TriageDecision::Answer {
+                    model_tier: "fast_extract".to_string(),
+                }
+            }
+        };
+
+        match decision {
+            TriageDecision::Answer { .. } => {
+                answer_bucket.push(question.clone());
+                stats.answered += 1;
+            }
+            TriageDecision::Defer {
+                check_interval,
+                triage_reason,
+            } => {
+                let qjson = serde_json::to_string(question).unwrap_or_else(|_| "{}".into());
+                let contribution_id = policy.contribution_id.as_deref();
+                if let Err(e) = db::defer_question(
+                    &conn,
+                    slug,
+                    &question.question_id,
+                    &qjson,
+                    &check_interval,
+                    Some(&triage_reason),
+                    contribution_id,
+                ) {
+                    warn!(
+                        question_id = %question.question_id,
+                        error = %e,
+                        "triage defer: failed to persist deferred question, answering instead"
+                    );
+                    answer_bucket.push(question.clone());
+                    stats.answered += 1;
+                } else {
+                    stats.deferred += 1;
+                }
+            }
+            TriageDecision::Skip { reason } => {
+                info!(
+                    question_id = %question.question_id,
+                    reason = %reason,
+                    "triage skip: dropping question"
+                );
+                stats.skipped += 1;
+            }
+        }
+    }
+
+    Ok(TriageGateResult {
+        answer_questions: answer_bucket,
+        stats,
+    })
+}
+
+/// Normalize a window string to a SQLite datetime modifier format.
+/// Accepts both "7d"/"14d" and "-7 days"/"-14 days" styles.
+fn normalize_window(window: &str) -> String {
+    let w = window.trim();
+    if w.starts_with('-') || w.contains(' ') {
+        return w.to_string();
+    }
+    // Short form: "7d" → "-7 days"; "14d" → "-14 days"; "1h" → "-1 hours".
+    let (num_part, unit_part): (String, String) = w
+        .chars()
+        .partition(|c| c.is_ascii_digit());
+    let n: i64 = num_part.parse().unwrap_or(14);
+    let unit = match unit_part.as_str() {
+        "d" => "days",
+        "h" => "hours",
+        "w" => "days",
+        "m" => "minutes",
+        _ => "days",
+    };
+    let n = if unit == "days" && unit_part == "w" {
+        n * 7
+    } else {
+        n
+    };
+    format!("-{} {}", n, unit)
+}
+
+// ── Phase 12 Triage Gate Tests ────────────────────────────────────────────
+
+#[cfg(test)]
+mod triage_gate_tests {
+    use super::*;
+    use crate::pyramid::db::{
+        init_pyramid_db, upsert_evidence_policy, DemandSignalRuleYaml, EvidencePolicyYaml,
+        PolicyBudgetYaml, TriageRuleYaml,
+    };
+    use rusqlite::Connection;
+
+    fn mem_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        init_pyramid_db(&conn).unwrap();
+        conn
+    }
+
+    fn mk_question(id: &str) -> LayerQuestion {
+        LayerQuestion {
+            question_id: id.to_string(),
+            question_text: "?".to_string(),
+            layer: 1,
+            about: "".to_string(),
+            creates: "".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_triage_gate_fallthrough_when_no_policy() {
+        let conn = mem_conn();
+        // No policy → all questions go to Answer bucket.
+        // Persist the DB to a file so run_triage_gate can reopen it.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db_path = tmp.path().to_string_lossy().to_string();
+        let real_conn = crate::pyramid::db::open_pyramid_connection(tmp.path()).unwrap();
+        init_pyramid_db(&real_conn).unwrap();
+
+        let questions = vec![mk_question("Q1"), mk_question("Q2")];
+        let result = run_triage_gate(&db_path, "no-policy-slug", &questions).unwrap();
+        assert_eq!(result.answer_questions.len(), 2);
+        assert_eq!(result.stats.answered, 2);
+        assert_eq!(result.stats.deferred, 0);
+        assert_eq!(result.stats.skipped, 0);
+        let _ = conn;
+    }
+
+    #[test]
+    fn test_triage_gate_partitions_questions() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db_path = tmp.path().to_string_lossy().to_string();
+        let conn = crate::pyramid::db::open_pyramid_connection(tmp.path()).unwrap();
+        init_pyramid_db(&conn).unwrap();
+
+        // Register a contribution row for FK.
+        conn.execute(
+            "INSERT INTO pyramid_config_contributions
+                (contribution_id, slug, schema_type, yaml_content, status)
+             VALUES ('c-pol', 'part-slug', 'evidence_policy', '', 'active')",
+            [],
+        )
+        .unwrap();
+
+        // Policy: defer all questions at layer 1 (the default in mk_question).
+        let yaml = EvidencePolicyYaml {
+            triage_rules: Some(vec![TriageRuleYaml {
+                condition: "depth == 1".into(),
+                action: "defer".into(),
+                check_interval: Some("7d".into()),
+                ..Default::default()
+            }]),
+            demand_signals: None,
+            budget: Some(PolicyBudgetYaml::default()),
+            demand_signal_attenuation: None,
+        };
+        upsert_evidence_policy(&conn, &Some("part-slug".to_string()), &yaml, "c-pol").unwrap();
+        drop(conn);
+
+        let questions = vec![mk_question("Q1"), mk_question("Q2"), mk_question("Q3")];
+        let result = run_triage_gate(&db_path, "part-slug", &questions).unwrap();
+        assert_eq!(result.answer_questions.len(), 0);
+        assert_eq!(result.stats.answered, 0);
+        assert_eq!(result.stats.deferred, 3);
+        assert_eq!(result.stats.skipped, 0);
+
+        // Verify deferred rows landed.
+        let reopen = crate::pyramid::db::open_pyramid_connection(tmp.path()).unwrap();
+        let all = crate::pyramid::db::list_all_deferred(&reopen, "part-slug").unwrap();
+        assert_eq!(all.len(), 3);
+    }
+
+    #[test]
+    fn test_normalize_window_short_and_long_forms() {
+        assert_eq!(normalize_window("7d"), "-7 days");
+        assert_eq!(normalize_window("14d"), "-14 days");
+        assert_eq!(normalize_window("-7 days"), "-7 days");
+        assert_eq!(normalize_window("1h"), "-1 hours");
+        assert_eq!(normalize_window("2w"), "-14 days");
     }
 }
