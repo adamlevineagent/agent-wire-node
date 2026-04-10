@@ -12,7 +12,7 @@ use tokio::sync::Mutex;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use super::config_helper::{config_for_model, estimate_cost};
+use super::config_helper::estimate_cost;
 use super::db;
 use super::llm::LlmConfig;
 use super::llm::{call_model_with_usage, extract_json};
@@ -29,7 +29,7 @@ pub async fn process_annotation(
     writer: &Arc<Mutex<Connection>>,
     slug: &str,
     annotation: &PyramidAnnotation,
-    api_key: &str,
+    base_config: &LlmConfig,
     model: &str,
 ) -> Result<Option<FaqNode>> {
     // Only process annotations that have a question_context
@@ -57,7 +57,7 @@ pub async fn process_annotation(
             slug
         );
         let faq =
-            create_new_faq(writer, slug, &question_context, annotation, api_key, model).await?;
+            create_new_faq(writer, slug, &question_context, annotation, base_config, model).await?;
         return Ok(Some(faq));
     }
 
@@ -84,14 +84,9 @@ pub async fn process_annotation(
         question_context, faq_list
     );
 
-    let config = LlmConfig {
-        api_key: api_key.to_string(),
-        auth_token: String::new(),
-        primary_model: model.to_string(),
-        fallback_model_1: model.to_string(),
-        fallback_model_2: model.to_string(),
-        ..Default::default()
-    };
+    // Phase 3 fix pass: clone the live config (preserves provider_registry +
+    // credential_store) instead of building a fresh LlmConfig.
+    let config = base_config.clone_with_model_override(model);
 
     let response = super::llm::call_model(&config, system_prompt, &user_prompt, 0.1, 100).await?;
     let response = response.trim();
@@ -104,7 +99,7 @@ pub async fn process_annotation(
         );
 
         // Update the matched FAQ with new annotation content
-        let updated = update_faq_answer(reader, writer, faq_id, annotation, api_key, model).await?;
+        let updated = update_faq_answer(reader, writer, faq_id, annotation, base_config, model).await?;
         Ok(Some(updated))
     } else {
         // NEW — create a fresh FAQ
@@ -113,7 +108,7 @@ pub async fn process_annotation(
             annotation.id, slug
         );
         let faq =
-            create_new_faq(writer, slug, &question_context, annotation, api_key, model).await?;
+            create_new_faq(writer, slug, &question_context, annotation, base_config, model).await?;
         Ok(Some(faq))
     }
 }
@@ -128,7 +123,7 @@ pub async fn match_faq(
     writer: &Arc<Mutex<Connection>>,
     slug: &str,
     question: &str,
-    api_key: &str,
+    base_config: &LlmConfig,
     model: &str,
 ) -> Result<Option<FaqNode>> {
     let all_faqs = {
@@ -198,7 +193,7 @@ pub async fn match_faq(
 
     if candidates.is_empty() {
         // No keyword matches — try LLM against all FAQs
-        return match_faq_with_llm(writer, question, &all_faqs, api_key, model).await;
+        return match_faq_with_llm(writer, question, &all_faqs, base_config, model).await;
     }
 
     if candidates.len() == 1 {
@@ -213,7 +208,7 @@ pub async fn match_faq(
         writer,
         question,
         &candidates.into_iter().cloned().collect::<Vec<_>>(),
-        api_key,
+        base_config,
         model,
     )
     .await
@@ -224,7 +219,7 @@ async fn match_faq_with_llm(
     writer: &Arc<Mutex<Connection>>,
     question: &str,
     candidates: &[FaqNode],
-    api_key: &str,
+    base_config: &LlmConfig,
     model: &str,
 ) -> Result<Option<FaqNode>> {
     // Change 2: Include match_triggers in the LLM disambiguation prompt
@@ -250,14 +245,9 @@ async fn match_faq_with_llm(
         question, faq_list
     );
 
-    let config = LlmConfig {
-        api_key: api_key.to_string(),
-        auth_token: String::new(),
-        primary_model: model.to_string(),
-        fallback_model_1: model.to_string(),
-        fallback_model_2: model.to_string(),
-        ..Default::default()
-    };
+    // Phase 3 fix pass: clone the live config (preserves provider_registry +
+    // credential_store) instead of building a fresh LlmConfig.
+    let config = base_config.clone_with_model_override(model);
 
     let response = super::llm::call_model(&config, system_prompt, &user_prompt, 0.1, 100).await?;
     let response = response.trim();
@@ -289,7 +279,7 @@ pub async fn update_faq_answer(
     writer: &Arc<Mutex<Connection>>,
     faq_id: &str,
     new_annotation: &PyramidAnnotation,
-    api_key: &str,
+    base_config: &LlmConfig,
     model: &str,
 ) -> Result<FaqNode> {
     // Load the existing FAQ
@@ -299,14 +289,9 @@ pub async fn update_faq_answer(
             .ok_or_else(|| anyhow::anyhow!("FAQ node '{}' not found", faq_id))?
     };
 
-    let config = LlmConfig {
-        api_key: api_key.to_string(),
-        auth_token: String::new(),
-        primary_model: model.to_string(),
-        fallback_model_1: model.to_string(),
-        fallback_model_2: model.to_string(),
-        ..Default::default()
-    };
+    // Phase 3 fix pass: clone the live config (preserves provider_registry +
+    // credential_store) instead of building a fresh LlmConfig.
+    let config = base_config.clone_with_model_override(model);
 
     // --- Answer refinement ---
     let system_prompt = "You are a FAQ answer refiner. Given an existing FAQ answer and a new piece of information from an annotation, produce an updated, comprehensive answer that incorporates the new information. Keep it concise and well-structured. Return ONLY the updated answer text, no preamble.";
@@ -394,7 +379,7 @@ async fn create_new_faq(
     slug: &str,
     question: &str,
     annotation: &PyramidAnnotation,
-    api_key: &str,
+    base_config: &LlmConfig,
     model: &str,
 ) -> Result<FaqNode> {
     let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
@@ -407,15 +392,9 @@ async fn create_new_faq(
         let generalized_text =
             annotation.content[gen_pos + "Generalized understanding:".len()..].trim();
 
-        // Call LLM to produce a generalized question
-        let config = LlmConfig {
-            api_key: api_key.to_string(),
-            auth_token: String::new(),
-            primary_model: model.to_string(),
-            fallback_model_1: model.to_string(),
-            fallback_model_2: model.to_string(),
-            ..Default::default()
-        };
+        // Phase 3 fix pass: clone the live config (preserves provider_registry +
+        // credential_store) instead of building a fresh LlmConfig.
+        let config = base_config.clone_with_model_override(model);
 
         let gen_system = "You are a question generalization engine. Produce a single one-sentence generalized question about the underlying mechanism. Output only the question, nothing else.";
         let gen_user = format!(
@@ -488,7 +467,7 @@ pub async fn get_faq_directory(
     reader: &Arc<Mutex<Connection>>,
     writer: &Arc<Mutex<Connection>>,
     slug: &str,
-    api_key: &str,
+    base_config: &LlmConfig,
     model: &str,
     tier2: &super::Tier2Config,
 ) -> Result<FaqDirectory> {
@@ -518,7 +497,7 @@ pub async fn get_faq_directory(
 
     let categories = if existing_categories.is_empty() {
         // No categories exist — run meta-pass
-        match run_faq_category_meta_pass(reader, writer, slug, &all_faqs, api_key, model).await {
+        match run_faq_category_meta_pass(reader, writer, slug, &all_faqs, base_config, model).await {
             Ok(cats) => cats,
             Err(e) => {
                 warn!(
@@ -579,7 +558,7 @@ pub async fn run_faq_category_meta_pass(
     writer: &Arc<Mutex<Connection>>,
     slug: &str,
     faqs: &[FaqNode],
-    api_key: &str,
+    base_config: &LlmConfig,
     model: &str,
 ) -> Result<Vec<FaqCategory>> {
     let faq_list: String = faqs
@@ -608,7 +587,9 @@ Return ONLY valid JSON: an array of objects with fields "name", "faq_ids", and "
         faq_list
     );
 
-    let config = config_for_model(api_key, model);
+    // Phase 3 fix pass: clone the live config (preserves provider_registry +
+    // credential_store) instead of building a fresh `config_for_model`.
+    let config = base_config.clone_with_model_override(model);
     let (response, usage) =
         call_model_with_usage(&config, system_prompt, &user_prompt, 0.3, 4096).await?;
 

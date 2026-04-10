@@ -18,8 +18,8 @@ use similar::{ChangeTag, TextDiff};
 use tracing::{info, warn};
 
 
-use super::config_helper::{config_for_model, estimate_cost};
-use super::llm::{call_model_with_usage, extract_json};
+use super::config_helper::estimate_cost;
+use super::llm::{call_model_with_usage, extract_json, LlmConfig};
 use super::naming::{headline_from_path, tombstone_headline};
 use super::stale_helpers_upper::{
     resolve_evidence_targets_for_node_ids, resolve_live_canonical_node_id,
@@ -132,7 +132,7 @@ fn enqueue_parent_confirmed_stales(
 pub async fn dispatch_file_stale_check(
     batch: Vec<PendingMutation>,
     db_path: &str,
-    api_key: &str,
+    base_config: &LlmConfig,
     model: &str,
 ) -> Result<Vec<StaleCheckResult>> {
     let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
@@ -288,8 +288,9 @@ Output JSON only. Array of objects, one per file:
         ));
     }
 
-    // Call LLM
-    let config = config_for_model(api_key, model);
+    // Call LLM via the live config (preserves Phase 3 provider_registry +
+    // credential_store) with the model overridden to the per-call slug.
+    let config = base_config.clone_with_model_override(model);
     let (response, usage) =
         call_model_with_usage(&config, system_prompt, &user_prompt, 0.1, 1024).await?;
 
@@ -704,7 +705,7 @@ pub async fn dispatch_tombstone(batch: Vec<PendingMutation>, db_path: &str) -> R
 pub async fn dispatch_rename_check(
     mutation: PendingMutation,
     db_path: &str,
-    api_key: &str,
+    base_config: &LlmConfig,
     model: &str,
 ) -> Result<RenameResult> {
     info!(
@@ -784,8 +785,9 @@ Output JSON only:
         old_path, old_distilled, new_path, new_content_head
     );
 
-    // Call LLM
-    let config = config_for_model(api_key, model);
+    // Call LLM via the live config (preserves Phase 3 provider_registry +
+    // credential_store) with the model overridden to the per-call slug.
+    let config = base_config.clone_with_model_override(model);
     let (response, usage) =
         call_model_with_usage(&config, system_prompt, &user_prompt, 0.1, 256).await?;
 
@@ -1062,7 +1064,7 @@ Output JSON only:
 pub async fn dispatch_evidence_set_apex_synthesis(
     batch: Vec<PendingMutation>,
     db_path: &str,
-    api_key: &str,
+    base_config: &LlmConfig,
     model: &str,
 ) -> Result<Vec<StaleCheckResult>> {
     let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
@@ -1178,8 +1180,9 @@ Output JSON only:
             context
         );
 
-        // Call LLM
-        let config = config_for_model(api_key, model);
+        // Call LLM via the live config (preserves Phase 3 provider_registry +
+        // credential_store) with the model overridden to the per-call slug.
+        let config = base_config.clone_with_model_override(model);
         let (response, usage) =
             call_model_with_usage(&config, system_prompt, &user_prompt, 0.2, 1024).await?;
 
@@ -1309,7 +1312,7 @@ Output JSON only:
 pub async fn dispatch_targeted_l0_stale_check(
     batch: Vec<PendingMutation>,
     db_path: &str,
-    api_key: &str,
+    base_config: &LlmConfig,
     model: &str,
 ) -> Result<Vec<StaleCheckResult>> {
     let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
@@ -1436,8 +1439,9 @@ Output JSON only:
             self_prompt, distilled, file_content
         );
 
-        // Call LLM (low temperature for factual evaluation)
-        let config = config_for_model(api_key, model);
+        // Call LLM via the live config (preserves Phase 3 provider_registry +
+        // credential_store) with the model overridden to the per-call slug.
+        let config = base_config.clone_with_model_override(model);
         let (response, usage) =
             call_model_with_usage(&config, system_prompt, &user_prompt, 0.1, 256).await?;
 

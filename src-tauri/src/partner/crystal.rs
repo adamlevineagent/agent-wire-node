@@ -12,6 +12,7 @@ use tracing::{info, warn};
 
 use crate::pyramid::db;
 use crate::pyramid::delta;
+use crate::pyramid::llm::LlmConfig;
 use crate::pyramid::webbing;
 
 /// Result of a crystallization pass.
@@ -25,7 +26,7 @@ pub async fn crystallize(
     reader: &Arc<Mutex<Connection>>,
     writer: &Arc<Mutex<Connection>>,
     slug: &str,
-    api_key: &str,
+    base_config: &LlmConfig,
     collapse_model: &str,
     ops: &crate::pyramid::OperationalConfig,
 ) -> anyhow::Result<CrystalResult> {
@@ -52,7 +53,7 @@ pub async fn crystallize(
                 writer,
                 slug,
                 &thread.thread_id,
-                api_key,
+                base_config,
                 collapse_model,
                 ops,
             )
@@ -81,7 +82,9 @@ pub async fn crystallize(
         let reader = reader.clone();
         let writer = writer.clone();
         let slug = slug.to_string();
-        let api_key = api_key.to_string();
+        // Phase 3 fix pass: clone the live LlmConfig so the spawned task
+        // keeps the provider_registry + credential_store handles.
+        let spawned_config = base_config.clone();
         let collapse_model = collapse_model.to_string();
         let tier3 = ops.tier3.clone();
         tokio::spawn(async move {
@@ -89,7 +92,7 @@ pub async fn crystallize(
                 &reader,
                 &writer,
                 &slug,
-                &api_key,
+                &spawned_config,
                 &collapse_model,
                 &tier3,
             )

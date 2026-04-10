@@ -11,9 +11,9 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
-use crate::pyramid::config_helper::config_for_model;
 use crate::pyramid::db;
 use crate::pyramid::llm;
+use crate::pyramid::llm::LlmConfig;
 use crate::pyramid::types::*;
 
 use super::Tier3Config;
@@ -194,7 +194,7 @@ pub async fn collapse_web_edge(
     writer: &Arc<Mutex<Connection>>,
     slug: &str,
     edge_id: i64,
-    api_key: &str,
+    base_config: &LlmConfig,
     model: &str,
     tier3: &Tier3Config,
 ) -> anyhow::Result<()> {
@@ -263,7 +263,9 @@ Output JSON only:
         delta_contents = delta_contents,
     );
 
-    let cfg = config_for_model(api_key, model);
+    // Phase 3 fix pass: clone the live config (preserves provider_registry +
+    // credential_store) instead of building a fresh `config_for_model`.
+    let cfg = base_config.clone_with_model_override(model);
     let raw = llm::call_model(&cfg, system_prompt, &user_prompt, 0.2, 500).await?;
     let parsed = llm::extract_json(&raw)?;
 
@@ -298,7 +300,7 @@ pub async fn check_and_collapse_edges(
     reader: &Arc<Mutex<Connection>>,
     writer: &Arc<Mutex<Connection>>,
     slug: &str,
-    api_key: &str,
+    base_config: &LlmConfig,
     model: &str,
     tier3: &Tier3Config,
 ) -> anyhow::Result<usize> {
@@ -310,7 +312,8 @@ pub async fn check_and_collapse_edges(
     let mut collapsed = 0;
     for edge in &edges {
         if edge.delta_count >= tier3.web_edge_collapse_threshold {
-            match collapse_web_edge(reader, writer, slug, edge.id, api_key, model, tier3).await {
+            match collapse_web_edge(reader, writer, slug, edge.id, base_config, model, tier3).await
+            {
                 Ok(()) => collapsed += 1,
                 Err(e) => warn!("[webbing] failed to collapse edge {}: {}", edge.id, e),
             }

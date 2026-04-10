@@ -3784,8 +3784,11 @@ async fn handle_annotate(
     let annotation_clone = saved.clone();
     let writer_clone = state.writer.clone();
     let reader_clone = state.reader.clone();
-    let api_key = { state.config.read().await.api_key.clone() };
-    let model = { state.config.read().await.primary_model.clone() };
+    // Phase 3 fix pass: thread the live LlmConfig (with provider_registry +
+    // credential_store) through to the annotation hook so its delta + faq
+    // calls keep using the registry path.
+    let base_config = state.config.read().await.clone();
+    let model = base_config.primary_model.clone();
     let slug_clone = saved.slug.clone();
     let ops_clone = state.operational.clone();
 
@@ -3795,7 +3798,7 @@ async fn handle_annotate(
             &writer_clone,
             &slug_clone,
             &annotation_clone,
-            &api_key,
+            &base_config,
             &model,
             &ops_clone,
         )
@@ -3819,7 +3822,7 @@ async fn process_annotation_hook(
     writer: &Arc<tokio::sync::Mutex<rusqlite::Connection>>,
     slug: &str,
     annotation: &PyramidAnnotation,
-    api_key: &str,
+    base_config: &super::llm::LlmConfig,
     model: &str,
     ops: &super::OperationalConfig,
 ) -> anyhow::Result<()> {
@@ -3849,7 +3852,7 @@ async fn process_annotation_hook(
                     &thread.thread_id,
                     &delta_content,
                     Some(&annotation.node_id),
-                    api_key,
+                    base_config,
                     model,
                     ops,
                 )
@@ -3933,7 +3936,7 @@ async fn process_annotation_hook(
 
     // FAQ processing — for any annotation with question_context
     if annotation.question_context.is_some() {
-        match faq::process_annotation(reader, writer, slug, annotation, api_key, model).await {
+        match faq::process_annotation(reader, writer, slug, annotation, base_config, model).await {
             Ok(Some(faq_node)) => {
                 tracing::info!(
                     "[annotation] FAQ processed: annotation #{} → FAQ '{}'",
@@ -4018,16 +4021,15 @@ async fn handle_meta_run(
         }
     }
 
-    // Get LLM config
-    let (api_key, model) = {
-        let config = state.config.read().await;
-        (config.api_key.clone(), config.primary_model.clone())
-    };
+    // Phase 3 fix pass: clone the live LlmConfig (with provider_registry +
+    // credential_store) instead of pulling raw api_key/model strings.
+    let base_config = state.config.read().await.clone();
+    let model = base_config.primary_model.clone();
 
     let reader = state.reader.clone();
     let writer = state.writer.clone();
 
-    match meta::run_all_meta_passes(&reader, &writer, &slug_name, &api_key, &model).await {
+    match meta::run_all_meta_passes(&reader, &writer, &slug_name, &base_config, &model).await {
         Ok(quickstart) => Ok(json_ok(&serde_json::json!({
             "slug": slug_name,
             "status": "complete",
@@ -4075,17 +4077,17 @@ async fn handle_match_faq(
     state: Arc<PyramidState>,
     params: FaqMatchQuery,
 ) -> Result<warp::reply::Response, warp::Rejection> {
-    let config = state.config.read().await;
-    let api_key = config.api_key.clone();
-    let model = config.primary_model.clone();
-    drop(config);
+    // Phase 3 fix pass: clone the live LlmConfig (with provider_registry +
+    // credential_store) so faq::match_faq stays on the registry path.
+    let base_config = state.config.read().await.clone();
+    let model = base_config.primary_model.clone();
 
     match faq::match_faq(
         &state.reader,
         &state.writer,
         &slug_name,
         &params.q,
-        &api_key,
+        &base_config,
         &model,
     )
     .await
@@ -4105,16 +4107,16 @@ async fn handle_faq_directory(
     slug_name: String,
     state: Arc<PyramidState>,
 ) -> Result<warp::reply::Response, warp::Rejection> {
-    let config = state.config.read().await;
-    let api_key = config.api_key.clone();
-    let model = config.primary_model.clone();
-    drop(config);
+    // Phase 3 fix pass: clone the live LlmConfig (with provider_registry +
+    // credential_store) so faq::get_faq_directory stays on the registry path.
+    let base_config = state.config.read().await.clone();
+    let model = base_config.primary_model.clone();
 
     match faq::get_faq_directory(
         &state.reader,
         &state.writer,
         &slug_name,
-        &api_key,
+        &base_config,
         &model,
         &state.operational.tier2,
     )
@@ -5317,12 +5319,15 @@ async fn handle_auto_update_l0_sweep(
         )
     };
 
+    // Phase 3 fix pass: clone the engine's live LlmConfig (with provider_registry +
+    // credential_store) instead of its prior raw api_key field. The
+    // drain_and_dispatch helper now expects the registry-aware config.
     let engine_data = {
         let engines = state.stale_engines.lock().await;
         engines.get(&slug_name).map(|engine| {
             (
                 engine.db_path.clone(),
-                engine.api_key.clone(),
+                engine.base_config.clone(),
                 engine.model.clone(),
                 engine.concurrent_helpers.clone(),
                 engine.current_phase.clone(),
@@ -5332,30 +5337,36 @@ async fn handle_auto_update_l0_sweep(
         })
     };
 
-    let dispatch_status =
-        if let Some((db_path, api_key, model, semaphore, phase_arc, detail_arc, summary_arc)) =
-            engine_data
-        {
-            for layer in 0..=3 {
-                let _ = stale_engine::drain_and_dispatch(
-                    &slug_name,
-                    layer,
-                    0,
-                    &db_path,
-                    semaphore.clone(),
-                    &api_key,
-                    &model,
-                    phase_arc.clone(),
-                    detail_arc.clone(),
-                    summary_arc.clone(),
-                    &state.operational,
-                )
-                .await;
-            }
-            "completed"
-        } else {
-            "enqueued_only"
-        };
+    let dispatch_status = if let Some((
+        db_path,
+        base_config,
+        model,
+        semaphore,
+        phase_arc,
+        detail_arc,
+        summary_arc,
+    )) = engine_data
+    {
+        for layer in 0..=3 {
+            let _ = stale_engine::drain_and_dispatch(
+                &slug_name,
+                layer,
+                0,
+                &db_path,
+                semaphore.clone(),
+                &base_config,
+                &model,
+                phase_arc.clone(),
+                detail_arc.clone(),
+                summary_arc.clone(),
+                &state.operational,
+            )
+            .await;
+        }
+        "completed"
+    } else {
+        "enqueued_only"
+    };
 
     Ok(json_ok(&serde_json::json!({
         "status": dispatch_status,

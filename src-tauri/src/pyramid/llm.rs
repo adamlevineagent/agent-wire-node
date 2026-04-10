@@ -212,6 +212,31 @@ impl Default for LlmConfig {
     }
 }
 
+impl LlmConfig {
+    /// Clone this config with a different primary model. Preserves
+    /// `provider_registry`, `credential_store`, and every other field —
+    /// use this instead of `config_helper::config_for_model` whenever you
+    /// have a live `LlmConfig` (e.g. from `PyramidState.config`) and need
+    /// a variant pinned to a specific model.
+    ///
+    /// `config_for_model(api_key, model)` (now deprecated) ends in
+    /// `..Default::default()`, which silently zeroes the new
+    /// `provider_registry` and `credential_store` fields. Every helper
+    /// that uses it bypasses the Phase 3 provider registry +
+    /// `.credentials` file. `clone_with_model_override` preserves both
+    /// runtime handles by construction so the maintenance subsystem
+    /// stays on the registry path.
+    pub fn clone_with_model_override(&self, model: &str) -> Self {
+        let mut cloned = self.clone();
+        cloned.primary_model = model.to_string();
+        // Pin both fallbacks to the same model so the cascade stays
+        // on-model — mirrors the legacy `config_for_model` semantics.
+        cloned.fallback_model_1 = model.to_string();
+        cloned.fallback_model_2 = model.to_string();
+        cloned
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct LlmCallOptions {
     pub min_timeout_secs: Option<u64>,

@@ -20,6 +20,7 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use super::faq;
+use super::llm::LlmConfig;
 use super::stale_helpers;
 use super::stale_helpers_upper;
 use super::types::{AutoUpdateConfig, PendingMutation, StaleCheckResult};
@@ -81,7 +82,14 @@ pub struct PyramidStaleEngine {
     pub frozen: bool,
     pub concurrent_helpers: Arc<Semaphore>,
     pub db_path: String,
-    pub api_key: String,
+    /// Phase 3 fix pass: live LlmConfig (with provider_registry +
+    /// credential_store) cloned at engine construction. Replaces the prior
+    /// `api_key: String` field which dropped both runtime handles and forced
+    /// every helper into the legacy fallback path. The model is read from
+    /// `base_config.primary_model` so per-tier routing can override at the
+    /// helper layer in a future refactor; today the engine still passes a
+    /// single primary model through to dispatch helpers.
+    pub base_config: LlmConfig,
     pub model: String,
     poll_handle: Option<tokio::task::JoinHandle<()>>,
     /// Current lifecycle phase: "idle", "debounce", "evaluating", "cascading", "done_stale", "done_clean"
@@ -98,11 +106,19 @@ pub struct PyramidStaleEngine {
 
 impl PyramidStaleEngine {
     /// Create an engine with layer timers for L0, L1, L2, L3 (apex).
+    ///
+    /// Phase 3 fix pass: takes a live `LlmConfig` (with provider_registry +
+    /// credential_store) instead of raw `api_key`. The caller is expected
+    /// to clone `pyramid_state.config.read().await.clone()` (which is built
+    /// via `PyramidConfig::to_llm_config_with_runtime` at boot). The
+    /// `model` parameter still exists separately for callers that want to
+    /// pin a different model than `base_config.primary_model`; today both
+    /// boot paths just pass `base_config.primary_model.clone()`.
     pub fn new(
         slug: &str,
         config: AutoUpdateConfig,
         db_path: &str,
-        api_key: &str,
+        base_config: LlmConfig,
         model: &str,
         ops: OperationalConfig,
     ) -> Self {
@@ -130,7 +146,7 @@ impl PyramidStaleEngine {
             config,
             concurrent_helpers: Arc::new(Semaphore::new(max_concurrent_helpers())),
             db_path: db_path.to_string(),
-            api_key: api_key.to_string(),
+            base_config,
             model: model.to_string(),
             poll_handle: None,
             current_phase: Arc::new(std::sync::Mutex::new("idle".to_string())),
@@ -159,7 +175,11 @@ impl PyramidStaleEngine {
             .expect("Layer 0 timer must exist — engine was constructed without layers");
         let semaphore = self.concurrent_helpers.clone();
         let min_changed_files = self.config.min_changed_files;
-        let api_key = self.api_key.clone();
+        // Phase 3 fix pass: clone the live LlmConfig (with provider_registry +
+        // credential_store) so the spawned poll loop keeps the registry path
+        // active for every dispatched helper. Replaces the prior raw api_key
+        // string clone which dropped both runtime handles.
+        let base_config = self.base_config.clone();
         let model = self.model.clone();
         let phase_arc = self.current_phase.clone();
         let detail_arc = self.phase_detail.clone();
@@ -244,7 +264,7 @@ impl PyramidStaleEngine {
                         min_changed_files,
                         &db_path,
                         semaphore.clone(),
-                        &api_key,
+                        &base_config,
                         &model,
                         phase_arc.clone(),
                         detail_arc.clone(),
@@ -341,7 +361,9 @@ impl PyramidStaleEngine {
         let db_path = self.db_path.clone();
         let semaphore = self.concurrent_helpers.clone();
         let min_changed_files = self.config.min_changed_files;
-        let api_key = self.api_key.clone();
+        // Phase 3 fix pass: clone the live LlmConfig so the spawned timer
+        // task keeps the provider_registry + credential_store handles.
+        let base_config = self.base_config.clone();
         let model = self.model.clone();
         let phase_arc = self.current_phase.clone();
         let detail_arc = self.phase_detail.clone();
@@ -374,7 +396,7 @@ impl PyramidStaleEngine {
                 min_changed_files,
                 &db_path,
                 semaphore,
-                &api_key,
+                &base_config,
                 &model,
                 phase_arc,
                 detail_arc,
@@ -460,7 +482,9 @@ impl PyramidStaleEngine {
     pub async fn run_layer_now(&self, layer: i32) {
         let slug = self.slug.clone();
         let db_path = self.db_path.clone();
-        let api_key = self.api_key.clone();
+        // Phase 3 fix pass: clone the live LlmConfig instead of api_key so
+        // the manual run keeps the registry path active.
+        let base_config = self.base_config.clone();
         let model = self.model.clone();
         let semaphore = self.concurrent_helpers.clone();
 
@@ -471,7 +495,7 @@ impl PyramidStaleEngine {
             0,
             &db_path,
             semaphore,
-            &api_key,
+            &base_config,
             &model,
             self.current_phase.clone(),
             self.phase_detail.clone(),
@@ -544,13 +568,18 @@ impl PyramidStaleEngine {
 /// Core drain function. Reads unprocessed mutations from WAL, batches them,
 /// and dispatches helpers. This is a free async function (not a method) so it
 /// can be called from spawned tasks without Send issues around `&Connection`.
+///
+/// Phase 3 fix pass: takes `base_config: &LlmConfig` (with provider_registry +
+/// credential_store) instead of `api_key: &str` so every dispatched helper
+/// stays on the registry path. The function clones the config once into
+/// `base_config_owned` and then re-clones per spawned task.
 pub async fn drain_and_dispatch(
     slug: &str,
     layer: i32,
     min_changed_files: i32,
     db_path: &str,
     semaphore: Arc<Semaphore>,
-    api_key: &str,
+    base_config: &LlmConfig,
     model: &str,
     phase_arc: Arc<std::sync::Mutex<String>>,
     detail_arc: Arc<std::sync::Mutex<String>>,
@@ -559,7 +588,7 @@ pub async fn drain_and_dispatch(
 ) -> Result<()> {
     let slug_owned = slug.to_string();
     let db_owned = db_path.to_string();
-    let api_key_owned = api_key.to_string();
+    let base_config_owned = base_config.clone();
     let model_owned = model.to_string();
 
     // Set phase to evaluating at entry; record start time for minimum display duration
@@ -796,10 +825,10 @@ pub async fn drain_and_dispatch(
         let db = db_owned.clone();
         let s = slug_owned.clone();
         let bid = batch_id.clone();
-        let key = api_key_owned.clone();
+        let cfg = base_config_owned.clone();
         let mdl = model_owned.clone();
         handles.push(tokio::spawn(async move {
-            let results = match stale_helpers::dispatch_file_stale_check(batch, &db, &key, &mdl).await {
+            let results = match stale_helpers::dispatch_file_stale_check(batch, &db, &cfg, &mdl).await {
                 Ok(r) => r,
                 Err(e) => {
                     error!(slug = %s, error = %e, "dispatch_file_stale_check failed");
@@ -836,7 +865,7 @@ pub async fn drain_and_dispatch(
 
                     for node_id in &node_ids {
                         if let Err(e) = stale_helpers_upper::execute_supersession(
-                            node_id, &db, &s, &key, &mdl,
+                            node_id, &db, &s, &cfg, &mdl,
                         ).await {
                             error!(slug = %s, target = %result.target_id, node_id = %node_id, error = %e, "execute_supersession (L0 file_change) failed");
                         } else {
@@ -920,11 +949,11 @@ pub async fn drain_and_dispatch(
         let db = db_owned.clone();
         let s = slug_owned.clone();
         let bid = batch_id.clone();
-        let key = api_key_owned.clone();
+        let cfg = base_config_owned.clone();
         let mdl = model_owned.clone();
         handles.push(tokio::spawn(async move {
             let results = match stale_helpers_upper::dispatch_node_stale_check(
-                batch, &db, &key, &mdl,
+                batch, &db, &cfg, &mdl,
             )
             .await
             {
@@ -951,10 +980,10 @@ pub async fn drain_and_dispatch(
         let db = db_owned.clone();
         let s = slug_owned.clone();
         let bid = batch_id.clone();
-        let key = api_key_owned.clone();
+        let cfg = base_config_owned.clone();
         let mdl = model_owned.clone();
         handles.push(tokio::spawn(async move {
-            let results = match stale_helpers_upper::dispatch_node_stale_check(batch, &db, &key, &mdl).await {
+            let results = match stale_helpers_upper::dispatch_node_stale_check(batch, &db, &cfg, &mdl).await {
                 Ok(r) => r,
                 Err(e) => {
                     error!(slug = %s, error = %e, "dispatch_node_stale_check (confirmed) failed");
@@ -966,7 +995,7 @@ pub async fn drain_and_dispatch(
             for result in &mut results {
                 if result.stale == 1 {
                     if let Err(e) = stale_helpers_upper::execute_supersession(
-                        &result.target_id, &db, &s, &key, &mdl,
+                        &result.target_id, &db, &s, &cfg, &mdl,
                     ).await {
                         error!(slug = %s, target = %result.target_id, error = %e, "execute_supersession failed");
                     } else {
@@ -992,11 +1021,11 @@ pub async fn drain_and_dispatch(
         let db = db_owned.clone();
         let s = slug_owned.clone();
         let bid = batch_id.clone();
-        let key = api_key_owned.clone();
+        let cfg = base_config_owned.clone();
         let mdl = model_owned.clone();
         handles.push(tokio::spawn(async move {
             let results = match stale_helpers_upper::dispatch_edge_stale_check(
-                batch, &db, &key, &mdl,
+                batch, &db, &cfg, &mdl,
             )
             .await
             {
@@ -1049,10 +1078,10 @@ pub async fn drain_and_dispatch(
             let permit = semaphore.clone().acquire_owned().await?;
             let db = db_owned.clone();
             let s = slug_owned.clone();
-            let key = api_key_owned.clone();
+            let cfg = base_config_owned.clone();
             let mdl = model_owned.clone();
             handles.push(tokio::spawn(async move {
-                match stale_helpers::dispatch_rename_check(mutation, &db, &key, &mdl).await {
+                match stale_helpers::dispatch_rename_check(mutation, &db, &cfg, &mdl).await {
                     Ok(result) => {
                         info!(
                             slug = %s,
@@ -1076,11 +1105,11 @@ pub async fn drain_and_dispatch(
         let db = db_owned.clone();
         let s = slug_owned.clone();
         let bid = batch_id.clone();
-        let key = api_key_owned.clone();
+        let cfg = base_config_owned.clone();
         let mdl = model_owned.clone();
         handles.push(tokio::spawn(async move {
             let results = match stale_helpers::dispatch_evidence_set_apex_synthesis(
-                batch, &db, &key, &mdl,
+                batch, &db, &cfg, &mdl,
             )
             .await
             {
@@ -1107,11 +1136,11 @@ pub async fn drain_and_dispatch(
         let db = db_owned.clone();
         let s = slug_owned.clone();
         let bid = batch_id.clone();
-        let key = api_key_owned.clone();
+        let cfg = base_config_owned.clone();
         let mdl = model_owned.clone();
         handles.push(tokio::spawn(async move {
             let results = match stale_helpers::dispatch_targeted_l0_stale_check(
-                batch, &db, &key, &mdl,
+                batch, &db, &cfg, &mdl,
             )
             .await
             {
@@ -1136,7 +1165,7 @@ pub async fn drain_and_dispatch(
     if !faq_category_stales.is_empty() {
         let db = db_owned.clone();
         let s = slug_owned.clone();
-        let key = api_key_owned.clone();
+        let cfg = base_config_owned.clone();
         let mdl = model_owned.clone();
         let permit = semaphore.clone().acquire_owned().await?;
         handles.push(tokio::spawn(async move {
@@ -1198,7 +1227,7 @@ pub async fn drain_and_dispatch(
 
             info!(slug = %s, faq_count = faqs.len(), stale_categories = category_ids.len(), "Scoped FAQ re-distillation to stale categories");
 
-            if let Err(e) = faq::run_faq_category_meta_pass(&reader, &writer, &s, &faqs, &key, &mdl).await {
+            if let Err(e) = faq::run_faq_category_meta_pass(&reader, &writer, &s, &faqs, &cfg, &mdl).await {
                 warn!(slug = %s, error = %e, "FAQ category meta-pass failed during stale dispatch");
             } else {
                 info!(slug = %s, "FAQ category meta-pass completed via stale dispatch");
@@ -1567,8 +1596,19 @@ mod tests {
             frozen: false,
             frozen_at: None,
         };
-        let engine =
-            PyramidStaleEngine::new("test", config, "/tmp/test.db", "", "inception/mercury-2", super::OperationalConfig::default());
+        // Phase 3 fix pass: tests build a default LlmConfig (no registry/credential
+        // store attached) since this test doesn't exercise the dispatch path —
+        // it only checks the engine's struct construction. Production callers
+        // pass a live LlmConfig built via PyramidConfig::to_llm_config_with_runtime.
+        let test_config = LlmConfig::default();
+        let engine = PyramidStaleEngine::new(
+            "test",
+            config,
+            "/tmp/test.db",
+            test_config,
+            "inception/mercury-2",
+            super::OperationalConfig::default(),
+        );
         assert_eq!(engine.slug, "test");
         assert_eq!(engine.layers.len(), 4);
         assert!(!engine.breaker_tripped);

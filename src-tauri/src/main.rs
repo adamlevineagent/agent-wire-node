@@ -3296,9 +3296,13 @@ async fn post_build_seed(
     }
 
     // Start stale engine + file watcher
-    let (api_key, model) = {
+    // Phase 3 fix pass: clone the live LlmConfig (with provider_registry +
+    // credential_store) so PyramidStaleEngine carries the registry path
+    // through every dispatched helper, instead of pulling raw api_key/model
+    // strings that drop both runtime handles.
+    let (base_config, model) = {
         let cfg = pyramid_state.config.read().await;
-        (cfg.api_key.clone(), cfg.primary_model.clone())
+        (cfg.clone(), cfg.primary_model.clone())
     };
 
     let config = {
@@ -3329,7 +3333,7 @@ async fn post_build_seed(
         slug,
         config,
         &db_path,
-        &api_key,
+        base_config,
         &model,
         pyramid_state.operational.as_ref().clone(),
     );
@@ -4520,17 +4524,21 @@ async fn pyramid_meta_run(
             .ok_or_else(|| format!("Slug '{}' not found", slug))?;
     }
 
-    // Get LLM config
-    let (api_key, model) = {
-        let config = state.pyramid.config.read().await;
-        (config.api_key.clone(), config.primary_model.clone())
-    };
+    // Phase 3 fix pass: clone the live LlmConfig (with provider_registry +
+    // credential_store) instead of pulling raw api_key/model strings, so
+    // run_all_meta_passes stays on the registry path.
+    let base_config = state.pyramid.config.read().await.clone();
+    let model = base_config.primary_model.clone();
 
     let reader = state.pyramid.reader.clone();
     let writer = state.pyramid.writer.clone();
 
     match wire_node_lib::pyramid::meta::run_all_meta_passes(
-        &reader, &writer, &slug, &api_key, &model,
+        &reader,
+        &writer,
+        &slug,
+        &base_config,
+        &model,
     )
     .await
     {
@@ -5949,16 +5957,19 @@ async fn pyramid_auto_update_config_init(
                 .join("pyramid.db")
                 .to_string_lossy()
                 .to_string();
-            let (api_key, model) = {
+            // Phase 3 fix pass: clone the live LlmConfig (with provider_registry +
+            // credential_store) so PyramidStaleEngine carries the registry path
+            // through every dispatched helper.
+            let (base_config, model) = {
                 let cfg = state.pyramid.config.read().await;
-                (cfg.api_key.clone(), cfg.primary_model.clone())
+                (cfg.clone(), cfg.primary_model.clone())
             };
 
             let mut engine = wire_node_lib::pyramid::stale_engine::PyramidStaleEngine::new(
                 &slug,
                 config.clone(),
                 &db_path,
-                &api_key,
+                base_config,
                 &model,
                 state.pyramid.operational.as_ref().clone(),
             );
@@ -6428,16 +6439,16 @@ async fn pyramid_faq_directory(
     state: tauri::State<'_, SharedState>,
     slug: String,
 ) -> Result<serde_json::Value, String> {
-    let config = state.pyramid.config.read().await;
-    let api_key = config.api_key.clone();
-    let model = config.primary_model.clone();
-    drop(config);
+    // Phase 3 fix pass: clone the live LlmConfig (with provider_registry +
+    // credential_store) so faq::get_faq_directory stays on the registry path.
+    let base_config = state.pyramid.config.read().await.clone();
+    let model = base_config.primary_model.clone();
 
     let directory = pyramid_faq::get_faq_directory(
         &state.pyramid.reader,
         &state.pyramid.writer,
         &slug,
-        &api_key,
+        &base_config,
         &model,
         &state.pyramid.operational.tier2,
     )

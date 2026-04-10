@@ -621,7 +621,13 @@ pub async fn handle_message(
             if should_spawn {
                 let reader = state.pyramid_reader.clone();
                 let writer = state.pyramid.writer.clone();
-                let api_key = llm_config.api_key.clone();
+                // Phase 3 fix pass: clone the pyramid's live LlmConfig (with
+                // provider_registry + credential_store) so the spawned warm
+                // pass keeps the registry path active for its delta + faq
+                // calls. PartnerLlmConfig only carries (api_key, partner_model)
+                // and would lose both runtime handles if we built a fresh
+                // LlmConfig from it.
+                let spawned_config = state.pyramid.config.read().await.clone();
                 let model = llm_config.partner_model.clone();
                 let collapse_model = state
                     .pyramid
@@ -639,7 +645,7 @@ pub async fn handle_message(
                         &slug,
                         &reader,
                         &writer,
-                        &api_key,
+                        &spawned_config,
                         &model,
                         &collapse_model,
                         &ops,

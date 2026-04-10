@@ -15,6 +15,7 @@ use tracing::info;
 use crate::partner::crystal;
 use crate::partner::{Message, Session, SessionTopic};
 use crate::pyramid::delta;
+use crate::pyramid::llm::LlmConfig;
 use tracing::warn;
 
 /// Threshold: run warm pass after this many new messages since last pass.
@@ -112,7 +113,7 @@ pub async fn warm_pass(
     slug: &str,
     reader: &Arc<Mutex<Connection>>,
     writer: &Arc<Mutex<Connection>>,
-    api_key: &str,
+    base_config: &LlmConfig,
     model: &str,
     collapse_model: &str,
     ops: &crate::pyramid::OperationalConfig,
@@ -151,14 +152,22 @@ pub async fn warm_pass(
         slug,
         &combined,
         &provisional_node_id,
-        api_key,
+        base_config,
         model,
     )
     .await?;
 
     // Create a delta
     let delta = delta::create_delta(
-        reader, writer, slug, &thread_id, &combined, None, api_key, model, ops,
+        reader,
+        writer,
+        slug,
+        &thread_id,
+        &combined,
+        None,
+        base_config,
+        model,
+        ops,
     )
     .await?;
 
@@ -185,7 +194,10 @@ pub async fn warm_pass(
         let reader = reader.clone();
         let writer = writer.clone();
         let slug = slug.to_string();
-        let api_key = api_key.to_string();
+        // Phase 3 fix pass: clone the live LlmConfig so the spawned
+        // crystallization keeps the provider_registry + credential_store
+        // handles the registry path needs.
+        let spawned_config = base_config.clone();
         let collapse_model = collapse_model.to_string();
         let ops_clone = ops.clone();
         tokio::spawn(async move {
@@ -193,7 +205,7 @@ pub async fn warm_pass(
                 &reader,
                 &writer,
                 &slug,
-                &api_key,
+                &spawned_config,
                 &collapse_model,
                 &ops_clone,
             )
