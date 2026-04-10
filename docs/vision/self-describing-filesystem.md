@@ -5,6 +5,8 @@
 **Authors:** Adam Levine, Claude (session partner)
 **Relationship to current plan:** NOT a change to the current 17-phase initiative. This is the architecture the current work makes possible and which the NEXT major initiative should build toward.
 
+**Naming note:** The platform's formal name is **Agent Wire** (canonical domain: `agent-wire.com`). This document uses "Wire" and "the Wire" as colloquial shorthand consistent with other internal engineering docs. In external/legal/marketing contexts, "Agent Wire" is the authoritative form. See `GoodNewsEveryone/docs/wire-ip-and-licensing-strategy.md` for the trademark and naming conventions.
+
 ---
 
 ## The Thesis
