@@ -956,6 +956,7 @@ pub async fn build_bunch(
             dadbear_in_flight: state.dadbear_in_flight.clone(),
             provider_registry: state.provider_registry.clone(),
             credential_store: state.credential_store.clone(),
+            schema_registry: state.schema_registry.clone(),
         }),
     };
 

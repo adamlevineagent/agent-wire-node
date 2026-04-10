@@ -1,8 +1,12 @@
 // pyramid/wire_migration.rs — Phase 5: on-disk prompts + chains → contributions.
+//                              Phase 8: on-disk schema annotations → contributions.
+//                              Phase 9: bundled contributions manifest → contributions.
 //
 // Canonical references:
 //   /Users/adamlevine/AI Project Files/agent-wire-node/docs/specs/wire-contribution-mapping.md
-//     — "Migration from On-Disk Prompts and Schemas" section
+//     — "Migration from On-Disk Prompts and Schemas" section, "Seed Contributions Ship with the Binary"
+//   /Users/adamlevine/AI Project Files/agent-wire-node/docs/specs/generative-config-pattern.md
+//     — "Seed Defaults Architecture" section (Phase 9 extension)
 //   /Users/adamlevine/AI Project Files/GoodNewsEveryone/docs/wire-skills.md
 //     — skills as contributions
 //   /Users/adamlevine/AI Project Files/GoodNewsEveryone/docs/wire-actions.md
@@ -45,6 +49,7 @@ use std::path::Path;
 
 use anyhow::Result;
 use rusqlite::Connection;
+use serde::Deserialize;
 use tracing::{debug, warn};
 
 use crate::pyramid::config_contributions::create_config_contribution_with_metadata;
@@ -65,7 +70,8 @@ const PROMPT_MIGRATION_MARKER: &str = "_prompt_migration_marker";
 /// chains, and schema annotations successfully inserted, plus any
 /// files that were skipped. Phase 8 added the
 /// `schema_annotations_*` fields alongside the existing prompt/chain
-/// counters.
+/// counters. Phase 9 added the `bundled_*` fields for the bundled
+/// contributions manifest walk.
 #[derive(Debug, Default, Clone)]
 pub struct MigrationReport {
     pub prompts_inserted: usize,
@@ -81,6 +87,18 @@ pub struct MigrationReport {
     pub schema_annotations_skipped_already_present: usize,
     /// Phase 8: schema annotation rows that failed to insert.
     pub schema_annotations_failed: usize,
+    /// Phase 9: bundled manifest rows inserted this run. Runs on
+    /// every boot with per-entry INSERT OR IGNORE semantics — NOT
+    /// gated by the `_prompt_migration_marker` sentinel so app
+    /// upgrades can add new bundled entries without being blocked
+    /// by a stale marker.
+    pub bundled_inserted: usize,
+    /// Phase 9: bundled manifest rows skipped because a row with the
+    /// same `contribution_id` already existed (from a prior run, or
+    /// because the user has already superseded the bundled default).
+    pub bundled_skipped_already_present: usize,
+    /// Phase 9: bundled manifest rows that failed to insert.
+    pub bundled_failed: usize,
     pub marker_written: bool,
     pub ran: bool,
 }
@@ -107,7 +125,44 @@ pub fn migrate_prompts_and_chains_to_contributions(
 ) -> Result<MigrationReport> {
     let mut report = MigrationReport::default();
 
-    // Idempotency guard: short-circuit if the sentinel exists.
+    // ── Phase 9: bundled contributions manifest walk ─────────────
+    //
+    // Runs on EVERY boot (not gated by the prompt-migration marker)
+    // so app upgrades can land new bundled entries without being
+    // blocked by a stale sentinel. Per-entry INSERT OR IGNORE
+    // semantics make this safe — existing rows are skipped, new
+    // rows are inserted.
+    //
+    // Rationale for running this outside the sentinel guard: if the
+    // sentinel is present (prior run completed Phase 5 migration),
+    // Phase 9 still needs to be able to ADD new bundled
+    // contributions that didn't exist at Phase 5 time. The sentinel
+    // only protects the disk-walk steps below, not the manifest walk.
+    match walk_bundled_contributions_manifest(conn) {
+        Ok(bundled_report) => {
+            report.bundled_inserted = bundled_report.inserted;
+            report.bundled_skipped_already_present = bundled_report.skipped_already_present;
+            report.bundled_failed = bundled_report.failed;
+            if bundled_report.inserted > 0 || bundled_report.skipped_already_present > 0 {
+                debug!(
+                    inserted = bundled_report.inserted,
+                    skipped = bundled_report.skipped_already_present,
+                    failed = bundled_report.failed,
+                    "Phase 9 bundled contributions: walk complete"
+                );
+            }
+        }
+        Err(e) => {
+            warn!(
+                error = %e,
+                "Phase 9 bundled contributions walk failed; Phase 5 disk-walk still runs"
+            );
+        }
+    }
+
+    // Idempotency guard: short-circuit the DISK walks (prompts +
+    // chains + schema annotations) if the sentinel exists. The
+    // Phase 9 bundled walk above is NOT gated by this sentinel.
     let marker_exists: i64 = conn.query_row(
         "SELECT COUNT(*) FROM pyramid_config_contributions
          WHERE schema_type = ?1
@@ -118,7 +173,7 @@ pub fn migrate_prompts_and_chains_to_contributions(
     )?;
     if marker_exists > 0 {
         debug!(
-            "Phase 5 prompt migration: sentinel row already present, skipping migration"
+            "Phase 5 prompt migration: sentinel row already present, skipping disk-walk migration"
         );
         return Ok(report);
     }
@@ -803,6 +858,236 @@ fn build_schema_annotation_metadata(slug: &str) -> WireNativeMetadata {
     metadata
 }
 
+// ── Phase 9: Bundled contributions manifest ─────────────────────────────────
+
+/// Bundled contributions manifest shipped inside the binary at
+/// `src-tauri/assets/bundled_contributions.json`. Phase 9 loads this on
+/// first run (or after an app upgrade that adds new bundled entries)
+/// and inserts every contribution with `source = 'bundled'`,
+/// `status = 'active'`, `created_by = 'bootstrap'`, and the explicit
+/// `contribution_id` from the manifest (NOT an auto-generated UUID).
+///
+/// The manifest format is documented in `wire-contribution-mapping.md`
+/// → "Bundle manifest" and in `generative-config-pattern.md` →
+/// "Seed Defaults Architecture".
+#[derive(Debug, Deserialize)]
+pub struct BundledContributionsManifest {
+    pub manifest_version: u32,
+    #[serde(default)]
+    pub app_version: String,
+    #[serde(default)]
+    pub generated_at: String,
+    pub contributions: Vec<BundledContributionEntry>,
+}
+
+/// A single entry inside the bundled contributions manifest. Maps 1:1
+/// to a `pyramid_config_contributions` row, with the explicit
+/// `contribution_id` and `yaml_content` preserved across app upgrades.
+///
+/// `topics_extra` is a Phase 9 convenience field — the canonical Wire
+/// Native metadata is computed at migration time via
+/// `build_bundled_metadata()` (which applies the mapping table + slug +
+/// these extra topics), so the manifest itself doesn't need to inline
+/// the full canonical metadata object. Keeps the manifest compact and
+/// lets Phase 5's mapping table stay the single source of truth for
+/// per-schema-type defaults.
+#[derive(Debug, Deserialize)]
+pub struct BundledContributionEntry {
+    pub contribution_id: String,
+    pub schema_type: String,
+    #[serde(default)]
+    pub slug: Option<String>,
+    pub yaml_content: String,
+    pub triggering_note: String,
+    /// Extra topic tags (beyond the mapping-table defaults) added to
+    /// the canonical metadata at migration time. Used for generation
+    /// skills to tag them with `generation` + the target schema_type.
+    #[serde(default)]
+    pub topics_extra: Vec<String>,
+    /// For `schema_definition` entries: the target config schema_type
+    /// the JSON schema applies to. Added as a topic tag so the schema
+    /// registry's lookup-by-target-type scan can find it.
+    #[serde(default)]
+    pub applies_to: Option<String>,
+}
+
+/// Load the bundled contributions manifest from the binary assets.
+/// Single source of truth: the `include_str!` path. Parse failures
+/// abort the migration (the bundled manifest ships with the binary
+/// so a parse failure is a bug in the release, not a user-facing
+/// error).
+pub fn load_bundled_manifest() -> Result<BundledContributionsManifest> {
+    // `include_str!` paths are relative to the current Rust source file
+    // (src-tauri/src/pyramid/wire_migration.rs). The assets directory
+    // lives at src-tauri/assets/, so we go up three levels.
+    const MANIFEST_JSON: &str =
+        include_str!("../../assets/bundled_contributions.json");
+    let manifest: BundledContributionsManifest = serde_json::from_str(MANIFEST_JSON)
+        .map_err(|e| anyhow::anyhow!("failed to parse bundled contributions manifest: {e}"))?;
+    Ok(manifest)
+}
+
+/// Build the canonical `WireNativeMetadata` for a bundled contribution.
+/// Starts from the Phase 5 mapping-table default and overrides:
+///   * `maturity` = `Canon` (bundled seeds ship as battle-tested)
+///   * `price` = 1 (Wire minimum — bundled defaults are free starting
+///                  points; users can edit the price at publish time)
+///   * `topics` = mapping defaults + the entry's `topics_extra` +
+///                the `applies_to` target (if present)
+///
+/// Keeps the Phase 5 mapping table as the single source of truth for
+/// per-schema-type default tags; Phase 9 just adds per-entry extras.
+fn build_bundled_metadata(entry: &BundledContributionEntry) -> WireNativeMetadata {
+    let mut metadata = default_wire_native_metadata(
+        &entry.schema_type,
+        entry.slug.as_deref(),
+    );
+    metadata.maturity = WireMaturity::Canon;
+    metadata.price = Some(1);
+
+    for extra in &entry.topics_extra {
+        if !metadata.topics.iter().any(|t| t == extra) {
+            metadata.topics.push(extra.clone());
+        }
+    }
+
+    if let Some(applies_to) = &entry.applies_to {
+        if !metadata.topics.iter().any(|t| t == applies_to) {
+            metadata.topics.push(applies_to.clone());
+        }
+    }
+
+    metadata
+}
+
+/// Insert a bundled contribution with an EXPLICIT contribution_id. The
+/// standard `create_config_contribution_with_metadata` auto-generates a
+/// UUID — Phase 9 bundled contributions need their IDs to be stable
+/// across app upgrades so the schema registry can reference them by
+/// durable handle.
+///
+/// Uses `INSERT OR IGNORE` semantics: if a row with this
+/// `contribution_id` already exists (second run, app upgrade, or
+/// user-superseded default), the insert is a no-op. The caller detects
+/// this by inspecting the return value (`Ok(true)` = inserted,
+/// `Ok(false)` = skipped).
+///
+/// **Do NOT use INSERT OR REPLACE here.** A user who has superseded a
+/// bundled default with their own refinement would lose their version
+/// on the next app launch. Skip-on-conflict is the correct behavior.
+fn insert_bundled_contribution(
+    conn: &Connection,
+    entry: &BundledContributionEntry,
+    metadata: &WireNativeMetadata,
+) -> Result<bool> {
+    let metadata_json = metadata
+        .to_json()
+        .map_err(|e| anyhow::anyhow!("failed to serialize wire_native_metadata: {e}"))?;
+
+    // Use INSERT OR IGNORE to skip if the contribution_id already
+    // exists. Returns the number of rows affected — 0 if skipped, 1 if
+    // inserted.
+    let rows = conn.execute(
+        "INSERT OR IGNORE INTO pyramid_config_contributions (
+            contribution_id, slug, schema_type, yaml_content,
+            wire_native_metadata_json, wire_publication_state_json,
+            supersedes_id, superseded_by_id, triggering_note,
+            status, source, wire_contribution_id, created_by, accepted_at
+         ) VALUES (
+            ?1, ?2, ?3, ?4,
+            ?5, '{}',
+            NULL, NULL, ?6,
+            'active', 'bundled', NULL, 'bootstrap', datetime('now')
+         )",
+        rusqlite::params![
+            entry.contribution_id,
+            entry.slug,
+            entry.schema_type,
+            entry.yaml_content,
+            metadata_json,
+            entry.triggering_note,
+        ],
+    )?;
+
+    Ok(rows > 0)
+}
+
+/// Report from the Phase 9 bundled contributions walk. Counts how many
+/// bundled entries were freshly inserted, skipped (because a row with
+/// the same `contribution_id` already existed — either from a prior
+/// run or a user supersession), and failed.
+#[derive(Debug, Default, Clone)]
+pub struct BundledMigrationReport {
+    pub inserted: usize,
+    pub skipped_already_present: usize,
+    pub failed: usize,
+}
+
+/// Walk the bundled contributions manifest and insert each entry as a
+/// contribution via `insert_bundled_contribution`. Idempotent — the
+/// per-entry INSERT OR IGNORE semantics mean re-running this function
+/// (or running it after an app upgrade) is safe.
+///
+/// Unlike the Phase 5 prompt/chain walk which uses a whole-run sentinel,
+/// Phase 9 relies entirely on per-entry idempotency. Rationale:
+/// bundled contributions may be ADDED on app upgrades (new schema
+/// types, new defaults), and a whole-run sentinel would prevent those
+/// new entries from ever landing. Per-entry `INSERT OR IGNORE` is
+/// exactly the right primitive.
+///
+/// **Edge case:** if a user has superseded a bundled default with their
+/// own refinement, the bundled contribution_id still exists in the
+/// table (marked `superseded`, `superseded_by_id = user's refinement`).
+/// INSERT OR IGNORE therefore skips the bundled row on re-run, which
+/// correctly preserves the user's work. The user's refinement remains
+/// the active version for that (schema_type, slug) pair.
+pub fn walk_bundled_contributions_manifest(
+    conn: &Connection,
+) -> Result<BundledMigrationReport> {
+    let mut report = BundledMigrationReport::default();
+
+    let manifest = match load_bundled_manifest() {
+        Ok(m) => m,
+        Err(e) => {
+            warn!(
+                error = %e,
+                "Phase 9 bundled manifest load failed; skipping bundled contributions"
+            );
+            report.failed += 1;
+            return Ok(report);
+        }
+    };
+
+    debug!(
+        manifest_version = manifest.manifest_version,
+        app_version = %manifest.app_version,
+        contributions = manifest.contributions.len(),
+        "Phase 9 bundled contributions: processing manifest"
+    );
+
+    for entry in &manifest.contributions {
+        let metadata = build_bundled_metadata(entry);
+        match insert_bundled_contribution(conn, entry, &metadata) {
+            Ok(true) => {
+                report.inserted += 1;
+            }
+            Ok(false) => {
+                report.skipped_already_present += 1;
+            }
+            Err(e) => {
+                warn!(
+                    contribution_id = %entry.contribution_id,
+                    error = %e,
+                    "Phase 9 bundled contributions: failed to insert entry"
+                );
+                report.failed += 1;
+            }
+        }
+    }
+
+    Ok(report)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1005,18 +1290,24 @@ fields:
         assert_eq!(first.chains_inserted, 2);
         assert!(first.marker_written);
 
-        // Second call: short-circuit on sentinel.
+        // Second call: short-circuit on disk-walk sentinel. Phase 9
+        // bundled walk still runs but every bundled row is already
+        // present (per-entry INSERT OR IGNORE), so nothing new lands.
         let second = migrate_prompts_and_chains_to_contributions(&conn, chains.path()).unwrap();
         assert!(!second.ran);
         assert_eq!(second.prompts_inserted, 0);
         assert_eq!(second.chains_inserted, 0);
+        assert_eq!(second.bundled_inserted, 0);
+        assert!(second.bundled_skipped_already_present > 0);
 
-        // Total number of skill rows should equal prompts_inserted
-        // from the first run (no duplicates).
+        // Total number of DISK-migrated skill rows should equal
+        // prompts_inserted from the first run (no duplicates). Phase 9
+        // bundled skills (from the manifest) are filtered out by
+        // created_by = 'phase5_bootstrap'.
         let skill_count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM pyramid_config_contributions
-                 WHERE schema_type = 'skill'",
+                 WHERE schema_type = 'skill' AND created_by = 'phase5_bootstrap'",
                 [],
                 |row| row.get(0),
             )
@@ -1168,20 +1459,180 @@ applies_to: 'chain_step_config'
             migrate_prompts_and_chains_to_contributions(&conn, chains.path()).unwrap();
         assert_eq!(first.schema_annotations_inserted, 2);
 
-        // Second run short-circuits on the sentinel — no duplicates.
+        // Second run short-circuits on the disk-walk sentinel — no
+        // duplicates from the disk walk. Phase 9 bundled annotations
+        // (from the manifest) are still present but counted separately.
         let second =
             migrate_prompts_and_chains_to_contributions(&conn, chains.path()).unwrap();
         assert!(!second.ran);
 
-        let count: i64 = conn
+        // Total schema_annotation count = 2 disk-migrated (from
+        // setup_chains_dir) + however many the Phase 9 bundled
+        // manifest ships. Filter by created_by to isolate the disk-
+        // walk rows we actually care about.
+        let disk_count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM pyramid_config_contributions
-                 WHERE schema_type = 'schema_annotation'",
+                 WHERE schema_type = 'schema_annotation' AND created_by = 'phase5_bootstrap'",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(count, 2);
+        assert_eq!(disk_count, 2);
+    }
+
+    // ── Phase 9 bundled manifest tests ─────────────────────────────
+
+    #[test]
+    fn phase9_bundled_manifest_parses() {
+        // Smoke test: the shipped manifest must parse successfully.
+        let manifest = load_bundled_manifest().unwrap();
+        assert_eq!(manifest.manifest_version, 1);
+        assert!(
+            manifest.contributions.len() >= 15,
+            "manifest should have >= 15 entries, got {}",
+            manifest.contributions.len()
+        );
+        // Every contribution_id must start with "bundled-".
+        for entry in &manifest.contributions {
+            assert!(
+                entry.contribution_id.starts_with("bundled-"),
+                "contribution_id {} does not start with 'bundled-'",
+                entry.contribution_id
+            );
+        }
+        // IDs must be unique across the manifest.
+        let mut seen = std::collections::HashSet::new();
+        for entry in &manifest.contributions {
+            assert!(
+                seen.insert(&entry.contribution_id),
+                "duplicate contribution_id {} in manifest",
+                entry.contribution_id
+            );
+        }
+    }
+
+    #[test]
+    fn phase9_bundled_walk_inserts_all_entries() {
+        let conn = mem_conn();
+        let report = walk_bundled_contributions_manifest(&conn).unwrap();
+        assert!(
+            report.inserted >= 15,
+            "expected >= 15 bundled rows inserted, got {}",
+            report.inserted
+        );
+        assert_eq!(report.skipped_already_present, 0);
+        assert_eq!(report.failed, 0);
+
+        // Every bundled row should land with source = 'bundled' and
+        // created_by = 'bootstrap'.
+        let bundled_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pyramid_config_contributions
+                 WHERE source = 'bundled' AND created_by = 'bootstrap'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(bundled_count >= 15);
+    }
+
+    #[test]
+    fn phase9_bundled_walk_is_idempotent() {
+        let conn = mem_conn();
+        let first = walk_bundled_contributions_manifest(&conn).unwrap();
+        let inserted_first = first.inserted;
+        assert!(inserted_first > 0);
+
+        // Second run: every entry already exists, nothing inserts.
+        let second = walk_bundled_contributions_manifest(&conn).unwrap();
+        assert_eq!(second.inserted, 0);
+        assert_eq!(second.skipped_already_present, inserted_first);
+        assert_eq!(second.failed, 0);
+    }
+
+    #[test]
+    fn phase9_bundled_walk_skips_user_superseded() {
+        let conn = mem_conn();
+        // First run: bundled defaults land.
+        walk_bundled_contributions_manifest(&conn).unwrap();
+
+        // Simulate the user superseding the bundled evidence_policy
+        // default with their own refinement. Mark the bundled row
+        // superseded + point at a new user row.
+        let bundled_id = "bundled-evidence_policy-default-v1";
+        let user_id = uuid::Uuid::new_v4().to_string();
+        conn.execute(
+            "INSERT INTO pyramid_config_contributions (
+                contribution_id, slug, schema_type, yaml_content,
+                wire_native_metadata_json, wire_publication_state_json,
+                supersedes_id, superseded_by_id, triggering_note,
+                status, source, wire_contribution_id, created_by, accepted_at
+             ) VALUES (
+                ?1, NULL, 'evidence_policy', 'schema_type: evidence_policy',
+                '{}', '{}',
+                ?2, NULL, 'user refinement',
+                'active', 'local', NULL, 'user', datetime('now')
+             )",
+            rusqlite::params![user_id, bundled_id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE pyramid_config_contributions
+             SET status = 'superseded', superseded_by_id = ?1
+             WHERE contribution_id = ?2",
+            rusqlite::params![user_id, bundled_id],
+        )
+        .unwrap();
+
+        // Second walk: bundled id already exists (as superseded),
+        // INSERT OR IGNORE skips it, user's version remains active.
+        let second = walk_bundled_contributions_manifest(&conn).unwrap();
+        assert_eq!(second.inserted, 0);
+
+        // Verify the user's refinement is still active.
+        let active_source: String = conn
+            .query_row(
+                "SELECT source FROM pyramid_config_contributions
+                 WHERE schema_type = 'evidence_policy'
+                   AND status = 'active'
+                   AND superseded_by_id IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(active_source, "local");
+    }
+
+    #[test]
+    fn phase9_bundled_walk_runs_before_sentinel_check() {
+        // Regression test for the Phase 9 extension: even when the
+        // Phase 5 disk-walk sentinel is present, the bundled walk
+        // must still run so app upgrades can add new manifest entries.
+        let conn = mem_conn();
+        // Manually insert the sentinel as though a prior run finished.
+        let marker_id = uuid::Uuid::new_v4().to_string();
+        conn.execute(
+            "INSERT INTO pyramid_config_contributions (
+                contribution_id, slug, schema_type, yaml_content,
+                wire_native_metadata_json, wire_publication_state_json,
+                status, source, created_by, accepted_at
+             ) VALUES (
+                ?1, NULL, ?2, '',
+                '{}', '{}',
+                'active', 'migration', 'phase5_bootstrap', datetime('now')
+             )",
+            rusqlite::params![marker_id, PROMPT_MIGRATION_MARKER],
+        )
+        .unwrap();
+
+        let dir = TempDir::new().unwrap();
+        let report =
+            migrate_prompts_and_chains_to_contributions(&conn, dir.path()).unwrap();
+        // Disk walk short-circuits (sentinel present).
+        assert!(!report.ran);
+        // But Phase 9 bundled walk still ran.
+        assert!(report.bundled_inserted >= 15);
     }
 
     #[test]

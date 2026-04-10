@@ -5744,6 +5744,7 @@ async fn pyramid_vine_integrity(
         dadbear_in_flight: state.pyramid.dadbear_in_flight.clone(),
         provider_registry: state.pyramid.provider_registry.clone(),
         credential_store: state.pyramid.credential_store.clone(),
+        schema_registry: state.pyramid.schema_registry.clone(),
     });
 
     let summary = vine::run_integrity_check(&pyramid_state, &slug)
@@ -5796,6 +5797,7 @@ async fn pyramid_vine_rebuild_upper(
         dadbear_in_flight: state.pyramid.dadbear_in_flight.clone(),
         provider_registry: state.pyramid.provider_registry.clone(),
         credential_store: state.pyramid.credential_store.clone(),
+        schema_registry: state.pyramid.schema_registry.clone(),
     });
 
     let cancel = tokio_util::sync::CancellationToken::new();
@@ -7310,6 +7312,223 @@ async fn yaml_renderer_estimate_cost(
     ))
 }
 
+// ── Phase 9: Generative config IPC ─────────────────────────────────────────
+//
+// Per `docs/specs/generative-config-pattern.md` → "IPC Contract" section
+// (~line 300) and `docs/specs/config-contribution-and-wire-sharing.md` →
+// "IPC Contract (Full)" section for the canonical signatures.
+//
+// Six commands wrap the Phase 9 backend logic:
+//
+//   pyramid_generate_config(schema_type, slug?, intent)
+//     Generates a new config YAML from an intent string. Creates a
+//     draft contribution via Phase 4's CRUD layer and returns the
+//     contribution_id + YAML body for the renderer.
+//
+//   pyramid_refine_config(contribution_id, current_yaml, note)
+//     Refines an existing contribution with a user note. Rejects
+//     empty notes at the IPC boundary per the Notes Capture
+//     Lifecycle. Creates a new draft supersession.
+//
+//   pyramid_accept_config(schema_type, slug?, yaml?, triggering_note?)
+//     Promotes a draft (or accepts an inline YAML payload) to active
+//     and runs sync_config_to_operational. Returns the full
+//     AcceptConfigResponse shape with sync_result metadata.
+//
+//   pyramid_active_config(schema_type, slug?)
+//     Returns the active contribution for a (type, slug) pair. Thin
+//     wrapper over Phase 4's `load_active_config_contribution`.
+//
+//   pyramid_config_versions(schema_type, slug?)
+//     Returns the full version history chain. Thin wrapper over
+//     Phase 4's `load_config_version_history`.
+//
+//   pyramid_config_schemas()
+//     Returns the Phase 9 schema registry's compact summary list —
+//     every schema_type the bundled manifest (or user contributions)
+//     has registered.
+//
+// Every LLM call inside these handlers goes through Phase 6's
+// cache-aware entry point (`call_model_unified_with_options_and_ctx`)
+// with a fully populated StepContext. Every contribution write goes
+// through Phase 4's CRUD helpers. Neither path is bypassed.
+
+#[tauri::command]
+async fn pyramid_generate_config(
+    state: tauri::State<'_, SharedState>,
+    schema_type: String,
+    slug: Option<String>,
+    intent: String,
+) -> Result<wire_node_lib::pyramid::generative_config::GenerateConfigResponse, String> {
+    let llm_config = state.pyramid.config.read().await.clone();
+    let db_path = state
+        .pyramid
+        .data_dir
+        .as_ref()
+        .map(|d| d.join("pyramid.db").to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    // Phase 1: load inputs from the DB, then drop the lock so the
+    // LLM await doesn't hold a non-Send rusqlite::Connection across
+    // task scheduling points.
+    let inputs = {
+        let reader = state.pyramid.reader.lock().await;
+        wire_node_lib::pyramid::generative_config::load_generation_inputs(
+            &reader,
+            &state.pyramid.schema_registry,
+            &schema_type,
+            slug.as_deref(),
+            &intent,
+        )
+        .map_err(|e| e.to_string())?
+    };
+
+    // Phase 2: run the LLM call with no DB lock held.
+    let llm_output = wire_node_lib::pyramid::generative_config::run_generation_llm_call(
+        &llm_config,
+        &state.pyramid.build_event_bus,
+        &state.pyramid.provider_registry,
+        &db_path,
+        &inputs,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    // Phase 3: persist the draft via the writer lock.
+    let writer = state.pyramid.writer.lock().await;
+    wire_node_lib::pyramid::generative_config::persist_generated_draft(
+        &writer,
+        &inputs,
+        &llm_output,
+    )
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn pyramid_refine_config(
+    state: tauri::State<'_, SharedState>,
+    contribution_id: String,
+    current_yaml: String,
+    note: String,
+) -> Result<wire_node_lib::pyramid::generative_config::RefineConfigResponse, String> {
+    // Notes enforcement at the IPC boundary per the Notes Capture
+    // Lifecycle. The backend helper re-validates defensively but the
+    // IPC layer rejects empty/whitespace-only notes here so the user
+    // never burns an LLM round-trip on a request that would fail to
+    // save.
+    wire_node_lib::pyramid::config_contributions::validate_note(&note)?;
+
+    let llm_config = state.pyramid.config.read().await.clone();
+    let db_path = state
+        .pyramid
+        .data_dir
+        .as_ref()
+        .map(|d| d.join("pyramid.db").to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    // Phase 1: load inputs from the DB, then drop the lock.
+    let inputs = {
+        let reader = state.pyramid.reader.lock().await;
+        wire_node_lib::pyramid::generative_config::load_refinement_inputs(
+            &reader,
+            &state.pyramid.schema_registry,
+            &contribution_id,
+            &current_yaml,
+            &note,
+        )
+        .map_err(|e| e.to_string())?
+    };
+
+    // Phase 2: run the LLM call with no DB lock held.
+    let llm_output = wire_node_lib::pyramid::generative_config::run_refinement_llm_call(
+        &llm_config,
+        &state.pyramid.build_event_bus,
+        &state.pyramid.provider_registry,
+        &db_path,
+        &inputs,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    // Phase 3: persist the refined draft via the writer lock.
+    let mut writer = state.pyramid.writer.lock().await;
+    wire_node_lib::pyramid::generative_config::persist_refined_draft(
+        &mut writer,
+        &inputs,
+        &llm_output,
+    )
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn pyramid_accept_config(
+    state: tauri::State<'_, SharedState>,
+    schema_type: String,
+    slug: Option<String>,
+    yaml: Option<serde_json::Value>,
+    triggering_note: Option<String>,
+) -> Result<wire_node_lib::pyramid::generative_config::AcceptConfigResponse, String> {
+    let mut writer = state.pyramid.writer.lock().await;
+    wire_node_lib::pyramid::generative_config::accept_config_draft(
+        &mut writer,
+        &state.pyramid.build_event_bus,
+        &state.pyramid.schema_registry,
+        schema_type,
+        slug,
+        yaml,
+        triggering_note,
+    )
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn pyramid_active_config(
+    state: tauri::State<'_, SharedState>,
+    schema_type: String,
+    slug: Option<String>,
+) -> Result<
+    Option<wire_node_lib::pyramid::generative_config::ActiveConfigResponse>,
+    String,
+> {
+    let reader = state.pyramid.reader.lock().await;
+    wire_node_lib::pyramid::generative_config::active_config_for(
+        &reader,
+        &schema_type,
+        slug.as_deref(),
+    )
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn pyramid_config_versions(
+    state: tauri::State<'_, SharedState>,
+    schema_type: String,
+    slug: Option<String>,
+) -> Result<
+    Vec<wire_node_lib::pyramid::config_contributions::ConfigContribution>,
+    String,
+> {
+    let reader = state.pyramid.reader.lock().await;
+    wire_node_lib::pyramid::generative_config::config_version_history_for(
+        &reader,
+        &schema_type,
+        slug.as_deref(),
+    )
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn pyramid_config_schemas(
+    state: tauri::State<'_, SharedState>,
+) -> Result<
+    Vec<wire_node_lib::pyramid::schema_registry::ConfigSchemaSummary>,
+    String,
+> {
+    Ok(wire_node_lib::pyramid::generative_config::list_config_schemas(
+        &state.pyramid.schema_registry,
+    ))
+}
+
 // ── Phase 7: Cache warming on pyramid import IPC commands ─────────────────
 //
 // Per `docs/specs/cache-warming-and-import.md` "IPC Contract" section
@@ -7699,6 +7918,36 @@ fn main() {
         }
     }
 
+    // Phase 9: hydrate the schema registry from pyramid_config_contributions.
+    // Runs AFTER the Phase 5+9 migration above so bundled manifest entries
+    // are visible. The registry is held on PyramidState as an Arc so IPC
+    // handlers (pyramid_config_schemas, pyramid_generate_config, etc.) can
+    // share a single view without cloning on every call.
+    let schema_registry: std::sync::Arc<
+        wire_node_lib::pyramid::schema_registry::SchemaRegistry,
+    > = {
+        let registry = match wire_node_lib::pyramid::db::open_pyramid_connection(&pyramid_db_path) {
+            Ok(conn) => {
+                wire_node_lib::pyramid::schema_registry::SchemaRegistry::hydrate_from_contributions(&conn)
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(
+                            "failed to hydrate Phase 9 schema registry: {}; starting empty",
+                            e
+                        );
+                        wire_node_lib::pyramid::schema_registry::SchemaRegistry::new()
+                    })
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "failed to open pyramid connection for schema registry hydration: {}",
+                    e
+                );
+                wire_node_lib::pyramid::schema_registry::SchemaRegistry::new()
+            }
+        };
+        std::sync::Arc::new(registry)
+    };
+
     let pyramid_state = Arc::new(wire_node_lib::pyramid::PyramidState {
         reader: Arc::new(tokio::sync::Mutex::new(pyramid_reader)),
         writer: Arc::new(tokio::sync::Mutex::new(pyramid_writer)),
@@ -7747,6 +7996,7 @@ fn main() {
         )),
         provider_registry: provider_registry.clone(),
         credential_store: credential_store.clone(),
+        schema_registry: schema_registry.clone(),
     });
 
     // Load persisted event subscriptions into the in-memory event bus
@@ -8670,6 +8920,13 @@ fn main() {
             pyramid_get_schema_annotation,
             yaml_renderer_resolve_options,
             yaml_renderer_estimate_cost,
+            // Phase 9: Generative config pattern
+            pyramid_generate_config,
+            pyramid_refine_config,
+            pyramid_accept_config,
+            pyramid_active_config,
+            pyramid_config_versions,
+            pyramid_config_schemas,
             // Phase 7: Cache Warming on Pyramid Import
             pyramid_import_pyramid,
             pyramid_import_progress,

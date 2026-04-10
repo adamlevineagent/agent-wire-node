@@ -14595,6 +14595,9 @@ mod tests {
                 std::mem::forget(tmp);
                 store
             },
+            schema_registry: std::sync::Arc::new(
+                crate::pyramid::schema_registry::SchemaRegistry::new(),
+            ),
         };
 
         let chain = make_integration_code_chain();
@@ -14693,6 +14696,9 @@ mod tests {
                 std::mem::forget(tmp);
                 store
             },
+            schema_registry: std::sync::Arc::new(
+                crate::pyramid::schema_registry::SchemaRegistry::new(),
+            ),
         };
 
         let chain = make_integration_code_chain();
@@ -14811,6 +14817,9 @@ mod tests {
                 std::mem::forget(tmp);
                 store
             },
+            schema_registry: std::sync::Arc::new(
+                crate::pyramid::schema_registry::SchemaRegistry::new(),
+            ),
         };
 
         assert!(!pyramid_state
@@ -14893,6 +14902,9 @@ mod tests {
                 std::mem::forget(tmp);
                 store
             },
+            schema_registry: std::sync::Arc::new(
+                crate::pyramid::schema_registry::SchemaRegistry::new(),
+            ),
         };
 
         let chain = make_integration_code_chain();

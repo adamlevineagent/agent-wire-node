@@ -1320,6 +1320,9 @@ mod tests {
             credential_store: Arc::new(
                 crate::pyramid::credentials::CredentialStore::load(&data_dir).unwrap(),
             ),
+            schema_registry: Arc::new(
+                crate::pyramid::schema_registry::SchemaRegistry::new(),
+            ),
         });
         (state, data_dir)
     }
