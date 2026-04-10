@@ -150,6 +150,12 @@ pub struct CachedStepOutput {
     pub created_at: String,
     pub force_fresh: bool,
     pub supersedes_cache_id: Option<i64>,
+    /// Phase 13: user rationale attached to reroll writes.
+    pub note: Option<String>,
+    /// Phase 13: set by the downstream invalidation walker when a
+    /// parent reroll orphans this entry. Non-null values are treated
+    /// as a forced cache miss on subsequent lookups.
+    pub invalidated_by: Option<String>,
 }
 
 /// New cache entry ready for insertion. Callers construct this from the
@@ -171,6 +177,9 @@ pub struct CacheEntry {
     pub latency_ms: Option<i64>,
     pub force_fresh: bool,
     pub supersedes_cache_id: Option<i64>,
+    /// Phase 13: user rationale captured at reroll time. Non-reroll
+    /// writes pass `None`.
+    pub note: Option<String>,
 }
 
 /// Verify that a cache hit is safe to return to the caller. This is the
@@ -581,6 +590,8 @@ mod tests {
             created_at: "2026-04-10 00:00:00".into(),
             force_fresh: false,
             supersedes_cache_id: None,
+            note: None,
+            invalidated_by: None,
         }
     }
 

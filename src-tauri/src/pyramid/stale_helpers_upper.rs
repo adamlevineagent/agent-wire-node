@@ -1968,24 +1968,60 @@ pub(crate) async fn persist_change_manifest(
     manifest: &ChangeManifest,
     note: Option<String>,
 ) -> Result<i64> {
+    persist_change_manifest_with_bus(db_path, slug, node_id, build_version, manifest, note, None)
+        .await
+}
+
+/// Phase 13: extended persist helper that also emits `ManifestGenerated`
+/// on the bus (if present). Existing call sites continue to use
+/// `persist_change_manifest`; reroll and the full build path both flow
+/// through this variant with a bus attached.
+pub(crate) async fn persist_change_manifest_with_bus(
+    db_path: &str,
+    slug: &str,
+    node_id: &str,
+    build_version: i64,
+    manifest: &ChangeManifest,
+    note: Option<String>,
+    bus: Option<std::sync::Arc<super::event_bus::BuildEventBus>>,
+) -> Result<i64> {
     let manifest_json = serde_json::to_string(manifest)?;
     let db = db_path.to_string();
-    let slug = slug.to_string();
-    let node_id = node_id.to_string();
+    let slug_owned = slug.to_string();
+    let node_id_owned = node_id.to_string();
     let note_owned = note;
-    tokio::task::spawn_blocking(move || -> Result<i64> {
+    let manifest_id = tokio::task::spawn_blocking(move || -> Result<i64> {
         let conn = super::db::open_pyramid_connection(Path::new(&db))?;
         super::db::save_change_manifest(
             &conn,
-            &slug,
-            &node_id,
+            &slug_owned,
+            &node_id_owned,
             build_version,
             &manifest_json,
             note_owned.as_deref(),
             None,
         )
     })
-    .await?
+    .await??;
+
+    // Phase 13: emit ManifestGenerated if we have a bus. `depth` is
+    // not directly available here (persist is decoupled from the node
+    // row lookup), so we pass 0 — the UI will patch depth from the
+    // surrounding step's context when the event arrives. For reroll,
+    // the caller passes an explicit depth via the spawn caller.
+    if let Some(bus) = bus {
+        let _ = bus.tx.send(super::event_bus::TaggedBuildEvent {
+            slug: slug.to_string(),
+            kind: super::event_bus::TaggedKind::ManifestGenerated {
+                slug: slug.to_string(),
+                build_id: format!("{}-manifest-{}", slug, build_version),
+                manifest_id,
+                depth: 0,
+                node_id: node_id.to_string(),
+            },
+        });
+    }
+    Ok(manifest_id)
 }
 
 // ── 4b. Execute Supersession ────────────────────────────────────────────────

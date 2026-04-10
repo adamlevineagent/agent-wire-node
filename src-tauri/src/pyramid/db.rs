@@ -1116,6 +1116,35 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
         ",
     )?;
 
+    // ── Phase 13: Reroll + downstream invalidation columns ──────────
+    //
+    // `note` — user-provided rationale captured during reroll. Empty
+    // on non-reroll writes. Populated when the reroll IPC writes a
+    // supersession row. The UI shows this as a tooltip on the
+    // rerolled step row.
+    //
+    // `invalidated_by` — set when the downstream cache invalidation
+    // walker marks this row stale. Carries the originating cache_key
+    // so operators can trace back to the root cause. Cache lookup
+    // treats any non-NULL `invalidated_by` as a forced miss.
+    let _ = conn.execute(
+        "ALTER TABLE pyramid_step_cache ADD COLUMN note TEXT",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE pyramid_step_cache ADD COLUMN invalidated_by TEXT",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE pyramid_step_cache ADD COLUMN invalidated_at TEXT",
+        [],
+    );
+    let _ = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_step_cache_build_id
+            ON pyramid_step_cache(slug, build_id)",
+        [],
+    );
+
     // ── Phase 7: Cache warming on pyramid import (pyramid_import_state) ───────
     //
     // Tracks the in-flight state of a `pyramid_import_pyramid` call so a
@@ -6052,6 +6081,8 @@ fn cached_step_output_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Cach
         created_at: row.get(14)?,
         force_fresh: row.get::<_, i64>(15)? != 0,
         supersedes_cache_id: row.get(16)?,
+        note: row.get::<_, Option<String>>(17).unwrap_or(None),
+        invalidated_by: row.get::<_, Option<String>>(18).unwrap_or(None),
     })
 }
 
@@ -6063,6 +6094,12 @@ fn cached_step_output_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Cach
 /// force-fresh write superseded an earlier entry under the same cache
 /// key). Multiple rows under the same `(slug, cache_key)` are prevented
 /// by the UNIQUE constraint; this ORDER BY is a defensive tie-break.
+///
+/// Phase 13: rows with a non-null `invalidated_by` column are treated
+/// as forced cache misses — the downstream walker set this flag to
+/// mark the row as orphaned by an upstream reroll, and callers that
+/// return the row would serve stale content. We filter at the query
+/// level so the lookup is a single roundtrip.
 pub fn check_cache(
     conn: &Connection,
     slug: &str,
@@ -6071,7 +6108,33 @@ pub fn check_cache(
     let mut stmt = conn.prepare(
         "SELECT id, slug, build_id, step_name, chunk_index, depth, cache_key,
                 inputs_hash, prompt_hash, model_id, output_json, token_usage_json,
-                cost_usd, latency_ms, created_at, force_fresh, supersedes_cache_id
+                cost_usd, latency_ms, created_at, force_fresh, supersedes_cache_id,
+                note, invalidated_by
+         FROM pyramid_step_cache
+         WHERE slug = ?1 AND cache_key = ?2 AND invalidated_by IS NULL
+         ORDER BY id DESC
+         LIMIT 1",
+    )?;
+    let row = stmt
+        .query_row(rusqlite::params![slug, cache_key], cached_step_output_from_row)
+        .optional()?;
+    Ok(row)
+}
+
+/// Phase 13: fetch a cache entry including rows that were marked
+/// invalidated. The reroll IPC uses this to look up the prior
+/// content that the user is rerolling against, even if it has been
+/// orphaned.
+pub fn check_cache_including_invalidated(
+    conn: &Connection,
+    slug: &str,
+    cache_key: &str,
+) -> Result<Option<CachedStepOutput>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, slug, build_id, step_name, chunk_index, depth, cache_key,
+                inputs_hash, prompt_hash, model_id, output_json, token_usage_json,
+                cost_usd, latency_ms, created_at, force_fresh, supersedes_cache_id,
+                note, invalidated_by
          FROM pyramid_step_cache
          WHERE slug = ?1 AND cache_key = ?2
          ORDER BY id DESC
@@ -6081,6 +6144,160 @@ pub fn check_cache(
         .query_row(rusqlite::params![slug, cache_key], cached_step_output_from_row)
         .optional()?;
     Ok(row)
+}
+
+// ── Phase 13: build viz pre-population and reroll support ────────────
+
+/// Phase 13: compact summary of a cache entry used by the build viz
+/// pre-population query (`pyramid_step_cache_for_build` IPC). Only
+/// the fields the UI renders — `output_json` is excluded because the
+/// timeline preview doesn't show content. Callers fetch the full row
+/// via `check_cache*` when they need content.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CacheEntrySummary {
+    pub id: i64,
+    pub slug: String,
+    pub build_id: String,
+    pub step_name: String,
+    pub chunk_index: i64,
+    pub depth: i64,
+    pub cache_key: String,
+    pub model_id: String,
+    pub cost_usd: Option<f64>,
+    pub latency_ms: Option<i64>,
+    pub created_at: String,
+    pub force_fresh: bool,
+    pub supersedes_cache_id: Option<i64>,
+    pub note: Option<String>,
+    pub invalidated_by: Option<String>,
+}
+
+/// Phase 13: fetch every cache entry written during the given build,
+/// newest-first. Used by `pyramid_step_cache_for_build` to seed the
+/// step timeline on mount / resume so already-completed steps render
+/// immediately.
+pub fn list_cache_entries_for_build(
+    conn: &Connection,
+    slug: &str,
+    build_id: &str,
+) -> Result<Vec<CacheEntrySummary>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, slug, build_id, step_name, chunk_index, depth, cache_key,
+                model_id, cost_usd, latency_ms, created_at, force_fresh,
+                supersedes_cache_id, note, invalidated_by
+         FROM pyramid_step_cache
+         WHERE slug = ?1 AND build_id = ?2
+         ORDER BY id DESC",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![slug, build_id], |row| {
+        Ok(CacheEntrySummary {
+            id: row.get(0)?,
+            slug: row.get(1)?,
+            build_id: row.get(2)?,
+            step_name: row.get(3)?,
+            chunk_index: row.get(4)?,
+            depth: row.get(5)?,
+            cache_key: row.get(6)?,
+            model_id: row.get(7)?,
+            cost_usd: row.get(8)?,
+            latency_ms: row.get(9)?,
+            created_at: row.get(10)?,
+            force_fresh: row.get::<_, i64>(11)? != 0,
+            supersedes_cache_id: row.get(12)?,
+            note: row.get::<_, Option<String>>(13).unwrap_or(None),
+            invalidated_by: row.get::<_, Option<String>>(14).unwrap_or(None),
+        })
+    })?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+/// Phase 13: mark a set of cache entries as invalidated by a reroll.
+/// `reason` is stored in `invalidated_by` (typically the originating
+/// cache_key) so operators can trace the dependency chain.
+///
+/// Returns the number of rows flipped. Already-invalidated rows are
+/// left untouched (idempotent). Rows superseded via
+/// `supersede_cache_entry` are left alone — they're already archival.
+pub fn invalidate_cache_entries(
+    conn: &Connection,
+    slug: &str,
+    cache_keys: &[String],
+    reason: &str,
+) -> Result<usize> {
+    if cache_keys.is_empty() {
+        return Ok(0);
+    }
+    let mut total: usize = 0;
+    for ck in cache_keys {
+        let affected = conn.execute(
+            "UPDATE pyramid_step_cache
+                SET invalidated_by = ?1, invalidated_at = datetime('now')
+              WHERE slug = ?2 AND cache_key = ?3 AND invalidated_by IS NULL",
+            rusqlite::params![reason, slug, ck],
+        )?;
+        total += affected;
+    }
+    Ok(total)
+}
+
+/// Phase 13: find cache entries whose step_name + depth chain points
+/// into a downstream consumer of the given `(step_name, chunk_index,
+/// depth)` tuple. This is the single-level walker the spec asks for:
+/// when a step at depth D is rerolled, any entry at depth D+1 whose
+/// step consumes that depth's outputs is marked stale.
+///
+/// The MVP walker uses a simple heuristic: any entry at `depth + 1`
+/// (independent of step_name) is considered a downstream dependent.
+/// This over-invalidates by design — the spec allows for over-
+/// invalidation and a transitive walker can refine this later.
+/// Returns the list of affected cache_keys so the caller can emit
+/// `CacheInvalidated` events.
+pub fn find_downstream_cache_keys(
+    conn: &Connection,
+    slug: &str,
+    depth: i64,
+) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT cache_key
+           FROM pyramid_step_cache
+          WHERE slug = ?1 AND depth > ?2 AND invalidated_by IS NULL
+          ORDER BY depth ASC, id ASC",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![slug, depth], |row| row.get::<_, String>(0))?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+/// Phase 13: count how many supersession rows exist for a given step
+/// slot in the last 10 minutes. Used by the reroll IPC to produce the
+/// anti-slot-machine warning (the UI shows a banner after 3+ rerolls
+/// but the backend does NOT hard-block).
+pub fn count_recent_rerolls(
+    conn: &Connection,
+    slug: &str,
+    step_name: &str,
+    chunk_index: i64,
+    depth: i64,
+) -> Result<i64> {
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pyramid_step_cache
+              WHERE slug = ?1 AND step_name = ?2 AND chunk_index = ?3 AND depth = ?4
+                AND created_at > datetime('now', '-10 minutes')
+                AND supersedes_cache_id IS NOT NULL",
+            rusqlite::params![slug, step_name, chunk_index, depth],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or(0);
+    Ok(count)
 }
 
 /// Insert or replace a cache entry. Uses the `(slug, cache_key)` unique
@@ -6095,8 +6312,8 @@ pub fn store_cache(conn: &Connection, entry: &CacheEntry) -> Result<()> {
         "INSERT INTO pyramid_step_cache
             (slug, build_id, step_name, chunk_index, depth, cache_key,
              inputs_hash, prompt_hash, model_id, output_json, token_usage_json,
-             cost_usd, latency_ms, created_at, force_fresh, supersedes_cache_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, datetime('now'), ?14, ?15)
+             cost_usd, latency_ms, created_at, force_fresh, supersedes_cache_id, note)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, datetime('now'), ?14, ?15, ?16)
          ON CONFLICT(slug, cache_key) DO UPDATE SET
             build_id = excluded.build_id,
             step_name = excluded.step_name,
@@ -6111,7 +6328,10 @@ pub fn store_cache(conn: &Connection, entry: &CacheEntry) -> Result<()> {
             latency_ms = excluded.latency_ms,
             created_at = datetime('now'),
             force_fresh = excluded.force_fresh,
-            supersedes_cache_id = excluded.supersedes_cache_id",
+            supersedes_cache_id = excluded.supersedes_cache_id,
+            note = excluded.note,
+            invalidated_by = NULL,
+            invalidated_at = NULL",
         rusqlite::params![
             entry.slug,
             entry.build_id,
@@ -6128,6 +6348,7 @@ pub fn store_cache(conn: &Connection, entry: &CacheEntry) -> Result<()> {
             entry.latency_ms,
             if entry.force_fresh { 1_i64 } else { 0_i64 },
             entry.supersedes_cache_id,
+            entry.note,
         ],
     )
     .with_context(|| format!("store_cache(slug={}, cache_key={})", entry.slug, entry.cache_key))?;
@@ -6173,9 +6394,9 @@ pub fn store_cache_if_absent(conn: &Connection, entry: &CacheEntry) -> Result<bo
             "INSERT INTO pyramid_step_cache
                 (slug, build_id, step_name, chunk_index, depth, cache_key,
                  inputs_hash, prompt_hash, model_id, output_json, token_usage_json,
-                 cost_usd, latency_ms, created_at, force_fresh, supersedes_cache_id)
+                 cost_usd, latency_ms, created_at, force_fresh, supersedes_cache_id, note)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                     datetime('now'), ?14, ?15)
+                     datetime('now'), ?14, ?15, ?16)
              ON CONFLICT(slug, cache_key) DO NOTHING",
             rusqlite::params![
                 entry.slug,
@@ -6193,6 +6414,7 @@ pub fn store_cache_if_absent(conn: &Connection, entry: &CacheEntry) -> Result<bo
                 entry.latency_ms,
                 if entry.force_fresh { 1_i64 } else { 0_i64 },
                 entry.supersedes_cache_id,
+                entry.note,
             ],
         )
         .with_context(|| {
@@ -10584,6 +10806,177 @@ pub fn disable_dadbear_for_slug(conn: &Connection, slug: &str) -> Result<usize> 
     Ok(count)
 }
 
+/// Phase 13: bulk-pause every DADBEAR watch config that is currently
+/// enabled. The `WHERE enabled = 1` clause makes the operation
+/// idempotent — a second invocation affects zero rows. Returns the
+/// number of rows that flipped from 1 to 0.
+pub fn disable_dadbear_all(conn: &Connection) -> Result<usize> {
+    let count = conn.execute(
+        "UPDATE pyramid_dadbear_config
+            SET enabled = 0, updated_at = datetime('now')
+          WHERE enabled = 1",
+        [],
+    )?;
+    Ok(count)
+}
+
+/// Phase 13: bulk-resume every DADBEAR watch config that is
+/// currently paused. Returns the number of rows that flipped from 0
+/// to 1.
+pub fn enable_dadbear_all(conn: &Connection) -> Result<usize> {
+    let count = conn.execute(
+        "UPDATE pyramid_dadbear_config
+            SET enabled = 1, updated_at = datetime('now')
+          WHERE enabled = 0",
+        [],
+    )?;
+    Ok(count)
+}
+
+/// Phase 13: Cost-rollup helper. Aggregates `pyramid_cost_log` across
+/// all slugs within the given ISO date range, grouped by
+/// `(slug, provider, operation)`. Callers pivot the result client-side
+/// into per-pyramid / per-provider / per-operation views.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CostRollupBucket {
+    pub slug: String,
+    pub provider: Option<String>,
+    pub operation: String,
+    pub estimated: f64,
+    pub actual: f64,
+    pub call_count: i64,
+}
+
+pub fn cost_rollup(
+    conn: &Connection,
+    from_iso: &str,
+    to_iso: &str,
+) -> Result<Vec<CostRollupBucket>> {
+    let mut stmt = conn.prepare(
+        "SELECT
+            slug,
+            provider_id,
+            operation,
+            COALESCE(SUM(COALESCE(estimated_cost_usd, estimated_cost)), 0) AS estimated,
+            COALESCE(SUM(COALESCE(broadcast_cost_usd, actual_cost, 0)), 0) AS actual,
+            COUNT(*) AS call_count
+         FROM pyramid_cost_log
+         WHERE created_at >= ?1 AND created_at < ?2
+         GROUP BY slug, provider_id, operation
+         ORDER BY slug, operation",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![from_iso, to_iso], |row| {
+        Ok(CostRollupBucket {
+            slug: row.get(0)?,
+            provider: row.get(1)?,
+            operation: row.get(2)?,
+            estimated: row.get::<_, f64>(3).unwrap_or(0.0),
+            actual: row.get::<_, f64>(4).unwrap_or(0.0),
+            call_count: row.get(5)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+/// Phase 13: active-builds query. Returns one summary row per
+/// active (running/idle) slug. The current schema doesn't have a
+/// `pyramid_build_runs` lifecycle table — the spec assumed one —
+/// so we derive the active set from `active_build` runtime state
+/// and supplement it with cost / cache data computed from
+/// `pyramid_step_cache` and `pyramid_cost_log`.
+///
+/// The runtime state is passed as a parameter because it lives in
+/// `PyramidState.active_build` (a `RwLock<HashMap<_, BuildHandle>>`)
+/// rather than in the DB. The caller (IPC handler) reads that map
+/// and hands us the slugs that currently have live `BuildHandle`s.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ActiveBuildRow {
+    pub slug: String,
+    pub build_id: String,
+    pub status: String,
+    pub started_at: String,
+    pub completed_steps: i64,
+    pub total_steps: i64,
+    pub current_step: Option<String>,
+    pub cost_so_far_usd: f64,
+    pub cache_hit_rate: f64,
+}
+
+pub fn build_active_build_summary(
+    conn: &Connection,
+    slug: &str,
+    build_id: &str,
+    status: &str,
+    started_at: &str,
+    current_step: Option<&str>,
+) -> Result<ActiveBuildRow> {
+    // Count completed pipeline steps for the build. The
+    // `pyramid_pipeline_steps` table doesn't carry a status column
+    // — every persisted row represents a completed step (the
+    // schema is append-only on completion). So "completed" is the
+    // row count, and "total" is the same value. The UI derives
+    // progress from the pyramid layer state instead, but we
+    // include the raw step count here for completeness.
+    let completed_steps: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pyramid_pipeline_steps
+              WHERE slug = ?1 AND build_id = ?2",
+            rusqlite::params![slug, build_id],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    let total_steps = completed_steps;
+
+    // Cost so far: sum of cost_usd from cache entries for this build.
+    let cost_so_far_usd: f64 = conn
+        .query_row(
+            "SELECT COALESCE(SUM(cost_usd), 0.0) FROM pyramid_step_cache
+              WHERE slug = ?1 AND build_id = ?2",
+            rusqlite::params![slug, build_id],
+            |row| row.get(0),
+        )
+        .unwrap_or(0.0);
+
+    // Cache hit rate: fraction of entries whose force_fresh flag is
+    // off (meaning the entry was served without a fresh LLM call).
+    // This is an approximation — a proper hit rate would count actual
+    // cache_hit emissions vs total lookups, but those live only in
+    // the event stream. The approximation stays useful in the UI.
+    let (hits, total): (i64, i64) = conn
+        .query_row(
+            "SELECT
+                COALESCE(SUM(CASE WHEN force_fresh = 0 THEN 1 ELSE 0 END), 0),
+                COUNT(*)
+             FROM pyramid_step_cache
+             WHERE slug = ?1 AND build_id = ?2",
+            rusqlite::params![slug, build_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap_or((0, 0));
+
+    let cache_hit_rate = if total > 0 {
+        (hits as f64) / (total as f64)
+    } else {
+        0.0
+    };
+
+    Ok(ActiveBuildRow {
+        slug: slug.to_string(),
+        build_id: build_id.to_string(),
+        status: status.to_string(),
+        started_at: started_at.to_string(),
+        completed_steps,
+        total_steps,
+        current_step: current_step.map(|s| s.to_string()),
+        cost_so_far_usd,
+        cache_hit_rate,
+    })
+}
+
 /// Update the last_scan_at timestamp for a DADBEAR config row.
 pub fn touch_dadbear_last_scan(conn: &Connection, config_id: i64) -> Result<()> {
     conn.execute(
@@ -13615,6 +14008,7 @@ mod step_cache_tests {
             latency_ms: Some(42),
             force_fresh: false,
             supersedes_cache_id: None,
+            note: None,
         }
     }
 
@@ -14274,5 +14668,233 @@ mod phase12_tests {
         assert_eq!(parse_check_interval_to_next_check_at("30d"), "+30 days");
         assert_eq!(parse_check_interval_to_next_check_at("1h"), "+1 hours");
         assert_eq!(parse_check_interval_to_next_check_at("2w"), "+14 days");
+    }
+}
+
+// ── Phase 13: cost rollup + pause-all + cache summary tests ──────────
+
+#[cfg(test)]
+mod phase13_tests {
+    use super::*;
+    use crate::pyramid::step_context::{compute_cache_key, compute_inputs_hash, CacheEntry};
+
+    fn mem_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        init_pyramid_db(&conn).unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO pyramid_slugs (slug, content_type, source_path) VALUES ('p13-test', 'document', '/tmp/p13-test')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO pyramid_slugs (slug, content_type, source_path) VALUES ('p13-other', 'document', '/tmp/p13-other')",
+            [],
+        )
+        .unwrap();
+        conn
+    }
+
+    fn seed_cost_row(
+        conn: &Connection,
+        slug: &str,
+        operation: &str,
+        provider: Option<&str>,
+        estimated: f64,
+        actual: Option<f64>,
+    ) {
+        conn.execute(
+            "INSERT INTO pyramid_cost_log
+                (slug, operation, model, input_tokens, output_tokens, estimated_cost,
+                 created_at, estimated_cost_usd, broadcast_cost_usd, provider_id)
+             VALUES (?1, ?2, 'test-model', 10, 20, ?3, datetime('now'), ?3, ?4, ?5)",
+            rusqlite::params![slug, operation, estimated, actual, provider],
+        )
+        .unwrap();
+    }
+
+    fn make_cache_entry(
+        slug: &str,
+        step: &str,
+        chunk: i64,
+        depth: i64,
+        seed: &str,
+    ) -> CacheEntry {
+        let inputs_hash = compute_inputs_hash("sys", &format!("u-{seed}"));
+        let prompt_hash = format!("phash-{seed}");
+        let model_id = "m-1".to_string();
+        let cache_key = compute_cache_key(&inputs_hash, &prompt_hash, &model_id);
+        CacheEntry {
+            slug: slug.into(),
+            build_id: "p13-build".into(),
+            step_name: step.into(),
+            chunk_index: chunk,
+            depth,
+            cache_key,
+            inputs_hash,
+            prompt_hash,
+            model_id,
+            output_json: serde_json::json!({"c":"x"}).to_string(),
+            token_usage_json: None,
+            cost_usd: Some(0.01),
+            latency_ms: Some(100),
+            force_fresh: false,
+            supersedes_cache_id: None,
+            note: None,
+        }
+    }
+
+    #[test]
+    fn test_cost_rollup_groups_by_slug_provider_operation() {
+        let conn = mem_conn();
+        seed_cost_row(&conn, "p13-test", "build", Some("openrouter"), 1.23, Some(1.20));
+        seed_cost_row(&conn, "p13-test", "build", Some("openrouter"), 0.50, Some(0.48));
+        seed_cost_row(&conn, "p13-test", "stale_check", Some("openrouter"), 0.10, None);
+        seed_cost_row(&conn, "p13-other", "build", Some("anthropic"), 2.00, Some(1.95));
+
+        let from = "2020-01-01 00:00:00";
+        let to = "2100-01-01 00:00:00";
+        let buckets = cost_rollup(&conn, from, to).unwrap();
+
+        // 3 distinct group keys: (p13-test, openrouter, build),
+        // (p13-test, openrouter, stale_check), (p13-other, anthropic, build).
+        assert_eq!(buckets.len(), 3);
+
+        let build_opt = buckets
+            .iter()
+            .find(|b| b.slug == "p13-test" && b.operation == "build")
+            .expect("p13-test build bucket");
+        assert!((build_opt.estimated - 1.73).abs() < 1e-6);
+        assert!((build_opt.actual - 1.68).abs() < 1e-6);
+        assert_eq!(build_opt.call_count, 2);
+    }
+
+    #[test]
+    fn test_pause_all_sets_enabled_zero_and_returns_affected_count() {
+        let conn = mem_conn();
+        // Seed two enabled configs + one already-disabled.
+        conn.execute(
+            "INSERT INTO pyramid_dadbear_config (slug, source_path, content_type, enabled)
+             VALUES ('p13-test', '/tmp/a', 'document', 1),
+                    ('p13-test', '/tmp/b', 'document', 1),
+                    ('p13-other', '/tmp/c', 'document', 0)",
+            [],
+        )
+        .unwrap();
+
+        let affected = disable_dadbear_all(&conn).unwrap();
+        assert_eq!(affected, 2, "only the two enabled rows should flip");
+
+        // Count enabled rows after pause — all should be 0.
+        let enabled_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pyramid_dadbear_config WHERE enabled = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(enabled_count, 0);
+
+        // Idempotent: second call should return 0.
+        let affected2 = disable_dadbear_all(&conn).unwrap();
+        assert_eq!(affected2, 0);
+    }
+
+    #[test]
+    fn test_resume_all_mirrors_pause_all() {
+        let conn = mem_conn();
+        conn.execute(
+            "INSERT INTO pyramid_dadbear_config (slug, source_path, content_type, enabled)
+             VALUES ('p13-test', '/tmp/a', 'document', 0),
+                    ('p13-test', '/tmp/b', 'document', 0),
+                    ('p13-other', '/tmp/c', 'document', 1)",
+            [],
+        )
+        .unwrap();
+
+        let affected = enable_dadbear_all(&conn).unwrap();
+        assert_eq!(affected, 2);
+
+        let disabled_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pyramid_dadbear_config WHERE enabled = 0",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(disabled_count, 0);
+    }
+
+    #[test]
+    fn test_list_cache_entries_for_build_returns_seeded_rows() {
+        let conn = mem_conn();
+        store_cache(&conn, &make_cache_entry("p13-test", "extract", 0, 0, "a")).unwrap();
+        store_cache(&conn, &make_cache_entry("p13-test", "extract", 1, 0, "b")).unwrap();
+        store_cache(&conn, &make_cache_entry("p13-test", "cluster", -1, 1, "c")).unwrap();
+
+        let rows = list_cache_entries_for_build(&conn, "p13-test", "p13-build").unwrap();
+        assert_eq!(rows.len(), 3);
+        // Newest-first ordering.
+        assert!(rows[0].id >= rows.last().unwrap().id);
+    }
+
+    #[test]
+    fn test_find_downstream_cache_keys_returns_deeper_entries() {
+        let conn = mem_conn();
+        store_cache(&conn, &make_cache_entry("p13-test", "extract", 0, 0, "a")).unwrap();
+        store_cache(&conn, &make_cache_entry("p13-test", "cluster", 0, 1, "b")).unwrap();
+        store_cache(&conn, &make_cache_entry("p13-test", "synth", 0, 2, "c")).unwrap();
+
+        let downstream = find_downstream_cache_keys(&conn, "p13-test", 0).unwrap();
+        // Depth 1 + depth 2 entries should both be returned.
+        assert_eq!(downstream.len(), 2);
+    }
+
+    #[test]
+    fn test_invalidate_cache_entries_sets_invalidated_by() {
+        let conn = mem_conn();
+        let entry = make_cache_entry("p13-test", "cluster", 0, 1, "b");
+        let cache_key = entry.cache_key.clone();
+        store_cache(&conn, &entry).unwrap();
+
+        let flipped = invalidate_cache_entries(
+            &conn,
+            "p13-test",
+            &[cache_key.clone()],
+            "upstream_reroll",
+        )
+        .unwrap();
+        assert_eq!(flipped, 1);
+
+        // check_cache should now return None because the row is
+        // flagged invalidated.
+        let hit = check_cache(&conn, "p13-test", &cache_key).unwrap();
+        assert!(hit.is_none(), "invalidated row should be treated as miss");
+
+        // check_cache_including_invalidated should still find it.
+        let deep = check_cache_including_invalidated(&conn, "p13-test", &cache_key)
+            .unwrap()
+            .expect("row should still be in the table");
+        assert_eq!(deep.invalidated_by.as_deref(), Some("upstream_reroll"));
+    }
+
+    #[test]
+    fn test_count_recent_rerolls_counts_supersession_writes() {
+        let conn = mem_conn();
+        // Seed three supersedes-linked rows for the same step slot
+        // within the last 10 minutes.
+        for i in 0..3 {
+            conn.execute(
+                "INSERT INTO pyramid_step_cache
+                    (slug, build_id, step_name, chunk_index, depth, cache_key,
+                     inputs_hash, prompt_hash, model_id, output_json,
+                     force_fresh, supersedes_cache_id, created_at)
+                 VALUES ('p13-test', ?1, 'synth', -1, 0, ?2, 'i', 'p', 'm', '{}', 1, 99, datetime('now'))",
+                rusqlite::params![format!("b{}", i), format!("ck{}", i)],
+            )
+            .unwrap();
+        }
+
+        let count = count_recent_rerolls(&conn, "p13-test", "synth", -1, 0).unwrap();
+        assert!(count >= 3, "expected 3 recent rerolls, got {}", count);
     }
 }

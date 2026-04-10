@@ -40,6 +40,8 @@ pub mod demand_gen;
 pub mod delta;
 pub mod demand_signal;
 pub mod triage;
+pub mod reroll;
+pub mod cross_pyramid_router;
 pub mod event_bus;
 pub mod event_chain;
 pub mod public_html;
@@ -816,6 +818,12 @@ pub struct PyramidState {
     /// calls `SchemaRegistry::invalidate` after a schema_definition
     /// supersession lands.
     pub schema_registry: Arc<schema_registry::SchemaRegistry>,
+    /// Phase 13: cross-pyramid event router. Tracks which slugs have
+    /// active builds so the frontend's CrossPyramidTimeline can seed
+    /// from a single IPC query, and owns the Tauri forwarder that
+    /// re-emits every build event as a `cross-build-event` so the
+    /// frontend can listen once across all slugs.
+    pub cross_pyramid_router: Arc<cross_pyramid_router::CrossPyramidEventRouter>,
 }
 
 impl PyramidState {
@@ -929,6 +937,7 @@ impl PyramidState {
             provider_registry: self.provider_registry.clone(),
             credential_store: self.credential_store.clone(),
             schema_registry: self.schema_registry.clone(),
+            cross_pyramid_router: self.cross_pyramid_router.clone(),
         }))
     }
 }

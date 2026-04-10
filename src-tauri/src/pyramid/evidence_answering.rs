@@ -413,6 +413,21 @@ pub async fn answer_questions(
         });
     }
 
+    // Phase 13: capture bus + build_id once for all event emissions
+    // in this function. `bus_for_events` is None when the config has
+    // no cache plumbing (unit tests), in which case the emit helpers
+    // all no-op.
+    let bus_for_events = llm_config
+        .cache_access
+        .as_ref()
+        .and_then(|ca| ca.bus.clone());
+    let build_id_for_events = llm_config
+        .cache_access
+        .as_ref()
+        .map(|ca| ca.build_id.clone())
+        .unwrap_or_else(|| format!("{}-evidence", slug));
+    let step_name_for_events = "answer_questions".to_string();
+
     // ── Phase 12: Triage gate ───────────────────────────────────────
     //
     // Before dispatching questions to the expensive answering path,
@@ -426,6 +441,23 @@ pub async fn answer_questions(
     // populated (i.e. we have a db_path to read the policy from).
     // Unit tests that don't set cache_access keep the pre-Phase-12
     // behavior.
+
+    // Phase 13: emit EvidenceProcessing { action: "triage" } at the
+    // start of the triage pass.
+    if let Some(bus) = bus_for_events.as_ref() {
+        let _ = bus.tx.send(crate::pyramid::event_bus::TaggedBuildEvent {
+            slug: slug.to_string(),
+            kind: crate::pyramid::event_bus::TaggedKind::EvidenceProcessing {
+                slug: slug.to_string(),
+                build_id: build_id_for_events.clone(),
+                step_name: step_name_for_events.clone(),
+                question_count: questions.len() as i64,
+                action: "triage".to_string(),
+                model_tier: "fast_extract".to_string(),
+            },
+        });
+    }
+
     let (triaged_questions, triage_stats) = if let Some(ca) = llm_config.cache_access.as_ref() {
         let db_path = ca.db_path.to_string();
         let slug_for_triage = slug.to_string();
@@ -440,6 +472,26 @@ pub async fn answer_questions(
         })
         .await
         .map_err(|e| anyhow!("triage gate join error: {}", e))??;
+
+        // Phase 13: emit one TriageDecision event per question. This
+        // gives the UI a concrete per-question view — the spec says
+        // every decision is its own row.
+        if let Some(bus) = bus_for_events.as_ref() {
+            for rec in &triage_result.decisions {
+                let _ = bus.tx.send(crate::pyramid::event_bus::TaggedBuildEvent {
+                    slug: slug.to_string(),
+                    kind: crate::pyramid::event_bus::TaggedKind::TriageDecision {
+                        slug: slug.to_string(),
+                        build_id: build_id_for_events.clone(),
+                        step_name: step_name_for_events.clone(),
+                        item_id: rec.question_id.clone(),
+                        decision: rec.decision_tag.clone(),
+                        reason: rec.reason.clone(),
+                    },
+                });
+            }
+        }
+
         (triage_result.answer_questions, triage_result.stats)
     } else {
         // No cache_access → triage disabled; all questions answered.
@@ -473,6 +525,24 @@ pub async fn answer_questions(
     // bucket. `questions` shadows the original slice with a
     // `Vec<LayerQuestion>`.
     let questions: &[LayerQuestion] = &triaged_questions;
+
+    // Phase 13: emit EvidenceProcessing { action: "answer" } at the
+    // start of the parallel answering loop. `question_count` is the
+    // post-triage size; the UI can diff against the earlier "triage"
+    // event to render the "N deferred, M answered" split.
+    if let Some(bus) = bus_for_events.as_ref() {
+        let _ = bus.tx.send(crate::pyramid::event_bus::TaggedBuildEvent {
+            slug: slug.to_string(),
+            kind: crate::pyramid::event_bus::TaggedKind::EvidenceProcessing {
+                slug: slug.to_string(),
+                build_id: build_id_for_events.clone(),
+                step_name: step_name_for_events.clone(),
+                question_count: questions.len() as i64,
+                action: "answer".to_string(),
+                model_tier: "synth_heavy".to_string(),
+            },
+        });
+    }
 
     // Build a lookup map for all nodes by ORIGINAL ID
     let node_map: HashMap<&str, &PyramidNode> =
@@ -1901,10 +1971,24 @@ pub struct TriageStats {
     pub skipped: usize,
 }
 
+/// Per-question triage decision record captured for Phase 13
+/// observability. The tuple is `(question_id, decision_tag, reason)`
+/// where `decision_tag` is one of `"answer"`, `"defer"`, `"skip"`.
+/// Reason carries the matched rule description or a default tag.
+#[derive(Debug, Clone)]
+pub struct TriageDecisionRecord {
+    pub question_id: String,
+    pub decision_tag: String,
+    pub reason: String,
+}
+
 /// Result of running the triage gate over a batch of questions.
 pub struct TriageGateResult {
     pub answer_questions: Vec<LayerQuestion>,
     pub stats: TriageStats,
+    /// Phase 13: per-question decisions in the order they were made,
+    /// so the caller can emit `TriageDecision` events on the bus.
+    pub decisions: Vec<TriageDecisionRecord>,
 }
 
 /// Phase 12: Open a connection, load the active evidence_policy,
@@ -1939,9 +2023,18 @@ pub fn run_triage_gate(
                 "triage gate: failed to open DB connection, falling back to answer-all"
             );
             stats.answered = questions.len();
+            let decisions = questions
+                .iter()
+                .map(|q| TriageDecisionRecord {
+                    question_id: q.question_id.clone(),
+                    decision_tag: "answer".into(),
+                    reason: "no_policy_conn".into(),
+                })
+                .collect();
             return Ok(TriageGateResult {
                 answer_questions: questions.to_vec(),
                 stats,
+                decisions,
             });
         }
     };
@@ -1954,9 +2047,18 @@ pub fn run_triage_gate(
                 "triage gate: failed to load evidence policy, falling back to answer-all"
             );
             stats.answered = questions.len();
+            let decisions = questions
+                .iter()
+                .map(|q| TriageDecisionRecord {
+                    question_id: q.question_id.clone(),
+                    decision_tag: "answer".into(),
+                    reason: "policy_load_failed".into(),
+                })
+                .collect();
             return Ok(TriageGateResult {
                 answer_questions: questions.to_vec(),
                 stats,
+                decisions,
             });
         }
     };
@@ -1964,9 +2066,18 @@ pub fn run_triage_gate(
     // If no rules are configured, skip the gate entirely.
     if policy.triage_rules.is_empty() {
         stats.answered = questions.len();
+        let decisions = questions
+            .iter()
+            .map(|q| TriageDecisionRecord {
+                question_id: q.question_id.clone(),
+                decision_tag: "answer".into(),
+                reason: "no_rules".into(),
+            })
+            .collect();
         return Ok(TriageGateResult {
             answer_questions: questions.to_vec(),
             stats,
+            decisions,
         });
     }
 
@@ -1984,6 +2095,7 @@ pub fn run_triage_gate(
         .unwrap_or(false);
 
     let mut answer_bucket: Vec<LayerQuestion> = Vec::new();
+    let mut decisions: Vec<TriageDecisionRecord> = Vec::with_capacity(questions.len());
 
     // Phase 12 wanderer fix: `has_demand_signals` is evaluated
     // ONCE per triage pass, at slug granularity, not per-question.
@@ -2038,14 +2150,21 @@ pub fn run_triage_gate(
         };
 
         match decision {
-            TriageDecision::Answer { .. } => {
+            TriageDecision::Answer { ref model_tier } => {
+                decisions.push(TriageDecisionRecord {
+                    question_id: question.question_id.clone(),
+                    decision_tag: "answer".to_string(),
+                    reason: format!("model_tier={}", model_tier),
+                });
                 answer_bucket.push(question.clone());
                 stats.answered += 1;
             }
             TriageDecision::Defer {
-                check_interval,
-                triage_reason,
+                ref check_interval,
+                ref triage_reason,
             } => {
+                let check_interval = check_interval.clone();
+                let triage_reason = triage_reason.clone();
                 let qjson = serde_json::to_string(question).unwrap_or_else(|_| "{}".into());
                 let contribution_id = policy.contribution_id.as_deref();
                 if let Err(e) = db::defer_question(
@@ -2062,18 +2181,34 @@ pub fn run_triage_gate(
                         error = %e,
                         "triage defer: failed to persist deferred question, answering instead"
                     );
+                    decisions.push(TriageDecisionRecord {
+                        question_id: question.question_id.clone(),
+                        decision_tag: "answer".to_string(),
+                        reason: format!("defer_persist_failed: {}", e),
+                    });
                     answer_bucket.push(question.clone());
                     stats.answered += 1;
                 } else {
+                    decisions.push(TriageDecisionRecord {
+                        question_id: question.question_id.clone(),
+                        decision_tag: "defer".to_string(),
+                        reason: triage_reason,
+                    });
                     stats.deferred += 1;
                 }
             }
-            TriageDecision::Skip { reason } => {
+            TriageDecision::Skip { ref reason } => {
+                let reason = reason.clone();
                 info!(
                     question_id = %question.question_id,
                     reason = %reason,
                     "triage skip: dropping question"
                 );
+                decisions.push(TriageDecisionRecord {
+                    question_id: question.question_id.clone(),
+                    decision_tag: "skip".to_string(),
+                    reason,
+                });
                 stats.skipped += 1;
             }
         }
@@ -2082,6 +2217,7 @@ pub fn run_triage_gate(
     Ok(TriageGateResult {
         answer_questions: answer_bucket,
         stats,
+        decisions,
     })
 }
 

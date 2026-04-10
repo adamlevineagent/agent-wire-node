@@ -94,6 +94,38 @@ fn audience_value_to_legacy_string(v: &Value) -> Option<String> {
     }
 }
 
+// ── Phase 13: Build-event emission helper ───────────────────────────────────
+//
+// Chain-executor step sites (`execute_web_step`, `execute_recursive_cluster`,
+// gap processing, etc.) emit TaggedKind variants via the bus attached to the
+// dispatch context's cache_base. No-op when cache_base is absent (legacy test
+// paths). Kept private to this module — other modules have their own
+// emission helpers.
+fn emit_chain_event(
+    dispatch_ctx: &chain_dispatch::StepContext,
+    kind: crate::pyramid::event_bus::TaggedKind,
+) {
+    if let Some(cb) = dispatch_ctx.cache_base.as_ref() {
+        if let Some(bus) = cb.bus.as_ref() {
+            let _ = bus.tx.send(crate::pyramid::event_bus::TaggedBuildEvent {
+                slug: dispatch_ctx.slug.clone(),
+                kind,
+            });
+        }
+    }
+}
+
+/// Extract the build_id stored on the cache_base, or fall back to a
+/// synthetic id derived from the slug. The synthetic fallback should
+/// only be reached in tests where cache_base is `None`.
+fn dispatch_build_id(dispatch_ctx: &chain_dispatch::StepContext) -> String {
+    dispatch_ctx
+        .cache_base
+        .as_ref()
+        .map(|cb| cb.build_id.clone())
+        .unwrap_or_else(|| format!("{}-no-cache", dispatch_ctx.slug))
+}
+
 // ── Error strategy ──────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq)]
@@ -5605,6 +5637,23 @@ async fn execute_process_gaps(
         "starting gap processing pass"
     );
 
+    // Phase 13: emit GapProcessing { action: "identify" } at the start
+    // of the loop. Depth is 0 for gap processing — gaps are filled by
+    // re-examining L0 source files.
+    let _ = state.build_event_bus.tx.send(
+        crate::pyramid::event_bus::TaggedBuildEvent {
+            slug: slug.to_string(),
+            kind: crate::pyramid::event_bus::TaggedKind::GapProcessing {
+                slug: slug.to_string(),
+                build_id: gaps_build_id.clone(),
+                step_name: step.name.clone(),
+                depth: 0,
+                gap_count: unresolved_gaps.len() as i64,
+                action: "identify".to_string(),
+            },
+        },
+    );
+
     let mut gaps_processed = 0;
     let mut gaps_with_new_evidence = 0;
 
@@ -5835,6 +5884,22 @@ async fn execute_process_gaps(
     info!(
         slug,
         gaps_processed, gaps_with_new_evidence, "gap processing pass complete"
+    );
+
+    // Phase 13: emit GapProcessing { action: "fill" } at the end so
+    // the UI can flip the step row to complete with a summary count.
+    let _ = state.build_event_bus.tx.send(
+        crate::pyramid::event_bus::TaggedBuildEvent {
+            slug: slug.to_string(),
+            kind: crate::pyramid::event_bus::TaggedKind::GapProcessing {
+                slug: slug.to_string(),
+                build_id: gaps_build_id.clone(),
+                step_name: step.name.clone(),
+                depth: 0,
+                gap_count: gaps_processed as i64,
+                action: "fill".to_string(),
+            },
+        },
     );
 
     Ok(serde_json::json!({
@@ -8367,6 +8432,27 @@ async fn execute_recursive_cluster(
                 &dispatch_ctx.config.primary_model,
             )
             .await?;
+
+            // Phase 13: emit ClusterAssignment after the clusters are
+            // saved. Count the clusters produced so the UI can show
+            // "grouped 72 nodes into 5 clusters" as a single discrete
+            // event.
+            let cluster_count = output
+                .get("clusters")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.len() as i64)
+                .unwrap_or(0);
+            emit_chain_event(
+                dispatch_ctx,
+                crate::pyramid::event_bus::TaggedKind::ClusterAssignment {
+                    slug: ctx.slug.clone(),
+                    build_id: dispatch_build_id(dispatch_ctx),
+                    step_name: step.name.clone(),
+                    depth: target_depth,
+                    node_count: current_nodes.len() as i64,
+                    cluster_count,
+                },
+            );
             output
         };
 
@@ -9184,6 +9270,18 @@ async fn execute_web_step(
         ));
     }
 
+    // Phase 13: emit WebEdgeStarted before the webbing LLM batch.
+    let webbing_started_at = std::time::Instant::now();
+    emit_chain_event(
+        dispatch_ctx,
+        crate::pyramid::event_bus::TaggedKind::WebEdgeStarted {
+            slug: ctx.slug.clone(),
+            build_id: dispatch_build_id(dispatch_ctx),
+            step_name: step.name.clone(),
+            source_node_count: nodes.len() as i64,
+        },
+    );
+
     let normalized_edges = if nodes.len() >= 2 {
         let max_tokens = step.max_input_tokens.unwrap_or(80_000);
         web_nodes_batched(
@@ -9274,6 +9372,18 @@ async fn execute_web_step(
         depth,
         nodes.len(),
         saved_edge_count
+    );
+
+    // Phase 13: emit WebEdgeCompleted after edges are persisted.
+    emit_chain_event(
+        dispatch_ctx,
+        crate::pyramid::event_bus::TaggedKind::WebEdgeCompleted {
+            slug: ctx.slug.clone(),
+            build_id: dispatch_build_id(dispatch_ctx),
+            step_name: step.name.clone(),
+            edges_created: saved_edge_count as i64,
+            latency_ms: webbing_started_at.elapsed().as_millis() as i64,
+        },
     );
 
     Ok(final_output)
@@ -14643,6 +14753,9 @@ mod tests {
             schema_registry: std::sync::Arc::new(
                 crate::pyramid::schema_registry::SchemaRegistry::new(),
             ),
+            cross_pyramid_router: std::sync::Arc::new(
+                crate::pyramid::cross_pyramid_router::CrossPyramidEventRouter::new(),
+            ),
         };
 
         let chain = make_integration_code_chain();
@@ -14743,6 +14856,9 @@ mod tests {
             },
             schema_registry: std::sync::Arc::new(
                 crate::pyramid::schema_registry::SchemaRegistry::new(),
+            ),
+            cross_pyramid_router: std::sync::Arc::new(
+                crate::pyramid::cross_pyramid_router::CrossPyramidEventRouter::new(),
             ),
         };
 
@@ -14865,6 +14981,9 @@ mod tests {
             schema_registry: std::sync::Arc::new(
                 crate::pyramid::schema_registry::SchemaRegistry::new(),
             ),
+            cross_pyramid_router: std::sync::Arc::new(
+                crate::pyramid::cross_pyramid_router::CrossPyramidEventRouter::new(),
+            ),
         };
 
         assert!(!pyramid_state
@@ -14949,6 +15068,9 @@ mod tests {
             },
             schema_registry: std::sync::Arc::new(
                 crate::pyramid::schema_registry::SchemaRegistry::new(),
+            ),
+            cross_pyramid_router: std::sync::Arc::new(
+                crate::pyramid::cross_pyramid_router::CrossPyramidEventRouter::new(),
             ),
         };
 

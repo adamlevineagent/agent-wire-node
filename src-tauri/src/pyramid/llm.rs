@@ -623,6 +623,19 @@ pub async fn call_model_unified_with_options_and_ctx(
         // Rate limit: wait for sliding window capacity
         rate_limit_wait(config.rate_limit_max_requests, config.rate_limit_window_secs).await;
 
+        // Phase 13: emit LlmCallStarted once per HTTP dispatch. We
+        // emit inside the retry loop so every attempt gets its own
+        // timeline entry — the UI can render a "retrying" status
+        // without guessing. The cache_key may be absent for legacy
+        // call sites without a cache-usable ctx; in that case we
+        // pass an empty string so the event is still emitted but the
+        // correlation key is empty.
+        let cache_key_for_event = cache_lookup
+            .as_ref()
+            .map(|l| l.cache_key.clone())
+            .unwrap_or_default();
+        emit_llm_call_started(ctx, &use_model, &cache_key_for_event);
+
         let mut request = client.post(&url).timeout(timeout);
         for (k, v) in &built_headers {
             request = request.header(k, v);
@@ -639,6 +652,15 @@ pub async fn call_model_unified_with_options_and_ctx(
                         e,
                         attempt + 1
                     );
+                    // Phase 13: per-attempt retry event.
+                    let backoff_ms = (config.retry_base_sleep_secs as i64) * 1000;
+                    emit_step_retry(
+                        ctx,
+                        attempt as i64,
+                        config.max_retries as i64,
+                        &format!("request error: {}", e),
+                        backoff_ms,
+                    );
                     tokio::time::sleep(std::time::Duration::from_secs(config.retry_base_sleep_secs)).await;
                     continue;
                 }
@@ -651,12 +673,16 @@ pub async fn call_model_unified_with_options_and_ctx(
                     &health_provider_id,
                     super::provider_health::ProviderErrorKind::ConnectionFailure,
                 );
-                return Err(anyhow!(
+                // Phase 13: terminal error event so the UI can flip
+                // the step row to `failed`.
+                let err_msg = format!(
                     "Request failed after {} attempts (timeout={}s): {}",
                     config.max_retries,
                     timeout.as_secs(),
                     e
-                ));
+                );
+                emit_step_error(ctx, &err_msg);
+                return Err(anyhow!(err_msg));
             }
         };
 
@@ -732,6 +758,14 @@ pub async fn call_model_unified_with_options_and_ctx(
                     super::provider_health::ProviderErrorKind::Http5xx,
                 );
             }
+            // Phase 13: step retry event.
+            emit_step_retry(
+                ctx,
+                attempt as i64,
+                config.max_retries as i64,
+                &format!("HTTP {} retry", status),
+                (wait as i64) * 1000,
+            );
             tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
             continue;
         }
@@ -741,6 +775,14 @@ pub async fn call_model_unified_with_options_and_ctx(
             let body_text = resp.text().await.unwrap_or_default();
             if attempt + 1 < config.max_retries {
                 info!("  HTTP {}, retry {}...", status, attempt + 1);
+                // Phase 13: step retry event.
+                emit_step_retry(
+                    ctx,
+                    attempt as i64,
+                    config.max_retries as i64,
+                    &format!("HTTP {} retry", status),
+                    (config.retry_base_sleep_secs as i64) * 1000,
+                );
                 tokio::time::sleep(std::time::Duration::from_secs(config.retry_base_sleep_secs)).await;
                 continue;
             }
@@ -755,7 +797,14 @@ pub async fn call_model_unified_with_options_and_ctx(
                     super::provider_health::ProviderErrorKind::Http5xx,
                 );
             }
-            return Err(anyhow!("HTTP {} after {} attempts: {}", status, config.max_retries, body_text));
+            let err_msg = format!(
+                "HTTP {} after {} attempts: {}",
+                status,
+                config.max_retries,
+                &body_text[..body_text.len().min(200)]
+            );
+            emit_step_error(ctx, &err_msg);
+            return Err(anyhow!(err_msg));
         }
 
         let body_text = match resp.text().await {
@@ -768,10 +817,22 @@ pub async fn call_model_unified_with_options_and_ctx(
                         e,
                         attempt + 1
                     );
+                    emit_step_retry(
+                        ctx,
+                        attempt as i64,
+                        config.max_retries as i64,
+                        &format!("response read error: {}", e),
+                        (config.retry_base_sleep_secs as i64) * 1000,
+                    );
                     tokio::time::sleep(std::time::Duration::from_secs(config.retry_base_sleep_secs)).await;
                     continue;
                 }
-                return Err(anyhow!("Failed to read response after {} attempts: {}", config.max_retries, e));
+                let err_msg = format!(
+                    "Failed to read response after {} attempts: {}",
+                    config.max_retries, e
+                );
+                emit_step_error(ctx, &err_msg);
+                return Err(anyhow!(err_msg));
             }
         };
 
@@ -798,14 +859,22 @@ pub async fn call_model_unified_with_options_and_ctx(
                 }
                 if attempt + 1 < config.max_retries {
                     info!("  parse error, retry {}...", attempt + 1);
+                    emit_step_retry(
+                        ctx,
+                        attempt as i64,
+                        config.max_retries as i64,
+                        &format!("parse error: {}", e),
+                        (config.retry_base_sleep_secs as i64) * 1000,
+                    );
                     tokio::time::sleep(std::time::Duration::from_secs(config.retry_base_sleep_secs)).await;
                     continue;
                 }
-                return Err(anyhow!(
+                let err_msg = format!(
                     "Failed to parse response after {} attempts: {}",
-                    config.max_retries,
-                    e
-                ));
+                    config.max_retries, e
+                );
+                emit_step_error(ctx, &err_msg);
+                return Err(anyhow!(err_msg));
             }
         };
 
@@ -845,13 +914,22 @@ pub async fn call_model_unified_with_options_and_ctx(
         if parsed.content.is_empty() {
             if attempt + 1 < config.max_retries {
                 info!("  empty content, retry {}...", attempt + 1);
+                emit_step_retry(
+                    ctx,
+                    attempt as i64,
+                    config.max_retries as i64,
+                    "empty content",
+                    (config.retry_base_sleep_secs as i64) * 1000,
+                );
                 tokio::time::sleep(std::time::Duration::from_secs(config.retry_base_sleep_secs)).await;
                 continue;
             }
-            return Err(anyhow!(
+            let err_msg = format!(
                 "Model returned empty content after {} attempts",
                 config.max_retries
-            ));
+            );
+            emit_step_error(ctx, &err_msg);
+            return Err(anyhow!(err_msg));
         }
 
         let response = LlmResponse {
@@ -874,10 +952,29 @@ pub async fn call_model_unified_with_options_and_ctx(
         // when the lookup phase didn't compute a key.
         try_cache_store(ctx, cache_lookup.as_ref(), &response, call_started);
 
+        // Phase 13: emit LlmCallCompleted on the success exit. The
+        // actual cost from OpenRouter is preferred when present;
+        // otherwise we fall back to a heuristic estimate based on
+        // token counts so the running total is never empty.
+        let cost_usd = response
+            .actual_cost_usd
+            .unwrap_or_else(|| super::config_helper::estimate_cost(&response.usage));
+        let latency_ms = call_started.elapsed().as_millis() as i64;
+        emit_llm_call_completed(
+            ctx,
+            &use_model,
+            &cache_key_for_event,
+            &response.usage,
+            cost_usd,
+            latency_ms,
+        );
+
         return Ok(response);
     }
 
-    Err(anyhow!("Max retries exceeded"))
+    let err_msg = "Max retries exceeded".to_string();
+    emit_step_error(ctx, &err_msg);
+    Err(anyhow!(err_msg))
 }
 
 // ── Phase 6: Cache support types and helpers ────────────────────────────────
@@ -959,6 +1056,121 @@ fn emit_cache_event(ctx: &StepContext, kind: TaggedKind) {
             kind,
         });
     }
+}
+
+/// Phase 13: emit an arbitrary TaggedKind on the ctx's bus if present.
+/// Mirrors `emit_cache_event` but without restricting to the
+/// cache-related variants. Used by the LLM call path for
+/// `LlmCallStarted` / `LlmCallCompleted` / `StepRetry` / `StepError`.
+/// Private to llm.rs — call sites in other modules have their own
+/// emission helpers that thread the bus differently.
+fn emit_build_event(ctx: &StepContext, kind: TaggedKind) {
+    if let Some(bus) = ctx.bus.as_ref() {
+        let _ = bus.tx.send(TaggedBuildEvent {
+            slug: ctx.slug.clone(),
+            kind,
+        });
+    }
+}
+
+/// Phase 13: helper for the retry loop to emit `StepRetry` on each
+/// attempt. Called from inside the retry path only when an HTTP error,
+/// 5xx response, parse failure, or empty-content retry triggers a
+/// backoff. `attempt` is 0-indexed internally but we emit 1-indexed
+/// for the UI (attempt 1 = "first retry after initial failure").
+fn emit_step_retry(
+    ctx: Option<&StepContext>,
+    attempt: i64,
+    max_attempts: i64,
+    error: &str,
+    backoff_ms: i64,
+) {
+    let Some(sc) = ctx else {
+        return;
+    };
+    emit_build_event(
+        sc,
+        TaggedKind::StepRetry {
+            slug: sc.slug.clone(),
+            build_id: sc.build_id.clone(),
+            step_name: sc.step_name.clone(),
+            attempt: attempt + 1,
+            max_attempts,
+            error: error.to_string(),
+            backoff_ms,
+        },
+    );
+}
+
+/// Phase 13: helper to emit `StepError` after retries are exhausted or
+/// when a fatal error occurs outside the retry loop.
+fn emit_step_error(ctx: Option<&StepContext>, error: &str) {
+    let Some(sc) = ctx else {
+        return;
+    };
+    emit_build_event(
+        sc,
+        TaggedKind::StepError {
+            slug: sc.slug.clone(),
+            build_id: sc.build_id.clone(),
+            step_name: sc.step_name.clone(),
+            error: error.to_string(),
+            depth: sc.depth,
+            chunk_index: sc.chunk_index,
+        },
+    );
+}
+
+/// Phase 13: emit `LlmCallStarted` for every HTTP dispatch (including
+/// retries — each attempt is a distinct network call). Gated on the
+/// presence of a StepContext + a resolved model id; without those we
+/// have no primary key for the timeline row.
+fn emit_llm_call_started(ctx: Option<&StepContext>, model_id: &str, cache_key: &str) {
+    let Some(sc) = ctx else {
+        return;
+    };
+    emit_build_event(
+        sc,
+        TaggedKind::LlmCallStarted {
+            slug: sc.slug.clone(),
+            build_id: sc.build_id.clone(),
+            step_name: sc.step_name.clone(),
+            primitive: sc.primitive.clone(),
+            model_tier: sc.model_tier.clone(),
+            model_id: model_id.to_string(),
+            cache_key: cache_key.to_string(),
+            depth: sc.depth,
+            chunk_index: sc.chunk_index,
+        },
+    );
+}
+
+/// Phase 13: emit `LlmCallCompleted` after a successful response parse.
+fn emit_llm_call_completed(
+    ctx: Option<&StepContext>,
+    model_id: &str,
+    cache_key: &str,
+    usage: &TokenUsage,
+    cost_usd: f64,
+    latency_ms: i64,
+) {
+    let Some(sc) = ctx else {
+        return;
+    };
+    emit_build_event(
+        sc,
+        TaggedKind::LlmCallCompleted {
+            slug: sc.slug.clone(),
+            build_id: sc.build_id.clone(),
+            step_name: sc.step_name.clone(),
+            cache_key: cache_key.to_string(),
+            tokens_prompt: usage.prompt_tokens,
+            tokens_completion: usage.completion_tokens,
+            cost_usd,
+            latency_ms,
+            model_id: model_id.to_string(),
+        },
+    );
 }
 
 /// Result of a cache probe performed by `try_cache_lookup_or_key`.
@@ -1232,6 +1444,11 @@ fn try_cache_store(
         latency_ms: Some(latency_ms),
         force_fresh: sc.force_fresh,
         supersedes_cache_id: None,
+        // Phase 13: the normal cache-store path doesn't attach a note.
+        // Only the reroll IPC attaches a note, and it calls
+        // `supersede_cache_entry` directly rather than going through
+        // the LLM retry loop's store path.
+        note: None,
     };
     let db_path = sc.db_path.clone();
     let slug_for_write = sc.slug.clone();
@@ -1500,6 +1717,11 @@ pub async fn call_model_via_registry(
         config.timeout_increment_secs,
     );
 
+    let cache_key_for_event = cache_lookup
+        .as_ref()
+        .map(|l| l.cache_key.clone())
+        .unwrap_or_default();
+
     for attempt in 0..config.max_retries {
         let mut body = serde_json::json!({
             "model": resolved.tier.model_id,
@@ -1521,6 +1743,9 @@ pub async fn call_model_via_registry(
 
         rate_limit_wait(config.rate_limit_max_requests, config.rate_limit_window_secs).await;
 
+        // Phase 13: emit LlmCallStarted once per HTTP dispatch.
+        emit_llm_call_started(ctx, &resolved.tier.model_id, &cache_key_for_event);
+
         let mut request = client.post(&url).timeout(timeout);
         for (k, v) in &headers {
             request = request.header(k, v);
@@ -1535,6 +1760,13 @@ pub async fn call_model_via_registry(
                         timeout.as_secs(),
                         e,
                         attempt + 1
+                    );
+                    emit_step_retry(
+                        ctx,
+                        attempt as i64,
+                        config.max_retries as i64,
+                        &format!("request error: {}", e),
+                        (config.retry_base_sleep_secs as i64) * 1000,
                     );
                     tokio::time::sleep(std::time::Duration::from_secs(
                         config.retry_base_sleep_secs,
@@ -1551,12 +1783,12 @@ pub async fn call_model_via_registry(
                     &resolved.provider.id,
                     super::provider_health::ProviderErrorKind::ConnectionFailure,
                 );
-                return Err(anyhow!(
+                let err_msg = format!(
                     "Request to tier `{}` failed after {} attempts: {}",
-                    tier_name,
-                    config.max_retries,
-                    e
-                ));
+                    tier_name, config.max_retries, e
+                );
+                emit_step_error(ctx, &err_msg);
+                return Err(anyhow!(err_msg));
             }
         };
 
@@ -1578,6 +1810,13 @@ pub async fn call_model_via_registry(
                     super::provider_health::ProviderErrorKind::Http5xx,
                 );
             }
+            emit_step_retry(
+                ctx,
+                attempt as i64,
+                config.max_retries as i64,
+                &format!("HTTP {} retry", status),
+                (wait as i64) * 1000,
+            );
             tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
             continue;
         }
@@ -1590,13 +1829,15 @@ pub async fn call_model_via_registry(
                     super::provider_health::ProviderErrorKind::Http5xx,
                 );
             }
-            return Err(anyhow!(
+            let err_msg = format!(
                 "HTTP {} from tier `{}` (provider={}): {}",
                 status,
                 tier_name,
                 provider_type.as_str(),
-                &body_text[..body_text.len().min(500)]
-            ));
+                &body_text[..body_text.len().min(200)]
+            );
+            emit_step_error(ctx, &err_msg);
+            return Err(anyhow!(err_msg));
         }
 
         let body_text = resp.text().await?;
@@ -1609,15 +1850,23 @@ pub async fn call_model_via_registry(
                     tier_name,
                     attempt + 1
                 );
+                emit_step_retry(
+                    ctx,
+                    attempt as i64,
+                    config.max_retries as i64,
+                    "empty content",
+                    (config.retry_base_sleep_secs as i64) * 1000,
+                );
                 tokio::time::sleep(std::time::Duration::from_secs(config.retry_base_sleep_secs))
                     .await;
                 continue;
             }
-            return Err(anyhow!(
+            let err_msg = format!(
                 "tier `{}` returned empty content after {} attempts",
-                tier_name,
-                config.max_retries
-            ));
+                tier_name, config.max_retries
+            );
+            emit_step_error(ctx, &err_msg);
+            return Err(anyhow!(err_msg));
         }
 
         info!(
@@ -1641,10 +1890,26 @@ pub async fn call_model_via_registry(
         // ── Phase 6 (fix pass): Cache store path ───────────────────
         try_cache_store(ctx, cache_lookup.as_ref(), &response, call_started);
 
+        // Phase 13: emit LlmCallCompleted on success.
+        let cost_usd = response
+            .actual_cost_usd
+            .unwrap_or_else(|| super::config_helper::estimate_cost(&response.usage));
+        let latency_ms = call_started.elapsed().as_millis() as i64;
+        emit_llm_call_completed(
+            ctx,
+            &resolved.tier.model_id,
+            &cache_key_for_event,
+            &response.usage,
+            cost_usd,
+            latency_ms,
+        );
+
         return Ok(response);
     }
 
-    Err(anyhow!("Max retries exceeded for tier `{}`", tier_name))
+    let err_msg = format!("Max retries exceeded for tier `{}`", tier_name);
+    emit_step_error(ctx, &err_msg);
+    Err(anyhow!(err_msg))
 }
 
 /// Call OpenRouter with structured output enforcement via JSON schema.
@@ -2309,6 +2574,7 @@ mod tests {
             latency_ms: Some(7),
             force_fresh: false,
             supersedes_cache_id: None,
+            note: None,
         };
         super::super::db::store_cache(&conn, &entry).expect("seed cache row");
     }

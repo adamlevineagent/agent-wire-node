@@ -5900,6 +5900,7 @@ async fn pyramid_vine_integrity(
         provider_registry: state.pyramid.provider_registry.clone(),
         credential_store: state.pyramid.credential_store.clone(),
         schema_registry: state.pyramid.schema_registry.clone(),
+        cross_pyramid_router: state.pyramid.cross_pyramid_router.clone(),
     });
 
     let summary = vine::run_integrity_check(&pyramid_state, &slug)
@@ -5953,6 +5954,7 @@ async fn pyramid_vine_rebuild_upper(
         provider_registry: state.pyramid.provider_registry.clone(),
         credential_store: state.pyramid.credential_store.clone(),
         schema_registry: state.pyramid.schema_registry.clone(),
+        cross_pyramid_router: state.pyramid.cross_pyramid_router.clone(),
     });
 
     let cancel = tokio_util::sync::CancellationToken::new();
@@ -6310,6 +6312,259 @@ async fn pyramid_cost_summary(
 ) -> Result<serde_json::Value, String> {
     let conn = state.pyramid.reader.lock().await;
     pyramid_db::get_cost_summary(&conn, &slug, window.as_deref()).map_err(|e| e.to_string())
+}
+
+// ── Phase 13: Build Viz Expansion IPC ────────────────────────────────
+
+/// Phase 13: fetch every cache entry for a given build so the
+/// frontend can pre-populate the step timeline on mount. Used when a
+/// user opens a running build viz — the viz seeds its step timeline
+/// from the cache table, then listens for live events going forward.
+#[tauri::command]
+async fn pyramid_step_cache_for_build(
+    state: tauri::State<'_, SharedState>,
+    slug: String,
+    build_id: String,
+) -> Result<Vec<wire_node_lib::pyramid::db::CacheEntrySummary>, String> {
+    let conn = state.pyramid.reader.lock().await;
+    pyramid_db::list_cache_entries_for_build(&conn, &slug, &build_id)
+        .map_err(|e| e.to_string())
+}
+
+/// Phase 13: reroll a node or intermediate cache entry with a
+/// user-provided note. Exactly one of `node_id` or `cache_key` must
+/// be provided. Returns the new cache entry id, any manifest id
+/// that was written, and the new content.
+#[tauri::command]
+async fn pyramid_reroll_node(
+    state: tauri::State<'_, SharedState>,
+    slug: String,
+    node_id: Option<String>,
+    cache_key: Option<String>,
+    note: String,
+    force_fresh: Option<bool>,
+) -> Result<wire_node_lib::pyramid::reroll::RerollOutput, String> {
+    use wire_node_lib::pyramid::reroll::{reroll_node, RerollInput};
+
+    let input = RerollInput {
+        slug: slug.clone(),
+        node_id,
+        cache_key,
+        note,
+        force_fresh: force_fresh.unwrap_or(true),
+    };
+
+    // Attach the cache plumbing (DB path + bus) to the LlmConfig so
+    // the reroll's LLM call flows through the content-addressable
+    // cache and emits the full event set.
+    let build_id = format!(
+        "reroll-{}-{}",
+        slug,
+        chrono::Utc::now().timestamp_millis()
+    );
+    let llm_config = state.pyramid.llm_config_with_cache(&slug, &build_id).await;
+
+    let db_path = state
+        .pyramid
+        .data_dir
+        .as_ref()
+        .map(|d| d.join("pyramid.db").to_string_lossy().into_owned())
+        .ok_or_else(|| "reroll: no data_dir configured".to_string())?;
+
+    let bus = state.pyramid.build_event_bus.clone();
+    reroll_node(input, llm_config, db_path, bus)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Phase 13: list every active build across every slug. Seeds the
+/// CrossPyramidTimeline frontend on mount; subsequent updates flow
+/// via the `cross-build-event` Tauri channel.
+#[tauri::command]
+async fn pyramid_active_builds(
+    state: tauri::State<'_, SharedState>,
+) -> Result<Vec<wire_node_lib::pyramid::db::ActiveBuildRow>, String> {
+    let active_map = state.pyramid.active_build.read().await;
+    if active_map.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let conn = state.pyramid.reader.lock().await;
+    let mut rows = Vec::with_capacity(active_map.len());
+    for (slug, handle) in active_map.iter() {
+        let status_guard = handle.status.read().await;
+        let status = status_guard.status.clone();
+        let started_at = format!(
+            "{}s ago",
+            handle.started_at.elapsed().as_secs()
+        );
+        let build_id = status_guard.slug.clone();
+        drop(status_guard);
+
+        // We don't have a canonical "build_id" yet (see module doc
+        // on cross_pyramid_router) — the status.slug doubles as a
+        // provisional build identifier so the query at least
+        // returns something for the cost/cache columns. A future
+        // phase will add a proper pyramid_build_runs table.
+        let current_step = None;
+        match pyramid_db::build_active_build_summary(
+            &conn,
+            slug,
+            &build_id,
+            &status,
+            &started_at,
+            current_step,
+        ) {
+            Ok(row) => rows.push(row),
+            Err(e) => {
+                tracing::warn!(
+                    slug = %slug,
+                    error = %e,
+                    "failed to build active build summary row"
+                );
+            }
+        }
+    }
+    Ok(rows)
+}
+
+#[derive(serde::Deserialize)]
+struct CostRollupArgs {
+    range: String,
+    from: Option<String>,
+    to: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct CostRollupResponse {
+    total_estimated: f64,
+    total_actual: f64,
+    buckets: Vec<wire_node_lib::pyramid::db::CostRollupBucket>,
+    from: String,
+    to: String,
+}
+
+/// Phase 13: aggregate `pyramid_cost_log` across all slugs for a
+/// given date range. The range parameter accepts `today`, `week`,
+/// `month`, or `custom` (with explicit `from` / `to` ISO strings).
+/// The frontend pivots the returned buckets into three views
+/// (by pyramid / by provider / by operation).
+#[tauri::command]
+async fn pyramid_cost_rollup(
+    state: tauri::State<'_, SharedState>,
+    range: String,
+    from: Option<String>,
+    to: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let args = CostRollupArgs { range, from, to };
+    let (from_iso, to_iso) = resolve_cost_rollup_range(&args).map_err(|e| e.to_string())?;
+
+    let conn = state.pyramid.reader.lock().await;
+    let buckets = pyramid_db::cost_rollup(&conn, &from_iso, &to_iso)
+        .map_err(|e| e.to_string())?;
+    drop(conn);
+
+    let total_estimated: f64 = buckets.iter().map(|b| b.estimated).sum();
+    let total_actual: f64 = buckets.iter().map(|b| b.actual).sum();
+
+    let resp = CostRollupResponse {
+        total_estimated,
+        total_actual,
+        buckets,
+        from: from_iso,
+        to: to_iso,
+    };
+
+    serde_json::to_value(&resp).map_err(|e| e.to_string())
+}
+
+/// Parse the IPC's `range` parameter into an ISO `(from, to)`
+/// window pair. Custom ranges are capped at 1 year per the spec.
+fn resolve_cost_rollup_range(args: &CostRollupArgs) -> anyhow::Result<(String, String)> {
+    use chrono::{Duration, Utc};
+    let now = Utc::now();
+    let (from, to) = match args.range.as_str() {
+        "today" => {
+            let start = now.date_naive().and_hms_opt(0, 0, 0).unwrap();
+            (
+                chrono::DateTime::<Utc>::from_naive_utc_and_offset(start, Utc),
+                now,
+            )
+        }
+        "week" => (now - Duration::days(7), now),
+        "month" => (now - Duration::days(30), now),
+        "custom" => {
+            let from_str = args
+                .from
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("range=custom requires `from`"))?;
+            let to_str = args
+                .to
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("range=custom requires `to`"))?;
+            let from_dt = chrono::DateTime::parse_from_rfc3339(from_str)
+                .map(|d| d.with_timezone(&Utc))
+                .map_err(|e| anyhow::anyhow!("invalid `from` ISO timestamp: {}", e))?;
+            let to_dt = chrono::DateTime::parse_from_rfc3339(to_str)
+                .map(|d| d.with_timezone(&Utc))
+                .map_err(|e| anyhow::anyhow!("invalid `to` ISO timestamp: {}", e))?;
+            if to_dt - from_dt > Duration::days(366) {
+                return Err(anyhow::anyhow!(
+                    "custom range exceeds 1-year cap — split the query"
+                ));
+            }
+            if to_dt <= from_dt {
+                return Err(anyhow::anyhow!("custom range has `to` <= `from`"));
+            }
+            (from_dt, to_dt)
+        }
+        other => {
+            return Err(anyhow::anyhow!(
+                "unknown range `{}` (expected today|week|month|custom)",
+                other
+            ))
+        }
+    };
+    Ok((from.format("%Y-%m-%d %H:%M:%S").to_string(), to.format("%Y-%m-%d %H:%M:%S").to_string()))
+}
+
+/// Phase 13: bulk-pause DADBEAR across all pyramids. Idempotent —
+/// returns the number of rows whose `enabled` column flipped from
+/// 1 to 0 (rows already paused contribute 0 to the count).
+#[tauri::command]
+async fn pyramid_pause_dadbear_all(
+    state: tauri::State<'_, SharedState>,
+    scope: String,
+    _scope_value: Option<String>,
+) -> Result<serde_json::Value, String> {
+    if scope != "all" {
+        // Folder / circle scopes are deferred to Phase 14/15.
+        return Err(format!(
+            "pyramid_pause_dadbear_all: scope `{}` not implemented — only `all` is supported in Phase 13",
+            scope
+        ));
+    }
+    let conn = state.pyramid.writer.lock().await;
+    let affected = pyramid_db::disable_dadbear_all(&conn).map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({ "affected": affected }))
+}
+
+/// Phase 13: mirror of `pyramid_pause_dadbear_all`.
+#[tauri::command]
+async fn pyramid_resume_dadbear_all(
+    state: tauri::State<'_, SharedState>,
+    scope: String,
+    _scope_value: Option<String>,
+) -> Result<serde_json::Value, String> {
+    if scope != "all" {
+        return Err(format!(
+            "pyramid_resume_dadbear_all: scope `{}` not implemented — only `all` is supported in Phase 13",
+            scope
+        ));
+    }
+    let conn = state.pyramid.writer.lock().await;
+    let affected = pyramid_db::enable_dadbear_all(&conn).map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({ "affected": affected }))
 }
 
 // ── WS-3: Evidence Density ──────────────────────────────────────────────────
@@ -8270,6 +8525,9 @@ fn main() {
         provider_registry: provider_registry.clone(),
         credential_store: credential_store.clone(),
         schema_registry: schema_registry.clone(),
+        cross_pyramid_router: Arc::new(
+            wire_node_lib::pyramid::cross_pyramid_router::CrossPyramidEventRouter::new(),
+        ),
     });
 
     // Load persisted event subscriptions into the in-memory event bus
@@ -8405,6 +8663,23 @@ fn main() {
         .manage(state.clone())
         .setup(move |app| {
             let state = state.clone();
+
+            // --- Phase 13: cross-pyramid event forwarder ---
+            //
+            // Subscribe once to the shared build event bus and re-emit
+            // every event via Tauri's `cross-build-event` channel so
+            // the CrossPyramidTimeline frontend can listen once across
+            // all slugs.
+            {
+                let router = state.pyramid.cross_pyramid_router.clone();
+                let bus = state.pyramid.build_event_bus.clone();
+                let app_handle = app.handle().clone();
+                wire_node_lib::pyramid::cross_pyramid_router::CrossPyramidEventRouter::spawn_tauri_forwarder(
+                    router,
+                    bus,
+                    app_handle,
+                );
+            }
 
             // --- System Tray ---
             let show_item = MenuItemBuilder::with_id("show", "Show Wire Node").build(app)?;
@@ -9250,6 +9525,13 @@ fn main() {
             pyramid_import_pyramid,
             pyramid_import_progress,
             pyramid_import_cancel,
+            // Phase 13: Build Viz Expansion + Reroll + Cross-Pyramid
+            pyramid_step_cache_for_build,
+            pyramid_reroll_node,
+            pyramid_active_builds,
+            pyramid_cost_rollup,
+            pyramid_pause_dadbear_all,
+            pyramid_resume_dadbear_all,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Wire Node");
