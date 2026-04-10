@@ -6811,6 +6811,26 @@ async fn pyramid_create_config_contribution(
             "active",
         )
         .map_err(|e| e.to_string())?;
+
+    // Phase 4 invariant: every write path to pyramid_config_contributions
+    // that lands as `active` MUST sync to operational tables immediately.
+    // Per the spec: "Write path: always write to pyramid_config_contributions
+    // first, then sync to operational tables." Without this call the
+    // operational tables stay stale and the executor reads prior values.
+    let contribution =
+        wire_node_lib::pyramid::config_contributions::load_contribution_by_id(
+            &writer,
+            &contribution_id,
+        )
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "contribution disappeared immediately after create".to_string())?;
+    wire_node_lib::pyramid::config_contributions::sync_config_to_operational(
+        &writer,
+        &state.pyramid.build_event_bus,
+        &contribution,
+    )
+    .map_err(|e| e.to_string())?;
+
     Ok(CreateConfigContributionResponse { contribution_id })
 }
 
@@ -6836,6 +6856,26 @@ async fn pyramid_supersede_config(
             Some("user"),
         )
         .map_err(|e| e.to_string())?;
+
+    // Phase 4 invariant: sync the newly-active contribution to its
+    // operational table so the executor sees the new value on its
+    // next read. See `pyramid_create_config_contribution` for the
+    // rationale — same invariant applies to every write path that
+    // produces an `active` contribution.
+    let contribution =
+        wire_node_lib::pyramid::config_contributions::load_contribution_by_id(
+            &writer,
+            &new_contribution_id,
+        )
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "contribution disappeared immediately after supersede".to_string())?;
+    wire_node_lib::pyramid::config_contributions::sync_config_to_operational(
+        &writer,
+        &state.pyramid.build_event_bus,
+        &contribution,
+    )
+    .map_err(|e| e.to_string())?;
+
     Ok(SupersedeConfigResponse { new_contribution_id })
 }
 
@@ -6918,6 +6958,27 @@ async fn pyramid_accept_proposal(
     let mut writer = state.pyramid.writer.lock().await;
     wire_node_lib::pyramid::config_contributions::accept_proposal(&mut writer, &contribution_id)
         .map_err(|e| e.to_string())?;
+
+    // Phase 4 invariant: accept transitions the proposal to `active`.
+    // Sync the now-active contribution to its operational table so the
+    // executor sees the newly-accepted value. Without this the
+    // operational table keeps returning the prior (now-superseded)
+    // row — which is exactly the bug the contribution pattern was
+    // meant to eliminate.
+    let contribution =
+        wire_node_lib::pyramid::config_contributions::load_contribution_by_id(
+            &writer,
+            &contribution_id,
+        )
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "contribution disappeared immediately after accept".to_string())?;
+    wire_node_lib::pyramid::config_contributions::sync_config_to_operational(
+        &writer,
+        &state.pyramid.build_event_bus,
+        &contribution,
+    )
+    .map_err(|e| e.to_string())?;
+
     Ok(CreateConfigContributionResponse {
         contribution_id,
     })
@@ -6987,6 +7048,26 @@ async fn pyramid_rollback_config(
         Some("user"),
     )
     .map_err(|e| e.to_string())?;
+
+    // Phase 4 invariant: rollback produces a new `active` contribution
+    // carrying the target's YAML. Sync it to the operational table so
+    // the executor picks up the rolled-back value. Without this, the
+    // rollback is cosmetic — the audit trail shows a rollback but the
+    // runtime keeps using the pre-rollback value.
+    let new_contribution =
+        wire_node_lib::pyramid::config_contributions::load_contribution_by_id(
+            &writer,
+            &new_id,
+        )
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "rollback contribution disappeared immediately after create".to_string())?;
+    wire_node_lib::pyramid::config_contributions::sync_config_to_operational(
+        &writer,
+        &state.pyramid.build_event_bus,
+        &new_contribution,
+    )
+    .map_err(|e| e.to_string())?;
+
     Ok(SupersedeConfigResponse {
         new_contribution_id: new_id,
     })

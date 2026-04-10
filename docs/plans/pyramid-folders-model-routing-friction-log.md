@@ -414,3 +414,71 @@ Where `redact_bearer_tokens` runs a regex like `sk-or-[a-zA-Z0-9-]{20,}` → `sk
 **Status:** Informational. Pre-existing, documented here for follow-up. Not a Phase 3 regression — this warn! line already existed.
 
 ---
+
+### 2026-04-10 — Phase 4 wanderer: sync_config_to_operational was never called from production (BLOCKING, fixed in-place)
+
+**Phase / workstream:** Phase 4 (wanderer pass, post-verifier)
+
+**What hit friction:** The Phase 4 spec's central invariant says "Write path: always write to `pyramid_config_contributions` first, then sync to operational tables." The verifier pass reported clean against its punch list (schema + CRUD + dispatcher shape), but an end-to-end trace revealed that **none of the 9 new IPC handlers in `main.rs` actually called `sync_config_to_operational`**. The dispatcher existed only as dead code reachable from tests. Every production write path (`pyramid_create_config_contribution`, `pyramid_supersede_config`, `pyramid_accept_proposal`, `pyramid_rollback_config`) inserted a row into `pyramid_config_contributions` and returned — leaving operational tables (`pyramid_dadbear_config`, the 4 new tables, `pyramid_tier_routing`, `pyramid_step_overrides`) unchanged. A user saving a new DADBEAR policy through Phase 4's contribution IPC would create an audit row but the executor would keep reading the prior (stale) operational value indefinitely.
+
+`grep -rn "sync_config_to_operational" src-tauri/src` returned 4 hits total: 3 in `config_contributions.rs` itself (one definition, two test call sites) and 1 in a comment in `db.rs`. Zero production call sites.
+
+**Root cause:** The Phase 4 workstream prompt described the dispatcher as a piece of functionality to build but didn't explicitly call out "and wire it into every IPC handler that produces an `active` contribution". The verifier punch list matched the workstream prompt and checked "does `sync_config_to_operational` exist with all 14 branches" — true — rather than "does it fire on every write path". The implementer built the dispatcher to spec, the verifier checked it against the spec, and the spec's invariant-phrasing ("Write path: always write to `pyramid_config_contributions` first, then sync") lived several sections away from the IPC endpoint list, so it never made it onto the punch list.
+
+**What we did about it:** Wanderer added the missing sync call to all 4 write-path IPC handlers (`pyramid_create_config_contribution`, `pyramid_supersede_config`, `pyramid_accept_proposal`, `pyramid_rollback_config`). The pattern is uniform: after the CRUD call, re-load the contribution by id, then call `sync_config_to_operational(&writer, &state.pyramid.build_event_bus, &contribution)`. `pyramid_propose_config` and `pyramid_reject_proposal` do NOT sync (a proposal is `status = 'proposed'`, not active; a rejection stays non-active). `pyramid_accept_proposal` gained a sync call because accept promotes a proposal to active. The fix is on branch `phase-4-config-contributions`.
+
+**Lesson for future phases:** Write-path invariants deserve their own punch-list line, separate from "does the helper function exist". The verifier should trace at least one example write path end-to-end from the IPC boundary to the operational table and confirm every step is wired. "Dispatcher exists" and "dispatcher has all 14 branches" are not the same as "dispatcher is reachable from production code". This is exactly the class of bug the wanderer protocol was designed to catch — the punch list verifier was reading the same map the implementer was writing from; only a wanderer with no map asks "okay but does this actually run?"
+
+Relatedly: the spec should have an explicit "Every IPC handler that creates or activates a contribution calls `sync_config_to_operational` before returning" requirement, not buried in a paragraph. Adding to the "Operational Table Sync" section of `config-contribution-and-wire-sharing.md` is a follow-up for the planner.
+
+---
+
+### 2026-04-10 — Phase 4 wanderer: six legacy bypass paths still write directly to operational tables (NON-BLOCKING, deferred)
+
+**Phase / workstream:** Phase 4 (wanderer pass, scope-boundary concern)
+
+**What hit friction:** Even with the Phase 4 IPC handlers fixed to call the dispatcher, multiple **pre-existing** write paths still write directly to operational tables without creating contributions. This violates the spec's invariant in spirit, but Phase 4's scope boundary explicitly said "do NOT modify Phase 3's provider registry CRUD except to call into it from the sync dispatcher," and similar pre-existing paths for DADBEAR were never called out as Phase 4 scope.
+
+Direct-write paths still open after Phase 4:
+
+1. `src-tauri/src/pyramid/routes.rs:8057` — `POST /pyramid/:slug/dadbear/watch` HTTP handler calls `db::save_dadbear_config` directly. The new row lands with `contribution_id = NULL`.
+2. `src-tauri/src/pyramid/routes.rs:9452` — another HTTP DADBEAR save handler, same pattern.
+3. `src-tauri/src/pyramid/routes.rs:3288` — inside the async build orchestrator, DADBEAR config is created directly from post-build metadata. `contribution_id = NULL` on the resulting row.
+4. `src-tauri/src/main.rs:3274` — same post-build DADBEAR config creation inside `pyramid_continue_build`.
+5. `src-tauri/src/pyramid/routes.rs:8107`, `:8129` — `enable_dadbear_for_slug` / `disable_dadbear_for_slug` HTTP handlers UPDATE the operational table directly for on/off toggles.
+6. `src-tauri/src/main.rs:6688` — `pyramid_save_tier_routing` IPC (Phase 3) writes `pyramid_tier_routing` directly.
+7. `src-tauri/src/main.rs:6731` — `pyramid_save_step_override` IPC (Phase 3) writes `pyramid_step_overrides` directly.
+8. `src-tauri/src/pyramid/db.rs:10863..10898` — `seed_default_provider_registry` writes 4 tier_routing rows on first boot via `save_tier_routing` (i.e., first-boot seed is a bypass).
+
+The bootstrap migration's idempotency guards (sentinel marker + per-row `contribution_id IS NULL` check) are sequenced so the marker gets written during `init_pyramid_db` on first boot; from that point forward, any direct-write bypass that lands a `contribution_id = NULL` row WILL NEVER get migrated, because the sentinel marker guard short-circuits `migrate_legacy_dadbear_to_contributions` on every subsequent call. There is no per-run "catch up any orphaned rows" pass.
+
+**Root cause:** The spec's invariant is aspirational for Phase 4 — it assumed the Phase 4 IPC handlers would be the ONLY write path. It didn't model the pre-existing HTTP routes or the Phase 3 IPC commands as callers that also need to be migrated. Phase 4's workstream prompt explicitly excluded Phase 3's provider registry from modification, which makes sense for Phase 4 scope, but also means those IPC paths continue to write operational rows without contribution provenance.
+
+**What we did about it:** Flagged as non-blocking because (a) the 4 new operational tables (`pyramid_evidence_policy`, `pyramid_build_strategy`, `pyramid_custom_prompts`, `pyramid_folder_ingestion_heuristics`) have no direct-write callers, so they're clean; (b) Phase 3's tier_routing and step_overrides IPCs were explicitly out-of-scope; (c) the DADBEAR direct-write paths are pre-existing and don't regress Phase 4. The escalation is described in the deviation block below.
+
+**Lesson for future phases:** When introducing a "source of truth" invariant, the migration plan needs to include either (a) a deprecation pass that removes all legacy direct writers in the same phase, or (b) an explicit "coexistence" design where legacy writers shim into contribution creation. Phase 4 did neither — it introduced the new path but left all old paths running in parallel. Phase 5/6/9/10 will each need to handle "which legacy path am I replacing?" for their own schema types.
+
+> [For the planner]
+>
+> Phase 4's central invariant (every config change flows through `pyramid_config_contributions` first, then syncs to operational tables) is architecturally sound but is contradicted by six pre-existing direct-write paths that Phase 4 did not touch:
+>
+> 1. **DADBEAR HTTP routes** (`POST /pyramid/:slug/dadbear/watch`, `POST /pyramid/:slug/dadbear/enable|disable`, `POST /pyramid/:slug/dadbear/commit`) — still write `pyramid_dadbear_config` directly via `save_dadbear_config` / `enable_dadbear_for_slug` / `disable_dadbear_for_slug`.
+> 2. **Post-build DADBEAR creation** (`main.rs:3274`, `routes.rs:3288`) — called automatically at the end of each build to seed a DADBEAR watch config from the source path. Direct `save_dadbear_config` write.
+> 3. **Phase 3 tier routing / step override IPCs** (`pyramid_save_tier_routing`, `pyramid_save_step_override`) — Phase 3 provider registry writes, still reachable from the frontend after Phase 4.
+> 4. **`seed_default_provider_registry`** (`db.rs:10817`) — seeds 4 default tiers on first boot via direct `save_tier_routing` calls. First-boot state has no `tier_routing` contributions.
+>
+> **Question for planner:** How should Phase 5/6/9 handle these? Three options come to mind:
+>
+> a. **Shim legacy writers into contributions.** Wrap each direct-write call site with a "create contribution then sync" shim. Lowest friction for callers, introduces no new IPC commands, keeps the frontend stable. Cost: every old call site grows by 5 lines and has to handle the extra error path.
+>
+> b. **Deprecate legacy writers and force all writes through Phase 4 IPCs.** Remove `pyramid_save_tier_routing`, `POST /pyramid/:slug/dadbear/watch`, etc. Force the frontend to call `pyramid_create_config_contribution` with `schema_type = "tier_routing"` / `"dadbear_policy"`. Highest architectural purity, highest frontend churn.
+>
+> c. **Defer: accept the coexistence and document that legacy writers produce operational rows with `contribution_id = NULL`.** Add a runtime migration that re-runs per boot and retroactively creates contributions for orphaned operational rows (removing the sentinel-marker short-circuit and replacing it with per-row guards).
+>
+> Option (c) is the path of least resistance but punts the invariant enforcement forever. Option (a) is probably right for Phase 4.5 / Phase 9. Option (b) is the right end-state but needs coordinated frontend work.
+>
+> Separately: **`seed_default_provider_registry` should either seed via `bundled` contributions or be explicitly documented as a pre-contribution initial state.** The first boot of a fresh node currently has 4 tier_routing rows with NO contribution provenance. If the "contribution-first" invariant is taken seriously, seed data should itself be a `source = 'bundled'` contribution that syncs on first boot. This matches the Phase 4 bootstrap migration pattern and gives seed data the same audit trail as user-created data.
+>
+> Finally: the Phase 4 bootstrap migration's idempotency guard (sentinel marker) is a one-way latch. Once the marker exists, any direct-write DADBEAR row that lands afterward never gets a contribution. If Phase 4.5/9 adopts option (c) above, the marker needs to be per-row rather than global.
+
+---
