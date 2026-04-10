@@ -9,20 +9,109 @@
 use anyhow::{anyhow, Result};
 use rusqlite::Connection;
 use serde_json::Value;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use super::chain_engine::{ChainDefaults, ChainStep};
+use super::event_bus::BuildEventBus;
 use super::execution_plan::{ModelRequirements, Step, StepOperation};
 use super::expression::ValueEnv;
 use super::llm::{self, AuditContext, LlmConfig, LlmResponse};
 use super::naming::headline_from_analysis;
+use super::step_context::{compute_prompt_hash, StepContext as CacheStepContext};
 use super::transform_runtime;
 use super::types::{Correction, Decision, PyramidNode, Term, Topic};
 use super::{OperationalConfig, Tier1Config};
 
 // ── Step context ────────────────────────────────────────────────────────────
+
+/// Phase 6 fix pass: build-scoped cache plumbing plus lazy prompt/model
+/// hash caches. Lives on `chain_dispatch::StepContext` so every LLM call
+/// site in the dispatcher (dispatch_ir_llm, dispatch_llm) can construct
+/// a per-call `pyramid::step_context::StepContext` without re-hashing the
+/// prompt template or re-resolving the tier.
+///
+/// Cloned via `Arc` — the same instance is shared across every parallel
+/// forEach task spawned from a given chain run.
+pub struct CacheDispatchBase {
+    /// Absolute filesystem path to the pyramid SQLite database. Used by
+    /// the cache layer to open ephemeral connections for reads and writes
+    /// (which deliberately bypass the writer mutex — the cache is
+    /// content-addressable and `INSERT OR REPLACE` on a unique key is
+    /// idempotent).
+    pub db_path: String,
+    /// Build id stamped on every cache row produced by this chain run.
+    /// Phase 13's oversight UI reads this column for provenance.
+    pub build_id: String,
+    /// Optional handle to the tagged build event bus. When present,
+    /// cache hit / miss / verification-failed events flow out during
+    /// lookups and writes.
+    pub bus: Option<Arc<BuildEventBus>>,
+    /// Phase 6 lazy cache: prompt template path → SHA-256 hex. The same
+    /// template path used by multiple steps in the same build hashes
+    /// exactly once. Populated by `dispatch_ir_llm` via
+    /// `get_or_compute_prompt_hash`. Uses `std::sync::Mutex` because the
+    /// operations are non-awaiting and short-lived.
+    pub prompt_hashes: Arc<StdMutex<HashMap<String, String>>>,
+    /// Phase 6 lazy cache: tier name → canonical model id. Populated by
+    /// `dispatch_ir_llm` after tier resolution so every subsequent cache
+    /// write uses the same resolved model id within a build.
+    pub resolved_models: Arc<StdMutex<HashMap<String, String>>>,
+}
+
+impl CacheDispatchBase {
+    /// Look up or compute the SHA-256 prompt hash for a template key.
+    ///
+    /// `key` is typically the instruction path (`step.instruction.as_deref()`)
+    /// — any stable identifier for the template body works. The first
+    /// call for a given key computes the hash via the provided closure;
+    /// every subsequent call hits the cache.
+    pub fn get_or_compute_prompt_hash(
+        &self,
+        key: &str,
+        body_provider: impl FnOnce() -> String,
+    ) -> String {
+        {
+            let guard = self
+                .prompt_hashes
+                .lock()
+                .expect("prompt_hashes mutex poisoned");
+            if let Some(existing) = guard.get(key) {
+                return existing.clone();
+            }
+        }
+        let body = body_provider();
+        let hash = compute_prompt_hash(&body);
+        let mut guard = self
+            .prompt_hashes
+            .lock()
+            .expect("prompt_hashes mutex poisoned");
+        guard.entry(key.to_string()).or_insert_with(|| hash.clone());
+        hash
+    }
+
+    /// Record a tier → resolved-model mapping for the build.
+    pub fn cache_resolved_model(&self, tier: &str, model_id: &str) {
+        let mut guard = self
+            .resolved_models
+            .lock()
+            .expect("resolved_models mutex poisoned");
+        guard
+            .entry(tier.to_string())
+            .or_insert_with(|| model_id.to_string());
+    }
+
+    /// Look up a previously cached tier → resolved-model mapping.
+    pub fn get_resolved_model(&self, tier: &str) -> Option<String> {
+        let guard = self
+            .resolved_models
+            .lock()
+            .expect("resolved_models mutex poisoned");
+        guard.get(tier).cloned()
+    }
+}
 
 /// Context available to all chain steps during execution.
 #[derive(Clone)]
@@ -38,6 +127,29 @@ pub struct StepContext {
     /// Optional audit context for Theatre LLM audit trail.
     /// When present, all LLM calls in dispatch are recorded.
     pub audit: Option<AuditContext>,
+    /// Phase 6 fix pass: cache plumbing + lazy hash caches shared across
+    /// every step of a chain run. `None` only in unit tests and legacy
+    /// bring-up paths; production executors populate it at dispatch
+    /// context construction time.
+    pub cache_base: Option<Arc<CacheDispatchBase>>,
+}
+
+impl CacheDispatchBase {
+    /// Build a fresh `CacheDispatchBase` with empty lazy caches. Called
+    /// once per chain run from the executor entry points.
+    pub fn new(
+        db_path: impl Into<String>,
+        build_id: impl Into<String>,
+        bus: Option<Arc<BuildEventBus>>,
+    ) -> Self {
+        Self {
+            db_path: db_path.into(),
+            build_id: build_id.into(),
+            bus,
+            prompt_hashes: Arc::new(StdMutex::new(HashMap::new())),
+            resolved_models: Arc::new(StdMutex::new(HashMap::new())),
+        }
+    }
 }
 
 // ── Top-level dispatcher ────────────────────────────────────────────────────
@@ -917,6 +1029,11 @@ pub async fn dispatch_ir_step(
 ///
 /// Returns `(parsed_json, LlmResponse)` so the caller can log costs from the
 /// LlmResponse (usage, generation_id).
+///
+/// Phase 6 fix pass: builds a per-call `pyramid::step_context::StepContext`
+/// from the dispatcher's `cache_base` (when present) and threads it
+/// through every HTTP call in this function so the cache is reachable
+/// from the production IR chain path.
 pub async fn dispatch_ir_llm(
     step: &Step,
     resolved_input: &Value,
@@ -973,6 +1090,19 @@ pub async fn dispatch_ir_llm(
         llm_options.min_timeout_secs
     );
 
+    // Phase 6 fix pass: construct a cache-aware StepContext when the
+    // dispatcher has a cache base attached. The base carries the
+    // build-scoped db_path / build_id / event bus; per-call we layer
+    // the step name, depth, chunk index, resolved model id, and prompt
+    // hash on top.
+    let cache_ctx = build_cache_ctx_for_ir_step(
+        ctx,
+        step,
+        &resolved_model,
+        system_prompt,
+        &user_prompt,
+    );
+
     // If step has a response_schema, use structured outputs for guaranteed JSON
     if let Some(ref schema) = step.response_schema {
         let schema_name = step.id.replace('-', "_").replace('.', "_");
@@ -990,8 +1120,9 @@ pub async fn dispatch_ir_llm(
                 "schema": schema
             }
         });
-        let response = llm::call_model_unified_with_options(
+        let response = llm::call_model_unified_with_options_and_ctx(
             config_ref,
+            cache_ctx.as_ref(),
             system_prompt,
             &user_prompt,
             temperature,
@@ -1016,7 +1147,15 @@ pub async fn dispatch_ir_llm(
         step.id,
     );
 
-    // Standard path: call model, parse JSON, retry at temp 0.1 on failure
+    // Standard path: call model, parse JSON, retry at temp 0.1 on failure.
+    //
+    // The audited path does NOT thread the cache_ctx through today: the
+    // existing `call_model_audited` writes its own audit row and delegates
+    // to the non-ctx `call_model_unified` path. Phase 12's broader retrofit
+    // will either (a) add an `_audited_and_ctx` variant or (b) merge the
+    // audit into the cache's event bus stream. For this fix pass we keep
+    // the audit path untouched but route the non-audit path through the
+    // cache so that build runs without Theatre audit still benefit.
     let response = if let Some(ref audit) = ctx.audit {
         let audit = AuditContext {
             step_name: step.id.clone(),
@@ -1028,9 +1167,17 @@ pub async fn dispatch_ir_llm(
         ).await?;
         resp
     } else {
-        llm::call_model_unified_with_options(
-            config_ref, system_prompt, &user_prompt, temperature, max_tokens, None, llm_options,
-        ).await?
+        llm::call_model_unified_with_options_and_ctx(
+            config_ref,
+            cache_ctx.as_ref(),
+            system_prompt,
+            &user_prompt,
+            temperature,
+            max_tokens,
+            None,
+            llm_options,
+        )
+        .await?
     };
 
     match llm::extract_json(&response.content) {
@@ -1044,8 +1191,9 @@ pub async fn dispatch_ir_llm(
                 "[IR] step '{}' → JSON parse failed, retrying at temp 0.1",
                 step.id
             );
-            let retry_response = llm::call_model_unified_with_options(
+            let retry_response = llm::call_model_unified_with_options_and_ctx(
                 config_ref,
+                cache_ctx.as_ref(),
                 system_prompt,
                 &user_prompt,
                 0.1,
@@ -1065,6 +1213,111 @@ pub async fn dispatch_ir_llm(
             Ok((parsed, retry_response))
         }
     }
+}
+
+/// Phase 6 fix pass: build a per-call `pyramid::step_context::StepContext`
+/// for an IR chain step so the cache hook in
+/// `call_model_unified_with_options_and_ctx` is reachable from the
+/// production dispatcher path.
+///
+/// Returns `None` in any of the following cases (the cache is then
+/// bypassed for that call, and the LLM path falls through to the
+/// legacy HTTP retry loop):
+///
+/// * The dispatch context has no `cache_base` (unit tests, pre-init
+///   boot paths).
+/// * The resolved model id is empty.
+/// * The instruction key cannot be derived from the step.
+///
+/// Populates the dispatcher's lazy caches as a side effect: the
+/// resolved model id is recorded against the tier, and the prompt hash
+/// is cached keyed on the instruction.
+fn build_cache_ctx_for_ir_step(
+    ctx: &StepContext,
+    step: &Step,
+    resolved_model: &str,
+    system_prompt: &str,
+    user_prompt: &str,
+) -> Option<CacheStepContext> {
+    let base = ctx.cache_base.as_ref()?;
+    if resolved_model.is_empty() {
+        return None;
+    }
+
+    let tier = step
+        .model_requirements
+        .tier
+        .clone()
+        .unwrap_or_else(|| "mid".to_string());
+    base.cache_resolved_model(&tier, resolved_model);
+
+    // Instruction key: prefer the resolved instruction string (the
+    // template body as supplied by the IR). Falls back to the step id
+    // when no instruction is attached (mechanical-ish LLM steps).
+    let instruction_key = step
+        .instruction
+        .clone()
+        .unwrap_or_else(|| step.id.clone());
+    let prompt_hash = base.get_or_compute_prompt_hash(&instruction_key, || {
+        // Include both the system prompt and the user prompt template
+        // in the body snapshot. The caller above already substituted
+        // `$var` references, so hashing `system_prompt + user_prompt`
+        // gives us a build-scoped snapshot of "the prompt text this
+        // step will ship to the LLM" — identical to what the spec
+        // calls the "resolved instruction file content".
+        let mut combined = String::with_capacity(system_prompt.len() + user_prompt.len() + 8);
+        combined.push_str(system_prompt);
+        combined.push_str("\n--user--\n");
+        combined.push_str(user_prompt);
+        combined
+    });
+
+    if prompt_hash.is_empty() {
+        return None;
+    }
+
+    // Step metadata — primitive defaults to the step id when the
+    // step has no primitive attached (legacy chain steps that use
+    // `rust_function` instead).
+    let primitive = step
+        .primitive
+        .clone()
+        .unwrap_or_else(|| step.id.clone());
+    let depth = step
+        .storage_directive
+        .as_ref()
+        .and_then(|sd| sd.depth)
+        .or_else(|| {
+            step.metadata
+                .as_ref()
+                .and_then(|meta| meta.get("target_depth"))
+                .and_then(|d| d.as_i64())
+        })
+        .unwrap_or(0);
+
+    let mut cache_ctx = CacheStepContext::new(
+        ctx.slug.clone(),
+        base.build_id.clone(),
+        step.id.clone(),
+        primitive,
+        depth,
+        // chunk_index is set by the caller for forEach iterations via
+        // the `chunk_index` field already on Step metadata; the IR
+        // dispatcher does not currently pass a specific chunk index to
+        // dispatch_ir_llm, so we leave it as `None` and rely on the
+        // cache key for content addressing. The `pyramid_step_cache`
+        // `chunk_index` column is written as -1 (the StepContext
+        // default) which aligns with the Phase 2 retrofit pattern for
+        // whole-node LLM calls.
+        None,
+        base.db_path.clone(),
+    )
+    .with_model_resolution(tier, resolved_model.to_string())
+    .with_prompt_hash(prompt_hash);
+    if let Some(bus) = base.bus.as_ref() {
+        cache_ctx = cache_ctx.with_bus(bus.clone());
+    }
+    Some(cache_ctx)
 }
 
 /// Dispatch an IR mechanical step: look up `step.rust_function` in the registry.
@@ -1151,6 +1404,7 @@ mod tests {
             tier1: Tier1Config::default(),
             ops: OperationalConfig::default(),
             audit: None,
+            cache_base: None,
         };
         let result = dispatch_mechanical("nonexistent", &serde_json::json!({}), &ctx);
         assert!(result.is_err());
@@ -1170,6 +1424,7 @@ mod tests {
             tier1: Tier1Config::default(),
             ops: OperationalConfig::default(),
             audit: None,
+            cache_base: None,
         };
         let input = serde_json::json!({"files": ["main.rs"]});
         let result = dispatch_mechanical("extract_import_graph", &input, &ctx).unwrap();
@@ -1413,6 +1668,7 @@ mod tests {
             tier1: Tier1Config::default(),
             ops: OperationalConfig::default(),
             audit: None,
+            cache_base: None,
         };
         let mut step = ir_step("mech_step", StepOperation::Mechanical);
         step.rust_function = Some("extract_import_graph".into());
@@ -1433,6 +1689,7 @@ mod tests {
             tier1: Tier1Config::default(),
             ops: OperationalConfig::default(),
             audit: None,
+            cache_base: None,
         };
         let step = ir_step("no_fn", StepOperation::Mechanical);
         // rust_function is None
@@ -1454,6 +1711,7 @@ mod tests {
             tier1: Tier1Config::default(),
             ops: OperationalConfig::default(),
             audit: None,
+            cache_base: None,
         };
         let mut step = ir_step("bad_fn", StepOperation::Mechanical);
         step.rust_function = Some("nonexistent_fn".into());
@@ -1475,6 +1733,7 @@ mod tests {
             tier1: Tier1Config::default(),
             ops: OperationalConfig::default(),
             audit: None,
+            cache_base: None,
         };
         let mut step = ir_step("count_step", StepOperation::Transform);
         step.transform = Some(TransformSpec {
@@ -1498,6 +1757,7 @@ mod tests {
             tier1: Tier1Config::default(),
             ops: OperationalConfig::default(),
             audit: None,
+            cache_base: None,
         };
         let mut step = ir_step("coalesce_step", StepOperation::Transform);
         step.transform = Some(TransformSpec {
@@ -1525,6 +1785,7 @@ mod tests {
             tier1: Tier1Config::default(),
             ops: OperationalConfig::default(),
             audit: None,
+            cache_base: None,
         };
         let step = ir_step("bad_transform", StepOperation::Transform);
         // transform is None
@@ -1546,6 +1807,7 @@ mod tests {
             tier1: Tier1Config::default(),
             ops: OperationalConfig::default(),
             audit: None,
+            cache_base: None,
         };
         let step = ir_step("wire_step", StepOperation::Wire);
         let result = dispatch_ir_step(&step, &serde_json::json!({}), "", &ctx).await;
@@ -1563,6 +1825,7 @@ mod tests {
             tier1: Tier1Config::default(),
             ops: OperationalConfig::default(),
             audit: None,
+            cache_base: None,
         };
         let step = ir_step("task_step", StepOperation::Task);
         let result = dispatch_ir_step(&step, &serde_json::json!({}), "", &ctx).await;
@@ -1580,6 +1843,7 @@ mod tests {
             tier1: Tier1Config::default(),
             ops: OperationalConfig::default(),
             audit: None,
+            cache_base: None,
         };
         let step = ir_step("game_step", StepOperation::Game);
         let result = dispatch_ir_step(&step, &serde_json::json!({}), "", &ctx).await;
@@ -1597,6 +1861,7 @@ mod tests {
             tier1: Tier1Config::default(),
             ops: OperationalConfig::default(),
             audit: None,
+            cache_base: None,
         };
         let mut step = ir_step("mech", StepOperation::Mechanical);
         step.rust_function = Some("extract_mechanical_metadata".into());
