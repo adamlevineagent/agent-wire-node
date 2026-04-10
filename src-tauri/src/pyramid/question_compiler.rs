@@ -162,19 +162,6 @@ fn derive_step_id(creates: &str, _idx: usize) -> String {
     }
 }
 
-fn conceptual_depth_for_creates(creates: &str) -> Option<i64> {
-    match creates {
-        "L0 nodes" | "L0 classification tags" | "web edges between L0 nodes" => Some(0),
-        "L1 topic assignments"
-        | "L1 thread assignments"
-        | "L1 nodes"
-        | "web edges between L1 nodes" => Some(1),
-        "L2 nodes" | "web edges between L2 nodes" => Some(2),
-        "apex" => None,
-        _ => None,
-    }
-}
-
 fn source_depth_for_scope(scope: &str) -> Option<i64> {
     match scope {
         "all L0 nodes at once" | "all L0 topics at once" => Some(0),

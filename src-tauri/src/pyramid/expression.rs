@@ -123,8 +123,8 @@ impl Expr {
                     };
                     Ok(Value::Bool(result))
                 } else {
-                    let lhs = coerce_number(&lhs)?;
-                    let rhs = coerce_number(&rhs)?;
+                    let _lhs = coerce_number(&lhs)?;
+                    let _rhs = coerce_number(&rhs)?;
                     let lhs = coerce_number(&left.evaluate(env)?)?;
                     let rhs = coerce_number(&right.evaluate(env)?)?;
                     let result = match op {

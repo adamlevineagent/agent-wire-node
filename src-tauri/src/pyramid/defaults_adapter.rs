@@ -466,11 +466,8 @@ fn analyze_dependencies(step: &ChainStep, step_names: &[String], step_idx: usize
     if deps.is_empty() && step_idx > 0 {
         // Web steps that don't declare explicit input depend on the prior node-producing step
         if step.primitive == "web" && step.input.is_none() {
-            // Find the most recent step that produces nodes at a compatible depth
-            for i in (0..step_idx).rev() {
-                deps.push(step_names[i].clone());
-                break;
-            }
+            // Depend on the most recent prior step
+            deps.push(step_names[step_idx - 1].clone());
         }
     }
 

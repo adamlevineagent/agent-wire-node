@@ -124,16 +124,6 @@ impl VocabularyRegistry {
         }
     }
 
-    /// Look up a command's dispatch entry by name.
-    pub fn get_dispatch(&self, command_name: &str) -> Option<&(DispatchEntry, Vec<ParamDef>)> {
-        self.dispatch_table.get(command_name)
-    }
-
-    /// Check if a command exists in the registry.
-    pub fn has_command(&self, command_name: &str) -> bool {
-        self.dispatch_table.contains_key(command_name)
-    }
-
     /// Generate LLM-friendly prompt text from the vocabulary.
     /// Excludes dispatch blocks — the LLM only sees name, description, and params.
     pub fn to_prompt_text(&self) -> String {

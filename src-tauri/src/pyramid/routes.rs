@@ -727,6 +727,7 @@ struct QueryCostParams {
     /// Query type: "apex", "drill", "search", "export"
     query_type: Option<String>,
     /// Node ID (required for drill queries, used for handle-path resolution)
+    #[allow(dead_code)] // Deserialized from query params; not read in Rust but part of API contract
     node_id: Option<String>,
 }
 
@@ -6869,7 +6870,7 @@ async fn handle_query_cost(
 /// 3. If confirmed (or public): call Wire payment-intent, forward query with payment token
 /// 4. Return result to Vibesmithy
 async fn handle_remote_query(
-    state: Arc<PyramidState>,
+    _state: Arc<PyramidState>,
     body: RemoteQueryBody,
     confirm_payment: Option<String>,
     rate_limiter: Arc<Mutex<std::collections::HashMap<String, (u64, std::time::Instant)>>>,
@@ -9375,7 +9376,7 @@ fn default_preview_session_timeout() -> u64 { 1800 }
 /// model, and returns a BuildPreview with estimated cost, time, scope, and
 /// warnings. The operator reviews this before committing.
 async fn handle_preview_generate(
-    slug_name: String,
+    _slug_name: String,
     body: PreviewRequestBody,
     state: Arc<PyramidState>,
 ) -> Result<warp::reply::Response, warp::Rejection> {

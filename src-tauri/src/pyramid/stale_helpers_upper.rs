@@ -356,38 +356,6 @@ pub(crate) fn resolve_stale_target_for_node(
     Ok(ensure_thread_target(conn, slug, node_id)?.map(|target| target.thread_id))
 }
 
-pub(crate) fn resolve_parent_targets_for_node_ids(
-    conn: &Connection,
-    slug: &str,
-    node_ids: &[String],
-) -> Result<Vec<String>> {
-    let mut targets = BTreeSet::new();
-
-    for node_id in node_ids {
-        let parent_id: Option<String> = conn
-            .query_row(
-                "SELECT parent_id FROM pyramid_nodes
-                 WHERE slug = ?1 AND id = ?2 AND parent_id IS NOT NULL",
-                rusqlite::params![slug, node_id],
-                |row| row.get(0),
-            )
-            .ok()
-            .flatten();
-
-        let Some(parent_id) = parent_id else {
-            continue;
-        };
-
-        if let Some(target) = resolve_stale_target_for_node(conn, slug, &parent_id)? {
-            targets.insert(target);
-        } else {
-            warn!(slug = %slug, node_id = %node_id, parent_id = %parent_id, "Parent node does not map to a live thread target");
-        }
-    }
-
-    Ok(targets.into_iter().collect())
-}
-
 /// Resolve propagation targets for question pyramids by following the evidence DAG.
 ///
 /// For each node_id, finds all answer nodes that KEEP it as evidence (across all slugs),
@@ -429,28 +397,6 @@ pub(crate) fn resolve_evidence_targets_for_node_ids(
     }
 
     Ok(targets.into_iter().collect())
-}
-
-pub(crate) fn resolve_parent_targets_for_file(
-    conn: &Connection,
-    slug: &str,
-    file_path: &str,
-) -> Result<Vec<String>> {
-    let node_ids_json: Option<String> = conn
-        .query_row(
-            "SELECT node_ids FROM pyramid_file_hashes
-             WHERE slug = ?1 AND file_path = ?2",
-            rusqlite::params![slug, file_path],
-            |row| row.get(0),
-        )
-        .ok();
-
-    let Some(node_ids_json) = node_ids_json else {
-        return Ok(Vec::new());
-    };
-
-    let node_ids: Vec<String> = serde_json::from_str(&node_ids_json).unwrap_or_default();
-    resolve_parent_targets_for_node_ids(conn, slug, &node_ids)
 }
 
 // ── 1. Node Stale-Check (Template 2) ─────────────────────────────────────────

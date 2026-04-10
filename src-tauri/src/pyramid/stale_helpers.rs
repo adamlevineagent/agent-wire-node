@@ -23,7 +23,6 @@ use super::llm::{call_model_with_usage, extract_json};
 use super::naming::{headline_from_path, tombstone_headline};
 use super::stale_helpers_upper::{
     resolve_evidence_targets_for_node_ids, resolve_live_canonical_node_id,
-    resolve_parent_targets_for_node_ids,
 };
 use super::types::{FileStaleResult, PendingMutation, RenameResult, StaleCheckResult};
 

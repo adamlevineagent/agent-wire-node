@@ -2100,7 +2100,7 @@ async fn handle_question_fragment(
     headers: warp::http::HeaderMap,
 ) -> warp::reply::Response {
     let auth = resolve_auth(&headers, peer, &state, &jwt_public_key).await;
-    let (_source_info, question_info) =
+    let (_source_info, _question_info) =
         match validate_question_pair(&state, &source_slug, &question_slug, &auth).await {
             Ok(p) => p,
             Err(resp) => return resp,

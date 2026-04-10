@@ -4493,7 +4493,7 @@ pub async fn execute_chain_from(
 async fn execute_cross_build_input(
     state: &PyramidState,
     step: &ChainStep,
-    ctx: &mut ChainContext,
+    _ctx: &mut ChainContext,
     slug: &str,
 ) -> Result<Value> {
     info!(slug, step_name = %step.name, "executing cross_build_input primitive");
@@ -6683,7 +6683,6 @@ async fn execute_for_each_concurrent(
                     info!("[CHAIN] [{}] {} -- resumed (complete)", step_owned.name, node_id);
 
                     let mut output_val = Value::Null;
-                    let mut resume_label: Option<String> = None;
                     match load_prior_step_output(
                         &reader_producer,
                         &ctx_snap_producer.slug,
@@ -6695,7 +6694,6 @@ async fn execute_for_each_concurrent(
                     .await
                     {
                         Ok(Some(prior_output)) => {
-                            resume_label = prior_output.get("headline").and_then(|v| v.as_str()).map(|s| s.to_string());
                             output_val = decorate_step_output(prior_output, &node_id, chunk_index);
                         }
                         Ok(None) => {
@@ -7224,7 +7222,7 @@ async fn execute_for_each_work_item(
     saves_node: bool,
     writer_tx: &mpsc::Sender<WriteOp>,
     reader: &Arc<Mutex<Connection>>,
-    layer_tx: Option<mpsc::Sender<LayerEvent>>,
+    _layer_tx: Option<mpsc::Sender<LayerEvent>>,
 ) -> Result<Value> {
     let fallback_key = format!("{}-{}", step.name, work.index);
     let t0 = Instant::now();
@@ -9258,7 +9256,7 @@ async fn execute_single(
     progress_tx: &Option<mpsc::Sender<BuildProgress>>,
     done: &mut i64,
     total: i64,
-    layer_tx: &Option<mpsc::Sender<LayerEvent>>,
+    _layer_tx: &Option<mpsc::Sender<LayerEvent>>,
 ) -> Result<Value> {
     let depth = step.depth.unwrap_or(0);
     let node_id = if let Some(ref pattern) = step.node_id_pattern {

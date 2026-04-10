@@ -3247,7 +3247,7 @@ impl VineJSONLWatcher {
         mut self,
         state: Arc<PyramidState>,
         vine_slug: String,
-        llm: LlmConfig,
+        _llm: LlmConfig,
         cancel: CancellationToken,
     ) {
         let rebuild_lock = Arc::new(Mutex::new(()));
@@ -3448,7 +3448,7 @@ pub async fn run_integrity_check(state: &PyramidState, vine_slug: &str) -> Resul
     let conn = state.reader.lock().await;
 
     let mut barren_interior: Vec<String> = Vec::new();
-    let mut true_orphans: Vec<String> = Vec::new();
+    let true_orphans: Vec<String>;
     let mut broken_parents: Vec<String> = Vec::new();
     let unclustered_l0: Vec<String>;
 

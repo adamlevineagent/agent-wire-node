@@ -290,7 +290,7 @@ pub async fn call_model_unified_with_options(
     system_prompt: &str,
     user_prompt: &str,
     temperature: f32,
-    max_tokens: usize,
+    _max_tokens: usize,
     response_format: Option<&serde_json::Value>,
     options: LlmCallOptions,
 ) -> Result<LlmResponse> {

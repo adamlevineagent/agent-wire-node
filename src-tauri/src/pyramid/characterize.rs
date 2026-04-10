@@ -14,7 +14,6 @@
 use std::path::Path;
 
 use anyhow::Result;
-use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use super::llm::{self, LlmConfig};

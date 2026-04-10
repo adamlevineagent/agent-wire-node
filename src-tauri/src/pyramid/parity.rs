@@ -1024,7 +1024,7 @@ pub fn validate_question_compilation(
         .iter()
         .flat_map(|s| s.depends_on.iter().map(|d| d.as_str()))
         .collect();
-    let terminal_step_ids: std::collections::HashSet<&str> = plan
+    let _terminal_step_ids: std::collections::HashSet<&str> = plan
         .steps
         .iter()
         .filter(|s| {

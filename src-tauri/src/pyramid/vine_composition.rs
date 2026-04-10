@@ -8,14 +8,12 @@
 // CRITICAL: This module does NOT modify vine.rs per Q2 constraint. All new
 // composition dispatch goes through build_runner::run_build_from.
 
-use anyhow::{anyhow, Result};
-use std::sync::Arc;
+use anyhow::Result;
 use tracing::{info, warn};
 
 use super::db;
 use super::event_bus::{TaggedBuildEvent, TaggedKind};
 use super::lock_manager::LockManager;
-use super::query;
 use super::PyramidState;
 
 /// Called when a bedrock build completes. Looks up which vines include this
