@@ -1,0 +1,121 @@
+# Chain step configuration — Phase 8 seed annotation.
+#
+# Describes how the YamlConfigRenderer presents a single chain step's
+# configurable fields. Loaded into `pyramid_config_contributions` at
+# first run via `wire_migration::walk_schema_files`; from that point on
+# every read goes through `pyramid_get_schema_annotation` against the
+# contributions table, NOT this file.
+#
+# Source of truth for the field shape: docs/specs/yaml-to-ui-renderer.md
+# (Schema Annotation Model section).
+
+schema_type: chain_step_config
+applies_to: chain_step_config
+version: 1
+label: "Chain Step Configuration"
+description: "Per-step model routing, error strategy, and token budget controls."
+
+fields:
+  model_tier:
+    label: "Model Tier"
+    help: "Which compute tier to use for this step. Inherits from chain defaults if not set."
+    widget: select
+    options_from: tier_registry
+    visibility: basic
+    inherits_from: defaults.model_tier
+    show_cost: true
+    order: 1
+
+  temperature:
+    label: "Temperature"
+    help: "LLM sampling temperature. Lower = more deterministic, higher = more creative."
+    widget: slider
+    min: 0.0
+    max: 1.0
+    step: 0.05
+    visibility: basic
+    inherits_from: defaults.temperature
+    order: 2
+
+  concurrency:
+    label: "Parallel Workers"
+    help: "How many items to process simultaneously. Higher = faster but more resource-intensive."
+    widget: number
+    min: 1
+    max: 50
+    visibility: basic
+    order: 3
+
+  on_error:
+    label: "Error Strategy"
+    help: "What to do when a step fails."
+    widget: select
+    options:
+      - value: "retry(1)"
+        label: "Retry once"
+      - value: "retry(2)"
+        label: "Retry twice"
+      - value: "retry(3)"
+        label: "Retry three times"
+      - value: "skip"
+        label: "Skip and continue"
+      - value: "abort"
+        label: "Abort build"
+    visibility: basic
+    inherits_from: defaults.on_error
+    order: 4
+
+  max_input_tokens:
+    label: "Max Input Size"
+    help: "Token limit per LLM call. Larger inputs are split automatically."
+    widget: number
+    min: 1000
+    max: 200000
+    step: 1000
+    suffix: "tokens"
+    visibility: advanced
+    group: "Token Budget"
+    order: 10
+
+  batch_size:
+    label: "Batch Size"
+    help: "Number of items per LLM call in batched operations."
+    widget: number
+    min: 1
+    max: 100
+    visibility: advanced
+    group: "Token Budget"
+    order: 11
+
+  split_strategy:
+    label: "Split Strategy"
+    help: "How to split oversized inputs that exceed max_input_tokens."
+    widget: select
+    options:
+      - value: "sections"
+        label: "By sections"
+      - value: "lines"
+        label: "By lines"
+      - value: "tokens"
+        label: "By token count"
+    visibility: advanced
+    group: "Token Budget"
+    order: 12
+
+  dehydrate:
+    label: "Dehydration Rules"
+    help: "Fields to drop from inputs when they exceed the token budget."
+    widget: list
+    item_widget: select
+    item_options_from: node_fields
+    visibility: advanced
+    group: "Token Budget"
+    order: 13
+
+  compact_inputs:
+    label: "Compact Mode"
+    help: "Strip whitespace from inputs to save tokens."
+    widget: toggle
+    visibility: advanced
+    group: "Token Budget"
+    order: 14

@@ -90,6 +90,7 @@ pub mod webbing;
 pub mod wire_import;
 pub mod wire_migration;
 pub mod wire_publish;
+pub mod yaml_renderer;
 
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};

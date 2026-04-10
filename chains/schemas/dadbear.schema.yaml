@@ -1,0 +1,48 @@
+# DADBEAR policy — Phase 8 seed annotation.
+#
+# Describes how the YamlConfigRenderer presents DADBEAR's per-pyramid
+# policy (the contents of `pyramid_dadbear_config`). Small 4-field
+# example to exercise the renderer with a simpler config surface than
+# chain steps.
+
+schema_type: dadbear_policy
+applies_to: dadbear_policy
+version: 1
+label: "DADBEAR Policy"
+description: "Controls how DADBEAR watches and maintains this pyramid."
+
+fields:
+  enabled:
+    label: "Enabled"
+    help: "Whether DADBEAR runs on this pyramid. When disabled, no maintenance or ingestion happens."
+    widget: toggle
+    visibility: basic
+    order: 1
+
+  scan_interval_secs:
+    label: "Scan Interval"
+    help: "How often DADBEAR polls the source folder for new files (seconds)."
+    widget: number
+    min: 1
+    max: 3600
+    step: 1
+    suffix: "sec"
+    visibility: basic
+    order: 2
+
+  max_concurrent_ingests:
+    label: "Max Concurrent Ingests"
+    help: "How many files DADBEAR can ingest in parallel per tick."
+    widget: number
+    min: 1
+    max: 16
+    visibility: advanced
+    order: 3
+
+  content_type:
+    label: "Default Content Type"
+    help: "Which chain pipeline to dispatch for newly-discovered files."
+    widget: select
+    options_from: chain_list
+    visibility: basic
+    order: 4
