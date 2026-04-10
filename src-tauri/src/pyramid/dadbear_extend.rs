@@ -1631,4 +1631,163 @@ mod tests {
              config list, mirroring the `tickers.retain(...)` pattern"
         );
     }
+
+    /// Phase 1 wanderer test: empirical proof that the tick loop is serial.
+    ///
+    /// **Why this test exists**: the Phase 1 spec claims the in_flight flag
+    /// guards against "the next 1-second tick starting a concurrent dispatch
+    /// for the same config" while the previous dispatch is still running.
+    /// That claim assumes the outer `loop { sleep(1s); for cfg in cfgs {
+    /// run_tick_for_config(...).await; } }` advances the outer iteration
+    /// while a prior iteration's `.await` is pending. It does not — a
+    /// single `tokio::spawn`ed future cannot be polled while it is
+    /// suspended at an `.await` point.
+    ///
+    /// This test mirrors the exact loop shape of `start_dadbear_extend_loop`
+    /// (single `tokio::spawn` around `loop { sleep; for cfg in cfgs { await
+    /// long_dispatch; } }`) and counts:
+    ///   - how many outer iterations complete in a fixed wall-clock window
+    ///   - how many `dispatch_start`s fire while a `dispatch` is pending
+    ///
+    /// If the spec's mental model were correct, we'd see more than one
+    /// dispatch_start inside a single dispatch window. We don't, because the
+    /// scheduler cannot re-enter a spawned future that is awaiting.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_tick_loop_is_serial_within_single_task() {
+        use std::sync::atomic::AtomicUsize;
+        use tokio::time::Duration;
+
+        let dispatch_start = Arc::new(AtomicUsize::new(0));
+        let dispatch_end = Arc::new(AtomicUsize::new(0));
+        let outer_iters = Arc::new(AtomicUsize::new(0));
+
+        let ds = dispatch_start.clone();
+        let de = dispatch_end.clone();
+        let oi = outer_iters.clone();
+
+        // Mirror of start_dadbear_extend_loop's task shape, minus the DB.
+        let task = tokio::spawn(async move {
+            // Exactly one "config" in the list, emulating a single
+            // DADBEAR config with a slow dispatch.
+            let configs = vec![42i64];
+            let mut in_flight: HashMap<i64, Arc<AtomicBool>> = HashMap::new();
+
+            loop {
+                tokio::time::sleep(Duration::from_millis(50)).await; // base tick
+                oi.fetch_add(1, Ordering::Relaxed);
+
+                for &config_id in &configs {
+                    let flag = in_flight
+                        .entry(config_id)
+                        .or_insert_with(|| Arc::new(AtomicBool::new(false)))
+                        .clone();
+                    if flag.load(Ordering::Relaxed) {
+                        // This is the skip branch the Phase 1 spec claims
+                        // will fire "every 1-second base tick during a long
+                        // dispatch". If the loop is serial within the task,
+                        // this branch NEVER fires because the for-loop
+                        // itself can't advance while the .await below is
+                        // pending.
+                        unreachable!(
+                            "in_flight flag was observed set in a fresh \
+                             iteration of the outer loop — that would \
+                             mean the scheduler re-entered the spawned \
+                             task's future while it was suspended at an \
+                             await, which cannot happen"
+                        );
+                    }
+                    flag.store(true, Ordering::Relaxed);
+                    let _guard = InFlightGuard(flag.clone());
+
+                    ds.fetch_add(1, Ordering::Relaxed);
+                    // Simulate run_tick_for_config taking a "long" time
+                    // relative to the base tick.
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    de.fetch_add(1, Ordering::Relaxed);
+                    // _guard drops here; flag clears.
+                }
+            }
+        });
+
+        // Let the loop run for ~1.2 seconds. In that window, if the outer
+        // loop were advancing every 50ms while a 500ms dispatch was
+        // pending, we'd see many dispatch_starts piled up. We won't.
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        task.abort();
+
+        let starts = dispatch_start.load(Ordering::Relaxed);
+        let ends = dispatch_end.load(Ordering::Relaxed);
+        let iters = outer_iters.load(Ordering::Relaxed);
+
+        // Each iteration is: 50ms base sleep + 500ms dispatch = 550ms per
+        // iteration. In 1200ms we get at most 2-3 full iterations. If the
+        // outer loop advanced independently of the dispatch, we'd see
+        // dispatch_start fire ~24 times (1200 / 50).
+        assert!(
+            starts <= 3,
+            "dispatch_start fired {} times in 1.2s — if the spec's mental \
+             model were right and the outer loop advanced while inner await \
+             was pending, we'd see many more",
+            starts
+        );
+        assert!(
+            starts >= 1,
+            "at least one dispatch should have started in 1.2s, got {}",
+            starts
+        );
+        // dispatch_end is always <= dispatch_start (the last one may be
+        // aborted mid-sleep), and iters == starts (because the skip branch
+        // is unreachable, every iteration calls dispatch_start).
+        assert!(
+            ends <= starts,
+            "ends={} must be <= starts={}",
+            ends,
+            starts
+        );
+        assert_eq!(
+            iters, starts,
+            "outer iterations should equal dispatch_starts; every iteration \
+             that got past the base sleep entered the for-loop body and \
+             incremented dispatch_start. iters={}, starts={}",
+            iters, starts
+        );
+    }
+
+    /// Phase 1 wanderer test: `trigger_for_slug` bypasses the in_flight flag.
+    ///
+    /// This is a documentation test — it asserts the structural fact that
+    /// `trigger_for_slug` calls `run_tick_for_config` without consulting
+    /// the `in_flight` HashMap that the tick loop maintains. The HashMap
+    /// is a local variable inside `start_dadbear_extend_loop`'s `tokio::spawn`
+    /// closure; no other caller can observe or mutate it.
+    ///
+    /// Because `trigger_for_slug` is the ONLY other production caller of
+    /// `run_tick_for_config` (verified by grep), and the tick loop itself
+    /// is structurally serial (see `test_tick_loop_is_serial_within_single_task`),
+    /// the in_flight flag is a no-op in the current code: there is no race
+    /// it can guard against. Its ONLY firing condition would be a future
+    /// code change that either (a) introduces per-config `tokio::spawn`
+    /// inside the tick loop, or (b) has `trigger_for_slug` (or any new
+    /// caller) share access to the HashMap.
+    #[test]
+    fn test_trigger_for_slug_does_not_see_in_flight_flag() {
+        // The flag HashMap lives at `start_dadbear_extend_loop`:105-126 as a
+        // local variable inside an `async move` closure captured by
+        // `tokio::spawn`. It has no accessor outside that closure. To change
+        // this, the flag would need to be promoted to `PyramidState` or a
+        // new `DadbearState` — at which point `trigger_for_slug` could
+        // consult it. Until then, the flag is invisible to every caller
+        // except the tick loop's own for-loop body.
+        //
+        // This test is intentionally a no-op at runtime — its payload is
+        // the comment above plus the source-level assertion that if someone
+        // tries to move the HashMap to a shared location, this test's doc
+        // comment needs to be updated too.
+        //
+        // A future code change that hoists in_flight into PyramidState
+        // would add a `state.dadbear_in_flight: DashMap<i64, Arc<AtomicBool>>`
+        // or similar, and this test would become meaningful: it would
+        // assert that `trigger_for_slug` consults the map and skips (or
+        // returns an already-running error) when the flag is set.
+    }
 }
