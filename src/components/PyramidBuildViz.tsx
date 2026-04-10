@@ -61,9 +61,12 @@ export function PyramidBuildViz({ slug, onComplete, onClose, onRetry }: PyramidB
     useEffect(() => { onCompleteRef.current = onComplete; });
 
     // Phase 13: step timeline state. The hook seeds from the
-    // `pyramid_step_cache_for_build` IPC and then listens for live
-    // events on `cross-build-event`.
-    const { state: timelineState } = useStepTimeline(slug, slug);
+    // `pyramid_step_cache_for_build` IPC (latest-build path) and
+    // then listens for live events on `cross-build-event`.
+    // Verifier fix: passing `null` (not the slug) triggers the
+    // backend's "latest build for this slug" resolution so the
+    // seed query actually matches rows.
+    const { state: timelineState } = useStepTimeline(slug, null);
     const [expandedStep, setExpandedStep] = useState<string | null>(null);
     const [rerollTarget, setRerollTarget] = useState<RerollTarget | null>(null);
     const [rerollContent, setRerollContent] = useState<string | null>(null);

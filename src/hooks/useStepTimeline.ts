@@ -106,7 +106,10 @@ export function useStepTimeline(slug: string, buildId: string | null) {
     stateRef.current = state;
 
     const refresh = useCallback(async () => {
-        if (!buildId) return;
+        // Phase 13 verifier fix: allow null buildId — the backend
+        // resolves the latest build for the slug when buildId is
+        // absent. The previous implementation early-returned here
+        // which silently bypassed the pre-populate.
         try {
             const entries = await invoke<CacheEntrySummary[]>(
                 'pyramid_step_cache_for_build',

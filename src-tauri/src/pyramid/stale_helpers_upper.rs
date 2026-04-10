@@ -2316,13 +2316,24 @@ async fn apply_supersession_manifest(
         // build_version on disk, not the (invalid) one the manifest
         // claimed.
         let bv = node_ctx.current_build_version;
-        let _ = persist_change_manifest(
+        // Phase 13 verifier fix: extract the bus from base_config so the
+        // `ManifestGenerated` event reaches the build viz on the stale
+        // path (validation-failure branch). Without this, only the
+        // reroll path emitted `ManifestGenerated` — a Phase 13 spec
+        // requirement (A2 / Event emission points) was unmet in the
+        // DADBEAR build path.
+        let validation_bus = base_config
+            .cache_access
+            .as_ref()
+            .and_then(|ca| ca.bus.clone());
+        let _ = persist_change_manifest_with_bus(
             db_path,
             slug,
             resolved_node_id,
             bv,
             &manifest,
             Some(format!("validation_failed: {err}")),
+            validation_bus,
         )
         .await;
         return Err(anyhow::anyhow!(
@@ -2385,13 +2396,22 @@ async fn apply_supersession_manifest(
     };
 
     // Persist the manifest row with the NEW build_version (post-bump).
-    let manifest_id = persist_change_manifest(
+    // Phase 13 verifier fix: thread the build event bus through so
+    // `ManifestGenerated` actually fires on the DADBEAR production
+    // path. The bus lives on `base_config.cache_access` (Phase 12
+    // retrofit) so extracting it is zero-plumbing.
+    let stale_bus = base_config
+        .cache_access
+        .as_ref()
+        .and_then(|ca| ca.bus.clone());
+    let manifest_id = persist_change_manifest_with_bus(
         db_path,
         slug,
         resolved_node_id,
         new_build_version,
         &manifest,
         None,
+        stale_bus,
     )
     .await?;
 
@@ -4554,6 +4574,74 @@ mod tests {
         assert_eq!(ctx.primitive, "manifest_generation");
         assert_eq!(ctx.depth, 2);
         assert_eq!(ctx.chunk_index, None);
+    }
+
+    /// Phase 13 verifier fix: the bus-variant of `persist_change_manifest`
+    /// must actually emit `ManifestGenerated` on the attached bus. The
+    /// prior implementation wired the function but every production
+    /// caller passed `None`, so the event was dead code. The
+    /// apply_supersession_manifest fix threads the bus from
+    /// base_config.cache_access; this test verifies the helper emits
+    /// as promised.
+    #[test]
+    fn test_persist_change_manifest_with_bus_emits_manifest_generated() {
+        use crate::pyramid::event_bus::{BuildEventBus, TaggedKind};
+        use std::sync::Arc;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let (file, _conn) = setup_test_db();
+        let db_path = file.path().to_string_lossy().into_owned();
+
+        // Seed a node so the change manifest FK passes.
+        let conn2 = open_pyramid_db(file.path()).unwrap();
+        insert_node(&conn2, "L1-test-001", None);
+
+        let bus = Arc::new(BuildEventBus::new());
+        let mut rx = bus.subscribe();
+
+        let manifest = ChangeManifest {
+            node_id: "L1-test-001".to_string(),
+            identity_changed: false,
+            content_updates: ContentUpdates::default(),
+            children_swapped: vec![],
+            reason: "verifier-test".to_string(),
+            build_version: 2,
+        };
+
+        rt.block_on(async {
+            let manifest_id = super::persist_change_manifest_with_bus(
+                &db_path,
+                "test-slug",
+                "L1-test-001",
+                2,
+                &manifest,
+                Some("verifier fix".to_string()),
+                Some(bus.clone()),
+            )
+            .await
+            .expect("persist with bus should succeed");
+            assert!(manifest_id > 0);
+        });
+
+        // The event must be on the bus. Drain up to one event with
+        // a short timeout so a bug where nothing is emitted fails
+        // loudly instead of hanging.
+        let event = rt.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+                .await
+                .expect("event should arrive within 200ms")
+                .expect("receiver should see the event")
+        });
+        match event.kind {
+            TaggedKind::ManifestGenerated { manifest_id, node_id, .. } => {
+                assert!(manifest_id > 0);
+                assert_eq!(node_id, "L1-test-001");
+            }
+            other => panic!("expected ManifestGenerated, got {:?}", other),
+        }
     }
 }
 

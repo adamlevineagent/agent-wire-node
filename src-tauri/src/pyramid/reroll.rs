@@ -473,8 +473,18 @@ fn run_downstream_invalidation(
         return Ok(Vec::new());
     }
 
-    let flipped = db::invalidate_cache_entries(&conn, slug, &downstream, origin_cache_key)?;
-    let actually_flipped: Vec<String> = downstream.into_iter().take(flipped).collect();
+    // Phase 13 verifier fix: use the variant that returns the
+    // ACTUALLY flipped keys rather than `take(count)` on the input
+    // list — the prior logic would emit `CacheInvalidated` events
+    // for the first N items in `downstream` regardless of whether
+    // they were the ones that flipped, producing incorrect event
+    // payloads when some entries were already invalidated.
+    let actually_flipped = db::invalidate_cache_entries_returning_flipped(
+        &conn,
+        slug,
+        &downstream,
+        origin_cache_key,
+    )?;
 
     for ck in &actually_flipped {
         let _ = bus.tx.send(TaggedBuildEvent {

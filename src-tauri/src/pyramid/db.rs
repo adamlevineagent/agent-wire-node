@@ -6172,6 +6172,46 @@ pub struct CacheEntrySummary {
     pub invalidated_by: Option<String>,
 }
 
+/// Phase 13: find the most-recent build_id for a slug by scanning
+/// `pyramid_step_cache` for the newest row. Used by
+/// `list_cache_entries_for_latest_build` when the caller has no
+/// explicit build_id (e.g. the PyramidBuildViz pre-populate path
+/// where the UI only has a slug).
+///
+/// Phase 13 verifier fix: the initial implementation called the
+/// `pyramid_step_cache_for_build` IPC with `(slug, slug)` as the
+/// `(slug, build_id)` pair, which never matched any row since real
+/// build_ids are strings like `chain-<uuid>`. This helper unblocks
+/// the pre-populate path for the common "open the viz on the
+/// current/latest build" flow.
+pub fn find_latest_build_id_for_slug(conn: &Connection, slug: &str) -> Result<Option<String>> {
+    let row: Option<String> = conn
+        .query_row(
+            "SELECT build_id FROM pyramid_step_cache
+              WHERE slug = ?1
+              ORDER BY id DESC
+              LIMIT 1",
+            rusqlite::params![slug],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(row)
+}
+
+/// Phase 13 verifier fix: list cache entries for the latest build of
+/// a slug. Frontend callers that only have a slug (PyramidBuildViz
+/// pre-populate path) use this so the step timeline seeds with real
+/// data even though the UI doesn't know the build_id at mount time.
+pub fn list_cache_entries_for_latest_build(
+    conn: &Connection,
+    slug: &str,
+) -> Result<Vec<CacheEntrySummary>> {
+    let Some(build_id) = find_latest_build_id_for_slug(conn, slug)? else {
+        return Ok(Vec::new());
+    };
+    list_cache_entries_for_build(conn, slug, &build_id)
+}
+
 /// Phase 13: fetch every cache entry written during the given build,
 /// newest-first. Used by `pyramid_step_cache_for_build` to seed the
 /// step timeline on mount / resume so already-completed steps render
@@ -6242,6 +6282,34 @@ pub fn invalidate_cache_entries(
         total += affected;
     }
     Ok(total)
+}
+
+/// Phase 13 verifier fix: invalidate cache entries and return the
+/// exact set of cache keys that actually flipped (as opposed to
+/// just a count). The reroll path emits `CacheInvalidated` events
+/// per flipped key; without this helper it was emitting events for
+/// the first N items of the input list, which may not correspond
+/// to the actually-flipped rows when some entries were already
+/// stale.
+pub fn invalidate_cache_entries_returning_flipped(
+    conn: &Connection,
+    slug: &str,
+    cache_keys: &[String],
+    reason: &str,
+) -> Result<Vec<String>> {
+    let mut flipped: Vec<String> = Vec::new();
+    for ck in cache_keys {
+        let affected = conn.execute(
+            "UPDATE pyramid_step_cache
+                SET invalidated_by = ?1, invalidated_at = datetime('now')
+              WHERE slug = ?2 AND cache_key = ?3 AND invalidated_by IS NULL",
+            rusqlite::params![reason, slug, ck],
+        )?;
+        if affected > 0 {
+            flipped.push(ck.clone());
+        }
+    }
+    Ok(flipped)
 }
 
 /// Phase 13: find cache entries whose step_name + depth chain points
@@ -10914,6 +10982,31 @@ pub fn build_active_build_summary(
     started_at: &str,
     current_step: Option<&str>,
 ) -> Result<ActiveBuildRow> {
+    // Phase 13 verifier fix: the caller doesn't know the real
+    // build_id at runtime (BuildHandle doesn't carry it). The
+    // initial implementation passed the slug as a placeholder,
+    // which meant every JOIN against `pyramid_step_cache.build_id`
+    // returned zero. Resolve the effective build_id here by
+    // preferring the caller-supplied value if it actually matches a
+    // row, otherwise walking the cache for the latest build seen.
+    let effective_build_id = if !build_id.is_empty() && build_id != slug {
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pyramid_step_cache
+                  WHERE slug = ?1 AND build_id = ?2",
+                rusqlite::params![slug, build_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        if exists > 0 {
+            build_id.to_string()
+        } else {
+            find_latest_build_id_for_slug(conn, slug)?.unwrap_or_else(|| build_id.to_string())
+        }
+    } else {
+        find_latest_build_id_for_slug(conn, slug)?.unwrap_or_else(|| slug.to_string())
+    };
+
     // Count completed pipeline steps for the build. The
     // `pyramid_pipeline_steps` table doesn't carry a status column
     // — every persisted row represents a completed step (the
@@ -10925,7 +11018,7 @@ pub fn build_active_build_summary(
         .query_row(
             "SELECT COUNT(*) FROM pyramid_pipeline_steps
               WHERE slug = ?1 AND build_id = ?2",
-            rusqlite::params![slug, build_id],
+            rusqlite::params![slug, effective_build_id],
             |row| row.get(0),
         )
         .unwrap_or(0);
@@ -10936,7 +11029,7 @@ pub fn build_active_build_summary(
         .query_row(
             "SELECT COALESCE(SUM(cost_usd), 0.0) FROM pyramid_step_cache
               WHERE slug = ?1 AND build_id = ?2",
-            rusqlite::params![slug, build_id],
+            rusqlite::params![slug, effective_build_id],
             |row| row.get(0),
         )
         .unwrap_or(0.0);
@@ -10953,7 +11046,7 @@ pub fn build_active_build_summary(
                 COUNT(*)
              FROM pyramid_step_cache
              WHERE slug = ?1 AND build_id = ?2",
-            rusqlite::params![slug, build_id],
+            rusqlite::params![slug, effective_build_id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap_or((0, 0));
@@ -10966,7 +11059,7 @@ pub fn build_active_build_summary(
 
     Ok(ActiveBuildRow {
         slug: slug.to_string(),
-        build_id: build_id.to_string(),
+        build_id: effective_build_id,
         status: status.to_string(),
         started_at: started_at.to_string(),
         completed_steps,
@@ -14896,5 +14989,159 @@ mod phase13_tests {
 
         let count = count_recent_rerolls(&conn, "p13-test", "synth", -1, 0).unwrap();
         assert!(count >= 3, "expected 3 recent rerolls, got {}", count);
+    }
+
+    // ── Phase 13 verifier fix tests ────────────────────────────────
+
+    #[test]
+    fn test_find_latest_build_id_for_slug_returns_most_recent() {
+        let conn = mem_conn();
+        // Seed entries with different build_ids using a raw insert so
+        // we can control the build_id explicitly — make_cache_entry
+        // hardcodes "p13-build".
+        conn.execute(
+            "INSERT INTO pyramid_step_cache
+                (slug, build_id, step_name, chunk_index, depth, cache_key,
+                 inputs_hash, prompt_hash, model_id, output_json,
+                 force_fresh, supersedes_cache_id, created_at)
+             VALUES ('slug-a', 'chain-001', 'extract', 0, 0, 'ck-a',
+                     'i', 'p', 'm', '{}', 0, NULL, datetime('now', '-2 hours'))",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO pyramid_step_cache
+                (slug, build_id, step_name, chunk_index, depth, cache_key,
+                 inputs_hash, prompt_hash, model_id, output_json,
+                 force_fresh, supersedes_cache_id, created_at)
+             VALUES ('slug-a', 'chain-002', 'cluster', 0, 1, 'ck-b',
+                     'i', 'p', 'm', '{}', 0, NULL, datetime('now'))",
+            [],
+        )
+        .unwrap();
+
+        let latest = find_latest_build_id_for_slug(&conn, "slug-a").unwrap();
+        assert_eq!(latest.as_deref(), Some("chain-002"));
+
+        // Non-existent slug returns None.
+        let none = find_latest_build_id_for_slug(&conn, "nope").unwrap();
+        assert!(none.is_none());
+    }
+
+    #[test]
+    fn test_list_cache_entries_for_latest_build_resolves_on_slug() {
+        let conn = mem_conn();
+        // Two builds for the same slug. Latest one wins.
+        conn.execute(
+            "INSERT INTO pyramid_step_cache
+                (slug, build_id, step_name, chunk_index, depth, cache_key,
+                 inputs_hash, prompt_hash, model_id, output_json,
+                 force_fresh, supersedes_cache_id, created_at)
+             VALUES ('slug-b', 'chain-old', 'extract', 0, 0, 'ck-old',
+                     'i', 'p', 'm', '{}', 0, NULL, datetime('now', '-1 day'))",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO pyramid_step_cache
+                (slug, build_id, step_name, chunk_index, depth, cache_key,
+                 inputs_hash, prompt_hash, model_id, output_json,
+                 force_fresh, supersedes_cache_id, created_at)
+             VALUES ('slug-b', 'chain-new', 'extract', 0, 0, 'ck-new',
+                     'i', 'p', 'm', '{}', 0, NULL, datetime('now'))",
+            [],
+        )
+        .unwrap();
+
+        let rows = list_cache_entries_for_latest_build(&conn, "slug-b").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].build_id, "chain-new");
+        assert_eq!(rows[0].cache_key, "ck-new");
+
+        // Empty slug returns empty vec (not an error).
+        let empty = list_cache_entries_for_latest_build(&conn, "nope").unwrap();
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn test_invalidate_cache_entries_returning_flipped_matches_actual_writes() {
+        let conn = mem_conn();
+        let e1 = make_cache_entry("p13-test", "a", 0, 0, "1");
+        let e2 = make_cache_entry("p13-test", "b", 0, 0, "2");
+        let e3 = make_cache_entry("p13-test", "c", 0, 0, "3");
+        let k1 = e1.cache_key.clone();
+        let k2 = e2.cache_key.clone();
+        let k3 = e3.cache_key.clone();
+        store_cache(&conn, &e1).unwrap();
+        store_cache(&conn, &e2).unwrap();
+        store_cache(&conn, &e3).unwrap();
+
+        // Pre-invalidate the middle row so the next call has to
+        // report only k1 + k3 as freshly flipped.
+        invalidate_cache_entries(&conn, "p13-test", &[k2.clone()], "setup").unwrap();
+
+        let flipped = invalidate_cache_entries_returning_flipped(
+            &conn,
+            "p13-test",
+            &[k1.clone(), k2.clone(), k3.clone()],
+            "upstream_reroll",
+        )
+        .unwrap();
+        assert_eq!(flipped.len(), 2);
+        assert!(flipped.contains(&k1));
+        assert!(!flipped.contains(&k2), "already-invalidated key should be skipped");
+        assert!(flipped.contains(&k3));
+    }
+
+    #[test]
+    fn test_build_active_build_summary_resolves_latest_when_build_id_is_slug() {
+        let conn = mem_conn();
+        // The production path uses the slug as a placeholder
+        // build_id (because BuildHandle has no build_id field).
+        // The summary query must detect that and fall back to the
+        // latest real build.
+        conn.execute(
+            "INSERT INTO pyramid_step_cache
+                (slug, build_id, step_name, chunk_index, depth, cache_key,
+                 inputs_hash, prompt_hash, model_id, output_json, cost_usd,
+                 force_fresh, supersedes_cache_id, created_at)
+             VALUES ('summary-slug', 'chain-42', 'extract', 0, 0, 'ck-a',
+                     'i', 'p', 'm', '{}', 0.0123, 1, NULL, datetime('now'))",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO pyramid_step_cache
+                (slug, build_id, step_name, chunk_index, depth, cache_key,
+                 inputs_hash, prompt_hash, model_id, output_json, cost_usd,
+                 force_fresh, supersedes_cache_id, created_at)
+             VALUES ('summary-slug', 'chain-42', 'cluster', 0, 1, 'ck-b',
+                     'i', 'p', 'm', '{}', 0.0321, 0, NULL, datetime('now'))",
+            [],
+        )
+        .unwrap();
+
+        // Pass the slug itself as the placeholder build_id — the
+        // fallback should kick in.
+        let row = build_active_build_summary(
+            &conn,
+            "summary-slug",
+            "summary-slug",
+            "running",
+            "3s ago",
+            None,
+        )
+        .unwrap();
+        assert_eq!(row.build_id, "chain-42", "fallback resolved latest build");
+        assert!(
+            (row.cost_so_far_usd - 0.0444).abs() < 0.0001,
+            "cost summed from both rows: {}",
+            row.cost_so_far_usd
+        );
+        assert!(
+            row.cache_hit_rate > 0.0 && row.cache_hit_rate < 1.0,
+            "mixed hit/miss expected: {}",
+            row.cache_hit_rate
+        );
     }
 }

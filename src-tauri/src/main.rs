@@ -6320,15 +6320,27 @@ async fn pyramid_cost_summary(
 /// frontend can pre-populate the step timeline on mount. Used when a
 /// user opens a running build viz — the viz seeds its step timeline
 /// from the cache table, then listens for live events going forward.
+///
+/// `build_id` is optional. When absent, the backend resolves the
+/// latest build for the slug by walking `pyramid_step_cache` newest-
+/// first. This is the common path for the PyramidBuildViz "open on
+/// the current/latest build" flow where the UI has no build_id in
+/// scope at mount time.
 #[tauri::command]
 async fn pyramid_step_cache_for_build(
     state: tauri::State<'_, SharedState>,
     slug: String,
-    build_id: String,
+    build_id: Option<String>,
 ) -> Result<Vec<wire_node_lib::pyramid::db::CacheEntrySummary>, String> {
     let conn = state.pyramid.reader.lock().await;
-    pyramid_db::list_cache_entries_for_build(&conn, &slug, &build_id)
-        .map_err(|e| e.to_string())
+    match build_id.as_deref() {
+        Some(bid) if !bid.is_empty() => {
+            pyramid_db::list_cache_entries_for_build(&conn, &slug, bid)
+                .map_err(|e| e.to_string())
+        }
+        _ => pyramid_db::list_cache_entries_for_latest_build(&conn, &slug)
+            .map_err(|e| e.to_string()),
+    }
 }
 
 /// Phase 13: reroll a node or intermediate cache entry with a
