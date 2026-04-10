@@ -10927,11 +10927,18 @@ async fn execute_ir_single(
     output = decorate_ir_step_output(output, &node_id, chunk_index);
 
     // Log cost
+    //
+    // Phase 11: uses the synchronous-path helper so the row is born
+    // with `reconciliation_status = 'synchronous'` and
+    // `actual_cost = response.usage.cost`. The broadcast webhook will
+    // later confirm this row via `generation_id`; the leak detection
+    // sweep flips unconfirmed rows to `'broadcast_missing'` after the
+    // grace period.
     if let Some(ref response) = llm_response {
         let model =
             chain_dispatch::resolve_ir_model(&step.model_requirements, &dispatch_ctx.config);
         let _ = exec_state
-            .log_cost(
+            .log_cost_synchronous(
                 step_name,
                 &model,
                 response.usage.prompt_tokens,
@@ -10941,6 +10948,8 @@ async fn execute_ir_single(
                 Some((elapsed * 1000.0) as i64),
                 response.generation_id.as_deref(),
                 None,
+                response.actual_cost_usd,
+                response.provider_id.as_deref(),
             )
             .await;
     }
@@ -11404,14 +11413,14 @@ async fn execute_ir_sequential_foreach(
             Ok((mut output, llm_response)) => {
                 output = decorate_ir_step_output(output, &node_id, chunk_index);
 
-                // Log cost
+                // Log cost — Phase 11 synchronous path.
                 if let Some(ref response) = llm_response {
                     let model = chain_dispatch::resolve_ir_model(
                         &step.model_requirements,
                         &dispatch_ctx.config,
                     );
                     let _ = exec_state
-                        .log_cost(
+                        .log_cost_synchronous(
                             step_name,
                             &model,
                             response.usage.prompt_tokens,
@@ -11421,6 +11430,8 @@ async fn execute_ir_sequential_foreach(
                             Some((elapsed * 1000.0) as i64),
                             response.generation_id.as_deref(),
                             None,
+                            response.actual_cost_usd,
+                            response.provider_id.as_deref(),
                         )
                         .await;
                 }
@@ -11807,12 +11818,12 @@ async fn execute_ir_web_edges(
         .await?;
         let elapsed = start.elapsed().as_secs_f64();
 
-        // Log cost
+        // Log cost — Phase 11 synchronous path.
         if let Some(ref response) = llm_resp {
             let model =
                 chain_dispatch::resolve_ir_model(&step.model_requirements, &dispatch_ctx.config);
             let _ = exec_state
-                .log_cost(
+                .log_cost_synchronous(
                     step_name,
                     &model,
                     response.usage.prompt_tokens,
@@ -11822,6 +11833,8 @@ async fn execute_ir_web_edges(
                     Some((elapsed * 1000.0) as i64),
                     response.generation_id.as_deref(),
                     None,
+                    response.actual_cost_usd,
+                    response.provider_id.as_deref(),
                 )
                 .await;
         }

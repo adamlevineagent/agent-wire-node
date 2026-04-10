@@ -40,6 +40,13 @@ use super::types::TokenUsage;
 /// the outgoing request body so downstream observability (OpenRouter
 /// Broadcast, OTLP) can correlate per-build cost back to specific
 /// chain steps.
+///
+/// Phase 11 extended `RequestMetadata` with `layer`, `check_type`, and
+/// `chunk_index` so the full `trace.metadata.*` namespace reaches
+/// downstream OTLP destinations. Per `docs/specs/
+/// evidence-triage-and-dadbear.md` Part 4, these attribute keys are
+/// used by the webhook correlator to look up the originating
+/// `pyramid_cost_log` row on confirmation.
 #[derive(Debug, Clone, Default)]
 pub struct RequestMetadata {
     pub build_id: Option<String>,
@@ -49,6 +56,57 @@ pub struct RequestMetadata {
     pub depth: Option<i64>,
     pub node_identity: Option<String>,
     pub session_id: Option<String>,
+    /// Phase 11: chunk index for per-chunk step calls (e.g., source
+    /// extraction). Serialized under `trace.metadata.chunk_index` so
+    /// broadcasts for the same step on different chunks can be
+    /// distinguished during correlation.
+    pub chunk_index: Option<i64>,
+    /// Phase 11: layer identifier for layered step calls (e.g.,
+    /// synth/reconcile/apex). Serialized under `trace.metadata.layer`.
+    pub layer: Option<i64>,
+    /// Phase 11: stale-check type / node-check discriminator. Surfaces
+    /// in broadcast traces under `trace.metadata.check_type` so the
+    /// oversight page can group stale-maintenance calls separately
+    /// from normal builds.
+    pub check_type: Option<String>,
+}
+
+impl RequestMetadata {
+    /// Construct a `RequestMetadata` from a Phase 6 `StepContext` so
+    /// the Phase 11 LLM call path injects build_id / slug / step_name
+    /// / depth / chunk_index into the outgoing trace. The caller can
+    /// override or extend individual fields afterwards (e.g., set
+    /// `node_identity` from the app's identity table).
+    pub fn from_step_context(ctx: &super::step_context::StepContext) -> Self {
+        Self {
+            build_id: if ctx.build_id.is_empty() {
+                None
+            } else {
+                Some(ctx.build_id.clone())
+            },
+            slug: if ctx.slug.is_empty() {
+                None
+            } else {
+                Some(ctx.slug.clone())
+            },
+            step_name: if ctx.step_name.is_empty() {
+                None
+            } else {
+                Some(ctx.step_name.clone())
+            },
+            depth: Some(ctx.depth),
+            chunk_index: ctx.chunk_index,
+            // chain_id / layer / check_type / node_identity are not
+            // on StepContext today. Callers that know them should
+            // fill them in before handing the metadata to the LLM
+            // call path.
+            chain_id: None,
+            layer: None,
+            check_type: None,
+            node_identity: None,
+            session_id: None,
+        }
+    }
 }
 
 /// Unified parsed response. Providers map their native envelope into this
@@ -356,33 +414,88 @@ impl LlmProvider for OpenRouterProvider {
     fn augment_request_body(&self, body: &mut Value, metadata: &RequestMetadata) {
         let Some(map) = body.as_object_mut() else { return };
 
-        // Build the OpenRouter `trace` object so downstream Broadcast
-        // subscribers (Phase 11) get per-step attribution.
+        // Phase 11: the `trace` object carries BOTH OpenRouter's
+        // recognized hierarchy keys (trace_id / trace_name / span_name
+        // / generation_name) AND our custom metadata. OpenRouter's
+        // OTLP translation promotes anything else in this object to
+        // `trace.metadata.<key>` attributes on the span, which is
+        // where the webhook receiver pulls them from for correlation.
+        //
+        // See `docs/specs/evidence-triage-and-dadbear.md` Part 4 for
+        // the authoritative attribute key table.
         let mut trace = serde_json::Map::new();
+
+        // ── OpenRouter-recognized hierarchy keys ────────────────────
         if let Some(b) = &metadata.build_id {
-            trace.insert("build_id".into(), Value::String(b.clone()));
-        }
-        if let Some(s) = &metadata.slug {
-            trace.insert("slug".into(), Value::String(s.clone()));
+            trace.insert("trace_id".into(), Value::String(b.clone()));
         }
         if let Some(c) = &metadata.chain_id {
-            trace.insert("chain_id".into(), Value::String(c.clone()));
+            trace.insert("trace_name".into(), Value::String(c.clone()));
+        }
+        if let Some(s) = &metadata.step_name {
+            trace.insert("span_name".into(), Value::String(s.clone()));
+            trace.insert("generation_name".into(), Value::String(s.clone()));
+        }
+
+        // ── Custom metadata passed through to trace.metadata.* ──────
+        // Both flat AND nested-under-`metadata` forms are written so
+        // OpenRouter's OTLP translator has a consistent surface to
+        // work from regardless of which path it takes. This is
+        // intentional belt-and-suspenders: the spec's attribute key
+        // convention uses `trace.metadata.<key>`, but earlier phases
+        // of the node were writing them flat and we don't want to
+        // silently break prior broadcast ingestion. Both paths are
+        // legal per the OpenRouter docs — dashboard destinations
+        // accept either.
+        let mut meta = serde_json::Map::new();
+        if let Some(s) = &metadata.slug {
+            trace.insert("pyramid_slug".into(), Value::String(s.clone()));
+            meta.insert("pyramid_slug".into(), Value::String(s.clone()));
+        }
+        if let Some(b) = &metadata.build_id {
+            trace.insert("build_id".into(), Value::String(b.clone()));
+            meta.insert("build_id".into(), Value::String(b.clone()));
         }
         if let Some(s) = &metadata.step_name {
             trace.insert("step_name".into(), Value::String(s.clone()));
+            meta.insert("step_name".into(), Value::String(s.clone()));
         }
         if let Some(d) = metadata.depth {
-            trace.insert(
-                "depth".into(),
-                Value::Number(serde_json::Number::from(d)),
-            );
+            let n = Value::Number(serde_json::Number::from(d));
+            trace.insert("depth".into(), n.clone());
+            meta.insert("depth".into(), n);
         }
+        if let Some(c) = &metadata.chain_id {
+            trace.insert("chain_id".into(), Value::String(c.clone()));
+            meta.insert("chain_id".into(), Value::String(c.clone()));
+        }
+        if let Some(l) = metadata.layer {
+            let n = Value::Number(serde_json::Number::from(l));
+            trace.insert("layer".into(), n.clone());
+            meta.insert("layer".into(), n);
+        }
+        if let Some(ct) = &metadata.check_type {
+            trace.insert("check_type".into(), Value::String(ct.clone()));
+            meta.insert("check_type".into(), Value::String(ct.clone()));
+        }
+        if let Some(ci) = metadata.chunk_index {
+            let n = Value::Number(serde_json::Number::from(ci));
+            trace.insert("chunk_index".into(), n.clone());
+            meta.insert("chunk_index".into(), n);
+        }
+
+        if !meta.is_empty() {
+            trace.insert("metadata".into(), Value::Object(meta));
+        }
+
         if !trace.is_empty() {
             map.insert("trace".into(), Value::Object(trace));
         }
 
         // `session_id` scopes per-build sampling in OpenRouter. Prefer
         // the explicit override, otherwise synthesize from slug+build.
+        // The webhook correlator splits on `/` and uses the first
+        // half as the slug filter for its fallback correlation path.
         let session_id = metadata.session_id.clone().or_else(|| {
             match (&metadata.slug, &metadata.build_id) {
                 (Some(slug), Some(bid)) => Some(format!("{slug}/{bid}")),
@@ -1251,16 +1364,85 @@ mod tests {
             depth: Some(1),
             node_identity: Some("node-abc".into()),
             session_id: None,
+            chunk_index: None,
+            layer: None,
+            check_type: None,
         };
         let mut body = serde_json::json!({ "model": "x", "messages": [] });
         provider.augment_request_body(&mut body, &metadata);
         let map = body.as_object().unwrap();
         let trace = map.get("trace").unwrap().as_object().unwrap();
         assert_eq!(trace.get("build_id").unwrap(), "b-42");
-        assert_eq!(trace.get("slug").unwrap(), "my-slug");
+        // Phase 11: slug is now written as `pyramid_slug` in the
+        // trace object per the spec's attribute-key convention.
+        assert_eq!(trace.get("pyramid_slug").unwrap(), "my-slug");
         assert_eq!(trace.get("step_name").unwrap(), "extract");
         assert_eq!(map.get("session_id").unwrap(), "my-slug/b-42");
         assert_eq!(map.get("user").unwrap(), "node-abc");
+        // Phase 11: OpenRouter-recognized hierarchy keys.
+        assert_eq!(trace.get("trace_id").unwrap(), "b-42");
+        assert_eq!(trace.get("trace_name").unwrap(), "code_chain");
+        assert_eq!(trace.get("span_name").unwrap(), "extract");
+        // Phase 11: `metadata` sub-object also present for OTLP
+        // translation per trace.metadata.* attribute keys.
+        let meta = trace.get("metadata").unwrap().as_object().unwrap();
+        assert_eq!(meta.get("pyramid_slug").unwrap(), "my-slug");
+        assert_eq!(meta.get("build_id").unwrap(), "b-42");
+        assert_eq!(meta.get("step_name").unwrap(), "extract");
+    }
+
+    #[test]
+    fn request_metadata_injects_layer_chunk_check_type() {
+        let provider = OpenRouterProvider {
+            id: "openrouter".into(),
+            display_name: "OpenRouter".into(),
+            base_url: "https://openrouter.ai/api/v1".into(),
+            extra_headers: vec![],
+        };
+        let metadata = RequestMetadata {
+            build_id: Some("b-99".into()),
+            slug: Some("target".into()),
+            step_name: Some("stale_check".into()),
+            depth: Some(2),
+            chunk_index: Some(4),
+            layer: Some(1),
+            check_type: Some("node_stale".into()),
+            ..Default::default()
+        };
+        let mut body = serde_json::json!({ "model": "x", "messages": [] });
+        provider.augment_request_body(&mut body, &metadata);
+        let trace = body
+            .as_object()
+            .unwrap()
+            .get("trace")
+            .unwrap()
+            .as_object()
+            .unwrap();
+        let meta = trace.get("metadata").unwrap().as_object().unwrap();
+        assert_eq!(meta.get("layer").unwrap(), 1);
+        assert_eq!(meta.get("chunk_index").unwrap(), 4);
+        assert_eq!(meta.get("check_type").unwrap(), "node_stale");
+        assert_eq!(meta.get("depth").unwrap(), 2);
+    }
+
+    #[test]
+    fn request_metadata_from_step_context() {
+        use super::super::step_context::StepContext;
+        let ctx = StepContext::new(
+            "slug-a",
+            "build-1",
+            "source_extract",
+            "extraction",
+            3,
+            Some(7),
+            "/tmp/test.db",
+        );
+        let metadata = RequestMetadata::from_step_context(&ctx);
+        assert_eq!(metadata.slug.as_deref(), Some("slug-a"));
+        assert_eq!(metadata.build_id.as_deref(), Some("build-1"));
+        assert_eq!(metadata.step_name.as_deref(), Some("source_extract"));
+        assert_eq!(metadata.depth, Some(3));
+        assert_eq!(metadata.chunk_index, Some(7));
     }
 
     #[test]

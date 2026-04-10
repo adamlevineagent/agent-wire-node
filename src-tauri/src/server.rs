@@ -749,6 +749,215 @@ pub async fn start_server(
             })
     };
 
+    // POST /hooks/openrouter — Phase 11 broadcast webhook receiver.
+    //
+    // Accepts OTLP JSON payloads pushed by OpenRouter's Broadcast
+    // feature. The route is publicly exposed via the Cloudflare
+    // tunnel so auth is mandatory — any unauthenticated request is
+    // a potential leak attack surface.
+    //
+    // Flow:
+    //   1. Validate the `X-Webhook-Secret` header against the secret
+    //      stored in `pyramid_providers.broadcast_config_json` using
+    //      constant-time comparison (subtle::ConstantTimeEq).
+    //   2. Detect OpenRouter's test-connection ping via the
+    //      `X-Test-Connection: true` header or an empty payload —
+    //      respond 200 with no correlation side effects.
+    //   3. Parse the OTLP JSON into BroadcastTrace structs and feed
+    //      each into `process_trace()`. That function handles:
+    //        - correlation (gen_id primary, session_id fallback)
+    //        - discrepancy detection vs the synchronous ledger
+    //        - orphan broadcast logging
+    //        - CostReconciliationDiscrepancy / OrphanBroadcastDetected
+    //          event emission
+    //        - provider health state machine feeds
+    //   4. Return 200 regardless of per-trace outcome so OpenRouter
+    //      does not retry (they don't retry on non-2xx anyway, but
+    //      we explicitly return success for logging clarity).
+    let openrouter_webhook = {
+        let state = state.clone();
+        warp::path!("hooks" / "openrouter")
+            .and(warp::post().or(warp::put()).unify())
+            .and(warp::header::optional::<String>("x-webhook-secret"))
+            .and(warp::header::optional::<String>("x-test-connection"))
+            .and(warp::body::content_length_limit(16 * 1024 * 1024)) // 16 MiB cap
+            .and(warp::body::json::<serde_json::Value>())
+            .and_then(
+                move |secret_header: Option<String>,
+                      test_connection_header: Option<String>,
+                      payload: serde_json::Value| {
+                    let state = state.clone();
+                    async move {
+                        use crate::pyramid::openrouter_webhook::{
+                            parse_otlp_payload, process_trace, verify_webhook_secret,
+                            WebhookAuthError,
+                        };
+                        use crate::pyramid::provider_health::CostReconciliationPolicy;
+
+                        // Phase 11: auth gate. Scoped to the default
+                        // 'openrouter' provider row. Wire Node
+                        // currently supports a single OpenRouter
+                        // provider; multi-provider broadcast support
+                        // (e.g., multiple OR accounts) is Phase 15.
+                        let auth_result = {
+                            let conn = state.pyramid.writer.lock().await;
+                            verify_webhook_secret(
+                                &conn,
+                                "openrouter",
+                                secret_header.as_deref(),
+                            )
+                        };
+                        match auth_result {
+                            Ok(()) => {}
+                            Err(WebhookAuthError::NoSecretConfigured) => {
+                                tracing::warn!(
+                                    "openrouter webhook: rejected — no secret configured yet"
+                                );
+                                return Ok::<_, warp::Rejection>(Reply::into_response(
+                                    warp::reply::with_status(
+                                        warp::reply::json(&serde_json::json!({
+                                            "status": "service_unavailable",
+                                            "message": "webhook secret not yet configured on this node",
+                                        })),
+                                        warp::http::StatusCode::SERVICE_UNAVAILABLE,
+                                    ),
+                                ));
+                            }
+                            Err(e) => {
+                                // Do NOT log the header value — we
+                                // only log the failure mode.
+                                tracing::warn!(
+                                    reason = ?e,
+                                    "openrouter webhook: auth rejected"
+                                );
+                                return Ok::<_, warp::Rejection>(Reply::into_response(
+                                    warp::reply::with_status(
+                                        warp::reply::json(&serde_json::json!({
+                                            "status": "unauthorized",
+                                        })),
+                                        warp::http::StatusCode::UNAUTHORIZED,
+                                    ),
+                                ));
+                            }
+                        }
+
+                        // Test-connection ping handling — OpenRouter
+                        // sends an empty payload with
+                        // `X-Test-Connection: true` when the user
+                        // saves the webhook destination. We accept
+                        // it without side effects.
+                        let is_test_ping = test_connection_header
+                            .as_deref()
+                            .map(|v| v.eq_ignore_ascii_case("true"))
+                            .unwrap_or(false);
+
+                        if is_test_ping {
+                            return Ok::<_, warp::Rejection>(Reply::into_response(
+                                warp::reply::with_status(
+                                    warp::reply::json(&serde_json::json!({
+                                        "status": "test_connection_ok",
+                                    })),
+                                    warp::http::StatusCode::OK,
+                                ),
+                            ));
+                        }
+
+                        // Parse + process each trace in the payload.
+                        // Parse errors are logged and return 200 —
+                        // OpenRouter's webhook destination does not
+                        // retry on non-2xx, so a 400 would just
+                        // lose the trace with no recovery path.
+                        let traces = match parse_otlp_payload(&payload) {
+                            Ok(t) => t,
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = %e,
+                                    "openrouter webhook: OTLP parse failed"
+                                );
+                                return Ok::<_, warp::Rejection>(Reply::into_response(
+                                    warp::reply::with_status(
+                                        warp::reply::json(&serde_json::json!({
+                                            "status": "parse_error",
+                                            "message": e.to_string(),
+                                        })),
+                                        warp::http::StatusCode::OK,
+                                    ),
+                                ));
+                            }
+                        };
+
+                        let policy = CostReconciliationPolicy::default();
+                        let bus = state.pyramid.build_event_bus.clone();
+                        let mut confirmed = 0usize;
+                        let mut discrepancies = 0usize;
+                        let mut orphans = 0usize;
+                        let mut recoveries = 0usize;
+                        let mut test_pings = 0usize;
+
+                        {
+                            let conn = state.pyramid.writer.lock().await;
+                            for trace in &traces {
+                                match process_trace(
+                                    &conn,
+                                    trace,
+                                    "openrouter",
+                                    &policy,
+                                    Some(&bus),
+                                ) {
+                                    Ok(crate::pyramid::openrouter_webhook::BroadcastOutcome::Confirmed { .. }) => {
+                                        confirmed += 1;
+                                    }
+                                    Ok(crate::pyramid::openrouter_webhook::BroadcastOutcome::Discrepancy { .. }) => {
+                                        discrepancies += 1;
+                                    }
+                                    Ok(crate::pyramid::openrouter_webhook::BroadcastOutcome::Recovered { .. }) => {
+                                        recoveries += 1;
+                                    }
+                                    Ok(crate::pyramid::openrouter_webhook::BroadcastOutcome::Orphan { .. }) => {
+                                        orphans += 1;
+                                    }
+                                    Ok(crate::pyramid::openrouter_webhook::BroadcastOutcome::TestPing) => {
+                                        test_pings += 1;
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            error = %e,
+                                            "openrouter webhook: process_trace failed"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+
+                        tracing::info!(
+                            traces = traces.len(),
+                            confirmed,
+                            discrepancies,
+                            recoveries,
+                            orphans,
+                            test_pings,
+                            "openrouter webhook batch processed"
+                        );
+
+                        Ok::<_, warp::Rejection>(Reply::into_response(
+                            warp::reply::with_status(
+                                warp::reply::json(&serde_json::json!({
+                                    "status": "ok",
+                                    "traces": traces.len(),
+                                    "confirmed": confirmed,
+                                    "discrepancies": discrepancies,
+                                    "recovered": recoveries,
+                                    "orphans": orphans,
+                                    "test_pings": test_pings,
+                                })),
+                                warp::http::StatusCode::OK,
+                            ),
+                        ))
+                    }
+                },
+            )
+    };
+
     // Explicit OPTIONS preflight handler
     // S2: Use the same origin allowlist as the CORS middleware.
     // Warp's cors() middleware handles preflight for standard CORS, but the
@@ -813,8 +1022,26 @@ pub async fn start_server(
     // Partner (Dennis) routes
     let partner_routes = partner::routes::partner_routes(state.partner.clone());
 
+    // Phase 11: the OpenRouter Broadcast webhook is called from
+    // OpenRouter's egress servers, not from a browser. Origin
+    // headers (if sent at all) come from a wide range of IPs, so
+    // the strict desktop-API allowlist would reject valid
+    // webhooks. We scope a permissive CORS just for this route,
+    // then gate access at the application layer via the shared
+    // secret in `verify_webhook_secret`.
+    let webhook_cors = warp::cors()
+        .allow_any_origin()
+        .allow_methods(vec!["POST", "PUT", "OPTIONS"])
+        .allow_headers(vec![
+            "Content-Type",
+            "X-Webhook-Secret",
+            "X-Test-Connection",
+        ]);
+    let openrouter_webhook_with_cors = openrouter_webhook.with(webhook_cors);
+
     let routes = preflight
         .or(public_html_with_cors)
+        .or(openrouter_webhook_with_cors)
         .or(pyramid_routes
             .or(partner_routes)
             .or(auth_callback

@@ -6758,6 +6758,112 @@ async fn pyramid_delete_step_override(
         .map_err(|e| e.to_string())
 }
 
+// --- Phase 11: Provider Health + Broadcast Oversight IPC commands -----------
+//
+// Per `docs/specs/evidence-triage-and-dadbear.md` Part 3 (Provider
+// Health Alerting). These endpoints back the Phase 15 DADBEAR
+// Oversight Page. They return health snapshots and allow the admin
+// to acknowledge alerts.
+//
+// `pyramid_list_orphan_broadcasts` is a Phase 11 bonus (originally
+// flagged as optional in the brief) — trivial to ship here and the
+// test harness needs it to assert orphan insertion during a fresh
+// install scenario.
+
+#[tauri::command]
+async fn pyramid_provider_health(
+    state: tauri::State<'_, SharedState>,
+) -> Result<Vec<wire_node_lib::pyramid::db::ProviderHealthEntry>, String> {
+    let conn = state.pyramid.reader.lock().await;
+    // 24h window is what the spec's Oversight page shows by default.
+    wire_node_lib::pyramid::db::list_provider_health(&conn, 86_400)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn pyramid_acknowledge_provider_health(
+    state: tauri::State<'_, SharedState>,
+    provider_id: String,
+) -> Result<(), String> {
+    let writer = state.pyramid.writer.lock().await;
+    let bus = state.pyramid.build_event_bus.clone();
+    wire_node_lib::pyramid::provider_health::acknowledge_provider(
+        &writer,
+        &provider_id,
+        Some(&bus),
+    )
+    .map_err(|e| e.to_string())
+}
+
+#[derive(serde::Serialize)]
+struct OrphanBroadcastRow {
+    id: i64,
+    received_at: String,
+    provider_id: Option<String>,
+    generation_id: Option<String>,
+    session_id: Option<String>,
+    pyramid_slug: Option<String>,
+    build_id: Option<String>,
+    step_name: Option<String>,
+    model: Option<String>,
+    cost_usd: Option<f64>,
+    tokens_in: Option<i64>,
+    tokens_out: Option<i64>,
+    acknowledged_at: Option<String>,
+    acknowledgment_reason: Option<String>,
+}
+
+#[tauri::command]
+async fn pyramid_list_orphan_broadcasts(
+    state: tauri::State<'_, SharedState>,
+    limit: Option<i64>,
+    include_acknowledged: Option<bool>,
+) -> Result<Vec<OrphanBroadcastRow>, String> {
+    let conn = state.pyramid.reader.lock().await;
+    let limit = limit.unwrap_or(100).clamp(1, 1000);
+    let include = include_acknowledged.unwrap_or(false);
+    let sql = if include {
+        "SELECT id, received_at, provider_id, generation_id, session_id,
+                pyramid_slug, build_id, step_name, model, cost_usd,
+                tokens_in, tokens_out, acknowledged_at, acknowledgment_reason
+         FROM pyramid_orphan_broadcasts
+         ORDER BY received_at DESC
+         LIMIT ?1"
+    } else {
+        "SELECT id, received_at, provider_id, generation_id, session_id,
+                pyramid_slug, build_id, step_name, model, cost_usd,
+                tokens_in, tokens_out, acknowledged_at, acknowledgment_reason
+         FROM pyramid_orphan_broadcasts
+         WHERE acknowledged_at IS NULL
+         ORDER BY received_at DESC
+         LIMIT ?1"
+    };
+    let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(rusqlite::params![limit], |row| {
+            Ok(OrphanBroadcastRow {
+                id: row.get(0)?,
+                received_at: row.get(1)?,
+                provider_id: row.get(2)?,
+                generation_id: row.get(3)?,
+                session_id: row.get(4)?,
+                pyramid_slug: row.get(5)?,
+                build_id: row.get(6)?,
+                step_name: row.get(7)?,
+                model: row.get(8)?,
+                cost_usd: row.get(9)?,
+                tokens_in: row.get(10)?,
+                tokens_out: row.get(11)?,
+                acknowledged_at: row.get(12)?,
+                acknowledgment_reason: row.get(13)?,
+            })
+        })
+        .map_err(|e| e.to_string())?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(rows)
+}
+
 // --- Phase 4: Config Contribution Foundation IPC commands -------------------
 //
 // Per `docs/specs/config-contribution-and-wire-sharing.md`. These
@@ -8037,6 +8143,47 @@ fn main() {
         });
     }
 
+    // Phase 11: broadcast leak detection sweep.
+    //
+    // Runs periodically to flip synchronous cost_log rows whose
+    // broadcast confirmation never arrived past the grace period to
+    // `reconciliation_status = 'broadcast_missing'`. The loop uses
+    // the same per-app cancellation pattern as the DADBEAR extend
+    // loop so it drops cleanly on app exit. See
+    // `docs/specs/evidence-triage-and-dadbear.md` Part 4.
+    {
+        let ps = pyramid_state.clone();
+        tauri::async_runtime::spawn(async move {
+            use wire_node_lib::pyramid::openrouter_webhook::run_leak_sweep;
+            use wire_node_lib::pyramid::provider_health::CostReconciliationPolicy;
+            // TODO(Phase 12/15): load the interval + grace period
+            // from the active `dadbear_policy` contribution via the
+            // config registry. Until then we use the spec defaults.
+            let policy = CostReconciliationPolicy::default();
+            let interval =
+                std::time::Duration::from_secs(policy.broadcast_audit_interval_secs as u64);
+            // Wait one full interval before the first run so the
+            // app has time to ingest any initial cost_log rows.
+            tokio::time::sleep(interval).await;
+            loop {
+                let bus = ps.build_event_bus.clone();
+                let result = {
+                    let conn = ps.writer.lock().await;
+                    run_leak_sweep(&conn, &policy, Some(&bus))
+                };
+                match result {
+                    Ok(n) if n > 0 => tracing::info!(
+                        rows_flipped = n,
+                        "broadcast leak detection sweep flipped rows"
+                    ),
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(error = %e, "broadcast leak detection sweep failed"),
+                }
+                tokio::time::sleep(interval).await;
+            }
+        });
+    }
+
     // WS-E: spawn the web_sessions sweeper (idempotent OnceLock guard).
     wire_node_lib::pyramid::public_html::web_sessions::spawn_sweeper(pyramid_state.clone());
 
@@ -8903,6 +9050,10 @@ fn main() {
             pyramid_get_step_overrides,
             pyramid_save_step_override,
             pyramid_delete_step_override,
+            // Phase 11: Broadcast webhook + provider health oversight
+            pyramid_provider_health,
+            pyramid_acknowledge_provider_health,
+            pyramid_list_orphan_broadcasts,
             // Phase 4: Config Contribution Foundation
             pyramid_create_config_contribution,
             pyramid_supersede_config,
