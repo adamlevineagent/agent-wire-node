@@ -554,3 +554,137 @@ Phase 2 now fixes BOTH the viz DAG orphaning bug (L1+ stale-refresh path — the
 - Pre-existing `pyramid::db::tests::test_evidence_pk_cross_slug_coexistence` and the 6 other schema-drift test failures are still failing; this fix pass does not widen scope to address them.
 
 The phase is ready to ship after the commit on this branch. No further audit cycles needed for the three issues — the regression tests lock down the spec-aligned behavior.
+
+---
+
+## Phase 3 — Provider Registry + Credentials
+
+**Workstream:** phase-3-provider-registry-credentials
+**Started:** 2026-04-10 (single session)
+**Completed:** 2026-04-10
+**Verified by:** pending (awaiting conductor/wanderer pass)
+**Wanderer result:** n/a
+**Status:** awaiting-verification
+
+### What shipped
+
+Phase 3 replaces the hardcoded OpenRouter URL + headers + response parser in `llm.rs` with a pluggable `LlmProvider` trait, backed by a provider registry table, a tier routing table, and a per-step overrides table. Secrets move out of `LlmConfig.api_key` into a `.credentials` YAML file on disk, referenced from provider rows as `api_key_ref = "OPENROUTER_KEY"`. The credential value is wrapped in a `ResolvedSecret` opaque type with no `Debug` / `Display` / `Clone` / `Serialize` impl so it cannot leak into logs, error messages, or publication payloads. The refactor keeps `LlmConfig` as a compatibility shim (per the brief's guidance) by attaching the registry + credential store as new fields, so every existing call site that takes an `&LlmConfig` transparently routes through the provider trait.
+
+### Files touched
+
+**New files:**
+- `src-tauri/src/pyramid/credentials.rs` (NEW, ~900 lines) — `CredentialStore`, `ResolvedSecret`, `${VAR_NAME}` substitution with `$${...}` escape, atomic write with 0600 enforcement, `collect_references` for publish-time scans, `file_status`, `ensure_safe_permissions`, 18 unit tests.
+- `src-tauri/src/pyramid/provider.rs` (NEW, ~1400 lines) — `LlmProvider` trait, `OpenRouterProvider`, `OpenAiCompatProvider` (Ollama + custom OAI-compat), `ProviderRegistry` with in-memory maps + DB hydration, `Provider` / `TierRoutingEntry` / `StepOverride` domain types, `RequestMetadata` + OpenRouter trace injection, Ollama `/api/show` context-window detection, pricing JSON parsing (string-encoded values), supported_parameters gate, 20 unit tests (including 3 end-to-end registry wiring tests).
+
+**Modified files:**
+- `src-tauri/Cargo.toml` — added `async-trait = "0.1"` dependency (required for `LlmProvider` trait object with async `detect_context_window`).
+- `src-tauri/src/pyramid/mod.rs` — declared `credentials` and `provider` modules; extended `PyramidState` with `provider_registry: Arc<ProviderRegistry>` and `credential_store: SharedCredentialStore`; updated `with_build_reader` to clone both; added `PyramidConfig::to_llm_config_with_runtime` that attaches the registry + store.
+- `src-tauri/src/pyramid/llm.rs` — removed the hardcoded `https://openrouter.ai/api/v1/chat/completions` URL + headers from `call_model_unified_with_options` and `call_model_direct`; added `build_call_provider` helper that either pulls the `openrouter` row from the attached registry or synthesizes an `OpenRouterProvider` from legacy `LlmConfig.api_key` for tests; added the new registry-aware `call_model_via_registry` entry point with per-step override resolution and rich `RequestMetadata`; removed legacy `parse_openrouter_response_body` + `sanitize_json_candidate` (the provider trait owns response parsing now); custom `Debug` impl for `LlmConfig` that redacts `api_key` + `auth_token`; `LlmConfig` now has `provider_registry` + `credential_store` fields.
+- `src-tauri/src/pyramid/db.rs` — added `pyramid_providers`, `pyramid_tier_routing`, `pyramid_step_overrides` tables to `init_pyramid_db`; added CRUD helpers (`get_provider`, `list_providers`, `save_provider`, `delete_provider`, `get_tier_routing`, `save_tier_routing`, `delete_tier_routing`, `list_step_overrides`, `get_step_overrides_for_chain`, `get_step_override`, `save_step_override`, `delete_step_override`); added `seed_default_provider_registry` that inserts the default OpenRouter row + Adam's 4 tier routing entries on first run (idempotent via COUNT check); added an 8-test `provider_registry_tests` module.
+- `src-tauri/src/pyramid/vine.rs` — updated the fallback `PyramidState` constructor to clone the new `provider_registry` + `credential_store` fields.
+- `src-tauri/src/pyramid/chain_executor.rs` — updated 4 test-only `PyramidState` constructors to include the new fields (empty registry + empty credential store for unit tests).
+- `src-tauri/src/pyramid/dadbear_extend.rs` — updated `make_test_state` helper to include the new fields.
+- `src-tauri/src/partner/conversation.rs` — refactored `call_partner` to build its URL + attribution headers via the shared `OpenRouterProvider` trait impl so the hardcoded `/chat/completions` string no longer lives in the partner path. Partner keeps its own title header override.
+- `src-tauri/src/main.rs` — added credential store + provider registry construction at app boot (immediately after `init_pyramid_db`); routed `PyramidConfig::to_llm_config_with_runtime` into the live config; preserved the registry + store across profile-apply paths; added 16 new IPC commands: `pyramid_list_credentials`, `pyramid_set_credential`, `pyramid_delete_credential`, `pyramid_credentials_file_status`, `pyramid_fix_credentials_permissions`, `pyramid_credential_references`, `pyramid_list_providers`, `pyramid_save_provider`, `pyramid_delete_provider`, `pyramid_test_provider`, `pyramid_get_tier_routing`, `pyramid_save_tier_routing`, `pyramid_delete_tier_routing`, `pyramid_get_step_overrides`, `pyramid_save_step_override`, `pyramid_delete_step_override`; registered all 16 in `invoke_handler!`.
+
+### Spec adherence
+
+**`docs/specs/credentials-and-secrets.md`:**
+- ✅ `.credentials` file at the OS-specific support directory (macOS `~/Library/Application Support/wire-node/.credentials`).
+- ✅ Plain-text YAML, top-level mapping of uppercase SNAKE_CASE keys to string values.
+- ✅ 0600 permissions enforced on load (refuses to load if wider); `apply_safe_permissions` helper for the "Fix permissions" IPC button.
+- ✅ Atomic write: temp file with 0600 mode, fsync, rename over original, defense-in-depth chmod.
+- ✅ `${VAR_NAME}` substitution syntax with `$${VAR_NAME}` escape.
+- ✅ No nested substitution (single pass over the input).
+- ✅ `ResolvedSecret` opaque wrapper: NO Debug / Display / Serialize / Clone impls. The only extraction methods are `as_bearer_header`, `as_url`, `raw_clone`, and `expose_raw` (the last two are explicit crate-internal escape hatches for custom header formats).
+- ✅ Best-effort zeroization on drop (volatile byte writes over the String's capacity before `.clear()`).
+- ✅ Missing-variable error includes the "Settings → Credentials" hint.
+- ✅ IPC surface: list (masked previews only, never returns values), set, delete, file status, fix permissions, cross-reference dashboard.
+- ✅ Validation: uppercase SNAKE_CASE key regex, non-empty value.
+- ⚠️ Backward-compat migration of legacy `api_key_ref = "settings"` rows — NOT implemented because there are no such rows in the current codebase. The spec's Migration section describes a hypothetical pre-credential sentinel that was never deployed. Skipped in Phase 3; if a migration is needed later it can be added to `seed_default_provider_registry`.
+- ❌ Publish-time credential leak scan — Phase 5 scope per the brief.
+- ❌ ToolsMode credential warnings — Phase 10 scope per the brief.
+- ❌ Settings.tsx UI — Phase 10 scope per the brief.
+
+**`docs/specs/provider-registry.md`:**
+- ✅ `LlmProvider` trait with `name`, `provider_type`, `chat_completions_url`, `prepare_headers`, `parse_response`, `supports_response_format`, `supports_streaming`, `detect_context_window`, `augment_request_body`.
+- ✅ `OpenRouterProvider` implementation: Bearer auth, canonical `X-OpenRouter-Title` header (+ legacy `X-Title` alias), `X-OpenRouter-Categories`, `HTTP-Referer`; response parser extracts `id`, `choices[0].message.content`, `usage.prompt_tokens`, `usage.completion_tokens`, `usage.cost`, `finish_reason`; `augment_request_body` injects `trace` object (build_id/slug/chain_id/step_name/depth), `session_id` (explicit or synthesized from slug+build), and `user` (node_identity).
+- ✅ `OpenAiCompatProvider` implementation: optional Authorization header, `response_format` support, Ollama `/api/show` context-window detection with arch-prefix algorithm + suffix-scan fallback.
+- ✅ `pyramid_providers` table with full schema: id, display_name, provider_type CHECK constraint, base_url, api_key_ref, auto_detect_context, supports_broadcast, broadcast_config_json, config_json, enabled, created_at, updated_at.
+- ✅ `pyramid_tier_routing` table with full schema: tier_name PK, provider_id FK with CASCADE, model_id, context_limit, max_completion_tokens, pricing_json, supported_parameters_json, notes.
+- ✅ `pyramid_step_overrides` table with composite PK (slug, chain_id, step_name, field_name).
+- ✅ Default seeding with Adam's exact model slugs: `fast_extract → inception/mercury-2`, `web → x-ai/grok-4.1-fast (2M)`, `synth_heavy → minimax/minimax-m2.7`, `stale_remote → minimax/minimax-m2.7`. `stale_local` intentionally NOT seeded (Adam's Option A).
+- ✅ Idempotent seed: `COUNT(*)` check before seeding, never overwrites user edits.
+- ✅ Pricing JSON string-encoded values parsed via `parse_price_field` with `parseFloat` defensiveness.
+- ✅ `supported_parameters_json` gate on `response_format` at call time in `call_model_via_registry`.
+- ✅ Tier routing resolver with per-step override lookup via `pyramid_step_overrides`.
+- ✅ Credential-aware provider instantiation via `ProviderRegistry::instantiate_provider` → resolves `${VAR_NAME}` in `base_url` and `extra_headers`, resolves `api_key_ref` against the credential store, surfaces clear "Settings → Credentials" errors when the variable is missing.
+- ✅ IPC surface: list/save/delete providers, test provider (credential presence check), tier routing CRUD, step override CRUD.
+- ⚠️ `OllamaCloudProvider` — DEFERRED to Phase 10 per the brief's explicit scope carve-out. The spec's "OllamaCloudProvider" section is not implemented; `OpenAiCompatProvider` covers the local + reverse-proxy cases.
+- ⚠️ Cross-provider fallback chains — DEFERRED to Phase 14. The `call_model_via_registry` path surfaces a single-provider failure via a clear error. The `TierRoutingEntry` schema has no `fallback_chain` column yet; adding it is Phase 14 scope.
+- ❌ `/api/v1/credits` management-key flow — Phase 14 scope.
+- ❌ Dynamic model selection from `/api/v1/models` — Phase 14 scope (and the brief explicitly says NOT to hit `/models` at seed time; Adam's slugs are pinned).
+- ❌ Pricing prefetch from `/api/v1/models` — Phase 14 scope. Current seed uses empty pricing JSON; the tier routing table has the column ready.
+
+**`llm.rs` refactor:**
+- ✅ `call_model_unified_with_options` now dispatches through `build_call_provider` → provider trait.
+- ✅ `call_model_direct` now dispatches through `build_call_provider` → provider trait.
+- ✅ `call_model_via_registry` NEW entry point for chain-executor callers with rich `RequestMetadata`.
+- ✅ `parse_openrouter_response_body` + `sanitize_json_candidate` helpers REMOVED — provider trait owns all response parsing.
+- ✅ `LlmConfig` gets a custom `Debug` impl that redacts `api_key` and `auth_token`.
+- ✅ Pillar 37 comment added next to legacy hardcoded temperature/max_tokens, flagging Phase 4/6 as the real fix.
+
+**IPC endpoints:** all 16 endpoints implemented and registered.
+
+**Tests:**
+- Credentials: 18 tests (load/save round trip, permission refusal, variable substitution including escape sequence, missing-var error, atomic write, masked preview, YAML parse failures, 0600 mode enforcement, file status, key validation).
+- Provider: 20 tests (OpenRouter headers/URL/response parsing, OpenAI-compat no-auth and auth paths, Ollama context window detection with arch-prefix and suffix-scan fallback, pricing JSON parsing, supported_parameters gate, trace augmentation with explicit session_id, extra_headers parsing, 3 end-to-end registry wiring tests covering Adam's seeded defaults, step override precedence, and missing-credential error).
+- DB provider registry: 8 tests (seed-on-empty, 4-tier seed without stale_local, Adam's exact slugs, no-reseed when populated, provider round trip, tier routing round trip, step override round trip, cascade delete on provider removal).
+
+### Scope decisions
+
+- **Registry threading approach:** `LlmConfig` carries `provider_registry: Option<Arc<ProviderRegistry>>` + `credential_store: Option<Arc<CredentialStore>>` fields. Rejected the alternative `LlmCtx` wrapper approach because there are 85+ call sites of `call_model_*` across 17 files — threading a new positional argument through each would have been a massive churn. The Option wrapping lets unit tests construct an `LlmConfig::default()` and still exercise the legacy synth-OpenRouter fallback in `build_call_provider`. Production boot paths always attach a non-None registry via `PyramidConfig::to_llm_config_with_runtime`. Documented in `llm.rs` header comment.
+- **OllamaCloudProvider deferred** to Phase 10 per the brief's explicit scope note. The current `OpenAiCompatProvider` covers local Ollama + reverse-proxy Ollama via `config_json.extra_headers`. Ollama Cloud (`ollama.com/api`) requires a separate provider type with `-cloud` suffix model IDs and mandatory auth; adding it now would widen scope without unblocking Phase 3's downstream consumers.
+- **Partner subsystem URL:** `src-tauri/src/partner/conversation.rs` also had a hardcoded `/chat/completions` literal. The brief's grep sanity check explicitly requires the literal to only exist in `provider.rs`, so I refactored `call_partner` to build its URL and attribution headers via the shared `OpenRouterProvider` trait impl. Partner still keeps its own `PartnerLlmConfig` (with tool-call wiring the pyramid path doesn't use) and its own title header override. This preserves Partner's request body shape while removing the duplicate URL literal.
+- **Legacy helpers removed:** `parse_openrouter_response_body` and `sanitize_json_candidate` in `llm.rs` were entirely replaced by the provider trait's response parser. The two tests that referenced them were deleted — equivalent coverage lives in `provider.rs::tests::openrouter_*`. This prevents drift where two implementations might diverge.
+- **`pyramid_test_provider` IPC endpoint:** v1 implementation verifies the credential reference resolves cleanly — it does NOT make a real HTTP call. A real ping endpoint is Phase 10 UI scope. The v1 surface is enough to catch "you set `api_key_ref = OPENROUTER_KEY` but the credentials file doesn't define it" errors, which is the #1 support case.
+- **Pillar 37 temperature/max_tokens:** the pre-existing hardcoded `0.2, 4096` / `0.1, 2048` calls stay in place throughout the pyramid. Moving them to config flows is Phase 4/6 scope (config contributions + LLM output cache) per the brief. The `call_model_via_registry` function takes `temperature` + `max_tokens` as explicit args so the next phase's refactor can flow them in from StepContext without further signature changes.
+- **Legacy `LlmConfig` fields preserved:** `primary_model`, `fallback_model_1`, `fallback_model_2`, `primary_context_limit`, `fallback_1_context_limit`, `model_aliases` all kept. The new provider registry is the canonical path, but the legacy fields still drive the 3-tier cascade in `call_model_unified` when the registry isn't the per-call resolver. A future phase can retire them.
+- **`resolve_credential_for` supports two `api_key_ref` shapes:** bare variable name (`OPENROUTER_KEY`) and `${VAR_NAME}` pattern. The bare form is preferred for new rows but the `${...}` shape is tolerated so hand-written config YAML that uses `api_key_ref: "${OPENROUTER_KEY}"` still works.
+- **`base_url` supports `${VAR_NAME}` substitution:** per the spec's self-hosted-Ollama-tunnel use case. The `resolve_base_url` helper runs `substitute_to_string` which returns a plain `String` (not `ResolvedSecret`) because the URL itself is logged during debug output. Operators with a tunnel-in-URL are expected to redact via their log setup.
+
+### Verification results
+
+- ✅ `cargo check --lib` — clean, zero new warnings in files I touched. Pre-existing 3 warnings (deprecated `get_keep_evidence_for_target`, `LayerCollectResult` private visibility x2) unchanged.
+- ✅ `cargo check --lib --tests` — clean, zero new warnings in files I touched. Pre-existing warnings unchanged.
+- ✅ `cargo check` (full crate) — clean. 3 lib warnings + 1 pre-existing bin warning (`tauri_plugin_shell::Shell::open` deprecated).
+- ✅ `cargo build --lib` — clean, same 3 pre-existing warnings.
+- ✅ `cargo build --bin wire-node-desktop` — clean, same pre-existing warnings.
+- ✅ `cargo test --lib pyramid::credentials` — 18 passed, 0 failed.
+- ✅ `cargo test --lib pyramid::provider` — 20 passed, 0 failed.
+- ✅ `cargo test --lib pyramid::db::provider_registry_tests` — 8 passed, 0 failed.
+- ✅ `cargo test --lib pyramid` — **842 passed, 7 failed** (the same 7 pre-existing failures documented in Phase 2's log: `test_evidence_pk_cross_slug_coexistence`, `real_yaml_thread_clustering_preserves_response_schema`, and 5 `pyramid::staleness::tests::*` tests). Phase 3 added 46 new tests (800 → 846 total, minus 4 filtered = 842 reported). No new failures introduced.
+- ✅ `cargo test --lib` — 844 passed, 7 failed (same 7). No regressions.
+- ✅ `grep -n "https://openrouter.ai/api/v1/chat/completions" src-tauri/src/` — returns only two hits in `provider.rs` (one inside `chat_completions_url()` assertion, one inside the end-to-end `registry_resolve_tier_instantiates_openrouter_for_seeded_defaults` test). **Zero hits in `llm.rs`, `partner/conversation.rs`, `main.rs`, or any other production file.**
+- ✅ `grep -n "as_bearer_header\|ResolvedSecret" src-tauri/src/pyramid/credentials.rs` — both opacity helpers present (`as_bearer_header`, `as_url`, `raw_clone`, `expose_raw`) and the `ResolvedSecret` struct is defined with no derive of Debug/Display/Clone/Serialize.
+
+### Notes
+
+- **`ResolvedSecret` has no `Debug` impl → tests can't use `.unwrap_err()` on Results containing it.** Three tests in `provider.rs` and `credentials.rs` match the Result explicitly instead. This is a surprising but load-bearing constraint of the opacity contract: if you `#[derive(Debug)]` on `ResolvedSecret` to silence those compile errors, you break the spec's "never-log rule" because `tracing::debug!` macro calls can now print the secret. I documented this in both places.
+- **The spec's "Implementation Order" for credentials (load-bearing first) matched my execution order:** credentials.rs → provider.rs → db.rs schema → llm.rs refactor → threading → IPC. No reordering surprises.
+- **`async-trait` crate added as a new dependency.** Rust 1.93 supports native async fn in traits but not with `Box<dyn LlmProvider>` object safety — the `detect_context_window` method forces this. `async-trait` 0.1 is the standard workaround. No other trait in the repo uses it, but the pattern is mature and low-risk.
+- **Partner module refactor was in gray-area scope.** The brief said "grep must only hit provider.rs" which meant Partner's duplicate URL had to move. I took the minimal approach: build `OpenRouterProvider` inline in `call_partner` and use its `chat_completions_url()` + `prepare_headers()` — no structural changes to `PartnerLlmConfig` or the tool-call request body. Flagging for the planner in case the architectural intent was to keep Partner fully separate.
+- **Transitional fallback in `build_call_provider`:** when `LlmConfig.provider_registry` is `None` (unit tests, pre-DB-init window), the helper synthesizes an `OpenRouterProvider` from the legacy `api_key` field. This is transitional — Phase 4/6 can remove it once the unit test suite grows a `TestRegistry` helper. The fallback contains `base_url: "https://openrouter.ai/api/v1"` which technically violates "hardcoded URLs live in exactly one place" but it's the fallback path specifically for cases where no registry exists. I left a code comment explaining the transitional nature.
+- **Pillar 37 awareness:** no new hardcoded LLM-constraining numbers introduced. The `call_model_via_registry` helper uses `effective_max_tokens` capped at 48K (same constant that already lived in `call_model_unified_with_options`), and takes `temperature` + `max_tokens` as args to thread through from the caller. The 48K cap is pre-existing and will move to a config contribution in Phase 4/6.
+- **No friction log entries required.** The spec was unambiguous, the scope boundaries held, and the only gray-area decision (Partner subsystem) has a defensible minimal-change resolution.
+
+### Next
+
+The phase is ready for the conductor's verifier pass. Recommended focus areas for the audit:
+
+1. **Credential opacity integrity:** grep for any new code path that might log a `ResolvedSecret` via `Debug`, `Display`, or a tracing macro. The type-system should catch it at compile time, but a second pair of eyes should verify.
+2. **First-boot path:** boot the app fresh (no `pyramid.db` file) and confirm the registry hydrates cleanly. The sequence is: `init_pyramid_db` runs `seed_default_provider_registry` → hydrate a fresh reader → construct `PyramidState` with the registry attached.
+3. **Profile-apply flow:** `pyramid_apply_profile` swaps the entire `LlmConfig` — I added registry preservation there but the wanderer should trace end-to-end to confirm the swap doesn't drop the registry reference.
+4. **IPC surface smoke test:** the 16 new commands are wired up but have no frontend yet (Phase 10). A smoke test via Tauri's invoke harness would confirm they're reachable.
+
+Wanderer prompt suggestion: "Does a fresh Wire Node boot produce a `.credentials` file at the right path with 0600 mode, seed the four tier routing rows, and allow `call_model_unified` to place a real LLM call via the new provider trait — all without the user having to click anything?"

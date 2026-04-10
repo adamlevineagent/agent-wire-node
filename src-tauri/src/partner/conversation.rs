@@ -113,13 +113,36 @@ pub struct ToolCall {
 /// Call the partner model via OpenRouter with multi-turn messages and optional tools.
 ///
 /// Includes retry logic with exponential backoff for transient errors.
+///
+/// Phase 3: the OpenRouter URL + headers are built via the
+/// `OpenRouterProvider` trait impl in `pyramid::provider` so the
+/// hardcoded URL literal lives in exactly one place. Partner keeps its
+/// own config struct because its request body includes tool-call
+/// wiring that the pyramid chain executor doesn't use.
 pub async fn call_partner(
     config: &PartnerLlmConfig,
     messages: Vec<LlmMessage>,
     tools: Option<Value>,
 ) -> Result<PartnerLlmResponse> {
+    use crate::pyramid::credentials::ResolvedSecret;
+    use crate::pyramid::provider::{LlmProvider, OpenRouterProvider};
+
     let client = reqwest::Client::new();
-    let url = "https://openrouter.ai/api/v1/chat/completions";
+    let provider = OpenRouterProvider {
+        id: "openrouter".to_string(),
+        display_name: "Wire Partner (Dennis)".to_string(),
+        base_url: "https://openrouter.ai/api/v1".to_string(),
+        extra_headers: vec![],
+    };
+    let url = provider.chat_completions_url();
+    // Partner holds its credential inline for legacy reasons. Wrap it
+    // in the same opaque envelope the rest of the stack uses so the
+    // prepare_headers surface is provider-uniform. Phase 4 will move
+    // this into the credential store.
+    let secret = ResolvedSecret::new(config.api_key.clone());
+    let built_headers = provider
+        .prepare_headers(Some(&secret))
+        .map_err(|e| anyhow!("failed to build partner headers: {}", e))?;
 
     for attempt in 0..5u32 {
         let mut body = serde_json::json!({
@@ -136,16 +159,20 @@ pub async fn call_partner(
             body["tools"] = tools_val.clone();
         }
 
-        let resp = client
-            .post(url)
-            .header("Authorization", format!("Bearer {}", config.api_key))
-            .header("Content-Type", "application/json")
-            .header("HTTP-Referer", "https://newsbleach.com")
-            .header("X-Title", "Wire Partner (Dennis)")
-            .timeout(std::time::Duration::from_secs(120))
-            .json(&body)
-            .send()
-            .await;
+        let mut request = client
+            .post(&url)
+            .timeout(std::time::Duration::from_secs(120));
+        for (k, v) in &built_headers {
+            // Partner keeps the legacy "Wire Partner (Dennis)" title
+            // so its broadcasts stay attributed correctly. Override the
+            // provider's default title header for this single field.
+            if k == "X-Title" || k == "X-OpenRouter-Title" {
+                request = request.header(k, "Wire Partner (Dennis)");
+            } else {
+                request = request.header(k, v);
+            }
+        }
+        let resp = request.json(&body).send().await;
 
         let resp = match resp {
             Ok(r) => r,

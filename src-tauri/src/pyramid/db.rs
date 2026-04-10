@@ -1272,6 +1272,67 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
         ",
     )?;
 
+    // ── Phase 3: Provider registry, tier routing, per-step overrides ─────────
+    //
+    // Per `docs/specs/provider-registry.md`. Replaces the hardcoded
+    // OpenRouter URL + model cascade in `llm.rs` with a pluggable
+    // provider registry. Rows here are populated via the IPC surface
+    // in `main.rs` or seeded on first run via `seed_default_provider_registry`.
+    //
+    // `pyramid_providers.api_key_ref` stores a CREDENTIAL VARIABLE NAME
+    // (e.g. "OPENROUTER_KEY") rather than the literal key — the actual
+    // secret lives in the `.credentials` file (see credentials-and-secrets.md).
+    // `pyramid_tier_routing.pricing_json` follows OpenRouter's shape where
+    // individual fields are STRING-encoded numbers.
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS pyramid_providers (
+            id TEXT PRIMARY KEY,
+            display_name TEXT NOT NULL,
+            provider_type TEXT NOT NULL CHECK(provider_type IN ('openrouter', 'openai_compat')),
+            base_url TEXT NOT NULL,
+            api_key_ref TEXT,
+            auto_detect_context INTEGER NOT NULL DEFAULT 0,
+            supports_broadcast INTEGER NOT NULL DEFAULT 0,
+            broadcast_config_json TEXT,
+            config_json TEXT NOT NULL DEFAULT '{}',
+            enabled INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE IF NOT EXISTS pyramid_tier_routing (
+            tier_name TEXT PRIMARY KEY,
+            provider_id TEXT NOT NULL REFERENCES pyramid_providers(id) ON DELETE CASCADE,
+            model_id TEXT NOT NULL,
+            context_limit INTEGER,
+            max_completion_tokens INTEGER,
+            pricing_json TEXT NOT NULL DEFAULT '{}',
+            supported_parameters_json TEXT,
+            notes TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_tier_routing_provider
+            ON pyramid_tier_routing(provider_id);
+
+        CREATE TABLE IF NOT EXISTS pyramid_step_overrides (
+            slug TEXT NOT NULL,
+            chain_id TEXT NOT NULL,
+            step_name TEXT NOT NULL,
+            field_name TEXT NOT NULL,
+            value_json TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (slug, chain_id, step_name, field_name)
+        );
+        ",
+    )?;
+
+    // First-run seeding. Only fires when pyramid_providers is empty so
+    // we don't clobber user-customized rows on subsequent boots.
+    seed_default_provider_registry(conn)?;
+
     Ok(())
 }
 
@@ -10193,4 +10254,550 @@ pub fn defer_chain_proposal(conn: &Connection, proposal_id: &str, operator_notes
         }
     }
     Ok(())
+}
+
+// ── Phase 3: Provider registry CRUD helpers ──────────────────────────────────
+//
+// These helpers back `pyramid::provider::ProviderRegistry` and the IPC
+// commands in `main.rs`. All reads return domain types from
+// `pyramid::provider`. All writes upsert and bump `updated_at`.
+
+use super::provider::{Provider, ProviderType, StepOverride, TierRoutingEntry};
+
+fn provider_from_row(row: &rusqlite::Row) -> rusqlite::Result<Provider> {
+    let provider_type_str: String = row.get("provider_type")?;
+    let provider_type = ProviderType::from_str(&provider_type_str).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())),
+        )
+    })?;
+    let auto_detect: i64 = row.get("auto_detect_context")?;
+    let supports_broadcast: i64 = row.get("supports_broadcast")?;
+    let enabled: i64 = row.get("enabled")?;
+    Ok(Provider {
+        id: row.get("id")?,
+        display_name: row.get("display_name")?,
+        provider_type,
+        base_url: row.get("base_url")?,
+        api_key_ref: row.get("api_key_ref")?,
+        auto_detect_context: auto_detect != 0,
+        supports_broadcast: supports_broadcast != 0,
+        broadcast_config_json: row.get("broadcast_config_json")?,
+        config_json: row.get("config_json")?,
+        enabled: enabled != 0,
+    })
+}
+
+/// Get a single provider row by id.
+pub fn get_provider(conn: &Connection, id: &str) -> Result<Option<Provider>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, display_name, provider_type, base_url, api_key_ref,
+                auto_detect_context, supports_broadcast, broadcast_config_json,
+                config_json, enabled
+         FROM pyramid_providers
+         WHERE id = ?1",
+    )?;
+    let row = stmt
+        .query_row(rusqlite::params![id], provider_from_row)
+        .optional()
+        .context("get_provider query_row")?;
+    Ok(row)
+}
+
+/// List every provider row in display-name order.
+pub fn list_providers(conn: &Connection) -> Result<Vec<Provider>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, display_name, provider_type, base_url, api_key_ref,
+                auto_detect_context, supports_broadcast, broadcast_config_json,
+                config_json, enabled
+         FROM pyramid_providers
+         ORDER BY display_name",
+    )?;
+    let rows = stmt.query_map([], provider_from_row)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// Insert or update a provider row. Idempotent via ON CONFLICT.
+pub fn save_provider(conn: &Connection, provider: &Provider) -> Result<()> {
+    conn.execute(
+        "INSERT INTO pyramid_providers (
+            id, display_name, provider_type, base_url, api_key_ref,
+            auto_detect_context, supports_broadcast, broadcast_config_json,
+            config_json, enabled, created_at, updated_at
+         ) VALUES (
+            ?1, ?2, ?3, ?4, ?5,
+            ?6, ?7, ?8,
+            ?9, ?10, datetime('now'), datetime('now')
+         )
+         ON CONFLICT(id) DO UPDATE SET
+            display_name = excluded.display_name,
+            provider_type = excluded.provider_type,
+            base_url = excluded.base_url,
+            api_key_ref = excluded.api_key_ref,
+            auto_detect_context = excluded.auto_detect_context,
+            supports_broadcast = excluded.supports_broadcast,
+            broadcast_config_json = excluded.broadcast_config_json,
+            config_json = excluded.config_json,
+            enabled = excluded.enabled,
+            updated_at = datetime('now')
+        ",
+        rusqlite::params![
+            provider.id,
+            provider.display_name,
+            provider.provider_type.as_str(),
+            provider.base_url,
+            provider.api_key_ref,
+            provider.auto_detect_context as i64,
+            provider.supports_broadcast as i64,
+            provider.broadcast_config_json,
+            provider.config_json,
+            provider.enabled as i64,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Delete a provider row by id. Cascades to tier routing rows via the
+/// ON DELETE CASCADE constraint.
+pub fn delete_provider(conn: &Connection, id: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM pyramid_providers WHERE id = ?1",
+        rusqlite::params![id],
+    )?;
+    Ok(())
+}
+
+fn tier_routing_from_row(row: &rusqlite::Row) -> rusqlite::Result<TierRoutingEntry> {
+    let context_limit: Option<i64> = row.get("context_limit")?;
+    let max_completion_tokens: Option<i64> = row.get("max_completion_tokens")?;
+    Ok(TierRoutingEntry {
+        tier_name: row.get("tier_name")?,
+        provider_id: row.get("provider_id")?,
+        model_id: row.get("model_id")?,
+        context_limit: context_limit.map(|n| n as usize),
+        max_completion_tokens: max_completion_tokens.map(|n| n as usize),
+        pricing_json: row.get("pricing_json")?,
+        supported_parameters_json: row.get("supported_parameters_json")?,
+        notes: row.get("notes")?,
+    })
+}
+
+/// Return every tier routing entry keyed by tier_name.
+pub fn get_tier_routing(conn: &Connection) -> Result<HashMap<String, TierRoutingEntry>> {
+    let mut stmt = conn.prepare(
+        "SELECT tier_name, provider_id, model_id, context_limit, max_completion_tokens,
+                pricing_json, supported_parameters_json, notes
+         FROM pyramid_tier_routing
+         ORDER BY tier_name",
+    )?;
+    let rows = stmt.query_map([], tier_routing_from_row)?;
+    let mut out = HashMap::new();
+    for row in rows {
+        let entry = row?;
+        out.insert(entry.tier_name.clone(), entry);
+    }
+    Ok(out)
+}
+
+/// Upsert a tier routing entry.
+pub fn save_tier_routing(conn: &Connection, entry: &TierRoutingEntry) -> Result<()> {
+    conn.execute(
+        "INSERT INTO pyramid_tier_routing (
+            tier_name, provider_id, model_id, context_limit, max_completion_tokens,
+            pricing_json, supported_parameters_json, notes, created_at, updated_at
+         ) VALUES (
+            ?1, ?2, ?3, ?4, ?5,
+            ?6, ?7, ?8, datetime('now'), datetime('now')
+         )
+         ON CONFLICT(tier_name) DO UPDATE SET
+            provider_id = excluded.provider_id,
+            model_id = excluded.model_id,
+            context_limit = excluded.context_limit,
+            max_completion_tokens = excluded.max_completion_tokens,
+            pricing_json = excluded.pricing_json,
+            supported_parameters_json = excluded.supported_parameters_json,
+            notes = excluded.notes,
+            updated_at = datetime('now')
+        ",
+        rusqlite::params![
+            entry.tier_name,
+            entry.provider_id,
+            entry.model_id,
+            entry.context_limit.map(|n| n as i64),
+            entry.max_completion_tokens.map(|n| n as i64),
+            entry.pricing_json,
+            entry.supported_parameters_json,
+            entry.notes,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Delete a tier routing entry.
+pub fn delete_tier_routing(conn: &Connection, tier_name: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM pyramid_tier_routing WHERE tier_name = ?1",
+        rusqlite::params![tier_name],
+    )?;
+    Ok(())
+}
+
+fn step_override_from_row(row: &rusqlite::Row) -> rusqlite::Result<StepOverride> {
+    Ok(StepOverride {
+        slug: row.get("slug")?,
+        chain_id: row.get("chain_id")?,
+        step_name: row.get("step_name")?,
+        field_name: row.get("field_name")?,
+        value_json: row.get("value_json")?,
+    })
+}
+
+/// Return every step override row.
+pub fn list_step_overrides(conn: &Connection) -> Result<Vec<StepOverride>> {
+    let mut stmt = conn.prepare(
+        "SELECT slug, chain_id, step_name, field_name, value_json
+         FROM pyramid_step_overrides
+         ORDER BY slug, chain_id, step_name, field_name",
+    )?;
+    let rows = stmt.query_map([], step_override_from_row)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// Return step overrides for a specific (slug, chain_id) pair.
+pub fn get_step_overrides_for_chain(
+    conn: &Connection,
+    slug: &str,
+    chain_id: &str,
+) -> Result<Vec<StepOverride>> {
+    let mut stmt = conn.prepare(
+        "SELECT slug, chain_id, step_name, field_name, value_json
+         FROM pyramid_step_overrides
+         WHERE slug = ?1 AND chain_id = ?2
+         ORDER BY step_name, field_name",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![slug, chain_id], step_override_from_row)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// Look up a single step override by the full composite key.
+pub fn get_step_override(
+    conn: &Connection,
+    slug: &str,
+    chain_id: &str,
+    step_name: &str,
+    field_name: &str,
+) -> Result<Option<StepOverride>> {
+    let mut stmt = conn.prepare(
+        "SELECT slug, chain_id, step_name, field_name, value_json
+         FROM pyramid_step_overrides
+         WHERE slug = ?1 AND chain_id = ?2 AND step_name = ?3 AND field_name = ?4",
+    )?;
+    let row = stmt
+        .query_row(
+            rusqlite::params![slug, chain_id, step_name, field_name],
+            step_override_from_row,
+        )
+        .optional()?;
+    Ok(row)
+}
+
+/// Upsert a step override.
+pub fn save_step_override(conn: &Connection, override_row: &StepOverride) -> Result<()> {
+    conn.execute(
+        "INSERT INTO pyramid_step_overrides (
+            slug, chain_id, step_name, field_name, value_json, created_at, updated_at
+         ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, datetime('now'), datetime('now')
+         )
+         ON CONFLICT(slug, chain_id, step_name, field_name) DO UPDATE SET
+            value_json = excluded.value_json,
+            updated_at = datetime('now')
+        ",
+        rusqlite::params![
+            override_row.slug,
+            override_row.chain_id,
+            override_row.step_name,
+            override_row.field_name,
+            override_row.value_json,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Delete a step override.
+pub fn delete_step_override(
+    conn: &Connection,
+    slug: &str,
+    chain_id: &str,
+    step_name: &str,
+    field_name: &str,
+) -> Result<()> {
+    conn.execute(
+        "DELETE FROM pyramid_step_overrides
+         WHERE slug = ?1 AND chain_id = ?2 AND step_name = ?3 AND field_name = ?4",
+        rusqlite::params![slug, chain_id, step_name, field_name],
+    )?;
+    Ok(())
+}
+
+/// First-run seeding of the provider registry + tier routing table.
+///
+/// Adam's default model slugs (provided explicitly; do NOT verify
+/// against `/api/v1/models` at seed time — they are pinned here):
+///
+/// | Tier          | Provider    | Model slug                |
+/// | ------------- | ----------- | ------------------------- |
+/// | `fast_extract`| openrouter  | `inception/mercury-2`      |
+/// | `web`         | openrouter  | `x-ai/grok-4.1-fast` (2M)  |
+/// | `synth_heavy` | openrouter  | `minimax/minimax-m2.7`     |
+/// | `stale_remote`| openrouter  | `minimax/minimax-m2.7`     |
+///
+/// `stale_local` is NOT seeded — it only exists once a user registers
+/// a local provider (Ollama). Do not insert a row pointing at a
+/// placeholder; the absence is deliberate per Adam's decision.
+///
+/// Idempotent: the seed only fires when `pyramid_providers` is empty
+/// so existing rows are never overwritten.
+pub fn seed_default_provider_registry(conn: &Connection) -> Result<()> {
+    let existing: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pyramid_providers",
+        [],
+        |row| row.get(0),
+    )?;
+    if existing > 0 {
+        return Ok(());
+    }
+
+    let openrouter = Provider {
+        id: "openrouter".into(),
+        display_name: "OpenRouter".into(),
+        provider_type: ProviderType::Openrouter,
+        base_url: "https://openrouter.ai/api/v1".into(),
+        api_key_ref: Some("OPENROUTER_KEY".into()),
+        auto_detect_context: false,
+        supports_broadcast: true,
+        broadcast_config_json: None,
+        config_json: "{}".into(),
+        enabled: true,
+    };
+    save_provider(conn, &openrouter)?;
+
+    // Seed the four tiers Adam specified. Pricing is left as an empty
+    // object — Phase 14 will prefetch live pricing from
+    // `GET /api/v1/models`. The context limits reflect each model's
+    // published window.
+    let empty_pricing = "{}".to_string();
+    let seed_tier = |tier_name: &str,
+                     model_id: &str,
+                     context_limit: Option<usize>,
+                     notes: &str|
+     -> TierRoutingEntry {
+        TierRoutingEntry {
+            tier_name: tier_name.to_string(),
+            provider_id: "openrouter".into(),
+            model_id: model_id.to_string(),
+            context_limit,
+            max_completion_tokens: None,
+            pricing_json: empty_pricing.clone(),
+            supported_parameters_json: None,
+            notes: Some(notes.to_string()),
+        }
+    };
+
+    save_tier_routing(
+        conn,
+        &seed_tier(
+            "fast_extract",
+            "inception/mercury-2",
+            Some(120_000),
+            "Very fast, very cheap, smart enough for most extraction (Adam's default)",
+        ),
+    )?;
+    save_tier_routing(
+        conn,
+        &seed_tier(
+            "web",
+            "x-ai/grok-4.1-fast",
+            Some(2_000_000),
+            "2M context window for whole-array relational work (Adam's default)",
+        ),
+    )?;
+    save_tier_routing(
+        conn,
+        &seed_tier(
+            "synth_heavy",
+            "minimax/minimax-m2.7",
+            Some(200_000),
+            "Near-frontier (very smart), slow (40 tps), very inexpensive (Adam's default)",
+        ),
+    )?;
+    save_tier_routing(
+        conn,
+        &seed_tier(
+            "stale_remote",
+            "minimax/minimax-m2.7",
+            Some(200_000),
+            "Same quality profile for upper-layer stale checks (Adam's default)",
+        ),
+    )?;
+
+    // `stale_local` is intentionally NOT seeded — the tier materializes
+    // when a local provider (Ollama) is added. Do not insert a
+    // placeholder row here.
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod provider_registry_tests {
+    use super::*;
+
+    fn mem_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        init_pyramid_db(&conn).unwrap();
+        conn
+    }
+
+    #[test]
+    fn init_seeds_default_providers_on_empty_db() {
+        let conn = mem_conn();
+        let providers = list_providers(&conn).unwrap();
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].id, "openrouter");
+        assert_eq!(providers[0].api_key_ref.as_deref(), Some("OPENROUTER_KEY"));
+    }
+
+    #[test]
+    fn init_seeds_four_tiers_but_not_stale_local() {
+        let conn = mem_conn();
+        let tiers = get_tier_routing(&conn).unwrap();
+        assert!(tiers.contains_key("fast_extract"));
+        assert!(tiers.contains_key("web"));
+        assert!(tiers.contains_key("synth_heavy"));
+        assert!(tiers.contains_key("stale_remote"));
+        assert!(
+            !tiers.contains_key("stale_local"),
+            "stale_local must NOT be seeded — only exists after a local provider is registered"
+        );
+        assert_eq!(tiers.len(), 4);
+    }
+
+    #[test]
+    fn seed_tiers_use_adams_model_slugs() {
+        let conn = mem_conn();
+        let tiers = get_tier_routing(&conn).unwrap();
+        assert_eq!(tiers["fast_extract"].model_id, "inception/mercury-2");
+        assert_eq!(tiers["web"].model_id, "x-ai/grok-4.1-fast");
+        assert_eq!(tiers["synth_heavy"].model_id, "minimax/minimax-m2.7");
+        assert_eq!(tiers["stale_remote"].model_id, "minimax/minimax-m2.7");
+        assert_eq!(tiers["web"].context_limit, Some(2_000_000));
+    }
+
+    #[test]
+    fn init_does_not_reseed_populated_db() {
+        let conn = mem_conn();
+        // Overwrite a field to prove reseed doesn't clobber it.
+        conn.execute(
+            "UPDATE pyramid_providers SET display_name = 'User-customized' WHERE id = 'openrouter'",
+            [],
+        )
+        .unwrap();
+        seed_default_provider_registry(&conn).unwrap();
+        let providers = list_providers(&conn).unwrap();
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].display_name, "User-customized");
+    }
+
+    #[test]
+    fn save_and_get_provider_round_trip() {
+        let conn = mem_conn();
+        let provider = Provider {
+            id: "ollama-local".into(),
+            display_name: "Ollama Local".into(),
+            provider_type: ProviderType::OpenaiCompat,
+            base_url: "http://localhost:11434/v1".into(),
+            api_key_ref: None,
+            auto_detect_context: true,
+            supports_broadcast: false,
+            broadcast_config_json: None,
+            config_json: r#"{"extra_headers":{}}"#.into(),
+            enabled: true,
+        };
+        save_provider(&conn, &provider).unwrap();
+        let loaded = get_provider(&conn, "ollama-local").unwrap().unwrap();
+        assert_eq!(loaded.provider_type, ProviderType::OpenaiCompat);
+        assert_eq!(loaded.base_url, "http://localhost:11434/v1");
+        assert!(loaded.api_key_ref.is_none());
+        assert!(loaded.auto_detect_context);
+    }
+
+    #[test]
+    fn save_and_get_tier_routing_round_trip() {
+        let conn = mem_conn();
+        let entry = TierRoutingEntry {
+            tier_name: "custom_tier".into(),
+            provider_id: "openrouter".into(),
+            model_id: "anthropic/claude-sonnet-4-5".into(),
+            context_limit: Some(200_000),
+            max_completion_tokens: Some(64_000),
+            pricing_json: r#"{"prompt":"0.000003","completion":"0.000015"}"#.into(),
+            supported_parameters_json: Some(r#"["tools","response_format"]"#.into()),
+            notes: Some("quality tier".into()),
+        };
+        save_tier_routing(&conn, &entry).unwrap();
+        let tiers = get_tier_routing(&conn).unwrap();
+        let loaded = tiers.get("custom_tier").unwrap();
+        assert_eq!(loaded.model_id, "anthropic/claude-sonnet-4-5");
+        assert_eq!(loaded.context_limit, Some(200_000));
+        assert_eq!(loaded.max_completion_tokens, Some(64_000));
+    }
+
+    #[test]
+    fn save_and_get_step_override_round_trip() {
+        let conn = mem_conn();
+        let override_row = StepOverride {
+            slug: "my-slug".into(),
+            chain_id: "code_pyramid".into(),
+            step_name: "deep_synthesis".into(),
+            field_name: "model_tier".into(),
+            value_json: r#""synth_heavy""#.into(),
+        };
+        save_step_override(&conn, &override_row).unwrap();
+        let loaded = get_step_override(
+            &conn,
+            "my-slug",
+            "code_pyramid",
+            "deep_synthesis",
+            "model_tier",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(loaded.value_json, r#""synth_heavy""#);
+    }
+
+    #[test]
+    fn delete_provider_cascades_to_tier_routing() {
+        let conn = mem_conn();
+        // The seeded openrouter provider + seeded tiers are linked.
+        delete_provider(&conn, "openrouter").unwrap();
+        let tiers = get_tier_routing(&conn).unwrap();
+        assert!(
+            tiers.is_empty(),
+            "deleting a provider should cascade to tier routing rows via FK"
+        );
+    }
 }

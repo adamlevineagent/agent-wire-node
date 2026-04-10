@@ -1308,6 +1308,18 @@ mod tests {
             csrf_secret: [0u8; 32],
             dadbear_handle: Arc::new(TokioMutex::new(None)),
             dadbear_in_flight: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            provider_registry: {
+                // Phase 3: test state gets an empty provider registry.
+                // The DADBEAR tick loop doesn't invoke LLM calls in the
+                // unit tests that use this helper.
+                let store = Arc::new(
+                    crate::pyramid::credentials::CredentialStore::load(&data_dir).unwrap(),
+                );
+                Arc::new(crate::pyramid::provider::ProviderRegistry::new(store))
+            },
+            credential_store: Arc::new(
+                crate::pyramid::credentials::CredentialStore::load(&data_dir).unwrap(),
+            ),
         });
         (state, data_dir)
     }
