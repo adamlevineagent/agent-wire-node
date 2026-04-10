@@ -1144,6 +1144,150 @@ wire:
         meta.derived_from[1].validate().unwrap();
     }
 
+    /// Parse the exact canonical YAML example from
+    /// `GoodNewsEveryone/docs/wire-native-documents.md` lines 27-92
+    /// verbatim (the "Full Schema" block). This is the independent
+    /// byte-level verification that every field name in
+    /// `WireNativeMetadata` matches the canonical schema — if a
+    /// canonical field name ever drifts, this test is the safety net.
+    ///
+    /// Note: this test does NOT call `meta.validate()` because the
+    /// canonical example intentionally shows both `price` AND
+    /// `pricing_curve` together as a documentation convenience (to
+    /// illustrate all available fields). The canonical schema treats
+    /// them as mutually exclusive at publish time, but the parser
+    /// must still accept the documentation example as-is.
+    #[test]
+    fn canonical_example_from_wire_native_documents_parses_verbatim() {
+        // Note the `r###"..."###` delimiter: the canonical example's
+        // `"## Economics":` line contains a literal `"##` sequence
+        // that would close a `r##"..."##` raw string prematurely, so
+        // we bump the hash count to 3.
+        let yaml = r###"
+wire:
+  destination: corpus
+  corpus: wire-design-docs
+  contribution_type: analysis
+  scope: unscoped
+  topics: [wire-architecture, actions, composability]
+  entities:
+    - { name: TSMC, type: org, role: subject }
+    - { name: Rotator Arm, type: mechanism, role: referenced }
+    - { name: Newsbleach, type: product, role: example }
+  maturity: design
+  derived_from:
+    - { ref: "nightingale/77/3", weight: 0.3, justification: "Baltic analysis" }
+    - { doc: wire-actions.md, weight: 0.3, justification: "details the action system" }
+    - { doc: synthesis-primitives.md, weight: 0.2, justification: "vocabulary source" }
+  supersedes: wire-templates.md
+  related:
+    - { doc: wire-skills.md, rel: contrasts }
+    - { doc: wire-circles.md, rel: uses }
+  claims:
+    - { text: "Four operation types are sufficient", trackable: true, end_date: "2026-09-01" }
+    - { text: "Actions earn perpetually", trackable: false }
+  price: 5
+  pricing_curve:
+    - { credits: 5, after_hours: 0 }
+    - { credits: 0, after_hours: 168 }
+  embargo_until: "+48h"
+  pin_to_lists: [compiler-updates, architecture-feed]
+  notify_subscribers: true
+  creator_split:
+    - { operator: playful-universe, slots: 30, justification: "architecture and design" }
+    - { operator: partner-agent, slots: 18, justification: "synthesis and documentation" }
+  auto_supersede: true
+  sync_mode: review
+  sections:
+    "## Economics":
+      contribution_type: extraction
+      topics: [wire-economics, credit-economy]
+      price: 3
+"###;
+
+        let meta = WireNativeMetadata::from_canonical_yaml(yaml).unwrap_or_else(|e| {
+            panic!("canonical YAML parse failed: {e}\n\n\
+                 This means a field in WireNativeMetadata does NOT \
+                 match wire-native-documents.md byte-for-byte. Check \
+                 the field names against the canonical schema.");
+        });
+
+        // Routing
+        assert_eq!(meta.destination, WireDestination::Corpus);
+        assert_eq!(meta.corpus.as_deref(), Some("wire-design-docs"));
+        assert_eq!(meta.contribution_type, WireContributionType::Analysis);
+        assert_eq!(meta.scope, WireScope::Unscoped);
+
+        // Identity
+        assert_eq!(meta.topics.len(), 3);
+        assert!(meta.topics.iter().any(|t| t == "wire-architecture"));
+        assert!(meta.topics.iter().any(|t| t == "actions"));
+        assert!(meta.topics.iter().any(|t| t == "composability"));
+        assert_eq!(meta.entities.len(), 3);
+        assert_eq!(meta.entities[0].name, "TSMC");
+        assert_eq!(meta.entities[0].entity_type, "org");
+        assert_eq!(meta.entities[0].role, "subject");
+        assert_eq!(meta.entities[1].name, "Rotator Arm");
+        assert_eq!(meta.entities[1].entity_type, "mechanism");
+        assert_eq!(meta.entities[2].name, "Newsbleach");
+        assert_eq!(meta.maturity, WireMaturity::Design);
+
+        // Relationships
+        assert_eq!(meta.derived_from.len(), 3);
+        assert_eq!(meta.derived_from[0].ref_.as_deref(), Some("nightingale/77/3"));
+        assert_eq!(meta.derived_from[0].weight, 0.3);
+        assert_eq!(meta.derived_from[1].doc.as_deref(), Some("wire-actions.md"));
+        assert_eq!(meta.derived_from[2].doc.as_deref(), Some("synthesis-primitives.md"));
+        for entry in &meta.derived_from {
+            entry.validate().unwrap();
+        }
+        assert_eq!(meta.supersedes.as_deref(), Some("wire-templates.md"));
+        assert_eq!(meta.related.len(), 2);
+        assert_eq!(meta.related[0].doc.as_deref(), Some("wire-skills.md"));
+        assert_eq!(meta.related[0].rel, "contrasts");
+        assert_eq!(meta.related[1].doc.as_deref(), Some("wire-circles.md"));
+        assert_eq!(meta.related[1].rel, "uses");
+
+        // Claims
+        assert_eq!(meta.claims.len(), 2);
+        assert!(meta.claims[0].trackable);
+        assert_eq!(meta.claims[0].end_date.as_deref(), Some("2026-09-01"));
+        assert!(!meta.claims[1].trackable);
+
+        // Economics (canonical example has both; parser accepts it)
+        assert_eq!(meta.price, Some(5));
+        assert_eq!(meta.pricing_curve.as_ref().map(|c| c.len()), Some(2));
+        assert_eq!(meta.pricing_curve.as_ref().unwrap()[0].credits, 5);
+        assert_eq!(meta.pricing_curve.as_ref().unwrap()[0].after_hours, 0);
+        assert_eq!(meta.pricing_curve.as_ref().unwrap()[1].credits, 0);
+        assert_eq!(meta.pricing_curve.as_ref().unwrap()[1].after_hours, 168);
+        assert_eq!(meta.embargo_until.as_deref(), Some("+48h"));
+
+        // Distribution
+        assert_eq!(meta.pin_to_lists.len(), 2);
+        assert!(meta.notify_subscribers);
+
+        // Circle splits (must sum to 48 per canonical protocol rule)
+        assert_eq!(meta.creator_split.len(), 2);
+        let slot_sum: u32 = meta.creator_split.iter().map(|e| e.slots).sum();
+        assert_eq!(slot_sum, 48, "canonical example's creator_split must sum to 48");
+        assert_eq!(meta.creator_split[0].operator, "playful-universe");
+        assert_eq!(meta.creator_split[0].slots, 30);
+        assert_eq!(meta.creator_split[1].operator, "partner-agent");
+        assert_eq!(meta.creator_split[1].slots, 18);
+
+        // Lifecycle
+        assert!(meta.auto_supersede);
+        assert_eq!(meta.sync_mode, WireSyncMode::Review);
+
+        // Decomposition
+        assert_eq!(meta.sections.len(), 1);
+        let section = meta.sections.get("## Economics").unwrap();
+        assert_eq!(section.contribution_type, Some(WireContributionType::Extraction));
+        assert_eq!(section.topics.as_ref().map(|t| t.len()), Some(2));
+        assert_eq!(section.price, Some(3));
+    }
+
     #[test]
     fn validate_rejects_price_and_curve_together() {
         let mut meta = default_wire_native_metadata("skill", None);
