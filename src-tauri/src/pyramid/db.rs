@@ -5917,6 +5917,78 @@ pub fn store_cache(conn: &Connection, entry: &CacheEntry) -> Result<()> {
     Ok(())
 }
 
+/// Phase 7: idempotent cache insert for `populate_from_import`.
+///
+/// Uses `INSERT ... ON CONFLICT(slug, cache_key) DO NOTHING`, which is the
+/// SQLite equivalent of `INSERT OR IGNORE` on a conflict. Unlike
+/// [`store_cache`], this helper will NEVER overwrite an existing row — it
+/// silently leaves pre-existing rows untouched and reports whether the new
+/// row landed.
+///
+/// This is the exact semantic `docs/specs/cache-warming-and-import.md`
+/// mandates for the import path (see "Idempotency" section ~line 341):
+///
+/// > Cache entries are content-addressable. Re-importing the same entry is
+/// > a no-op because `pyramid_step_cache` has `UNIQUE(slug, cache_key)` and
+/// > the import uses `INSERT OR IGNORE`. A partial import's inserted
+/// > entries are not duplicated on resume.
+///
+/// The reason we need `DO NOTHING` specifically (and not `DO UPDATE`) is
+/// the reroll + resume scenario: if a user imports a pyramid, then
+/// force-rerolls a step locally (which writes a fresh row through
+/// `supersede_cache_entry` at the same content-addressable key with
+/// `force_fresh = 1` and a `supersedes_cache_id` pointing at the archival
+/// row), and then for any reason re-runs the import (network failure,
+/// crash recovery, explicit resume), `store_cache`'s `DO UPDATE` branch
+/// would clobber the rerolled row: the `output_json`, `force_fresh` flag,
+/// and `supersedes_cache_id` link would all be overwritten by the
+/// imported values. That silently undoes the user's reroll.
+///
+/// With `DO NOTHING`, the rerolled row is preserved and the re-imported
+/// row is simply skipped. Returns `true` if the row was actually inserted,
+/// `false` if a prior row occupied the slot.
+///
+/// Force-fresh writes should NEVER go through this helper — they go
+/// through `supersede_cache_entry` which preserves supersession history.
+pub fn store_cache_if_absent(conn: &Connection, entry: &CacheEntry) -> Result<bool> {
+    let affected = conn
+        .execute(
+            "INSERT INTO pyramid_step_cache
+                (slug, build_id, step_name, chunk_index, depth, cache_key,
+                 inputs_hash, prompt_hash, model_id, output_json, token_usage_json,
+                 cost_usd, latency_ms, created_at, force_fresh, supersedes_cache_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                     datetime('now'), ?14, ?15)
+             ON CONFLICT(slug, cache_key) DO NOTHING",
+            rusqlite::params![
+                entry.slug,
+                entry.build_id,
+                entry.step_name,
+                entry.chunk_index,
+                entry.depth,
+                entry.cache_key,
+                entry.inputs_hash,
+                entry.prompt_hash,
+                entry.model_id,
+                entry.output_json,
+                entry.token_usage_json,
+                entry.cost_usd,
+                entry.latency_ms,
+                if entry.force_fresh { 1_i64 } else { 0_i64 },
+                entry.supersedes_cache_id,
+            ],
+        )
+        .with_context(|| {
+            format!(
+                "store_cache_if_absent(slug={}, cache_key={})",
+                entry.slug, entry.cache_key
+            )
+        })?;
+    // SQLite returns the number of rows actually affected. DO NOTHING
+    // means a conflict yields 0 rows affected.
+    Ok(affected == 1)
+}
+
 /// Delete a cache row by its content-addressable key. Used by the
 /// verification-failure path in `call_model_unified_with_options` — when
 /// `verify_cache_hit` returns `Mismatch*` or `CorruptedOutput`, the
@@ -12247,6 +12319,91 @@ mod step_cache_tests {
         // Just confirm the fields round-trip — the assertion above is
         // enough; this test exists to lock down the SELECT shape.
         assert_eq!(fetched.cache_key, entry.cache_key);
+    }
+
+    #[test]
+    fn test_store_cache_if_absent_returns_true_on_fresh_insert() {
+        // `store_cache_if_absent` with no prior row should return `true`
+        // (row was actually inserted) and the row should be present in
+        // the table afterward.
+        let conn = mem_conn();
+        let entry = make_entry("ts", "fresh");
+        let inserted = store_cache_if_absent(&conn, &entry).unwrap();
+        assert!(inserted, "expected true for a fresh insert");
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pyramid_step_cache
+                 WHERE slug = 'ts' AND cache_key = ?1",
+                [&entry.cache_key],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_store_cache_if_absent_returns_false_on_conflict_and_preserves_row() {
+        // Phase 7 contract (spec "Idempotency" section ~line 341):
+        // `INSERT OR IGNORE` semantics must leave pre-existing rows
+        // untouched on conflict. This is the spec mandate the Phase 7
+        // import flow relies on to protect local rerolls during resume.
+        let conn = mem_conn();
+
+        // Plant a row that looks like a local force-reroll — same
+        // cache_key as what the import will bring, but with `force_fresh`
+        // set and a distinct output_json.
+        let mut rerolled = make_entry("ts", "conflict");
+        rerolled.output_json =
+            serde_json::json!({"content":"LOCAL_REROLL","usage":{}}).to_string();
+        rerolled.force_fresh = true;
+        rerolled.build_id = "local-reroll".into();
+        store_cache(&conn, &rerolled).unwrap();
+
+        // Now attempt to import a row at the same cache_key with the
+        // imported-style payload. Under `INSERT OR IGNORE` semantics
+        // this must NOT clobber the rerolled row.
+        let mut imported = make_entry("ts", "conflict");
+        imported.output_json =
+            serde_json::json!({"content":"IMPORTED","usage":{}}).to_string();
+        imported.force_fresh = false;
+        imported.build_id = "import:wire:p1".into();
+        let inserted = store_cache_if_absent(&conn, &imported).unwrap();
+        assert!(!inserted, "expected false because a prior row exists");
+
+        // Row count is still 1 — no duplicate.
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pyramid_step_cache
+                 WHERE slug = 'ts' AND cache_key = ?1",
+                [&rerolled.cache_key],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+
+        // The active row is STILL the local reroll, not the import.
+        let (active_output, active_force_fresh, active_build_id): (
+            String,
+            i64,
+            String,
+        ) = conn
+            .query_row(
+                "SELECT output_json, force_fresh, build_id FROM pyramid_step_cache
+                 WHERE slug = 'ts' AND cache_key = ?1",
+                [&rerolled.cache_key],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert!(
+            active_output.contains("LOCAL_REROLL"),
+            "store_cache_if_absent clobbered the local reroll output_json: {active_output}"
+        );
+        assert_eq!(active_force_fresh, 1, "force_fresh flag was cleared");
+        assert_eq!(
+            active_build_id, "local-reroll",
+            "build_id was overwritten"
+        );
     }
 }
 

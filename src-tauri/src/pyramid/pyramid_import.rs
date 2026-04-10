@@ -32,12 +32,22 @@
 //      entirely — their cache entries are dropped, the next build will
 //      re-run them fresh.
 //
-// Idempotency: every cache insert uses the existing `db::store_cache` helper
-// (which uses `INSERT ... ON CONFLICT ... DO UPDATE` keyed on the unique
-// `(slug, cache_key)` constraint). Re-importing the same manifest is a
-// no-op for the rows that have already landed. The `pyramid_import_state`
-// table provides the cursor so a partially-completed import can resume from
-// the last node processed without re-running the L0 hashing.
+// Idempotency: every cache insert goes through `db::store_cache_if_absent`
+// which is the `INSERT OR IGNORE` semantic the spec mandates
+// (see `docs/specs/cache-warming-and-import.md` "Idempotency" section
+// ~line 341). Unlike the default `store_cache` helper which uses
+// `ON CONFLICT DO UPDATE`, this helper leaves pre-existing rows untouched
+// on conflict. That's the load-bearing property for the reroll-then-resume
+// case: if a user imports a pyramid, then force-rerolls a step locally
+// (which writes a new row at the same content-addressable key with
+// `force_fresh = 1`), and then for any reason the import is re-run (resume
+// from cursor after crash, or explicit retry), the rerolled row is NOT
+// clobbered. The re-imported row is silently skipped at the row that
+// already exists, the rerolled state is preserved, and the three counters
+// in `ImportReport` still reflect the fact that the slot is occupied. The
+// `pyramid_import_state` table provides the cursor so a partially-completed
+// import can resume from the last node processed without re-running the
+// L0 hashing.
 //
 // Privacy: this module IMPORTS only — `wire_publish.rs::export_cache_manifest`
 // is the gate that decides whether the source node ships a manifest in the
@@ -230,9 +240,10 @@ fn normalize_hash(hash: &str) -> &str {
 /// `node.source_path`, SHA-256 the file, compare to `node.source_hash`.
 /// Files that are missing OR mismatch are stale; their owning L0 nodes
 /// are added to the stale set and their cache entries are dropped.
-/// Surviving L0 nodes have their cache entries inserted via the existing
-/// `db::store_cache` helper (idempotent INSERT OR REPLACE on the unique
-/// `(slug, cache_key)` constraint).
+/// Surviving L0 nodes have their cache entries inserted via
+/// `db::store_cache_if_absent` — `INSERT ... ON CONFLICT DO NOTHING`
+/// on the unique `(slug, cache_key)` constraint, so any locally-existing
+/// row at the same content-addressable key is left untouched.
 ///
 /// Pass 2 (upward propagation): build an in-memory `dependents` map from
 /// the manifest's `derived_from` lists, then BFS from the stale L0 set
@@ -246,10 +257,15 @@ fn normalize_hash(hash: &str) -> &str {
 /// Returns an `ImportReport` summarizing the four counters.
 ///
 /// Idempotency: re-running this function with the same manifest produces
-/// the same result with no duplicate rows. The cache table's unique
-/// `(slug, cache_key)` constraint catches the second insert and reduces
-/// it to a no-op update. Resumption from a partial cursor is the caller's
-/// concern (`import_pyramid`); this function always re-runs the full pass.
+/// the same result with no duplicate rows. The helper uses
+/// `INSERT ... ON CONFLICT DO NOTHING` so a second call leaves every
+/// already-landed row untouched. Critically, this also preserves any
+/// local force-fresh (reroll) rows that the user wrote between import
+/// attempts — the spec's `INSERT OR IGNORE` requirement (see
+/// "Idempotency" section ~line 341) exists precisely to avoid
+/// clobbering local rerolls during resume. Resumption from a partial
+/// cursor is the caller's concern (`import_pyramid`); this function
+/// always re-runs the full pass.
 pub fn populate_from_import(
     conn: &Connection,
     manifest: &CacheManifest,
@@ -429,13 +445,21 @@ pub fn populate_from_import(
 }
 
 /// Insert a slice of imported cache entries into `pyramid_step_cache` for
-/// the target slug. Each insert goes through `db::store_cache` which uses
-/// `INSERT ... ON CONFLICT(slug, cache_key) DO UPDATE` so re-imports of
-/// the same row don't duplicate.
+/// the target slug. Each insert goes through `db::store_cache_if_absent`
+/// which uses `INSERT ... ON CONFLICT(slug, cache_key) DO NOTHING` so
+/// re-imports of the same row don't duplicate AND don't overwrite any
+/// row the local user may have written between import attempts (e.g. a
+/// force-rerolled cache entry).
 ///
-/// Returns the count of entries actually attempted (== entries.len() on
-/// success). Per-row failures emit a warning and continue — a single
-/// corrupt entry shouldn't abort the whole import.
+/// Returns the count of entries the report should consider "valid" —
+/// the spec's `ImportReport.cache_entries_valid` counts every entry whose
+/// content-addressable slot is occupied after the call, regardless of
+/// whether THIS import wrote it or a prior attempt did. That matches the
+/// importer's mental model ("this many entries are now populated in my
+/// cache") and gives a stable report across resumes.
+///
+/// Per-row failures emit a warning and continue — a single corrupt
+/// entry shouldn't abort the whole import.
 fn insert_cache_entries(
     conn: &Connection,
     target_slug: &str,
@@ -464,8 +488,15 @@ fn insert_cache_entries(
             force_fresh: false,
             supersedes_cache_id: None,
         };
-        match db::store_cache(conn, &cache_entry) {
-            Ok(_) => inserted += 1,
+        match db::store_cache_if_absent(conn, &cache_entry) {
+            Ok(_row_actually_inserted) => {
+                // Count the slot as "valid" whether this call wrote the
+                // row or a prior import (or a local reroll) already did.
+                // The importer's counter is "how many entries are now
+                // present in my cache", not "how many bytes did I just
+                // write". That makes the count stable across resumes.
+                inserted += 1;
+            }
             Err(e) => {
                 warn!(
                     target_slug,
@@ -1097,9 +1128,10 @@ mod tests {
             .unwrap();
         assert_eq!(row_count_after_first, 5);
 
-        // Second import: same manifest. The store_cache helper uses
-        // INSERT OR REPLACE on the unique (slug, cache_key) constraint,
-        // so re-importing produces no duplicate rows.
+        // Second import: same manifest. `store_cache_if_absent` uses
+        // INSERT ... ON CONFLICT DO NOTHING on the unique (slug, cache_key)
+        // constraint, so re-importing produces no duplicate rows AND
+        // does not overwrite anything already present.
         let r2 =
             populate_from_import(&conn, &manifest, "test-import", dir.path()).unwrap();
         assert_eq!(r2.cache_entries_valid, 5);
@@ -1114,6 +1146,153 @@ mod tests {
         assert_eq!(
             row_count_after_second, 5,
             "re-import should not duplicate rows"
+        );
+    }
+
+    /// Regression guard for the spec's `INSERT OR IGNORE` mandate (see
+    /// `docs/specs/cache-warming-and-import.md` "Idempotency" section
+    /// ~line 341). If a user imports a pyramid, rerolls one of the cached
+    /// steps locally (which writes a fresh row at the SAME
+    /// content-addressable key with `force_fresh = 1`, a new `output_json`,
+    /// and a supersession link to the archival row), and then — for any
+    /// reason — re-runs the import (resume after crash, explicit retry),
+    /// the re-import MUST NOT clobber the rerolled row. The reroll is the
+    /// user's latest intention and we don't have the right to undo it.
+    ///
+    /// This test pins that contract directly: import, reroll, re-import,
+    /// then assert that the row at the rerolled cache_key still carries
+    /// the rerolled `output_json` and `force_fresh = 1`.
+    #[test]
+    fn test_re_import_preserves_local_reroll_force_fresh_row() {
+        let conn = mem_conn();
+        let dir = TempDir::new().unwrap();
+        let l0a_path = dir.path().join("a.txt");
+        let l0b_path = dir.path().join("b.txt");
+        let l0c_path = dir.path().join("c.txt");
+        let l0a_hash = write_and_hash(&l0a_path, "alpha");
+        let l0b_hash = write_and_hash(&l0b_path, "beta");
+        let l0c_hash = write_and_hash(&l0c_path, "gamma");
+
+        let manifest = build_mixed_manifest(
+            "a.txt", &l0a_hash, "b.txt", &l0b_hash, "c.txt", &l0c_hash,
+        );
+
+        // First import: all 5 nodes land in the cache with
+        // force_fresh = 0 and the imported output_json.
+        let r1 =
+            populate_from_import(&conn, &manifest, "test-import", dir.path()).unwrap();
+        assert_eq!(r1.cache_entries_valid, 5);
+
+        // Simulate a local force-reroll on the L0a cache row. We reuse the
+        // same inputs/prompt/model triple so the cache_key is identical to
+        // the imported row (that's the whole point of "reroll at the same
+        // content-addressable key"). Going through `supersede_cache_entry`
+        // archives the imported row and writes a fresh row at the same
+        // cache_key with `force_fresh = 1` and a supersession link.
+        let l0a_cache_key =
+            compute_cache_key("inputs:L0a-extract", "prompt:L0a-extract", "openrouter/test-1");
+
+        let rerolled = CacheEntry {
+            slug: "test-import".into(),
+            build_id: "local-reroll".into(),
+            step_name: "source_extract".into(),
+            chunk_index: 0,
+            depth: 0,
+            cache_key: l0a_cache_key.clone(),
+            inputs_hash: "inputs:L0a-extract".into(),
+            prompt_hash: "prompt:L0a-extract".into(),
+            model_id: "openrouter/test-1".into(),
+            output_json:
+                serde_json::json!({"content":"REROLLED","usage":{}}).to_string(),
+            token_usage_json: Some("{}".into()),
+            cost_usd: Some(0.005),
+            latency_ms: Some(123),
+            force_fresh: true,
+            supersedes_cache_id: None,
+        };
+        db::supersede_cache_entry(&conn, "test-import", &l0a_cache_key, &rerolled)
+            .unwrap();
+
+        // Sanity: the active row at the cache_key is now the rerolled one.
+        let (active_output, active_force_fresh): (String, i64) = conn
+            .query_row(
+                "SELECT output_json, force_fresh FROM pyramid_step_cache
+                 WHERE slug = 'test-import' AND cache_key = ?1",
+                [&l0a_cache_key],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(
+            active_output.contains("REROLLED"),
+            "pre-check: rerolled row should be active after supersede"
+        );
+        assert_eq!(
+            active_force_fresh, 1,
+            "pre-check: rerolled row should have force_fresh = 1"
+        );
+
+        // Re-run the import. Under `store_cache_if_absent`, the re-import
+        // must leave the rerolled row alone.
+        let r2 =
+            populate_from_import(&conn, &manifest, "test-import", dir.path()).unwrap();
+        // Report still shows all 5 slots occupied — the importer counts
+        // "entries now present" regardless of whether this call wrote them.
+        assert_eq!(r2.cache_entries_valid, 5);
+
+        // The row at the rerolled cache_key must still be the reroll, not
+        // the re-imported copy.
+        let (preserved_output, preserved_force_fresh, preserved_build_id): (
+            String,
+            i64,
+            String,
+        ) = conn
+            .query_row(
+                "SELECT output_json, force_fresh, build_id FROM pyramid_step_cache
+                 WHERE slug = 'test-import' AND cache_key = ?1",
+                [&l0a_cache_key],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert!(
+            preserved_output.contains("REROLLED"),
+            "local reroll output_json was clobbered by re-import: got {preserved_output}"
+        );
+        assert_eq!(
+            preserved_force_fresh, 1,
+            "local reroll force_fresh flag was clobbered by re-import"
+        );
+        assert_eq!(
+            preserved_build_id, "local-reroll",
+            "local reroll build_id was clobbered by re-import"
+        );
+
+        // The other 4 rows (non-rerolled) are still present and unchanged.
+        let row_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pyramid_step_cache WHERE slug = 'test-import'
+                 AND cache_key NOT LIKE 'archived:%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            row_count, 5,
+            "expected 5 active rows (4 imported + 1 rerolled)"
+        );
+
+        // The archival row from the reroll is still present — the
+        // supersession chain is intact.
+        let archival_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pyramid_step_cache WHERE slug = 'test-import'
+                 AND cache_key LIKE 'archived:%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            archival_count, 1,
+            "expected 1 archival row from the reroll supersession"
         );
     }
 
