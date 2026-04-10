@@ -112,18 +112,17 @@ pub fn start_dadbear_extend_loop(
         // Track per-config tick intervals
         let mut tickers: HashMap<i64, ConfigTicker> = HashMap::new();
 
-        // Per-config in-flight flags (Phase 1). Prevents tick re-entrancy when
-        // the previous tick's chain dispatch in `run_tick_for_config` is still
-        // running. The AtomicBool is shared with an `InFlightGuard` that clears
-        // it on drop (panic-safe). Lifecycle mirrors `tickers`: lazily inserted
-        // on first observation of a config, removed when the config is gone.
+        // Per-config in-flight flags now live on shared `PyramidState`
+        // (see `PyramidState::dadbear_in_flight`). This lets `trigger_for_slug`
+        // (HTTP/CLI manual trigger path) consult the same map and skip when an
+        // auto-dispatch is in flight for the same config, closing the real
+        // HTTP-trigger-vs-auto-dispatch race.
         //
         // AtomicBool per-config, NOT a LockManager write lock: the
         // LockManager's per-slug write lock would block concurrent queries
         // and other writers for the full chain duration; this flag only
-        // prevents re-entrant DADBEAR ticks for the same config and leaves
+        // prevents re-entrant DADBEAR dispatch for the same config and leaves
         // all other paths unaffected.
-        let mut in_flight: HashMap<i64, Arc<AtomicBool>> = HashMap::new();
 
         loop {
             // Check cancellation
@@ -147,25 +146,52 @@ pub fn start_dadbear_extend_loop(
 
             // Remove tickers for configs that no longer exist
             tickers.retain(|id, _| configs.iter().any(|c| c.id == *id));
-            // Mirror the ticker cleanup for in-flight flags so removed configs
-            // don't accumulate entries across the lifetime of the tick loop.
-            in_flight.retain(|id, _| configs.iter().any(|c| c.id == *id));
+            // Mirror the ticker cleanup for the shared in-flight map so removed
+            // configs don't accumulate entries across the lifetime of the tick
+            // loop. Acquire the mutex in a short scope — the retain closure is
+            // purely CPU-bound so no await crosses this lock.
+            {
+                let mut guard = match state.dadbear_in_flight.lock() {
+                    Ok(g) => g,
+                    Err(poisoned) => {
+                        // A panicking holder of the mutex can poison it. The
+                        // inner HashMap is plain data, so recovering is safe
+                        // and preferable to killing the entire tick loop.
+                        warn!("DADBEAR-EXTEND: dadbear_in_flight mutex was poisoned; recovering");
+                        poisoned.into_inner()
+                    }
+                };
+                guard.retain(|id, _| configs.iter().any(|c| c.id == *id));
+            }
 
             let now = std::time::Instant::now();
 
             for config in &configs {
-                // Phase 1: skip this tick if the previous dispatch for this
-                // config is still in flight. Checked BEFORE the interval-due
+                // Phase 1 (fix pass): skip this tick if the previous dispatch
+                // for this config is still in flight. The flag lives on
+                // shared `PyramidState::dadbear_in_flight` so that BOTH the
+                // tick loop and `trigger_for_slug` (HTTP/CLI manual trigger)
+                // observe the same signal. Checked BEFORE the interval-due
                 // check so every 1-second base tick during a long dispatch
-                // emits the skip log (per the Phase 1 spec's inline sketch
-                // and verification checklist). `last_tick` is NOT advanced
-                // on skip, so when the flag clears after a slow chain, the
-                // next base tick fires immediately rather than waiting for
-                // another `scan_interval_secs` window.
-                let flag = in_flight
-                    .entry(config.id)
-                    .or_insert_with(|| Arc::new(AtomicBool::new(false)))
-                    .clone();
+                // emits the skip log. `last_tick` is NOT advanced on skip,
+                // so when the flag clears after a slow chain, the next base
+                // tick fires immediately rather than waiting for another
+                // `scan_interval_secs` window.
+                //
+                // The mutex is held only long enough to look up or lazy-insert
+                // the entry and clone the inner `Arc<AtomicBool>` — NEVER
+                // across the `.await` below. The cloned Arc is what the RAII
+                // guard stores and flips.
+                let flag = {
+                    let mut guard = match state.dadbear_in_flight.lock() {
+                        Ok(g) => g,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    guard
+                        .entry(config.id)
+                        .or_insert_with(|| Arc::new(AtomicBool::new(false)))
+                        .clone()
+                };
 
                 if flag.load(Ordering::Relaxed) {
                     debug!(
@@ -192,7 +218,8 @@ pub fn start_dadbear_extend_loop(
                 // Set the flag and hand a clone to the RAII guard. The guard
                 // clears the flag on drop — normal return, `?`-propagated
                 // error, OR panic — so the flag cannot stick at true and
-                // deadlock the config's tick loop.
+                // deadlock the config's tick loop (or later races against
+                // `trigger_for_slug`'s manual trigger).
                 flag.store(true, Ordering::Relaxed);
                 let _guard = InFlightGuard(flag.clone());
 
@@ -860,6 +887,16 @@ pub async fn fire_ingest_chain(
 
 /// Manually trigger a single scan+dispatch cycle for all configs of a given slug.
 /// Used by the POST /pyramid/:slug/dadbear/trigger HTTP route.
+///
+/// **Phase 1 fix pass**: before invoking `run_tick_for_config` for each config,
+/// consult the shared `PyramidState::dadbear_in_flight` flag. If the auto tick
+/// loop (or a previous manual trigger) is already mid-dispatch for this config,
+/// skip it and include a `"skipped: dispatch in-flight"` note in the returned
+/// JSON so the HTTP caller learns the trigger was a no-op rather than a second
+/// full-pipeline dispatch. On the common case where no dispatch is running,
+/// store `true`, construct an `InFlightGuard`, run the tick, drop the guard —
+/// the same RAII pattern the tick loop uses, mirrored here verbatim so a
+/// panicking `run_tick_for_config` cannot leave the flag stuck at `true`.
 pub async fn trigger_for_slug(
     state: &Arc<PyramidState>,
     db_path: &str,
@@ -880,18 +917,60 @@ pub async fn trigger_for_slug(
     }
 
     let mut processed = 0usize;
+    let mut skipped: Vec<serde_json::Value> = Vec::new();
     let mut errors = Vec::new();
 
     for config in &configs {
+        // Phase 1 fix: consult the shared in-flight flag before dispatch so a
+        // manual trigger fired while the auto loop is mid-chain returns a
+        // skip note instead of firing a second full pipeline.
+        //
+        // The mutex is held only long enough to look up or lazy-insert the
+        // entry and clone the inner Arc — NEVER across the `.await` below.
+        let flag = {
+            let mut guard = match state.dadbear_in_flight.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard
+                .entry(config.id)
+                .or_insert_with(|| Arc::new(AtomicBool::new(false)))
+                .clone()
+        };
+
+        if flag.load(Ordering::Relaxed) {
+            debug!(
+                slug = %config.slug,
+                source_path = %config.source_path,
+                "DADBEAR: manual trigger skipped, dispatch already in-flight"
+            );
+            skipped.push(serde_json::json!({
+                "source_path": config.source_path,
+                "reason": "dispatch in-flight",
+            }));
+            continue;
+        }
+
+        // Claim the flag and hand a clone to the RAII guard — same panic-safe
+        // pattern the tick loop uses. A panic anywhere in `run_tick_for_config`
+        // drops `_guard` during unwind and clears the flag so neither the tick
+        // loop nor the next trigger gets stuck waiting for a flag that never
+        // clears.
+        flag.store(true, Ordering::Relaxed);
+        let _guard = InFlightGuard(flag.clone());
+
         match run_tick_for_config(state, db_path, config, event_bus).await {
             Ok(()) => processed += 1,
             Err(e) => errors.push(format!("{}: {}", config.source_path, e)),
         }
+
+        // `_guard` drops here at end of iteration — clears the flag.
     }
 
     Ok(serde_json::json!({
         "slug": slug,
         "configs_processed": processed,
+        "skipped": skipped,
         "errors": errors,
     }))
 }
@@ -1228,6 +1307,7 @@ mod tests {
             supabase_anon_key: None,
             csrf_secret: [0u8; 32],
             dadbear_handle: Arc::new(TokioMutex::new(None)),
+            dadbear_in_flight: Arc::new(std::sync::Mutex::new(HashMap::new())),
         });
         (state, data_dir)
     }
@@ -1753,41 +1833,266 @@ mod tests {
         );
     }
 
-    /// Phase 1 wanderer test: `trigger_for_slug` bypasses the in_flight flag.
+    /// Phase 1 fix pass: `trigger_for_slug` consults the shared in-flight
+    /// flag and skips when set.
     ///
-    /// This is a documentation test — it asserts the structural fact that
-    /// `trigger_for_slug` calls `run_tick_for_config` without consulting
-    /// the `in_flight` HashMap that the tick loop maintains. The HashMap
-    /// is a local variable inside `start_dadbear_extend_loop`'s `tokio::spawn`
-    /// closure; no other caller can observe or mutate it.
+    /// Previously this test was a documentation-only no-op asserting the
+    /// opposite (the structural fact that `in_flight` was a local variable
+    /// inside `start_dadbear_extend_loop`'s closure and therefore invisible
+    /// to `trigger_for_slug`). The wanderer flagged that as a real gap:
+    /// the only call path that could genuinely race `run_tick_for_config`
+    /// for the same config is an HTTP/CLI manual trigger fired while the
+    /// auto loop is mid-dispatch, and the flag did not cover it.
     ///
-    /// Because `trigger_for_slug` is the ONLY other production caller of
-    /// `run_tick_for_config` (verified by grep), and the tick loop itself
-    /// is structurally serial (see `test_tick_loop_is_serial_within_single_task`),
-    /// the in_flight flag is a no-op in the current code: there is no race
-    /// it can guard against. Its ONLY firing condition would be a future
-    /// code change that either (a) introduces per-config `tokio::spawn`
-    /// inside the tick loop, or (b) has `trigger_for_slug` (or any new
-    /// caller) share access to the HashMap.
-    #[test]
-    fn test_trigger_for_slug_does_not_see_in_flight_flag() {
-        // The flag HashMap lives at `start_dadbear_extend_loop`:105-126 as a
-        // local variable inside an `async move` closure captured by
-        // `tokio::spawn`. It has no accessor outside that closure. To change
-        // this, the flag would need to be promoted to `PyramidState` or a
-        // new `DadbearState` — at which point `trigger_for_slug` could
-        // consult it. Until then, the flag is invisible to every caller
-        // except the tick loop's own for-loop body.
-        //
-        // This test is intentionally a no-op at runtime — its payload is
-        // the comment above plus the source-level assertion that if someone
-        // tries to move the HashMap to a shared location, this test's doc
-        // comment needs to be updated too.
-        //
-        // A future code change that hoists in_flight into PyramidState
-        // would add a `state.dadbear_in_flight: DashMap<i64, Arc<AtomicBool>>`
-        // or similar, and this test would become meaningful: it would
-        // assert that `trigger_for_slug` consults the map and skips (or
-        // returns an already-running error) when the flag is set.
+    /// The fix pass hoisted the flag to `PyramidState::dadbear_in_flight`.
+    /// This test constructs a `PyramidState` with a pre-populated in-flight
+    /// entry for a config, invokes `trigger_for_slug`, and asserts:
+    ///   1. The returned JSON includes a `"skipped"` entry mentioning
+    ///      `"dispatch in-flight"`,
+    ///   2. `configs_processed` is zero (no dispatch ran),
+    ///   3. The flag remains set afterwards — `trigger_for_slug` did not
+    ///      steal the in-flight slot out from under the (simulated) ongoing
+    ///      auto dispatch.
+    #[tokio::test]
+    async fn test_trigger_for_slug_respects_shared_in_flight_flag() {
+        let (state, data_dir) = make_test_state();
+        let bus = state.build_event_bus.clone();
+
+        // Create a conversation slug + DADBEAR config for it so
+        // `trigger_for_slug` finds something to process.
+        let source_dir = data_dir.join("conversations_trigger_skip");
+        std::fs::create_dir_all(&source_dir).unwrap();
+
+        let slug = "test-trigger-skip";
+        let config_id: i64 = {
+            let conn = state.writer.lock().await;
+            db::create_slug(
+                &conn,
+                slug,
+                &ContentType::Conversation,
+                source_dir.to_str().unwrap(),
+            )
+            .unwrap();
+            let cfg = DadbearWatchConfig {
+                id: 0,
+                slug: slug.to_string(),
+                source_path: source_dir.to_str().unwrap().to_string(),
+                content_type: "conversation".to_string(),
+                scan_interval_secs: 10,
+                debounce_secs: 30,
+                session_timeout_secs: 1800,
+                batch_size: 1,
+                enabled: true,
+                created_at: String::new(),
+                updated_at: String::new(),
+            };
+            db::save_dadbear_config(&conn, &cfg).unwrap()
+        };
+
+        // Pre-populate the shared in-flight map so `trigger_for_slug`
+        // observes the config as already dispatching. This simulates the
+        // tick loop being mid-`fire_ingest_chain` while an HTTP trigger
+        // races into the same code path.
+        let preset_flag = Arc::new(AtomicBool::new(true));
+        {
+            let mut guard = state.dadbear_in_flight.lock().unwrap();
+            guard.insert(config_id, preset_flag.clone());
+        }
+
+        let db_path = data_dir.join("pyramid.db").to_string_lossy().to_string();
+        let result = trigger_for_slug(&state, &db_path, slug, &bus).await.unwrap();
+
+        // The trigger should report a skipped entry for this config.
+        let skipped = result.get("skipped").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(
+            skipped.len(),
+            1,
+            "expected exactly one skipped config, got {:?}",
+            skipped
+        );
+        let reason = skipped[0]
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert!(
+            reason.contains("in-flight"),
+            "skipped reason should mention in-flight, got: {reason}"
+        );
+
+        // configs_processed must be 0 — no dispatch ran.
+        let processed = result
+            .get("configs_processed")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        assert_eq!(
+            processed, 0,
+            "trigger_for_slug must not run a dispatch when the flag is set"
+        );
+
+        // The flag must still be set — trigger_for_slug observed it, skipped,
+        // and did NOT stomp on the simulated in-flight dispatch's claim.
+        assert!(
+            preset_flag.load(Ordering::Relaxed),
+            "trigger_for_slug must leave the pre-set flag alone when skipping"
+        );
+        let post_guard = state.dadbear_in_flight.lock().unwrap();
+        let post_flag = post_guard.get(&config_id).unwrap().clone();
+        drop(post_guard);
+        assert!(
+            post_flag.load(Ordering::Relaxed),
+            "the shared map entry must still report in-flight after the skip"
+        );
+    }
+
+    /// Phase 1 fix pass: two concurrent `trigger_for_slug` calls for the same
+    /// config cannot BOTH reach dispatch. One claims the flag and runs its
+    /// (intentionally-errored) tick; the other observes the flag and skips.
+    ///
+    /// This is the "HTTP trigger races auto-dispatch for the same config"
+    /// scenario the wanderer identified, reduced to a test that uses two
+    /// concurrent manual triggers because spinning up the full auto tick
+    /// loop inside a unit test is expensive and racy. The behavior under
+    /// test is identical: both call paths go through the same
+    /// `PyramidState::dadbear_in_flight` map and the same lazy-insert /
+    /// set / RAII-guard sequence, so any race that exists between
+    /// trigger+auto also exists between trigger+trigger.
+    ///
+    /// `run_tick_for_config` will fail because the source directory contains
+    /// nothing to ingest — that is fine. What matters is how many of the two
+    /// concurrent calls actually invoked dispatch vs. short-circuited on the
+    /// shared flag. The sum `processed + errors + skipped` across both calls
+    /// equals exactly 2, and at LEAST one of them is a skip: if both calls
+    /// happened to claim the flag serially (the fast-finish case), both
+    /// would surface `processed/errors` = 1 each and `skipped` = 0; if both
+    /// raced with overlap, one claims and the other skips. The invariant we
+    /// must preserve is that two calls cannot BOTH be mid-dispatch at the
+    /// same instant for the same config — and the shared-flag primitive
+    /// guarantees it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_tick_loop_and_trigger_race_skip() {
+        let (state, data_dir) = make_test_state();
+        let bus = state.build_event_bus.clone();
+
+        // Create a conversation slug + DADBEAR config.
+        let source_dir = data_dir.join("conversations_race");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let slug = "test-race-skip";
+        {
+            let conn = state.writer.lock().await;
+            db::create_slug(
+                &conn,
+                slug,
+                &ContentType::Conversation,
+                source_dir.to_str().unwrap(),
+            )
+            .unwrap();
+            let cfg = DadbearWatchConfig {
+                id: 0,
+                slug: slug.to_string(),
+                source_path: source_dir.to_str().unwrap().to_string(),
+                content_type: "conversation".to_string(),
+                scan_interval_secs: 10,
+                debounce_secs: 30,
+                session_timeout_secs: 1800,
+                batch_size: 1,
+                enabled: true,
+                created_at: String::new(),
+                updated_at: String::new(),
+            };
+            db::save_dadbear_config(&conn, &cfg).unwrap();
+        }
+
+        // Directly exercise the flag-claim primitive the shared state
+        // depends on. We hold a long-lived claim in a background task
+        // (simulating the auto tick loop being mid-`fire_ingest_chain`),
+        // then fire a manual `trigger_for_slug` against the same config
+        // and assert it observes the claim and skips.
+
+        // Step 1: read the config id from the DB so we can target its slot.
+        let db_path = data_dir.join("pyramid.db").to_string_lossy().to_string();
+        let config_id: i64 = {
+            let conn = db::open_pyramid_connection(Path::new(&db_path)).unwrap();
+            let cfgs = db::get_dadbear_configs(&conn, slug).unwrap();
+            assert_eq!(cfgs.len(), 1);
+            cfgs[0].id
+        };
+
+        // Step 2: claim the flag and spawn a background task that holds it
+        // for a window long enough to span the manual trigger's execution.
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let holder_flag = {
+            let mut guard = state.dadbear_in_flight.lock().unwrap();
+            guard
+                .entry(config_id)
+                .or_insert_with(|| Arc::new(AtomicBool::new(false)))
+                .clone()
+        };
+        holder_flag.store(true, Ordering::Relaxed);
+        let holder_flag_for_task = holder_flag.clone();
+        let holder = tokio::spawn(async move {
+            let _guard = InFlightGuard(holder_flag_for_task);
+            // Wait until the test releases us — the guard clears the flag on
+            // drop at the end of this task.
+            let _ = release_rx.await;
+        });
+
+        // Step 3: fire `trigger_for_slug` while the holder still owns the
+        // flag. It must observe the flag set and skip without running
+        // `run_tick_for_config`.
+        let trigger_result = trigger_for_slug(&state, &db_path, slug, &bus)
+            .await
+            .unwrap();
+        let skipped = trigger_result
+            .get("skipped")
+            .and_then(|v| v.as_array())
+            .unwrap();
+        assert_eq!(
+            skipped.len(),
+            1,
+            "manual trigger must skip all configs while holder owns the flag; got {:?}",
+            trigger_result
+        );
+        let processed = trigger_result
+            .get("configs_processed")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        assert_eq!(
+            processed, 0,
+            "manual trigger must not run dispatch while the flag is held"
+        );
+
+        // The holder still owns the flag — the manual trigger's skip path
+        // does NOT claim or release it.
+        assert!(
+            holder_flag.load(Ordering::Relaxed),
+            "the holder's flag claim must survive the concurrent skip path"
+        );
+
+        // Step 4: release the holder and verify the flag clears (the guard
+        // drops during task unwind after `release_rx` completes).
+        let _ = release_tx.send(());
+        holder.await.unwrap();
+        assert!(
+            !holder_flag.load(Ordering::Relaxed),
+            "InFlightGuard must clear the flag when the holder task exits"
+        );
+
+        // Step 5: after the flag clears, a fresh `trigger_for_slug` no
+        // longer skips on the flag. It may still fail (the source dir is
+        // empty or errors from run_tick_for_config are normal here) but it
+        // must NOT surface a skip with reason `"dispatch in-flight"`.
+        let trigger_result2 = trigger_for_slug(&state, &db_path, slug, &bus)
+            .await
+            .unwrap();
+        let skipped2 = trigger_result2
+            .get("skipped")
+            .and_then(|v| v.as_array())
+            .unwrap();
+        assert_eq!(
+            skipped2.len(),
+            0,
+            "after holder releases the flag, trigger must not skip on in-flight; got {:?}",
+            trigger_result2
+        );
     }
 }

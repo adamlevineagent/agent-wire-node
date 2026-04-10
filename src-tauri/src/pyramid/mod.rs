@@ -728,6 +728,33 @@ pub struct PyramidState {
     /// DADBEAR extend loop handle for conversation/vine lifecycle management.
     /// Started on first conversation build; dropped on app exit.
     pub dadbear_handle: Arc<Mutex<Option<crate::pyramid::dadbear_extend::DadbearExtendHandle>>>,
+    /// Phase 1 fix: shared per-config DADBEAR dispatch in-flight flags, keyed by
+    /// `pyramid_dadbear_config.id`.
+    ///
+    /// Set when `dadbear_extend::run_tick_for_config` is about to invoke its
+    /// dispatch body, and cleared via an RAII `InFlightGuard` on every exit
+    /// path (normal, `?`-propagated error, panic unwind). Consulted by BOTH
+    /// the auto tick loop in `start_dadbear_extend_loop` AND the manual
+    /// `trigger_for_slug` (HTTP/CLI) entry point, so two concurrent
+    /// `run_tick_for_config` calls for the same config cannot both reach
+    /// `fire_ingest_chain` and fire a "double work" chain build back-to-back.
+    ///
+    /// Uses `std::sync::Mutex` (not tokio's) because access is short-lived:
+    /// acquire, look up or lazy-insert the entry, clone the inner
+    /// `Arc<AtomicBool>`, drop. The mutex MUST NOT be held across any
+    /// `.await`. The inner `Arc<AtomicBool>` is what the guard stores and
+    /// flips, and it's a non-blocking atomic — the mutex only protects the
+    /// HashMap shape itself.
+    ///
+    /// Initial state: empty. Entries are lazy-inserted on first tick
+    /// observation of a config, and removed by the tick loop's cleanup pass
+    /// when the corresponding config is gone (mirroring the `tickers`
+    /// HashMap's `retain` call).
+    pub dadbear_in_flight: Arc<
+        std::sync::Mutex<
+            HashMap<i64, Arc<std::sync::atomic::AtomicBool>>,
+        >,
+    >,
 }
 
 impl PyramidState {
@@ -772,6 +799,7 @@ impl PyramidState {
             supabase_anon_key: self.supabase_anon_key.clone(),
             csrf_secret: self.csrf_secret,
             dadbear_handle: self.dadbear_handle.clone(),
+            dadbear_in_flight: self.dadbear_in_flight.clone(),
         }))
     }
 }

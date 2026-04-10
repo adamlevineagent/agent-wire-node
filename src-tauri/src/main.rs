@@ -5726,6 +5726,7 @@ async fn pyramid_vine_integrity(
         supabase_anon_key: state.pyramid.supabase_anon_key.clone(),
         csrf_secret: state.pyramid.csrf_secret,
         dadbear_handle: state.pyramid.dadbear_handle.clone(),
+        dadbear_in_flight: state.pyramid.dadbear_in_flight.clone(),
     });
 
     let summary = vine::run_integrity_check(&pyramid_state, &slug)
@@ -5775,6 +5776,7 @@ async fn pyramid_vine_rebuild_upper(
         supabase_anon_key: state.pyramid.supabase_anon_key.clone(),
         csrf_secret: state.pyramid.csrf_secret,
         dadbear_handle: state.pyramid.dadbear_handle.clone(),
+        dadbear_in_flight: state.pyramid.dadbear_in_flight.clone(),
     });
 
     let cancel = tokio_util::sync::CancellationToken::new();
@@ -6605,6 +6607,13 @@ fn main() {
             s
         },
         dadbear_handle: Arc::new(tokio::sync::Mutex::new(None)),
+        // Phase 1 fix: shared per-config DADBEAR in-flight flag map.
+        // Consulted by both the tick loop and `trigger_for_slug` so two
+        // concurrent `run_tick_for_config` calls for the same config cannot
+        // both reach dispatch (the HTTP-trigger-vs-auto-dispatch race).
+        dadbear_in_flight: Arc::new(std::sync::Mutex::new(
+            std::collections::HashMap::new(),
+        )),
     });
 
     // Load persisted event subscriptions into the in-memory event bus

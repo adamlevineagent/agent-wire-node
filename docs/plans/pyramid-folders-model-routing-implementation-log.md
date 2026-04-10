@@ -302,3 +302,70 @@ Feature branch `phase-0b-pipeline-b-dispatch` is ready to push to origin. Procee
 - **No friction log entries needed** — the spec's sketch was exact enough that implementation tracked it closely. One micro-correction (flag check before interval check) is documented in the "Spec adherence" section above and in-code as a comment.
 
 The phase is ready for the verifier pass. After that, the wanderer pass should trace end-to-end: "does the tick loop actually skip on a long-running dispatch, and does it recover cleanly when the dispatch completes?"
+
+### Wanderer pass — 2026-04-10
+
+**Workstream:** wanderer agent (no punch list, just "does the tick loop actually skip on a long-running dispatch?")
+**Started:** 2026-04-10
+**Completed:** 2026-04-10
+**Status:** **caught a structural no-op — logged + escalated to planner, did NOT commit a fix**
+**Wanderer commit:** `9d6c9ca phase-1: wanderer — in-flight flag is a no-op in current tick loop shape`
+
+**The catch:** the in-flight flag is a structural no-op in the current code. The tick loop is a single `tokio::spawn`ed future around `loop { sleep(1s); for cfg in cfgs { run_tick_for_config(...).await; } }`. The outer `loop { }` cannot advance while a prior iteration's `.await` is pending — tokio does not re-enter a spawned future while it is suspended at an await. The skip branch (`dadbear_extend.rs:170-176`) is unreachable from the tick loop's own flow.
+
+The only other caller of `run_tick_for_config`, `trigger_for_slug` (via POST `/pyramid/:slug/dadbear/trigger`), did NOT consult the flag because `in_flight` was a local variable inside `start_dadbear_extend_loop`'s spawned closure and invisible to any other caller.
+
+The wanderer wrote two tests proving the structural facts (`test_tick_loop_is_serial_within_single_task` which empirically verifies outer-loop serialization, and `test_trigger_for_slug_does_not_see_in_flight_flag` which is a documentation-only fixture for the claim that `trigger_for_slug` bypasses the flag). Escalated via a deviation block to the planner with three decision points and a proposed fix shape: hoist `in_flight` into `PyramidState`.
+
+### Phase 1 fix pass — 2026-04-10
+
+**Workstream:** fix-pass implementer (no-punch-list prompt based on planner's go-ahead for the wanderer's proposed hoist-to-shared-state approach)
+**Started:** 2026-04-10
+**Completed:** 2026-04-10
+**Status:** ✅ verified
+**Fix commit:** (this commit)
+
+**What the wanderer found (recap):** the in-flight flag as shipped was structurally unobservable. The tick loop was serial within its own spawned future, and `trigger_for_slug` had no access to the local HashMap. The flag fired on a race that did not exist.
+
+**The fix:** hoist the per-config in-flight HashMap to `PyramidState::dadbear_in_flight` so every caller of `run_tick_for_config` consults the same map. The race this actually guards is now the real one: a manual HTTP/CLI trigger fired while the auto tick loop is mid-`fire_ingest_chain` for the same config. Under the old code, both calls would race into `dispatch_pending_ingests`, both would claim non-overlapping pending records under the per-slug lock, and the SECOND call's `fire_ingest_chain` would run a full second chain build after the first completes — not a data-corruption race, but a "double work" race that burned LLM budget and time. Under the new code, the second caller observes the flag set, skips with a `"skipped: dispatch in-flight"` JSON note, and the HTTP caller gets a fast response instead of queuing a duplicate full-pipeline dispatch.
+
+**Spec adherence (fix pass):**
+- ✅ **Shared per-config in-flight flag** — added `PyramidState::dadbear_in_flight: Arc<std::sync::Mutex<HashMap<i64, Arc<AtomicBool>>>>`. Updated `with_build_reader` to clone it (build-scoped state observes the same flag map). Updated every `PyramidState { ... }` construction site: `main.rs` (3 sites), `vine.rs` (1 site), `chain_executor.rs` (4 test fixtures), `dadbear_extend.rs::make_test_state` (1 test fixture).
+- ✅ **Tick loop consults shared state** — removed the local `HashMap<i64, Arc<AtomicBool>>` inside `start_dadbear_extend_loop`'s closure. Lazy-insert + clone-out now happens under `state.dadbear_in_flight.lock()` in a short scope that drops the mutex BEFORE `run_tick_for_config(...).await`. The `retain` cleanup for removed configs also uses the shared mutex in a short scope. Both lock acquisitions recover from mutex poisoning (`.lock().or(poisoned.into_inner())`) rather than killing the tick loop.
+- ✅ **`trigger_for_slug` consults shared state** — before calling `run_tick_for_config` for each config, the new code acquires `state.dadbear_in_flight.lock()`, lazy-inserts or clones the entry, drops the mutex, and checks the atomic flag. If set, the config is skipped and added to a new `"skipped"` array in the returned JSON with reason `"dispatch in-flight"`. If clear, the code sets the flag, constructs an `InFlightGuard` (same RAII primitive the tick loop uses), runs the tick, and the guard clears the flag on every exit path (normal, error, panic unwind). `configs_processed` remains the count of configs that actually ran.
+- ✅ **Panic safety preserved** — both call sites build `InFlightGuard` the same way. The `InFlightGuard::drop` impl is unchanged and still load-bearing. No second primitive, no divergent cleanup paths.
+- ✅ **HTTP route (`routes.rs::handle_dadbear_trigger`)** — unchanged; the signature of `trigger_for_slug` is unchanged, only the returned JSON gained a `"skipped"` field.
+
+**Files touched (fix pass):**
+- `src-tauri/src/pyramid/mod.rs` — added `dadbear_in_flight` field to `PyramidState`, threaded through `with_build_reader`.
+- `src-tauri/src/main.rs` — initialized `dadbear_in_flight` in the canonical `PyramidState` construction at line ~6574 and cloned it in the two `vine_integrity` / `vine_rebuild_upper` constructor sites.
+- `src-tauri/src/pyramid/vine.rs` — cloned `dadbear_in_flight` in the `run_build` fallback state builder.
+- `src-tauri/src/pyramid/chain_executor.rs` — added `dadbear_in_flight` initializer to all 4 test fixtures (`integration_execute_plan_initializes_state`, `integration_execute_plan_with_chunks_reaches_first_step`, `integration_build_runner_ir_flag_exists`, `integration_execute_plan_respects_pre_cancellation`) via `replace_all`.
+- `src-tauri/src/pyramid/dadbear_extend.rs`:
+  - Removed the local `let mut in_flight: HashMap<i64, Arc<AtomicBool>> = HashMap::new();` inside `start_dadbear_extend_loop`'s spawned closure.
+  - Replaced the old `in_flight.retain(...)` cleanup with a mutex-acquired retain against `state.dadbear_in_flight`.
+  - Replaced the old per-iteration `in_flight.entry(...)` with a mutex-acquired lookup/insert/clone against `state.dadbear_in_flight`.
+  - Taught `trigger_for_slug` to consult the flag, collect skipped configs into a new JSON `"skipped"` array, and claim the flag via `InFlightGuard` when it proceeds.
+  - Replaced the stale wanderer documentation test `test_trigger_for_slug_does_not_see_in_flight_flag` with a real `test_trigger_for_slug_respects_shared_in_flight_flag` that asserts the opposite behavior: pre-populate the shared map with a set flag, call `trigger_for_slug`, verify the JSON `"skipped"` array contains the config with reason `"dispatch in-flight"`, verify `configs_processed == 0`, verify the flag remains set (the skip path does not stomp on the holder's claim).
+  - Added a new test `test_tick_loop_and_trigger_race_skip` that exercises the concurrent-holder-vs-trigger race: spawn a background task that claims the flag and holds it via `InFlightGuard`, fire `trigger_for_slug` while the holder owns the flag, assert it skips; release the holder, verify the flag clears; fire `trigger_for_slug` again, assert it no longer surfaces a skip.
+  - Added `dadbear_in_flight` initializer to `make_test_state`.
+- `docs/plans/pyramid-folders-model-routing-implementation-log.md` — this entry.
+- `docs/plans/pyramid-folders-model-routing-friction-log.md` — resolution note appended to the "Phase 1 wanderer" entry.
+
+**Verification results (fix pass):**
+- ✅ `cargo check` (from `src-tauri/`) — clean. Same pre-existing warning set as before (3 `LayerCollectResult` private-interface in `publication.rs`, 1 deprecated `get_keep_evidence_for_target` in `routes.rs`, 1 deprecated `tauri_plugin_shell::Shell::open` in `main.rs:5226`). **Zero new warnings in any file touched by the fix pass.**
+- ✅ `cargo build` (from `src-tauri/`) — clean, same warning set.
+- ✅ `cargo test --lib pyramid::dadbear_extend` — **15/15 tests passing** in 9.75s:
+  - 11 pre-existing dadbear_extend tests (Phase 0b + Phase 0b wanderer) — unchanged, all pass
+  - `test_in_flight_guard_skip_and_panic_safety` (Phase 1 primitive test) — still passes, unchanged
+  - `test_tick_loop_is_serial_within_single_task` (Phase 1 wanderer structural test) — still passes, unchanged — the scheduler facts it tests are independent of where the HashMap lives
+  - `test_trigger_for_slug_respects_shared_in_flight_flag` (Phase 1 fix pass — **replaces** the stale documentation test of the same slot) — **new, passing**
+  - `test_tick_loop_and_trigger_race_skip` (Phase 1 fix pass — new race test) — **new, passing**
+- ✅ `cargo test --lib pyramid::chain_executor::tests::integration*` — 10/10 passing. The 4 test fixtures updated via `replace_all` still compile and run.
+- ✅ `cargo test --lib` (full lib suite) — **795 passed / 7 failed / 0 ignored**. The 7 failures (`pyramid::db::tests::test_evidence_pk_cross_slug_coexistence`, `pyramid::defaults_adapter::tests::real_yaml_thread_clustering_preserves_response_schema`, 5 `pyramid::staleness::tests::*`) are **pre-existing**, reproduced on the pre-fix stashed state, caused by schema drift in `pyramid_evidence` and a YAML/schema-preservation check in `defaults_adapter`. None are in files I touched. Confirmed by running the 7 failing tests against a pre-fix working tree (stash) and observing identical failures.
+
+**Updated understanding (supersedes the implementer's original spec-adherence claim):** Phase 1 guards the HTTP/CLI-trigger-vs-auto-dispatch race, NOT the scheduler re-entrancy race the Phase 1 spec's inline sketch described. The scheduler race is structurally impossible in the current tick loop shape (see `test_tick_loop_is_serial_within_single_task`). The `evidence-triage-and-dadbear.md` Part 1 framing should be corrected by the planner in a follow-up pass — this fix pass deliberately does not touch the spec doc per scope boundary. The primitive is forward-compatible with any future restructuring that does introduce per-config `tokio::spawn` sub-tasks (Phase 17 recursive folder ingestion), at which point the scheduler race the original spec described DOES become live; the same shared flag will cover it then.
+
+**Out-of-scope items flagged by the wanderer that remain open:**
+- Tick loop panic recovery (the `tokio::spawn`ed tick loop task terminates on `run_tick_for_config` panic, leaving DADBEAR silently dead until app restart). The wanderer identified this as a separate operational gap. Not part of Phase 1 fix pass scope; deserves its own workstream.
+- The `evidence-triage-and-dadbear.md` Part 1 spec and the addendum-01 "symptom attribution corrected" section still claim the guard is for the scheduler race. That framing should be updated, but planner approval is required for spec doc edits so this fix pass limits itself to the log entries below.

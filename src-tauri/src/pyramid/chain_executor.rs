@@ -14547,6 +14547,9 @@ mod tests {
             supabase_anon_key: None,
             csrf_secret: [0u8; 32],
             dadbear_handle: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+            dadbear_in_flight: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
         };
 
         let chain = make_integration_code_chain();
@@ -14622,6 +14625,9 @@ mod tests {
             supabase_anon_key: None,
             csrf_secret: [0u8; 32],
             dadbear_handle: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+            dadbear_in_flight: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
         };
 
         let chain = make_integration_code_chain();
@@ -14717,6 +14723,9 @@ mod tests {
             supabase_anon_key: None,
             csrf_secret: [0u8; 32],
             dadbear_handle: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+            dadbear_in_flight: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
         };
 
         assert!(!pyramid_state
@@ -14776,6 +14785,9 @@ mod tests {
             supabase_anon_key: None,
             csrf_secret: [0u8; 32],
             dadbear_handle: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+            dadbear_in_flight: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
         };
 
         let chain = make_integration_code_chain();
