@@ -24,6 +24,9 @@ pub mod characterize;
 pub mod collapse;
 pub mod config_contributions;
 pub mod config_helper;
+pub mod prompt_cache;
+pub mod rotator_allocation;
+pub mod wire_native_metadata;
 pub mod converge_expand;
 pub mod cost_model;
 pub mod credentials;
@@ -83,6 +86,7 @@ pub mod vocabulary;
 pub mod watcher;
 pub mod webbing;
 pub mod wire_import;
+pub mod wire_migration;
 pub mod wire_publish;
 
 use rusqlite::Connection;

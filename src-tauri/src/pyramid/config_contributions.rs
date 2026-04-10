@@ -28,6 +28,7 @@ use tracing::{debug, warn};
 
 use crate::pyramid::db;
 use crate::pyramid::event_bus::{BuildEventBus, TaggedBuildEvent, TaggedKind};
+use crate::pyramid::wire_native_metadata::{default_wire_native_metadata, WireNativeMetadata};
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -128,10 +129,21 @@ const CONTRIBUTION_SELECT: &str =
 /// Create a new config contribution row. Returns the generated
 /// contribution_id (UUID v4).
 ///
+/// **Phase 5 behavior**: the `wire_native_metadata_json` column is
+/// initialized from `default_wire_native_metadata(schema_type, slug)`
+/// instead of `'{}'`. Every row therefore lands with a canonical,
+/// schema-type-appropriate metadata stub (draft maturity, unscoped
+/// scope, review sync mode, topic tags from the mapping table) that
+/// publish IPC and ToolsMode can render immediately.
+///
 /// Caller is responsible for picking the right `status`: the standard
 /// path is `'active'` for direct user-created configs and `'proposed'`
 /// for agent proposals. `source` is one of the canonical vocabulary
 /// values (`local`, `agent`, `wire`, `bundled`, `migration`).
+///
+/// For callers that need to supply explicit metadata (migration from
+/// disk, bundled seeds, Wire pulls), use
+/// `create_config_contribution_with_metadata()` directly.
 pub fn create_config_contribution(
     conn: &Connection,
     schema_type: &str,
@@ -142,7 +154,43 @@ pub fn create_config_contribution(
     created_by: Option<&str>,
     status: &str,
 ) -> Result<String> {
+    let metadata = default_wire_native_metadata(schema_type, slug);
+    create_config_contribution_with_metadata(
+        conn,
+        schema_type,
+        slug,
+        yaml_content,
+        triggering_note,
+        source,
+        created_by,
+        status,
+        &metadata,
+    )
+}
+
+/// Create a new config contribution row with explicit canonical
+/// metadata. Used by the migration path, bundled seeds, and Wire
+/// pulls where the caller has richer metadata than the default
+/// mapping produces. Returns the generated contribution_id.
+///
+/// Callers that don't care about metadata should use
+/// `create_config_contribution()` which applies the Phase 5 default
+/// automatically.
+pub fn create_config_contribution_with_metadata(
+    conn: &Connection,
+    schema_type: &str,
+    slug: Option<&str>,
+    yaml_content: &str,
+    triggering_note: Option<&str>,
+    source: &str,
+    created_by: Option<&str>,
+    status: &str,
+    metadata: &WireNativeMetadata,
+) -> Result<String> {
     let contribution_id = uuid::Uuid::new_v4().to_string();
+    let metadata_json = metadata
+        .to_json()
+        .map_err(|e| anyhow::anyhow!("failed to serialize wire_native_metadata: {e}"))?;
     conn.execute(
         "INSERT INTO pyramid_config_contributions (
             contribution_id, slug, schema_type, yaml_content,
@@ -151,16 +199,17 @@ pub fn create_config_contribution(
             status, source, wire_contribution_id, created_by, accepted_at
          ) VALUES (
             ?1, ?2, ?3, ?4,
-            '{}', '{}',
-            NULL, NULL, ?5,
-            ?6, ?7, NULL, ?8,
-            CASE WHEN ?6 = 'active' THEN datetime('now') ELSE NULL END
+            ?5, '{}',
+            NULL, NULL, ?6,
+            ?7, ?8, NULL, ?9,
+            CASE WHEN ?7 = 'active' THEN datetime('now') ELSE NULL END
          )",
         rusqlite::params![
             contribution_id,
             slug,
             schema_type,
             yaml_content,
+            metadata_json,
             triggering_note,
             status,
             source,
@@ -196,17 +245,22 @@ pub fn supersede_config_contribution(
 
     let tx = conn.transaction()?;
 
-    // Load the prior contribution to inherit schema_type + slug.
-    let prior: Option<(String, Option<String>, String)> = tx
+    // Load the prior contribution to inherit schema_type + slug +
+    // canonical metadata + publication state. Phase 5: metadata is
+    // carried forward with `maturity` reset to Draft per the spec's
+    // "Auto-population on refinement" rules, and `supersedes` is set
+    // to the prior version's handle-path if it was Wire-published.
+    let prior: Option<(String, Option<String>, String, String, String)> = tx
         .query_row(
-            "SELECT schema_type, slug, status FROM pyramid_config_contributions
+            "SELECT schema_type, slug, status, wire_native_metadata_json, wire_publication_state_json
+             FROM pyramid_config_contributions
              WHERE contribution_id = ?1",
             rusqlite::params![prior_contribution_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
         )
         .optional()?;
 
-    let (schema_type, slug, prior_status) = prior
+    let (schema_type, slug, prior_status, prior_metadata_json, prior_pub_state_json) = prior
         .ok_or_else(|| anyhow::anyhow!("prior contribution {prior_contribution_id} not found"))?;
 
     if prior_status == "superseded" {
@@ -214,6 +268,34 @@ pub fn supersede_config_contribution(
             "prior contribution {prior_contribution_id} is already superseded — cannot supersede a non-active version"
         );
     }
+
+    // Carry forward the prior's canonical metadata with maturity reset
+    // to Draft (re-review needed) and `supersedes` set to the prior
+    // version's handle-path if it was Wire-published. Falls back to
+    // the default metadata if the prior row has an empty/invalid JSON
+    // blob (Phase 4 stored `'{}'`).
+    let mut new_metadata = WireNativeMetadata::from_json(&prior_metadata_json).unwrap_or_else(|_| {
+        default_wire_native_metadata(&schema_type, slug.as_deref())
+    });
+    new_metadata.maturity = crate::pyramid::wire_native_metadata::WireMaturity::Draft;
+
+    // If the prior was Wire-published, point `supersedes` at its
+    // handle-path so publishing the new version creates the next
+    // entry in the Wire supersession chain. Publication state is
+    // stored separately from metadata per the spec.
+    if let Ok(prior_pub_state) =
+        serde_json::from_str::<crate::pyramid::wire_native_metadata::WirePublicationState>(
+            &prior_pub_state_json,
+        )
+    {
+        if let Some(handle_path) = prior_pub_state.handle_path {
+            new_metadata.supersedes = Some(handle_path);
+        }
+    }
+
+    let metadata_json = new_metadata
+        .to_json()
+        .map_err(|e| anyhow::anyhow!("failed to serialize wire_native_metadata: {e}"))?;
 
     // Insert the new active contribution first (so we have its
     // contribution_id to write back into the prior row).
@@ -226,15 +308,16 @@ pub fn supersede_config_contribution(
             status, source, wire_contribution_id, created_by, accepted_at
          ) VALUES (
             ?1, ?2, ?3, ?4,
-            '{}', '{}',
-            ?5, NULL, ?6,
-            'active', ?7, NULL, ?8, datetime('now')
+            ?5, '{}',
+            ?6, NULL, ?7,
+            'active', ?8, NULL, ?9, datetime('now')
          )",
         rusqlite::params![
             new_id,
             slug,
             schema_type,
             new_yaml_content,
+            metadata_json,
             prior_contribution_id,
             triggering_note,
             source,
@@ -681,10 +764,15 @@ fn validate_yaml_against_schema(
 // Ok(()). Future phases replace the stub body with the real
 // implementation.
 
-/// Phase 6: cache-invalidate the prompt composition layer so the next
-/// LLM call re-reads prompts from pyramid_config_contributions.
+/// Phase 5 wiring: invalidate the global prompt cache so the next
+/// LLM call re-reads prompts from pyramid_config_contributions. The
+/// cache is backed by `pyramid::prompt_cache::PromptCache` which was
+/// introduced in Phase 5 alongside the on-disk → contributions
+/// migration. Coarse-grained: the entire map is cleared; next read
+/// re-faults on demand.
 fn invalidate_prompt_cache() {
-    debug!("invalidate_prompt_cache: Phase 4 stub (Phase 6 wires this up)");
+    debug!("invalidate_prompt_cache: clearing global prompt cache (Phase 5)");
+    crate::pyramid::prompt_cache::invalidate_global_prompt_cache();
 }
 
 /// Phase 3 already has a provider registry. The cache invalidation
@@ -833,7 +921,22 @@ mod tests {
         assert_eq!(loaded.source, "local");
         assert_eq!(loaded.triggering_note.as_deref(), Some("initial intent"));
         assert!(loaded.accepted_at.is_some());
-        assert_eq!(loaded.wire_native_metadata_json, "{}");
+        // Phase 5: wire_native_metadata_json is now populated with the
+        // canonical default for the schema_type, not the `'{}'` stub.
+        // Verify that deserializing it yields the expected mapping-
+        // table defaults rather than comparing against a raw string.
+        let meta = WireNativeMetadata::from_json(&loaded.wire_native_metadata_json).unwrap();
+        assert_eq!(
+            meta.contribution_type,
+            crate::pyramid::wire_native_metadata::WireContributionType::Template
+        );
+        assert_eq!(
+            meta.maturity,
+            crate::pyramid::wire_native_metadata::WireMaturity::Draft
+        );
+        assert!(meta.topics.iter().any(|t| t == "dadbear_policy"));
+        assert!(meta.topics.iter().any(|t| t == "my-slug"));
+        // Wire publication state stays empty until first publish.
         assert_eq!(loaded.wire_publication_state_json, "{}");
 
         let active = load_active_config_contribution(&conn, "dadbear_policy", Some("my-slug"))
@@ -1427,5 +1530,440 @@ mod tests {
         .unwrap();
         let err = accept_proposal(&mut conn, &id).unwrap_err();
         assert!(err.to_string().contains("not `proposed`"));
+    }
+
+    // ── Phase 5: creation-time capture tests ──────────────────────────────
+
+    /// Every schema_type in the Phase 5 mapping table must produce a
+    /// non-empty, canonical `wire_native_metadata_json` on creation
+    /// (not the `'{}'` stub Phase 4 shipped with). This is the
+    /// "Creation-Time Capture" spec requirement from
+    /// `docs/specs/wire-contribution-mapping.md`.
+    #[test]
+    fn phase5_create_populates_canonical_metadata_for_all_14_schema_types() {
+        use crate::pyramid::wire_native_metadata::{
+            WireContributionType, WireMaturity, WireNativeMetadata, WireScope,
+        };
+
+        let conn = mem_conn();
+
+        // The Phase 5 mapping table's 14 schema types — 9 template
+        // types + 1 skill + 1 action + 3 config-template subtypes.
+        let cases: &[(&str, WireContributionType)] = &[
+            ("skill", WireContributionType::Skill),
+            ("schema_definition", WireContributionType::Template),
+            ("schema_annotation", WireContributionType::Template),
+            ("evidence_policy", WireContributionType::Template),
+            ("build_strategy", WireContributionType::Template),
+            ("dadbear_policy", WireContributionType::Template),
+            ("tier_routing", WireContributionType::Template),
+            ("step_overrides", WireContributionType::Template),
+            ("custom_prompts", WireContributionType::Template),
+            ("folder_ingestion_heuristics", WireContributionType::Template),
+            ("custom_chain", WireContributionType::Action),
+            ("custom_chains", WireContributionType::Action),
+            ("wire_discovery_weights", WireContributionType::Template),
+            ("wire_auto_update_settings", WireContributionType::Template),
+        ];
+
+        for (schema_type, expected_type) in cases {
+            let slug = format!("test-slug-{schema_type}");
+            let id = create_config_contribution(
+                &conn,
+                schema_type,
+                Some(&slug),
+                "noop: true\n",
+                Some("phase 5 creation-time capture test"),
+                "local",
+                Some("user"),
+                "active",
+            )
+            .unwrap();
+
+            let loaded = load_contribution_by_id(&conn, &id).unwrap().unwrap();
+
+            // Phase 5 assertion: no `'{}'` stubs allowed.
+            assert_ne!(
+                loaded.wire_native_metadata_json, "{}",
+                "schema_type {schema_type}: wire_native_metadata_json must not be the '{{}}' stub"
+            );
+
+            // The serialized metadata must deserialize to the correct
+            // contribution_type, draft maturity, unscoped scope, and
+            // review sync_mode per the spec's Creation-Time Capture
+            // table.
+            let meta = WireNativeMetadata::from_json(&loaded.wire_native_metadata_json).unwrap();
+            assert_eq!(
+                meta.contribution_type, *expected_type,
+                "schema_type {schema_type}: expected {expected_type:?}, got {:?}",
+                meta.contribution_type
+            );
+            assert_eq!(
+                meta.maturity,
+                WireMaturity::Draft,
+                "schema_type {schema_type}: default maturity must be Draft"
+            );
+            assert!(
+                matches!(meta.scope, WireScope::Unscoped),
+                "schema_type {schema_type}: default scope must be Unscoped"
+            );
+            assert!(
+                !meta.topics.is_empty(),
+                "schema_type {schema_type}: default topics must not be empty"
+            );
+            // Slug should appear in the topic list for discovery.
+            assert!(
+                meta.topics.iter().any(|t| t == &slug),
+                "schema_type {schema_type}: slug must appear in topics, got {:?}",
+                meta.topics
+            );
+
+            // Publication state stays empty until first publish.
+            assert_eq!(loaded.wire_publication_state_json, "{}");
+        }
+    }
+
+    /// Supersession must carry forward canonical metadata with
+    /// maturity reset to Draft — per the spec's "Auto-population on
+    /// refinement" rules.
+    #[test]
+    fn phase5_supersede_carries_metadata_with_draft_reset() {
+        use crate::pyramid::wire_native_metadata::{WireMaturity, WireNativeMetadata};
+
+        let mut conn = mem_conn();
+        let v1 = create_config_contribution(
+            &conn,
+            "dadbear_policy",
+            Some("carry-slug"),
+            &sample_dadbear_yaml("carry-slug"),
+            Some("initial"),
+            "local",
+            Some("user"),
+            "active",
+        )
+        .unwrap();
+
+        // Promote v1 metadata to Canon so we can verify the reset.
+        {
+            let loaded = load_contribution_by_id(&conn, &v1).unwrap().unwrap();
+            let mut meta =
+                WireNativeMetadata::from_json(&loaded.wire_native_metadata_json).unwrap();
+            meta.maturity = WireMaturity::Canon;
+            meta.topics.push("custom-tag".to_string());
+            let meta_json = meta.to_json().unwrap();
+            conn.execute(
+                "UPDATE pyramid_config_contributions
+                 SET wire_native_metadata_json = ?1
+                 WHERE contribution_id = ?2",
+                rusqlite::params![meta_json, v1],
+            )
+            .unwrap();
+        }
+
+        let v2 = supersede_config_contribution(
+            &mut conn,
+            &v1,
+            &sample_dadbear_yaml("carry-slug"),
+            "refinement",
+            "local",
+            Some("user"),
+        )
+        .unwrap();
+
+        let loaded = load_contribution_by_id(&conn, &v2).unwrap().unwrap();
+        let meta = WireNativeMetadata::from_json(&loaded.wire_native_metadata_json).unwrap();
+
+        // Maturity must be reset to Draft.
+        assert_eq!(meta.maturity, WireMaturity::Draft);
+        // Custom topic from v1 must carry forward.
+        assert!(meta.topics.iter().any(|t| t == "custom-tag"));
+        // supersedes should still be None because v1 was not
+        // Wire-published (no handle_path in wire_publication_state).
+        assert!(meta.supersedes.is_none());
+    }
+
+    /// Supersession with a Wire-published prior version should set
+    /// `supersedes` to the prior's handle-path.
+    #[test]
+    fn phase5_supersede_sets_supersedes_when_prior_is_wire_published() {
+        use crate::pyramid::wire_native_metadata::{WireNativeMetadata, WirePublicationState};
+
+        let mut conn = mem_conn();
+        let v1 = create_config_contribution(
+            &conn,
+            "dadbear_policy",
+            Some("pub-slug"),
+            &sample_dadbear_yaml("pub-slug"),
+            Some("initial"),
+            "local",
+            Some("user"),
+            "active",
+        )
+        .unwrap();
+
+        // Simulate a Wire publish by writing a publication state.
+        let pub_state = WirePublicationState {
+            wire_contribution_id: Some("wire-uuid-1".to_string()),
+            handle_path: Some("playful/77/3".to_string()),
+            chain_root: None,
+            chain_head: None,
+            published_at: Some("2026-04-10T00:00:00Z".to_string()),
+            last_resolved_derived_from: Vec::new(),
+        };
+        let pub_state_json = serde_json::to_string(&pub_state).unwrap();
+        conn.execute(
+            "UPDATE pyramid_config_contributions
+             SET wire_publication_state_json = ?1
+             WHERE contribution_id = ?2",
+            rusqlite::params![pub_state_json, v1],
+        )
+        .unwrap();
+
+        let v2 = supersede_config_contribution(
+            &mut conn,
+            &v1,
+            &sample_dadbear_yaml("pub-slug"),
+            "refinement after publish",
+            "local",
+            Some("user"),
+        )
+        .unwrap();
+
+        let loaded = load_contribution_by_id(&conn, &v2).unwrap().unwrap();
+        let meta = WireNativeMetadata::from_json(&loaded.wire_native_metadata_json).unwrap();
+
+        // supersedes should be set to the prior's handle-path.
+        assert_eq!(meta.supersedes.as_deref(), Some("playful/77/3"));
+    }
+
+    /// `create_config_contribution_with_metadata` must honor the
+    /// caller-supplied metadata (used by the bundled seed +
+    /// migration paths).
+    #[test]
+    fn phase5_create_with_metadata_honors_caller_values() {
+        use crate::pyramid::wire_native_metadata::{
+            default_wire_native_metadata, WireMaturity, WireNativeMetadata,
+        };
+
+        let conn = mem_conn();
+        let mut meta = default_wire_native_metadata("skill", Some("my-seed"));
+        meta.maturity = WireMaturity::Canon;
+        meta.price = Some(2);
+
+        let id = create_config_contribution_with_metadata(
+            &conn,
+            "skill",
+            Some("my-seed"),
+            "# Seed body",
+            Some("bundled seed"),
+            "bundled",
+            Some("phase5_bootstrap"),
+            "active",
+            &meta,
+        )
+        .unwrap();
+
+        let loaded = load_contribution_by_id(&conn, &id).unwrap().unwrap();
+        let loaded_meta =
+            WireNativeMetadata::from_json(&loaded.wire_native_metadata_json).unwrap();
+        assert_eq!(loaded_meta.maturity, WireMaturity::Canon);
+        assert_eq!(loaded_meta.price, Some(2));
+    }
+
+    /// `invalidate_prompt_cache` must actually clear the global cache
+    /// when a skill contribution lands via the dispatcher.
+    #[test]
+    fn phase5_dispatcher_invalidates_prompt_cache_on_skill_sync() {
+        use crate::pyramid::prompt_cache::{global_prompt_cache, PromptCache};
+
+        let conn = mem_conn();
+        let bus = mem_bus();
+
+        // Prime the global cache by inserting a skill directly and
+        // pulling it through the cache.
+        insert_seed_skill(&conn, "prime/test.md", "primed body");
+        let _ = global_prompt_cache().get(&conn, "$prompts/prime/test.md");
+        // Small sanity: global_prompt_cache is populated.
+        assert!(global_prompt_cache().contains("prime/test.md"));
+
+        // Create a *different* skill via the dispatcher. The
+        // dispatcher should call `invalidate_prompt_cache`, which
+        // clears the global cache. The primed entry should disappear.
+        let id = create_config_contribution(
+            &conn,
+            "skill",
+            Some("other/skill.md"),
+            "# Other body",
+            Some("test"),
+            "local",
+            Some("user"),
+            "active",
+        )
+        .unwrap();
+        let contribution = load_contribution_by_id(&conn, &id).unwrap().unwrap();
+        sync_config_to_operational(&conn, &bus, &contribution).unwrap();
+
+        // Global cache should have been cleared.
+        assert!(!global_prompt_cache().contains("prime/test.md"));
+
+        // Local cache behavior sanity check (verifies the invalidation
+        // is not a global-scope bug).
+        let local = PromptCache::new();
+        let _ = local.get(&conn, "$prompts/prime/test.md");
+        assert!(local.contains("prime/test.md"));
+    }
+
+    fn insert_seed_skill(conn: &Connection, slug: &str, body: &str) {
+        conn.execute(
+            "INSERT INTO pyramid_config_contributions (
+                contribution_id, slug, schema_type, yaml_content,
+                wire_native_metadata_json, wire_publication_state_json,
+                status, source, created_by, accepted_at
+             ) VALUES (
+                ?1, ?2, 'skill', ?3,
+                '{}', '{}',
+                'active', 'bundled', 'test', datetime('now')
+             )",
+            rusqlite::params![uuid::Uuid::new_v4().to_string(), slug, body],
+        )
+        .unwrap();
+    }
+
+    /// Dry-run publish must refuse a draft-maturity contribution and
+    /// surface credential-leak warnings when the body contains
+    /// `${VAR_NAME}` references.
+    #[test]
+    fn phase5_dry_run_publish_surfaces_warnings_for_draft_with_credentials() {
+        use crate::pyramid::wire_native_metadata::WireNativeMetadata;
+        use crate::pyramid::wire_publish::PyramidPublisher;
+
+        let conn = mem_conn();
+        let id = create_config_contribution(
+            &conn,
+            "custom_prompts",
+            Some("leaky-slug"),
+            "header: ${OPENROUTER_API_KEY}\n",
+            Some("initial"),
+            "local",
+            Some("user"),
+            "active",
+        )
+        .unwrap();
+        let contribution = load_contribution_by_id(&conn, &id).unwrap().unwrap();
+        let metadata =
+            WireNativeMetadata::from_json(&contribution.wire_native_metadata_json).unwrap();
+
+        let publisher = PyramidPublisher::new("https://x.invalid".to_string(), String::new());
+        let report = publisher
+            .dry_run_publish(
+                &contribution.contribution_id,
+                &contribution.schema_type,
+                &contribution.yaml_content,
+                &metadata,
+            )
+            .unwrap();
+
+        // Warnings should mention credential references.
+        let joined = report.warnings.join(" | ");
+        assert!(
+            joined.contains("credential"),
+            "expected credential warning, got: {joined}"
+        );
+
+        // Visibility should serialize the unscoped scope.
+        assert_eq!(report.visibility, "unscoped");
+        // Wire type should match the mapping table.
+        assert_eq!(report.wire_type, "template");
+    }
+
+    /// Dry-run publish should compute a 28-slot allocation from the
+    /// metadata's derived_from weights.
+    #[test]
+    fn phase5_dry_run_publish_allocates_28_slots_from_derived_from() {
+        use crate::pyramid::wire_native_metadata::{
+            WireNativeMetadata, WireRef,
+        };
+        use crate::pyramid::wire_publish::PyramidPublisher;
+
+        let conn = mem_conn();
+        let id = create_config_contribution(
+            &conn,
+            "skill",
+            Some("with-sources"),
+            "# Skill body",
+            Some("initial"),
+            "local",
+            Some("user"),
+            "active",
+        )
+        .unwrap();
+
+        // Inject derived_from into the metadata column.
+        let mut metadata = {
+            let loaded = load_contribution_by_id(&conn, &id).unwrap().unwrap();
+            WireNativeMetadata::from_json(&loaded.wire_native_metadata_json).unwrap()
+        };
+        metadata.derived_from = vec![
+            WireRef {
+                ref_: Some("author/1/1".to_string()),
+                doc: None,
+                corpus: None,
+                weight: 0.5,
+                justification: "primary".to_string(),
+            },
+            WireRef {
+                ref_: None,
+                doc: Some("wire-actions.md".to_string()),
+                corpus: None,
+                weight: 0.3,
+                justification: "secondary".to_string(),
+            },
+            WireRef {
+                ref_: None,
+                doc: None,
+                corpus: Some("corpus-name/x.md".to_string()),
+                weight: 0.2,
+                justification: "tertiary".to_string(),
+            },
+        ];
+        let meta_json = metadata.to_json().unwrap();
+        conn.execute(
+            "UPDATE pyramid_config_contributions
+             SET wire_native_metadata_json = ?1
+             WHERE contribution_id = ?2",
+            rusqlite::params![meta_json, id],
+        )
+        .unwrap();
+
+        let contribution = load_contribution_by_id(&conn, &id).unwrap().unwrap();
+        let metadata =
+            WireNativeMetadata::from_json(&contribution.wire_native_metadata_json).unwrap();
+
+        let publisher = PyramidPublisher::new("https://x.invalid".to_string(), String::new());
+        let report = publisher
+            .dry_run_publish(
+                &contribution.contribution_id,
+                &contribution.schema_type,
+                &contribution.yaml_content,
+                &metadata,
+            )
+            .unwrap();
+
+        assert_eq!(report.resolved_derived_from.len(), 3);
+        let total_slots: u32 = report
+            .resolved_derived_from
+            .iter()
+            .map(|e| e.allocated_slots)
+            .sum();
+        assert_eq!(total_slots, 28, "slot allocation must sum to 28");
+        // Every source should receive at least 1 slot.
+        for entry in &report.resolved_derived_from {
+            assert!(entry.allocated_slots >= 1);
+        }
+        // Phase 5: references are unresolved until Phase 10's live
+        // path→UUID map ships.
+        for entry in &report.resolved_derived_from {
+            assert!(!entry.resolved);
+        }
     }
 }
