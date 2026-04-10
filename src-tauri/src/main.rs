@@ -7322,6 +7322,20 @@ fn main() {
     wire_node_lib::pyramid::db::init_pyramid_db(&pyramid_reader)
         .expect("Failed to initialize pyramid schema on reader");
 
+    // ── Phase 5 wanderer fix: stash pyramid.db path for prompt cache ──
+    //
+    // The Phase 5 PromptCache uses ephemeral reader connections opened
+    // from this stashed path whenever `chain_loader::resolve_prompt_refs`
+    // needs to fault a prompt in from the contribution store. Without
+    // this call the cache stays cold and `chain_loader` would fall
+    // through to disk on every lookup — the Phase 5 contribution-backed
+    // prompt lookup would be dead code. Must be set BEFORE any chain
+    // load attempt, which is safe here because the migration and
+    // subsequent chain execution both happen after this point.
+    wire_node_lib::pyramid::prompt_cache::set_global_prompt_cache_db_path(
+        pyramid_db_path.clone(),
+    );
+
     // Load pyramid config from disk (or use defaults)
     let pyramid_config = wire_node_lib::pyramid::PyramidConfig::load(&config.data_dir());
     tracing::info!(

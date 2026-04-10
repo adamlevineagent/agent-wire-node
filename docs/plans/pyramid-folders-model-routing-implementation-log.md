@@ -1032,3 +1032,17 @@ The phase is ready for the conductor's verifier pass. Recommended focus areas fo
 5. **Spec-vs-canonical follow-up**: the spec file `docs/specs/wire-contribution-mapping.md` has three struct-shape divergences from the canonical. A tiny correction pass should update the spec to match the Rust types (which in turn match the canonical).
 
 Wanderer prompt suggestion: "Does Wire Node boot on a fresh DB, run the Phase 5 prompt+chain migration end-to-end, populate the prompt cache on first lookup, serve a skill contribution's body through the chain loader, then let a user call `pyramid_dry_run_publish` for any of the 14 schema types and see a coherent preview with 28 resolved slots and zero panics?"
+
+### Wanderer pass — 2026-04-10
+
+Status: **two blocking findings fixed in place**. Details in `docs/plans/pyramid-folders-model-routing-friction-log.md` → "Phase 5 wanderer pass".
+
+Summary:
+
+1. **`PromptCache` was dead code (FIXED).** `chain_loader::resolve_prompt_refs` still read from disk via `std::fs::read_to_string` — zero imports of `prompt_cache` in either `chain_executor.rs` or `chain_loader.rs`. The Phase 5 migration populated skill contributions that the runtime never read. Added `set_global_prompt_cache_db_path()` + `resolve_prompt_global()` to `prompt_cache.rs` (ephemeral-connection resolver pattern keeps all call sites unchanged), stashed the path once in `main.rs` during setup, rewrote `chain_loader::resolve_prompt_refs` to consult the global resolver first and fall back to disk on miss. Added 2 new tests in `prompt_cache.rs`.
+
+2. **`migrate_legacy_dadbear_to_contributions` wrote `'{}'` metadata (FIXED).** `db.rs:1543` — the Phase 4 DADBEAR bootstrap migration direct INSERT — hardcoded `wire_native_metadata_json = '{}'`, bypassing Phase 5's canonical-metadata helpers. The spec's Creation-Time Capture table says bootstrap migrations write canonical metadata with `maturity: canon`. Fix: build a canonical `WireNativeMetadata` via `default_wire_native_metadata("dadbear_policy", Some(slug))`, override `maturity` to `Canon`, serialize and use in the INSERT. Added 1 new test in `db.rs::provider_registry_tests`.
+
+3. **Spec file still has old struct shapes (NOT FIXED, flagged).** `docs/specs/wire-contribution-mapping.md` retains three pre-canonical struct definitions (`WireScope` tagged enum, `WireRef` tagged enum, `supersedes: Option<WireRefKey>`) that the Rust code correctly diverges from. Standalone editing task; not in wanderer scope.
+
+Verification: `cargo check` clean; `cargo test --lib pyramid` reports 923 passed, 7 pre-existing failures unchanged. Phase 5 implementer reported 919 passing, verifier commit added 1, wanderer fix adds 3 → 923. Zero regressions. Files modified: `src-tauri/src/pyramid/prompt_cache.rs`, `src-tauri/src/pyramid/chain_loader.rs`, `src-tauri/src/pyramid/db.rs`, `src-tauri/src/main.rs`. Commit: `phase-5: wanderer fix — PromptCache wire-up + DADBEAR canonical metadata` on branch `phase-5-wire-contribution-mapping`.

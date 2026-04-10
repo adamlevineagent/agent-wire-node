@@ -1538,6 +1538,27 @@ pub fn migrate_legacy_dadbear_to_contributions(conn: &Connection) -> Result<()> 
             cfg.enabled,
         );
 
+        // Phase 5 wanderer fix: write canonical metadata instead of '{}'
+        // per `docs/specs/wire-contribution-mapping.md` Creation-Time
+        // Capture table, which says:
+        //   "Bootstrap migration from legacy tables | Empty defaults.
+        //    maturity = canon. description via prepare LLM on first publish."
+        // Phase 5's original pass missed this direct-insert path — the
+        // config_contributions.rs helpers now write canonical
+        // metadata, but this low-level bootstrap migration still used
+        // the `'{}'` stub. Without the fix, every legacy DADBEAR row
+        // lands with default metadata (maturity=Draft) which means
+        // `pyramid_publish_to_wire` refuses to publish them until the
+        // user manually supersedes the row.
+        let mut metadata = crate::pyramid::wire_native_metadata::default_wire_native_metadata(
+            "dadbear_policy",
+            Some(cfg.slug.as_str()),
+        );
+        metadata.maturity = crate::pyramid::wire_native_metadata::WireMaturity::Canon;
+        let metadata_json = metadata
+            .to_json()
+            .unwrap_or_else(|_| "{}".to_string());
+
         let contribution_id = uuid::Uuid::new_v4().to_string();
         conn.execute(
             "INSERT INTO pyramid_config_contributions (
@@ -1547,11 +1568,11 @@ pub fn migrate_legacy_dadbear_to_contributions(conn: &Connection) -> Result<()> 
                 status, source, wire_contribution_id, created_by, accepted_at
              ) VALUES (
                 ?1, ?2, 'dadbear_policy', ?3,
-                '{}', '{}',
+                ?4, '{}',
                 NULL, NULL, 'Migrated from legacy pyramid_dadbear_config',
                 'active', 'migration', NULL, 'dadbear_bootstrap', datetime('now')
              )",
-            rusqlite::params![contribution_id, cfg.slug, yaml],
+            rusqlite::params![contribution_id, cfg.slug, yaml, metadata_json],
         )?;
         conn.execute(
             "UPDATE pyramid_dadbear_config SET contribution_id = ?1 WHERE id = ?2",
@@ -11440,6 +11461,100 @@ mod provider_registry_tests {
         assert!(
             tiers.is_empty(),
             "deleting a provider should cascade to tier routing rows via FK"
+        );
+    }
+
+    // ── Phase 5 wanderer fix: DADBEAR migration writes canonical metadata ──
+    //
+    // Per `docs/specs/wire-contribution-mapping.md` Creation-Time
+    // Capture table, bootstrap migrations from legacy tables must
+    // write canonical metadata (not `'{}'`) with `maturity = canon`.
+    // Phase 5's original pass updated `config_contributions.rs` helpers
+    // to populate canonical metadata but missed this low-level direct
+    // INSERT inside `migrate_legacy_dadbear_to_contributions`. This
+    // test inserts a legacy DADBEAR row, runs the migration, and
+    // verifies the resulting contribution row has real canonical
+    // metadata with `maturity: canon`, not the `'{}'` stub.
+    #[test]
+    fn phase5_dadbear_migration_writes_canonical_metadata_not_empty_json() {
+        // Build a bare sqlite connection and initialize the schema.
+        // Can't use `mem_conn()` here because we need to insert into
+        // `pyramid_dadbear_config` BEFORE `init_pyramid_db` runs the
+        // migration, which only happens on a completely fresh DB.
+        let conn = Connection::open_in_memory().unwrap();
+        init_pyramid_db(&conn).unwrap();
+
+        // The migration should have already run during init_pyramid_db.
+        // Since the DADBEAR table was empty at init time, no rows
+        // were migrated. We need to:
+        //   1. Clear the sentinel so the migration can run again
+        //   2. Insert a legacy DADBEAR row
+        //   3. Re-run the migration
+        //   4. Verify the resulting contribution has canonical metadata
+        conn.execute(
+            "DELETE FROM pyramid_config_contributions WHERE schema_type = '_migration_marker'",
+            [],
+        )
+        .unwrap();
+
+        // Insert a legacy DADBEAR row directly (bypassing the Phase 4
+        // helper so it lands without a contribution_id).
+        conn.execute(
+            "INSERT INTO pyramid_dadbear_config (
+                slug, source_path, content_type, scan_interval_secs,
+                debounce_secs, session_timeout_secs, batch_size, enabled,
+                created_at, updated_at
+             ) VALUES (
+                'test-slug', '/tmp/test-source', 'code', 10,
+                30, 1800, 5, 1,
+                datetime('now'), datetime('now')
+             )",
+            [],
+        )
+        .unwrap();
+
+        // Re-run the migration.
+        migrate_legacy_dadbear_to_contributions(&conn).unwrap();
+
+        // Load the migrated contribution and check its metadata.
+        let (metadata_json, schema_type, source): (String, String, String) = conn
+            .query_row(
+                "SELECT wire_native_metadata_json, schema_type, source
+                 FROM pyramid_config_contributions
+                 WHERE schema_type = 'dadbear_policy' AND source = 'migration'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+
+        assert_eq!(schema_type, "dadbear_policy");
+        assert_eq!(source, "migration");
+        assert_ne!(
+            metadata_json, "{}",
+            "Phase 5 wanderer fix: DADBEAR bootstrap migration must write canonical metadata, not the '{{}}' stub"
+        );
+
+        // Parse the metadata and verify maturity = Canon (per spec).
+        let metadata =
+            crate::pyramid::wire_native_metadata::WireNativeMetadata::from_json(&metadata_json)
+                .unwrap();
+        assert!(
+            matches!(
+                metadata.maturity,
+                crate::pyramid::wire_native_metadata::WireMaturity::Canon
+            ),
+            "Phase 5 spec says bootstrap migration writes maturity=canon; got {:?}",
+            metadata.maturity
+        );
+        // The contribution_type should be Template (from the mapping
+        // table) since dadbear_policy maps to a template contribution.
+        assert!(
+            matches!(
+                metadata.contribution_type,
+                crate::pyramid::wire_native_metadata::WireContributionType::Template
+            ),
+            "dadbear_policy should map to contribution_type=template per mapping table; got {:?}",
+            metadata.contribution_type
         );
     }
 }
