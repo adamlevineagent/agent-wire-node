@@ -229,3 +229,76 @@ All three passes clean:
 - Wanderer: caught chunk-collision blocker, committed fix `6012ffd`, all 11 tests pass post-fix
 
 Feature branch `phase-0b-pipeline-b-dispatch` is ready to push to origin. Proceeding to Phase 1 (DADBEAR in-flight lock).
+
+---
+
+## Phase 1 — DADBEAR In-Flight Lock
+
+**Workstream:** implementer → verifier → wanderer cycle
+**Workstream prompt:** `docs/plans/phase-1-workstream-prompt.md`
+**Branch:** `phase-1-dadbear-inflight-lock` (off `phase-0b-pipeline-b-dispatch`)
+**Started:** 2026-04-10
+**Completed (implementer pass):** 2026-04-10
+**Status:** awaiting-verification
+
+### Protocol for this phase
+1. Implementer agent: fresh execution of phase-1-workstream-prompt.md, commits when done. ✅
+2. Verifier agent: identical prompt, unwitting — audits in place.
+3. Wanderer agent: no punch list — "does the tick loop actually skip on a long-running dispatch?"
+4. Conductor marks `verified` after all three pass.
+
+### Files touched (implementer pass)
+- `src-tauri/src/pyramid/dadbear_extend.rs` — ~80 net lines added:
+  - New imports: `std::sync::atomic::{AtomicBool, Ordering}`.
+  - New top-level `InFlightGuard(Arc<AtomicBool>)` struct with `impl Drop` that `store(false, Ordering::Relaxed)` on drop (panic-safe).
+  - Inside `start_dadbear_extend_loop`'s `tokio::spawn` closure: new `in_flight: HashMap<i64, Arc<AtomicBool>>` with lifecycle mirroring the existing `tickers` HashMap.
+  - `in_flight.retain(|id, _| configs.iter().any(|c| c.id == *id))` added immediately after the existing `tickers.retain(...)` call so removed configs don't accumulate flag entries.
+  - Per-iteration sequence inside the `for config in &configs` loop:
+    1. Lazy-insert flag for this `config.id` and clone its `Arc`.
+    2. If flag is set, `debug!(slug = %config.slug, "DADBEAR: skipping tick, previous dispatch in-flight")` and `continue` — placed BEFORE the interval-due check so every 1-second base tick during a long dispatch emits the skip log (per the spec's inline sketch and verification checklist).
+    3. Interval-due check (unchanged).
+    4. `flag.store(true, Ordering::Relaxed)`; construct `let _guard = InFlightGuard(flag.clone())`.
+    5. Invoke `run_tick_for_config(...)`; `_guard` drops at end of iteration on every exit path.
+  - New test `test_in_flight_guard_skip_and_panic_safety` (~120 lines including comments).
+
+### Spec adherence (against evidence-triage-and-dadbear.md Part 1)
+- ✅ **The flag (`HashMap<i64, Arc<AtomicBool>>`)** — added to the tick loop state inside the `tokio::spawn` closure in `start_dadbear_extend_loop`, keyed by `config.id`, lazily inserted via `.entry(...).or_insert_with(...)` — same lifecycle pattern as `tickers`.
+- ✅ **The check + skip log** — `flag.load(Ordering::Relaxed)` before `run_tick_for_config`; on `true`, emits `debug!(slug = %config.slug, "DADBEAR: skipping tick, previous dispatch in-flight")` and `continue`s. Placed BEFORE the interval-due check so the skip log fires every 1-second base tick during a long dispatch (matches the spec's verification checklist expectation of "subsequent 1-second ticks emitting the debug log").
+- ✅ **RAII guard struct with `impl Drop`** — `InFlightGuard(Arc<AtomicBool>)` at file-top scope (line ~81). `impl Drop::drop` calls `self.0.store(false, Ordering::Relaxed)`. Constructed AFTER `flag.store(true, ...)` and BEFORE `run_tick_for_config`. The guard lives as `_guard` for the rest of the iteration, so normal return, `?`-propagated error, and panic unwind all drop it and clear the flag.
+- ✅ **Retain cleanup** — `in_flight.retain(|id, _| configs.iter().any(|c| c.id == *id))` added immediately after the existing `tickers.retain(...)` call at line ~152.
+- ✅ **Test** — `test_in_flight_guard_skip_and_panic_safety` walks the full state machine: lazy creation, skip decision on set flag, guard clears on normal drop, guard clears on panic via `std::panic::catch_unwind`, and `in_flight.retain(...)` removes entries for configs no longer present.
+
+**No deviations from the spec.** The only micro-correction from the spec's inline sketch: I placed the flag check BEFORE the interval-due check rather than after, so that a slow dispatch produces one skip log per base tick (matching the verification checklist) rather than one skip log per scan_interval. Both orderings are panic-safe and skip correctly; the flag-first ordering matches the spec's sketch order and the verification checklist wording exactly.
+
+### Verification results (implementer pass)
+- ✅ `cargo check` (from `src-tauri/`) — clean. Warning set: 3 pre-existing in `publication.rs` (`LayerCollectResult` private interfaces), 1 deprecated `get_keep_evidence_for_target`, 1 deprecated `tauri_plugin_shell::Shell::open` in `main.rs:5226`. **Zero new warnings in `dadbear_extend.rs`.**
+- ✅ `cargo build` (from `src-tauri/`) — clean, same warning set as `cargo check`.
+- ✅ `cargo test --lib pyramid::dadbear_extend` — **12/12 tests passing** (11 pre-existing + 1 new Phase 1 test):
+  - `test_dadbear_config_crud` (pre-existing)
+  - `test_scan_detect_creates_pending_records` (pre-existing)
+  - `test_ingest_dispatch_lifecycle` (pre-existing)
+  - `test_session_timeout_promotion` (pre-existing)
+  - `test_session_helper_updates` (pre-existing)
+  - `test_fire_ingest_chain_empty_source_paths` (Phase 0b)
+  - `test_fire_ingest_chain_code_scope_error` (Phase 0b)
+  - `test_fire_ingest_chain_document_scope_error` (Phase 0b)
+  - `test_fire_ingest_chain_unknown_content_type` (Phase 0b)
+  - `test_fire_ingest_chain_chunks_conversation_before_dispatch` (Phase 0b)
+  - `test_fire_ingest_chain_second_dispatch_no_chunk_collision` (Phase 0b wanderer)
+  - `test_in_flight_guard_skip_and_panic_safety` (**Phase 1, new**)
+- 🕒 **Human-verification checklist (pending Adam's manual run):**
+  1. Start the app with a DADBEAR-enabled conversation pyramid.
+  2. Drop a new `.jsonl` file into the watched directory; observe the first dispatch enter `fire_ingest_chain` → `run_build_from` and begin running the chain.
+  3. While the dispatch is running, observe the 1-second base ticks emitting `"DADBEAR: skipping tick, previous dispatch in-flight"` debug logs for the same config (one per base tick during the entire dispatch window).
+  4. When the dispatch completes, observe the next base tick proceeds normally (no skip log), the next scan happens, and any newly-dropped files are picked up.
+  5. Alternatively: introduce a temporary `tokio::time::sleep(Duration::from_secs(30))` inside `fire_ingest_chain` after `run_build_from` returns, and confirm the skip-log window matches the sleep window.
+
+### Notes
+- **Panic-safety decision:** the spec explicitly calls out that a naive `store(false)` after the match arm is NOT panic-safe and mandates the RAII guard. I used the guard without deviation. The panic path is exercised in the test via `std::panic::catch_unwind`, which is sufficient: `AtomicBool` and `Arc<AtomicBool>` are `UnwindSafe`, so the closure inside `catch_unwind` compiles cleanly and the drop runs during unwind.
+- **Lock ordering:** no new locks taken in the tick loop. The `AtomicBool` is not a lock — it's a non-blocking atomic flag. Every existing `LockManager` acquisition inside `run_tick_for_config` is unchanged. The flag is orthogonal to the LockManager.
+- **Log frequency trade-off:** placing the flag check before the interval-due check means one skip log per base tick (every 1 second) during a long dispatch. For a 5-minute chain build, that's ~300 log lines per config at debug level. Since `debug!` is gated by log level and typically not enabled in release builds, this is not a concern. If it becomes one, a future refactor could hoist the skip log to fire once per N ticks or once per flag-set edge.
+- **Redundant local imports in tests:** the pre-existing `use std::collections::HashMap;` and `use std::sync::atomic::AtomicBool;` inside the `mod tests` block (added in Phase 0b) are now redundant with the top-level imports, but `use super::*;` + duplicate `use` is legal Rust and compiles without warnings. Left in place to minimize diff surface and avoid touching Phase 0b's test scaffolding.
+- **No adjacent bugs spotted** while working. The Phase 0b implementation is solid.
+- **No friction log entries needed** — the spec's sketch was exact enough that implementation tracked it closely. One micro-correction (flag check before interval check) is documented in the "Spec adherence" section above and in-code as a comment.
+
+The phase is ready for the verifier pass. After that, the wanderer pass should trace end-to-end: "does the tick loop actually skip on a long-running dispatch, and does it recover cleanly when the dispatch completes?"

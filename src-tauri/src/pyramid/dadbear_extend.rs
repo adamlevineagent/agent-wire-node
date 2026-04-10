@@ -13,6 +13,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
@@ -61,6 +62,30 @@ struct ConfigTicker {
     interval: std::time::Duration,
 }
 
+/// RAII guard that clears a per-config in-flight flag on drop.
+///
+/// The tick loop sets a `HashMap<config.id, Arc<AtomicBool>>` entry to `true`
+/// before calling [`run_tick_for_config`], then constructs an `InFlightGuard`
+/// holding a clone of the same `Arc<AtomicBool>`. When the guard drops — on
+/// normal return, early `?` propagation, OR a panic unwinding through the
+/// tick invocation — `Drop::drop` stores `false` so the next tick can proceed.
+///
+/// **Why this is load-bearing**: `run_tick_for_config` calls into
+/// [`fire_ingest_chain`], which in turn calls [`build_runner::run_build_from`]
+/// and drives an LLM chain. A panic anywhere in that stack (LLM parse failure,
+/// DB corruption, missing chain YAML, etc.) would, with a naive
+/// `store(false)` after the match arm, leave the flag stuck at `true`
+/// forever — every subsequent tick for that config would skip and no
+/// ingest would ever fire again until the process restarts. The RAII guard
+/// cannot be forgotten on any exit path.
+struct InFlightGuard(Arc<AtomicBool>);
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Relaxed);
+    }
+}
+
 // ── Core tick loop ─────────────────────────────────────────────────────────────
 
 /// Start the DADBEAR extend tick loop. Spawns a background task that:
@@ -87,6 +112,19 @@ pub fn start_dadbear_extend_loop(
         // Track per-config tick intervals
         let mut tickers: HashMap<i64, ConfigTicker> = HashMap::new();
 
+        // Per-config in-flight flags (Phase 1). Prevents tick re-entrancy when
+        // the previous tick's chain dispatch in `run_tick_for_config` is still
+        // running. The AtomicBool is shared with an `InFlightGuard` that clears
+        // it on drop (panic-safe). Lifecycle mirrors `tickers`: lazily inserted
+        // on first observation of a config, removed when the config is gone.
+        //
+        // AtomicBool per-config, NOT a LockManager write lock: the
+        // LockManager's per-slug write lock would block concurrent queries
+        // and other writers for the full chain duration; this flag only
+        // prevents re-entrant DADBEAR ticks for the same config and leaves
+        // all other paths unaffected.
+        let mut in_flight: HashMap<i64, Arc<AtomicBool>> = HashMap::new();
+
         loop {
             // Check cancellation
             tokio::select! {
@@ -109,10 +147,34 @@ pub fn start_dadbear_extend_loop(
 
             // Remove tickers for configs that no longer exist
             tickers.retain(|id, _| configs.iter().any(|c| c.id == *id));
+            // Mirror the ticker cleanup for in-flight flags so removed configs
+            // don't accumulate entries across the lifetime of the tick loop.
+            in_flight.retain(|id, _| configs.iter().any(|c| c.id == *id));
 
             let now = std::time::Instant::now();
 
             for config in &configs {
+                // Phase 1: skip this tick if the previous dispatch for this
+                // config is still in flight. Checked BEFORE the interval-due
+                // check so every 1-second base tick during a long dispatch
+                // emits the skip log (per the Phase 1 spec's inline sketch
+                // and verification checklist). `last_tick` is NOT advanced
+                // on skip, so when the flag clears after a slow chain, the
+                // next base tick fires immediately rather than waiting for
+                // another `scan_interval_secs` window.
+                let flag = in_flight
+                    .entry(config.id)
+                    .or_insert_with(|| Arc::new(AtomicBool::new(false)))
+                    .clone();
+
+                if flag.load(Ordering::Relaxed) {
+                    debug!(
+                        slug = %config.slug,
+                        "DADBEAR: skipping tick, previous dispatch in-flight"
+                    );
+                    continue;
+                }
+
                 // Initialize or check ticker
                 let ticker = tickers.entry(config.id).or_insert_with(|| ConfigTicker {
                     last_tick: now - std::time::Duration::from_secs(config.scan_interval_secs + 1), // fire immediately on first load
@@ -127,6 +189,13 @@ pub fn start_dadbear_extend_loop(
                 }
                 ticker.last_tick = now;
 
+                // Set the flag and hand a clone to the RAII guard. The guard
+                // clears the flag on drop — normal return, `?`-propagated
+                // error, OR panic — so the flag cannot stick at true and
+                // deadlock the config's tick loop.
+                flag.store(true, Ordering::Relaxed);
+                let _guard = InFlightGuard(flag.clone());
+
                 // Run the tick for this config
                 if let Err(e) = run_tick_for_config(&state, &db_path, config, &event_bus).await {
                     error!(
@@ -136,6 +205,8 @@ pub fn start_dadbear_extend_loop(
                         "DADBEAR-EXTEND tick failed"
                     );
                 }
+
+                // `_guard` drops here at end of iteration — clears the flag.
             }
         }
 
@@ -1437,5 +1508,127 @@ mod tests {
         // If run_build_from somehow succeeded (e.g. via a working chains dir
         // fallback), that's fine — chunks still have to exist, which is the
         // above assertion.
+    }
+
+    // ── Phase 1: in-flight guard tests ─────────────────────────────────────
+
+    /// Phase 1 skip decision + RAII guard lifecycle.
+    ///
+    /// The spec's test requirement is: "exercise the skip decision" and
+    /// verify the flag clears even on panic. This test walks the same state
+    /// machine the tick loop runs per config:
+    ///
+    /// 1. Build a `HashMap<i64, Arc<AtomicBool>>` the same way
+    ///    `start_dadbear_extend_loop` does.
+    /// 2. Assert the first look-up for a config lazily creates a cleared flag
+    ///    that does NOT cause the skip branch to fire.
+    /// 3. Set the flag and construct an `InFlightGuard` around a clone of the
+    ///    same `Arc<AtomicBool>`.
+    /// 4. Assert a second iteration for the same `config.id` reuses the stored
+    ///    flag, observes it set, and would `continue` (skip the tick).
+    /// 5. Drop the guard (normal return path) and assert the flag clears.
+    /// 6. Assert a third iteration after the guard drop does NOT skip.
+    /// 7. Set the flag again and invoke a panicking closure inside
+    ///    `std::panic::catch_unwind`; after the panic is caught, assert the
+    ///    flag cleared — this is the load-bearing panic-safety guarantee
+    ///    that the RAII guard exists to provide.
+    /// 8. Exercise `in_flight.retain(...)` with a config list that no longer
+    ///    contains the original config.id and assert the entry is removed.
+    #[test]
+    fn test_in_flight_guard_skip_and_panic_safety() {
+        // ── (1) Same state the tick loop maintains ─────────────────────
+        let mut in_flight: HashMap<i64, Arc<AtomicBool>> = HashMap::new();
+        let config_id: i64 = 42;
+
+        // ── (2) Lazy creation: first look-up makes a cleared flag ──────
+        let flag = in_flight
+            .entry(config_id)
+            .or_insert_with(|| Arc::new(AtomicBool::new(false)))
+            .clone();
+        assert!(
+            !flag.load(Ordering::Relaxed),
+            "freshly-inserted flag must be cleared — otherwise a brand-new \
+             config would skip its very first tick"
+        );
+
+        // ── (3) Set the flag, construct the guard ──────────────────────
+        flag.store(true, Ordering::Relaxed);
+        let guard = InFlightGuard(flag.clone());
+
+        // ── (4) Second iteration for same config.id observes the flag ──
+        {
+            let looked_up = in_flight
+                .entry(config_id)
+                .or_insert_with(|| Arc::new(AtomicBool::new(false)))
+                .clone();
+            assert!(
+                Arc::ptr_eq(&looked_up, &flag),
+                "second entry lookup must return the SAME Arc (lifecycle \
+                 matches tickers: insert once, observe each tick)"
+            );
+            assert!(
+                looked_up.load(Ordering::Relaxed),
+                "flag is still set while the guard lives — this is the \
+                 condition the tick loop checks to decide to skip"
+            );
+            // The tick loop's `if flag.load(Ordering::Relaxed) { continue; }`
+            // branch would fire here.
+        }
+
+        // ── (5) Guard drops on normal scope exit → flag clears ─────────
+        drop(guard);
+        assert!(
+            !flag.load(Ordering::Relaxed),
+            "InFlightGuard::drop must clear the flag on normal return"
+        );
+
+        // ── (6) Next iteration can proceed ─────────────────────────────
+        assert!(
+            !flag.load(Ordering::Relaxed),
+            "after guard drop, a subsequent tick iteration must find the \
+             flag cleared and proceed to run_tick_for_config"
+        );
+
+        // ── (7) Panic safety — the load-bearing requirement ────────────
+        // With a naive `flag.store(false)` after the match arm, a panic
+        // inside `run_tick_for_config` would bypass the store and leave the
+        // flag stuck at true forever. The RAII guard MUST clear the flag on
+        // panic unwind.
+        flag.store(true, Ordering::Relaxed);
+        let flag_for_panic = flag.clone();
+        let panic_result = std::panic::catch_unwind(move || {
+            let _guard = InFlightGuard(flag_for_panic);
+            // Simulate a panic inside run_tick_for_config (LLM parse failure,
+            // DB corruption, etc.) — the guard should still drop.
+            panic!("simulated tick panic");
+        });
+        assert!(
+            panic_result.is_err(),
+            "catch_unwind should report the simulated panic"
+        );
+        assert!(
+            !flag.load(Ordering::Relaxed),
+            "InFlightGuard::drop MUST clear the flag on panic unwind — \
+             otherwise the config's tick loop stays stuck until process \
+             restart"
+        );
+
+        // ── (8) retain() removes entries for configs that no longer exist ──
+        // Sanity-check the tick loop's cleanup pattern:
+        //   in_flight.retain(|id, _| configs.iter().any(|c| c.id == *id));
+        // When the active config list no longer contains config_id 42, the
+        // entry for 42 must be dropped so the HashMap doesn't grow
+        // unboundedly across the lifetime of the tick loop.
+        assert!(
+            in_flight.contains_key(&config_id),
+            "precondition: in_flight still holds the entry we inserted"
+        );
+        let active_ids: Vec<i64> = vec![7, 99]; // config_id 42 is absent
+        in_flight.retain(|id, _| active_ids.iter().any(|active| active == id));
+        assert!(
+            !in_flight.contains_key(&config_id),
+            "retain() must drop entries whose config.id is not in the active \
+             config list, mirroring the `tickers.retain(...)` pattern"
+        );
     }
 }
