@@ -89,6 +89,8 @@ pub mod vocabulary;
 pub mod watcher;
 pub mod webbing;
 pub mod schema_registry;
+#[cfg(test)]
+pub mod test_phase9_wanderer;
 pub mod wire_import;
 pub mod wire_migration;
 pub mod wire_publish;

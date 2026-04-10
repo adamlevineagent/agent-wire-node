@@ -550,12 +550,15 @@ pub fn persist_refined_draft(
         "persist_refined_draft: created draft supersession"
     );
 
-    let history = load_config_version_history(
-        conn,
-        &inputs.prior.schema_type,
-        inputs.prior.slug.as_deref(),
-    )?;
-    let version = (history.len() as u32) + 1;
+    // Phase 9 wanderer fix: compute the version number by walking the
+    // `supersedes_id` chain backward from the new draft. The previous
+    // implementation used `load_config_version_history`, which walks
+    // from the currently-active row — but `create_draft_supersession`
+    // no longer flips the prior's status (so refinement drafts do NOT
+    // become the active row), and the previous code was
+    // undercounting (returning 1 when it should return 2+) because
+    // the active chain didn't include the draft.
+    let version = version_by_chain_walk(conn, &new_id)?;
 
     Ok(RefineConfigResponse {
         new_contribution_id: new_id,
@@ -588,12 +591,25 @@ pub async fn refine_config_with_note(
     persist_refined_draft(conn, &inputs, &llm_output)
 }
 
-/// Inline transaction: mark the prior contribution as `superseded`
-/// and create a new draft contribution that `supersedes_id → prior`.
+/// Inline transaction: create a new DRAFT contribution that
+/// `supersedes_id → prior`. Does NOT flip the prior row's status or
+/// write its `superseded_by_id` — those transitions happen at accept
+/// time via `promote_draft_to_active`. Leaving the prior untouched
+/// keeps the active chain intact during the refinement window so
+/// background loops (DADBEAR, builds) that read the active config
+/// keep seeing the last-accepted version until the user explicitly
+/// accepts the draft.
 ///
-/// Used by `refine_config_with_note` because `supersede_config_contribution`
-/// forces the new row to `active`, which is wrong for the Phase 9
-/// draft flow.
+/// Used by `refine_config_with_note` because
+/// `supersede_config_contribution` forces the new row to `active` AND
+/// marks the prior superseded, which is wrong for the Phase 9 draft
+/// flow.
+///
+/// If the prior is itself a draft that was previously returned from a
+/// refine call, we link the new draft to the PRIOR DRAFT via
+/// supersedes_id (per the spec's refinement chain model) but still
+/// leave both drafts with `superseded_by_id` unset — the chain is
+/// traced purely via `supersedes_id` backpointers until accept.
 fn create_draft_supersession(
     conn: &mut Connection,
     prior: &ConfigContribution,
@@ -643,19 +659,70 @@ fn create_draft_supersession(
         ],
     )?;
 
-    // Mark the prior row as superseded (only if it was active — draft
-    // supersessions of drafts are also valid, in which case we leave
-    // the prior draft status alone but update the link).
-    tx.execute(
-        "UPDATE pyramid_config_contributions
-         SET superseded_by_id = ?1,
-             status = CASE WHEN status = 'active' THEN 'superseded' ELSE status END
-         WHERE contribution_id = ?2",
-        rusqlite::params![new_id, prior.contribution_id],
-    )?;
+    // Phase 9 wanderer fix: do NOT flip the prior's status here. The
+    // prior (if it was active) MUST remain active until the user
+    // accepts the draft — otherwise the active-config lookup returns
+    // None during the draft window and background loops (DADBEAR,
+    // builds) lose their reference to the current policy. The
+    // `promote_draft_to_active` path handles the active-transfer
+    // transaction at accept time.
+    //
+    // If the prior was itself a draft produced by an earlier refine,
+    // we also leave its `superseded_by_id` unset — the refinement
+    // chain is traced via `supersedes_id` backpointers only, and the
+    // accept-time promote walks the chain to find the current active
+    // to supersede.
 
     tx.commit()?;
     Ok(new_id)
+}
+
+/// Walk the `supersedes_id` chain backward from a starting contribution
+/// and count the chain length (1-indexed, where the starting row is
+/// version N and each predecessor decrements). Used by the refine path
+/// to compute the version number returned to the UI without depending
+/// on `load_active_config_contribution` (which filters out draft rows).
+///
+/// Returns the 1-indexed version of the starting row — i.e. if the
+/// chain is `v1 -> v2 -> v3 (start)` then this returns 3. Stops at the
+/// first row with `supersedes_id = NULL` or if the chain self-loops
+/// (bounded by a safety cap).
+fn version_by_chain_walk(conn: &Connection, start_contribution_id: &str) -> Result<u32> {
+    let mut version: u32 = 1;
+    let mut current_id = start_contribution_id.to_string();
+    let mut seen = std::collections::HashSet::new();
+    loop {
+        if !seen.insert(current_id.clone()) {
+            // Cycle guard — should not happen with well-formed data
+            // but we refuse to loop forever.
+            warn!(
+                contribution_id = %current_id,
+                "version_by_chain_walk: supersedes_id cycle detected, breaking walk"
+            );
+            break;
+        }
+        if seen.len() > 10_000 {
+            warn!("version_by_chain_walk: chain length exceeded safety cap");
+            break;
+        }
+        let predecessor_id: Option<String> = conn
+            .query_row(
+                "SELECT supersedes_id FROM pyramid_config_contributions
+                 WHERE contribution_id = ?1",
+                rusqlite::params![current_id],
+                |row| row.get(0),
+            )
+            .ok()
+            .flatten();
+        match predecessor_id {
+            Some(prev) => {
+                version += 1;
+                current_id = prev;
+            }
+            None => break,
+        }
+    }
+    Ok(version)
 }
 
 /// Accept a config contribution, promoting it to `active` and running
@@ -700,20 +767,91 @@ pub fn accept_config_draft(
             return Err(anyhow!("triggering_note must not be empty or whitespace"));
         }
 
+        // Phase 9 wanderer fix: the direct-YAML path MUST supersede
+        // any existing active contribution for this (schema_type,
+        // slug) pair. The previous implementation called
+        // `create_config_contribution_with_metadata` in isolation,
+        // which left the prior row alone — two rows with status=active
+        // and superseded_by_id=NULL would accumulate on every save,
+        // and the schema registry's find_bundled_default_id /
+        // load_active_config_contribution queries would become
+        // non-deterministic.
+        //
+        // We wrap the transition in a transaction so the new row and
+        // the prior row's supersession write land together. If a prior
+        // active exists for this (type, slug), the new row sets its
+        // supersedes_id to the prior row and the prior is flipped to
+        // `superseded`.
+        let tx = conn.transaction()?;
+
+        // Find the prior active row (if any) to thread supersession
+        // through. Uses the same predicate as
+        // `load_active_config_contribution` but inside the transaction.
+        let prior_active_id: Option<String> = if let Some(slug_val) = slug.as_deref() {
+            tx.query_row(
+                "SELECT contribution_id FROM pyramid_config_contributions
+                 WHERE slug = ?1 AND schema_type = ?2
+                   AND status = 'active' AND superseded_by_id IS NULL
+                 ORDER BY created_at DESC, id DESC
+                 LIMIT 1",
+                rusqlite::params![slug_val, schema_type],
+                |row| row.get(0),
+            )
+            .ok()
+        } else {
+            tx.query_row(
+                "SELECT contribution_id FROM pyramid_config_contributions
+                 WHERE slug IS NULL AND schema_type = ?1
+                   AND status = 'active' AND superseded_by_id IS NULL
+                 ORDER BY created_at DESC, id DESC
+                 LIMIT 1",
+                rusqlite::params![schema_type],
+                |row| row.get(0),
+            )
+            .ok()
+        };
+
         let mut metadata = default_wire_native_metadata(&schema_type, slug.as_deref());
         metadata.maturity = WireMaturity::Canon;
+        let metadata_json = metadata
+            .to_json()
+            .map_err(|e| anyhow!("failed to serialize wire_native_metadata: {e}"))?;
 
-        let new_id = create_config_contribution_with_metadata(
-            conn,
-            &schema_type,
-            slug.as_deref(),
-            &yaml_str,
-            Some(&note),
-            "local",
-            Some("user"),
-            "active",
-            &metadata,
+        let new_id = uuid::Uuid::new_v4().to_string();
+        tx.execute(
+            "INSERT INTO pyramid_config_contributions (
+                contribution_id, slug, schema_type, yaml_content,
+                wire_native_metadata_json, wire_publication_state_json,
+                supersedes_id, superseded_by_id, triggering_note,
+                status, source, wire_contribution_id, created_by, accepted_at
+             ) VALUES (
+                ?1, ?2, ?3, ?4,
+                ?5, '{}',
+                ?6, NULL, ?7,
+                'active', 'local', NULL, 'user', datetime('now')
+             )",
+            rusqlite::params![
+                new_id,
+                slug,
+                schema_type,
+                yaml_str,
+                metadata_json,
+                prior_active_id,
+                note,
+            ],
         )?;
+
+        if let Some(prior_id) = &prior_active_id {
+            tx.execute(
+                "UPDATE pyramid_config_contributions
+                 SET status = 'superseded',
+                     superseded_by_id = ?1
+                 WHERE contribution_id = ?2",
+                rusqlite::params![new_id, prior_id],
+            )?;
+        }
+
+        tx.commit()?;
 
         (new_id, yaml_str, note)
     } else {
@@ -1116,10 +1254,16 @@ mod tests {
     }
 
     #[test]
-    fn test_create_draft_supersession_marks_prior_superseded() {
+    fn test_create_draft_supersession_links_via_supersedes_id() {
+        // Phase 9 wanderer fix: `create_draft_supersession` no longer
+        // flips the prior row's status or writes its
+        // `superseded_by_id`. The prior must remain active during the
+        // draft window so the active-config lookup still resolves to
+        // the last-accepted version. The refinement chain is traced
+        // via `supersedes_id` backpointers only — the status transfer
+        // happens at accept time in `promote_draft_to_active`.
         let mut conn = mem_conn();
         walk_bundled_contributions_manifest(&conn).unwrap();
-        // Use the bundled evidence_policy default as the prior.
         let active = load_active_config_contribution(&conn, "evidence_policy", None)
             .unwrap()
             .unwrap();
@@ -1132,18 +1276,29 @@ mod tests {
         )
         .unwrap();
 
-        // New row is a draft pointing at the prior.
+        // New row is a draft pointing at the prior via supersedes_id.
         let new_row = load_contribution_by_id(&conn, &new_id).unwrap().unwrap();
         assert_eq!(new_row.status, "draft");
-        assert_eq!(new_row.supersedes_id.as_deref(), Some(active.contribution_id.as_str()));
+        assert_eq!(
+            new_row.supersedes_id.as_deref(),
+            Some(active.contribution_id.as_str())
+        );
         assert_eq!(new_row.created_by.as_deref(), Some("generative_config"));
 
-        // Prior row is superseded.
+        // Prior row MUST remain active (was "superseded" in the pre-fix
+        // implementation — this is the behavior change the wanderer
+        // caught).
         let prior_row = load_contribution_by_id(&conn, &active.contribution_id)
             .unwrap()
             .unwrap();
-        assert_eq!(prior_row.status, "superseded");
-        assert_eq!(prior_row.superseded_by_id.as_deref(), Some(new_id.as_str()));
+        assert_eq!(
+            prior_row.status, "active",
+            "prior stays active until the draft is accepted"
+        );
+        assert_eq!(
+            prior_row.superseded_by_id, None,
+            "prior's superseded_by_id is only written at accept time"
+        );
     }
 
     #[test]

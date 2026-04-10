@@ -1132,3 +1132,74 @@ Single wanderer-fix commit on `phase-8-yaml-to-ui-renderer` with message `phase-
 
 ---
 
+## Phase 9 wanderer pass — 2026-04-10
+
+**Branch:** `phase-9-generative-config-pattern`
+**Commit:** `5b9975a phase-9: generative config pattern` (implementer) + wanderer fix commit below
+
+Phase 9 shipped the backend for the generative config loop: 6 IPC commands, the schema registry, the bundled contributions manifest walker, and the 3-phase load → LLM → persist pattern. 1044 tests passing, 16 tests for `generative_config`, 10 for `schema_registry`. Clean verifier pass. The wanderer found two bugs in the refine/accept lifecycle that map directly to the "helper exists but isn't called from production" pattern the brief flagged.
+
+### Finding A — HIGH/CORRECTNESS: direct-YAML accept orphans the prior active contribution (FIXED)
+
+**What:** `accept_config_draft` has two paths: (a) promote-latest-draft (used when the user doesn't pass a YAML payload), and (b) direct-YAML (used when the user edits the YAML in the renderer and saves directly). The promote path correctly supersedes the prior active via `promote_draft_to_active`. The direct-YAML path calls `create_config_contribution_with_metadata(..., status="active", ...)` in isolation — which creates a new row but does NOT touch any existing active row.
+
+Result: every direct-YAML save accumulates a new active row without superseding the previous one. After N saves there are N+1 active rows for the same (schema_type, slug) pair. The schema registry's `find_bundled_default_id` and `load_active_config_contribution` queries `ORDER BY created_at DESC LIMIT 1` out of these, so the "most recent" wins — but the older rows are orphaned, and any code that does a COUNT(*) over active rows (or that assumes uniqueness) breaks.
+
+Exactly the class of bug the Phase 7 wanderer caught, and exactly the "helper exists but isn't called from production" pattern the Phase 9 brief flagged: `supersede_config_contribution` exists and does the right thing, but the direct-YAML path doesn't call it.
+
+**Reproduction:** Test `wanderer_accept_direct_yaml_does_not_orphan_prior_active` in `src-tauri/src/pyramid/test_phase9_wanderer.rs`. On a fresh DB with the bundled evidence_policy default active, calls `accept_config_draft(evidence_policy, yaml=<direct yaml>)`. Before fix: 2 active rows (bundled + new); bundled.status = "active" with superseded_by_id = None. After fix: 1 active row; bundled.status = "superseded" with superseded_by_id pointing at the new row.
+
+**Phase 10 impact:** Every interaction pattern the spec describes ("user accepts the refined YAML from the renderer") flows through the direct-YAML path. Ship-blocker — after even a single accept the DB would have two active evidence_policy contributions, and subsequent `pyramid_active_config` calls would still return the bundled default (ORDER BY created_at DESC would put the new row first, but the orphan is a time bomb for any per-slug COUNT / dedup logic).
+
+**Fix:** Rewrote the direct-YAML branch in `accept_config_draft` to run a transaction that (1) finds any existing active row for the (schema_type, slug) pair, (2) inserts the new row with `supersedes_id = prior_active_id`, and (3) marks the prior row as `superseded` with `superseded_by_id = new_id`. Matches the `supersede_config_contribution` semantics but honors the direct-YAML path's `source = "local"`, `created_by = "user"` metadata. When no prior active exists, the insert still runs (with `supersedes_id = NULL`) and no UPDATE fires.
+
+### Finding B — HIGH/CORRECTNESS: refine of an active contribution wipes the active chain (FIXED)
+
+**What:** `create_draft_supersession` (the refine path's backing helper) ran a two-statement transaction: INSERT the new draft with `supersedes_id = prior_id`, then UPDATE the prior row to set `superseded_by_id = new_id` and flip `status = 'active' → 'superseded'`. The problem is the status flip: when the user refines their currently-active config, the prior row becomes `superseded` and the new row is a `draft` — so there is NO row with `status = 'active' AND superseded_by_id IS NULL` for that (schema_type, slug) anymore.
+
+Consequences:
+1. `pyramid_active_config` returns `None` during the refine draft window — the UI loses its reference to the current policy while the user is still reviewing the draft.
+2. Background readers (DADBEAR ticks, ongoing builds) that resolve via `load_active_config_contribution` also lose their reference.
+3. `load_config_version_history` starts its chain walk from the active row, so it returns an empty `Vec` — and the refine response's version number (computed as `history.len() + 1`) is wrong (returns 1 when it should return 2).
+
+**Reproduction:** Tests `wanderer_refine_active_returns_correct_version` and `wanderer_multi_refine_increments_version` in `test_phase9_wanderer.rs`. Both fail before the fix and pass after.
+
+**Root cause:** The implementer's comment on `create_draft_supersession` says it exists "because `supersede_config_contribution` forces the new row to `active`, which is wrong for the Phase 9 draft flow." Correct diagnosis, but the fix went too far — it also inherited `supersede_config_contribution`'s "mark the prior as superseded" UPDATE, which is wrong for the draft flow too. The refinement draft is a PROPOSED successor, not an accepted one; the status transfer must wait until the user accepts.
+
+**Fix:** Removed the UPDATE on the prior row entirely. `create_draft_supersession` now only INSERTs the new draft with `supersedes_id = prior_id` — the prior row stays untouched. The refinement chain is traced purely via `supersedes_id` backpointers until accept, at which point `promote_draft_to_active` walks the chain and handles the active-transfer transaction.
+
+Also replaced the refine path's version computation: instead of calling `load_config_version_history` (which walks from the active and therefore can't see draft chains), the new `version_by_chain_walk` helper walks the `supersedes_id` chain backward from a given contribution_id and counts the depth. Handles cycle-safety with a HashSet visited set and a 10K chain-length cap.
+
+### Findings that were NOT bugs
+
+- **First-boot idempotency under `INSERT OR IGNORE`** — verified. The bundled walk runs on every boot (correctly not gated by the Phase 5 sentinel per the implementer's explicit comment), INSERT OR IGNORE skips existing rows including user supersessions, and the test `phase9_bundled_walk_skips_user_superseded` locks this in. The "new version of an existing contribution_id" case is intentionally NOT handled — app upgrades ship NEW `contribution_id` values (e.g. `bundled-evidence_policy-default-v2`), leaving the v1 in place. No change.
+- **`synth_heavy` hardcoded tier** — the implementer noted this and has a fallback path. Verified the fallback: if `resolve_tier("synth_heavy", ...)` returns None, it falls back to `llm_config.primary_model` with provider_id="openrouter" (telemetry only — the actual HTTP call builds its provider from `config.provider_registry.get_provider("openrouter")` in `build_call_provider`, and falls back to a legacy `OpenRouterProvider` if no registry is attached). The hardcoded "openrouter" is consistent with the rest of the codebase's provider resolution pattern, not a new Phase 9 coupling. `with_model_resolution` + `with_provider` on StepContext are telemetry-only — the actual model used in `call_model_unified_with_options_and_ctx` line 490 is always `config.primary_model`, regardless of what the ctx says.
+- **YAML extraction resilience** — verified all four documented cases (plain, fenced, prose-prefix, fence+prose) by reading `extract_yaml_body` + `extract_fenced_block`. The fenced-block regex is naive (first `\`\`\`` wins) but the Phase 9 prompts explicitly ask for YAML-only output, so the edge case of ``` in YAML comments is low-probability.
+- **Prompt substitution `{if X}...{end}` blocks** — verified. Conditionals are processed BEFORE value substitution, so `{end}` inside a note/current_yaml value is safe. Nested conditionals are not supported (the Phase 9 prompts don't use them). Unclosed `{if X}` returns input unchanged.
+- **3-phase Send-safety pattern** — verified. Each IPC handler drops the `tokio::sync::Mutex<Connection>` guard in a scoped block before the `.await` on the LLM call. `rusqlite::Connection` is `!Send`, so the block-scoped guard ensures it never crosses an await point. `cargo check --lib` is clean.
+- **Notes enforcement at IPC boundary** — verified. `pyramid_refine_config` calls `validate_note(&note)?` before the `config.read().await` and before any DB work. Empty notes error immediately.
+- **Bundled manifest `include_str!` path** — verified resolves correctly: `src-tauri/src/pyramid/wire_migration.rs` → `../../assets/bundled_contributions.json` → `src-tauri/assets/bundled_contributions.json`. Compile would fail if the path were wrong — `cargo check --lib` is clean.
+- **Generation skill body extraction** — the manifest ships the skill body inlined under `yaml_content`, and `insert_bundled_contribution` writes it directly to the `yaml_content` column. `load_contribution_by_id` reads the same column. End-to-end consistent.
+- **Schema registry loading under contention** — `SchemaRegistry` uses an `RwLock<HashMap<String, ConfigSchema>>` internally. Read locks are taken in `get` / `list` / `list_full` and released at method return. Write lock is taken only during `reload` / `invalidate`. An in-flight generation call that holds a `ConfigSchema` clone via `schema_registry.get(schema_type)?` will NOT see a mid-call invalidation because `get` clones the struct out of the read lock before returning — the clone is independent of the registry's state after that point.
+
+### Commit
+
+Single wanderer-fix commit on `phase-9-generative-config-pattern` with message `phase-9: wanderer fix — refine preserves active + direct-YAML accept supersedes`. Files modified:
+
+- `src-tauri/src/pyramid/generative_config.rs` — removed prior-row UPDATE from `create_draft_supersession`; added `version_by_chain_walk` helper and used it in `persist_refined_draft`; rewrote the direct-YAML branch of `accept_config_draft` to wrap its INSERT + UPDATE in a transaction.
+- `src-tauri/src/pyramid/test_phase9_wanderer.rs` — new test module with 4 tests covering the two fixed bugs + two sanity cases (direct-YAML with no prior, multi-refine version counting).
+- `src-tauri/src/pyramid/mod.rs` — register the test module behind `#[cfg(test)]`.
+- Updated `test_create_draft_supersession_marks_prior_superseded` → `test_create_draft_supersession_links_via_supersedes_id` to reflect the new correct behavior (prior stays active).
+
+### Verification after fix
+
+- `cargo test --lib "pyramid::generative_config"` — **16/16 passing** (pre-existing 16; one updated assertion reflects new correct semantics)
+- `cargo test --lib "pyramid::schema_registry"` — **10/10 passing**
+- `cargo test --lib "pyramid::wire_migration"` — **17/17 passing**
+- `cargo test --lib "pyramid::config_contributions"` — **21/21 passing**
+- `cargo test --lib "pyramid::test_phase9_wanderer"` — **4/4 passing** (new)
+- `cargo test --lib "pyramid::"` — 1048 passing vs 1044 pre-fix, same 7 pre-existing failures (+4 wanderer tests, no regressions)
+- `cargo check --lib` — clean
+
+---
+
