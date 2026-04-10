@@ -3285,7 +3285,7 @@ async fn post_build_seed(
                 let db_path_clone = db_path.clone();
                 let bus = pyramid_state.build_event_bus.clone();
                 let handle = wire_node_lib::pyramid::dadbear_extend::start_dadbear_extend_loop(
-                    db_path_clone, bus,
+                    pyramid_state.clone(), db_path_clone, bus,
                 );
                 *dadbear = Some(handle);
                 tracing::info!("Post-build: DADBEAR extend loop started");
@@ -6636,7 +6636,7 @@ fn main() {
             if has_configs {
                 let bus = ps.build_event_bus.clone();
                 let handle = wire_node_lib::pyramid::dadbear_extend::start_dadbear_extend_loop(
-                    db_path_str, bus,
+                    ps.clone(), db_path_str, bus,
                 );
                 let mut dh = ps.dadbear_handle.lock().await;
                 *dh = Some(handle);
