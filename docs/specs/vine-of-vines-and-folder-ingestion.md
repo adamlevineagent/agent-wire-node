@@ -226,6 +226,122 @@ For folder ingestion, the DADBEAR config Wire Node writes activates both pipelin
 
 Propagation of updates UP through the vine hierarchy happens on the Pipeline A side via change manifests (Phase 2) — when an ingested file changes and `execute_supersession` rewrites the affected L0 node in place, the change manifest propagates to parent vines via `vine_composition.rs::notify_vine_of_bedrock_completion`, which triggers vine-level manifest generation for each affected vine node (see `change-manifest-supersession.md` → Vine-Level Manifests section).
 
+### Claude Code Conversation Auto-Include (enhancement 2026-04-10)
+
+Recursive folder ingestion as described above expects conversation JSONLs to live co-located with the folder being ingested. For a user whose conversations about a project happen in Claude Code, that's wrong — Claude Code stores conversation history in a separate master directory (`~/.claude/projects/`), keyed by the encoded absolute path of the project the conversation was about. The conversation-to-code linkage exists on disk already; the import flow should surface it instead of requiring the user to hand-copy JSONL files.
+
+**The feature:** when the user kicks off recursive folder ingestion on a target folder, they see a checkbox labeled something like:
+
+> ☑ Include Claude Code conversations related to this folder and its subfolders
+>
+> Or pick a different conversation folder: [browse…]
+
+When checked (default ON if Claude Code is detected), the folder walker ALSO discovers every Claude Code project directory under `~/.claude/projects/` whose encoded path matches the target folder's encoded path OR any of its subfolders' encoded paths. Every matching directory's `*.jsonl` files are attached to the ingestion graph alongside the folder's own content, producing conversation pyramids that sit inside the same vine hierarchy as the code/doc pyramids for that folder.
+
+**Path encoding rule** (derived from observation of `~/.claude/projects/`):
+
+```
+/Users/adam/AI Project Files/agent-wire-node
+                    ↓ absolute path, slashes → dashes, leading dash preserved
+-Users-adam-AI-Project-Files-agent-wire-node
+```
+
+The encoded form is a simple `replace('/', '-')` on the absolute path. Spaces, case, and punctuation are preserved in the directory name. Subfolders, worktrees, and sub-project directories under the same parent each get their own encoded entry (e.g., `-Users-adam-AI-Project-Files-agent-wire-node--claude-worktrees-<name>` for a Claude Code worktree).
+
+**Matching algorithm:**
+
+```
+fn find_claude_code_conversation_dirs(target_folder: &Path) -> Vec<PathBuf>:
+    let claude_projects_root = home_dir().join(".claude").join("projects")
+    if !claude_projects_root.exists():
+        return vec![]  # Claude Code not installed or no conversations yet
+
+    let encoded_target = encode_path_for_claude_code(target_folder)
+    let mut matches = vec![]
+
+    for entry in read_dir(claude_projects_root):
+        let dir_name = entry.file_name().to_string_lossy()
+        # Match if the entry's encoded path is exactly the target OR starts with
+        # the target followed by a dash (indicating a subfolder of the target).
+        if dir_name == encoded_target:
+            matches.push(entry.path())
+        else if dir_name.starts_with(&format!("{}-", encoded_target)):
+            matches.push(entry.path())
+
+    return matches
+
+fn encode_path_for_claude_code(path: &Path) -> String:
+    # Absolute path with `/` replaced by `-`. Leading `-` from root is preserved.
+    path.to_string_lossy().replace('/', "-")
+```
+
+**Integration with the folder walk:**
+
+The matching directories are treated as additional conversation sources attached to the target folder's topical vine. Each Claude Code project directory becomes its own conversation pyramid (slug: `{target-folder-slug}-cc-{encoded-subfolder-segment}`), and all of them are added as bedrocks of the target folder's vine.
+
+Pseudocode extension to `ingest_folder`:
+
+```
+fn ingest_folder(path, parent_vine_slug, include_claude_code: bool):
+    # ... existing walk ...
+
+    if include_claude_code and is_top_level_call:
+        let cc_dirs = find_claude_code_conversation_dirs(path)
+        for cc_dir in cc_dirs:
+            let cc_slug = generate_slug_for_claude_code_dir(path, cc_dir)
+            create_pyramid(cc_slug, ContentType::Conversation, cc_dir.to_string())
+            add_bedrock_to_vine(vine_slug_for(path), cc_slug)
+```
+
+The `is_top_level_call` guard ensures we only do the Claude Code scan at the top of the recursion, not on every subfolder — the top-level scan already matches subfolder-encoded directories via the `starts_with` prefix check.
+
+**DADBEAR integration:** each Claude Code conversation pyramid gets its own DADBEAR config pointing at the Claude Code project directory. When the user continues their Claude Code session, new JSONL files appear in that directory, Pipeline B's scanner picks them up on the next tick, and the episodic memory pyramid grows automatically — the user doesn't have to re-import anything. Pipeline A continues to handle changes to existing JSONLs (Claude Code appends to the active session file).
+
+**Privacy note:** Claude Code conversations may contain sensitive context (API keys pasted in, private business logic, etc.). The auto-include feature is opt-in via the checkbox. The default state is ON only when the folder has a clear Claude Code conversation match (i.e., `find_claude_code_conversation_dirs` returns at least one directory) AND the folder is local (not a network mount). Otherwise default OFF, user must explicitly opt in.
+
+**UI surface (Phase 17 wizard):**
+
+```
+Ingest folder: AI Project Files/agent-wire-node
+
+  Content:           [Auto-detect (recommended)]
+  Recursion depth:   [No limit ▼]
+
+  ☑ Include Claude Code conversations related to this folder
+     Found 4 matching conversation directories in ~/.claude/projects:
+      • -Users-adam-AI-Project-Files-agent-wire-node (main)
+      • -Users-adam-AI-Project-Files-agent-wire-node-docs-pyramid-prototype
+      • -Users-adam-AI-Project-Files-agent-wire-node--claude-worktrees-nervous-lichterman
+      • -Users-adam-AI-Project-Files-agent-wire-node--claude-worktrees-wonderful-tesla
+
+     Or pick a different folder: [browse…]
+
+  [Cancel]  [Start ingestion]
+```
+
+**IPC surface addition** (for Phase 17 + Phase 10 wizard):
+
+```
+pyramid_find_claude_code_conversations(target_folder: String)
+  → Vec<{
+      encoded_path: String,
+      absolute_path: String,
+      jsonl_count: usize,
+      earliest_mtime: String,
+      latest_mtime: String,
+      is_main: bool,         // true if encoded_path matches target exactly
+      is_worktree: bool,     // true if encoded_path contains "--claude-worktrees-"
+    }>
+```
+
+The UI calls this command on folder selection to populate the pre-flight list. If the returned list is empty, the checkbox can be hidden or greyed out.
+
+**Configurable via heuristics:** the `folder_ingestion_heuristics` contribution (Phase 4) gains new fields:
+- `claude_code_auto_include: bool` — default ON
+- `claude_code_conversation_path: String` — default `"~/.claude/projects"`, user-overridable if Claude Code stores its conversations elsewhere or the user wants to point at a different source (e.g., a Cursor conversation cache)
+
+Both fields flow through the normal contribution/refinement loop — a user who wants to import Cursor history instead of Claude Code history can generate a variant heuristics config that points at a different path.
+
 ### Example Output
 
 ```
