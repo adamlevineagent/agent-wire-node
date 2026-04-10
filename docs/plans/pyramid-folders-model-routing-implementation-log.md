@@ -1175,3 +1175,139 @@ The phase is ready for the conductor's verifier pass. Recommended focus areas fo
 5. **Pre-existing `chain_dispatch::StepContext` coexistence** — confirm no test relies on a single canonical `StepContext` import path. Both types should be reachable via their module paths.
 
 Wanderer prompt suggestion: "Does Wire Node boot, run a fresh build, persist every LLM call to `pyramid_step_cache` with the right cache_key, and then on a re-build of the same source files use the cache for every step that has a usable StepContext — confirming end-to-end that the cache hit path is wired through chain_executor and produces zero network traffic for unchanged content?"
+
+---
+
+## Phase 7 — Cache Warming on Pyramid Import
+
+**Workstream:** phase-7-cache-warming-import
+**Workstream prompt:** `docs/plans/phase-7-workstream-prompt.md`
+**Spec:** `docs/specs/cache-warming-and-import.md`
+**Branch:** `phase-7-cache-warming-import` (off `phase-6-llm-output-cache`)
+**Started:** 2026-04-10
+**Completed (implementer pass):** 2026-04-10
+**Status:** awaiting-verification
+
+### What shipped
+
+Phase 7 builds the import-side counterpart to Phase 5's publication path and Phase 6's `pyramid_step_cache`. When a user pulls a pyramid from Wire, the source node's exported cache manifest is downloaded (frontend concern, Phase 10) and populated into the local cache via a three-pass staleness check: (1) L0 nodes get their source files hashed and compared to the manifest, (2) the stale L0 set propagates upward through the manifest's `derived_from` graph via BFS, (3) only upper-layer nodes NOT in the stale set have their cache entries inserted. Surviving rows use Phase 6's `db::store_cache` so idempotency is free — re-importing the same manifest is a no-op because of the `UNIQUE(slug, cache_key)` constraint.
+
+The module ships with a resumable state row (`pyramid_import_state`) + CRUD, the shared Rust manifest types (`CacheManifest`, `ImportNodeEntry`, `ImportedCacheEntry`) that both export and import encode/decode against, a content-addressable SHA-256 file hasher, the three-pass staleness algorithm (`populate_from_import`), the top-level entry point (`import_pyramid`), and the canonical DADBEAR auto-enable path — routed through Phase 4's `create_config_contribution_with_metadata` + `sync_config_to_operational` so the imported pyramid's DADBEAR row carries a proper `contribution_id` FK and audit trail.
+
+On the publication side, `PyramidPublisher::export_cache_manifest` reads `pyramid_step_cache` rows and assembles a canonical manifest, with a **privacy-safe default**: returns `Ok(None)` unless the caller explicitly passes `include_cache = true`. Phase 10 will add the opt-in checkbox to the publish wizard with appropriate warnings. Three new Tauri IPC commands wire the module to the frontend: `pyramid_import_pyramid`, `pyramid_import_progress`, and `pyramid_import_cancel`.
+
+### Files touched
+
+**New files:**
+
+- `src-tauri/src/pyramid/pyramid_import.rs` (~880 lines) — Phase 7 module:
+  - Shared manifest types: `CacheManifest`, `ImportNodeEntry`, `ImportedCacheEntry`, `ImportReport` with serde derives matching the spec's JSON shape byte-for-byte (manifest_version, source_pyramid_id, exported_at, nodes with layer/source_path/source_hash/source_size_bytes/derived_from/cache_entries).
+  - `sha256_file_hex` — streaming 64KiB-chunk file hasher that keeps large sources off-heap.
+  - `normalize_hash` — case-insensitive `sha256:` prefix stripper so manifests that include the prefix (per spec example) and locally-computed bare-hex hashes compare equal.
+  - `resolve_source_path` — path joiner with `\`/`/` separator normalization and parent-traversal refusal (`..` returns empty path).
+  - `populate_from_import` — the three-pass staleness algorithm. Pass 1 (L0 file-hash check), Pass 2 (BFS upward via in-memory `derived_from` graph), Pass 3 (upper-layer cache insertion for non-stale nodes). Returns `ImportReport` with `cache_entries_valid`, `cache_entries_stale`, `nodes_needing_rebuild`, `nodes_with_valid_cache`. Rejects unsupported `manifest_version`.
+  - `import_pyramid` — top-level entry that validates inputs, creates or resumes the import state row, runs the staleness pass, enables DADBEAR via the Phase 4 contribution path, and flips status to `complete`.
+  - `enable_dadbear_via_contribution` — builds a canonical `dadbear_policy` YAML, creates a contribution row via `create_config_contribution_with_metadata` (source=`import`, maturity=`Canon`), then dispatches through `sync_config_to_operational`. Does NOT write directly to `pyramid_dadbear_config`.
+  - `yaml_escape` — best-effort YAML scalar escaper for source_path strings.
+  - 14 unit tests covering hash normalization, path resolution, parent-traversal refusal, YAML escaping, manifest version rejection, the mixed-stale three-pass flow (integration test: 3 L0s + 2 upper layers, one L0 mismatch propagates to the upper layer that references it), missing-L0-file stale marking, idempotent re-import (INSERT OR IGNORE semantics), full-flow `import_pyramid` with state-row progression, resume-same-pyramid succeeds, refuse-different-pyramid-for-same-slug, reject-missing-source-path, serde round-trip, canonical DADBEAR metadata on the contribution row.
+
+**Modified files:**
+
+- `src-tauri/src/pyramid/db.rs` (+~210 lines):
+  - Added `pyramid_import_state` table to `init_pyramid_db` per the spec's "Import Resumability" section: `target_slug` PK, `wire_pyramid_id`, `source_path`, `status`, `nodes_total`, `nodes_processed`, `cache_entries_total`, `cache_entries_validated`, `cache_entries_inserted`, `last_node_id_processed`, `error_message`, `started_at`, `updated_at`, plus `idx_pyramid_import_state_status` on status.
+  - Added `ImportState` struct + `ImportStateProgress` partial-update struct.
+  - Added CRUD helpers: `create_import_state`, `load_import_state`, `update_import_state` (uses COALESCE for partial updates so only-supplied fields are written), `delete_import_state` (idempotent).
+  - Added `import_state_tests` module with 5 tests: create+load, load-missing-returns-None, duplicate-create-fails, coalesced partial update that preserves other fields, idempotent delete.
+
+- `src-tauri/src/pyramid/wire_publish.rs` (+~290 lines):
+  - New `impl PyramidPublisher` block with two methods: `export_cache_manifest` (async, privacy-gate wrapper — returns `Ok(None)` unless `include_cache = true`) and `build_cache_manifest` (pure-local manifest builder used internally + by tests).
+  - `build_cache_manifest` reads `pyramid_step_cache` (optionally filtered by `build_id`, always excluding archived-prefix cache_keys so supersession chains don't leak), joins against `pyramid_pipeline_steps` on `(slug, step_type=step_name, chunk_index, depth)` to recover `node_id`, loads L0 source metadata from `pyramid_file_hashes` (keyed on node_ids JSON array), and loads upper-layer `derived_from` from `pyramid_evidence` (KEEP verdicts only). Groups by node_id, sorts by `(layer, node_id)` for deterministic output. Rows that can't be joined to a pipeline step fall into a synthetic `synth:L{depth}:C{chunk_index}` bucket so they still land in the manifest.
+  - 6 new Phase 7 tests: privacy gate default off returns None, opt-in returns populated manifest, empty slug returns empty-nodes manifest, build_id filter works, archived rows are excluded, full export → import round-trip (seed cache → export manifest → populate_from_import into a fresh slug → verify row counts match).
+
+- `src-tauri/src/pyramid/mod.rs` — declared `pub mod pyramid_import`.
+
+- `src-tauri/src/main.rs` (+~140 lines):
+  - Added 3 Phase 7 Tauri IPC commands: `pyramid_import_pyramid(wire_pyramid_id, target_slug, source_path, manifest_json)` (parses the manifest JSON, calls `pyramid_import::import_pyramid` under the writer mutex, returns an `ImportPyramidResponse` with the five report counters), `pyramid_import_progress(target_slug)` (reads the `pyramid_import_state` row and computes the spec's weighted progress: `(nodes_processed/nodes_total)*0.5 + (cache_entries_validated/cache_entries_total)*0.5`), `pyramid_import_cancel(target_slug)` (deletes the state row; cache rows are idempotent so they stay).
+  - Registered all 3 commands in `invoke_handler!`.
+
+- `docs/plans/pyramid-folders-model-routing-implementation-log.md` — this entry.
+
+### Spec adherence (against `cache-warming-and-import.md`)
+
+- ✅ **`pyramid_import_state` table** — schema matches the spec's SQL byte-for-byte: `target_slug` PRIMARY KEY, `wire_pyramid_id`, `source_path`, `status`, `nodes_total`/`nodes_processed`, `cache_entries_total`/`cache_entries_validated`/`cache_entries_inserted`, `last_node_id_processed`, `error_message`, `started_at`/`updated_at` with `datetime('now')` defaults. Plus a status index for fast "in-flight imports" queries.
+- ✅ **CRUD helpers** — `create_import_state`, `load_import_state`, `update_import_state` (with COALESCE partial update), `delete_import_state` (idempotent).
+- ✅ **Cache manifest types** — `CacheManifest`, `ImportNodeEntry`, `ImportedCacheEntry` match the spec's JSON shape (manifest_version, source_pyramid_id, exported_at, nodes with layer/source_path/source_hash/source_size_bytes/derived_from/cache_entries). All fields serde-derived with `#[serde(default)]` on optional fields.
+- ✅ **Three-pass staleness algorithm** — `populate_from_import` implements the spec's exact three passes: L0 hash check → upward BFS propagation → upper-layer cache insertion. Idempotency via `db::store_cache`'s `INSERT ... ON CONFLICT DO UPDATE` on the `UNIQUE(slug, cache_key)` constraint. Mixed-stale integration test (`test_populate_from_import_mixed_stale_l0_propagates_to_upper_layers`) covers the exact scenario the verification criteria called out.
+- ✅ **`ImportReport`** — four counters: `cache_entries_valid`, `cache_entries_stale`, `nodes_needing_rebuild`, `nodes_with_valid_cache`.
+- ✅ **`import_pyramid` main entry** — validates inputs (non-empty slug, existing directory), checks for an existing state row (resume-same-pyramid vs refuse-different-pyramid), updates status through `downloading_manifest` → `validating_sources` → `populating_cache` → `complete`, calls `populate_from_import`, enables DADBEAR via the contribution path, marks complete.
+- ✅ **`export_cache_manifest` with privacy-safe default** — returns `Ok(None)` unless `include_cache = true`. Phase 10 adds the opt-in checkbox. Documented in-code referencing the spec's "Privacy Consideration" section. When opted in, the manifest is built from `pyramid_step_cache` joined with `pyramid_pipeline_steps` + `pyramid_file_hashes` + `pyramid_evidence`.
+- ✅ **3 IPC commands** — `pyramid_import_pyramid`, `pyramid_import_progress`, `pyramid_import_cancel`. Progress calculation matches the spec's weighted formula `(nodes_processed/nodes_total)*0.5 + (cache_entries_validated/cache_entries_total)*0.5` with a clamp to [0,1] and None-total → 0 fallback.
+- ✅ **DADBEAR auto-enable via Phase 4 contribution path** — `enable_dadbear_via_contribution` constructs a minimal `dadbear_policy` YAML, calls `create_config_contribution_with_metadata` with `source=import` and `maturity=Canon`, then dispatches through `sync_config_to_operational`. The operational `pyramid_dadbear_config` row is populated via the contribution sync path, NOT via direct INSERT. `test_dadbear_contribution_has_canonical_metadata` and `test_import_pyramid_full_flow_creates_state_then_completes` lock this down.
+- ✅ **Build_id synthetic tag** — imported cache rows get `build_id = format!("import:{wire_pyramid_id}")` per the spec's "Integration with LLM Output Cache" section. Distinguishes imported rows from locally-built rows for audit trails without affecting the content-addressable lookup (which ignores build_id).
+- ✅ **Manifest version validation** — `populate_from_import` rejects any `manifest_version != 1` with a clear error. Future additive extensions get their own version bump.
+- ✅ **Archived cache rows excluded from export** — the publish-side query filters `cache_key NOT LIKE 'archived:%'` so supersession history never leaks through a manifest.
+- ✅ **Idempotency test** — `test_populate_from_import_idempotent` re-runs the same manifest twice against the same DB, asserts the cache row count is unchanged after the second pass.
+- ⚠️ **`RemotePyramidClient` manifest download** — NOT in scope. The spec's "Import Flow" step 3 talks about downloading the manifest from the source node's tunnel URL, but the existing `WireImportClient` in `wire_import.rs` is scoped to chain definitions / question sets, not pyramid manifests. Phase 10's ImportPyramidWizard will own the frontend download (likely via a new endpoint) and pass the raw manifest JSON into `pyramid_import_pyramid` as a string argument. Phase 7 ships the IPC entry point that accepts the manifest; the download wiring is explicitly deferred.
+- ⚠️ **Privacy gate detection logic** — Phase 7 ships the safer default-off rather than the full public-source detection the spec describes (~line 270). The spec's full version walks the L0 set and checks each corpus document's `visibility` field; Phase 10's publish UI will implement that detection alongside the opt-in checkbox. Phase 7's default-off is strictly safer than the full detection because it can't false-positive.
+- ⚠️ **Frontend wizard / sidebar / build viz integration** — Phase 10 / Phase 13 scope. Phase 7 ships backend-only.
+
+### Scope decisions
+
+- **`pyramid_import.rs` as a new module**: the spec's "Files Modified" table lists "New `pyramid_import.rs`" explicitly. Chose the name `pyramid_import` (not just `import`) to avoid colliding with the Rust `import` keyword as a filename concern on case-insensitive file systems, and to stay consistent with `wire_import.rs` (which handles chain imports, not pyramid imports — the two domains are orthogonal and I did not touch `wire_import.rs`).
+- **Manifest types live in `pyramid_import.rs`, not `types.rs` or a shared location**: both the export side (`wire_publish.rs::build_cache_manifest`) and the import side (`pyramid_import::populate_from_import`) need to speak the same types, so they live in the module that owns the import-side semantics. `wire_publish.rs` references them via fully-qualified path `crate::pyramid::pyramid_import::*`. This avoids introducing a new crate-root type file for what is essentially one set of structs with two callers.
+- **In-memory dependency graph from the manifest, not from `pyramid_evidence`**: the spec's deviation protocol explicitly lists "the manifest carries its own `derived_from` lists, so you can build the dependency graph in-memory from the manifest alone without touching the local `pyramid_evidence` table. Use this approach to avoid coupling to the local state during import." The three-pass algorithm builds `dependents: HashMap<String, Vec<String>>` from the manifest's `ImportNodeEntry.derived_from` fields at runtime. This keeps import decoupled from the local state — a partial `pyramid_evidence` table (e.g. a prior failed import) cannot poison the staleness pass.
+- **`store_cache` (INSERT OR REPLACE) vs `INSERT OR IGNORE`**: the spec's workstream prompt mentions both. Phase 7 uses `store_cache` which is `INSERT ... ON CONFLICT(slug, cache_key) DO UPDATE` — "replace" semantics, not "ignore". The spec's idempotency requirement is satisfied either way because the cache is content-addressable: if the cache_key matches, the content IS identical, so REPLACE and IGNORE produce the same observable state. Using `store_cache` keeps the import path consistent with every other cache write in the codebase, and the force-fresh bit that distinguishes reroll writes is carried explicitly on the entry struct. The `ImportedCacheEntry` → `CacheEntry` conversion always sets `force_fresh = false` because imported entries are peer cached outputs, not user-initiated rerolls.
+- **Missing source file = stale (not error)**: the spec's staleness flow says "if file missing → mark node + dependents stale, skip cache entry." This is a graceful-degradation path. Phase 7 honors it — `!local_path.exists()` adds the L0 to the stale set and continues. Same for unreadable files (hash computation failure) and L0 nodes with no `source_hash` in the manifest. A single problem file can't abort the whole import.
+- **`resolve_source_path` refuses parent traversal**: `..` segments are defense-in-depth — a manifest from an untrusted peer cannot escape the local source root. `resolve_source_path` returns an empty PathBuf on `..`, which hits the `.exists()` check and stale-marks the node. Documented + tested.
+- **Build ID for imported rows**: `format!("import:{wire_pyramid_id}")` so an audit query filtering by `build_id LIKE 'import:%'` isolates every row that came from a peer manifest. The cache hit path ignores `build_id` (it's content-addressable) so this doesn't affect lookup behavior.
+- **DADBEAR content_type default = "document"**: the `pyramid_dadbear_config` table's `content_type` column has a CHECK constraint limiting it to `code`/`conversation`/`document`. The manifest doesn't carry the source pyramid's declared content type, so Phase 7 defaults to `document` — the widest compatibility option. Phase 10's import wizard can override. Documented in-code.
+- **DADBEAR maturity = Canon, not Draft**: the default metadata factory produces Draft, but an imported pyramid's DADBEAR config is a verified config from another node, not a user draft. `enable_dadbear_via_contribution` explicitly overrides `maturity` to `Canon`. Matches Phase 5's bundled migration pattern.
+- **Publisher query filters archived rows**: `cache_key NOT LIKE 'archived:%'` in the export query. Phase 6's `supersede_cache_entry` archives prior rows under the `archived:` prefix; those rows still live in the table for history but must not surface in a published manifest. The filter is applied in both the `build_id`-scoped and unscoped query paths.
+- **Manifest export uses synthetic node IDs for unjoinable rows**: a cache row that has no matching `pyramid_pipeline_steps` entry (edge case: a test fixture, or a subsystem that bypasses pipeline step logging) falls into a `synth:L{depth}:C{chunk_index}` bucket so it still appears in the exported manifest. The importer treats synthetic L0 nodes as stale by default (no `source_path`) — the test `test_export_then_import_round_trip` exercises this path end-to-end.
+- **IPC commands are Tauri invoke, not HTTP**: Phase 5 and 6 both wired new commands through `#[tauri::command]` in `main.rs` with `invoke_handler!` registration. The spec's "Files Modified" table mentions `routes.rs`, but the workstream prompt says "match whichever surface Phase 5/6 use" and the implementation log's Phase 5 entry confirms Tauri commands. Phase 7 follows suit.
+
+### Verification results
+
+- ✅ `cargo check --lib` — clean. Same 3 pre-existing warnings (deprecated `get_keep_evidence_for_target`, two `LayerCollectResult` private-visibility warnings). Zero new warnings from Phase 7 files.
+- ✅ `cargo check` (full crate including binary) — clean. Same 3 lib warnings + 1 pre-existing binary warning (`tauri_plugin_shell::Shell::open`). Zero new warnings.
+- ✅ `cargo build --lib` — clean, same 3 pre-existing warnings.
+- ✅ `cargo test --lib pyramid::pyramid_import` — **14/14 passed** in ~1.0s.
+- ✅ `cargo test --lib pyramid::db::import_state_tests` — **5/5 passed** in ~0.5s.
+- ✅ `cargo test --lib pyramid::wire_publish` — **20/20 passed** (14 pre-existing + 6 new Phase 7 tests) in ~0.75s.
+- ✅ `cargo test --lib pyramid` — **986 passed, 7 failed** in ~30s. The 7 failures are the same pre-existing unrelated tests carried from Phase 6 (`pyramid::db::tests::test_evidence_pk_cross_slug_coexistence`, `pyramid::defaults_adapter::tests::real_yaml_thread_clustering_preserves_response_schema`, 5 × `pyramid::staleness::tests::*`). Phase 6 ended at 961 passing; Phase 7 added 25 new tests (14 pyramid_import + 5 import_state + 6 wire_publish) bringing the total to 986. Zero regressions.
+- ✅ **Integration test verification**: `test_populate_from_import_mixed_stale_l0_propagates_to_upper_layers` constructs a cache manifest with 3 L0 nodes (L0a, L0b, L0c) and 2 upper-layer nodes (L1a derives from L0a+L0b, L1b derives from L0b+L0c), seeds a temp dir with matching files for L0a+L0b and a mismatched hash for L0c, calls `populate_from_import`, and asserts:
+  - L0c is stale (hash mismatch)
+  - L0a + L0b are fresh → their cache entries land in `pyramid_step_cache`
+  - L1a depends on L0a + L0b (both fresh) → cache entry lands
+  - L1b depends on L0b + L0c → L0c stale propagates → L1b is stale → cache entry dropped
+  - `report.cache_entries_valid == 3`, `report.cache_entries_stale == 2`, `report.nodes_needing_rebuild == 2`, `report.nodes_with_valid_cache == 3`
+  - Direct SQL count verifies `pyramid_step_cache` has exactly 3 rows under `imp-slug`
+  - Direct SQL query verifies the stale L1b cache_key is NOT present
+- ✅ **Idempotency verification**: `test_populate_from_import_idempotent` runs `populate_from_import` twice on the same manifest + DB, asserts the row count stays at 5 after the second pass.
+- ✅ **DADBEAR-via-contribution verification**: `test_import_pyramid_full_flow_creates_state_then_completes` runs the full `import_pyramid` entry point and asserts:
+  - `pyramid_config_contributions` has one active row with `schema_type='dadbear_policy'`, `source='import'`, `status='active'` for the target slug
+  - `pyramid_dadbear_config` has one row with a non-NULL `contribution_id` FK for the target slug
+- ✅ `grep -rn "pyramid_import" src-tauri/src/pyramid` — confirms the module is declared in `mod.rs`, the types are referenced from `wire_publish.rs`, and the IPC commands call into it from `main.rs`.
+
+### Notes
+
+- **The three-pass algorithm is the safety net.** Getting the pass ordering wrong is a correctness regression: if Pass 2 ran before Pass 1, an upper-layer node could cache-hit with stale L0 ancestors; if Pass 3 ran before Pass 2, stale propagation wouldn't reach nodes that depend on stale L0s. The integration test locks down the exact ordering with a manifest that will fail if any pass shifts.
+- **In-memory dependency graph avoids coupling to `pyramid_evidence`.** This was the most important scope decision. The spec's deviation protocol called it out explicitly — building the graph from the manifest means the import cannot be poisoned by stale local state from a prior failed import. The BFS walks entirely in a `HashMap<String, Vec<String>>` constructed at the top of the function.
+- **`store_cache` idempotency is free.** The `UNIQUE(slug, cache_key)` constraint + `ON CONFLICT DO UPDATE` means re-imports are zero-churn — the UPDATE only bumps `created_at`. The test `test_populate_from_import_idempotent` locks down the row count invariant.
+- **DADBEAR auto-enable is the load-bearing contribution-path example.** Phase 4's wanderer caught `sync_config_to_operational` being dead code; Phase 5's wanderer caught `PromptCache` being dead code + a direct DADBEAR migration INSERT bypassing canonical metadata. Phase 7's `enable_dadbear_via_contribution` is exactly the Phase 4 canonical route — create a contribution via the helper, re-load it, dispatch through sync. This pattern is what Phase 4's invariant calls for, and Phase 7 adds zero new bypass paths.
+- **Privacy-safe default is strictly safer than the full detection.** The spec's full public-source detection walks the L0 set and checks each corpus document's visibility flag — that's fine for Phase 10 when the UI has the publish wizard to present warnings, but Phase 7 shipping it would mean a single bug in the detection logic could leak cache contents. Defaulting to off with an explicit opt-in keeps the safety net simple. Phase 10's wanderer pass will validate the detection logic when it's added.
+- **`RemotePyramidClient` deferred to Phase 10.** The existing `WireImportClient` handles chain and question-set imports, not pyramid manifests. Writing a new HTTP client in Phase 7 would have added scope that Phase 10 can own properly when it has the full frontend wizard in view. The Phase 7 IPC command accepts the manifest JSON as a string parameter so Phase 10 can fetch it however it wants (direct HTTP, through the existing wire_import infrastructure, from a file, from a pasted blob, etc.).
+- **No friction log entries required.** The spec was unambiguous, the three-pass algorithm compiled on the first try (the test harness caught two minor issues in manifest version validation and normalize_hash before I extracted them), and the DADBEAR-via-contribution path worked without incident because Phase 4's helpers were built for exactly this use case.
+
+### Next
+
+The phase is ready for the conductor's verifier pass. Recommended focus areas for the audit:
+
+1. **Three-pass ordering correctness** — re-read `populate_from_import` and confirm Pass 1 (L0 staleness) → Pass 2 (BFS propagation) → Pass 3 (upper-layer insert) is the canonical order. Any reordering breaks the safety net.
+2. **`enable_dadbear_via_contribution` is the ONLY path** — confirm no direct `pyramid_dadbear_config` INSERT exists anywhere in `pyramid_import.rs`. The contribution path is the canonical route; direct writes would be a regression.
+3. **`export_cache_manifest` default-off** — verify every caller passes `include_cache = false` by default, and confirm the Phase 10 opt-in wiring (when it lands) surfaces a warning to the user before flipping the bit.
+4. **Integration test coverage** — `test_populate_from_import_mixed_stale_l0_propagates_to_upper_layers` is the load-bearing test. A verifier should mutate the test (e.g. swap which L0 mismatches) and confirm the stale propagation tracks. The propagation is what makes upper-layer cache safety work.
+5. **Idempotency lock-down** — `test_populate_from_import_idempotent` should pass even if the manifest is re-imported a third time. The UNIQUE constraint guarantees this but a verifier should exercise the third run as a defensive check.
+6. **Build_id audit trail** — imported cache rows have `build_id = "import:{wire_pyramid_id}"`. A verifier should confirm Phase 13's build viz (when it lands) can filter by this prefix to distinguish imported rows from locally-built rows.
+
+Wanderer prompt suggestion: "Does Wire Node boot, accept a `pyramid_import_pyramid` IPC call with a realistic manifest, walk the three-pass staleness check, insert the correct subset of cache rows, enable DADBEAR through the Phase 4 contribution path with canonical metadata, and flip the import state to complete — all without leaving any dangling state rows or bypassing the contribution path for operational table writes?"

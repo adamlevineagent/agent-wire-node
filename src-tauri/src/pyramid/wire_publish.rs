@@ -1307,6 +1307,340 @@ pub fn get_all_mappings(conn: &rusqlite::Connection, slug: &str) -> Result<Vec<(
     Ok(mappings)
 }
 
+// ─── Phase 7: Cache manifest export ──────────────────────────────────────────
+//
+// The publication-side counterpart to `pyramid_import::populate_from_import`.
+// When a pyramid is published to Wire, the publisher can optionally include
+// a cache manifest so downstream importers pay near-zero LLM cost for the
+// unchanged subset of source files.
+//
+// **Privacy gate**: `export_cache_manifest` returns `Ok(None)` unless the
+// caller passes `include_cache = true`. This is the Phase 7 default-off
+// safety net — any pyramid with private source data would otherwise leak
+// its LLM outputs through the manifest. Phase 10 lands the opt-in
+// checkbox in the publish wizard with appropriate warnings. See
+// `docs/specs/cache-warming-and-import.md` "Privacy Consideration" section
+// (~line 270) for the full privacy design.
+
+impl PyramidPublisher {
+    /// Export the `pyramid_step_cache` rows for a given slug + build id as
+    /// a serializable cache manifest. Returns `Ok(None)` by default — the
+    /// caller MUST explicitly opt in via `include_cache = true` to get a
+    /// populated manifest.
+    ///
+    /// The privacy rationale is spelled out in the spec's "Privacy
+    /// Consideration" section (line 270 of
+    /// `cache-warming-and-import.md`): cache contents are LLM
+    /// interpretations of source files and may leak sensitive data from
+    /// private sources. Phase 10 will add the publish-wizard checkbox
+    /// with warnings; Phase 7 ships the safer default.
+    ///
+    /// When opted in, the function:
+    ///   1. Reads every `pyramid_step_cache` row for the slug that matches
+    ///      the given `build_id` (or every row if `build_id` is None).
+    ///   2. Joins against `pyramid_pipeline_steps` to recover the
+    ///      `node_id` that each cache row belongs to (the cache table
+    ///      doesn't carry node_id directly; the join key is
+    ///      `(slug, step_type = step_name, chunk_index, depth)`).
+    ///   3. Joins against `pyramid_nodes` to get `depth` as `layer`, and
+    ///      against `pyramid_file_hashes` for L0 `source_path` +
+    ///      `source_hash`.
+    ///   4. Groups rows by `node_id` and assembles a `CacheManifest`.
+    ///
+    /// The returned manifest has `manifest_version = 1`. Empty slugs
+    /// (no cache rows) return an empty-nodes manifest rather than None
+    /// so the caller can distinguish "manifest withheld for privacy"
+    /// (None) from "manifest is empty because nothing was cached" (Some
+    /// with zero nodes).
+    pub async fn export_cache_manifest(
+        &self,
+        conn: &rusqlite::Connection,
+        slug: &str,
+        wire_pyramid_id: &str,
+        build_id: Option<&str>,
+        include_cache: bool,
+    ) -> Result<Option<crate::pyramid::pyramid_import::CacheManifest>> {
+        // Privacy gate: default off. Caller must explicitly opt in.
+        if !include_cache {
+            tracing::debug!(
+                slug,
+                "export_cache_manifest: include_cache=false, returning None per \
+                 Phase 7 privacy-safe default"
+            );
+            return Ok(None);
+        }
+
+        self.build_cache_manifest(conn, slug, wire_pyramid_id, build_id)
+            .map(Some)
+    }
+
+    /// Pure-local manifest builder. No privacy gate — callers go
+    /// through `export_cache_manifest` which applies the gate first. This
+    /// is also used by tests.
+    fn build_cache_manifest(
+        &self,
+        conn: &rusqlite::Connection,
+        slug: &str,
+        wire_pyramid_id: &str,
+        build_id: Option<&str>,
+    ) -> Result<crate::pyramid::pyramid_import::CacheManifest> {
+        use crate::pyramid::pyramid_import::{
+            CacheManifest, ImportNodeEntry, ImportedCacheEntry,
+        };
+        use std::collections::HashMap;
+
+        // Query every cache row for the slug (optionally filtered by
+        // build_id). We collect into a vector of (row fields) so the
+        // join/assembly logic stays readable.
+        let mut rows: Vec<(
+            String, // step_name
+            i64,    // chunk_index
+            i64,    // depth
+            String, // cache_key
+            String, // inputs_hash
+            String, // prompt_hash
+            String, // model_id
+            String, // output_json
+            Option<String>, // token_usage_json
+            Option<f64>,    // cost_usd
+            Option<i64>,    // latency_ms
+            String,         // created_at
+        )> = Vec::new();
+
+        if let Some(bid) = build_id {
+            let mut stmt = conn.prepare(
+                "SELECT step_name, chunk_index, depth, cache_key, inputs_hash,
+                        prompt_hash, model_id, output_json, token_usage_json,
+                        cost_usd, latency_ms, created_at
+                 FROM pyramid_step_cache
+                 WHERE slug = ?1 AND build_id = ?2 AND cache_key NOT LIKE 'archived:%'
+                 ORDER BY depth ASC, chunk_index ASC, step_name ASC",
+            )?;
+            let iter = stmt.query_map(rusqlite::params![slug, bid], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Option<f64>>(9)?,
+                    row.get::<_, Option<i64>>(10)?,
+                    row.get::<_, String>(11)?,
+                ))
+            })?;
+            for r in iter {
+                rows.push(r?);
+            }
+        } else {
+            let mut stmt = conn.prepare(
+                "SELECT step_name, chunk_index, depth, cache_key, inputs_hash,
+                        prompt_hash, model_id, output_json, token_usage_json,
+                        cost_usd, latency_ms, created_at
+                 FROM pyramid_step_cache
+                 WHERE slug = ?1 AND cache_key NOT LIKE 'archived:%'
+                 ORDER BY depth ASC, chunk_index ASC, step_name ASC",
+            )?;
+            let iter = stmt.query_map(rusqlite::params![slug], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Option<f64>>(9)?,
+                    row.get::<_, Option<i64>>(10)?,
+                    row.get::<_, String>(11)?,
+                ))
+            })?;
+            for r in iter {
+                rows.push(r?);
+            }
+        }
+
+        // Resolve node_id for each cache row by joining with
+        // `pyramid_pipeline_steps` on `(slug, step_type = step_name,
+        // chunk_index, depth)`. The cache table's `step_name` column is
+        // the same concept as `pyramid_pipeline_steps.step_type` — named
+        // differently for historical reasons but semantically identical
+        // strings (e.g. `source_extract`, `cluster_synthesize`).
+        //
+        // If no matching pipeline step exists (can happen if the cache
+        // row was written by a subsystem that doesn't populate
+        // pyramid_pipeline_steps), fall back to a synthetic
+        // `(depth, chunk_index)` node id so the row still lands in the
+        // manifest and the importer's hash-based validation path still
+        // works.
+        let mut step_to_node: HashMap<(String, i64, i64), String> = HashMap::new();
+        {
+            let mut stmt = conn.prepare(
+                "SELECT step_type, chunk_index, depth, node_id
+                 FROM pyramid_pipeline_steps
+                 WHERE slug = ?1 AND node_id != ''",
+            )?;
+            let iter = stmt.query_map(rusqlite::params![slug], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?;
+            for r in iter {
+                let (step_type, chunk_index, depth, node_id) = r?;
+                step_to_node.insert((step_type, chunk_index, depth), node_id);
+            }
+        }
+
+        // Load source file metadata for L0 nodes. The authoritative
+        // source of file_path + hash is `pyramid_file_hashes`, which is
+        // keyed on `(slug, file_path)`. We want a `node_id → (path, hash,
+        // size)` map — since node_ids are stored as JSON strings on
+        // `pyramid_file_hashes.node_ids`, we walk them once.
+        let mut node_to_source: HashMap<String, (String, String, Option<u64>)> =
+            HashMap::new();
+        {
+            let mut stmt = conn.prepare(
+                "SELECT file_path, hash, node_ids
+                 FROM pyramid_file_hashes
+                 WHERE slug = ?1",
+            )?;
+            let iter = stmt.query_map(rusqlite::params![slug], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?;
+            for r in iter {
+                let (file_path, hash, node_ids_json) = r?;
+                let byte_size = std::fs::metadata(&file_path)
+                    .ok()
+                    .map(|m| m.len());
+                if let Ok(ids) = serde_json::from_str::<Vec<String>>(&node_ids_json) {
+                    for id in ids {
+                        node_to_source
+                            .insert(id, (file_path.clone(), hash.clone(), byte_size));
+                    }
+                }
+            }
+        }
+
+        // Load upper-layer `derived_from` lists from `pyramid_evidence`.
+        // Evidence rows are directed: `source_node_id` feeds
+        // `target_node_id`. For the manifest's `derived_from` field we
+        // want, for each target, the set of sources that fed it.
+        let mut target_to_sources: HashMap<String, Vec<String>> = HashMap::new();
+        {
+            let mut stmt = conn.prepare(
+                "SELECT source_node_id, target_node_id
+                 FROM pyramid_evidence
+                 WHERE slug = ?1 AND verdict = 'KEEP'",
+            )?;
+            let iter = stmt.query_map(rusqlite::params![slug], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for r in iter {
+                let (source, target) = r?;
+                target_to_sources
+                    .entry(target)
+                    .or_default()
+                    .push(source);
+            }
+        }
+
+        // Group cache rows by resolved node_id. Rows that can't be
+        // resolved fall into a synthetic bucket keyed on `(depth,
+        // chunk_index)`.
+        let mut nodes_by_id: HashMap<String, ImportNodeEntry> = HashMap::new();
+        for (
+            step_name,
+            chunk_index,
+            depth,
+            cache_key,
+            inputs_hash,
+            prompt_hash,
+            model_id,
+            output_json,
+            token_usage_json,
+            cost_usd,
+            latency_ms,
+            created_at,
+        ) in rows
+        {
+            let node_id = step_to_node
+                .get(&(step_name.clone(), chunk_index, depth))
+                .cloned()
+                .unwrap_or_else(|| format!("synth:L{depth}:C{chunk_index}"));
+
+            let entry = nodes_by_id
+                .entry(node_id.clone())
+                .or_insert_with(|| ImportNodeEntry {
+                    node_id: node_id.clone(),
+                    layer: depth,
+                    source_path: None,
+                    source_hash: None,
+                    source_size_bytes: None,
+                    derived_from: Vec::new(),
+                    cache_entries: Vec::new(),
+                });
+
+            // Populate L0 source metadata from the file hashes map.
+            if depth == 0 && entry.source_path.is_none() {
+                if let Some((path, hash, size)) = node_to_source.get(&node_id) {
+                    entry.source_path = Some(path.clone());
+                    entry.source_hash = Some(format!("sha256:{hash}"));
+                    entry.source_size_bytes = *size;
+                }
+            }
+
+            // Populate upper-layer derived_from from the evidence map.
+            if depth > 0 && entry.derived_from.is_empty() {
+                if let Some(sources) = target_to_sources.get(&node_id) {
+                    entry.derived_from = sources.clone();
+                }
+            }
+
+            entry.cache_entries.push(ImportedCacheEntry {
+                step_name,
+                chunk_index: Some(chunk_index),
+                depth: Some(depth),
+                cache_key,
+                inputs_hash,
+                prompt_hash,
+                model_id,
+                output_json,
+                token_usage_json,
+                cost_usd,
+                latency_ms,
+                created_at: Some(created_at),
+            });
+        }
+
+        // Sort nodes by (layer, node_id) for deterministic output.
+        let mut nodes: Vec<ImportNodeEntry> = nodes_by_id.into_values().collect();
+        nodes.sort_by(|a, b| {
+            a.layer
+                .cmp(&b.layer)
+                .then_with(|| a.node_id.cmp(&b.node_id))
+        });
+
+        Ok(CacheManifest {
+            manifest_version: 1,
+            source_pyramid_id: wire_pyramid_id.to_string(),
+            exported_at: chrono::Utc::now().to_rfc3339(),
+            nodes,
+        })
+    }
+}
+
 // ─── Tests ───────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1633,5 +1967,302 @@ mod tests {
         assert!(!teaser.contains("{"));
         assert!(!teaser.contains("\"depth\""));
         assert!(teaser.contains("Headline"));
+    }
+
+    // ── Phase 7: export_cache_manifest privacy gate + round-trip ────────────
+
+    use crate::pyramid::db::init_pyramid_db;
+    use crate::pyramid::step_context::{compute_cache_key, CacheEntry};
+
+    fn mem_pyramid_conn() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        init_pyramid_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO pyramid_slugs (slug, content_type, source_path)
+             VALUES ('exp-slug', 'document', '')",
+            [],
+        )
+        .unwrap();
+        conn
+    }
+
+    fn seed_cache_row(
+        conn: &rusqlite::Connection,
+        slug: &str,
+        step_name: &str,
+        chunk_index: i64,
+        depth: i64,
+        seed: &str,
+    ) -> String {
+        let inputs_hash = format!("inputs:{seed}");
+        let prompt_hash = format!("prompt:{seed}");
+        let model_id = "openrouter/test-1".to_string();
+        let cache_key = compute_cache_key(&inputs_hash, &prompt_hash, &model_id);
+        let entry = CacheEntry {
+            slug: slug.to_string(),
+            build_id: "b1".to_string(),
+            step_name: step_name.to_string(),
+            chunk_index,
+            depth,
+            cache_key: cache_key.clone(),
+            inputs_hash,
+            prompt_hash,
+            model_id,
+            output_json: serde_json::json!({"content":"hello"}).to_string(),
+            token_usage_json: Some("{}".to_string()),
+            cost_usd: Some(0.001),
+            latency_ms: Some(10),
+            force_fresh: false,
+            supersedes_cache_id: None,
+        };
+        crate::pyramid::db::store_cache(conn, &entry).unwrap();
+        cache_key
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_export_cache_manifest_privacy_gate_default_off() {
+        // Phase 7 default: export returns None unless the caller explicitly
+        // opts in via include_cache = true. This is the Phase 7 safety net —
+        // Phase 10's publish wizard will add the opt-in checkbox with
+        // warnings.
+        let conn = mem_pyramid_conn();
+        seed_cache_row(&conn, "exp-slug", "source_extract", 0, 0, "row-1");
+
+        let publisher = PyramidPublisher::new(
+            "https://dry-run.invalid".to_string(),
+            String::new(),
+        );
+
+        let result = publisher
+            .export_cache_manifest(&conn, "exp-slug", "wire:exp", None, false)
+            .await
+            .unwrap();
+        assert!(
+            result.is_none(),
+            "expected None with include_cache=false per Phase 7 default"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_export_cache_manifest_opt_in_returns_manifest() {
+        // Opt-in path: caller explicitly passes include_cache = true. The
+        // manifest should enumerate cached rows grouped by node_id (or
+        // synthetic IDs where no pipeline step ties the row to a node).
+        let conn = mem_pyramid_conn();
+        let k1 = seed_cache_row(&conn, "exp-slug", "source_extract", 0, 0, "row-1");
+        let k2 = seed_cache_row(&conn, "exp-slug", "cluster_synthesize", -1, 1, "row-2");
+
+        let publisher = PyramidPublisher::new(
+            "https://dry-run.invalid".to_string(),
+            String::new(),
+        );
+
+        let manifest = publisher
+            .export_cache_manifest(&conn, "exp-slug", "wire:exp", None, true)
+            .await
+            .unwrap()
+            .expect("opt-in should yield Some(manifest)");
+
+        assert_eq!(manifest.manifest_version, 1);
+        assert_eq!(manifest.source_pyramid_id, "wire:exp");
+        assert_eq!(manifest.nodes.len(), 2, "expected 2 node entries");
+
+        // Each node should carry exactly one cache entry. Their cache_keys
+        // should match what we seeded.
+        let cache_keys: Vec<String> = manifest
+            .nodes
+            .iter()
+            .flat_map(|n| n.cache_entries.iter().map(|e| e.cache_key.clone()))
+            .collect();
+        assert!(cache_keys.contains(&k1));
+        assert!(cache_keys.contains(&k2));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_export_cache_manifest_empty_slug_returns_empty_nodes() {
+        // Opt-in but zero cached rows → Some(empty manifest). The caller
+        // can distinguish "withheld for privacy" (None) from "empty by
+        // construction" (Some with no nodes).
+        let conn = mem_pyramid_conn();
+
+        let publisher = PyramidPublisher::new(
+            "https://dry-run.invalid".to_string(),
+            String::new(),
+        );
+
+        let manifest = publisher
+            .export_cache_manifest(&conn, "exp-slug", "wire:exp", None, true)
+            .await
+            .unwrap()
+            .expect("opt-in should always return Some");
+        assert_eq!(manifest.manifest_version, 1);
+        assert_eq!(manifest.nodes.len(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_export_cache_manifest_filters_by_build_id_when_set() {
+        let conn = mem_pyramid_conn();
+        // Seed two rows with different build_ids via direct store_cache
+        // calls (the helper uses build_id = "b1").
+        seed_cache_row(&conn, "exp-slug", "source_extract", 0, 0, "r1");
+
+        // Insert a second entry manually under a different build_id.
+        let inputs_hash = "inputs:r2".to_string();
+        let prompt_hash = "prompt:r2".to_string();
+        let model_id = "openrouter/test-1".to_string();
+        let cache_key = compute_cache_key(&inputs_hash, &prompt_hash, &model_id);
+        let entry = CacheEntry {
+            slug: "exp-slug".to_string(),
+            build_id: "b2".to_string(),
+            step_name: "source_extract".to_string(),
+            chunk_index: 1,
+            depth: 0,
+            cache_key,
+            inputs_hash,
+            prompt_hash,
+            model_id,
+            output_json: serde_json::json!({"content":"hi"}).to_string(),
+            token_usage_json: None,
+            cost_usd: None,
+            latency_ms: None,
+            force_fresh: false,
+            supersedes_cache_id: None,
+        };
+        crate::pyramid::db::store_cache(&conn, &entry).unwrap();
+
+        let publisher = PyramidPublisher::new(
+            "https://dry-run.invalid".to_string(),
+            String::new(),
+        );
+
+        // Filter by build_id = b1 → one entry.
+        let manifest_b1 = publisher
+            .export_cache_manifest(&conn, "exp-slug", "wire:exp", Some("b1"), true)
+            .await
+            .unwrap()
+            .unwrap();
+        let total_entries_b1: usize = manifest_b1
+            .nodes
+            .iter()
+            .map(|n| n.cache_entries.len())
+            .sum();
+        assert_eq!(total_entries_b1, 1, "b1 should yield 1 cache entry");
+
+        // No filter → both entries.
+        let manifest_all = publisher
+            .export_cache_manifest(&conn, "exp-slug", "wire:exp", None, true)
+            .await
+            .unwrap()
+            .unwrap();
+        let total_entries_all: usize = manifest_all
+            .nodes
+            .iter()
+            .map(|n| n.cache_entries.len())
+            .sum();
+        assert_eq!(total_entries_all, 2, "no build filter should yield 2 entries");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_export_cache_manifest_excludes_archived_rows() {
+        // Supersession archives a row by rewriting its cache_key to
+        // `archived:{id}:{orig}`. Archived rows must NOT appear in the
+        // exported manifest.
+        let conn = mem_pyramid_conn();
+        let key = seed_cache_row(&conn, "exp-slug", "source_extract", 0, 0, "orig");
+
+        // Manually move the row to an archival key to simulate a
+        // supersession that happened in the past.
+        conn.execute(
+            "UPDATE pyramid_step_cache
+             SET cache_key = 'archived:1:' || ?1
+             WHERE slug = 'exp-slug' AND cache_key = ?1",
+            rusqlite::params![key],
+        )
+        .unwrap();
+
+        let publisher = PyramidPublisher::new(
+            "https://dry-run.invalid".to_string(),
+            String::new(),
+        );
+
+        let manifest = publisher
+            .export_cache_manifest(&conn, "exp-slug", "wire:exp", None, true)
+            .await
+            .unwrap()
+            .unwrap();
+        let total_entries: usize = manifest
+            .nodes
+            .iter()
+            .map(|n| n.cache_entries.len())
+            .sum();
+        assert_eq!(total_entries, 0, "archived rows should not appear in manifest");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_export_then_import_round_trip() {
+        // Full pipeline: seed a cache → export → import into a FRESH slug
+        // in the same DB → verify the exported rows land under the new
+        // slug.
+        let conn = mem_pyramid_conn();
+        // Populate cache rows for the source slug.
+        seed_cache_row(&conn, "exp-slug", "source_extract", 0, 0, "r1");
+        seed_cache_row(&conn, "exp-slug", "cluster_synthesize", -1, 1, "r2");
+
+        let publisher = PyramidPublisher::new(
+            "https://dry-run.invalid".to_string(),
+            String::new(),
+        );
+
+        let manifest = publisher
+            .export_cache_manifest(&conn, "exp-slug", "wire:exp", None, true)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Prepare a temp dir with no source files — the L0 nodes will all
+        // mark stale, which is fine because synthetic L0s built from
+        // cache-only rows don't have real source paths.
+        let tempdir = tempfile::TempDir::new().unwrap();
+
+        // Create the target slug.
+        conn.execute(
+            "INSERT INTO pyramid_slugs (slug, content_type, source_path)
+             VALUES ('imp-slug', 'document', '')",
+            [],
+        )
+        .unwrap();
+
+        // Populate from import: since the exported manifest's nodes have
+        // synthetic ids with no source_path, every L0 is marked stale.
+        // The interesting assertion here is that re-import is idempotent
+        // even if the staleness set is non-trivial, AND that the
+        // populate path doesn't panic on synthetic-id nodes.
+        let report = crate::pyramid::pyramid_import::populate_from_import(
+            &conn,
+            &manifest,
+            "imp-slug",
+            tempdir.path(),
+        )
+        .unwrap();
+
+        // Both L0 entries are stale because synthetic nodes lack source
+        // paths. The upper-layer entry gets dropped because its synthetic
+        // parent dependency graph is empty (the upper node has no
+        // derived_from). Total valid = 1 (the upper-layer node with
+        // empty derived_from was NOT in the stale set).
+        // Exact counts depend on the synthetic-id shape; what matters is
+        // that the function succeeds and the total rows in pyramid_step_cache
+        // for 'imp-slug' == report.cache_entries_valid.
+        let imp_row_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pyramid_step_cache WHERE slug = 'imp-slug'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            imp_row_count as u64, report.cache_entries_valid,
+            "imp-slug cache row count must match report.cache_entries_valid"
+        );
     }
 }

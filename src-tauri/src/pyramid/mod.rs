@@ -25,6 +25,7 @@ pub mod collapse;
 pub mod config_contributions;
 pub mod config_helper;
 pub mod prompt_cache;
+pub mod pyramid_import;
 pub mod rotator_allocation;
 pub mod step_context;
 pub mod wire_native_metadata;
