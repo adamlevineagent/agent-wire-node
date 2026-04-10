@@ -2723,6 +2723,16 @@ pub fn mutate_provisional_node(
 //   2. It explicitly updates `pyramid_evidence.source_node_id` rows for
 //      children_swapped entries, so the evidence graph stays consistent with
 //      the new children list on the updated node.
+//
+// NOTE on immutability enforcement: `apply_supersession` enforces
+// WS-IMMUTABILITY-ENFORCE (depth <= 1 && !provisional rejects mutation).
+// `update_node_in_place` deliberately does NOT apply that check — the
+// immutability invariant exists for Wire publication (the pyramid is a
+// snapshot at publish time), not for local refresh. DADBEAR-driven
+// file_change supersession (the primary depth==0 use case) needs to mutate
+// local L0 nodes in place so files stay in sync with the live filesystem
+// as the user edits. Dropping the guard here is the correct semantic for
+// the local-node use case.
 
 /// Apply a LLM-produced change manifest to a live pyramid node in place,
 /// without creating a new node ID. Same ID, bumped `build_version`, prior
@@ -2739,8 +2749,8 @@ pub fn mutate_provisional_node(
 ///     - replaces `old` with `new` in the node's `children` JSON array
 ///     - UPDATEs `pyramid_evidence` rows where `source_node_id = old AND
 ///       target_node_id = node_id` to point at `new`.
-/// - `build_id` — recorded on the snapshot row for audit.
-/// - `supersession_reason` — e.g. "stale_refresh", "reroll".
+/// - `supersession_reason` — e.g. "stale_refresh", "reroll". Recorded on
+///   the pyramid_node_versions snapshot row.
 ///
 /// Returns the new `build_version` after the bump.
 pub fn update_node_in_place(
@@ -2749,7 +2759,6 @@ pub fn update_node_in_place(
     node_id: &str,
     updates: &super::types::ContentUpdates,
     children_swapped: &[(String, String)],
-    build_id: &str,
     supersession_reason: &str,
 ) -> Result<i64> {
     use super::types::ContentUpdates;
@@ -3010,12 +3019,6 @@ pub fn update_node_in_place(
                 )?;
             }
         }
-
-        // Log a no-op reference to build_id so the parameter is used even
-        // when children_swapped is empty. (build_id is carried into the
-        // snapshot above — this line exists purely to silence unused-var
-        // lints in the release build with no children_swapped.)
-        let _ = build_id;
 
         // 8. Return the new build_version.
         let new_bv: i64 = conn.query_row(

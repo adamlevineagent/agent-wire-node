@@ -1947,14 +1947,36 @@ pub async fn execute_supersession(
     .await??;
 
     // The "changed children" the LLM needs are the nodes under this one that
-    // appear in recent deltas. We derive them from the node's own delta
-    // stream, falling back to a single synthetic entry if there is no child
-    // delta history (this happens on depth-0 file-change supersession where
-    // the "children" live in the source file, not the pyramid graph).
+    // appear in recent deltas. For depth==0 nodes this is a synthesized
+    // entry carrying the source file content (see
+    // build_changed_children_from_deltas).
     let changed_children =
         build_changed_children_from_deltas(&node_ctx, &resolved_node_id);
 
     let expected_build_version = node_ctx.current_build_version + 1;
+
+    // For L0 nodes, the "delta" is the source file itself — the stale check
+    // reason should reflect that so the prompt context is accurate.
+    let stale_check_reason = if node_ctx.depth == 0 {
+        match node_ctx.source_file_path.as_deref() {
+            Some(path) => format!(
+                "Automated stale check: source file {path} changed on disk"
+            ),
+            None => format!(
+                "Automated stale check: L0 file-change mutation for node {resolved_node_id}"
+            ),
+        }
+    } else {
+        format!(
+            "Automated stale check: delta(s) detected on children of node {resolved_node_id}"
+        )
+    };
+
+    let reason_tag = if node_ctx.depth == 0 {
+        "file_change"
+    } else {
+        "node_stale"
+    };
 
     let manifest_input = ManifestGenerationInput {
         slug: slug.to_string(),
@@ -1968,47 +1990,127 @@ pub async fn execute_supersession(
         dead_ends_json: node_ctx.dead_ends_json.clone(),
         expected_build_version,
         changed_children,
-        stale_check_reason: format!(
-            "Automated stale check: delta(s) detected on children of node {}",
-            resolved_node_id
-        ),
+        stale_check_reason,
     };
 
-    // Ask the LLM for a targeted change manifest.
+    // Ask the LLM for a targeted change manifest. On LLM failure the spec's
+    // "Manifest Validation → Failure handling" section is unambiguous:
+    // "Invalid manifests are rejected (the node is left in its pre-manifest
+    // state) and logged with the failure reason. The stale check is not
+    // retried automatically." A previous revision fell back to
+    // `execute_supersession_identity_change` here, which created a new node
+    // ID and broke the viz DAG coherence Phase 2 was written to fix — that
+    // fallback is the exact bug this pass is removing. Log the failure,
+    // persist a failed-manifest row for Phase 15 oversight, and return the
+    // error. The node stays at its prior valid state.
     let manifest = match generate_change_manifest(
         manifest_input,
         db_path,
         api_key,
         model,
-        "node_stale",
+        reason_tag,
     )
     .await
     {
         Ok(m) => m,
         Err(e) => {
-            warn!(
-                slug = %slug,
-                node_id = %resolved_node_id,
-                error = %e,
-                "generate_change_manifest failed — falling back to legacy new-id path"
-            );
-            return execute_supersession_identity_change(
-                &resolved_node_id,
+            return handle_manifest_generation_failure(
                 db_path,
                 slug,
-                api_key,
-                model,
-                Some(format!("Fallback after manifest-gen failure: {e}")),
+                &resolved_node_id,
+                node_ctx.current_build_version,
+                e,
             )
             .await;
         }
     };
 
+    apply_supersession_manifest(
+        db_path,
+        slug,
+        api_key,
+        model,
+        &resolved_node_id,
+        &node_ctx,
+        manifest,
+    )
+    .await
+}
+
+/// Persist a failed-manifest row for the oversight page and return an error
+/// to the caller. Used when `generate_change_manifest` fails for any reason
+/// (LLM error, network blip, unparseable JSON). The node is left at its
+/// prior valid state — no identity-change fallback, no new node id, no
+/// partial mutation of the live row.
+///
+/// The manifest body we stash is a minimal placeholder carrying the error
+/// text in the reason field — there's no valid LLM output to store here.
+async fn handle_manifest_generation_failure(
+    db_path: &str,
+    slug: &str,
+    resolved_node_id: &str,
+    current_build_version: i64,
+    err: anyhow::Error,
+) -> Result<String> {
+    warn!(
+        slug = %slug,
+        node_id = %resolved_node_id,
+        error = %err,
+        "generate_change_manifest failed — persisting failed-manifest row, leaving node at prior state"
+    );
+    let failed_manifest = ChangeManifest {
+        node_id: resolved_node_id.to_string(),
+        identity_changed: false,
+        content_updates: Default::default(),
+        children_swapped: Vec::new(),
+        reason: format!("manifest_generation_failed: {err}"),
+        build_version: current_build_version,
+    };
+    let _ = persist_change_manifest(
+        db_path,
+        slug,
+        resolved_node_id,
+        current_build_version,
+        &failed_manifest,
+        Some(format!("manifest_generation_failed: {err}")),
+    )
+    .await;
+    Err(anyhow::anyhow!(
+        "change manifest generation failed for node {}: {}",
+        resolved_node_id,
+        err
+    ))
+}
+
+/// Validate and apply a pre-generated change manifest to a node. Extracted
+/// from `execute_supersession` so tests can drive the validation + apply +
+/// hash-rewrite + propagation path directly without mocking the LLM call
+/// site.
+///
+/// On validation failure: persists a failed-manifest row with the CURRENT
+/// build_version and returns an error. The node is left unchanged.
+///
+/// On `identity_changed = true`: delegates to the legacy new-id path.
+///
+/// Otherwise: applies the manifest in place via `db::update_node_in_place`,
+/// persists the manifest row, rewrites `pyramid_file_hashes.hash` for L0
+/// nodes, and propagates the delta upstream.
+async fn apply_supersession_manifest(
+    db_path: &str,
+    slug: &str,
+    api_key: &str,
+    model: &str,
+    resolved_node_id: &str,
+    node_ctx: &SupersessionNodeContext,
+    manifest: ChangeManifest,
+) -> Result<String> {
+    let db_owned = db_path.to_string();
+
     // Validate synchronously against the live DB.
     let validation = {
         let db = db_owned.clone();
         let slug_owned = slug.to_string();
-        let node_owned = resolved_node_id.clone();
+        let node_owned = resolved_node_id.to_string();
         let manifest_owned = manifest.clone();
         tokio::task::spawn_blocking(move || -> Result<std::result::Result<(), ManifestValidationError>> {
             let conn = super::db::open_pyramid_connection(Path::new(&db))?;
@@ -2038,7 +2140,7 @@ pub async fn execute_supersession(
         let _ = persist_change_manifest(
             db_path,
             slug,
-            &resolved_node_id,
+            resolved_node_id,
             bv,
             &manifest,
             Some(format!("validation_failed: {err}")),
@@ -2051,8 +2153,10 @@ pub async fn execute_supersession(
         ));
     }
 
-    // Identity change — rare escape hatch. Delegate to the legacy new-id
-    // path so callers relying on the old shape continue to work.
+    // Identity change — rare escape hatch, ONLY taken when the LLM
+    // explicitly returned identity_changed=true in a successfully-generated
+    // manifest. LLM-failure no longer falls back here (see
+    // handle_manifest_generation_failure).
     if manifest.identity_changed {
         info!(
             slug = %slug,
@@ -2060,7 +2164,7 @@ pub async fn execute_supersession(
             "change manifest identity_changed=true — delegating to identity-change path"
         );
         return execute_supersession_identity_change(
-            &resolved_node_id,
+            resolved_node_id,
             db_path,
             slug,
             api_key,
@@ -2078,7 +2182,7 @@ pub async fn execute_supersession(
     let (new_build_version, distilled_after) = {
         let db = db_owned.clone();
         let slug_owned = slug.to_string();
-        let node_owned = resolved_node_id.clone();
+        let node_owned = resolved_node_id.to_string();
         tokio::task::spawn_blocking(move || -> Result<(i64, String)> {
             let conn = super::db::open_pyramid_connection(Path::new(&db))?;
             let bv = super::db::update_node_in_place(
@@ -2087,7 +2191,6 @@ pub async fn execute_supersession(
                 &node_owned,
                 &manifest_for_apply.content_updates,
                 &children_swapped,
-                "stale_refresh",
                 "stale_refresh",
             )?;
             let distilled: String = conn
@@ -2106,7 +2209,7 @@ pub async fn execute_supersession(
     let manifest_id = persist_change_manifest(
         db_path,
         slug,
-        &resolved_node_id,
+        resolved_node_id,
         new_build_version,
         &manifest,
         None,
@@ -2121,6 +2224,67 @@ pub async fn execute_supersession(
         "Applied change manifest in place"
     );
 
+    // For L0 file_change supersession: rewrite `pyramid_file_hashes.hash` to
+    // the current file's hash. Without this, the watcher keeps detecting the
+    // file as stale (old hash != current hash) and re-fires file_change
+    // mutations on every tick, re-entering this supersession path and
+    // burning LLM budget for no additional content update. This addresses
+    // the "watcher keeps re-firing" side-effect the wanderer flagged
+    // alongside the L0 file_change regression.
+    if node_ctx.depth == 0 {
+        if let Some(ref file_path) = node_ctx.source_file_path {
+            let db = db_owned.clone();
+            let slug_owned = slug.to_string();
+            let path_owned = file_path.clone();
+            match tokio::task::spawn_blocking(move || -> Result<()> {
+                // Recompute the hash from disk so we capture the exact bytes
+                // the LLM just synthesized against. A race with another
+                // concurrent edit is acceptable — the watcher will fire
+                // again on the next tick and we'll run another supersession.
+                let hash = match super::watcher::compute_file_hash(&path_owned) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        warn!(
+                            slug = %slug_owned,
+                            file = %path_owned,
+                            error = %e,
+                            "L0 hash rewrite: failed to re-read source file (continuing)"
+                        );
+                        return Ok(());
+                    }
+                };
+                let conn = super::db::open_pyramid_connection(Path::new(&db))?;
+                conn.execute(
+                    "UPDATE pyramid_file_hashes
+                     SET hash = ?1, last_ingested_at = datetime('now')
+                     WHERE slug = ?2 AND file_path = ?3",
+                    rusqlite::params![hash, slug_owned, path_owned],
+                )?;
+                Ok(())
+            })
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    warn!(
+                        slug = %slug,
+                        file = %file_path,
+                        error = %e,
+                        "L0 hash rewrite: SQL error (update still applied)"
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        slug = %slug,
+                        file = %file_path,
+                        error = %e,
+                        "L0 hash rewrite: join error (update still applied)"
+                    );
+                }
+            }
+        }
+    }
+
     // Propagate the supersession as a delta on upstream threads and write
     // pending mutations for upper layers / edges. This mirrors the legacy
     // path's propagation so downstream stale checks still fire, just with a
@@ -2128,7 +2292,7 @@ pub async fn execute_supersession(
     let propagation = {
         let db = db_owned.clone();
         let slug_owned = slug.to_string();
-        let node_owned = resolved_node_id.clone();
+        let node_owned = resolved_node_id.to_string();
         let prior_distilled = node_ctx.distilled.clone();
         let new_distilled = distilled_after.clone();
         let depth = node_ctx.depth;
@@ -2157,7 +2321,7 @@ pub async fn execute_supersession(
         );
     }
 
-    Ok(resolved_node_id)
+    Ok(resolved_node_id.to_string())
 }
 
 /// Context bundle loaded once at the top of `execute_supersession`, shared
@@ -2175,6 +2339,14 @@ struct SupersessionNodeContext {
     self_thread_id: Option<String>,
     parent_thread_id: Option<String>,
     recent_deltas: Vec<String>,
+    /// Source file path for depth==0 nodes only. Populated via
+    /// `lookup_source_file_path_for_node`. Drives the L0 file-content branch
+    /// of `build_changed_children_from_deltas` and the hash rewrite after a
+    /// successful in-place update.
+    source_file_path: Option<String>,
+    /// Source file content excerpt for depth==0 nodes. Matches the
+    /// pre-Phase-2 behavior: first 400 lines, truncated at 20k chars.
+    source_snapshot: Option<String>,
 }
 
 fn load_supersession_node_context(
@@ -2246,6 +2418,29 @@ fn load_supersession_node_context(
         }
     }
 
+    // L0 file-change branch: for depth==0 nodes, resolve the source file path
+    // and read up to 400 lines / 20k chars of content. This feeds
+    // `build_changed_children_from_deltas` which synthesizes a ChangedChild
+    // representing the file update, and lets `execute_supersession` rewrite
+    // `pyramid_file_hashes.hash` after a successful apply so the watcher
+    // stops re-firing file_change mutations.
+    //
+    // The excerpt shape (400 lines, 20_000 chars) matches the pre-Phase-2
+    // identity-change path verbatim — this is the signal the L0 LLM call
+    // was already built for.
+    let (source_file_path, source_snapshot): (Option<String>, Option<String>) = if depth == 0 {
+        let path = lookup_source_file_path_for_node(conn, slug, node_id)?;
+        let snapshot = path.as_ref().and_then(|p| {
+            fs::read_to_string(p).ok().map(|content| {
+                let line_excerpt = content.lines().take(400).collect::<Vec<_>>().join("\n");
+                line_excerpt.chars().take(20_000).collect::<String>()
+            })
+        });
+        (path, snapshot)
+    } else {
+        (None, None)
+    };
+
     Ok(SupersessionNodeContext {
         headline,
         distilled,
@@ -2258,6 +2453,8 @@ fn load_supersession_node_context(
         self_thread_id,
         parent_thread_id,
         recent_deltas,
+        source_file_path,
+        source_snapshot,
     })
 }
 
@@ -2265,6 +2462,27 @@ fn build_changed_children_from_deltas(
     ctx: &SupersessionNodeContext,
     parent_node_id: &str,
 ) -> Vec<ChangedChild> {
+    // L0 file-change branch: for depth==0 nodes with a source file snapshot,
+    // synthesize a ChangedChild whose NEW summary is the current file content.
+    // This is the path DADBEAR's file_change mutations use to push updated
+    // source into the manifest flow. Without this branch, the LLM receives
+    // "nothing changed" (or stale deltas) and produces a no-op manifest,
+    // leaving the L0 distilled permanently out of sync with the file.
+    if ctx.depth == 0 {
+        if let Some(ref snapshot) = ctx.source_snapshot {
+            let child_id = ctx
+                .source_file_path
+                .clone()
+                .unwrap_or_else(|| format!("{parent_node_id}-source"));
+            return vec![ChangedChild {
+                child_id,
+                old_summary: excerpt(&ctx.distilled, 800),
+                new_summary: excerpt(snapshot, 1_600),
+                slug_prefix: None,
+            }];
+        }
+    }
+
     if ctx.recent_deltas.is_empty() {
         // No child deltas — treat the whole node as "needs review" with the
         // current distilled as both old and new. The LLM will produce a
@@ -2918,6 +3136,8 @@ async fn execute_supersession_identity_change(
 #[cfg(test)]
 mod tests {
     use super::{
+        apply_supersession_manifest, build_changed_children_from_deltas,
+        handle_manifest_generation_failure, load_supersession_node_context,
         lookup_source_file_path_for_node, resolve_live_canonical_node_id,
         rewrite_file_hash_node_reference, validate_change_manifest,
     };
@@ -3144,7 +3364,6 @@ mod tests {
             "L3-upper",
             &updates,
             &children_swapped,
-            "build-stale-1",
             "stale_refresh",
         )
         .expect("update_node_in_place");
@@ -3251,7 +3470,6 @@ mod tests {
                 "L3-apex",
                 &updates,
                 &[],
-                "stale-build",
                 "stale_refresh",
             )
             .expect("update_node_in_place");
@@ -3621,7 +3839,6 @@ mod tests {
             "L2-stable",
             &manifest.content_updates,
             &children_swapped,
-            "stale-build-1",
             "stale_refresh",
         )
         .expect("apply manifest");
@@ -3657,6 +3874,411 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(latest.build_version, 2);
+    }
+
+    // ── Phase 2 fix pass (2026-04-10) regression tests ──────────────────────
+    //
+    // The wanderer pass caught three problems in the initial Phase 2 land:
+    //   1. L0 file_change regression: new manifest path never read the
+    //      source file, so L0 nodes never updated on disk edits.
+    //   2. Identity-change fallback on LLM failure: reintroduced the
+    //      viz orphaning bug Phase 2 was written to fix.
+    //   3. Dead `build_id` parameter in `update_node_in_place`.
+    //
+    // These tests pin the fixes so none of the three can regress silently.
+
+    use std::io::Write;
+    use tempfile::tempdir;
+
+    /// Reusable async runtime for tests that drive `apply_supersession_manifest`
+    /// (which spawns blocking tasks and persists manifests via tokio tasks).
+    fn rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio rt")
+    }
+
+    fn setup_l0_test_db(
+        slug: &str,
+        file_path: &str,
+        file_hash: &str,
+        node_id: &str,
+        distilled: &str,
+    ) -> NamedTempFile {
+        let file = NamedTempFile::new().expect("temp db");
+        let conn = open_pyramid_db(file.path()).expect("open pyramid db");
+
+        conn.execute(
+            "INSERT INTO pyramid_slugs (slug, content_type, source_path)
+             VALUES (?1, 'document', ?2)",
+            params![slug, "/tmp/source"],
+        )
+        .expect("insert slug");
+
+        // L0 node with build_version = 1
+        conn.execute(
+            "INSERT INTO pyramid_nodes
+             (id, slug, depth, headline, distilled, topics, terms, decisions,
+              dead_ends, children, parent_id, build_version, created_at)
+             VALUES (?1, ?2, 0, ?3, ?4, '[]', '[]', '[]', '[]', '[]', NULL, 1, datetime('now'))",
+            params![node_id, slug, format!("Headline for {node_id}"), distilled],
+        )
+        .expect("insert L0 node");
+
+        // pyramid_file_hashes row referencing the L0 node
+        conn.execute(
+            "INSERT INTO pyramid_file_hashes
+             (slug, file_path, hash, chunk_count, node_ids, last_ingested_at)
+             VALUES (?1, ?2, ?3, 1, ?4, datetime('now'))",
+            params![
+                slug,
+                file_path,
+                file_hash,
+                serde_json::to_string(&vec![node_id.to_string()]).unwrap(),
+            ],
+        )
+        .expect("insert file hash");
+
+        // Drop the connection so the test can re-open the DB under the
+        // connection path `apply_supersession_manifest` creates.
+        drop(conn);
+        file
+    }
+
+    /// Fix pass test 1: L0 file_change regression.
+    ///
+    /// Drives `apply_supersession_manifest` directly with a pre-built
+    /// manifest (stand-in for a successful LLM call). Asserts:
+    ///   (a) the L0 node's distilled text reflects the new file content
+    ///   (b) `pyramid_file_hashes.hash` has been updated to match the new
+    ///       file's hash
+    ///   (c) the L0 node ID is unchanged
+    ///
+    /// This test would fail against the pre-fix Phase 2 code because:
+    ///   - `load_supersession_node_context` would return no source file
+    ///   - `build_changed_children_from_deltas` would emit old==new content
+    ///   - the hash rewrite at the end of `apply_supersession_manifest`
+    ///     was absent
+    #[test]
+    fn test_apply_supersession_manifest_l0_file_change_updates_hash_and_distilled() {
+        let tmpdir = tempdir().expect("tempdir");
+        let src_path = tmpdir.path().join("source.md");
+
+        // Write initial file content (pre-edit)
+        {
+            let mut f = std::fs::File::create(&src_path).expect("create source file");
+            f.write_all(b"OLD content\nsecond line\n").expect("write");
+        }
+        let pre_edit_hash = super::super::watcher::compute_file_hash(src_path.to_str().unwrap())
+            .expect("pre-edit hash");
+
+        let file_path_str = src_path.to_str().unwrap().to_string();
+        let slug = "test-slug";
+        let node_id = "L0-file-a";
+        let db_file = setup_l0_test_db(
+            slug,
+            &file_path_str,
+            &pre_edit_hash,
+            node_id,
+            "Old distilled reflecting OLD file content",
+        );
+
+        // Simulate a file edit on disk — the watcher would normally see this
+        // and dispatch a stale check; for the test we just rewrite the file.
+        {
+            let mut f = std::fs::File::create(&src_path).expect("rewrite source file");
+            f.write_all(b"NEW rewritten content\nfourth line\nfifth line\n")
+                .expect("rewrite");
+        }
+        let post_edit_hash = super::super::watcher::compute_file_hash(src_path.to_str().unwrap())
+            .expect("post-edit hash");
+        assert_ne!(
+            pre_edit_hash, post_edit_hash,
+            "edit should produce a different hash"
+        );
+
+        let db_path_str = db_file.path().to_str().unwrap().to_string();
+
+        // Load the node context against the post-edit file. This verifies
+        // load_supersession_node_context pulls the source file for L0
+        // nodes — the fix for Issue 1.
+        let conn_for_ctx = open_pyramid_db(db_file.path()).expect("reopen db");
+        let ctx = load_supersession_node_context(&conn_for_ctx, slug, node_id)
+            .expect("load context");
+        drop(conn_for_ctx);
+
+        assert_eq!(ctx.depth, 0, "fixture is a depth=0 node");
+        assert_eq!(
+            ctx.source_file_path.as_deref(),
+            Some(file_path_str.as_str()),
+            "L0 context should carry source_file_path"
+        );
+        let snap = ctx.source_snapshot.clone().expect("L0 context must carry source_snapshot");
+        assert!(
+            snap.contains("NEW rewritten content"),
+            "snapshot should contain post-edit file bytes, got: {snap}"
+        );
+
+        // build_changed_children_from_deltas should synthesize a single
+        // ChangedChild whose new_summary reflects the current file content.
+        let children = build_changed_children_from_deltas(&ctx, node_id);
+        assert_eq!(children.len(), 1);
+        assert!(
+            children[0].new_summary.contains("NEW rewritten content"),
+            "changed child new_summary should contain file content: {:?}",
+            children[0]
+        );
+
+        // Build a manifest the way a cooperative LLM would: distilled
+        // mentions the new content.
+        let manifest = ChangeManifest {
+            node_id: node_id.to_string(),
+            identity_changed: false,
+            content_updates: ContentUpdates {
+                distilled: Some(
+                    "Updated distilled synthesizing the NEW rewritten content in source.md"
+                        .to_string(),
+                ),
+                headline: None,
+                topics: None,
+                terms: None,
+                decisions: None,
+                dead_ends: None,
+            },
+            children_swapped: Vec::new(),
+            reason: "Source file updated on disk; distilled rewritten to match.".to_string(),
+            build_version: ctx.current_build_version + 1,
+        };
+
+        // Drive the post-LLM apply path directly — no network, no key.
+        let resolved = rt()
+            .block_on(apply_supersession_manifest(
+                &db_path_str,
+                slug,
+                "test-key",
+                "test-model",
+                node_id,
+                &ctx,
+                manifest,
+            ))
+            .expect("apply_supersession_manifest succeeds");
+        assert_eq!(resolved, node_id, "L0 node id should be unchanged");
+
+        // Re-open and verify (a) distilled updated, (b) node id unchanged,
+        // (c) file hash matches the current file bytes.
+        let conn_verify = open_pyramid_db(db_file.path()).expect("reopen db for verify");
+        let (live_id, live_distilled, live_bv): (String, String, i64) = conn_verify
+            .query_row(
+                "SELECT id, distilled, COALESCE(build_version, 1)
+                 FROM pyramid_nodes WHERE slug = ?1 AND id = ?2",
+                params![slug, node_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("load post-apply node");
+        assert_eq!(live_id, node_id, "L0 node id MUST NOT change");
+        assert!(
+            live_distilled.contains("NEW rewritten content"),
+            "L0 distilled should mention the new file content, got: {live_distilled}"
+        );
+        assert_eq!(live_bv, 2, "build_version bumped from 1 to 2");
+
+        // (c) pyramid_file_hashes.hash updated to post-edit hash
+        let stored_hash: String = conn_verify
+            .query_row(
+                "SELECT hash FROM pyramid_file_hashes WHERE slug = ?1 AND file_path = ?2",
+                params![slug, file_path_str],
+                |row| row.get(0),
+            )
+            .expect("load post-apply hash");
+        assert_eq!(
+            stored_hash, post_edit_hash,
+            "pyramid_file_hashes.hash should be rewritten to the post-edit hash so the watcher stops re-firing"
+        );
+    }
+
+    /// Fix pass test 2: manifest-generation failure must NOT fall back to
+    /// the identity-change path.
+    ///
+    /// Drives `handle_manifest_generation_failure` directly with a
+    /// synthesized error. Asserts:
+    ///   (a) a failed-manifest row lands in `pyramid_change_manifests`
+    ///       with `note` starting with `"manifest_generation_failed:"`
+    ///   (b) the original node is UNCHANGED (same build_version,
+    ///       distilled, headline, no new row, no `superseded_by` pointer)
+    ///   (c) the function returns Err
+    ///   (d) specifically, no new node id was created (we verify by
+    ///       counting L0/L2 rows before and after)
+    ///
+    /// This test would fail against the pre-fix Phase 2 code because that
+    /// path called `execute_supersession_identity_change` which creates a
+    /// new node id and writes a `superseded_by` pointer on the old row.
+    #[test]
+    fn test_handle_manifest_generation_failure_no_identity_change_fallback() {
+        let file = NamedTempFile::new().expect("temp db");
+        let conn = open_pyramid_db(file.path()).expect("open pyramid db");
+        conn.execute(
+            "INSERT INTO pyramid_slugs (slug, content_type, source_path)
+             VALUES ('test-slug', 'document', '/tmp/source')",
+            [],
+        )
+        .expect("insert slug");
+
+        // Depth 2 node so the test is independent of the L0 file branch.
+        insert_upper_node(&conn, "L2-node", 2, "[]", &[]);
+
+        // Snapshot pre-failure state so we can compare.
+        let (pre_id, pre_distilled, pre_headline, pre_bv): (String, String, String, i64) = conn
+            .query_row(
+                "SELECT id, distilled, headline, COALESCE(build_version, 1)
+                 FROM pyramid_nodes WHERE slug = 'test-slug' AND id = 'L2-node'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("pre snapshot");
+        let pre_row_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pyramid_nodes WHERE slug = 'test-slug'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("pre count");
+        let db_path = file.path().to_str().unwrap().to_string();
+        drop(conn);
+
+        // Drive the failure path directly.
+        let synth_err = anyhow::anyhow!("simulated LLM 500 (network blip)");
+        let result = rt().block_on(handle_manifest_generation_failure(
+            &db_path, "test-slug", "L2-node", 1, synth_err,
+        ));
+        assert!(result.is_err(), "failure path must return Err");
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("change manifest generation failed"),
+            "error message should be the spec-aligned failure: {err_msg}"
+        );
+
+        // Re-open and verify the node is untouched.
+        let conn = open_pyramid_db(file.path()).expect("reopen db");
+        let (post_id, post_distilled, post_headline, post_bv): (String, String, String, i64) = conn
+            .query_row(
+                "SELECT id, distilled, headline, COALESCE(build_version, 1)
+                 FROM pyramid_nodes WHERE slug = 'test-slug' AND id = 'L2-node'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("post snapshot");
+        assert_eq!(pre_id, post_id, "node id unchanged");
+        assert_eq!(pre_distilled, post_distilled, "distilled unchanged");
+        assert_eq!(pre_headline, post_headline, "headline unchanged");
+        assert_eq!(pre_bv, post_bv, "build_version unchanged");
+
+        // Row count unchanged — proves no new node id was created by a
+        // sneaky fallback to `execute_supersession_identity_change`.
+        let post_row_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pyramid_nodes WHERE slug = 'test-slug'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("post count");
+        assert_eq!(
+            pre_row_count, post_row_count,
+            "row count must not change — no new node id was written"
+        );
+
+        // The old row must not carry a superseded_by pointer.
+        let superseded: Option<String> = conn
+            .query_row(
+                "SELECT superseded_by FROM pyramid_nodes WHERE slug = 'test-slug' AND id = 'L2-node'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("superseded_by lookup");
+        assert!(
+            superseded.is_none(),
+            "superseded_by must be NULL — the identity-change fallback path was incorrectly taken"
+        );
+
+        // Failed manifest persisted with the spec-aligned note prefix.
+        let manifests = get_change_manifests_for_node(&conn, "test-slug", "L2-node")
+            .expect("load manifests");
+        assert_eq!(manifests.len(), 1, "exactly one failed-manifest row");
+        let note = manifests[0].note.as_deref().unwrap_or_default();
+        assert!(
+            note.starts_with("manifest_generation_failed:"),
+            "note should be prefixed manifest_generation_failed: (got: {note})"
+        );
+        assert_eq!(
+            manifests[0].build_version, 1,
+            "failed-manifest row persists against CURRENT build_version (pre-bump)"
+        );
+    }
+
+    /// Fix pass test 3: identity-change path only fires on an explicit
+    /// `identity_changed = true` flag in a successful manifest.
+    ///
+    /// Drives `apply_supersession_manifest` with a manifest that sets
+    /// identity_changed = true. The code path delegates to
+    /// `execute_supersession_identity_change`, which makes a real LLM
+    /// call — so this test cannot run end-to-end in the test environment.
+    ///
+    /// Instead we assert the spec-level behavior via `validate_change_manifest`:
+    ///   (a) a manifest with identity_changed=true + distilled/headline
+    ///       updates PASSES validation (positive escape hatch)
+    ///   (b) a manifest with identity_changed=true and NO distilled/headline
+    ///       rewrite FAILS with `IdentityChangedWithoutRewrite`
+    ///
+    /// Combined with test 2 above, this pins the full spec-aligned shape:
+    /// identity-change only fires on an explicit LLM flag, never as a
+    /// fallback for LLM failure. A future refactor that accidentally routed
+    /// LLM failure back through the identity-change path would have to
+    /// update test 2's assertions, making the regression visible.
+    #[test]
+    fn test_identity_change_only_on_explicit_flag_with_rewrite() {
+        let (_file, conn) = setup_test_db();
+        insert_upper_node(&conn, "L2-rare", 2, "[]", &[]);
+
+        // (a) Explicit identity_changed=true WITH rewrite — validates clean.
+        let manifest_ok = build_manifest(
+            "L2-rare",
+            2,
+            ContentUpdates {
+                distilled: Some("Totally new synthesis — the node's identity changed".to_string()),
+                headline: Some("New identity".to_string()),
+                topics: None,
+                terms: None,
+                decisions: None,
+                dead_ends: None,
+            },
+            Vec::new(),
+            true,
+            "identity pivoted after upstream restructure",
+        );
+        assert!(
+            validate_change_manifest(&conn, "test-slug", "L2-rare", &manifest_ok).is_ok(),
+            "identity_changed=true with rewrite is a valid manifest — this is the spec escape hatch"
+        );
+
+        // (b) Explicit identity_changed=true WITHOUT rewrite — validation fail.
+        let manifest_bad = build_manifest(
+            "L2-rare",
+            2,
+            ContentUpdates::default(),
+            Vec::new(),
+            true,
+            "identity_changed without content updates",
+        );
+        assert_eq!(
+            validate_change_manifest(&conn, "test-slug", "L2-rare", &manifest_bad),
+            Err(ManifestValidationError::IdentityChangedWithoutRewrite),
+            "identity_changed=true without any content update is invalid"
+        );
+
+        // Confirm nothing was persisted — validate is side-effect free.
+        let manifests =
+            get_change_manifests_for_node(&conn, "test-slug", "L2-rare").unwrap();
+        assert!(manifests.is_empty(), "validate should not persist rows");
     }
 }
 

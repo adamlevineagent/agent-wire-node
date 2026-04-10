@@ -488,3 +488,69 @@ Phase 2's fix is the viz-orphaning bug. To verify the DAG stays coherent after a
 - **No friction log entries required.** Scope held, spec was clear, no architectural questions came up. The Pillar 37 note above is mentioned here rather than in the friction log because it's a pre-existing condition of the entire `stale_helpers_upper.rs` file, not a Phase 2 regression or new violation.
 
 The phase is ready for the verifier pass. After that, the wanderer pass should trace end-to-end: "does a stale check on an upper-layer node preserve the node id, bump build_version, keep evidence links valid, and leave get_tree() coherent?"
+
+### Phase 2 fix pass — 2026-04-10
+
+The wanderer pass on `phase-2-change-manifest-supersession` caught three problems in the initial Phase 2 land. All three are fixed in this pass on the same branch; a single follow-up commit lands on top of commit `3ff7e14 phase-2: change-manifest supersession` and its wanderer friction log commit `951ce94`.
+
+**Wanderer verdict (three issues):**
+
+1. **BLOCKING — L0 file_change regression.** `execute_supersession` has two callers in `stale_engine.rs`: the L1+ confirmed_stale path at line 968 AND the L0 file_change path at line 838. The Phase 2 spec only described the L1+ path, and the implementer's rewrite of `execute_supersession` dropped the `depth == 0` source-file-reading branch that the pre-Phase-2 body (now `execute_supersession_identity_change`) had at lines 2551-2562. `load_supersession_node_context` reads only pyramid state; `build_changed_children_from_deltas` emits old==new content for L0 nodes with no deltas; `update_node_in_place` applies a no-op and bumps `build_version`. Net effect: L0 distilled text never updates when the user edits a file on disk. Compounding: `pyramid_file_hashes.hash` is never updated on file_change, so the watcher re-fires on every tick until the hash matches — DADBEAR enters a loop burning LLM budget on no-op updates.
+
+2. **BLOCKING — identity-change fallback reintroduces the orphaning bug.** On `generate_change_manifest` LLM failure, `execute_supersession` fell back to `execute_supersession_identity_change` — the pre-Phase-2 body preserved verbatim. That body creates a new node id via `next_sequential_node_id` and leaves the old evidence links pointing at the old id, which is EXACTLY the viz orphaning bug Phase 2 was written to fix. A 5% LLM flakiness rate reintroduces the bug 5% of the time. The spec's "Manifest Validation → Failure handling" section at line 251 says unambiguously: "Invalid manifests are rejected (the node is left in its pre-manifest state) and logged with the failure reason. The stale check is not retried automatically." The implementer read that as "validation failure" only and applied the wrong graceful-degradation default to LLM failure.
+
+3. **MINOR — dead `build_id` parameter in `update_node_in_place`.** The parameter is declared, receives the literal string `"stale_refresh"` from the caller, and is never written anywhere — line ~3018 had a `let _ = build_id;` with a misleading comment. The snapshot INSERT uses `snap.build_id` (the pre-update node's existing build_id), not the function parameter.
+
+**Fix directions:**
+
+1. **L0 file_change regression — thread source file through the manifest flow.**
+   - Extended `SupersessionNodeContext` with `source_file_path: Option<String>` and `source_snapshot: Option<String>`, populated by `load_supersession_node_context` for depth==0 nodes only via `lookup_source_file_path_for_node` + `fs::read_to_string` + 400-line/20k-char truncation (matches the pre-Phase-2 body verbatim).
+   - Extended `build_changed_children_from_deltas` with an L0 branch that synthesizes a `ChangedChild { child_id: file_path, old_summary: current_distilled, new_summary: file_excerpt }` when the context has a source snapshot. The LLM's existing "what changed?" prompt handles this cleanly — the "child" is the source file, the "delta" is the new content.
+   - Added a `stale_check_reason` branch that reflects the L0 case ("source file changed on disk") and a `reason_tag` branch (`file_change` vs `node_stale`) for cost-log categorization.
+   - After a successful `update_node_in_place` on a depth==0 node, `execute_supersession` now UPDATEs `pyramid_file_hashes.hash` with a freshly-computed hash via `super::watcher::compute_file_hash`. This stops the watcher's re-fire loop — the next tick sees the hash match and skips the file. Failures are logged WARN but do not roll back the apply (the update is still correct; the watcher will re-fire next tick if the UPDATE didn't land, which is benign).
+   - Added a code comment on `db::update_node_in_place` documenting that the absence of the `depth <= 1 && !provisional` immutability check from `apply_supersession` is deliberate: the immutability invariant exists for Wire publication snapshot, not for local refresh. Local L0 nodes need to mutate in place as files change.
+
+2. **Identity-change fallback on LLM failure — removed.**
+   - Extracted `handle_manifest_generation_failure` as a private async helper. On LLM failure `execute_supersession` now calls it instead of `execute_supersession_identity_change`. The helper persists a placeholder `ChangeManifest` row in `pyramid_change_manifests` with `note = "manifest_generation_failed: <error>"` against the CURRENT build_version, then returns an error to the stale engine. The node stays at its prior valid state — same id, same distilled, same build_version.
+   - Also extracted `apply_supersession_manifest` as a private async helper that takes a pre-generated manifest. `execute_supersession`'s main body now generates the manifest and delegates to the applier. The identity-change path ONLY fires inside `apply_supersession_manifest` when the LLM explicitly returned `identity_changed = true` in a SUCCESSFUL manifest — the rare escape hatch the spec describes.
+   - `execute_supersession_identity_change` is unchanged (the pre-Phase-2 body preserved verbatim) and is called from exactly ONE place: the `identity_changed == true` branch inside `apply_supersession_manifest`. A grep for the name confirms the single call site. The extraction also makes `apply_supersession_manifest` directly callable from tests, which is how Test 1 drives the full L0 hash-rewrite path without mocking the LLM.
+
+3. **Dead `build_id` parameter — removed.**
+   - Removed `build_id: &str` from `update_node_in_place`'s signature. Removed the dead `let _ = build_id;` body line. Updated the doc comment. Updated the one production caller (`stale_helpers_upper.rs::apply_supersession_manifest`) and the three existing test callers (`test_update_node_in_place_normal_case`, `test_update_node_in_place_stable_id`, `test_validate_then_apply_end_to_end`). `snap.build_id.clone()` (the local Snapshot struct field inside the function body) is unchanged — that's the pre-update node's original build_id which is correctly carried into the snapshot row.
+
+**Files touched:**
+
+- `src-tauri/src/pyramid/stale_helpers_upper.rs` — extended `SupersessionNodeContext`, `load_supersession_node_context`, `build_changed_children_from_deltas`; extracted `handle_manifest_generation_failure` and `apply_supersession_manifest`; added L0 hash rewrite; updated the one `update_node_in_place` caller; added three fix-pass regression tests + a shared `setup_l0_test_db` helper.
+- `src-tauri/src/pyramid/db.rs` — removed `build_id` parameter from `update_node_in_place`; added doc-comment note about why the immutability guard is deliberately omitted (local refresh semantics, not Wire publication).
+
+Not touched: `vine.rs`, `chain_executor.rs` (Phase 2 scope boundary held), `stale_engine.rs` (both call sites still go through `execute_supersession` with the same five-argument signature — the fix is transparent to callers).
+
+**New tests (3, all in `pyramid::stale_helpers_upper::tests`):**
+
+1. `test_apply_supersession_manifest_l0_file_change_updates_hash_and_distilled` — the L0 regression test. Writes a source file, creates an L0 node + `pyramid_file_hashes` row with the pre-edit hash, then rewrites the file on disk. Loads `SupersessionNodeContext` via `load_supersession_node_context` and asserts it carries `source_file_path` + `source_snapshot` with the post-edit content. Calls `build_changed_children_from_deltas` and asserts the synthesized child's `new_summary` contains the new file bytes. Builds a synthetic manifest (stand-in for the LLM call) with `distilled` referencing the new content, then calls `apply_supersession_manifest` directly. After the apply, asserts (a) the L0 node's distilled mentions the new content, (b) `build_version` bumped from 1 to 2, (c) the L0 node id is unchanged, (d) `pyramid_file_hashes.hash` has been rewritten to the post-edit hash.
+
+2. `test_handle_manifest_generation_failure_no_identity_change_fallback` — directly drives the failure-path helper with a synthesized anyhow error. Snapshots the node state pre-failure, calls the helper, re-opens the DB and asserts: (a) node id unchanged, (b) distilled unchanged, (c) headline unchanged, (d) build_version unchanged, (e) total row count unchanged (so no new node id was created by a sneaky fallback), (f) `superseded_by` is still NULL on the original row, (g) a failed-manifest row lands in `pyramid_change_manifests` with `note` starting `"manifest_generation_failed:"` and `build_version` = 1 (pre-bump).
+
+3. `test_identity_change_only_on_explicit_flag_with_rewrite` — pins the spec-aligned semantics of the identity-change escape hatch via `validate_change_manifest`. A manifest with `identity_changed = true` AND `distilled`/`headline` updates validates clean (positive escape hatch). A manifest with `identity_changed = true` and no rewrite returns `Err(IdentityChangedWithoutRewrite)`. Confirms the validator does not persist rows (validation is side-effect free). Combined with test 2, this pins the full shape: identity-change fires only on an explicit LLM flag, never as a fallback for LLM failure. A future accidental re-introduction of the LLM-failure-to-identity-change path would have to update test 2's assertions, making the regression visible in review.
+
+**Verification results:**
+
+- `cargo check --lib` — clean. No new warnings (3 pre-existing warnings unchanged: `get_keep_evidence_for_target` deprecated use, and two `LayerCollectResult` visibility warnings in `publication.rs`).
+- `cargo build --lib` — clean, same 3 pre-existing warnings.
+- `cargo test --lib pyramid::stale_helpers_upper` — **10/10 passed** (7 existing Phase 2 tests + 3 new fix-pass tests, matching the expected count in the fix-pass prompt). Finished in 0.68s.
+- `cargo test --lib pyramid` — **798 passed, 7 failed** (the same 7 pre-existing schema-drift failures in `pyramid::db::tests::test_evidence_pk_cross_slug_coexistence`, `pyramid::defaults_adapter::tests::real_yaml_thread_clustering_preserves_response_schema`, and 5 `pyramid::staleness::tests::*` tests). No new failures from this fix pass. The Phase 1 fix-pass log entry at line 152 lists the same 7 failures as pre-existing.
+- `grep -n "execute_supersession_identity_change" src-tauri/src/pyramid/stale_helpers_upper.rs` — function still exists at its original location; called from exactly ONE place in production code (the `if manifest.identity_changed` branch inside `apply_supersession_manifest`). No call from the LLM-failure path.
+- `grep -n "build_id" src-tauri/src/pyramid/db.rs` around `update_node_in_place` — the parameter is gone from the signature. The dead `let _ = build_id;` line is gone. `snap.build_id.clone()` inside the function body remains correct (it's the pre-update node's build_id being carried into the snapshot row).
+
+**Updated understanding:**
+
+Phase 2 now fixes BOTH the viz DAG orphaning bug (L1+ stale-refresh path — the original target) AND the L0 content sync on file_change regression (the wanderer-caught gap). It also removes the fallback-reintroduces-bug trap: LLM-failure no longer silently creates a new node id, so the viz DAG stays coherent even under flaky LLM conditions. The spec's "Invalid manifests are rejected... not retried automatically" semantics are now restored for the LLM-failure branch, not just the validation-failure branch.
+
+**Scope boundary maintained:**
+
+- `vine.rs:3381` and `chain_executor.rs:4821` still use wholesale-rebuild semantics (intentional, spec-aligned, correct as-is per the "Scope boundary: which call sites this phase touches" section of `change-manifest-supersession.md`).
+- No StepContext threading added to `generate_change_manifest` — still Phase 6's scope.
+- `generate_change_manifest` and `validate_change_manifest` bodies are unchanged beyond what the three issues required (the only touch to the manifest generation call site is the addition of the L0 reason tag / stale_check_reason branches which feed the existing function).
+- Pre-existing `pyramid::db::tests::test_evidence_pk_cross_slug_coexistence` and the 6 other schema-drift test failures are still failing; this fix pass does not widen scope to address them.
+
+The phase is ready to ship after the commit on this branch. No further audit cycles needed for the three issues — the regression tests lock down the spec-aligned behavior.
