@@ -1259,6 +1259,112 @@ mod tests {
     }
 
     #[test]
+    fn test_init_pyramid_db_idempotent_with_contributions() {
+        // Second idempotency guarantee per the Phase 4 brief: calling
+        // `init_pyramid_db` twice on the same connection must not
+        // duplicate any Phase 4 rows (including the bootstrap migration
+        // path). This complements `test_bootstrap_migration_idempotent`
+        // which exercises the migration helper directly; this test
+        // exercises the full init path twice.
+        let conn = Connection::open_in_memory().unwrap();
+        init_pyramid_db(&conn).unwrap();
+
+        // Seed a legacy DADBEAR row that DOES NOT have a contribution_id,
+        // so the next init pass's migration helper must pick it up.
+        conn.execute(
+            "INSERT INTO pyramid_dadbear_config
+                (slug, source_path, content_type, scan_interval_secs, debounce_secs,
+                 session_timeout_secs, batch_size, enabled)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params![
+                "init-slug",
+                "/tmp/init-source",
+                "conversation",
+                10,
+                30,
+                1800,
+                1,
+                1,
+            ],
+        )
+        .unwrap();
+
+        // First re-init — the seeded row is still unmigrated, but the
+        // marker already exists from the first init pass, so the
+        // migration helper short-circuits and leaves the row alone.
+        init_pyramid_db(&conn).unwrap();
+
+        let first_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pyramid_config_contributions",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let first_marker: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pyramid_config_contributions
+                 WHERE schema_type = '_migration_marker'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        // Second re-init — still no new rows.
+        init_pyramid_db(&conn).unwrap();
+
+        let second_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pyramid_config_contributions",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let second_marker: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pyramid_config_contributions
+                 WHERE schema_type = '_migration_marker'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(
+            first_count, second_count,
+            "re-running init_pyramid_db duplicated pyramid_config_contributions rows"
+        );
+        assert_eq!(
+            first_marker, second_marker,
+            "re-running init_pyramid_db duplicated the _migration_marker sentinel"
+        );
+
+        // The four new operational tables must exist (CREATE TABLE IF
+        // NOT EXISTS idempotent) — sanity check a SELECT doesn't error.
+        for tbl in [
+            "pyramid_evidence_policy",
+            "pyramid_build_strategy",
+            "pyramid_custom_prompts",
+            "pyramid_folder_ingestion_heuristics",
+            "pyramid_config_contributions",
+        ] {
+            let _: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {tbl}"), [], |r| r.get(0))
+                .unwrap_or_else(|e| panic!("{tbl} table missing or unreadable: {e}"));
+        }
+
+        // The contribution_id column must exist on pyramid_dadbear_config
+        // after both init passes.
+        let _: Option<String> = conn
+            .query_row(
+                "SELECT contribution_id FROM pyramid_dadbear_config
+                 WHERE slug = 'init-slug' AND source_path = '/tmp/init-source'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+    }
+
+    #[test]
     fn test_unknown_schema_type_fails_loudly() {
         let conn = mem_conn();
         let bus = mem_bus();
