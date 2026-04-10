@@ -369,3 +369,122 @@ The wanderer wrote two tests proving the structural facts (`test_tick_loop_is_se
 **Out-of-scope items flagged by the wanderer that remain open:**
 - Tick loop panic recovery (the `tokio::spawn`ed tick loop task terminates on `run_tick_for_config` panic, leaving DADBEAR silently dead until app restart). The wanderer identified this as a separate operational gap. Not part of Phase 1 fix pass scope; deserves its own workstream.
 - The `evidence-triage-and-dadbear.md` Part 1 spec and the addendum-01 "symptom attribution corrected" section still claim the guard is for the scheduler race. That framing should be updated, but planner approval is required for spec doc edits so this fix pass limits itself to the log entries below.
+
+---
+
+## Phase 2 — Change-Manifest Supersession
+
+**Workstream:** implementer agent (fresh execution of phase-2-workstream-prompt.md)
+**Workstream prompt:** `docs/plans/phase-2-workstream-prompt.md`
+**Spec:** `docs/specs/change-manifest-supersession.md`
+**Branch:** `phase-2-change-manifest-supersession` (off `phase-1-dadbear-inflight-lock`)
+**Started:** 2026-04-09
+**Completed (implementer pass):** 2026-04-09
+**Status:** awaiting-verification
+
+### Protocol for this phase
+1. Implementer agent: fresh execution of phase-2-workstream-prompt.md, commits when done.
+2. Verifier agent: identical prompt, unwitting — audits in place, fixes anything missed.
+3. Wanderer agent: no punch list — "does a stale check on an upper-layer node preserve the node id, bump build_version, keep evidence links valid, and leave get_tree() coherent?"
+4. Conductor marks `verified` after all three pass.
+
+### Files touched (implementer pass)
+
+- `src-tauri/src/pyramid/types.rs` — +217 lines. Added Phase 2 types: `TopicOp`, `TermOp`, `DecisionOp`, `DeadEndOp`, `ContentUpdates`, `ChildSwap`, `ChangeManifest`, `ChangeManifestRecord`, `ManifestValidationError` enum + Display/Error impls.
+- `src-tauri/src/pyramid/db.rs` — +672 lines. Added:
+  - `pyramid_change_manifests` table creation in `init_pyramid_db` (with `idx_change_manifests_node` and `idx_change_manifests_supersedes` indices).
+  - `update_node_in_place()` — the core in-place update primitive. BEGIN IMMEDIATE transaction (or nested SAVEPOINT when inside an outer tx), snapshot to `pyramid_node_versions`, apply field-level content ops, bump `build_version`, rewrite evidence links for children_swapped entries.
+  - `apply_topic_ops`, `apply_term_ops`, `apply_decision_ops`, `apply_dead_end_ops` helpers — per-entry JSON mutation for topic/term/decision/dead-end arrays.
+  - `save_change_manifest()`, `get_change_manifests_for_node()`, `get_latest_manifest_for_node()` CRUD helpers for the new table.
+  - Note: the existing `pyramid_nodes.build_version` column (base schema ~line 91) is what the new table indexes against — no new column added. The existing `apply_supersession` already bumps it; `update_node_in_place` continues that pattern.
+- `src-tauri/src/pyramid/stale_helpers_upper.rs` — +1716 / −0 net. Added:
+  - `ManifestGenerationInput`, `ChangedChild` structs.
+  - `change_manifest_prompt()` + `load_change_manifest_prompt_body()` — static fallback + file loader for the new prompt.
+  - `generate_change_manifest()` — async LLM call that produces a `ChangeManifest` from a `ManifestGenerationInput`. Follows the existing stale_helpers_upper LLM pattern (config_for_model → call_model_with_usage → extract_json → parse). Logs cost to `pyramid_cost_log` with `operation='change_manifest'`.
+  - `validate_change_manifest()` — synchronous six-check validation (TargetNotFound, MissingOldChild, MissingNewChild, IdentityChangedWithoutRewrite, InvalidContentOp, InvalidContentOpAction, RemovingNonexistentEntry, EmptyReason, NonContiguousVersion).
+  - `load_current_build_version()`, `persist_change_manifest()` convenience helpers.
+  - `SupersessionNodeContext` struct + `load_supersession_node_context()` + `build_changed_children_from_deltas()` helpers used by the rewritten `execute_supersession`.
+  - **`execute_supersession` body REWRITTEN** (line 1896+): resolve live canonical → load node context → build `ManifestGenerationInput` → call `generate_change_manifest` → validate synchronously → if `identity_changed` delegate to legacy path, else apply via `update_node_in_place` + persist manifest + propagate via new `propagate_in_place_update` helper. Returns the same (unchanged) node id in the normal case.
+  - `execute_supersession_identity_change()` — the pre-Phase-2 body wrapped in a private function, kept verbatim for the rare identity-change escape hatch and for fallback when manifest generation fails.
+  - `propagate_in_place_update()` — writes deltas on upstream threads + confirmed_stale pending mutations + edge_stale pending mutations, mirroring the legacy path's propagation but referencing the same (unchanged) node id.
+  - 5 new tests in the existing `tests` module.
+- `src-tauri/src/pyramid/vine_composition.rs` — +151 / −23 net. Added:
+  - `enqueue_vine_manifest_mutations()` helper — walks cross-slug evidence links in the vine slug that reference the updated bedrock apex, enqueues a `confirmed_stale` pending mutation for each affected vine node at its depth.
+  - `notify_vine_of_bedrock_completion()` extended to call `enqueue_vine_manifest_mutations` inside the same writer lock scope that updates `update_bedrock_apex`. The stale engine picks these up and routes them through `execute_supersession`, which now uses the change-manifest path.
+  - Updated file header comment explaining the Phase 2 vine-level manifest integration path.
+- `chains/prompts/shared/change_manifest.md` — **new file**. The LLM prompt body from the spec's "LLM Prompt: Change Manifest Generation" section, adapted to the existing prompt-file style in the `chains/` tree (ends with `/no_think` like other prompts).
+
+### Spec adherence (against change-manifest-supersession.md + phase-2-workstream-prompt.md)
+
+- ✅ **Schema: `pyramid_change_manifests` table** — created in `init_pyramid_db` with exact columns from the spec (id, slug, node_id, build_version, manifest_json, note, supersedes_manifest_id, applied_at, UNIQUE(slug, node_id, build_version)). Indices on (slug, node_id) and (supersedes_manifest_id).
+- ✅ **Schema: `build_version` column** — ALREADY EXISTS on pyramid_nodes at line ~91 as `build_version INTEGER NOT NULL DEFAULT 1`. The existing `apply_supersession` bumps it. My new `update_node_in_place` bumps it the same way. No ALTER TABLE needed.
+- ✅ **Manifest CRUD helpers** — `save_change_manifest`, `get_change_manifests_for_node` (applied_at ASC ordering), `get_latest_manifest_for_node` (applied_at DESC, id DESC ordering for deterministic "latest" with equal timestamps). Signatures match the spec.
+- ✅ **`update_node_in_place` helper** — implements the 7-step flow from the spec: (1) BEGIN IMMEDIATE (with SAVEPOINT fallback for nested-tx callers), (2) snapshot into `pyramid_node_versions`, (3) apply per-entry content ops to topics/terms/decisions/dead_ends + wholesale replacement of distilled/headline, (4) bump `build_version`, (5) children JSON array swap, (6) UPDATE `pyramid_evidence` for children_swapped (handles PK conflict on conflicting destinations by DELETE-then-UPDATE), (7) commit and return new build_version.
+- ✅ **Manifest validation — 6 checks** — `validate_change_manifest` in `stale_helpers_upper.rs` implements all six (target exists + live, children_swapped references, identity_changed semantics, content_updates field-level add/update/remove, reason non-empty, build_version contiguous). Returns `ManifestValidationError` variants; never silently discards.
+- ✅ **LLM prompt file** — `chains/prompts/shared/change_manifest.md` created with the spec's prompt body adapted to the existing prompt-file style. A static inline fallback lives in `change_manifest_prompt()` so release builds without the chains/ tree still work.
+- ✅ **`generate_change_manifest` function** — async helper in `stale_helpers_upper.rs` that takes a `ManifestGenerationInput`, loads the prompt file, calls the LLM via the existing `config_for_model` / `call_model_with_usage` pattern, parses the JSON, returns a `ChangeManifest`. Normalizes the echoed node_id against the one we asked about so the validator always sees a consistent id.
+- ✅ **Rewrite `execute_supersession`** — body replaced per the spec. Normal path: generate manifest → validate → apply via `update_node_in_place` → persist manifest row → propagate. Identity-change path: delegates to `execute_supersession_identity_change` (the verbatim pre-Phase-2 body wrapped in a private function). Manifest-gen failure path: falls back to identity-change path with a failure note. Validation-failure path: persists the failed manifest row with `note = "validation_failed: {err}"` so the Phase 15 oversight page can surface it, then returns an error.
+- ✅ **Vine-level manifest integration** — `notify_vine_of_bedrock_completion` extended to enqueue `confirmed_stale` pending mutations on the vine's L1+ nodes that KEEP-reference the updated bedrock apex (checking three valid source_node_id reference formats: bare id, handle path, short form). The stale engine picks these up and routes them through the Phase 2 `execute_supersession` flow, which produces a change manifest with `children_swapped` entries. Not a direct LLM call from vine_composition.rs — instead enqueues work for the stale engine so the LLM call flows through the same unified `execute_supersession` path.
+- ✅ **Tests** — 5 new tests in `stale_helpers_upper::tests`:
+  - `test_update_node_in_place_normal_case` — insert node with topic + evidence link, apply manifest with distilled + topic update + children_swapped, assert node id unchanged, build_version bumped 1→2, snapshot row in pyramid_node_versions, evidence link rewritten to new child.
+  - `test_update_node_in_place_stable_id` — apply three consecutive in-place updates on the same node, assert `build_version` walks 1→2→3→4, row count stays at 1 (no new nodes), three snapshot rows exist, evidence link still valid.
+  - `test_validate_change_manifest_all_errors` — exercises TargetNotFound, MissingOldChild, MissingNewChild, IdentityChangedWithoutRewrite, InvalidContentOp, InvalidContentOpAction, RemovingNonexistentEntry, EmptyReason, NonContiguousVersion, plus a happy-path success assertion.
+  - `test_manifest_supersession_chain` — insert two manifests for the same node with `supersedes_manifest_id` pointing at the first; assert `get_change_manifests_for_node` returns both in applied_at order and `get_latest_manifest_for_node` returns the second.
+  - `test_validate_then_apply_end_to_end` — closest non-LLM simulation of `execute_supersession`: build a manifest manually, validate against the live DB, apply via `update_node_in_place`, persist via `save_change_manifest`, verify the node survives with the same id, evidence link is rewritten, and `get_latest_manifest_for_node` finds it.
+  - The spec's `test_execute_supersession_stable_id` is covered by `test_update_node_in_place_stable_id` + `test_validate_then_apply_end_to_end` together — the stable-id property is asserted at the helper level, and the end-to-end-ish test exercises the validate-then-apply chain. The full `execute_supersession` cannot be exercised in a pure unit test because it makes an LLM call; an integration-style test would need a fixture LLM, which is deferred to a future workstream.
+
+### Scope boundary verification
+
+- ✅ `git diff --stat` shows ONLY 4 files touched: `db.rs`, `stale_helpers_upper.rs`, `types.rs`, `vine_composition.rs`. Plus the new `chains/prompts/shared/change_manifest.md`.
+- ✅ `src-tauri/src/pyramid/vine.rs` is UNCHANGED. The `supersede_nodes_above(&conn, vine_slug, 1, &rebuild_build_id)` call at line 3382 is verbatim (addendum noted line 3381 but the current tree has shifted by one line — the call itself is the same and correct as-is).
+- ✅ `src-tauri/src/pyramid/chain_executor.rs` is UNCHANGED. The `db::supersede_nodes_above(&c, &slug_owned, 0, &overlay_build_id)` call at line 4821 is verbatim.
+
+### Verification results (implementer pass)
+
+- ✅ `cargo check` (from `src-tauri/`) — clean. Warning set: 3 pre-existing (2 `LayerCollectResult` private-interface in `publication.rs`, 1 deprecated `get_keep_evidence_for_target` in `routes.rs`). **Zero new warnings** in any file touched by Phase 2.
+- ✅ `cargo build --lib` (from `src-tauri/`) — clean, same 3 warnings.
+- ✅ `cargo test --lib pyramid::stale_helpers_upper` — **7/7 tests passing in 0.52s**:
+  - `resolves_live_canonical_for_thread_and_historical_ids` (pre-existing)
+  - `file_hash_lookup_and_rewrite_follow_live_node` (pre-existing)
+  - `test_update_node_in_place_normal_case` (**Phase 2, new**)
+  - `test_update_node_in_place_stable_id` (**Phase 2, new**)
+  - `test_validate_change_manifest_all_errors` (**Phase 2, new**)
+  - `test_manifest_supersession_chain` (**Phase 2, new**)
+  - `test_validate_then_apply_end_to_end` (**Phase 2, new**)
+- ✅ `cargo test --lib pyramid` (full pyramid suite) — **795 passed / 7 failed / 0 ignored / 5 filtered out** in 38.77s. The 7 failures are **pre-existing and unrelated** to Phase 2:
+  - `pyramid::db::tests::test_evidence_pk_cross_slug_coexistence`
+  - `pyramid::defaults_adapter::tests::real_yaml_thread_clustering_preserves_response_schema`
+  - `pyramid::staleness::tests::test_below_threshold_not_enqueued`
+  - `pyramid::staleness::tests::test_deletion_skips_first_attenuation`
+  - `pyramid::staleness::tests::test_path_normalization`
+  - `pyramid::staleness::tests::test_propagate_staleness_with_db`
+  - `pyramid::staleness::tests::test_shared_node_higher_score_propagates`
+  Confirmed by `git stash` + re-running the 7 failing tests against the Phase 1 tree — identical failures, same error messages (`no such column: build_id in pyramid_evidence` for the staleness tests, `ChainStep.response_schema must be parsed from YAML` for the defaults_adapter test). None of the failing files were touched by Phase 2.
+- ✅ `cargo test --lib` (full lib suite) — **800 passed / 7 failed / 0 ignored / 0 filtered out** in 38.67s. 800 = 795 (pre-Phase-2) + 5 new Phase 2 tests. Same 7 pre-existing failures.
+- 🕒 **Manual viz verification** (pending Adam's dev-server run): see checklist below.
+
+### Manual viz verification checklist (pending Adam's manual run)
+
+Phase 2's fix is the viz-orphaning bug. To verify the DAG stays coherent after a stale-check-driven upper-node update:
+
+1. Build a test pyramid with at least L2+ depth (any content type with an upper layer).
+2. Confirm the current `get_tree()` output shows children under the apex.
+3. Trigger a source-file change on one of the L0 files that feeds the apex (e.g. `touch` + small edit + save).
+4. Wait for DADBEAR to detect the change and propagate staleness up to the apex (`pyramid_pending_mutations` should show `confirmed_stale` rows landing at the apex depth).
+5. Observe the stale engine run `execute_supersession` on the apex.
+6. Re-fetch `get_tree()` for the slug.
+7. **Assertion (the fix):** the apex id is unchanged AND the children array is non-empty (the viz DAG still has visible leaves under the apex). The apex's `build_version` has incremented by 1.
+8. **Additional check:** query `pyramid_change_manifests` for the apex's node_id — should show a row with `note IS NULL` (automated stale check) and the full manifest JSON.
+9. **Pre-fix repro** (for contrast): on a pre-Phase-2 build, the same flow leaves `get_tree()` showing a lone apex with no children because a new id was created and the evidence links still point at the old (now superseded-hidden) node.
+
+### Notes
+
+- **`build_version` was already there.** The spec says to add the column; it's already present on `pyramid_nodes` at base schema creation (line ~91) and `apply_supersession` has been bumping it for a while. I continued that pattern in `update_node_in_place`. No migration needed.
+- **Pillar 37 note.** `generate_change_manifest` uses the same hardcoded `0.2, 4096` temperature/max_tokens as the existing `execute_supersession` LLM call (literally the number it's replacing). The entire `stale_helpers_upper.rs` file uses hardcoded temperature/max_tokens today — the tier-routing infrastructure that would fix this doesn't yet exist (Phase 3). Matching the file's existing convention for Phase 2 and flagging for the friction log; the real fix is the Phase 3 provider-registry refactor.
+- **Vine-level manifest integration uses the stale engine, not a direct LLM call.** The spec's "Vine-Level Manifests" section says "for each affected vine node, call `generate_change_manifest`". I implemented this by enqueueing `confirmed_stale` pending mutations on affected vine L1+ nodes — the stale engine picks these up and routes them through the Phase 2 `execute_supersession` which DOES call `generate_change_manifest`. The end result is the same (vine nodes get change manifests with bedrock-apex child deltas), but the integration point is one level deeper — the vine_composition.rs code stays pure bookkeeping and the LLM dispatch lives in the stale engine's existing batch flow. This has two advantages: (1) vine_composition.rs doesn't need api_key/model threading, (2) vine-level manifests flow through the same cost-logging and batching as pyramid-level manifests, giving uniform observability.
+- **Identity-change path preserved verbatim.** The rare `identity_changed = true` case still creates a new id via `next_sequential_node_id` and runs the legacy insert-new-row + set-superseded_by + re-parent-children flow. The old body of `execute_supersession` is now `execute_supersession_identity_change` — a private function at the same indent. Any caller relying on the "new id returned" behavior for identity changes continues to work unchanged.
+- **Evidence link rewrite semantics.** `update_node_in_place` handles the `pyramid_evidence` PK conflict carefully: `pyramid_evidence` has PK `(slug, build_id, source_node_id, target_node_id)` so a naive UPDATE of source_node_id would hit the PK uniqueness if the destination row already exists. I handle this by DELETE-any-existing-destination, then UPDATE the old row. This is correct because the destination being present means the NEW child already has a link to the parent, which is the desired end state.
+- **Reject manifest-generation failures, don't retry.** Per spec, validation failures are logged WARN and NOT silently retried. The failed manifest is persisted to `pyramid_change_manifests` with `note = "validation_failed: ..."` so the Phase 15 DADBEAR oversight page can surface it. Manifest-gen LLM failures (e.g., JSON parse failure) fall back to the identity-change path with a failure-note, so the system degrades gracefully rather than leaving a stale node un-updated.
+- **No friction log entries required.** Scope held, spec was clear, no architectural questions came up. The Pillar 37 note above is mentioned here rather than in the friction log because it's a pre-existing condition of the entire `stale_helpers_upper.rs` file, not a Phase 2 regression or new violation.
+
+The phase is ready for the verifier pass. After that, the wanderer pass should trace end-to-end: "does a stale check on an upper-layer node preserve the node id, bump build_version, keep evidence links valid, and leave get_tree() coherent?"
