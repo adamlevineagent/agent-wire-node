@@ -583,7 +583,23 @@ pub async fn fire_ingest_chain(
 
     // ── 2. Chunk new source files into pyramid_chunks. execute_chain_from
     //       at chain_executor.rs:3804 rejects non-question pipelines with zero
-    //       chunks, so this step is mandatory for conversation/code/doc. ──
+    //       chunks, so this step is mandatory for conversation/code/doc.
+    //
+    //       IMPORTANT: We MUST clear existing chunks before re-ingesting. Both
+    //       `ingest_conversation` here and the existing wizard/routes.rs ingest
+    //       path use chunk_index starting at 0 per file, so re-dispatches
+    //       collide with the prior run's chunks on the `UNIQUE(slug,
+    //       chunk_index)` constraint of pyramid_chunks (db.rs:107). The
+    //       equivalent wizard path handles this at routes.rs:3431 with an
+    //       explicit `clear_chunks` before re-ingest; Pipeline B must do the
+    //       same or the SECOND dispatch for any slug fails with a UNIQUE
+    //       constraint error and the ingest record is marked failed.
+    //
+    //       Re-chunking the whole file on re-dispatch (with clear+re-ingest) is
+    //       correct-if-slow for Phase 0b; Phase 6's content-addressable LLM
+    //       output cache will make the re-chunk work cheap downstream, and a
+    //       future phase can introduce per-file message counters to enable
+    //       `ingest_continuation` as an incremental alternative. ──
     match ct {
         ContentType::Conversation => {
             let _lock = LockManager::global().write(slug).await;
@@ -592,6 +608,17 @@ pub async fn fire_ingest_chain(
             let paths_owned: Vec<String> = source_paths.to_vec();
             tokio::task::spawn_blocking(move || -> Result<()> {
                 let conn = writer.blocking_lock();
+                // Clear existing chunks for this slug to prevent UNIQUE
+                // constraint collisions with prior runs or with earlier files
+                // in the same dispatch. Mirrors routes.rs:3431.
+                let cleared = db::clear_chunks(&conn, &slug_owned)?;
+                if cleared > 0 {
+                    info!(
+                        slug = %slug_owned,
+                        cleared,
+                        "fire_ingest_chain: cleared stale chunks before re-ingest"
+                    );
+                }
                 for path_str in &paths_owned {
                     let path = Path::new(path_str);
                     if !path.exists() {
@@ -606,11 +633,7 @@ pub async fn fire_ingest_chain(
                     // ingest_continuation here because Pipeline B's ingest
                     // record schema doesn't track per-file message offsets —
                     // the message count it would need for `skip_messages` isn't
-                    // stored anywhere. Re-chunking the whole file on
-                    // re-dispatch is correct-if-slow for Phase 0b; Phase 6's
-                    // content-addressable LLM output cache will make the
-                    // re-chunk work cheap downstream, and a future phase can
-                    // introduce per-file message counters if needed.
+                    // stored anywhere.
                     ingest::ingest_conversation(&conn, &slug_owned, path)?;
                 }
                 Ok(())
@@ -1262,6 +1285,86 @@ mod tests {
     //   2. The eventual error (expected because no chains dir / no LLM) does
     //      NOT come from the zero-chunks guard — it must come from later
     //      in the pipeline
+
+    /// Regression test for the second-dispatch chunk-collision bug caught
+    /// by the Phase 0b wanderer pass. `ingest_conversation` inserts chunks
+    /// with `chunk_index` starting at 0, and `pyramid_chunks` has a
+    /// `UNIQUE(slug, chunk_index)` constraint (db.rs:107). Without a
+    /// `clear_chunks` call before re-ingesting, the SECOND dispatch for any
+    /// slug that already has chunks fails with a UNIQUE constraint
+    /// violation, the build never fires, and the ingest record gets marked
+    /// `failed`. See `fire_ingest_chain`'s chunking block at ~line 603 and
+    /// `routes.rs:3431` for the equivalent clear in the wizard path.
+    #[tokio::test]
+    async fn test_fire_ingest_chain_second_dispatch_no_chunk_collision() {
+        let (state, data_dir) = make_test_state();
+        let bus = state.build_event_bus.clone();
+
+        let source_dir = data_dir.join("conversations2");
+        std::fs::create_dir_all(&source_dir).unwrap();
+
+        // First file
+        let jsonl_path = source_dir.join("session1.jsonl");
+        {
+            let mut f = std::fs::File::create(&jsonl_path).unwrap();
+            for i in 0..3 {
+                writeln!(
+                    f,
+                    r#"{{"type":"user","message":{{"role":"user","content":"hi {i}"}},"timestamp":"2026-04-09T10:00:00"}}"#,
+                )
+                .unwrap();
+            }
+        }
+
+        {
+            let conn = state.writer.lock().await;
+            db::create_slug(
+                &conn,
+                "test-repro-collision",
+                &ContentType::Conversation,
+                source_dir.to_str().unwrap(),
+            )
+            .unwrap();
+        }
+
+        // First dispatch — should chunk
+        let _result1 = fire_ingest_chain(
+            &state,
+            "test-repro-collision",
+            "conversation",
+            &[jsonl_path.to_string_lossy().to_string()],
+            &bus,
+        )
+        .await;
+
+        let count1 = {
+            let conn = state.reader.lock().await;
+            db::count_chunks(&conn, "test-repro-collision").unwrap()
+        };
+        assert!(count1 > 0, "first dispatch should produce chunks");
+
+        // Second dispatch — same file, no content change
+        let result2 = fire_ingest_chain(
+            &state,
+            "test-repro-collision",
+            "conversation",
+            &[jsonl_path.to_string_lossy().to_string()],
+            &bus,
+        )
+        .await;
+
+        // If fire_ingest_chain clears chunks before re-ingesting, the second
+        // dispatch will succeed (or fail at a later step like chains-dir).
+        // If it does NOT clear, the chunking step itself will bubble up a
+        // UNIQUE(slug, chunk_index) error.
+        if let Err(e) = &result2 {
+            let msg = e.to_string();
+            assert!(
+                !msg.contains("UNIQUE") && !msg.contains("constraint failed"),
+                "second dispatch must not fail on chunk UNIQUE constraint; got: {msg}"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn test_fire_ingest_chain_chunks_conversation_before_dispatch() {
