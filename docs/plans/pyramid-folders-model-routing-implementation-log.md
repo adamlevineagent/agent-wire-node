@@ -2657,3 +2657,42 @@ Fresh audit against the workstream prompt and the two spec files found four prod
 
 `awaiting-verification` (verifier fix pass committed separately) — Phase 13 end-state criteria met, with the four production-wiring gaps patched. The implementer's commit is retained; the verifier fix is a separate commit on the same branch.
 
+### Wanderer pass (2026-04-10)
+
+Ran the full 12-question wanderer trace without a punch list. Traced every event from Rust emission through Tauri fan-out to the frontend reducer; walked the reroll IPC from input validation through the DB supersession write; verified pause-all, cost rollup, active-builds, and cross-pyramid router flows end-to-end. Found two real bugs that the verifier's punch-list audit missed. Both are fixed in place on this branch.
+
+**W1 — Retrying-then-succeeding steps get stuck on wrong status (`useBuildRowState.ts`).** The `derivedStepStatus` helper early-returned on `step.status === 'retrying'` (line 165), which meant that once a `step_retry` event flipped the step to `retrying`, no subsequent `llm_call_completed` or `chain_step_finished` event could compute a terminal status — the helper short-circuited and returned `'retrying'` forever. Even with the early-return removed, a secondary bug surfaced: the retry loop in `llm.rs::call_model_unified_with_options_and_ctx` re-emits `LlmCallStarted` on each attempt, so `step.calls` ends up holding stale `{cacheKey, status: 'retrying'}` entries from the failed attempts alongside the final `{cacheKey, status: 'completed'}` — and the aggregate logic walked every entry equally, causing both `allCompleted` and `anyFailed` to miss, so the step landed on `'running'` instead of `'completed'`. Fix: (a) drop the `'retrying'` early-return from `derivedStepStatus`; (b) re-derive status from "last call per cache_key" so stale retry markers are ignored; (c) preserve `step.status === 'retrying'` inside the `llm_call_started` handler so the UI keeps showing `retry N/M` while the retry attempt is in flight. `src/hooks/useBuildRowState.ts:164-201`, `:266-289`.
+
+**W2 — Reroll cache-key mismatch makes the entire reroll flow pointless (`reroll.rs`).** The reroll path threaded `with_prompt_hash(prior.prompt_hash)` onto the StepContext, which made `cache_is_usable()` return true, so `call_model_unified_with_options_and_ctx` computed a new `cache_key = hash(hash(reroll_system, reroll_user), prior_prompt_hash, prior_model_id)` — different from `prior.cache_key`, because `build_reroll_prompts` wraps the original output in a "rerolling a prior output" template with completely different text. Consequences that cascaded into other Phase 13 features:
+  1. `supersede_cache_entry` looked up the prior row at the NEW cache_key, found nothing, and inserted the rerolled row as a fresh entry with `supersedes_cache_id = NULL`.
+  2. `load_new_cache_row(db_path, slug, &prior.cache_key)` then loaded the UNTOUCHED prior row (still at prior.cache_key) instead of the rerolled row. `new_cache_entry_id` returned to the frontend was the prior row's id.
+  3. `apply_note_to_cache_row(db_path, new_cache_entry_id, note)` wrote the reroll note onto the prior row, not the rerolled row.
+  4. `count_recent_rerolls` — which gates the anti-slot-machine warning on `supersedes_cache_id IS NOT NULL` — never counted the reroll. The rate limit was effectively disabled.
+  5. Subsequent normal builds with the original prompts computed prior.cache_key and hit the untouched prior row, serving the pre-reroll content. **The reroll never took effect on future builds.**
+
+The root cause is a property the implementer's log did not surface: `supersede_cache_entry` only works correctly when the new row's cache_key matches the prior row's cache_key. Since the reroll wrapper prompts are intentionally different from the original, that invariant was violated.
+
+Fix: route the DB write manually. The new `write_reroll_cache_entry` helper:
+  - constructs the StepContext WITHOUT `with_prompt_hash`, so `cache_is_usable() = false` and the LLM path skips its automatic lookup/store entirely (events still fire because `ctx.bus.is_some()`),
+  - builds a `CacheEntry` with `cache_key = prior.cache_key`, `inputs_hash = prior.inputs_hash`, `prompt_hash = prior.prompt_hash`, `model_id = prior.model_id`, so `verify_cache_hit` passes on read-back,
+  - calls `db::supersede_cache_entry` directly, which archives the prior row under `archived:{id}:{prior.cache_key}` and inserts the rerolled row at `prior.cache_key` with `supersedes_cache_id = prior_id` and `force_fresh = true`,
+  - persists the user's note on the new row via the `note: Option<String>` field on `CacheEntry`,
+  - returns the new row's id via a follow-up `check_cache_including_invalidated` read.
+
+`load_new_cache_row` and `apply_note_to_cache_row` were deleted — they were only reachable from the broken auto-store path. `src/pyramid/reroll.rs:120-210`, `:378-465`.
+
+**Wanderer tests added (2, both passing):**
+- `test_write_reroll_cache_entry_archives_prior_and_links_supersession` — proves the new row lands at prior.cache_key, the archived row exists at `archived:{id}:{cache_key}`, `supersedes_cache_id` points at the archived id, `force_fresh` is true, the note lives on the new row, and a subsequent `db::check_cache(slug, prior.cache_key)` returns the rerolled row (not the archived one) so future builds see the rerolled content.
+- `test_write_reroll_cache_entry_makes_count_recent_rerolls_tick` — proves the anti-slot-machine counter actually increments after rerolls now (the pre-fix code left `supersedes_cache_id = NULL` so the counter was always zero).
+
+**Verification state after the wanderer fix:**
+- `cargo check --lib` — clean (3 pre-existing warnings unchanged)
+- `cargo test --lib pyramid` — 1137 passed / 7 failed (baseline 1135 after verifier fix + 2 wanderer regression tests; same 7 pre-existing failures)
+- `cargo test --lib pyramid::reroll` — 9 passed, 0 failed (all reroll tests including the 2 new ones)
+- `npm run build` — clean, no new TypeScript errors
+- Code traces for Q1-Q12 recorded below in the friction log entry.
+
+### Status
+
+`awaiting-wanderer-verification` — Phase 13 has now passed implementer, verifier, AND wanderer audit. Two wanderer commits on the same branch: the W1/W2 fix + regression tests. Ready for merge review pending a sanity check that nothing else in Phase 13 surfaces a new issue from the wanderer trace.
+

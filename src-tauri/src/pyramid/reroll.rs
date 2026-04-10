@@ -34,8 +34,8 @@ use serde_json::Value;
 
 use super::db;
 use super::event_bus::{BuildEventBus, TaggedBuildEvent, TaggedKind};
-use super::llm::{call_model_unified_with_options_and_ctx, LlmCallOptions, LlmConfig};
-use super::step_context::{CachedStepOutput, StepContext};
+use super::llm::{call_model_unified_with_options_and_ctx, LlmCallOptions, LlmConfig, LlmResponse};
+use super::step_context::{CacheEntry, CachedStepOutput, StepContext};
 
 // ── IPC contract types ─────────────────────────────────────────────
 
@@ -123,10 +123,34 @@ pub async fn reroll_node(
     // without a specialized template.
     let (system_prompt, user_prompt) = build_reroll_prompts(&prior, &prior_content, &note);
 
-    // 4. Construct a force-fresh StepContext that points at the
-    // exact slot the original row occupies. The cache layer looks
-    // up (slug, cache_key) so it finds the prior row and routes
-    // the write through `supersede_cache_entry`.
+    // 4. Construct a StepContext that carries the bus (so the
+    // LlmCallStarted/Completed events still fire) but is NOT
+    // cache-usable — `prompt_hash` is left empty, so
+    // `try_cache_lookup_or_key` short-circuits to
+    // `MissOrBypass(None)` and `try_cache_store` no-ops. We do the
+    // cache write manually below so the new row lands at the PRIOR
+    // cache_key (not the content-addressable hash of the reroll
+    // wrapper prompts).
+    //
+    // Phase 13 wanderer fix: the previous implementation passed
+    // `with_prompt_hash(prior.prompt_hash)` which made the ctx
+    // cache-usable, but the call path then computed a NEW cache_key
+    // from `(hash(reroll_system, reroll_user), prior_prompt_hash,
+    // prior_model_id)` — different from `prior.cache_key`. The
+    // auto-store landed the new row at the NEW key,
+    // `supersede_cache_entry` found no prior row at the new key, and
+    // the supersession chain was never created. `load_new_cache_row`
+    // then silently loaded the PRIOR (untouched) row back, so:
+    //   - the returned `new_cache_entry_id` was the old row's id,
+    //   - the note was UPDATE'd onto the old row,
+    //   - the new row had `supersedes_cache_id = NULL`,
+    //   - `count_recent_rerolls` never counted the reroll (it gates
+    //     on `supersedes_cache_id IS NOT NULL`), disabling the
+    //     anti-slot-machine rate limit,
+    //   - subsequent normal builds still hit the original prompts'
+    //     cache_key and served the pre-reroll content.
+    // The fix routes the DB write manually so the new row occupies
+    // prior.cache_key with a proper supersedes_cache_id link.
     let build_id = format!(
         "reroll-{}-{}",
         slug,
@@ -146,13 +170,21 @@ pub async fn reroll_node(
         db_path.clone(),
     )
     .with_model_resolution("reroll", prior.model_id.clone())
-    .with_prompt_hash(prior.prompt_hash.clone())
     .with_bus(bus.clone())
     .with_force_fresh(input.force_fresh);
+    // Deliberately NOT calling `.with_prompt_hash(...)` — leaving
+    // `prompt_hash = ""` flips `cache_is_usable()` to false.
+    debug_assert!(
+        !ctx.cache_is_usable(),
+        "reroll ctx must bypass the cache-aware path so the manual \
+         supersession below lands at the prior cache_key"
+    );
 
-    // 5. Call the LLM through the unified cache-aware path. The
-    // force_fresh flag bypasses the cache read and routes the store
-    // through `supersede_cache_entry`.
+    // 5. Call the LLM. Events fire (LlmCallStarted, LlmCallCompleted,
+    // StepRetry, StepError) because `ctx.bus` is present; the cache
+    // lookup/store path is skipped because the ctx is not
+    // cache-usable.
+    let call_started = std::time::Instant::now();
     let response = call_model_unified_with_options_and_ctx(
         &llm_config,
         Some(&ctx),
@@ -174,12 +206,22 @@ pub async fn reroll_node(
         Err(_) => serde_json::json!({ "content": response.content }),
     };
 
-    // 7. Write the note onto the new row. The cache store path
-    // doesn't know about the note — we UPDATE the row post-write
-    // via a dedicated helper. We also capture the new row id.
-    let new_row = load_new_cache_row(&db_path, &slug, &prior.cache_key)?;
-    let new_cache_entry_id = new_row.id;
-    apply_note_to_cache_row(&db_path, new_cache_entry_id, &note)?;
+    // 7. Manually supersede the prior cache row. The new entry
+    // occupies prior.cache_key so future builds with the original
+    // prompts hit the rerolled content. inputs_hash / prompt_hash /
+    // model_id are intentionally copied from the prior row so
+    // `verify_cache_hit` passes on subsequent lookups — the
+    // content-addressable invariant (key == hash of inputs) still
+    // holds for the slot, just with the rerolled body.
+    let latency_ms = call_started.elapsed().as_millis() as i64;
+    let new_cache_entry_id = write_reroll_cache_entry(
+        &db_path,
+        &prior,
+        &build_id,
+        &response,
+        &note,
+        latency_ms,
+    )?;
 
     // 8. Node-level reroll also writes a change-manifest row with
     // the note populated. Intermediate (cache_key only) reroll
@@ -367,23 +409,90 @@ fn build_reroll_prompts(
     (system_prompt, user_prompt)
 }
 
-/// After the LLM call lands the new row through
-/// `supersede_cache_entry`, re-fetch it so we can return the id to
-/// the caller and (optionally) persist the note.
-fn load_new_cache_row(db_path: &str, slug: &str, cache_key: &str) -> Result<CachedStepOutput> {
-    let conn = db::open_pyramid_connection(Path::new(db_path))?;
-    db::check_cache_including_invalidated(&conn, slug, cache_key)?
-        .ok_or_else(|| anyhow!("reroll: new cache row not found post-write (slug={})", slug))
-}
+/// Phase 13 wanderer fix: manually archive the prior cache row and
+/// insert the rerolled row at the same cache_key. This replaces the
+/// broken auto-store path — the reroll wrapper prompts produce a
+/// different content-addressable key than the original, so we can't
+/// rely on the cache-aware store path to route the write through
+/// `supersede_cache_entry` with the right prior key.
+///
+/// The new row:
+///   - occupies `prior.cache_key` (so subsequent builds hit it),
+///   - carries the ORIGINAL `inputs_hash`/`prompt_hash`/`model_id`
+///     so `verify_cache_hit` passes on read-back,
+///   - has `force_fresh = true` and `supersedes_cache_id` linked to
+///     the archived prior row (set by `supersede_cache_entry`),
+///   - stores the user's note so `count_recent_rerolls` (which
+///     gates the anti-slot-machine warning on
+///     `supersedes_cache_id IS NOT NULL`) counts this reroll.
+///
+/// Returns the id of the newly-inserted row.
+fn write_reroll_cache_entry(
+    db_path: &str,
+    prior: &CachedStepOutput,
+    build_id: &str,
+    response: &LlmResponse,
+    note: &str,
+    latency_ms: i64,
+) -> Result<i64> {
+    // Mirror of llm.rs::serialize_response_for_cache — kept private
+    // over there, replicated here so the cache row format is
+    // consistent between the normal store path and the reroll path.
+    let output_json = serde_json::json!({
+        "content": response.content,
+        "usage": {
+            "prompt_tokens": response.usage.prompt_tokens,
+            "completion_tokens": response.usage.completion_tokens,
+        },
+        "generation_id": response.generation_id,
+        "actual_cost_usd": response.actual_cost_usd,
+        "provider_id": response.provider_id,
+    })
+    .to_string();
 
-/// Persist the note to the freshly-written cache row.
-fn apply_note_to_cache_row(db_path: &str, row_id: i64, note: &str) -> Result<()> {
+    let token_usage_json = serde_json::to_string(&serde_json::json!({
+        "prompt_tokens": response.usage.prompt_tokens,
+        "completion_tokens": response.usage.completion_tokens,
+    }))
+    .ok();
+
+    let note_opt = if note.is_empty() { None } else { Some(note.to_string()) };
+
+    let new_entry = CacheEntry {
+        slug: prior.slug.clone(),
+        build_id: build_id.to_string(),
+        step_name: prior.step_name.clone(),
+        chunk_index: prior.chunk_index,
+        depth: prior.depth,
+        cache_key: prior.cache_key.clone(),
+        inputs_hash: prior.inputs_hash.clone(),
+        prompt_hash: prior.prompt_hash.clone(),
+        model_id: prior.model_id.clone(),
+        output_json,
+        token_usage_json,
+        cost_usd: response.actual_cost_usd,
+        latency_ms: Some(latency_ms),
+        force_fresh: true,
+        supersedes_cache_id: None, // set by supersede_cache_entry
+        note: note_opt,
+    };
+
     let conn = db::open_pyramid_connection(Path::new(db_path))?;
-    conn.execute(
-        "UPDATE pyramid_step_cache SET note = ?1 WHERE id = ?2",
-        rusqlite::params![note, row_id],
-    )?;
-    Ok(())
+    db::supersede_cache_entry(&conn, &prior.slug, &prior.cache_key, &new_entry)?;
+
+    // Re-read the just-written row to grab its id. The row lives
+    // at prior.cache_key (supersede archived the old one), and we
+    // need the id for both `NodeRerolled` and the RerollOutput
+    // returned to the frontend.
+    let new_row = db::check_cache_including_invalidated(&conn, &prior.slug, &prior.cache_key)?
+        .ok_or_else(|| {
+            anyhow!(
+                "reroll: new cache row not found post-write (slug={}, key={})",
+                prior.slug,
+                prior.cache_key
+            )
+        })?;
+    Ok(new_row.id)
 }
 
 /// Write the change manifest row for node-level reroll. Intermediate
@@ -730,5 +839,154 @@ mod tests {
 
         let (_sys, usr) = build_reroll_prompts(&prior, &content, "needs more context");
         assert!(usr.contains("needs more context"));
+    }
+
+    // ── Phase 13 wanderer fix regression tests ──────────────────────
+
+    /// Synthesize an LlmResponse without hitting the network.
+    fn synth_response(content: &str) -> crate::pyramid::llm::LlmResponse {
+        crate::pyramid::llm::LlmResponse {
+            content: content.to_string(),
+            usage: crate::pyramid::types::TokenUsage {
+                prompt_tokens: 11,
+                completion_tokens: 22,
+            },
+            generation_id: Some("gen-test".to_string()),
+            actual_cost_usd: Some(0.00042),
+            provider_id: Some("openrouter".to_string()),
+        }
+    }
+
+    /// Load a prior cache row by (slug, cache_key) for post-condition
+    /// assertions that target a SPECIFIC key rather than the most-recent
+    /// row — needed because the wanderer tests compare the archived
+    /// prior vs the rerolled row.
+    fn load_row_by_key(db_path: &str, slug: &str, cache_key: &str) -> Option<CachedStepOutput> {
+        let conn = db::open_pyramid_connection(Path::new(db_path)).unwrap();
+        db::check_cache_including_invalidated(&conn, slug, cache_key).unwrap()
+    }
+
+    /// Wanderer regression: the reroll must land a new row AT the
+    /// prior cache_key with `supersedes_cache_id` pointing at the
+    /// archived prior. The pre-fix code routed the write through
+    /// `try_cache_store` with the REROLL-prompts' cache_key, which
+    /// produced a disconnected row at a different key and left the
+    /// supersession chain broken.
+    #[test]
+    fn test_write_reroll_cache_entry_archives_prior_and_links_supersession() {
+        let (_dir, db_path) = temp_db();
+        let prior_key = seed_cache_entry(
+            &db_path,
+            "reroll-test",
+            "synth",
+            2,
+            0,
+            "original_body",
+        );
+
+        // Grab the prior row so we can compare ids after the write.
+        let prior = load_row_by_key(&db_path, "reroll-test", &prior_key).unwrap();
+        let prior_id = prior.id;
+
+        let response = synth_response("rerolled_body");
+        let new_id = write_reroll_cache_entry(
+            &db_path,
+            &prior,
+            "reroll-build-1",
+            &response,
+            "needs more context",
+            1234,
+        )
+        .unwrap();
+
+        // (a) A new row occupies prior_key — and it is NOT the
+        // archived original.
+        let new_row =
+            load_row_by_key(&db_path, "reroll-test", &prior_key).expect("new row at prior key");
+        assert_eq!(new_row.id, new_id, "write_reroll_cache_entry returned id must match row at prior_key");
+        assert_ne!(
+            new_row.id, prior_id,
+            "new row must have a distinct id from the archived prior"
+        );
+
+        // (b) The new row has a proper supersession link.
+        assert_eq!(
+            new_row.supersedes_cache_id,
+            Some(prior_id),
+            "new row must link to the archived prior via supersedes_cache_id"
+        );
+
+        // (c) force_fresh is set on the new row.
+        assert!(new_row.force_fresh, "rerolled row must have force_fresh=true");
+
+        // (d) The note landed on the new row (not the archived prior).
+        assert_eq!(
+            new_row.note.as_deref(),
+            Some("needs more context"),
+            "reroll note must live on the new row"
+        );
+
+        // (e) The old row was moved to an archived cache_key so a
+        // future content-addressable lookup at prior_key returns the
+        // rerolled body, not the original.
+        let archived_key = format!("archived:{}:{}", prior_id, prior_key);
+        let archived = load_row_by_key(&db_path, "reroll-test", &archived_key)
+            .expect("prior row should exist at archived cache_key");
+        assert_eq!(archived.id, prior_id, "archived row id matches the prior id");
+        assert!(
+            archived.output_json.contains("original_body"),
+            "archived row preserves the pre-reroll content"
+        );
+
+        // (f) The rerolled content is what the new row carries.
+        assert!(
+            new_row.output_json.contains("rerolled_body"),
+            "new row carries the rerolled content, not the archived one"
+        );
+
+        // (g) Subsequent lookups via `check_cache` (which filters
+        // invalidated_by IS NULL) find the rerolled row — not the
+        // archived original — so future normal builds see the fix.
+        let conn = db::open_pyramid_connection(Path::new(&db_path)).unwrap();
+        let hit = db::check_cache(&conn, "reroll-test", &prior_key).unwrap();
+        let hit = hit.expect("normal cache lookup must hit the rerolled row");
+        assert_eq!(hit.id, new_id, "normal cache lookup returns the rerolled row");
+    }
+
+    /// Wanderer regression: after the reroll lands,
+    /// `count_recent_rerolls` must actually increment — it gates on
+    /// `supersedes_cache_id IS NOT NULL`, which the pre-fix code
+    /// never set (because `supersede_cache_entry` couldn't find the
+    /// prior row at the wrong cache_key).
+    #[test]
+    fn test_write_reroll_cache_entry_makes_count_recent_rerolls_tick() {
+        let (_dir, db_path) = temp_db();
+        let key = seed_cache_entry(&db_path, "reroll-test", "rate-limited", 1, 0, "v0");
+        let prior = load_row_by_key(&db_path, "reroll-test", &key).unwrap();
+
+        // Baseline: no rerolls yet.
+        {
+            let conn = db::open_pyramid_connection(Path::new(&db_path)).unwrap();
+            let n = db::count_recent_rerolls(&conn, "reroll-test", "rate-limited", 0, 1).unwrap();
+            assert_eq!(n, 0, "no rerolls yet");
+        }
+
+        // Reroll twice: the new rows must have supersedes_cache_id
+        // set, so count_recent_rerolls ticks up.
+        let response = synth_response("v1");
+        write_reroll_cache_entry(&db_path, &prior, "build-r1", &response, "note", 10).unwrap();
+        // After the first reroll the row at `key` is the new one —
+        // load it to get its own id and supersede again.
+        let after_r1 = load_row_by_key(&db_path, "reroll-test", &key).unwrap();
+        let response2 = synth_response("v2");
+        write_reroll_cache_entry(&db_path, &after_r1, "build-r2", &response2, "note2", 20).unwrap();
+
+        let conn = db::open_pyramid_connection(Path::new(&db_path)).unwrap();
+        let n = db::count_recent_rerolls(&conn, "reroll-test", "rate-limited", 0, 1).unwrap();
+        assert!(
+            n >= 2,
+            "count_recent_rerolls must see both rerolled rows (supersedes_cache_id IS NOT NULL); got {}",
+            n
+        );
     }
 }

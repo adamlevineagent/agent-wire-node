@@ -162,17 +162,41 @@ function logActivity(state: BuildRowState, entry: Omit<ActivityLogEntry, 'elapse
 }
 
 function derivedStepStatus(step: StepState): StepStatus {
-    if (step.status === 'failed' || step.status === 'retrying') return step.status;
+    // Terminal failed state set by explicit step_error wins outright.
+    // Other states (including 'retrying') are re-derived from the calls
+    // array — a successful retry otherwise leaves the step stuck on
+    // 'retrying' forever because the earlier-stale 'retrying' entry in
+    // `step.calls` keeps the aggregate logic from reaching 'completed'.
+    if (step.status === 'failed') return step.status;
     if (step.calls.length === 0) return step.status === 'running' ? 'running' : 'pending';
-    const hasPending = step.calls.some(c => c.status === 'running');
+
+    // Phase 13 wanderer fix: multiple calls can share a cache_key when
+    // the HTTP retry loop re-emits `LlmCallStarted` for the same key on
+    // each attempt. Only the LAST attempt per cache_key contributes to
+    // the aggregate status — earlier entries are stale retry markers.
+    // Calls without a cache_key (legacy / reroll path / non-cache-aware
+    // contexts) get a synthetic slot so each is considered independently.
+    const lastByCacheKey = new Map<string, StepCall>();
+    let syntheticSlot = 0;
+    for (const c of step.calls) {
+        const key = c.cacheKey && c.cacheKey.length > 0
+            ? c.cacheKey
+            : `__no_key_${syntheticSlot++}`;
+        lastByCacheKey.set(key, c);
+    }
+    const effective = Array.from(lastByCacheKey.values());
+
+    const hasPending = effective.some(c => c.status === 'running');
     if (hasPending) return 'running';
-    const allCached = step.calls.every(c => c.status === 'cached');
+    const hasRetrying = effective.some(c => c.status === 'retrying');
+    if (hasRetrying) return 'retrying';
+    const allCached = effective.every(c => c.status === 'cached');
     if (allCached) return 'cached';
-    const anyCached = step.calls.some(c => c.status === 'cached');
-    const allCompleted = step.calls.every(c => c.status === 'completed' || c.status === 'cached');
+    const anyCached = effective.some(c => c.status === 'cached');
+    const allCompleted = effective.every(c => c.status === 'completed' || c.status === 'cached');
     if (anyCached && allCompleted) return 'partial_cache';
     if (allCompleted) return 'completed';
-    const anyFailed = step.calls.some(c => c.status === 'failed');
+    const anyFailed = effective.some(c => c.status === 'failed');
     return anyFailed ? 'failed' : 'running';
 }
 
@@ -241,7 +265,16 @@ export function reduceBuildRowEvent(state: BuildRowState, event: TaggedKind): Bu
         }
         case 'llm_call_started': {
             const step = findOrCreateStep(next, event.step_name, event.depth, event.primitive, event.model_tier);
-            step.status = 'running';
+            // Phase 13 wanderer fix: preserve the 'retrying' status
+            // when a retry's HTTP dispatch fires its own LlmCallStarted.
+            // The previous code unconditionally reset to 'running',
+            // erasing the retry state the UI uses to render "retry N/M".
+            // A retry always follows a StepRetry that set status='retrying';
+            // if we're not in 'retrying', fall back to 'running' so a
+            // fresh call still flips the row out of 'pending'.
+            if (step.status !== 'retrying') {
+                step.status = 'running';
+            }
             step.calls.push({
                 cacheKey: event.cache_key,
                 status: 'running',

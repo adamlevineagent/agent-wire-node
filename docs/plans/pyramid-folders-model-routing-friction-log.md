@@ -1413,3 +1413,84 @@ Traced each of the 11 wanderer-focus questions end-to-end:
 
 ---
 
+## Phase 13 — Build viz expansion + reroll + cross-pyramid
+
+### Wanderer pass (2026-04-10)
+
+Traced all 12 wanderer questions end-to-end. Found two real bugs the verifier's punch-list audit missed — one a subtle event-ordering issue in the React reducer, one a load-bearing cache-key invariant violation in the reroll backend that cascaded into four other visible features.
+
+### Bugs fixed
+
+**W1 — `derivedStepStatus` early-returns on `retrying`; retry loop pollutes `step.calls` (`src/hooks/useBuildRowState.ts:164-201`, `:266-289`)**
+
+The reducer's aggregate-status helper had `if (step.status === 'failed' || step.status === 'retrying') return step.status;` at the top. Once `step_retry` flipped the step to `retrying`, no subsequent `llm_call_completed` could compute a terminal status — the helper short-circuited on the stale `retrying` string and the step was stuck forever.
+
+Even with that guard removed, a secondary bug lurked: `llm.rs::call_model_unified_with_options_and_ctx` re-emits `LlmCallStarted` inside its retry loop on every attempt. The reducer's `llm_call_started` handler does `step.calls.push(...)` unconditionally, so a retried-then-succeeded step ends up with `step.calls = [{cacheKey, status: 'retrying'}, {cacheKey, status: 'completed'}]`. The aggregate logic walked BOTH entries and found `allCompleted = false` (first entry is `'retrying'`) and `anyFailed = false`, landing on `'running'` instead of `'completed'`. Retries silently left steps stuck at `running` in the UI.
+
+**Fix:**
+1. Drop the `'retrying'` early-return from `derivedStepStatus` (keep the `'failed'` early-return — that's still terminal).
+2. Re-derive status from "last call per cache_key" so stale retry markers are ignored; the last attempt per key wins. Calls with an empty cache_key (e.g., the reroll's non-cache-aware path) get synthetic slots so they're considered independently.
+3. In the `llm_call_started` handler, preserve `step.status === 'retrying'` when a retry's fresh attempt fires, so the UI keeps showing `retry N/M` until the attempt either completes or fails.
+
+**W2 — Reroll cache-key mismatch breaks the ENTIRE reroll flow (`src/pyramid/reroll.rs:120-210`, `:378-465`)**
+
+The reroll path threaded `with_prompt_hash(prior.prompt_hash)` onto the StepContext, making `cache_is_usable() = true`. `call_model_unified_with_options_and_ctx` then computed `cache_key = hash(hash(reroll_system, reroll_user), prior_prompt_hash, prior_model_id)` — **different** from `prior.cache_key` because `build_reroll_prompts` intentionally wraps the original output in a "rerolling a prior output" template. That different cache_key cascaded into five broken user-visible behaviors:
+
+1. `supersede_cache_entry(slug, NEW_cache_key, entry)` found no prior row at the NEW key, so it inserted the rerolled row as a fresh entry with `supersedes_cache_id = NULL` and never archived the original.
+2. The original row remained untouched at `prior.cache_key`.
+3. `load_new_cache_row(slug, prior.cache_key)` loaded the UNTOUCHED original — the reroll IPC returned the old row's `id` as `new_cache_entry_id` to the frontend.
+4. `apply_note_to_cache_row(new_cache_entry_id, note)` wrote the reroll note onto the ORIGINAL row, not the rerolled row.
+5. `count_recent_rerolls` — which gates the anti-slot-machine rate limit on `WHERE supersedes_cache_id IS NOT NULL` — never counted the reroll. **The rate limit was effectively disabled.**
+6. On subsequent normal builds, the lookup computed `prior.cache_key` from the ORIGINAL prompts and hit the UNTOUCHED original row, serving the pre-reroll content. **The reroll never took effect on future builds.**
+
+The root invariant the implementer missed: `supersede_cache_entry` only works when the new row's cache_key matches the prior row's cache_key. The reroll wrapper prompts intentionally violate that invariant.
+
+**Fix:** bypass the cache-aware path for the reroll and route the DB write manually via a new `write_reroll_cache_entry` helper. The helper:
+- constructs the StepContext WITHOUT `with_prompt_hash`, so `cache_is_usable() = false` and the LLM path skips its automatic lookup/store entirely (events still fire because `ctx.bus.is_some()`),
+- builds a `CacheEntry` with `cache_key = prior.cache_key`, `inputs_hash = prior.inputs_hash`, `prompt_hash = prior.prompt_hash`, `model_id = prior.model_id` so `verify_cache_hit` passes on read-back,
+- calls `db::supersede_cache_entry` directly, which archives the prior row under `archived:{id}:{prior.cache_key}` and inserts the rerolled row at `prior.cache_key` with `supersedes_cache_id = prior_id` and `force_fresh = true`,
+- persists the user's note via `CacheEntry.note` (no post-write UPDATE needed),
+- returns the new row's id via a follow-up `check_cache_including_invalidated` read.
+
+`load_new_cache_row` and `apply_note_to_cache_row` were deleted — they were only reachable from the broken auto-store path.
+
+### Findings that were NOT bugs
+
+Traced each of the 12 wanderer-focus questions end-to-end:
+
+- **Q1/Q11 — step timeline event ordering.** `LlmCallStarted` is emitted INSIDE the retry loop after `try_cache_lookup_or_key` has already short-circuited cache hits. Cache hits fire `CacheHit` + `return Ok(response)` BEFORE `LlmCallStarted`. Cache misses fire `CacheMiss` and fall through to the loop. So the event sequence is always either `CacheHit` alone OR `(LlmCallStarted[, StepRetry]*, LlmCallCompleted | StepError)`. Never both. `llm.rs:537-538, 637, 963`.
+- **Q2 — cache-hit savings accumulator.** Uses a heuristic `avgCost = step.totalCostUsd / max(1, step.cacheMisses)` because the Phase 6 `CacheHit` variant doesn't carry `original_cost_usd` (pre-dates Phase 13's expanded payloads). Savings are approximate — zero on the first call of a fully-cached step — but the implementer documented this as a deliberate deviation ("A future refinement can thread the original cost through the event"). Not a wanderer fix, just a known limitation.
+- **Q6 — cross-pyramid timeline seeding.** `pyramid_active_builds` returns `Ok(Vec::new())` (not an error) when the active-build map is empty. The frontend hook seeds from the IPC, polls every 30s as a safety net, and subscribes to `cross-build-event`. Works as spec'd.
+- **Q7 — cost rollup SQL + client-side pivot.** `GROUP BY slug, provider_id, operation`. Frontend iterates distinct `(slug, provider, operation)` triples and pivots into three views. No double-counting. `db.rs::cost_rollup:10918-10951`, `CostRollupSection.tsx:36-63`.
+- **Q8 — Pause All respects `enabled = 0`.** `dadbear_extend.rs::dadbear_tick_loop` reloads configs every 1 second via `load_enabled_configs → get_enabled_dadbear_configs`, which filters on `enabled = 1`. Paused rows are skipped immediately on the next reload tick. `disable_dadbear_all` is idempotent (`WHERE enabled = 1`). `dadbear_extend.rs:139`, `db.rs:10845-10857, 10881-10901`.
+- **Q10 — cross-pyramid router lifetime.** The forwarder task runs indefinitely — fine, it's a singleton. `active_slugs` lazy-populates inside the forwarder (F5 deviation documented by the verifier). Entries with `unregistered = true` are pruned after 60s, but nothing calls `unregister_slug`, so the map grows monotonically with every distinct slug ever seen. Slow unbounded growth, practically bounded by the user's pyramid set (~10s). Minor known leak, not a wanderer fix.
+- **Q12 — downstream invalidation walker scope.** The implementer's log claims "single-level" but the code uses `SELECT ... WHERE depth > rerolled_depth` in `find_downstream_cache_keys`, which invalidates EVERY deeper row regardless of whether it actually depended on the rerolled content. The implementer's deviation #3 acknowledges this over-invalidation. The workstream prompt allowed it ("ship node-level invalidation only"). Not a bug, just a comment/log wording mismatch.
+
+### Non-blocking concerns surfaced (not fixed)
+
+- **Reroll wrapper template vs original prompt template.** The reroll sends a "you are rerolling a prior output" system prompt + a user prompt containing the prior output + the note. A future refinement could thread the ORIGINAL prompt template body through cache metadata and have the reroll replay the original prompts with the note injected — that would make the rerolled content match the original call's shape more closely. Out of scope for the wanderer fix; the current template is functionally correct because the resulting row stores `inputs_hash = prior.inputs_hash` (semantic lie but cache-correct).
+- **Cache savings heuristic in `useBuildRowState.ts::cache_hit` handler.** Computes `avgCost = step.totalCostUsd / max(1, step.cacheMisses)` which is zero on the first call of a fully-cached step. A real fix would extend the `CacheHit` TaggedKind with `original_cost_usd` and `original_model_id` fields (per the Phase 13 spec's original intent), and the reducer would use the actual saved cost. That touches Phase 6's event shape — non-trivial blast radius. Wanderer left alone.
+- **`CrossPyramidEventRouter::register_slug` / `unregister_slug` never called from production (F5 deviation documented by the verifier).** The router's explicit lifecycle hooks are dead. Runtime behavior matches the spec via lazy auto-population inside `spawn_tauri_forwarder`, but the 60-second grace window is effectively "forever" because nothing ever flips `unregistered = true`. Minor leak, not a wanderer fix.
+- **Reroll's node→cache_key lookup is a text search (`lookup_cache_entry_for_node`).** `SELECT ... WHERE output_json LIKE '%{node_id}%'` — relies on the node_id appearing verbatim in the cache row's output_json, which holds for the current chains but is fragile against future prompt changes that wrap or reformat node ids. Implementer deviation #2 documented this; a cleaner path is a future schema refinement adding `cache_key` to `pyramid_nodes`. Not a wanderer fix.
+- **Step timeline callIndex on empty cache_key.** The reroll's non-cache-aware ctx produces `LlmCallStarted` events with `cache_key = ""`. The reducer's `next.callIndex.set("", ...)` could collide with other events carrying empty keys, but in practice the reroll is a single one-off call and no concurrent call shares the empty-key slot. With the wanderer fix to `derivedStepStatus` using synthetic `__no_key_N` slots, the aggregate logic is already robust against the collision.
+
+### Commits
+
+1. `phase-13: wanderer fix — reroll cache key mismatch + retry status derivation`
+
+### Verification after fix
+
+- `cargo check --lib`: 3 pre-existing warnings only. No new warnings.
+- `cargo test --lib pyramid`: **1137 passing / 7 failing** (baseline 1135 after verifier fix + 2 wanderer regression tests). Same 7 pre-existing failures (2 defaults_adapter + 5 staleness tests documented in every prior phase log).
+- `cargo test --lib pyramid::reroll`: 9 passing / 0 failing (all reroll tests including the 2 new wanderer regression tests).
+- `npm run build`: clean, 140 modules transformed, no new TypeScript errors.
+- Code traces for Q1-Q12 recorded above; all 12 answered with file:line citations.
+
+### Lesson for future phases
+
+**When a reroll path uses `supersede_cache_entry`, the new row's cache_key MUST match the prior row's cache_key — otherwise the supersession chain silently detaches.** The invariant isn't documented on `supersede_cache_entry` itself — its signature just takes `(slug, prior_cache_key, new_entry)` and you'd reasonably assume the helper handles the key-matching internally. It doesn't. If `new_entry.cache_key != prior_cache_key`, the helper finds no prior row, skips the archival step, and inserts the new row at its own key — the supersession semantics only work when the content-addressable invariant (`cache_key = hash(inputs_hash, prompt_hash, model_id)`) stays the same on both sides. The reroll path violates this by construction (wrapper template produces different prompts → different inputs_hash → different cache_key), and the fix is to bypass the cache-aware write path entirely and build the `CacheEntry` manually with the prior cache_key.
+
+**The wanderer's value on a retried-then-succeeded path was: trace what the reducer actually computes vs what the spec says should display.** The verifier checked that `StepRetry` events fire and the reducer has a `step_retry` case. The wanderer simulated the event sequence `LlmCallStarted → StepRetry → LlmCallStarted → LlmCallCompleted` in their head and traced through the aggregate logic line by line, finding two orthogonal bugs: the early-return guard and the stale retry-marker pollution of `step.calls`. Event reducers are tricky because the state is observable only by sending events through them — static analysis of the switch statements rarely catches the pathological sequences.
+
+---
+
