@@ -4406,3 +4406,118 @@ cloud output) is unblocked.
 
 Single commit on `phase-18a-local-mode-providers`. Not pushed,
 not merged.
+
+### Verifier pass (2026-04-11)
+
+Fresh-eyes audit of commit `35b3173` against workstream prompt +
+provider-registry.md §382-395 / §559-561 + deferral-ledger
+L1/L2/L3/L5. **Result: clean, no new commit.**
+
+`cargo check --lib` clean (same 3 pre-existing warnings from
+`publication.rs`). `cargo test --lib pyramid` and `npm run build`
+blocked by persistent ENOSPC on harness task-output storage from
+parallel Phase 18 verifier worktrees. Static audit compensated:
+all 16 new test bodies read in full, compile-checked via cargo
+check, exercise public APIs matching the db.rs/local_mode.rs
+implementations they depend on.
+
+11-point failure-mode checklist — every item verified:
+
+1. **TierRoutingYaml repair.** `db.rs:14137` struct uses
+   `entries:` with `#[serde(default, alias = "tiers")]`.
+   `upsert_tier_routing_from_contribution` at L14187 deletes
+   tier rows not in the incoming contribution (`DELETE FROM
+   pyramid_tier_routing WHERE tier_name NOT IN (…)` or full
+   wipe on empty) before upserting. Required for Local Mode
+   reversibility (stale `web` row would otherwise route to
+   OpenRouter even under local mode). Tests
+   `tier_routing_yaml_struct_accepts_legacy_tiers_alias` and
+   `tier_routing_yaml_struct_accepts_canonical_entries` cover
+   both shapes.
+2. **Toggle reversibility.** `enable_local_mode` at
+   `local_mode.rs:295` snapshots prior contribution_ids into
+   `pyramid_local_mode_state` BEFORE superseding via
+   `save_local_mode_state` at L434. Disable at L582 loads
+   `restore_from_contribution_id` by id, copies its
+   `yaml_content` into a new supersession of the currently-
+   active local-mode contribution. Enable also force-includes
+   the 5 canonical tier names (`fast_extract`, `web`,
+   `synth_heavy`, `stale_remote`, `stale_local`) at L399 so
+   chain steps asking for a tier the prior contribution
+   dropped still resolve during local mode.
+3. **State table snapshot semantics.** `db.rs:1639` declares
+   `pyramid_local_mode_state` with BOTH
+   `restore_from_contribution_id` (tier_routing) AND
+   `restore_build_strategy_contribution_id` (build_strategy)
+   as TEXT columns. `load_local_mode_state` (L12807) and
+   `save_local_mode_state` (L12845) read/write both.
+4. **Settings.tsx Local LLM section.** Lives at L297-527
+   between Mesh Hosting (L280) and Auto-Update (L529). URL
+   field `disabled={localMode.status?.enabled || localMode.loading}`.
+   Model dropdown picks from live `status.available_models` or
+   `probeResult.available_models`. Status line renders
+   green/red/grey per spec. Orange concurrency warning banner
+   at L451. Two-step disable confirm modal at L469.
+5. **`/api/tags` resolver caching.** `OLLAMA_TAGS_CACHE` at
+   `yaml_renderer.rs:368` with 30s TTL. `lookup_cached_models`
+   at L380 correctly returns None when TTL elapsed. Failures
+   (unreachable, parse error, base_url credential sub failure)
+   cache empty list with same TTL. `std::sync::Mutex` never
+   held across await — synchronous entry point
+   `resolve_model_list_sync` for DB-only branches, async
+   `resolve_model_list_only` for the Ollama path.
+6. **IPC registrations (5 new).** Each def + each
+   invoke_handler entry present in `main.rs`:
+   `pyramid_get_local_mode_status` (L7702/L10539),
+   `pyramid_enable_local_mode` (L7714/L10540),
+   `pyramid_disable_local_mode` (L7734/L10541),
+   `pyramid_probe_ollama` (L7750/L10542),
+   `pyramid_preview_pull_contribution` (L7767/L10543).
+7. **Credential warning modal.** `ToolsMode.tsx:2273`
+   `handlePull` calls `pyramid_preview_pull_contribution`
+   first, stages modal at L2470-2566 when
+   `missing_credentials` is non-empty, lists missing keys at
+   L2498, offers Cancel (L2544) / Pull anyway (L2549). Backend
+   IPC at `main.rs:7767` calls `collect_references` +
+   `store.contains(name)` (`credentials.rs:306/420`).
+8. **Concurrency pin to 1.**
+   `build_local_mode_build_strategy_yaml` at
+   `local_mode.rs:551` parses prior YAML as untyped
+   `serde_yaml::Value` (preserving evidence_mode, webbing,
+   quality) and inserts `concurrency: 1` into both
+   `initial_build` and `maintenance` sub-mappings. Test
+   `build_local_mode_build_strategy_yaml_pins_concurrency_one`
+   asserts webbing/model_tier round-trip + concurrency=1.
+9. **Dehydration budget scaling deferred.** Documented above
+   under "Dehydration budget scaling decision" and in friction
+   log. Acceptable per workstream prompt deviation clause.
+10. **OllamaCloudProvider (L3) re-deferred.** Documented above
+    under "Deviations" as "Phase 18a+1 fix pass" candidate.
+    Acceptable per workstream prompt L3 optional clause.
+11. **`yaml_renderer_resolve_options` IPC** at `main.rs:8810`
+    correctly drops the rusqlite reader lock BEFORE awaiting
+    `resolve_model_list_only` so non-Send `&Connection` never
+    crosses an await point.
+
+Additional structural checks: `pyramid/mod.rs:59` declares
+`pub mod local_mode;`. `Provider` struct fields
+(`provider.rs:185`) match the fields set in `local_mode.rs:350`.
+`ProviderRegistry::resolve_base_url` (`provider.rs:967`)
+handles `${VAR}` substitution used by the Ollama `/api/tags`
+resolver. `supersede_config_contribution` takes
+`&mut Connection` and auto-reborrows fine from
+`&mut conn` in `enable_local_mode` / `disable_local_mode`.
+
+Minor observation (not a blocker): fresh-install fallback at
+`local_mode.rs:484` creates a concurrency-1 build_strategy
+contribution when no prior exists; subsequent disable leaves
+that contribution in place (because
+`restore_build_strategy_contribution_id = None`). Not reachable
+in practice because `bundled-build_strategy-default-v1`
+(`bundled_contributions.json:61`) is always seeded by
+`walk_bundled_contributions_manifest` on every boot. Flagged
+for future hardening only.
+
+**Status: clean, no new commit added.** Original `35b3173`
+stands. Wanderer pass recommended next per
+`feedback_wanderer_after_verifier.md`.
