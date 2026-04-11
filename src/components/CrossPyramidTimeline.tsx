@@ -1,16 +1,21 @@
 // Phase 13 — Cross-Pyramid Timeline top-level view.
 //
 // Shows every active build in a single list, a running cost
-// accumulator across all slugs, the spend rollup section, and the
-// "Pause All DADBEAR" button. Clicking "View" on a row opens the
-// detailed PyramidBuildViz in a drawer.
+// accumulator across all slugs, and the "Pause All DADBEAR" button.
+// Clicking "View" on a row opens the detailed PyramidBuildViz in a
+// drawer.
+//
+// Phase 15 relocated the `CostRollupSection` from this view to the
+// DADBEAR Oversight page (the spec-intended home for the spend
+// rollup). Cost attribution for individual in-flight builds still
+// lives in `CrossPyramidCostFooter`; the full rollup with pivots
+// now lives in `DadbearOversightPage.tsx`.
 
 import { useState, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { useCrossPyramidTimeline } from '../hooks/useCrossPyramidTimeline';
 import { ActiveBuildRow } from './ActiveBuildRow';
 import { CrossPyramidCostFooter } from './CrossPyramidCostFooter';
-import { CostRollupSection } from './CostRollupSection';
 import { PyramidBuildViz } from './PyramidBuildViz';
 
 interface PauseAllConfirmModalProps {
@@ -133,8 +138,6 @@ export function CrossPyramidTimeline() {
             </section>
 
             <CrossPyramidCostFooter byslug={state.byslug} />
-
-            <CostRollupSection />
 
             {viewSlug && (
                 <div className="cpt-drawer-backdrop" onClick={() => setViewSlug(null)}>

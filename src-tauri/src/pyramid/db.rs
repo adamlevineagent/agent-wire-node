@@ -11139,6 +11139,222 @@ pub fn cost_rollup(
     Ok(out)
 }
 
+// ── Phase 15: DADBEAR Oversight Page helpers ────────────────────────────────
+//
+// The Oversight page needs per-slug aggregation of DADBEAR status,
+// pending mutations, deferred questions, demand signals, and cost
+// reconciliation state. The IPC handler in `main.rs` composes
+// `build_dadbear_overview_rows` with the runtime `dadbear_in_flight`
+// state map to produce the final response. Splitting the DB-level
+// aggregation out of the IPC handler keeps the pure logic testable
+// against an in-memory Connection.
+
+/// Phase 15: per-slug row for the DADBEAR Oversight page, minus the
+/// in-flight stale check count (which lives on runtime state). The
+/// IPC handler fills `in_flight_stale_checks` from the shared
+/// `dadbear_in_flight` map.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DadbearOverviewRowDb {
+    pub slug: String,
+    pub config_ids: Vec<i64>,
+    pub enabled: bool,
+    pub scan_interval_secs: i64,
+    pub debounce_secs: i64,
+    pub last_scan_at: Option<String>,
+    pub pending_mutations_count: i64,
+    pub deferred_questions_count: i64,
+    pub demand_signals_24h: i64,
+    pub cost_24h_estimated_usd: f64,
+    pub cost_24h_actual_usd: f64,
+    pub cost_reconciliation_status: String,
+    pub recent_manifest_count: i64,
+}
+
+/// Phase 15: build every per-slug overview row from a single
+/// connection. Iterates `pyramid_dadbear_config`, groups by slug,
+/// and folds in counts + cost rollups. Pure function — the IPC
+/// handler appends the in-flight count after the fact.
+pub fn build_dadbear_overview_rows(
+    conn: &Connection,
+) -> Result<Vec<DadbearOverviewRowDb>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, slug, enabled, scan_interval_secs, debounce_secs, last_scan_at
+         FROM pyramid_dadbear_config
+         ORDER BY slug ASC, id ASC",
+    )?;
+    #[allow(clippy::type_complexity)]
+    let raw: Vec<(i64, String, bool, i64, i64, Option<String>)> = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i32>(2)? != 0,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, Option<String>>(5)?,
+            ))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+    drop(stmt);
+
+    #[derive(Default)]
+    struct SlugBucket {
+        config_ids: Vec<i64>,
+        enabled_any: bool,
+        min_scan_interval: Option<i64>,
+        min_debounce: Option<i64>,
+        latest_scan: Option<String>,
+    }
+    let mut buckets: std::collections::BTreeMap<String, SlugBucket> =
+        std::collections::BTreeMap::new();
+    for (id, slug, enabled, scan_iv, debounce, last_scan_at) in raw {
+        let bucket = buckets.entry(slug).or_default();
+        bucket.config_ids.push(id);
+        if enabled {
+            bucket.enabled_any = true;
+        }
+        bucket.min_scan_interval = Some(
+            bucket
+                .min_scan_interval
+                .map_or(scan_iv, |cur| cur.min(scan_iv)),
+        );
+        bucket.min_debounce = Some(
+            bucket
+                .min_debounce
+                .map_or(debounce, |cur| cur.min(debounce)),
+        );
+        if let Some(ts) = last_scan_at {
+            bucket.latest_scan = match &bucket.latest_scan {
+                Some(cur) if cur >= &ts => Some(cur.clone()),
+                _ => Some(ts),
+            };
+        }
+    }
+
+    let mut rows: Vec<DadbearOverviewRowDb> = Vec::with_capacity(buckets.len());
+    for (slug, bucket) in buckets {
+        let pending_mutations_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pyramid_pending_mutations
+                 WHERE slug = ?1 AND processed = 0",
+                rusqlite::params![slug],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+
+        let deferred_questions_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pyramid_deferred_questions WHERE slug = ?1",
+                rusqlite::params![slug],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+
+        let demand_signals_24h: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pyramid_demand_signals
+                 WHERE slug = ?1 AND created_at > datetime('now', '-24 hours')",
+                rusqlite::params![slug],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+
+        let (cost_24h_estimated_usd, cost_24h_actual_usd): (f64, f64) = conn
+            .query_row(
+                "SELECT
+                    COALESCE(SUM(COALESCE(estimated_cost_usd, estimated_cost, 0)), 0),
+                    COALESCE(SUM(COALESCE(broadcast_cost_usd, actual_cost, 0)), 0)
+                 FROM pyramid_cost_log
+                 WHERE slug = ?1 AND created_at > datetime('now', '-24 hours')",
+                rusqlite::params![slug],
+                |r| Ok((r.get::<_, f64>(0)?, r.get::<_, f64>(1)?)),
+            )
+            .unwrap_or((0.0, 0.0));
+
+        // Severity-ordered reconciliation aggregation.
+        let worst_discrepancy: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pyramid_cost_log
+                 WHERE slug = ?1
+                   AND reconciliation_status = 'discrepancy'
+                   AND created_at > datetime('now', '-24 hours')",
+                rusqlite::params![slug],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        let worst_missing: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pyramid_cost_log
+                 WHERE slug = ?1
+                   AND reconciliation_status = 'broadcast_missing'
+                   AND created_at > datetime('now', '-24 hours')",
+                rusqlite::params![slug],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        let pending: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pyramid_cost_log
+                 WHERE slug = ?1
+                   AND (reconciliation_status IS NULL
+                        OR reconciliation_status = 'synchronous'
+                        OR reconciliation_status = 'pending')
+                   AND created_at > datetime('now', '-24 hours')",
+                rusqlite::params![slug],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        let total_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pyramid_cost_log
+                 WHERE slug = ?1
+                   AND created_at > datetime('now', '-24 hours')",
+                rusqlite::params![slug],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        let cost_reconciliation_status = if worst_discrepancy > 0 {
+            "discrepancy".to_string()
+        } else if worst_missing > 0 {
+            "broadcast_missing".to_string()
+        } else if total_rows == 0 {
+            "healthy".to_string()
+        } else if pending > 0 {
+            "pending".to_string()
+        } else {
+            "healthy".to_string()
+        };
+
+        let recent_manifest_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pyramid_change_manifests
+                 WHERE slug = ?1 AND applied_at > datetime('now', '-24 hours')",
+                rusqlite::params![slug],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+
+        rows.push(DadbearOverviewRowDb {
+            slug,
+            config_ids: bucket.config_ids,
+            enabled: bucket.enabled_any,
+            scan_interval_secs: bucket.min_scan_interval.unwrap_or(10),
+            debounce_secs: bucket.min_debounce.unwrap_or(30),
+            last_scan_at: bucket.latest_scan,
+            pending_mutations_count,
+            deferred_questions_count,
+            demand_signals_24h,
+            cost_24h_estimated_usd,
+            cost_24h_actual_usd,
+            cost_reconciliation_status,
+            recent_manifest_count,
+        });
+    }
+
+    Ok(rows)
+}
+
 /// Phase 13: active-builds query. Returns one summary row per
 /// active (running/idle) slug. The current schema doesn't have a
 /// `pyramid_build_runs` lifecycle table — the spec assumed one —
@@ -15440,5 +15656,326 @@ mod phase13_tests {
         assert_eq!(tracked[0].0, "local-1");
         assert_eq!(tracked[0].1, "w-orig");
         assert_eq!(tracked[0].2, "custom_prompts");
+    }
+}
+
+// ── Phase 15 tests: DADBEAR Oversight aggregation ──────────────────────────
+#[cfg(test)]
+mod phase15_tests {
+    use super::*;
+
+    fn mem_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        init_pyramid_db(&conn).unwrap();
+        // Seed a couple of slugs — the foreign key on
+        // pyramid_dadbear_config.slug is relaxed in the schema but we
+        // still want parent rows because cost_log, pending_mutations,
+        // and change_manifests all reference pyramid_slugs ON DELETE
+        // CASCADE.
+        for s in ["p15-alpha", "p15-beta", "p15-gamma"] {
+            conn.execute(
+                "INSERT OR IGNORE INTO pyramid_slugs (slug, content_type, source_path)
+                 VALUES (?1, 'document', '/tmp/p15')",
+                rusqlite::params![s],
+            )
+            .unwrap();
+        }
+        conn
+    }
+
+    fn seed_dadbear_config(
+        conn: &Connection,
+        slug: &str,
+        source_path: &str,
+        enabled: bool,
+        scan_interval: i64,
+    ) -> i64 {
+        conn.execute(
+            "INSERT INTO pyramid_dadbear_config
+                (slug, source_path, content_type, scan_interval_secs, debounce_secs, enabled)
+             VALUES (?1, ?2, 'document', ?3, 30, ?4)",
+            rusqlite::params![slug, source_path, scan_interval, enabled as i32],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    fn seed_cost_with_status(
+        conn: &Connection,
+        slug: &str,
+        status: Option<&str>,
+        estimated: f64,
+        actual: Option<f64>,
+    ) {
+        conn.execute(
+            "INSERT INTO pyramid_cost_log
+                (slug, operation, model, input_tokens, output_tokens,
+                 estimated_cost, estimated_cost_usd, broadcast_cost_usd,
+                 reconciliation_status, created_at)
+             VALUES (?1, 'stale_check', 'm-1', 10, 20, ?2, ?2, ?3, ?4, datetime('now'))",
+            rusqlite::params![slug, estimated, actual, status],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_overview_aggregates_single_slug() {
+        let conn = mem_conn();
+        seed_dadbear_config(&conn, "p15-alpha", "/tmp/a", true, 10);
+        // Two pending mutations, one already processed.
+        conn.execute(
+            "INSERT INTO pyramid_pending_mutations
+                (slug, layer, mutation_type, target_ref, processed)
+             VALUES
+                ('p15-alpha', 0, 'reextract', 'n1', 0),
+                ('p15-alpha', 0, 'reextract', 'n2', 0),
+                ('p15-alpha', 0, 'reextract', 'n3', 1)",
+            [],
+        )
+        .unwrap();
+        // Three demand signals.
+        for _ in 0..3 {
+            conn.execute(
+                "INSERT INTO pyramid_demand_signals
+                    (slug, node_id, signal_type, weight)
+                 VALUES ('p15-alpha', 'n1', 'agent_query', 1.0)",
+                [],
+            )
+            .unwrap();
+        }
+        // One deferred question.
+        conn.execute(
+            "INSERT INTO pyramid_deferred_questions
+                (slug, question_id, question_json, next_check_at, check_interval)
+             VALUES ('p15-alpha', 'q1', '{}', datetime('now', '+1 day'), 'daily')",
+            [],
+        )
+        .unwrap();
+        // Two cost rows — one synchronous, one confirmed healthy.
+        seed_cost_with_status(&conn, "p15-alpha", Some("synchronous"), 0.05, None);
+        seed_cost_with_status(&conn, "p15-alpha", Some("confirmed"), 0.10, Some(0.09));
+        // One change manifest.
+        conn.execute(
+            "INSERT INTO pyramid_change_manifests
+                (slug, node_id, build_version, manifest_json, applied_at)
+             VALUES ('p15-alpha', 'n1', 1, '{}', datetime('now'))",
+            [],
+        )
+        .unwrap();
+
+        let rows = build_dadbear_overview_rows(&conn).unwrap();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.slug, "p15-alpha");
+        assert!(row.enabled);
+        assert_eq!(row.config_ids.len(), 1);
+        assert_eq!(row.pending_mutations_count, 2);
+        assert_eq!(row.deferred_questions_count, 1);
+        assert_eq!(row.demand_signals_24h, 3);
+        assert!((row.cost_24h_estimated_usd - 0.15).abs() < 1e-9);
+        assert!((row.cost_24h_actual_usd - 0.09).abs() < 1e-9);
+        assert_eq!(row.recent_manifest_count, 1);
+        // Synchronous rows count as pending (waiting for broadcast
+        // confirmation), so the status should be 'pending' here.
+        assert_eq!(row.cost_reconciliation_status, "pending");
+    }
+
+    #[test]
+    fn test_overview_reports_discrepancy_when_any_row_discrepant() {
+        let conn = mem_conn();
+        seed_dadbear_config(&conn, "p15-alpha", "/tmp/a", true, 10);
+        seed_cost_with_status(&conn, "p15-alpha", Some("confirmed"), 0.10, Some(0.10));
+        seed_cost_with_status(&conn, "p15-alpha", Some("discrepancy"), 0.05, Some(0.20));
+
+        let rows = build_dadbear_overview_rows(&conn).unwrap();
+        assert_eq!(rows[0].cost_reconciliation_status, "discrepancy");
+    }
+
+    #[test]
+    fn test_overview_reports_broadcast_missing_when_no_discrepancy() {
+        let conn = mem_conn();
+        seed_dadbear_config(&conn, "p15-alpha", "/tmp/a", true, 10);
+        seed_cost_with_status(&conn, "p15-alpha", Some("broadcast_missing"), 0.10, None);
+        seed_cost_with_status(&conn, "p15-alpha", Some("confirmed"), 0.05, Some(0.05));
+
+        let rows = build_dadbear_overview_rows(&conn).unwrap();
+        assert_eq!(rows[0].cost_reconciliation_status, "broadcast_missing");
+    }
+
+    #[test]
+    fn test_overview_reports_healthy_with_no_rows() {
+        let conn = mem_conn();
+        seed_dadbear_config(&conn, "p15-alpha", "/tmp/a", true, 10);
+        let rows = build_dadbear_overview_rows(&conn).unwrap();
+        assert_eq!(rows[0].cost_reconciliation_status, "healthy");
+    }
+
+    #[test]
+    fn test_overview_groups_multi_config_per_slug() {
+        let conn = mem_conn();
+        // Two configs for the same slug — one enabled, one not.
+        // The bucket should report enabled=true (any-enabled) and
+        // carry both config_ids.
+        let id_a = seed_dadbear_config(&conn, "p15-alpha", "/tmp/a", true, 10);
+        let id_b = seed_dadbear_config(&conn, "p15-alpha", "/tmp/b", false, 20);
+
+        let rows = build_dadbear_overview_rows(&conn).unwrap();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert!(row.enabled, "enabled should be true if any config is enabled");
+        assert_eq!(row.config_ids.len(), 2);
+        assert!(row.config_ids.contains(&id_a));
+        assert!(row.config_ids.contains(&id_b));
+        // scan_interval_secs should be the MIN across configs.
+        assert_eq!(row.scan_interval_secs, 10);
+    }
+
+    #[test]
+    fn test_overview_reports_all_paused_when_all_disabled() {
+        let conn = mem_conn();
+        seed_dadbear_config(&conn, "p15-alpha", "/tmp/a", false, 10);
+        seed_dadbear_config(&conn, "p15-beta", "/tmp/b", false, 10);
+
+        let rows = build_dadbear_overview_rows(&conn).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| !r.enabled));
+    }
+
+    #[test]
+    fn test_overview_multi_slug_aggregates() {
+        let conn = mem_conn();
+        seed_dadbear_config(&conn, "p15-alpha", "/tmp/a", true, 10);
+        seed_dadbear_config(&conn, "p15-beta", "/tmp/b", false, 20);
+        seed_dadbear_config(&conn, "p15-gamma", "/tmp/c", true, 30);
+
+        // Only alpha has pending mutations.
+        conn.execute(
+            "INSERT INTO pyramid_pending_mutations
+                (slug, layer, mutation_type, target_ref, processed)
+             VALUES ('p15-alpha', 0, 'reextract', 'n1', 0)",
+            [],
+        )
+        .unwrap();
+        // Beta has a deferred question.
+        conn.execute(
+            "INSERT INTO pyramid_deferred_questions
+                (slug, question_id, question_json, next_check_at, check_interval)
+             VALUES ('p15-beta', 'q1', '{}', datetime('now', '+1 day'), 'daily')",
+            [],
+        )
+        .unwrap();
+        // Gamma has a cost row.
+        seed_cost_with_status(&conn, "p15-gamma", Some("confirmed"), 0.50, Some(0.48));
+
+        let rows = build_dadbear_overview_rows(&conn).unwrap();
+        assert_eq!(rows.len(), 3);
+
+        let alpha = rows.iter().find(|r| r.slug == "p15-alpha").unwrap();
+        let beta = rows.iter().find(|r| r.slug == "p15-beta").unwrap();
+        let gamma = rows.iter().find(|r| r.slug == "p15-gamma").unwrap();
+
+        assert_eq!(alpha.pending_mutations_count, 1);
+        assert!(alpha.enabled);
+
+        assert_eq!(beta.deferred_questions_count, 1);
+        assert!(!beta.enabled);
+
+        assert!((gamma.cost_24h_estimated_usd - 0.50).abs() < 1e-9);
+        assert!((gamma.cost_24h_actual_usd - 0.48).abs() < 1e-9);
+        assert!(gamma.enabled);
+    }
+
+    #[test]
+    fn test_per_slug_pause_and_resume() {
+        let conn = mem_conn();
+        seed_dadbear_config(&conn, "p15-alpha", "/tmp/a", true, 10);
+        seed_dadbear_config(&conn, "p15-alpha", "/tmp/b", true, 10);
+        seed_dadbear_config(&conn, "p15-beta", "/tmp/c", true, 10);
+
+        let paused = disable_dadbear_for_slug(&conn, "p15-alpha").unwrap();
+        assert_eq!(paused, 2);
+
+        // alpha is now paused, beta is not.
+        let rows = build_dadbear_overview_rows(&conn).unwrap();
+        let alpha = rows.iter().find(|r| r.slug == "p15-alpha").unwrap();
+        let beta = rows.iter().find(|r| r.slug == "p15-beta").unwrap();
+        assert!(!alpha.enabled);
+        assert!(beta.enabled);
+
+        // Resume alpha — both configs should flip back.
+        let resumed = enable_dadbear_for_slug(&conn, "p15-alpha").unwrap();
+        assert_eq!(resumed, 2);
+        let rows = build_dadbear_overview_rows(&conn).unwrap();
+        let alpha = rows.iter().find(|r| r.slug == "p15-alpha").unwrap();
+        assert!(alpha.enabled);
+    }
+
+    #[test]
+    fn test_acknowledge_orphan_broadcast_updates_row() {
+        let conn = mem_conn();
+        // Seed one unacknowledged orphan.
+        conn.execute(
+            "INSERT INTO pyramid_orphan_broadcasts
+                (provider_id, generation_id, session_id, pyramid_slug, build_id,
+                 step_name, model, cost_usd, tokens_in, tokens_out, payload_json)
+             VALUES ('openrouter', 'gen-1', 'p15-alpha/b1', 'p15-alpha', 'b1',
+                     'extract', 'm-1', 0.01, 100, 50, '{}')",
+            [],
+        )
+        .unwrap();
+        let orphan_id: i64 = conn
+            .query_row(
+                "SELECT id FROM pyramid_orphan_broadcasts WHERE generation_id = 'gen-1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        // Before acknowledgement, unacknowledged count = 1.
+        let unack: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pyramid_orphan_broadcasts
+                 WHERE acknowledged_at IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(unack, 1);
+
+        // Simulate the IPC's UPDATE.
+        let now = "2026-04-10 12:00:00";
+        let affected = conn
+            .execute(
+                "UPDATE pyramid_orphan_broadcasts
+                    SET acknowledged_at = ?1,
+                        acknowledgment_reason = ?2
+                  WHERE id = ?3 AND acknowledged_at IS NULL",
+                rusqlite::params![now, "reviewed", orphan_id],
+            )
+            .unwrap();
+        assert_eq!(affected, 1);
+
+        // Re-ack should affect 0 rows (idempotent).
+        let affected2 = conn
+            .execute(
+                "UPDATE pyramid_orphan_broadcasts
+                    SET acknowledged_at = ?1,
+                        acknowledgment_reason = ?2
+                  WHERE id = ?3 AND acknowledged_at IS NULL",
+                rusqlite::params![now, "reviewed again", orphan_id],
+            )
+            .unwrap();
+        assert_eq!(affected2, 0);
+
+        // Unacknowledged count now 0.
+        let unack: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pyramid_orphan_broadcasts
+                 WHERE acknowledged_at IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(unack, 0);
     }
 }

@@ -1603,3 +1603,64 @@ The fix is mechanical: take the hint as an optional UX preference but always re-
 
 ---
 
+## Phase 15 — DADBEAR Oversight Page
+
+### Deviation 1: In-flight stale check detection not from `pyramid_stale_check_log`
+
+**Friction:** the workstream prompt specifies `COUNT(*) FROM pyramid_stale_check_log WHERE slug = ? AND completed_at IS NULL` for the Oversight page's `in_flight_stale_checks` field. The actual schema has no `completed_at` or `started_at` column on `pyramid_stale_check_log` — every row in that table is a completed check with `checked_at`, `stale`, and `reason` populated at insert time. The prompt anticipated this: "if there's no `completed_at` column, use a different signal".
+
+**Resolution:** derive in-flight state from the existing `PyramidState::dadbear_in_flight` AtomicBool map, which is keyed by `pyramid_dadbear_config.id` and already tracks per-config dispatch state (set when the tick loop fires, cleared when it returns). This is the authoritative runtime signal — the same map the tick loop and the HTTP/CLI manual trigger already consult to avoid re-entrant dispatch. The IPC takes a snapshot of the flags, then per slug, filters the snapshot to the config ids belonging to that slug and counts the `true` entries.
+
+**Why this is not a Pillar 37 violation:** the fix routes through an existing user/tick-loop-controlled state primitive rather than introducing a new number or hardcoded threshold. The count faithfully reflects "how many of this slug's DADBEAR configs are currently dispatching". No new constants, no magic windows, no silent fallback — just reusing the map that already exists for the same purpose.
+
+### Deviation 2: per-pyramid `pyramid_dadbear_pause`/`_resume` IPCs did not exist
+
+**Friction:** the prompt said to "check first" for these IPCs. At the start of Phase 15, only the Phase 13 `*_all` variants were registered in `main.rs`. The DB-level helpers (`enable_dadbear_for_slug`, `disable_dadbear_for_slug`) existed but were unreachable from the frontend.
+
+**Resolution:** added two thin IPC wrappers (`pyramid_dadbear_pause`, `pyramid_dadbear_resume`) that call the existing DB helpers and return `{ ok: bool, affected: usize }`. No new DB code.
+
+### Deviation 3: `pyramid_acknowledge_orphan_broadcast` IPC did not exist
+
+**Friction:** prompt said "check first". Did not exist. Phase 11 shipped `pyramid_list_orphan_broadcasts` but not the ack counterpart.
+
+**Resolution:** added the IPC. Updates `pyramid_orphan_broadcasts.acknowledged_at` + `acknowledgment_reason` with a predicate guard so re-acks are idempotent no-ops.
+
+### Deviation 4: Page placed as a tab within `PyramidsMode`, not a new top-level Mode
+
+**Friction:** the prompt says "new top-level mode/tab/route — recommend a new top-level page that shares the `useBuildRowState` hook". The existing `PyramidsMode` already has two tabs (Dashboard, Builds) that are conceptually adjacent to Oversight, and the sidebar already surfaces "Understanding" (pyramids).
+
+**Resolution:** added a third tab "Oversight" within PyramidsMode. Keeps the sidebar uncluttered, puts the Oversight surface alongside the Builds timeline where operators already look for DADBEAR status. The prompt explicitly permitted either choice ("tab on the same page or create a new page").
+
+### Deviation 5: `CostRollupSection` removed from `CrossPyramidTimeline` entirely
+
+**Friction:** the prompt says "Remove the Phase 13 mount OR keep it in both places (a small duplication is fine). Document the choice."
+
+**Resolution:** removed from CrossPyramidTimeline. Spec intent is that the Oversight page is the canonical home; having it in two places would split user expectation for where to find the spend pivot view. The compact live footer (`CrossPyramidCostFooter`) still lives on the Builds tab.
+
+### Deviation 6: Preset bridge as module-level singleton + CustomEvent, not AppContext extension
+
+**Friction:** the prompt says "Wire the button to open the Phase 9/10 `CreatePanel` workflow with those preset values. If that's not trivially possible due to how Phase 10 wired the CreatePanel, open a new modal that dispatches the same invoke calls."
+
+**Resolution:** the Phase 10 CreatePanel already takes a `seed: CreateSeed | null` prop that drives an "edit existing" flow, but "Set Default Norms" doesn't need a seeded draft — it just needs to pre-select the `dadbear_policy` schema and jump to the intent step. Added a separate `preset` prop (`ToolsModePreset`, same shape as pick-schema arguments) with its own effect. The cross-component bridge is a module-level one-shot variable (`takeToolsModePreset`) + a `wire-node:tools-mode-preset` CustomEvent. Rationale: the preset is ephemeral cross-component handoff data (not persistent app state), so AppContext is the wrong place for it. This avoids polluting the reducer with a prop that's always empty except for one mode transition.
+
+### Non-blocking concerns surfaced (not fixed)
+
+- **`display_name` returned from `pyramid_dadbear_overview` is just the slug.** The database schema has no per-pyramid display_name column; a future phase can swap in a real display name when `pyramid_slugs` gains one. Not a correctness issue — the frontend still renders the slug in a monospace header which is what Adam already sees elsewhere.
+- **`next_scan_at` is computed as `last_scan_at + scan_interval_secs` without accounting for the debounce period or the in-flight flag.** For most users this is accurate enough; the UI shows "due now" when the computed time is in the past.
+- **`pyramid_dadbear_activity_log` merges the three sources in memory and then sorts + truncates.** At 500 rows the LIMIT cap this is a non-issue. A future optimization would push the union into SQL so the LIMIT applies before sort.
+- **Polling intervals are hardcoded (10s for overview, 30s for provider health, 60s for orphans).** These should probably move to config contributions so operators can dial them, but that's out of scope for Phase 15 — the plan was explicit that Oversight is frontend assembly, not new configuration surface.
+
+### Commits
+
+1. `phase-15: dadbear oversight page`
+
+### Verification after phase
+
+- `cargo check --lib`: 3 pre-existing warnings only. No new warnings.
+- `cargo check --bin wire-node-desktop`: 1 pre-existing binary warning.
+- `cargo test --lib pyramid`: **1179 passing / 7 failing** (baseline 1170 + 9 new Phase 15 tests). Same 7 pre-existing failures.
+- `cargo test --lib pyramid::db::phase15_tests`: **9 passing / 0 failing**.
+- `npm run build`: clean, 150 modules transformed, no new TypeScript errors.
+
+---
+

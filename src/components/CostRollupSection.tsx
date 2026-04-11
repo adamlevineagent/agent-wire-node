@@ -1,10 +1,10 @@
 // Phase 13 — spend rollup section.
 //
-// Mounted on the CrossPyramidTimeline view in Phase 13 (Phase 15
-// will move it to the DADBEAR Oversight page). Fetches the
-// aggregated cost data from `pyramid_cost_rollup` and pivots it
-// client-side into three views: by pyramid, by provider, by
-// operation.
+// Mounted on the DADBEAR Oversight page (Phase 15 relocated this
+// section from the Phase 13 CrossPyramidTimeline placeholder to its
+// spec-intended home). Fetches the aggregated cost data from
+// `pyramid_cost_rollup` and pivots it client-side into three views:
+// by pyramid, by provider, by operation.
 
 import { useEffect, useState, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';

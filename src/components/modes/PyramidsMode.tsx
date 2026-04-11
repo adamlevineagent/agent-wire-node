@@ -3,9 +3,10 @@ import { invoke } from '@tauri-apps/api/core';
 import { PyramidDashboard } from '../PyramidDashboard';
 import { PyramidFirstRun } from '../PyramidFirstRun';
 import { CrossPyramidTimeline } from '../CrossPyramidTimeline';
+import { DadbearOversightPage } from '../DadbearOversightPage';
 import { SlugInfo, PyramidConfigInfo } from '../pyramid-types';
 
-type PyramidsTab = 'dashboard' | 'builds';
+type PyramidsTab = 'dashboard' | 'builds' | 'oversight';
 
 export function PyramidsMode() {
     const [showFirstRun, setShowFirstRun] = useState(false);
@@ -58,9 +59,16 @@ export function PyramidsMode() {
                 >
                     Builds
                 </button>
+                <button
+                    className={`pyramids-mode-tab ${tab === 'oversight' ? 'pyramids-mode-tab-active' : ''}`}
+                    onClick={() => setTab('oversight')}
+                >
+                    Oversight
+                </button>
             </div>
             {tab === 'dashboard' && <PyramidDashboard />}
             {tab === 'builds' && <CrossPyramidTimeline />}
+            {tab === 'oversight' && <DadbearOversightPage />}
         </div>
     );
 }

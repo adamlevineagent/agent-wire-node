@@ -6579,6 +6579,378 @@ async fn pyramid_resume_dadbear_all(
     Ok(serde_json::json!({ "affected": affected }))
 }
 
+// ── Phase 15: DADBEAR Oversight Page ────────────────────────────────────────
+//
+// Per `docs/specs/evidence-triage-and-dadbear.md` Part 3 (DADBEAR
+// Oversight Page). The Oversight page is a unified view assembling
+// per-pyramid DADBEAR status, pending mutations, in-flight checks,
+// deferred questions, demand signals, cost reconciliation, and
+// activity logs. These IPCs aggregate data from existing operational
+// tables in a single round trip so the frontend can poll cheaply.
+//
+// The `pyramid_dadbear_overview` command is the primary entry point;
+// `pyramid_dadbear_activity_log` powers a per-slug activity drawer;
+// `pyramid_dadbear_pause` / `pyramid_dadbear_resume` are per-slug
+// toggles (the `*_all` variants Phase 13 shipped remain the global
+// controls). `pyramid_acknowledge_orphan_broadcast` closes the loop
+// on Phase 11's leak detection surface by letting the admin dismiss
+// a specific orphan row after review.
+
+#[derive(serde::Serialize)]
+struct DadbearOverviewRow {
+    slug: String,
+    display_name: String,
+    enabled: bool,
+    scan_interval_secs: i64,
+    debounce_secs: i64,
+    last_scan_at: Option<String>,
+    next_scan_at: Option<String>,
+    pending_mutations_count: i64,
+    in_flight_stale_checks: i64,
+    deferred_questions_count: i64,
+    demand_signals_24h: i64,
+    cost_24h_estimated_usd: f64,
+    cost_24h_actual_usd: f64,
+    cost_reconciliation_status: String,
+    recent_manifest_count: i64,
+}
+
+#[derive(serde::Serialize)]
+struct DadbearOverviewTotals {
+    total_estimated_24h_usd: f64,
+    total_actual_24h_usd: f64,
+    total_pending_mutations: i64,
+    total_in_flight_checks: i64,
+    total_deferred_questions: i64,
+    paused_count: i64,
+    active_count: i64,
+}
+
+#[derive(serde::Serialize)]
+struct DadbearOverviewResponse {
+    pyramids: Vec<DadbearOverviewRow>,
+    totals: DadbearOverviewTotals,
+}
+
+/// Phase 15: aggregate DADBEAR status across every pyramid that has
+/// a `pyramid_dadbear_config` row. Delegates to
+/// `pyramid_db::build_dadbear_overview_rows` for the pure DB aggregation,
+/// then folds in the runtime `dadbear_in_flight` map to fill the
+/// `in_flight_stale_checks` column and computes per-row
+/// `next_scan_at` + global totals. Called by the Oversight page on
+/// mount and on a polling interval.
+#[tauri::command]
+async fn pyramid_dadbear_overview(
+    state: tauri::State<'_, SharedState>,
+) -> Result<DadbearOverviewResponse, String> {
+    let conn = state.pyramid.reader.lock().await;
+
+    // Snapshot of the in-flight flag map, keyed by
+    // `pyramid_dadbear_config.id`. We only hold the mutex long
+    // enough to copy the current flag values.
+    let in_flight_snapshot: std::collections::HashMap<i64, bool> = {
+        let guard = match state.pyramid.dadbear_in_flight.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard
+            .iter()
+            .map(|(id, flag)| {
+                (*id, flag.load(std::sync::atomic::Ordering::Relaxed))
+            })
+            .collect()
+    };
+
+    let db_rows = pyramid_db::build_dadbear_overview_rows(&conn)
+        .map_err(|e| e.to_string())?;
+    drop(conn);
+
+    let mut pyramids: Vec<DadbearOverviewRow> = Vec::with_capacity(db_rows.len());
+    let mut total_estimated_24h_usd = 0.0;
+    let mut total_actual_24h_usd = 0.0;
+    let mut total_pending_mutations: i64 = 0;
+    let mut total_in_flight_checks: i64 = 0;
+    let mut total_deferred_questions: i64 = 0;
+    let mut paused_count: i64 = 0;
+    let mut active_count: i64 = 0;
+
+    for db_row in db_rows {
+        // In-flight count: configs whose per-id flag is currently
+        // set. `pyramid_stale_check_log` has no `completed_at`
+        // column, so the runtime AtomicBool map is the authoritative
+        // in-flight signal (see the deviation note in the Phase 15
+        // implementation log).
+        let in_flight_stale_checks: i64 = db_row
+            .config_ids
+            .iter()
+            .filter(|id| in_flight_snapshot.get(id).copied().unwrap_or(false))
+            .count() as i64;
+
+        let next_scan_at = db_row.last_scan_at.as_ref().and_then(|ts| {
+            chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%d %H:%M:%S")
+                .ok()
+                .map(|dt| {
+                    (dt + chrono::Duration::seconds(db_row.scan_interval_secs))
+                        .format("%Y-%m-%d %H:%M:%S")
+                        .to_string()
+                })
+        });
+
+        if db_row.enabled {
+            active_count += 1;
+        } else {
+            paused_count += 1;
+        }
+        total_estimated_24h_usd += db_row.cost_24h_estimated_usd;
+        total_actual_24h_usd += db_row.cost_24h_actual_usd;
+        total_pending_mutations += db_row.pending_mutations_count;
+        total_in_flight_checks += in_flight_stale_checks;
+        total_deferred_questions += db_row.deferred_questions_count;
+
+        pyramids.push(DadbearOverviewRow {
+            slug: db_row.slug.clone(),
+            display_name: db_row.slug,
+            enabled: db_row.enabled,
+            scan_interval_secs: db_row.scan_interval_secs,
+            debounce_secs: db_row.debounce_secs,
+            last_scan_at: db_row.last_scan_at,
+            next_scan_at,
+            pending_mutations_count: db_row.pending_mutations_count,
+            in_flight_stale_checks,
+            deferred_questions_count: db_row.deferred_questions_count,
+            demand_signals_24h: db_row.demand_signals_24h,
+            cost_24h_estimated_usd: db_row.cost_24h_estimated_usd,
+            cost_24h_actual_usd: db_row.cost_24h_actual_usd,
+            cost_reconciliation_status: db_row.cost_reconciliation_status,
+            recent_manifest_count: db_row.recent_manifest_count,
+        });
+    }
+
+    Ok(DadbearOverviewResponse {
+        pyramids,
+        totals: DadbearOverviewTotals {
+            total_estimated_24h_usd,
+            total_actual_24h_usd,
+            total_pending_mutations,
+            total_in_flight_checks,
+            total_deferred_questions,
+            paused_count,
+            active_count,
+        },
+    })
+}
+
+#[derive(serde::Serialize)]
+struct DadbearActivityEntry {
+    timestamp: String,
+    event_type: String,
+    slug: String,
+    target_id: Option<String>,
+    details: Option<String>,
+}
+
+/// Phase 15: return recent DADBEAR-adjacent events for a single slug,
+/// merged across the stale-check log, pending mutations, and change
+/// manifests. The activity drawer uses this to render a per-slug
+/// timeline when the user clicks "View Activity" on a pyramid card.
+#[tauri::command]
+async fn pyramid_dadbear_activity_log(
+    state: tauri::State<'_, SharedState>,
+    slug: String,
+    limit: Option<i64>,
+) -> Result<Vec<DadbearActivityEntry>, String> {
+    let conn = state.pyramid.reader.lock().await;
+    let limit = limit.unwrap_or(100).clamp(1, 500);
+
+    let mut entries: Vec<DadbearActivityEntry> = Vec::new();
+
+    // Stale-check log rows. Each row is a completed check, so we
+    // use it as a proxy for "stale check fired/returned". We tag
+    // the event_type with the stale flag.
+    let mut stale_stmt = conn
+        .prepare(
+            "SELECT checked_at, layer, target_id, stale, reason
+             FROM pyramid_stale_check_log
+             WHERE slug = ?1
+             ORDER BY checked_at DESC
+             LIMIT ?2",
+        )
+        .map_err(|e| e.to_string())?;
+    let stale_rows = stale_stmt
+        .query_map(rusqlite::params![slug, limit], |row| {
+            let checked_at: String = row.get(0)?;
+            let layer: i64 = row.get(1)?;
+            let target_id: String = row.get(2)?;
+            let stale: i32 = row.get(3)?;
+            let reason: String = row.get(4).unwrap_or_default();
+            Ok(DadbearActivityEntry {
+                timestamp: checked_at,
+                event_type: if stale != 0 {
+                    "stale_check_stale".to_string()
+                } else {
+                    "stale_check_fresh".to_string()
+                },
+                slug: slug.clone(),
+                target_id: Some(target_id),
+                details: Some(
+                    serde_json::json!({
+                        "layer": layer,
+                        "reason": reason,
+                    })
+                    .to_string(),
+                ),
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    for row in stale_rows {
+        if let Ok(entry) = row {
+            entries.push(entry);
+        }
+    }
+    drop(stale_stmt);
+
+    // Pending mutations — each row represents a pending action on
+    // a node. We surface detected_at as the event time.
+    let mut pm_stmt = conn
+        .prepare(
+            "SELECT detected_at, layer, mutation_type, target_ref, detail, processed
+             FROM pyramid_pending_mutations
+             WHERE slug = ?1
+             ORDER BY detected_at DESC
+             LIMIT ?2",
+        )
+        .map_err(|e| e.to_string())?;
+    let pm_rows = pm_stmt
+        .query_map(rusqlite::params![slug, limit], |row| {
+            let detected_at: String = row.get(0)?;
+            let layer: i64 = row.get(1)?;
+            let mutation_type: String = row.get(2)?;
+            let target_ref: String = row.get(3)?;
+            let detail: Option<String> = row.get(4)?;
+            let processed: i32 = row.get(5)?;
+            Ok(DadbearActivityEntry {
+                timestamp: detected_at,
+                event_type: if processed != 0 {
+                    format!("mutation_applied_{}", mutation_type)
+                } else {
+                    format!("mutation_pending_{}", mutation_type)
+                },
+                slug: slug.clone(),
+                target_id: Some(target_ref),
+                details: Some(
+                    serde_json::json!({
+                        "layer": layer,
+                        "detail": detail,
+                    })
+                    .to_string(),
+                ),
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    for row in pm_rows {
+        if let Ok(entry) = row {
+            entries.push(entry);
+        }
+    }
+    drop(pm_stmt);
+
+    // Change manifests — each row is a supersession event. Use
+    // applied_at as the event time. The manifest_json is only
+    // surfaced in truncated form so the drawer stays readable.
+    let mut cm_stmt = conn
+        .prepare(
+            "SELECT applied_at, node_id, build_version, note
+             FROM pyramid_change_manifests
+             WHERE slug = ?1
+             ORDER BY applied_at DESC
+             LIMIT ?2",
+        )
+        .map_err(|e| e.to_string())?;
+    let cm_rows = cm_stmt
+        .query_map(rusqlite::params![slug, limit], |row| {
+            let applied_at: String = row.get(0)?;
+            let node_id: String = row.get(1)?;
+            let build_version: i64 = row.get(2)?;
+            let note: Option<String> = row.get(3)?;
+            Ok(DadbearActivityEntry {
+                timestamp: applied_at,
+                event_type: "change_manifest_applied".to_string(),
+                slug: slug.clone(),
+                target_id: Some(node_id),
+                details: Some(
+                    serde_json::json!({
+                        "build_version": build_version,
+                        "note": note,
+                    })
+                    .to_string(),
+                ),
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    for row in cm_rows {
+        if let Ok(entry) = row {
+            entries.push(entry);
+        }
+    }
+    drop(cm_stmt);
+
+    // Sort merged events by timestamp DESC and truncate.
+    entries.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    entries.truncate(limit as usize);
+    Ok(entries)
+}
+
+/// Phase 15: per-slug pause. Thin wrapper around the existing
+/// `disable_dadbear_for_slug` helper. The global `*_all` variants
+/// stay put for Phase 13's Pause All button. Returns the number of
+/// `pyramid_dadbear_config` rows whose `enabled` flipped.
+#[tauri::command]
+async fn pyramid_dadbear_pause(
+    state: tauri::State<'_, SharedState>,
+    slug: String,
+) -> Result<serde_json::Value, String> {
+    let conn = state.pyramid.writer.lock().await;
+    let affected = pyramid_db::disable_dadbear_for_slug(&conn, &slug)
+        .map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({ "ok": true, "affected": affected }))
+}
+
+/// Phase 15: per-slug resume. Mirror of `pyramid_dadbear_pause`.
+#[tauri::command]
+async fn pyramid_dadbear_resume(
+    state: tauri::State<'_, SharedState>,
+    slug: String,
+) -> Result<serde_json::Value, String> {
+    let conn = state.pyramid.writer.lock().await;
+    let affected = pyramid_db::enable_dadbear_for_slug(&conn, &slug)
+        .map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({ "ok": true, "affected": affected }))
+}
+
+/// Phase 15: acknowledge a single orphan broadcast row after review.
+/// Stamps `acknowledged_at` + `acknowledgment_reason` so the Oversight
+/// page can stop surfacing the row in its red-banner counter. The
+/// counterpart to Phase 11's `pyramid_list_orphan_broadcasts`.
+#[tauri::command]
+async fn pyramid_acknowledge_orphan_broadcast(
+    state: tauri::State<'_, SharedState>,
+    orphan_id: i64,
+    reason: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let conn = state.pyramid.writer.lock().await;
+    let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let affected = conn
+        .execute(
+            "UPDATE pyramid_orphan_broadcasts
+                SET acknowledged_at = ?1,
+                    acknowledgment_reason = ?2
+              WHERE id = ?3 AND acknowledged_at IS NULL",
+            rusqlite::params![now, reason, orphan_id],
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({ "ok": true, "affected": affected }))
+}
+
 // ── WS-3: Evidence Density ──────────────────────────────────────────────────
 
 #[tauri::command]
@@ -9958,6 +10330,12 @@ fn main() {
             pyramid_cost_rollup,
             pyramid_pause_dadbear_all,
             pyramid_resume_dadbear_all,
+            // Phase 15: DADBEAR Oversight Page
+            pyramid_dadbear_overview,
+            pyramid_dadbear_activity_log,
+            pyramid_dadbear_pause,
+            pyramid_dadbear_resume,
+            pyramid_acknowledge_orphan_broadcast,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Wire Node");

@@ -3025,3 +3025,101 @@ Both W1 and W2 share a root cause: the pull flow captures an externally-supplied
 5. `WireUpdatePoller` reads the Wire auth token from `PyramidState.config.auth_token` or `WIRE_AUTH_TOKEN` env var — NOT the canonical `AuthState`. Documented implementer coupling shortcut; missing auth → poller skips cycles cleanly.
 
 **Commit**: `phase-14: wanderer fix — atomic active-row resolution in wire pull flow`. NOT amending. Branch remains `phase-14-wire-discovery-ranking`.
+
+---
+
+## Phase 15 — DADBEAR Oversight Page
+
+**Workstream:** single implementer on branch `phase-15-dadbear-oversight`
+**Started:** 2026-04-10
+**Completed:** 2026-04-10
+**Verified by:** implementer (awaiting Adam's manual verification)
+**Wanderer result:** pending
+**Status:** awaiting-verification
+
+### Files touched
+
+Backend (Rust):
+- `src-tauri/src/pyramid/db.rs` — added `DadbearOverviewRowDb` struct + `build_dadbear_overview_rows()` pure helper that aggregates `pyramid_dadbear_config`, `pyramid_pending_mutations`, `pyramid_deferred_questions`, `pyramid_demand_signals`, `pyramid_cost_log`, and `pyramid_change_manifests` per slug with a 24h window + severity-ordered reconciliation status. Added `phase15_tests` module with 9 new tests.
+- `src-tauri/src/main.rs` — added 5 new `#[tauri::command]` IPCs: `pyramid_dadbear_overview` (delegates to DB helper + folds in `dadbear_in_flight` runtime state + computes totals), `pyramid_dadbear_activity_log` (merges stale-check log + pending mutations + change manifests, time-descending), `pyramid_dadbear_pause` / `pyramid_dadbear_resume` (per-slug wrappers around the existing `enable/disable_dadbear_for_slug` helpers), `pyramid_acknowledge_orphan_broadcast` (stamps `acknowledged_at` + `acknowledgment_reason`). All five registered in `invoke_handler!`.
+
+Frontend (React/TypeScript):
+- `src/hooks/useDadbearOverview.ts` (new) — polls `pyramid_dadbear_overview` every 10s, exposes typed response + refetch.
+- `src/hooks/useProviderHealth.ts` (new) — wraps Phase 11 `pyramid_provider_health` with a 30s poll + acknowledge helper.
+- `src/hooks/useOrphanBroadcasts.ts` (new) — wraps Phase 11 `pyramid_list_orphan_broadcasts` with a 60s poll + acknowledge helper.
+- `src/components/DadbearPyramidCard.tsx` (new) — per-pyramid status card with pause/resume, configure, view-activity actions.
+- `src/components/ProviderHealthBanner.tsx` (new) — provider health section with color-coded chips + acknowledge buttons.
+- `src/components/OrphanBroadcastsPanel.tsx` (new) — leak detection surface with per-row acknowledge (id `orphan-broadcasts` for the top-banner scroll target).
+- `src/components/DadbearActivityDrawer.tsx` (new) — modal drawer for per-slug activity log.
+- `src/components/DadbearOversightPage.tsx` (new) — assembly page composing all of the above + `CostRollupSection` + totals bar + global pause/resume/set-default-norms controls.
+- `src/utils/toolsModeBridge.ts` (new) — module-level one-shot preset bridge + custom DOM event so the Oversight page's "Set Default Norms" and per-pyramid "Configure" buttons can switch the user to ToolsMode/Create pre-loaded with `dadbear_policy`.
+- `src/components/modes/ToolsMode.tsx` — accepts + consumes the preset bridge in `ToolsMode` and the `CreatePanel` child. On preset consumption, dispatches a `pick-schema` for the requested schema type (no YAML seed, just jumps to the intent step).
+- `src/components/modes/PyramidsMode.tsx` — added third tab "Oversight" that renders `DadbearOversightPage`.
+- `src/components/CrossPyramidTimeline.tsx` — removed `CostRollupSection` import + mount (relocated to Oversight page). Comment updated.
+- `src/components/CostRollupSection.tsx` — updated top comment to reflect the new home.
+- `src/styles/dashboard.css` — appended Phase 15 style blocks: `.dadbear-oversight-page`, `.dadbear-oversight-header`, `.dadbear-oversight-leak-banner`, `.dadbear-oversight-globals`, `.dadbear-oversight-totals`, `.dadbear-oversight-card-grid`, `.dadbear-card*`, `.provider-health-*`, `.orphan-broadcasts-*`, `.dadbear-activity-*`.
+
+### Spec adherence
+
+- ✅ `pyramid_dadbear_overview` IPC returns per-pyramid summary + totals exactly as spec shape describes.
+- ✅ `pyramid_dadbear_activity_log` IPC merges stale-check log + pending mutations + change manifests (spec: "Sources: `pyramid_stale_check_log` + `pyramid_pending_mutations` + `pyramid_change_manifests`. UNION + ORDER BY timestamp DESC").
+- ✅ Per-pyramid `pyramid_dadbear_pause` / `pyramid_dadbear_resume` IPCs added as the per-slug counterparts to Phase 13's `*_all` variants. The db-level helpers already existed (`enable_dadbear_for_slug` / `disable_dadbear_for_slug`) — the IPCs are thin wrappers, as expected.
+- ✅ `pyramid_acknowledge_orphan_broadcast` IPC added (the closure on Phase 11's `pyramid_list_orphan_broadcasts`).
+- ✅ `DadbearOversightPage` implements the spec layout (Global Controls row → per-pyramid status cards with filter → Cost Rollup → Provider Health → Orphan Broadcasts).
+- ✅ "Set Default Norms" button wired to Phase 9/10 generative config flow without a new backend IPC. Uses a module-level one-shot preset bridge that `ToolsMode` consumes on mount + on custom event; the user lands in the Create tab with `dadbear_policy` already picked and sees the intent input step.
+- ✅ `CostRollupSection` relocated from Phase 13 CrossPyramidTimeline to the Oversight page.
+- ✅ Top-level leak-detection banner + scroll-to-panel behavior for orphan broadcasts (spec Part 4: "Red banner at the top of the Oversight page if any unacknowledged orphans exist").
+- ⚠️ **In-flight stale check counting deviation**: the spec suggests using `pyramid_stale_check_log WHERE completed_at IS NULL` for in-flight detection. The schema has no `completed_at` column — every row in `pyramid_stale_check_log` is a completed check result. The implementation instead derives in-flight state from the existing `PyramidState::dadbear_in_flight` AtomicBool map (keyed by `pyramid_dadbear_config.id`). This matches the actual runtime signal (the tick loop uses the same map) and requires no new schema column. Documented in the IPC source comment.
+- ⚠️ **Per-pyramid pause IPC did not exist**: the workstream prompt said "check first". It did not exist (only the `*_all` variants from Phase 13 + the `enable/disable_dadbear_for_slug` DB helpers). Added the IPCs as wrappers.
+- ⚠️ **`pyramid_change_manifests` table shape check**: table exists with `slug`, `node_id`, `build_version`, `manifest_json`, `note`, `applied_at`. The overview IPC uses `applied_at` (not `created_at`) for the 24h window filter.
+- ⚠️ **`pyramid_acknowledge_orphan_broadcast` IPC did not exist**: the workstream prompt said "check first". It did not exist. Added as a new IPC.
+- ⚠️ **Display name fallback**: The spec shows per-pyramid cards with "display_name" but the database has no per-pyramid display_name field. The IPC currently returns `slug` as `display_name`. A future phase can swap in a real display name when `pyramid_slugs` gains one.
+- ℹ️ **Page placement**: the workstream prompt says "new top-level mode/tab/route — recommend a new top-level page". Implemented as a third tab ("Oversight") within the existing `PyramidsMode` to keep the sidebar nav surface clean. This is a judgment call within the latitude the prompt grants ("tab on the same page or create a new page"). The tab lives alongside "Dashboard" and "Builds" at the top of PyramidsMode — a single click switches between them.
+
+### Verification results
+
+Backend:
+- `cargo check --lib` from `src-tauri/` — clean, 3 pre-existing warnings.
+- `cargo check --bin wire-node-desktop` — clean, 1 pre-existing binary warning.
+- `cargo test --lib pyramid::db::phase15_tests` — 9 new tests, all passing:
+  - `test_overview_aggregates_single_slug`
+  - `test_overview_reports_discrepancy_when_any_row_discrepant`
+  - `test_overview_reports_broadcast_missing_when_no_discrepancy`
+  - `test_overview_reports_healthy_with_no_rows`
+  - `test_overview_groups_multi_config_per_slug`
+  - `test_overview_reports_all_paused_when_all_disabled`
+  - `test_overview_multi_slug_aggregates`
+  - `test_per_slug_pause_and_resume`
+  - `test_acknowledge_orphan_broadcast_updates_row`
+- `cargo test --lib pyramid` — **1179 passing / 7 failing** (Phase 14 baseline 1170 + 9 new Phase 15 tests; same 7 pre-existing failures: `test_evidence_pk_cross_slug_coexistence`, `real_yaml_thread_clustering_preserves_response_schema`, 5 staleness propagation tests, all blocked by the pre-existing `pyramid_evidence.build_id` schema drift).
+
+Frontend:
+- `npm run build` — clean, 150 modules transformed, 779kB bundle (up from 744kB pre-Phase-15). No new TypeScript errors. Bundle size warning is pre-existing.
+
+### Manual verification steps
+
+Adam should run these in dev (`npm run tauri dev`):
+
+1. Launch the app. Click the "Understanding" (pyramids) sidebar item. Click the "Oversight" tab. Expect the DADBEAR Oversight Page to render with a global controls row, per-pyramid status cards for each pyramid that has a DADBEAR config, a cost rollup section, provider health, and orphan broadcasts panel.
+2. Click "Pause All" — the IPC fires, toast shows "Paused DADBEAR on N pyramid(s)", cards flip to Paused, Status chip updates on next 10s poll.
+3. Click "Resume All" — reverse; cards flip back to Active.
+4. Click "Pause" on a single pyramid card — only that slug flips; others unchanged.
+5. Click "Configure" on a pyramid card — switches to Tools mode, Create tab, with `dadbear_policy` schema pre-selected and the pyramid slug bound. The intent input is visible.
+6. Click "Set Default Norms" (top of Oversight) — switches to Tools mode, Create tab, with `dadbear_policy` schema pre-selected and `slug=null` (global). Intent input visible.
+7. Click "View Activity" on a pyramid card — modal drawer opens showing stale-check, pending-mutation, and change-manifest rows merged in time-descending order.
+8. If any orphan broadcasts exist (manual trigger via `/hooks/openrouter` with mismatched metadata), a red leak-detection banner appears at the top of the page. Clicking scrolls to the Orphan Broadcasts panel. Enter a reason and click Acknowledge — row flips to the acked state and drops out of the unacked counter on next 60s poll.
+9. Provider Health section renders green/yellow/red chips based on each provider's current health state. Degraded providers show an Acknowledge button.
+10. Click "Active" / "Paused" filter buttons — the card grid filters correctly.
+11. The Cost Reconciliation section (Phase 13 `CostRollupSection`) is visible on the Oversight page. Verify the Phase 13 Builds tab no longer shows the cost rollup (it was relocated).
+
+### Notes
+
+**Commit**: single commit on branch `phase-15-dadbear-oversight`, message `phase-15: dadbear oversight page`. Not pushed. Not amended.
+
+**Deviations written to friction log**: in-flight detection routed through `dadbear_in_flight` runtime map (not `pyramid_stale_check_log`) because the schema has no `completed_at`/`started_at` columns. The spec's suggested pattern doesn't match the actual schema. This is not a Pillar 37 violation — the pattern is "use the existing runtime signal" rather than adding a new column.
+
+**Preset bridge rationale**: considered extending AppContext state to carry the Create-tab preset, but the preset is a one-shot ephemeral signal, not persistent state. Module-level variable + CustomEvent is the idiomatic React pattern for ephemeral cross-component handoffs that don't belong in a reducer.
+
+**Placement decision (tab vs new mode)**: PyramidsMode already owned two tabs ("Dashboard", "Builds") that are conceptually adjacent to Oversight. Adding a third tab keeps the sidebar uncluttered and puts Oversight where operators already look for DADBEAR/build status. The workstream prompt explicitly permitted either choice.
+
+**CostRollupSection relocation**: removed from `CrossPyramidTimeline` entirely (not duplicated). The spec intent is that the Oversight page is the canonical home; mounting in two places would split user expectation. `CrossPyramidCostFooter` (the compact live-build footer) remains on the Builds tab as the quick reference.
