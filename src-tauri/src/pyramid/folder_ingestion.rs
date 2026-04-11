@@ -657,6 +657,26 @@ pub fn describe_claude_code_dirs(
     out
 }
 
+/// Phase 18e wanderer: count `*.jsonl` files in a CC dir
+/// (non-recursive). Used by the planner to decide whether to emit the
+/// conversation subplan ops for a given CC dir. Matches the shape of
+/// `describe_claude_code_dirs`'s jsonl probe so the planner and the
+/// wizard preview agree on when a CC dir is "conversation-populated."
+pub(crate) fn count_cc_jsonl_files(cc_dir: &Path) -> usize {
+    let Ok(iter) = std::fs::read_dir(cc_dir) else {
+        return 0;
+    };
+    iter.flatten()
+        .filter(|entry| {
+            entry
+                .path()
+                .extension()
+                .and_then(OsStr::to_str)
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("jsonl"))
+        })
+        .count()
+}
+
 /// Phase 18e: recursively count `.md` files under a CC `memory/`
 /// directory. Mirrors what `ingest_docs` walks: it descends into all
 /// subdirectories, skips hidden directories (matching the
@@ -948,6 +968,40 @@ fn plan_recursive(
     // identify in the slug table later.
     if is_top_level && include_claude_code && config.claude_code_auto_include {
         for (idx, cc_dir) in cc_matches.iter().enumerate() {
+            // ── Phase 18e wanderer fix: content-aware subplan emission
+            // Probe both the jsonl and memory populations up front so
+            // we can skip CC dirs that would produce dead-weight slugs.
+            // Three cases:
+            //   - jsonls  +  memory md files → 8-op subplan (CC vine +
+            //     conversation bedrock + memory bedrock + attaches)
+            //   - jsonls  +  no memory       → 5-op subplan (CC vine +
+            //     conversation bedrock + attaches)
+            //   - no jsonls + memory md files → 5-op subplan (CC vine +
+            //     memory bedrock + attaches). This path skips Ops 2–4
+            //     because the conversation bedrock would have zero
+            //     chunks to pre-populate and DADBEAR would watch an
+            //     empty conversation source.
+            //   - no jsonls + no memory → CC dir skipped entirely. An
+            //     empty CC vine has no value on the root vine and the
+            //     topical-vine chain would run against zero children.
+            // Without these guards the planner emitted a dead
+            // conversation bedrock for every memory-only CC dir, and
+            // an empty CC vine when both sources were empty.
+            let jsonl_count = count_cc_jsonl_files(cc_dir);
+            let memory_dir = cc_dir.join("memory");
+            let memory_md_count = if memory_dir.is_dir() {
+                count_memory_md_files(&memory_dir)
+            } else {
+                0
+            };
+            if jsonl_count == 0 && memory_md_count == 0 {
+                warn!(
+                    cc_dir = %cc_dir.display(),
+                    "folder_ingestion: CC dir has no jsonls and no memory md files, skipping"
+                );
+                continue;
+            }
+
             // Mint the CC vine slug. Slug naming preserves the
             // Phase 17 `{root_vine}-cc-{N}` convention so existing
             // automation expecting that prefix still finds the CC
@@ -976,62 +1030,68 @@ fn plan_recursive(
             });
             plan.claude_code_vine_slugs.push(cc_vine_slug.clone());
 
-            // Mint the conversation bedrock slug. Use the
-            // `{cc_vine_slug}-conversations` suffix; collision-resolve
-            // by suffix-bump if anything already claimed it.
-            let mut convo_slug =
-                super::slug::slugify(&format!("{}-conversations", cc_vine_slug));
-            if convo_slug.is_empty() {
-                convo_slug = format!("{}-conversations", cc_vine_slug);
-            }
-            let mut convo_dedup = 2usize;
-            while existing.contains(&convo_slug) {
-                convo_slug = super::slug::slugify(&format!(
-                    "{}-conversations-{}",
-                    cc_vine_slug, convo_dedup
-                ));
-                convo_dedup += 1;
-            }
-            existing.insert(convo_slug.clone());
+            // ── Ops 2–4 (optional): conversation bedrock ─────────
+            // Only emit the conversation subplan when the CC dir has
+            // at least one jsonl. Memory-only CC dirs (no jsonls)
+            // skip this block so no dead conversation slug lands in
+            // the DB and DADBEAR doesn't watch an empty jsonl dir.
+            if jsonl_count > 0 {
+                // Mint the conversation bedrock slug. Use the
+                // `{cc_vine_slug}-conversations` suffix; collision-resolve
+                // by suffix-bump if anything already claimed it.
+                let mut convo_slug =
+                    super::slug::slugify(&format!("{}-conversations", cc_vine_slug));
+                if convo_slug.is_empty() {
+                    convo_slug = format!("{}-conversations", cc_vine_slug);
+                }
+                let mut convo_dedup = 2usize;
+                while existing.contains(&convo_slug) {
+                    convo_slug = super::slug::slugify(&format!(
+                        "{}-conversations-{}",
+                        cc_vine_slug, convo_dedup
+                    ));
+                    convo_dedup += 1;
+                }
+                existing.insert(convo_slug.clone());
 
-            // ── Op 2: Create the conversation bedrock ────────────
-            plan.operations.push(IngestionOperation::CreatePyramid {
-                slug: convo_slug.clone(),
-                content_type: ContentType::Conversation.as_str().to_string(),
-                source_path: cc_path.clone(),
-            });
-            plan.claude_code_conversation_slugs.push(convo_slug.clone());
-
-            // ── Op 3: Attach conversation bedrock to CC vine ────
-            plan.operations.push(IngestionOperation::AddChildToVine {
-                vine_slug: cc_vine_slug.clone(),
-                child_slug: convo_slug.clone(),
-                position: child_position(plan, &cc_vine_slug),
-                child_type: "bedrock".to_string(),
-            });
-
-            // ── Op 4: DADBEAR config for the conversation pyramid
-            plan.operations
-                .push(IngestionOperation::RegisterDadbearConfig {
+                // ── Op 2: Create the conversation bedrock ────────
+                plan.operations.push(IngestionOperation::CreatePyramid {
                     slug: convo_slug.clone(),
-                    source_path: cc_path.clone(),
                     content_type: ContentType::Conversation.as_str().to_string(),
-                    scan_interval_secs: config.default_scan_interval_secs,
+                    source_path: cc_path.clone(),
+                });
+                plan.claude_code_conversation_slugs.push(convo_slug.clone());
+
+                // ── Op 3: Attach conversation bedrock to CC vine ─
+                plan.operations.push(IngestionOperation::AddChildToVine {
+                    vine_slug: cc_vine_slug.clone(),
+                    child_slug: convo_slug.clone(),
+                    position: child_position(plan, &cc_vine_slug),
+                    child_type: "bedrock".to_string(),
                 });
 
+                // ── Op 4: DADBEAR config for the conversation pyramid
+                plan.operations
+                    .push(IngestionOperation::RegisterDadbearConfig {
+                        slug: convo_slug.clone(),
+                        source_path: cc_path.clone(),
+                        content_type: ContentType::Conversation.as_str().to_string(),
+                        scan_interval_secs: config.default_scan_interval_secs,
+                    });
+            } else {
+                info!(
+                    cc_dir = %cc_dir.display(),
+                    memory_md_count,
+                    "folder_ingestion: CC dir has memory md files but no jsonls; skipping conversation bedrock"
+                );
+            }
+
             // ── Optional Ops 5-7: memory document bedrock ────────
-            // Probe `<cc_dir>/memory/` for `.md` files. Only emit
-            // the memory bedrock when the subfolder exists AND has
-            // at least one `.md` file. An empty memory/ subfolder is
+            // Only emit the memory bedrock when the subfolder has at
+            // least one `.md` file. An empty memory/ subfolder is
             // treated as if it doesn't exist — the document chain
             // would fail with "No documents found in {dir}" so it
             // is safer to skip the bedrock entirely.
-            let memory_dir = cc_dir.join("memory");
-            let memory_md_count = if memory_dir.is_dir() {
-                count_memory_md_files(&memory_dir)
-            } else {
-                0
-            };
             if memory_md_count > 0 {
                 let mut memory_slug =
                     super::slug::slugify(&format!("{}-memory", cc_vine_slug));
@@ -1191,8 +1251,50 @@ pub async fn execute_plan(
                         .push(format!("unknown content_type '{}' for {}", content_type, slug));
                     continue;
                 };
-                match db::create_slug(&conn, &slug, &ct, &source_path) {
-                    Ok(_) => {
+                // Phase 18e wanderer fix: the Phase 17 idempotency path
+                // used `msg.contains("already exists")` on the error
+                // string from `db::create_slug`, but sqlite's UNIQUE
+                // constraint error wrapped by `.with_context(...)`
+                // reports only the top-level context ("Failed to
+                // create slug '{slug}'") via `e.to_string()`, so the
+                // string match never fired. That silently broke
+                // re-running an ingestion against the same folder —
+                // every CreatePyramid op would surface as a real error
+                // and the wizard would flag the run as failed. Pre-
+                // check with `db::get_slug` instead: if the slug
+                // exists, verify the content_type matches (treating a
+                // mismatch as a hard error because the plan is
+                // semantically wrong, not idempotent) and fall through
+                // to the idempotent-success path.
+                let existing = match db::get_slug(&conn, &slug) {
+                    Ok(info) => info,
+                    Err(e) => {
+                        result
+                            .errors
+                            .push(format!("get_slug {}: {}", slug, e));
+                        continue;
+                    }
+                };
+                let create_outcome: Result<(), String> = if let Some(info) = existing {
+                    if info.content_type != ct {
+                        Err(format!(
+                            "slug '{}' already exists with content_type '{}' but plan expected '{}'",
+                            slug,
+                            info.content_type.as_str(),
+                            ct.as_str()
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                } else {
+                    match db::create_slug(&conn, &slug, &ct, &source_path) {
+                        Ok(_) => Ok(()),
+                        Err(e) => Err(format!("create_slug {}: {:#}", slug, e)),
+                    }
+                };
+
+                match create_outcome {
+                    Ok(()) => {
                         // Phase 18e: route CC bedrock slugs into the
                         // dedicated tracking buckets in addition to
                         // the regular pyramid list, so the wizard can
@@ -1208,31 +1310,48 @@ pub async fn execute_plan(
                         }
                         result.pyramids_created.push(slug);
                     }
-                    Err(e) => {
-                        let msg = e.to_string();
-                        if msg.contains("already exists") {
-                            // Idempotent: treat existing slugs as success.
-                            if cc_conversation_set.contains(&slug) {
-                                result
-                                    .claude_code_conversation_pyramids
-                                    .push(slug.clone());
-                                result.claude_code_pyramids.push(slug.clone());
-                            } else if cc_memory_set.contains(&slug) {
-                                result
-                                    .claude_code_memory_pyramids
-                                    .push(slug.clone());
-                                result.claude_code_pyramids.push(slug.clone());
-                            }
-                            result.pyramids_created.push(slug);
-                        } else {
-                            result.errors.push(format!("create_slug {}: {}", slug, msg));
-                        }
+                    Err(msg) => {
+                        result.errors.push(msg);
                     }
                 }
             }
             IngestionOperation::CreateVine { slug, source_path } => {
-                match db::create_slug(&conn, &slug, &ContentType::Vine, &source_path) {
-                    Ok(_) => {
+                // Phase 18e wanderer fix: same idempotency story as
+                // the CreatePyramid arm above. Pre-check with
+                // `db::get_slug`, verify content_type is Vine if the
+                // slug already exists (a conversation pyramid from an
+                // older Phase 17 run with the SAME slug would report
+                // as a real error here instead of being silently
+                // treated as a vine), and fall through to the
+                // idempotent-success path when the match holds.
+                let existing = match db::get_slug(&conn, &slug) {
+                    Ok(info) => info,
+                    Err(e) => {
+                        result
+                            .errors
+                            .push(format!("get_slug {}: {}", slug, e));
+                        continue;
+                    }
+                };
+                let create_outcome: Result<(), String> = if let Some(info) = existing {
+                    if info.content_type != ContentType::Vine {
+                        Err(format!(
+                            "slug '{}' already exists with content_type '{}' but plan expected 'vine'",
+                            slug,
+                            info.content_type.as_str()
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                } else {
+                    match db::create_slug(&conn, &slug, &ContentType::Vine, &source_path) {
+                        Ok(_) => Ok(()),
+                        Err(e) => Err(format!("create_vine {}: {:#}", slug, e)),
+                    }
+                };
+
+                match create_outcome {
+                    Ok(()) => {
                         // Phase 18e: CC vines go into the dedicated
                         // bucket so the wizard knows how many CC
                         // dirs were processed independently of how
@@ -1242,16 +1361,8 @@ pub async fn execute_plan(
                         }
                         result.vines_created.push(slug);
                     }
-                    Err(e) => {
-                        let msg = e.to_string();
-                        if msg.contains("already exists") {
-                            if cc_vine_set.contains(&slug) {
-                                result.claude_code_vines.push(slug.clone());
-                            }
-                            result.vines_created.push(slug);
-                        } else {
-                            result.errors.push(format!("create_vine {}: {}", slug, msg));
-                        }
+                    Err(msg) => {
+                        result.errors.push(msg);
                     }
                 }
             }
@@ -2772,5 +2883,463 @@ mod phase18e_tests {
 
         assert!(cc_vine_idx < convo_idx, "CC vine must precede conversation bedrock");
         assert!(convo_idx < memory_idx, "conversation bedrock must precede memory bedrock");
+    }
+
+    // ── Phase 18e wanderer regression tests ─────────────────────────────
+    //
+    // These cover two cross-cutting bugs the verifier's per-item audit
+    // could not see:
+    //
+    //   1. CC dirs with no jsonls (memory-only or fully empty) must not
+    //      emit a conversation bedrock, and a CC dir with NO jsonls AND
+    //      NO memory must be skipped entirely instead of producing a
+    //      childless CC vine.
+    //   2. `execute_plan`'s Phase 17 idempotency path used
+    //      `msg.contains("already exists")` on an anyhow-wrapped sqlite
+    //      error, which never matched (`to_string()` returns only the
+    //      top-level context, not the chain). Re-running an ingestion
+    //      now goes through a `db::get_slug` pre-check that both avoids
+    //      the string-matching trap and rejects slug re-use when the
+    //      existing content_type mismatches the plan's expectation.
+
+    /// Set up a CC dir that has neither jsonls nor memory. The dir
+    /// exists (so `find_claude_code_conversation_dirs` matches it) but
+    /// contains no ingestible content. The planner must skip it.
+    fn setup_target_with_empty_cc_dir(
+        target_files: &[(&str, &str)],
+    ) -> (TempDir, PathBuf, PathBuf, FolderIngestionConfig) {
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("myrepo");
+        fs::create_dir_all(&target).unwrap();
+        for (name, body) in target_files {
+            fs::write(target.join(name), body).unwrap();
+        }
+        let cc_root = tmp.path().join(".claude").join("projects");
+        fs::create_dir_all(&cc_root).unwrap();
+        let canonical_target = target.canonicalize().unwrap();
+        let encoded = encode_path_for_claude_code(&canonical_target);
+        let cc_dir = cc_root.join(&encoded);
+        fs::create_dir_all(&cc_dir).unwrap();
+        // Intentionally leave cc_dir empty — no jsonl, no memory/.
+        let config = FolderIngestionConfig {
+            claude_code_conversation_path: cc_root.to_string_lossy().to_string(),
+            ..default_config()
+        };
+        (tmp, target, cc_dir, config)
+    }
+
+    /// Set up a CC dir that has ONLY a memory/ subfolder with .md
+    /// files — no jsonls. The planner must emit a CC vine + memory
+    /// bedrock (Ops 1, 5-7, 8) and skip the conversation subplan
+    /// (Ops 2-4). The end state is a CC vine with exactly one child
+    /// (the memory bedrock).
+    fn setup_target_with_memory_only_cc_dir(
+        memory_md_count: usize,
+        target_files: &[(&str, &str)],
+    ) -> (TempDir, PathBuf, PathBuf, FolderIngestionConfig) {
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("myrepo");
+        fs::create_dir_all(&target).unwrap();
+        for (name, body) in target_files {
+            fs::write(target.join(name), body).unwrap();
+        }
+        let cc_root = tmp.path().join(".claude").join("projects");
+        fs::create_dir_all(&cc_root).unwrap();
+        let canonical_target = target.canonicalize().unwrap();
+        let encoded = encode_path_for_claude_code(&canonical_target);
+        let cc_dir = cc_root.join(&encoded);
+        fs::create_dir_all(&cc_dir).unwrap();
+        // No jsonls here — intentionally omitted so the planner takes
+        // the memory-only branch.
+        let memory = cc_dir.join("memory");
+        fs::create_dir_all(&memory).unwrap();
+        for i in 0..memory_md_count {
+            fs::write(
+                memory.join(format!("note-{}.md", i + 1)),
+                format!("# note {}\n", i + 1),
+            )
+            .unwrap();
+        }
+        let config = FolderIngestionConfig {
+            claude_code_conversation_path: cc_root.to_string_lossy().to_string(),
+            ..default_config()
+        };
+        (tmp, target, cc_dir, config)
+    }
+
+    /// CC dir with neither jsonls nor memory files must be skipped
+    /// entirely — no CC vine, no bedrocks, no attach-to-root op. The
+    /// root folder's plan is whatever it would have been without the
+    /// CC auto-include at all.
+    #[test]
+    fn test_plan_skips_cc_dir_with_no_jsonls_and_no_memory() {
+        let (_tmp, target, _cc_dir, config) = setup_target_with_empty_cc_dir(
+            &[("a.md", "x"), ("b.md", "y"), ("c.md", "z")],
+        );
+        let plan = plan_ingestion(&target, &config, true).unwrap();
+
+        assert!(
+            plan.claude_code_vine_slugs.is_empty(),
+            "empty CC dir must not produce a CC vine"
+        );
+        assert!(
+            plan.claude_code_conversation_slugs.is_empty(),
+            "empty CC dir must not produce a conversation bedrock"
+        );
+        assert!(
+            plan.claude_code_memory_slugs.is_empty(),
+            "empty CC dir must not produce a memory bedrock"
+        );
+
+        // No CreateVine should name a CC vine slug. The only vine
+        // allowed is the root vine (or the plan emitted none at all
+        // if the target folder degenerated to a leaf pyramid).
+        let any_cc_vine_op = plan.operations.iter().any(|op| match op {
+            IngestionOperation::CreateVine { slug, source_path }
+                if source_path.contains(".claude") || slug.contains("-cc-") =>
+            {
+                true
+            }
+            _ => false,
+        });
+        assert!(
+            !any_cc_vine_op,
+            "plan must not contain any CC-vine CreateVine op, got ops: {:?}",
+            plan.operations
+        );
+    }
+
+    /// CC dir with memory md files but no jsonls: the planner must
+    /// emit the CC vine + memory bedrock (Ops 1, 5, 6, 7, 8) and skip
+    /// the conversation subplan (Ops 2-4). Under the bug, the planner
+    /// unconditionally emitted a conversation bedrock pointing at the
+    /// CC dir — a dead slug that would fail its first build with
+    /// "No chunks found for slug".
+    #[test]
+    fn test_plan_emits_memory_only_subplan_when_cc_has_no_jsonls() {
+        let (_tmp, target, cc_dir, config) = setup_target_with_memory_only_cc_dir(
+            3,
+            &[("a.md", "x"), ("b.md", "y"), ("c.md", "z")],
+        );
+        let plan = plan_ingestion(&target, &config, true).unwrap();
+
+        // Exactly one CC vine + one memory bedrock; no conversation
+        // bedrock at all.
+        assert_eq!(
+            plan.claude_code_vine_slugs.len(),
+            1,
+            "expected a CC vine for the memory-only CC dir"
+        );
+        assert!(
+            plan.claude_code_conversation_slugs.is_empty(),
+            "memory-only CC dir must NOT produce a conversation bedrock, got {:?}",
+            plan.claude_code_conversation_slugs
+        );
+        assert_eq!(
+            plan.claude_code_memory_slugs.len(),
+            1,
+            "expected exactly one memory bedrock"
+        );
+
+        let cc_vine_slug = plan.claude_code_vine_slugs[0].clone();
+        let memory_slug = plan.claude_code_memory_slugs[0].clone();
+        assert_eq!(memory_slug, format!("{}-memory", cc_vine_slug));
+
+        // No conversation CreatePyramid op exists.
+        let has_conversation_op = plan.operations.iter().any(|op| {
+            matches!(op, IngestionOperation::CreatePyramid { content_type, .. }
+                if content_type == "conversation")
+        });
+        assert!(
+            !has_conversation_op,
+            "plan must not contain any conversation CreatePyramid op"
+        );
+
+        // The conversation bedrock DADBEAR config must not exist.
+        let has_conversation_dadbear = plan.operations.iter().any(|op| {
+            matches!(op, IngestionOperation::RegisterDadbearConfig { content_type, .. }
+                if content_type == "conversation")
+        });
+        assert!(
+            !has_conversation_dadbear,
+            "plan must not contain any conversation DADBEAR config"
+        );
+
+        // The memory bedrock's source path points at the memory dir.
+        let memory_path = cc_dir.join("memory").to_string_lossy().to_string();
+        let memory_create = plan
+            .operations
+            .iter()
+            .find(|op| matches!(op, IngestionOperation::CreatePyramid {
+                slug, source_path, ..
+            } if slug == &memory_slug && source_path == &memory_path));
+        assert!(memory_create.is_some(), "memory bedrock CreatePyramid missing");
+
+        // The CC vine attaches to the root vine as child_type='vine'.
+        let root_vine_slug = plan.root_slug.clone().unwrap();
+        let attached_as_vine = plan.operations.iter().any(|op| {
+            matches!(op, IngestionOperation::AddChildToVine {
+                vine_slug, child_slug, child_type, ..
+            } if vine_slug == &root_vine_slug
+                && child_slug == &cc_vine_slug
+                && child_type == "vine")
+        });
+        assert!(attached_as_vine, "CC vine must still attach to root vine as child_type='vine'");
+
+        // The memory bedrock is the CC vine's ONLY child, and it
+        // attaches at position 0 (not 1, because no conversation
+        // bedrock precedes it).
+        let cc_children: Vec<&IngestionOperation> = plan
+            .operations
+            .iter()
+            .filter(|op| matches!(op, IngestionOperation::AddChildToVine {
+                vine_slug, ..
+            } if vine_slug == &cc_vine_slug))
+            .collect();
+        assert_eq!(
+            cc_children.len(),
+            1,
+            "CC vine must have exactly one child (the memory bedrock)"
+        );
+        if let IngestionOperation::AddChildToVine { position, child_slug, child_type, .. } =
+            cc_children[0]
+        {
+            assert_eq!(*position, 0, "memory bedrock attaches at position 0");
+            assert_eq!(child_slug, &memory_slug);
+            assert_eq!(child_type, "bedrock");
+        }
+    }
+
+    // ── execute_plan idempotency + content-type mismatch tests ──────────
+    //
+    // These tests exercise the live `execute_plan` path rather than
+    // the planner. They construct an in-memory PyramidState and run
+    // the same plan twice (idempotency) or run a plan against a
+    // pre-existing slug with the wrong content_type (mismatch). The
+    // verifier's live test run passed because it only exercised
+    // fresh-DB flows — the idempotency breakage was invisible without
+    // a repeat-execution test.
+
+    use crate::pyramid::PyramidState;
+    use std::collections::HashMap;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc as StdArc;
+    use tokio::sync::Mutex as TokioMutex;
+
+    /// Build a minimal `PyramidState` with an initialized in-memory
+    /// DB. Mirrors the helper inside dadbear_extend::tests but trimmed
+    /// to the fields `execute_plan` actually touches. All other
+    /// fields get safe defaults that the folder_ingestion path never
+    /// dereferences (chains_dir is set to data_dir/chains to keep the
+    /// PyramidState constructor happy).
+    fn make_execute_plan_test_state() -> (StdArc<PyramidState>, tempfile::TempDir) {
+        let dir = TempDir::new().unwrap();
+        let data_dir = dir.path().to_path_buf();
+        let db_path = data_dir.join("pyramid.db");
+        let writer_conn = crate::pyramid::db::open_pyramid_db(&db_path).unwrap();
+        let reader_conn = crate::pyramid::db::open_pyramid_connection(&db_path).unwrap();
+        let llm_config = crate::pyramid::llm::LlmConfig::default();
+        let state = StdArc::new(PyramidState {
+            reader: StdArc::new(TokioMutex::new(reader_conn)),
+            writer: StdArc::new(TokioMutex::new(writer_conn)),
+            config: StdArc::new(tokio::sync::RwLock::new(llm_config)),
+            active_build: StdArc::new(tokio::sync::RwLock::new(HashMap::new())),
+            data_dir: Some(data_dir.clone()),
+            stale_engines: StdArc::new(TokioMutex::new(HashMap::new())),
+            file_watchers: StdArc::new(TokioMutex::new(HashMap::new())),
+            vine_builds: StdArc::new(TokioMutex::new(HashMap::new())),
+            use_chain_engine: AtomicBool::new(false),
+            use_ir_executor: AtomicBool::new(false),
+            event_bus: StdArc::new(crate::pyramid::event_chain::LocalEventBus::new()),
+            operational: StdArc::new(crate::pyramid::OperationalConfig::default()),
+            chains_dir: data_dir.join("chains"),
+            remote_query_rate_limiter: StdArc::new(TokioMutex::new(HashMap::new())),
+            absorption_gate: StdArc::new(TokioMutex::new(
+                crate::pyramid::AbsorptionGate::new(),
+            )),
+            build_event_bus: StdArc::new(
+                crate::pyramid::event_bus::BuildEventBus::new(),
+            ),
+            supabase_url: None,
+            supabase_anon_key: None,
+            csrf_secret: [0u8; 32],
+            dadbear_handle: StdArc::new(TokioMutex::new(None)),
+            dadbear_in_flight: StdArc::new(std::sync::Mutex::new(HashMap::new())),
+            provider_registry: {
+                let store = StdArc::new(
+                    crate::pyramid::credentials::CredentialStore::load(&data_dir).unwrap(),
+                );
+                StdArc::new(crate::pyramid::provider::ProviderRegistry::new(store))
+            },
+            credential_store: StdArc::new(
+                crate::pyramid::credentials::CredentialStore::load(&data_dir).unwrap(),
+            ),
+            schema_registry: StdArc::new(
+                crate::pyramid::schema_registry::SchemaRegistry::new(),
+            ),
+            cross_pyramid_router: StdArc::new(
+                crate::pyramid::cross_pyramid_router::CrossPyramidEventRouter::new(),
+            ),
+        });
+        (state, dir)
+    }
+
+    /// Re-running `execute_plan` against the same plan must NOT emit
+    /// errors. Every CreatePyramid / CreateVine op should go through
+    /// the pre-check (slug already exists with matching content_type)
+    /// and report success. Without the fix, the Phase 17 code path
+    /// tried to detect "already exists" by substring match on
+    /// `e.to_string()`, but anyhow's `with_context` wrapper makes
+    /// `to_string()` return only the top-level context. Every repeat
+    /// op surfaced as a hard error.
+    #[tokio::test]
+    async fn test_execute_plan_is_idempotent_on_rerun() {
+        let (state, _tmp) = make_execute_plan_test_state();
+        let plan = IngestionPlan {
+            operations: vec![
+                IngestionOperation::CreateVine {
+                    slug: "root-vine".to_string(),
+                    source_path: "/tmp/root".to_string(),
+                },
+                IngestionOperation::CreatePyramid {
+                    slug: "root-doc".to_string(),
+                    content_type: "document".to_string(),
+                    source_path: "/tmp/root/docs".to_string(),
+                },
+                IngestionOperation::AddChildToVine {
+                    vine_slug: "root-vine".to_string(),
+                    child_slug: "root-doc".to_string(),
+                    position: 0,
+                    child_type: "bedrock".to_string(),
+                },
+                IngestionOperation::RegisterDadbearConfig {
+                    slug: "root-doc".to_string(),
+                    source_path: "/tmp/root/docs".to_string(),
+                    content_type: "document".to_string(),
+                    scan_interval_secs: 30,
+                },
+            ],
+            root_slug: Some("root-vine".to_string()),
+            root_source_path: "/tmp/root".to_string(),
+            ..Default::default()
+        };
+
+        // First run — fresh DB.
+        let first = execute_plan(&state, plan.clone()).await.unwrap();
+        assert!(
+            first.errors.is_empty(),
+            "first run must be clean, got errors: {:?}",
+            first.errors
+        );
+        assert_eq!(first.pyramids_created.len(), 1);
+        assert_eq!(first.vines_created.len(), 1);
+        assert_eq!(first.compositions_added, 1);
+        assert_eq!(first.dadbear_configs.len(), 1);
+
+        // Second run — same plan against the populated DB. Under the
+        // bug every CreatePyramid/CreateVine op would be pushed into
+        // `errors` because the "already exists" substring check never
+        // fired. After the fix the pre-check catches the existing
+        // slug, confirms the content_type matches, and routes to the
+        // idempotent-success path. Vine compositions use ON CONFLICT
+        // DO UPDATE, so they stay clean too.
+        let second = execute_plan(&state, plan).await.unwrap();
+        assert!(
+            second.errors.is_empty(),
+            "second run must be idempotent, got errors: {:?}",
+            second.errors
+        );
+        assert_eq!(second.pyramids_created.len(), 1);
+        assert_eq!(second.vines_created.len(), 1);
+        assert_eq!(second.compositions_added, 1);
+        assert_eq!(second.dadbear_configs.len(), 1);
+    }
+
+    /// A plan that re-uses a slug with a DIFFERENT content_type must
+    /// surface a real error instead of silently treating the wrong
+    /// slug as an idempotent hit. This protects the old Phase 17
+    /// layout (where `{root}-cc-1` was a conversation pyramid) from
+    /// being reinterpreted as a vine by a fresh Phase 18e run.
+    #[tokio::test]
+    async fn test_execute_plan_rejects_slug_with_mismatched_content_type() {
+        let (state, _tmp) = make_execute_plan_test_state();
+
+        // Pre-populate the DB with a conversation slug "legacy-cc-1",
+        // mimicking what the old Phase 17 planner wrote to the DB.
+        {
+            let conn = state.writer.lock().await;
+            crate::pyramid::db::create_slug(
+                &conn,
+                "legacy-cc-1",
+                &ContentType::Conversation,
+                "/tmp/old",
+            )
+            .unwrap();
+        }
+
+        // Now run a plan that wants "legacy-cc-1" to be a vine (the
+        // Phase 18e shape). The executor must reject this instead of
+        // treating the pre-existing conversation slug as idempotent.
+        let plan = IngestionPlan {
+            operations: vec![IngestionOperation::CreateVine {
+                slug: "legacy-cc-1".to_string(),
+                source_path: "/tmp/old".to_string(),
+            }],
+            ..Default::default()
+        };
+        let result = execute_plan(&state, plan).await.unwrap();
+        assert_eq!(
+            result.vines_created.len(),
+            0,
+            "mismatched slug must not land in vines_created"
+        );
+        assert_eq!(
+            result.errors.len(),
+            1,
+            "expected one error, got: {:?}",
+            result.errors
+        );
+        let err = &result.errors[0];
+        assert!(
+            err.contains("legacy-cc-1") && err.contains("content_type"),
+            "error must name the slug and the content_type mismatch, got: {}",
+            err
+        );
+    }
+
+    /// A plan that creates a conversation slug, then re-runs against
+    /// the same slug but asking for 'document', must reject the
+    /// second run. Same content_type-mismatch story as the vine case
+    /// but exercising the CreatePyramid arm.
+    #[tokio::test]
+    async fn test_execute_plan_rejects_pyramid_content_type_mismatch() {
+        let (state, _tmp) = make_execute_plan_test_state();
+
+        // Seed with a conversation slug.
+        {
+            let conn = state.writer.lock().await;
+            crate::pyramid::db::create_slug(
+                &conn,
+                "shared-slug",
+                &ContentType::Conversation,
+                "/tmp/conv",
+            )
+            .unwrap();
+        }
+
+        let plan = IngestionPlan {
+            operations: vec![IngestionOperation::CreatePyramid {
+                slug: "shared-slug".to_string(),
+                content_type: "document".to_string(),
+                source_path: "/tmp/doc".to_string(),
+            }],
+            ..Default::default()
+        };
+        let result = execute_plan(&state, plan).await.unwrap();
+        assert_eq!(result.pyramids_created.len(), 0);
+        assert_eq!(result.errors.len(), 1);
+        let err = &result.errors[0];
+        assert!(err.contains("shared-slug"));
+        assert!(err.contains("conversation") || err.contains("document"));
     }
 }

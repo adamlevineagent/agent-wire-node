@@ -2220,3 +2220,184 @@ multi-workstream phase.
 
 ---
 
+## Phase 18e Wanderer Pass (2026-04-11)
+
+Wanderer audit of Phase 18e at commit `4617972` (verifier pass —
+all 12 failure modes cleared, tests live-run). The per-item checklist
+was clean; this pass was specifically looking for cross-cutting
+interaction bugs between the 18e restructure and the Phase 16 vine
+composition / Phase 17 first-build dispatch primitives. Two real
+bugs surfaced, both unreachable from the per-item audit because
+they required end-to-end tracing plus a direct test against
+`execute_plan` on a populated DB.
+
+**Bug 1 (critical): `execute_plan`'s idempotency path never fired
+against sqlite UNIQUE constraint errors.**
+
+The Phase 17 code path did:
+
+```rust
+Err(e) => {
+    let msg = e.to_string();
+    if msg.contains("already exists") {
+        // Idempotent: treat existing slugs as success.
+        ...
+    }
+}
+```
+
+The intuition — "sqlite says 'already exists' when you double-insert
+a UNIQUE slug" — is wrong on three counts:
+
+1. Sqlite's actual constraint-violation strings are `"UNIQUE
+   constraint failed: pyramid_slugs.slug"` and `"PRIMARY KEY constraint
+   failed"`, never the English phrase "already exists."
+2. `db::create_slug` wraps the error with
+   `.with_context(|| format!("Failed to create slug '{slug}'"))`.
+   After that wrap, `e.to_string()` returns only the top-level
+   context (`"Failed to create slug 'foo'"`). The underlying sqlite
+   error text lives in the `{:#}` chain format, not `{}`.
+3. Even if the string matched, a semantic bug lurks: treating an
+   existing slug as idempotent success silently accepts the case
+   where the pre-existing slug has a DIFFERENT content_type (e.g.,
+   Phase 17 wrote `{root}-cc-1` as a conversation pyramid, Phase 18e
+   wants it as a vine). The executor would push a conversation slug
+   into `vines_created` and move on.
+
+Reproduced by a standalone `rusqlite + anyhow` test:
+```
+display: Failed to create slug 'foo'
+{:#}:    Failed to create slug 'foo': UNIQUE constraint failed: pyramid_slugs.slug: Error code 1555: A PRIMARY KEY constraint failed
+contains('already exists'): false
+```
+
+The idempotency check in the Phase 17 + Phase 18e code was a no-op.
+Any re-run of `execute_plan` against a populated DB would push a
+create_slug/create_vine error for EVERY op into `result.errors`. The
+wizard would surface the errors to the user even though the DB
+state is entirely correct from a previous run. The bug was invisible
+to the verifier's "cargo test --lib pyramid::folder_ingestion" run
+because every test used a fresh in-memory DB; no test exercised
+re-execution.
+
+**Fix:** pre-check via `db::get_slug` before calling `db::create_slug`.
+If the slug exists, verify the content_type matches the plan's
+expectation — mismatch becomes a hard error with a clear message
+naming both types. Match becomes the idempotent-success path. Insert
+only happens when the slug genuinely doesn't exist, at which point
+any real failure (IO, schema corruption) gets the full `{:#}` chain
+formatter so we don't lose the sqlite layer again.
+
+Regression tests: `test_execute_plan_is_idempotent_on_rerun`,
+`test_execute_plan_rejects_slug_with_mismatched_content_type`,
+`test_execute_plan_rejects_pyramid_content_type_mismatch`.
+
+**Bug 2 (moderate): CC dir with `memory/*.md` but no jsonls
+unconditionally emits a dead conversation bedrock.**
+
+The Phase 18e loop unconditionally emitted Ops 2–4 (conversation
+`CreatePyramid` + `AddChildToVine` + `RegisterDadbearConfig`) for
+every CC dir match. `describe_claude_code_dirs`'s `jsonl_count`
+field was only read by the wizard preview; the planner never
+consulted it. A CC dir with zero jsonls but a populated `memory/`
+subfolder therefore got an EMPTY conversation bedrock slug, whose
+first build would hit `chain_executor`'s `"No chunks found for slug
+'...' — cannot run conversation pipeline with zero chunks"` error.
+The DADBEAR config would watch a conversation source that would
+never produce jsonls. The conversation slug lands in the DB
+permanently as dead weight.
+
+A related edge case: a CC dir with BOTH zero jsonls AND zero
+memory files produces a CC vine with zero children. Phase 17
+never hit this because pre-Phase 18e's "single conversation
+pyramid per CC dir" emitted `RegisterClaudeCodePyramid` which
+effectively deduplicated to "the CC dir is empty — leave it
+alone." Phase 18e's mini-subplan split the branches but never
+added back the guard.
+
+**Fix:** extracted `count_cc_jsonl_files` alongside
+`count_memory_md_files` so the planner can probe both populations
+once per CC dir. Then a three-way branch:
+
+1. `jsonl_count == 0 && memory_md_count == 0` → skip the CC dir
+   entirely (no CC vine, no attach-to-root op). Logged at WARN so
+   the user sees the skip in the log.
+2. `jsonl_count > 0 && memory_md_count == 0` → emit 5 ops
+   (CC vine + conversation bedrock triplet + attach to root).
+3. `jsonl_count == 0 && memory_md_count > 0` → emit 5 ops
+   (CC vine + memory bedrock triplet + attach to root). This is
+   the new path that used to be mis-handled — memory-only CC dirs
+   now produce a valid subplan.
+4. `jsonl_count > 0 && memory_md_count > 0` → emit 8 ops (the full
+   subplan).
+
+Regression tests: `test_plan_skips_cc_dir_with_no_jsonls_and_no_memory`,
+`test_plan_emits_memory_only_subplan_when_cc_has_no_jsonls`.
+Existing tests for the common 5-op and 8-op paths unchanged.
+
+**What went right (from the wanderer seat):**
+
+1. The planner's structure made both fixes surgical. `plan_recursive`
+   was already deterministic and testable in isolation; extracting
+   `count_cc_jsonl_files` was a ~15-line addition, and the content-
+   aware branch in `plan_recursive` slotted into the existing flow
+   without touching the op generators. `execute_plan`'s match arms
+   for CreatePyramid and CreateVine were structured almost
+   identically so the same pre-check pattern applied to both.
+2. The Phase 17 test fixture (`setup_target_with_cc`) was extensible
+   — splitting it into `setup_target_with_empty_cc_dir` and
+   `setup_target_with_memory_only_cc_dir` was clean because the
+   existing helper already parameterized the file layout.
+3. The `PyramidState` test-harness pattern from `dadbear_extend.rs`
+   was directly reusable: `make_execute_plan_test_state` is a
+   ~40-line copy that gives us a full in-memory PyramidState for
+   async `execute_plan` tests. Worth generalizing into a shared
+   test helper in a future pass — four files now carry the same
+   snippet.
+
+**What went wrong (wanderer's meta-observation):**
+
+1. **The verifier's per-item audit could not see the idempotency
+   bug.** Each item on the 12-failure-mode list was addressable via
+   static code inspection. None of them said "re-run the plan
+   against a populated DB." The bug required a dynamic test: either
+   run the wizard twice in the app, or write a test that re-invokes
+   `execute_plan`. Meta-lesson: for fix-passes on executors, ALWAYS
+   run at least one test that exercises the executor against a
+   non-fresh state. For idempotency-critical paths this should be
+   in the per-item list.
+2. **`e.to_string()` vs `format!("{:#}", e)` is a landmine.** Anyhow
+   hides the chain by default. Any code that tries to pattern-match
+   on the underlying error text (sqlite constraint strings,
+   filesystem errors, etc.) will silently fail unless it uses the
+   alternate formatter. A codebase-wide grep for
+   `.to_string().contains(` on anyhow errors would be worth running
+   as a hygiene pass.
+3. **The verifier reported "clean code inspection" as if the live
+   test run was also comprehensive.** It wasn't — the live test run
+   was for fresh-DB flows. That's an optical-illusion trap: the
+   verifier's header says "all 12 failure modes cleared, tests
+   live-run" and it's technically true, but the tests that were run
+   didn't cover the failure mode that was actually present. Going
+   forward, verifier passes should enumerate what the tests DID
+   cover, not just that they ran.
+4. **Phase 17's inherited cascade behavior is worth flagging even
+   though it's out of scope for 18e.** `spawn_initial_builds`
+   dispatches vines on a 2-second delay, not on leaf completion.
+   For nested hierarchies (root vine → CC vine → bedrocks), both
+   vines get their first build against empty children. The
+   `notify_vine_of_child_completion` cascade stops at a vine with
+   zero live nodes, so leaves that finish later don't trigger a
+   vine rebuild. Net effect: on a fresh ingestion of an
+   agent-wire-node-scale folder, the CC vine and root vine both
+   produce empty apexes initially and never auto-rebuild to
+   incorporate leaf content. The user has to manually trigger a
+   vine rebuild once leaves complete. This is a Phase 17 design
+   debt the 18e restructure inherits; the cleanest fix is to
+   either (a) wait for leaf completion before dispatching vines,
+   or (b) have `notify_vine_of_child_completion` dispatch a fresh
+   build for a parent vine with zero nodes. See
+   `vine_composition.rs:255` for where the cascade stops.
+
+---
+
