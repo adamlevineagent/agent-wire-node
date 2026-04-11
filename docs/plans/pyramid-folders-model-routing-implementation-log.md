@@ -4059,3 +4059,279 @@ failure-mode writeup.
 **Status:** wanderer pass complete → phase 17 complete → full
 17-phase initiative complete. New commit on branch
 `phase-17-recursive-folder-ingestion` (no amend, no push).
+
+## Phase 18d — Schema Migration UI (claims L6) — 2026-04-11
+
+**Branch:** `phase-18d-schema-migration-ui`
+
+**Claims:** L6 from `docs/plans/deferral-ledger.md` — schema migration UI
+in ToolsMode (LLM-assisted migration of configs flagged with
+`needs_migration = 1` after a `schema_definition` supersession).
+
+**Architectural shape:** mirror of Phase 9. Phase 9 ships intent → YAML
+via LLM with draft/refine/accept; this workstream ships
+(old_yaml + new_schema) → migrated_yaml via LLM with the same draft →
+review → accept semantics. Phase 9's `flag_configs_needing_migration`
+helper and the `needs_migration INTEGER NOT NULL DEFAULT 0` column on
+`pyramid_config_contributions` were the breadcrumbs Phase 4's
+dispatcher already sets when a `schema_definition` contribution
+supersedes a prior version. Phase 18d is the surface AND the migration
+execution path.
+
+### What shipped
+
+**1. Backend module: `src-tauri/src/pyramid/migration_config.rs`** (new
+file). Mirrors `generative_config.rs`'s 3-phase shape (load DB inputs →
+LLM call → persist) so the IPC handler can drop the writer/reader
+locks across the LLM await without pinning a non-Send rusqlite
+connection.
+
+Public functions:
+- `list_configs_needing_migration(conn) -> Vec<NeedsMigrationEntry>` —
+  walks every active row with `needs_migration = 1` and resolves the
+  current + prior schema_definition contribution_ids for each one.
+- `load_migration_inputs(conn, contribution_id, user_note?) -> MigrationInputs`
+  — loads the flagged contribution + the active schema_definition body
+  + the prior schema_definition body (via the chain walk) + the
+  bundled migration skill body.
+- `run_migration_llm_call(llm_config, bus, provider_registry, db_path, &inputs) -> String`
+  — substitutes the prompt placeholders, builds a `StepContext`
+  (`primitive = "config_migration"`, `step_name = "migrate_config"`),
+  and calls `call_model_unified_with_options_and_ctx` so cache hits
+  work for migrations.
+- `persist_migration_proposal(conn, &inputs, llm_output, bus) -> MigrationProposal`
+  — creates a `status = 'draft', source = 'migration', supersedes_id = <flagged>`
+  row inside a transaction. Emits `ConfigMigrationProposed`. Does NOT
+  flip the flagged row's status — the original stays active during
+  the review window so background loops still see the prior policy.
+- `accept_config_migration(conn, bus, schema_registry, draft_id, accept_note?) -> AcceptMigrationOutcome`
+  — promotes the draft to active inside a transaction, supersedes the
+  prior, clears `needs_migration` on the new row, then runs
+  `sync_config_to_operational_with_registry` so the operational table
+  picks up the migrated YAML. Emits `ConfigMigrationAccepted`. Refuses
+  to accept if the active config changed between propose and accept
+  (asks the user to re-propose).
+- `reject_config_migration(conn, draft_id) -> RejectMigrationOutcome`
+  — deletes the draft row. Refuses to delete anything that isn't a
+  draft with `source = 'migration'` (defends against a buggy frontend
+  using this IPC to delete random contributions).
+
+**2. Bundled migration skill: `chains/prompts/migration/migrate_config.md`**
++ entry in `src-tauri/assets/bundled_contributions.json` with
+`schema_type: skill`, `slug: migration/migrate_config.md`, and
+`topics_extra: ["migration", "schema_migration", "config"]`. Self-
+describing per the architectural frame — users can refine the
+migration prompt itself via the generative config flow without code
+changes. The skill substitutes `{old_schema}`, `{new_schema}`,
+`{old_yaml}`, and `{user_note}` placeholders (with the same simple
+`{if user_note}...{end}` block syntax Phase 9's generation skills
+use).
+
+**3. Four new Tauri IPC commands** registered in `src-tauri/src/main.rs`
+in the invoke_handler list and defined just after Phase 9's
+generative config block:
+
+```rust
+pyramid_list_configs_needing_migration() -> Vec<NeedsMigrationEntry>
+pyramid_propose_config_migration(input: { contribution_id, user_note? })
+    -> MigrationProposal
+pyramid_accept_config_migration(input: { draft_id, accept_note? })
+    -> AcceptMigrationOutcome
+pyramid_reject_config_migration(input: { draft_id })
+    -> RejectMigrationOutcome
+```
+
+`pyramid_propose_config_migration` follows Phase 9's 3-phase IPC
+shape: read lock for input loading → drop lock → LLM await → writer
+lock for persistence. The other three are single-lock single-step
+calls.
+
+**4. Two new `TaggedKind` variants** in
+`src-tauri/src/pyramid/event_bus.rs`:
+- `ConfigMigrationProposed { slug, schema_type, flagged_contribution_id, draft_contribution_id }`
+- `ConfigMigrationAccepted { slug, schema_type, new_contribution_id, superseded_contribution_id }`
+
+Consumed by the DADBEAR Oversight page's activity log + the
+MigrationPanel UI when it lands. Phase 18d emits but does not yet
+subscribe.
+
+**5. Frontend components** (mounted in ToolsMode):
+- `src/components/MigrationPanel.tsx` (new) — the Needs Migration tab
+  body. Calls `pyramid_list_configs_needing_migration` on mount and
+  on every refreshToken bump. Renders one MigrationCard per flagged
+  row with: schema_type + slug + supersession_note + collapsible
+  current YAML preview + "Propose migration" button. Empty state
+  message when nothing is flagged.
+- `src/components/MigrationReviewModal.tsx` (new) — the review modal.
+  Calls `pyramid_propose_config_migration` on mount, shows side-by-
+  side YAML diff (old vs LLM-proposed new) with color-coded panes,
+  collapsible "show schemas" advanced section, optional user_note
+  textarea + "Re-propose with guidance" button, optional accept_note
+  input, "Accept migration" / "Reject" / "Cancel" buttons. Accept
+  calls `pyramid_accept_config_migration`; reject calls
+  `pyramid_reject_config_migration`. The dialog uses the existing
+  `.diff-overlay` / `.diff-panel` classes from DiffViewer for visual
+  consistency.
+- `src/components/modes/ToolsMode.tsx` — added the "Needs Migration"
+  tab between My Tools and Discover (Option A from the workstream
+  prompt). The tab label carries an orange numeric badge showing the
+  count of flagged configs (refetched at mount and on every accept/
+  reject). MyToolsPanel now also receives a `flaggedContributionIds:
+  Set<string>` prop and passes a `needsMigration` boolean down to
+  ConfigCard, which renders an inline "MIGRATION NEEDED" chip on
+  every flagged card so users see the flag wherever they encounter
+  the contribution — not just in the dedicated tab.
+- `src/types/configContributions.ts` — added TypeScript mirrors of
+  the four Rust serde types: `NeedsMigrationEntry`,
+  `MigrationProposal`, `AcceptMigrationOutcome`,
+  `RejectMigrationOutcome`.
+
+**6. Schema chain walk method.** Option B from the workstream prompt
+(walk the schema_definition supersession chain backward by
+`created_at`) instead of Option A (add a `schema_contribution_id`
+column at config-creation time + backfill). Rationale: Option A is
+cleaner long-term but requires a schema migration + backfill of
+every existing row, which is scope creep beyond Phase 18d's reclaim
+mandate. Option B is a single-query lookup with an inclusive `<=`
+timestamp comparison (necessary because SQLite's `datetime('now')`
+has SECOND precision and can collide on tight test loops). The
+chain walk filters to `superseded_by_id IS NOT NULL` so it only
+returns schema_definition rows that have actually been superseded —
+the prior schema by definition MUST have been superseded, otherwise
+the config wouldn't be flagged for migration. Documented as a known
+limitation in the chain-walk helper's doc comment.
+
+### Tests added
+
+`src-tauri/src/pyramid/migration_config.rs::tests` — 11 new tests:
+
+- `test_list_returns_only_flagged_active_rows` — verifies
+  `needs_migration = 1 AND status = 'active'` filtering
+- `test_list_skips_drafts_and_superseded_rows` — verifies status
+  filter excludes drafts and superseded rows
+- `test_propose_creates_draft_with_correct_lineage` — verifies
+  `status = 'draft', source = 'migration', supersedes_id = <flagged>`
+  on the persisted draft + the flagged row stays active until accept
+- `test_propose_rejects_non_active_contribution` — verifies the
+  guard against trying to migrate a draft or superseded row
+- `test_accept_supersedes_and_clears_flag` — end-to-end accept flow:
+  draft → active, prior → superseded, `needs_migration = 0` on the
+  new row, sync runs successfully
+- `test_reject_deletes_draft_and_leaves_original` — verifies the
+  draft is deleted but the original flagged row stays active and
+  stays flagged
+- `test_reject_refuses_non_migration_drafts` — verifies the guard
+  against deleting random non-migration drafts via this path
+- `test_chain_walk_finds_prior_schema` — verifies the option-B
+  chain walk resolves the superseded schema_definition for a flagged
+  config row
+- `test_load_migration_skill_finds_bundled_prompt` — verifies the
+  slug-first lookup finds the bundled `migration/migrate_config.md`
+  contribution after `walk_bundled_contributions_manifest`
+- `test_substitute_migration_prompt_with_note` /
+  `test_substitute_migration_prompt_without_note` — verify the
+  `{old_schema}` / `{new_schema}` / `{old_yaml}` / `{if user_note}`
+  substitution logic
+
+Result: **11 passing / 0 failing** in the new tests; full pyramid
+suite is **1249 passing / 7 failing** (the same 7 pre-existing failures
+from main; +11 over the Phase 17 baseline of 1238).
+
+### Manual verification steps
+
+1. Build the app via `cargo tauri build` (or run `cargo tauri dev`).
+2. Open ToolsMode. Confirm a fourth tab "Needs Migration" appears
+   between My Tools and Discover. With no flagged configs, the tab
+   shows the empty-state copy.
+3. To seed a flag artificially:
+   - In SQLite (`pyramid.db`), `UPDATE pyramid_config_contributions
+     SET needs_migration = 1 WHERE schema_type = 'evidence_policy'
+     AND status = 'active' AND superseded_by_id IS NULL;`
+   - The Needs Migration tab should now show a count badge "1" and
+     list the flagged row with its current YAML preview.
+4. To exercise the propose flow more realistically:
+   - Open ToolsMode → Create.
+   - Generate a new schema_definition contribution for an existing
+     schema_type via the generative config flow (or supersede the
+     bundled one with a refinement). The Phase 4 dispatcher will
+     fire `flag_configs_for_migration` automatically.
+5. In Needs Migration, click "Propose migration" on a card. The
+   review modal opens, shows a "Generating migration…" spinner
+   while the LLM round-trips, then renders the side-by-side YAML
+   panes.
+6. Optional: type a user_note and click "Re-propose with guidance"
+   to ask the LLM for a different migration.
+7. Click "Accept migration". The modal closes, the panel refreshes,
+   the card disappears from Needs Migration, and the new active
+   contribution should show in My Tools without the "MIGRATION
+   NEEDED" chip.
+8. To exercise reject: propose, then click "Reject" instead. The
+   draft is deleted, the original flagged row is unchanged, and the
+   card stays in Needs Migration so the user can retry later.
+
+### Files changed
+
+- `src-tauri/src/pyramid/migration_config.rs` — new module (~750 lines
+  including 11 tests)
+- `src-tauri/src/pyramid/mod.rs` — added `pub mod migration_config;`
+- `src-tauri/src/pyramid/event_bus.rs` — added `ConfigMigrationProposed`
+  and `ConfigMigrationAccepted` `TaggedKind` variants
+- `src-tauri/src/main.rs` — added 4 new IPC handlers + invoke_handler
+  registration + 3 input structs (`ProposeMigrationInput`,
+  `AcceptMigrationInput`, `RejectMigrationInput`)
+- `src-tauri/assets/bundled_contributions.json` — added
+  `bundled-skill-migration-migrate_config-v1` entry
+- `chains/prompts/migration/migrate_config.md` — new bundled prompt
+  template (mirrored verbatim into the manifest entry)
+- `src/types/configContributions.ts` — added TypeScript mirrors of
+  the four Rust serde response types
+- `src/components/MigrationPanel.tsx` — new (the Needs Migration tab)
+- `src/components/MigrationReviewModal.tsx` — new (the review modal)
+- `src/components/modes/ToolsMode.tsx` — added the Needs Migration
+  tab with a count badge, refactored MyToolsPanel signature to
+  accept `flaggedContributionIds`, extended ConfigCard to render the
+  inline "MIGRATION NEEDED" chip
+- `docs/plans/pyramid-folders-model-routing-implementation-log.md` —
+  this Phase 18d entry
+
+### Deviations from the workstream prompt
+
+- **Schema chain walk method.** Used Option B (chain walk by
+  `created_at`) instead of Option A (new `schema_contribution_id`
+  column at creation time). Documented as a known limitation in the
+  helper's doc comment. Option A remains a clean follow-up if we
+  decide the chain walk is too brittle.
+- **Inclusive timestamp comparison.** SQLite `datetime('now')` has
+  second precision, so back-to-back inserts can collide. Switched
+  the chain walk filter from `created_at < ?` to `created_at <= ?`
+  (with the additional `superseded_by_id IS NOT NULL` filter so we
+  don't accidentally return the active schema as the prior).
+- **No structural JSON Schema validation.** Same as Phase 9 — the
+  `jsonschema` crate isn't in the workspace, so we parse the LLM
+  output as YAML for a sanity check but don't validate it against
+  the new schema_definition's JSON Schema before persisting.
+  Documented in the migration_config.rs doc comment. Phase 19 (or
+  later) can add structural validation when the dependency lands.
+- **No "edit before accepting" path.** The workstream prompt
+  mentioned an optional "Edit before accepting" button that opens a
+  YAML editor with the LLM's proposal pre-filled. Deferred for v1 —
+  the current modal supports re-proposing with user guidance, which
+  achieves the same goal more aligned with the LLM-driven flow.
+  The user can always accept, then edit normally via the existing
+  Create tab if they want to refine further. Documented in the
+  workstream prompt's "Out of scope" alignment.
+
+### Verification commands
+
+- `cargo check --lib` — clean, same 3 pre-existing warnings
+  (`LayerCollectResult` visibility, `get_keep_evidence_for_target`
+  deprecation).
+- `cargo test --lib pyramid::migration_config` — **11 passing /
+  0 failing**.
+- `cargo test --lib pyramid` — **1249 passing / 7 failing**. Same 7
+  pre-existing failures from main; +11 over the Phase 17 baseline of
+  1238.
+- `npm run build` — clean (152 modules, 803.72 kB bundle).
+
+**Status:** `awaiting-verification`. Single commit on branch
+`phase-18d-schema-migration-ui` (no amend, no push, no merge).

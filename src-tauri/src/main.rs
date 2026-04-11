@@ -8942,6 +8942,148 @@ async fn pyramid_config_schemas(
     ))
 }
 
+// ── Phase 18d: Schema Migration UI IPC commands ─────────────────────────
+//
+// Per `docs/plans/phase-18d-workstream-prompt.md` and ledger entry L6.
+// Four commands surface the `needs_migration` flag (set by Phase 9's
+// `flag_configs_needing_migration` helper inside Phase 4's
+// schema_definition dispatcher branch) and execute the LLM-assisted
+// migration flow:
+//
+//   pyramid_list_configs_needing_migration()
+//     Lists every active contribution flagged needing migration, plus
+//     the schema_definition contribution_ids that bracket the
+//     migration (current + prior). Powers the Needs Migration tab.
+//
+//   pyramid_propose_config_migration(input)
+//     Loads the flagged contribution + the prior/current schema
+//     definitions, calls the bundled migrate_config skill via the
+//     cache-aware LLM entry point, persists the result as a draft
+//     contribution. Mirrors Phase 9's pyramid_generate_config 3-phase
+//     shape (load → LLM → persist).
+//
+//   pyramid_accept_config_migration(input)
+//     Promotes the draft to active, supersedes the original flagged
+//     row, runs sync_config_to_operational so the operational table
+//     picks up the migrated YAML, and clears the needs_migration flag
+//     on the new active row.
+//
+//   pyramid_reject_config_migration(input)
+//     Deletes the draft. Original flagged row stays active and stays
+//     flagged so the user can re-propose later.
+//
+// User review is mandatory — there is no auto-apply path. The flow
+// always goes draft → review → accept, matching Phase 9's pattern.
+
+#[derive(serde::Deserialize)]
+struct ProposeMigrationInput {
+    #[serde(rename = "contributionId", alias = "contribution_id")]
+    contribution_id: String,
+    #[serde(default, rename = "userNote", alias = "user_note")]
+    user_note: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct AcceptMigrationInput {
+    #[serde(rename = "draftId", alias = "draft_id")]
+    draft_id: String,
+    #[serde(default, rename = "acceptNote", alias = "accept_note")]
+    accept_note: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct RejectMigrationInput {
+    #[serde(rename = "draftId", alias = "draft_id")]
+    draft_id: String,
+}
+
+#[tauri::command]
+async fn pyramid_list_configs_needing_migration(
+    state: tauri::State<'_, SharedState>,
+) -> Result<
+    Vec<wire_node_lib::pyramid::migration_config::NeedsMigrationEntry>,
+    String,
+> {
+    let reader = state.pyramid.reader.lock().await;
+    wire_node_lib::pyramid::migration_config::list_configs_needing_migration(&reader)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn pyramid_propose_config_migration(
+    state: tauri::State<'_, SharedState>,
+    input: ProposeMigrationInput,
+) -> Result<wire_node_lib::pyramid::migration_config::MigrationProposal, String> {
+    let llm_config = state.pyramid.config.read().await.clone();
+    let db_path = state
+        .pyramid
+        .data_dir
+        .as_ref()
+        .map(|d| d.join("pyramid.db").to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    // Phase 1: load inputs from the DB. Drop the read lock before the
+    // LLM await so we don't pin a non-Send rusqlite::Connection across
+    // a task scheduling point. Mirrors Phase 9's
+    // pyramid_generate_config / pyramid_refine_config 3-phase shape.
+    let inputs = {
+        let reader = state.pyramid.reader.lock().await;
+        wire_node_lib::pyramid::migration_config::load_migration_inputs(
+            &reader,
+            &input.contribution_id,
+            input.user_note.as_deref(),
+        )
+        .map_err(|e| e.to_string())?
+    };
+
+    // Phase 2: run the LLM call with no DB lock held.
+    let llm_output = wire_node_lib::pyramid::migration_config::run_migration_llm_call(
+        &llm_config,
+        &state.pyramid.build_event_bus,
+        &state.pyramid.provider_registry,
+        &db_path,
+        &inputs,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    // Phase 3: persist the proposal via the writer lock.
+    let mut writer = state.pyramid.writer.lock().await;
+    wire_node_lib::pyramid::migration_config::persist_migration_proposal(
+        &mut writer,
+        &inputs,
+        &llm_output,
+        &state.pyramid.build_event_bus,
+    )
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn pyramid_accept_config_migration(
+    state: tauri::State<'_, SharedState>,
+    input: AcceptMigrationInput,
+) -> Result<wire_node_lib::pyramid::migration_config::AcceptMigrationOutcome, String> {
+    let mut writer = state.pyramid.writer.lock().await;
+    wire_node_lib::pyramid::migration_config::accept_config_migration(
+        &mut writer,
+        &state.pyramid.build_event_bus,
+        &state.pyramid.schema_registry,
+        &input.draft_id,
+        input.accept_note.as_deref(),
+    )
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn pyramid_reject_config_migration(
+    state: tauri::State<'_, SharedState>,
+    input: RejectMigrationInput,
+) -> Result<wire_node_lib::pyramid::migration_config::RejectMigrationOutcome, String> {
+    let writer = state.pyramid.writer.lock().await;
+    wire_node_lib::pyramid::migration_config::reject_config_migration(&writer, &input.draft_id)
+        .map_err(|e| e.to_string())
+}
+
 // ── Phase 7: Cache warming on pyramid import IPC commands ─────────────────
 //
 // Per `docs/specs/cache-warming-and-import.md` "IPC Contract" section
@@ -10446,6 +10588,11 @@ fn main() {
             pyramid_active_config,
             pyramid_config_versions,
             pyramid_config_schemas,
+            // Phase 18d: Schema migration UI (claims L6 from deferral-ledger.md)
+            pyramid_list_configs_needing_migration,
+            pyramid_propose_config_migration,
+            pyramid_accept_config_migration,
+            pyramid_reject_config_migration,
             // Phase 7: Cache Warming on Pyramid Import
             pyramid_import_pyramid,
             pyramid_import_progress,

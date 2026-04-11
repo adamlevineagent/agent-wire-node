@@ -107,6 +107,29 @@ pub enum TaggedKind {
         prior_contribution_id: Option<String>,
     },
 
+    // ── Phase 18d: Schema Migration UI ───────────────────────────────
+    /// Emitted by `migration_config::persist_migration_proposal` when an
+    /// LLM-assisted migration draft lands in the contribution table.
+    /// Consumed by the DADBEAR Oversight page's activity log + the
+    /// MigrationPanel UI for live refresh. The flagged contribution is
+    /// still active at this point — the draft is awaiting user review.
+    ConfigMigrationProposed {
+        slug: Option<String>,
+        schema_type: String,
+        flagged_contribution_id: String,
+        draft_contribution_id: String,
+    },
+    /// Emitted by `migration_config::accept_config_migration` once a
+    /// migration draft is promoted to active. The `new_contribution_id`
+    /// is the now-active row; `superseded_contribution_id` is the old
+    /// row that the draft replaced.
+    ConfigMigrationAccepted {
+        slug: Option<String>,
+        schema_type: String,
+        new_contribution_id: String,
+        superseded_contribution_id: String,
+    },
+
     // ── Phase 6: LLM Output Cache ─────────────────────────────────────
     /// Emitted when `call_model_unified_with_options_and_ctx` finds a
     /// valid cache entry for the current call and returns it without

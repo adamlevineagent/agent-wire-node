@@ -60,6 +60,7 @@ pub mod local_store;
 pub mod lock_manager;
 pub mod manifest;
 pub mod meta;
+pub mod migration_config;
 pub mod multi_chain_overlay;
 pub mod naming;
 pub mod parity;
