@@ -493,6 +493,84 @@ impl ExecutionState {
         .await?
     }
 
+    /// Phase 11: write a synchronous cost_log row populated from the
+    /// authoritative response-body fields. Sets
+    /// `reconciliation_status = 'synchronous'` so the broadcast
+    /// webhook can later confirm it (and the leak sweep will flip
+    /// unconfirmed rows to `broadcast_missing` after the grace
+    /// period).
+    ///
+    /// Callers should use this in preference to `log_cost` for any
+    /// LLM call that went through the provider trait, since the
+    /// parsed response carries the authoritative `actual_cost_usd`
+    /// and `provider_id` needed for the second-channel webhook
+    /// correlation. The legacy `log_cost` above is kept as a
+    /// transitional path for call sites that haven't been retrofit
+    /// with the LlmResponse return — they log the estimated cost
+    /// without broadcast reconciliation.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn log_cost_synchronous(
+        &self,
+        step_name: &str,
+        model: &str,
+        input_tokens: i64,
+        output_tokens: i64,
+        estimated_cost: f64,
+        tier: Option<&str>,
+        latency_ms: Option<i64>,
+        generation_id: Option<&str>,
+        estimated_cost_usd: Option<f64>,
+        actual_cost: Option<f64>,
+        provider_id: Option<&str>,
+    ) -> Result<i64> {
+        let slug = self.slug.clone();
+        let chain_id = self.chain_id.clone();
+        let step_name = step_name.to_string();
+        let model = model.to_string();
+        let tier = tier.map(|s| s.to_string());
+        let generation_id = generation_id.map(|s| s.to_string());
+        let provider_id = provider_id.map(|s| s.to_string());
+        let db = self.writer.clone();
+
+        let reconciliation_status = if provider_id.as_deref() == Some("openrouter") {
+            "synchronous"
+        } else if actual_cost.map(|c| c == 0.0).unwrap_or(false) {
+            "synchronous_local"
+        } else if actual_cost.is_some() {
+            "synchronous"
+        } else {
+            "estimated"
+        };
+
+        tokio::task::spawn_blocking(move || {
+            let conn = db.blocking_lock();
+            db::insert_cost_log_synchronous(
+                &conn,
+                &slug,
+                &step_name,
+                &model,
+                input_tokens,
+                output_tokens,
+                estimated_cost,
+                "ir_executor",
+                None, // layer
+                None, // check_type
+                chain_id.as_deref(),
+                Some(&step_name),
+                tier.as_deref(),
+                latency_ms,
+                generation_id.as_deref(),
+                estimated_cost_usd,
+                actual_cost,
+                Some(input_tokens),
+                Some(output_tokens),
+                provider_id.as_deref(),
+                reconciliation_status,
+            )
+        })
+        .await?
+    }
+
     // ── Cleanup (from_depth rebuild) ──────────────────────────────────
 
     /// Supersede nodes and scope execution tables at and above `from_depth`.

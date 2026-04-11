@@ -430,6 +430,132 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
         "ALTER TABLE pyramid_cost_log ADD COLUMN estimated_cost_usd REAL",
         [],
     );
+
+    // ── Phase 11: Broadcast reconciliation + synchronous cost persistence ──
+    //
+    // Per `docs/specs/evidence-triage-and-dadbear.md` Parts 3 & 4, the
+    // synchronous cost path (`usage.cost` from the OpenRouter response)
+    // populates `actual_cost` + `reconciliation_status = 'synchronous'`
+    // immediately after the response is parsed. The Broadcast webhook
+    // receiver (Phase 11) then populates `broadcast_confirmed_at` +
+    // `broadcast_cost_usd` + `broadcast_discrepancy_ratio` when the trace
+    // arrives. The leak detection sweep transitions stale synchronous rows
+    // to `reconciliation_status = 'broadcast_missing'` after the grace
+    // period. NO auto-correction — discrepancies flip status to
+    // `'discrepancy'` and fire loud events; actual_cost is never silently
+    // rewritten.
+    let _ = conn.execute(
+        "ALTER TABLE pyramid_cost_log ADD COLUMN actual_cost REAL",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE pyramid_cost_log ADD COLUMN actual_tokens_in INTEGER",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE pyramid_cost_log ADD COLUMN actual_tokens_out INTEGER",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE pyramid_cost_log ADD COLUMN reconciled_at TEXT",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE pyramid_cost_log ADD COLUMN reconciliation_status TEXT",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE pyramid_cost_log ADD COLUMN provider_id TEXT",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE pyramid_cost_log ADD COLUMN broadcast_confirmed_at TEXT",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE pyramid_cost_log ADD COLUMN broadcast_payload_json TEXT",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE pyramid_cost_log ADD COLUMN broadcast_cost_usd REAL",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE pyramid_cost_log ADD COLUMN broadcast_discrepancy_ratio REAL",
+        [],
+    );
+    // Indexes for the correlation + leak sweep hot paths.
+    let _ = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_cost_log_reconciliation \
+         ON pyramid_cost_log(reconciliation_status, created_at)",
+        [],
+    );
+    let _ = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_cost_log_broadcast \
+         ON pyramid_cost_log(broadcast_confirmed_at)",
+        [],
+    );
+
+    // Provider health ALTERs are moved BELOW the
+    // pyramid_providers CREATE TABLE so they run after the table
+    // exists on fresh installs. For existing databases they apply
+    // as idempotent column additions.
+
+    // Orphan broadcasts landing zone — broadcast traces that arrive with
+    // a metadata shape no local pyramid_cost_log row expects. This is the
+    // primary indicator of credential exfiltration: someone else is
+    // making calls with the user's OpenRouter API key.
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS pyramid_orphan_broadcasts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            received_at TEXT NOT NULL DEFAULT (datetime('now')),
+            provider_id TEXT,
+            generation_id TEXT,
+            session_id TEXT,
+            pyramid_slug TEXT,
+            build_id TEXT,
+            step_name TEXT,
+            model TEXT,
+            cost_usd REAL,
+            tokens_in INTEGER,
+            tokens_out INTEGER,
+            payload_json TEXT NOT NULL,
+            acknowledged_at TEXT,
+            acknowledgment_reason TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_orphan_broadcasts_generation
+            ON pyramid_orphan_broadcasts(generation_id);
+        CREATE INDEX IF NOT EXISTS idx_orphan_broadcasts_received
+            ON pyramid_orphan_broadcasts(received_at);
+        CREATE INDEX IF NOT EXISTS idx_orphan_broadcasts_unreviewed
+            ON pyramid_orphan_broadcasts(acknowledged_at);
+        ",
+    )?;
+
+    // Phase 11 wanderer fix: provider error log for the state
+    // machine's threshold-based HTTP 5xx degrade. Each observation of a
+    // provider-side error is recorded here so `record_provider_error`
+    // can count recent occurrences within the policy window and only
+    // flip the provider health flag when the spec's 3-in-window
+    // threshold is crossed. Without this table the state machine
+    // degrades on the first 5xx, which is strictly more aggressive
+    // than the spec permits. Cost discrepancies continue to use
+    // `pyramid_cost_log.reconciliation_status = 'discrepancy'` as
+    // their counter surface — this table is HTTP-specific.
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS pyramid_provider_error_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            provider_id TEXT NOT NULL,
+            error_kind TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_provider_error_log_recent
+            ON pyramid_provider_error_log(provider_id, error_kind, created_at);
+        ",
+    )?;
+
     let _ = conn.execute(
         "ALTER TABLE pyramid_faq_nodes ADD COLUMN match_triggers TEXT DEFAULT '[]'",
         [],
@@ -1368,7 +1494,15 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
             config_json TEXT NOT NULL DEFAULT '{}',
             enabled INTEGER NOT NULL DEFAULT 1,
             created_at TEXT NOT NULL DEFAULT (datetime('now')),
-            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            -- Phase 11: provider health state machine columns. Carried
+            -- in-line here for fresh installs; the ALTER TABLE block
+            -- above also adds them to existing databases as a
+            -- separate upgrade path.
+            provider_health TEXT NOT NULL DEFAULT 'healthy',
+            health_reason TEXT,
+            health_since TEXT,
+            health_acknowledged_at TEXT
         );
 
         CREATE TABLE IF NOT EXISTS pyramid_tier_routing (
@@ -1398,6 +1532,34 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
         );
         ",
     )?;
+
+    // Phase 11: provider health state machine columns. Added as
+    // idempotent ALTERs after the CREATE TABLE so existing
+    // databases from before Phase 11 pick them up on next boot.
+    // Fresh installs get the columns directly from the CREATE TABLE
+    // above, so these ALTERs become no-ops (silently ignored via
+    // the try-and-ignore pattern).
+    //
+    // Health is a SIGNAL — it does NOT drive automatic failover or
+    // reroute traffic. Providers in a non-healthy state just emit a
+    // WARN log on every resolution until an admin acknowledges them.
+    let _ = conn.execute(
+        "ALTER TABLE pyramid_providers \
+         ADD COLUMN provider_health TEXT NOT NULL DEFAULT 'healthy'",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE pyramid_providers ADD COLUMN health_reason TEXT",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE pyramid_providers ADD COLUMN health_since TEXT",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE pyramid_providers ADD COLUMN health_acknowledged_at TEXT",
+        [],
+    );
 
     // First-run seeding. Only fires when pyramid_providers is empty so
     // we don't clobber user-customized rows on subsequent boots.
@@ -11676,6 +11838,62 @@ pub struct DadbearPolicyYaml {
     pub batch_size: i64,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Phase 11: cost reconciliation thresholds. Persisted back
+    /// through the contribution for Wire sharing + versioning but
+    /// not yet consumed by the runtime — `openrouter_webhook::
+    /// process_trace` uses `CostReconciliationPolicy::default()`.
+    /// Phase 12/15 will wire this into the live runtime policy so
+    /// users can tune the thresholds without a rebuild.
+    #[serde(default)]
+    pub cost_reconciliation: Option<DadbearCostReconciliationYaml>,
+}
+
+/// Phase 11: cost reconciliation policy surfaced on `dadbear_policy`.
+/// Mirrors `CostReconciliationPolicy` in `provider_health.rs` — the
+/// YAML is the persistent form, the struct is the runtime form.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DadbearCostReconciliationYaml {
+    #[serde(default = "default_discrepancy_ratio")]
+    pub discrepancy_ratio: f64,
+    #[serde(default = "default_provider_degrade_count")]
+    pub provider_degrade_count: i64,
+    #[serde(default = "default_provider_degrade_window_secs")]
+    pub provider_degrade_window_secs: i64,
+    #[serde(default = "default_true")]
+    pub broadcast_required: bool,
+    #[serde(default = "default_broadcast_grace_period_secs")]
+    pub broadcast_grace_period_secs: i64,
+    #[serde(default = "default_broadcast_audit_interval_secs")]
+    pub broadcast_audit_interval_secs: i64,
+}
+
+impl Default for DadbearCostReconciliationYaml {
+    fn default() -> Self {
+        Self {
+            discrepancy_ratio: default_discrepancy_ratio(),
+            provider_degrade_count: default_provider_degrade_count(),
+            provider_degrade_window_secs: default_provider_degrade_window_secs(),
+            broadcast_required: true,
+            broadcast_grace_period_secs: default_broadcast_grace_period_secs(),
+            broadcast_audit_interval_secs: default_broadcast_audit_interval_secs(),
+        }
+    }
+}
+
+fn default_discrepancy_ratio() -> f64 {
+    0.10
+}
+fn default_provider_degrade_count() -> i64 {
+    3
+}
+fn default_provider_degrade_window_secs() -> i64 {
+    600
+}
+fn default_broadcast_grace_period_secs() -> i64 {
+    600
+}
+fn default_broadcast_audit_interval_secs() -> i64 {
+    900
 }
 
 fn dadbear_default_scan_interval() -> i64 {
@@ -11835,6 +12053,596 @@ pub fn replace_step_overrides_bundle(
         save_step_override(conn, &row)?;
     }
     Ok(())
+}
+
+// ── Phase 11: OpenRouter Broadcast + Cost Reconciliation ────────────────────
+//
+// These helpers implement the database side of `docs/specs/
+// evidence-triage-and-dadbear.md` Parts 3 and 4. The invariants they
+// maintain, load-bearing for the leak-detection contract:
+//
+// 1. `insert_cost_log_pending` is the synchronous primary path. It
+//    INSERTs a row with `reconciliation_status = 'synchronous'` (or
+//    `'synchronous_local'` for zero-cost local calls) and populates
+//    `actual_cost` / `actual_tokens_*` directly from the response
+//    body. The caller must have already parsed the response so there
+//    is always either an authoritative number or `None`.
+//
+// 2. Correlation is keyed first on `generation_id` (OpenRouter's
+//    `gen-xxx`) and falls back to `(slug, step_name, model)` when the
+//    generation_id is missing. The fallback only returns the oldest
+//    still-unconfirmed row to avoid double-confirming the same
+//    broadcast.
+//
+// 3. `record_broadcast_confirmation` NEVER rewrites `actual_cost`.
+//    Even when the broadcast disagrees, we store the broadcast's cost
+//    in `broadcast_cost_usd` and flip `reconciliation_status` to
+//    `'discrepancy'` — the synchronous ledger is preserved so the user
+//    can audit the disagreement.
+//
+// 4. `sweep_broadcast_missing` is the leak detection pass. It
+//    transitions `synchronous` rows past the grace period to
+//    `broadcast_missing` so the oversight page can surface them as a
+//    red alert.
+//
+// 5. Orphan broadcasts are inserted when correlation finds no matching
+//    row. These are the primary credential-exfiltration indicator.
+
+/// Row returned from correlation queries. `id` is the primary key of
+/// the matched `pyramid_cost_log` row; `actual_cost` carries the
+/// synchronous value for discrepancy comparison.
+#[derive(Debug, Clone)]
+pub struct CorrelatedCostLogRow {
+    pub id: i64,
+    pub slug: String,
+    pub step_name: Option<String>,
+    pub model: String,
+    pub actual_cost: Option<f64>,
+    pub provider_id: Option<String>,
+    pub reconciliation_status: Option<String>,
+    pub broadcast_confirmed_at: Option<String>,
+}
+
+/// Insert a synchronous cost log row populated directly from the
+/// provider's response body. Called by the LLM call path immediately
+/// after parsing a successful response, so `actual_cost` and
+/// `reconciliation_status` are authoritative on row creation.
+///
+/// For Ollama and other local providers that report no cost, pass
+/// `actual_cost = Some(0.0)` and status = `"synchronous_local"`.
+#[allow(clippy::too_many_arguments)]
+pub fn insert_cost_log_synchronous(
+    conn: &Connection,
+    slug: &str,
+    operation: &str,
+    model: &str,
+    input_tokens: i64,
+    output_tokens: i64,
+    estimated_cost: f64,
+    source: &str,
+    layer: Option<i32>,
+    check_type: Option<&str>,
+    chain_id: Option<&str>,
+    step_name: Option<&str>,
+    tier: Option<&str>,
+    latency_ms: Option<i64>,
+    generation_id: Option<&str>,
+    estimated_cost_usd: Option<f64>,
+    actual_cost: Option<f64>,
+    actual_tokens_in: Option<i64>,
+    actual_tokens_out: Option<i64>,
+    provider_id: Option<&str>,
+    reconciliation_status: &str,
+) -> Result<i64> {
+    let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    conn.execute(
+        "INSERT INTO pyramid_cost_log (
+             slug, operation, model, input_tokens, output_tokens,
+             estimated_cost, source, layer, check_type, created_at,
+             chain_id, step_name, tier, latency_ms, generation_id,
+             estimated_cost_usd,
+             actual_cost, actual_tokens_in, actual_tokens_out,
+             provider_id, reconciliation_status, reconciled_at
+         ) VALUES (
+             ?1, ?2, ?3, ?4, ?5,
+             ?6, ?7, ?8, ?9, ?10,
+             ?11, ?12, ?13, ?14, ?15,
+             ?16,
+             ?17, ?18, ?19,
+             ?20, ?21, ?22
+         )",
+        rusqlite::params![
+            slug,
+            operation,
+            model,
+            input_tokens,
+            output_tokens,
+            estimated_cost,
+            source,
+            layer,
+            check_type,
+            now,
+            chain_id,
+            step_name,
+            tier,
+            latency_ms,
+            generation_id,
+            estimated_cost_usd,
+            actual_cost,
+            actual_tokens_in,
+            actual_tokens_out,
+            provider_id,
+            reconciliation_status,
+            now,
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// Find the single `pyramid_cost_log` row a broadcast trace should
+/// confirm. Primary correlation is by `generation_id` (the OpenRouter
+/// response.id we stored on row creation). Fallback correlation is by
+/// `(slug, step_name, model)` taking the oldest unconfirmed row.
+///
+/// Returns `None` when no match is found — the caller treats this as an
+/// orphan broadcast and writes a row into `pyramid_orphan_broadcasts`.
+pub fn correlate_broadcast_to_cost_log(
+    conn: &Connection,
+    generation_id: Option<&str>,
+    session_slug: Option<&str>,
+    step_name: Option<&str>,
+    model: Option<&str>,
+) -> Result<Option<CorrelatedCostLogRow>> {
+    // Path 1: generation_id exact match (authoritative).
+    if let Some(gid) = generation_id {
+        if !gid.is_empty() {
+            let mut stmt = conn.prepare(
+                "SELECT id, slug, step_name, model, actual_cost, provider_id,
+                        reconciliation_status, broadcast_confirmed_at
+                 FROM pyramid_cost_log
+                 WHERE generation_id = ?1
+                 ORDER BY id DESC
+                 LIMIT 1",
+            )?;
+            let mut rows = stmt.query(rusqlite::params![gid])?;
+            if let Some(row) = rows.next()? {
+                return Ok(Some(CorrelatedCostLogRow {
+                    id: row.get(0)?,
+                    slug: row.get(1)?,
+                    step_name: row.get(2)?,
+                    model: row.get(3)?,
+                    actual_cost: row.get(4)?,
+                    provider_id: row.get(5)?,
+                    reconciliation_status: row.get(6)?,
+                    broadcast_confirmed_at: row.get(7)?,
+                }));
+            }
+        }
+    }
+
+    // Path 2: session_id + step_name + model fallback. Returns the
+    // oldest still-unconfirmed row so repeated broadcasts for the same
+    // (slug, step) pair don't double-confirm.
+    let Some(slug) = session_slug else {
+        return Ok(None);
+    };
+    let Some(step) = step_name else {
+        return Ok(None);
+    };
+    let model_filter = model.unwrap_or("");
+    let mut stmt = conn.prepare(
+        "SELECT id, slug, step_name, model, actual_cost, provider_id,
+                reconciliation_status, broadcast_confirmed_at
+         FROM pyramid_cost_log
+         WHERE slug = ?1
+           AND step_name = ?2
+           AND (?3 = '' OR model = ?3)
+           AND broadcast_confirmed_at IS NULL
+         ORDER BY created_at ASC
+         LIMIT 1",
+    )?;
+    let mut rows = stmt.query(rusqlite::params![slug, step, model_filter])?;
+    if let Some(row) = rows.next()? {
+        return Ok(Some(CorrelatedCostLogRow {
+            id: row.get(0)?,
+            slug: row.get(1)?,
+            step_name: row.get(2)?,
+            model: row.get(3)?,
+            actual_cost: row.get(4)?,
+            provider_id: row.get(5)?,
+            reconciliation_status: row.get(6)?,
+            broadcast_confirmed_at: row.get(7)?,
+        }));
+    }
+    Ok(None)
+}
+
+/// Write a broadcast confirmation onto a matched `pyramid_cost_log`
+/// row. If the ratio exceeds the caller's threshold, the row is
+/// transitioned to `'discrepancy'` instead of kept at `'synchronous'`.
+/// `actual_cost` is NEVER rewritten — the broadcast cost lives in the
+/// separate `broadcast_cost_usd` column so the audit trail preserves
+/// both sides of a disagreement.
+pub fn record_broadcast_confirmation(
+    conn: &Connection,
+    cost_log_id: i64,
+    broadcast_cost_usd: Option<f64>,
+    payload_json: &str,
+    discrepancy_ratio: Option<f64>,
+    flag_discrepancy: bool,
+) -> Result<()> {
+    let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    if flag_discrepancy {
+        conn.execute(
+            "UPDATE pyramid_cost_log
+             SET broadcast_confirmed_at = ?1,
+                 broadcast_payload_json = ?2,
+                 broadcast_cost_usd = ?3,
+                 broadcast_discrepancy_ratio = ?4,
+                 reconciliation_status = 'discrepancy'
+             WHERE id = ?5",
+            rusqlite::params![now, payload_json, broadcast_cost_usd, discrepancy_ratio, cost_log_id],
+        )?;
+    } else {
+        conn.execute(
+            "UPDATE pyramid_cost_log
+             SET broadcast_confirmed_at = ?1,
+                 broadcast_payload_json = ?2,
+                 broadcast_cost_usd = ?3,
+                 broadcast_discrepancy_ratio = ?4
+             WHERE id = ?5
+               AND reconciliation_status != 'discrepancy'",
+            rusqlite::params![now, payload_json, broadcast_cost_usd, discrepancy_ratio, cost_log_id],
+        )?;
+    }
+    Ok(())
+}
+
+/// Recovery path: the synchronous primary path failed (parse error,
+/// connection drop mid-body) but the broadcast arrived afterwards with
+/// authoritative values. Populate `actual_cost` and flip status from
+/// `'estimated'` to `'broadcast'`. This is the ONLY path where the
+/// broadcast is allowed to set `actual_cost`, and only when the
+/// synchronous path explicitly failed.
+pub fn record_broadcast_recovery(
+    conn: &Connection,
+    cost_log_id: i64,
+    actual_cost: f64,
+    actual_tokens_in: Option<i64>,
+    actual_tokens_out: Option<i64>,
+    payload_json: &str,
+) -> Result<()> {
+    let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    conn.execute(
+        "UPDATE pyramid_cost_log
+         SET actual_cost = ?1,
+             actual_tokens_in = COALESCE(?2, actual_tokens_in),
+             actual_tokens_out = COALESCE(?3, actual_tokens_out),
+             broadcast_confirmed_at = ?4,
+             broadcast_payload_json = ?5,
+             broadcast_cost_usd = ?1,
+             reconciled_at = ?4,
+             reconciliation_status = 'broadcast'
+         WHERE id = ?6
+           AND reconciliation_status = 'estimated'",
+        rusqlite::params![
+            actual_cost,
+            actual_tokens_in,
+            actual_tokens_out,
+            now,
+            payload_json,
+            cost_log_id,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Insert an orphan broadcast row. Orphans are broadcasts that arrived
+/// with no matching local cost_log row — the primary indicator of
+/// credential exfiltration.
+#[allow(clippy::too_many_arguments)]
+pub fn insert_orphan_broadcast(
+    conn: &Connection,
+    provider_id: Option<&str>,
+    generation_id: Option<&str>,
+    session_id: Option<&str>,
+    pyramid_slug: Option<&str>,
+    build_id: Option<&str>,
+    step_name: Option<&str>,
+    model: Option<&str>,
+    cost_usd: Option<f64>,
+    tokens_in: Option<i64>,
+    tokens_out: Option<i64>,
+    payload_json: &str,
+) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO pyramid_orphan_broadcasts (
+             provider_id, generation_id, session_id, pyramid_slug, build_id,
+             step_name, model, cost_usd, tokens_in, tokens_out, payload_json
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        rusqlite::params![
+            provider_id,
+            generation_id,
+            session_id,
+            pyramid_slug,
+            build_id,
+            step_name,
+            model,
+            cost_usd,
+            tokens_in,
+            tokens_out,
+            payload_json,
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// Leak detection sweep. Flips `synchronous` rows whose broadcast
+/// confirmation never arrived within the grace period to
+/// `broadcast_missing`. Skipped entirely when the user opts out of
+/// broadcast confirmation via `broadcast_required: false`.
+///
+/// Returns the number of rows flipped.
+pub fn sweep_broadcast_missing(
+    conn: &Connection,
+    grace_period_secs: i64,
+) -> Result<usize> {
+    // SQLite datetime modifier format. The column was written with
+    // `datetime('now')` (UTC) so we compare against the same epoch.
+    let modifier = format!("-{} seconds", grace_period_secs.max(0));
+    let affected = conn.execute(
+        "UPDATE pyramid_cost_log
+         SET reconciliation_status = 'broadcast_missing'
+         WHERE reconciliation_status = 'synchronous'
+           AND broadcast_confirmed_at IS NULL
+           AND created_at < datetime('now', ?1)",
+        rusqlite::params![modifier],
+    )?;
+    Ok(affected)
+}
+
+// ── Phase 11: Provider Health State Machine ──────────────────────────
+
+/// Provider health classification. Stored as a lowercase string in
+/// `pyramid_providers.provider_health`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderHealth {
+    Healthy,
+    Degraded,
+    Down,
+}
+
+impl ProviderHealth {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProviderHealth::Healthy => "healthy",
+            ProviderHealth::Degraded => "degraded",
+            ProviderHealth::Down => "down",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "degraded" => ProviderHealth::Degraded,
+            "down" => ProviderHealth::Down,
+            _ => ProviderHealth::Healthy,
+        }
+    }
+}
+
+/// Snapshot of a provider's health state for the IPC surface.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ProviderHealthEntry {
+    pub provider_id: String,
+    pub display_name: String,
+    pub provider_type: String,
+    pub health: String,
+    pub reason: Option<String>,
+    pub since: Option<String>,
+    pub acknowledged_at: Option<String>,
+    pub recent_discrepancies: i64,
+    pub recent_broadcast_missing: i64,
+    pub recent_orphans: i64,
+}
+
+/// Set a provider's health state and record the reason. Called by
+/// `record_provider_error` when enough signals accumulate to degrade
+/// the provider. Does NOT auto-clear — admin must acknowledge via
+/// `acknowledge_provider_health`.
+pub fn set_provider_health(
+    conn: &Connection,
+    provider_id: &str,
+    health: ProviderHealth,
+    reason: &str,
+) -> Result<()> {
+    let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    conn.execute(
+        "UPDATE pyramid_providers
+         SET provider_health = ?1,
+             health_reason = ?2,
+             health_since = ?3
+         WHERE id = ?4",
+        rusqlite::params![health.as_str(), reason, now, provider_id],
+    )?;
+    Ok(())
+}
+
+/// Acknowledge a provider health alert. Resets state to `"healthy"`
+/// and stamps `health_acknowledged_at` with the current time. Keeps
+/// `health_reason` populated for the audit trail.
+pub fn acknowledge_provider_health(conn: &Connection, provider_id: &str) -> Result<()> {
+    let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    conn.execute(
+        "UPDATE pyramid_providers
+         SET provider_health = 'healthy',
+             health_acknowledged_at = ?1
+         WHERE id = ?2",
+        rusqlite::params![now, provider_id],
+    )?;
+    Ok(())
+}
+
+/// Read the current health state for a single provider.
+pub fn get_provider_health(conn: &Connection, provider_id: &str) -> Result<Option<(String, Option<String>, Option<String>, Option<String>)>> {
+    let mut stmt = conn.prepare(
+        "SELECT provider_health, health_reason, health_since, health_acknowledged_at
+         FROM pyramid_providers WHERE id = ?1",
+    )?;
+    let mut rows = stmt.query(rusqlite::params![provider_id])?;
+    if let Some(row) = rows.next()? {
+        Ok(Some((
+            row.get::<_, Option<String>>(0)?.unwrap_or_else(|| "healthy".into()),
+            row.get(1)?,
+            row.get(2)?,
+            row.get(3)?,
+        )))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Full provider health snapshot for the IPC surface. Includes recent
+/// discrepancy / broadcast_missing / orphan counts per provider so the
+/// UI can render signal density without running separate queries.
+pub fn list_provider_health(
+    conn: &Connection,
+    recent_window_secs: i64,
+) -> Result<Vec<ProviderHealthEntry>> {
+    let window_modifier = format!("-{} seconds", recent_window_secs.max(0));
+    let mut stmt = conn.prepare(
+        "SELECT id, display_name, provider_type, provider_health,
+                health_reason, health_since, health_acknowledged_at
+         FROM pyramid_providers
+         ORDER BY id",
+    )?;
+    let entries = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?.unwrap_or_else(|| "healthy".into()),
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+            ))
+        })?
+        .filter_map(|r| r.ok())
+        .collect::<Vec<_>>();
+
+    let mut out = Vec::with_capacity(entries.len());
+    for (provider_id, display_name, provider_type, health, reason, since, acked) in entries {
+        let recent_discrepancies: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pyramid_cost_log
+                 WHERE provider_id = ?1
+                   AND reconciliation_status = 'discrepancy'
+                   AND created_at > datetime('now', ?2)",
+                rusqlite::params![provider_id, window_modifier],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        let recent_broadcast_missing: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pyramid_cost_log
+                 WHERE provider_id = ?1
+                   AND reconciliation_status = 'broadcast_missing'
+                   AND created_at > datetime('now', ?2)",
+                rusqlite::params![provider_id, window_modifier],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        let recent_orphans: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pyramid_orphan_broadcasts
+                 WHERE provider_id = ?1
+                   AND received_at > datetime('now', ?2)
+                   AND acknowledged_at IS NULL",
+                rusqlite::params![provider_id, window_modifier],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+
+        out.push(ProviderHealthEntry {
+            provider_id,
+            display_name,
+            provider_type,
+            health,
+            reason,
+            since,
+            acknowledged_at: acked,
+            recent_discrepancies,
+            recent_broadcast_missing,
+            recent_orphans,
+        });
+    }
+    Ok(out)
+}
+
+/// Count discrepancies recorded for a provider inside a window.
+/// Called by the provider health state machine to decide whether to
+/// degrade after an N-in-M-seconds trigger.
+pub fn count_recent_cost_discrepancies(
+    conn: &Connection,
+    provider_id: &str,
+    window_secs: i64,
+) -> Result<i64> {
+    let modifier = format!("-{} seconds", window_secs.max(0));
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pyramid_cost_log
+             WHERE provider_id = ?1
+               AND reconciliation_status = 'discrepancy'
+               AND created_at > datetime('now', ?2)",
+            rusqlite::params![provider_id, modifier],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    Ok(count)
+}
+
+/// Phase 11 wanderer fix: record a single provider error observation
+/// into the rolling event log. Called by `provider_health::
+/// record_provider_error` for HTTP 5xx events before the threshold
+/// check runs. Connection failures and cost discrepancies continue to
+/// use their own single-occurrence / cost_log-based paths and do NOT
+/// write here — we only record errors whose spec behavior depends on
+/// a rolling count.
+pub fn record_provider_error_event(
+    conn: &Connection,
+    provider_id: &str,
+    error_kind: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO pyramid_provider_error_log (provider_id, error_kind)
+         VALUES (?1, ?2)",
+        rusqlite::params![provider_id, error_kind],
+    )?;
+    Ok(())
+}
+
+/// Phase 11 wanderer fix: count recent provider error events of a
+/// given kind within a rolling window. Used by the HTTP 5xx degrade
+/// threshold so the state machine only flips `provider_health` after
+/// the spec's 3-in-window signal, not on the first occurrence.
+pub fn count_recent_provider_errors(
+    conn: &Connection,
+    provider_id: &str,
+    error_kind: &str,
+    window_secs: i64,
+) -> Result<i64> {
+    let modifier = format!("-{} seconds", window_secs.max(0));
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pyramid_provider_error_log
+             WHERE provider_id = ?1
+               AND error_kind = ?2
+               AND created_at > datetime('now', ?3)",
+            rusqlite::params![provider_id, error_kind, modifier],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    Ok(count)
 }
 
 #[cfg(test)]

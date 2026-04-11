@@ -61,6 +61,8 @@ pub mod parity;
 pub mod preview;
 pub mod primer;
 pub mod provider;
+pub mod provider_health;
+pub mod openrouter_webhook;
 pub mod publication;
 pub mod query;
 pub mod question_compiler;

@@ -141,6 +141,54 @@ pub enum TaggedKind {
         cache_key: String,
         reason: String,
     },
+
+    // ── Phase 11: OpenRouter Broadcast + Cost Reconciliation ─────────
+    /// Emitted when a broadcast trace arrives with a cost that differs
+    /// from the synchronous ledger by more than the policy ratio. The
+    /// `pyramid_cost_log` row has been flipped to
+    /// `reconciliation_status = 'discrepancy'` and the fail-loud
+    /// oversight banner should surface this to the user. `actual_cost`
+    /// is NOT silently rewritten — both values live on the row so the
+    /// audit trail preserves the disagreement.
+    CostReconciliationDiscrepancy {
+        cost_log_id: i64,
+        step_name: Option<String>,
+        provider_id: Option<String>,
+        synchronous_cost_usd: Option<f64>,
+        broadcast_cost_usd: Option<f64>,
+        discrepancy_ratio: Option<f64>,
+    },
+    /// Emitted by `sweep_broadcast_missing` when a synchronous row
+    /// ages past the grace period without broadcast confirmation.
+    /// Indicates either a tunnel outage or a provider-side dropped
+    /// trace — the user needs to investigate.
+    BroadcastMissing {
+        rows_flipped: usize,
+        grace_period_secs: i64,
+    },
+    /// Emitted when the webhook receives a broadcast whose metadata
+    /// does not match any local `pyramid_cost_log` row. Primary
+    /// credential-exfiltration indicator — the user's OpenRouter API
+    /// key may be in use elsewhere.
+    OrphanBroadcastDetected {
+        orphan_id: i64,
+        provider_id: Option<String>,
+        generation_id: Option<String>,
+        session_id: Option<String>,
+        pyramid_slug: Option<String>,
+        step_name: Option<String>,
+        model: Option<String>,
+        cost_usd: Option<f64>,
+    },
+    /// Emitted when `record_provider_error` transitions a provider to
+    /// `degraded` or `down`, or when an admin acknowledges back to
+    /// `healthy`. Carries the old and new states for the oversight UI.
+    ProviderHealthChanged {
+        provider_id: String,
+        old_health: String,
+        new_health: String,
+        reason: String,
+    },
 }
 
 impl TaggedKind {

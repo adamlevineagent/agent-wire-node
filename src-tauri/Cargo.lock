@@ -6422,6 +6422,7 @@ dependencies = [
  "serde_yaml",
  "sha2",
  "similar",
+ "subtle",
  "tauri",
  "tauri-build",
  "tauri-plugin-deep-link",

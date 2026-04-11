@@ -98,6 +98,17 @@ pub struct LlmResponse {
     /// OpenRouter generation ID (the top-level `id` field in the response JSON).
     /// Used for cost observatory correlation. None if the API didn't return one.
     pub generation_id: Option<String>,
+    /// Phase 11: authoritative synchronous cost in USD from the
+    /// provider's response body (`usage.cost` for OpenRouter). `None`
+    /// for Ollama local (zero) and for providers that don't report
+    /// cost. Feeds `pyramid_cost_log.actual_cost` and the broadcast
+    /// webhook's discrepancy comparison.
+    pub actual_cost_usd: Option<f64>,
+    /// Phase 11: provider id resolved at call time (e.g., "openrouter",
+    /// "ollama-local"). Feeds `pyramid_cost_log.provider_id` so the
+    /// leak-detection sweep and provider-health state machine can
+    /// group rows per provider.
+    pub provider_id: Option<String>,
 }
 
 // ── Config ───────────────────────────────────────────────────────────────────
@@ -476,6 +487,13 @@ pub async fn call_model_unified_with_options_and_ctx(
     // any of that.
     let (provider_impl, secret, provider_type) = build_call_provider(config)?;
 
+    // Phase 11 wanderer fix: provider_id used for the health hook. The
+    // seeded registry row's `id` matches the provider_type tag on the
+    // default install (`"openrouter"`), so using the type string here
+    // resolves against the correct row in `pyramid_providers` for both
+    // the registry and transitional fallback paths in `build_call_provider`.
+    let health_provider_id = provider_type.as_str().to_string();
+
     // Model selection based on INPUT size only — max_tokens (output budget) is
     // irrelevant to whether the prompt fits in the model's context window.
     let est_input_tokens = estimate_tokens_llm(system_prompt, user_prompt).await;
@@ -529,12 +547,16 @@ pub async fn call_model_unified_with_options_and_ctx(
                 .insert("response_format".to_string(), rf.clone());
         }
 
-        // Let the provider augment the body (e.g., OpenRouter trace
-        // metadata, session_id). RequestMetadata is empty here because
-        // the caller didn't pass it; the deeper chain-executor path
-        // that DOES have metadata calls `call_model_via_registry`
-        // below.
-        provider_impl.augment_request_body(&mut body, &RequestMetadata::default());
+        // Phase 11: build RequestMetadata from the StepContext so the
+        // provider's augment_request_body hook receives build_id /
+        // slug / step_name / depth / chunk_index. When ctx is None
+        // (legacy callers) we fall back to RequestMetadata::default
+        // so the OpenRouter trace object is empty — still valid,
+        // just uncorrelated at the broadcast webhook.
+        let metadata = ctx
+            .map(RequestMetadata::from_step_context)
+            .unwrap_or_default();
+        provider_impl.augment_request_body(&mut body, &metadata);
 
         // Rate limit: wait for sliding window capacity
         rate_limit_wait(config.rate_limit_max_requests, config.rate_limit_window_secs).await;
@@ -558,6 +580,15 @@ pub async fn call_model_unified_with_options_and_ctx(
                     tokio::time::sleep(std::time::Duration::from_secs(config.retry_base_sleep_secs)).await;
                     continue;
                 }
+                // Phase 11 wanderer fix: feed the provider health state
+                // machine so the oversight page reflects the outage.
+                // Connection failure is a single-occurrence `down`
+                // signal per `provider_health::record_provider_error`.
+                maybe_record_provider_error(
+                    ctx,
+                    &health_provider_id,
+                    super::provider_health::ProviderErrorKind::ConnectionFailure,
+                );
                 return Err(anyhow!(
                     "Request failed after {} attempts (timeout={}s): {}",
                     config.max_retries,
@@ -627,6 +658,18 @@ pub async fn call_model_unified_with_options_and_ctx(
         if config.retryable_status_codes.contains(&status) {
             let wait = config.retry_base_sleep_secs * 2u64.pow(attempt + 1);
             info!("  HTTP {}, waiting {}s...", status, wait);
+            // Phase 11 wanderer fix: feed the provider health state
+            // machine on every 5xx observation, even when the call is
+            // about to retry. The state machine itself handles the
+            // threshold-based degrade decision so individual blips
+            // don't flap the health flag.
+            if status >= 500 {
+                maybe_record_provider_error(
+                    ctx,
+                    &health_provider_id,
+                    super::provider_health::ProviderErrorKind::Http5xx,
+                );
+            }
             tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
             continue;
         }
@@ -638,6 +681,17 @@ pub async fn call_model_unified_with_options_and_ctx(
                 info!("  HTTP {}, retry {}...", status, attempt + 1);
                 tokio::time::sleep(std::time::Duration::from_secs(config.retry_base_sleep_secs)).await;
                 continue;
+            }
+            // Phase 11 wanderer fix: record the terminal 5xx so the
+            // health state machine sees it. Non-5xx final errors
+            // (401/403/404) are NOT fed into the health hook — they
+            // indicate auth/config mistakes, not provider failure.
+            if status >= 500 {
+                maybe_record_provider_error(
+                    ctx,
+                    &health_provider_id,
+                    super::provider_health::ProviderErrorKind::Http5xx,
+                );
             }
             return Err(anyhow!("HTTP {} after {} attempts: {}", status, config.max_retries, body_text));
         }
@@ -742,6 +796,13 @@ pub async fn call_model_unified_with_options_and_ctx(
             content: parsed.content,
             usage,
             generation_id,
+            actual_cost_usd: parsed.actual_cost_usd,
+            // Legacy path without a provider registry: tag the row as
+            // coming from the provider impl's type so the webhook
+            // correlator has a non-null grouping key for the leak
+            // sweep. Phase 11's registry path (below) sets a real
+            // provider_id from the resolved registry row.
+            provider_id: Some(provider_type.as_str().to_string()),
         };
 
         // ── Phase 6: Cache store path ──────────────────────────────
@@ -779,6 +840,8 @@ fn serialize_response_for_cache(response: &LlmResponse) -> String {
             "completion_tokens": response.usage.completion_tokens,
         },
         "generation_id": response.generation_id,
+        "actual_cost_usd": response.actual_cost_usd,
+        "provider_id": response.provider_id,
     })
     .to_string()
 }
@@ -808,6 +871,11 @@ fn parse_cached_response(cached: &super::step_context::CachedStepOutput) -> Resu
         .get("generation_id")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
+    let actual_cost_usd = value.get("actual_cost_usd").and_then(|v| v.as_f64());
+    let provider_id = value
+        .get("provider_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
     Ok(LlmResponse {
         content,
         usage: TokenUsage {
@@ -815,6 +883,8 @@ fn parse_cached_response(cached: &super::step_context::CachedStepOutput) -> Resu
             completion_tokens,
         },
         generation_id,
+        actual_cost_usd,
+        provider_id,
     })
 }
 
@@ -1271,6 +1341,15 @@ pub async fn call_model_via_registry(
                     .await;
                     continue;
                 }
+                // Phase 11: connection failure → provider health state
+                // machine sees it as a hard `down` signal on a single
+                // occurrence. Fire-and-forget: we don't block the
+                // caller on the DB write.
+                maybe_record_provider_error(
+                    ctx,
+                    &resolved.provider.id,
+                    super::provider_health::ProviderErrorKind::ConnectionFailure,
+                );
                 return Err(anyhow!(
                     "Request to tier `{}` failed after {} attempts: {}",
                     tier_name,
@@ -1287,11 +1366,29 @@ pub async fn call_model_via_registry(
                 "  [via-registry:{}] HTTP {}, waiting {}s...",
                 tier_name, status, wait
             );
+            // Phase 11: HTTP 5xx is a provider-side failure signal
+            // even when the call will retry. Degrades only after
+            // the count-within-window threshold, so single blips
+            // don't trigger an alert.
+            if status >= 500 {
+                maybe_record_provider_error(
+                    ctx,
+                    &resolved.provider.id,
+                    super::provider_health::ProviderErrorKind::Http5xx,
+                );
+            }
             tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
             continue;
         }
         if !resp.status().is_success() {
             let body_text = resp.text().await.unwrap_or_default();
+            if status >= 500 {
+                maybe_record_provider_error(
+                    ctx,
+                    &resolved.provider.id,
+                    super::provider_health::ProviderErrorKind::Http5xx,
+                );
+            }
             return Err(anyhow!(
                 "HTTP {} from tier `{}` (provider={}): {}",
                 status,
@@ -1336,6 +1433,8 @@ pub async fn call_model_via_registry(
             content: parsed.content,
             usage: parsed.usage,
             generation_id: parsed.generation_id,
+            actual_cost_usd: parsed.actual_cost_usd,
+            provider_id: Some(resolved.provider.id.clone()),
         };
 
         // ── Phase 6 (fix pass): Cache store path ───────────────────
@@ -1696,6 +1795,51 @@ pub async fn call_model_direct(
     }
 
     Err(anyhow!("call_model_direct({}): max retries exceeded", model_id))
+}
+
+// ── Phase 11: Provider health hook ──────────────────────────────────────────
+//
+// Fire-and-forget helper that records a provider error into the
+// health state machine when the LLM call path has a StepContext in
+// scope. We open a fresh side connection from `ctx.db_path` so we
+// don't contend for the writer mutex inside the hot call loop; the
+// write is small, idempotent, and already guarded by a count-based
+// threshold in `record_provider_error`.
+fn maybe_record_provider_error(
+    ctx: Option<&StepContext>,
+    provider_id: &str,
+    kind: super::provider_health::ProviderErrorKind,
+) {
+    let Some(ctx) = ctx else {
+        return;
+    };
+    if ctx.db_path.is_empty() {
+        return;
+    }
+    let db_path = ctx.db_path.clone();
+    let provider_id = provider_id.to_string();
+    // Spawn into the rayon-friendly blocking pool; failures are
+    // logged and swallowed. This must never return an error to the
+    // LLM call loop — the health hook is a best-effort signal.
+    let _ = tokio::task::spawn_blocking(move || {
+        let Ok(conn) = rusqlite::Connection::open(&db_path) else {
+            return;
+        };
+        let policy = super::provider_health::CostReconciliationPolicy::default();
+        if let Err(e) = super::provider_health::record_provider_error(
+            &conn,
+            &provider_id,
+            kind,
+            &policy,
+            None,
+        ) {
+            tracing::debug!(
+                provider_id = provider_id.as_str(),
+                error = %e,
+                "maybe_record_provider_error: health update failed (non-critical)"
+            );
+        }
+    });
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
