@@ -15,17 +15,23 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use chrono::Utc;
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
+use super::build::WriteOp;
+use super::build_runner;
 use super::db;
 use super::event_bus::{BuildEventBus, TaggedBuildEvent, TaggedKind};
 use super::ingest;
 use super::lock_manager::LockManager;
 use super::types::{
-    ContentType, DadbearWatchConfig, DadbearWatchStatus, IngestRecord, SourceFile,
+    BuildProgress, ContentType, DadbearWatchConfig, DadbearWatchStatus, IngestRecord, LayerEvent,
+    SourceFile,
 };
+use super::PyramidState;
 
 /// Handle to the running DADBEAR extend tick loop. Drop to stop.
 pub struct DadbearExtendHandle {
@@ -61,8 +67,14 @@ struct ConfigTicker {
 ///   - Every second, checks which configs are due for a scan tick
 ///   - For each due config: scan → detect → upsert ingest records → check session timeouts → dispatch
 ///
+/// `state` is the shared `PyramidState` that chain builds run against. The loop
+/// holds an `Arc` for chain dispatch (see [`fire_ingest_chain`]). `db_path` is
+/// kept alongside `state` for short-lived DB operations that shouldn't contend
+/// on the shared reader Mutex (scanning, ingest record state transitions).
+///
 /// Returns a handle that can be used to stop the loop.
 pub fn start_dadbear_extend_loop(
+    state: Arc<PyramidState>,
     db_path: String,
     event_bus: Arc<BuildEventBus>,
 ) -> DadbearExtendHandle {
@@ -116,7 +128,7 @@ pub fn start_dadbear_extend_loop(
                 ticker.last_tick = now;
 
                 // Run the tick for this config
-                if let Err(e) = run_tick_for_config(&db_path, config, &event_bus).await {
+                if let Err(e) = run_tick_for_config(&state, &db_path, config, &event_bus).await {
                     error!(
                         slug = %config.slug,
                         source_path = %config.source_path,
@@ -151,6 +163,7 @@ fn load_enabled_configs(db_path: &str) -> Result<Vec<DadbearWatchConfig>> {
 ///   4. check for session timeout → fire promotion
 ///   5. dispatch pending ingest records
 pub async fn run_tick_for_config(
+    state: &Arc<PyramidState>,
     db_path: &str,
     config: &DadbearWatchConfig,
     event_bus: &Arc<BuildEventBus>,
@@ -252,7 +265,7 @@ pub async fn run_tick_for_config(
     }
 
     // ── 5. Dispatch pending ingest records ───────────────────────────────
-    dispatch_pending_ingests(db_path, config, event_bus).await?;
+    dispatch_pending_ingests(state, db_path, config, event_bus).await?;
 
     Ok(())
 }
@@ -351,10 +364,28 @@ async fn check_session_timeouts(
 
 // ── Ingest dispatch ────────────────────────────────────────────────────────────
 
-/// Pick up pending ingest records and dispatch them. Marks each as 'processing',
-/// emits IngestStarted, and on completion marks 'complete' with build_id (or
-/// 'failed' with error). Respects config.batch_size.
+/// Pick up pending ingest records and dispatch them through the chain engine.
+///
+/// **Shape rationale**: a pyramid build processes the whole slug, not one
+/// file at a time. Firing `run_build_from` N sequential times for N pending
+/// records would do N full builds where one suffices. Instead this function:
+///
+/// 1. Reads pending records (respecting `batch_size` as a claim cap, not a
+///    sequential-build multiplier)
+/// 2. Claims the batch under a short [`LockManager`] write-lock scope by
+///    marking each record `processing` in a single DB pass, then releases
+///    the lock so [`fire_ingest_chain`] → [`build_runner::run_build_from`]
+///    can take its own per-slug write lock (same-task re-acquisition of an
+///    exclusive `tokio::sync::RwLock` write guard deadlocks, see
+///    `lock_manager.rs` doc comment)
+/// 3. Emits `IngestStarted` events for each claimed record
+/// 4. Calls `fire_ingest_chain` ONCE for the whole batch
+/// 5. Under another short write-lock scope, marks all claimed records
+///    `complete` with the real `build_id` (on success) or `failed` with the
+///    error message (on failure)
+/// 6. Emits `IngestComplete` / `IngestFailed` events per record
 async fn dispatch_pending_ingests(
+    state: &Arc<PyramidState>,
     db_path: &str,
     config: &DadbearWatchConfig,
     event_bus: &Arc<BuildEventBus>,
@@ -362,7 +393,8 @@ async fn dispatch_pending_ingests(
     let slug = &config.slug;
     let batch_size = config.batch_size as usize;
 
-    // Get pending records
+    // Get pending records (no lock needed for a read of 'pending' rows — a
+    // racing writer would only add more pending rows, not remove ours).
     let pending = {
         let conn = db::open_pyramid_connection(Path::new(db_path))?;
         db::get_pending_ingests(&conn, slug)?
@@ -372,84 +404,385 @@ async fn dispatch_pending_ingests(
         return Ok(());
     }
 
-    // Process up to batch_size records
-    let to_process = &pending[..pending.len().min(batch_size)];
+    // Respect batch_size as a CLAIM cap — we'll fire a single chain build for
+    // the whole claimed batch, not batch_size sequential builds.
+    let claimed: Vec<IngestRecord> = pending
+        .into_iter()
+        .take(batch_size.max(1))
+        .collect();
 
-    for record in to_process {
-        // Mark as processing
-        {
-            let _lock = LockManager::global().write(slug).await;
-            let conn = db::open_pyramid_connection(Path::new(db_path))?;
-            db::mark_ingest_processing(&conn, record.id)?;
+    if claimed.is_empty() {
+        return Ok(());
+    }
+
+    // ── Claim: mark all claimed records as 'processing' under a short lock ──
+    {
+        let _lock = LockManager::global().write(slug).await;
+        let conn = db::open_pyramid_connection(Path::new(db_path))?;
+        for record in &claimed {
+            if let Err(e) = db::mark_ingest_processing(&conn, record.id) {
+                warn!(
+                    slug = %slug,
+                    record_id = record.id,
+                    error = %e,
+                    "DADBEAR: failed to mark ingest processing during claim"
+                );
+            }
         }
+    }
 
-        // Emit IngestStarted
+    // Emit IngestStarted per claimed record
+    for record in &claimed {
         let _ = event_bus.tx.send(TaggedBuildEvent {
             slug: slug.clone(),
             kind: TaggedKind::IngestStarted {
                 source_path: record.source_path.clone(),
             },
         });
+    }
 
-        info!(
-            slug = %slug,
-            source_path = %record.source_path,
-            record_id = record.id,
-            "DADBEAR: dispatching ingest"
-        );
+    let source_paths: Vec<String> = claimed.iter().map(|r| r.source_path.clone()).collect();
+    info!(
+        slug = %slug,
+        record_count = claimed.len(),
+        content_type = %config.content_type,
+        "DADBEAR: dispatching ingest chain for claimed batch"
+    );
 
-        // The actual build chain firing is done via invoke_chain or run_build.
-        // For now, mark as complete with a placeholder build_id. The real
-        // chain dispatch will be wired by WS-EM-CHAIN / WS-VINE-UNIFY when
-        // the chain YAML lands.
-        //
-        // FUTURE: Replace this stub with actual chain dispatch:
-        //   let build_id = fire_ingest_chain(state, slug, &record).await?;
-        let build_id = format!("dadbear-ingest-{}-{}", slug, uuid::Uuid::new_v4());
+    // ── Fire the chain ONCE for the whole claimed batch ──
+    // Must NOT hold the LockManager write lock here — run_build_from takes
+    // its own exclusive write lock internally (build_runner.rs:208), and
+    // the tokio RwLock is not reentrant.
+    let dispatch_result =
+        fire_ingest_chain(state, slug, &config.content_type, &source_paths, event_bus).await;
 
-        // Mark complete
-        {
-            let _lock = LockManager::global().write(slug).await;
-            let conn = db::open_pyramid_connection(Path::new(db_path))?;
-            if let Err(e) = db::mark_ingest_complete(&conn, record.id, &build_id) {
-                error!(
+    // ── Mark outcome for all claimed records under another short lock ──
+    match dispatch_result {
+        Ok(build_id) => {
+            {
+                let _lock = LockManager::global().write(slug).await;
+                let conn = db::open_pyramid_connection(Path::new(db_path))?;
+                for record in &claimed {
+                    if let Err(e) = db::mark_ingest_complete(&conn, record.id, &build_id) {
+                        error!(
+                            slug = %slug,
+                            record_id = record.id,
+                            error = %e,
+                            "DADBEAR: failed to mark ingest complete (record will remain processing)"
+                        );
+                        // Best-effort: try to mark failed so it leaves 'processing'.
+                        let _ = db::mark_ingest_failed(&conn, record.id, &e.to_string());
+                    }
+                }
+            }
+
+            for record in &claimed {
+                let _ = event_bus.tx.send(TaggedBuildEvent {
+                    slug: slug.clone(),
+                    kind: TaggedKind::IngestComplete {
+                        source_path: record.source_path.clone(),
+                        build_id: build_id.clone(),
+                    },
+                });
+                info!(
                     slug = %slug,
-                    record_id = record.id,
-                    error = %e,
-                    "DADBEAR: failed to mark ingest complete"
+                    source_path = %record.source_path,
+                    build_id = %build_id,
+                    "DADBEAR: ingest complete"
                 );
-                // Try to mark as failed instead
-                let _ = db::mark_ingest_failed(&conn, record.id, &e.to_string());
+            }
+        }
+        Err(err) => {
+            let err_msg = format!("{err}");
+            error!(
+                slug = %slug,
+                record_count = claimed.len(),
+                error = %err_msg,
+                "DADBEAR: ingest chain dispatch failed — marking claimed records failed"
+            );
 
+            {
+                let _lock = LockManager::global().write(slug).await;
+                let conn = db::open_pyramid_connection(Path::new(db_path))?;
+                for record in &claimed {
+                    if let Err(e) = db::mark_ingest_failed(&conn, record.id, &err_msg) {
+                        error!(
+                            slug = %slug,
+                            record_id = record.id,
+                            error = %e,
+                            "DADBEAR: failed to mark ingest failed"
+                        );
+                    }
+                }
+            }
+
+            for record in &claimed {
                 let _ = event_bus.tx.send(TaggedBuildEvent {
                     slug: slug.clone(),
                     kind: TaggedKind::IngestFailed {
                         source_path: record.source_path.clone(),
-                        error: e.to_string(),
+                        error: err_msg.clone(),
                     },
                 });
-                continue;
             }
         }
-
-        // Emit IngestComplete
-        let _ = event_bus.tx.send(TaggedBuildEvent {
-            slug: slug.clone(),
-            kind: TaggedKind::IngestComplete {
-                source_path: record.source_path.clone(),
-                build_id: build_id.clone(),
-            },
-        });
-
-        info!(
-            slug = %slug,
-            source_path = %record.source_path,
-            build_id = %build_id,
-            "DADBEAR: ingest complete"
-        );
     }
 
     Ok(())
+}
+
+// ── fire_ingest_chain ──────────────────────────────────────────────────────────
+
+/// Chunk new source files into `pyramid_chunks` and fire the content-type
+/// chain via [`build_runner::run_build_from`], returning the real `build_id`.
+///
+/// **Lock ordering contract** (load-bearing — do not move these scopes):
+///
+/// - Chunking takes a short-lived `LockManager::global().write(slug)` scope
+///   that is released BEFORE calling `run_build_from`.
+/// - `run_build_from` takes its own exclusive write lock at build_runner.rs:208
+///   for the full duration of the build. Because the tokio `RwLock` is not
+///   reentrant, holding that lock across the `run_build_from` call would
+///   deadlock the same tokio task on itself.
+///
+/// **Build-scoped reader**: creates an isolated reader via
+/// [`PyramidState::with_build_reader`] so the build doesn't contend on the
+/// shared reader Mutex with CLI/frontend queries.
+///
+/// **Channel setup**: creates ephemeral mpsc channels for `write_tx` (with a
+/// full local writer drain task covering every `WriteOp` variant),
+/// `progress_tx` (teed through `event_bus` so Pipeline B builds are visible
+/// in build viz), and `layer_tx` (drained locally — future Phase 13 work
+/// will expand build viz visibility for Pipeline B).
+///
+/// **Scope (Phase 0b)**: only conversation content type is supported.
+/// Non-conversation records return an explicit error so callers mark them
+/// `failed` rather than silently succeeding. Per-file code/doc ingest is
+/// Phase 17's scope; see the Phase 0b implementation log entry.
+pub async fn fire_ingest_chain(
+    state: &Arc<PyramidState>,
+    slug: &str,
+    content_type: &str,
+    source_paths: &[String],
+    event_bus: &Arc<BuildEventBus>,
+) -> Result<String> {
+    if source_paths.is_empty() {
+        return Err(anyhow!(
+            "fire_ingest_chain: no source paths provided for slug '{}'",
+            slug
+        ));
+    }
+
+    let ct = ContentType::from_str(content_type)
+        .ok_or_else(|| anyhow!("Unknown content type: {}", content_type))?;
+
+    // ── 1. Build-scoped state with isolated reader (matches main.rs:3566) ──
+    let build_state = state
+        .with_build_reader()
+        .map_err(|e| anyhow!("fire_ingest_chain: with_build_reader failed: {e}"))?;
+
+    // ── 2. Chunk new source files into pyramid_chunks. execute_chain_from
+    //       at chain_executor.rs:3804 rejects non-question pipelines with zero
+    //       chunks, so this step is mandatory for conversation/code/doc.
+    //
+    //       IMPORTANT: We MUST clear existing chunks before re-ingesting. Both
+    //       `ingest_conversation` here and the existing wizard/routes.rs ingest
+    //       path use chunk_index starting at 0 per file, so re-dispatches
+    //       collide with the prior run's chunks on the `UNIQUE(slug,
+    //       chunk_index)` constraint of pyramid_chunks (db.rs:107). The
+    //       equivalent wizard path handles this at routes.rs:3431 with an
+    //       explicit `clear_chunks` before re-ingest; Pipeline B must do the
+    //       same or the SECOND dispatch for any slug fails with a UNIQUE
+    //       constraint error and the ingest record is marked failed.
+    //
+    //       Re-chunking the whole file on re-dispatch (with clear+re-ingest) is
+    //       correct-if-slow for Phase 0b; Phase 6's content-addressable LLM
+    //       output cache will make the re-chunk work cheap downstream, and a
+    //       future phase can introduce per-file message counters to enable
+    //       `ingest_continuation` as an incremental alternative. ──
+    match ct {
+        ContentType::Conversation => {
+            let _lock = LockManager::global().write(slug).await;
+            let writer = state.writer.clone();
+            let slug_owned = slug.to_string();
+            let paths_owned: Vec<String> = source_paths.to_vec();
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                let conn = writer.blocking_lock();
+                // Clear existing chunks for this slug to prevent UNIQUE
+                // constraint collisions with prior runs or with earlier files
+                // in the same dispatch. Mirrors routes.rs:3431.
+                let cleared = db::clear_chunks(&conn, &slug_owned)?;
+                if cleared > 0 {
+                    info!(
+                        slug = %slug_owned,
+                        cleared,
+                        "fire_ingest_chain: cleared stale chunks before re-ingest"
+                    );
+                }
+                for path_str in &paths_owned {
+                    let path = Path::new(path_str);
+                    if !path.exists() {
+                        warn!(
+                            slug = %slug_owned,
+                            source_path = %path_str,
+                            "fire_ingest_chain: source file does not exist, skipping"
+                        );
+                        continue;
+                    }
+                    // Full ingest of the file's current contents. We do NOT use
+                    // ingest_continuation here because Pipeline B's ingest
+                    // record schema doesn't track per-file message offsets —
+                    // the message count it would need for `skip_messages` isn't
+                    // stored anywhere.
+                    ingest::ingest_conversation(&conn, &slug_owned, path)?;
+                }
+                Ok(())
+            })
+            .await
+            .map_err(|e| anyhow!("fire_ingest_chain: chunking task panicked: {e}"))??;
+        }
+        ContentType::Code | ContentType::Document => {
+            return Err(anyhow!(
+                "Phase 0b: content_type '{}' is not yet supported by Pipeline B ingest; \
+                 per-file code/doc ingest lands in Phase 17 (recursive folder ingestion). \
+                 Record will be marked failed.",
+                content_type
+            ));
+        }
+        ContentType::Vine | ContentType::Question => {
+            return Err(anyhow!(
+                "fire_ingest_chain: content_type '{}' is not a file-backed ingest target \
+                 (Pipeline B is for new-file ingestion; Vine/Question pyramids use other paths)",
+                content_type
+            ));
+        }
+    }
+
+    // ── 3. Set up ephemeral channels mirroring the canonical build dispatch
+    //       block in main.rs:3566-3730. The writer drain task must handle every
+    //       WriteOp variant for correctness under chain execution. ──
+    let (write_tx, mut write_rx) = mpsc::channel::<WriteOp>(256);
+    let writer_handle = {
+        let writer_conn = state.writer.clone();
+        tokio::spawn(async move {
+            while let Some(op) = write_rx.recv().await {
+                let result = {
+                    let conn = writer_conn.lock().await;
+                    match op {
+                        WriteOp::SaveNode {
+                            ref node,
+                            ref topics_json,
+                        } => db::save_node(&conn, node, topics_json.as_deref()),
+                        WriteOp::SaveStep {
+                            ref slug,
+                            ref step_type,
+                            chunk_index,
+                            depth,
+                            ref node_id,
+                            ref output_json,
+                            ref model,
+                            elapsed,
+                        } => db::save_step(
+                            &conn,
+                            slug,
+                            step_type,
+                            chunk_index,
+                            depth,
+                            node_id,
+                            output_json,
+                            model,
+                            elapsed,
+                        ),
+                        WriteOp::UpdateParent {
+                            ref slug,
+                            ref node_id,
+                            ref parent_id,
+                        } => db::update_parent(&conn, slug, node_id, parent_id),
+                        WriteOp::UpdateStats { ref slug } => db::update_slug_stats(&conn, slug),
+                        WriteOp::UpdateFileHash {
+                            ref slug,
+                            ref file_path,
+                            ref node_id,
+                        } => db::append_node_id_to_file_hash(&conn, slug, file_path, node_id),
+                        WriteOp::Flush { done } => {
+                            let _ = done.send(());
+                            Ok(())
+                        }
+                    }
+                };
+                if let Err(e) = result {
+                    error!("fire_ingest_chain writer drain: WriteOp failed: {e}");
+                }
+            }
+        })
+    };
+
+    // Progress channel — tee'd onto the build_event_bus so Pipeline B builds
+    // become visible in build viz alongside normal builds.
+    let (progress_tx, raw_progress_rx) = mpsc::channel::<BuildProgress>(64);
+    let mut progress_rx = super::event_bus::tee_build_progress_to_bus(
+        event_bus,
+        slug.to_string(),
+        raw_progress_rx,
+    );
+    let progress_handle = tokio::spawn(async move {
+        // Drain the teed progress so the upstream sender doesn't block.
+        while progress_rx.recv().await.is_some() {}
+    });
+
+    // Layer event channel — drained locally. Phase 13 will expand build viz
+    // to surface Pipeline B layer events the same way normal builds do.
+    let (layer_tx, mut layer_rx) = mpsc::channel::<LayerEvent>(256);
+    let layer_handle = tokio::spawn(async move {
+        while layer_rx.recv().await.is_some() {}
+    });
+
+    // Fresh cancellation token per dispatch. Pipeline B dispatch is not
+    // externally cancellable today; a future phase can add that.
+    let cancel = CancellationToken::new();
+
+    // ── 4. Fire the chain via the canonical entry point ──
+    let run_result = build_runner::run_build_from(
+        &build_state,
+        slug,
+        0,    // from_depth: full build
+        None, // stop_after
+        None, // force_from
+        &cancel,
+        Some(progress_tx.clone()),
+        &write_tx,
+        Some(layer_tx.clone()),
+    )
+    .await;
+
+    // Drop senders so drain tasks finish cleanly before we return.
+    drop(write_tx);
+    drop(progress_tx);
+    drop(layer_tx);
+    let _ = writer_handle.await;
+    let _ = progress_handle.await;
+    let _ = layer_handle.await;
+
+    match run_result {
+        Ok((build_id, _failures, _step_activity)) => {
+            info!(
+                slug = %slug,
+                build_id = %build_id,
+                source_count = source_paths.len(),
+                "fire_ingest_chain: chain build complete"
+            );
+            Ok(build_id)
+        }
+        Err(e) => {
+            error!(
+                slug = %slug,
+                source_count = source_paths.len(),
+                error = %e,
+                "fire_ingest_chain: chain build failed"
+            );
+            Err(e)
+        }
+    }
 }
 
 // ── Manual trigger ─────────────────────────────────────────────────────────────
@@ -457,6 +790,7 @@ async fn dispatch_pending_ingests(
 /// Manually trigger a single scan+dispatch cycle for all configs of a given slug.
 /// Used by the POST /pyramid/:slug/dadbear/trigger HTTP route.
 pub async fn trigger_for_slug(
+    state: &Arc<PyramidState>,
     db_path: &str,
     slug: &str,
     event_bus: &Arc<BuildEventBus>,
@@ -478,7 +812,7 @@ pub async fn trigger_for_slug(
     let mut errors = Vec::new();
 
     for config in &configs {
-        match run_tick_for_config(db_path, config, event_bus).await {
+        match run_tick_for_config(state, db_path, config, event_bus).await {
             Ok(()) => processed += 1,
             Err(e) => errors.push(format!("{}: {}", config.source_path, e)),
         }
@@ -775,5 +1109,333 @@ mod tests {
         db::update_session_chunk_progress(&conn, session_id, 10).unwrap();
         let session3 = db::get_provisional_session(&conn, session_id).unwrap().unwrap();
         assert_eq!(session3.last_chunk_processed, 10);
+    }
+
+    // ── fire_ingest_chain helpers + tests (Phase 0b) ────────────────────────
+
+    use std::collections::HashMap;
+    use std::sync::atomic::AtomicBool;
+    use tokio::sync::Mutex as TokioMutex;
+
+    /// Build a `PyramidState` rooted at a freshly-created tempdir containing
+    /// an initialized `pyramid.db`. The caller gets back (state, data_dir,
+    /// db_path) — `data_dir` must outlive the state (we leak it intentionally
+    /// because tests run to completion and the OS cleans up /tmp on its own
+    /// schedule; this is the same pattern `test_db()` uses above).
+    fn make_test_state() -> (Arc<PyramidState>, std::path::PathBuf) {
+        let dir = TempDir::new().unwrap();
+        let data_dir = dir.path().to_path_buf();
+        // Initialize the pyramid.db at data_dir/pyramid.db so with_build_reader
+        // and the writer both open the same on-disk database.
+        let db_path = data_dir.join("pyramid.db");
+        let writer_conn = db::open_pyramid_db(&db_path).unwrap();
+        let reader_conn = db::open_pyramid_connection(&db_path).unwrap();
+        // Leak the tempdir so it lives past test scope (the OS will clean up).
+        std::mem::forget(dir);
+
+        let llm_config = crate::pyramid::llm::LlmConfig::default();
+        let state = Arc::new(PyramidState {
+            reader: Arc::new(TokioMutex::new(reader_conn)),
+            writer: Arc::new(TokioMutex::new(writer_conn)),
+            config: Arc::new(tokio::sync::RwLock::new(llm_config)),
+            active_build: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            data_dir: Some(data_dir.clone()),
+            stale_engines: Arc::new(TokioMutex::new(HashMap::new())),
+            file_watchers: Arc::new(TokioMutex::new(HashMap::new())),
+            vine_builds: Arc::new(TokioMutex::new(HashMap::new())),
+            use_chain_engine: AtomicBool::new(false),
+            use_ir_executor: AtomicBool::new(false),
+            event_bus: Arc::new(crate::pyramid::event_chain::LocalEventBus::new()),
+            operational: Arc::new(crate::pyramid::OperationalConfig::default()),
+            chains_dir: data_dir.join("chains"),
+            remote_query_rate_limiter: Arc::new(TokioMutex::new(HashMap::new())),
+            absorption_gate: Arc::new(TokioMutex::new(
+                crate::pyramid::AbsorptionGate::new(),
+            )),
+            build_event_bus: Arc::new(BuildEventBus::new()),
+            supabase_url: None,
+            supabase_anon_key: None,
+            csrf_secret: [0u8; 32],
+            dadbear_handle: Arc::new(TokioMutex::new(None)),
+        });
+        (state, data_dir)
+    }
+
+    // ── Test 6: fire_ingest_chain rejects empty source paths ───────────────
+
+    #[tokio::test]
+    async fn test_fire_ingest_chain_empty_source_paths() {
+        let (state, _data_dir) = make_test_state();
+        let bus = state.build_event_bus.clone();
+
+        let result =
+            fire_ingest_chain(&state, "test-slug", "conversation", &[], &bus).await;
+
+        assert!(result.is_err(), "expected error for empty source_paths");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("no source paths"),
+            "error should mention empty source paths, got: {err}"
+        );
+    }
+
+    // ── Test 7: fire_ingest_chain returns scope-decision error for code ────
+
+    #[tokio::test]
+    async fn test_fire_ingest_chain_code_scope_error() {
+        let (state, _data_dir) = make_test_state();
+        let bus = state.build_event_bus.clone();
+
+        // Create a code slug so with_build_reader has a real DB to open.
+        {
+            let conn = state.writer.lock().await;
+            db::create_slug(&conn, "test-code", &ContentType::Code, "/tmp/src").unwrap();
+        }
+
+        let result = fire_ingest_chain(
+            &state,
+            "test-code",
+            "code",
+            &["/tmp/src/main.rs".to_string()],
+            &bus,
+        )
+        .await;
+
+        assert!(result.is_err(), "expected scope-decision error for code");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Phase 0b") && err.contains("code"),
+            "error should mention Phase 0b scope decision for code, got: {err}"
+        );
+        assert!(
+            err.contains("Phase 17") || err.contains("folder"),
+            "error should point at Phase 17 folder ingestion, got: {err}"
+        );
+    }
+
+    // ── Test 8: fire_ingest_chain returns scope-decision error for document ─
+
+    #[tokio::test]
+    async fn test_fire_ingest_chain_document_scope_error() {
+        let (state, _data_dir) = make_test_state();
+        let bus = state.build_event_bus.clone();
+
+        // Create a document slug.
+        {
+            let conn = state.writer.lock().await;
+            db::create_slug(&conn, "test-doc", &ContentType::Document, "/tmp/src").unwrap();
+        }
+
+        let result = fire_ingest_chain(
+            &state,
+            "test-doc",
+            "document",
+            &["/tmp/src/README.md".to_string()],
+            &bus,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "expected scope-decision error for document"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Phase 0b") && err.contains("document"),
+            "error should mention Phase 0b scope decision for document, got: {err}"
+        );
+    }
+
+    // ── Test 9: fire_ingest_chain rejects unknown content type ─────────────
+
+    #[tokio::test]
+    async fn test_fire_ingest_chain_unknown_content_type() {
+        let (state, _data_dir) = make_test_state();
+        let bus = state.build_event_bus.clone();
+
+        let result = fire_ingest_chain(
+            &state,
+            "test-slug",
+            "not_a_real_type",
+            &["/tmp/foo.bin".to_string()],
+            &bus,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "expected error for unknown content type"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Unknown content type"),
+            "error should mention unknown content type, got: {err}"
+        );
+    }
+
+    // ── Test 10: fire_ingest_chain chunks a conversation file before
+    //              reaching the chain engine (success-path chunking coverage) ─
+    //
+    // This test verifies the load-bearing invariant from
+    // chain_executor.rs:3804: "No chunks found for slug '...' — cannot run
+    // non-question pipeline with zero chunks". Our helper must chunk BEFORE
+    // calling run_build_from. We assert:
+    //   1. `fire_ingest_chain` populates `pyramid_chunks` for the slug (so
+    //      the chain step would not be rejected for zero chunks)
+    //   2. The eventual error (expected because no chains dir / no LLM) does
+    //      NOT come from the zero-chunks guard — it must come from later
+    //      in the pipeline
+
+    /// Regression test for the second-dispatch chunk-collision bug caught
+    /// by the Phase 0b wanderer pass. `ingest_conversation` inserts chunks
+    /// with `chunk_index` starting at 0, and `pyramid_chunks` has a
+    /// `UNIQUE(slug, chunk_index)` constraint (db.rs:107). Without a
+    /// `clear_chunks` call before re-ingesting, the SECOND dispatch for any
+    /// slug that already has chunks fails with a UNIQUE constraint
+    /// violation, the build never fires, and the ingest record gets marked
+    /// `failed`. See `fire_ingest_chain`'s chunking block at ~line 603 and
+    /// `routes.rs:3431` for the equivalent clear in the wizard path.
+    #[tokio::test]
+    async fn test_fire_ingest_chain_second_dispatch_no_chunk_collision() {
+        let (state, data_dir) = make_test_state();
+        let bus = state.build_event_bus.clone();
+
+        let source_dir = data_dir.join("conversations2");
+        std::fs::create_dir_all(&source_dir).unwrap();
+
+        // First file
+        let jsonl_path = source_dir.join("session1.jsonl");
+        {
+            let mut f = std::fs::File::create(&jsonl_path).unwrap();
+            for i in 0..3 {
+                writeln!(
+                    f,
+                    r#"{{"type":"user","message":{{"role":"user","content":"hi {i}"}},"timestamp":"2026-04-09T10:00:00"}}"#,
+                )
+                .unwrap();
+            }
+        }
+
+        {
+            let conn = state.writer.lock().await;
+            db::create_slug(
+                &conn,
+                "test-repro-collision",
+                &ContentType::Conversation,
+                source_dir.to_str().unwrap(),
+            )
+            .unwrap();
+        }
+
+        // First dispatch — should chunk
+        let _result1 = fire_ingest_chain(
+            &state,
+            "test-repro-collision",
+            "conversation",
+            &[jsonl_path.to_string_lossy().to_string()],
+            &bus,
+        )
+        .await;
+
+        let count1 = {
+            let conn = state.reader.lock().await;
+            db::count_chunks(&conn, "test-repro-collision").unwrap()
+        };
+        assert!(count1 > 0, "first dispatch should produce chunks");
+
+        // Second dispatch — same file, no content change
+        let result2 = fire_ingest_chain(
+            &state,
+            "test-repro-collision",
+            "conversation",
+            &[jsonl_path.to_string_lossy().to_string()],
+            &bus,
+        )
+        .await;
+
+        // If fire_ingest_chain clears chunks before re-ingesting, the second
+        // dispatch will succeed (or fail at a later step like chains-dir).
+        // If it does NOT clear, the chunking step itself will bubble up a
+        // UNIQUE(slug, chunk_index) error.
+        if let Err(e) = &result2 {
+            let msg = e.to_string();
+            assert!(
+                !msg.contains("UNIQUE") && !msg.contains("constraint failed"),
+                "second dispatch must not fail on chunk UNIQUE constraint; got: {msg}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fire_ingest_chain_chunks_conversation_before_dispatch() {
+        let (state, data_dir) = make_test_state();
+        let bus = state.build_event_bus.clone();
+
+        // Create a conversation slug backed by a real jsonl file on disk.
+        let source_dir = data_dir.join("conversations");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let jsonl_path = source_dir.join("session.jsonl");
+        {
+            let mut f = std::fs::File::create(&jsonl_path).unwrap();
+            // A handful of messages so the chunker has real content.
+            for i in 0..3 {
+                writeln!(
+                    f,
+                    r#"{{"type":"user","message":{{"role":"user","content":"message {i}"}},"timestamp":"2026-04-09T10:00:00"}}"#,
+                )
+                .unwrap();
+                writeln!(
+                    f,
+                    r#"{{"type":"assistant","message":{{"role":"assistant","content":"reply {i}"}},"timestamp":"2026-04-09T10:00:01"}}"#,
+                )
+                .unwrap();
+            }
+        }
+
+        {
+            let conn = state.writer.lock().await;
+            db::create_slug(
+                &conn,
+                "test-conv-chunk",
+                &ContentType::Conversation,
+                source_dir.to_str().unwrap(),
+            )
+            .unwrap();
+        }
+
+        // Fire the chain. We EXPECT this to fail at run_build_from because
+        // there's no chains dir with real chain YAML in our test state. The
+        // important thing is that it failed LATER than the chunking step.
+        let result = fire_ingest_chain(
+            &state,
+            "test-conv-chunk",
+            "conversation",
+            &[jsonl_path.to_string_lossy().to_string()],
+            &bus,
+        )
+        .await;
+
+        // Now assert chunks were persisted — this is the load-bearing
+        // invariant for Phase 0b's chunking-before-dispatch contract.
+        {
+            let conn = state.reader.lock().await;
+            let count = db::count_chunks(&conn, "test-conv-chunk").unwrap();
+            assert!(
+                count > 0,
+                "fire_ingest_chain must chunk before calling run_build_from; got 0 chunks"
+            );
+        }
+
+        // The error (if any) must not be the "No chunks found" guard.
+        if let Err(e) = &result {
+            let msg = e.to_string();
+            assert!(
+                !msg.contains("No chunks found"),
+                "fire_ingest_chain reached the zero-chunks guard despite chunking; error: {msg}"
+            );
+        }
+        // If run_build_from somehow succeeded (e.g. via a working chains dir
+        // fallback), that's fine — chunks still have to exist, which is the
+        // above assertion.
     }
 }

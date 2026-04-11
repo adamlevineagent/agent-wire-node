@@ -8142,7 +8142,7 @@ async fn handle_dadbear_trigger(
         }
     };
 
-    match super::dadbear_extend::trigger_for_slug(&db_path, &slug_name, &state.build_event_bus)
+    match super::dadbear_extend::trigger_for_slug(&state, &db_path, &slug_name, &state.build_event_bus)
         .await
     {
         Ok(result) => Ok(json_ok(&result)),
