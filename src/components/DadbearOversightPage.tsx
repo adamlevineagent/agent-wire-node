@@ -7,7 +7,7 @@
 // ProviderHealthBanner, OrphanBroadcastsPanel, DadbearActivityDrawer).
 // Spec: docs/specs/evidence-triage-and-dadbear.md Part 3 + Part 4.
 
-import { useCallback, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { useAppContext } from '../contexts/AppContext';
 import { useDadbearOverview } from '../hooks/useDadbearOverview';
@@ -56,10 +56,31 @@ export function DadbearOversightPage() {
     const [busyGlobal, setBusyGlobal] = useState(false);
     const [globalError, setGlobalError] = useState<string | null>(null);
     const [toast, setToast] = useState<string | null>(null);
+    // Hold the pending toast-clear timeout so we can clear it on a
+    // subsequent toast or on unmount. Without this, a queued timeout
+    // from a previous toast can step on the next one, and a toast
+    // fired right before unmount will call setState on an unmounted
+    // component (React warning, not a crash — still worth fixing).
+    const toastTimeoutRef = useRef<number | null>(null);
 
     const showToast = useCallback((msg: string) => {
+        if (toastTimeoutRef.current !== null) {
+            window.clearTimeout(toastTimeoutRef.current);
+        }
         setToast(msg);
-        window.setTimeout(() => setToast(null), 4000);
+        toastTimeoutRef.current = window.setTimeout(() => {
+            setToast(null);
+            toastTimeoutRef.current = null;
+        }, 4000);
+    }, []);
+
+    useEffect(() => {
+        return () => {
+            if (toastTimeoutRef.current !== null) {
+                window.clearTimeout(toastTimeoutRef.current);
+                toastTimeoutRef.current = null;
+            }
+        };
     }, []);
 
     const handlePauseAll = useCallback(async () => {
