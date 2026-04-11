@@ -1740,6 +1740,32 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
             ON pyramid_deferred_questions(slug, next_check_at);
         CREATE INDEX IF NOT EXISTS idx_deferred_questions_interval
             ON pyramid_deferred_questions(check_interval);
+
+        -- ── Phase 14: Wire discovery update cache ────────────────────────
+        --
+        -- pyramid_wire_update_cache: caches the results of the periodic
+        -- supersession-check run by `WireUpdatePoller`. The UI reads
+        -- from this table to render 'Update available' badges on
+        -- contributions with newer versions on the Wire, without having
+        -- to round-trip to the Wire on every render.
+        --
+        -- Per `wire-discovery-ranking.md` §Storage (line 297). Entries
+        -- are deleted when the user pulls the latest; `acknowledged_at`
+        -- is set when the user dismisses a badge (the poller preserves
+        -- the row so the badge doesn't re-appear on every sweep, but
+        -- clears it when an even-newer version arrives).
+        CREATE TABLE IF NOT EXISTS pyramid_wire_update_cache (
+            local_contribution_id TEXT PRIMARY KEY
+                REFERENCES pyramid_config_contributions(contribution_id),
+            latest_wire_contribution_id TEXT NOT NULL,
+            chain_length_delta INTEGER NOT NULL,
+            changes_summary TEXT,
+            author_handles_json TEXT,
+            checked_at TEXT NOT NULL DEFAULT (datetime('now')),
+            acknowledged_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_wire_update_cache_ack
+            ON pyramid_wire_update_cache(acknowledged_at);
         ",
     )?;
 
@@ -1913,6 +1939,169 @@ pub fn migrate_legacy_dadbear_to_contributions(conn: &Connection) -> Result<()> 
     )?;
 
     Ok(())
+}
+
+// ── Phase 14: pyramid_wire_update_cache CRUD helpers ─────────────────────────
+//
+// Per `docs/specs/wire-discovery-ranking.md` §Storage (line 297). These
+// helpers back the `WireUpdatePoller` and the
+// `pyramid_wire_update_available` / `pyramid_wire_acknowledge_update` /
+// `pyramid_wire_pull_latest` IPCs. The table is a cache: the source of
+// truth is the Wire's supersession state, and entries are expected to
+// expire naturally as the user pulls or dismisses them.
+
+/// A row from `pyramid_wire_update_cache`. One per pending update.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct WireUpdateCacheEntry {
+    pub local_contribution_id: String,
+    pub latest_wire_contribution_id: String,
+    pub chain_length_delta: i64,
+    pub changes_summary: Option<String>,
+    pub author_handles_json: Option<String>,
+    pub checked_at: String,
+    pub acknowledged_at: Option<String>,
+}
+
+/// Insert or update a row in `pyramid_wire_update_cache`. Idempotent:
+/// on PRIMARY KEY conflict (same `local_contribution_id`), the existing
+/// row is replaced. `checked_at` is refreshed to NOW on every upsert.
+///
+/// The caller (`WireUpdatePoller::run_once`) holds the writer lock so
+/// this function uses a single `INSERT OR REPLACE`.
+pub fn upsert_wire_update_cache(
+    conn: &Connection,
+    local_contribution_id: &str,
+    latest_wire_contribution_id: &str,
+    chain_length_delta: i64,
+    changes_summary: Option<&str>,
+    author_handles_json: Option<&str>,
+) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO pyramid_wire_update_cache (
+            local_contribution_id, latest_wire_contribution_id,
+            chain_length_delta, changes_summary, author_handles_json,
+            checked_at, acknowledged_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'), NULL)",
+        rusqlite::params![
+            local_contribution_id,
+            latest_wire_contribution_id,
+            chain_length_delta,
+            changes_summary,
+            author_handles_json,
+        ],
+    )?;
+    Ok(())
+}
+
+/// List pending Wire updates (rows with `acknowledged_at IS NULL`).
+/// When `slug` is `Some(...)`, filters to updates for contributions
+/// matching that slug via a join against `pyramid_config_contributions`.
+/// When `None`, returns all pending updates across every slug.
+pub fn list_pending_wire_updates(
+    conn: &Connection,
+    slug: Option<&str>,
+) -> Result<Vec<WireUpdateCacheEntry>> {
+    let mut rows: Vec<WireUpdateCacheEntry> = Vec::new();
+
+    let row_mapper = |row: &rusqlite::Row| -> rusqlite::Result<WireUpdateCacheEntry> {
+        Ok(WireUpdateCacheEntry {
+            local_contribution_id: row.get("local_contribution_id")?,
+            latest_wire_contribution_id: row.get("latest_wire_contribution_id")?,
+            chain_length_delta: row.get("chain_length_delta")?,
+            changes_summary: row.get("changes_summary")?,
+            author_handles_json: row.get("author_handles_json")?,
+            checked_at: row.get("checked_at")?,
+            acknowledged_at: row.get("acknowledged_at")?,
+        })
+    };
+
+    if let Some(slug_val) = slug {
+        let sql = "SELECT wuc.local_contribution_id, wuc.latest_wire_contribution_id,
+                          wuc.chain_length_delta, wuc.changes_summary,
+                          wuc.author_handles_json, wuc.checked_at, wuc.acknowledged_at
+                   FROM pyramid_wire_update_cache wuc
+                   JOIN pyramid_config_contributions pcc
+                     ON pcc.contribution_id = wuc.local_contribution_id
+                   WHERE wuc.acknowledged_at IS NULL
+                     AND (pcc.slug = ?1 OR pcc.slug IS NULL)
+                   ORDER BY wuc.checked_at DESC";
+        let mut stmt = conn.prepare(sql)?;
+        let iter = stmt.query_map(rusqlite::params![slug_val], row_mapper)?;
+        for r in iter {
+            rows.push(r?);
+        }
+    } else {
+        let sql = "SELECT local_contribution_id, latest_wire_contribution_id,
+                          chain_length_delta, changes_summary,
+                          author_handles_json, checked_at, acknowledged_at
+                   FROM pyramid_wire_update_cache
+                   WHERE acknowledged_at IS NULL
+                   ORDER BY checked_at DESC";
+        let mut stmt = conn.prepare(sql)?;
+        let iter = stmt.query_map([], row_mapper)?;
+        for r in iter {
+            rows.push(r?);
+        }
+    }
+
+    Ok(rows)
+}
+
+/// Mark a Wire update notification as acknowledged (the user dismissed
+/// the badge). Sets `acknowledged_at` to NOW. The row is preserved so
+/// the next poller sweep can detect if a newer version arrives and
+/// re-trigger the badge; it's not deleted.
+pub fn acknowledge_wire_update(
+    conn: &Connection,
+    local_contribution_id: &str,
+) -> Result<bool> {
+    let changed = conn.execute(
+        "UPDATE pyramid_wire_update_cache
+         SET acknowledged_at = datetime('now')
+         WHERE local_contribution_id = ?1",
+        rusqlite::params![local_contribution_id],
+    )?;
+    Ok(changed > 0)
+}
+
+/// Delete a row from `pyramid_wire_update_cache`. Called when the user
+/// pulls the update — after the pull flow writes the new local
+/// contribution, the cache entry is no longer relevant.
+pub fn delete_wire_update_cache(
+    conn: &Connection,
+    local_contribution_id: &str,
+) -> Result<bool> {
+    let changed = conn.execute(
+        "DELETE FROM pyramid_wire_update_cache WHERE local_contribution_id = ?1",
+        rusqlite::params![local_contribution_id],
+    )?;
+    Ok(changed > 0)
+}
+
+/// List contributions that are tracked on the Wire (have a non-null
+/// `wire_contribution_id`) and are currently active. Used by the
+/// update poller to build its supersession-check payload.
+pub fn list_wire_tracked_contributions(
+    conn: &Connection,
+) -> Result<Vec<(String, String, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT contribution_id, wire_contribution_id, schema_type
+         FROM pyramid_config_contributions
+         WHERE wire_contribution_id IS NOT NULL
+           AND status = 'active'",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
 }
 
 /// Wire Online Push — Schema Prep Migration.
@@ -15143,5 +15332,113 @@ mod phase13_tests {
             "mixed hit/miss expected: {}",
             row.cache_hit_rate
         );
+    }
+
+    // ── Phase 14: pyramid_wire_update_cache helper tests ──────────────
+
+    fn seed_wire_update_cache_config(conn: &Connection, contribution_id: &str) {
+        conn.execute(
+            "INSERT INTO pyramid_config_contributions (
+                contribution_id, slug, schema_type, yaml_content,
+                wire_native_metadata_json, wire_publication_state_json,
+                status, source, wire_contribution_id, created_by, accepted_at
+             ) VALUES (?1, NULL, 'custom_prompts', 'schema_type: custom_prompts\n',
+                '{}', '{}', 'active', 'wire', 'w-orig', 'test', datetime('now'))",
+            rusqlite::params![contribution_id],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_upsert_wire_update_cache_idempotent() {
+        let conn = mem_conn();
+        seed_wire_update_cache_config(&conn, "local-1");
+
+        upsert_wire_update_cache(
+            &conn,
+            "local-1",
+            "w-latest",
+            2,
+            Some("v2 changes"),
+            Some("[\"alice\"]"),
+        )
+        .unwrap();
+        // Upsert again with updated delta — should replace, not dupe.
+        upsert_wire_update_cache(
+            &conn,
+            "local-1",
+            "w-latest-2",
+            3,
+            Some("v3 changes"),
+            Some("[\"alice\",\"bob\"]"),
+        )
+        .unwrap();
+
+        let rows = list_pending_wire_updates(&conn, None).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].latest_wire_contribution_id, "w-latest-2");
+        assert_eq!(rows[0].chain_length_delta, 3);
+        assert_eq!(rows[0].changes_summary.as_deref(), Some("v3 changes"));
+    }
+
+    #[test]
+    fn test_list_pending_wire_updates_filters_acknowledged() {
+        let conn = mem_conn();
+        seed_wire_update_cache_config(&conn, "local-1");
+        seed_wire_update_cache_config(&conn, "local-2");
+
+        upsert_wire_update_cache(&conn, "local-1", "w-1", 1, None, None).unwrap();
+        upsert_wire_update_cache(&conn, "local-2", "w-2", 1, None, None).unwrap();
+
+        // Acknowledge local-1.
+        let changed = acknowledge_wire_update(&conn, "local-1").unwrap();
+        assert!(changed);
+
+        let rows = list_pending_wire_updates(&conn, None).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].local_contribution_id, "local-2");
+    }
+
+    #[test]
+    fn test_delete_wire_update_cache() {
+        let conn = mem_conn();
+        seed_wire_update_cache_config(&conn, "local-1");
+
+        upsert_wire_update_cache(&conn, "local-1", "w-1", 1, None, None).unwrap();
+        assert_eq!(list_pending_wire_updates(&conn, None).unwrap().len(), 1);
+
+        let deleted = delete_wire_update_cache(&conn, "local-1").unwrap();
+        assert!(deleted);
+        assert_eq!(list_pending_wire_updates(&conn, None).unwrap().len(), 0);
+
+        // Deleting a non-existent row returns false.
+        let deleted_again = delete_wire_update_cache(&conn, "local-1").unwrap();
+        assert!(!deleted_again);
+    }
+
+    #[test]
+    fn test_list_wire_tracked_contributions() {
+        let conn = mem_conn();
+        seed_wire_update_cache_config(&conn, "local-1");
+
+        // Second contribution without a wire_contribution_id — should
+        // NOT appear in the tracked list.
+        conn.execute(
+            "INSERT INTO pyramid_config_contributions (
+                contribution_id, slug, schema_type, yaml_content,
+                wire_native_metadata_json, wire_publication_state_json,
+                status, source, wire_contribution_id, created_by, accepted_at
+             ) VALUES ('local-2', NULL, 'custom_prompts',
+                'schema_type: custom_prompts\n', '{}', '{}',
+                'active', 'local', NULL, 'test', datetime('now'))",
+            [],
+        )
+        .unwrap();
+
+        let tracked = list_wire_tracked_contributions(&conn).unwrap();
+        assert_eq!(tracked.len(), 1);
+        assert_eq!(tracked[0].0, "local-1");
+        assert_eq!(tracked[0].1, "w-orig");
+        assert_eq!(tracked[0].2, "custom_prompts");
     }
 }

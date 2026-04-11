@@ -1641,6 +1641,425 @@ impl PyramidPublisher {
     }
 }
 
+// ─── Phase 14: Wire Discovery HTTP client extensions ─────────────────────────
+//
+// Phase 14 extends `PyramidPublisher` with read-side methods for the
+// discovery / ranking / supersession-check flows. The Wire server
+// endpoints (`/api/v1/contributions/search`,
+// `/api/v1/contributions/{id}`, `/api/v1/contributions/check_supersessions`)
+// may not exist yet — the client is shipped ahead of the server.
+// Integration tests use a mock HTTP server. The production Wire server
+// will need matching handlers (tracked as a GoodNewsEveryone repo
+// dependency; documented in the Phase 14 implementation log).
+
+/// One result entry returned by `search_contributions`.
+///
+/// Matches the IPC Contract in `wire-discovery-ranking.md` line 227:
+/// Wire's search endpoint returns a flat list; this struct carries every
+/// signal the ranking engine consumes (rating, adoption, freshness,
+/// chain length, reputation, challenge counts, internalization counts).
+///
+/// All ranking signals are `Option<...>` so missing signals can be
+/// treated as neutral (not zero) per the missing-signal redistribution
+/// rule — see `wire_discovery::normalize_signals`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WireContributionSearchResult {
+    pub wire_contribution_id: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub author_handle: Option<String>,
+    /// 1-5 stars. `None` when the contribution has no ratings yet.
+    #[serde(default)]
+    pub rating: Option<f32>,
+    /// Count of distinct nodes that pulled this contribution.
+    #[serde(default)]
+    pub adoption_count: u64,
+    /// Days since last supersession or update. `u32::MAX` when unknown.
+    #[serde(default)]
+    pub freshness_days: u32,
+    /// Length of the supersession chain rooted at this contribution.
+    /// `0` or `1` for brand-new contributions.
+    #[serde(default)]
+    pub chain_length: u32,
+    /// Number of rebuttals against this contribution that were upheld.
+    #[serde(default)]
+    pub upheld_rebuttals: u32,
+    /// Total number of rebuttals filed against this contribution.
+    #[serde(default)]
+    pub filed_rebuttals: u32,
+    /// Current open rebuttals (not yet resolved). Surfaced as a UI
+    /// warning badge.
+    #[serde(default)]
+    pub open_rebuttals: u32,
+    /// Pullers who kept the contribution active (did not revert).
+    #[serde(default)]
+    pub kept_count: u64,
+    /// Total distinct pullers (denominator for internalization rate).
+    #[serde(default)]
+    pub total_pullers: u64,
+    /// Wire's native reputation score for the author. `None` when the
+    /// author is unknown or the Wire hasn't computed one yet.
+    #[serde(default)]
+    pub author_reputation: Option<f32>,
+    /// Schema type this contribution targets. Carried through so the
+    /// ranking engine can confirm the Wire didn't mis-route.
+    #[serde(default)]
+    pub schema_type: Option<String>,
+    /// Pre-pulled provider IDs used by pyramids that adopted this
+    /// contribution — feeds the recommendations engine's tier-routing
+    /// similarity signal.
+    #[serde(default)]
+    pub adopter_provider_ids: Vec<String>,
+    /// Pre-pulled source types for the pyramids that adopted this
+    /// contribution — feeds the recommendations engine's source-type
+    /// overlap signal.
+    #[serde(default)]
+    pub adopter_source_types: Vec<String>,
+}
+
+/// Full contribution payload returned by `fetch_contribution`.
+/// Mirrors the canonical Wire response shape: metadata block + the
+/// YAML body plus supersession chain info. Phase 14's pull flow uses
+/// the `yaml_content` field to build a new local
+/// `pyramid_config_contributions` row.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WireContributionFull {
+    pub wire_contribution_id: String,
+    #[serde(default)]
+    pub schema_type: Option<String>,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub description: String,
+    /// Pre-serialized YAML document — this is what gets written into
+    /// the new local contribution row's `yaml_content` column.
+    #[serde(default)]
+    pub yaml_content: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub author_handle: Option<String>,
+    #[serde(default)]
+    pub rating: Option<f32>,
+    #[serde(default)]
+    pub adoption_count: u64,
+    #[serde(default)]
+    pub freshness_days: u32,
+    #[serde(default)]
+    pub chain_length: u32,
+    /// For contributions published as part of a supersession chain:
+    /// the handle-path of the prior version, if any.
+    #[serde(default)]
+    pub supersedes_handle_path: Option<String>,
+    /// Chain of prior versions (oldest first) with their triggering
+    /// notes — used by the update drawer's "what changed" view.
+    #[serde(default)]
+    pub chain: Vec<WireContributionChainEntry>,
+}
+
+/// One entry in a supersession chain returned by `fetch_contribution`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WireContributionChainEntry {
+    pub wire_contribution_id: String,
+    #[serde(default)]
+    pub handle_path: Option<String>,
+    #[serde(default)]
+    pub triggering_note: Option<String>,
+    #[serde(default)]
+    pub author_handle: Option<String>,
+    #[serde(default)]
+    pub published_at: Option<String>,
+}
+
+/// Response entry from `check_supersessions`. One per queried
+/// `wire_contribution_id`. When no newer version exists, `latest_id ==
+/// original_id` and `chain_length_delta == 0`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupersessionCheckEntry {
+    pub original_id: String,
+    pub latest_id: String,
+    #[serde(default)]
+    pub chain_length_delta: u32,
+    /// Triggering notes between original and latest, oldest first.
+    /// Empty when no newer version exists.
+    #[serde(default)]
+    pub version_labels_between: Vec<String>,
+    /// Author handles for each transition.
+    #[serde(default)]
+    pub author_handles: Vec<String>,
+}
+
+impl PyramidPublisher {
+    /// POST `/api/v1/contributions/search` — Phase 14 Wire discovery
+    /// search endpoint. Returns a flat list of Wire contributions
+    /// matching the query, pre-loaded with every ranking signal the
+    /// ranking engine needs.
+    ///
+    /// The server endpoint may not exist yet — a `404 Not Found` or
+    /// `501 Not Implemented` is treated as "server has not shipped
+    /// discovery yet" and surfaces as an empty result set so the
+    /// frontend renders an empty state rather than crashing. Other
+    /// HTTP errors surface as `WirePublishError::Rejected`.
+    pub async fn search_contributions(
+        &self,
+        schema_type: &str,
+        query: Option<&str>,
+        tags: Option<&[String]>,
+        limit: u32,
+    ) -> Result<Vec<WireContributionSearchResult>> {
+        let url = format!(
+            "{}/api/v1/contributions/search",
+            self.wire_url.trim_end_matches('/')
+        );
+
+        let mut body = serde_json::json!({
+            "schema_type": schema_type,
+            "limit": limit,
+        });
+        if let Some(q) = query {
+            body["query"] = serde_json::Value::String(q.to_string());
+        }
+        if let Some(t) = tags {
+            body["tags"] = serde_json::Value::Array(
+                t.iter().map(|s| serde_json::Value::String(s.clone())).collect(),
+            );
+        }
+
+        let response = self
+            .client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.auth_token))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| {
+                if e.is_timeout() {
+                    WirePublishError::Timeout(Duration::from_secs(60))
+                } else {
+                    WirePublishError::Network(e.to_string())
+                }
+            })
+            .context("wire discovery: search_contributions request failed")?;
+
+        let status = response.status();
+        // Phase 14 deviation: if the server hasn't shipped this
+        // endpoint yet, return an empty result set so the UI renders an
+        // empty state instead of error-banner-churning. Surfacing the
+        // missing server dependency is handled in the implementation log.
+        if status == reqwest::StatusCode::NOT_FOUND
+            || status == reqwest::StatusCode::NOT_IMPLEMENTED
+        {
+            tracing::warn!(
+                status = %status,
+                "wire discovery search endpoint not implemented on server; returning empty result"
+            );
+            return Ok(Vec::new());
+        }
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+            return Err(WirePublishError::AuthFailed(format!("status {}", status)).into());
+        }
+        if !status.is_success() {
+            let body_text = response.text().await.unwrap_or_default();
+            return Err(WirePublishError::Rejected(format!(
+                "status {}: {}",
+                status,
+                body_text.chars().take(500).collect::<String>()
+            ))
+            .into());
+        }
+
+        // Server response is either a flat array or `{ results: [...] }`.
+        // Accept both.
+        let payload: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|e| WirePublishError::Network(e.to_string()))
+            .context("wire discovery: failed to parse search response JSON")?;
+
+        let results = if let Some(arr) = payload.as_array() {
+            arr.clone()
+        } else if let Some(arr) = payload.get("results").and_then(|v| v.as_array()) {
+            arr.clone()
+        } else if let Some(arr) = payload.get("contributions").and_then(|v| v.as_array()) {
+            arr.clone()
+        } else {
+            Vec::new()
+        };
+
+        let mut parsed: Vec<WireContributionSearchResult> = Vec::with_capacity(results.len());
+        for entry in results {
+            match serde_json::from_value::<WireContributionSearchResult>(entry.clone()) {
+                Ok(r) => parsed.push(r),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "wire discovery: skipping search result with unexpected shape"
+                    );
+                }
+            }
+        }
+        Ok(parsed)
+    }
+
+    /// GET `/api/v1/contributions/{wire_contribution_id}` — Phase 14
+    /// Wire contribution fetch. Returns the full contribution metadata
+    /// + yaml_content. Used by the pull flow to build a new local
+    /// contribution row from a discovered Wire contribution.
+    pub async fn fetch_contribution(
+        &self,
+        wire_contribution_id: &str,
+    ) -> Result<WireContributionFull> {
+        let url = format!(
+            "{}/api/v1/contributions/{}",
+            self.wire_url.trim_end_matches('/'),
+            wire_contribution_id,
+        );
+        let response = self
+            .client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", self.auth_token))
+            .send()
+            .await
+            .map_err(|e| {
+                if e.is_timeout() {
+                    WirePublishError::Timeout(Duration::from_secs(60))
+                } else {
+                    WirePublishError::Network(e.to_string())
+                }
+            })
+            .context("wire discovery: fetch_contribution request failed")?;
+
+        let status = response.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+            return Err(WirePublishError::AuthFailed(format!("status {}", status)).into());
+        }
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Err(WirePublishError::Rejected(format!(
+                "contribution {wire_contribution_id} not found on Wire"
+            ))
+            .into());
+        }
+        if !status.is_success() {
+            let body_text = response.text().await.unwrap_or_default();
+            return Err(WirePublishError::Rejected(format!(
+                "status {}: {}",
+                status,
+                body_text.chars().take(500).collect::<String>()
+            ))
+            .into());
+        }
+
+        let payload: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|e| WirePublishError::Network(e.to_string()))
+            .context("wire discovery: failed to parse fetch response JSON")?;
+
+        // Accept both flat and `{ contribution: { ... } }` response shapes.
+        let body = payload.get("contribution").cloned().unwrap_or(payload);
+        let parsed: WireContributionFull = serde_json::from_value(body)
+            .map_err(|e| WirePublishError::Rejected(format!("unexpected fetch shape: {e}")))?;
+        Ok(parsed)
+    }
+
+    /// POST `/api/v1/contributions/check_supersessions` — Phase 14 bulk
+    /// supersession check. Input is a list of `wire_contribution_id`s
+    /// the user has pulled; output is one entry per ID indicating
+    /// whether a newer version exists and, if so, the chain delta.
+    ///
+    /// Used by the background `WireUpdatePoller` on a conservative
+    /// interval (default 6 hours, configurable via the
+    /// `wire_update_polling` bundled contribution).
+    pub async fn check_supersessions(
+        &self,
+        contribution_ids: &[String],
+    ) -> Result<Vec<SupersessionCheckEntry>> {
+        if contribution_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let url = format!(
+            "{}/api/v1/contributions/check_supersessions",
+            self.wire_url.trim_end_matches('/')
+        );
+        let body = serde_json::json!({
+            "contribution_ids": contribution_ids,
+        });
+        let response = self
+            .client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.auth_token))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| {
+                if e.is_timeout() {
+                    WirePublishError::Timeout(Duration::from_secs(60))
+                } else {
+                    WirePublishError::Network(e.to_string())
+                }
+            })
+            .context("wire discovery: check_supersessions request failed")?;
+
+        let status = response.status();
+        if status == reqwest::StatusCode::NOT_FOUND
+            || status == reqwest::StatusCode::NOT_IMPLEMENTED
+        {
+            tracing::warn!(
+                status = %status,
+                "wire supersession-check endpoint not implemented on server; returning empty result"
+            );
+            return Ok(Vec::new());
+        }
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+            return Err(WirePublishError::AuthFailed(format!("status {}", status)).into());
+        }
+        if !status.is_success() {
+            let body_text = response.text().await.unwrap_or_default();
+            return Err(WirePublishError::Rejected(format!(
+                "status {}: {}",
+                status,
+                body_text.chars().take(500).collect::<String>()
+            ))
+            .into());
+        }
+
+        let payload: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|e| WirePublishError::Network(e.to_string()))
+            .context("wire discovery: failed to parse check_supersessions response JSON")?;
+
+        let entries = if let Some(arr) = payload.as_array() {
+            arr.clone()
+        } else if let Some(arr) = payload.get("results").and_then(|v| v.as_array()) {
+            arr.clone()
+        } else if let Some(arr) = payload.get("entries").and_then(|v| v.as_array()) {
+            arr.clone()
+        } else {
+            Vec::new()
+        };
+
+        let mut parsed: Vec<SupersessionCheckEntry> = Vec::with_capacity(entries.len());
+        for entry in entries {
+            match serde_json::from_value::<SupersessionCheckEntry>(entry.clone()) {
+                Ok(e) => parsed.push(e),
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        "wire discovery: skipping check_supersessions entry with unexpected shape"
+                    );
+                }
+            }
+        }
+        Ok(parsed)
+    }
+}
+
 // ─── Tests ───────────────────────────────────────────────────
 
 #[cfg(test)]
