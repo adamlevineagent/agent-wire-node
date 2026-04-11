@@ -4059,3 +4059,307 @@ failure-mode writeup.
 **Status:** wanderer pass complete → phase 17 complete → full
 17-phase initiative complete. New commit on branch
 `phase-17-recursive-folder-ingestion` (no amend, no push).
+
+---
+
+## Phase 18b — Cache integrity retrofit + search_hit signal path (2026-04-11)
+
+**Branch:** `phase-18b-cache-integrity` (parallel worktree at
+`/private/tmp/agent-wire-phase-18b` because the main worktree was
+shared with sibling 18a/18c/18d/18e agents).
+
+**Ledger entries claimed:** L7 (`search_hit` demand signal recording
+path) and L8 (`call_model_audited` cache retrofit) from
+`docs/plans/deferral-ledger.md`.
+
+**Mandate recap:** Phase 12 punted the audited LLM call sites because
+`call_model_audited` wrote its own audit row and bypassed the Phase 6
+cache. Result: every audited build re-burned tokens on every re-run.
+Phase 12 also punted `search_hit` because Wire Node had no session /
+referer mechanism to link a search hit to a subsequent drill. Phase 13
+was supposed to pick both up. It didn't. Phase 18b reclaims them.
+
+### L8 — `call_model_audited` cache retrofit
+
+**Option A picked (clean unification).** I retired
+`call_model_audited` as a thin deprecated wrapper and added a new
+public entry point `call_model_unified_with_audit_and_ctx` that
+threads BOTH a `StepContext` (for cache lookup/storage) and an
+`AuditContext` (for the audit row writes) through a single
+implementation. The legacy `call_model_unified_with_options_and_ctx`
+becomes a thin wrapper that delegates with `audit = None`. The
+existing function body in `llm.rs` is now the shared body for both
+the cache-only and the cache+audit paths.
+
+**Rationale for Option A over B/C:**
+
+- B (new `_with_ctx` variant alongside `call_model_audited`) preserves
+  two ways of writing audited calls; the second one will rot.
+- C (cache probe at each retrofit site) duplicates the cache-key
+  computation across 5+ files and is hard to evolve.
+- A matches what Phase 12 did when it unified the non-audited paths.
+  It also gives the audit + cost reconciliation systems the cache_hit
+  distinction "for free" — a single audit row per call regardless of
+  which path served it.
+
+**Audit row cache_hit distinction.** The `pyramid_llm_audit` table
+gained a new `cache_hit INTEGER NOT NULL DEFAULT 0` column via an
+idempotent migration (pragma_table_info check + ALTER TABLE). Cache
+hits write a row with `cache_hit = 1` via a new
+`db::insert_llm_audit_cache_hit` helper that emits a single
+'complete' row in one INSERT (no pending → complete dance because the
+cached read is sub-millisecond). Wire calls continue to go through
+the existing `insert_llm_audit_pending` → HTTP → `complete_llm_audit`
+flow with `cache_hit = 0` (the column default). The
+`LlmAuditRecord` Rust struct also gained the `cache_hit` field with
+`#[serde(default)]` so the IPC layer carries it to the Inspector
+modal whenever the DADBEAR Oversight UI starts reading it.
+
+**Audit failure path.** All six terminal-error sites in the unified
+inner function (connection error, HTTP 400 not-context, terminal
+non-success, response read fail, parse fail, empty content) now call
+a new `maybe_fail_audit` helper that flips the pending row to
+`status = 'failed'` so the audit trail isn't left with dangling
+pending rows. The max-retries-exhausted path at the end of the loop
+also calls `maybe_fail_audit`.
+
+### Retrofit table
+
+| File | Site | Step name | Before | After |
+|---|---|---|---|---|
+| `evidence_answering.rs:285` | `pre_map_layer` | `evidence_pre_map` | `call_model_audited(audit)` (audit branch) + `call_model_unified_and_ctx(ctx)` (else branch) | single `call_model_unified_with_audit_and_ctx(ctx, audit)` call |
+| `evidence_answering.rs:954` | `answer_questions` per-batch | `evidence_answer` | `call_model_audited(audit.for_node(...))` (audit branch) + `call_model_unified_and_ctx(ctx)` (else branch) | single `call_model_unified_with_audit_and_ctx(ctx, audit.for_node(...))` call |
+| `evidence_answering.rs:1427` | `merge_answer_batches` | `evidence_answer_merge` | same split | single unified call |
+| `evidence_answering.rs:1648` | `targeted_reexamination` | `evidence_answer` (gap_answer purpose) | same split | single unified call |
+| `chain_dispatch.rs:407` | `dispatch_llm` (legacy v2 chain) | step.name | `call_model_audited(audit)` (audit branch) + `call_model_and_ctx(dispatch_cache_ctx)` (else branch) | single `call_model_unified_with_audit_and_ctx(dispatch_cache_ctx, audit)` call |
+| `chain_dispatch.rs:1326` | `dispatch_ir_llm` (v3 IR chain) | step.id | `call_model_audited(audit)` (audit branch — Phase 6 fix pass left a TODO comment here) + `call_model_unified_with_options_and_ctx(cache_ctx)` (else branch) | single `call_model_unified_with_audit_and_ctx(cache_ctx, audit)` call |
+
+Total: **6 retrofit sites** unified.
+
+### Retrofit ratio grep — before / after
+
+**Before (Phase 18b baseline at `phase-18b-cache-integrity`):**
+
+```
+$ grep -c "call_model_audited(" src-tauri/src/pyramid/*.rs | grep -v ":0$"
+src-tauri/src/pyramid/chain_dispatch.rs:2
+src-tauri/src/pyramid/evidence_answering.rs:4
+src-tauri/src/pyramid/llm.rs:2  (1 fn definition + 1 doc reference)
+```
+
+**After:**
+
+```
+$ grep -c "call_model_audited(" src-tauri/src/pyramid/*.rs | grep -v ":0$"
+src-tauri/src/pyramid/llm.rs:1  (deprecated wrapper definition only)
+```
+
+**After (new unified entry point):**
+
+```
+$ grep -c "call_model_unified_with_audit_and_ctx" src-tauri/src/pyramid/*.rs | grep -v ":0$"
+src-tauri/src/pyramid/chain_dispatch.rs:3   (2 retrofit calls + 1 doc comment)
+src-tauri/src/pyramid/evidence_answering.rs:4
+src-tauri/src/pyramid/llm.rs:9              (1 def + wrappers + tests + docs)
+```
+
+Production code-path call count for `call_model_audited(`: **flipped
+from 6 to 0**. Only the deprecated function definition remains in
+`llm.rs`.
+
+### L7 — `search_hit` demand signal recording path
+
+**Approach B picked (frontend-cooperative `?from=search` query param /
+IPC arg).**
+
+**Rationale for B over A/C:**
+
+- A (in-memory session store keyed by IP/session) adds a mutex + a
+  per-request lookup for a heuristic that propagates 50%-attenuated
+  through the evidence graph anyway. Architectural overkill.
+- B is explicit, survives privacy-preserving Referer policies, and
+  requires only a 1-line frontend change in the search-result onClick
+  handler.
+- C (Referer header inspection) is fragile because Referer can be
+  stripped by browser privacy settings.
+
+**Backend changes (both HTTP + IPC paths).** Wire Node has TWO drill
+entry points:
+
+1. `routes.rs::handle_drill` — the HTTP route used by external
+   clients and MCP agents over the wire.
+2. `main.rs::pyramid_drill` — the Tauri IPC used by the desktop UI.
+
+Both got the L7 wiring:
+
+| Path | Mechanism | Code |
+|---|---|---|
+| `routes.rs::handle_drill` | New `DrillQuery` struct deserialized from `?from=search` query param. Filter chain adds `warp::query::<DrillQuery>()` between the auth filter and `with_agent_id()`. | `routes.rs:357-372` (struct), `routes.rs:884-895` (filter), `routes.rs:2758-2840` (handler) |
+| `main.rs::pyramid_drill` | New `from_search: Option<bool>` parameter on the `#[tauri::command]` function. Optional with `unwrap_or(false)` so existing IPC callers that don't pass it stay on the bare-drill behavior. | `main.rs:3044-3100` |
+
+In both handlers, when the flag is true, the fire-and-forget
+`tokio::spawn` task calls `record_demand_signal` TWICE — once with
+`signal_type = "user_drill"` (the existing call) and a second time
+with `signal_type = "search_hit"` (the L7 fix). Both rows land in
+`pyramid_demand_signals`, both propagate through the evidence graph
+via the existing BFS attenuation, and the triage policy can give
+them separate weights via the `demand_signals` rule list.
+
+**Frontend change.** `src/components/PyramidNavPage.tsx::handleNodeClick`
+gained an optional second arg `fromSearch: boolean = false` that gets
+threaded into the `pyramid_drill` IPC's `from_search` parameter. The
+two views that render search results — `SearchModeView` (verbatim
+search) and `QuestionResultView` (question results from the search
+endpoint) — now pass `true` when their result-row onClick fires. The
+non-search drill paths (tree view, walk view, thread view, decisions
+view, speaker view) leave the second arg as default `false` and only
+the standard `user_drill` signal fires.
+
+### Tests added
+
+**L8 (3 tests in `pyramid::llm::tests`):**
+
+- `test_phase18b_audited_cache_hit_writes_cache_hit_audit_row` —
+  pre-populates a cache row, calls
+  `call_model_unified_with_audit_and_ctx(Some(ctx), Some(audit))`,
+  asserts the cached response is returned AND exactly one audit row
+  is written with `cache_hit = 1`.
+- `test_phase18b_audited_cache_miss_falls_through_to_pending_path` —
+  no cache row, calls the unified function, asserts the call errors
+  on HTTP and a pending → failed audit row landed with `cache_hit = 0`.
+- `test_phase18b_unified_no_audit_matches_legacy_cache_path` —
+  regression: `audit = None` returns the cached response with no
+  audit row written. Confirms the wrapper path is unchanged.
+
+**L7 (2 tests in `pyramid::demand_signal::tests`):**
+
+- `test_phase18b_l7_search_hit_records_two_rows_per_drill` — mirrors
+  what `handle_drill` does on the from=search path: emit `user_drill`
+  then `search_hit` for the same node, asserts both rows landed at
+  the leaf with weight 1.0.
+- `test_phase18b_l7_search_hit_propagates_like_other_signals` —
+  spot-check that the `search_hit` signal type rides through the
+  attenuation BFS the same way `user_drill` and `agent_query` do.
+
+### Verification
+
+- `cargo check --lib`: clean, **3 pre-existing warnings only** (the
+  publication.rs `LayerCollectResult` private-in-public pair and the
+  deprecated `get_keep_evidence_for_target` reference). Zero new
+  warnings from Phase 18b.
+- `cargo test --lib pyramid`: **1243 passed / 7 failed**. Test count
+  delta from baseline: **+5 (3 L8 tests in pyramid::llm + 2 L7 tests
+  in pyramid::demand_signal)**. Same 7 pre-existing failures
+  documented in every prior phase log.
+- `cargo test --lib pyramid::llm::tests::test_phase18b` — 3/3 pass.
+- `cargo test --lib pyramid::demand_signal::tests::test_phase18b` —
+  2/2 pass.
+- `tsc --noEmit` — clean (no new TypeScript errors from the
+  PyramidNavPage signature change).
+
+### Manual verification path (post-build)
+
+1. **L8 cache reuse on rebuild.**
+   1. Run a fresh build of a small pyramid with audit enabled.
+   2. Note the cost / token usage from the run.
+   3. Re-run the same build with no input changes.
+   4. Open the Inspector modal on a few nodes; confirm the audit
+      rows for the second run show `cache_hit = 1` (or the equivalent
+      UI badge once the Oversight page is updated to read the new
+      column).
+   5. Confirm the cost on the second run is dramatically lower (or
+      zero) because the audited steps now hit the cache.
+2. **L7 search→drill flow.**
+   1. Open the desktop app, navigate to a pyramid, switch to Search
+      reading mode.
+   2. Run a search that returns at least one hit.
+   3. Click a result.
+   4. Open `pyramid.db` (the SQLite file) and run:
+      `SELECT signal_type, COUNT(*) FROM pyramid_demand_signals WHERE slug = '<slug>' GROUP BY signal_type;`
+      You should see BOTH `user_drill` and `search_hit` rows for the
+      drilled node — one of each per click.
+
+### Files changed
+
+**Backend:**
+
+- `src-tauri/src/pyramid/db.rs` — `cache_hit` column on
+  `pyramid_llm_audit` (CREATE TABLE + idempotent migration), new
+  `insert_llm_audit_cache_hit` helper, `get_node_audit_records` /
+  `get_llm_audit_by_id` SELECTs include `cache_hit`,
+  `parse_llm_audit_row` populates the field.
+- `src-tauri/src/pyramid/types.rs` — `LlmAuditRecord` gains
+  `cache_hit: bool` with `#[serde(default)]`.
+- `src-tauri/src/pyramid/llm.rs` — new
+  `call_model_unified_with_audit_and_ctx` public entry point;
+  `call_model_unified_with_options_and_ctx` becomes a thin wrapper
+  that passes `audit = None`; the inner function body now writes a
+  cache_hit audit row on the cache hit path, inserts a pending row on
+  the cache miss path, and calls `maybe_fail_audit` at every terminal
+  error site; `call_model_audited` is now a `#[deprecated]` thin
+  wrapper that delegates to the new entry point with `ctx = None`.
+  New `maybe_fail_audit` helper for the error sites. Three new tests
+  in `tests` module.
+- `src-tauri/src/pyramid/evidence_answering.rs` — 4 retrofit sites
+  unified to call `call_model_unified_with_audit_and_ctx`.
+- `src-tauri/src/pyramid/chain_dispatch.rs` — 2 retrofit sites
+  unified.
+- `src-tauri/src/pyramid/demand_signal.rs` — 2 new tests for the L7
+  search_hit signal recording + propagation behavior.
+- `src-tauri/src/pyramid/routes.rs` — `DrillQuery` struct, drill
+  route filter wires the query param, `handle_drill` accepts the new
+  `drill_query` arg and fires `search_hit` in addition to the
+  standard signal type when `from=search`.
+- `src-tauri/src/main.rs` — `pyramid_drill` IPC accepts a new
+  `from_search: Option<bool>` arg and fires `search_hit` in addition
+  to `user_drill` when set.
+
+**Frontend:**
+
+- `src/components/PyramidNavPage.tsx` — `handleNodeClick` gains an
+  optional `fromSearch: boolean = false` second arg threaded into
+  the `pyramid_drill` IPC. `SearchModeView` and `QuestionResultView`
+  pass `true` from their result-row onClick handlers. Other views
+  leave it default-false.
+
+**Docs:**
+
+- `docs/plans/pyramid-folders-model-routing-implementation-log.md` —
+  this Phase 18b entry.
+
+### Sibling-workstream coordination
+
+Phase 18a, 18c, 18d, 18e ran in parallel on their own branches. The
+main worktree at `/Users/adamlevine/AI Project Files/agent-wire-node`
+was checked out to one of those branches by another agent during my
+session, so I created an isolated worktree at
+`/private/tmp/agent-wire-phase-18b` to avoid file conflicts. Zero
+overlap with sibling workstreams: my edits touch
+`db.rs / types.rs / llm.rs / evidence_answering.rs / chain_dispatch.rs`
+(L8) and `routes.rs / main.rs / PyramidNavPage.tsx /
+demand_signal.rs` (L7). The Phase 18a workstream owns Local Mode
+toggle + provider IPCs in `main.rs` — these touch different functions
+in `main.rs` than my single-line `pyramid_drill` change. The Phase
+18c workstream owns pause-all scoping in `db.rs` (`disable_dadbear_*`
+functions) — different functions than my `pyramid_llm_audit`
+migration. Conflict markers may surface at merge time but the
+diffs are non-overlapping.
+
+### Known limitations / followups
+
+- The audit row id for cache hits is no longer surfaced via the
+  legacy `call_model_audited` return tuple — the wrapper returns `0`
+  for the id field. Production callers always pattern-match
+  `(resp, _)` and ignore the id (verified via grep). Tests that need
+  the audit row id should query `pyramid_llm_audit` by `(slug,
+  build_id)`. This is documented in the wrapper's deprecation
+  message.
+- The Inspector modal / DADBEAR Oversight page doesn't yet visually
+  distinguish cache_hit rows from wire-call rows — the column exists
+  in the schema and the IPC layer carries it, but the UI doesn't
+  read it yet. That's a Phase 15+ Oversight UI task.
+- Three Phase 18b tests use `tokio::test(flavor = "multi_thread")`
+  to match the Phase 6 cache test pattern. The cache lookup uses
+  `block_in_place` on a multi-thread runtime.
+
+**Status:** awaiting-verification.

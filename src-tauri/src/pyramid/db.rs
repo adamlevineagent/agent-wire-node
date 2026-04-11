@@ -1061,7 +1061,8 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
             generation_id TEXT,
             status TEXT NOT NULL DEFAULT 'pending',
             created_at TEXT NOT NULL DEFAULT (datetime('now')),
-            completed_at TEXT
+            completed_at TEXT,
+            cache_hit INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS idx_llm_audit_slug_build ON pyramid_llm_audit(slug, build_id);
         CREATE INDEX IF NOT EXISTS idx_llm_audit_node ON pyramid_llm_audit(slug, node_id);
@@ -1076,6 +1077,25 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
         );
         ",
     )?;
+
+    // Phase 18b: idempotent migration adding the `cache_hit` distinction to
+    // pyramid_llm_audit. Pre-Phase-18b rows default to `0` (treated as
+    // wire-served). Audited cache hits write a row with `cache_hit = 1` so
+    // the audit trail / DADBEAR Oversight page / cost reconciliation can
+    // distinguish "served from cache" from "served by HTTP call to model X".
+    {
+        let has_cache_hit: bool = conn
+            .prepare(
+                "SELECT 1 FROM pragma_table_info('pyramid_llm_audit') WHERE name = 'cache_hit'",
+            )?
+            .exists([])?;
+        if !has_cache_hit {
+            conn.execute(
+                "ALTER TABLE pyramid_llm_audit ADD COLUMN cache_hit INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+    }
 
     // ── Phase 6: LLM output cache (pyramid_step_cache) ─────────────────────
     //
@@ -6044,6 +6064,58 @@ pub fn fail_llm_audit(
     Ok(())
 }
 
+/// Phase 18b: insert a fully-formed audit row stamped as a cache hit in
+/// a single statement. Cache hits don't go through the pending → complete
+/// dance because there is no LLM call to "fail mid-flight" — the cached
+/// result is read in microseconds. The row carries `parsed_ok = true`
+/// (the cached output already parsed once when it was stored) and
+/// `cache_hit = 1` so the audit trail can distinguish it from wire calls.
+///
+/// Returns the inserted audit row id.
+#[allow(clippy::too_many_arguments)]
+pub fn insert_llm_audit_cache_hit(
+    conn: &Connection,
+    slug: &str,
+    build_id: &str,
+    node_id: Option<&str>,
+    step_name: &str,
+    call_purpose: &str,
+    depth: Option<i64>,
+    model: &str,
+    system_prompt: &str,
+    user_prompt: &str,
+    raw_response: &str,
+    prompt_tokens: i64,
+    completion_tokens: i64,
+    latency_ms: i64,
+    generation_id: Option<&str>,
+) -> Result<i64> {
+    // Deduplicate system prompt via hash, matching insert_llm_audit_pending.
+    let sys_hash = prompt_hash(system_prompt);
+    let _ = conn.execute(
+        "INSERT OR IGNORE INTO pyramid_prompt_store (hash, content, char_count)
+         VALUES (?1, ?2, ?3)",
+        rusqlite::params![sys_hash, system_prompt, system_prompt.len() as i64],
+    );
+    let sys_ref = format!("@@hash:{}", sys_hash);
+
+    conn.execute(
+        "INSERT INTO pyramid_llm_audit
+         (slug, build_id, node_id, step_name, call_purpose, depth, model,
+          system_prompt, user_prompt, raw_response, parsed_ok,
+          prompt_tokens, completion_tokens, latency_ms, generation_id,
+          status, completed_at, cache_hit)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1,
+                 ?11, ?12, ?13, ?14, 'complete', datetime('now'), 1)",
+        rusqlite::params![
+            slug, build_id, node_id, step_name, call_purpose, depth,
+            model, sys_ref, user_prompt, raw_response,
+            prompt_tokens, completion_tokens, latency_ms, generation_id,
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
 /// Get all audit records for a specific node in a build.
 /// Hash-referenced system prompts are resolved to full text.
 pub fn get_node_audit_records(
@@ -6055,7 +6127,7 @@ pub fn get_node_audit_records(
         "SELECT id, slug, build_id, node_id, step_name, call_purpose, depth, model,
                 system_prompt, user_prompt, raw_response, parsed_ok,
                 prompt_tokens, completion_tokens, latency_ms, generation_id,
-                status, created_at, completed_at
+                status, created_at, completed_at, cache_hit
          FROM pyramid_llm_audit
          WHERE slug = ?1 AND node_id = ?2
          ORDER BY id ASC",
@@ -6078,7 +6150,7 @@ pub fn get_llm_audit_by_id(
         "SELECT id, slug, build_id, node_id, step_name, call_purpose, depth, model,
                 system_prompt, user_prompt, raw_response, parsed_ok,
                 prompt_tokens, completion_tokens, latency_ms, generation_id,
-                status, created_at, completed_at
+                status, created_at, completed_at, cache_hit
          FROM pyramid_llm_audit WHERE id = ?1",
     )?;
     let mut rows: Vec<LlmAuditRecord> = stmt
@@ -6164,6 +6236,11 @@ fn parse_llm_audit_row(row: &rusqlite::Row) -> rusqlite::Result<LlmAuditRecord> 
         status: row.get(16)?,
         created_at: row.get(17)?,
         completed_at: row.get(18)?,
+        // Phase 18b: cache_hit is the 20th column. Default to false on
+        // pre-Phase-18b rows that haven't been touched by the migration
+        // (the migration is idempotent + run on init, but defensively
+        // handle row.get errors with `unwrap_or(0)`).
+        cache_hit: row.get::<_, i32>(19).unwrap_or(0) != 0,
     })
 }
 
