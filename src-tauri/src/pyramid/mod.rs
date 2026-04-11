@@ -48,6 +48,7 @@ pub mod execution_state;
 pub mod expression;
 pub mod extraction_schema;
 pub mod faq;
+pub mod generative_config;
 pub mod ingest;
 pub mod llm;
 pub mod local_store;
@@ -87,6 +88,9 @@ pub mod vine_prompts;
 pub mod vocabulary;
 pub mod watcher;
 pub mod webbing;
+pub mod schema_registry;
+#[cfg(test)]
+pub mod test_phase9_wanderer;
 pub mod wire_import;
 pub mod wire_migration;
 pub mod wire_publish;
@@ -799,6 +803,14 @@ pub struct PyramidState {
     /// own clone of this Arc; we keep it here too so IPC endpoints can
     /// reach it without going through the registry.
     pub credential_store: SharedCredentialStore,
+    /// Phase 9: schema registry. View over pyramid_config_contributions
+    /// that resolves every (schema_definition, schema_annotation,
+    /// generation skill, seed default) tuple for a target config type.
+    /// Hydrated at boot after the Phase 5+9 migration runs. The
+    /// Phase 4 dispatcher's `invalidate_schema_registry_cache` stub
+    /// calls `SchemaRegistry::invalidate` after a schema_definition
+    /// supersession lands.
+    pub schema_registry: Arc<schema_registry::SchemaRegistry>,
 }
 
 impl PyramidState {
@@ -846,6 +858,7 @@ impl PyramidState {
             dadbear_in_flight: self.dadbear_in_flight.clone(),
             provider_registry: self.provider_registry.clone(),
             credential_store: self.credential_store.clone(),
+            schema_registry: self.schema_registry.clone(),
         }))
     }
 }

@@ -1528,6 +1528,21 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
         [],
     );
 
+    // ── Phase 9 migration: needs_migration flag ──────────────────────
+    //
+    // Phase 9's schema_definition supersession flow flags downstream
+    // config rows as "needs migration" so ToolsMode can surface a
+    // Migrate button and the user can run an LLM-assisted refinement
+    // into the new schema shape. The flag lives on
+    // `pyramid_config_contributions` as an integer column, defaulting
+    // to 0. Idempotent ALTER — the error is ignored when the column
+    // already exists, matching the `pyramid_dadbear_config` precedent
+    // above.
+    let _ = conn.execute(
+        "ALTER TABLE pyramid_config_contributions ADD COLUMN needs_migration INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
+
     // Bootstrap migration: convert legacy pyramid_dadbear_config rows
     // to pyramid_config_contributions. Idempotent — the migration
     // checks the `_migration_marker` contribution before running, and

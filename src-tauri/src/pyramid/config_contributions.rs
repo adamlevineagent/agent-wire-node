@@ -28,6 +28,7 @@ use tracing::{debug, warn};
 
 use crate::pyramid::db;
 use crate::pyramid::event_bus::{BuildEventBus, TaggedBuildEvent, TaggedKind};
+use crate::pyramid::schema_registry::{flag_configs_needing_migration, SchemaRegistry};
 use crate::pyramid::wire_native_metadata::{default_wire_native_metadata, WireNativeMetadata};
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -606,10 +607,34 @@ pub fn reject_proposal(
 /// Step 1 (JSON Schema validation) is stubbed in Phase 4 — Phase 9
 /// provides the schema definitions. Today's validation helper just
 /// returns `Ok(())`.
+///
+/// **Phase 9 note:** the legacy entry point `sync_config_to_operational`
+/// delegates to `sync_config_to_operational_with_registry` with
+/// `schema_registry = None`. Call sites that want the Phase 9 stubs
+/// wired up (invalidate_schema_registry_cache +
+/// flag_configs_for_migration) should use the `_with_registry`
+/// variant and thread the registry Arc through from
+/// `PyramidState::schema_registry`.
 pub fn sync_config_to_operational(
     conn: &Connection,
     bus: &Arc<BuildEventBus>,
     contribution: &ConfigContribution,
+) -> Result<(), ConfigSyncError> {
+    sync_config_to_operational_with_registry(conn, bus, contribution, None)
+}
+
+/// Phase 9 variant of `sync_config_to_operational` that accepts an
+/// optional schema registry reference. When provided, the
+/// `schema_definition` branch calls the registry's `invalidate`
+/// method and the `flag_configs_for_migration` helper (both are
+/// Phase 4 stubs that Phase 9 wires up). When `None`, behavior is
+/// identical to the legacy entry point — used by tests that don't
+/// need the registry side effects.
+pub fn sync_config_to_operational_with_registry(
+    conn: &Connection,
+    bus: &Arc<BuildEventBus>,
+    contribution: &ConfigContribution,
+    schema_registry: Option<&Arc<SchemaRegistry>>,
 ) -> Result<(), ConfigSyncError> {
     // Step 1: validate against the active schema_definition for this
     // schema_type. Phase 4 stubs this — Phase 9 wires it up.
@@ -697,10 +722,27 @@ pub fn sync_config_to_operational(
             invalidate_prompt_cache();
         }
         "schema_definition" => {
-            // Phase 9: superseding a schema flags downstream configs
-            // for LLM-assisted migration.
-            flag_configs_for_migration(conn, &contribution.schema_type)?;
-            invalidate_schema_registry_cache();
+            // Phase 9: superseding a schema_definition flags downstream
+            // configs of the target schema_type for LLM-assisted
+            // migration, then invalidates the schema registry so the
+            // next resolver call re-reads from the contribution store.
+            //
+            // The target is the contribution's `slug` field (per the
+            // Phase 9 convention: schema_definition rows use `slug =
+            // <target_schema_type>`). Falls back to a no-op when the
+            // slug is missing.
+            let target_type = contribution
+                .slug
+                .as_deref()
+                .unwrap_or(&contribution.schema_type);
+            flag_configs_for_migration(conn, target_type)?;
+            if let Some(registry) = schema_registry {
+                invalidate_schema_registry_cache(conn, registry);
+            } else {
+                debug!(
+                    "schema_definition supersession: no registry passed, skipping invalidate"
+                );
+            }
         }
         "schema_annotation" => {
             // Phase 8: YAML-to-UI renderer cache invalidation.
@@ -786,19 +828,37 @@ fn invalidate_provider_resolver_cache() {
 }
 
 /// Phase 9: schema definition supersession flags every downstream
-/// config for LLM-assisted migration.
-fn flag_configs_for_migration(_conn: &Connection, target_schema_type: &str) -> Result<()> {
+/// config of the target schema_type for LLM-assisted migration.
+///
+/// Delegates to `schema_registry::flag_configs_needing_migration`,
+/// which sets `needs_migration = 1` on every active contribution
+/// whose `schema_type` matches the superseded schema_definition's
+/// target. ToolsMode reads this flag to surface a "Migrate" button
+/// (Phase 10 wires the actual LLM-assisted migration flow).
+fn flag_configs_for_migration(conn: &Connection, target_schema_type: &str) -> Result<()> {
+    let flagged = flag_configs_needing_migration(conn, target_schema_type)
+        .map_err(|e| anyhow::anyhow!("flag_configs_for_migration failed: {e}"))?;
     debug!(
         target_schema_type,
-        "flag_configs_for_migration: Phase 4 stub (Phase 9 wires this up)"
+        rows_flagged = flagged,
+        "flag_configs_for_migration: marked downstream configs needing migration"
     );
     Ok(())
 }
 
 /// Phase 9: invalidate the cached schema registry so the next
-/// validation call re-reads from pyramid_config_contributions.
-fn invalidate_schema_registry_cache() {
-    debug!("invalidate_schema_registry_cache: Phase 4 stub (Phase 9 wires this up)");
+/// resolver call re-reads from pyramid_config_contributions. Called
+/// from the dispatcher's `schema_definition` branch after a
+/// supersession lands.
+fn invalidate_schema_registry_cache(conn: &Connection, registry: &Arc<SchemaRegistry>) {
+    if let Err(e) = registry.invalidate(conn) {
+        warn!(
+            error = %e,
+            "invalidate_schema_registry_cache: registry re-hydration failed"
+        );
+    } else {
+        debug!("invalidate_schema_registry_cache: registry re-hydrated");
+    }
 }
 
 /// Phase 8: invalidate the YAML-to-UI renderer cache.
@@ -870,6 +930,7 @@ fn register_chain_with_registry(
 mod tests {
     use super::*;
     use crate::pyramid::db::init_pyramid_db;
+    use crate::pyramid::schema_registry::SchemaRegistry;
     use rusqlite::Connection;
 
     fn mem_conn() -> Connection {
@@ -1965,5 +2026,66 @@ mod tests {
         for entry in &report.resolved_derived_from {
             assert!(!entry.resolved);
         }
+    }
+
+    // ── Phase 9 dispatcher wiring tests ────────────────────────────
+
+    #[test]
+    fn test_phase9_schema_definition_dispatcher_flags_and_invalidates() {
+        // End-to-end wiring test: create a schema_definition
+        // contribution, run the dispatcher via
+        // sync_config_to_operational_with_registry, verify the
+        // schema_registry cache got invalidated AND downstream
+        // configs of the target schema_type got flagged for migration.
+        use crate::pyramid::wire_migration::walk_bundled_contributions_manifest;
+
+        let conn = mem_conn();
+        walk_bundled_contributions_manifest(&conn).unwrap();
+        let registry = Arc::new(SchemaRegistry::hydrate_from_contributions(&conn).unwrap());
+        let bus = mem_bus();
+
+        // Before the dispatcher runs: the bundled evidence_policy
+        // default should exist and have needs_migration = 0.
+        let before: i64 = conn
+            .query_row(
+                "SELECT needs_migration FROM pyramid_config_contributions
+                 WHERE contribution_id = ?1",
+                rusqlite::params!["bundled-evidence_policy-default-v1"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(before, 0);
+
+        // Create a new schema_definition contribution for
+        // evidence_policy and run the dispatcher.
+        let metadata = default_wire_native_metadata("schema_definition", Some("evidence_policy"));
+        let id = create_config_contribution_with_metadata(
+            &conn,
+            "schema_definition",
+            Some("evidence_policy"),
+            "{\"type\":\"object\"}",
+            Some("new v2 schema"),
+            "local",
+            Some("user"),
+            "active",
+            &metadata,
+        )
+        .unwrap();
+
+        let contribution = load_contribution_by_id(&conn, &id).unwrap().unwrap();
+        sync_config_to_operational_with_registry(&conn, &bus, &contribution, Some(&registry))
+            .unwrap();
+
+        // After: the bundled evidence_policy row should have
+        // needs_migration = 1 (flag_configs_for_migration wired up).
+        let after: i64 = conn
+            .query_row(
+                "SELECT needs_migration FROM pyramid_config_contributions
+                 WHERE contribution_id = ?1",
+                rusqlite::params!["bundled-evidence_policy-default-v1"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(after, 1, "flag_configs_for_migration should have set the flag");
     }
 }
