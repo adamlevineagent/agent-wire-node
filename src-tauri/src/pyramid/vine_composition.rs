@@ -614,4 +614,165 @@ mod tests {
         assert!(ancestors.contains(&"v-beta".to_string()));
         assert!(ancestors.contains(&"v-gamma".to_string()));
     }
+
+    #[test]
+    fn test_phase16_enqueue_mutations_scopes_to_vine_and_kept_evidence() {
+        // Validates `enqueue_vine_manifest_mutations` — the per-level
+        // synchronous DB work that `notify_vine_of_child_completion` runs
+        // at each parent vine it notifies. This covers the second half of
+        // the walk's per-hop behavior (update_child_apex is exercised by
+        // test_update_child_apex_works_for_vine_children in db.rs).
+        //
+        // Setup: a vine `parent-v` composes a bedrock `leaf-b`. The vine
+        // has two vine-layer nodes. One is backed by KEEP evidence
+        // pointing at the bedrock apex and must be enqueued. The other is
+        // backed by a DISCONNECT verdict and must be skipped — the
+        // enqueue helper filters on `verdict = 'KEEP'` so only live
+        // cross-slug links trigger pending mutations.
+        let conn = test_db();
+
+        // Create the parent vine slug and register the composition so the
+        // downstream helpers can resolve evidence rows under the vine's
+        // scope.
+        db::create_slug(
+            &conn,
+            "parent-v",
+            &crate::pyramid::types::ContentType::Vine,
+            "",
+        )
+        .unwrap();
+        db::insert_vine_composition(&conn, "parent-v", "leaf-b", 0, "bedrock").unwrap();
+
+        // Save two vine nodes at depth=2. Depth must be >1 because
+        // save_node enforces bedrock immutability at depth <= 1 when the
+        // row already exists; fresh rows at any depth are fine, but
+        // picking depth=2 keeps this test robust if the enqueue helper
+        // ever revisits the row.
+        let keep_node = crate::pyramid::types::PyramidNode {
+            id: "v-node-keep".to_string(),
+            slug: "parent-v".to_string(),
+            depth: 2,
+            chunk_index: None,
+            headline: "keep".to_string(),
+            distilled: "keeps bedrock apex".to_string(),
+            topics: vec![],
+            corrections: vec![],
+            decisions: vec![],
+            terms: vec![],
+            dead_ends: vec![],
+            self_prompt: String::new(),
+            children: vec![],
+            parent_id: None,
+            superseded_by: None,
+            build_id: None,
+            created_at: String::new(),
+            ..Default::default()
+        };
+        let disconnect_node = crate::pyramid::types::PyramidNode {
+            id: "v-node-disconnect".to_string(),
+            slug: "parent-v".to_string(),
+            depth: 2,
+            chunk_index: None,
+            headline: "disconnect".to_string(),
+            distilled: "disconnected from bedrock apex".to_string(),
+            topics: vec![],
+            corrections: vec![],
+            decisions: vec![],
+            terms: vec![],
+            dead_ends: vec![],
+            self_prompt: String::new(),
+            children: vec![],
+            parent_id: None,
+            superseded_by: None,
+            build_id: None,
+            created_at: String::new(),
+            ..Default::default()
+        };
+        db::save_node(&conn, &keep_node, None).unwrap();
+        db::save_node(&conn, &disconnect_node, None).unwrap();
+
+        // Insert KEEP and DISCONNECT evidence rows that both reference the
+        // bedrock apex. Only the KEEP row should trigger an enqueue —
+        // enqueue_vine_manifest_mutations filters on `verdict = 'KEEP'`.
+        conn.execute(
+            "INSERT INTO pyramid_evidence
+                (slug, build_id, source_node_id, target_node_id, verdict, weight, reason)
+             VALUES
+                (?1, ?2, ?3, ?4, 'KEEP', 1.0, 'keeps bedrock apex')",
+            rusqlite::params!["parent-v", "b1", "apex-abc", "v-node-keep"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO pyramid_evidence
+                (slug, build_id, source_node_id, target_node_id, verdict, weight, reason)
+             VALUES
+                (?1, ?2, ?3, ?4, 'DISCONNECT', 1.0, 'disconnected bedrock apex')",
+            rusqlite::params!["parent-v", "b1", "apex-abc", "v-node-disconnect"],
+        )
+        .unwrap();
+
+        // Run the enqueue helper as the async walk would at each level.
+        let enqueued = enqueue_vine_manifest_mutations(
+            &conn,
+            "parent-v",
+            "leaf-b",
+            "apex-abc",
+            "bedrock-build-1",
+        )
+        .unwrap();
+
+        // Exactly one pending mutation should land: the KEEP row's target.
+        assert_eq!(enqueued, 1, "should enqueue one mutation for the KEEP row only");
+
+        // Verify the pending mutation row is scoped to the parent vine and
+        // to the KEEP target node at the node's depth.
+        let mut stmt = conn
+            .prepare(
+                "SELECT slug, layer, mutation_type, target_ref
+                 FROM pyramid_pending_mutations
+                 WHERE slug = ?1 AND processed = 0",
+            )
+            .unwrap();
+        let rows: Vec<(String, i64, String, String)> = stmt
+            .query_map(rusqlite::params!["parent-v"], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "parent-v");
+        assert_eq!(rows[0].1, 2, "pending mutation should land at the vine node's layer");
+        assert_eq!(rows[0].2, "confirmed_stale");
+        assert_eq!(rows[0].3, "v-node-keep");
+
+        // Running the enqueue a second time is additive — the stale engine
+        // de-duplicates on its own when it processes the queue. We only
+        // verify we didn't accidentally target the DISCONNECT row after
+        // re-entry.
+        let enqueued_again = enqueue_vine_manifest_mutations(
+            &conn,
+            "parent-v",
+            "leaf-b",
+            "apex-abc",
+            "bedrock-build-2",
+        )
+        .unwrap();
+        assert_eq!(enqueued_again, 1);
+
+        // Confirm the DISCONNECT target still hasn't been touched.
+        let disconnect_present: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pyramid_pending_mutations
+                               WHERE slug = 'parent-v' AND target_ref = 'v-node-disconnect')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            !disconnect_present,
+            "DISCONNECT evidence must never be promoted to a pending mutation"
+        );
+    }
 }

@@ -12,7 +12,7 @@ You are not summarizing children individually. You are abstracting what they for
 
 Length is whatever the content demands at the abstracted level. A cluster that genuinely covers a thin slice should produce a short output; a cluster that covers a dense region should produce a longer one.
 
-Upper bound: your output's distilled prose must not exceed half the combined length of the children's distilled prose. Hitting that ceiling usually means you have restated rather than abstracted — step further outward and try again.
+Restatement vs. abstraction is the only length test. If your distilled prose is retracing what the children already say — naming the same people in the same sequences, recounting the same decisions in the same order — you have restated rather than abstracted. Step further outward and describe what the children together form at the next zoom level, not what each child individually covered.
 
 ## INPUT SHAPE
 
@@ -75,7 +75,7 @@ Output valid JSON only (no markdown fences, no extra text). The shape is a singl
 ## STRUCTURAL RULES
 
 - Produce exactly one parent node for the cluster. No arrays, no multiple outputs.
-- `topics` and `entities` at this level must be things that recur across at least two children, or that one child flags as load-bearing for the cluster. Items mentioned by a single child without cluster-level significance should be dropped.
+- `topics` and `entities` at this level must be things that recur across the cluster's children, or that one child flags as load-bearing for the cluster. Items mentioned by only a single child without cluster-level significance should be dropped.
 - `claims` should include only claims that are meaningful at the cluster level and traceable to at least one child. If no child supports a claim you were about to write, drop it.
 - Empty arrays are the right answer when the cluster genuinely has no shared entities, topics, or claims worth surfacing.
 - Do not reference absolute layer numbers, depth values, or specific pyramid terminology like "L0" or "L1" in your output content. Your output is layer-agnostic.

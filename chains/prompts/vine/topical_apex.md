@@ -12,7 +12,7 @@ You are not summarizing. You are abstracting. A summary compresses content at th
 
 Length is whatever the content demands at the abstracted level. Do not pad short content to reach a target. Do not truncate dense content to fit a budget.
 
-Upper bound: your output's distilled prose must not exceed half the combined length of the input distilled prose. If you hit the ceiling you have probably restated rather than abstracted — step further outward and try again.
+Restatement vs. abstraction is the only length test. If your distilled prose is retracing the inputs in the same sequence, repeating the same cluster-level claims with lightly rewritten phrasing, you have restated rather than abstracted. Step further outward and describe what the inputs together form at the next zoom level, not what each input individually covered.
 
 ## INPUT SHAPE
 

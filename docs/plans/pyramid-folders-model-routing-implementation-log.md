@@ -3350,3 +3350,48 @@ The following scenarios should be executed by a human verifier before marking Ph
   2. The topical clustering prompt simplifies "entity overlap + import graph signals" to "shared entities and topics" because the import graph isn't computed at the composition layer.
 
 **Status:** implementer → awaiting-verification. Single commit on branch `phase-16-vine-of-vines`: `phase-16: vine-of-vines + topical vine recipe`. Not amended. Not pushed.
+
+### Verifier pass (2026-04-10)
+
+**Verifier:** solo verifier, fresh read of the workstream prompt + Part 1 of the vine-of-vines spec, full audit of commit `76740ca`.
+
+**Punch list audited:**
+- Schema migration idempotency (pragma_table_info gated ALTER TABLE) — ✅ clean.
+- `child_type` column + helpers (insert_vine_composition, list_vine_compositions, update_child_apex, get_vines_for_child, get_parent_vines_recursive) — ✅ clean.
+- Legacy aliases preserved for Phase 2/13 callers — ✅ routes.rs and recovery.rs still compile + call through without edits.
+- `notify_vine_of_child_completion` BFS with visited set keyed by slug + cycle guard + depth cap — ✅ clean.
+- Fire-and-forget: sync DB writes + async rebuilds via stale engine pending_mutations — ✅ clean.
+- Chain YAML loads, bundled in `include_str!` for release builds, prompts bundled — ✅ clean.
+- `cross_build_input` primitive extension for vine children (bedrock + sub-vine uniform handling, empty array for bedrock-only vines, defensive fallback to `get_all_live_nodes` highest-depth when composition row has no stored apex) — ✅ clean.
+- `chain_registry::default_chain_id_for_mode("vine", _) = "topical-vine"` — ✅ clean.
+- Chain engine `VALID_CONTENT_TYPES` includes `"vine"` — ✅ clean.
+
+**Issues found and fixed in verifier commit:**
+
+1. **Pillar 37 violations in vine prompts.** `topical_cluster.md` hard-capped output at 2–6 clusters ("no more than 6", "at least 2") and `topical_synthesis.md` + `topical_apex.md` constrained distilled length to "must not exceed half the combined length of children's distilled prose". Per `feedback_pillar37_no_hedging.md`, any number constraining LLM output is a Pillar 37 violation with no exceptions. Rewrote the clustering prompt to let thematic structure decide cluster count (with a single-cluster degeneracy guard based on "pick the strongest secondary axis the material supports" rather than a numeric floor). Rewrote both length-constraint blocks to frame the test as "restatement vs. abstraction" — if the output retraces the inputs in the same sequence, it's restated rather than abstracted, step further outward. Also removed a secondary numeric constraint in `topical_synthesis.md` ("topics must recur across at least two children") to "topics must recur across the cluster's children, not be mentioned by only a single child".
+
+2. **Legacy build_runner still rejected `ContentType::Vine`.** Failure mode #10 in the verifier prompt: the implementer claimed both rejections were flipped but `build_runner::run_legacy_build` at line 717 still errored. For installs with `use_chain_engine = false` (the `PyramidConfig::default`), all vine builds were failing. Rewrote the `ContentType::Vine` arm of `run_legacy_build` to delegate to `build::build_topical_vine`, which gives the legacy path the same topical-vine chain dispatch as `run_chain_build`.
+
+3. **`build::build_topical_vine` was unreachable dead code.** Failure mode #1 in the verifier prompt: traced `run_build_pipeline → ContentType::Vine → build_topical_vine` and confirmed the only caller of `run_build_pipeline` (the conversation-bunch fallback at `vine.rs:1051`) passes `ContentType::Conversation`, so the Vine arm was never hit. Fixed in the same motion as #2 — now `run_legacy_build` dispatches vines through `build::build_topical_vine`, so the function has a real production caller. The `vine.rs::run_build_pipeline` Vine arm remains as a secondary reachable entry for any future caller that routes through it.
+
+4. **Shallow test coverage of the per-level DB work.** `notify_vine_of_child_completion`'s helper `enqueue_vine_manifest_mutations` had no dedicated test — only indirect coverage via the DB-layer graph-walk tests. Added `test_phase16_enqueue_mutations_scopes_to_vine_and_kept_evidence`: sets up a parent vine with two vine nodes at depth 2, one backed by KEEP evidence and one by DISCONNECT, runs the enqueue helper twice, and asserts that only the KEEP row produces a pending mutation scoped to the correct vine, layer, and target node. The DISCONNECT row is verified never-touched.
+
+**Files touched by verifier:**
+- `chains/prompts/vine/topical_cluster.md` — removed 2–6 cluster cap/floor, reworked to thematic-structure guidance.
+- `chains/prompts/vine/topical_synthesis.md` — removed "half combined length" numeric constraint, reworked to restatement-vs-abstraction framing; softened "at least two children" to "across the cluster's children".
+- `chains/prompts/vine/topical_apex.md` — removed "half combined length" numeric constraint, reworked to restatement-vs-abstraction framing.
+- `src-tauri/src/pyramid/build_runner.rs` — `run_legacy_build` Vine arm now delegates to `build::build_topical_vine`.
+- `src-tauri/src/pyramid/vine_composition.rs` — added `test_phase16_enqueue_mutations_scopes_to_vine_and_kept_evidence` (+1 test).
+
+**Post-verifier verification:**
+- `cargo check --lib` clean, 3 pre-existing warnings.
+- `cargo test --lib phase16` — 17 passing (was 16, +1 new enqueue test).
+- `cargo test --lib pyramid` — 1200 passing / 7 pre-existing failing. Test count +1 from 1199.
+- `npm run build` clean (150 modules, 779.37 kB bundle).
+- `grep -rn "ContentType::Vine => Err" src-tauri/src/ --include="*.rs"` — empty. Both legacy and chain paths accept vines.
+- `chains/defaults/topical-vine.yaml` and `chains/prompts/vine/{topical_cluster,topical_synthesis,topical_apex}.md` all present and bundled via `include_str!` in `chain_loader::ensure_default_chains`.
+
+**Deferred / not fixed (out of verifier scope):**
+- Production wiring of `notify_vine_of_child_completion` to a build-completion hook. The function is still only called from the manual HTTP trigger in `routes.rs::handle_vine_trigger_delta`. Wiring it to the DADBEAR build completion path (or `build_runner`'s post-build referrer-notification block) is a follow-up that should land before the manual end-to-end verification scenario in the implementer's log can pass without manual triggering. Noted here rather than fixed because the verifier prompt's scope was auditing the commit against Phase 16 end-state criteria, and hooking a new caller exceeds "fix issues in place".
+
+**Status:** verifier pass → awaiting-verification. Verifier commit is separate from the implementer commit (no amend, no push).

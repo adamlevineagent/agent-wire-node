@@ -715,7 +715,18 @@ async fn run_legacy_build(
             .await?
         }
         ContentType::Vine => {
-            return Err(anyhow!("Vine builds use the vine-specific build endpoint"));
+            // Phase 16: the legacy path has no standalone vine builder.
+            // Vines are always dispatched through the chain engine via the
+            // topical-vine chain, regardless of the legacy/IR/chain flags.
+            // Delegate to `build::build_topical_vine`, which loads the
+            // topical-vine chain YAML and runs it through
+            // `chain_executor::execute_chain_from` — exactly the behaviour
+            // `run_chain_build` uses for the non-legacy path, but packaged
+            // behind a stable entry point so future callers (including the
+            // `vine.rs::run_build_pipeline` fallback arm) can share one
+            // implementation.
+            let failures = build::build_topical_vine(state, slug_name, cancel, ptx).await?;
+            return Ok(("topical-vine".to_string(), failures));
         }
         ContentType::Question => {
             return Err(anyhow!(

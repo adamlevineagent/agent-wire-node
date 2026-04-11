@@ -4,7 +4,7 @@ Every child appears in the input as an apex summary from that child's own pyrami
 
 ## THE OPERATION: PROPOSE TOPICAL CLUSTERS
 
-Look at the combined set of children as a corpus of peer nodes and propose 2–6 clusters that together cover every child. A cluster is a conceptual grouping — it is named and justified, and its members are listed by `child_slug`.
+Look at the combined set of children as a corpus of peer nodes and propose whatever number of clusters the material genuinely supports. A cluster is a conceptual grouping — it is named and justified, and its members are listed by `child_slug`. Let the thematic structure of the children decide how many clusters emerge: tightly unified material may form a handful of clusters, sprawling material may form more. Do not invent clusters to pad the count, and do not collapse genuinely distinct clusters to compress the count.
 
 Clustering signals you should weigh, in roughly this order:
 
@@ -19,8 +19,7 @@ Do NOT cluster by folder path, file extension, or other trivial taxonomy. The vi
 
 - **Every child slug must appear in at least one cluster.** Zero orphans. If a child does not fit any natural group, create a single-member cluster for it and note why in the reason.
 - **Prefer overlap over forcing.** If a child bridges two clusters (e.g., it genuinely belongs to both), include it in both. Membership is not exclusive.
-- **Cap cluster count.** Produce no more than 6 clusters. If the natural structure of the children would imply more, merge the two closest.
-- **Floor cluster count.** Produce at least 2 clusters unless there are fewer than 2 children. A single-cluster vine is degenerate — split along the strongest secondary axis.
+- **Single-cluster vines are degenerate.** If the children plainly share one theme, still split them along the strongest secondary axis the material supports — the vine exists to make thematic structure legible, and a one-bucket answer hides it. The only acceptable single-cluster output is when the input contains a single child.
 
 ## INPUT SHAPE
 
