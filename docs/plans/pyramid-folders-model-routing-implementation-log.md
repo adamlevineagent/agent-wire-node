@@ -4330,3 +4330,95 @@ commit on branch `phase-18e-cc-memory-subfolder`. Other Phase 18
 workstreams (18a/18b/18c/18d) run in parallel on their own branches
 and do not touch the files Phase 18e modifies. No amend, no push,
 no merge.
+
+### Verifier pass (2026-04-11)
+
+Second-pass audit of commit 242ee47 against the workstream prompt's
+12 failure modes. All 12 cleared on code inspection; no in-place
+fixes needed. Summary:
+
+1. **8-op subplan with memory, 5-op without:** verified at
+   `folder_ingestion.rs:949-1091`. Op sequence matches exactly:
+   CreateVine → CreatePyramid(convo) → AddChildToVine(bedrock) →
+   RegisterDadbearConfig → [opt. memory triplet] →
+   AddChildToVine(cc_vine→root, child_type='vine').
+2. **`RegisterClaudeCodePyramid` retired:** variant gone from
+   `IngestionOperation`; remaining references are all doc-comment
+   historical notes. Frontend TS union at `AddWorkspace.tsx:50-54`
+   drops the variant.
+3. **CC vine→root with `child_type='vine'`:** `folder_ingestion.rs:1085-1090`.
+   Test `test_plan_generates_cc_vine_plus_conversation_bedrock`
+   at lines 2517-2529 asserts.
+4. **`extract_build_dispatches`:** no dedicated CC arm; CC vines
+   flow through `CreateVine` arm, bedrocks through `CreatePyramid`.
+   Test at lines 2684-2735.
+5. **`ClaudeCodeConversationDir` memory metadata fields:** all three
+   present with `#[serde(default)]` at lines 165-190.
+6. **`count_memory_md_files` recursive + skip hidden:** stack-based
+   walk at lines 671-704, skips `.`-prefixed names. Test at
+   lines 2462-2484 exercises nested + `.hidden/` + `.dotfile.md`.
+7. **`IngestionPlan` CC classification sets:** three `Vec<String>`
+   fields at lines 107-120. Test `test_plan_records_cc_classification_sets_in_order`
+   at lines 2743-2775 verifies op-order invariants.
+8. **`IngestionResult` new vecs + legacy preserved:** lines 141-151.
+   Executor routes via three `HashSet<String>` lookups at
+   lines 1163-1177.
+9. **Frontend three-row preview:** `AddWorkspace.tsx:1204-1234`
+   (CC vines / ↳ Conversation beds / ↳ Memory doc beds).
+   Per-dir jsonl+memory-md line at 1139-1154. Post-execution summary
+   at 1352-1382 mirrors the breakdown.
+10. **Slug naming:** CC vine `{root}-cc-{N}`, conversation
+    `{cc_vine}-conversations`, memory `{cc_vine}-memory`. Asserted
+    by tests at folder_ingestion.rs:2515 and 2581.
+11. **Phase 0b inherited limitation:** `prepopulate_chunks_for`
+    still single-jsonl; documented out-of-scope in log lines
+    4172-4185. No changes.
+12. **Test count & build (all four commands run live):**
+    - `cargo check --lib` — **clean**: 3 pre-existing warnings,
+      0 errors, 0 new warnings. Confirms the retired variant has
+      no lingering pattern-match arms, the new serde-default
+      fields migrate cleanly, and every new call site is reachable.
+    - `cargo test --lib pyramid::folder_ingestion` —
+      **36 passed, 0 failed**, 1222 filtered out. All 8 new
+      `phase18e_tests` pass (`test_find_cc_dirs_populates_memory_subfolder_metadata`,
+      `test_find_cc_dirs_memory_absent_returns_false`,
+      `test_count_memory_md_files_walks_recursively_skipping_hidden`,
+      `test_plan_generates_cc_vine_plus_conversation_bedrock`,
+      `test_plan_generates_cc_vine_plus_both_bedrocks_when_memory_present`,
+      `test_plan_skips_memory_bedrock_when_no_md_files`,
+      `test_extract_build_dispatches_partitions_cc_vines_and_bedrocks_correctly`,
+      `test_plan_records_cc_classification_sets_in_order`).
+      The 28 `phase17_tests` still pass including the three
+      updated ones (`test_plan_ingestion_with_claude_code_attaches_cc_pyramids`,
+      `test_plan_ingestion_below_threshold_with_cc_still_creates_vine`,
+      `test_extract_build_dispatches_partitions_leaves_and_vines`).
+    - `cargo test --lib pyramid` — **1246 passed, 7 failed**.
+      The 7 failures are all pre-existing schema-drift tests
+      unrelated to Phase 18e and match the implementer's
+      reported baseline exactly:
+      `pyramid::db::tests::test_evidence_pk_cross_slug_coexistence`,
+      `pyramid::defaults_adapter::tests::real_yaml_thread_clustering_preserves_response_schema`,
+      and five `pyramid::staleness::tests::*`
+      (`test_below_threshold_not_enqueued`,
+      `test_deletion_skips_first_attenuation`,
+      `test_path_normalization`, `test_propagate_staleness_with_db`,
+      `test_shared_node_higher_score_propagates`). The staleness
+      failures all panic on `no such column: build_id in SELECT ...
+      FROM pyramid_evidence` — a documented pre-existing drift
+      between fixture sqlite schema and production schema. Test
+      count delta from Phase 17 wanderer baseline (1238) is +8,
+      matching the new `phase18e_tests` count exactly.
+    - `npm run build` — **clean**. `tsc && vite build` succeeds;
+      150 modules transformed; output:
+      `dist/index.html 0.39 kB, dist/assets/index-*.css 301.18 kB,
+       dist/assets/index-*.js 792.53 kB` (Vite's chunk-size
+      warning is cosmetic, pre-existing, unrelated to 18e).
+
+**In-place fixes by the verifier:** none. Every failure mode cleared
+on first inspection, and all four verification commands pass live.
+The 18e commit ships as-is.
+
+**Status:** `verified`. Commit at HEAD unchanged:
+`242ee47 phase-18e: CC dir → vine with conversation + memory bedrocks`.
+No verifier-pass commit needed — the implementer's work is correct
+and complete against the workstream prompt.
