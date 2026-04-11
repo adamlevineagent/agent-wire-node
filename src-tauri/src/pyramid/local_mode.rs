@@ -306,24 +306,45 @@ pub async fn get_local_mode_status(conn: &Connection) -> Result<LocalModeStatus>
 
 // ── Enable ──────────────────────────────────────────────────────────────────
 
-/// Enable Local Mode end to end. See module docs for the full
-/// sequence. Returns the post-enable status snapshot.
+/// Plan produced by the async prepare phase. Captures everything the
+/// sync commit phase needs to write rows without touching the wire.
 ///
-/// Per the spec, this MUST be reversible: the disable path needs the
-/// pre-enable contribution_ids stored in
-/// `pyramid_local_mode_state.restore_from_contribution_id` /
-/// `restore_build_strategy_contribution_id`. Both columns are
-/// populated before the new contributions are inserted so a crash
-/// between snapshot and supersession can be recovered manually
-/// (though the supersession itself is atomic per the underlying
-/// `supersede_config_contribution` transaction).
-pub async fn enable_local_mode(
-    conn: &mut Connection,
-    bus: &Arc<BuildEventBus>,
-    registry: &ProviderRegistry,
+/// Split out by the Phase 18a fix-pass after the build failed with
+/// Send errors on `pyramid_enable_local_mode`: holding a
+/// `&mut Connection` across `probe_ollama().await` + `detect_ollama_context_window().await`
+/// inside an async Tauri command handler makes the enclosing future
+/// `!Send` because `rusqlite::Connection` is `!Sync`. The binary's
+/// Tauri runtime is multi-threaded, so command futures MUST be Send.
+/// `cargo check --lib` does not catch this — only the binary crate
+/// elaborates the command futures.
+///
+/// Fix: keep every `.await` in `prepare_enable_local_mode` (which
+/// never touches the DB) and do every DB write in
+/// `commit_enable_local_mode` (which is plain `fn`, no async). The
+/// IPC handler threads them: first await the prepare, THEN take the
+/// writer lock, THEN call commit synchronously, THEN drop the lock.
+#[derive(Debug, Clone)]
+pub struct EnableLocalModePlan {
+    pub base_url: String,
+    pub chosen_model: String,
+    pub detected_context: usize,
+    /// Full list of models reported by `/api/tags`. Carried forward so
+    /// the returned status can show the user the other models they
+    /// could switch to without re-probing.
+    pub available_models: Vec<String>,
+}
+
+/// Async prepare phase: validate URL, probe Ollama, pick a model,
+/// detect the context window. No DB, no lock — safe to call from any
+/// async context. The result is a `EnableLocalModePlan` ready to be
+/// committed under the writer lock by `commit_enable_local_mode`.
+///
+/// Returns an error if Ollama is not reachable, has no models, or the
+/// caller's `model_override` doesn't exist on the server.
+pub async fn prepare_enable_local_mode(
     base_url_raw: String,
     model_override: Option<String>,
-) -> Result<LocalModeStatus> {
+) -> Result<EnableLocalModePlan> {
     // Step 1: validate the URL.
     let base_url = normalize_base_url(&base_url_raw)?;
 
@@ -370,6 +391,66 @@ pub async fn enable_local_mode(
     let detected_context = detect_ollama_context_window(&base_url, &chosen_model)
         .await
         .unwrap_or(DEFAULT_OLLAMA_CONTEXT_FALLBACK);
+
+    Ok(EnableLocalModePlan {
+        base_url,
+        chosen_model,
+        detected_context,
+        available_models: sorted_models,
+    })
+}
+
+/// Enable Local Mode end to end. See module docs for the full
+/// sequence. Returns the post-enable status snapshot.
+///
+/// Per the spec, this MUST be reversible: the disable path needs the
+/// pre-enable contribution_ids stored in
+/// `pyramid_local_mode_state.restore_from_contribution_id` /
+/// `restore_build_strategy_contribution_id`. Both columns are
+/// populated before the new contributions are inserted so a crash
+/// between snapshot and supersession can be recovered manually
+/// (though the supersession itself is atomic per the underlying
+/// `supersede_config_contribution` transaction).
+///
+/// **Phase 18a fix-pass:** kept as a thin async wrapper around
+/// `prepare_enable_local_mode` + `commit_enable_local_mode` for
+/// backwards compatibility with existing tests. New code (Tauri
+/// command handlers that must keep their future `Send`) should call
+/// the two-phase API directly — see `pyramid_enable_local_mode` in
+/// `main.rs`.
+pub async fn enable_local_mode(
+    conn: &mut Connection,
+    bus: &Arc<BuildEventBus>,
+    registry: &ProviderRegistry,
+    base_url_raw: String,
+    model_override: Option<String>,
+) -> Result<LocalModeStatus> {
+    let plan = prepare_enable_local_mode(base_url_raw, model_override).await?;
+    commit_enable_local_mode(conn, bus, registry, plan)?;
+    // Return the sync snapshot; the caller can refresh reachability
+    // outside any lock if they want to re-probe.
+    load_status_snapshot(conn)
+}
+
+/// Sync commit phase: take the plan produced by
+/// `prepare_enable_local_mode` and write every row. This is plain
+/// `fn`, not `async fn`, so the caller's Tauri command future stays
+/// `Send` even while holding a `&mut Connection` across the call.
+///
+/// All DB work (provider upsert, state snapshot, tier_routing
+/// supersession, build_strategy supersession) runs here.
+pub fn commit_enable_local_mode(
+    conn: &mut Connection,
+    bus: &Arc<BuildEventBus>,
+    registry: &ProviderRegistry,
+    plan: EnableLocalModePlan,
+) -> Result<()> {
+    let EnableLocalModePlan {
+        base_url,
+        chosen_model,
+        detected_context,
+        available_models: _,
+    } = plan;
 
     // Step 5: upsert the `ollama-local` provider row.
     let provider = Provider {
@@ -541,8 +622,10 @@ pub async fn enable_local_mode(
     // contribution. See `docs/plans/pyramid-folders-model-routing-friction-log.md`
     // for the carry-forward note.
 
-    // Step 10: build and return the updated status snapshot.
-    get_local_mode_status(conn).await
+    // Step 10: commit is done; caller rebuilds the status snapshot
+    // via `load_status_snapshot` (sync) or `get_local_mode_status`
+    // (async) as they see fit.
+    Ok(())
 }
 
 /// Build a `tier_routing` YAML string from a `TierRoutingYaml` value
@@ -604,14 +687,37 @@ fn build_local_mode_build_strategy_yaml(prior_yaml: &str) -> Result<String> {
 /// Disable Local Mode end to end. Restores the prior tier_routing
 /// and build_strategy contributions verbatim. Idempotent — calling
 /// when `enabled = false` returns the current status unchanged.
+///
+/// **Phase 18a fix-pass:** kept as a thin async wrapper around
+/// `commit_disable_local_mode` for backwards compatibility. New
+/// code (Tauri command handlers) should call the sync variant
+/// directly to avoid the Send-check trap where holding a
+/// `&mut Connection` across `.await` in an async command makes the
+/// enclosing future `!Send`.
 pub async fn disable_local_mode(
     conn: &mut Connection,
     bus: &Arc<BuildEventBus>,
     registry: &ProviderRegistry,
 ) -> Result<LocalModeStatus> {
+    commit_disable_local_mode(conn, bus, registry)?;
+    let snapshot = load_status_snapshot(conn)?;
+    Ok(refresh_status_reachability(snapshot).await)
+}
+
+/// Sync disable: performs the restoration writes under a caller-
+/// held writer lock, returns nothing. Callers rebuild the status
+/// snapshot via `load_status_snapshot` (sync) or
+/// `get_local_mode_status` (async) after releasing the lock.
+///
+/// Idempotent: if `enabled = false`, it's a no-op and returns `Ok(())`.
+pub fn commit_disable_local_mode(
+    conn: &mut Connection,
+    bus: &Arc<BuildEventBus>,
+    registry: &ProviderRegistry,
+) -> Result<()> {
     let row = load_local_mode_state(conn)?;
     if !row.enabled {
-        return get_local_mode_status(conn).await;
+        return Ok(());
     }
 
     // Restore tier_routing first.
@@ -684,7 +790,7 @@ pub async fn disable_local_mode(
         },
     )?;
 
-    get_local_mode_status(conn).await
+    Ok(())
 }
 
 // Marker re-exports so the helper API stays inside this module's

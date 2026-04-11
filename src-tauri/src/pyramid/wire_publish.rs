@@ -1435,7 +1435,15 @@ impl PyramidPublisher {
     /// so the caller can distinguish "manifest withheld for privacy"
     /// (None) from "manifest is empty because nothing was cached" (Some
     /// with zero nodes).
-    pub async fn export_cache_manifest(
+    /// Phase 18a fix-pass: dropped the `async` keyword. The body
+    /// never awaited anything — it was a vestigial marker from an
+    /// earlier design. Because callers held a `&Connection` across
+    /// the (vestigial) `.await`, the compiler's Send check on the
+    /// binary crate would fail on any async Tauri command that
+    /// invoked this method while holding a reader/writer lock.
+    /// Making the function sync eliminates the problem at every
+    /// call site with zero behavior change.
+    pub fn export_cache_manifest(
         &self,
         conn: &rusqlite::Connection,
         slug: &str,
@@ -2538,7 +2546,6 @@ mod tests {
 
         let result = publisher
             .export_cache_manifest(&conn, "exp-slug", "wire:exp", None, false)
-            .await
             .unwrap();
         assert!(
             result.is_none(),
@@ -2562,7 +2569,6 @@ mod tests {
 
         let manifest = publisher
             .export_cache_manifest(&conn, "exp-slug", "wire:exp", None, true)
-            .await
             .unwrap()
             .expect("opt-in should yield Some(manifest)");
 
@@ -2595,7 +2601,6 @@ mod tests {
 
         let manifest = publisher
             .export_cache_manifest(&conn, "exp-slug", "wire:exp", None, true)
-            .await
             .unwrap()
             .expect("opt-in should always return Some");
         assert_eq!(manifest.manifest_version, 1);
@@ -2642,7 +2647,6 @@ mod tests {
         // Filter by build_id = b1 → one entry.
         let manifest_b1 = publisher
             .export_cache_manifest(&conn, "exp-slug", "wire:exp", Some("b1"), true)
-            .await
             .unwrap()
             .unwrap();
         let total_entries_b1: usize = manifest_b1
@@ -2655,7 +2659,6 @@ mod tests {
         // No filter → both entries.
         let manifest_all = publisher
             .export_cache_manifest(&conn, "exp-slug", "wire:exp", None, true)
-            .await
             .unwrap()
             .unwrap();
         let total_entries_all: usize = manifest_all
@@ -2691,7 +2694,6 @@ mod tests {
 
         let manifest = publisher
             .export_cache_manifest(&conn, "exp-slug", "wire:exp", None, true)
-            .await
             .unwrap()
             .unwrap();
         let total_entries: usize = manifest
@@ -2719,7 +2721,6 @@ mod tests {
 
         let manifest = publisher
             .export_cache_manifest(&conn, "exp-slug", "wire:exp", None, true)
-            .await
             .unwrap()
             .unwrap();
 

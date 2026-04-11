@@ -7846,34 +7846,59 @@ async fn pyramid_enable_local_mode(
     base_url: String,
     model: Option<String>,
 ) -> Result<wire_node_lib::pyramid::local_mode::LocalModeStatus, String> {
-    let mut writer = state.pyramid.writer.lock().await;
-    let status = wire_node_lib::pyramid::local_mode::enable_local_mode(
-        &mut writer,
-        &state.pyramid.build_event_bus,
-        &state.pyramid.provider_registry,
-        base_url,
-        model,
-    )
-    .await
-    .map_err(|e| e.to_string())?;
-    drop(writer);
-    Ok(status)
+    // Phase 18a fix-pass: split the async probe phase from the sync
+    // DB commit phase so the IPC handler's future stays `Send`.
+    // Holding a `&mut Connection` across `.await` in an async Tauri
+    // command fails the compiler's Send check on the binary crate
+    // (rusqlite::Connection is !Sync). `cargo check --lib` did not
+    // catch this; only the full binary build elaborates the command
+    // futures. See `enable_local_mode`'s module docs for the split.
+    let plan = wire_node_lib::pyramid::local_mode::prepare_enable_local_mode(base_url, model)
+        .await
+        .map_err(|e| e.to_string())?;
+    let snapshot = {
+        let mut writer = state.pyramid.writer.lock().await;
+        wire_node_lib::pyramid::local_mode::commit_enable_local_mode(
+            &mut writer,
+            &state.pyramid.build_event_bus,
+            &state.pyramid.provider_registry,
+            plan,
+        )
+        .map_err(|e| e.to_string())?;
+        let snapshot = wire_node_lib::pyramid::local_mode::load_status_snapshot(&writer)
+            .map_err(|e| e.to_string())?;
+        drop(writer);
+        snapshot
+    };
+    // Refresh reachability OUTSIDE the lock so the probe doesn't
+    // block concurrent reader-bound IPCs. The snapshot already has
+    // the just-committed state, so this only updates the `reachable`
+    // + `available_models` fields with fresh data.
+    Ok(wire_node_lib::pyramid::local_mode::refresh_status_reachability(snapshot).await)
 }
 
 #[tauri::command]
 async fn pyramid_disable_local_mode(
     state: tauri::State<'_, SharedState>,
 ) -> Result<wire_node_lib::pyramid::local_mode::LocalModeStatus, String> {
-    let mut writer = state.pyramid.writer.lock().await;
-    let status = wire_node_lib::pyramid::local_mode::disable_local_mode(
-        &mut writer,
-        &state.pyramid.build_event_bus,
-        &state.pyramid.provider_registry,
-    )
-    .await
-    .map_err(|e| e.to_string())?;
-    drop(writer);
-    Ok(status)
+    // Phase 18a fix-pass: same split-phase pattern as enable. The
+    // sync commit runs under the writer lock; the async reachability
+    // refresh runs after the lock drops so the command future stays
+    // `Send` on the multi-threaded Tauri runtime.
+    let snapshot = {
+        let mut writer = state.pyramid.writer.lock().await;
+        wire_node_lib::pyramid::local_mode::commit_disable_local_mode(
+            &mut writer,
+            &state.pyramid.build_event_bus,
+            &state.pyramid.provider_registry,
+        )
+        .map_err(|e| e.to_string())?;
+        let snapshot = wire_node_lib::pyramid::local_mode::load_status_snapshot(&writer)
+            .map_err(|e| e.to_string())?;
+        drop(writer);
+        snapshot
+    };
+    Ok(wire_node_lib::pyramid::local_mode::refresh_status_reachability(snapshot).await)
 }
 
 #[tauri::command]
@@ -8438,7 +8463,17 @@ async fn pyramid_publish_to_wire(
     // Phase 7 safe-default behavior (cache manifest withheld). The
     // PublishPreviewModal flips this to true when the "Include cache
     // manifest" checkbox is checked.
-    #[serde(default)] include_cache_manifest: Option<bool>,
+    //
+    // Phase 18a fix-pass: removed a bogus `#[serde(default)]`
+    // attribute that the implementer added here. That attribute is
+    // for struct fields, not function parameters, and `serde` is a
+    // crate not an attribute macro in main.rs's scope. Tauri already
+    // treats `Option<T>` command parameters as optional — if the
+    // frontend omits the field, it arrives as `None`. The former
+    // attribute did nothing except trip the binary compile, which
+    // only surfaced when the full `cargo check` elaborated the
+    // command futures — `cargo check --lib` does not compile main.rs.
+    include_cache_manifest: Option<bool>,
 ) -> Result<PublishToWireResponse, String> {
     if !confirm {
         return Err(
@@ -8500,19 +8535,27 @@ async fn pyramid_publish_to_wire(
     let cache_manifest = if opt_in_cache {
         match contribution.slug.as_deref() {
             Some(slug) if !slug.is_empty() => {
-                let conn = state.pyramid.reader.lock().await;
                 // Use the contribution_id as a synthetic wire_pyramid_id
                 // for the manifest header — this ties the manifest to the
                 // exact publication request.
-                publisher
-                    .export_cache_manifest(
+                //
+                // Phase 18a fix-pass: `export_cache_manifest` is now a
+                // sync fn (the `async` was vestigial). We take the
+                // reader lock, call it synchronously inside a block,
+                // and drop the lock before any subsequent `.await`.
+                let manifest_result = {
+                    let conn = state.pyramid.reader.lock().await;
+                    let out = publisher.export_cache_manifest(
                         &conn,
                         slug,
                         &contribution.contribution_id,
                         None,
                         true,
-                    )
-                    .await
+                    );
+                    drop(conn);
+                    out
+                };
+                manifest_result
                     .map_err(|e| format!("failed to export cache manifest: {e}"))?
             }
             _ => {
