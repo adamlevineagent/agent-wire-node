@@ -1968,24 +1968,60 @@ pub(crate) async fn persist_change_manifest(
     manifest: &ChangeManifest,
     note: Option<String>,
 ) -> Result<i64> {
+    persist_change_manifest_with_bus(db_path, slug, node_id, build_version, manifest, note, None)
+        .await
+}
+
+/// Phase 13: extended persist helper that also emits `ManifestGenerated`
+/// on the bus (if present). Existing call sites continue to use
+/// `persist_change_manifest`; reroll and the full build path both flow
+/// through this variant with a bus attached.
+pub(crate) async fn persist_change_manifest_with_bus(
+    db_path: &str,
+    slug: &str,
+    node_id: &str,
+    build_version: i64,
+    manifest: &ChangeManifest,
+    note: Option<String>,
+    bus: Option<std::sync::Arc<super::event_bus::BuildEventBus>>,
+) -> Result<i64> {
     let manifest_json = serde_json::to_string(manifest)?;
     let db = db_path.to_string();
-    let slug = slug.to_string();
-    let node_id = node_id.to_string();
+    let slug_owned = slug.to_string();
+    let node_id_owned = node_id.to_string();
     let note_owned = note;
-    tokio::task::spawn_blocking(move || -> Result<i64> {
+    let manifest_id = tokio::task::spawn_blocking(move || -> Result<i64> {
         let conn = super::db::open_pyramid_connection(Path::new(&db))?;
         super::db::save_change_manifest(
             &conn,
-            &slug,
-            &node_id,
+            &slug_owned,
+            &node_id_owned,
             build_version,
             &manifest_json,
             note_owned.as_deref(),
             None,
         )
     })
-    .await?
+    .await??;
+
+    // Phase 13: emit ManifestGenerated if we have a bus. `depth` is
+    // not directly available here (persist is decoupled from the node
+    // row lookup), so we pass 0 — the UI will patch depth from the
+    // surrounding step's context when the event arrives. For reroll,
+    // the caller passes an explicit depth via the spawn caller.
+    if let Some(bus) = bus {
+        let _ = bus.tx.send(super::event_bus::TaggedBuildEvent {
+            slug: slug.to_string(),
+            kind: super::event_bus::TaggedKind::ManifestGenerated {
+                slug: slug.to_string(),
+                build_id: format!("{}-manifest-{}", slug, build_version),
+                manifest_id,
+                depth: 0,
+                node_id: node_id.to_string(),
+            },
+        });
+    }
+    Ok(manifest_id)
 }
 
 // ── 4b. Execute Supersession ────────────────────────────────────────────────
@@ -2280,13 +2316,24 @@ async fn apply_supersession_manifest(
         // build_version on disk, not the (invalid) one the manifest
         // claimed.
         let bv = node_ctx.current_build_version;
-        let _ = persist_change_manifest(
+        // Phase 13 verifier fix: extract the bus from base_config so the
+        // `ManifestGenerated` event reaches the build viz on the stale
+        // path (validation-failure branch). Without this, only the
+        // reroll path emitted `ManifestGenerated` — a Phase 13 spec
+        // requirement (A2 / Event emission points) was unmet in the
+        // DADBEAR build path.
+        let validation_bus = base_config
+            .cache_access
+            .as_ref()
+            .and_then(|ca| ca.bus.clone());
+        let _ = persist_change_manifest_with_bus(
             db_path,
             slug,
             resolved_node_id,
             bv,
             &manifest,
             Some(format!("validation_failed: {err}")),
+            validation_bus,
         )
         .await;
         return Err(anyhow::anyhow!(
@@ -2349,13 +2396,22 @@ async fn apply_supersession_manifest(
     };
 
     // Persist the manifest row with the NEW build_version (post-bump).
-    let manifest_id = persist_change_manifest(
+    // Phase 13 verifier fix: thread the build event bus through so
+    // `ManifestGenerated` actually fires on the DADBEAR production
+    // path. The bus lives on `base_config.cache_access` (Phase 12
+    // retrofit) so extracting it is zero-plumbing.
+    let stale_bus = base_config
+        .cache_access
+        .as_ref()
+        .and_then(|ca| ca.bus.clone());
+    let manifest_id = persist_change_manifest_with_bus(
         db_path,
         slug,
         resolved_node_id,
         new_build_version,
         &manifest,
         None,
+        stale_bus,
     )
     .await?;
 
@@ -4518,6 +4574,74 @@ mod tests {
         assert_eq!(ctx.primitive, "manifest_generation");
         assert_eq!(ctx.depth, 2);
         assert_eq!(ctx.chunk_index, None);
+    }
+
+    /// Phase 13 verifier fix: the bus-variant of `persist_change_manifest`
+    /// must actually emit `ManifestGenerated` on the attached bus. The
+    /// prior implementation wired the function but every production
+    /// caller passed `None`, so the event was dead code. The
+    /// apply_supersession_manifest fix threads the bus from
+    /// base_config.cache_access; this test verifies the helper emits
+    /// as promised.
+    #[test]
+    fn test_persist_change_manifest_with_bus_emits_manifest_generated() {
+        use crate::pyramid::event_bus::{BuildEventBus, TaggedKind};
+        use std::sync::Arc;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let (file, _conn) = setup_test_db();
+        let db_path = file.path().to_string_lossy().into_owned();
+
+        // Seed a node so the change manifest FK passes.
+        let conn2 = open_pyramid_db(file.path()).unwrap();
+        insert_node(&conn2, "L1-test-001", None);
+
+        let bus = Arc::new(BuildEventBus::new());
+        let mut rx = bus.subscribe();
+
+        let manifest = ChangeManifest {
+            node_id: "L1-test-001".to_string(),
+            identity_changed: false,
+            content_updates: ContentUpdates::default(),
+            children_swapped: vec![],
+            reason: "verifier-test".to_string(),
+            build_version: 2,
+        };
+
+        rt.block_on(async {
+            let manifest_id = super::persist_change_manifest_with_bus(
+                &db_path,
+                "test-slug",
+                "L1-test-001",
+                2,
+                &manifest,
+                Some("verifier fix".to_string()),
+                Some(bus.clone()),
+            )
+            .await
+            .expect("persist with bus should succeed");
+            assert!(manifest_id > 0);
+        });
+
+        // The event must be on the bus. Drain up to one event with
+        // a short timeout so a bug where nothing is emitted fails
+        // loudly instead of hanging.
+        let event = rt.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+                .await
+                .expect("event should arrive within 200ms")
+                .expect("receiver should see the event")
+        });
+        match event.kind {
+            TaggedKind::ManifestGenerated { manifest_id, node_id, .. } => {
+                assert!(manifest_id > 0);
+                assert_eq!(node_id, "L1-test-001");
+            }
+            other => panic!("expected ManifestGenerated, got {:?}", other),
+        }
     }
 }
 

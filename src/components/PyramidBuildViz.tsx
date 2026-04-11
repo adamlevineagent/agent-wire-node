@@ -1,5 +1,8 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { useStepTimeline } from '../hooks/useStepTimeline';
+import { StepState, StepCall, CostAccumulator } from '../hooks/useBuildRowState';
+import { RerollModal, RerollTarget } from './RerollModal';
 
 // ── Types matching Rust BuildProgressV2 ─────────────────────────────────────
 
@@ -56,6 +59,17 @@ export function PyramidBuildViz({ slug, onComplete, onClose, onRetry }: PyramidB
     const logRef = useRef<HTMLDivElement>(null);
     const onCompleteRef = useRef(onComplete);
     useEffect(() => { onCompleteRef.current = onComplete; });
+
+    // Phase 13: step timeline state. The hook seeds from the
+    // `pyramid_step_cache_for_build` IPC (latest-build path) and
+    // then listens for live events on `cross-build-event`.
+    // Verifier fix: passing `null` (not the slug) triggers the
+    // backend's "latest build for this slug" resolution so the
+    // seed query actually matches rows.
+    const { state: timelineState } = useStepTimeline(slug, null);
+    const [expandedStep, setExpandedStep] = useState<string | null>(null);
+    const [rerollTarget, setRerollTarget] = useState<RerollTarget | null>(null);
+    const [rerollContent, setRerollContent] = useState<string | null>(null);
 
     // Poll both v1 (for status) and v2 (for layers)
     useEffect(() => {
@@ -202,6 +216,33 @@ export function PyramidBuildViz({ slug, onComplete, onClose, onRetry }: PyramidB
                 </div>
             )}
 
+            {/* Phase 13: step timeline — per-step introspection */}
+            {timelineState.steps.length > 0 && (
+                <StepTimelinePanel
+                    steps={timelineState.steps}
+                    cost={timelineState.cost}
+                    expandedStep={expandedStep}
+                    onToggleStep={step => setExpandedStep(expandedStep === step ? null : step)}
+                    onRerollCall={(stepName, call) => {
+                        setRerollTarget({ type: 'cache', cacheKey: call.cacheKey, stepName });
+                        setRerollContent(null);
+                    }}
+                />
+            )}
+
+            {/* Phase 13: reroll modal */}
+            {rerollTarget && (
+                <RerollModal
+                    slug={slug}
+                    target={rerollTarget}
+                    currentContent={rerollContent}
+                    onClose={() => setRerollTarget(null)}
+                    onRerolled={() => {
+                        setRerollTarget(null);
+                    }}
+                />
+            )}
+
             {/* Completion / failure / actions */}
             {isComplete && status && (
                 <div className="build-complete-summary">
@@ -288,6 +329,131 @@ function ApexNode({ completed, label }: { completed: boolean; label: string | nu
     return (
         <div className={`pbv-apex ${completed ? 'pbv-apex-lit' : ''}`} title={label ?? 'Apex'}>
             <div className="pbv-apex-diamond" />
+        </div>
+    );
+}
+
+// ── Phase 13: Step Timeline Panel ─────────────────────────────────
+
+interface StepTimelinePanelProps {
+    steps: StepState[];
+    cost: CostAccumulator;
+    expandedStep: string | null;
+    onToggleStep: (stepName: string) => void;
+    onRerollCall: (stepName: string, call: StepCall) => void;
+}
+
+function StepTimelinePanel({
+    steps,
+    cost,
+    expandedStep,
+    onToggleStep,
+    onRerollCall,
+}: StepTimelinePanelProps) {
+    const formatCost = (v: number) => `$${v.toFixed(2)}`;
+    return (
+        <div className="pbv-step-timeline">
+            <div className="pbv-step-timeline-header">
+                <div className="pbv-step-timeline-title">Step Timeline</div>
+                <div className="pbv-cost-accumulator">
+                    <span>
+                        Cost: <strong>{formatCost(cost.estimatedUsd)}</strong> est
+                        {cost.actualUsd !== null && (
+                            <> / <strong>{formatCost(cost.actualUsd)}</strong> actual</>
+                        )}
+                    </span>
+                    {cost.cacheSavingsUsd > 0 && (
+                        <span className="pbv-cache-savings">
+                            Cache savings: <strong>{formatCost(cost.cacheSavingsUsd)}</strong>
+                        </span>
+                    )}
+                </div>
+            </div>
+            <div className="pbv-step-timeline-rows">
+                {steps.map(step => (
+                    <StepRow
+                        key={step.stepName}
+                        step={step}
+                        expanded={expandedStep === step.stepName}
+                        onToggle={() => onToggleStep(step.stepName)}
+                        onRerollCall={onRerollCall}
+                    />
+                ))}
+            </div>
+        </div>
+    );
+}
+
+interface StepRowProps {
+    step: StepState;
+    expanded: boolean;
+    onToggle: () => void;
+    onRerollCall: (stepName: string, call: StepCall) => void;
+}
+
+function StepRow({ step, expanded, onToggle, onRerollCall }: StepRowProps) {
+    const statusClass = `pbv-step-status pbv-step-status-${step.status}`;
+    const totalCalls = step.calls.length;
+    const hitsLabel = step.cacheHits > 0 ? `${step.cacheHits}/${totalCalls} cached` : '';
+    return (
+        <div className={`pbv-step-row pbv-step-row-${step.status}`}>
+            <button className="pbv-step-row-header" onClick={onToggle}>
+                <span className={statusClass}>{step.status}</span>
+                <span className="pbv-step-name">{step.stepName}</span>
+                {step.activityHint && (
+                    <span className="pbv-step-hint">{step.activityHint}</span>
+                )}
+                <span className="pbv-step-cost">${step.totalCostUsd.toFixed(3)}</span>
+                {hitsLabel && <span className="pbv-step-cache-badge">{hitsLabel}</span>}
+                <span className="pbv-step-chevron">{expanded ? '▾' : '▸'}</span>
+            </button>
+            {expanded && step.calls.length > 0 && (
+                <div className="pbv-step-calls">
+                    {step.calls.map((call, i) => (
+                        <StepCallRow
+                            key={`${call.cacheKey}-${i}`}
+                            call={call}
+                            onReroll={() => onRerollCall(step.stepName, call)}
+                        />
+                    ))}
+                </div>
+            )}
+        </div>
+    );
+}
+
+function StepCallRow({
+    call,
+    onReroll,
+}: {
+    call: StepCall;
+    onReroll: () => void;
+}) {
+    const statusClass = `pbv-call-status pbv-call-status-${call.status}`;
+    return (
+        <div className="pbv-step-call">
+            <span className={statusClass}>{call.status}</span>
+            <span className="pbv-call-model">{call.modelId}</span>
+            {call.costUsd !== undefined && (
+                <span className="pbv-call-cost">${call.costUsd.toFixed(4)}</span>
+            )}
+            {call.latencyMs !== undefined && (
+                <span className="pbv-call-latency">{call.latencyMs}ms</span>
+            )}
+            {call.tokensPrompt !== undefined && call.tokensCompletion !== undefined && (
+                <span className="pbv-call-tokens">
+                    {call.tokensPrompt}/{call.tokensCompletion}
+                </span>
+            )}
+            {call.error && <span className="pbv-call-error" title={call.error}>error</span>}
+            <button
+                className="pbv-call-reroll"
+                onClick={onReroll}
+                disabled={call.status === 'running'}
+                title="Reroll this call with a note"
+            >
+                Reroll
+            </button>
         </div>
     );
 }

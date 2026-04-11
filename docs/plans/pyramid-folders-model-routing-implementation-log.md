@@ -2419,3 +2419,280 @@ The stale `list_on_demand_deferred_for_node` helper is retained for any future c
 
 `wanderer-pass-applied` — Phase 12 is now functionally complete. The triage gate's `has_demand_signals` condition actually evaluates meaningful facts instead of always-false. Drill events on pyramid nodes actually reactivate `on_demand`/`never` deferred questions. Global evidence_policy supersessions actually re-evaluate deferred rows across every affected slug. The test count is 1101/7 (+2 over the verifier pass, same 7 pre-existing failures).
 
+## Phase 13 — Build Viz Expansion + Reroll + Cross-Pyramid (2026-04-10)
+
+**Implementer:** Phase 13 agent
+**Scope:** three specs rolled into one initiative phase — build-viz-expansion, cross-pyramid-observability, and the node/cache-entry reroll-with-notes flow. No scope was deferred between the three; folder/circle scope on pause-all and the DADBEAR Oversight page mount were the only deferred items, both per the workstream prompt.
+
+### What landed
+
+#### 1. TaggedKind extensions (event_bus.rs)
+
+13 new variants added under a Phase 13 section with `#[serde(tag = "type", rename_all = "snake_case")]`:
+
+- `LlmCallStarted` / `LlmCallCompleted` — per-call observability. `LlmCallStarted` fires just before the HTTP send; `LlmCallCompleted` fires after a successful response parse with tokens + cost + latency. Cost falls back to `config_helper::estimate_cost` when OpenRouter didn't return an actual cost.
+- `StepRetry` / `StepError` — retry loop instrumentation. `StepRetry` fires on every retryable path (HTTP error, 5xx, parse failure, empty content, response read failure); `StepError` fires at every terminal-error exit point in the loop.
+- `WebEdgeStarted` / `WebEdgeCompleted` — wraps `execute_web_step` in `chain_executor.rs`.
+- `EvidenceProcessing` — fires at `answer_questions` with `action="triage"` (batch start) and again with `action="answer"` (post-triage loop start).
+- `TriageDecision` — emitted per question after the DSL resolves. `run_triage_gate` now captures the decisions into `TriageDecisionRecord` rows that the caller emits in bulk after the spawn_blocking join.
+- `GapProcessing` — fires at `execute_process_gaps` start/end with `action="identify"` and `action="fill"`.
+- `ClusterAssignment` — fires in `execute_recursive_cluster` after each `save_cluster_assignment_output`. The cluster count comes from the saved output's `clusters` array.
+- `NodeRerolled` — emitted by the reroll IPC after the new cache entry lands. Carries the (optional) `node_id`, the note, and both the new cache id and manifest id.
+- `CacheInvalidated` — emitted for each downstream entry flipped by the single-level walker.
+- `ManifestGenerated` — emitted at `persist_change_manifest_with_bus` and also in the reroll IPC's manifest write path.
+
+All 13 variants are discrete (they naturally bypass the 60ms coalesce since `is_discrete()` returns true for anything that isn't Progress/V2Snapshot).
+
+#### 2. Event emission sites
+
+| Site | File | Approximate line | Event |
+|---|---|---|---|
+| HTTP dispatch in unified path | `src-tauri/src/pyramid/llm.rs` | ~640 | `LlmCallStarted` |
+| Retry after request error | `src-tauri/src/pyramid/llm.rs` | ~660 | `StepRetry` |
+| Fatal request error | `src-tauri/src/pyramid/llm.rs` | ~690 | `StepError` |
+| 5xx retry branch | `src-tauri/src/pyramid/llm.rs` | ~760 | `StepRetry` |
+| Non-success terminal | `src-tauri/src/pyramid/llm.rs` | ~800 | `StepError` |
+| Response-read error retry/fatal | `src-tauri/src/pyramid/llm.rs` | ~820 | `StepRetry` + `StepError` |
+| Parse error retry/fatal | `src-tauri/src/pyramid/llm.rs` | ~850 | `StepRetry` + `StepError` |
+| Empty content retry/fatal | `src-tauri/src/pyramid/llm.rs` | ~890 | `StepRetry` + `StepError` |
+| Successful response | `src-tauri/src/pyramid/llm.rs` | ~920 | `LlmCallCompleted` |
+| call_model_via_registry (all same sites) | `src-tauri/src/pyramid/llm.rs` | ~1735–1900 | (mirror set of events) |
+| execute_web_step entry | `src-tauri/src/pyramid/chain_executor.rs` | ~9200 | `WebEdgeStarted` |
+| execute_web_step exit | `src-tauri/src/pyramid/chain_executor.rs` | ~9310 | `WebEdgeCompleted` |
+| execute_recursive_cluster save | `src-tauri/src/pyramid/chain_executor.rs` | ~8425 | `ClusterAssignment` |
+| execute_process_gaps start | `src-tauri/src/pyramid/chain_executor.rs` | ~5645 | `GapProcessing { action: "identify" }` |
+| execute_process_gaps end | `src-tauri/src/pyramid/chain_executor.rs` | ~5905 | `GapProcessing { action: "fill" }` |
+| answer_questions triage start | `src-tauri/src/pyramid/evidence_answering.rs` | ~445 | `EvidenceProcessing { action: "triage" }` |
+| answer_questions per-decision | `src-tauri/src/pyramid/evidence_answering.rs` | ~480 | `TriageDecision` |
+| answer_questions answer start | `src-tauri/src/pyramid/evidence_answering.rs` | ~530 | `EvidenceProcessing { action: "answer" }` |
+| persist_change_manifest_with_bus | `src-tauri/src/pyramid/stale_helpers_upper.rs` | ~1990 | `ManifestGenerated` |
+| reroll_node IPC | `src-tauri/src/pyramid/reroll.rs` | ~210 | `NodeRerolled` + `CacheInvalidated` |
+
+The emission helpers are `emit_llm_call_started`/`emit_llm_call_completed`/`emit_step_retry`/`emit_step_error` in `llm.rs` (all gated on `ctx.bus.is_some()`), and `emit_chain_event` in `chain_executor.rs` (gated on `dispatch_ctx.cache_base.and_then(|cb| cb.bus.as_ref())`). No call site emits an event without a live bus attached.
+
+#### 3. Cache schema extensions (db.rs + step_context.rs)
+
+- Added `pyramid_step_cache.note TEXT`, `invalidated_by TEXT`, `invalidated_at TEXT` columns via idempotent `ALTER TABLE` statements (per Phase 4's migration pattern).
+- Added index `idx_step_cache_build_id ON (slug, build_id)` for the pre-population query.
+- `check_cache` now filters on `invalidated_by IS NULL` so stale-by-reroll rows are treated as forced misses.
+- `check_cache_including_invalidated` exposes the full row for the reroll IPC's "load the prior content" path.
+- `CacheEntry` + `CachedStepOutput` gained a `note: Option<String>` field; `CachedStepOutput` also gained `invalidated_by`. Every constructor across the codebase (llm.rs, wire_publish.rs, pyramid_import.rs, step_context.rs tests, db.rs tests) was updated to pass `note: None`.
+- New helpers: `list_cache_entries_for_build`, `find_downstream_cache_keys`, `invalidate_cache_entries`, `count_recent_rerolls`, and the summary struct `CacheEntrySummary` used by the pre-population IPC.
+- New bulk DADBEAR helpers: `disable_dadbear_all` and `enable_dadbear_all`. Both filter on `enabled = 1/0` respectively so they're idempotent.
+- New rollup helpers: `cost_rollup`, `CostRollupBucket`, `build_active_build_summary`, `ActiveBuildRow`.
+
+#### 4. Reroll IPC (`src-tauri/src/pyramid/reroll.rs`)
+
+New module. Exports `reroll_node(input, llm_config, db_path, bus)` which:
+
+1. Validates exactly one of `node_id` / `cache_key` is supplied (error on both or neither).
+2. Loads the prior cache row via `check_cache_including_invalidated` (cache_key path) or a best-effort `output_json LIKE '%{node_id}%'` lookup (node_id path). Documented in-file as the MVP linkage strategy — a cleaner path is a future schema refinement (explicit `node_id → cache_key` column on `pyramid_nodes`).
+3. Constructs system + user prompts from the prior entry's stored JSON + the user's note.
+4. Calls `call_model_unified_with_options_and_ctx` with `force_fresh = true` so the cache layer routes the write through `supersede_cache_entry` (which archives the prior row under `archived:{id}:{cache_key}` and inserts the new row at the original cache_key).
+5. `UPDATE pyramid_step_cache SET note = ?` on the new row id so the note lands on the row.
+6. For node_id reroll: writes a `pyramid_change_manifests` row with `note` populated, computes `build_version = MAX + 1` for the (slug, node_id) pair. Emits `ManifestGenerated`.
+7. Walks downstream via `find_downstream_cache_keys(slug, rerolled_depth)` (single-level), flips their `invalidated_by` column via `invalidate_cache_entries`, and emits `CacheInvalidated` per flipped row.
+8. Emits `NodeRerolled`.
+9. Computes `count_recent_rerolls(...)` and surfaces a `rate_limit_warning: true` flag in the response when >= 3 rerolls in the last 10 minutes. The backend does NOT hard-block; the UI banner is the primary deterrent.
+
+Output: `RerollOutput { new_cache_entry_id, manifest_id, new_content, downstream_invalidated, rate_limit_warning }`.
+
+#### 5. Cross-pyramid router (`src-tauri/src/pyramid/cross_pyramid_router.rs`)
+
+New module. `CrossPyramidEventRouter` is a thin wrapper over the already-shared `BuildEventBus`:
+
+- `register_slug` / `unregister_slug` — track which slugs have active builds for the frontend's metadata overlay. Registrations are idempotent; unregister keeps the entry for a 60s grace window.
+- `spawn_tauri_forwarder(router, bus, app_handle)` — subscribes to the shared bus once and emits every event via `app_handle.emit("cross-build-event", &event)` (Tauri 2 API). Lagged events are logged; a closed channel exits the loop cleanly.
+- `list_active_slugs` — snapshot helper for metadata queries.
+- `prune(grace_secs)` — drops unregistered entries past the grace window; `grace_secs = 0` forces immediate removal of every unregistered entry (used in tests).
+
+Wired into `PyramidState.cross_pyramid_router: Arc<CrossPyramidEventRouter>`. Constructed at boot in `main.rs` and copied through `with_build_reader()` + all 4 test `PyramidState` constructors in chain_executor + vine.rs + dadbear_extend.rs. The forwarder task is spawned in the Tauri `.setup()` callback alongside the other startup tasks.
+
+**Design note:** the spec's Option A with per-slug forwarder tasks is unnecessary in this codebase — the existing `BuildEventBus` is already a single shared broadcast channel where the slug lives on the outer `TaggedBuildEvent` envelope. The router becomes a thin fan-out + metadata tracker rather than a per-slug subscription farm. Documented in the module header.
+
+#### 6. IPC commands (main.rs)
+
+Six new `#[tauri::command]` functions registered in `invoke_handler!`:
+
+- `pyramid_step_cache_for_build(slug, build_id) -> Vec<CacheEntrySummary>` — seeds the step timeline on mount.
+- `pyramid_reroll_node(slug, node_id?, cache_key?, note, force_fresh?) -> RerollOutput` — delegates to `reroll::reroll_node`.
+- `pyramid_active_builds() -> Vec<ActiveBuildRow>` — reads the runtime `active_build` map and joins against `pyramid_pipeline_steps` + `pyramid_step_cache` for cost/cache metrics.
+- `pyramid_cost_rollup(range, from?, to?) -> CostRollupResponse` — parses the range into ISO (`today`/`week`/`month`/`custom`), caps custom at 1 year, delegates to `db::cost_rollup`, aggregates the totals.
+- `pyramid_pause_dadbear_all(scope, scope_value?)` / `pyramid_resume_dadbear_all(scope, scope_value?)` — only `scope="all"` is implemented in Phase 13. `scope="folder"` and `scope="circle"` return an explicit error. Uses `disable_dadbear_all` / `enable_dadbear_all`.
+
+#### 7. Frontend
+
+- `src/hooks/useBuildRowState.ts` — shared discriminated-union reducer. Maintains per-step `StepState` with `calls: StepCall[]`, a `CostAccumulator`, and an `activityLog` of cluster/triage/reroll/manifest events. Typed as `KnownTaggedKind | { type: string; [key: string]: unknown }` so unknown variants don't break parsing but the reducer's switch arms are narrowed via a `KNOWN_EVENT_TYPES` type guard.
+- `src/hooks/useStepTimeline.ts` — per-pyramid wrapper. Seeds from `pyramid_step_cache_for_build` on mount, then subscribes to `cross-build-event` filtered by slug.
+- `src/hooks/useCrossPyramidTimeline.ts` — multi-slug wrapper. Seeds from `pyramid_active_builds`, polls every 30s as a safety net, subscribes to `cross-build-event` and routes every event to the matching per-slug `BuildRowState`.
+- `src/components/RerollModal.tsx` — modal with current-content preview, note textarea (strongly-encouraged), empty-note confirmation flow, submit button, rate-limit warning banner, and result summary view. Calls `invoke('pyramid_reroll_node', ...)`.
+- `src/components/PyramidBuildViz.tsx` — extended with a `StepTimelinePanel` sub-component, cost accumulator, `StepRow` / `StepCallRow`, per-call Reroll button, and a mounted `RerollModal` state slot.
+- `src/components/ActiveBuildRow.tsx` — compact per-build row for the cross-pyramid view with progress bar + cost + cache % + View button.
+- `src/components/CrossPyramidCostFooter.tsx` — running totals footer.
+- `src/components/CostRollupSection.tsx` — spend rollup with range picker (today/week/month) and pivot picker (by pyramid/provider/operation). Mounted on CrossPyramidTimeline for Phase 13; Phase 15 can re-mount on the DADBEAR Oversight page.
+- `src/components/CrossPyramidTimeline.tsx` — top-level page. Subscribes to the cross-pyramid hook, renders active builds, cost footer, cost rollup, and owns the Pause All DADBEAR button + confirmation modal + paused banner. Clicking "View" on a row opens the existing `PyramidBuildViz` in a drawer.
+- `src/components/modes/PyramidsMode.tsx` — gained a two-tab layout: "Dashboard" (existing PyramidDashboard) and "Builds" (new CrossPyramidTimeline). Tabs use the existing CSS conventions.
+- `src/styles/dashboard.css` — added ~700 lines of Phase 13 CSS for the step timeline, reroll modal, cross-pyramid timeline, cost rollup, and pyramids-mode tabs. All styles use the existing design tokens (`--glass`, `--text-primary`, `--accent-cyan`, `--accent-green`, etc).
+
+#### 8. Tests added
+
+**Rust:**
+
+- `event_bus.rs::phase13_tests` — 9 tests confirming every new variant serializes with snake_case tags + the `is_discrete()` gate.
+- `db.rs::phase13_tests` — 7 tests covering cost_rollup grouping, pause_all / resume_all idempotency, cache entry listing by build, downstream walker, invalidation, and recent-rerolls counter.
+- `cross_pyramid_router.rs::tests` — 6 tests covering register/unregister/list, idempotent register, grace-window behaviour, concurrent multi-slug registration.
+- `reroll.rs::tests` — 7 tests covering input validation, target resolution by cache_key + node_id, downstream walker, rate-limit counter, and the reroll prompt builder (empty-note + with-note paths).
+
+Total Phase 13 tests added: **29**.
+
+**Frontend:** no test runner in this repo (Phase 8's implementation log noted this). Skipped per the workstream prompt; manual verification steps below.
+
+#### 9. Verification
+
+- `cargo check --lib`: clean, 3 pre-existing warnings (`publication::LayerCollectResult` visibility — unchanged from Phase 12 baseline).
+- `cargo test --lib pyramid`: **1130 passing / 7 failing**. Phase 12 left the suite at 1101/7; Phase 13 added 29 tests and no new failures. Same 7 pre-existing failures (2 defaults_adapter + staleness tests documented in every prior phase log).
+- `npm run build`: clean, 140 modules transformed, ~743 KB js + ~291 KB css. No new TypeScript errors. No new ESLint violations.
+
+### Manual verification
+
+1. **Event emission smoke test.** Start a dev build on any pyramid with `pyramid_build`. Open Builds tab in PyramidsMode. Verify:
+   - Active builds row appears within 2s.
+   - Step timeline panel populates as steps land.
+   - Cost accumulator ticks up on each `llm_call_completed` event.
+   - Cache hits show the green "cached" treatment on their step rows.
+   - Retry events (throttle the model to force a 429) flip the step row to orange "retrying".
+
+2. **Reroll smoke test.** With a running or completed build, expand a step row in the timeline, click "Reroll" on a per-call sub-row, enter a note, submit. Verify:
+   - The modal shows the current output preview.
+   - Empty-note submit triggers the confirmation banner.
+   - After submit, the modal flips to the result view with the new cache entry id + downstream invalidation count.
+   - `sqlite3 pyramid.db 'SELECT id, note, supersedes_cache_id FROM pyramid_step_cache ORDER BY id DESC LIMIT 3'` shows the new row with the note and a non-null `supersedes_cache_id`.
+   - For node_id reroll: `sqlite3 pyramid.db 'SELECT id, note FROM pyramid_change_manifests ORDER BY id DESC LIMIT 1'` shows a manifest row with the note.
+
+3. **Rate-limit warning.** Reroll the same step 4 times in under 10 minutes. On the 4th, the modal result view should render the "You've rerolled this node multiple times" banner.
+
+4. **Cross-pyramid timeline.** Start builds on 2+ pyramids. Switch to Builds tab. Verify both rows appear, both update in real-time, total cost footer sums across them.
+
+5. **Pause All DADBEAR.** Click "Pause All DADBEAR" while multiple slugs have enabled configs. Confirm modal shows the correct affected count. After confirm, verify `sqlite3 pyramid.db 'SELECT COUNT(*) FROM pyramid_dadbear_config WHERE enabled = 1'` returns 0 and the banner appears at the top of the cross-pyramid view. Click Resume, verify they flip back.
+
+6. **Cost rollup.** Run at least one paid build so `pyramid_cost_log` has rows. Switch the range picker between today/week/month. Switch the pivot between pyramid/provider/operation. Verify the buckets update and the totals match `sqlite3 pyramid.db 'SELECT SUM(estimated_cost_usd) FROM pyramid_cost_log WHERE created_at >= datetime(\"now\", \"-7 days\")'`.
+
+### Deviations
+
+1. **`pyramid_build_runs` table does not exist.** The cross-pyramid spec assumed a `pyramid_build_runs` lifecycle table with `status`, `started_at`, etc. Phase 13 derives the active-builds set from the existing `PyramidState.active_build: RwLock<HashMap<slug, BuildHandle>>` runtime state instead. `build_active_build_summary` joins that runtime data against `pyramid_pipeline_steps` + `pyramid_step_cache` for the cost/cache columns. The step count is approximate (`pyramid_pipeline_steps` has no `status` column — every persisted row represents a completed step, so completed_steps == total_steps in the return value). Documented inline in `db.rs::build_active_build_summary`.
+
+2. **Node → cache_entry linkage is a best-effort text search.** The reroll path looks up a node's producing cache entry via `output_json LIKE '%{node_id}%'` rather than a proper foreign-key traversal. The current schema doesn't carry an explicit cache_key column on `pyramid_nodes`, and threading one in would be a cross-cutting change. Documented in `reroll.rs::lookup_cache_entry_for_node` as an MVP; a cleaner schema refinement is a future phase item.
+
+3. **Downstream invalidation is depth-level, not graph-level.** The walker uses `depth > rerolled_depth` rather than walking the evidence graph forward. This over-invalidates — any deeper cache entry, not just the ones whose inputs actually depended on the rerolled row, will be flipped. The spec allows for over-invalidation and the workstream prompt explicitly said "ship node-level invalidation only". Documented in `db.rs::find_downstream_cache_keys`.
+
+4. **Reroll prompt reconstruction is a wrapper template, not the original.** The reroll doesn't re-derive the original prompt template from stored metadata — instead, it builds a new "rerolling a prior output with user feedback" prompt that includes the prior content as context. A future refinement can thread the original prompt template body through cache metadata so the reroll matches the exact original shape. Documented in `reroll.rs::build_reroll_prompts`.
+
+5. **CrossPyramidEventRouter uses the shared bus directly, not per-slug subscription tasks.** The spec's Option A pseudo-code had one forwarder task per slug reading from a per-slug bus. In this codebase, the bus is already shared across all slugs with the slug on the envelope, so the router is a single subscriber + metadata tracker. Simpler and equivalent in behaviour. Documented in the module header and the router is named the same class as the spec.
+
+6. **Pause-all scope is `"all"` only.** Folder/circle scopes are deferred to Phase 14/15 per the workstream prompt. The IPC handlers return an explicit error on any other scope value.
+
+7. **Cost rollup actual cost uses `COALESCE(broadcast_cost_usd, actual_cost, 0)`.** Matches the Phase 11 naming for the reconciled column. Rows without broadcast confirmation contribute 0 to the actual total (not NULL); the UI shows est vs actual side-by-side so the difference is visible.
+
+8. **DADBEAR Oversight mount for cost rollup is deferred.** Phase 13 mounts the `CostRollupSection` component on `CrossPyramidTimeline`. Phase 15 can re-mount it on the DADBEAR Oversight page with no code changes (the component is self-contained).
+
+### Files touched
+
+- `src-tauri/src/pyramid/event_bus.rs` — +13 variants, +9 tests
+- `src-tauri/src/pyramid/llm.rs` — emission helpers + retry-loop instrumentation on both `call_model_unified_with_options_and_ctx` and `call_model_via_registry`
+- `src-tauri/src/pyramid/chain_executor.rs` — emission helper + web edge + cluster + gap events
+- `src-tauri/src/pyramid/evidence_answering.rs` — `TriageDecisionRecord` on `TriageGateResult` + event emission in `answer_questions`
+- `src-tauri/src/pyramid/stale_helpers_upper.rs` — `persist_change_manifest_with_bus` variant emitting `ManifestGenerated`
+- `src-tauri/src/pyramid/step_context.rs` — `note` + `invalidated_by` fields
+- `src-tauri/src/pyramid/db.rs` — schema migration (3 ALTER TABLE + 1 index), `check_cache` invalidated-by filter, `check_cache_including_invalidated`, `list_cache_entries_for_build`, `find_downstream_cache_keys`, `invalidate_cache_entries`, `count_recent_rerolls`, `disable_dadbear_all`, `enable_dadbear_all`, `cost_rollup`, `build_active_build_summary`, and 7 tests
+- `src-tauri/src/pyramid/reroll.rs` — NEW (7 tests)
+- `src-tauri/src/pyramid/cross_pyramid_router.rs` — NEW (6 tests)
+- `src-tauri/src/pyramid/mod.rs` — registers new modules + cross_pyramid_router field on PyramidState
+- `src-tauri/src/pyramid/vine.rs` / `dadbear_extend.rs` / `chain_executor.rs` test state — new field wiring
+- `src-tauri/src/main.rs` — 6 new IPC commands, `invoke_handler` registration, Tauri forwarder spawn
+- `src-tauri/src/pyramid/wire_publish.rs` / `pyramid_import.rs` — `note: None` on CacheEntry literals
+- `src/hooks/useBuildRowState.ts` — NEW
+- `src/hooks/useStepTimeline.ts` — NEW
+- `src/hooks/useCrossPyramidTimeline.ts` — NEW
+- `src/components/RerollModal.tsx` — NEW
+- `src/components/ActiveBuildRow.tsx` — NEW
+- `src/components/CrossPyramidCostFooter.tsx` — NEW
+- `src/components/CostRollupSection.tsx` — NEW
+- `src/components/CrossPyramidTimeline.tsx` — NEW
+- `src/components/PyramidBuildViz.tsx` — extended with step timeline + reroll mount
+- `src/components/modes/PyramidsMode.tsx` — tabbed layout wiring CrossPyramidTimeline
+- `src/styles/dashboard.css` — Phase 13 styles (~700 lines)
+
+### Status
+
+`awaiting-verification` — Phase 13 is complete from the implementer's perspective. All 10 end-state criteria from the workstream prompt are met: 13 new TaggedKind variants, event emission at every listed site, reroll IPC supporting both node_id and cache_key with single-level downstream invalidation, cache-entry pre-population IPC, step timeline UI with per-call drilldown and reroll buttons, RerollModal mounted, CrossPyramidEventRouter + PyramidState wiring, active builds + cost rollup + pause-all IPCs registered and tested, cross-pyramid timeline components + shared hooks exist and build, `cargo check --lib` and frontend build clean, test count 1130/7 (baseline 1101/7 + 29 new Phase 13 tests, same 7 pre-existing failures). Single commit on `phase-13-build-viz-reroll` branch per the workstream prompt. Verifier pass and wanderer pass pending.
+
+### Verifier pass (2026-04-10)
+
+Fresh audit against the workstream prompt and the two spec files found four production-wiring gaps and a minor correctness bug. All five were fixed in place on the same branch.
+
+**F1 — `ManifestGenerated` dead code in the DADBEAR stale-refresh path.** `stale_helpers_upper::persist_change_manifest_with_bus` was defined with a bus parameter and emits `ManifestGenerated` when a bus is present, but every production caller went through the `persist_change_manifest` thin wrapper which hard-codes `bus: None`. The reroll path's direct `db::save_change_manifest` bypass was fine, but the spec's A2 requirement ("stale_helpers_upper.rs::generate_change_manifest: emit ManifestGenerated after the manifest row is inserted") was unmet on the normal stale-refresh flow. Fix: `apply_supersession_manifest` now extracts the bus from `base_config.cache_access` and routes both the success path (line 2397) and the validation-failure path (line 2319) through `persist_change_manifest_with_bus` with that bus attached. This is zero-plumbing because Phase 12 already wired `cache_access` onto every production `LlmConfig`. (`src-tauri/src/pyramid/stale_helpers_upper.rs:2319-2344`, `:2398-2420`.)
+
+**F2 — `useStepTimeline(slug, slug)` passed slug as build_id.** `PyramidBuildViz.tsx` line 66 was calling the hook as `useStepTimeline(slug, slug)`, so the `pyramid_step_cache_for_build` IPC ran `WHERE build_id = <slug>`. Real production build_ids look like `chain-<8-char-uuid>`, `decompose-<slug>-<step>`, `evidence-<slug>-<step>`, etc. (see `chain_executor.rs:3835` and siblings), which NEVER match a slug. Result: the step-timeline pre-populate silently returned zero rows on every mount. Live events still reduced into the UI, but the initial render always missed the "resume on a running build" case the spec explicitly calls out. Fix: (a) backend gains `find_latest_build_id_for_slug` + `list_cache_entries_for_latest_build` helpers in `db.rs`; (b) the `pyramid_step_cache_for_build` IPC now takes `build_id: Option<String>` and resolves the latest build when absent; (c) `PyramidBuildViz.tsx` passes `null` instead of `slug`; (d) `useStepTimeline.ts` no longer early-returns on `null` buildId. (`src-tauri/src/pyramid/db.rs:6149-6220`, `src-tauri/src/main.rs:6323-6347`, `src/components/PyramidBuildViz.tsx:66-72`, `src/hooks/useStepTimeline.ts:108-125`.)
+
+**F3 — `pyramid_active_builds` computed cost/cache columns against slug-as-build_id.** The IPC handler constructs the summary from `status_guard.slug.clone()` as the build_id because `BuildHandle` has no `build_id` field at runtime (`main.rs:6401`). `build_active_build_summary` then ran three JOINs against `pyramid_step_cache WHERE build_id = <slug>` — all returning zero even when real builds were running. The live event stream compensates at the per-row level via the reducer, but the initial seed was always a `$0.00 / 0 steps / 0% cache` row until events landed. Fix: `build_active_build_summary` now falls back to `find_latest_build_id_for_slug` when the passed-in build_id equals the slug or is empty. The real build_id ends up on the returned `ActiveBuildRow.build_id` so the frontend can at least identify which build it's looking at, and the cost/cache/step counts reflect reality. (`src-tauri/src/pyramid/db.rs:10969-11025`.)
+
+**F4 — Downstream invalidation walker emitted events for wrong cache keys when some entries were already stale.** `reroll::run_downstream_invalidation` called `db::invalidate_cache_entries` which returns a count, then did `downstream.into_iter().take(flipped).collect()` to derive the list of "flipped" keys. Problem: if entry #1 in `downstream` was already invalidated (the SQL guard `invalidated_by IS NULL` skipped it), `take(count)` still took entry #1 because count matched entries #2..#N. The emitted `CacheInvalidated` events therefore carried cache_keys that weren't actually flipped. Fix: new `db::invalidate_cache_entries_returning_flipped` returns the exact set of actually-flipped keys; the walker uses it and emits `CacheInvalidated` for the true list. The original count-returning variant is retained for backwards compatibility with the existing tests. (`src-tauri/src/pyramid/db.rs:6296-6336`, `src-tauri/src/pyramid/reroll.rs:458-502`.)
+
+**F5 — `CrossPyramidEventRouter::register_slug` / `unregister_slug` never called from production (spec deviation, not a runtime bug).** The spec said "whenever a build starts...call `router.register_slug(slug, bus)`". The implementer went with lazy population inside `spawn_tauri_forwarder` — every event auto-inserts into `active_slugs`. Runtime behavior matches the spec's intent (active_slugs is populated, events forward, `list_active_slugs` works) but the explicit lifecycle hooks are dead. `pyramid_active_builds` does NOT use the router's state anyway — it reads from `PyramidState.active_build`. This is a spec deviation with a working substitute; left as-is and documented here. A follow-up phase can wire the explicit hooks if the 60-second grace window semantics need exact enforcement. (`src-tauri/src/pyramid/cross_pyramid_router.rs:71-97`.)
+
+**Fix-pass tests added (5, all passing):**
+- `test_find_latest_build_id_for_slug_returns_most_recent` — helper resolution
+- `test_list_cache_entries_for_latest_build_resolves_on_slug` — end-to-end for the seed IPC's latest-build path
+- `test_invalidate_cache_entries_returning_flipped_matches_actual_writes` — proves the event emission now matches reality when some entries were pre-invalidated
+- `test_build_active_build_summary_resolves_latest_when_build_id_is_slug` — proves the fallback kicks in when the placeholder slug is passed, and that cost/cache columns reflect reality
+- `test_persist_change_manifest_with_bus_emits_manifest_generated` — proves the stale-path bus emission fires (the load-bearing regression check for F1)
+
+**Verification state after the fix pass:**
+- `cargo check --lib` — clean (3 pre-existing warnings, unchanged)
+- `cargo test --lib pyramid` — 1135 passed / 7 failed (baseline 1130 after implementer's commit + 5 verifier-fix tests; same 7 pre-existing failures)
+- `npm run build` — clean
+- Events verified by code tracing: `ManifestGenerated` now fires from the DADBEAR stale-refresh path (`apply_supersession_manifest` → `persist_change_manifest_with_bus` with bus from `base_config.cache_access`) in addition to the reroll path's direct emission. `LlmCallStarted` / `LlmCallCompleted` / `StepRetry` / `StepError` emission sites in `llm.rs` are unchanged and correctly ordered (cache-hit short-circuits before `LlmCallStarted`). Cross-pyramid event forwarder wiring is intact: `spawn_tauri_forwarder` is called from `main.rs` setup (line 8677) with a cloned `BuildEventBus` subscriber, and the frontend's `useCrossPyramidTimeline` listens on `cross-build-event`.
+
+### Status
+
+`awaiting-verification` (verifier fix pass committed separately) — Phase 13 end-state criteria met, with the four production-wiring gaps patched. The implementer's commit is retained; the verifier fix is a separate commit on the same branch.
+
+### Wanderer pass (2026-04-10)
+
+Ran the full 12-question wanderer trace without a punch list. Traced every event from Rust emission through Tauri fan-out to the frontend reducer; walked the reroll IPC from input validation through the DB supersession write; verified pause-all, cost rollup, active-builds, and cross-pyramid router flows end-to-end. Found two real bugs that the verifier's punch-list audit missed. Both are fixed in place on this branch.
+
+**W1 — Retrying-then-succeeding steps get stuck on wrong status (`useBuildRowState.ts`).** The `derivedStepStatus` helper early-returned on `step.status === 'retrying'` (line 165), which meant that once a `step_retry` event flipped the step to `retrying`, no subsequent `llm_call_completed` or `chain_step_finished` event could compute a terminal status — the helper short-circuited and returned `'retrying'` forever. Even with the early-return removed, a secondary bug surfaced: the retry loop in `llm.rs::call_model_unified_with_options_and_ctx` re-emits `LlmCallStarted` on each attempt, so `step.calls` ends up holding stale `{cacheKey, status: 'retrying'}` entries from the failed attempts alongside the final `{cacheKey, status: 'completed'}` — and the aggregate logic walked every entry equally, causing both `allCompleted` and `anyFailed` to miss, so the step landed on `'running'` instead of `'completed'`. Fix: (a) drop the `'retrying'` early-return from `derivedStepStatus`; (b) re-derive status from "last call per cache_key" so stale retry markers are ignored; (c) preserve `step.status === 'retrying'` inside the `llm_call_started` handler so the UI keeps showing `retry N/M` while the retry attempt is in flight. `src/hooks/useBuildRowState.ts:164-201`, `:266-289`.
+
+**W2 — Reroll cache-key mismatch makes the entire reroll flow pointless (`reroll.rs`).** The reroll path threaded `with_prompt_hash(prior.prompt_hash)` onto the StepContext, which made `cache_is_usable()` return true, so `call_model_unified_with_options_and_ctx` computed a new `cache_key = hash(hash(reroll_system, reroll_user), prior_prompt_hash, prior_model_id)` — different from `prior.cache_key`, because `build_reroll_prompts` wraps the original output in a "rerolling a prior output" template with completely different text. Consequences that cascaded into other Phase 13 features:
+  1. `supersede_cache_entry` looked up the prior row at the NEW cache_key, found nothing, and inserted the rerolled row as a fresh entry with `supersedes_cache_id = NULL`.
+  2. `load_new_cache_row(db_path, slug, &prior.cache_key)` then loaded the UNTOUCHED prior row (still at prior.cache_key) instead of the rerolled row. `new_cache_entry_id` returned to the frontend was the prior row's id.
+  3. `apply_note_to_cache_row(db_path, new_cache_entry_id, note)` wrote the reroll note onto the prior row, not the rerolled row.
+  4. `count_recent_rerolls` — which gates the anti-slot-machine warning on `supersedes_cache_id IS NOT NULL` — never counted the reroll. The rate limit was effectively disabled.
+  5. Subsequent normal builds with the original prompts computed prior.cache_key and hit the untouched prior row, serving the pre-reroll content. **The reroll never took effect on future builds.**
+
+The root cause is a property the implementer's log did not surface: `supersede_cache_entry` only works correctly when the new row's cache_key matches the prior row's cache_key. Since the reroll wrapper prompts are intentionally different from the original, that invariant was violated.
+
+Fix: route the DB write manually. The new `write_reroll_cache_entry` helper:
+  - constructs the StepContext WITHOUT `with_prompt_hash`, so `cache_is_usable() = false` and the LLM path skips its automatic lookup/store entirely (events still fire because `ctx.bus.is_some()`),
+  - builds a `CacheEntry` with `cache_key = prior.cache_key`, `inputs_hash = prior.inputs_hash`, `prompt_hash = prior.prompt_hash`, `model_id = prior.model_id`, so `verify_cache_hit` passes on read-back,
+  - calls `db::supersede_cache_entry` directly, which archives the prior row under `archived:{id}:{prior.cache_key}` and inserts the rerolled row at `prior.cache_key` with `supersedes_cache_id = prior_id` and `force_fresh = true`,
+  - persists the user's note on the new row via the `note: Option<String>` field on `CacheEntry`,
+  - returns the new row's id via a follow-up `check_cache_including_invalidated` read.
+
+`load_new_cache_row` and `apply_note_to_cache_row` were deleted — they were only reachable from the broken auto-store path. `src/pyramid/reroll.rs:120-210`, `:378-465`.
+
+**Wanderer tests added (2, both passing):**
+- `test_write_reroll_cache_entry_archives_prior_and_links_supersession` — proves the new row lands at prior.cache_key, the archived row exists at `archived:{id}:{cache_key}`, `supersedes_cache_id` points at the archived id, `force_fresh` is true, the note lives on the new row, and a subsequent `db::check_cache(slug, prior.cache_key)` returns the rerolled row (not the archived one) so future builds see the rerolled content.
+- `test_write_reroll_cache_entry_makes_count_recent_rerolls_tick` — proves the anti-slot-machine counter actually increments after rerolls now (the pre-fix code left `supersedes_cache_id = NULL` so the counter was always zero).
+
+**Verification state after the wanderer fix:**
+- `cargo check --lib` — clean (3 pre-existing warnings unchanged)
+- `cargo test --lib pyramid` — 1137 passed / 7 failed (baseline 1135 after verifier fix + 2 wanderer regression tests; same 7 pre-existing failures)
+- `cargo test --lib pyramid::reroll` — 9 passed, 0 failed (all reroll tests including the 2 new ones)
+- `npm run build` — clean, no new TypeScript errors
+- Code traces for Q1-Q12 recorded below in the friction log entry.
+
+### Status
+
+`awaiting-wanderer-verification` — Phase 13 has now passed implementer, verifier, AND wanderer audit. Two wanderer commits on the same branch: the W1/W2 fix + regression tests. Ready for merge review pending a sanity check that nothing else in Phase 13 surfaces a new issue from the wanderer trace.
+

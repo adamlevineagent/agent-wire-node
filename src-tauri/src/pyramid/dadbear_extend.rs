@@ -1323,6 +1323,9 @@ mod tests {
             schema_registry: Arc::new(
                 crate::pyramid::schema_registry::SchemaRegistry::new(),
             ),
+            cross_pyramid_router: Arc::new(
+                crate::pyramid::cross_pyramid_router::CrossPyramidEventRouter::new(),
+            ),
         });
         (state, data_dir)
     }

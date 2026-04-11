@@ -957,6 +957,7 @@ pub async fn build_bunch(
             provider_registry: state.provider_registry.clone(),
             credential_store: state.credential_store.clone(),
             schema_registry: state.schema_registry.clone(),
+            cross_pyramid_router: state.cross_pyramid_router.clone(),
         }),
     };
 

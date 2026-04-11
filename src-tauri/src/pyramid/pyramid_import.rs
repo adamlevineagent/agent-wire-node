@@ -487,6 +487,7 @@ fn insert_cache_entries(
             // user-initiated cache invalidations.
             force_fresh: false,
             supersedes_cache_id: None,
+            note: None,
         };
         match db::store_cache_if_absent(conn, &cache_entry) {
             Ok(_row_actually_inserted) => {
@@ -1349,6 +1350,7 @@ mod tests {
             latency_ms: Some(123),
             force_fresh: true,
             supersedes_cache_id: None,
+            note: None,
         };
         db::supersede_cache_entry(&conn, "test-import", &l0a_cache_key, &rerolled)
             .unwrap();
@@ -1679,6 +1681,7 @@ mod tests {
             latency_ms: None,
             force_fresh: false,
             supersedes_cache_id: None,
+            note: None,
         };
         db::store_cache(&conn, &local_entry).unwrap();
 

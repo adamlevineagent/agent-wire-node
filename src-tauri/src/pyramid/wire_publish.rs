@@ -2014,6 +2014,7 @@ mod tests {
             latency_ms: Some(10),
             force_fresh: false,
             supersedes_cache_id: None,
+            note: None,
         };
         crate::pyramid::db::store_cache(conn, &entry).unwrap();
         cache_key
@@ -2127,6 +2128,7 @@ mod tests {
             latency_ms: None,
             force_fresh: false,
             supersedes_cache_id: None,
+            note: None,
         };
         crate::pyramid::db::store_cache(&conn, &entry).unwrap();
 

@@ -2,11 +2,15 @@ import { useState, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { PyramidDashboard } from '../PyramidDashboard';
 import { PyramidFirstRun } from '../PyramidFirstRun';
+import { CrossPyramidTimeline } from '../CrossPyramidTimeline';
 import { SlugInfo, PyramidConfigInfo } from '../pyramid-types';
+
+type PyramidsTab = 'dashboard' | 'builds';
 
 export function PyramidsMode() {
     const [showFirstRun, setShowFirstRun] = useState(false);
     const [checking, setChecking] = useState(true);
+    const [tab, setTab] = useState<PyramidsTab>('dashboard');
 
     useEffect(() => {
         (async () => {
@@ -41,7 +45,22 @@ export function PyramidsMode() {
 
     return (
         <div className="mode-container">
-            <PyramidDashboard />
+            <div className="pyramids-mode-tabs">
+                <button
+                    className={`pyramids-mode-tab ${tab === 'dashboard' ? 'pyramids-mode-tab-active' : ''}`}
+                    onClick={() => setTab('dashboard')}
+                >
+                    Dashboard
+                </button>
+                <button
+                    className={`pyramids-mode-tab ${tab === 'builds' ? 'pyramids-mode-tab-active' : ''}`}
+                    onClick={() => setTab('builds')}
+                >
+                    Builds
+                </button>
+            </div>
+            {tab === 'dashboard' && <PyramidDashboard />}
+            {tab === 'builds' && <CrossPyramidTimeline />}
         </div>
     );
 }
