@@ -19,6 +19,11 @@ import { OrphanBroadcastsPanel } from './OrphanBroadcastsPanel';
 import { DadbearActivityDrawer } from './DadbearActivityDrawer';
 import { CostRollupSection } from './CostRollupSection';
 import { requestToolsModePreset } from '../utils/toolsModeBridge';
+// Phase 18c (L9): scope picker modal for the bulk pause/resume flow.
+import {
+    DadbearPauseScopeModal,
+    type DadbearPauseScope,
+} from './DadbearPauseScopeModal';
 
 type PyramidFilter = 'all' | 'active' | 'paused';
 
@@ -56,6 +61,12 @@ export function DadbearOversightPage() {
     const [busyGlobal, setBusyGlobal] = useState(false);
     const [globalError, setGlobalError] = useState<string | null>(null);
     const [toast, setToast] = useState<string | null>(null);
+    // Phase 18c (L9): scope picker modal for pause / resume. Single
+    // state field — null when closed, "pause"/"resume" when open in
+    // the corresponding action mode.
+    const [scopeModalAction, setScopeModalAction] = useState<
+        'pause' | 'resume' | null
+    >(null);
     // Hold the pending toast-clear timeout so we can clear it on a
     // subsequent toast or on unmount. Without this, a queued timeout
     // from a previous toast can step on the next one, and a toast
@@ -83,43 +94,55 @@ export function DadbearOversightPage() {
         };
     }, []);
 
-    const handlePauseAll = useCallback(async () => {
-        setBusyGlobal(true);
-        setGlobalError(null);
-        try {
-            const resp = await invoke<{ affected: number }>(
-                'pyramid_pause_dadbear_all',
-                { scope: 'all', scopeValue: null },
-            );
-            await refetchOverview();
-            showToast(
-                `Paused DADBEAR on ${resp.affected} pyramid${resp.affected === 1 ? '' : 's'}`,
-            );
-        } catch (e) {
-            setGlobalError(String(e));
-        } finally {
-            setBusyGlobal(false);
-        }
-    }, [refetchOverview, showToast]);
+    // Phase 18c (L9): handlers receive (scope, scope_value) from the
+    // scope picker modal and forward them to the existing IPCs which
+    // already accept those parameters. The modal does the count
+    // preview and validation; these handlers just dispatch.
+    const handlePauseWithScope = useCallback(
+        async (scope: DadbearPauseScope, scopeValue: string | null) => {
+            setScopeModalAction(null);
+            setBusyGlobal(true);
+            setGlobalError(null);
+            try {
+                const resp = await invoke<{ affected: number }>(
+                    'pyramid_pause_dadbear_all',
+                    { scope, scopeValue },
+                );
+                await refetchOverview();
+                showToast(
+                    `Paused DADBEAR on ${resp.affected} pyramid${resp.affected === 1 ? '' : 's'}`,
+                );
+            } catch (e) {
+                setGlobalError(String(e));
+            } finally {
+                setBusyGlobal(false);
+            }
+        },
+        [refetchOverview, showToast],
+    );
 
-    const handleResumeAll = useCallback(async () => {
-        setBusyGlobal(true);
-        setGlobalError(null);
-        try {
-            const resp = await invoke<{ affected: number }>(
-                'pyramid_resume_dadbear_all',
-                { scope: 'all', scopeValue: null },
-            );
-            await refetchOverview();
-            showToast(
-                `Resumed DADBEAR on ${resp.affected} pyramid${resp.affected === 1 ? '' : 's'}`,
-            );
-        } catch (e) {
-            setGlobalError(String(e));
-        } finally {
-            setBusyGlobal(false);
-        }
-    }, [refetchOverview, showToast]);
+    const handleResumeWithScope = useCallback(
+        async (scope: DadbearPauseScope, scopeValue: string | null) => {
+            setScopeModalAction(null);
+            setBusyGlobal(true);
+            setGlobalError(null);
+            try {
+                const resp = await invoke<{ affected: number }>(
+                    'pyramid_resume_dadbear_all',
+                    { scope, scopeValue },
+                );
+                await refetchOverview();
+                showToast(
+                    `Resumed DADBEAR on ${resp.affected} pyramid${resp.affected === 1 ? '' : 's'}`,
+                );
+            } catch (e) {
+                setGlobalError(String(e));
+            } finally {
+                setBusyGlobal(false);
+            }
+        },
+        [refetchOverview, showToast],
+    );
 
     const handleSetDefaultNorms = useCallback(() => {
         // Queue the preset + switch to ToolsMode. The ToolsMode
@@ -197,19 +220,21 @@ export function DadbearOversightPage() {
 
             <section className="dadbear-oversight-globals">
                 <div className="dadbear-oversight-global-controls">
+                    {/* Phase 18c (L9): "Pause..." / "Resume..." (with
+                        ellipsis) signals the scope picker modal opens. */}
                     <button
                         className="btn btn-danger"
                         disabled={busyGlobal}
-                        onClick={handlePauseAll}
+                        onClick={() => setScopeModalAction('pause')}
                     >
-                        Pause All
+                        Pause...
                     </button>
                     <button
                         className="btn btn-primary"
                         disabled={busyGlobal}
-                        onClick={handleResumeAll}
+                        onClick={() => setScopeModalAction('resume')}
                     >
-                        Resume All
+                        Resume...
                     </button>
                     <button
                         className="btn btn-secondary"
@@ -332,6 +357,21 @@ export function DadbearOversightPage() {
                 <DadbearActivityDrawer
                     slug={activityDrawerSlug}
                     onClose={() => setActivityDrawerSlug(null)}
+                />
+            )}
+
+            {/* Phase 18c (L9): scope picker modal for pause / resume.
+                Lives at the page level so the backdrop can cover the
+                full oversight view. */}
+            {scopeModalAction && (
+                <DadbearPauseScopeModal
+                    action={scopeModalAction}
+                    onCancel={() => setScopeModalAction(null)}
+                    onConfirm={
+                        scopeModalAction === 'pause'
+                            ? handlePauseWithScope
+                            : handleResumeWithScope
+                    }
                 />
             )}
         </div>

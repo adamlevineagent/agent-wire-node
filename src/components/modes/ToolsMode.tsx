@@ -26,6 +26,7 @@ import { YamlConfigRenderer } from "../YamlConfigRenderer";
 import { useYamlRendererSources } from "../../hooks/useYamlRendererSources";
 import { PublishPreviewModal } from "../PublishPreviewModal";
 import { ContributionDetailDrawer } from "../ContributionDetailDrawer";
+import { MigrationPanel } from "../MigrationPanel";
 import { QualityBadges } from "../QualityBadges";
 import type { SchemaAnnotation } from "../../types/yamlRenderer";
 import type {
@@ -36,13 +37,18 @@ import type {
     ConfigSchemaSummary,
     DiscoveryResult,
     GenerateConfigResponse,
+    NeedsMigrationEntry,
     PullLatestResponse,
     Recommendation,
     RefineConfigResponse,
     WireUpdateEntry,
 } from "../../types/configContributions";
 
-type ToolsTab = "my-tools" | "discover" | "create";
+// Phase 18d: add a fourth top-level tab for the schema migration
+// surface. Order: My Tools, Needs Migration (only when there are
+// flagged configs), Discover, Create. The badge on the tab label
+// shows the count of flagged configs.
+type ToolsTab = "my-tools" | "needs-migration" | "discover" | "create";
 
 const TYPE_BADGE_COLORS: Record<string, string> = {
     action: "#3b82f6",
@@ -81,6 +87,16 @@ export function ToolsMode() {
         null,
     );
 
+    // Phase 18d: count of configs flagged needing migration. Drives the
+    // tab badge AND the per-card "needs migration" chip in My Tools.
+    // Refreshed when ToolsMode mounts and whenever a migration is
+    // accepted/rejected. Stored as a Set of contribution_ids so the
+    // My Tools panel can ask "is this contribution flagged?" in O(1).
+    const [needsMigration, setNeedsMigration] = useState<Set<string>>(
+        new Set(),
+    );
+    const [migrationRefreshToken, setMigrationRefreshToken] = useState(0);
+
     const openCreateFrom = useCallback((seed: CreateSeed) => {
         setCreateSeed(seed);
         setActiveTab("create");
@@ -88,6 +104,37 @@ export function ToolsMode() {
 
     const clearSeed = useCallback(() => setCreateSeed(null), []);
     const clearPreset = useCallback(() => setCreatePreset(null), []);
+
+    const bumpMigrationRefresh = useCallback(
+        () => setMigrationRefreshToken((n) => n + 1),
+        [],
+    );
+
+    // Phase 18d: fetch the flagged-config list at mount and on every
+    // refresh bump so both the tab badge and the My Tools chip stay in
+    // sync. Best-effort — failures log + leave the set empty so the
+    // UI stays usable.
+    useEffect(() => {
+        let cancelled = false;
+        invoke<NeedsMigrationEntry[]>("pyramid_list_configs_needing_migration")
+            .then((rows) => {
+                if (cancelled) return;
+                const next = new Set<string>();
+                for (const r of rows) {
+                    next.add(r.contribution_id);
+                }
+                setNeedsMigration(next);
+            })
+            .catch((err) => {
+                console.warn(
+                    "[ToolsMode] needs migration fetch failed:",
+                    err,
+                );
+            });
+        return () => {
+            cancelled = true;
+        };
+    }, [migrationRefreshToken]);
 
     // Phase 15: consume any preset queued by the bridge at mount time
     // AND subscribe to the custom event so presets queued while
@@ -111,6 +158,8 @@ export function ToolsMode() {
         };
     }, []);
 
+    const migrationCount = needsMigration.size;
+
     return (
         <div className="mode-container">
             <nav className="node-tabs">
@@ -121,6 +170,41 @@ export function ToolsMode() {
                     onClick={() => setActiveTab("my-tools")}
                 >
                     My Tools
+                </button>
+                <button
+                    className={`node-tab ${
+                        activeTab === "needs-migration"
+                            ? "node-tab-active"
+                            : ""
+                    }`}
+                    onClick={() => setActiveTab("needs-migration")}
+                    title="Configs flagged for LLM-assisted migration after a schema change"
+                    style={{
+                        display: "inline-flex",
+                        alignItems: "center",
+                        gap: 6,
+                    }}
+                >
+                    Needs Migration
+                    {migrationCount > 0 && (
+                        <span
+                            style={{
+                                display: "inline-flex",
+                                alignItems: "center",
+                                justifyContent: "center",
+                                minWidth: 18,
+                                height: 18,
+                                padding: "0 6px",
+                                fontSize: 10,
+                                fontWeight: 700,
+                                color: "#1a1a2e",
+                                background: "#f59e0b",
+                                borderRadius: 9,
+                            }}
+                        >
+                            {migrationCount}
+                        </span>
+                    )}
                 </button>
                 <button
                     className={`node-tab ${
@@ -142,7 +226,16 @@ export function ToolsMode() {
 
             <div className="node-tab-content">
                 {activeTab === "my-tools" && (
-                    <MyToolsPanel onEdit={openCreateFrom} />
+                    <MyToolsPanel
+                        onEdit={openCreateFrom}
+                        flaggedContributionIds={needsMigration}
+                    />
+                )}
+                {activeTab === "needs-migration" && (
+                    <MigrationPanel
+                        refreshToken={migrationRefreshToken}
+                        onMigrationChanged={bumpMigrationRefresh}
+                    />
                 )}
                 {activeTab === "discover" && <DiscoverPanel />}
                 {activeTab === "create" && (
@@ -162,9 +255,18 @@ export function ToolsMode() {
 
 interface MyToolsPanelProps {
     onEdit: (seed: CreateSeed) => void;
+    /** Phase 18d: contribution_ids that are flagged needs_migration = 1.
+     *  Each ConfigCard gets a "needs migration" chip when its active
+     *  contribution_id is in this set. Allows discovery of the flag from
+     *  the existing My Tools surface even if the user never opens the
+     *  Needs Migration tab. */
+    flaggedContributionIds?: Set<string>;
 }
 
-function MyToolsPanel({ onEdit }: MyToolsPanelProps) {
+function MyToolsPanel({
+    onEdit,
+    flaggedContributionIds,
+}: MyToolsPanelProps) {
     const { wireApiCall } = useAppContext();
 
     // Existing Wire-published actions (Sprint 3 behavior — keep as-is).
@@ -519,12 +621,20 @@ function MyToolsPanel({ onEdit }: MyToolsPanelProps) {
                                 u.local_contribution_id ===
                                     active.contribution_id),
                     );
+                    // Phase 18d: surface the needs_migration chip when
+                    // this card's active contribution is in the flagged
+                    // set provided by ToolsMode.
+                    const needsMigration =
+                        active != null &&
+                        flaggedContributionIds != null &&
+                        flaggedContributionIds.has(active.contribution_id);
                     return (
                         <ConfigCard
                             key={schema.schema_type}
                             schema={schema}
                             active={active}
                             update={update}
+                            needsMigration={needsMigration}
                             onView={() => handleOpenDetail(schema.schema_type)}
                             onHistory={() =>
                                 handleOpenHistory(schema.schema_type)
@@ -691,6 +801,7 @@ function ConfigCard({
     onHistory,
     onPublish,
     onOpenUpdate,
+    needsMigration,
 }: {
     schema: ConfigSchemaSummary;
     active: ActiveConfigResponse | null | undefined;
@@ -699,6 +810,10 @@ function ConfigCard({
     onHistory: () => void;
     onPublish: () => void;
     onOpenUpdate?: () => void;
+    /** Phase 18d: render the "needs migration" chip when this card's
+     *  active contribution is flagged. The user can click the chip to
+     *  hop to the Needs Migration tab via the toolsModeBridge. */
+    needsMigration?: boolean;
 }) {
     const hasActive = !!active;
     const version = active?.version_chain_length ?? 0;
@@ -787,6 +902,24 @@ function ConfigCard({
                     >
                         Update available ({update.chain_length_delta})
                     </button>
+                )}
+                {needsMigration && (
+                    <span
+                        style={{
+                            fontSize: 10,
+                            padding: "2px 8px",
+                            borderRadius: 4,
+                            background: "rgba(245, 158, 11, 0.18)",
+                            color: "#f59e0b",
+                            fontWeight: 600,
+                            border: "1px solid rgba(245, 158, 11, 0.4)",
+                            textTransform: "uppercase",
+                            letterSpacing: "0.04em",
+                        }}
+                        title="The schema this config was written against has been refined — open the Needs Migration tab to review the LLM-assisted migration"
+                    >
+                        Migration needed
+                    </span>
                 )}
             </div>
             <p
@@ -2132,6 +2265,19 @@ function DiscoverPanel() {
     const [pullMessage, setPullMessage] = useState<string | null>(null);
     const [showAutoUpdate, setShowAutoUpdate] = useState(false);
 
+    // Phase 18a (L2): credential preview modal state. Populated by
+    // the `pyramid_preview_pull_contribution` IPC before a pull is
+    // committed. When `missing_credentials` is non-empty the user
+    // sees a warning and can cancel, set credentials first, or
+    // pull anyway.
+    const [pendingPull, setPendingPull] = useState<{
+        wire_contribution_id: string;
+        activate: boolean;
+        required_credentials: string[];
+        missing_credentials: string[];
+        title: string;
+    } | null>(null);
+
     // ── Load schema list + slug list on mount.
     useEffect(() => {
         (async () => {
@@ -2217,7 +2363,11 @@ function DiscoverPanel() {
         }
     }, [schemaType, query, tags, sortBy]);
 
-    const handlePull = useCallback(
+    // Phase 18a (L2): inner pull that runs after the user has seen
+    // any credential warnings. Separated from `handlePull` so the
+    // preview modal can call it on the "Pull anyway" path without
+    // re-running the preview round trip.
+    const executePull = useCallback(
         async (wire_contribution_id: string, activate: boolean) => {
             if (pullBusy) return;
             setPullBusy(true);
@@ -2239,7 +2389,6 @@ function DiscoverPanel() {
                 setSelectedResult(null);
             } catch (err) {
                 const message = String(err);
-                // Surface credential safety gate errors clearly.
                 if (message.includes("credential")) {
                     setPullMessage(
                         `Pull refused — ${message}. Add the missing credentials in Settings → Credentials, then retry.`,
@@ -2252,6 +2401,47 @@ function DiscoverPanel() {
             }
         },
         [pullBusy, recSlug],
+    );
+
+    const handlePull = useCallback(
+        async (wire_contribution_id: string, activate: boolean) => {
+            if (pullBusy) return;
+            // Phase 18a (L2): preview the contribution first to scan
+            // for missing credential references. If anything is
+            // missing, show a confirmation modal listing the keys
+            // before committing to the actual pull.
+            setPullMessage(null);
+            try {
+                const preview = await invoke<{
+                    yaml: string;
+                    schema_type: string | null;
+                    title: string;
+                    description: string;
+                    required_credentials: string[];
+                    missing_credentials: string[];
+                }>("pyramid_preview_pull_contribution", {
+                    wireContributionId: wire_contribution_id,
+                });
+                if (preview.missing_credentials.length === 0) {
+                    // No missing credentials — pull immediately.
+                    await executePull(wire_contribution_id, activate);
+                } else {
+                    // Stage the modal so the user can decide.
+                    setPendingPull({
+                        wire_contribution_id,
+                        activate,
+                        required_credentials: preview.required_credentials,
+                        missing_credentials: preview.missing_credentials,
+                        title: preview.title || preview.schema_type || "Wire contribution",
+                    });
+                }
+            } catch (err) {
+                // Preview failed (network or auth) — surface the
+                // error without falling through to a blind pull.
+                setPullMessage(`Preview failed: ${String(err)}`);
+            }
+        },
+        [pullBusy, executePull],
     );
 
     return (
@@ -2384,6 +2574,127 @@ function DiscoverPanel() {
                     }}
                 >
                     {pullMessage}
+                </div>
+            )}
+
+            {/* ── Phase 18a (L2): credential preview confirmation ────────── */}
+            {pendingPull && (
+                <div
+                    role="dialog"
+                    aria-modal="true"
+                    style={{
+                        position: "fixed",
+                        inset: 0,
+                        background: "rgba(0, 0, 0, 0.6)",
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "center",
+                        zIndex: 1000,
+                    }}
+                    onClick={() => setPendingPull(null)}
+                >
+                    <div
+                        onClick={(e) => e.stopPropagation()}
+                        style={{
+                            background: "var(--bg-elevated, #1a1a1a)",
+                            border: "1px solid rgba(248, 113, 113, 0.4)",
+                            borderRadius: 8,
+                            padding: 20,
+                            maxWidth: 540,
+                            width: "calc(100% - 40px)",
+                            display: "flex",
+                            flexDirection: "column",
+                            gap: 12,
+                        }}
+                    >
+                        <div
+                            style={{
+                                fontSize: 14,
+                                fontWeight: 600,
+                                color: "#fca5a5",
+                            }}
+                        >
+                            Missing credentials
+                        </div>
+                        <p style={{ fontSize: 12, lineHeight: 1.5, margin: 0 }}>
+                            <strong>{pendingPull.title}</strong> requires credentials you
+                            haven't set yet:
+                        </p>
+                        <ul
+                            style={{
+                                margin: 0,
+                                padding: "0 0 0 18px",
+                                fontSize: 12,
+                                color: "#fdba74",
+                            }}
+                        >
+                            {pendingPull.missing_credentials.map((key) => (
+                                <li key={key}>
+                                    <code>{key}</code>
+                                </li>
+                            ))}
+                        </ul>
+                        {pendingPull.required_credentials.length >
+                            pendingPull.missing_credentials.length && (
+                            <p
+                                style={{
+                                    margin: 0,
+                                    fontSize: 11,
+                                    color: "var(--text-secondary)",
+                                }}
+                            >
+                                Other credentials this contribution references are already
+                                set:{" "}
+                                {pendingPull.required_credentials
+                                    .filter(
+                                        (k) =>
+                                            !pendingPull.missing_credentials.includes(k),
+                                    )
+                                    .join(", ")}
+                            </p>
+                        )}
+                        <p
+                            style={{
+                                margin: 0,
+                                fontSize: 12,
+                                lineHeight: 1.5,
+                                color: "var(--text-secondary)",
+                            }}
+                        >
+                            Set them in Settings → Credentials, or pull anyway. The
+                            contribution will be inactive until the credentials exist.
+                        </p>
+                        <div
+                            style={{
+                                display: "flex",
+                                gap: 8,
+                                justifyContent: "flex-end",
+                                marginTop: 4,
+                            }}
+                        >
+                            <button
+                                type="button"
+                                className="compose-btn"
+                                onClick={() => setPendingPull(null)}
+                            >
+                                Cancel
+                            </button>
+                            <button
+                                type="button"
+                                className="save-btn"
+                                onClick={async () => {
+                                    const pull = pendingPull;
+                                    setPendingPull(null);
+                                    await executePull(
+                                        pull.wire_contribution_id,
+                                        pull.activate,
+                                    );
+                                }}
+                            >
+                                Pull anyway
+                            </button>
+                        </div>
+                    </div>
                 </div>
             )}
 

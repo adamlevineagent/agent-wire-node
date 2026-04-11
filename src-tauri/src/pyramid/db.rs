@@ -1061,7 +1061,8 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
             generation_id TEXT,
             status TEXT NOT NULL DEFAULT 'pending',
             created_at TEXT NOT NULL DEFAULT (datetime('now')),
-            completed_at TEXT
+            completed_at TEXT,
+            cache_hit INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS idx_llm_audit_slug_build ON pyramid_llm_audit(slug, build_id);
         CREATE INDEX IF NOT EXISTS idx_llm_audit_node ON pyramid_llm_audit(slug, node_id);
@@ -1076,6 +1077,25 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
         );
         ",
     )?;
+
+    // Phase 18b: idempotent migration adding the `cache_hit` distinction to
+    // pyramid_llm_audit. Pre-Phase-18b rows default to `0` (treated as
+    // wire-served). Audited cache hits write a row with `cache_hit = 1` so
+    // the audit trail / DADBEAR Oversight page / cost reconciliation can
+    // distinguish "served from cache" from "served by HTTP call to model X".
+    {
+        let has_cache_hit: bool = conn
+            .prepare(
+                "SELECT 1 FROM pragma_table_info('pyramid_llm_audit') WHERE name = 'cache_hit'",
+            )?
+            .exists([])?;
+        if !has_cache_hit {
+            conn.execute(
+                "ALTER TABLE pyramid_llm_audit ADD COLUMN cache_hit INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+    }
 
     // ── Phase 6: LLM output cache (pyramid_step_cache) ─────────────────────
     //
@@ -1618,6 +1638,41 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
     // First-run seeding. Only fires when pyramid_providers is empty so
     // we don't clobber user-customized rows on subsequent boots.
     seed_default_provider_registry(conn)?;
+
+    // ── Phase 18a: Local Mode state row ───────────────────────────────────────
+    //
+    // Per `docs/specs/provider-registry.md` §382-395, the Local LLM
+    // (Ollama) toggle is a single conceptual switch. The state behind
+    // it lives here so toggle-off can restore the prior tier_routing
+    // and build_strategy contributions verbatim. The table is
+    // single-row (id = 1 PRIMARY KEY); existing installs see the row
+    // appear with `enabled = 0` on next boot.
+    //
+    // Two restore columns because Phase 18a supersedes BOTH the active
+    // tier_routing contribution (route every tier through Ollama) AND
+    // the active build_strategy contribution (set concurrency to 1).
+    // Disable must restore both, otherwise toggling off would leave
+    // the user pinned at concurrency 1 against OpenRouter — slow and
+    // expensive.
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS pyramid_local_mode_state (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            enabled INTEGER NOT NULL DEFAULT 0,
+            ollama_base_url TEXT,
+            ollama_model TEXT,
+            detected_context_limit INTEGER,
+            restore_from_contribution_id TEXT,
+            restore_build_strategy_contribution_id TEXT,
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        ",
+    )?;
+    // Idempotent: insert the singleton row if missing.
+    conn.execute(
+        "INSERT OR IGNORE INTO pyramid_local_mode_state (id, enabled) VALUES (1, 0)",
+        [],
+    )?;
 
     // ── Phase 4: Config Contribution Foundation ───────────────────────────────
     //
@@ -6044,6 +6099,58 @@ pub fn fail_llm_audit(
     Ok(())
 }
 
+/// Phase 18b: insert a fully-formed audit row stamped as a cache hit in
+/// a single statement. Cache hits don't go through the pending → complete
+/// dance because there is no LLM call to "fail mid-flight" — the cached
+/// result is read in microseconds. The row carries `parsed_ok = true`
+/// (the cached output already parsed once when it was stored) and
+/// `cache_hit = 1` so the audit trail can distinguish it from wire calls.
+///
+/// Returns the inserted audit row id.
+#[allow(clippy::too_many_arguments)]
+pub fn insert_llm_audit_cache_hit(
+    conn: &Connection,
+    slug: &str,
+    build_id: &str,
+    node_id: Option<&str>,
+    step_name: &str,
+    call_purpose: &str,
+    depth: Option<i64>,
+    model: &str,
+    system_prompt: &str,
+    user_prompt: &str,
+    raw_response: &str,
+    prompt_tokens: i64,
+    completion_tokens: i64,
+    latency_ms: i64,
+    generation_id: Option<&str>,
+) -> Result<i64> {
+    // Deduplicate system prompt via hash, matching insert_llm_audit_pending.
+    let sys_hash = prompt_hash(system_prompt);
+    let _ = conn.execute(
+        "INSERT OR IGNORE INTO pyramid_prompt_store (hash, content, char_count)
+         VALUES (?1, ?2, ?3)",
+        rusqlite::params![sys_hash, system_prompt, system_prompt.len() as i64],
+    );
+    let sys_ref = format!("@@hash:{}", sys_hash);
+
+    conn.execute(
+        "INSERT INTO pyramid_llm_audit
+         (slug, build_id, node_id, step_name, call_purpose, depth, model,
+          system_prompt, user_prompt, raw_response, parsed_ok,
+          prompt_tokens, completion_tokens, latency_ms, generation_id,
+          status, completed_at, cache_hit)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1,
+                 ?11, ?12, ?13, ?14, 'complete', datetime('now'), 1)",
+        rusqlite::params![
+            slug, build_id, node_id, step_name, call_purpose, depth,
+            model, sys_ref, user_prompt, raw_response,
+            prompt_tokens, completion_tokens, latency_ms, generation_id,
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
 /// Get all audit records for a specific node in a build.
 /// Hash-referenced system prompts are resolved to full text.
 pub fn get_node_audit_records(
@@ -6055,7 +6162,7 @@ pub fn get_node_audit_records(
         "SELECT id, slug, build_id, node_id, step_name, call_purpose, depth, model,
                 system_prompt, user_prompt, raw_response, parsed_ok,
                 prompt_tokens, completion_tokens, latency_ms, generation_id,
-                status, created_at, completed_at
+                status, created_at, completed_at, cache_hit
          FROM pyramid_llm_audit
          WHERE slug = ?1 AND node_id = ?2
          ORDER BY id ASC",
@@ -6078,7 +6185,7 @@ pub fn get_llm_audit_by_id(
         "SELECT id, slug, build_id, node_id, step_name, call_purpose, depth, model,
                 system_prompt, user_prompt, raw_response, parsed_ok,
                 prompt_tokens, completion_tokens, latency_ms, generation_id,
-                status, created_at, completed_at
+                status, created_at, completed_at, cache_hit
          FROM pyramid_llm_audit WHERE id = ?1",
     )?;
     let mut rows: Vec<LlmAuditRecord> = stmt
@@ -6164,6 +6271,11 @@ fn parse_llm_audit_row(row: &rusqlite::Row) -> rusqlite::Result<LlmAuditRecord> 
         status: row.get(16)?,
         created_at: row.get(17)?,
         completed_at: row.get(18)?,
+        // Phase 18b: cache_hit is the 20th column. Default to false on
+        // pre-Phase-18b rows that haven't been touched by the migration
+        // (the migration is idempotent + run on init, but defensively
+        // handle row.get errors with `unwrap_or(0)`).
+        cache_hit: row.get::<_, i32>(19).unwrap_or(0) != 0,
     })
 }
 
@@ -11166,6 +11278,138 @@ pub fn enable_dadbear_all(conn: &Connection) -> Result<usize> {
     Ok(count)
 }
 
+// ── Phase 18c (L9): Scoped pause/resume for DADBEAR ──────────────────────────
+//
+// Phase 13 shipped only `scope: "all"`. Phase 18c adds the folder scope
+// per `cross-pyramid-observability.md` "Pause-All Semantics" section
+// (~line 286). The circle scope referenced in the spec depends on a
+// `pyramid_metadata.circle_id` table that does not currently exist in
+// the local DB schema (circle membership lives only in the Wire JWT
+// claim layer, not in the local pyramid DB), so the circle scope is
+// deferred to a later phase. See `deferral-ledger.md` for the deferral
+// note.
+//
+// Folder canonicalization strategy: lexical only. The input folder
+// has any trailing slash stripped before matching, then SQL uses
+// `(source_path = ?1 OR source_path LIKE ?1 || '/%')` to match both
+// the exact path and any descendant. No filesystem resolution, no
+// symlink handling — the DB stores whatever the user originally
+// configured, and we match against that text. Trailing-slash
+// equivalence is preserved by the input normalization.
+
+/// Strip a single trailing slash from a folder path so the LIKE match
+/// works consistently for inputs like `/a/` vs `/a`. The root path `/`
+/// is preserved as-is so it doesn't collapse to an empty string.
+fn normalize_dadbear_folder(folder: &str) -> String {
+    if folder.len() > 1 && folder.ends_with('/') {
+        folder[..folder.len() - 1].to_string()
+    } else {
+        folder.to_string()
+    }
+}
+
+/// Phase 18c: bulk-pause DADBEAR for every config whose `source_path`
+/// is exactly the given folder or is a descendant of it. Idempotent —
+/// already-disabled rows do not contribute to the affected count.
+/// Returns the number of rows that flipped from `enabled = 1` to
+/// `enabled = 0`.
+pub fn disable_dadbear_by_folder(conn: &Connection, folder: &str) -> Result<usize> {
+    let normalized = normalize_dadbear_folder(folder);
+    let count = conn.execute(
+        "UPDATE pyramid_dadbear_config
+            SET enabled = 0, updated_at = datetime('now')
+          WHERE enabled = 1
+            AND (source_path = ?1 OR source_path LIKE ?1 || '/%')",
+        rusqlite::params![normalized],
+    )?;
+    Ok(count)
+}
+
+/// Phase 18c: mirror of `disable_dadbear_by_folder`. Resumes DADBEAR
+/// on every config whose `source_path` is the given folder or a
+/// descendant. Returns the number of rows that flipped from
+/// `enabled = 0` to `enabled = 1`.
+pub fn enable_dadbear_by_folder(conn: &Connection, folder: &str) -> Result<usize> {
+    let normalized = normalize_dadbear_folder(folder);
+    let count = conn.execute(
+        "UPDATE pyramid_dadbear_config
+            SET enabled = 1, updated_at = datetime('now')
+          WHERE enabled = 0
+            AND (source_path = ?1 OR source_path LIKE ?1 || '/%')",
+        rusqlite::params![normalized],
+    )?;
+    Ok(count)
+}
+
+/// Phase 18c: distinct list of `source_path` values across all
+/// DADBEAR configs. Used by the frontend scope picker to populate the
+/// folder dropdown. Sorted alphabetically; duplicates removed at the
+/// SQL level via `DISTINCT`.
+pub fn list_dadbear_source_paths(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT source_path FROM pyramid_dadbear_config
+         ORDER BY source_path ASC",
+    )?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// Phase 18c: count rows that WOULD be flipped by a pause-all call
+/// with the given scope, without actually mutating any rows. Used by
+/// the frontend scope picker to show the live count as the user
+/// changes scope. The `target_state` parameter selects whether we
+/// count rows currently enabled (would-pause) or currently disabled
+/// (would-resume). Returns 0 for unknown scopes (the IPC layer
+/// validates the scope name and returns an error in that case).
+///
+/// Folder canonicalization matches `disable_dadbear_by_folder` /
+/// `enable_dadbear_by_folder` exactly so the preview count and the
+/// real action agree on which rows match.
+pub fn count_dadbear_scope(
+    conn: &Connection,
+    scope: &str,
+    scope_value: Option<&str>,
+    target_state: bool,
+) -> Result<usize> {
+    // `target_state = true` means "would-pause" — we count rows that
+    // are currently `enabled = 1` (they will flip to disabled). The
+    // resume preview is the inverse: `enabled = 0` rows that will
+    // flip to enabled.
+    let current_enabled: i64 = if target_state { 1 } else { 0 };
+    match scope {
+        "all" => {
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM pyramid_dadbear_config WHERE enabled = ?1",
+                rusqlite::params![current_enabled],
+                |r| r.get(0),
+            )?;
+            Ok(count as usize)
+        }
+        "folder" => {
+            let folder = match scope_value {
+                Some(f) if !f.is_empty() => normalize_dadbear_folder(f),
+                _ => return Ok(0),
+            };
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM pyramid_dadbear_config
+                  WHERE enabled = ?1
+                    AND (source_path = ?2 OR source_path LIKE ?2 || '/%')",
+                rusqlite::params![current_enabled, folder],
+                |r| r.get(0),
+            )?;
+            Ok(count as usize)
+        }
+        // "circle" is deferred — no schema to query. Return 0 so the
+        // IPC layer can show "Circle scoping not yet available".
+        "circle" => Ok(0),
+        _ => Ok(0),
+    }
+}
+
 /// Phase 13: Cost-rollup helper. Aggregates `pyramid_cost_log` across
 /// all slugs within the given ISO date range, grouped by
 /// `(slug, provider, operation)`. Callers pivot the result client-side
@@ -12751,6 +12995,94 @@ pub fn seed_default_provider_registry(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+// ── Phase 18a: Local Mode state row helpers ───────────────────────────────────
+
+/// Snapshot of `pyramid_local_mode_state`. Mirrors the table 1:1 and
+/// is consumed by the IPC handlers in `main.rs`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct LocalModeStateRow {
+    pub enabled: bool,
+    pub ollama_base_url: Option<String>,
+    pub ollama_model: Option<String>,
+    pub detected_context_limit: Option<i64>,
+    pub restore_from_contribution_id: Option<String>,
+    pub restore_build_strategy_contribution_id: Option<String>,
+    pub updated_at: String,
+}
+
+/// Read the singleton `pyramid_local_mode_state` row. Returns a row
+/// initialized with the table defaults if the singleton was never
+/// inserted (defensive — `init_pyramid_db` always inserts it).
+pub fn load_local_mode_state(conn: &Connection) -> Result<LocalModeStateRow> {
+    let row = conn
+        .query_row(
+            "SELECT enabled, ollama_base_url, ollama_model,
+                    detected_context_limit,
+                    restore_from_contribution_id,
+                    restore_build_strategy_contribution_id,
+                    updated_at
+             FROM pyramid_local_mode_state
+             WHERE id = 1",
+            [],
+            |row| {
+                Ok(LocalModeStateRow {
+                    enabled: row.get::<_, i64>(0)? != 0,
+                    ollama_base_url: row.get(1)?,
+                    ollama_model: row.get(2)?,
+                    detected_context_limit: row.get(3)?,
+                    restore_from_contribution_id: row.get(4)?,
+                    restore_build_strategy_contribution_id: row.get(5)?,
+                    updated_at: row.get(6)?,
+                })
+            },
+        )
+        .optional()?;
+    Ok(row.unwrap_or_else(|| LocalModeStateRow {
+        enabled: false,
+        ollama_base_url: None,
+        ollama_model: None,
+        detected_context_limit: None,
+        restore_from_contribution_id: None,
+        restore_build_strategy_contribution_id: None,
+        updated_at: String::new(),
+    }))
+}
+
+/// Write the singleton `pyramid_local_mode_state` row. The `id = 1`
+/// row is created on first call (or by `init_pyramid_db`'s
+/// `INSERT OR IGNORE`).
+pub fn save_local_mode_state(conn: &Connection, state: &LocalModeStateRow) -> Result<()> {
+    conn.execute(
+        "INSERT INTO pyramid_local_mode_state (
+            id, enabled, ollama_base_url, ollama_model,
+            detected_context_limit,
+            restore_from_contribution_id,
+            restore_build_strategy_contribution_id,
+            updated_at
+         ) VALUES (
+            1, ?1, ?2, ?3, ?4, ?5, ?6, datetime('now')
+         )
+         ON CONFLICT(id) DO UPDATE SET
+            enabled = excluded.enabled,
+            ollama_base_url = excluded.ollama_base_url,
+            ollama_model = excluded.ollama_model,
+            detected_context_limit = excluded.detected_context_limit,
+            restore_from_contribution_id = excluded.restore_from_contribution_id,
+            restore_build_strategy_contribution_id = excluded.restore_build_strategy_contribution_id,
+            updated_at = datetime('now')
+        ",
+        rusqlite::params![
+            state.enabled as i64,
+            state.ollama_base_url,
+            state.ollama_model,
+            state.detected_context_limit,
+            state.restore_from_contribution_id,
+            state.restore_build_strategy_contribution_id,
+        ],
+    )?;
+    Ok(())
+}
+
 // ── Phase 4: Operational table upsert helpers ─────────────────────────────────
 //
 // Each schema_type whose `sync_config_to_operational()` writes to a dedicated
@@ -13998,9 +14330,22 @@ pub fn upsert_dadbear_policy(
 /// the `tier_routing` schema_type sync dispatcher. The real
 /// `TierRoutingEntry` lives in `provider.rs` with richer fields; this
 /// struct is the YAML-serializable surface.
+///
+/// **Phase 18a fix:** the canonical field name is `entries:` per the
+/// bundled `tier_routing` JSON Schema (see
+/// `assets/bundled_contributions.json` →
+/// `bundled-schema_definition-tier_routing-v1`) and the bundled
+/// default tier_routing seed. Phase 4 originally declared this struct
+/// as `tiers:`, so the bundled seed parsed silently into an empty
+/// list and never reached the operational `pyramid_tier_routing`
+/// table during contribution-driven supersessions. The struct now
+/// uses `entries:` (matching the schema_definition + the seed) and
+/// accepts the legacy `tiers:` alias so any in-flight contributions
+/// written against the broken shape still deserialize cleanly.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct TierRoutingYaml {
-    pub tiers: Vec<TierRoutingYamlEntry>,
+    #[serde(default, alias = "tiers")]
+    pub entries: Vec<TierRoutingYamlEntry>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -14018,29 +14363,101 @@ pub struct TierRoutingYamlEntry {
     pub supported_parameters_json: Option<String>,
     #[serde(default)]
     pub notes: Option<String>,
+    /// Phase 18a: bundled `tier_routing` schema_definition exposes a
+    /// per-entry `priority` integer for fallback ordering inside a
+    /// single contribution. Phase 18a does not yet thread priority
+    /// into the operational table — Phase 19 will. Carrying it on
+    /// the YAML struct lets bundled + pulled-from-Wire contributions
+    /// parse without an unknown-field error.
+    #[serde(default)]
+    pub priority: Option<i64>,
+    /// Phase 18a: bundled `tier_routing` schema accepts pricing as
+    /// flat per-token numbers in addition to the structured
+    /// `pricing_json` blob. We accept both — flat numbers are
+    /// synthesized into a `pricing_json` blob in the upsert.
+    #[serde(default)]
+    pub prompt_price_per_token: Option<f64>,
+    #[serde(default)]
+    pub completion_price_per_token: Option<f64>,
 }
 
 /// UPSERT a bundle of tier routing entries from a contribution.
 /// Delegates to the existing `save_tier_routing` helper per entry so
 /// the Phase 3 data model stays authoritative.
+///
+/// **Phase 18a:** also DELETEs any existing `pyramid_tier_routing`
+/// rows whose `tier_name` is NOT in the new contribution. Without
+/// this, an active local-mode contribution listing only
+/// `fast_extract`/`synth_heavy`/etc. would leave a stale `web` row
+/// pointing at OpenRouter, and a chain step asking for the `web`
+/// tier would silently route to OpenRouter even though local mode is
+/// on. The DELETE matches the rest of the dispatcher's
+/// "contribution is the source of truth" model.
 pub fn upsert_tier_routing_from_contribution(
     conn: &Connection,
     yaml: &TierRoutingYaml,
     _contribution_id: &str,
 ) -> Result<()> {
+    // Phase 18a: drop tiers not present in the incoming contribution.
+    let incoming_names: Vec<String> =
+        yaml.entries.iter().map(|e| e.tier_name.clone()).collect();
+    if incoming_names.is_empty() {
+        // Empty contribution = wipe the table.
+        conn.execute("DELETE FROM pyramid_tier_routing", [])?;
+    } else {
+        let placeholders = incoming_names
+            .iter()
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "DELETE FROM pyramid_tier_routing WHERE tier_name NOT IN ({placeholders})"
+        );
+        let params: Vec<&dyn rusqlite::ToSql> = incoming_names
+            .iter()
+            .map(|s| s as &dyn rusqlite::ToSql)
+            .collect();
+        conn.execute(&sql, params.as_slice())?;
+    }
+
     // Phase 4: we don't record contribution_id on individual
     // tier_routing rows — the existing schema doesn't have that column.
     // The contribution→tier linkage lives on
     // pyramid_config_contributions itself. Phase 14 can add a back-ref
     // column if the executor needs to trace tier → contribution.
-    for entry in &yaml.tiers {
+    for entry in &yaml.entries {
+        // Phase 18a: synthesize a pricing_json blob from the flat
+        // per-token rate fields when the contribution didn't supply
+        // its own pricing_json. Keeps the canonical bundled schema
+        // (which expresses pricing as flat numbers) and the
+        // structured-blob form interoperable.
+        let pricing_json = entry
+            .pricing_json
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| {
+                if entry.prompt_price_per_token.is_some()
+                    || entry.completion_price_per_token.is_some()
+                {
+                    let prompt = entry.prompt_price_per_token.unwrap_or(0.0);
+                    let completion = entry.completion_price_per_token.unwrap_or(0.0);
+                    serde_json::json!({
+                        "prompt": prompt.to_string(),
+                        "completion": completion.to_string(),
+                        "request": "0"
+                    })
+                    .to_string()
+                } else {
+                    "{}".to_string()
+                }
+            });
         let tier = TierRoutingEntry {
             tier_name: entry.tier_name.clone(),
             provider_id: entry.provider_id.clone(),
             model_id: entry.model_id.clone(),
             context_limit: entry.context_limit.map(|n| n as usize),
             max_completion_tokens: entry.max_completion_tokens.map(|n| n as usize),
-            pricing_json: entry.pricing_json.clone().unwrap_or_else(|| "{}".into()),
+            pricing_json,
             supported_parameters_json: entry.supported_parameters_json.clone(),
             notes: entry.notes.clone(),
         };
@@ -15767,6 +16184,209 @@ mod phase13_tests {
             )
             .unwrap();
         assert_eq!(disabled_count, 0);
+    }
+
+    // ── Phase 18c (L9) — Folder-scoped pause/resume + count ─────────────────
+
+    /// Helper for the Phase 18c folder-scope tests: seeds a path
+    /// hierarchy where /a, /a/b, and /a/b/c are all enabled descendants
+    /// of /a, plus /d as a sibling that should never be touched by
+    /// /a-scoped operations.
+    fn seed_dadbear_folder_hierarchy(conn: &Connection) {
+        conn.execute(
+            "INSERT INTO pyramid_dadbear_config (slug, source_path, content_type, enabled)
+             VALUES ('p18c-a',     '/a',     'document', 1),
+                    ('p18c-ab',    '/a/b',   'document', 1),
+                    ('p18c-abc',   '/a/b/c', 'document', 1),
+                    ('p18c-d',     '/d',     'document', 1)",
+            [],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_disable_dadbear_by_folder_matches_subtree() {
+        let conn = mem_conn();
+        seed_dadbear_folder_hierarchy(&conn);
+
+        // /a should match /a, /a/b, /a/b/c — three rows. /d is a
+        // sibling and must NOT be touched.
+        let affected = disable_dadbear_by_folder(&conn, "/a").unwrap();
+        assert_eq!(affected, 3, "expected /a + /a/b + /a/b/c, sibling /d untouched");
+
+        let still_enabled: Vec<String> = conn
+            .prepare(
+                "SELECT source_path FROM pyramid_dadbear_config
+                  WHERE enabled = 1 ORDER BY source_path",
+            )
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(still_enabled, vec!["/d".to_string()]);
+    }
+
+    #[test]
+    fn test_disable_dadbear_by_folder_handles_trailing_slash() {
+        let conn = mem_conn();
+        seed_dadbear_folder_hierarchy(&conn);
+
+        // Trailing-slash variant should match the same set as the
+        // no-slash variant. Canonicalization strips the trailing slash
+        // before matching.
+        let affected = disable_dadbear_by_folder(&conn, "/a/").unwrap();
+        assert_eq!(affected, 3);
+    }
+
+    #[test]
+    fn test_disable_dadbear_by_folder_idempotent() {
+        let conn = mem_conn();
+        seed_dadbear_folder_hierarchy(&conn);
+
+        let first = disable_dadbear_by_folder(&conn, "/a").unwrap();
+        assert_eq!(first, 3);
+        // Second call hits zero matching rows because they're all
+        // already disabled.
+        let second = disable_dadbear_by_folder(&conn, "/a").unwrap();
+        assert_eq!(second, 0);
+    }
+
+    #[test]
+    fn test_enable_dadbear_by_folder_mirrors_disable() {
+        let conn = mem_conn();
+        seed_dadbear_folder_hierarchy(&conn);
+        // Disable everything first.
+        disable_dadbear_all(&conn).unwrap();
+
+        let affected = enable_dadbear_by_folder(&conn, "/a").unwrap();
+        assert_eq!(affected, 3, "/a + /a/b + /a/b/c should re-enable");
+
+        // /d is still disabled.
+        let still_disabled: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pyramid_dadbear_config WHERE enabled = 0",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(still_disabled, 1);
+    }
+
+    #[test]
+    fn test_disable_dadbear_by_folder_does_not_match_partial_prefix() {
+        let conn = mem_conn();
+        // /alpha and /a are siblings — pausing /a must NOT match
+        // /alpha because the LIKE match uses '/%' as the suffix.
+        conn.execute(
+            "INSERT INTO pyramid_dadbear_config (slug, source_path, content_type, enabled)
+             VALUES ('p18c-a',     '/a',     'document', 1),
+                    ('p18c-alpha', '/alpha', 'document', 1)",
+            [],
+        )
+        .unwrap();
+
+        let affected = disable_dadbear_by_folder(&conn, "/a").unwrap();
+        assert_eq!(affected, 1, "only /a should match, not /alpha");
+
+        let alpha_enabled: i64 = conn
+            .query_row(
+                "SELECT enabled FROM pyramid_dadbear_config WHERE source_path = '/alpha'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(alpha_enabled, 1, "/alpha must still be enabled");
+    }
+
+    #[test]
+    fn test_list_dadbear_source_paths_returns_distinct_sorted() {
+        let conn = mem_conn();
+        conn.execute(
+            "INSERT INTO pyramid_dadbear_config (slug, source_path, content_type, enabled)
+             VALUES ('p18c-a',  '/zeta',  'document', 1),
+                    ('p18c-b',  '/alpha', 'document', 1),
+                    ('p18c-c',  '/alpha', 'document', 0),
+                    ('p18c-d',  '/mid',   'document', 1)",
+            [],
+        )
+        .unwrap();
+
+        let paths = list_dadbear_source_paths(&conn).unwrap();
+        // /alpha appears twice in the table but DISTINCT collapses
+        // to one entry. Result is alphabetically sorted.
+        assert_eq!(
+            paths,
+            vec!["/alpha".to_string(), "/mid".to_string(), "/zeta".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_count_dadbear_scope_all_returns_currently_enabled() {
+        let conn = mem_conn();
+        seed_dadbear_folder_hierarchy(&conn);
+        // Pause one row so the seeded hierarchy has 3 enabled / 1 disabled.
+        conn.execute(
+            "UPDATE pyramid_dadbear_config SET enabled = 0 WHERE source_path = '/d'",
+            [],
+        )
+        .unwrap();
+
+        // target_state=true means "would-pause" — count rows that are
+        // currently enabled (i.e. would flip to disabled).
+        let pause_count = count_dadbear_scope(&conn, "all", None, true).unwrap();
+        assert_eq!(pause_count, 3);
+
+        // target_state=false means "would-resume" — count rows that are
+        // currently disabled.
+        let resume_count = count_dadbear_scope(&conn, "all", None, false).unwrap();
+        assert_eq!(resume_count, 1);
+    }
+
+    #[test]
+    fn test_count_dadbear_scope_folder_matches_disable_helper() {
+        let conn = mem_conn();
+        seed_dadbear_folder_hierarchy(&conn);
+
+        // Preview should agree with the real action — both must say 3
+        // rows under /a.
+        let preview = count_dadbear_scope(&conn, "folder", Some("/a"), true).unwrap();
+        assert_eq!(preview, 3);
+
+        // After actually disabling, the preview drops to 0.
+        disable_dadbear_by_folder(&conn, "/a").unwrap();
+        let after = count_dadbear_scope(&conn, "folder", Some("/a"), true).unwrap();
+        assert_eq!(after, 0);
+
+        // And the resume preview now sees the 3 disabled rows.
+        let resume_preview = count_dadbear_scope(&conn, "folder", Some("/a"), false).unwrap();
+        assert_eq!(resume_preview, 3);
+    }
+
+    #[test]
+    fn test_count_dadbear_scope_folder_handles_missing_or_empty_value() {
+        let conn = mem_conn();
+        seed_dadbear_folder_hierarchy(&conn);
+
+        // Missing or empty scope_value returns 0 instead of matching
+        // every row — this prevents UI from accidentally implying a
+        // dangerous "everything" preview when the user hasn't typed
+        // a path yet.
+        assert_eq!(count_dadbear_scope(&conn, "folder", None, true).unwrap(), 0);
+        assert_eq!(count_dadbear_scope(&conn, "folder", Some(""), true).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_count_dadbear_scope_circle_returns_zero_pending_schema() {
+        let conn = mem_conn();
+        seed_dadbear_folder_hierarchy(&conn);
+
+        // The circle scope has no backing schema yet (deferred per
+        // Phase 18c deviation note). The count helper returns 0 so
+        // the UI can render "Circle scoping not yet available".
+        let count =
+            count_dadbear_scope(&conn, "circle", Some("any-circle"), true).unwrap();
+        assert_eq!(count, 0);
     }
 
     #[test]

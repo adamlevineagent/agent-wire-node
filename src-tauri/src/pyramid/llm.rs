@@ -518,10 +518,64 @@ pub async fn call_model_unified_with_options(
 /// * Cache writes use the DB path stashed on the StepContext — NOT the
 ///   writer mutex — because the cache is content-addressable and
 ///   `INSERT OR REPLACE` on a unique key is safe without serialization.
+///
+/// ## Phase 18b
+///
+/// This function now accepts an internal `audit: Option<&AuditContext>`
+/// parameter at the end of the signature via the new
+/// `call_model_unified_with_audit_and_ctx` entry point. The legacy
+/// public signature (no audit) is preserved here as a thin wrapper that
+/// passes `None`. Retrofit call sites that previously bypassed the
+/// cache by calling `call_model_audited` should be migrated to
+/// `call_model_unified_with_audit_and_ctx` so the cache becomes
+/// reachable from the audited path.
 #[allow(clippy::too_many_arguments)]
 pub async fn call_model_unified_with_options_and_ctx(
     config: &LlmConfig,
     ctx: Option<&StepContext>,
+    system_prompt: &str,
+    user_prompt: &str,
+    temperature: f32,
+    max_tokens: usize,
+    response_format: Option<&serde_json::Value>,
+    options: LlmCallOptions,
+) -> Result<LlmResponse> {
+    call_model_unified_with_audit_and_ctx(
+        config,
+        ctx,
+        None,
+        system_prompt,
+        user_prompt,
+        temperature,
+        max_tokens,
+        response_format,
+        options,
+    )
+    .await
+}
+
+/// Phase 18b: cache + audit unified entry point.
+///
+/// Threads BOTH a `StepContext` (for cache lookup/storage) and an
+/// `AuditContext` (for the Live Pyramid Theatre audit trail) through
+/// a single call path. Retrofit call sites that previously bypassed
+/// the cache by calling `call_model_audited` should be migrated to
+/// this entry point.
+///
+/// When the call serves from cache, an audit row is still written —
+/// stamped `cache_hit = true` — so the audit trail remains contiguous
+/// and the DADBEAR Oversight page / cost reconciliation can show the
+/// savings without losing audit-completeness.
+///
+/// When `audit` is `None`, behavior is identical to
+/// `call_model_unified_with_options_and_ctx`. When `ctx` is `None` or
+/// not cache-usable, the cache is bypassed but the audit trail is
+/// still written via the existing pending → complete dance.
+#[allow(clippy::too_many_arguments)]
+pub async fn call_model_unified_with_audit_and_ctx(
+    config: &LlmConfig,
+    ctx: Option<&StepContext>,
+    audit: Option<&AuditContext>,
     system_prompt: &str,
     user_prompt: &str,
     temperature: f32,
@@ -534,9 +588,67 @@ pub async fn call_model_unified_with_options_and_ctx(
     // Delegated to `try_cache_lookup_or_key`, which is shared with
     // `call_model_via_registry`. When it returns `CacheProbeOutcome::Hit`
     // the cached response short-circuits the HTTP path entirely.
+    //
+    // Phase 18b: cache hits still write an audit row stamped as such
+    // (when an AuditContext is supplied) so the audit trail remains
+    // contiguous and DADBEAR Oversight can show cache savings.
+    let probe_started = std::time::Instant::now();
     let cache_lookup = match try_cache_lookup_or_key(ctx, system_prompt, user_prompt) {
-        CacheProbeOutcome::Hit(response) => return Ok(response),
+        CacheProbeOutcome::Hit(response) => {
+            if let Some(audit_ctx) = audit {
+                let model_for_row = ctx
+                    .and_then(|c| c.resolved_model_id.clone())
+                    .filter(|m| !m.is_empty())
+                    .unwrap_or_else(|| config.primary_model.clone());
+                let latency_ms = probe_started.elapsed().as_millis() as i64;
+                let conn = audit_ctx.conn.lock().await;
+                let _ = super::db::insert_llm_audit_cache_hit(
+                    &conn,
+                    &audit_ctx.slug,
+                    &audit_ctx.build_id,
+                    audit_ctx.node_id.as_deref(),
+                    &audit_ctx.step_name,
+                    &audit_ctx.call_purpose,
+                    audit_ctx.depth,
+                    &model_for_row,
+                    system_prompt,
+                    user_prompt,
+                    &response.content,
+                    response.usage.prompt_tokens,
+                    response.usage.completion_tokens,
+                    latency_ms,
+                    response.generation_id.as_deref(),
+                );
+            }
+            return Ok(response);
+        }
         CacheProbeOutcome::MissOrBypass(lookup) => lookup,
+    };
+
+    // ── Phase 18b: Audit pending row insert ─────────────────────────
+    //
+    // Mirror the legacy `call_model_audited` flow: insert a pending row
+    // BEFORE the HTTP call so a crash mid-call leaves a trace. The row
+    // is updated to 'complete' or 'failed' below. When no AuditContext
+    // was supplied this is a no-op and the function reduces to the
+    // pre-Phase-18b cache-aware path.
+    let audit_id: Option<i64> = if let Some(audit_ctx) = audit {
+        let conn = audit_ctx.conn.lock().await;
+        super::db::insert_llm_audit_pending(
+            &conn,
+            &audit_ctx.slug,
+            &audit_ctx.build_id,
+            audit_ctx.node_id.as_deref(),
+            &audit_ctx.step_name,
+            &audit_ctx.call_purpose,
+            audit_ctx.depth,
+            &config.primary_model,
+            system_prompt,
+            user_prompt,
+        )
+        .ok()
+    } else {
+        None
     };
 
     let call_started = std::time::Instant::now();
@@ -682,6 +794,7 @@ pub async fn call_model_unified_with_options_and_ctx(
                     e
                 );
                 emit_step_error(ctx, &err_msg);
+                maybe_fail_audit(audit, audit_id, &err_msg).await;
                 return Err(anyhow!(err_msg));
             }
         };
@@ -734,11 +847,13 @@ pub async fn call_model_unified_with_options_and_ctx(
                     tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
                     continue;
                 }
-                return Err(anyhow!(
+                let err_msg = format!(
                     "HTTP 400 (not context-exceeded) after {} attempts: {}",
                     config.max_retries,
                     &body_400[..body_400.len().min(500)],
-                ));
+                );
+                maybe_fail_audit(audit, audit_id, &err_msg).await;
+                return Err(anyhow!(err_msg));
             }
         }
 
@@ -804,6 +919,7 @@ pub async fn call_model_unified_with_options_and_ctx(
                 &body_text[..body_text.len().min(200)]
             );
             emit_step_error(ctx, &err_msg);
+            maybe_fail_audit(audit, audit_id, &err_msg).await;
             return Err(anyhow!(err_msg));
         }
 
@@ -832,6 +948,7 @@ pub async fn call_model_unified_with_options_and_ctx(
                     config.max_retries, e
                 );
                 emit_step_error(ctx, &err_msg);
+                maybe_fail_audit(audit, audit_id, &err_msg).await;
                 return Err(anyhow!(err_msg));
             }
         };
@@ -874,6 +991,7 @@ pub async fn call_model_unified_with_options_and_ctx(
                     config.max_retries, e
                 );
                 emit_step_error(ctx, &err_msg);
+                maybe_fail_audit(audit, audit_id, &err_msg).await;
                 return Err(anyhow!(err_msg));
             }
         };
@@ -929,6 +1047,7 @@ pub async fn call_model_unified_with_options_and_ctx(
                 config.max_retries
             );
             emit_step_error(ctx, &err_msg);
+            maybe_fail_audit(audit, audit_id, &err_msg).await;
             return Err(anyhow!(err_msg));
         }
 
@@ -969,12 +1088,50 @@ pub async fn call_model_unified_with_options_and_ctx(
             latency_ms,
         );
 
+        // ── Phase 18b: Audit complete row write ──────────────────────
+        //
+        // Update the pending row inserted at the top of the function with
+        // the response, parsed_ok=true, token usage, latency, and the
+        // generation_id. No-op when no AuditContext was supplied. The
+        // row was inserted with `cache_hit = 0` (default) so the
+        // wire-call vs cache-hit distinction stays correct.
+        if let (Some(audit_ctx), Some(id)) = (audit, audit_id) {
+            let conn = audit_ctx.conn.lock().await;
+            let _ = super::db::complete_llm_audit(
+                &conn,
+                id,
+                &response.content,
+                true,
+                response.usage.prompt_tokens,
+                response.usage.completion_tokens,
+                latency_ms,
+                response.generation_id.as_deref(),
+            );
+        }
+
         return Ok(response);
     }
 
     let err_msg = "Max retries exceeded".to_string();
     emit_step_error(ctx, &err_msg);
+    maybe_fail_audit(audit, audit_id, &err_msg).await;
     Err(anyhow!(err_msg))
+}
+
+/// Phase 18b: helper for the inner function's terminal-error sites.
+/// When an audit row was inserted at the top of the function, this
+/// flips it to `status = 'failed'` so the audit trail isn't left with
+/// a dangling pending row. Acquires the audit conn lock for the
+/// duration of the UPDATE.
+async fn maybe_fail_audit(
+    audit: Option<&AuditContext>,
+    audit_id: Option<i64>,
+    error_message: &str,
+) {
+    if let (Some(audit_ctx), Some(id)) = (audit, audit_id) {
+        let conn = audit_ctx.conn.lock().await;
+        let _ = super::db::fail_llm_audit(&conn, id, error_message);
+    }
 }
 
 // ── Phase 6: Cache support types and helpers ────────────────────────────────
@@ -2025,13 +2182,36 @@ impl AuditContext {
     }
 }
 
-/// Audited LLM call: wraps `call_model_unified` with pre/post audit row writes.
+/// Phase 18b: legacy entry point retained as a thin deprecated wrapper.
 ///
-/// 1. Inserts a pending audit row BEFORE the call
-/// 2. Calls `call_model_unified`
-/// 3. Updates the row with response + metrics AFTER
+/// Historically this function inserted its own pending audit row and
+/// then called `call_model_unified`, bypassing the Phase 6 cache. That
+/// meant audited LLM calls (the only kind Wire Node makes during
+/// production builds) re-burned tokens on every re-run.
 ///
-/// Returns `(LlmResponse, audit_row_id)`.
+/// Phase 18b retired the duplicate audit-write path. The
+/// `call_model_unified_with_audit_and_ctx` entry point now threads BOTH
+/// the audit context AND a Phase 6 StepContext through a single
+/// implementation that:
+///
+///   1. Probes the cache and serves cache hits with a `cache_hit = true`
+///      audit row, OR
+///   2. Falls through to the existing pending-row → HTTP call →
+///      complete-row dance for wire calls.
+///
+/// This wrapper preserves the legacy `(LlmResponse, audit_id)` return
+/// shape so existing callers compile, but the returned id is `0` —
+/// production callers always pattern-match `(resp, _)` and ignore it.
+/// New retrofit sites should call `call_model_unified_with_audit_and_ctx`
+/// directly so they can thread a `StepContext` for cache reachability.
+///
+/// LEAVING THIS WRAPPER IN PLACE WITHOUT THREADING A StepContext IS A
+/// CACHE GAP. Every production call site MUST migrate to the unified
+/// entry point.
+#[deprecated(
+    note = "Phase 18b: prefer `call_model_unified_with_audit_and_ctx` so the cache is reachable. \
+            This wrapper passes ctx=None and re-burns tokens on every call."
+)]
 pub async fn call_model_audited(
     config: &LlmConfig,
     system_prompt: &str,
@@ -2041,62 +2221,25 @@ pub async fn call_model_audited(
     response_format: Option<&serde_json::Value>,
     audit: &AuditContext,
 ) -> Result<(LlmResponse, i64)> {
-    use super::db;
-
-    // Insert pending row (async lock on tokio mutex)
-    let audit_id = {
-        let conn = audit.conn.lock().await;
-        db::insert_llm_audit_pending(
-            &conn,
-            &audit.slug,
-            &audit.build_id,
-            audit.node_id.as_deref(),
-            &audit.step_name,
-            &audit.call_purpose,
-            audit.depth,
-            &config.primary_model,
-            system_prompt,
-            user_prompt,
-        )?
-    };
-
-    let start = std::time::Instant::now();
-
-    // Actual LLM call
-    let result = call_model_unified(
+    let resp = call_model_unified_with_audit_and_ctx(
         config,
+        None,
+        Some(audit),
         system_prompt,
         user_prompt,
         temperature,
         max_tokens,
         response_format,
+        LlmCallOptions::default(),
     )
-    .await;
-
-    let latency_ms = start.elapsed().as_millis() as i64;
-
-    match result {
-        Ok(resp) => {
-            let conn = audit.conn.lock().await;
-            let _ = db::complete_llm_audit(
-                &conn,
-                audit_id,
-                &resp.content,
-                true,
-                resp.usage.prompt_tokens,
-                resp.usage.completion_tokens,
-                latency_ms,
-                resp.generation_id.as_deref(),
-            );
-            Ok((resp, audit_id))
-        }
-        Err(e) => {
-            let conn = audit.conn.lock().await;
-            let _ = db::fail_llm_audit(&conn, audit_id, &e.to_string());
-            drop(conn);
-            Err(e)
-        }
-    }
+    .await?;
+    // Phase 18b: the audit row id is no longer surfaced — the cache-hit
+    // path inserts a single complete row in one statement and the
+    // wire-call path goes through pending → complete inside
+    // `call_model_unified_with_audit_and_ctx`. Production callers ignore
+    // the returned id; tests that need it should query
+    // `pyramid_llm_audit` by `(slug, build_id)`.
+    Ok((resp, 0))
 }
 
 // ── JSON extraction ──────────────────────────────────────────────────────────
@@ -2801,5 +2944,265 @@ mod tests {
             row.is_none(),
             "verification-failed row must be deleted from the cache"
         );
+    }
+
+    // ── Phase 18b L8: cache + audit unified path ─────────────────────────
+
+    /// Build a tokio-mutex-wrapped audit Connection on the given DB path.
+    /// The cache + audit unified function locks this guard to write the
+    /// audit row, so the test can verify the row landed.
+    fn audit_conn_for(
+        db_path: &std::path::Path,
+        slug: &str,
+    ) -> std::sync::Arc<tokio::sync::Mutex<rusqlite::Connection>> {
+        let conn = super::super::db::open_pyramid_db(db_path).expect("open audit conn");
+        // Make sure the slug row exists for FK-like wiring (not a real
+        // FK in the schema, but matches what the production code does).
+        let _ = conn.execute(
+            "INSERT OR IGNORE INTO pyramid_slugs (slug, content_type, source_path)
+             VALUES (?1, 'document', '/tmp/source')",
+            rusqlite::params![slug],
+        );
+        std::sync::Arc::new(tokio::sync::Mutex::new(conn))
+    }
+
+    /// Helper: count rows in `pyramid_llm_audit` for a given slug, with
+    /// an optional `cache_hit` filter (`Some(true)` for cache-hit rows,
+    /// `Some(false)` for wire-call rows, `None` for any).
+    fn count_audit_rows(
+        db_path: &std::path::Path,
+        slug: &str,
+        cache_hit_filter: Option<bool>,
+    ) -> i64 {
+        let conn = super::super::db::open_pyramid_db(db_path).expect("reopen for count");
+        match cache_hit_filter {
+            Some(flag) => {
+                let v = if flag { 1 } else { 0 };
+                conn.query_row(
+                    "SELECT COUNT(*) FROM pyramid_llm_audit
+                     WHERE slug = ?1 AND cache_hit = ?2",
+                    rusqlite::params![slug, v],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0)
+            }
+            None => conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pyramid_llm_audit WHERE slug = ?1",
+                    rusqlite::params![slug],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_phase18b_audited_cache_hit_writes_cache_hit_audit_row() {
+        // L8 acceptance: when an audited LLM call serves from cache,
+        // the unified entry point still writes a single audit row
+        // stamped `cache_hit = 1`. The cached response is returned
+        // without making an HTTP call.
+        let db = temp_pyramid_db_with_slug("p18b-l8");
+        let system = "audited cache hit system";
+        let user = "audited cache hit user";
+        let model_id = "test/model-l8";
+        let prompt_hash = "phash-l8";
+
+        let inputs_hash = compute_inputs_hash(system, user);
+        let cache_key = compute_cache_key(&inputs_hash, prompt_hash, model_id);
+        pre_populate_cache(
+            db.path(),
+            "p18b-l8",
+            &cache_key,
+            &inputs_hash,
+            prompt_hash,
+            model_id,
+            "cached-l8-content",
+        );
+
+        let ctx = StepContext::new(
+            "p18b-l8",
+            "build-l8",
+            "evidence_pre_map",
+            "extract",
+            0,
+            None,
+            db.path().to_string_lossy().to_string(),
+        )
+        .with_model_resolution("fast_extract", model_id)
+        .with_prompt_hash(prompt_hash);
+
+        let audit = AuditContext {
+            conn: audit_conn_for(db.path(), "p18b-l8"),
+            slug: "p18b-l8".to_string(),
+            build_id: "build-l8".to_string(),
+            node_id: None,
+            step_name: "evidence_pre_map".to_string(),
+            call_purpose: "test_l8_cache_hit".to_string(),
+            depth: Some(0),
+        };
+
+        // Baseline: no audit rows yet for this slug.
+        assert_eq!(count_audit_rows(db.path(), "p18b-l8", None), 0);
+
+        let cfg = LlmConfig::default();
+        let response = call_model_unified_with_audit_and_ctx(
+            &cfg,
+            Some(&ctx),
+            Some(&audit),
+            system,
+            user,
+            0.2,
+            4096,
+            None,
+            LlmCallOptions::default(),
+        )
+        .await
+        .expect("cache hit must return Ok");
+
+        // The cached content is returned, NOT something HTTP-fetched.
+        assert_eq!(response.content, "cached-l8-content");
+        assert_eq!(response.usage.prompt_tokens, 11);
+        assert_eq!(response.usage.completion_tokens, 22);
+
+        // The audit row landed and is stamped as a cache hit.
+        assert_eq!(
+            count_audit_rows(db.path(), "p18b-l8", Some(true)),
+            1,
+            "exactly one cache_hit=1 audit row"
+        );
+        assert_eq!(
+            count_audit_rows(db.path(), "p18b-l8", Some(false)),
+            0,
+            "no wire-call rows"
+        );
+        assert_eq!(
+            count_audit_rows(db.path(), "p18b-l8", None),
+            1,
+            "exactly one audit row total"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_phase18b_audited_cache_miss_falls_through_to_pending_path() {
+        // L8 secondary: when there is NO matching cached row but an
+        // AuditContext is supplied, the unified entry point inserts a
+        // pending audit row, then attempts the HTTP call. With no
+        // provider configured the HTTP path errors, and the audit row
+        // is flipped to `failed` via maybe_fail_audit. The test
+        // confirms an audit row exists, that it's NOT a cache_hit row,
+        // and that the call returned an error (not a cached response).
+        let db = temp_pyramid_db_with_slug("p18b-l8-miss");
+        let system = "audited miss system";
+        let user = "audited miss user";
+
+        let ctx = StepContext::new(
+            "p18b-l8-miss",
+            "build-miss",
+            "evidence_pre_map",
+            "extract",
+            0,
+            None,
+            db.path().to_string_lossy().to_string(),
+        )
+        .with_model_resolution("fast_extract", "test/model-miss")
+        .with_prompt_hash("phash-miss");
+
+        let audit = AuditContext {
+            conn: audit_conn_for(db.path(), "p18b-l8-miss"),
+            slug: "p18b-l8-miss".to_string(),
+            build_id: "build-miss".to_string(),
+            node_id: None,
+            step_name: "evidence_pre_map".to_string(),
+            call_purpose: "test_l8_cache_miss".to_string(),
+            depth: Some(0),
+        };
+
+        let mut cfg = LlmConfig::default();
+        cfg.max_retries = 1;
+        cfg.base_timeout_secs = 1;
+        cfg.retryable_status_codes = vec![];
+        cfg.retry_base_sleep_secs = 0;
+
+        let _ = call_model_unified_with_audit_and_ctx(
+            &cfg,
+            Some(&ctx),
+            Some(&audit),
+            system,
+            user,
+            0.2,
+            4096,
+            None,
+            LlmCallOptions::default(),
+        )
+        .await;
+
+        // Even though the HTTP call errored, the pending audit row was
+        // written before the call started, then flipped to 'failed' by
+        // maybe_fail_audit. The cache_hit flag is 0 because this was
+        // not a cache hit.
+        let total = count_audit_rows(db.path(), "p18b-l8-miss", None);
+        let cache_hits = count_audit_rows(db.path(), "p18b-l8-miss", Some(true));
+        let wire_calls = count_audit_rows(db.path(), "p18b-l8-miss", Some(false));
+        assert_eq!(total, 1, "one audit row total (the pending → failed row)");
+        assert_eq!(cache_hits, 0, "no cache_hit rows on a miss");
+        assert_eq!(wire_calls, 1, "exactly one wire-call audit row");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_phase18b_unified_no_audit_matches_legacy_cache_path() {
+        // Regression: when audit is None, the unified entry point must
+        // behave identically to the pre-Phase-18b
+        // `call_model_unified_with_options_and_ctx`. We pre-populate
+        // the cache and assert the cache hit returns the cached
+        // response without writing any audit row.
+        let db = temp_pyramid_db_with_slug("p18b-l8-noaudit");
+        let system = "noaudit system";
+        let user = "noaudit user";
+        let model_id = "test/model-noaudit";
+        let prompt_hash = "phash-noaudit";
+
+        let inputs_hash = compute_inputs_hash(system, user);
+        let cache_key = compute_cache_key(&inputs_hash, prompt_hash, model_id);
+        pre_populate_cache(
+            db.path(),
+            "p18b-l8-noaudit",
+            &cache_key,
+            &inputs_hash,
+            prompt_hash,
+            model_id,
+            "noaudit-cached",
+        );
+
+        let ctx = StepContext::new(
+            "p18b-l8-noaudit",
+            "build-1",
+            "test_step",
+            "extract",
+            0,
+            None,
+            db.path().to_string_lossy().to_string(),
+        )
+        .with_model_resolution("fast_extract", model_id)
+        .with_prompt_hash(prompt_hash);
+
+        let cfg = LlmConfig::default();
+        let response = call_model_unified_with_audit_and_ctx(
+            &cfg,
+            Some(&ctx),
+            None,
+            system,
+            user,
+            0.2,
+            4096,
+            None,
+            LlmCallOptions::default(),
+        )
+        .await
+        .expect("cache hit returns Ok");
+        assert_eq!(response.content, "noaudit-cached");
+
+        // No audit rows landed because audit was None.
+        assert_eq!(count_audit_rows(db.path(), "p18b-l8-noaudit", None), 0);
     }
 }

@@ -3046,6 +3046,12 @@ async fn pyramid_drill(
     state: tauri::State<'_, SharedState>,
     slug: String,
     node_id: String,
+    // Phase 18b L7: optional flag the frontend sets when the drill is
+    // launched from a search result. When true, the IPC fires
+    // `search_hit` IN ADDITION TO the standard `user_drill` so the
+    // demand signal subsystem can distinguish a direct drill from a
+    // search-then-drill flow. Defaults to `false` (the bare drill).
+    from_search: Option<bool>,
 ) -> Result<DrillResult, String> {
     let result = {
         let conn = state.pyramid.reader.lock().await;
@@ -3057,9 +3063,13 @@ async fn pyramid_drill(
     // Phase 12: fire-and-forget user_drill demand signal recording.
     // The IPC drill is always user-initiated (desktop UI), so we
     // always record `user_drill` with source "user".
+    //
+    // Phase 18b L7: when `from_search = true`, also record `search_hit`
+    // so the search→drill flow shows up as a distinct demand signal.
     let writer = state.pyramid.writer.clone();
     let slug_for_signal = slug.clone();
     let node_for_signal = node_id.clone();
+    let from_search_flag = from_search.unwrap_or(false);
     tokio::spawn(async move {
         let conn = writer.lock().await;
         let policy = match wire_node_lib::pyramid::db::load_active_evidence_policy(
@@ -3077,6 +3087,16 @@ async fn pyramid_drill(
             Some("user"),
             &policy,
         );
+        if from_search_flag {
+            let _ = wire_node_lib::pyramid::demand_signal::record_demand_signal(
+                &conn,
+                &slug_for_signal,
+                &node_for_signal,
+                "search_hit",
+                Some("user"),
+                &policy,
+            );
+        }
     });
 
     Ok(result)
@@ -6665,43 +6685,145 @@ fn resolve_cost_rollup_range(args: &CostRollupArgs) -> anyhow::Result<(String, S
     Ok((from.format("%Y-%m-%d %H:%M:%S").to_string(), to.format("%Y-%m-%d %H:%M:%S").to_string()))
 }
 
-/// Phase 13: bulk-pause DADBEAR across all pyramids. Idempotent —
-/// returns the number of rows whose `enabled` column flipped from
-/// 1 to 0 (rows already paused contribute 0 to the count).
+/// Phase 13 + Phase 18c: bulk-pause DADBEAR across pyramids matching
+/// the given scope. Idempotent — returns the number of rows whose
+/// `enabled` column flipped from 1 to 0 (rows already paused
+/// contribute 0 to the count).
+///
+/// Scopes (per `cross-pyramid-observability.md` "Pause-All Semantics"):
+/// - `"all"` — every enabled config (Phase 13)
+/// - `"folder"` — configs whose `source_path` is exactly `scope_value`
+///   or a descendant. `scope_value` is required. (Phase 18c L9)
+/// - `"circle"` — DEFERRED. The local DB has no `pyramid_metadata`
+///   table with `circle_id` to query against; circle membership lives
+///   only in the Wire JWT claim layer. Returns an error pointing the
+///   caller at the deferral note.
 #[tauri::command]
 async fn pyramid_pause_dadbear_all(
     state: tauri::State<'_, SharedState>,
     scope: String,
-    _scope_value: Option<String>,
+    scope_value: Option<String>,
 ) -> Result<serde_json::Value, String> {
-    if scope != "all" {
-        // Folder / circle scopes are deferred to Phase 14/15.
-        return Err(format!(
-            "pyramid_pause_dadbear_all: scope `{}` not implemented — only `all` is supported in Phase 13",
-            scope
-        ));
-    }
     let conn = state.pyramid.writer.lock().await;
-    let affected = pyramid_db::disable_dadbear_all(&conn).map_err(|e| e.to_string())?;
+    let affected = match scope.as_str() {
+        "all" => pyramid_db::disable_dadbear_all(&conn).map_err(|e| e.to_string())?,
+        "folder" => {
+            let folder = scope_value
+                .as_deref()
+                .filter(|v| !v.is_empty())
+                .ok_or_else(|| {
+                    "pyramid_pause_dadbear_all: scope `folder` requires a non-empty scope_value"
+                        .to_string()
+                })?;
+            pyramid_db::disable_dadbear_by_folder(&conn, folder).map_err(|e| e.to_string())?
+        }
+        "circle" => {
+            return Err(
+                "pyramid_pause_dadbear_all: scope `circle` is deferred — local DB has no \
+                 circle_id column on pyramid_metadata. Tracked in deferral-ledger.md as a \
+                 follow-up to Phase 18c."
+                    .to_string(),
+            )
+        }
+        other => {
+            return Err(format!(
+                "pyramid_pause_dadbear_all: unknown scope `{}` (expected all|folder|circle)",
+                other
+            ))
+        }
+    };
     Ok(serde_json::json!({ "affected": affected }))
 }
 
-/// Phase 13: mirror of `pyramid_pause_dadbear_all`.
+/// Phase 13 + Phase 18c: mirror of `pyramid_pause_dadbear_all`.
 #[tauri::command]
 async fn pyramid_resume_dadbear_all(
     state: tauri::State<'_, SharedState>,
     scope: String,
-    _scope_value: Option<String>,
+    scope_value: Option<String>,
 ) -> Result<serde_json::Value, String> {
-    if scope != "all" {
+    let conn = state.pyramid.writer.lock().await;
+    let affected = match scope.as_str() {
+        "all" => pyramid_db::enable_dadbear_all(&conn).map_err(|e| e.to_string())?,
+        "folder" => {
+            let folder = scope_value
+                .as_deref()
+                .filter(|v| !v.is_empty())
+                .ok_or_else(|| {
+                    "pyramid_resume_dadbear_all: scope `folder` requires a non-empty scope_value"
+                        .to_string()
+                })?;
+            pyramid_db::enable_dadbear_by_folder(&conn, folder).map_err(|e| e.to_string())?
+        }
+        "circle" => {
+            return Err(
+                "pyramid_resume_dadbear_all: scope `circle` is deferred — see \
+                 deferral-ledger.md for the follow-up note."
+                    .to_string(),
+            )
+        }
+        other => {
+            return Err(format!(
+                "pyramid_resume_dadbear_all: unknown scope `{}` (expected all|folder|circle)",
+                other
+            ))
+        }
+    };
+    Ok(serde_json::json!({ "affected": affected }))
+}
+
+/// Phase 18c (L9): list distinct `source_path` values across all
+/// DADBEAR configs. Powers the folder dropdown in the Pause All scope
+/// picker. Sorted alphabetically; duplicates collapsed.
+#[tauri::command]
+async fn pyramid_list_dadbear_source_paths(
+    state: tauri::State<'_, SharedState>,
+) -> Result<Vec<String>, String> {
+    let conn = state.pyramid.reader.lock().await;
+    pyramid_db::list_dadbear_source_paths(&conn).map_err(|e| e.to_string())
+}
+
+/// Phase 18c (L9): live count helper for the scope picker. Returns
+/// the number of rows that WOULD be flipped by a pause-all call with
+/// the given scope, without mutating any rows. The frontend calls
+/// this every time the user changes the scope picker so the
+/// confirmation modal can show "Pause N pyramid(s)" with the right N.
+///
+/// `target_state = "pause"` counts rows currently enabled (would
+/// flip to disabled). `target_state = "resume"` counts rows currently
+/// disabled. Anything else is an error.
+#[tauri::command]
+async fn pyramid_count_dadbear_scope(
+    state: tauri::State<'_, SharedState>,
+    scope: String,
+    scope_value: Option<String>,
+    target_state: String,
+) -> Result<serde_json::Value, String> {
+    let target_pause = match target_state.as_str() {
+        "pause" => true,
+        "resume" => false,
+        other => {
+            return Err(format!(
+                "pyramid_count_dadbear_scope: unknown target_state `{}` (expected pause|resume)",
+                other
+            ))
+        }
+    };
+    if !matches!(scope.as_str(), "all" | "folder" | "circle") {
         return Err(format!(
-            "pyramid_resume_dadbear_all: scope `{}` not implemented — only `all` is supported in Phase 13",
+            "pyramid_count_dadbear_scope: unknown scope `{}` (expected all|folder|circle)",
             scope
         ));
     }
-    let conn = state.pyramid.writer.lock().await;
-    let affected = pyramid_db::enable_dadbear_all(&conn).map_err(|e| e.to_string())?;
-    Ok(serde_json::json!({ "affected": affected }))
+    let conn = state.pyramid.reader.lock().await;
+    let count = pyramid_db::count_dadbear_scope(
+        &conn,
+        &scope,
+        scope_value.as_deref(),
+        target_pause,
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({ "count": count }))
 }
 
 // ── Phase 15: DADBEAR Oversight Page ────────────────────────────────────────
@@ -7689,6 +7811,126 @@ async fn pyramid_delete_step_override(
         .map_err(|e| e.to_string())
 }
 
+// --- Phase 18a: Local Mode toggle (L1 + L5 + L2) ----------------------------
+//
+// Per `docs/specs/provider-registry.md` §382-395 + §559-561 and
+// `docs/plans/deferral-ledger.md` entries L1/L2/L5. The Local Mode
+// toggle is a single switch in Settings that routes every model
+// tier through a local Ollama instance. Three IPC commands cover the
+// surface plus a probe helper plus a credential preview helper for
+// L2.
+
+#[tauri::command]
+async fn pyramid_get_local_mode_status(
+    state: tauri::State<'_, SharedState>,
+) -> Result<wire_node_lib::pyramid::local_mode::LocalModeStatus, String> {
+    // Wanderer fix (Phase 18a): split the synchronous DB snapshot
+    // from the async Ollama probe so the reader lock is released
+    // BEFORE the network round-trip. Holding the tokio::sync::Mutex
+    // across `probe_ollama().await` would block every other
+    // reader-bound IPC for up to 5 seconds while the probe ran.
+    let snapshot = {
+        let reader = state.pyramid.reader.lock().await;
+        let snapshot =
+            wire_node_lib::pyramid::local_mode::load_status_snapshot(&reader)
+                .map_err(|e| e.to_string())?;
+        drop(reader);
+        snapshot
+    };
+    Ok(wire_node_lib::pyramid::local_mode::refresh_status_reachability(snapshot).await)
+}
+
+#[tauri::command]
+async fn pyramid_enable_local_mode(
+    state: tauri::State<'_, SharedState>,
+    base_url: String,
+    model: Option<String>,
+) -> Result<wire_node_lib::pyramid::local_mode::LocalModeStatus, String> {
+    let mut writer = state.pyramid.writer.lock().await;
+    let status = wire_node_lib::pyramid::local_mode::enable_local_mode(
+        &mut writer,
+        &state.pyramid.build_event_bus,
+        &state.pyramid.provider_registry,
+        base_url,
+        model,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    drop(writer);
+    Ok(status)
+}
+
+#[tauri::command]
+async fn pyramid_disable_local_mode(
+    state: tauri::State<'_, SharedState>,
+) -> Result<wire_node_lib::pyramid::local_mode::LocalModeStatus, String> {
+    let mut writer = state.pyramid.writer.lock().await;
+    let status = wire_node_lib::pyramid::local_mode::disable_local_mode(
+        &mut writer,
+        &state.pyramid.build_event_bus,
+        &state.pyramid.provider_registry,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    drop(writer);
+    Ok(status)
+}
+
+#[tauri::command]
+async fn pyramid_probe_ollama(
+    base_url: String,
+) -> Result<wire_node_lib::pyramid::local_mode::OllamaProbeResult, String> {
+    Ok(wire_node_lib::pyramid::local_mode::probe_ollama(&base_url).await)
+}
+
+#[derive(serde::Serialize)]
+struct PreviewPullContributionResponse {
+    yaml: String,
+    schema_type: Option<String>,
+    title: String,
+    description: String,
+    required_credentials: Vec<String>,
+    missing_credentials: Vec<String>,
+}
+
+#[tauri::command]
+async fn pyramid_preview_pull_contribution(
+    state: tauri::State<'_, SharedState>,
+    wire_contribution_id: String,
+) -> Result<PreviewPullContributionResponse, String> {
+    // Phase 18a (L2): fetch a Wire contribution and scan its YAML
+    // for `${VAR}` references against the local credentials store.
+    // Used by the Discover panel's pull confirmation flow so users
+    // see "this contribution needs OPENAI_API_KEY which you haven't
+    // set" BEFORE the pull lands.
+    let wire_auth = get_api_token(&state.auth).await?;
+    let publisher = wire_publisher_from_state(&state, wire_auth);
+    let full = publisher
+        .fetch_contribution(&wire_contribution_id)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let required: Vec<String> =
+        wire_node_lib::pyramid::credentials::CredentialStore::collect_references(
+            &full.yaml_content,
+        );
+    let store = &state.pyramid.credential_store;
+    let missing: Vec<String> = required
+        .iter()
+        .filter(|name| !store.contains(name))
+        .cloned()
+        .collect();
+
+    Ok(PreviewPullContributionResponse {
+        yaml: full.yaml_content,
+        schema_type: full.schema_type,
+        title: full.title,
+        description: full.description,
+        required_credentials: required,
+        missing_credentials: missing,
+    })
+}
+
 // --- Phase 11: Provider Health + Broadcast Oversight IPC commands -----------
 //
 // Per `docs/specs/evidence-triage-and-dadbear.md` Part 3 (Provider
@@ -8176,6 +8418,14 @@ struct PublishToWireResponse {
     handle_path: Option<String>,
     wire_type: String,
     sections_published: Vec<String>,
+    /// Phase 18c (L4): set to the number of cache entries that were
+    /// attached to the publication when the user opted in to
+    /// `include_cache_manifest`. `None` means the user did not opt in
+    /// (the default-OFF privacy gate). `Some(0)` means they opted in
+    /// but the pyramid had no cached LLM outputs to ship. The
+    /// frontend uses this to surface "cache manifest included
+    /// (N entries)" in the success state.
+    cache_manifest_entries: Option<u64>,
 }
 
 #[tauri::command]
@@ -8183,6 +8433,12 @@ async fn pyramid_publish_to_wire(
     state: tauri::State<'_, SharedState>,
     contribution_id: String,
     confirm: bool,
+    // Phase 18c (L4): user opt-in for the cache manifest. Defaults to
+    // false so any caller that hasn't been updated still gets the
+    // Phase 7 safe-default behavior (cache manifest withheld). The
+    // PublishPreviewModal flips this to true when the "Include cache
+    // manifest" checkbox is checked.
+    #[serde(default)] include_cache_manifest: Option<bool>,
 ) -> Result<PublishToWireResponse, String> {
     if !confirm {
         return Err(
@@ -8190,6 +8446,8 @@ async fn pyramid_publish_to_wire(
                 .to_string(),
         );
     }
+
+    let opt_in_cache = include_cache_manifest.unwrap_or(false);
 
     // Load the contribution.
     let contribution = {
@@ -8230,12 +8488,59 @@ async fn pyramid_publish_to_wire(
     let publisher =
         wire_node_lib::pyramid::wire_publish::PyramidPublisher::new(wire_url, wire_auth);
 
+    // Phase 18c (L4): build the cache manifest BEFORE the network call
+    // so a manifest-build failure doesn't leave the contribution
+    // half-published. The manifest is then attached to the publish
+    // payload via the publisher (see publish_contribution_with_metadata).
+    //
+    // The slug lives on the contribution row. If the contribution is
+    // not slug-bound (a free-floating config contribution with no
+    // pyramid attached), we cannot export a cache manifest — those
+    // pyramids have no cached LLM outputs in the first place.
+    let cache_manifest = if opt_in_cache {
+        match contribution.slug.as_deref() {
+            Some(slug) if !slug.is_empty() => {
+                let conn = state.pyramid.reader.lock().await;
+                // Use the contribution_id as a synthetic wire_pyramid_id
+                // for the manifest header — this ties the manifest to the
+                // exact publication request.
+                publisher
+                    .export_cache_manifest(
+                        &conn,
+                        slug,
+                        &contribution.contribution_id,
+                        None,
+                        true,
+                    )
+                    .await
+                    .map_err(|e| format!("failed to export cache manifest: {e}"))?
+            }
+            _ => {
+                tracing::warn!(
+                    contribution_id = %contribution.contribution_id,
+                    "include_cache_manifest=true but contribution is not slug-bound; \
+                     cache manifest skipped"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let cache_manifest_entry_count = cache_manifest.as_ref().map(|m| {
+        m.nodes
+            .iter()
+            .map(|n| n.cache_entries.len() as u64)
+            .sum::<u64>()
+    });
+
     let outcome = publisher
-        .publish_contribution_with_metadata(
+        .publish_contribution_with_metadata_and_cache(
             &contribution.contribution_id,
             &contribution.schema_type,
             &contribution.yaml_content,
             &metadata,
+            cache_manifest.as_ref(),
         )
         .await
         .map_err(|e| e.to_string())?;
@@ -8269,11 +8574,20 @@ async fn pyramid_publish_to_wire(
             .map_err(|e| e.to_string())?;
     }
 
+    tracing::info!(
+        contribution_id = %contribution.contribution_id,
+        wire_contribution_id = %outcome.wire_contribution_id,
+        cache_manifest_attached = opt_in_cache && cache_manifest_entry_count.is_some(),
+        cache_manifest_entries = ?cache_manifest_entry_count,
+        "phase 18c L4: contribution published with cache opt-in state recorded"
+    );
+
     Ok(PublishToWireResponse {
         wire_contribution_id: outcome.wire_contribution_id,
         handle_path: outcome.handle_path,
         wire_type: outcome.wire_type,
         sections_published: outcome.sections_published,
+        cache_manifest_entries: cache_manifest_entry_count,
     })
 }
 
@@ -8699,13 +9013,28 @@ async fn yaml_renderer_resolve_options(
     state: tauri::State<'_, SharedState>,
     source: String,
 ) -> Result<Vec<wire_node_lib::pyramid::yaml_renderer::OptionValue>, String> {
+    // Phase 18a (L5): the `model_list:{provider_id}` branch is now
+    // network-bound for Ollama-shaped providers. Route that branch
+    // to the connection-free async resolver and drop the rusqlite
+    // lock before the round trip so a non-Send `&Connection` never
+    // crosses an await point. The DB-only branches stay on the
+    // synchronous resolver as before.
+    let registry = state.pyramid.provider_registry.clone();
+    if let Some(provider_id) = source.strip_prefix("model_list:") {
+        return Ok(
+            wire_node_lib::pyramid::yaml_renderer::resolve_model_list_only(
+                &registry,
+                provider_id,
+            )
+            .await,
+        );
+    }
     let reader = state.pyramid.reader.lock().await;
-    wire_node_lib::pyramid::yaml_renderer::resolve_option_source(
-        &reader,
-        &state.pyramid.provider_registry,
-        &source,
-    )
-    .map_err(|e| e.to_string())
+    let result = wire_node_lib::pyramid::yaml_renderer::resolve_option_source(
+        &reader, &registry, &source,
+    );
+    drop(reader);
+    result.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -8940,6 +9269,148 @@ async fn pyramid_config_schemas(
     Ok(wire_node_lib::pyramid::generative_config::list_config_schemas(
         &state.pyramid.schema_registry,
     ))
+}
+
+// ── Phase 18d: Schema Migration UI IPC commands ─────────────────────────
+//
+// Per `docs/plans/phase-18d-workstream-prompt.md` and ledger entry L6.
+// Four commands surface the `needs_migration` flag (set by Phase 9's
+// `flag_configs_needing_migration` helper inside Phase 4's
+// schema_definition dispatcher branch) and execute the LLM-assisted
+// migration flow:
+//
+//   pyramid_list_configs_needing_migration()
+//     Lists every active contribution flagged needing migration, plus
+//     the schema_definition contribution_ids that bracket the
+//     migration (current + prior). Powers the Needs Migration tab.
+//
+//   pyramid_propose_config_migration(input)
+//     Loads the flagged contribution + the prior/current schema
+//     definitions, calls the bundled migrate_config skill via the
+//     cache-aware LLM entry point, persists the result as a draft
+//     contribution. Mirrors Phase 9's pyramid_generate_config 3-phase
+//     shape (load → LLM → persist).
+//
+//   pyramid_accept_config_migration(input)
+//     Promotes the draft to active, supersedes the original flagged
+//     row, runs sync_config_to_operational so the operational table
+//     picks up the migrated YAML, and clears the needs_migration flag
+//     on the new active row.
+//
+//   pyramid_reject_config_migration(input)
+//     Deletes the draft. Original flagged row stays active and stays
+//     flagged so the user can re-propose later.
+//
+// User review is mandatory — there is no auto-apply path. The flow
+// always goes draft → review → accept, matching Phase 9's pattern.
+
+#[derive(serde::Deserialize)]
+struct ProposeMigrationInput {
+    #[serde(rename = "contributionId", alias = "contribution_id")]
+    contribution_id: String,
+    #[serde(default, rename = "userNote", alias = "user_note")]
+    user_note: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct AcceptMigrationInput {
+    #[serde(rename = "draftId", alias = "draft_id")]
+    draft_id: String,
+    #[serde(default, rename = "acceptNote", alias = "accept_note")]
+    accept_note: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct RejectMigrationInput {
+    #[serde(rename = "draftId", alias = "draft_id")]
+    draft_id: String,
+}
+
+#[tauri::command]
+async fn pyramid_list_configs_needing_migration(
+    state: tauri::State<'_, SharedState>,
+) -> Result<
+    Vec<wire_node_lib::pyramid::migration_config::NeedsMigrationEntry>,
+    String,
+> {
+    let reader = state.pyramid.reader.lock().await;
+    wire_node_lib::pyramid::migration_config::list_configs_needing_migration(&reader)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn pyramid_propose_config_migration(
+    state: tauri::State<'_, SharedState>,
+    input: ProposeMigrationInput,
+) -> Result<wire_node_lib::pyramid::migration_config::MigrationProposal, String> {
+    let llm_config = state.pyramid.config.read().await.clone();
+    let db_path = state
+        .pyramid
+        .data_dir
+        .as_ref()
+        .map(|d| d.join("pyramid.db").to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    // Phase 1: load inputs from the DB. Drop the read lock before the
+    // LLM await so we don't pin a non-Send rusqlite::Connection across
+    // a task scheduling point. Mirrors Phase 9's
+    // pyramid_generate_config / pyramid_refine_config 3-phase shape.
+    let inputs = {
+        let reader = state.pyramid.reader.lock().await;
+        wire_node_lib::pyramid::migration_config::load_migration_inputs(
+            &reader,
+            &input.contribution_id,
+            input.user_note.as_deref(),
+        )
+        .map_err(|e| e.to_string())?
+    };
+
+    // Phase 2: run the LLM call with no DB lock held.
+    let llm_output = wire_node_lib::pyramid::migration_config::run_migration_llm_call(
+        &llm_config,
+        &state.pyramid.build_event_bus,
+        &state.pyramid.provider_registry,
+        &db_path,
+        &inputs,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    // Phase 3: persist the proposal via the writer lock.
+    let mut writer = state.pyramid.writer.lock().await;
+    wire_node_lib::pyramid::migration_config::persist_migration_proposal(
+        &mut writer,
+        &inputs,
+        &llm_output,
+        &state.pyramid.build_event_bus,
+    )
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn pyramid_accept_config_migration(
+    state: tauri::State<'_, SharedState>,
+    input: AcceptMigrationInput,
+) -> Result<wire_node_lib::pyramid::migration_config::AcceptMigrationOutcome, String> {
+    let mut writer = state.pyramid.writer.lock().await;
+    wire_node_lib::pyramid::migration_config::accept_config_migration(
+        &mut writer,
+        &state.pyramid.build_event_bus,
+        &state.pyramid.schema_registry,
+        &input.draft_id,
+        input.accept_note.as_deref(),
+    )
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn pyramid_reject_config_migration(
+    state: tauri::State<'_, SharedState>,
+    input: RejectMigrationInput,
+) -> Result<wire_node_lib::pyramid::migration_config::RejectMigrationOutcome, String> {
+    let writer = state.pyramid.writer.lock().await;
+    wire_node_lib::pyramid::migration_config::reject_config_migration(&writer, &input.draft_id)
+        .map_err(|e| e.to_string())
 }
 
 // ── Phase 7: Cache warming on pyramid import IPC commands ─────────────────
@@ -10408,6 +10879,12 @@ fn main() {
             pyramid_get_step_overrides,
             pyramid_save_step_override,
             pyramid_delete_step_override,
+            // Phase 18a: Local Mode toggle (L1 + L5 + L2)
+            pyramid_get_local_mode_status,
+            pyramid_enable_local_mode,
+            pyramid_disable_local_mode,
+            pyramid_probe_ollama,
+            pyramid_preview_pull_contribution,
             // Phase 11: Broadcast webhook + provider health oversight
             pyramid_provider_health,
             pyramid_acknowledge_provider_health,
@@ -10446,6 +10923,11 @@ fn main() {
             pyramid_active_config,
             pyramid_config_versions,
             pyramid_config_schemas,
+            // Phase 18d: Schema migration UI (claims L6 from deferral-ledger.md)
+            pyramid_list_configs_needing_migration,
+            pyramid_propose_config_migration,
+            pyramid_accept_config_migration,
+            pyramid_reject_config_migration,
             // Phase 7: Cache Warming on Pyramid Import
             pyramid_import_pyramid,
             pyramid_import_progress,
@@ -10457,6 +10939,9 @@ fn main() {
             pyramid_cost_rollup,
             pyramid_pause_dadbear_all,
             pyramid_resume_dadbear_all,
+            // Phase 18c (L9): scoped pause/resume helper IPCs
+            pyramid_list_dadbear_source_paths,
+            pyramid_count_dadbear_scope,
             // Phase 15: DADBEAR Oversight Page
             pyramid_dadbear_overview,
             pyramid_dadbear_activity_log,
