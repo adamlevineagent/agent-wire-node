@@ -5,10 +5,20 @@
 // When a bedrock finishes building, its apex becomes the leftmost L0 of the vine,
 // and a delta propagates upward.
 //
+// Phase 2: adds vine-level change-manifest propagation. When a bedrock apex
+// updates, the vine nodes that reference that apex via cross-slug evidence
+// links are enqueued as `confirmed_stale` pending mutations. The stale
+// engine picks these up and routes them through `execute_supersession`,
+// which now generates a targeted change manifest via
+// `stale_helpers_upper::generate_change_manifest` and applies it in place on
+// the vine node — same id, bumped build_version. See
+// `docs/specs/change-manifest-supersession.md` → "Vine-Level Manifests".
+//
 // CRITICAL: This module does NOT modify vine.rs per Q2 constraint. All new
 // composition dispatch goes through build_runner::run_build_from.
 
 use anyhow::Result;
+use chrono::Utc;
 use tracing::{info, warn};
 
 use super::db;
@@ -60,8 +70,12 @@ pub async fn notify_vine_of_bedrock_completion(
             .write_child_then_parent(bedrock_slug, vine_slug)
             .await;
 
-        // 3. Update the bedrock's apex reference in the composition table
-        {
+        // 3. Update the bedrock's apex reference in the composition table.
+        //    Also enqueue vine-level pending mutations in the same writer
+        //    lock scope so the stale engine picks up the change and routes
+        //    affected vine L1+ nodes through execute_supersession (which
+        //    uses the change-manifest flow per Phase 2).
+        let enqueue_result = {
             let conn = state.writer.lock().await;
             if let Err(e) =
                 db::update_bedrock_apex(&conn, vine_slug, bedrock_slug, apex_node_id)
@@ -74,14 +88,47 @@ pub async fn notify_vine_of_bedrock_completion(
                 );
                 continue;
             }
+
+            enqueue_vine_manifest_mutations(
+                &conn,
+                vine_slug,
+                bedrock_slug,
+                apex_node_id,
+                bedrock_build_id,
+            )
+        };
+
+        match enqueue_result {
+            Ok(count) if count > 0 => {
+                info!(
+                    vine = vine_slug,
+                    bedrock = bedrock_slug,
+                    apex = apex_node_id,
+                    enqueued = count,
+                    "Enqueued {} vine-level change-manifest mutations for stale engine",
+                    count
+                );
+            }
+            Ok(_) => {
+                // No affected vine nodes — the vine may not yet have upper
+                // layers built, or the evidence links haven't been wired
+                // yet. Not an error.
+            }
+            Err(e) => {
+                warn!(
+                    vine = vine_slug,
+                    bedrock = bedrock_slug,
+                    error = %e,
+                    "enqueue_vine_manifest_mutations failed (continuing with event emission)"
+                );
+            }
         }
 
         // 4. Emit a DeltaLanded event on the vine's build event bus so that
         //    downstream consumers (DADBEAR, primer cache invalidation) know the
         //    vine's L0 has changed. The actual chain-driven delta propagation
-        //    through the vine's upper layers is dispatched by DADBEAR-EXTEND
-        //    when it observes this event — this module's job is just the
-        //    notification and apex-ref bookkeeping.
+        //    through the vine's upper layers is driven by the stale engine
+        //    processing the pending mutations enqueued above.
         let event = TaggedBuildEvent {
             slug: vine_slug.clone(),
             kind: TaggedKind::DeltaLanded {
@@ -111,6 +158,100 @@ pub async fn notify_vine_of_bedrock_completion(
     }
 
     Ok(notified)
+}
+
+/// Enqueue `confirmed_stale` pending mutations on the vine's L1+ nodes that
+/// reference the updated bedrock apex via cross-slug evidence links.
+///
+/// The stale engine processes these mutations by calling
+/// `execute_supersession`, which now generates a change manifest via
+/// `generate_change_manifest` and applies it in place on the affected vine
+/// node (same id, bumped build_version). For vine-level manifests the
+/// `children_swapped` entries use the `{bedrock_slug}:{node_id}` prefix
+/// format so the manifest audit trail records which bedrock apex changed.
+///
+/// Returns the number of pending mutation rows enqueued.
+fn enqueue_vine_manifest_mutations(
+    conn: &rusqlite::Connection,
+    vine_slug: &str,
+    bedrock_slug: &str,
+    apex_node_id: &str,
+    bedrock_build_id: &str,
+) -> Result<usize> {
+    // Cross-slug handle paths in pyramid_evidence use the format
+    // `{slug}/{depth}/{node_id}` (see db::parse_handle_path). Look for
+    // evidence links in the vine slug whose source_node_id matches the
+    // bedrock apex under any of its valid reference formats:
+    //   1. bare apex_node_id (same-slug embedding)
+    //   2. `{bedrock_slug}/{depth}/{apex_node_id}` handle path
+    //   3. `{bedrock_slug}:{apex_node_id}` short form used in some callers
+    //
+    // We query for any KEEP evidence row in the vine slug that mentions the
+    // apex id in any of those shapes.
+    let patterns = [
+        apex_node_id.to_string(),
+        format!("{bedrock_slug}/%/{apex_node_id}"),
+        format!("{bedrock_slug}:{apex_node_id}"),
+    ];
+
+    // Collect affected target_node_ids — these are the vine's L1+ nodes
+    // that built on the bedrock apex. We then write one confirmed_stale row
+    // per affected vine node, at the layer of that node.
+    let mut affected_vine_nodes: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
+
+    let mut stmt = conn.prepare(
+        "SELECT target_node_id FROM pyramid_evidence
+         WHERE slug = ?1
+           AND verdict = 'KEEP'
+           AND (source_node_id = ?2 OR source_node_id LIKE ?3 OR source_node_id = ?4)",
+    )?;
+
+    let rows = stmt.query_map(
+        rusqlite::params![vine_slug, &patterns[0], &patterns[1], &patterns[2]],
+        |row| row.get::<_, String>(0),
+    )?;
+
+    for row in rows {
+        if let Ok(tgt) = row {
+            affected_vine_nodes.insert(tgt);
+        }
+    }
+    drop(stmt);
+
+    if affected_vine_nodes.is_empty() {
+        return Ok(0);
+    }
+
+    let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let mut inserted = 0usize;
+
+    for vine_node_id in affected_vine_nodes {
+        // Look up the depth of the vine node so the pending mutation lands
+        // on the right stale-engine layer queue.
+        let depth: i64 = conn
+            .query_row(
+                "SELECT depth FROM pyramid_nodes WHERE slug = ?1 AND id = ?2",
+                rusqlite::params![vine_slug, vine_node_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(1);
+
+        let detail = format!(
+            "vine-level change manifest required: bedrock {} apex updated to {} (build {})",
+            bedrock_slug, apex_node_id, bedrock_build_id
+        );
+
+        let rows_changed = conn.execute(
+            "INSERT INTO pyramid_pending_mutations
+             (slug, layer, mutation_type, target_ref, detail, cascade_depth, detected_at, processed)
+             VALUES (?1, ?2, 'confirmed_stale', ?3, ?4, 0, ?5, 0)",
+            rusqlite::params![vine_slug, depth, vine_node_id, detail, now],
+        )?;
+        inserted += rows_changed;
+    }
+
+    Ok(inserted)
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────

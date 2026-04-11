@@ -582,6 +582,37 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
     )?;
     // ── end WS-SCHEMA-V2 migration block ──────────────────────────────────
 
+    // ── Phase 2: Change-Manifest Supersession ─────────────────────────────
+    //
+    // `pyramid_change_manifests` stores the LLM-produced targeted deltas
+    // applied during stale-check-driven supersession and user-initiated
+    // reroll-with-notes operations. Spec: docs/specs/change-manifest-supersession.md.
+    //
+    // NOTE: the existing `build_version` column on `pyramid_nodes` (created
+    // with the base schema at line ~91) is what this table indexes against.
+    // Phase 2 does NOT introduce a new column — it ties into the existing
+    // counter that `apply_supersession` already bumps.
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS pyramid_change_manifests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            slug TEXT NOT NULL REFERENCES pyramid_slugs(slug) ON DELETE CASCADE,
+            node_id TEXT NOT NULL,
+            build_version INTEGER NOT NULL,
+            manifest_json TEXT NOT NULL,
+            note TEXT,
+            supersedes_manifest_id INTEGER REFERENCES pyramid_change_manifests(id),
+            applied_at TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(slug, node_id, build_version)
+        );
+        CREATE INDEX IF NOT EXISTS idx_change_manifests_node
+            ON pyramid_change_manifests(slug, node_id);
+        CREATE INDEX IF NOT EXISTS idx_change_manifests_supersedes
+            ON pyramid_change_manifests(supersedes_manifest_id);
+        ",
+    )?;
+    // ── end Phase 2 migration block ──────────────────────────────────────
+
     // ── Compensating DELETE triggers for FK CASCADE on existing DBs ──
     // (SQLite cannot ALTER FK constraints, so these triggers handle cascading
     //  deletes for tables created before CASCADE was added)
@@ -2673,6 +2704,650 @@ pub fn mutate_provisional_node(
     )?;
     Ok(updated)
 }
+
+// ── Phase 2: Change-Manifest In-Place Updates ────────────────────────────────
+//
+// `update_node_in_place` + manifest CRUD helpers implement the stale-check
+// side of the change-manifest flow. The key property: the node ID stays the
+// same and the live `pyramid_nodes` row is mutated in place. All evidence
+// links and parent-child references stay valid because no new ID is created.
+//
+// The prior content is snapshotted into `pyramid_node_versions` using the
+// existing WS-SCHEMA-V2 versioning infrastructure (the snapshot format that
+// `apply_supersession` already writes), so the delta history is durable.
+//
+// This path is distinct from `apply_supersession` in two ways:
+//   1. It takes a ContentUpdates struct (field-level add/update/remove
+//      operations) rather than a complete new PyramidNode, so the LLM is
+//      asked to produce targeted edits only.
+//   2. It explicitly updates `pyramid_evidence.source_node_id` rows for
+//      children_swapped entries, so the evidence graph stays consistent with
+//      the new children list on the updated node.
+//
+// NOTE on immutability enforcement: `apply_supersession` enforces
+// WS-IMMUTABILITY-ENFORCE (depth <= 1 && !provisional rejects mutation).
+// `update_node_in_place` deliberately does NOT apply that check — the
+// immutability invariant exists for Wire publication (the pyramid is a
+// snapshot at publish time), not for local refresh. DADBEAR-driven
+// file_change supersession (the primary depth==0 use case) needs to mutate
+// local L0 nodes in place so files stay in sync with the live filesystem
+// as the user edits. Dropping the guard here is the correct semantic for
+// the local-node use case.
+
+/// Apply a LLM-produced change manifest to a live pyramid node in place,
+/// without creating a new node ID. Same ID, bumped `build_version`, prior
+/// state snapshotted into `pyramid_node_versions` for durability.
+///
+/// Arguments:
+/// - `conn` — a DB connection. The update runs inside a `BEGIN IMMEDIATE`
+///   transaction so snapshot + in-place update + evidence rewrite are
+///   atomic and roll back together on failure.
+/// - `slug` / `node_id` — target node (must exist in `pyramid_nodes`).
+/// - `updates` — field-level content updates (any None field is untouched).
+/// - `children_swapped` — pairs of `(old_child_id, new_child_id)`. For each
+///   pair the function:
+///     - replaces `old` with `new` in the node's `children` JSON array
+///     - UPDATEs `pyramid_evidence` rows where `source_node_id = old AND
+///       target_node_id = node_id` to point at `new`.
+/// - `supersession_reason` — e.g. "stale_refresh", "reroll". Recorded on
+///   the pyramid_node_versions snapshot row.
+///
+/// Returns the new `build_version` after the bump.
+pub fn update_node_in_place(
+    conn: &Connection,
+    slug: &str,
+    node_id: &str,
+    updates: &super::types::ContentUpdates,
+    children_swapped: &[(String, String)],
+    supersession_reason: &str,
+) -> Result<i64> {
+    use super::types::ContentUpdates;
+
+    // BEGIN IMMEDIATE for writer-serialization. If we're nested inside an
+    // outer transaction, use a SAVEPOINT instead so we can roll back just
+    // this in-place update without torching the outer tx. We detect nesting
+    // by attempting a BEGIN IMMEDIATE and falling back to a SAVEPOINT.
+    let using_savepoint = conn
+        .execute_batch("BEGIN IMMEDIATE;")
+        .is_err();
+    if using_savepoint {
+        conn.execute_batch("SAVEPOINT update_node_in_place_sp;")?;
+    }
+
+    let result: Result<i64> = (|| {
+        // 1. Load the current node row. We need the raw
+        //    topics/terms/decisions/dead_ends JSON strings to apply per-entry
+        //    operations, and the current headline/distilled for fallback
+        //    when the manifest leaves those fields null.
+        //
+        //    `depth` and `build_version` are selected but not read directly
+        //    — they're in the SELECT list so the snapshot row layout matches
+        //    the existing pyramid_node_versions schema when we INSERT the
+        //    snapshot row. The bump is done by the UPDATE statement
+        //    (`COALESCE(build_version, 1) + 1`) so Rust never needs them.
+        #[derive(Debug)]
+        #[allow(dead_code)]
+        struct Snapshot {
+            depth: i64,
+            headline: String,
+            distilled: String,
+            topics: String,
+            corrections: String,
+            decisions: String,
+            terms: String,
+            dead_ends: String,
+            self_prompt: Option<String>,
+            children: String,
+            parent_id: Option<String>,
+            current_version: i64,
+            build_version: i64,
+            current_version_chain_phase: Option<String>,
+            build_id: Option<String>,
+            time_range_start: Option<String>,
+            time_range_end: Option<String>,
+            weight: Option<f64>,
+            narrative_json: Option<String>,
+            entities_json: Option<String>,
+            key_quotes_json: Option<String>,
+            transitions_json: Option<String>,
+        }
+
+        let snap: Snapshot = conn
+            .query_row(
+                "SELECT depth, headline, distilled,
+                        COALESCE(topics, '[]'), COALESCE(corrections, '[]'),
+                        COALESCE(decisions, '[]'), COALESCE(terms, '[]'),
+                        COALESCE(dead_ends, '[]'), self_prompt,
+                        COALESCE(children, '[]'), parent_id,
+                        COALESCE(current_version, 1),
+                        COALESCE(build_version, 1),
+                        current_version_chain_phase, build_id,
+                        time_range_start, time_range_end, weight,
+                        narrative_json, entities_json, key_quotes_json, transitions_json
+                 FROM pyramid_nodes
+                 WHERE slug = ?1 AND id = ?2",
+                rusqlite::params![slug, node_id],
+                |row| {
+                    Ok(Snapshot {
+                        depth: row.get(0)?,
+                        headline: row.get(1)?,
+                        distilled: row.get(2)?,
+                        topics: row.get(3)?,
+                        corrections: row.get(4)?,
+                        decisions: row.get(5)?,
+                        terms: row.get(6)?,
+                        dead_ends: row.get(7)?,
+                        self_prompt: row.get(8)?,
+                        children: row.get(9)?,
+                        parent_id: row.get(10)?,
+                        current_version: row.get(11)?,
+                        build_version: row.get(12)?,
+                        current_version_chain_phase: row.get(13)?,
+                        build_id: row.get(14)?,
+                        time_range_start: row.get(15)?,
+                        time_range_end: row.get(16)?,
+                        weight: row.get(17)?,
+                        narrative_json: row.get(18)?,
+                        entities_json: row.get(19)?,
+                        key_quotes_json: row.get(20)?,
+                        transitions_json: row.get(21)?,
+                    })
+                },
+            )
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "update_node_in_place: load of ({slug}, {node_id}) failed: {e}"
+                )
+            })?;
+
+        // 2. Snapshot prior state into pyramid_node_versions BEFORE applying
+        //    the updates. This matches the format `apply_supersession` uses
+        //    so downstream tooling (collapse.rs, recovery.rs) finds a uniform
+        //    version history shape regardless of the write path.
+        conn.execute(
+            "INSERT INTO pyramid_node_versions (
+                slug, node_id, version,
+                headline, distilled, topics, corrections, decisions,
+                terms, dead_ends, self_prompt, children, parent_id,
+                time_range_start, time_range_end, weight,
+                narrative_json, entities_json, key_quotes_json, transitions_json,
+                chain_phase, build_id, supersession_reason
+             ) VALUES (
+                ?1, ?2, ?3,
+                ?4, ?5, ?6, ?7, ?8,
+                ?9, ?10, ?11, ?12, ?13,
+                ?14, ?15, ?16,
+                ?17, ?18, ?19, ?20,
+                ?21, ?22, ?23
+             )",
+            rusqlite::params![
+                slug,
+                node_id,
+                snap.current_version,
+                snap.headline,
+                snap.distilled,
+                snap.topics,
+                snap.corrections,
+                snap.decisions,
+                snap.terms,
+                snap.dead_ends,
+                snap.self_prompt.clone().unwrap_or_default(),
+                snap.children,
+                snap.parent_id.clone().unwrap_or_default(),
+                snap.time_range_start,
+                snap.time_range_end,
+                snap.weight,
+                snap.narrative_json,
+                snap.entities_json,
+                snap.key_quotes_json,
+                snap.transitions_json,
+                snap.current_version_chain_phase.clone().unwrap_or_default(),
+                snap.build_id.clone(),
+                supersession_reason,
+            ],
+        )?;
+
+        // 3. Apply per-entry operations to topics, terms, decisions, dead_ends.
+        let new_topics_json = apply_topic_ops(&snap.topics, updates.topics.as_deref())?;
+        let new_terms_json = apply_term_ops(&snap.terms, updates.terms.as_deref())?;
+        let new_decisions_json =
+            apply_decision_ops(&snap.decisions, updates.decisions.as_deref())?;
+        let new_dead_ends_json =
+            apply_dead_end_ops(&snap.dead_ends, updates.dead_ends.as_deref())?;
+
+        // 4. Apply wholesale replacements where present.
+        let new_distilled = updates
+            .distilled
+            .clone()
+            .unwrap_or(snap.distilled.clone());
+        let new_headline = updates
+            .headline
+            .clone()
+            .unwrap_or(snap.headline.clone());
+
+        // 5. Apply children_swapped to the children JSON array.
+        let mut children_vec: Vec<String> =
+            serde_json::from_str(&snap.children).unwrap_or_default();
+        if !children_swapped.is_empty() {
+            for (old, new) in children_swapped {
+                for existing in children_vec.iter_mut() {
+                    if existing == old {
+                        *existing = new.clone();
+                    }
+                }
+            }
+        }
+        let new_children_json =
+            serde_json::to_string(&children_vec).unwrap_or_else(|_| "[]".to_string());
+
+        // 6. In-place UPDATE on the live row. Bumps build_version and clears
+        //    any stale `superseded_by` pointer so the row remains visible in
+        //    the live_pyramid_nodes view.
+        let rows_affected = conn.execute(
+            "UPDATE pyramid_nodes SET
+                headline = ?3,
+                distilled = ?4,
+                topics = ?5,
+                terms = ?6,
+                decisions = ?7,
+                dead_ends = ?8,
+                children = ?9,
+                build_version = COALESCE(build_version, 1) + 1,
+                current_version = COALESCE(current_version, 1) + 1,
+                superseded_by = NULL
+             WHERE slug = ?1 AND id = ?2",
+            rusqlite::params![
+                slug,
+                node_id,
+                new_headline,
+                new_distilled,
+                new_topics_json,
+                new_terms_json,
+                new_decisions_json,
+                new_dead_ends_json,
+                new_children_json,
+            ],
+        )?;
+        if rows_affected == 0 {
+            return Err(anyhow::anyhow!(
+                "update_node_in_place: no row updated for ({slug}, {node_id})"
+            ));
+        }
+
+        // 7. Rewrite evidence links for swapped children. For each pair,
+        //    move KEEP and DISCONNECT rows from (old_child -> node) to
+        //    (new_child -> node). This is the load-bearing step that keeps
+        //    get_tree()'s children_by_parent lookup coherent after the
+        //    update.
+        //
+        //    `pyramid_evidence` PK is (slug, build_id, source_node_id,
+        //    target_node_id) so we handle potential conflicts by deleting
+        //    any existing row at the destination first.
+        for (old_child, new_child) in children_swapped {
+            if old_child == new_child {
+                continue;
+            }
+            // Collect the PK columns of the rows that need rewriting.
+            let mut select_stmt = conn.prepare(
+                "SELECT build_id FROM pyramid_evidence
+                 WHERE slug = ?1 AND source_node_id = ?2 AND target_node_id = ?3",
+            )?;
+            let existing_build_ids: Vec<String> = select_stmt
+                .query_map(rusqlite::params![slug, old_child, node_id], |row| {
+                    row.get::<_, String>(0)
+                })?
+                .filter_map(|r| r.ok())
+                .collect();
+            drop(select_stmt);
+
+            for ev_build_id in existing_build_ids {
+                // Delete any (slug, build_id, new_child, node) row that
+                // already exists to avoid PK conflict on UPDATE.
+                conn.execute(
+                    "DELETE FROM pyramid_evidence
+                     WHERE slug = ?1 AND build_id = ?2
+                       AND source_node_id = ?3 AND target_node_id = ?4",
+                    rusqlite::params![slug, ev_build_id, new_child, node_id],
+                )?;
+                // Rewrite the old row's source to the new id.
+                conn.execute(
+                    "UPDATE pyramid_evidence
+                     SET source_node_id = ?1
+                     WHERE slug = ?2 AND build_id = ?3
+                       AND source_node_id = ?4 AND target_node_id = ?5",
+                    rusqlite::params![new_child, slug, ev_build_id, old_child, node_id],
+                )?;
+            }
+        }
+
+        // 8. Return the new build_version.
+        let new_bv: i64 = conn.query_row(
+            "SELECT build_version FROM pyramid_nodes WHERE slug = ?1 AND id = ?2",
+            rusqlite::params![slug, node_id],
+            |r| r.get(0),
+        )?;
+        // Quiet the unused-import warning for ContentUpdates on older rustc
+        // bodies that inline the match.
+        let _ = std::mem::size_of::<ContentUpdates>();
+        Ok(new_bv)
+    })();
+
+    match result {
+        Ok(v) => {
+            if using_savepoint {
+                conn.execute_batch("RELEASE SAVEPOINT update_node_in_place_sp;")?;
+            } else {
+                conn.execute_batch("COMMIT;")?;
+            }
+            Ok(v)
+        }
+        Err(e) => {
+            if using_savepoint {
+                let _ = conn.execute_batch(
+                    "ROLLBACK TO SAVEPOINT update_node_in_place_sp; \
+                     RELEASE SAVEPOINT update_node_in_place_sp;",
+                );
+            } else {
+                let _ = conn.execute_batch("ROLLBACK;");
+            }
+            Err(e)
+        }
+    }
+}
+
+// ── Helpers for applying per-entry content updates ───────────────────────────
+//
+// Each of these takes the current JSON string stored on the node and an
+// Option<&[Op]> of updates, and returns the new JSON string. The helpers are
+// forgiving about malformed stored JSON — an unparseable current value is
+// treated as an empty array so the manifest can still rebuild from scratch.
+
+fn apply_topic_ops(
+    current_json: &str,
+    ops: Option<&[super::types::TopicOp]>,
+) -> Result<String> {
+    use super::types::Topic;
+    let ops = match ops {
+        Some(ops) => ops,
+        None => return Ok(current_json.to_string()),
+    };
+
+    let mut topics: Vec<Topic> =
+        serde_json::from_str(current_json).unwrap_or_default();
+
+    for op in ops {
+        match op.action.as_str() {
+            "add" => {
+                topics.push(Topic {
+                    name: op.name.clone(),
+                    current: op.current.clone(),
+                    entities: Vec::new(),
+                    corrections: Vec::new(),
+                    decisions: Vec::new(),
+                    extra: Default::default(),
+                });
+            }
+            "update" => {
+                if let Some(existing) = topics.iter_mut().find(|t| t.name == op.name) {
+                    existing.current = op.current.clone();
+                } else {
+                    // Treat update-of-missing as an add so the LLM's intent
+                    // is preserved even if the node drifted.
+                    topics.push(Topic {
+                        name: op.name.clone(),
+                        current: op.current.clone(),
+                        entities: Vec::new(),
+                        corrections: Vec::new(),
+                        decisions: Vec::new(),
+                        extra: Default::default(),
+                    });
+                }
+            }
+            "remove" => {
+                topics.retain(|t| t.name != op.name);
+            }
+            _ => {}
+        }
+    }
+
+    Ok(serde_json::to_string(&topics)?)
+}
+
+fn apply_term_ops(
+    current_json: &str,
+    ops: Option<&[super::types::TermOp]>,
+) -> Result<String> {
+    use super::types::Term;
+    let ops = match ops {
+        Some(ops) => ops,
+        None => return Ok(current_json.to_string()),
+    };
+
+    let mut terms: Vec<Term> = serde_json::from_str(current_json).unwrap_or_default();
+
+    for op in ops {
+        match op.action.as_str() {
+            "add" => {
+                terms.push(Term {
+                    term: op.term.clone(),
+                    definition: op.definition.clone(),
+                });
+            }
+            "update" => {
+                if let Some(existing) = terms.iter_mut().find(|t| t.term == op.term) {
+                    existing.definition = op.definition.clone();
+                } else {
+                    terms.push(Term {
+                        term: op.term.clone(),
+                        definition: op.definition.clone(),
+                    });
+                }
+            }
+            "remove" => {
+                terms.retain(|t| t.term != op.term);
+            }
+            _ => {}
+        }
+    }
+
+    Ok(serde_json::to_string(&terms)?)
+}
+
+fn apply_decision_ops(
+    current_json: &str,
+    ops: Option<&[super::types::DecisionOp]>,
+) -> Result<String> {
+    use super::types::Decision;
+    let ops = match ops {
+        Some(ops) => ops,
+        None => return Ok(current_json.to_string()),
+    };
+
+    let mut decisions: Vec<Decision> =
+        serde_json::from_str(current_json).unwrap_or_default();
+
+    for op in ops {
+        match op.action.as_str() {
+            "add" => {
+                decisions.push(Decision {
+                    decided: op.decided.clone(),
+                    why: op.why.clone(),
+                    rejected: String::new(),
+                    stance: if op.stance.is_empty() {
+                        "open".to_string()
+                    } else {
+                        op.stance.clone()
+                    },
+                    importance: 0.0,
+                    related: Vec::new(),
+                });
+            }
+            "update" => {
+                if let Some(existing) =
+                    decisions.iter_mut().find(|d| d.decided == op.decided)
+                {
+                    if !op.why.is_empty() {
+                        existing.why = op.why.clone();
+                    }
+                    if !op.stance.is_empty() {
+                        existing.stance = op.stance.clone();
+                    }
+                } else {
+                    decisions.push(Decision {
+                        decided: op.decided.clone(),
+                        why: op.why.clone(),
+                        rejected: String::new(),
+                        stance: if op.stance.is_empty() {
+                            "open".to_string()
+                        } else {
+                            op.stance.clone()
+                        },
+                        importance: 0.0,
+                        related: Vec::new(),
+                    });
+                }
+            }
+            "remove" => {
+                decisions.retain(|d| d.decided != op.decided);
+            }
+            _ => {}
+        }
+    }
+
+    Ok(serde_json::to_string(&decisions)?)
+}
+
+fn apply_dead_end_ops(
+    current_json: &str,
+    ops: Option<&[super::types::DeadEndOp]>,
+) -> Result<String> {
+    let ops = match ops {
+        Some(ops) => ops,
+        None => return Ok(current_json.to_string()),
+    };
+
+    let mut dead_ends: Vec<String> =
+        serde_json::from_str(current_json).unwrap_or_default();
+
+    for op in ops {
+        match op.action.as_str() {
+            "add" => {
+                if !dead_ends.iter().any(|d| d == &op.value) {
+                    dead_ends.push(op.value.clone());
+                }
+            }
+            "remove" => {
+                dead_ends.retain(|d| d != &op.value);
+            }
+            _ => {}
+        }
+    }
+
+    Ok(serde_json::to_string(&dead_ends)?)
+}
+
+// ── Manifest CRUD helpers ───────────────────────────────────────────────────
+
+/// Insert a `pyramid_change_manifests` row and return its new id.
+pub fn save_change_manifest(
+    conn: &Connection,
+    slug: &str,
+    node_id: &str,
+    build_version: i64,
+    manifest_json: &str,
+    note: Option<&str>,
+    supersedes_manifest_id: Option<i64>,
+) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO pyramid_change_manifests (
+            slug, node_id, build_version, manifest_json, note, supersedes_manifest_id
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![
+            slug,
+            node_id,
+            build_version,
+            manifest_json,
+            note,
+            supersedes_manifest_id,
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// Load all change manifests for a (slug, node_id), ordered by applied_at
+/// ascending (oldest first). Use this for audit views and supersession-chain
+/// walking.
+pub fn get_change_manifests_for_node(
+    conn: &Connection,
+    slug: &str,
+    node_id: &str,
+) -> Result<Vec<super::types::ChangeManifestRecord>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, slug, node_id, build_version, manifest_json, note,
+                supersedes_manifest_id, applied_at
+         FROM pyramid_change_manifests
+         WHERE slug = ?1 AND node_id = ?2
+         ORDER BY applied_at ASC, id ASC",
+    )?;
+
+    let rows = stmt.query_map(rusqlite::params![slug, node_id], |row| {
+        Ok(super::types::ChangeManifestRecord {
+            id: row.get(0)?,
+            slug: row.get(1)?,
+            node_id: row.get(2)?,
+            build_version: row.get(3)?,
+            manifest_json: row.get(4)?,
+            note: row.get(5)?,
+            supersedes_manifest_id: row.get(6)?,
+            applied_at: row.get(7)?,
+        })
+    })?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// Load the most recent change manifest for a (slug, node_id). Returns None
+/// if no manifests have been applied. "Most recent" is determined by
+/// `applied_at DESC, id DESC` so the latest row wins even with equal
+/// timestamps in the same second.
+pub fn get_latest_manifest_for_node(
+    conn: &Connection,
+    slug: &str,
+    node_id: &str,
+) -> Result<Option<super::types::ChangeManifestRecord>> {
+    let result = conn.query_row(
+        "SELECT id, slug, node_id, build_version, manifest_json, note,
+                supersedes_manifest_id, applied_at
+         FROM pyramid_change_manifests
+         WHERE slug = ?1 AND node_id = ?2
+         ORDER BY applied_at DESC, id DESC
+         LIMIT 1",
+        rusqlite::params![slug, node_id],
+        |row| {
+            Ok(super::types::ChangeManifestRecord {
+                id: row.get(0)?,
+                slug: row.get(1)?,
+                node_id: row.get(2)?,
+                build_version: row.get(3)?,
+                manifest_json: row.get(4)?,
+                note: row.get(5)?,
+                supersedes_manifest_id: row.get(6)?,
+                applied_at: row.get(7)?,
+            })
+        },
+    );
+    match result {
+        Ok(rec) => Ok(Some(rec)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+// ── end Phase 2 change-manifest helpers ─────────────────────────────────────
 
 /// WS-IMMUTABILITY-ENFORCE: Promote a provisional node to canonical status.
 ///

@@ -156,3 +156,56 @@ Files touched: `pyramid/mod.rs` (new field + `with_build_reader` clone), `pyrami
 - **Spec doc correction** — `evidence-triage-and-dadbear.md` Part 1 and `handoff-2026-04-09-pyramid-folders-model-routing-addendum-01.md` still describe the guard as covering the scheduler re-entrancy race. They should be updated to say "guards the HTTP/CLI-trigger-vs-auto-dispatch race today; becomes the scheduler guard automatically if Phase 17 restructures the tick loop into per-config sub-tasks." Planner approval required for spec doc edits; this fix pass deliberately does not touch the spec.
 
 ---
+
+### 2026-04-09 — Phase 2 wanderer: L0 file_change path silently de-contentifies L0 nodes
+
+**Phase / workstream:** Phase 2 (wanderer pass on `phase-2-change-manifest-supersession`)
+
+**What hit friction:** Phase 2's rewrite of `execute_supersession` only considered the upper-layer (L1+) stale-update path the spec discusses. In reality, `execute_supersession` has TWO callers in `stale_engine.rs`, not one: (a) the L1+ confirmed_stale path at line 968, and (b) the L0 file_change path at line 838 (inside `file_batches`' `if result.stale == 1` branch, after resolving file path → L0 node IDs via `pyramid_file_hashes.node_ids`). The L0 caller is load-bearing for the primary DADBEAR use case: "user edits a file on disk, pyramid L0 node needs to reflect the new content."
+
+Pre-Phase-2, the body of `execute_supersession` (now preserved verbatim as `execute_supersession_identity_change`) had an explicit `if depth == 0 { read_source_file ... }` branch at lines 2551-2562 that loaded the actual file content, packed the first 400 lines / 20k chars into the LLM prompt as `source_snapshot`, and asked the LLM to rewrite the L0 headline + distilled to match the current file.
+
+Post-Phase-2, the new body takes an entirely different code path that NEVER reads the source file. `load_supersession_node_context` (stale_helpers_upper.rs:2180) reads headline, distilled, topics, terms, decisions, dead_ends, and `pyramid_deltas` rows — but no source file. `build_changed_children_from_deltas` for an L0 node with no deltas returns a single synthetic `ChangedChild { child_id: format!("{parent}-children"), old_summary: distilled, new_summary: distilled }` — same string for OLD and NEW. The LLM gets "nothing changed" as input and (if it behaves) produces a near-empty manifest with `content_updates` all null. `update_node_in_place` applies essentially a no-op and just bumps build_version. **The L0 node's distilled text remains whatever it was before the file change.**
+
+If the LLM hallucinates instead (produces a non-null distilled update based on the existing distilled alone), it's WORSE than a no-op — it's hallucinated content drift.
+
+Compounding factors:
+- `pyramid_file_hashes.hash` is never updated on file_change (only on initial ingest via `upsert_file_hash` at main.rs:3454). So the watcher re-fires file_change on every tick until the hash matches. Previously the identity-change path masked this because it created new node IDs and at least tried to update headline/distilled; now it just bumps build_version repeatedly while content stays static.
+- `update_node_in_place` does NOT enforce WS-IMMUTABILITY-ENFORCE. Canonical L0 nodes (`depth <= 1 AND provisional = 0`) are supposed to be permanently immutable per `apply_supersession`'s check at db.rs:2481, but `update_node_in_place` has no such guard and will happily mutate an L0 canonical row. Pre-Phase-2, the identity-change path sidestepped this by writing a NEW node instead of mutating the existing L0 — which was in fact the entire cause of the viz orphaning bug, but it preserved the invariant.
+- Neither the spec (`docs/specs/change-manifest-supersession.md` → "Integration with Stale Engine") nor the workstream prompt mentions the L0 file_change caller. The spec's Current/New flow diagrams only show `PendingMutation → dispatch_node_stale_check → stale=true → execute_supersession`, which is the L1+ path.
+
+**Root cause:** The spec author identified the `supersede_nodes_above()` three-caller framing (which is factually off anyway — it's two callers, neither is stale_helpers_upper) but not the `execute_supersession` two-caller framing. The implementer followed the spec literally and tested only upper-layer node paths (the new tests use `insert_upper_node` at depth 2/3, with an explicit code comment at line 2961 "depth 2 is safe — it's above the bedrock immutability cutoff"). The verifier's punch list matched the spec and also missed the L0 caller. Both were scoped to the upper-layer concern.
+
+**Impact on the viz orphaning fix:** Phase 2 DOES fix the viz DAG coherence for the L1+ path (node IDs are stable, evidence links remain valid). It also accidentally "fixes" viz coherence for the L0 path in the sense that IDs are now stable there too. But it breaks the semantic correctness of L0 content sync: L0 nodes lose the ability to reflect file changes, and DADBEAR enters a loop where it keeps detecting the file as stale (because the hash never updates) and keeps firing no-op updates.
+
+**What we did about it:** documented here; the wanderer's verdict is that Phase 2 is a **non-blocking concern** for the viz-orphaning mission but a **blocking regression** for the L0 content-sync mission. Planner escalation with proposed fix options is in the wanderer's summary (see report). No code changes applied — the right fix needs planner direction on whether to (a) add a depth==0 branch to the new execute_supersession that threads file content into the manifest input, (b) route L0 file_change calls back to `execute_supersession_identity_change` explicitly rather than falling through the Phase 2 path, (c) add a depth==0 guard to `update_node_in_place` that refuses and escalates to a rebuild, or (d) accept the regression and fix it in a Phase 2.1 focused on L0.
+
+**Lesson for future phases:** Grep for EVERY caller of a function you're rewriting, not just the ones the spec describes. The spec in this case listed "three callers of supersede_nodes_above" but that's the wrong function — the actual thing being rewritten is `execute_supersession`, which has its own callers the spec didn't enumerate. Always grep the function name itself, not the function the spec mentions, when deciding scope.
+
+---
+
+### 2026-04-09 — Phase 2 wanderer: identity-change fallback reintroduces the orphaning bug verbatim
+
+**Phase / workstream:** Phase 2 (wanderer pass on `phase-2-change-manifest-supersession`)
+
+**What hit friction:** `stale_helpers_upper.rs::execute_supersession` falls back to `execute_supersession_identity_change` (the pre-Phase-2 body, preserved verbatim) in two situations: (1) when `generate_change_manifest` fails for any reason (LLM error, JSON parse failure, network blip), and (2) when the LLM returns `identity_changed: true`. The implementation log at `docs/plans/pyramid-folders-model-routing-implementation-log.md:487` frames this as "degrades gracefully rather than leaving a stale node un-updated." But `execute_supersession_identity_change` IS THE BUG Phase 2 was written to fix — it creates a new node ID (`next_sequential_node_id(..., "S")`), leaves all `pyramid_evidence` links pointing at the old ID, and marks the old node `superseded_by` so `live_pyramid_nodes` filters it out. That's exactly the pattern that produces the viz orphaning bug.
+
+If the manifest LLM is flaky (bad JSON 5% of the time), 5% of stale checks will reintroduce the exact viz orphaning bug Phase 2 was supposed to eliminate. The bug will be intermittent and hard to debug because the "fix is landed" narrative masks it.
+
+**Root cause:** The graceful-degradation tradeoff was well-intentioned but backwards — better to mark a failed manifest as failed and SKIP the update (leaving the node at its prior valid state) than to fall through to a path that corrupts the viz. The spec's "Failure handling" section at line 251 explicitly says "an unapplied manifest is visible and recoverable" but the implementation takes "fall back to new-id path" as the failure route, which is the worst of both worlds.
+
+**What we did about it:** documented here; wanderer report recommends the manifest-gen-failure fallback be replaced with a "log failure manifest row + return early without update" path that leaves the node untouched. The identity-change path should ONLY run when the LLM explicitly sets `identity_changed = true` after a successful manifest generation. No code changes applied — planner direction needed.
+
+---
+
+### 2026-04-09 — Phase 2 wanderer: `build_id` parameter in `update_node_in_place` is dead
+
+**Phase / workstream:** Phase 2 (wanderer pass on `phase-2-change-manifest-supersession`)
+
+**What hit friction:** `db::update_node_in_place(..., build_id: &str, supersession_reason: &str)` takes a `build_id` parameter that is never written to any row. The snapshot INSERT at db.rs:2896 uses `snap.build_id.clone()` (the pre-update node's existing build_id), not the function parameter. Line 3018 has `let _ = build_id;` with a misleading comment claiming "carried into the snapshot above". The caller at stale_helpers_upper.rs:2090 passes the literal string `"stale_refresh"` as BOTH `build_id` and `supersession_reason`, which is fine functionally but makes the code lie about its shape.
+
+**Impact:** No correctness bug — the snapshot preserves the node's original build_id, which is arguably the right semantic. But the API is misleading: future callers will think they're controlling the snapshot's build_id when they aren't.
+
+**What we did about it:** documented here. Fix is trivial: either remove the unused parameter from the signature, or actually write it to the snapshot's build_id column. Wanderer did not apply because the fix touches the public API and deserves a planner-approved cleanup.
+
+---

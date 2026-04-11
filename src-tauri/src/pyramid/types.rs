@@ -1967,3 +1967,220 @@ pub struct AncestorNode {
     pub depth: i64,
     pub headline: String,
 }
+
+// ── Phase 2: Change-Manifest Supersession ────────────────────────────────────
+//
+// Types backing the change-manifest flow defined in
+// `docs/specs/change-manifest-supersession.md`. The change manifest is the
+// LLM-produced targeted delta that stale-checks apply in place on an existing
+// upper-layer node (same ID, bumped version), rather than inserting a brand
+// new node with a fresh ID. This is the structural fix for the viz-orphaning
+// bug.
+
+/// A single topic-level operation in a change manifest: add a new topic,
+/// update an existing topic's content, or remove an obsolete topic.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TopicOp {
+    /// One of: "add" | "update" | "remove".
+    pub action: String,
+    /// Topic name — required for all operations.
+    pub name: String,
+    /// New topic text — required for "add" and "update", ignored for "remove".
+    #[serde(default)]
+    pub current: String,
+}
+
+/// A single term-level operation in a change manifest.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TermOp {
+    /// One of: "add" | "update" | "remove".
+    pub action: String,
+    /// Term identifier — required for all operations.
+    pub term: String,
+    /// New definition text — required for "add" and "update".
+    #[serde(default)]
+    pub definition: String,
+}
+
+/// A single decision-level operation in a change manifest.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DecisionOp {
+    /// One of: "add" | "update" | "remove".
+    pub action: String,
+    /// The decision text (identity key for add/update/remove).
+    pub decided: String,
+    #[serde(default)]
+    pub why: String,
+    #[serde(default)]
+    pub stance: String,
+}
+
+/// A single dead-end operation in a change manifest.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DeadEndOp {
+    /// One of: "add" | "remove". (Dead ends are opaque strings with no
+    /// "update" semantic — remove and re-add.)
+    pub action: String,
+    pub value: String,
+}
+
+/// Field-level updates that a change manifest applies to the target node.
+/// Every field is optional — `None` means "leave unchanged".
+///
+/// `topics`, `terms`, `decisions`, and `dead_ends` use per-entry action ops
+/// (add/update/remove); `distilled` and `headline` are wholesale replacements
+/// when present.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ContentUpdates {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub distilled: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub headline: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topics: Option<Vec<TopicOp>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terms: Option<Vec<TermOp>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decisions: Option<Vec<DecisionOp>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dead_ends: Option<Vec<DeadEndOp>>,
+}
+
+/// A child-id pair used by the `children_swapped` list in a change manifest.
+/// For pyramid-local manifests the ids are bare node ids (e.g. `L2-004`).
+/// For vine-level manifests they are slug-prefixed (`bedrock-x:L3-001`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ChildSwap {
+    pub old: String,
+    pub new: String,
+}
+
+/// The full change manifest produced by the LLM for a single stale-check
+/// (or user-initiated reroll) against a single upper-layer node. Serializes
+/// to / from the JSON shape documented in
+/// `docs/specs/change-manifest-supersession.md` → "Change Manifest Format".
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ChangeManifest {
+    /// Node this manifest targets.
+    pub node_id: String,
+    /// `true` iff the node's fundamental identity changed (rare). When
+    /// `true`, `execute_supersession` falls back to the legacy new-id path.
+    #[serde(default)]
+    pub identity_changed: bool,
+    /// Wholesale + per-field updates to apply to the target node.
+    #[serde(default)]
+    pub content_updates: ContentUpdates,
+    /// Which child references were replaced, for evidence-link rewriting.
+    #[serde(default)]
+    pub children_swapped: Vec<ChildSwap>,
+    /// LLM-authored reason: one sentence explaining what changed and why.
+    pub reason: String,
+    /// Expected new `build_version` after this manifest applies. Validated
+    /// against the live node's current `build_version + 1` — non-contiguous
+    /// bumps are rejected.
+    pub build_version: i64,
+}
+
+impl ChangeManifest {
+    /// Helper used by tests and by the update path to convert the manifest's
+    /// typed `children_swapped` into the `&[(String, String)]` slice shape
+    /// expected by the db helper.
+    pub fn children_swapped_pairs(&self) -> Vec<(String, String)> {
+        self.children_swapped
+            .iter()
+            .map(|swap| (swap.old.clone(), swap.new.clone()))
+            .collect()
+    }
+}
+
+/// A row from `pyramid_change_manifests`. Carries both the raw manifest JSON
+/// (for round-tripping and audit display) and the parsed form (for app code).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChangeManifestRecord {
+    pub id: i64,
+    pub slug: String,
+    pub node_id: String,
+    pub build_version: i64,
+    pub manifest_json: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes_manifest_id: Option<i64>,
+    pub applied_at: String,
+}
+
+/// Validation errors raised by `validate_change_manifest`. Every variant is
+/// surfaced in WARN-level logs with the full manifest JSON and, in Phase 15,
+/// in the DADBEAR oversight page as an unapplied-manifest entry.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ManifestValidationError {
+    /// The target node_id does not exist as a live row (no pyramid_nodes row
+    /// or all rows superseded) in this slug.
+    TargetNotFound,
+    /// An `old` id in `children_swapped` does not appear as a source_node_id
+    /// in `pyramid_evidence` with verdict = 'KEEP' targeting this node.
+    MissingOldChild(String),
+    /// A `new` id in `children_swapped` does not exist in `pyramid_nodes`.
+    MissingNewChild(String),
+    /// `identity_changed: true` but neither `distilled` nor `headline` is
+    /// provided — invalid per spec.
+    IdentityChangedWithoutRewrite,
+    /// A topic/term/decision op is missing a required field.
+    InvalidContentOp {
+        field: String,
+        detail: String,
+    },
+    /// A topic/term/decision op uses an unknown action string.
+    InvalidContentOpAction {
+        field: String,
+        action: String,
+    },
+    /// A "remove" op targets an entry that does not exist on the current node.
+    RemovingNonexistentEntry {
+        field: String,
+        name: String,
+    },
+    /// The LLM-authored `reason` field is empty or whitespace only.
+    EmptyReason,
+    /// The manifest's `build_version` is not exactly `current + 1`.
+    NonContiguousVersion {
+        expected: i64,
+        got: i64,
+    },
+}
+
+impl std::fmt::Display for ManifestValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TargetNotFound => write!(f, "target node not found or not live"),
+            Self::MissingOldChild(id) => {
+                write!(f, "children_swapped.old='{id}' has no KEEP evidence link")
+            }
+            Self::MissingNewChild(id) => {
+                write!(f, "children_swapped.new='{id}' does not exist as a node")
+            }
+            Self::IdentityChangedWithoutRewrite => write!(
+                f,
+                "identity_changed=true requires distilled or headline to be set"
+            ),
+            Self::InvalidContentOp { field, detail } => {
+                write!(f, "invalid {field} op: {detail}")
+            }
+            Self::InvalidContentOpAction { field, action } => {
+                write!(f, "unknown {field} op action: '{action}'")
+            }
+            Self::RemovingNonexistentEntry { field, name } => {
+                write!(f, "remove {field} '{name}' — not present on current node")
+            }
+            Self::EmptyReason => write!(f, "reason field is empty"),
+            Self::NonContiguousVersion { expected, got } => {
+                write!(
+                    f,
+                    "build_version bump is non-contiguous: expected {expected}, got {got}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for ManifestValidationError {}
