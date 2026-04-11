@@ -25,7 +25,14 @@ type Step =
     | 'folder-ingest-pick'
     | 'folder-ingest-review';
 
-// Phase 17 IPC shapes — must match `folder_ingestion.rs`.
+// Phase 17 / Phase 18e IPC shapes — must match `folder_ingestion.rs`.
+//
+// Phase 18e (D1) extends `ClaudeCodeConversationDir` with memory
+// subfolder metadata, retires the `register_claude_code_pyramid` op
+// in favor of standard `create_pyramid` + `create_vine` ops, and
+// adds CC vine / conversation / memory slug tracking lists to both
+// `IngestionPlan` and `IngestionResult` so the wizard preview can
+// show per-category counts.
 interface ClaudeCodeConversationDir {
     encoded_path: string;
     absolute_path: string;
@@ -34,14 +41,17 @@ interface ClaudeCodeConversationDir {
     latest_mtime: string | null;
     is_main: boolean;
     is_worktree: boolean;
+    // Phase 18e additions:
+    has_memory_subfolder?: boolean;
+    memory_md_count?: number;
+    memory_subfolder_path?: string | null;
 }
 
 type IngestionOperation =
     | { op: 'create_pyramid'; slug: string; content_type: string; source_path: string }
     | { op: 'create_vine'; slug: string; source_path: string }
     | { op: 'add_child_to_vine'; vine_slug: string; child_slug: string; position: number; child_type: string }
-    | { op: 'register_dadbear_config'; slug: string; source_path: string; content_type: string; scan_interval_secs: number }
-    | { op: 'register_claude_code_pyramid'; slug: string; source_path: string; is_main: boolean; is_worktree: boolean };
+    | { op: 'register_dadbear_config'; slug: string; source_path: string; content_type: string; scan_interval_secs: number };
 
 interface IngestionPlan {
     operations: IngestionOperation[];
@@ -49,6 +59,11 @@ interface IngestionPlan {
     root_source_path: string;
     total_files: number;
     total_ignored: number;
+    // Phase 18e: classification sets so the wizard can show CC vines
+    // / conversation bedrocks / memory bedrocks distinctly.
+    claude_code_vine_slugs?: string[];
+    claude_code_conversation_slugs?: string[];
+    claude_code_memory_slugs?: string[];
 }
 
 interface IngestionResult {
@@ -56,6 +71,10 @@ interface IngestionResult {
     vines_created: string[];
     dadbear_configs: string[];
     claude_code_pyramids: string[];
+    // Phase 18e: per-category result tracking.
+    claude_code_conversation_pyramids?: string[];
+    claude_code_memory_pyramids?: string[];
+    claude_code_vines?: string[];
     compositions_added: number;
     root_slug: string | null;
     errors: string[];
@@ -1117,7 +1136,22 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
                                                     fontSize: '0.9em',
                                                 }}
                                             >
-                                                ({dir.jsonl_count} jsonl)
+                                                ({dir.jsonl_count} jsonl
+                                                {dir.has_memory_subfolder && (
+                                                    <>
+                                                        ,{' '}
+                                                        <span
+                                                            style={{
+                                                                color: dir.memory_md_count
+                                                                    ? 'var(--accent-color, #4a90e2)'
+                                                                    : undefined,
+                                                            }}
+                                                        >
+                                                            {dir.memory_md_count ?? 0} memory md
+                                                        </span>
+                                                    </>
+                                                )}
+                                                )
                                             </span>
                                         </li>
                                     ))}
@@ -1167,14 +1201,35 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
                                         }
                                     </span>
                                 </div>
+                                {/* Phase 18e: CC vines + per-bedrock category counts. Each
+                                    CC dir produces one CC vine, one conversation bedrock, and
+                                    optionally one memory document bedrock when the CC dir has
+                                    a `memory/*.md` subfolder. */}
                                 <div className="preview-row">
-                                    <span className="preview-label">CC pyramids</span>
+                                    <span className="preview-label">CC vines</span>
+                                    <span className="preview-value">
+                                        {(folderPlan.claude_code_vine_slugs ?? []).length}
+                                    </span>
+                                </div>
+                                <div
+                                    className="preview-row"
+                                    style={{ paddingLeft: '16px' }}
+                                >
+                                    <span className="preview-label">↳ Conversation beds</span>
                                     <span className="preview-value">
                                         {
-                                            folderPlan.operations.filter(
-                                                (op) => op.op === 'register_claude_code_pyramid',
-                                            ).length
+                                            (folderPlan.claude_code_conversation_slugs ?? [])
+                                                .length
                                         }
+                                    </span>
+                                </div>
+                                <div
+                                    className="preview-row"
+                                    style={{ paddingLeft: '16px' }}
+                                >
+                                    <span className="preview-label">↳ Memory doc beds</span>
+                                    <span className="preview-value">
+                                        {(folderPlan.claude_code_memory_slugs ?? []).length}
                                     </span>
                                 </div>
                                 <div className="preview-row">
@@ -1212,17 +1267,40 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
                                     }}
                                 >
                                     {folderPlan.operations.map((op, idx) => {
+                                        // Phase 18e: tag ops that belong to the CC mini-subplan
+                                        // so the operation list reads naturally — `+ cc-vine`,
+                                        // `+ cc-conversations`, `+ cc-memory` instead of plain
+                                        // `+ vine` / `+ pyramid` for slugs the user might
+                                        // mistake for ordinary folder children.
+                                        const ccVineSet = new Set(
+                                            folderPlan.claude_code_vine_slugs ?? [],
+                                        );
+                                        const ccConvoSet = new Set(
+                                            folderPlan.claude_code_conversation_slugs ?? [],
+                                        );
+                                        const ccMemorySet = new Set(
+                                            folderPlan.claude_code_memory_slugs ?? [],
+                                        );
+
                                         let label = '';
                                         if (op.op === 'create_pyramid') {
-                                            label = `+ pyramid  ${op.slug} (${op.content_type})`;
+                                            if (ccConvoSet.has(op.slug)) {
+                                                label = `+ cc-bed  ${op.slug} (conversation)`;
+                                            } else if (ccMemorySet.has(op.slug)) {
+                                                label = `+ cc-bed  ${op.slug} (memory document)`;
+                                            } else {
+                                                label = `+ pyramid  ${op.slug} (${op.content_type})`;
+                                            }
                                         } else if (op.op === 'create_vine') {
-                                            label = `+ vine     ${op.slug}`;
+                                            if (ccVineSet.has(op.slug)) {
+                                                label = `+ cc-vine ${op.slug}`;
+                                            } else {
+                                                label = `+ vine     ${op.slug}`;
+                                            }
                                         } else if (op.op === 'add_child_to_vine') {
                                             label = `    attach ${op.child_slug} (${op.child_type}) → ${op.vine_slug}`;
                                         } else if (op.op === 'register_dadbear_config') {
                                             label = `    dadbear ${op.slug} every ${op.scan_interval_secs}s`;
-                                        } else if (op.op === 'register_claude_code_pyramid') {
-                                            label = `+ cc       ${op.slug}${op.is_main ? ' (main)' : op.is_worktree ? ' (worktree)' : ''}`;
                                         }
                                         return (
                                             <li
@@ -1268,10 +1346,38 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
                                     {folderIngestResult.vines_created.length}
                                 </span>
                             </div>
+                            {/* Phase 18e: per-category CC summary so the
+                                wizard mirrors the preview's "CC vines / Conversation beds /
+                                Memory doc beds" breakdown after execution. */}
                             <div className="summary-row">
-                                <span className="summary-label">CC pyramids:</span>
+                                <span className="summary-label">CC vines:</span>
                                 <span className="summary-value">
-                                    {folderIngestResult.claude_code_pyramids.length}
+                                    {(
+                                        folderIngestResult.claude_code_vines ?? []
+                                    ).length}
+                                </span>
+                            </div>
+                            <div
+                                className="summary-row"
+                                style={{ paddingLeft: '16px' }}
+                            >
+                                <span className="summary-label">↳ Conversation beds:</span>
+                                <span className="summary-value">
+                                    {(
+                                        folderIngestResult.claude_code_conversation_pyramids ??
+                                        []
+                                    ).length}
+                                </span>
+                            </div>
+                            <div
+                                className="summary-row"
+                                style={{ paddingLeft: '16px' }}
+                            >
+                                <span className="summary-label">↳ Memory doc beds:</span>
+                                <span className="summary-value">
+                                    {(
+                                        folderIngestResult.claude_code_memory_pyramids ?? []
+                                    ).length}
                                 </span>
                             </div>
                             <div className="summary-row">
