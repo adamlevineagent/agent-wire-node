@@ -3296,9 +3296,13 @@ async fn post_build_seed(
     }
 
     // Start stale engine + file watcher
-    let (api_key, model) = {
+    // Phase 3 fix pass: clone the live LlmConfig (with provider_registry +
+    // credential_store) so PyramidStaleEngine carries the registry path
+    // through every dispatched helper, instead of pulling raw api_key/model
+    // strings that drop both runtime handles.
+    let (base_config, model) = {
         let cfg = pyramid_state.config.read().await;
-        (cfg.api_key.clone(), cfg.primary_model.clone())
+        (cfg.clone(), cfg.primary_model.clone())
     };
 
     let config = {
@@ -3329,7 +3333,7 @@ async fn post_build_seed(
         slug,
         config,
         &db_path,
-        &api_key,
+        base_config,
         &model,
         pyramid_state.operational.as_ref().clone(),
     );
@@ -4520,17 +4524,21 @@ async fn pyramid_meta_run(
             .ok_or_else(|| format!("Slug '{}' not found", slug))?;
     }
 
-    // Get LLM config
-    let (api_key, model) = {
-        let config = state.pyramid.config.read().await;
-        (config.api_key.clone(), config.primary_model.clone())
-    };
+    // Phase 3 fix pass: clone the live LlmConfig (with provider_registry +
+    // credential_store) instead of pulling raw api_key/model strings, so
+    // run_all_meta_passes stays on the registry path.
+    let base_config = state.pyramid.config.read().await.clone();
+    let model = base_config.primary_model.clone();
 
     let reader = state.pyramid.reader.clone();
     let writer = state.pyramid.writer.clone();
 
     match wire_node_lib::pyramid::meta::run_all_meta_passes(
-        &reader, &writer, &slug, &api_key, &model,
+        &reader,
+        &writer,
+        &slug,
+        &base_config,
+        &model,
     )
     .await
     {
@@ -5349,7 +5357,14 @@ async fn pyramid_apply_profile(
     // Push the new LlmConfig into the running state so the next build
     // sees it. The api_key + auth_token come from the live config, not
     // the profile (profiles only override model selection + tier params).
-    let new_llm = pyramid_config.to_llm_config();
+    //
+    // Phase 3: preserve the provider_registry + credential_store that
+    // were attached at app startup — the profile apply only mutates
+    // model selection and tier params, not the backing registry.
+    let new_llm = pyramid_config.to_llm_config_with_runtime(
+        state.pyramid.provider_registry.clone(),
+        state.pyramid.credential_store.clone(),
+    );
     let mut live = state.pyramid.config.write().await;
     let preserved_api_key = live.api_key.clone();
     let preserved_auth_token = live.auth_token.clone();
@@ -5727,6 +5742,8 @@ async fn pyramid_vine_integrity(
         csrf_secret: state.pyramid.csrf_secret,
         dadbear_handle: state.pyramid.dadbear_handle.clone(),
         dadbear_in_flight: state.pyramid.dadbear_in_flight.clone(),
+        provider_registry: state.pyramid.provider_registry.clone(),
+        credential_store: state.pyramid.credential_store.clone(),
     });
 
     let summary = vine::run_integrity_check(&pyramid_state, &slug)
@@ -5777,6 +5794,8 @@ async fn pyramid_vine_rebuild_upper(
         csrf_secret: state.pyramid.csrf_secret,
         dadbear_handle: state.pyramid.dadbear_handle.clone(),
         dadbear_in_flight: state.pyramid.dadbear_in_flight.clone(),
+        provider_registry: state.pyramid.provider_registry.clone(),
+        credential_store: state.pyramid.credential_store.clone(),
     });
 
     let cancel = tokio_util::sync::CancellationToken::new();
@@ -5938,16 +5957,19 @@ async fn pyramid_auto_update_config_init(
                 .join("pyramid.db")
                 .to_string_lossy()
                 .to_string();
-            let (api_key, model) = {
+            // Phase 3 fix pass: clone the live LlmConfig (with provider_registry +
+            // credential_store) so PyramidStaleEngine carries the registry path
+            // through every dispatched helper.
+            let (base_config, model) = {
                 let cfg = state.pyramid.config.read().await;
-                (cfg.api_key.clone(), cfg.primary_model.clone())
+                (cfg.clone(), cfg.primary_model.clone())
             };
 
             let mut engine = wire_node_lib::pyramid::stale_engine::PyramidStaleEngine::new(
                 &slug,
                 config.clone(),
                 &db_path,
-                &api_key,
+                base_config,
                 &model,
                 state.pyramid.operational.as_ref().clone(),
             );
@@ -6417,16 +6439,16 @@ async fn pyramid_faq_directory(
     state: tauri::State<'_, SharedState>,
     slug: String,
 ) -> Result<serde_json::Value, String> {
-    let config = state.pyramid.config.read().await;
-    let api_key = config.api_key.clone();
-    let model = config.primary_model.clone();
-    drop(config);
+    // Phase 3 fix pass: clone the live LlmConfig (with provider_registry +
+    // credential_store) so faq::get_faq_directory stays on the registry path.
+    let base_config = state.pyramid.config.read().await.clone();
+    let model = base_config.primary_model.clone();
 
     let directory = pyramid_faq::get_faq_directory(
         &state.pyramid.reader,
         &state.pyramid.writer,
         &slug,
-        &api_key,
+        &base_config,
         &model,
         &state.pyramid.operational.tier2,
     )
@@ -6447,6 +6469,285 @@ async fn pyramid_faq_category_drill(
         .map_err(|e| e.to_string())?;
 
     serde_json::to_value(&entry).map_err(|e| e.to_string())
+}
+
+// --- Phase 3: Credential IPC commands ---------------------------------------
+//
+// Mirrors `docs/specs/credentials-and-secrets.md` §IPC Contract. These
+// commands never return credential values over IPC — only masked
+// previews, metadata, and status. Mutations accept plaintext values
+// but those are immediately handed to the store's atomic write path
+// and dropped from scope.
+
+#[derive(serde::Serialize)]
+struct CredentialPreview {
+    key: String,
+    masked_preview: String,
+}
+
+#[tauri::command]
+async fn pyramid_list_credentials(
+    state: tauri::State<'_, SharedState>,
+) -> Result<Vec<CredentialPreview>, String> {
+    let previews = state
+        .pyramid
+        .credential_store
+        .list_with_masked_previews();
+    Ok(previews
+        .into_iter()
+        .map(|(key, masked_preview)| CredentialPreview {
+            key,
+            masked_preview,
+        })
+        .collect())
+}
+
+#[tauri::command]
+async fn pyramid_set_credential(
+    state: tauri::State<'_, SharedState>,
+    key: String,
+    value: String,
+) -> Result<(), String> {
+    state
+        .pyramid
+        .credential_store
+        .set(&key, &value)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn pyramid_delete_credential(
+    state: tauri::State<'_, SharedState>,
+    key: String,
+) -> Result<(), String> {
+    state
+        .pyramid
+        .credential_store
+        .delete(&key)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn pyramid_credentials_file_status(
+    state: tauri::State<'_, SharedState>,
+) -> Result<wire_node_lib::pyramid::credentials::CredentialFileStatus, String> {
+    state
+        .pyramid
+        .credential_store
+        .file_status()
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn pyramid_fix_credentials_permissions(
+    state: tauri::State<'_, SharedState>,
+) -> Result<wire_node_lib::pyramid::credentials::CredentialFileStatus, String> {
+    state
+        .pyramid
+        .credential_store
+        .ensure_safe_permissions()
+        .map_err(|e| e.to_string())?;
+    state
+        .pyramid
+        .credential_store
+        .file_status()
+        .map_err(|e| e.to_string())
+}
+
+#[derive(serde::Serialize)]
+struct CredentialReferenceRow {
+    key: String,
+    defined: bool,
+    referenced_by: Vec<String>,
+}
+
+#[tauri::command]
+async fn pyramid_credential_references(
+    state: tauri::State<'_, SharedState>,
+) -> Result<Vec<CredentialReferenceRow>, String> {
+    // Cross-reference every provider row for its `api_key_ref` so the
+    // UI can surface missing credentials with a clear "referenced by"
+    // list. Phase 5 will extend this to scan config contributions too.
+    let registry = state.pyramid.provider_registry.clone();
+    let providers = registry.list_providers();
+    let store = &state.pyramid.credential_store;
+
+    // Build a map: key_name → list of provider descriptions.
+    let mut map: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for provider in &providers {
+        if let Some(key_ref) = &provider.api_key_ref {
+            // Handle bare "OPENROUTER_KEY" and "${OPENROUTER_KEY}" shapes.
+            let names: Vec<String> = if key_ref.contains("${") {
+                wire_node_lib::pyramid::credentials::CredentialStore::collect_references(key_ref)
+            } else {
+                vec![key_ref.clone()]
+            };
+            for name in names {
+                map.entry(name).or_default().push(format!(
+                    "provider `{}` ({})",
+                    provider.display_name, provider.id
+                ));
+            }
+        }
+    }
+
+    // Also include every currently-defined key even if nothing references it.
+    for key in store.keys() {
+        map.entry(key).or_default();
+    }
+
+    Ok(map
+        .into_iter()
+        .map(|(key, referenced_by)| CredentialReferenceRow {
+            defined: store.contains(&key),
+            key,
+            referenced_by,
+        })
+        .collect())
+}
+
+// --- Phase 3: Provider registry IPC commands --------------------------------
+
+#[tauri::command]
+async fn pyramid_list_providers(
+    state: tauri::State<'_, SharedState>,
+) -> Result<Vec<wire_node_lib::pyramid::provider::Provider>, String> {
+    Ok(state.pyramid.provider_registry.list_providers())
+}
+
+#[tauri::command]
+async fn pyramid_save_provider(
+    state: tauri::State<'_, SharedState>,
+    provider: wire_node_lib::pyramid::provider::Provider,
+) -> Result<(), String> {
+    let writer = state.pyramid.writer.lock().await;
+    state
+        .pyramid
+        .provider_registry
+        .save_provider(&writer, provider)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn pyramid_delete_provider(
+    state: tauri::State<'_, SharedState>,
+    id: String,
+) -> Result<(), String> {
+    let writer = state.pyramid.writer.lock().await;
+    state
+        .pyramid
+        .provider_registry
+        .delete_provider(&writer, &id)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn pyramid_test_provider(
+    state: tauri::State<'_, SharedState>,
+    id: String,
+) -> Result<serde_json::Value, String> {
+    // Resolve the provider row, instantiate, and confirm the
+    // credential reference is defined. We deliberately do NOT make
+    // a real HTTP call here — a real "ping" endpoint is Phase 10 UI
+    // scope. The v1 test only surfaces missing-credential errors so
+    // the user knows which key to set in Settings → Credentials.
+    let provider = state
+        .pyramid
+        .provider_registry
+        .get_provider(&id)
+        .ok_or_else(|| format!("provider `{id}` not found"))?;
+    let (_impl, secret) = state
+        .pyramid
+        .provider_registry
+        .instantiate_provider(&provider)
+        .map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "provider_id": provider.id,
+        "provider_type": provider.provider_type.as_str(),
+        "credential_defined": secret.is_some(),
+        "chat_completions_url_resolved": true,
+    }))
+}
+
+#[tauri::command]
+async fn pyramid_get_tier_routing(
+    state: tauri::State<'_, SharedState>,
+) -> Result<Vec<wire_node_lib::pyramid::provider::TierRoutingEntry>, String> {
+    Ok(state.pyramid.provider_registry.list_tier_routing())
+}
+
+#[tauri::command]
+async fn pyramid_save_tier_routing(
+    state: tauri::State<'_, SharedState>,
+    entry: wire_node_lib::pyramid::provider::TierRoutingEntry,
+) -> Result<(), String> {
+    let writer = state.pyramid.writer.lock().await;
+    state
+        .pyramid
+        .provider_registry
+        .save_tier_routing(&writer, entry)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn pyramid_delete_tier_routing(
+    state: tauri::State<'_, SharedState>,
+    tier_name: String,
+) -> Result<(), String> {
+    let writer = state.pyramid.writer.lock().await;
+    state
+        .pyramid
+        .provider_registry
+        .delete_tier_routing(&writer, &tier_name)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn pyramid_get_step_overrides(
+    state: tauri::State<'_, SharedState>,
+    slug: Option<String>,
+    chain_id: Option<String>,
+) -> Result<Vec<wire_node_lib::pyramid::provider::StepOverride>, String> {
+    let all = state.pyramid.provider_registry.list_step_overrides();
+    let filtered: Vec<_> = all
+        .into_iter()
+        .filter(|o| {
+            slug.as_deref().map_or(true, |s| o.slug == s)
+                && chain_id.as_deref().map_or(true, |c| o.chain_id == c)
+        })
+        .collect();
+    Ok(filtered)
+}
+
+#[tauri::command]
+async fn pyramid_save_step_override(
+    state: tauri::State<'_, SharedState>,
+    override_row: wire_node_lib::pyramid::provider::StepOverride,
+) -> Result<(), String> {
+    let writer = state.pyramid.writer.lock().await;
+    state
+        .pyramid
+        .provider_registry
+        .save_step_override(&writer, override_row)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn pyramid_delete_step_override(
+    state: tauri::State<'_, SharedState>,
+    slug: String,
+    chain_id: String,
+    step_name: String,
+    field_name: String,
+) -> Result<(), String> {
+    let writer = state.pyramid.writer.lock().await;
+    state
+        .pyramid
+        .provider_registry
+        .delete_step_override(&writer, &slug, &chain_id, &step_name, &field_name)
+        .map_err(|e| e.to_string())
 }
 
 // --- App Setup --------------------------------------------------------------
@@ -6573,10 +6874,76 @@ fn main() {
         tracing::warn!("Failed to sync chain files: {e}");
     }
 
+    // ── Phase 3: credential store + provider registry ────────────────────
+    //
+    // Load the `.credentials` file from the data dir (creates an empty
+    // store on first run). Then hydrate the provider registry from the
+    // DB; the first `init_pyramid_db` call above will have seeded the
+    // default OpenRouter provider + four tier routing entries.
+    let credential_store: std::sync::Arc<wire_node_lib::pyramid::credentials::CredentialStore> =
+        match wire_node_lib::pyramid::credentials::CredentialStore::load(&config.data_dir()) {
+            Ok(store) => std::sync::Arc::new(store),
+            Err(e) => {
+                tracing::error!(
+                    "failed to load .credentials file ({}): LLM calls requiring credentials will fail until this is resolved. \
+                     Visit Settings → Credentials to fix the file permissions.",
+                    e
+                );
+                // Load from a throwaway path so the app still boots. The
+                // user can use Settings → Credentials to repair.
+                let fallback_path = config.data_dir().join(".credentials");
+                std::sync::Arc::new(
+                    wire_node_lib::pyramid::credentials::CredentialStore::load_from_path(
+                        fallback_path,
+                    )
+                    .unwrap_or_else(|_| {
+                        // As a last resort, create an in-memory empty store
+                        // rooted at the expected path so resolve_var still
+                        // returns the spec's clear error.
+                        wire_node_lib::pyramid::credentials::CredentialStore::load_from_path(
+                            config.data_dir().join(".credentials.fallback"),
+                        )
+                        .expect("unreachable: empty store construction")
+                    }),
+                )
+            }
+        };
+
+    let provider_registry = std::sync::Arc::new(
+        wire_node_lib::pyramid::provider::ProviderRegistry::new(credential_store.clone()),
+    );
+    {
+        // Open a one-shot connection to hydrate the in-memory registry
+        // from the DB. The default seed rows were already inserted by
+        // `init_pyramid_db` above, so this picks up Adam's 4 tier
+        // routing entries on first run.
+        match wire_node_lib::pyramid::db::open_pyramid_connection(&pyramid_db_path) {
+            Ok(conn) => {
+                if let Err(e) = provider_registry.load_from_db(&conn) {
+                    tracing::error!(
+                        "failed to hydrate provider registry from DB: {}; LLM routing will be broken until fixed",
+                        e
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::error!(
+                    "failed to open pyramid connection for registry hydration: {}",
+                    e
+                );
+            }
+        }
+    }
+
     let pyramid_state = Arc::new(wire_node_lib::pyramid::PyramidState {
         reader: Arc::new(tokio::sync::Mutex::new(pyramid_reader)),
         writer: Arc::new(tokio::sync::Mutex::new(pyramid_writer)),
-        config: Arc::new(RwLock::new(pyramid_config.to_llm_config())),
+        config: Arc::new(RwLock::new(
+            pyramid_config.to_llm_config_with_runtime(
+                provider_registry.clone(),
+                credential_store.clone(),
+            ),
+        )),
         active_build: Arc::new(RwLock::new(std::collections::HashMap::new())),
         data_dir: Some(config.data_dir()),
         stale_engines: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
@@ -6614,6 +6981,8 @@ fn main() {
         dadbear_in_flight: Arc::new(std::sync::Mutex::new(
             std::collections::HashMap::new(),
         )),
+        provider_registry: provider_registry.clone(),
+        credential_store: credential_store.clone(),
     });
 
     // Load persisted event subscriptions into the in-memory event bus
@@ -7503,6 +7872,23 @@ fn main() {
             // Sprint 1.5b: Single-stage intent planner (full vocabulary)
             planner_call,
             get_vocabulary_registry,
+            // Phase 3: Credentials & Provider Registry
+            pyramid_list_credentials,
+            pyramid_set_credential,
+            pyramid_delete_credential,
+            pyramid_credentials_file_status,
+            pyramid_fix_credentials_permissions,
+            pyramid_credential_references,
+            pyramid_list_providers,
+            pyramid_save_provider,
+            pyramid_delete_provider,
+            pyramid_test_provider,
+            pyramid_get_tier_routing,
+            pyramid_save_tier_routing,
+            pyramid_delete_tier_routing,
+            pyramid_get_step_overrides,
+            pyramid_save_step_override,
+            pyramid_delete_step_override,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Wire Node");

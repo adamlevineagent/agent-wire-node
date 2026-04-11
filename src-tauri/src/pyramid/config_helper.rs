@@ -1,14 +1,47 @@
 // pyramid/config_helper.rs — Shared helper for building single-model LlmConfig instances.
-// DADBEAR test edit — if you see this in the stale log, the bear is awake.
 //
-// Consolidates the `config_for_model()` function that was duplicated across
-// delta.rs, webbing.rs, and meta.rs.
+// **Phase 3 fix pass:** `config_for_model(api_key, model)` is DEPRECATED.
+// Production code should use `LlmConfig::clone_with_model_override(&self,
+// model)` instead — that helper preserves the `provider_registry` and
+// `credential_store` runtime handles that the Phase 3 refactor added to
+// `LlmConfig`. The legacy `config_for_model` builds a fresh `LlmConfig`
+// via `..Default::default()`, which zeroes both runtime handles, so
+// every caller silently bypasses the provider registry, the
+// `pyramid_tier_routing` table, the `pyramid_step_overrides` table, and
+// the `.credentials` file. The maintenance subsystem (~22 call sites
+// across `stale_helpers*`, `faq.rs`, `delta.rs`, `meta.rs`, `webbing.rs`)
+// was using this helper everywhere; the fix pass retired it from
+// production code and re-routed everything through
+// `clone_with_model_override`.
+//
+// `config_for_model` is retained ONLY for unit-test fixtures that don't
+// have a live `PyramidState` to clone from. Do NOT call it in
+// production code paths — the deprecation warning is wired up to make
+// any new caller fail clippy.
 
 use crate::pyramid::llm::LlmConfig;
 use crate::pyramid::types::TokenUsage;
 use crate::pyramid::Tier1Config;
 
-/// Build an LlmConfig targeting a specific model (no cascade — uses model as primary).
+/// **DEPRECATED — use `LlmConfig::clone_with_model_override` instead.**
+///
+/// Build an `LlmConfig` targeting a specific model from raw `(api_key,
+/// model)` strings. This helper drops the Phase 3 `provider_registry`
+/// and `credential_store` fields because it ends in
+/// `..Default::default()`, so every LLM call routed through the
+/// resulting config silently bypasses the provider registry and the
+/// `.credentials` file. Any caller in production code is a bug — use
+/// `LlmConfig::clone_with_model_override(&self, model)` to clone the
+/// live `PyramidState.config` while overriding the primary model.
+///
+/// This function is retained for unit-test fixtures that build a fresh
+/// `LlmConfig` from scratch without a `PyramidState`.
+#[deprecated(
+    note = "Drops provider_registry + credential_store. Use \
+            LlmConfig::clone_with_model_override on the live config from \
+            PyramidState.config (or thread an &LlmConfig down to the \
+            helper) so registry-aware Phase 3 routing applies."
+)]
 pub fn config_for_model(api_key: &str, model: &str) -> LlmConfig {
     let defaults = Tier1Config::default();
     LlmConfig {

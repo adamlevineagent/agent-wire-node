@@ -8,7 +8,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::info;
 
-use crate::pyramid::config_helper::config_for_model;
+use crate::pyramid::llm::LlmConfig;
 use crate::pyramid::{db, llm, types::*};
 
 // ── Meta analysis passes ─────────────────────────────────────────────────────
@@ -18,7 +18,7 @@ pub async fn timeline_forward(
     reader: &Arc<Mutex<Connection>>,
     writer: &Arc<Mutex<Connection>>,
     slug: &str,
-    api_key: &str,
+    base_config: &LlmConfig,
     model: &str,
 ) -> anyhow::Result<String> {
     let threads = {
@@ -58,7 +58,9 @@ Output the timeline as plain text (not JSON). Be concise but capture the arc."#,
         thread_summaries.join("\n\n")
     );
 
-    let cfg = config_for_model(api_key, model);
+    // Phase 3 fix pass: clone the live config (preserves provider_registry +
+    // credential_store) instead of building a fresh `config_for_model`.
+    let cfg = base_config.clone_with_model_override(model);
     let system_prompt =
         "You are a meta-analysis engine for a knowledge pyramid. Produce clear, concise analysis.";
     let result = llm::call_model(&cfg, system_prompt, &prompt, 0.3, 2000).await?;
@@ -82,7 +84,7 @@ pub async fn timeline_backward(
     writer: &Arc<Mutex<Connection>>,
     slug: &str,
     forward_timeline: &str,
-    api_key: &str,
+    base_config: &LlmConfig,
     model: &str,
 ) -> anyhow::Result<String> {
     let _ = reader; // reader not needed for this pass
@@ -98,7 +100,9 @@ Output the reverse analysis as plain text. Be concise."#,
         forward_timeline
     );
 
-    let cfg = config_for_model(api_key, model);
+    // Phase 3 fix pass: clone the live config (preserves provider_registry +
+    // credential_store) instead of building a fresh `config_for_model`.
+    let cfg = base_config.clone_with_model_override(model);
     let system_prompt =
         "You are a meta-analysis engine for a knowledge pyramid. Produce clear, concise analysis.";
     let result = llm::call_model(&cfg, system_prompt, &prompt, 0.3, 2000).await?;
@@ -122,7 +126,7 @@ pub async fn narrative(
     slug: &str,
     forward_timeline: &str,
     backward_timeline: &str,
-    api_key: &str,
+    base_config: &LlmConfig,
     model: &str,
 ) -> anyhow::Result<String> {
     let _ = reader; // reader not needed for this pass
@@ -140,7 +144,9 @@ Output the narrative as plain text. This should read like a story, not a report.
         forward_timeline, backward_timeline
     );
 
-    let cfg = config_for_model(api_key, model);
+    // Phase 3 fix pass: clone the live config (preserves provider_registry +
+    // credential_store) instead of building a fresh `config_for_model`.
+    let cfg = base_config.clone_with_model_override(model);
     let system_prompt =
         "You are a meta-analysis engine for a knowledge pyramid. Produce clear, concise analysis.";
     let result = llm::call_model(&cfg, system_prompt, &prompt, 0.3, 2000).await?;
@@ -156,7 +162,7 @@ pub async fn quickstart(
     writer: &Arc<Mutex<Connection>>,
     slug: &str,
     narrative_text: &str,
-    api_key: &str,
+    base_config: &LlmConfig,
     model: &str,
 ) -> anyhow::Result<String> {
     // Also read thread chain tips and web edges for completeness
@@ -204,7 +210,9 @@ Produce the quickstart (target: under 1500 tokens). The reader should have the s
         narrative_text, context
     );
 
-    let cfg = config_for_model(api_key, model);
+    // Phase 3 fix pass: clone the live config (preserves provider_registry +
+    // credential_store) instead of building a fresh `config_for_model`.
+    let cfg = base_config.clone_with_model_override(model);
     let system_prompt =
         "You are a meta-analysis engine for a knowledge pyramid. Produce clear, concise analysis.";
     let result = llm::call_model(&cfg, system_prompt, &prompt, 0.2, 2000).await?;
@@ -219,20 +227,20 @@ pub async fn run_all_meta_passes(
     reader: &Arc<Mutex<Connection>>,
     writer: &Arc<Mutex<Connection>>,
     slug: &str,
-    api_key: &str,
+    base_config: &LlmConfig,
     model: &str,
 ) -> anyhow::Result<String> {
     info!("[meta] Running timeline forward for '{}'", slug);
-    let forward = timeline_forward(reader, writer, slug, api_key, model).await?;
+    let forward = timeline_forward(reader, writer, slug, base_config, model).await?;
 
     info!("[meta] Running timeline backward for '{}'", slug);
-    let backward = timeline_backward(reader, writer, slug, &forward, api_key, model).await?;
+    let backward = timeline_backward(reader, writer, slug, &forward, base_config, model).await?;
 
     info!("[meta] Running narrative for '{}'", slug);
-    let narr = narrative(reader, writer, slug, &forward, &backward, api_key, model).await?;
+    let narr = narrative(reader, writer, slug, &forward, &backward, base_config, model).await?;
 
     info!("[meta] Running quickstart for '{}'", slug);
-    let qs = quickstart(reader, writer, slug, &narr, api_key, model).await?;
+    let qs = quickstart(reader, writer, slug, &narr, base_config, model).await?;
 
     info!("[meta] All meta passes complete for '{}'", slug);
     Ok(qs)

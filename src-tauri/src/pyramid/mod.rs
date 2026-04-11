@@ -25,6 +25,7 @@ pub mod collapse;
 pub mod config_helper;
 pub mod converge_expand;
 pub mod cost_model;
+pub mod credentials;
 pub mod crystallization;
 pub mod dadbear_extend;
 pub mod db;
@@ -52,6 +53,7 @@ pub mod naming;
 pub mod parity;
 pub mod preview;
 pub mod primer;
+pub mod provider;
 pub mod publication;
 pub mod query;
 pub mod question_compiler;
@@ -90,8 +92,10 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+use self::credentials::SharedCredentialStore;
 use self::event_chain::LocalEventBus;
 use self::llm::LlmConfig;
+use self::provider::ProviderRegistry;
 use self::stale_engine::PyramidStaleEngine;
 use self::types::BuildStatus;
 use self::watcher::PyramidFileWatcher;
@@ -613,6 +617,12 @@ impl PyramidConfig {
     }
 
     /// Convert to an LlmConfig for use with the build pipeline.
+    ///
+    /// This variant builds a "legacy" LlmConfig with no provider
+    /// registry attached. Production boot paths should use
+    /// `to_llm_config_with_runtime` so every LLM call routes through
+    /// the Phase 3 provider trait. `to_llm_config` is retained so
+    /// unit tests and pre-registry boot windows still compile.
     pub fn to_llm_config(&self) -> LlmConfig {
         LlmConfig {
             api_key: self.openrouter_api_key.clone(),
@@ -633,7 +643,23 @@ impl PyramidConfig {
             rate_limit_window_secs: self.operational.tier1.llm_rate_limit_window_secs,
             llm_debug_logging: self.operational.tier1.llm_debug_logging,
             model_aliases: self.model_aliases.clone(),
+            provider_registry: None,
+            credential_store: None,
         }
+    }
+
+    /// Phase 3 variant: attach the provider registry + credential
+    /// store so every LLM call routes through the new pluggable
+    /// provider trait. Production boot paths call this one.
+    pub fn to_llm_config_with_runtime(
+        &self,
+        provider_registry: Arc<ProviderRegistry>,
+        credential_store: SharedCredentialStore,
+    ) -> LlmConfig {
+        let mut cfg = self.to_llm_config();
+        cfg.provider_registry = Some(provider_registry);
+        cfg.credential_store = Some(credential_store);
+        cfg
     }
 }
 
@@ -755,6 +781,16 @@ pub struct PyramidState {
             HashMap<i64, Arc<std::sync::atomic::AtomicBool>>,
         >,
     >,
+    /// Phase 3: provider registry. Holds all pyramid_providers +
+    /// pyramid_tier_routing + pyramid_step_overrides rows in memory.
+    /// Shared via Arc so build-scoped reader clones and IPC mutators
+    /// see the same state.
+    pub provider_registry: Arc<ProviderRegistry>,
+    /// Phase 3: credential store backed by the `.credentials` file in
+    /// the app data directory. Shared via Arc. The registry holds its
+    /// own clone of this Arc; we keep it here too so IPC endpoints can
+    /// reach it without going through the registry.
+    pub credential_store: SharedCredentialStore,
 }
 
 impl PyramidState {
@@ -800,6 +836,8 @@ impl PyramidState {
             csrf_secret: self.csrf_secret,
             dadbear_handle: self.dadbear_handle.clone(),
             dadbear_in_flight: self.dadbear_in_flight.clone(),
+            provider_registry: self.provider_registry.clone(),
+            credential_store: self.credential_store.clone(),
         }))
     }
 }

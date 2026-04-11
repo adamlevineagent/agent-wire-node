@@ -16,9 +16,9 @@ use tokio::sync::Mutex;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::pyramid::config_helper::config_for_model;
 use crate::pyramid::db;
 use crate::pyramid::llm;
+use crate::pyramid::llm::LlmConfig;
 use crate::pyramid::naming::{clean_headline, headline_for_node};
 use crate::pyramid::types::*;
 
@@ -49,7 +49,7 @@ pub async fn match_or_create_thread(
     slug: &str,
     l1_content: &str,
     l1_node_id: &str,
-    api_key: &str,
+    base_config: &LlmConfig,
     model: &str,
 ) -> anyhow::Result<String> {
     let threads = {
@@ -101,7 +101,9 @@ Output JSON:
 {{"match": "thread-id" | "NEW", "thread_name": "name for new thread if NEW"}}"#
     );
 
-    let cfg = config_for_model(api_key, model);
+    // Phase 3 fix pass: clone the live config (preserves provider_registry +
+    // credential_store) instead of building a fresh `config_for_model`.
+    let cfg = base_config.clone_with_model_override(model);
     let raw = llm::call_model(&cfg, system_prompt, &user_prompt, 0.2, 200).await?;
     let parsed = llm::extract_json(&raw)?;
 
@@ -183,7 +185,7 @@ pub async fn create_delta(
     thread_id: &str,
     new_content: &str,
     source_node_id: Option<&str>,
-    api_key: &str,
+    base_config: &LlmConfig,
     model: &str,
     ops: &OperationalConfig,
 ) -> anyhow::Result<Delta> {
@@ -272,7 +274,9 @@ Output JSON only:
         n = recent_deltas.len(),
     );
 
-    let cfg = config_for_model(api_key, model);
+    // Phase 3 fix pass: clone the live config (preserves provider_registry +
+    // credential_store) instead of building a fresh `config_for_model`.
+    let cfg = base_config.clone_with_model_override(model);
     let raw = llm::call_model(&cfg, system_prompt, &user_prompt, 0.3, 500).await?;
     let parsed = llm::extract_json(&raw)?;
 
@@ -349,7 +353,8 @@ Output JSON only:
 
     // 7. Rewrite distillation
     let web_edge_notes =
-        rewrite_distillation(reader, writer, slug, thread_id, &delta, api_key, model, ops).await?;
+        rewrite_distillation(reader, writer, slug, thread_id, &delta, base_config, model, ops)
+            .await?;
 
     // 7b. Process web edge notes (cross-thread connections)
     if let Some(notes) = web_edge_notes {
@@ -424,7 +429,7 @@ pub async fn rewrite_distillation(
     slug: &str,
     thread_id: &str,
     delta: &Delta,
-    api_key: &str,
+    base_config: &LlmConfig,
     model: &str,
     ops: &OperationalConfig,
 ) -> anyhow::Result<Option<Vec<WebEdgeNote>>> {
@@ -490,7 +495,9 @@ Output JSON only:
         budget = ops.tier2.distillation_token_budget,
     );
 
-    let cfg = config_for_model(api_key, model);
+    // Phase 3 fix pass: clone the live config (preserves provider_registry +
+    // credential_store) instead of building a fresh `config_for_model`.
+    let cfg = base_config.clone_with_model_override(model);
     let raw = llm::call_model(&cfg, system_prompt, &user_prompt, 0.2, 1000).await?;
     let parsed = llm::extract_json(&raw)?;
 
@@ -579,7 +586,7 @@ pub async fn collapse_thread(
     writer: &Arc<Mutex<Connection>>,
     slug: &str,
     thread_id: &str,
-    api_key: &str,
+    base_config: &LlmConfig,
     collapse_model: &str,
     ops: &OperationalConfig,
 ) -> anyhow::Result<String> {
@@ -674,7 +681,9 @@ Output valid JSON matching this schema:
         deltas = deltas_text,
     );
 
-    let cfg = config_for_model(api_key, collapse_model);
+    // Phase 3 fix pass: clone the live config (preserves provider_registry +
+    // credential_store) instead of building a fresh `config_for_model`.
+    let cfg = base_config.clone_with_model_override(collapse_model);
     let raw = llm::call_model(&cfg, system_prompt, &user_prompt, 0.2, 4000).await?;
     let parsed = llm::extract_json(&raw)?;
 

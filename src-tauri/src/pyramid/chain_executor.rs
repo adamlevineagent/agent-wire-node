@@ -14550,6 +14550,26 @@ mod tests {
             dadbear_in_flight: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
+            provider_registry: {
+                // Phase 3: tests get an empty registry + empty credential store.
+                // The integration tests don't hit the LLM, so the registry never
+                // needs to resolve a provider. See `pyramid::provider` for the
+                // full registry behavior under production.
+                let tmp = tempfile::TempDir::new().unwrap();
+                let store = std::sync::Arc::new(
+                    crate::pyramid::credentials::CredentialStore::load(tmp.path()).unwrap(),
+                );
+                std::mem::forget(tmp);
+                std::sync::Arc::new(crate::pyramid::provider::ProviderRegistry::new(store))
+            },
+            credential_store: {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let store = std::sync::Arc::new(
+                    crate::pyramid::credentials::CredentialStore::load(tmp.path()).unwrap(),
+                );
+                std::mem::forget(tmp);
+                store
+            },
         };
 
         let chain = make_integration_code_chain();
@@ -14628,6 +14648,26 @@ mod tests {
             dadbear_in_flight: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
+            provider_registry: {
+                // Phase 3: tests get an empty registry + empty credential store.
+                // The integration tests don't hit the LLM, so the registry never
+                // needs to resolve a provider. See `pyramid::provider` for the
+                // full registry behavior under production.
+                let tmp = tempfile::TempDir::new().unwrap();
+                let store = std::sync::Arc::new(
+                    crate::pyramid::credentials::CredentialStore::load(tmp.path()).unwrap(),
+                );
+                std::mem::forget(tmp);
+                std::sync::Arc::new(crate::pyramid::provider::ProviderRegistry::new(store))
+            },
+            credential_store: {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let store = std::sync::Arc::new(
+                    crate::pyramid::credentials::CredentialStore::load(tmp.path()).unwrap(),
+                );
+                std::mem::forget(tmp);
+                store
+            },
         };
 
         let chain = make_integration_code_chain();
@@ -14726,6 +14766,26 @@ mod tests {
             dadbear_in_flight: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
+            provider_registry: {
+                // Phase 3: tests get an empty registry + empty credential store.
+                // The integration tests don't hit the LLM, so the registry never
+                // needs to resolve a provider. See `pyramid::provider` for the
+                // full registry behavior under production.
+                let tmp = tempfile::TempDir::new().unwrap();
+                let store = std::sync::Arc::new(
+                    crate::pyramid::credentials::CredentialStore::load(tmp.path()).unwrap(),
+                );
+                std::mem::forget(tmp);
+                std::sync::Arc::new(crate::pyramid::provider::ProviderRegistry::new(store))
+            },
+            credential_store: {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let store = std::sync::Arc::new(
+                    crate::pyramid::credentials::CredentialStore::load(tmp.path()).unwrap(),
+                );
+                std::mem::forget(tmp);
+                store
+            },
         };
 
         assert!(!pyramid_state
@@ -14788,6 +14848,26 @@ mod tests {
             dadbear_in_flight: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
+            provider_registry: {
+                // Phase 3: tests get an empty registry + empty credential store.
+                // The integration tests don't hit the LLM, so the registry never
+                // needs to resolve a provider. See `pyramid::provider` for the
+                // full registry behavior under production.
+                let tmp = tempfile::TempDir::new().unwrap();
+                let store = std::sync::Arc::new(
+                    crate::pyramid::credentials::CredentialStore::load(tmp.path()).unwrap(),
+                );
+                std::mem::forget(tmp);
+                std::sync::Arc::new(crate::pyramid::provider::ProviderRegistry::new(store))
+            },
+            credential_store: {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let store = std::sync::Arc::new(
+                    crate::pyramid::credentials::CredentialStore::load(tmp.path()).unwrap(),
+                );
+                std::mem::forget(tmp);
+                store
+            },
         };
 
         let chain = make_integration_code_chain();

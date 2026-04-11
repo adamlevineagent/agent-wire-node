@@ -13,8 +13,8 @@ use chrono::Utc;
 use rusqlite::Connection;
 use tracing::{error, info, warn};
 
-use super::config_helper::{config_for_model, estimate_cost};
-use super::llm::{call_model_with_usage, extract_json};
+use super::config_helper::estimate_cost;
+use super::llm::{call_model_with_usage, extract_json, LlmConfig};
 use super::naming::{clean_headline, headline_for_node};
 use super::stale_engine::batch_items;
 use super::types::{
@@ -409,7 +409,7 @@ pub(crate) fn resolve_evidence_targets_for_node_ids(
 pub async fn dispatch_node_stale_check(
     batch: Vec<PendingMutation>,
     db_path: &str,
-    api_key: &str,
+    base_config: &LlmConfig,
     model: &str,
 ) -> Result<Vec<StaleCheckResult>> {
     if batch.is_empty() {
@@ -591,8 +591,9 @@ pub async fn dispatch_node_stale_check(
         [{\"node_id\": \"...\", \"stale\": true, \"reason\": \"one sentence\"}]",
     );
 
-    // Call LLM
-    let config = config_for_model(api_key, model);
+    // Call LLM via the live config (preserves Phase 3 provider_registry +
+    // credential_store) with the model overridden to the per-call slug.
+    let config = base_config.clone_with_model_override(model);
     let (response, usage) =
         call_model_with_usage(&config, system_prompt, &user_prompt, 0.1, 2048).await?;
 
@@ -696,7 +697,7 @@ pub async fn dispatch_connection_check(
     new_node_id: &str,
     db_path: &str,
     slug: &str,
-    api_key: &str,
+    base_config: &LlmConfig,
     model: &str,
 ) -> Result<Vec<ConnectionCheckResult>> {
     let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
@@ -897,8 +898,9 @@ pub async fn dispatch_connection_check(
             [{\"connection_id\": \"...\", \"still_valid\": true, \"reason\": \"one sentence\"}]",
         );
 
-        // Call LLM
-        let config = config_for_model(api_key, model);
+        // Call LLM via the live config (preserves Phase 3 provider_registry +
+        // credential_store) with the model overridden to the per-call slug.
+        let config = base_config.clone_with_model_override(model);
         let (response, conn_usage) =
             call_model_with_usage(&config, system_prompt, &user_prompt, 0.1, 2048).await?;
 
@@ -1063,7 +1065,7 @@ pub async fn dispatch_connection_check(
 pub async fn dispatch_edge_stale_check(
     batch: Vec<PendingMutation>,
     db_path: &str,
-    api_key: &str,
+    base_config: &LlmConfig,
     model: &str,
 ) -> Result<Vec<StaleCheckResult>> {
     if batch.is_empty() {
@@ -1235,7 +1237,9 @@ pub async fn dispatch_edge_stale_check(
             truncate_str(&edge_data.new_content, 500),
         );
 
-        let config = config_for_model(api_key, model);
+        // Call LLM via the live config (preserves Phase 3 provider_registry +
+        // credential_store) with the model overridden to the per-call slug.
+        let config = base_config.clone_with_model_override(model);
         let (response, usage) =
             call_model_with_usage(&config, system_prompt, &user_prompt, 0.1, 1024).await?;
 
@@ -1484,7 +1488,7 @@ fn load_change_manifest_prompt_body() -> String {
 pub async fn generate_change_manifest(
     input: ManifestGenerationInput,
     db_path: &str,
-    api_key: &str,
+    base_config: &LlmConfig,
     model: &str,
     supersession_reason_tag: &str,
 ) -> Result<ChangeManifest> {
@@ -1552,7 +1556,10 @@ pub async fn generate_change_manifest(
     // Note (Pillar 37): temperature + max_tokens here match the existing
     // execute_supersession pattern (0.2, 4096). A structural refactor in a
     // later phase will thread these through tier-routing config.
-    let config = config_for_model(api_key, model);
+    //
+    // Phase 3 fix pass: clone the live config (preserves provider_registry +
+    // credential_store) instead of building a fresh `config_for_model`.
+    let config = base_config.clone_with_model_override(model);
     let (response, usage) =
         call_model_with_usage(&config, system_prompt, &user_prompt, 0.2, 4096).await?;
 
@@ -1897,7 +1904,7 @@ pub async fn execute_supersession(
     node_id: &str,
     db_path: &str,
     slug: &str,
-    api_key: &str,
+    base_config: &LlmConfig,
     model: &str,
 ) -> Result<String> {
     let requested_node_id = node_id.to_string();
@@ -2006,7 +2013,7 @@ pub async fn execute_supersession(
     let manifest = match generate_change_manifest(
         manifest_input,
         db_path,
-        api_key,
+        base_config,
         model,
         reason_tag,
     )
@@ -2028,7 +2035,7 @@ pub async fn execute_supersession(
     apply_supersession_manifest(
         db_path,
         slug,
-        api_key,
+        base_config,
         model,
         &resolved_node_id,
         &node_ctx,
@@ -2098,7 +2105,7 @@ async fn handle_manifest_generation_failure(
 async fn apply_supersession_manifest(
     db_path: &str,
     slug: &str,
-    api_key: &str,
+    base_config: &LlmConfig,
     model: &str,
     resolved_node_id: &str,
     node_ctx: &SupersessionNodeContext,
@@ -2167,7 +2174,7 @@ async fn apply_supersession_manifest(
             resolved_node_id,
             db_path,
             slug,
-            api_key,
+            base_config,
             model,
             Some(manifest.reason.clone()),
         )
@@ -2659,7 +2666,7 @@ async fn execute_supersession_identity_change(
     node_id: &str,
     db_path: &str,
     slug: &str,
-    api_key: &str,
+    base_config: &LlmConfig,
     model: &str,
     reason_override: Option<String>,
 ) -> Result<String> {
@@ -2853,7 +2860,9 @@ async fn execute_supersession_identity_change(
         )
     };
 
-    let config = config_for_model(api_key, model);
+    // Phase 3 fix pass: clone the live config (preserves provider_registry +
+    // credential_store) instead of building a fresh `config_for_model`.
+    let config = base_config.clone_with_model_override(model);
     let (supersession_response, supersession_usage) =
         call_model_with_usage(&config, system_prompt, &user_prompt, 0.2, 4096).await?;
     let supersession_json = extract_json(&supersession_response).ok();
@@ -3108,7 +3117,7 @@ async fn execute_supersession_identity_change(
     .await??;
 
     let conn_results =
-        dispatch_connection_check(node_id, &new_node_id, db_path, slug, api_key, model).await;
+        dispatch_connection_check(node_id, &new_node_id, db_path, slug, base_config, model).await;
 
     match conn_results {
         Ok(results) => {
@@ -3145,6 +3154,7 @@ mod tests {
         get_change_manifests_for_node, get_latest_manifest_for_node, open_pyramid_db,
         save_change_manifest, update_node_in_place,
     };
+    use crate::pyramid::llm::LlmConfig;
     use crate::pyramid::types::{
         ChangeManifest, ChildSwap, ContentUpdates, ManifestValidationError, TopicOp,
     };
@@ -4052,11 +4062,15 @@ mod tests {
         };
 
         // Drive the post-LLM apply path directly — no network, no key.
+        // Phase 3 fix pass: pass a default LlmConfig because the test
+        // takes the no-LLM apply branch (identity_changed = false) and
+        // never reaches the registry path.
+        let test_config = LlmConfig::default();
         let resolved = rt()
             .block_on(apply_supersession_manifest(
                 &db_path_str,
                 slug,
-                "test-key",
+                &test_config,
                 "test-model",
                 node_id,
                 &ctx,

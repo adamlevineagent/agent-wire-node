@@ -954,6 +954,8 @@ pub async fn build_bunch(
             csrf_secret: state.csrf_secret,
             dadbear_handle: state.dadbear_handle.clone(),
             dadbear_in_flight: state.dadbear_in_flight.clone(),
+            provider_registry: state.provider_registry.clone(),
+            credential_store: state.credential_store.clone(),
         }),
     };
 

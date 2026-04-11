@@ -1,17 +1,36 @@
-// pyramid/llm.rs — OpenRouter API client with 3-tier model cascade
+// pyramid/llm.rs — LLM call surface with pluggable provider registry.
 //
 // Unified entry point: `call_model_unified` returns content + usage + generation_id.
 // The legacy `call_model`, `call_model_with_usage`, and `call_model_structured`
 // are thin wrappers for backward compatibility.
+//
+// Phase 3 refactor: the hardcoded OpenRouter URL, headers, and response
+// parsing have been moved to `pyramid::provider`. `LlmConfig` now carries
+// an optional `provider_registry` + `credential_store` reference so every
+// call site that passes an `LlmConfig` transparently goes through the
+// provider trait. When the registry is unset (e.g., unit tests or
+// pre-Phase-3 boot paths), we synthesize an `OpenRouterProvider` from the
+// legacy `LlmConfig` fields so the codebase remains callable during
+// transitional states.
+//
+// The hardcoded OpenRouter chat-completions URL no longer lives in
+// this file — it is encoded once, inside
+// `OpenRouterProvider::chat_completions_url` in `provider.rs`, as the
+// trait impl's default base URL.
 
 use anyhow::{anyhow, Result};
 use regex::Regex;
 use serde_json::Value;
 use std::collections::VecDeque;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 use tokio::sync::Mutex as TokioMutex;
 use tracing::{info, warn};
 
+use super::credentials::{CredentialStore, ResolvedSecret};
+use super::provider::{
+    LlmProvider, OpenRouterProvider, ParsedLlmResponse, ProviderRegistry, ProviderType,
+    RequestMetadata, ResolvedTier,
+};
 use super::types::TokenUsage;
 
 // ── Global rate limiter: configurable sliding window ────────────────────────
@@ -78,7 +97,7 @@ pub struct LlmResponse {
 
 // ── Config ───────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct LlmConfig {
     pub api_key: String,
     pub auth_token: String,
@@ -108,7 +127,62 @@ pub struct LlmConfig {
     /// When true, log full LLM response bodies for failed/truncated calls to the debug log file.
     pub llm_debug_logging: bool,
     /// Custom aliases mapping a "model_tier" string to a specific model.
+    ///
+    /// Phase 3 NOTE: this field is legacy. The `provider_registry` +
+    /// `pyramid_tier_routing` table now carry the canonical tier → model
+    /// mapping. `model_aliases` remains as a transitional escape hatch
+    /// for code paths that want to override a tier lookup before the
+    /// registry is fully populated; Phase 4 will retire it.
     pub model_aliases: std::collections::HashMap<String, String>,
+    /// Phase 3: optional provider registry. When present, LLM calls
+    /// resolve their provider + model via this registry instead of the
+    /// hardcoded OpenRouter URL + cascade. Unset in unit tests and in
+    /// the narrow window between app startup and DB init.
+    pub provider_registry: Option<Arc<ProviderRegistry>>,
+    /// Phase 3: optional credential store. Threaded here alongside the
+    /// provider registry so call sites that hold an `LlmConfig`
+    /// reference can resolve `${VAR_NAME}` substitutions without
+    /// touching the database.
+    pub credential_store: Option<Arc<CredentialStore>>,
+}
+
+// `LlmConfig` carries secrets in `api_key` + `auth_token`. Derive-on
+// `Debug` would log those by default; override it so nothing sensitive
+// appears in error dumps or `tracing::debug!` output.
+impl std::fmt::Debug for LlmConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LlmConfig")
+            .field("api_key", &"[redacted]")
+            .field("auth_token", &"[redacted]")
+            .field("primary_model", &self.primary_model)
+            .field("fallback_model_1", &self.fallback_model_1)
+            .field("fallback_model_2", &self.fallback_model_2)
+            .field("primary_context_limit", &self.primary_context_limit)
+            .field("fallback_1_context_limit", &self.fallback_1_context_limit)
+            .field("max_retries", &self.max_retries)
+            .field("base_timeout_secs", &self.base_timeout_secs)
+            .field("max_timeout_secs", &self.max_timeout_secs)
+            .field("retryable_status_codes", &self.retryable_status_codes)
+            .field("retry_base_sleep_secs", &self.retry_base_sleep_secs)
+            .field(
+                "timeout_chars_per_increment",
+                &self.timeout_chars_per_increment,
+            )
+            .field("timeout_increment_secs", &self.timeout_increment_secs)
+            .field("rate_limit_max_requests", &self.rate_limit_max_requests)
+            .field("rate_limit_window_secs", &self.rate_limit_window_secs)
+            .field("llm_debug_logging", &self.llm_debug_logging)
+            .field("model_aliases", &self.model_aliases)
+            .field(
+                "provider_registry",
+                &self.provider_registry.as_ref().map(|_| "<registry>"),
+            )
+            .field(
+                "credential_store",
+                &self.credential_store.as_ref().map(|_| "<store>"),
+            )
+            .finish()
+    }
 }
 
 impl Default for LlmConfig {
@@ -132,13 +206,90 @@ impl Default for LlmConfig {
             rate_limit_window_secs: 5.0,
             llm_debug_logging: false,
             model_aliases: std::collections::HashMap::new(),
+            provider_registry: None,
+            credential_store: None,
         }
+    }
+}
+
+impl LlmConfig {
+    /// Clone this config with a different primary model. Preserves
+    /// `provider_registry`, `credential_store`, and every other field —
+    /// use this instead of `config_helper::config_for_model` whenever you
+    /// have a live `LlmConfig` (e.g. from `PyramidState.config`) and need
+    /// a variant pinned to a specific model.
+    ///
+    /// `config_for_model(api_key, model)` (now deprecated) ends in
+    /// `..Default::default()`, which silently zeroes the new
+    /// `provider_registry` and `credential_store` fields. Every helper
+    /// that uses it bypasses the Phase 3 provider registry +
+    /// `.credentials` file. `clone_with_model_override` preserves both
+    /// runtime handles by construction so the maintenance subsystem
+    /// stays on the registry path.
+    pub fn clone_with_model_override(&self, model: &str) -> Self {
+        let mut cloned = self.clone();
+        cloned.primary_model = model.to_string();
+        // Pin both fallbacks to the same model so the cascade stays
+        // on-model — mirrors the legacy `config_for_model` semantics.
+        cloned.fallback_model_1 = model.to_string();
+        cloned.fallback_model_2 = model.to_string();
+        cloned
     }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct LlmCallOptions {
     pub min_timeout_secs: Option<u64>,
+}
+
+// ── Provider synthesis (Phase 3 bridge) ──────────────────────────────────────
+
+/// Build a concrete `LlmProvider` trait object for a call. When the
+/// config has a provider registry attached, we look up the default
+/// `openrouter` provider row and instantiate it through the registry
+/// (which resolves the `${VAR_NAME}` credential references). When the
+/// registry is absent (unit tests or the narrow transitional state
+/// before DB init), we synthesize an `OpenRouterProvider` from the
+/// legacy `LlmConfig.api_key` field so the existing call sites that
+/// construct an `LlmConfig::default()` and go straight to HTTP still
+/// work.
+///
+/// Returns `(provider_impl, optional_secret, provider_type)`.
+/// `provider_type` is used for tracing so the logs record which
+/// backend handled the call.
+pub(crate) fn build_call_provider(
+    config: &LlmConfig,
+) -> Result<(Box<dyn LlmProvider>, Option<ResolvedSecret>, ProviderType)> {
+    if let Some(registry) = &config.provider_registry {
+        // Prefer the tier-routing `fast_extract` entry's provider if
+        // present; fall back to the `openrouter` seeded row. This keeps
+        // the default path pointing at OpenRouter without hardcoding
+        // its ID again here.
+        let provider = registry
+            .get_provider("openrouter")
+            .ok_or_else(|| anyhow!("provider `openrouter` is not registered — run DB init"))?;
+        let (impl_box, secret) = registry.instantiate_provider(&provider)?;
+        let provider_type = provider.provider_type;
+        return Ok((impl_box, secret, provider_type));
+    }
+
+    // Transitional fallback path: no registry, no credential store.
+    // Build an `OpenRouterProvider` directly from the legacy api_key
+    // field. This is only hit by unit tests and the narrow window
+    // between app start and DB init; production boots always attach a
+    // registry.
+    let provider = OpenRouterProvider {
+        id: "openrouter".into(),
+        display_name: "OpenRouter".into(),
+        base_url: "https://openrouter.ai/api/v1".into(),
+        extra_headers: vec![],
+    };
+    let secret = if config.api_key.is_empty() {
+        None
+    } else {
+        Some(ResolvedSecret::new(config.api_key.clone()))
+    };
+    Ok((Box::new(provider), secret, ProviderType::Openrouter))
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -203,61 +354,13 @@ fn compute_timeout(
     std::time::Duration::from_secs(timeout_secs)
 }
 
-fn sanitize_json_candidate(text: &str) -> String {
-    text.chars()
-        .filter(|c| !c.is_control() || matches!(c, '\n' | '\r' | '\t'))
-        .collect()
-}
-
-fn parse_openrouter_response_body(body_text: &str) -> Result<Value> {
-    let trimmed = body_text.trim();
-    if trimmed.is_empty() {
-        anyhow::bail!("empty response body");
-    }
-
-    if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
-        return Ok(value);
-    }
-
-    let sse_payload = trimmed
-        .lines()
-        .filter_map(|line| line.trim().strip_prefix("data:"))
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && *line != "[DONE]")
-        .collect::<Vec<_>>()
-        .join("\n");
-    if !sse_payload.is_empty() {
-        if let Ok(value) = serde_json::from_str::<Value>(&sse_payload) {
-            return Ok(value);
-        }
-    }
-
-    if let (Some(start), Some(end)) = (trimmed.find('{'), trimmed.rfind('}')) {
-        if end >= start {
-            let candidate = &trimmed[start..=end];
-            if let Ok(value) = serde_json::from_str::<Value>(candidate) {
-                return Ok(value);
-            }
-
-            let sanitized = sanitize_json_candidate(candidate);
-            if let Ok(value) = serde_json::from_str::<Value>(&sanitized) {
-                return Ok(value);
-            }
-        }
-    }
-
-    let sanitized = sanitize_json_candidate(trimmed);
-    if sanitized != trimmed {
-        if let Ok(value) = serde_json::from_str::<Value>(&sanitized) {
-            return Ok(value);
-        }
-    }
-
-    anyhow::bail!(
-        "could not parse OpenRouter JSON envelope from: {}",
-        &trimmed[..trimmed.len().min(400)]
-    )
-}
+// NOTE: The legacy `parse_openrouter_response_body` +
+// `sanitize_json_candidate` helpers were removed in Phase 3. Their
+// responsibilities moved to
+// `pyramid::provider::OpenRouterProvider::parse_response`, which is the
+// single place that encodes the OpenRouter JSON envelope shape. The
+// provider's test suite covers the same SSE / prefixed-json fixtures
+// the old tests exercised.
 
 // ── Unified entry point ──────────────────────────────────────────────────────
 
@@ -294,6 +397,14 @@ pub async fn call_model_unified_with_options(
     response_format: Option<&serde_json::Value>,
     options: LlmCallOptions,
 ) -> Result<LlmResponse> {
+    // Resolve the provider trait impl + credential for this call. The
+    // registry path is preferred; if no registry is attached to the
+    // config we synthesize an `OpenRouterProvider` from the legacy
+    // fields. Either way the resulting `Box<dyn LlmProvider>` owns the
+    // URL, headers, and response parser — `llm.rs` no longer encodes
+    // any of that.
+    let (provider_impl, secret, provider_type) = build_call_provider(config)?;
+
     // Model selection based on INPUT size only — max_tokens (output budget) is
     // irrelevant to whether the prompt fits in the model's context window.
     let est_input_tokens = estimate_tokens_llm(system_prompt, user_prompt).await;
@@ -309,7 +420,8 @@ pub async fn call_model_unified_with_options(
     };
 
     let client = &*HTTP_CLIENT;
-    let url = "https://openrouter.ai/api/v1/chat/completions";
+    let url = provider_impl.chat_completions_url();
+    let built_headers = provider_impl.prepare_headers(secret.as_ref())?;
 
     // Scale timeout with prompt size: base + increment_secs per chars_per_increment, capped at max
     let prompt_chars = system_prompt.len() + user_prompt.len();
@@ -346,19 +458,21 @@ pub async fn call_model_unified_with_options(
                 .insert("response_format".to_string(), rf.clone());
         }
 
+        // Let the provider augment the body (e.g., OpenRouter trace
+        // metadata, session_id). RequestMetadata is empty here because
+        // the caller didn't pass it; the deeper chain-executor path
+        // that DOES have metadata calls `call_model_via_registry`
+        // below.
+        provider_impl.augment_request_body(&mut body, &RequestMetadata::default());
+
         // Rate limit: wait for sliding window capacity
         rate_limit_wait(config.rate_limit_max_requests, config.rate_limit_window_secs).await;
 
-        let resp = client
-            .post(url)
-            .header("Authorization", format!("Bearer {}", config.api_key))
-            .header("Content-Type", "application/json")
-            .header("HTTP-Referer", "https://newsbleach.com")
-            .header("X-Title", "Wire Pyramid Engine")
-            .timeout(timeout)
-            .json(&body)
-            .send()
-            .await;
+        let mut request = client.post(&url).timeout(timeout);
+        for (k, v) in &built_headers {
+            request = request.header(k, v);
+        }
+        let resp = request.json(&body).send().await;
 
         let resp = match resp {
             Ok(r) => r,
@@ -474,9 +588,11 @@ pub async fn call_model_unified_with_options(
             }
         };
 
-        // Parse response JSON
-        let data: Value = match parse_openrouter_response_body(&body_text) {
-            Ok(v) => v,
+        // Delegate to the provider trait for response parsing. Every
+        // provider returns the same `ParsedLlmResponse` shape so the
+        // retry + debug-logging branches below are provider-agnostic.
+        let parsed: ParsedLlmResponse = match provider_impl.parse_response(&body_text) {
+            Ok(p) => p,
             Err(e) => {
                 warn!(
                     "[LLM] response envelope parse failed on {} attempt {}: {}",
@@ -484,7 +600,6 @@ pub async fn call_model_unified_with_options(
                     attempt + 1,
                     e
                 );
-                // Log the raw response that failed to parse so we can see what the LLM returned
                 if config.llm_debug_logging {
                     let preview_len = body_text.len().min(2000);
                     warn!(
@@ -499,66 +614,39 @@ pub async fn call_model_unified_with_options(
                     tokio::time::sleep(std::time::Duration::from_secs(config.retry_base_sleep_secs)).await;
                     continue;
                 }
-                return Err(anyhow!("Failed to parse response after {} attempts: {}", config.max_retries, e));
+                return Err(anyhow!(
+                    "Failed to parse response after {} attempts: {}",
+                    config.max_retries,
+                    e
+                ));
             }
         };
 
-        // Extract content from choices[0].message.content
-        let content = data
-            .get("choices")
-            .and_then(|c| c.get(0))
-            .and_then(|c| c.get("message"))
-            .and_then(|m| m.get("content"))
-            .and_then(|c| c.as_str());
-
-        // Extract token usage, falling back to zeros if missing
-        let usage = TokenUsage {
-            prompt_tokens: data
-                .get("usage")
-                .and_then(|u| u.get("prompt_tokens"))
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0),
-            completion_tokens: data
-                .get("usage")
-                .and_then(|u| u.get("completion_tokens"))
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0),
-        };
-
-        // Extract generation_id from the top-level `id` field in the OpenRouter response
-        let generation_id = data
-            .get("id")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-
-        // Extract finish_reason for diagnostics
-        let finish_reason = data
-            .get("choices")
-            .and_then(|c| c.get(0))
-            .and_then(|c| c.get("finish_reason"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown");
+        let usage = parsed.usage.clone();
+        let generation_id = parsed.generation_id.clone();
+        let finish_reason_str = parsed
+            .finish_reason
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string());
 
         // Always log finish_reason so it shows up in normal tracing
         info!(
-            "[LLM] model={} finish_reason={} prompt_tokens={} completion_tokens={}",
+            "[LLM] provider={} model={} finish_reason={} prompt_tokens={} completion_tokens={}",
+            provider_type.as_str(),
             short_name(&use_model),
-            finish_reason,
+            finish_reason_str,
             usage.prompt_tokens,
             usage.completion_tokens,
         );
 
-        // Debug logging for truncated/abnormal responses
         if config.llm_debug_logging {
-            let content_len = content.map(|s| s.len()).unwrap_or(0);
-            if finish_reason != "stop" || content_len > 20_000 {
-                let preview = content
-                    .map(|s| &s[..s.len().min(2000)])
-                    .unwrap_or("<null content>");
+            let content_len = parsed.content.len();
+            if finish_reason_str != "stop" || content_len > 20_000 {
+                let preview = &parsed.content[..parsed.content.len().min(2000)];
                 warn!(
                     "[LLM-DEBUG] Abnormal response (model={}, finish_reason={}, content_len={}, prompt_tokens={}, completion_tokens={}):\n{}",
                     short_name(&use_model),
-                    finish_reason,
+                    finish_reason_str,
                     content_len,
                     usage.prompt_tokens,
                     usage.completion_tokens,
@@ -567,23 +655,23 @@ pub async fn call_model_unified_with_options(
             }
         }
 
-        match content {
-            Some(text) => {
-                return Ok(LlmResponse {
-                    content: text.to_string(),
-                    usage,
-                    generation_id,
-                });
+        if parsed.content.is_empty() {
+            if attempt + 1 < config.max_retries {
+                info!("  empty content, retry {}...", attempt + 1);
+                tokio::time::sleep(std::time::Duration::from_secs(config.retry_base_sleep_secs)).await;
+                continue;
             }
-            None => {
-                if attempt + 1 < config.max_retries {
-                    info!("  null content, retry {}...", attempt + 1);
-                    tokio::time::sleep(std::time::Duration::from_secs(config.retry_base_sleep_secs)).await;
-                    continue;
-                }
-                return Err(anyhow!("Model returned null content after {} attempts", config.max_retries));
-            }
+            return Err(anyhow!(
+                "Model returned empty content after {} attempts",
+                config.max_retries
+            ));
         }
+
+        return Ok(LlmResponse {
+            content: parsed.content,
+            usage,
+            generation_id,
+        });
     }
 
     Err(anyhow!("Max retries exceeded"))
@@ -638,6 +726,199 @@ pub async fn call_model_with_usage(
     Ok((resp.content, resp.usage))
 }
 
+// ── Registry-aware call path (Phase 3) ─────────────────────────────────────
+
+/// Call the LLM via the provider registry: resolve a `tier_name` to
+/// a provider + model, then issue the request with rich observability
+/// metadata. This is the spec's preferred entry point for
+/// chain-executor callers that have `(slug, chain_id, step_name)` in
+/// scope and want per-step overrides to apply.
+///
+/// The `tier_name` is resolved against `pyramid_tier_routing`, with
+/// a per-step override lookup in `pyramid_step_overrides` if
+/// `slug`/`chain_id`/`step_name` are provided. The caller still
+/// passes `system_prompt` / `user_prompt` / `temperature` /
+/// `max_tokens` because those are per-call decisions (Phase 4/6 will
+/// move them into contributions).
+///
+/// Errors:
+/// * `tier <name> is not defined in pyramid_tier_routing` — user
+///   needs to add the tier via Settings → Model Routing.
+/// * `config references credential ${...}` — the provider's
+///   `api_key_ref` resolves to a variable that isn't in the
+///   credentials file. Points the user at Settings → Credentials.
+pub async fn call_model_via_registry(
+    config: &LlmConfig,
+    tier_name: &str,
+    system_prompt: &str,
+    user_prompt: &str,
+    temperature: f32,
+    max_tokens: usize,
+    response_format: Option<&serde_json::Value>,
+    metadata: RequestMetadata,
+) -> Result<LlmResponse> {
+    let registry = config
+        .provider_registry
+        .as_ref()
+        .ok_or_else(|| anyhow!("call_model_via_registry requires an LlmConfig with a provider_registry attached"))?;
+
+    let resolved: ResolvedTier = registry.resolve_tier(
+        tier_name,
+        metadata.slug.as_deref(),
+        metadata.chain_id.as_deref(),
+        metadata.step_name.as_deref(),
+    )?;
+
+    let (provider_impl, secret) = registry.instantiate_provider(&resolved.provider)?;
+    let provider_type = resolved.provider.provider_type;
+    let url = provider_impl.chat_completions_url();
+    let headers = provider_impl.prepare_headers(secret.as_ref())?;
+    let client = &*HTTP_CLIENT;
+
+    let est_input_tokens = estimate_tokens_llm(system_prompt, user_prompt).await;
+    let context_limit = resolved
+        .tier
+        .context_limit
+        .unwrap_or(config.primary_context_limit);
+    // Output budget is the smaller of (context - input), the tier's
+    // max_completion_tokens cap (if specified), and a sane 48K ceiling.
+    let mut effective_max_tokens = context_limit
+        .saturating_sub(est_input_tokens)
+        .min(48_000)
+        .max(1024);
+    if let Some(cap) = resolved.tier.max_completion_tokens {
+        effective_max_tokens = effective_max_tokens.min(cap);
+    }
+    // Honor the caller's explicit max_tokens if it's smaller (i.e., the
+    // caller is asking for a short response even though the model can
+    // produce more). Never raise it above effective_max_tokens.
+    if max_tokens > 0 && max_tokens < effective_max_tokens {
+        effective_max_tokens = max_tokens;
+    }
+
+    let prompt_chars = system_prompt.len() + user_prompt.len();
+    let timeout = compute_timeout(
+        prompt_chars,
+        LlmCallOptions::default(),
+        config.base_timeout_secs,
+        config.max_timeout_secs,
+        config.timeout_chars_per_increment,
+        config.timeout_increment_secs,
+    );
+
+    for attempt in 0..config.max_retries {
+        let mut body = serde_json::json!({
+            "model": resolved.tier.model_id,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            "temperature": temperature,
+            "max_tokens": effective_max_tokens
+        });
+        if let Some(rf) = response_format {
+            if provider_impl.supports_response_format() && resolved.tier.supports_response_format() {
+                body.as_object_mut()
+                    .unwrap()
+                    .insert("response_format".to_string(), rf.clone());
+            }
+        }
+        provider_impl.augment_request_body(&mut body, &metadata);
+
+        rate_limit_wait(config.rate_limit_max_requests, config.rate_limit_window_secs).await;
+
+        let mut request = client.post(&url).timeout(timeout);
+        for (k, v) in &headers {
+            request = request.header(k, v);
+        }
+        let resp = match request.json(&body).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                if attempt + 1 < config.max_retries {
+                    info!(
+                        "  [via-registry:{}] request error (timeout={}s, err={}), retry {}...",
+                        tier_name,
+                        timeout.as_secs(),
+                        e,
+                        attempt + 1
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(
+                        config.retry_base_sleep_secs,
+                    ))
+                    .await;
+                    continue;
+                }
+                return Err(anyhow!(
+                    "Request to tier `{}` failed after {} attempts: {}",
+                    tier_name,
+                    config.max_retries,
+                    e
+                ));
+            }
+        };
+
+        let status = resp.status().as_u16();
+        if config.retryable_status_codes.contains(&status) {
+            let wait = config.retry_base_sleep_secs * 2u64.pow(attempt + 1);
+            info!(
+                "  [via-registry:{}] HTTP {}, waiting {}s...",
+                tier_name, status, wait
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+            continue;
+        }
+        if !resp.status().is_success() {
+            let body_text = resp.text().await.unwrap_or_default();
+            return Err(anyhow!(
+                "HTTP {} from tier `{}` (provider={}): {}",
+                status,
+                tier_name,
+                provider_type.as_str(),
+                &body_text[..body_text.len().min(500)]
+            ));
+        }
+
+        let body_text = resp.text().await?;
+        let parsed = provider_impl.parse_response(&body_text)?;
+
+        if parsed.content.is_empty() {
+            if attempt + 1 < config.max_retries {
+                info!(
+                    "  [via-registry:{}] empty content, retry {}...",
+                    tier_name,
+                    attempt + 1
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(config.retry_base_sleep_secs))
+                    .await;
+                continue;
+            }
+            return Err(anyhow!(
+                "tier `{}` returned empty content after {} attempts",
+                tier_name,
+                config.max_retries
+            ));
+        }
+
+        info!(
+            "[LLM-TIER] tier={} provider={} model={} prompt_tokens={} completion_tokens={} cost={:?}",
+            tier_name,
+            provider_type.as_str(),
+            resolved.tier.model_id,
+            parsed.usage.prompt_tokens,
+            parsed.usage.completion_tokens,
+            parsed.actual_cost_usd,
+        );
+
+        return Ok(LlmResponse {
+            content: parsed.content,
+            usage: parsed.usage,
+            generation_id: parsed.generation_id,
+        });
+    }
+
+    Err(anyhow!("Max retries exceeded for tier `{}`", tier_name))
+}
+
 /// Call OpenRouter with structured output enforcement via JSON schema.
 ///
 /// Returns only the content string. For usage/generation_id, use `call_model_unified`
@@ -674,7 +955,6 @@ pub async fn call_model_structured(
 // ── Audited LLM Call (Live Pyramid Theatre) ─────────────────────────────────
 
 use rusqlite::Connection;
-use std::sync::Arc;
 use tokio::sync::Mutex as TokioMutexSync;
 
 /// Context for recording LLM calls to the audit trail. Thread through build
@@ -881,12 +1161,14 @@ pub async fn call_model_direct(
     user_prompt: &str,
     max_tokens: u32,
 ) -> Result<String> {
+    let (provider_impl, secret, _) = build_call_provider(config)?;
     let client = &*HTTP_CLIENT;
-    let url = "https://openrouter.ai/api/v1/chat/completions";
+    let url = provider_impl.chat_completions_url();
+    let built_headers = provider_impl.prepare_headers(secret.as_ref())?;
     let timeout = std::time::Duration::from_secs(config.base_timeout_secs);
 
     for attempt in 0..config.max_retries {
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "model": model_id,
             "messages": [
                 {"role": "system", "content": system_prompt},
@@ -894,19 +1176,15 @@ pub async fn call_model_direct(
             ],
             "max_tokens": max_tokens
         });
+        provider_impl.augment_request_body(&mut body, &RequestMetadata::default());
 
         rate_limit_wait(config.rate_limit_max_requests, config.rate_limit_window_secs).await;
 
-        let resp = client
-            .post(url)
-            .header("Authorization", format!("Bearer {}", config.api_key))
-            .header("Content-Type", "application/json")
-            .header("HTTP-Referer", "https://newsbleach.com")
-            .header("X-Title", "Wire Pyramid Engine")
-            .timeout(timeout)
-            .json(&body)
-            .send()
-            .await;
+        let mut request = client.post(&url).timeout(timeout);
+        for (k, v) in &built_headers {
+            request = request.header(k, v);
+        }
+        let resp = request.json(&body).send().await;
 
         let resp = match resp {
             Ok(r) => r,
@@ -948,36 +1226,45 @@ pub async fn call_model_direct(
             }
         };
 
-        let data: Value = match parse_openrouter_response_body(&body_text) {
-            Ok(v) => v,
+        let parsed = match provider_impl.parse_response(&body_text) {
+            Ok(p) => p,
             Err(e) => {
                 if attempt + 1 < config.max_retries {
-                    warn!("[direct:{}] parse error, retry {}: {}", short_name(model_id), attempt + 1, e);
-                    tokio::time::sleep(std::time::Duration::from_secs(config.retry_base_sleep_secs)).await;
+                    warn!(
+                        "[direct:{}] parse error, retry {}: {}",
+                        short_name(model_id),
+                        attempt + 1,
+                        e
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(config.retry_base_sleep_secs))
+                        .await;
                     continue;
                 }
-                return Err(anyhow!("parse failed after {} attempts: {}", config.max_retries, e));
+                return Err(anyhow!(
+                    "parse failed after {} attempts: {}",
+                    config.max_retries,
+                    e
+                ));
             }
         };
 
-        let content = data
-            .get("choices")
-            .and_then(|c| c.get(0))
-            .and_then(|c| c.get("message"))
-            .and_then(|m| m.get("content"))
-            .and_then(|c| c.as_str());
-
-        match content {
-            Some(text) => return Ok(text.to_string()),
-            None => {
-                if attempt + 1 < config.max_retries {
-                    info!("  [direct:{}] null content, retry {}...", short_name(model_id), attempt + 1);
-                    tokio::time::sleep(std::time::Duration::from_secs(config.retry_base_sleep_secs)).await;
-                    continue;
-                }
-                return Err(anyhow!("null content after {} attempts", config.max_retries));
+        if parsed.content.is_empty() {
+            if attempt + 1 < config.max_retries {
+                info!(
+                    "  [direct:{}] empty content, retry {}...",
+                    short_name(model_id),
+                    attempt + 1
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(config.retry_base_sleep_secs))
+                    .await;
+                continue;
             }
+            return Err(anyhow!(
+                "empty content after {} attempts",
+                config.max_retries
+            ));
         }
+        return Ok(parsed.content);
     }
 
     Err(anyhow!("call_model_direct({}): max retries exceeded", model_id))
@@ -1089,19 +1376,9 @@ mod tests {
         assert_eq!(usage.completion_tokens, 0);
     }
 
-    #[test]
-    fn test_parse_openrouter_response_body_accepts_prefixed_json() {
-        let raw = "noise before {\"id\":\"gen-1\",\"choices\":[{\"message\":{\"content\":\"hi\"}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2}} trailing";
-        let parsed = parse_openrouter_response_body(raw).unwrap();
-        assert_eq!(parsed["id"], "gen-1");
-    }
-
-    #[test]
-    fn test_parse_openrouter_response_body_accepts_sse_data_lines() {
-        let raw = "data: {\"id\":\"gen-2\",\"choices\":[{\"message\":{\"content\":\"hi\"}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2}}\n\ndata: [DONE]";
-        let parsed = parse_openrouter_response_body(raw).unwrap();
-        assert_eq!(parsed["id"], "gen-2");
-    }
+    // Phase 3: prefixed-json and SSE envelope parsing live in
+    // `pyramid::provider::OpenRouterProvider::parse_response`. The
+    // corresponding coverage is in `pyramid::provider::tests`.
 
     #[test]
     fn test_extract_json_basic() {

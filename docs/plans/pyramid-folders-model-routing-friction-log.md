@@ -209,3 +209,208 @@ If the manifest LLM is flaky (bad JSON 5% of the time), 5% of stale checks will 
 **What we did about it:** documented here. Fix is trivial: either remove the unused parameter from the signature, or actually write it to the snapshot's build_id column. Wanderer did not apply because the fix touches the public API and deserves a planner-approved cleanup.
 
 ---
+
+### 2026-04-10 — Phase 3 wanderer: `config_for_model` loses the provider registry, so stale engine + faq + delta + webbing + meta + stale_helpers* all hit the transitional fallback
+
+**Phase / workstream:** Phase 3 (wanderer pass on `phase-3-provider-registry-credentials`)
+
+**What hit friction:** The implementer's framing in the Phase 3 log says "production boots always attach a non-None registry via `PyramidConfig::to_llm_config_with_runtime`. The registry path is the canonical path, but legacy fields still drive the cascade when the registry isn't the per-call resolver." The phrasing "when the registry isn't the per-call resolver" is doing a lot of work — in reality, the registry IS the per-call resolver **only for code paths that hold an `LlmConfig` derived from `PyramidState.config`**. Every other code path in the repo that constructs a fresh `LlmConfig` via `config_helper::config_for_model(api_key, model)` gets `provider_registry: None` + `credential_store: None` (because `config_for_model` ends with `..Default::default()` and `Default::default()` explicitly zeroes both new fields). That means every LLM call from:
+
+- `stale_engine.rs` / `stale_helpers.rs` / `stale_helpers_upper.rs` (L0 and L1+ stale dispatch, including `generate_change_manifest`, `dispatch_connection_check`, `dispatch_edge_stale_check`, `execute_supersession_identity_change`)
+- `faq.rs` (query refinement, auto-annotate, FAQ generation — 6 call sites)
+- `delta.rs` (delta generation — 4 call sites)
+- `webbing.rs`, `meta.rs` (1 call each per file, 5 call sites total)
+- `build.rs` (legacy build path's `call_and_parse`)
+
+... goes into `call_model_with_usage` → `call_model_unified` → `call_model_unified_with_options` → `build_call_provider(config)`, which sees `provider_registry: None` and falls into the transitional fallback path:
+
+```rust
+// Transitional fallback path: no registry, no credential store.
+let provider = OpenRouterProvider {
+    id: "openrouter".into(),
+    display_name: "OpenRouter".into(),
+    base_url: "https://openrouter.ai/api/v1".into(),
+    extra_headers: vec![],
+};
+let secret = if config.api_key.is_empty() {
+    None
+} else {
+    Some(ResolvedSecret::new(config.api_key.clone()))
+};
+```
+
+This path:
+1. Uses the hardcoded `base_url` string literal in `build_call_provider` — **not the `pyramid_providers.base_url` column** — so a user who edits the provider row (e.g. for an OpenAI-compatible mirror) will be ignored on every stale/faq/delta/webbing/meta/build call.
+2. Wraps `config.api_key` (which ultimately comes from the legacy `pyramid_config.openrouter_api_key` on-disk JSON field) into a `ResolvedSecret`. **The `.credentials` file's `OPENROUTER_KEY` entry is not consulted.**
+3. Never reads any row from `pyramid_providers`, `pyramid_tier_routing`, or `pyramid_step_overrides` — so per-tier routing, per-step overrides, pricing, and `supported_parameters` gating are all silently skipped.
+
+The ~22 `config_for_model` call sites are **more than half** the LLM call sites in the repo. The new provider registry and credential store only service the remaining call sites (chain executor, partner, public_html routes, routes.rs semantic search, evidence_answering, characterize, question_decomposition, extraction_schema, supersession, planner_call in main.rs) — roughly the "chain-driven build" path. The "DADBEAR maintenance + faq refresh + delta generation" paths silently bypass the whole Phase 3 infrastructure.
+
+**What the user will observe:**
+
+1. On first boot with a valid `OPENROUTER_KEY` in `.credentials` AND a non-empty legacy `pyramid_config.openrouter_api_key`, everything works. Chain executor calls pick up `.credentials`; stale engine calls pick up the legacy field. Both hit OpenRouter successfully.
+
+2. On first boot with a valid `OPENROUTER_KEY` in `.credentials` and an EMPTY legacy `pyramid_config.openrouter_api_key`: chain executor builds still work (they resolve via `.credentials`). Stale engine / faq / delta / webbing / meta / build-path calls will all fail with the `OpenRouterProvider::prepare_headers` error:
+   > `OpenRouter provider `openrouter` requires an api_key_ref but the credential resolved to None`
+   because `build_call_provider` passes `None` for the secret when `config.api_key.is_empty()`. This is the "`.credentials` file is authoritative" scenario and it fails silently except via the error bubbling up as a stale-dispatch failure.
+
+3. On rotation: if the user rotates `OPENROUTER_KEY` via `pyramid_set_credential`, the chain executor picks up the new key immediately (registry `instantiate_provider` re-resolves on every call). Stale engine does NOT pick it up — `PyramidStaleEngine` caches `api_key: String` at construction time (from `pyramid_state.config.api_key` at the moment `pyramid_start_file_watcher_stale_engine` fires), and propagates that cached string through every `drain_and_dispatch → dispatch_node_stale_check → config_for_model` call chain. The only way to refresh it is to restart the app or re-apply a profile (which re-reads `pyramid_state.config` — but `pyramid_state.config.api_key` still comes from the legacy `PyramidConfig.openrouter_api_key` field, not `.credentials`).
+
+**Root cause:** the implementer's framing focused on "replacing the URL literal in llm.rs" and achieved that locally. But the repo already had a pattern (`config_for_model`) that constructs a throwaway `LlmConfig` for every LLM call from the maintenance pipelines. That pattern was invisible to the implementer's "grep for `call_model_*` and thread the registry through" search because the registry lives on the `LlmConfig` struct itself, not on the `call_model_*` arguments. The call sites DO thread through a working `LlmConfig` — it's just a fresh one that lost the registry fields on the way. The spec's "85+ call sites" framing described the count accurately but not the shape: the refactor needed to either (a) retire `config_for_model` and force every caller to pass the live `LlmConfig` through, OR (b) thread `Arc<ProviderRegistry>` + `Arc<CredentialStore>` into `config_for_model` as parameters. Neither was done.
+
+**Impact:**
+
+- **Not a build-breaking bug.** Builds still fire LLM calls successfully as long as the legacy `pyramid_config.openrouter_api_key` field is set.
+- **Credential rotation is half-broken.** Rotating via Settings → Credentials only affects chain-executor calls. The maintenance subsystem keeps using the old key until restart.
+- **Per-tier routing is silently ignored** on the entire maintenance subsystem. If the user assigns `stale_remote` to a different model in `pyramid_tier_routing`, it has zero effect on stale dispatch — that code path hardcodes `primary_model` from `LlmConfig` via `config_for_model`.
+- **Provider registry's base URL is silently ignored** on the maintenance subsystem. A user who adds a self-hosted OpenAI-compatible provider as the default cannot use it for stale/faq/delta — those calls always go to `https://openrouter.ai/api/v1`.
+- **`.credentials` file is effectively write-only for the maintenance subsystem** — nothing reads it.
+
+**Status:** Non-blocking for Phase 3's literal scope (which was "replace the hardcoded URL + parser with a trait"). Blocking for the spec's intent ("`.credentials` is the one source of truth; the provider registry is the canonical resolver; per-tier routing works everywhere"). The implementer's log entry does partially disclose this ("legacy fields still drive the cascade in `call_model_unified` when the registry isn't the per-call resolver") but does not call out that ~22 call sites silently bypass the new infrastructure via `config_for_model`. The phrasing minimizes an architectural gap that will become load-bearing the moment Phase 4/6 tries to move temperature/max_tokens into contributions — those phases will need to either (a) retire `config_for_model` or (b) thread the registry into it. Either way, fixing it earlier is cheaper than later.
+
+**Proposed fix options (planner decision required):**
+
+1. **Thread the registry through `config_for_model`.** Change signature to `config_for_model(api_key: &str, model: &str, registry: Option<Arc<ProviderRegistry>>, creds: Option<Arc<CredentialStore>>) -> LlmConfig`. Update every `dispatch_node_stale_check`, `fire_webbing`, `generate_faq_*`, `generate_delta_*` function to accept and forward `Arc<ProviderRegistry>` + `Arc<CredentialStore>` from its caller. The caller chain terminates at `PyramidStaleEngine::new` / the HTTP route handlers / `dadbear_extend::run_tick_for_config` / etc., each of which already has a `PyramidState` in scope.
+
+2. **Retire `config_for_model` in favor of `PyramidState.config.clone_with_model_override(model)`.** Add a helper on `LlmConfig` that clones and overrides just the `primary_model` field. Every caller passes the live `LlmConfig` from `state.config.read().await.clone()` and mutates the model in place. This preserves the registry fields by construction.
+
+3. **Keep `config_for_model` but require `Arc<CredentialStore>` globally.** Store the credential store in a `OnceLock<Arc<CredentialStore>>` at boot time. `config_for_model` reads from the global. This is the lowest-churn fix but introduces a global singleton which is exactly the shape the Phase 3 spec was trying to avoid.
+
+Option 2 is the cleanest and the one the implementer probably intended. Option 1 is a bigger surface-area change but matches the existing pattern of threading dependencies explicitly. Option 3 is the smallest change but worst architecturally.
+
+**What the wanderer did:** documented here; did NOT apply a fix because the right fix requires a planner-level decision about which approach to take. All three options touch the same ~22 call sites and ~5 intermediate function signatures; the cleanup is straightforward in any direction but should be done once, not in dribs and drabs.
+
+**Lesson for future phases:** when refactoring a shared config struct to add "optional runtime handles", grep for `..Default::default()` / `LlmConfig { .. }` struct literal expressions in production code, not just for the struct's construction sites via `new()` or equivalent. A helper that wraps `Default::default()` to build a fresh instance will silently zero any new optional fields — that's the exact scenario `config_for_model` hit. Also: if the refactor claim is "X gets carried through", the test suite should include at least one end-to-end test that exercises a call path terminating in `build_call_provider` and asserts that the `provider_registry` branch (not the fallback) was hit. None of the Phase 3 tests do this — they exercise the registry directly via `ProviderRegistry::instantiate_provider`, not via `call_model_unified` starting from `config_for_model`.
+
+---
+
+### 2026-04-10 — Phase 3 wanderer: credential store reads in-memory cache, not the file, so file-edits-outside-UI aren't picked up
+
+**Phase / workstream:** Phase 3 (wanderer pass on `phase-3-provider-registry-credentials`)
+
+**What hit friction:** The `credentials-and-secrets.md` spec's Open Questions section explicitly recommends "no file watcher in v1 — resolver reads the file on every resolve. This is slow but correct and simple." The implementation does the opposite: `CredentialStore::load` reads the file once at boot into a `BTreeMap<String, String>` guarded by an `RwLock`, and `resolve_var` / `substitute` walk that in-memory map. Subsequent edits via `pyramid_set_credential` → `store.set(key, value)` mutate the in-memory map and call `save_atomic` to flush to disk, so IPC-driven rotation works within the session. But **direct edits to `.credentials` with a text editor** (which is the whole point of a human-readable YAML file per the spec) are not observed by the running app — the user's `chmod` and `vim` edits sit unused until the next restart.
+
+**Impact:** Not a correctness bug within the IPC surface — that's intentionally routed through the store. It is a spec deviation (the spec explicitly calls out "The resolver reads the file on every resolve" as the chosen v1 semantics) and a UX gotcha for users who follow the spec's "you can edit the file with your preferred editor" framing in the comments of the serialized YAML. The serialized YAML header reads:
+
+```
+# Wire Node credentials file — YAML, plain text, 0600 mode enforced.
+# Managed by Wire Node. Edit via Settings → Credentials or in your preferred editor.
+# Reference credentials in configs as ${VAR_NAME}.
+```
+
+The "or in your preferred editor" phrasing implies live reload, which isn't implemented.
+
+**Status:** Non-blocking. Two reasonable fixes:
+
+1. **Implement the spec's on-every-resolve read.** Change `resolve_var` / `substitute_to_string` to re-parse the file on each call. This is what the spec recommends. Slow in hot paths (LLM calls) but only a few ms per call. Acceptable for v1.
+2. **Update the comment in `serialize_credentials_yaml`** to say "Edit via Settings → Credentials (live). Editing the file directly requires an app restart." This matches current behavior and preserves the in-memory fast path.
+
+I lean toward option 2 for v1 — live reload adds complexity for a rare use case, and the comment clarification is a 2-line change. But the spec says option 1 is the chosen approach, so planner direction is required.
+
+**Proposed action:** document via this friction log; planner decides option 1 vs option 2. Wanderer did not apply a fix.
+
+---
+
+### 2026-04-10 — Phase 3 wanderer: `pyramid_test_api_key` IPC endpoint still uses hardcoded URL + legacy api_key field, bypassing the new registry
+
+**Phase / workstream:** Phase 3 (wanderer pass on `phase-3-provider-registry-credentials`)
+
+**What hit friction:** The existing `pyramid_test_api_key` IPC command in `main.rs:5383` does a `GET https://openrouter.ai/api/v1/models` with `Authorization: Bearer {config.api_key}` hardcoded directly, bypassing both the provider registry and the credential store. Phase 3 added a separate `pyramid_test_provider` IPC command (which v1 just checks credential presence without making a real HTTP call), but the legacy `pyramid_test_api_key` remains wired up and unchanged. The frontend Settings page still calls it as the "Test API Key" button.
+
+**Impact:**
+
+- The test button reports success/failure based on the legacy `LlmConfig.api_key` field, not the `.credentials` file's `OPENROUTER_KEY`. A user who just rotated their key via Settings → Credentials will see the test button report **old** key's status because the button consults `config.api_key` which hasn't updated.
+- The hardcoded URL means users with a self-hosted or OpenAI-compatible provider registered in `pyramid_providers` cannot test it via this button — it always hits openrouter.ai.
+- The phase 3 implementer's "grep returns only two hits in provider.rs" verification claim is only true for the specific `openrouter.ai/api/v1/chat/completions` literal. The broader `openrouter.ai/api/v1` prefix appears in `main.rs`, `partner/conversation.rs`, `db.rs` (seed row), and `llm.rs` (transitional fallback) too. Three of those are legitimate (seed, transitional fallback, partner); `main.rs:5393` is a missed refactor.
+
+**Status:** Non-blocking; the old button still works for the legacy path. Fix options:
+
+1. **Route `pyramid_test_api_key` through `ProviderRegistry::instantiate_provider`** — resolve the `openrouter` row, build the provider impl, do a 1-ping `GET /models` using `provider.chat_completions_url().strip_suffix("/chat/completions") + "/models"` or add a `fn models_url(&self) -> String` method to the trait. Drop the hardcoded URL.
+2. **Delete `pyramid_test_api_key` entirely** and migrate the frontend button to use `pyramid_test_provider` which was introduced in Phase 3.
+
+Option 2 is cleaner (single test code path) but requires a frontend change. Option 1 is a 15-line backend fix that keeps the existing frontend button working. Either is fine; the current state is a gap between "old way" and "new way" that will confuse users during the migration window.
+
+**What the wanderer did:** documented; did not delete the legacy command because it's load-bearing on the current frontend. Planner should decide option 1 vs option 2.
+
+---
+
+### 2026-04-10 — Phase 3 wanderer: `.credentials` atomic write doesn't fsync the parent directory
+
+**Phase / workstream:** Phase 3 (wanderer pass on `phase-3-provider-registry-credentials`)
+
+**What hit friction:** `CredentialStore::save_atomic` writes to a sibling temp file, fsyncs the file, renames over the original, and re-applies 0600 on the final. It does NOT fsync the containing directory after the rename. POSIX's full crash-safe rename pattern is:
+
+1. Write temp file
+2. fsync temp file
+3. rename temp → target
+4. **fsync containing directory** ← missing
+
+Without step 4, a system crash immediately after step 3 can leave the filesystem directory block unflushed, meaning the rename may not be visible on the next boot — the user could see the OLD credentials file with stale content and NO temp file.
+
+**Impact:** Very narrow. A `.credentials` file is typically written only when the user rotates a key via the IPC endpoint, which is rare enough that the probability of a system crash landing in the exact window between the rename and the next flush is effectively zero for a desktop app. Servers doing frequent writes would care about this; desktop Tauri apps basically don't.
+
+**Status:** Informational. Not worth fixing unless the credentials file is ever written in a tight loop. The spec's "atomic writes" requirement is met in spirit (the rename itself is atomic); it's just not maximally crash-safe.
+
+---
+
+### 2026-04-10 — Phase 3 wanderer: `parse_openai_envelope` drops the control-char sanitize fallback that the old parser had
+
+**Phase / workstream:** Phase 3 (wanderer pass on `phase-3-provider-registry-credentials`)
+
+**What hit friction:** The pre-Phase 3 `parse_openrouter_response_body` in `llm.rs` had three levels of defensiveness:
+
+1. Direct `serde_json::from_str`
+2. SSE `data:` line extraction + parse
+3. `{...}` substring extraction + parse
+4. **`sanitize_json_candidate` fallback that strips non-whitespace control characters** then re-parses both the substring and the full trimmed body
+
+The new `parse_openai_envelope` in `provider.rs::540+` has levels 1-3 but **not** level 4 (the control-char sanitize pass). The implementer's impl log says "The provider's test suite covers the same SSE / prefixed-json fixtures the old tests exercised" — which is true for the SSE and prefixed-json fixtures, but the old sanitize test case (`test_parse_openrouter_response_body_accepts_control_chars` or similar) is gone too.
+
+**Impact:** Narrow. Some upstream LLM providers (particularly models behind aggressive streaming infrastructure) occasionally emit stray `\x01` / `\x02` control bytes in the response body. Pre-Phase 3 those would be stripped and the parse would succeed on retry. Post-Phase 3 those requests will fail the parse and go through the retry loop. The retry loop will probably succeed on the second try (streaming artifacts are non-deterministic), so the effective user-visible behavior is "one extra retry on corrupted responses." Not a correctness regression, but it does weaken the parser's resilience.
+
+**Proposed fix:** port `sanitize_json_candidate` into `parse_openai_envelope` as the final fallback before returning `Err`. The old code was ~10 lines:
+
+```rust
+fn sanitize_json_candidate(text: &str) -> String {
+    text.chars()
+        .filter(|c| !c.is_control() || matches!(c, '\n' | '\r' | '\t'))
+        .collect()
+}
+```
+
+Then add a final attempt in `parse_openai_envelope` that sanitizes and re-parses. Low-risk, low-cost, restores parity with the pre-refactor behavior.
+
+**Status:** Non-blocking. Documented here. A wanderer could apply the fix inline (10 lines) or leave it as a planner decision.
+
+---
+
+### 2026-04-10 — Phase 3 wanderer: HTTP 400 error body is logged at WARN level including any API key echoed back by the provider
+
+**Phase / workstream:** Phase 3 (wanderer pass on `phase-3-provider-registry-credentials`)
+
+**What hit friction:** `call_model_unified_with_options` at `llm.rs:479` logs:
+
+```rust
+warn!(
+    "[LLM] HTTP 400 from {} — body: {}",
+    short_name(&use_model),
+    &body_400[..body_400.len().min(500)],
+);
+```
+
+The first 500 bytes of the response body go to the tracing fmt layer, which writes to both stdout and a log file. Most 400 responses from OpenRouter don't echo back the API key, but some error paths might (e.g., "authorization header malformed: Bearer sk-or-v1-..." in a debug-heavy backend). There is no explicit sanitization of the body before the warn! call.
+
+This is **pre-existing behavior** (same warn! line existed before Phase 3) and not a regression, but Phase 3's emphasis on the never-log rule for credentials makes the gap worth flagging: the Phase 3 claim is "`ResolvedSecret` opacity prevents credentials from appearing in logs" — and that's true for the credential as it passes through the type system, but the HTTP response body is a separate channel that could leak via a misconfigured or verbose provider.
+
+**Impact:** Near-zero in the common case. Worth a one-line sanitization pass on the logged body before the warn!:
+
+```rust
+let safe_body = redact_bearer_tokens(&body_400[..body_400.len().min(500)]);
+warn!("[LLM] HTTP 400 from {} — body: {}", short_name(&use_model), safe_body);
+```
+
+Where `redact_bearer_tokens` runs a regex like `sk-or-[a-zA-Z0-9-]{20,}` → `sk-or-[redacted]`.
+
+**Status:** Informational. Pre-existing, documented here for follow-up. Not a Phase 3 regression — this warn! line already existed.
+
+---

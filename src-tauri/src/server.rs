@@ -184,10 +184,12 @@ pub async fn init_stale_engines(pyramid_state: &Arc<pyramid::PyramidState>) {
         }
     }
 
-    // Get API key and model from pyramid config
-    let (api_key, model) = {
+    // Phase 3 fix pass: clone the live LlmConfig (with provider_registry +
+    // credential_store) so every PyramidStaleEngine constructed below
+    // carries the registry path through dispatched helpers.
+    let (base_config, model) = {
         let config = pyramid_state.config.read().await;
-        (config.api_key.clone(), config.primary_model.clone())
+        (config.clone(), config.primary_model.clone())
     };
 
     // Get the DB path from data_dir
@@ -261,7 +263,7 @@ pub async fn init_stale_engines(pyramid_state: &Arc<pyramid::PyramidState>) {
             &slug,
             config.clone(),
             &db_path,
-            &api_key,
+            base_config.clone(),
             &model,
             pyramid_state.operational.as_ref().clone(),
         );
