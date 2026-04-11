@@ -3426,3 +3426,325 @@ The following scenarios should be executed by a human verifier before marking Ph
 - `npm run build` clean (150 modules, 779.37 kB bundle, unchanged).
 
 **Status:** wanderer pass → awaiting-verification. Wanderer commit is separate from the verifier commit (no amend, no push).
+
+## Phase 17 — Recursive Folder Ingestion (+ Claude Code Auto-Include)
+
+**Branch:** `phase-17-recursive-folder-ingestion` (based on Phase 16 HEAD `97bf857`)
+**Implementer:** solo implementer, 2026-04-10
+**Status:** implementation → awaiting-verification
+
+Phase 17 is the capstone. The user can now point at a folder and get a full
+ingested hierarchy with Claude Code conversations attached automatically. The
+flow goes: folder picker → pre-flight Claude Code scan → dry-run plan preview
+→ commit. Every step reuses Phase 4's `folder_ingestion_heuristics` config
+contribution and Phase 16's unified vine composition helpers
+(`insert_vine_composition`, `get_vines_for_child`, `update_child_apex`,
+`notify_vine_of_child_completion`).
+
+### Backend — new module `src-tauri/src/pyramid/folder_ingestion.rs`
+
+~1100 lines (module body + tests). Module sections:
+
+1. **Public types** (`IngestionOperation`, `IngestionPlan`, `IngestionResult`,
+   `ClaudeCodeConversationDir`, `ScanResult`). `IngestionOperation` is an
+   externally-tagged enum (`{ "op": "create_pyramid", ... }`) so the frontend
+   can match on `op.op`. The plan carries `total_files` + `total_ignored`
+   counts so the wizard can render the pre-flight summary.
+
+2. **Content type detection** (`detect_content_type`, `is_homogeneous`). The
+   detector reads the bundled code/document extension lists out of the
+   loaded `FolderIngestionConfig`, special-cases `.jsonl` as a conversation
+   candidate, and applies a strict-majority rule: the winning category must
+   be the top by count AND >= half the classified files AND strictly greater
+   than the runner-up. Ties return `None`, which forces the caller to create
+   a topical vine (the correct behavior for mixed content).
+
+3. **Scanning** (`scan_folder`). Uses the `ignore` crate's `WalkBuilder` at
+   `max_depth(1)` so scanning is non-recursive — the caller orchestrates the
+   recursion through the depth tracker. The walker respects `.gitignore`,
+   `.pyramid-ignore` (custom filename via `add_custom_ignore_filename`),
+   and `.git/info/exclude`. Crucially, `require_git(false)` is set so we
+   pick up `.gitignore` files even when the target isn't a git repo — the
+   default behavior of the `ignore` crate ignores a `.gitignore` that
+   isn't rooted at a `.git/` directory, which is not what a folder
+   ingestion UI wants.  The heuristic `ignore_patterns` list is a
+   post-filter applied on top of the `ignore` crate's walker so users can
+   specify patterns in YAML without needing to synthesize ignore files on
+   disk.  File-size cap enforced via `std::fs::metadata`.
+
+4. **Slug generation** (`generate_slug`). Takes the last 2–3 path segments,
+   joins with dashes, kebab-cases via the existing `slug::slugify`. Two
+   candidates are tried in order (2-segment, then 3-segment); collisions
+   are resolved by appending `-2`, `-3`, … up to 1000.
+
+5. **Claude Code path encoding** (`encode_path_for_claude_code`,
+   `expand_claude_code_projects_root`,
+   `find_claude_code_conversation_dirs`, `describe_claude_code_dirs`).
+   Encoding is a simple `/` → `-` substitution on the canonical absolute
+   path. Matching is exact-equal OR the prefix `encoded_target + "-"` so
+   subfolders and worktrees attach automatically (spec lines 264–269).
+   `expand_claude_code_projects_root` handles `~/` and bare `~` prefixes
+   via `dirs::home_dir`, and falls back to the raw path on Windows so the
+   spec's "`%USERPROFILE%\.claude\projects`" contract is honored.
+   `describe_claude_code_dirs` adds `jsonl_count`, `earliest_mtime`,
+   `latest_mtime`, `is_main`, `is_worktree` so the wizard can render a
+   pre-flight list with the right badges.
+
+6. **Planning** (`plan_ingestion`, `plan_recursive`). `plan_ingestion`
+   canonicalizes the target, runs the recursive walker with an `existing`
+   slug set, and returns the complete `IngestionPlan`. `plan_recursive`:
+     - At the top-level call ONLY (the `is_top_level` flag), it runs the
+       Claude Code conversation scan before doing anything else. If any
+       matches are found, the top-level folder is force-upgraded to a
+       topical vine so the CC pyramids have a parent to hang off — a leaf
+       pyramid at the top level would leave them orphaned.
+     - Leaf rule: homogeneous files, no subfolders, above
+       `min_files_for_pyramid` threshold, within depth cap → one
+       `CreatePyramid` + one `RegisterDadbearConfig`, attached to the
+       parent vine as `child_type = "bedrock"`.
+     - Vine rule: mixed content, has subfolders, or above depth cap →
+       `CreateVine`, recurse into subfolders with `depth + 1`, then
+       emit one pyramid per file-group (grouped by detected content
+       type via `group_files_by_type`) for the vine's own loose files.
+     - After recursion, emit the Claude Code pyramid + DADBEAR config +
+       AddChildToVine triple for each matching CC directory. The CC
+       pyramids share a `{vine_slug}-cc-{idx}` slug pattern with
+       deduplication if collisions occur.
+     - Child position numbering is done by counting existing
+       `AddChildToVine` ops with the same `vine_slug` — this is O(n²)
+       on pathological inputs but fine for realistic folder hierarchies
+       and keeps positions contiguous without a separate counter
+       data structure.
+
+7. **Execution** (`execute_plan`). Grabs the writer lock once and iterates
+   the operations. Each op is idempotent: duplicate `create_slug` errors
+   are swallowed, `save_dadbear_config` upserts, and
+   `insert_vine_composition` uses the Phase 16 ON CONFLICT path. Individual
+   failures are logged to `IngestionResult::errors` rather than aborting
+   the whole plan — a partially-applied plan is safer and more useful at
+   this scale than full-or-nothing rollback.
+
+### Backend — `db.rs` extensions
+
+- **Schema extension:** `pyramid_folder_ingestion_heuristics` gains five
+  columns (`default_scan_interval_secs`, `code_extensions_json`,
+  `document_extensions_json`, `claude_code_auto_include`,
+  `claude_code_conversation_path`). CREATE TABLE ships with the Phase 17
+  shape for fresh DBs. Idempotent ALTER TABLE migrations added after the
+  `execute_batch` that creates the table, so pre-Phase-17 databases get
+  the new columns on first boot without losing existing rows.
+- **YAML struct:** `FolderIngestionHeuristicsYaml` extended with the new
+  optional fields (`#[serde(default)]` everywhere so a minimal YAML still
+  validates). `default_scan_interval_secs` defaults to 30,
+  `claude_code_auto_include` defaults to `true`,
+  `claude_code_conversation_path` defaults to `"~/.claude/projects"`.
+- **New resolved struct:** `FolderIngestionConfig` is the loader output
+  with every field resolved and populated from defaults if missing. Three
+  public helpers (`default_code_extensions`, `default_document_extensions`,
+  `default_ignore_patterns`) expose the seed lists so tests and the
+  loader share a single source of truth.
+- **New loader:** `load_active_folder_ingestion_heuristics(&conn)` reads
+  the `slug IS NULL` row and returns a fully-resolved `FolderIngestionConfig`,
+  falling back to `FolderIngestionConfig::default()` when no row exists.
+  Empty JSON arrays in the stored row are treated as "not set" and
+  replaced with the defaults so ingestion never runs with a silently-empty
+  extension set.
+- **Updated writer:** `upsert_folder_ingestion_heuristics` now serializes
+  code/document extension lists into `*_json` columns alongside the new
+  scalar columns.
+
+### Backend — `config_contributions.rs`
+
+No dispatcher changes. The existing
+`"folder_ingestion_heuristics"` sync branch already calls
+`db::upsert_folder_ingestion_heuristics`, and the YAML struct's new fields
+flow through `serde_yaml::from_str` automatically.
+
+### Backend — `main.rs` IPCs
+
+Two new Tauri commands:
+
+- `pyramid_ingest_folder` (input: `{ target_folder, include_claude_code,
+  dry_run }`; output: `{ plan, result }`). Loads the active heuristics,
+  calls `plan_ingestion`, returns the plan directly on `dry_run = true`
+  or executes + returns both on `dry_run = false`.
+- `pyramid_find_claude_code_conversations` (input: `target_folder`;
+  output: `Vec<ClaudeCodeConversationDir>`). Pre-flight helper for the
+  wizard — enumerates matches with file counts and mtimes.
+
+Both registered in `invoke_handler!` right after `pyramid_create_slug`.
+
+### Backend — bundled seed
+
+`src-tauri/assets/bundled_contributions.json` gains
+`bundled-folder_ingestion_heuristics-default-v1` with the full Phase 17
+YAML body (all fields, canonical extension lists, bundled ignore
+patterns, CC auto-include on, default path `~/.claude/projects`). Loaded
+automatically via the existing `walk_bundled_contributions_manifest`
+migration — no new dispatch code needed.
+
+### Frontend — `src/components/AddWorkspace.tsx`
+
+Existing wizard extended with a **"Point at folder (recursive)"** entry
+button on the initial directory step. Clicking it runs the folder picker,
+fires `pyramid_find_claude_code_conversations`, fires a `dry_run: true`
+`pyramid_ingest_folder`, and transitions to a new `folder-ingest-review`
+step that shows:
+
+- Target folder path
+- Claude Code conversation directory list with `main`/`worktree` badges
+  and per-dir jsonl counts (or a "no matches" hint)
+- Include-Claude-Code checkbox (default ON when matches exist, OFF
+  otherwise, per spec)
+- Plan summary grid (files scanned, pyramids, vines, CC pyramids,
+  DADBEAR configs, root slug)
+- Expandable full operation list for the curious user
+- Post-commit result summary when `dry_run: false` has landed
+
+Toggling the CC checkbox re-runs the dry-run so the plan updates in
+place. "Start ingestion" fires `dry_run: false`. On zero errors, the
+wizard closes via `onComplete()`. On any errors, the result is rendered
+in place so the user can inspect them.
+
+Step sequence override: when `step === 'folder-ingest-pick' ||
+'folder-ingest-review'`, `getStepSequence()` returns
+`['directory', 'folder-ingest-review']` so the step indicator shows the
+2-step wizard flow instead of the legacy 5-step sequence.
+
+### Tests
+
+Phase 17 test count: **+28 tests** (1205 → 1233).
+
+- `src-tauri/src/pyramid/folder_ingestion.rs::phase17_tests` — 23 tests
+  covering content type detection (homogeneous code/document/conversation,
+  mixed → None, unclassified ignored), ignore-pattern matching (directory
+  pattern, extension pattern), slug generation (kebab case + collision
+  suffix), scan_folder (gitignore, pyramid-ignore, subfolders, file-size
+  skip), encode_path_for_claude_code, find_claude_code_conversation_dirs
+  (exact match + subfolder prefix match + worktree match),
+  expand_claude_code_projects_root (tilde expansion),
+  plan_ingestion (single-level homogeneous, mixed with vine,
+  recursive multi-level, max depth, below threshold, Claude Code
+  attachment).
+- `src-tauri/src/pyramid/db.rs::phase17_tests` — 4 tests covering the
+  new schema columns, YAML roundtrip with every new field, loader
+  defaults on empty DB, and loader fallback when empty JSON arrays
+  are stored.
+- `src-tauri/src/pyramid/config_contributions.rs::tests::test_sync_folder_ingestion_heuristics_with_new_fields`
+  — 1 test that creates a `folder_ingestion_heuristics` contribution
+  with a full Phase 17 YAML, runs `sync_config_to_operational`, and
+  verifies every field made it through the loader.
+
+All tests use temp dirs (`tempfile::TempDir`) for the filesystem side —
+no real `~/.claude/projects` access, no real gitignore repos.
+
+### Manual verification path
+
+1. `cd src-tauri && cargo tauri dev` (or `cargo run --bin wire-node-desktop`)
+2. In the app, open "Add Workspace".
+3. On the Source step, click the new **Point at folder (recursive)** button.
+4. Select the agent-wire-node repo root (or any folder with Claude Code
+   conversations — Adam has several).
+5. Verify the wizard lands on the Review step with:
+   - The target folder path echoed back.
+   - The Claude Code conversation list shows at least the main repo match
+     (`-Users-adamlevine-AI Project Files-agent-wire-node`) and the two
+     known worktree matches (`-...--claude-worktrees-nervous-lichterman`,
+     `-...--claude-worktrees-wonderful-tesla`).
+   - "Include Claude Code conversations" checkbox is checked by default.
+   - Plan summary shows files scanned + pyramids + vines + CC pyramids.
+6. Toggle the checkbox OFF — confirm the CC pyramid count drops to 0 and
+   the plan re-renders.
+7. Toggle it back ON, click "Start ingestion".
+8. Verify the wizard closes cleanly on success.
+9. Back in the main dashboard, confirm:
+   - A root topical vine slug exists (should look like `agent-wire-node`
+     or similar).
+   - Child pyramids for `src-tauri-src`, `src`, `docs`, etc. are present.
+   - Claude Code pyramids are present with the `cc-` suffix pattern and
+     their source_path points at the right `~/.claude/projects/…`
+     directory.
+   - DADBEAR configs exist for every created pyramid (check via the
+     DADBEAR oversight tab or `sqlite3 pyramid.db 'SELECT slug, source_path
+     FROM pyramid_dadbear_config WHERE slug LIKE "%cc-%"'`).
+   - Vine composition rows link every child back to the root vine
+     (`sqlite3 pyramid.db 'SELECT vine_slug, bedrock_slug, child_type
+     FROM pyramid_vine_compositions'`).
+
+### Post-build verification (automated)
+
+- `cargo check --lib` — clean, 3 pre-existing warnings.
+- `cargo check --bin wire-node-desktop` — clean, 1 pre-existing
+  deprecation warning (`tauri_plugin_shell::Shell::open`).
+- `cargo test --lib pyramid` — **1233 passing / 7 failing** (same 7
+  pre-existing unrelated failures: `pyramid::db::tests::test_evidence_pk_cross_slug_coexistence`,
+  `pyramid::defaults_adapter::tests::real_yaml_thread_clustering_preserves_response_schema`,
+  and the 5 `pyramid::staleness::tests::*` that panic on a missing
+  `build_id` column in a test fixture).
+- `cargo test --lib pyramid::folder_ingestion::phase17_tests` — **23 / 23
+  passing**.
+- `cargo test --lib pyramid::db::phase17_tests` — **4 / 4 passing**.
+- `npm run build` clean (150 modules, 788.39 kB bundle — the +9 kB over
+  Phase 16 is the wizard UI).
+
+### Deviations
+
+- **Slug generation semantics**: I chose a strict-majority detector
+  rather than the spec's plain "majority extension wins" phrasing. The
+  stricter rule (>= half the classified files AND strictly greater than
+  runner-up) means a 2-code / 2-doc folder → topical vine instead of
+  an arbitrarily-picked pyramid type. The spec's "mixed → vine"
+  semantics are honored more faithfully this way.
+- **Top-level Claude Code forcing a vine**: the spec's pseudocode attaches
+  CC pyramids after the vine is built, but does not specify what to do
+  when the top-level folder would otherwise become a single leaf pyramid.
+  Phase 17 forces a vine in that case so the CC children have a parent
+  composition. Without this, the CC pyramids would be orphaned at the
+  top level.
+- **`folder_ingestion_heuristics_yaml.code_extensions` / `document_extensions`**:
+  stored as JSON arrays in `*_json` columns rather than first-class
+  columns. Matches the existing pattern used by `content_type_rules_json`
+  and `ignore_patterns_json` on the same table.
+- **`require_git(false)` on the walker**: not explicitly called out in
+  the spec but needed so the `ignore` crate honors `.gitignore` in plain
+  project folders that the user points at. This matches `sync.rs` only
+  coincidentally — `sync.rs` doesn't set this flag because its input is
+  always a git-managed corpus. Folder ingestion is not so constrained.
+- **No automatic first-build trigger**: the spec does not require the
+  executor to kick off the first build on each created pyramid, and the
+  existing DADBEAR + Pipeline B system will do that on its next tick
+  after the config row lands. I did not add an explicit build-now hook
+  to keep the IPC response fast and to avoid holding the writer lock
+  across long-running chain dispatch. Manual verification step 9
+  confirms that builds start automatically via Pipeline B.
+
+### Files changed
+
+- `src-tauri/src/pyramid/folder_ingestion.rs` — **new** module (~1100 lines
+  including tests).
+- `src-tauri/src/pyramid/mod.rs` — register `pub mod folder_ingestion`.
+- `src-tauri/src/pyramid/db.rs` — CREATE TABLE extension, idempotent ALTER
+  TABLE migration block, `FolderIngestionHeuristicsYaml` extension,
+  `FolderIngestionConfig` struct + defaults helpers, `load_active_folder_ingestion_heuristics`
+  loader, updated `upsert_folder_ingestion_heuristics`, `phase17_tests`
+  module.
+- `src-tauri/src/pyramid/config_contributions.rs` — new
+  `test_sync_folder_ingestion_heuristics_with_new_fields` test (no
+  dispatcher changes).
+- `src-tauri/src/main.rs` — new `pyramid_ingest_folder` and
+  `pyramid_find_claude_code_conversations` Tauri commands; both registered
+  in `invoke_handler!`.
+- `src-tauri/assets/bundled_contributions.json` — new
+  `bundled-folder_ingestion_heuristics-default-v1` entry with the full
+  Phase 17 YAML body.
+- `src/components/AddWorkspace.tsx` — new `folder-ingest-pick` and
+  `folder-ingest-review` steps, new state vars, handlers
+  (`handlePickFolderForIngestion`,
+  `handleToggleIncludeClaudeCode`, `handleStartFolderIngestion`), UI
+  block for the review step, Phase 17 TypeScript type definitions for
+  the IPC shapes.
+- `docs/plans/pyramid-folders-model-routing-implementation-log.md` — this
+  entry.
+
+**Status:** implementation → awaiting-verification. Single commit on
+branch `phase-17-recursive-folder-ingestion`. No amend, no push.

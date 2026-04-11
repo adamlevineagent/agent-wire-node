@@ -1850,3 +1850,82 @@ Compare with working patterns in `conversation-episodic.yaml`'s `l1_classify` / 
 
 ---
 
+## 2026-04-10 — Phase 17 implementer notes
+
+### Deviations from the spec / workstream prompt
+
+1. **Strict-majority content type detection** (spec says "majority extension
+   wins", implementation uses "must be >= half AND strictly greater than
+   runner-up"). The spec's plain majority rule would tie-break arbitrarily
+   on a 2-code/2-doc folder. Stricter rule matches the spec's "mixed →
+   vine" behavior more faithfully. Documented in `detect_content_type`
+   doc comment.
+
+2. **Top-level folder forced to vine when Claude Code matches exist.** The
+   spec's pseudocode attaches CC pyramids "as bedrocks of the target
+   folder's vine", but doesn't specify what to do when the target would
+   otherwise become a single leaf pyramid (e.g. a folder with just .md
+   files). Phase 17 forces a topical vine in that case so the CC children
+   have a parent composition row — without this, the CC pyramids would be
+   orphaned. Documented in `plan_recursive` comment block.
+
+3. **`require_git(false)` on `ignore::WalkBuilder`.** Not in the spec, but
+   required so `.gitignore` works on non-git folders the user points at.
+   The `ignore` crate's default refuses to honor `.gitignore` unless the
+   directory is inside a `.git/` directory, which is the wrong default
+   for folder ingestion. Added as a comment on the builder configuration.
+
+4. **Extension lists stored as `*_json` columns, not first-class columns.**
+   `code_extensions_json` and `document_extensions_json` mirror the
+   existing `content_type_rules_json` / `ignore_patterns_json` pattern
+   on the same table. This keeps migrations small and avoids the
+   schema-rigidity problem (spec may evolve to allow per-extension
+   metadata later).
+
+5. **No explicit first-build trigger after plan execution.** The spec
+   doesn't require it, and Pipeline B's scanner will pick up the new
+   DADBEAR configs on its next tick. Adding an explicit build-now hook
+   would require holding the writer lock across long-running chain
+   dispatch which is exactly what Phase 16's `run_post_build_hooks`
+   refactor was trying to avoid. Manual verification step 9 confirms
+   builds start automatically.
+
+### Surprises
+
+1. **`pyramid_config_contributions` column is `wire_native_metadata_json`,
+   not `canonical_metadata`.** First pass at the db phase17 test helpers
+   wrote `canonical_metadata` based on Phase 5 naming in the log. Only
+   discovered at test runtime. The column was renamed in Phase 5 but the
+   naming in commit messages is inconsistent. **Add to friction: when
+   writing backend tests, grep for the actual `CREATE TABLE` before
+   writing INSERT statements — memory is unreliable across renames.**
+
+2. **Migration ordering matters.** First pass put the Phase 17 idempotent
+   ALTER TABLE block at the top of `init_pyramid_db` near the Phase 16
+   `child_type` migration. This runs BEFORE the `execute_batch` that
+   creates `pyramid_folder_ingestion_heuristics`, so the ALTER failed on
+   "no such table". Moved the block to after the execute_batch that
+   creates the table. **Add to friction: in-place ALTER blocks must come
+   after the CREATE TABLE in the same initialization path; the "migration
+   marker" pattern used elsewhere in the codebase doesn't enforce this.**
+
+3. **`tempfile::TempDir` paths on macOS go through `/private/var/...`
+   via symlink.** When the test canonicalizes the target folder, the
+   path changes from `/var/folders/...` to `/private/var/folders/...`.
+   The first draft of `test_find_claude_code_conversation_dirs_matches_encoded_target`
+   failed until I realized the test needed to canonicalize its own
+   target to compute the expected encoded path — otherwise the encoded
+   string in the `.claude/projects/` directory name didn't match the
+   one the implementation computed. Fix was trivial once the cause was
+   identified: `target.canonicalize().unwrap()` at the top of the test.
+
+### Test count delta
+
+- Phase 16 baseline: 1205 passing / 7 failing.
+- Phase 17 total: **1233 passing / 7 failing** (+28 tests).
+- New tests: 23 `folder_ingestion::phase17_tests` + 4 `db::phase17_tests`
+  + 1 `config_contributions::tests::test_sync_folder_ingestion_heuristics_with_new_fields`.
+- Pre-existing failures unchanged.
+
+---
+

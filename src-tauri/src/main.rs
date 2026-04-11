@@ -4195,6 +4195,89 @@ async fn pyramid_create_slug(
     Ok(info)
 }
 
+// ── Phase 17: Recursive folder ingestion IPCs ───────────────────────────────
+
+#[derive(serde::Deserialize)]
+struct IngestFolderInput {
+    target_folder: String,
+    include_claude_code: bool,
+    dry_run: bool,
+}
+
+#[derive(serde::Serialize)]
+struct IngestFolderOutput {
+    plan: wire_node_lib::pyramid::folder_ingestion::IngestionPlan,
+    result: Option<wire_node_lib::pyramid::folder_ingestion::IngestionResult>,
+}
+
+/// Phase 17: recursive folder ingestion entry point.
+///
+/// `dry_run = true` returns the planned operations without executing
+/// them. `dry_run = false` executes the plan and returns both the
+/// plan and the execution result.
+#[tauri::command]
+async fn pyramid_ingest_folder(
+    state: tauri::State<'_, SharedState>,
+    input: IngestFolderInput,
+) -> Result<IngestFolderOutput, String> {
+    use wire_node_lib::pyramid::folder_ingestion;
+
+    let target = std::path::PathBuf::from(&input.target_folder);
+    if !target.exists() {
+        return Err(format!("target folder does not exist: {}", input.target_folder));
+    }
+
+    // Load the active folder_ingestion_heuristics contribution (or
+    // fall back to bundled defaults if no contribution is synced).
+    let config = {
+        let conn = state.pyramid.reader.lock().await;
+        wire_node_lib::pyramid::db::load_active_folder_ingestion_heuristics(&conn)
+            .map_err(|e| format!("load_active_folder_ingestion_heuristics: {}", e))?
+    };
+
+    let plan = folder_ingestion::plan_ingestion(&target, &config, input.include_claude_code)
+        .map_err(|e| format!("plan_ingestion: {}", e))?;
+
+    if input.dry_run {
+        return Ok(IngestFolderOutput { plan, result: None });
+    }
+
+    let result = folder_ingestion::execute_plan(&state.pyramid, plan.clone())
+        .await
+        .map_err(|e| format!("execute_plan: {}", e))?;
+
+    Ok(IngestFolderOutput {
+        plan,
+        result: Some(result),
+    })
+}
+
+/// Phase 17: pre-flight IPC for the AddWorkspace wizard. Returns the
+/// list of `~/.claude/projects/` directories whose encoded path
+/// matches the target folder or any of its subfolders. Used by the
+/// UI to populate the "Include Claude Code conversations" checkbox
+/// list before the dry-run plan.
+#[tauri::command]
+async fn pyramid_find_claude_code_conversations(
+    state: tauri::State<'_, SharedState>,
+    target_folder: String,
+) -> Result<Vec<wire_node_lib::pyramid::folder_ingestion::ClaudeCodeConversationDir>, String> {
+    use wire_node_lib::pyramid::folder_ingestion;
+
+    let target = std::path::PathBuf::from(&target_folder);
+    if !target.exists() {
+        return Err(format!("target folder does not exist: {}", target_folder));
+    }
+
+    let config = {
+        let conn = state.pyramid.reader.lock().await;
+        wire_node_lib::pyramid::db::load_active_folder_ingestion_heuristics(&conn)
+            .map_err(|e| format!("load_active_folder_ingestion_heuristics: {}", e))?
+    };
+
+    Ok(folder_ingestion::describe_claude_code_dirs(&target, &config))
+}
+
 #[tauri::command]
 async fn pyramid_delete_slug(
     state: tauri::State<'_, SharedState>,
@@ -10196,6 +10279,8 @@ fn main() {
             pyramid_ingest,
             pyramid_set_config,
             pyramid_create_slug,
+            pyramid_ingest_folder,
+            pyramid_find_claude_code_conversations,
             pyramid_delete_slug,
             pyramid_get_config,
             pyramid_get_auth_token,

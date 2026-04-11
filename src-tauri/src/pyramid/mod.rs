@@ -52,6 +52,7 @@ pub mod execution_state;
 pub mod expression;
 pub mod extraction_schema;
 pub mod faq;
+pub mod folder_ingestion;
 pub mod generative_config;
 pub mod ingest;
 pub mod llm;
