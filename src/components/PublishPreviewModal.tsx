@@ -41,6 +41,11 @@ export function PublishPreviewModal({
     const [publishError, setPublishError] = useState<string | null>(null);
     const [publishResult, setPublishResult] =
         useState<PublishToWireResponse | null>(null);
+    // Phase 18c (L4): cache manifest opt-in. Defaults to FALSE — the
+    // user must explicitly check the box to ship cached LLM outputs
+    // alongside the contribution. No clever auto-check heuristic; the
+    // privacy gate is the user's deliberate action.
+    const [includeCacheManifest, setIncludeCacheManifest] = useState(false);
 
     // Fetch the dry-run report on mount. Phase 5's handler doesn't
     // require auth — it's a pure local transform over the contribution
@@ -85,9 +90,16 @@ export function PublishPreviewModal({
         setPublishing(true);
         setPublishError(null);
         try {
+            // Phase 18c (L4): pass the cache-manifest opt-in through
+            // to the backend. Default-OFF; only `true` when the user
+            // explicitly checked the Advanced Publishing Options box.
             const result = await invoke<PublishToWireResponse>(
                 "pyramid_publish_to_wire",
-                { contributionId, confirm: true },
+                {
+                    contributionId,
+                    confirm: true,
+                    includeCacheManifest,
+                },
             );
             setPublishResult(result);
             if (onPublished) onPublished(result);
@@ -96,7 +108,7 @@ export function PublishPreviewModal({
         } finally {
             setPublishing(false);
         }
-    }, [contributionId, onPublished]);
+    }, [contributionId, includeCacheManifest, onPublished]);
 
     return (
         <div
@@ -358,6 +370,99 @@ export function PublishPreviewModal({
                             </pre>
                         </Section>
 
+                        {/* Phase 18c (L4): Advanced publishing options. The
+                            cache manifest opt-in lives here so it stays
+                            visually separate from the must-review fields
+                            above. Default-OFF; the user must explicitly
+                            check the box to ship cached LLM outputs. */}
+                        <Section title="Advanced publishing options">
+                            <label
+                                htmlFor="phase-18c-cache-opt-in"
+                                style={{
+                                    display: "flex",
+                                    alignItems: "flex-start",
+                                    gap: 10,
+                                    cursor: "pointer",
+                                    paddingTop: 4,
+                                }}
+                            >
+                                <input
+                                    type="checkbox"
+                                    id="phase-18c-cache-opt-in"
+                                    checked={includeCacheManifest}
+                                    onChange={(e) =>
+                                        setIncludeCacheManifest(
+                                            e.target.checked,
+                                        )
+                                    }
+                                    disabled={publishing}
+                                    style={{
+                                        marginTop: 3,
+                                        flexShrink: 0,
+                                        cursor: "pointer",
+                                    }}
+                                />
+                                <div
+                                    style={{
+                                        display: "flex",
+                                        flexDirection: "column",
+                                        gap: 6,
+                                        fontSize: 12,
+                                        lineHeight: 1.5,
+                                        color: "var(--text-primary)",
+                                    }}
+                                >
+                                    <div
+                                        style={{
+                                            fontWeight: 600,
+                                            color: "var(--text-primary)",
+                                        }}
+                                    >
+                                        Include cache manifest
+                                    </div>
+                                    <div
+                                        style={{
+                                            color: "var(--text-secondary)",
+                                        }}
+                                    >
+                                        Pullers of this pyramid will be able
+                                        to reuse your cached LLM outputs to
+                                        rebuild instantly without re-running
+                                        expensive model calls — a large cost
+                                        saving for popular pyramids.
+                                    </div>
+                                    <div
+                                        style={{
+                                            color: "#fbbf24",
+                                            paddingTop: 2,
+                                        }}
+                                    >
+                                        Warning: cached outputs may contain
+                                        excerpts from your source material.
+                                        Only enable for pyramids whose source
+                                        is already public and whose L0 nodes
+                                        reference public corpus documents.
+                                    </div>
+                                    {includeCacheManifest && (
+                                        <div
+                                            style={{
+                                                color: "var(--accent-cyan)",
+                                                paddingTop: 2,
+                                                fontStyle: "italic",
+                                            }}
+                                        >
+                                            Cache manifest will be attached
+                                            to this publish. Audit count of
+                                            L0 nodes referencing private
+                                            sources is a follow-up — review
+                                            your source visibility manually
+                                            before confirming.
+                                        </div>
+                                    )}
+                                </div>
+                            </label>
+                        </Section>
+
                         {publishError && (
                             <div
                                 style={{
@@ -444,6 +549,19 @@ export function PublishPreviewModal({
                                 value={publishResult.sections_published.join(", ")}
                             />
                         )}
+                        {/* Phase 18c (L4): surface the cache manifest
+                            attachment state in the success view so the user
+                            sees confirmation that their opt-in took effect.
+                            `null` means the user did not opt in (default
+                            behavior); a number means the manifest was
+                            attached with that many entries. */}
+                        {publishResult.cache_manifest_entries !== null &&
+                        publishResult.cache_manifest_entries !== undefined ? (
+                            <KeyValue
+                                label="Cache manifest"
+                                value={`${publishResult.cache_manifest_entries} entries attached`}
+                            />
+                        ) : null}
                         <div
                             style={{
                                 display: "flex",

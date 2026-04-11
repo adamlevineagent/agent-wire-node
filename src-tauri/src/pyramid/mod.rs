@@ -56,6 +56,7 @@ pub mod folder_ingestion;
 pub mod generative_config;
 pub mod ingest;
 pub mod llm;
+pub mod local_mode;
 pub mod local_store;
 pub mod lock_manager;
 pub mod manifest;

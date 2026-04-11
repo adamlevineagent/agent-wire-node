@@ -1761,7 +1761,10 @@ mod tests {
             &conn,
             "tier_routing",
             None,
-            "tiers: []\n",
+            // Phase 18a: canonical field is `entries:` per the bundled
+            // tier_routing JSON Schema. Legacy `tiers:` is still
+            // accepted as an alias on the struct.
+            "entries: []\n",
             Some("initial"),
             "local",
             Some("user"),

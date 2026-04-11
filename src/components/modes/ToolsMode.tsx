@@ -2265,6 +2265,19 @@ function DiscoverPanel() {
     const [pullMessage, setPullMessage] = useState<string | null>(null);
     const [showAutoUpdate, setShowAutoUpdate] = useState(false);
 
+    // Phase 18a (L2): credential preview modal state. Populated by
+    // the `pyramid_preview_pull_contribution` IPC before a pull is
+    // committed. When `missing_credentials` is non-empty the user
+    // sees a warning and can cancel, set credentials first, or
+    // pull anyway.
+    const [pendingPull, setPendingPull] = useState<{
+        wire_contribution_id: string;
+        activate: boolean;
+        required_credentials: string[];
+        missing_credentials: string[];
+        title: string;
+    } | null>(null);
+
     // ── Load schema list + slug list on mount.
     useEffect(() => {
         (async () => {
@@ -2350,7 +2363,11 @@ function DiscoverPanel() {
         }
     }, [schemaType, query, tags, sortBy]);
 
-    const handlePull = useCallback(
+    // Phase 18a (L2): inner pull that runs after the user has seen
+    // any credential warnings. Separated from `handlePull` so the
+    // preview modal can call it on the "Pull anyway" path without
+    // re-running the preview round trip.
+    const executePull = useCallback(
         async (wire_contribution_id: string, activate: boolean) => {
             if (pullBusy) return;
             setPullBusy(true);
@@ -2372,7 +2389,6 @@ function DiscoverPanel() {
                 setSelectedResult(null);
             } catch (err) {
                 const message = String(err);
-                // Surface credential safety gate errors clearly.
                 if (message.includes("credential")) {
                     setPullMessage(
                         `Pull refused — ${message}. Add the missing credentials in Settings → Credentials, then retry.`,
@@ -2385,6 +2401,47 @@ function DiscoverPanel() {
             }
         },
         [pullBusy, recSlug],
+    );
+
+    const handlePull = useCallback(
+        async (wire_contribution_id: string, activate: boolean) => {
+            if (pullBusy) return;
+            // Phase 18a (L2): preview the contribution first to scan
+            // for missing credential references. If anything is
+            // missing, show a confirmation modal listing the keys
+            // before committing to the actual pull.
+            setPullMessage(null);
+            try {
+                const preview = await invoke<{
+                    yaml: string;
+                    schema_type: string | null;
+                    title: string;
+                    description: string;
+                    required_credentials: string[];
+                    missing_credentials: string[];
+                }>("pyramid_preview_pull_contribution", {
+                    wireContributionId: wire_contribution_id,
+                });
+                if (preview.missing_credentials.length === 0) {
+                    // No missing credentials — pull immediately.
+                    await executePull(wire_contribution_id, activate);
+                } else {
+                    // Stage the modal so the user can decide.
+                    setPendingPull({
+                        wire_contribution_id,
+                        activate,
+                        required_credentials: preview.required_credentials,
+                        missing_credentials: preview.missing_credentials,
+                        title: preview.title || preview.schema_type || "Wire contribution",
+                    });
+                }
+            } catch (err) {
+                // Preview failed (network or auth) — surface the
+                // error without falling through to a blind pull.
+                setPullMessage(`Preview failed: ${String(err)}`);
+            }
+        },
+        [pullBusy, executePull],
     );
 
     return (
@@ -2517,6 +2574,127 @@ function DiscoverPanel() {
                     }}
                 >
                     {pullMessage}
+                </div>
+            )}
+
+            {/* ── Phase 18a (L2): credential preview confirmation ────────── */}
+            {pendingPull && (
+                <div
+                    role="dialog"
+                    aria-modal="true"
+                    style={{
+                        position: "fixed",
+                        inset: 0,
+                        background: "rgba(0, 0, 0, 0.6)",
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "center",
+                        zIndex: 1000,
+                    }}
+                    onClick={() => setPendingPull(null)}
+                >
+                    <div
+                        onClick={(e) => e.stopPropagation()}
+                        style={{
+                            background: "var(--bg-elevated, #1a1a1a)",
+                            border: "1px solid rgba(248, 113, 113, 0.4)",
+                            borderRadius: 8,
+                            padding: 20,
+                            maxWidth: 540,
+                            width: "calc(100% - 40px)",
+                            display: "flex",
+                            flexDirection: "column",
+                            gap: 12,
+                        }}
+                    >
+                        <div
+                            style={{
+                                fontSize: 14,
+                                fontWeight: 600,
+                                color: "#fca5a5",
+                            }}
+                        >
+                            Missing credentials
+                        </div>
+                        <p style={{ fontSize: 12, lineHeight: 1.5, margin: 0 }}>
+                            <strong>{pendingPull.title}</strong> requires credentials you
+                            haven't set yet:
+                        </p>
+                        <ul
+                            style={{
+                                margin: 0,
+                                padding: "0 0 0 18px",
+                                fontSize: 12,
+                                color: "#fdba74",
+                            }}
+                        >
+                            {pendingPull.missing_credentials.map((key) => (
+                                <li key={key}>
+                                    <code>{key}</code>
+                                </li>
+                            ))}
+                        </ul>
+                        {pendingPull.required_credentials.length >
+                            pendingPull.missing_credentials.length && (
+                            <p
+                                style={{
+                                    margin: 0,
+                                    fontSize: 11,
+                                    color: "var(--text-secondary)",
+                                }}
+                            >
+                                Other credentials this contribution references are already
+                                set:{" "}
+                                {pendingPull.required_credentials
+                                    .filter(
+                                        (k) =>
+                                            !pendingPull.missing_credentials.includes(k),
+                                    )
+                                    .join(", ")}
+                            </p>
+                        )}
+                        <p
+                            style={{
+                                margin: 0,
+                                fontSize: 12,
+                                lineHeight: 1.5,
+                                color: "var(--text-secondary)",
+                            }}
+                        >
+                            Set them in Settings → Credentials, or pull anyway. The
+                            contribution will be inactive until the credentials exist.
+                        </p>
+                        <div
+                            style={{
+                                display: "flex",
+                                gap: 8,
+                                justifyContent: "flex-end",
+                                marginTop: 4,
+                            }}
+                        >
+                            <button
+                                type="button"
+                                className="compose-btn"
+                                onClick={() => setPendingPull(null)}
+                            >
+                                Cancel
+                            </button>
+                            <button
+                                type="button"
+                                className="save-btn"
+                                onClick={async () => {
+                                    const pull = pendingPull;
+                                    setPendingPull(null);
+                                    await executePull(
+                                        pull.wire_contribution_id,
+                                        pull.activate,
+                                    );
+                                }}
+                            >
+                                Pull anyway
+                            </button>
+                        </div>
+                    </div>
                 </div>
             )}
 

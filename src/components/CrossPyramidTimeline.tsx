@@ -1,7 +1,8 @@
 // Phase 13 — Cross-Pyramid Timeline top-level view.
 //
 // Shows every active build in a single list, a running cost
-// accumulator across all slugs, and the "Pause All DADBEAR" button.
+// accumulator across all slugs, and the "Pause..." button (Phase 18c
+// L9 — was "Pause All DADBEAR" in Phase 13).
 // Clicking "View" on a row opens the detailed PyramidBuildViz in a
 // drawer.
 //
@@ -10,6 +11,12 @@
 // rollup). Cost attribution for individual in-flight builds still
 // lives in `CrossPyramidCostFooter`; the full rollup with pivots
 // now lives in `DadbearOversightPage.tsx`.
+//
+// Phase 18c (L9): the Pause All button now opens a scope picker modal
+// (DadbearPauseScopeModal) instead of going straight to scope=all.
+// The user can pause every pyramid (the original behavior), every
+// pyramid under a folder path, or — once the schema lands — every
+// pyramid in a specific Wire circle.
 
 import { useState, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
@@ -17,74 +24,78 @@ import { useCrossPyramidTimeline } from '../hooks/useCrossPyramidTimeline';
 import { ActiveBuildRow } from './ActiveBuildRow';
 import { CrossPyramidCostFooter } from './CrossPyramidCostFooter';
 import { PyramidBuildViz } from './PyramidBuildViz';
-
-interface PauseAllConfirmModalProps {
-    count: number;
-    onCancel: () => void;
-    onConfirm: () => void;
-}
-
-function PauseAllConfirmModal({ count, onCancel, onConfirm }: PauseAllConfirmModalProps) {
-    return (
-        <div className="cpt-confirm-backdrop" onClick={onCancel}>
-            <div className="cpt-confirm-modal" onClick={e => e.stopPropagation()}>
-                <h3>Pause DADBEAR?</h3>
-                <p>
-                    This will pause DADBEAR auto-update on <strong>{count}</strong>{' '}
-                    pyramid{count === 1 ? '' : 's'}. In-flight builds will continue;
-                    only the background stale-check loop stops.
-                </p>
-                <div className="cpt-confirm-actions">
-                    <button className="btn btn-secondary" onClick={onCancel}>
-                        Cancel
-                    </button>
-                    <button className="btn btn-danger" onClick={onConfirm}>
-                        Pause All
-                    </button>
-                </div>
-            </div>
-        </div>
-    );
-}
+import {
+    DadbearPauseScopeModal,
+    type DadbearPauseScope,
+} from './DadbearPauseScopeModal';
 
 export function CrossPyramidTimeline() {
     const { state, refreshActive } = useCrossPyramidTimeline();
     const [viewSlug, setViewSlug] = useState<string | null>(null);
-    const [confirming, setConfirming] = useState(false);
+    // Phase 18c (L9): when set, the scope picker modal is open in
+    // either "pause" or "resume" mode. Single state field instead of
+    // a separate boolean per action — simpler open/close semantics.
+    const [scopeModalAction, setScopeModalAction] = useState<
+        'pause' | 'resume' | null
+    >(null);
     const [pausedBanner, setPausedBanner] = useState<number | null>(null);
     const [toast, setToast] = useState<string | null>(null);
     const [error, setError] = useState<string | null>(null);
 
-    const doPauseAll = useCallback(async () => {
-        setConfirming(false);
-        setError(null);
-        try {
-            const resp = await invoke<{ affected: number }>('pyramid_pause_dadbear_all', {
-                scope: 'all',
-                scopeValue: null,
-            });
-            setPausedBanner(resp.affected);
-            setToast(`Paused DADBEAR on ${resp.affected} pyramid${resp.affected === 1 ? '' : 's'}`);
-            window.setTimeout(() => setToast(null), 4000);
-        } catch (e) {
-            setError(String(e));
-        }
-    }, []);
+    // Phase 18c (L9): scope picker confirms with a (scope, scope_value)
+    // tuple. Pass them through to the existing pause/resume IPCs which
+    // already accept these parameters.
+    const doPauseWithScope = useCallback(
+        async (scope: DadbearPauseScope, scopeValue: string | null) => {
+            setScopeModalAction(null);
+            setError(null);
+            try {
+                const resp = await invoke<{ affected: number }>(
+                    'pyramid_pause_dadbear_all',
+                    { scope, scopeValue },
+                );
+                setPausedBanner(resp.affected);
+                setToast(
+                    `Paused DADBEAR on ${resp.affected} pyramid${resp.affected === 1 ? '' : 's'}`,
+                );
+                window.setTimeout(() => setToast(null), 4000);
+            } catch (e) {
+                setError(String(e));
+            }
+        },
+        [],
+    );
 
+    const doResumeWithScope = useCallback(
+        async (scope: DadbearPauseScope, scopeValue: string | null) => {
+            setScopeModalAction(null);
+            setError(null);
+            try {
+                const resp = await invoke<{ affected: number }>(
+                    'pyramid_resume_dadbear_all',
+                    { scope, scopeValue },
+                );
+                setPausedBanner(null);
+                setToast(
+                    `Resumed DADBEAR on ${resp.affected} pyramid${resp.affected === 1 ? '' : 's'}`,
+                );
+                window.setTimeout(() => setToast(null), 4000);
+            } catch (e) {
+                setError(String(e));
+            }
+        },
+        [],
+    );
+
+    // Resume from the banner: short-circuits the scope picker because
+    // the banner shows up after a pause-all-style action and the user
+    // typically wants the same scope back. Defaults to scope=all to
+    // mirror the legacy banner-resume behavior; users who paused via
+    // a more specific scope can re-open the picker via the resume
+    // path on the DADBEAR Oversight page.
     const doResumeAll = useCallback(async () => {
-        setError(null);
-        try {
-            const resp = await invoke<{ affected: number }>('pyramid_resume_dadbear_all', {
-                scope: 'all',
-                scopeValue: null,
-            });
-            setPausedBanner(null);
-            setToast(`Resumed DADBEAR on ${resp.affected} pyramid${resp.affected === 1 ? '' : 's'}`);
-            window.setTimeout(() => setToast(null), 4000);
-        } catch (e) {
-            setError(String(e));
-        }
-    }, []);
+        await doResumeWithScope('all', null);
+    }, [doResumeWithScope]);
 
     const activeCount = state.activeBuilds.length;
 
@@ -96,12 +107,15 @@ export function CrossPyramidTimeline() {
                     <button className="btn btn-secondary" onClick={refreshActive}>
                         Refresh
                     </button>
+                    {/* Phase 18c (L9): "Pause..." (with ellipsis) signals
+                        the scope picker modal opens, replacing Phase 13's
+                        "Pause All DADBEAR" which went straight to scope=all. */}
                     <button
                         className="btn btn-danger"
-                        onClick={() => setConfirming(true)}
+                        onClick={() => setScopeModalAction('pause')}
                         disabled={pausedBanner !== null}
                     >
-                        Pause All DADBEAR
+                        Pause...
                     </button>
                 </div>
             </div>
@@ -154,11 +168,16 @@ export function CrossPyramidTimeline() {
                 </div>
             )}
 
-            {confirming && (
-                <PauseAllConfirmModal
-                    count={activeCount}
-                    onCancel={() => setConfirming(false)}
-                    onConfirm={doPauseAll}
+            {/* Phase 18c (L9): scope picker modal for pause/resume. */}
+            {scopeModalAction && (
+                <DadbearPauseScopeModal
+                    action={scopeModalAction}
+                    onCancel={() => setScopeModalAction(null)}
+                    onConfirm={
+                        scopeModalAction === 'pause'
+                            ? doPauseWithScope
+                            : doResumeWithScope
+                    }
                 />
             )}
         </div>

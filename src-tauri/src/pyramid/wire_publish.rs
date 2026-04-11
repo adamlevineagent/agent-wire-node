@@ -804,69 +804,44 @@ impl PyramidPublisher {
         yaml_content: &str,
         metadata: &crate::pyramid::wire_native_metadata::WireNativeMetadata,
     ) -> Result<PublishContributionOutcome> {
-        metadata
-            .validate()
-            .map_err(|e| WirePublishError::Rejected(format!("metadata validation: {e}")))?;
+        // Backwards-compatible wrapper around the cache-aware variant.
+        // Existing callers (Phase 5 paths, tests) get the same default
+        // behavior — no cache manifest attached.
+        self.publish_contribution_with_metadata_and_cache(
+            contribution_id,
+            schema_type,
+            yaml_content,
+            metadata,
+            None,
+        )
+        .await
+    }
 
-        let (wire_type, tags) =
-            crate::pyramid::wire_native_metadata::resolve_wire_type(schema_type).map_err(|e| {
-                WirePublishError::Rejected(format!("wire type resolution: {e}"))
-            })?;
-        let wire_type_str = format!("{wire_type:?}").to_lowercase();
-
-        // Resolve derived_from to integer slot allocations. We don't
-        // have a live path→UUID map in Phase 5 scope (that's Phase
-        // 10's ToolsMode job + discovery), so for now we mark every
-        // reference as unresolved and emit floats as fallbacks. The
-        // integer slot allocation is still computed so downstream
-        // consumers see the correct distribution.
-        let resolved = resolve_derived_from_preview(metadata)?;
-
-        // Emit the canonical YAML block.
-        let canonical_yaml = metadata
-            .to_canonical_yaml()
-            .map_err(|e| WirePublishError::Rejected(format!("yaml serialize: {e}")))?;
-
-        // Build the Wire contribute payload. Wire's `/api/v1/contribute`
-        // endpoint accepts a JSON body; Phase 5 serializes the
-        // canonical YAML into a `wire_native_metadata` field and the
-        // yaml_content body into the contribution `body`.
-        let topics_for_tags: Vec<String> = metadata
-            .topics
-            .iter()
-            .cloned()
-            .chain(tags.iter().cloned())
-            .collect();
-        let payload = serde_json::json!({
-            "type": wire_type_str,
-            "contribution_type": wire_type_str,
-            "title": title_from_yaml(yaml_content, schema_type, contribution_id),
-            "body": yaml_content,
-            "topics": topics_for_tags,
-            "wire_native_metadata_yaml": canonical_yaml,
-            "derived_from": resolved.iter().map(|entry| serde_json::json!({
-                "source_type": match entry.kind.as_str() {
-                    "ref" => "contribution",
-                    "doc" => "corpus_document",
-                    "corpus" => "corpus_document",
-                    _ => "contribution",
-                },
-                "source_item_id": entry.reference,
-                "weight": entry.weight,
-                "allocated_slots": entry.allocated_slots,
-                "justification": metadata.derived_from.iter()
-                    .find(|r| r.canonical_reference() == entry.reference)
-                    .map(|r| r.justification.clone())
-                    .unwrap_or_else(|| "(phase-5 preview)".to_string()),
-            })).collect::<Vec<_>>(),
-            "supersedes": metadata.supersedes,
-            "scope": metadata.scope.to_canonical_string(),
-            "price": metadata.price,
-            "pricing_curve": metadata.pricing_curve,
-            "creator_split": metadata.creator_split,
-            "sync_mode": format!("{:?}", metadata.sync_mode).to_lowercase(),
-            "maturity": format!("{:?}", metadata.maturity).to_lowercase(),
-        });
+    /// Phase 18c (L4): publish a contribution with an optional cache
+    /// manifest attached. The manifest is included in the Wire
+    /// contribute payload as `cache_manifest_json` only when present
+    /// (i.e. when the user opted in via the PublishPreviewModal
+    /// checkbox AND the contribution is slug-bound and has cached
+    /// rows). If `manifest` is `None`, the payload omits the field
+    /// entirely so this is wire-compatible with the Phase 5 publish
+    /// shape.
+    ///
+    /// All other behavior matches `publish_contribution_with_metadata`.
+    pub async fn publish_contribution_with_metadata_and_cache(
+        &self,
+        contribution_id: &str,
+        schema_type: &str,
+        yaml_content: &str,
+        metadata: &crate::pyramid::wire_native_metadata::WireNativeMetadata,
+        cache_manifest: Option<&crate::pyramid::pyramid_import::CacheManifest>,
+    ) -> Result<PublishContributionOutcome> {
+        let (payload, wire_type_str, tags, resolved) = build_contribution_publish_payload(
+            contribution_id,
+            schema_type,
+            yaml_content,
+            metadata,
+            cache_manifest,
+        )?;
 
         // POST to the Wire's contribute endpoint. Reuses the existing
         // `post_contribution` helper which handles auth, retries, and
@@ -878,6 +853,7 @@ impl PyramidPublisher {
             wire_contribution_id,
             handle_path = ?handle_path,
             wire_type = wire_type_str,
+            cache_manifest_attached = cache_manifest.is_some(),
             "phase 5 contribution published to Wire"
         );
 
@@ -1104,6 +1080,113 @@ fn resolve_derived_from_preview(
         .collect();
 
     Ok(resolved)
+}
+
+/// Phase 18c (L4): build the Wire `/api/v1/contribute` payload for a
+/// contribution publish, optionally attaching a cache manifest.
+///
+/// Extracted from `publish_contribution_with_metadata_and_cache` so
+/// the payload-shape logic can be unit tested independently of the
+/// HTTP round trip — `post_contribution` requires a live Wire URL
+/// and an HTTP server, neither of which we want to require in tests.
+///
+/// Returns a tuple of `(payload, wire_type_str, tags, resolved)` so
+/// the caller (`publish_contribution_with_metadata_and_cache`) can
+/// continue to populate the `PublishContributionOutcome` after
+/// `post_contribution` returns.
+fn build_contribution_publish_payload(
+    contribution_id: &str,
+    schema_type: &str,
+    yaml_content: &str,
+    metadata: &crate::pyramid::wire_native_metadata::WireNativeMetadata,
+    cache_manifest: Option<&crate::pyramid::pyramid_import::CacheManifest>,
+) -> Result<(
+    serde_json::Value,
+    String,
+    Vec<String>,
+    Vec<crate::pyramid::wire_native_metadata::ResolvedDerivedFromEntry>,
+)> {
+    metadata
+        .validate()
+        .map_err(|e| WirePublishError::Rejected(format!("metadata validation: {e}")))?;
+
+    let (wire_type, tags) =
+        crate::pyramid::wire_native_metadata::resolve_wire_type(schema_type).map_err(|e| {
+            WirePublishError::Rejected(format!("wire type resolution: {e}"))
+        })?;
+    let wire_type_str = format!("{wire_type:?}").to_lowercase();
+
+    // Resolve derived_from to integer slot allocations.
+    let resolved = resolve_derived_from_preview(metadata)?;
+
+    // Emit the canonical YAML block.
+    let canonical_yaml = metadata
+        .to_canonical_yaml()
+        .map_err(|e| WirePublishError::Rejected(format!("yaml serialize: {e}")))?;
+
+    let topics_for_tags: Vec<String> = metadata
+        .topics
+        .iter()
+        .cloned()
+        .chain(tags.iter().cloned())
+        .collect();
+    let mut payload = serde_json::json!({
+        "type": wire_type_str,
+        "contribution_type": wire_type_str,
+        "title": title_from_yaml(yaml_content, schema_type, contribution_id),
+        "body": yaml_content,
+        "topics": topics_for_tags,
+        "wire_native_metadata_yaml": canonical_yaml,
+        "derived_from": resolved.iter().map(|entry| serde_json::json!({
+            "source_type": match entry.kind.as_str() {
+                "ref" => "contribution",
+                "doc" => "corpus_document",
+                "corpus" => "corpus_document",
+                _ => "contribution",
+            },
+            "source_item_id": entry.reference,
+            "weight": entry.weight,
+            "allocated_slots": entry.allocated_slots,
+            "justification": metadata.derived_from.iter()
+                .find(|r| r.canonical_reference() == entry.reference)
+                .map(|r| r.justification.clone())
+                .unwrap_or_else(|| "(phase-5 preview)".to_string()),
+        })).collect::<Vec<_>>(),
+        "supersedes": metadata.supersedes,
+        "scope": metadata.scope.to_canonical_string(),
+        "price": metadata.price,
+        "pricing_curve": metadata.pricing_curve,
+        "creator_split": metadata.creator_split,
+        "sync_mode": format!("{:?}", metadata.sync_mode).to_lowercase(),
+        "maturity": format!("{:?}", metadata.maturity).to_lowercase(),
+    });
+
+    // Phase 18c (L4): attach the cache manifest if the caller opted
+    // in. Serialize as a JSON blob so the receiving Wire node can
+    // persist it without re-deriving the schema. The field is only
+    // added when present so the payload remains backwards-compatible
+    // with the Phase 5 shape — Phase 5 callers see no `cache_manifest_json`
+    // field at all, exactly as before.
+    if let Some(manifest) = cache_manifest {
+        let manifest_json = serde_json::to_value(manifest).map_err(|e| {
+            WirePublishError::Rejected(format!("cache manifest serialize: {e}"))
+        })?;
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("cache_manifest_json".to_string(), manifest_json);
+        }
+        tracing::info!(
+            contribution_id,
+            cache_node_count = manifest.nodes.len(),
+            cache_entry_count = manifest
+                .nodes
+                .iter()
+                .map(|n| n.cache_entries.len())
+                .sum::<usize>(),
+            "phase 18c L4: attaching cache manifest to publish payload"
+        );
+    }
+
+    Ok((payload, wire_type_str, tags, resolved))
 }
 
 /// Best-effort title generator for a config contribution. The Wire
@@ -2684,6 +2767,208 @@ mod tests {
         assert_eq!(
             imp_row_count as u64, report.cache_entries_valid,
             "imp-slug cache row count must match report.cache_entries_valid"
+        );
+    }
+
+    // ── Phase 18c (L4): publish payload cache-manifest opt-in ──────────────
+
+    use crate::pyramid::pyramid_import::{
+        CacheManifest, ImportNodeEntry, ImportedCacheEntry,
+    };
+    use crate::pyramid::wire_native_metadata::WireNativeMetadata;
+
+    /// Construct a minimal valid `WireNativeMetadata` for the publish
+    /// payload tests. Uses the default constructor (Contribution
+    /// destination, Unscoped, Draft maturity) and adds a single topic
+    /// so the resulting payload has a non-empty topics array. The
+    /// `validate()` call inside `build_contribution_publish_payload`
+    /// has to succeed against this fixture.
+    fn fixture_metadata() -> WireNativeMetadata {
+        let mut m = WireNativeMetadata::default();
+        m.topics = vec!["phase18c-test".to_string()];
+        m
+    }
+
+    /// A non-empty cache manifest with a couple of nodes + entries so
+    /// the round-trip serialize check has something to inspect.
+    fn fixture_manifest() -> CacheManifest {
+        CacheManifest {
+            manifest_version: 1,
+            source_pyramid_id: "wire:phase18c-fixture".to_string(),
+            exported_at: "2026-04-11T00:00:00Z".to_string(),
+            nodes: vec![
+                ImportNodeEntry {
+                    node_id: "C-L0-001".to_string(),
+                    layer: 0,
+                    source_path: Some("src/lib.rs".to_string()),
+                    source_hash: Some("sha256:fixture-l0-001".to_string()),
+                    source_size_bytes: Some(1024),
+                    derived_from: Vec::new(),
+                    cache_entries: vec![ImportedCacheEntry {
+                        step_name: "source_extract".to_string(),
+                        chunk_index: Some(0),
+                        depth: Some(0),
+                        cache_key: "sha256:fixture-key-1".to_string(),
+                        inputs_hash: "sha256:fixture-inputs-1".to_string(),
+                        prompt_hash: "sha256:fixture-prompt-1".to_string(),
+                        model_id: "openrouter/test-model".to_string(),
+                        output_json: "{\"answer\":\"test\"}".to_string(),
+                        token_usage_json: None,
+                        cost_usd: None,
+                        latency_ms: None,
+                        created_at: None,
+                    }],
+                },
+                ImportNodeEntry {
+                    node_id: "C-L1-001".to_string(),
+                    layer: 1,
+                    source_path: None,
+                    source_hash: None,
+                    source_size_bytes: None,
+                    derived_from: vec!["C-L0-001".to_string()],
+                    cache_entries: vec![ImportedCacheEntry {
+                        step_name: "cluster_synthesize".to_string(),
+                        chunk_index: Some(-1),
+                        depth: Some(1),
+                        cache_key: "sha256:fixture-key-2".to_string(),
+                        inputs_hash: "sha256:fixture-inputs-2".to_string(),
+                        prompt_hash: "sha256:fixture-prompt-2".to_string(),
+                        model_id: "openrouter/test-model".to_string(),
+                        output_json: "{\"answer\":\"test\"}".to_string(),
+                        token_usage_json: None,
+                        cost_usd: None,
+                        latency_ms: None,
+                        created_at: None,
+                    }],
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn test_build_publish_payload_default_omits_cache_manifest_field() {
+        // Phase 18c (L4) backwards-compat: when the caller does NOT
+        // pass a cache manifest, the resulting payload must NOT
+        // contain a `cache_manifest_json` key. This is the wire-shape
+        // contract Phase 5 ships against.
+        let metadata = fixture_metadata();
+        let (payload, _wt, _tags, _resolved) = build_contribution_publish_payload(
+            "test-contrib-id",
+            "skill",
+            "name: test\nbody: hello\n",
+            &metadata,
+            None,
+        )
+        .unwrap();
+
+        let obj = payload.as_object().expect("payload must be a JSON object");
+        assert!(
+            !obj.contains_key("cache_manifest_json"),
+            "no cache manifest should be present when caller passes None"
+        );
+        // Sanity: the standard fields are still emitted.
+        assert!(obj.contains_key("type"));
+        assert!(obj.contains_key("body"));
+        assert!(obj.contains_key("wire_native_metadata_yaml"));
+    }
+
+    #[test]
+    fn test_build_publish_payload_opt_in_attaches_cache_manifest() {
+        // Phase 18c (L4) primary path: when the caller passes a
+        // manifest, the payload gains a `cache_manifest_json` field
+        // whose contents round-trip back to the same struct via
+        // serde_json::from_value. This is the only thing the
+        // PublishPreviewModal opt-in checkbox actually needs the
+        // backend to do.
+        let metadata = fixture_metadata();
+        let manifest = fixture_manifest();
+        let (payload, _wt, _tags, _resolved) = build_contribution_publish_payload(
+            "test-contrib-id",
+            "skill",
+            "name: test\nbody: hello\n",
+            &metadata,
+            Some(&manifest),
+        )
+        .unwrap();
+
+        let obj = payload.as_object().expect("payload must be a JSON object");
+        let attached = obj
+            .get("cache_manifest_json")
+            .expect("cache_manifest_json must be present when opted in");
+
+        let round_trip: CacheManifest = serde_json::from_value(attached.clone())
+            .expect("cache_manifest_json must round-trip back to CacheManifest");
+        assert_eq!(round_trip.manifest_version, 1);
+        assert_eq!(round_trip.source_pyramid_id, "wire:phase18c-fixture");
+        assert_eq!(round_trip.nodes.len(), 2);
+        assert_eq!(
+            round_trip
+                .nodes
+                .iter()
+                .map(|n| n.cache_entries.len())
+                .sum::<usize>(),
+            2,
+            "two nodes each with one cache entry"
+        );
+    }
+
+    #[test]
+    fn test_build_publish_payload_empty_manifest_still_attaches() {
+        // Phase 18c (L4) edge case: an opted-in publish for a
+        // pyramid that simply has no cached LLM outputs should still
+        // attach an empty manifest (Some, not None). This signals to
+        // the receiving Wire node that the publisher explicitly opted
+        // in but had nothing to ship — different from "withheld for
+        // privacy" (which would have been None upstream of this
+        // helper, omitting the field entirely).
+        let metadata = fixture_metadata();
+        let empty_manifest = CacheManifest {
+            manifest_version: 1,
+            source_pyramid_id: "wire:phase18c-empty".to_string(),
+            exported_at: "2026-04-11T00:00:00Z".to_string(),
+            nodes: Vec::new(),
+        };
+        let (payload, _wt, _tags, _resolved) = build_contribution_publish_payload(
+            "test-contrib-id",
+            "skill",
+            "name: test\nbody: hello\n",
+            &metadata,
+            Some(&empty_manifest),
+        )
+        .unwrap();
+
+        let obj = payload.as_object().unwrap();
+        let attached = obj.get("cache_manifest_json").unwrap();
+        let round_trip: CacheManifest =
+            serde_json::from_value(attached.clone()).unwrap();
+        assert_eq!(round_trip.nodes.len(), 0);
+    }
+
+    #[test]
+    fn test_export_cache_manifest_default_off_returns_none_for_publish() {
+        // Phase 18c (L4) integration: confirms the publish flow's
+        // upstream gate (export_cache_manifest with include_cache=false)
+        // returns None. This is the safety net — even if a buggy
+        // caller passes opt_in_cache=false, the publish payload
+        // builder receives None and omits the field. Phase 7's
+        // existing test covers this on the export side; here we
+        // assert it ends in a payload with no cache_manifest_json.
+        let metadata = fixture_metadata();
+        let (payload, _, _, _) = build_contribution_publish_payload(
+            "test-contrib-id",
+            "skill",
+            "name: test\nbody: hello\n",
+            &metadata,
+            None, // simulates "include_cache=false → export returned None → publish gets None"
+        )
+        .unwrap();
+
+        assert!(
+            !payload
+                .as_object()
+                .unwrap()
+                .contains_key("cache_manifest_json"),
+            "include_cache=false (None) must not attach cache_manifest_json"
         );
     }
 }

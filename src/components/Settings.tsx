@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { useLocalMode, type OllamaProbeResult } from "../hooks/useLocalMode";
 
 // --- Types ------------------------------------------------------------------
 
@@ -43,6 +44,90 @@ export function Settings() {
     const [checking, setChecking] = useState(false);
     const [installing, setInstalling] = useState(false);
     const [nodeName, setNodeName] = useState("Wire Node");
+
+    // --- Phase 18a (L1): Local Mode toggle state -------------------------
+    //
+    // The hook owns the IPC round trips; this component owns the
+    // user-editable form state (URL, model picker, probe results) and
+    // the disable confirmation guard. The hook's `status` is the
+    // source of truth for the toggle state — when the toggle is on,
+    // URL/model fields are read-only and reflect the saved values.
+    const localMode = useLocalMode();
+    const [localUrl, setLocalUrl] = useState("http://localhost:11434/v1");
+    const [localModelChoice, setLocalModelChoice] = useState<string>("");
+    const [probeResult, setProbeResult] = useState<OllamaProbeResult | null>(null);
+    const [probeBusy, setProbeBusy] = useState(false);
+    const [confirmingDisable, setConfirmingDisable] = useState(false);
+
+    // Sync local form state with the hook's status whenever it
+    // refreshes — so the URL and dropdown reflect the persisted
+    // ollama_base_url / ollama_model from the state row.
+    useEffect(() => {
+        if (localMode.status?.base_url) {
+            setLocalUrl(localMode.status.base_url);
+        }
+        if (localMode.status?.model) {
+            setLocalModelChoice(localMode.status.model);
+        }
+    }, [localMode.status]);
+
+    const handleProbe = useCallback(async () => {
+        setProbeBusy(true);
+        setProbeResult(null);
+        try {
+            const result = await localMode.probe(localUrl);
+            setProbeResult(result);
+            // If the probe found models and the user hasn't picked
+            // one yet, pre-select the first.
+            if (
+                result.reachable &&
+                result.available_models.length > 0 &&
+                !localModelChoice
+            ) {
+                setLocalModelChoice(result.available_models[0]);
+            }
+        } catch (err) {
+            setProbeResult({
+                reachable: false,
+                reachability_error: String(err),
+                available_models: [],
+            });
+        } finally {
+            setProbeBusy(false);
+        }
+    }, [localMode, localUrl, localModelChoice]);
+
+    const handleEnableLocalMode = useCallback(async () => {
+        // Need a model selection — fall back to the probe's first
+        // result if the dropdown is empty.
+        let model: string | null = localModelChoice || null;
+        if (!model && probeResult && probeResult.available_models.length > 0) {
+            model = probeResult.available_models[0];
+        }
+        await localMode.enable(localUrl, model);
+    }, [localMode, localUrl, localModelChoice, probeResult]);
+
+    const handleDisableLocalMode = useCallback(async () => {
+        if (!confirmingDisable) {
+            // First click arms the confirmation; second click commits.
+            setConfirmingDisable(true);
+            return;
+        }
+        setConfirmingDisable(false);
+        await localMode.disable();
+    }, [localMode, confirmingDisable]);
+
+    // The list of models the dropdown shows: prefer the live status
+    // (when toggle is on) or the probe result (when off).
+    const availableModels: string[] = (() => {
+        if (localMode.status?.enabled && localMode.status.available_models.length > 0) {
+            return localMode.status.available_models;
+        }
+        if (probeResult && probeResult.available_models.length > 0) {
+            return probeResult.available_models;
+        }
+        return [];
+    })();
 
     const fetchData = useCallback(async () => {
         try {
@@ -207,6 +292,238 @@ export function Settings() {
                     />
                     <span>Enable mesh hosting</span>
                 </label>
+            </div>
+
+            {/* --- Phase 18a (L1): Local LLM (Ollama) -------------------- */}
+            <div className="settings-section">
+                <div className="settings-section-header">Local LLM (Ollama)</div>
+                <p className="settings-section-desc">
+                    Route all tiers through a local Ollama instance. When enabled,
+                    every build uses local models instead of cloud providers.
+                </p>
+
+                <label className="settings-toggle">
+                    <input
+                        type="checkbox"
+                        checked={localMode.status?.enabled ?? false}
+                        disabled={localMode.loading}
+                        onChange={async (e) => {
+                            if (e.target.checked) {
+                                await handleEnableLocalMode();
+                            } else {
+                                await handleDisableLocalMode();
+                            }
+                        }}
+                    />
+                    <span>
+                        Use local models (Ollama)
+                        {localMode.loading && (
+                            <span style={{ marginLeft: 8, opacity: 0.7 }}>
+                                working…
+                            </span>
+                        )}
+                    </span>
+                </label>
+
+                {/* URL field — read-only when toggle is on */}
+                <div style={{ marginTop: 12, display: "flex", flexDirection: "column", gap: 6 }}>
+                    <label
+                        style={{
+                            fontSize: 11,
+                            color: "var(--text-secondary)",
+                            textTransform: "uppercase",
+                            letterSpacing: 0.5,
+                        }}
+                    >
+                        Base URL
+                    </label>
+                    <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                        <input
+                            type="text"
+                            value={localUrl}
+                            onChange={(e) => setLocalUrl(e.target.value)}
+                            disabled={localMode.status?.enabled || localMode.loading}
+                            className="settings-input"
+                            placeholder="http://localhost:11434/v1"
+                            style={{ flex: 1, padding: "6px 8px", fontSize: 12 }}
+                        />
+                        <button
+                            type="button"
+                            className="compose-btn"
+                            onClick={handleProbe}
+                            disabled={
+                                probeBusy ||
+                                localMode.loading ||
+                                localMode.status?.enabled === true
+                            }
+                            title="Reach Ollama at the URL above and list available models"
+                        >
+                            {probeBusy ? "Testing…" : "Test connection"}
+                        </button>
+                    </div>
+                    {!localUrl.startsWith("http://") && !localUrl.startsWith("https://") && (
+                        <span style={{ color: "#f87171", fontSize: 11 }}>
+                            URL must start with http:// or https://
+                        </span>
+                    )}
+                </div>
+
+                {/* Model dropdown */}
+                <div style={{ marginTop: 12, display: "flex", flexDirection: "column", gap: 6 }}>
+                    <label
+                        style={{
+                            fontSize: 11,
+                            color: "var(--text-secondary)",
+                            textTransform: "uppercase",
+                            letterSpacing: 0.5,
+                        }}
+                    >
+                        Model
+                    </label>
+                    <select
+                        value={localModelChoice}
+                        onChange={(e) => setLocalModelChoice(e.target.value)}
+                        disabled={
+                            localMode.status?.enabled ||
+                            localMode.loading ||
+                            availableModels.length === 0
+                        }
+                        className="settings-input"
+                        style={{ padding: "6px 8px", fontSize: 12 }}
+                    >
+                        {availableModels.length === 0 && (
+                            <option value="">
+                                {probeResult
+                                    ? "No models found — pull a model with `ollama pull` first"
+                                    : "Click Test connection to populate"}
+                            </option>
+                        )}
+                        {availableModels.map((m) => (
+                            <option key={m} value={m}>
+                                {m}
+                            </option>
+                        ))}
+                    </select>
+                </div>
+
+                {/* Status line */}
+                <div style={{ marginTop: 12, fontSize: 12 }}>
+                    {localMode.status?.enabled && localMode.status.reachable ? (
+                        <span style={{ color: "#4ade80" }}>
+                            ✓ Enabled — routing all tiers through{" "}
+                            <strong>{localMode.status.model ?? "?"}</strong> on{" "}
+                            <strong>{localMode.status.base_url ?? "?"}</strong>
+                            {localMode.status.detected_context_limit && (
+                                <>
+                                    {" "}
+                                    · context limit{" "}
+                                    {Math.round(
+                                        localMode.status.detected_context_limit / 1000,
+                                    )}
+                                    K tokens
+                                </>
+                            )}
+                        </span>
+                    ) : localMode.status?.enabled && !localMode.status.reachable ? (
+                        <span style={{ color: "#f87171" }}>
+                            ✗ Cannot reach Ollama at{" "}
+                            <strong>{localMode.status.base_url ?? "?"}</strong>:{" "}
+                            {localMode.status.reachability_error ?? "unknown error"}
+                        </span>
+                    ) : probeResult && probeResult.reachable ? (
+                        <span style={{ color: "#4ade80" }}>
+                            ✓ Reachable — {probeResult.available_models.length}{" "}
+                            model{probeResult.available_models.length === 1 ? "" : "s"} available
+                        </span>
+                    ) : probeResult && !probeResult.reachable ? (
+                        <span style={{ color: "#f87171" }}>
+                            ✗ Cannot reach Ollama:{" "}
+                            {probeResult.reachability_error ?? "unknown error"}
+                        </span>
+                    ) : (
+                        <span style={{ color: "var(--text-secondary)" }}>
+                            Disabled — builds use cloud providers (OpenRouter)
+                        </span>
+                    )}
+                </div>
+
+                {/* Warning banner when enabled */}
+                {localMode.status?.enabled && (
+                    <div
+                        style={{
+                            marginTop: 12,
+                            padding: "8px 12px",
+                            borderRadius: 6,
+                            background: "rgba(251, 146, 60, 0.1)",
+                            border: "1px solid rgba(251, 146, 60, 0.3)",
+                            fontSize: 12,
+                            color: "#fdba74",
+                        }}
+                    >
+                        Local mode sets concurrency to 1 (home hardware constraint).
+                        Builds run entirely on your machine but will be slower.
+                    </div>
+                )}
+
+                {/* Confirm disable */}
+                {confirmingDisable && (
+                    <div
+                        style={{
+                            marginTop: 12,
+                            padding: "8px 12px",
+                            borderRadius: 6,
+                            background: "rgba(248, 113, 113, 0.1)",
+                            border: "1px solid rgba(248, 113, 113, 0.3)",
+                            fontSize: 12,
+                            color: "#fca5a5",
+                            display: "flex",
+                            justifyContent: "space-between",
+                            alignItems: "center",
+                            gap: 8,
+                        }}
+                    >
+                        <span>
+                            Disable local mode? This will restore your previous tier
+                            routing.
+                        </span>
+                        <div style={{ display: "flex", gap: 6 }}>
+                            <button
+                                type="button"
+                                className="compose-btn"
+                                onClick={() => setConfirmingDisable(false)}
+                            >
+                                Cancel
+                            </button>
+                            <button
+                                type="button"
+                                className="save-btn"
+                                onClick={async () => {
+                                    setConfirmingDisable(false);
+                                    await localMode.disable();
+                                }}
+                            >
+                                Yes, disable
+                            </button>
+                        </div>
+                    </div>
+                )}
+
+                {/* Error surface */}
+                {localMode.error && !localMode.loading && (
+                    <div
+                        style={{
+                            marginTop: 12,
+                            padding: "8px 12px",
+                            borderRadius: 6,
+                            background: "rgba(248, 113, 113, 0.1)",
+                            border: "1px solid rgba(248, 113, 113, 0.3)",
+                            fontSize: 12,
+                            color: "#fca5a5",
+                        }}
+                    >
+                        {localMode.error}
+                    </div>
+                )}
             </div>
 
             {/* Auto-Update */}
