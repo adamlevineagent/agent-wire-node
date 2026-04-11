@@ -1664,3 +1664,62 @@ The fix is mechanical: take the hint as an optional UX preference but always re-
 
 ---
 
+## Phase 15 — DADBEAR Oversight Page (wanderer pass, 2026-04-10)
+
+Unguided end-to-end wanderer on the Phase 15 verifier commit. Verifier had flagged one known-issue and declared the rest clean. Wanderer caught three additional real bugs because the verifier's punch list didn't question the seed helpers.
+
+### Friction 1: Tests seeded with a fictitious `'confirmed'` reconciliation status
+
+**Friction:** the implementer's Phase 15 test helpers passed `Some("confirmed")` as `pyramid_cost_log.reconciliation_status`. No production writer ever stores `'confirmed'` — the writers use `'synchronous'`, `'synchronous_local'`, `'broadcast'`, `'broadcast_missing'`, `'discrepancy'`, and `'estimated'`. The tests passed only because the query's final `else → healthy` fallthrough accidentally caught the unknown value.
+
+**Root cause:** no one checked the set of actual reconciliation_status values at write time against the test seeds. The tests were internally consistent (seed+query agreed on the fictional value) but untethered from production.
+
+**Lesson:** when seeding enum-like columns in tests, the seed value list should be a literal reference to the writer's `match` arms, not an independent dictionary. For Phase 15 specifically, the writer's state graph is documented in `db::record_broadcast_confirmation` and `db::insert_cost_log_synchronous` — the seeds should have copy-pasted from there. Add to the implementer handoff prompt: "If your test seeds touch an enum-valued column, grep the writer paths for the literal string before coding the seed."
+
+### Friction 2: Overview's "pending" bucket counts healthy broadcast-confirmed rows as pending
+
+**Friction:** a pyramid with fully-reconciled synchronous rows (broadcast arrived, matched, healthy) renders `'pending'` on its Oversight card. The `pyramid_cost_log.reconciliation_status` column stays at `'synchronous'` even AFTER the broadcast confirms — the production contract in `record_broadcast_confirmation` only flips the status field on divergence; the success path stamps `broadcast_confirmed_at` and leaves the status alone. The overview query was using the status field as the sole signal and missed the `broadcast_confirmed_at` axis.
+
+**Root cause:** two axes of truth (status + broadcast_confirmed_at) were collapsed into one in the query design. The rest of the codebase (e.g. `sweep_broadcast_missing` at `db.rs:13986`) already uses `broadcast_confirmed_at IS NULL` as the "still waiting" signal — the overview query was inconsistent with that convention.
+
+**Lesson:** the overview is the UI surface for reconciliation state, so its query shape should match the axes the writers use. Add a test that explicitly covers: synchronous + not-confirmed → pending; synchronous + confirmed → healthy; synchronous_local → healthy; broadcast_missing → broadcast_missing; discrepancy → discrepancy. The wanderer added the first two.
+
+### Friction 3: "Set Default Norms" silently corrupts pyramid_config_contributions
+
+**Friction:** the verifier flagged this as "known issue — contribution lands as a draft and the accept errors out". Wanderer traced more carefully: the direct-YAML accept path at `generative_config.rs:785-854` commits the new row as `status = 'active'` (and supersedes the prior active) BEFORE calling `sync_config_to_operational`. When sync fails with `"dadbear_policy requires a slug (per-pyramid scope)"`, the transaction has already committed — the contribution table now has an orphaned active slug=NULL row with no operational mirror. Every retry layers another orphan row on top.
+
+**Root cause 1:** the accept flow commits the contribution transaction before sync runs. This is intentional (the contribution is the source of truth regardless of whether sync succeeds) but it means any sync failure leaves observable state in the contribution table that no consumer can process.
+
+**Root cause 2:** the `upsert_dadbear_policy` helper was written with a hard requirement on a non-null slug because the operational `pyramid_dadbear_config` table has a NOT NULL slug column. But the helper lives downstream of the contribution layer, which should be schema-agnostic about per-slug vs global.
+
+**Resolution:** made `upsert_dadbear_policy(None)` a no-op instead of an error. The contribution still persists in `pyramid_config_contributions` (version history, Wire sharing). A future phase can implement a layered resolver that merges the active global `dadbear_policy` contribution with per-slug rows at `get_enabled_dadbear_configs` read time.
+
+**Lesson:** sync dispatchers must never fail on structural expectations about the contribution shape that the contribution layer has no constraints on. If the operational table can't mirror a shape, that's a sync no-op, not a hard error. Add to the handoff prompt: "Sync dispatcher branches that reject valid contributions are bugs — if an operational table can't represent a shape, the dispatcher should log + no-op, not error."
+
+### Friction 4: Provider health `'down'` state renders as grey unknown chip
+
+**Friction:** the frontend `ProviderHealthBanner` maps `'healthy' | 'degraded' | 'alerting' | 'unhealthy'` to chip classes, but the backend emits `'down'` when connection/DNS/TLS failures hit. Down providers render with a grey `'provider-health-chip-unknown'` class and the raw `'down'` text as the label.
+
+**Root cause:** the frontend author worked from the spec's provider health section which mentions `healthy | degraded | down`, but then wrote the map based on a different naming convention (alerting/unhealthy) and forgot to cross-reference against the backend's `ProviderHealth::Down` enum variant.
+
+**Lesson:** enum union types in TypeScript should be copy-pasted from a single source of truth (e.g. a generated `.d.ts` or a hand-maintained comment pointing at the Rust file). The hook at `useProviderHealth.ts:14` already had `'alerting'` as a legacy fallback — that was a smell the wanderer should have caught on sight. Cheap fix: added `'down'` to the union + the two switch statements.
+
+### Meta: wanderer caught what the verifier missed because the seed helpers lied
+
+The verifier confidently declared Phase 15 clean on the reconciliation priority axis. Wanderer caught the bug because the wanderer questioned "what does `'confirmed'` mean here — is that a real state or a made-up one?" and grepped the writers. The verifier's punch list methodology was to check each spec bullet against the code; the wanderer's end-to-end trace methodology exposed a class of bug that existed BELOW the spec's specificity level (the status semantics).
+
+Add to the "wanderers on built systems" memory: **When tests use enum-like values, the wanderer should always grep the writer paths for the literal values before trusting the test's assertions. A green test on a fictitious seed is worth less than no test at all.**
+
+### Commits
+
+1. `phase-15: wanderer fix — reconciliation pending bucket + default norms no-op + provider down state`
+
+### Verification after wanderer pass
+
+- `cargo check --lib`: 3 pre-existing warnings only.
+- `cargo test --lib pyramid`: **1183 passing / 7 failing** (+4 new wanderer tests vs verifier baseline of 1179). Same 7 pre-existing failures.
+- `cargo test --lib pyramid::db::phase15_tests`: **13 passing / 0 failing** (9 implementer + 4 wanderer).
+- `npm run build`: clean, 150 modules, 779.37 kB bundle.
+
+---
+

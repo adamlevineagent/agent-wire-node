@@ -11,7 +11,7 @@ export interface ProviderHealthEntry {
     provider_id: string;
     display_name: string;
     provider_type: string;
-    health: 'healthy' | 'degraded' | 'alerting' | string;
+    health: 'healthy' | 'degraded' | 'down' | 'alerting' | string;
     reason: string | null;
     since: string | null;
     acknowledged_at: string | null;

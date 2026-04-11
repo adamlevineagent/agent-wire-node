@@ -3165,3 +3165,65 @@ Fresh verifier run against the implementer commit (`4b1a8fc phase-15: dadbear ov
 - `cargo test --lib pyramid` — 1179 / 7 failing, unchanged.
 
 **Status:** awaiting-verification → **verified** pending Adam's manual smoke test of the Oversight tab. The commit is functionally correct against the end-state criteria; the Set Default Norms latent accept failure is a pre-existing backend constraint documented above for follow-up.
+
+### Wanderer pass (2026-04-10)
+
+Unguided end-to-end trace of all 12 Phase 15 flows (oversight load, pause, Set Default Norms, orphan ack, activity drawer, provider health, cost rollup relocation, reconciliation priority, in-flight counting, tab state, toast cleanup, slug=null blocker). The verifier's punch list confirmed clean; the wanderer caught two real production bugs that slipped through because the seed helpers used a fictitious `'confirmed'` reconciliation status that doesn't appear anywhere in the writer path.
+
+#### Traced clean (file:line citations)
+
+- **Q1 Oversight page load end-to-end**: `PyramidsMode.tsx:71` renders `DadbearOversightPage` when `tab === 'oversight'`; `DadbearOversightPage.tsx:31-50` fires `useDadbearOverview` (10s poll), `useProviderHealth` (30s poll), `useOrphanBroadcasts` (60s poll); all three hooks invoke Phase 15 IPCs; backend `pyramid_dadbear_overview` at `main.rs:6643-6741` delegates to `build_dadbear_overview_rows` at `db.rs:11177` which joins `pyramid_dadbear_config`, `pyramid_pending_mutations`, `pyramid_deferred_questions`, `pyramid_demand_signals`, `pyramid_cost_log`, `pyramid_change_manifests` per slug with a 24h window; response folds in `dadbear_in_flight` and totals; page renders totals bar, per-pyramid cards, cost rollup, provider health banner, orphan broadcasts panel. Every link verified.
+- **Q2 Per-pyramid pause end-to-end**: `DadbearPyramidCard.tsx:95-98` invokes `pyramid_dadbear_pause({ slug })`; backend at `main.rs:6908-6916` calls `db::disable_dadbear_for_slug` at `db.rs:11058` which `UPDATE pyramid_dadbear_config SET enabled = 0 WHERE slug = ?1`; the DADBEAR tick loop at `dadbear_extend.rs:139-148` reloads configs via `get_enabled_dadbear_configs` (which filters `WHERE enabled = 1`) on the next 1-second base tick and `tickers.retain(...)` drops the paused configs, while the `dadbear_in_flight` map's `guard.retain(...)` at `dadbear_extend.rs:164` mirrors the cleanup. Next overview poll reads the disabled row directly (the overview query does NOT filter by enabled) and the card re-renders with `enabled: false`. Pause takes effect within one base tick interval.
+- **Q4 Orphan broadcast acknowledgment**: `OrphanBroadcastsPanel.tsx:125-160` renders a reason input and Acknowledge button per unacked row; click invokes `acknowledgeOrphan(row.id, reason)` at `useOrphanBroadcasts.ts:68-81` which fires `pyramid_acknowledge_orphan_broadcast({ orphanId, reason })` then refetches; backend at `main.rs:6935-6952` runs `UPDATE pyramid_orphan_broadcasts SET acknowledged_at = ?1, acknowledgment_reason = ?2 WHERE id = ?3 AND acknowledged_at IS NULL` (idempotent); default `includeAcknowledged: false` at `useOrphanBroadcasts.ts:50` filters the list server-side, so acked rows drop out next poll.
+- **Q5 Activity drawer**: `DadbearPyramidCard.tsx:225` triggers `onViewActivity(slug)` → `DadbearOversightPage.tsx:307` sets `activityDrawerSlug` → renders `DadbearActivityDrawer`; drawer's `useEffect` at `DadbearActivityDrawer.tsx:62-85` invokes `pyramid_dadbear_activity_log({ slug, limit: 200 })`; backend at `main.rs:6757-6901` runs three independent SELECTs (stale_check_log, pending_mutations, change_manifests) each with `LIMIT ?2`, pushes into a merged Vec, sorts by timestamp DESC, then `entries.truncate(limit as usize)`. Worst-case DB fetch is 3×limit rows; the merge-sort-truncate produces the newest `limit` rows across all sources. Backend accesses `pyramid_change_manifests.applied_at` (confirmed column at `db.rs:723` per the verifier).
+- **Q6 Provider health banner** (one small cosmetic fix applied, see below): Phase 11's `set_provider_health` and `acknowledge_provider_health` at `db.rs:14042-14073` flip rows in `pyramid_providers`; the state machine at `provider_health.rs` writes `healthy|degraded|down`; `pyramid_provider_health` IPC returns the live state; `ProviderHealthBanner.tsx` color-codes by value and shows Acknowledge for non-healthy rows. Acknowledge fires `pyramid_acknowledge_provider_health(providerId)` which resets state to healthy.
+- **Q7 Cost rollup relocation**: `CostRollupSection` is imported exclusively in `DadbearOversightPage.tsx:20` and rendered at line 315. `CrossPyramidTimeline.tsx:8-12` retains only a comment referencing the relocation; the import and mount are fully removed. `CostRollupSection.tsx` unchanged except for a refreshed comment. `pyramid_cost_rollup` IPC is unchanged and still callable from its new location.
+- **Q9 In-flight stale check accuracy**: The `PyramidState::dadbear_in_flight` map is `Arc<std::sync::Mutex<HashMap<i64, Arc<AtomicBool>>>>` keyed by config id. Written by the tick loop at `dadbear_extend.rs:185-193` (lazy-insert + set true before dispatch) and cleared by the RAII `InFlightGuard` at `dadbear_extend.rs:83-87` (fires on normal return, `?`-propagated error, OR panic). The overview IPC snapshots flags at `main.rs:6651-6662`, drops the lock before the DB query, then per-row filters `config_ids` against the snapshot at `main.rs:6683-6687`. No deadlock (std::sync::Mutex dropped before any `.await`). Map is in-memory only — on app restart all flags reset to false, which is safe because the tick loop is idempotent (pending mutations are DB-durable).
+- **Q10 Tab state preservation**: `tab` is `useState` inside `PyramidsMode` (`PyramidsMode.tsx:14`); switching Oversight→Builds unmounts `DadbearOversightPage` entirely and remounts when the user returns. Each hook's `useEffect` cleanup clears its interval and sets the cancelled ref, so intervals don't leak. Switching Modes (PyramidsMode→ToolsMode) unmounts PyramidsMode, so the tab state resets to `'dashboard'` — pre-existing pattern for all tabbed modes.
+- **Q11 Toast cleanup**: `DadbearOversightPage.tsx:58-84` stores the timeout handle in `toastTimeoutRef`, clears the pending timeout at the top of `showToast` before setting a new one, and the unmount effect at line 77-84 clears any pending handle. Verifier-added fix is correct.
+
+#### Bugs found and fixed
+
+**Fix 1: reconciliation "pending" bucket miscounts confirmed synchronous rows (Q8)**
+
+`build_dadbear_overview_rows` at `db.rs:11296-11307` originally counted all `reconciliation_status = 'synchronous'` rows as pending regardless of whether the broadcast had already landed. Production contract in `db::record_broadcast_confirmation` at `db.rs:13876-13887` stamps `broadcast_confirmed_at` and leaves the status field at `'synchronous'` (only flips to `'discrepancy'` on broadcast divergence). So after a clean broadcast confirmation, a row is fully-reconciled-healthy but shows as `'pending'` to the overview page.
+
+**Impact**: a pyramid with all-confirmed synchronous cost rows renders "Pending confirmation" on its Oversight card — a persistent false positive. User sees yellow status when the pipe is healthy.
+
+**Fix**: replaced the pending query with `broadcast_confirmed_at IS NULL AND status NOT IN ('synchronous_local', 'broadcast_missing', 'discrepancy', 'broadcast')` at `db.rs:11296-11319`. `'synchronous_local'` (Ollama / zero-cost local calls — no broadcast to wait for) is explicitly excluded because those rows never have a broadcast. `'broadcast'` (recovery path) and `'broadcast_missing'` / `'discrepancy'` are also excluded — they're either healthy or handled by the earlier worst-* queries. `'synchronous'` rows with `broadcast_confirmed_at NOT NULL` are now correctly reported as healthy.
+
+**Fix 2: tests seeded with fictitious `'confirmed'` status that doesn't exist in production writers**
+
+The implementer's Phase 15 tests passed `Some("confirmed")` as the reconciliation status in `seed_cost_with_status`, but `'confirmed'` is never written by any production code path — the writers use `'synchronous'`, `'synchronous_local'`, `'broadcast'`, `'broadcast_missing'`, `'discrepancy'`, or `'estimated'`. The tests passed only because the query's final `else → healthy` branch accidentally caught the unknown value. This masked Fix 1's bug.
+
+**Fix**: added a `seed_cost_row_confirmed` helper at `db.rs:15733-15756` that writes the production shape (`reconciliation_status = 'synchronous'` + `broadcast_confirmed_at = datetime('now')`). Replaced every `seed_cost_with_status(..., Some("confirmed"), ...)` call with `seed_cost_row_confirmed`. Added two new tests covering the real production states:
+- `test_overview_reports_healthy_when_all_synchronous_confirmed` — pyramid with only confirmed synchronous rows reports `'healthy'`.
+- `test_overview_reports_healthy_when_only_synchronous_local` — pyramid with only local-calls reports `'healthy'`.
+
+**Fix 3: "Set Default Norms" accept orphan-row corruption (Q12)**
+
+The verifier flagged this as "known issue not fixed" but traced through more carefully: the verifier said "the contribution lands as a draft". Actually, the direct-YAML accept path at `generative_config.rs:785-854` commits the new row as `status = 'active'` (and supersedes any prior active) BEFORE calling `sync_config_to_operational`. When sync then fails at `upsert_dadbear_policy` with `"dadbear_policy requires a slug (per-pyramid scope)"`, the `pyramid_config_contributions` table has already been mutated: the prior active slug=NULL row (if any) is now `'superseded'` and the new row is `'active'` but has no operational-table mirror. Every retry layers another orphan row on top. Silent corruption, not just a user-facing error.
+
+**Fix**: changed `upsert_dadbear_policy` at `db.rs:13508-13548` to treat `slug = None` as a no-op instead of erroring. The contribution remains persisted in `pyramid_config_contributions` (it's the source of truth for version history), but there's no per-slug operational row to write. `trigger_dadbear_reload` is already a no-op so nothing downstream breaks. A future phase can add a layered resolver that merges the active global `dadbear_policy` contribution with per-slug rows at `get_enabled_dadbear_configs` read time — the contribution layering pattern is Wire-native and matches `evidence_policy`'s future shape. Until then, the user experience is: Accept succeeds, the global contribution appears in version history, and the defaults don't yet take effect at runtime (but that's the honest state, not silent corruption).
+
+Added tests:
+- `test_upsert_dadbear_policy_global_is_noop` — `upsert_dadbear_policy(None, ...)` succeeds and writes nothing to `pyramid_dadbear_config`.
+- `test_upsert_dadbear_policy_per_slug_still_writes` — sanity check that per-slug upsert still lands correctly.
+
+**Fix 4: Provider health `'down'` state renders as grey 'unknown' chip (Q6 cosmetic)**
+
+`ProviderHealthBanner.tsx:17-44`'s `healthClass`/`healthLabel` switches didn't list `'down'` (the backend emits this when connection/DNS/TLS failures hit, per `provider_health.rs:148`), so a down provider rendered with the `'provider-health-chip-unknown'` CSS class and the raw `'down'` text label. Added `'down'` cases to both functions: it now maps to the alerting chip style (red) and displays as "Down". Also added `'down'` to the `ProviderHealthEntry.health` union at `useProviderHealth.ts:14`.
+
+#### Wanderer verification commands
+
+- `cd src-tauri && cargo check --lib` — clean, 3 pre-existing warnings (publication.rs).
+- `cd src-tauri && cargo test --lib pyramid::db::phase15_tests` — **13/13 passing** (9 original + 4 new: healthy-when-confirmed, healthy-when-synchronous-local, global-noop, per-slug-still-writes).
+- `cd src-tauri && cargo test --lib pyramid` — **1183 passing / 7 failing**. Up from verifier's 1179 by +4 new wanderer tests. Same 7 pre-existing failures (`pyramid_evidence.build_id` drift + thread clustering + path normalization).
+- `npm run build` — clean, 150 modules, 779.37 kB bundle.
+
+#### What's still deferred (acceptable)
+
+- **Global dadbear_policy defaults don't influence runtime yet.** The contribution lands correctly, but no consumer reads the global `dadbear_policy` to layer it over per-slug rows — this requires a future phase to implement a layered resolver in `get_enabled_dadbear_configs` + the cost reconciliation webhook processor. Not a regression (the old behavior was "error"; the new behavior is "persists but doesn't take effect"). Documented in the fix comment at `db.rs:13520-13531`.
+- **`pyramid_dadbear_config.slug` FK constraint.** Unchanged. The slug column still requires a valid `pyramid_slugs` row, as the per-slug path needs.
+
+**Status:** verifier → **wanderer-clean**. All 12 traces verified, 4 bugs fixed in place, test count +4. Single new commit on branch `phase-15-dadbear-oversight`: `phase-15: wanderer fix — reconciliation pending bucket + default norms no-op + provider down state`. Not amended. Not pushed.

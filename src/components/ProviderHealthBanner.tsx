@@ -20,6 +20,10 @@ function healthClass(health: string): string {
             return 'provider-health-chip-healthy';
         case 'degraded':
             return 'provider-health-chip-degraded';
+        // `down` is the backend's hardest state (connection failures,
+        // DNS, TLS). Map it to the same alerting style as degraded so
+        // it doesn't render as a grey "unknown" chip.
+        case 'down':
         case 'alerting':
         case 'unhealthy':
             return 'provider-health-chip-alerting';
@@ -34,6 +38,8 @@ function healthLabel(health: string): string {
             return 'Healthy';
         case 'degraded':
             return 'Degraded';
+        case 'down':
+            return 'Down';
         case 'alerting':
             return 'Alerting';
         case 'unhealthy':

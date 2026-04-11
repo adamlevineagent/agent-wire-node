@@ -11293,13 +11293,25 @@ pub fn build_dadbear_overview_rows(
                 |r| r.get(0),
             )
             .unwrap_or(0);
+        // Rows are "pending confirmation" when a broadcast was
+        // expected but has not yet landed. The `reconciliation_status`
+        // stays at `'synchronous'` even AFTER a healthy broadcast
+        // arrives (see `record_broadcast_confirmation` — it only
+        // flips on discrepancy; success leaves the status alone and
+        // stamps `broadcast_confirmed_at` instead). So the right
+        // signal for "still waiting" is `broadcast_confirmed_at IS
+        // NULL`, not the status value alone. `'synchronous_local'`
+        // rows are zero-cost/local calls with nothing to reconcile —
+        // they never pend.
         let pending: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM pyramid_cost_log
                  WHERE slug = ?1
-                   AND (reconciliation_status IS NULL
-                        OR reconciliation_status = 'synchronous'
-                        OR reconciliation_status = 'pending')
+                   AND broadcast_confirmed_at IS NULL
+                   AND reconciliation_status != 'synchronous_local'
+                   AND reconciliation_status != 'broadcast_missing'
+                   AND reconciliation_status != 'discrepancy'
+                   AND reconciliation_status != 'broadcast'
                    AND created_at > datetime('now', '-24 hours')",
                 rusqlite::params![slug],
                 |r| r.get(0),
@@ -13505,18 +13517,30 @@ fn dadbear_default_batch_size() -> i64 {
 /// records the `contribution_id` FK on the existing row. A per-slug
 /// DADBEAR row is identified by (slug, source_path) — the same
 /// composite key the existing CRUD uses.
+///
+/// Phase 15 wanderer: when `slug` is `None`, this is a global-defaults
+/// contribution (from the DADBEAR Oversight "Set Default Norms"
+/// button). The `pyramid_dadbear_config` operational table has no
+/// global row to update (its `slug` column is NOT NULL with a FK to
+/// `pyramid_slugs`), so we treat the operational-table write as a
+/// no-op and leave the contribution itself as the source of truth in
+/// `pyramid_config_contributions`. A future phase can introduce a
+/// layered resolver that merges the active global `dadbear_policy`
+/// contribution with per-slug rows at read time, giving users a way
+/// to see and edit defaults without a sentinel `pyramid_slugs` row.
 pub fn upsert_dadbear_policy(
     conn: &Connection,
     slug: &Option<String>,
     yaml: &DadbearPolicyYaml,
     contribution_id: &str,
 ) -> Result<()> {
-    // DADBEAR policy is per-pyramid — a global slug doesn't make sense
-    // here. If the caller passes None, we reject because the existing
-    // `pyramid_dadbear_config.slug` column is NOT NULL.
-    let slug_str = slug
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("dadbear_policy requires a slug (per-pyramid scope)"))?;
+    let Some(slug_str) = slug.as_deref() else {
+        // Global defaults: contribution already landed via
+        // `accept_config_draft`'s transaction — nothing to mirror in
+        // the operational table. Return Ok so the sync dispatcher
+        // doesn't error and leak an orphaned active contribution.
+        return Ok(());
+    };
 
     conn.execute(
         "INSERT INTO pyramid_dadbear_config (
@@ -15707,6 +15731,11 @@ mod phase15_tests {
         estimated: f64,
         actual: Option<f64>,
     ) {
+        // Production writers stamp `broadcast_confirmed_at` when a
+        // broadcast lands healthy (status stays `'synchronous'`), and
+        // leave it NULL otherwise. Default the seed to NULL; the
+        // `seed_cost_row_confirmed` helper stamps it for the confirmed
+        // case.
         conn.execute(
             "INSERT INTO pyramid_cost_log
                 (slug, operation, model, input_tokens, output_tokens,
@@ -15714,6 +15743,29 @@ mod phase15_tests {
                  reconciliation_status, created_at)
              VALUES (?1, 'stale_check', 'm-1', 10, 20, ?2, ?2, ?3, ?4, datetime('now'))",
             rusqlite::params![slug, estimated, actual, status],
+        )
+        .unwrap();
+    }
+
+    /// Seed a cost_log row matching the production "confirmed
+    /// synchronous" state: status stays `'synchronous'` and
+    /// `broadcast_confirmed_at` is stamped. This is the state
+    /// `record_broadcast_confirmation` leaves a row in after a clean
+    /// broadcast arrives (see `db::record_broadcast_confirmation`).
+    fn seed_cost_row_confirmed(
+        conn: &Connection,
+        slug: &str,
+        estimated: f64,
+        actual: f64,
+    ) {
+        conn.execute(
+            "INSERT INTO pyramid_cost_log
+                (slug, operation, model, input_tokens, output_tokens,
+                 estimated_cost, estimated_cost_usd, broadcast_cost_usd,
+                 reconciliation_status, broadcast_confirmed_at, created_at)
+             VALUES (?1, 'stale_check', 'm-1', 10, 20, ?2, ?2, ?3,
+                     'synchronous', datetime('now'), datetime('now'))",
+            rusqlite::params![slug, estimated, actual],
         )
         .unwrap();
     }
@@ -15751,9 +15803,12 @@ mod phase15_tests {
             [],
         )
         .unwrap();
-        // Two cost rows — one synchronous, one confirmed healthy.
+        // Two cost rows — one synchronous-unconfirmed (pending
+        // broadcast), one synchronous-confirmed (broadcast landed
+        // healthy; status stays 'synchronous' per the production
+        // contract in `record_broadcast_confirmation`).
         seed_cost_with_status(&conn, "p15-alpha", Some("synchronous"), 0.05, None);
-        seed_cost_with_status(&conn, "p15-alpha", Some("confirmed"), 0.10, Some(0.09));
+        seed_cost_row_confirmed(&conn, "p15-alpha", 0.10, 0.09);
         // One change manifest.
         conn.execute(
             "INSERT INTO pyramid_change_manifests
@@ -15775,16 +15830,46 @@ mod phase15_tests {
         assert!((row.cost_24h_estimated_usd - 0.15).abs() < 1e-9);
         assert!((row.cost_24h_actual_usd - 0.09).abs() < 1e-9);
         assert_eq!(row.recent_manifest_count, 1);
-        // Synchronous rows count as pending (waiting for broadcast
-        // confirmation), so the status should be 'pending' here.
+        // One synchronous row is unconfirmed (broadcast_confirmed_at
+        // IS NULL) so overall status is "pending" — the confirmed
+        // one doesn't count against us.
         assert_eq!(row.cost_reconciliation_status, "pending");
+    }
+
+    #[test]
+    fn test_overview_reports_healthy_when_all_synchronous_confirmed() {
+        let conn = mem_conn();
+        seed_dadbear_config(&conn, "p15-alpha", "/tmp/a", true, 10);
+        // Both cost rows are synchronous-confirmed — broadcast
+        // landed healthy. The status should be "healthy", not
+        // "pending". This is the bug the wanderer fixed.
+        seed_cost_row_confirmed(&conn, "p15-alpha", 0.05, 0.05);
+        seed_cost_row_confirmed(&conn, "p15-alpha", 0.10, 0.10);
+
+        let rows = build_dadbear_overview_rows(&conn).unwrap();
+        assert_eq!(rows[0].cost_reconciliation_status, "healthy");
+    }
+
+    #[test]
+    fn test_overview_reports_healthy_when_only_synchronous_local() {
+        let conn = mem_conn();
+        seed_dadbear_config(&conn, "p15-alpha", "/tmp/a", true, 10);
+        // Ollama / zero-cost local calls land as
+        // `'synchronous_local'` with `broadcast_confirmed_at` NULL
+        // — there's no broadcast to wait for, so the row must not
+        // be counted as pending.
+        seed_cost_with_status(&conn, "p15-alpha", Some("synchronous_local"), 0.0, Some(0.0));
+        seed_cost_with_status(&conn, "p15-alpha", Some("synchronous_local"), 0.0, Some(0.0));
+
+        let rows = build_dadbear_overview_rows(&conn).unwrap();
+        assert_eq!(rows[0].cost_reconciliation_status, "healthy");
     }
 
     #[test]
     fn test_overview_reports_discrepancy_when_any_row_discrepant() {
         let conn = mem_conn();
         seed_dadbear_config(&conn, "p15-alpha", "/tmp/a", true, 10);
-        seed_cost_with_status(&conn, "p15-alpha", Some("confirmed"), 0.10, Some(0.10));
+        seed_cost_row_confirmed(&conn, "p15-alpha", 0.10, 0.10);
         seed_cost_with_status(&conn, "p15-alpha", Some("discrepancy"), 0.05, Some(0.20));
 
         let rows = build_dadbear_overview_rows(&conn).unwrap();
@@ -15796,7 +15881,7 @@ mod phase15_tests {
         let conn = mem_conn();
         seed_dadbear_config(&conn, "p15-alpha", "/tmp/a", true, 10);
         seed_cost_with_status(&conn, "p15-alpha", Some("broadcast_missing"), 0.10, None);
-        seed_cost_with_status(&conn, "p15-alpha", Some("confirmed"), 0.05, Some(0.05));
+        seed_cost_row_confirmed(&conn, "p15-alpha", 0.05, 0.05);
 
         let rows = build_dadbear_overview_rows(&conn).unwrap();
         assert_eq!(rows[0].cost_reconciliation_status, "broadcast_missing");
@@ -15864,8 +15949,8 @@ mod phase15_tests {
             [],
         )
         .unwrap();
-        // Gamma has a cost row.
-        seed_cost_with_status(&conn, "p15-gamma", Some("confirmed"), 0.50, Some(0.48));
+        // Gamma has a confirmed synchronous cost row.
+        seed_cost_row_confirmed(&conn, "p15-gamma", 0.50, 0.48);
 
         let rows = build_dadbear_overview_rows(&conn).unwrap();
         assert_eq!(rows.len(), 3);
@@ -15977,5 +16062,73 @@ mod phase15_tests {
             )
             .unwrap();
         assert_eq!(unack, 0);
+    }
+
+    #[test]
+    fn test_upsert_dadbear_policy_global_is_noop() {
+        // Phase 15 wanderer: global (slug=None) dadbear_policy
+        // contributions must not error and must not touch the
+        // per-slug operational table. The contribution itself is
+        // persisted in `pyramid_config_contributions` by the accept
+        // flow; this helper is only responsible for the operational
+        // mirror, which has no global row.
+        let conn = mem_conn();
+        let yaml = DadbearPolicyYaml {
+            source_path: "/tmp/unused".to_string(),
+            content_type: "document".to_string(),
+            scan_interval_secs: 30,
+            debounce_secs: 5,
+            session_timeout_secs: 600,
+            batch_size: 10,
+            enabled: true,
+            cost_reconciliation: None,
+        };
+        // Should succeed (no error) when slug is None.
+        upsert_dadbear_policy(&conn, &None, &yaml, "contrib-global-1").unwrap();
+        // And must not have inserted anything into the operational
+        // table (the global contribution has nowhere to land there).
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pyramid_dadbear_config",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_upsert_dadbear_policy_per_slug_still_writes() {
+        // Sanity check: per-slug contributions (the Configure-per-
+        // pyramid path) still land in the operational table.
+        let conn = mem_conn();
+        // p15-alpha already exists in mem_conn; need a slug row.
+        let yaml = DadbearPolicyYaml {
+            source_path: "/tmp/alpha".to_string(),
+            content_type: "document".to_string(),
+            scan_interval_secs: 42,
+            debounce_secs: 7,
+            session_timeout_secs: 300,
+            batch_size: 5,
+            enabled: true,
+            cost_reconciliation: None,
+        };
+        upsert_dadbear_policy(
+            &conn,
+            &Some("p15-alpha".to_string()),
+            &yaml,
+            "contrib-alpha-1",
+        )
+        .unwrap();
+        let (scan, debounce): (i64, i64) = conn
+            .query_row(
+                "SELECT scan_interval_secs, debounce_secs
+                 FROM pyramid_dadbear_config WHERE slug = 'p15-alpha'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(scan, 42);
+        assert_eq!(debounce, 7);
     }
 }
