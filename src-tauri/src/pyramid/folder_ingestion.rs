@@ -657,6 +657,19 @@ fn plan_recursive(
         return Ok(None);
     }
 
+    // Below-threshold guard: if the folder has only a handful of files
+    // that won't meet `min_files_for_pyramid`, no subfolders, and no CC
+    // matches, there's nothing worth creating. Dropping this case
+    // avoids emitting an empty vine with no children — which would
+    // show up in the wizard preview as a useless "1 vine, 0 pyramids"
+    // summary and pollute the slug table.
+    if !force_vine_for_cc
+        && scan.subfolders.is_empty()
+        && scan.files.len() < config.min_files_for_pyramid
+    {
+        return Ok(None);
+    }
+
     // Leaf case: homogeneous content, no subfolders, above threshold.
     // Disabled at the top level when Claude Code matches are going
     // to be attached — the CC pyramids need a vine parent.
@@ -1411,15 +1424,23 @@ mod phase17_tests {
             ..default_config()
         };
         let plan = plan_ingestion(&root, &config, false).unwrap();
-        // Below threshold + no subfolders → still creates a vine
-        // (because leaf_eligible requires min_files), but no pyramid.
-        // The vine has no children → nothing under it.
+        // Below threshold + no subfolders + no CC → nothing to plan.
+        // The walker refuses to emit an empty vine in this case so
+        // the wizard preview doesn't show a useless "1 vine, 0
+        // pyramids" summary.
         let pyramids: Vec<_> = plan
             .operations
             .iter()
             .filter(|o| matches!(o, IngestionOperation::CreatePyramid { .. }))
             .collect();
         assert_eq!(pyramids.len(), 0);
+        let vines: Vec<_> = plan
+            .operations
+            .iter()
+            .filter(|o| matches!(o, IngestionOperation::CreateVine { .. }))
+            .collect();
+        assert_eq!(vines.len(), 0);
+        assert!(plan.root_slug.is_none());
     }
 
     #[test]
@@ -1453,6 +1474,81 @@ mod phase17_tests {
             .filter(|o| matches!(o, IngestionOperation::RegisterClaudeCodePyramid { .. }))
             .collect();
         assert_eq!(cc_ops.len(), 1, "expected one CC pyramid op");
+    }
+
+    /// Regression test for the verifier-pass fix: below-threshold folder
+    /// but WITH Claude Code matches must still create a top-level vine
+    /// so the CC pyramids have a parent. Without the `force_vine_for_cc`
+    /// bypass, the empty-vine guard would drop the CC pyramids on the
+    /// floor.
+    #[test]
+    fn test_plan_ingestion_below_threshold_with_cc_still_creates_vine() {
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("solo");
+        fs::create_dir_all(&target).unwrap();
+        // Single file — below the default min_files_for_pyramid (3).
+        make_file(&target, "only.md", 10);
+
+        let cc_root = tmp.path().join(".claude").join("projects");
+        fs::create_dir_all(&cc_root).unwrap();
+        let canonical_target = target.canonicalize().unwrap();
+        let encoded = encode_path_for_claude_code(&canonical_target);
+        let cc_dir = cc_root.join(&encoded);
+        fs::create_dir_all(&cc_dir).unwrap();
+        fs::write(cc_dir.join("sess-1.jsonl"), "{}").unwrap();
+
+        let config = FolderIngestionConfig {
+            claude_code_conversation_path: cc_root.to_string_lossy().to_string(),
+            ..default_config()
+        };
+
+        let plan = plan_ingestion(&target, &config, true).unwrap();
+
+        let vines: Vec<_> = plan
+            .operations
+            .iter()
+            .filter(|o| matches!(o, IngestionOperation::CreateVine { .. }))
+            .collect();
+        assert_eq!(vines.len(), 1, "below-threshold + CC must still create a vine");
+
+        let cc_ops: Vec<_> = plan
+            .operations
+            .iter()
+            .filter(|o| matches!(o, IngestionOperation::RegisterClaudeCodePyramid { .. }))
+            .collect();
+        assert_eq!(cc_ops.len(), 1, "CC pyramid must still be attached");
+
+        assert!(plan.root_slug.is_some(), "root_slug must be set for CC attachment");
+    }
+
+    /// Regression test for the verifier-pass fix: below-threshold folder
+    /// with NO subfolders and NO CC matches should short-circuit to an
+    /// empty plan instead of emitting a childless vine.
+    #[test]
+    fn test_plan_ingestion_below_threshold_no_cc_returns_empty() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("tiny-no-cc");
+        fs::create_dir_all(&root).unwrap();
+        make_file(&root, "one.rs", 10);
+        make_file(&root, "two.rs", 10); // 2 files, below default threshold of 3
+
+        // Redirect Claude Code path to an empty temp dir so the scan
+        // can't accidentally pick up real `~/.claude/projects` hits.
+        let cc_root = tmp.path().join(".claude").join("projects");
+        fs::create_dir_all(&cc_root).unwrap();
+
+        let config = FolderIngestionConfig {
+            claude_code_conversation_path: cc_root.to_string_lossy().to_string(),
+            ..default_config()
+        };
+
+        let plan = plan_ingestion(&root, &config, true).unwrap();
+        assert!(
+            plan.operations.is_empty(),
+            "expected empty plan, got {:?}",
+            plan.operations
+        );
+        assert!(plan.root_slug.is_none());
     }
 
     #[test]

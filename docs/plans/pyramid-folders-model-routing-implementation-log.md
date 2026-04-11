@@ -3748,3 +3748,125 @@ no real `~/.claude/projects` access, no real gitignore repos.
 
 **Status:** implementation → awaiting-verification. Single commit on
 branch `phase-17-recursive-folder-ingestion`. No amend, no push.
+
+### Verifier pass (2026-04-10)
+
+Audited the Phase 17 implementation commit (`87cdbfc`) against the
+workstream prompt's end-state criteria and the Phase 17-specific
+failure modes in the verifier instructions.
+
+**End-to-end trace verified:** AddWorkspace "Point at folder (recursive)"
+button → `handlePickFolderForIngestion` → `pyramid_find_claude_code_conversations`
+IPC + `pyramid_ingest_folder` dry-run IPC → `folder_ingestion::plan_ingestion`
+→ `plan_recursive` → `execute_plan` when the user confirms → `db::create_slug`
++ `db::save_dadbear_config` + `db::insert_vine_composition` all land in
+the real operational tables. No dead code. Both IPCs appear twice in
+`main.rs` (function def + `invoke_handler!` registration). Bundled seed
+contribution is embedded via `include_str!` and loaded on every boot
+through `walk_bundled_contributions_manifest`.
+
+**Failure-mode checklist** (all verified):
+
+1. Plan execution creates actual pyramid rows via `db::create_slug` — not
+   just logs an intent. Same for DADBEAR configs and vine compositions.
+2. Content type detection uses strict majority + tie → None. Matches
+   the spec's "mixed → topical vine" semantics exactly. Tests cover
+   homogeneous code, homogeneous documents, mixed tie, unclassified
+   ignored, and jsonl wins.
+3. Claude Code auto-include correctness: path encoding is `replace('/',
+   '-')`; exact-equal OR `starts_with(encoded_target + "-")` prefix
+   match covers subfolders and worktrees; `--claude-worktrees-` flag
+   detects worktree entries; exact-equal to the encoded target sets
+   the `is_main` flag; the `is_top_level_call` guard prevents the CC
+   scan from running on every recursion level. Windows path handling
+   delegated to the `dirs` crate's `home_dir()`.
+4. Ignore-pattern handling via `ignore::WalkBuilder` with
+   `require_git(false)` so plain folders honor `.gitignore`, plus
+   `.pyramid-ignore` via `add_custom_ignore_filename`, plus the
+   bundled default patterns as a post-filter.
+5. Slug collision resolution: `generate_slug` retries with `-2`, `-3`,
+   ... up to 1000. The walker also tracks an `existing` HashSet to
+   catch cross-run collisions at plan time.
+6. Dry-run vs execute semantics: `dry_run: true` returns the plan and
+   runs zero DB writes; `dry_run: false` returns both the plan and the
+   execution result.
+7. Bundled seed contribution correctly listed in the manifest and
+   parses cleanly (verified via a Python JSON round-trip).
+8. Tests use `tempfile::TempDir` for all filesystem paths — no test
+   touches `~/.claude/projects` or `/tmp` directly. The one tilde
+   expansion test (`test_expand_claude_code_projects_root_tilde`)
+   short-circuits if `dirs::home_dir()` returns None so it doesn't
+   depend on real filesystem state.
+9. YAML schema extension compatibility: all new fields on
+   `FolderIngestionHeuristicsYaml` are `#[serde(default = ...)]` or
+   `Option<_>`, so pre-Phase-17 contributions that omit them still
+   parse cleanly.
+10. Frontend wizard: folder picker wires straight through to the
+    IPC chain, includes a CC checkbox default-ON when matches exist
+    (and default-OFF otherwise per spec), re-plans on toggle, commits
+    via `dry_run: false`, closes on zero errors, preserves result on
+    any errors.
+
+**Bug fixed:** Below-threshold single-file folders (no subfolders, no
+CC matches) would emit an empty `CreateVine` op with zero children.
+The wizard preview would show "1 vine, 0 pyramids" and the slug
+table would gain a useless vine row. Added a guard in `plan_recursive`
+that short-circuits with `Ok(None)` when `scan.files.len() <
+min_files_for_pyramid && scan.subfolders.is_empty() && !force_vine_for_cc`.
+The guard explicitly preserves the CC case — when the target has
+Claude Code matches, a top-level vine is still created so the CC
+pyramids have a parent to hang off (per spec lines 288-293).
+
+**New regression tests:**
+
+- `test_plan_ingestion_below_threshold_with_cc_still_creates_vine` —
+  single-file folder with a CC match must still produce a top-level
+  vine + CC pyramid + composition.
+- `test_plan_ingestion_below_threshold_no_cc_returns_empty` —
+  2-file folder below threshold with no CC matches must produce an
+  empty operation list and `root_slug == None`.
+- Updated `test_plan_ingestion_skips_below_threshold_files` to match
+  the new empty-plan expectation (0 vines + `root_slug == None`
+  alongside the existing "0 pyramids" assertion).
+
+**Non-issues observed but intentionally left alone:**
+
+- Phase 17 bypasses `slug::normalize_and_validate_source_path` (which
+  enforces `allowed_source_roots` + sensitive-segment checks +
+  content-type / file-or-directory validation) by calling
+  `db::create_slug` directly in `execute_plan`. This is intentional:
+  folder ingestion has already canonicalized paths, users point at
+  non-standard locations, and Claude Code conversation pyramids
+  legitimately point at a directory rather than a file even though
+  the normal conversation flow expects files. The programmatic
+  folder ingester is its own trust boundary.
+- The bundled `folder_ingestion_heuristics` seed is inserted via
+  `walk_bundled_contributions_manifest` but NOT auto-sync'd to the
+  operational table (`sync_config_to_operational` is only called on
+  user-initiated edits). This is by design —
+  `load_active_folder_ingestion_heuristics` falls back to
+  `FolderIngestionConfig::default()` when the operational row is
+  empty, and the hardcoded defaults match the bundled YAML values.
+  The seed becomes the active source only after the user edits it
+  via the generative flow, at which point `sync_config_to_operational`
+  writes the operational row. This mirrors the pattern used by other
+  bundled contributions in the same migration.
+
+**Verification commands (post-fix):**
+
+- `cargo check --lib` — clean, same 3 pre-existing warnings
+  (`LayerCollectResult` visibility, `get_keep_evidence_for_target`
+  deprecation).
+- `cargo test --lib pyramid` — **1235 passing / 7 failing**. Same 7
+  pre-existing unrelated failures as Phase 16 (no regression). Test
+  count is +2 over the initial Phase 17 commit (1233 → 1235) from
+  the two new regression tests added during the verifier pass.
+- `cargo test --lib pyramid::folder_ingestion::phase17_tests` — **25
+  passing** (23 original + 2 new).
+- `npm run build` — clean (150 modules, 788.39 kB bundle).
+- Grep confirms each new IPC appears twice in `main.rs`
+  (`pyramid_ingest_folder` = 2, `pyramid_find_claude_code_conversations`
+  = 2). Bundled contribution still in `bundled_contributions.json`.
+
+**Status:** verifier pass complete → awaiting-wanderer. New commit on
+branch `phase-17-recursive-folder-ingestion` (no amend, no push).
