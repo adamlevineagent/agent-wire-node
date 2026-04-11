@@ -2923,3 +2923,46 @@ Rust tests added (all passing):
 ### Status
 
 `awaiting-verification` — Phase 14 implementer pass complete. All scope items shipped: ranking engine (with mandatory missing-signal redistribution), recommendations engine (source_type + tier_routing similarity), supersession polling worker, pull flow with credential safety gate, `pyramid_wire_update_cache` table + CRUD helpers, 9 new/aliased IPCs, 3 new bundled contributions, event bus variants, ToolsMode Discover rewrite, My Tools update badges + drawer, QualityBadges component, auto-update toggles modal, 28 new Rust tests. Cargo check clean, cargo test at 1165/7 (7 pre-existing), npm build clean.
+
+### Verifier pass (2026-04-10)
+
+Fresh audit against the Phase 14 workstream prompt's 12 failure modes. The implementer's scope is well-represented in code — ranking engine redistribution, recommendations signals, supersession polling, credential safety gate, 9 IPC registrations, 3 bundled contributions, frontend components with real IPC calls, and event emission from the poller all land cleanly and pass their tests.
+
+Two real bugs found and fixed in place (no amend — new commit):
+
+1. **`spawn_wire_update_poller` would panic at app startup** — `src-tauri/src/pyramid/wire_update_poller.rs` used `tokio::spawn` at the top of `spawn_wire_update_poller`, but `main.rs` calls it from synchronous init code BEFORE `tauri::Builder::default().run()` starts the tokio runtime. At that point, `tokio::spawn` panics with "there is no reactor running, must be called from the context of a Tokio 1.x runtime". The implementer's sibling workers (DADBEAR tick loop at main.rs:8941, broadcast leak sweep at main.rs:8969) explicitly use `tauri::async_runtime::spawn` with the comment "Deferred via tauri::async_runtime::spawn because Tauri's setup() callback runs before the Tokio runtime is fully available for tokio::spawn". The Phase 14 spawn site (main.rs:9010) missed that pattern. Nothing in the Phase 14 tests exercised the spawn path — the 4 poller tests only validate `RunOnceReport` shape and `SupersessionCheckEntry` filter logic. This is exactly the "dead code / broken wiring" failure mode the workstream prompt flagged (the poller is constructed but would crash the app on first launch).
+
+   **Fix**: rewrote `spawn_wire_update_poller` in `src-tauri/src/pyramid/wire_update_poller.rs:72-177` to mirror the `web_sessions::spawn_sweeper` pattern. The helper now:
+   - Checks `tokio::runtime::Handle::try_current()` first — when a runtime is already active (tests, runtime-alive call sites) it spawns directly on it and returns a `JoinHandle` (fast path).
+   - Falls back to building a current-thread sidecar runtime on a dedicated OS thread when no runtime is present (slow path — what `main()` actually hits). The sidecar uses `tokio::select!` with a 5-second watchdog tick so dropping the returned handle cleanly signals the sidecar to exit within ~5 seconds via a shared `AtomicBool`.
+   - `WireUpdatePollerHandle` now holds `Option<JoinHandle>` (fast path) OR `Option<SidecarHandle>` (slow path); its `Drop` aborts the task / clears the watchdog as appropriate.
+
+   **Regression test**: new `test_spawn_wire_update_poller_from_sync_context_does_not_panic` in `phase14_tests` constructs a minimal in-memory `PyramidState` and calls `spawn_wire_update_poller` from a `#[test]` (not `#[tokio::test]`) — proving the sidecar path works without a panic. The prior implementation would panic here.
+
+2. **`pyramid_wire_recommendations` accepted empty slug** — `src-tauri/src/main.rs:7866-7887` took `slug: String` (non-optional at the Tauri boundary, which correctly rejects `null` from JS) but did not check for empty string. The spec §Validation at the IPC boundary line 288 is explicit: "pyramid_wire_recommendations requires an existing slug (not NULL) — global recommendations are not meaningful because similarity needs a pyramid profile". An empty-slug call would fall through to `build_pyramid_profile("")` which silently returns an empty profile (no `source_type`, empty providers list), resulting in silently-degraded recommendations.
+
+   **Fix**: added `if slug.trim().is_empty() { return Err("slug is required …") }` at the top of `pyramid_wire_recommendations` in `src-tauri/src/main.rs:7872-7880`. The frontend's `DiscoverPanel` already guards against empty `recSlug` before calling, so this doesn't break the happy path — it just hardens the IPC contract for any future caller.
+
+**Verified clean** (no fix needed):
+- All 9 Phase 14 IPCs registered in `invoke_handler!` AND defined as `#[tauri::command]` functions in main.rs — greps match the expected 2× appearance each.
+- Phase 10 stub aliases `pyramid_search_wire_configs` + `pyramid_pull_wire_config` correctly delegate to the new primary IPCs with matching argument shapes.
+- Missing-signal redistribution in `compute_score` — `test_compute_score_with_redistributed_weights` proves the sparse-signal case produces the same score as the full-signal case when normalized values match; `test_compute_score_all_missing_is_zero` covers the edge case.
+- Weight redistribution handles the `rating=None, adoption=Some(0)` distinction correctly via `Option<f64>` threading, per the explicit struct field comments.
+- Credential safety gate regex reuses `CredentialStore::collect_references()` which handles `${VAR_NAME}` + `$$` escape + YAML comments are scanned as plain text (comments like `# ${commented}` WILL match — but that's a known tradeoff documented in `CredentialStore`, not a Phase 14 concern; the safety-first position is "any unresolved `${VAR_NAME}` in the YAML is a blocker").
+- 3 new bundled contributions present in `bundled_contributions.json` with the expected seed shapes; `sync_config_to_operational` dispatcher covers all 3 new schema_types (dispatcher grew from 14 to 17 branches as promised).
+- `WireUpdateAvailable` and `WireAutoUpdateApplied` events ARE emitted from `run_once` (lines 200 and 216 in wire_update_poller.rs), not just defined in the enum.
+- ToolsMode's `DiscoverPanel` calls `invoke('pyramid_wire_discover', ...)` on search (line 2137), `invoke('pyramid_wire_recommendations', ...)` in an effect (line 2109), and `invoke('pyramid_pull_wire_config', ...)` on Pull (line 2160) — no stubs or TODOs.
+- `AutoUpdateSettingsModal` is mounted from `DiscoverPanel` at line 2400 via the `showAutoUpdate` state + header button — reachable from the UI.
+- `QualityBadges` handles `undefined` rating (early return from the rating block), `0` adoptionCount ("0 users"), `0` chainLength (suppressed), and `0` openRebuttals (suppressed) — no crashes on missing props.
+- `pyramid_wire_pull_latest`'s credential-gate-refused path keeps the cache entry intact (the `?` on the pull result returns the error BEFORE `delete_wire_update_cache` is called).
+- `PyramidPublisher::search_contributions` + `check_supersessions` gracefully return empty results on 404/501 (Wire server endpoints don't ship yet); `fetch_contribution` surfaces the 404 as a real error (correct — you can't construct a contribution from nothing).
+
+**Verification commands re-run after fixes:**
+- `cargo check --lib` — clean, 3 pre-existing warnings only
+- `cargo test --lib pyramid::wire_update_poller` — 5 tests pass (4 existing + 1 new sync-spawn test)
+- `cargo test --lib pyramid::wire_discovery::phase14_tests` — 14 tests pass
+- `cargo test --lib pyramid::wire_pull::phase14_tests` — 3 tests pass
+- `cargo test --lib pyramid` — 1166 passed, 7 pre-existing failures (1165 → 1166, +1 for new sync-spawn test)
+- `npm run build` — clean, no new TypeScript errors
+
+**Commit**: `phase-14: verifier fix — runtime-safe poller spawn + empty-slug IPC guard`. NOT amending the implementer's commit. Branch remains `phase-14-wire-discovery-ranking`.

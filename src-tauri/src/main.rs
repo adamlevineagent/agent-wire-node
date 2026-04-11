@@ -7869,6 +7869,17 @@ async fn pyramid_wire_recommendations(
     schema_type: String,
     limit: Option<u32>,
 ) -> Result<Vec<wire_node_lib::pyramid::wire_discovery::Recommendation>, String> {
+    // Spec §Validation at the IPC boundary (line 288):
+    // "pyramid_wire_recommendations requires an existing slug (not NULL)
+    // — global recommendations are not meaningful because similarity
+    // needs a pyramid profile". Tauri deserializes a missing JS field
+    // or an empty string to an empty String here, so we reject both.
+    if slug.trim().is_empty() {
+        return Err(
+            "slug is required — recommendations need a pyramid profile to compute similarity"
+                .to_string(),
+        );
+    }
     let wire_auth = get_api_token(&state.auth).await.unwrap_or_default();
     let publisher = wire_publisher_from_state(&state, wire_auth);
     let profile = {
