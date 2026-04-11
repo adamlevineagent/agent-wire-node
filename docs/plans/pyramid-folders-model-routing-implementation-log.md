@@ -4511,3 +4511,661 @@ Starting at HEAD `88a2350 phase-18b: verifier pass notes for cache integrity + s
 
 **Final wanderer disposition:** Phase 18b ships as committed at `a8a8655`. The verifier's static audit at `88a2350` stands correct. All 12 wanderer questions clear. The runtime checks the verifier punted all pass on the current worktree (111 GB free disk, no resource pressure). Zero code fixes required. This commit records the wanderer pass for traceability.
 
+## Phase 18a — Local Mode + Provider Management (2026-04-11)
+
+**Branch:** `phase-18a-local-mode-providers`
+**Ledger entries claimed:** L1, L2, L5 (L3 deferred — see Deferrals)
+**Status:** awaiting-verification
+
+### What shipped
+
+The single Local LLM (Ollama) toggle Adam asked for during first
+real-use of the Phase 17 ship. Routes every model tier through a
+local Ollama instance with one click in Settings, snapshots the
+prior cloud routing so toggle-off restores it verbatim, and refreshes
+the YAML renderer's `model_list` source from `/api/tags` for
+Ollama-shaped providers.
+
+### Three new IPC commands (plus a probe helper plus a credential
+preview helper)
+
+Per `provider-registry.md` §559-561 + Phase 18a workstream prompt:
+
+```
+pyramid_get_local_mode_status() -> LocalModeStatus
+pyramid_enable_local_mode(base_url, model?) -> LocalModeStatus
+pyramid_disable_local_mode() -> LocalModeStatus
+pyramid_probe_ollama(base_url) -> OllamaProbeResult
+pyramid_preview_pull_contribution(wire_contribution_id)
+    -> { yaml, schema_type, title, description,
+         required_credentials, missing_credentials }
+```
+
+`LocalModeStatus` shape:
+
+```rust
+struct LocalModeStatus {
+    enabled: bool,
+    base_url: Option<String>,
+    model: Option<String>,
+    detected_context_limit: Option<usize>,
+    available_models: Vec<String>,
+    reachable: bool,
+    reachability_error: Option<String>,
+    ollama_provider_id: String,
+    prior_tier_routing_contribution_id: Option<String>,
+    prior_build_strategy_contribution_id: Option<String>,
+}
+```
+
+`OllamaProbeResult`: `{ reachable, reachability_error, available_models }`.
+
+### State table
+
+New `pyramid_local_mode_state` row, single-row keyed `id = 1`:
+
+```sql
+CREATE TABLE IF NOT EXISTS pyramid_local_mode_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    enabled INTEGER NOT NULL DEFAULT 0,
+    ollama_base_url TEXT,
+    ollama_model TEXT,
+    detected_context_limit INTEGER,
+    restore_from_contribution_id TEXT,
+    restore_build_strategy_contribution_id TEXT,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+```
+
+Idempotent migration: `CREATE TABLE IF NOT EXISTS` plus
+`INSERT OR IGNORE INTO ... VALUES (1, 0)` so existing installs see
+the singleton row appear with `enabled = 0` on next boot. Picked
+**Option A** (state table) over Option B (chain walking) per the
+workstream prompt's recommendation — cleaner contract, no parsing
+structured data out of free-text triggering notes.
+
+The two restore columns are load-bearing for reversibility:
+
+- `restore_from_contribution_id` snapshots the active
+  `tier_routing` contribution_id before supersession.
+- `restore_build_strategy_contribution_id` snapshots the active
+  `build_strategy` contribution_id (for the concurrency-1 pin).
+
+Disable looks both up and copies their `yaml_content` into a new
+"restore" supersession of the currently-active local-mode
+contribution. After restore, the columns are cleared but
+`ollama_base_url` / `ollama_model` are preserved so the next enable
+starts from the user's last picks.
+
+### TierRoutingYaml mismatch finding (load-bearing fix)
+
+Phase 4's `TierRoutingYaml` struct in `db.rs` declared its tier
+list as `pub tiers: Vec<...>`, but the bundled
+`tier_routing` JSON Schema and the bundled default `tier_routing`
+contribution both used `entries:`. Result: every supersession of
+the bundled tier_routing seed parsed silently into an EMPTY
+`tiers` Vec, the upsert helper iterated over zero rows, and the
+operational `pyramid_tier_routing` table never picked up the
+contribution-driven changes. The breakage was invisible because
+the seeded `pyramid_tier_routing` rows from
+`seed_default_provider_registry` were unaffected — only later
+supersessions silently no-op'd.
+
+**Fix applied in this commit (Phase 5 side-effect repair):**
+
+1. Renamed the struct field to `pub entries: Vec<...>` with
+   `#[serde(default, alias = "tiers")]` so any in-flight
+   contributions written against the broken shape still
+   deserialize cleanly (forward + backward compatible).
+2. Extended `TierRoutingYamlEntry` with three previously-unknown
+   fields the bundled schema accepts: `priority`,
+   `prompt_price_per_token`, `completion_price_per_token`. Without
+   these, parsing the canonical seed errored on unknown fields.
+   The upsert synthesizes a `pricing_json` blob from the flat
+   per-token rate fields when no structured pricing_json was
+   supplied.
+3. **Added a `DELETE … WHERE tier_name NOT IN (…)` step to
+   `upsert_tier_routing_from_contribution`.** Without this, an
+   active local-mode contribution listing only fast_extract,
+   synth_heavy, etc. would leave a stale `web` row pointing at
+   OpenRouter and a chain step asking for the `web` tier would
+   silently route through OpenRouter even though local mode is on.
+   The DELETE matches the rest of the dispatcher's
+   "contribution is the source of truth" model and is required
+   for the Local Mode toggle to actually flip behavior.
+
+Test added:
+`pyramid::local_mode::tests::tier_routing_yaml_struct_accepts_canonical_entries`
+parses the bundled seed shape and asserts non-empty entries +
+`priority` round-trips. Plus
+`pyramid::local_mode::tests::tier_routing_yaml_struct_accepts_legacy_tiers_alias`
+verifies the legacy alias still works.
+
+### Dehydration budget scaling decision
+
+**Deferred** with documentation. Spec §390 calls for deriving
+dehydration budgets from the detected context limit. The relevant
+constants live in `OperationalConfig::tier2`
+(`pre_map_prompt_budget`, `answer_prompt_budget`) and are not
+currently surfaced as a contribution. Scaling them requires either
+threading a mutable handle into `local_mode.rs` or introducing a
+new contribution schema_type — both beyond Phase 18a scope. Local
+mode still works against the default budgets; users running
+tiny-context models may need to manually drop those values via a
+future Phase 19 `dehydration_budget` contribution.
+
+Carry-forward note added to the friction log.
+
+### Frontend components + mount points
+
+- **`src/hooks/useLocalMode.ts`** (new) — `useLocalMode()` hook
+  returning `{ status, loading, error, refresh, enable, disable,
+  probe }`. Wraps the four IPCs with in-flight state and error
+  capture.
+- **`src/components/Settings.tsx`** — new "Local LLM (Ollama)"
+  section between Mesh Hosting and Auto-Update. Renders:
+  - Toggle ("Use local models (Ollama)") backed by
+    `localMode.status.enabled`.
+  - Base URL input + "Test connection" button (disabled when
+    toggle is on so the user can't change URL while enabled).
+  - Model dropdown populated from the live status or the probe
+    result. Empty-list path renders "pull a model with
+    `ollama pull` first".
+  - Status line with green/red/grey indicators.
+  - Orange warning banner when enabled ("Local mode sets
+    concurrency to 1 — home hardware constraint").
+  - Confirm-before-disable inline modal (anti-fat-finger guard).
+  - Error surface for IPC failures.
+- **`src/components/modes/ToolsMode.tsx`** —
+  `DiscoverPanel.handlePull` now first calls
+  `pyramid_preview_pull_contribution` and stages a credential
+  warning modal when `missing_credentials` is non-empty. The
+  modal lists the missing keys, shows already-present required
+  keys for context, and offers Cancel / Pull anyway. Cancel
+  aborts the pull entirely.
+- **`src-tauri/src/pyramid/yaml_renderer.rs`** — `model_list:`
+  resolver split into a sync entry point (cache lookup +
+  tier-table fallback) and an async `resolve_model_list_only`
+  used by the IPC layer. The async path probes
+  `GET {base_url}/api/tags` for Ollama-shaped providers
+  (OpenaiCompat + base_url containing `:11434` OR id starting
+  with `ollama`), caches results per-provider for 30 seconds,
+  and degrades gracefully on failure (caches an empty list
+  briefly so the UI doesn't spin).
+
+### IPCs added in main.rs
+
+```
+pyramid_get_local_mode_status
+pyramid_enable_local_mode
+pyramid_disable_local_mode
+pyramid_probe_ollama
+pyramid_preview_pull_contribution
+```
+
+All five registered in the `invoke_handler!` macro under the
+"Phase 18a" section between `pyramid_delete_step_override` and
+`// Phase 11: Broadcast webhook…`.
+
+### Tests added
+
+**Rust (16 new tests):**
+
+In `pyramid::local_mode::tests`:
+- `normalize_base_url_strips_trailing_slash`
+- `normalize_base_url_rejects_missing_scheme`
+- `native_root_strips_v1_suffix`
+- `parse_tags_returns_sorted_unique_models`
+- `parse_tags_handles_empty_array`
+- `parse_tags_handles_missing_field`
+- `parse_tags_handles_malformed_json`
+- `local_mode_state_table_idempotent_init` (asserts double-init)
+- `local_mode_state_round_trip` (state row write+read)
+- `build_local_mode_build_strategy_yaml_pins_concurrency_one`
+  (preserves prior fields, forces concurrency=1)
+- `build_tier_routing_yaml_string_uses_entries` (canonical
+  serialization round-trip)
+- `tier_routing_yaml_struct_accepts_legacy_tiers_alias`
+- `tier_routing_yaml_struct_accepts_canonical_entries`
+- `enable_local_mode_with_unreachable_ollama_errors_clearly`
+  (refuses to half-enable on reachability failure)
+
+In `pyramid::yaml_renderer::tests`:
+- `test_resolve_model_list_ollama_caches_failure` (Ollama-shaped
+  provider, async + sync entry-point cache contract)
+- `test_is_ollama_shaped_heuristic` (id-prefix + port heuristic
+  + provider_type guard)
+
+**Test count:** 1238 (Phase 17 baseline) → 1254 passing. 7
+pre-existing failures unchanged. 5 filtered out (unchanged).
+`cargo test --lib pyramid` total: **1254 passing / 7 failing**.
+
+**Frontend tests:** None added — the repo doesn't have a frontend
+test runner configured. Manual verification steps below.
+
+### Manual verification path (the load-bearing one)
+
+1. **Build the app:** `cargo tauri build` (or dev mode via
+   `cargo tauri dev`).
+2. **Settings tab:** opens to a list of sections including the
+   new "Local LLM (Ollama)" section between Mesh Hosting and
+   Auto-Update.
+3. **Test connection (off-state):** With Ollama running locally
+   on the default port, click "Test connection". Status line
+   should turn green: "Reachable — N models available". Model
+   dropdown populates from `/api/tags`.
+4. **Toggle on:** Check the toggle. Status line should switch to
+   "Enabled — routing all tiers through {model} on {base_url}
+   · context limit {N}K tokens". Orange concurrency warning
+   banner appears. URL field becomes read-only.
+5. **End-to-end build verification:** Trigger a pyramid build
+   (any pyramid). Watch the build log; every LLM call should
+   route through `ollama-local` (the provider id this phase
+   creates). Concurrency should be 1.
+6. **Toggle off:** Uncheck the toggle. Confirm modal appears
+   ("Disable local mode? This will restore your previous tier
+   routing."). Click "Yes, disable". Status line goes grey.
+   Trigger another build — calls should route back through
+   OpenRouter (or whatever the prior tier_routing contribution
+   pointed at). Concurrency restored.
+7. **Credential preview modal (L2):** In the Tools tab →
+   Discover, search for any Wire contribution. Click Pull. If
+   the contribution's YAML references `${VAR}` patterns the
+   user hasn't set, a red modal appears listing the missing
+   keys with Cancel / Pull anyway buttons.
+8. **Ollama `/api/tags` model fetch (L5):** With local mode
+   enabled, opening any chain config that uses
+   `model_list:ollama-local` as an option source should populate
+   from `/api/tags`. With Ollama not running, the dropdown
+   should show "No models found" gracefully (cache stores the
+   empty list for 30s).
+
+### Verification commands
+
+- `cargo check --lib` from `src-tauri/` — clean, same 3
+  pre-existing warnings.
+- `cargo test --lib pyramid` — **1254 passing / 7 failing**.
+  Same 7 pre-existing failures unchanged. +16 new tests over
+  the Phase 17 baseline.
+- `npm run build` — clean (151 modules, 799.55 kB bundle).
+- IPC registration check: `grep -c
+  "pyramid_enable_local_mode\|pyramid_disable_local_mode\|pyramid_get_local_mode_status\|pyramid_preview_pull_contribution"
+  src-tauri/src/main.rs` returns **8** (4 fn defs + 4 handler
+  entries). Plus `pyramid_probe_ollama` adds 2 more (1 def + 1
+  entry).
+
+### Deviations
+
+1. **OllamaCloudProvider (L3) deferred.** Time/scope pressure
+   from the TierRoutingYaml mismatch repair plus the
+   `model_list:` resolver async refactor consumed the headroom
+   that would have gone to L3. The local Ollama path covers the
+   "Adam runs Ouro test" use case completely; L3 (remote Ollama
+   behind nginx) is a sharpening for users who run a hosted
+   Ollama somewhere. Recommend the conductor re-defers L3 to a
+   "Phase 18a+1 fix pass" or absorbs it into Phase 19.
+2. **Dehydration budget scaling deferred** with documentation
+   (see above).
+3. **TierRoutingYaml struct/seed mismatch repaired** as a Phase
+   5 side-effect (bundled seed continues to use canonical
+   `entries:` form). The legacy `tiers:` alias is preserved so
+   any in-flight contributions written under the broken shape
+   still parse.
+4. **DELETE-then-INSERT semantics added to
+   `upsert_tier_routing_from_contribution`.** This is a behavior
+   change for the Phase 4 dispatcher's tier_routing branch but is
+   load-bearing for Local Mode reversibility. Documented in the
+   function's doc comment.
+
+### Files touched
+
+Backend:
+- `src-tauri/src/pyramid/db.rs` — TierRoutingYaml struct rename +
+  alias + new fields, upsert DELETE-then-INSERT, new
+  `pyramid_local_mode_state` table init + helpers.
+- `src-tauri/src/pyramid/local_mode.rs` (new, ~960 lines) —
+  module body + 14 unit tests.
+- `src-tauri/src/pyramid/mod.rs` — `pub mod local_mode;`.
+- `src-tauri/src/pyramid/yaml_renderer.rs` — `model_list:`
+  resolver async split + per-provider cache + Ollama-shaped
+  heuristic + 2 new tests.
+- `src-tauri/src/pyramid/config_contributions.rs` — test fixture
+  fix (`tiers:` → `entries:`).
+- `src-tauri/src/main.rs` — 5 new IPC commands, 5 new
+  invoke_handler entries.
+
+Frontend:
+- `src/hooks/useLocalMode.ts` (new).
+- `src/components/Settings.tsx` — Local LLM section.
+- `src/components/modes/ToolsMode.tsx` — credential preview modal
+  + preview-then-pull flow.
+
+Docs:
+- `docs/plans/pyramid-folders-model-routing-implementation-log.md`
+  — this entry.
+- `docs/plans/pyramid-folders-model-routing-friction-log.md` —
+  Phase 18a section.
+
+### End state
+
+After this merges, Adam can flip Local Mode on and run a build
+entirely through localhost Ollama without editing YAML by hand or
+inserting SQLite rows manually. The Ouro test (compare local vs
+cloud output) is unblocked.
+
+Single commit on `phase-18a-local-mode-providers`. Not pushed,
+not merged.
+
+### Verifier pass (2026-04-11)
+
+Fresh-eyes audit of commit `35b3173` against workstream prompt +
+provider-registry.md §382-395 / §559-561 + deferral-ledger
+L1/L2/L3/L5. **Result: clean, no new commit.**
+
+`cargo check --lib` clean (same 3 pre-existing warnings from
+`publication.rs`). `cargo test --lib pyramid` and `npm run build`
+blocked by persistent ENOSPC on harness task-output storage from
+parallel Phase 18 verifier worktrees. Static audit compensated:
+all 16 new test bodies read in full, compile-checked via cargo
+check, exercise public APIs matching the db.rs/local_mode.rs
+implementations they depend on.
+
+11-point failure-mode checklist — every item verified:
+
+1. **TierRoutingYaml repair.** `db.rs:14137` struct uses
+   `entries:` with `#[serde(default, alias = "tiers")]`.
+   `upsert_tier_routing_from_contribution` at L14187 deletes
+   tier rows not in the incoming contribution (`DELETE FROM
+   pyramid_tier_routing WHERE tier_name NOT IN (…)` or full
+   wipe on empty) before upserting. Required for Local Mode
+   reversibility (stale `web` row would otherwise route to
+   OpenRouter even under local mode). Tests
+   `tier_routing_yaml_struct_accepts_legacy_tiers_alias` and
+   `tier_routing_yaml_struct_accepts_canonical_entries` cover
+   both shapes.
+2. **Toggle reversibility.** `enable_local_mode` at
+   `local_mode.rs:295` snapshots prior contribution_ids into
+   `pyramid_local_mode_state` BEFORE superseding via
+   `save_local_mode_state` at L434. Disable at L582 loads
+   `restore_from_contribution_id` by id, copies its
+   `yaml_content` into a new supersession of the currently-
+   active local-mode contribution. Enable also force-includes
+   the 5 canonical tier names (`fast_extract`, `web`,
+   `synth_heavy`, `stale_remote`, `stale_local`) at L399 so
+   chain steps asking for a tier the prior contribution
+   dropped still resolve during local mode.
+3. **State table snapshot semantics.** `db.rs:1639` declares
+   `pyramid_local_mode_state` with BOTH
+   `restore_from_contribution_id` (tier_routing) AND
+   `restore_build_strategy_contribution_id` (build_strategy)
+   as TEXT columns. `load_local_mode_state` (L12807) and
+   `save_local_mode_state` (L12845) read/write both.
+4. **Settings.tsx Local LLM section.** Lives at L297-527
+   between Mesh Hosting (L280) and Auto-Update (L529). URL
+   field `disabled={localMode.status?.enabled || localMode.loading}`.
+   Model dropdown picks from live `status.available_models` or
+   `probeResult.available_models`. Status line renders
+   green/red/grey per spec. Orange concurrency warning banner
+   at L451. Two-step disable confirm modal at L469.
+5. **`/api/tags` resolver caching.** `OLLAMA_TAGS_CACHE` at
+   `yaml_renderer.rs:368` with 30s TTL. `lookup_cached_models`
+   at L380 correctly returns None when TTL elapsed. Failures
+   (unreachable, parse error, base_url credential sub failure)
+   cache empty list with same TTL. `std::sync::Mutex` never
+   held across await — synchronous entry point
+   `resolve_model_list_sync` for DB-only branches, async
+   `resolve_model_list_only` for the Ollama path.
+6. **IPC registrations (5 new).** Each def + each
+   invoke_handler entry present in `main.rs`:
+   `pyramid_get_local_mode_status` (L7702/L10539),
+   `pyramid_enable_local_mode` (L7714/L10540),
+   `pyramid_disable_local_mode` (L7734/L10541),
+   `pyramid_probe_ollama` (L7750/L10542),
+   `pyramid_preview_pull_contribution` (L7767/L10543).
+7. **Credential warning modal.** `ToolsMode.tsx:2273`
+   `handlePull` calls `pyramid_preview_pull_contribution`
+   first, stages modal at L2470-2566 when
+   `missing_credentials` is non-empty, lists missing keys at
+   L2498, offers Cancel (L2544) / Pull anyway (L2549). Backend
+   IPC at `main.rs:7767` calls `collect_references` +
+   `store.contains(name)` (`credentials.rs:306/420`).
+8. **Concurrency pin to 1.**
+   `build_local_mode_build_strategy_yaml` at
+   `local_mode.rs:551` parses prior YAML as untyped
+   `serde_yaml::Value` (preserving evidence_mode, webbing,
+   quality) and inserts `concurrency: 1` into both
+   `initial_build` and `maintenance` sub-mappings. Test
+   `build_local_mode_build_strategy_yaml_pins_concurrency_one`
+   asserts webbing/model_tier round-trip + concurrency=1.
+9. **Dehydration budget scaling deferred.** Documented above
+   under "Dehydration budget scaling decision" and in friction
+   log. Acceptable per workstream prompt deviation clause.
+10. **OllamaCloudProvider (L3) re-deferred.** Documented above
+    under "Deviations" as "Phase 18a+1 fix pass" candidate.
+    Acceptable per workstream prompt L3 optional clause.
+11. **`yaml_renderer_resolve_options` IPC** at `main.rs:8810`
+    correctly drops the rusqlite reader lock BEFORE awaiting
+    `resolve_model_list_only` so non-Send `&Connection` never
+    crosses an await point.
+
+Additional structural checks: `pyramid/mod.rs:59` declares
+`pub mod local_mode;`. `Provider` struct fields
+(`provider.rs:185`) match the fields set in `local_mode.rs:350`.
+`ProviderRegistry::resolve_base_url` (`provider.rs:967`)
+handles `${VAR}` substitution used by the Ollama `/api/tags`
+resolver. `supersede_config_contribution` takes
+`&mut Connection` and auto-reborrows fine from
+`&mut conn` in `enable_local_mode` / `disable_local_mode`.
+
+Minor observation (not a blocker): fresh-install fallback at
+`local_mode.rs:484` creates a concurrency-1 build_strategy
+contribution when no prior exists; subsequent disable leaves
+that contribution in place (because
+`restore_build_strategy_contribution_id = None`). Not reachable
+in practice because `bundled-build_strategy-default-v1`
+(`bundled_contributions.json:61`) is always seeded by
+`walk_bundled_contributions_manifest` on every boot. Flagged
+for future hardening only.
+
+**Status: clean, no new commit added.** Original `35b3173`
+stands. Wanderer pass recommended next per
+`feedback_wanderer_after_verifier.md`.
+
+### Wanderer pass (2026-04-11)
+
+Fresh worktree at
+`/private/tmp/agent-wire-phase-18a-local-mode-providers-verifier`.
+Runtime baseline restored (the verifier punted this to the
+wanderer because disk pressure blocked their `cargo test` and
+`npm run build`):
+
+- `cargo test --lib pyramid` → **1254 passed / 7 failed** —
+  exactly the expected baseline. The 7 failures are
+  pre-existing (evidence schema `build_id` column, YAML
+  clustering, path normalization) — none touch local mode.
+- `npm run build` → clean (only the pre-existing 500KB chunk
+  size warning; 151 modules transformed, 991ms).
+
+Traced the 12-question wanderer script end-to-end through
+`local_mode.rs`, `db.rs`, `config_contributions.rs`,
+`yaml_renderer.rs`, `main.rs`, `Settings.tsx`,
+`useLocalMode.ts`, `ToolsMode.tsx`, and the bundled manifest.
+11 of 12 questions came back **clean** with the same file:line
+citations the verifier pinned. One wanderer fix applied.
+
+**Wanderer fix — reader lock held across `.await` in the
+status IPC.**
+
+The verifier's IPC audit line at `main.rs:8810` explicitly
+called out that `yaml_renderer_resolve_options` drops the
+rusqlite reader lock BEFORE awaiting the async `/api/tags`
+resolver. But they missed the same pattern in
+`pyramid_get_local_mode_status`:
+
+```rust
+async fn pyramid_get_local_mode_status(state) -> ... {
+    let reader = state.pyramid.reader.lock().await;
+    let status = get_local_mode_status(&reader).await?;  // <-- probe under lock
+    drop(reader);
+    Ok(status)
+}
+```
+
+`get_local_mode_status` calls `probe_ollama(&base_url).await`
+internally (up to 5 seconds of network wait). With the reader
+lock held, every concurrent reader-bound IPC would block on
+the lock for the duration of the probe. Not a data
+correctness bug — the tokio::sync::Mutex is an async mutex
+and Send-safe across `.await` — but a latency hazard for any
+background chain step, UI polling IPC, or another `compose`
+flow running at the same time as a Settings mount.
+
+**Fix:** split `get_local_mode_status` into two functions:
+- `load_status_snapshot(conn)` — synchronous, DB-only, builds
+  a partial status with `reachable=false` and empty probe
+  fields.
+- `refresh_status_reachability(status) -> status` — async,
+  takes ownership of the partial status, runs `probe_ollama`
+  (without any DB/mutex reference) and merges the
+  reachability fields in. No-op when `status.enabled = false`.
+
+The legacy `get_local_mode_status(&Connection)` is kept as a
+thin wrapper for the enable/disable return paths (they
+already hold the writer lock for the whole transaction, so
+the probe latency is irrelevant there).
+
+The `pyramid_get_local_mode_status` IPC now does:
+
+```rust
+let snapshot = {
+    let reader = state.pyramid.reader.lock().await;
+    load_status_snapshot(&reader)?   // sync, fast
+    // reader lock drops here
+};
+Ok(refresh_status_reachability(snapshot).await)  // no lock
+```
+
+**Tests added (4):**
+- `load_status_snapshot_disabled_returns_clean_row` — fresh
+  DB, snapshot returns disabled, no probe fields populated.
+- `load_status_snapshot_enabled_returns_saved_values_without_probing`
+  — populates the state row with enabled=true and asserts
+  the snapshot reflects saved values AND that
+  `available_models` / `reachable` are still empty (i.e. the
+  snapshot didn't secretly probe).
+- `refresh_status_reachability_disabled_is_noop` — passing a
+  disabled status through the refresh function must leave it
+  unchanged and not hit the network.
+- `refresh_status_reachability_enabled_with_unreachable_captures_error`
+  — enabled + unreachable URL → `reachable=false` +
+  `reachability_error` populated + `available_models` empty.
+
+Runtime after the fix:
+- `cargo test --lib pyramid::local_mode` → **18 passed /
+  0 failed** (was 14 before the fix).
+- `cargo test --lib pyramid` → **1258 passed / 7 failed**
+  (same 7 pre-existing).
+- `npm run build` → clean.
+
+**12 wanderer questions — final verdict:**
+
+1. **Enable end-to-end.** Clean. `local_mode.rs:295-521` walks
+   validate → probe → pick model → detect context →
+   `save_provider` → load prior contributions → snapshot
+   state → supersede tier_routing → sync operational →
+   supersede build_strategy → sync. Every hop verified.
+2. **Disable end-to-end.** Clean. `local_mode.rs:582-663`
+   restores by COPYING prior contribution YAML into a new
+   supersession of the currently-active local-mode
+   contribution. `upsert_tier_routing_from_contribution`
+   DELETEs stale rows + UPSERTs restored set → operational
+   table is bit-for-bit restored.
+3. **TierRoutingYaml repair.** Clean. `db.rs:14137` uses
+   `entries` with `#[serde(alias = "tiers")]`,
+   `upsert_tier_routing_from_contribution` at `db.rs:14187`
+   DELETEs stale rows. Bundled seed
+   `bundled_contributions.json:112` uses the canonical
+   `entries:` shape.
+4. **Reachability failure mode.** Clean. `local_mode.rs:306`
+   probes BEFORE any DB write; a failed probe returns Err
+   with no side effects. `save_provider` + state row writes
+   happen only after the probe succeeds.
+5. **/api/tags cache.** Clean. `yaml_renderer.rs:368-422`
+   implements the 30s per-provider cache. Failures cache an
+   empty list with the same TTL at `:555`. The std::sync::Mutex
+   is never held across `.await` because lookups return
+   owned clones and stores finish synchronously before any
+   `.await`. The async `resolve_model_list_only` function
+   exists specifically for the IPC path that must release
+   the rusqlite lock before awaiting.
+6. **ModelSelectorWidget integration.** Clean. The widget
+   defaults to `tier_registry` (sync, DB-only) so Local Mode
+   is automatically reflected via the new tier_routing rows.
+   No bundled schema annotations currently use
+   `model_list:{provider_id}`, but when one does, the
+   network-bound resolver handles it through the same
+   `yaml_renderer_resolve_options` IPC's async branch.
+7. **Credential warning modal.** Clean. `main.rs:7767`
+   fetches via `PyramidPublisher::fetch_contribution`, scans
+   via `CredentialStore::collect_references`, checks
+   `store.contains()`. `ToolsMode.tsx:2273-2312` modal lists
+   missing keys, offers Cancel / Pull anyway.
+8. **Concurrency pin to 1.** Clean. `local_mode.rs:551-575`
+   uses `serde_yaml::Value` mutation to preserve
+   webbing/evidence_mode/quality while forcing
+   `initial_build.concurrency = 1` and
+   `maintenance.concurrency = 1`. The disable path restores
+   the prior YAML verbatim via `build_strategy` supersession
+   + `upsert_build_strategy` (INSERT OR REPLACE).
+9. **No prior build_strategy edge case.** Not reachable.
+   `walk_bundled_contributions_manifest` at
+   `wire_migration.rs:1044` runs unconditionally on every
+   boot (outside the Phase 5 sentinel guard per `:141`). The
+   bundled `bundled-build_strategy-default-v1` entry in
+   `bundled_contributions.json:61-65` is always seeded with
+   INSERT OR IGNORE semantics. The only way to reach the
+   no-prior case is to manually archive every build_strategy
+   contribution AND patch the manifest — outside scope.
+10. **5 IPCs reachability.** Clean. All 5 defined
+    (`main.rs:7702/7714/7734/7750/7767`) + all 5 in
+    `invoke_handler` (`main.rs:10539-10543`) + all 5 have
+    real frontend call sites (`useLocalMode.ts:56/74/92/102`
+    + `ToolsMode.tsx:2289`).
+11. **Settings section in built bundle.** Clean. Grepped
+    `dist/assets/index-*.js` after `npm run build`: finds
+    "Local LLM (Ollama)", "Use local models (Ollama)",
+    "Test connection", and all 5 IPC names. Section between
+    Mesh Hosting and Auto-Update per workstream prompt.
+12. **Dehydration budget deferral.** Documented deferral.
+    `local_mode.rs:506-517` explicit comment, friction log
+    carry-forward, Phase 19 handoff. Risk: default budgets
+    (pre_map=80K, answer=100K) overflow on 8K/16K-context
+    models. Adam's Ouro test uses gemma3:27b (128K context)
+    so this doesn't block 18a. Small-context users need
+    manual tuning until Phase 19's dehydration_budget
+    contribution schema.
+
+**Other minor observations (flagged but NOT fixed — below
+wanderer-fix threshold):**
+
+- Enable path writes `save_provider` → `save_local_mode_state`
+  → `supersede_config_contribution` sequentially, and if the
+  supersede fails after the state row is persisted, the UI
+  shows enabled=true but tier_routing is still prior. Manual
+  recovery: click Enable again (idempotent via upsert).
+  Acceptable because supersede_config_contribution failures
+  are rare (DB IO errors).
+- `build_local_mode_build_strategy_yaml` silently skips the
+  concurrency pin if a phase value exists but isn't a
+  mapping. Not reachable in practice — bundled defaults
+  always use mapping form.
+- Two-step disable confirm via the toggle briefly renders a
+  visual flash from checked → unchecked → checked while
+  the confirmation modal is open (React controlled input
+  + hook status). Cosmetic; the modal "Yes, disable" button
+  works normally.
+
+Single wanderer commit appended to branch. Not pushed, not
+merged.
+
+Status: **wanderer-clean + 1 wanderer fix applied**.

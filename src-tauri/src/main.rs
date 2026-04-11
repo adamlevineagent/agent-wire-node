@@ -7709,6 +7709,126 @@ async fn pyramid_delete_step_override(
         .map_err(|e| e.to_string())
 }
 
+// --- Phase 18a: Local Mode toggle (L1 + L5 + L2) ----------------------------
+//
+// Per `docs/specs/provider-registry.md` §382-395 + §559-561 and
+// `docs/plans/deferral-ledger.md` entries L1/L2/L5. The Local Mode
+// toggle is a single switch in Settings that routes every model
+// tier through a local Ollama instance. Three IPC commands cover the
+// surface plus a probe helper plus a credential preview helper for
+// L2.
+
+#[tauri::command]
+async fn pyramid_get_local_mode_status(
+    state: tauri::State<'_, SharedState>,
+) -> Result<wire_node_lib::pyramid::local_mode::LocalModeStatus, String> {
+    // Wanderer fix (Phase 18a): split the synchronous DB snapshot
+    // from the async Ollama probe so the reader lock is released
+    // BEFORE the network round-trip. Holding the tokio::sync::Mutex
+    // across `probe_ollama().await` would block every other
+    // reader-bound IPC for up to 5 seconds while the probe ran.
+    let snapshot = {
+        let reader = state.pyramid.reader.lock().await;
+        let snapshot =
+            wire_node_lib::pyramid::local_mode::load_status_snapshot(&reader)
+                .map_err(|e| e.to_string())?;
+        drop(reader);
+        snapshot
+    };
+    Ok(wire_node_lib::pyramid::local_mode::refresh_status_reachability(snapshot).await)
+}
+
+#[tauri::command]
+async fn pyramid_enable_local_mode(
+    state: tauri::State<'_, SharedState>,
+    base_url: String,
+    model: Option<String>,
+) -> Result<wire_node_lib::pyramid::local_mode::LocalModeStatus, String> {
+    let mut writer = state.pyramid.writer.lock().await;
+    let status = wire_node_lib::pyramid::local_mode::enable_local_mode(
+        &mut writer,
+        &state.pyramid.build_event_bus,
+        &state.pyramid.provider_registry,
+        base_url,
+        model,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    drop(writer);
+    Ok(status)
+}
+
+#[tauri::command]
+async fn pyramid_disable_local_mode(
+    state: tauri::State<'_, SharedState>,
+) -> Result<wire_node_lib::pyramid::local_mode::LocalModeStatus, String> {
+    let mut writer = state.pyramid.writer.lock().await;
+    let status = wire_node_lib::pyramid::local_mode::disable_local_mode(
+        &mut writer,
+        &state.pyramid.build_event_bus,
+        &state.pyramid.provider_registry,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    drop(writer);
+    Ok(status)
+}
+
+#[tauri::command]
+async fn pyramid_probe_ollama(
+    base_url: String,
+) -> Result<wire_node_lib::pyramid::local_mode::OllamaProbeResult, String> {
+    Ok(wire_node_lib::pyramid::local_mode::probe_ollama(&base_url).await)
+}
+
+#[derive(serde::Serialize)]
+struct PreviewPullContributionResponse {
+    yaml: String,
+    schema_type: Option<String>,
+    title: String,
+    description: String,
+    required_credentials: Vec<String>,
+    missing_credentials: Vec<String>,
+}
+
+#[tauri::command]
+async fn pyramid_preview_pull_contribution(
+    state: tauri::State<'_, SharedState>,
+    wire_contribution_id: String,
+) -> Result<PreviewPullContributionResponse, String> {
+    // Phase 18a (L2): fetch a Wire contribution and scan its YAML
+    // for `${VAR}` references against the local credentials store.
+    // Used by the Discover panel's pull confirmation flow so users
+    // see "this contribution needs OPENAI_API_KEY which you haven't
+    // set" BEFORE the pull lands.
+    let wire_auth = get_api_token(&state.auth).await?;
+    let publisher = wire_publisher_from_state(&state, wire_auth);
+    let full = publisher
+        .fetch_contribution(&wire_contribution_id)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let required: Vec<String> =
+        wire_node_lib::pyramid::credentials::CredentialStore::collect_references(
+            &full.yaml_content,
+        );
+    let store = &state.pyramid.credential_store;
+    let missing: Vec<String> = required
+        .iter()
+        .filter(|name| !store.contains(name))
+        .cloned()
+        .collect();
+
+    Ok(PreviewPullContributionResponse {
+        yaml: full.yaml_content,
+        schema_type: full.schema_type,
+        title: full.title,
+        description: full.description,
+        required_credentials: required,
+        missing_credentials: missing,
+    })
+}
+
 // --- Phase 11: Provider Health + Broadcast Oversight IPC commands -----------
 //
 // Per `docs/specs/evidence-triage-and-dadbear.md` Part 3 (Provider
@@ -8719,13 +8839,28 @@ async fn yaml_renderer_resolve_options(
     state: tauri::State<'_, SharedState>,
     source: String,
 ) -> Result<Vec<wire_node_lib::pyramid::yaml_renderer::OptionValue>, String> {
+    // Phase 18a (L5): the `model_list:{provider_id}` branch is now
+    // network-bound for Ollama-shaped providers. Route that branch
+    // to the connection-free async resolver and drop the rusqlite
+    // lock before the round trip so a non-Send `&Connection` never
+    // crosses an await point. The DB-only branches stay on the
+    // synchronous resolver as before.
+    let registry = state.pyramid.provider_registry.clone();
+    if let Some(provider_id) = source.strip_prefix("model_list:") {
+        return Ok(
+            wire_node_lib::pyramid::yaml_renderer::resolve_model_list_only(
+                &registry,
+                provider_id,
+            )
+            .await,
+        );
+    }
     let reader = state.pyramid.reader.lock().await;
-    wire_node_lib::pyramid::yaml_renderer::resolve_option_source(
-        &reader,
-        &state.pyramid.provider_registry,
-        &source,
-    )
-    .map_err(|e| e.to_string())
+    let result = wire_node_lib::pyramid::yaml_renderer::resolve_option_source(
+        &reader, &registry, &source,
+    );
+    drop(reader);
+    result.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -10428,6 +10563,12 @@ fn main() {
             pyramid_get_step_overrides,
             pyramid_save_step_override,
             pyramid_delete_step_override,
+            // Phase 18a: Local Mode toggle (L1 + L5 + L2)
+            pyramid_get_local_mode_status,
+            pyramid_enable_local_mode,
+            pyramid_disable_local_mode,
+            pyramid_probe_ollama,
+            pyramid_preview_pull_contribution,
             // Phase 11: Broadcast webhook + provider health oversight
             pyramid_provider_health,
             pyramid_acknowledge_provider_health,
