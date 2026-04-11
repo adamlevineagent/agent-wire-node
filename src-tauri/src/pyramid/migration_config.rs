@@ -682,7 +682,31 @@ pub fn persist_migration_proposal(
     // the original stays active until the user accepts the migration,
     // matching Phase 9's draft-during-refinement semantics so background
     // loops still see the prior policy.
+    //
+    // Phase 18d wanderer fix: if a prior migration draft already exists
+    // for this flagged contribution (the user clicked "Re-propose with
+    // guidance" one or more times), delete it before inserting the new
+    // one. Without this, stale drafts accumulate: each retry inserts a
+    // fresh row but the frontend only tracks the latest draft_id, so
+    // the older rows sit in pyramid_config_contributions forever with
+    // status='draft', source='migration'. Guarded by the same filter
+    // `reject_config_migration` uses (status='draft' AND
+    // source='migration') so we can only delete our own drafts.
     let tx = conn.transaction()?;
+    let stale_drafts_deleted = tx.execute(
+        "DELETE FROM pyramid_config_contributions
+         WHERE supersedes_id = ?1
+           AND status = 'draft'
+           AND source = 'migration'",
+        rusqlite::params![inputs.flagged_contribution.contribution_id],
+    )?;
+    if stale_drafts_deleted > 0 {
+        debug!(
+            flagged_contribution_id = %inputs.flagged_contribution.contribution_id,
+            stale_drafts_deleted,
+            "persist_migration_proposal: replaced prior migration drafts"
+        );
+    }
     tx.execute(
         "INSERT INTO pyramid_config_contributions (
             contribution_id, slug, schema_type, yaml_content,
@@ -756,9 +780,17 @@ pub fn persist_migration_proposal(
 /// `needs_migration` flag on the new active row (it's freshly valid
 /// against the new schema).
 ///
-/// All four steps run inside a single transaction so a sync failure
-/// rolls back the supersession — the user can retry without losing
-/// the original flagged row.
+/// The supersession + flag clear run inside a single transaction so
+/// a mid-flight failure can't leave the contribution table in a
+/// half-updated state. sync_config_to_operational runs AFTER that
+/// transaction commits — intentionally: the dispatcher opens its own
+/// inner transactions (e.g. step_overrides DELETE+INSERT bundles), and
+/// we want sync failures to log a warning rather than roll the accept
+/// back. Rolling the accept back on a sync failure is the wrong move:
+/// the user has already approved the migrated YAML, and an out-of-date
+/// operational table can be recovered by a re-sync, while losing the
+/// accept forces the user through the LLM round-trip again for no
+/// benefit.
 pub fn accept_config_migration(
     conn: &mut Connection,
     bus: &Arc<BuildEventBus>,
@@ -1335,6 +1367,137 @@ mod tests {
             prior.is_some(),
             "chain walk should find the original bundled schema_definition"
         );
+    }
+
+    /// Phase 18d wanderer fix: cover the "no prior schema" case that
+    /// test_chain_walk_finds_prior_schema didn't exercise. When the
+    /// config was created against the very first schema_definition and
+    /// no supersession has ever happened, find_prior_schema_definition_id
+    /// must return None gracefully instead of erroring.
+    #[test]
+    fn test_chain_walk_returns_none_when_no_prior_exists() {
+        let conn = mem_conn();
+        let user_id = seed_user_evidence_policy(&conn);
+        // Intentionally do NOT supersede the schema — the bundled default
+        // is still active, so there is no superseded row to find.
+        let user_row = load_contribution_by_id(&conn, &user_id).unwrap().unwrap();
+        let prior =
+            find_prior_schema_definition_id(&conn, "evidence_policy", &user_row.created_at)
+                .unwrap();
+        assert!(
+            prior.is_none(),
+            "chain walk must return None when no superseded schema predates the config"
+        );
+    }
+
+    /// Phase 18d wanderer fix: confirm the chain walk is deterministic
+    /// under timestamp collision. SQLite's `datetime('now')` writes
+    /// second precision. If two schema_definitions land in the same
+    /// second, the `ORDER BY created_at DESC, id DESC` tiebreaker must
+    /// still pick a single row (not error, not swap across runs). We
+    /// seed two superseded schemas with the same created_at and assert
+    /// that find_prior_schema_definition_id returns one of them.
+    #[test]
+    fn test_chain_walk_tiebreaker_under_timestamp_collision() {
+        let conn = mem_conn();
+        let user_id = seed_user_evidence_policy(&conn);
+        let user_row = load_contribution_by_id(&conn, &user_id).unwrap().unwrap();
+
+        // Insert two synthetic superseded schema_definition rows with
+        // identical created_at timestamps (matching the user's row's
+        // timestamp so the `<=` predicate includes them). These simulate
+        // two back-to-back supersessions within the same SQLite second.
+        let colliding_ts = user_row.created_at.clone();
+        let ids = ["collision-a", "collision-b"];
+        for id in &ids {
+            conn.execute(
+                "INSERT INTO pyramid_config_contributions (
+                    contribution_id, slug, schema_type, yaml_content,
+                    wire_native_metadata_json, wire_publication_state_json,
+                    supersedes_id, superseded_by_id, triggering_note,
+                    status, source, wire_contribution_id, created_by,
+                    accepted_at, needs_migration, created_at
+                 ) VALUES (
+                    ?1, 'evidence_policy', 'schema_definition',
+                    '{\"type\":\"object\"}',
+                    '{}', '{}', NULL, 'some-later-superseder', 'collision test',
+                    'superseded', 'local', NULL, 'test', NULL, 0, ?2
+                 )",
+                rusqlite::params![id, colliding_ts],
+            )
+            .unwrap();
+        }
+
+        // The walk must pick exactly one row deterministically. We don't
+        // care which — only that it resolves without erroring and
+        // returns a value stable across runs (SQLite's id ordering is
+        // deterministic for a given dataset).
+        let first = find_prior_schema_definition_id(&conn, "evidence_policy", &colliding_ts)
+            .unwrap();
+        let second = find_prior_schema_definition_id(&conn, "evidence_policy", &colliding_ts)
+            .unwrap();
+        assert!(first.is_some(), "walk must succeed under collision");
+        assert_eq!(first, second, "walk must be deterministic");
+    }
+
+    /// Phase 18d wanderer fix: repeated proposes (the "Re-propose with
+    /// guidance" flow) must REPLACE the prior draft, not accumulate.
+    /// Without this, every retry stranded another draft row in the
+    /// contribution table because the frontend only tracks the latest
+    /// draft_id.
+    #[test]
+    fn test_repeated_propose_replaces_prior_draft() {
+        let mut conn = mem_conn();
+        let user_id = seed_user_evidence_policy(&conn);
+        flag_configs_needing_migration(&conn, "evidence_policy").unwrap();
+        let bus = Arc::new(BuildEventBus::new());
+
+        let inputs_first = load_migration_inputs(&conn, &user_id, Some("first note")).unwrap();
+        let first_proposal = persist_migration_proposal(
+            &mut conn,
+            &inputs_first,
+            "schema_type: evidence_policy\ntriage_rules: []\ndemand_signals: []\nbudget: {}\n",
+            &bus,
+        )
+        .unwrap();
+
+        // A second propose for the same flagged contribution (simulating
+        // "Re-propose with guidance") should DELETE the prior draft and
+        // insert a new one.
+        let inputs_second =
+            load_migration_inputs(&conn, &user_id, Some("refined note")).unwrap();
+        let second_proposal = persist_migration_proposal(
+            &mut conn,
+            &inputs_second,
+            "schema_type: evidence_policy\ntriage_rules:\n  - condition: x\n",
+            &bus,
+        )
+        .unwrap();
+
+        assert_ne!(first_proposal.draft_id, second_proposal.draft_id,
+            "each propose must mint a fresh draft_id");
+
+        // Only ONE draft row for this flagged contribution should remain
+        // after the second propose, and it must be the second one.
+        let drafts: Vec<String> = conn
+            .prepare(
+                "SELECT contribution_id FROM pyramid_config_contributions
+                 WHERE supersedes_id = ?1
+                   AND status = 'draft'
+                   AND source = 'migration'",
+            )
+            .unwrap()
+            .query_map(rusqlite::params![user_id], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(drafts.len(), 1, "stale draft must be deleted on re-propose");
+        assert_eq!(drafts[0], second_proposal.draft_id);
+
+        // The first draft row should be gone.
+        let first_exists = load_contribution_by_id(&conn, &first_proposal.draft_id).unwrap();
+        assert!(first_exists.is_none(),
+            "first propose draft must be deleted by the second");
     }
 
     #[test]

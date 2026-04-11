@@ -4453,3 +4453,110 @@ the 18d commit's source code or assets were needed.
 end-state matches the workstream prompt exactly. No fixes in place.
 Status remains `awaiting-verification` for the next stage, but
 all four verification criteria hit their targets.
+
+### Wanderer pass (2026-04-11)
+
+Third agent (wanderer) joined after the verifier and traced the 12
+end-to-end questions in the workstream prompt. Sanity runs confirmed
+the baseline: cargo check clean (3 pre-existing warnings), 11/11
+migration_config tests, 1249/7 full pyramid suite, frontend build
+clean. Then worked the 12 questions and found one real bug plus
+two test-coverage gaps.
+
+**Bug fix in place — re-propose accumulates stale drafts.**
+`persist_migration_proposal` always inserts a new draft row, and the
+frontend `MigrationReviewModal.handleRetry` (the "Re-propose with
+guidance" button) re-calls `pyramid_propose_config_migration` with
+the same `contribution_id` but a refined `userNote`. The frontend
+only tracks the latest `draft_id`, so every retry stranded another
+`status='draft', source='migration', supersedes_id=<original>` row
+that nothing ever cleaned up — `reject_config_migration` only deletes
+the draft the user explicitly rejects, and no loop sweeps orphan
+drafts. Over a session where the user refines a proposal three or
+four times, the contribution table accumulates `N` duplicate drafts
+for one flagged row.
+
+Fix: `persist_migration_proposal` now DELETEs any prior
+`supersedes_id = <flagged>` draft (scoped to
+`status='draft' AND source='migration'`, so it can only delete its
+own drafts — the same filter `reject_config_migration` uses) inside
+the same transaction before the INSERT. One draft per flagged row at
+any time, matching the frontend's single-draft mental model. Added
+`test_repeated_propose_replaces_prior_draft` to cover the path.
+
+**Test gap fill 1 — chain walk returns None when no prior exists.**
+`test_chain_walk_finds_prior_schema` only covered the "prior schema
+exists" case. If a config was created against the very first (never
+superseded) schema_definition, `find_prior_schema_definition_id`
+must return None gracefully — the function does via
+`.ok()` on `query_row`, but nothing exercised it. Added
+`test_chain_walk_returns_none_when_no_prior_exists` as a
+defense-in-depth guard.
+
+**Test gap fill 2 — chain walk determinism under timestamp
+collision.** SQLite's `datetime('now')` writes second-precision
+timestamps. The chain walk's `ORDER BY created_at DESC, id DESC`
+tiebreaker handles this, but nothing asserted the walk stays
+deterministic when two superseded schema_definition rows share a
+created_at (the exact hazard the implementer's helper worked around
+by sleeping 1.1 s in the test fixture). Added
+`test_chain_walk_tiebreaker_under_timestamp_collision` that inserts
+two synthetic superseded rows with identical timestamps and asserts
+the walk returns the same answer twice.
+
+**Doc-comment fix.** `accept_config_migration`'s original doc said
+"All four steps run inside a single transaction so a sync failure
+rolls back the supersession." The actual code does the supersession
++ flag clear inside one transaction, commits, THEN runs
+sync_config_to_operational OUTSIDE the transaction (correct
+behavior — the dispatcher opens inner transactions, and we don't
+want a sync failure to lose the user's accept). Updated the doc
+comment to describe what the code actually does and why.
+
+**Out-of-scope observations (noted, not fixed):**
+
+1. **No real-time count badge update when a new schema_definition is
+   accepted.** ToolsMode fetches `pyramid_list_configs_needing_migration`
+   only on mount and on `migrationRefreshToken` bumps. The token only
+   bumps when the migration panel itself accepts/rejects. If the
+   user supersedes a schema in the Create tab, the Needs Migration
+   count doesn't update until the user navigates away and back. An
+   event-driven refresh would need a new `TaggedKind::ConfigFlagged`
+   variant emitted from `flag_configs_for_migration` plus a frontend
+   listener. Workstream prompt didn't mandate this; leaving as a
+   UX gap for a later polish pass.
+2. **My Tools "Migration needed" chip is not clickable.** The chip
+   is a `<span>` with a tooltip. Clicking it does nothing — the user
+   has to navigate to the Needs Migration tab manually. Workstream
+   prompt said "a small badge on each flagged contribution" without
+   mandating click handlers; leaving as-is.
+3. **Pillar 37 surfaces in the Rust code (not the prompt).** The
+   LLM call hardcodes `temperature: 0.2` and `max_tokens: 4096`.
+   These match `generative_config.rs` exactly (Phase 9). Fixing it
+   in migration_config while leaving it in generative_config would
+   be inconsistent; out of scope for a 18d wanderer pass. The
+   prompt template itself (`chains/prompts/migration/migrate_config.md`)
+   is clean — only structural rules, no numbers constraining output.
+
+**Verification after wanderer fix:**
+
+- `cd src-tauri && cargo check --lib` — clean, 3 pre-existing
+  warnings unchanged.
+- `cd src-tauri && cargo test --lib pyramid::migration_config` —
+  **14 passing / 0 failing** (11 originals + 3 new:
+  `test_chain_walk_returns_none_when_no_prior_exists`,
+  `test_chain_walk_tiebreaker_under_timestamp_collision`,
+  `test_repeated_propose_replaces_prior_draft`).
+- `cd src-tauri && cargo test --lib pyramid` — **1252 passing /
+  7 failing**. The 7 failures are the same pre-existing ones the
+  verifier documented. +3 over the verifier baseline, matching the
+  3 new tests.
+- `npm run build` — clean (152 modules, 803.72 kB bundle, 805 ms).
+
+**Wanderer verdict:** 18d is functionally end-to-end clean after the
+re-propose draft cleanup fix. The 12-question trace found one real
+bug (re-propose draft accumulation), two test gaps (filled), one
+misleading doc comment (updated), and three out-of-scope UX/pattern
+observations. No additional runtime or integration issues surfaced.
+Single additional commit on branch `phase-18d-schema-migration-ui`
+(no amend, no push, no merge).

@@ -2147,3 +2147,108 @@ Documented inline at `folder_ingestion.rs::prepopulate_chunks_for`.
 
 ---
 
+## 2026-04-11 — Phase 18d wanderer
+
+### Bug: re-propose accumulates stale migration drafts
+
+`MigrationReviewModal.handleRetry` (the "Re-propose with guidance"
+button) re-invokes `pyramid_propose_config_migration` with the same
+`contribution_id` and a refined `userNote`. The backend's
+`persist_migration_proposal` always INSERTs a fresh draft row with a
+new UUID, so every retry stranded another
+`status='draft', source='migration', supersedes_id=<original>` row
+that nothing ever cleaned up — the frontend only tracks the latest
+`draft_id`, so the prior drafts sat orphaned in the contribution
+table until `reject_config_migration` was called on each, which
+won't happen because the user only sees the current proposal.
+
+Root cause: the backend treats every propose as a brand-new draft
+while the frontend treats them as edits of the same proposal. The
+contract was implicit; no test covered the retry path. Fixed by
+having `persist_migration_proposal` DELETE any prior
+`supersedes_id = <flagged>` draft (scoped to `status='draft'` AND
+`source='migration'`, matching the same filter
+`reject_config_migration` uses so it can only delete its own drafts)
+inside the same transaction before the INSERT. Added
+`test_repeated_propose_replaces_prior_draft` to assert the
+contract.
+
+Lesson: when the frontend composes a flow out of repeated backend
+calls ("retry" / "refine" buttons that re-enter an already-stateful
+endpoint), the backend needs explicit single-instance semantics.
+Phase 18d's propose IPC was modeled after Phase 9's `generate`,
+which doesn't have a retry path — the analogy broke at the retry
+boundary. A better future pattern: the backend returns the same
+draft_id for repeated proposes on the same flagged row, upserting
+in place. The current fix (delete + insert) achieves the same
+end-state (one draft per flagged row) without breaking the
+"fresh draft_id per proposal" frontend assumption.
+
+### Chain walk test gaps
+
+Verifier called the chain walk "clean" with one test. Wanderer
+found two missing cases:
+- **No prior schema exists.** Config created against the very first
+  schema_definition — no superseded row predates it. Function
+  returns None gracefully but nothing exercised it. Added
+  `test_chain_walk_returns_none_when_no_prior_exists`.
+- **Timestamp collision.** SQLite's `datetime('now')` is
+  second-precision. Two schema_definitions landing in the same
+  second create ambiguous ordering. The walk's
+  `ORDER BY created_at DESC, id DESC` tiebreaker handles this, but
+  nothing asserted the walk was deterministic across runs. Added
+  `test_chain_walk_tiebreaker_under_timestamp_collision`.
+
+Lesson: "the function handles this via `.ok()`" is not equivalent
+to "a test exercises this path." Defensive code paths need
+explicit test coverage or they rot — the next refactor could
+accidentally remove the graceful handling without anything
+catching it.
+
+### Doc/code drift on accept_config_migration
+
+The implementer's original doc comment on `accept_config_migration`
+said the sync ran "inside a single transaction so a sync failure
+rolls back the supersession." The actual code correctly runs sync
+OUTSIDE the transaction (otherwise the dispatcher's inner
+transactions would nest and fail, and a sync failure would lose
+the user's accept). The verifier's log entry also correctly
+described the code behavior. Only the doc comment was wrong.
+Updated to match the code and explain the reasoning.
+
+Lesson: implementers sometimes write the doc comment before they
+finalize the code, describe the intent, and forget to update it
+when the implementation diverges. Doc comments that describe
+transactional boundaries deserve a separate eyeball — they're
+load-bearing for future maintenance.
+
+### Out-of-scope but noted
+
+1. **No real-time flag propagation from Create → Needs Migration
+   tab.** ToolsMode only re-fetches the flagged list on mount and
+   on migration accept/reject. If the user supersedes a schema in
+   the Create tab (which flags downstream configs via the Phase 4
+   dispatcher), the Needs Migration count badge doesn't update
+   until the user navigates the tabs. An event-driven refresh would
+   need a new TaggedKind variant plus a frontend listener. Not a
+   18d correctness bug — just a UX latency gap for polish.
+
+2. **My Tools "Migration needed" chip is informational only.** The
+   chip is a styled `<span>` with a tooltip; clicking it does
+   nothing. Workstream prompt didn't mandate click-to-navigate, but
+   it's the natural expectation — users who see the chip in My
+   Tools assume clicking it takes them to the migration flow. Easy
+   polish target: add an `onClick` that sets the active tab to
+   `"needs-migration"`.
+
+3. **Pillar 37 in the LLM call parameters.** `run_migration_llm_call`
+   hardcodes `temperature: 0.2` and `max_tokens: 4096`. These mirror
+   `generative_config.rs` exactly (Phase 9 pattern). Fixing in 18d
+   without a matching Phase 9 change would be inconsistent. Should
+   be addressed in a unified pass across all LLM call sites that
+   hardcode these values. The migration prompt template itself
+   (`chains/prompts/migration/migrate_config.md`) is clean — no
+   numerical constraints, only structural rules.
+
+---
+
