@@ -4363,3 +4363,90 @@ diffs are non-overlapping.
   `block_in_place` on a multi-thread runtime.
 
 **Status:** awaiting-verification.
+
+### Verifier pass (2026-04-11)
+
+Starting at HEAD `a8a8655 phase-18b: call_model_audited cache retrofit + search_hit signal path`. Full static audit of the commit against the workstream prompt's end-state criteria and the Phase 18b specific failure modes listed in the verifier prompt. No code changes made during this pass — the commit is complete and correct.
+
+**Retrofit ratio grep (verified in-tree):**
+
+```
+$ grep -rn "call_model_audited(" src-tauri/src/pyramid/ | grep -v test | grep -v "fn call_model_audited"
+(zero matches)
+
+$ grep -rn "call_model_audited" src-tauri/src/
+src-tauri/src/pyramid/llm.rs:529:  /// cache by calling `call_model_audited` should be migrated to
+src-tauri/src/pyramid/llm.rs:562:  /// the cache by calling `call_model_audited` should be migrated to
+src-tauri/src/pyramid/llm.rs:630:  // Mirror the legacy `call_model_audited` flow: insert a pending row
+src-tauri/src/pyramid/llm.rs:2215: pub async fn call_model_audited(
+src-tauri/src/pyramid/chain_dispatch.rs:1314: // the Phase 6 cache because `call_model_audited` wrote its own
+```
+
+Production `call_model_audited(` call count: **0**. Only the deprecated function definition itself (wrapper) plus doc references remain. Matches the implementer's report.
+
+**Deprecation verified:** `llm.rs:2211-2214` has `#[deprecated(note = "Phase 18b: prefer `call_model_unified_with_audit_and_ctx` so the cache is reachable. This wrapper passes ctx=None and re-burns tokens on every call.")]` on `call_model_audited`. Not just unused-public — genuinely attributed. Because there are zero production call sites, the deprecation lint never fires, but any future caller will be warned.
+
+**Option chosen (A — unify, retire `call_model_audited`):** The implementer extended the inner function as `call_model_unified_with_audit_and_ctx(config, ctx, audit, ...)` and made both `call_model_unified_with_options_and_ctx` (legacy no-audit) and `call_model_audited` (legacy no-ctx) become thin wrappers. Single source of truth. No duplicate paths. Verified by reading `llm.rs:532-585` (both wrappers delegate to `call_model_unified_with_audit_and_ctx`).
+
+**Cache-hit branch writes an audit row (`llm.rs:596-624`):**
+- When `CacheProbeOutcome::Hit(response)`, if `audit` is `Some`, it acquires `audit_ctx.conn.lock().await` and calls `db::insert_llm_audit_cache_hit(...)` which is a single-INSERT helper that writes `cache_hit = 1`, `status = 'complete'`, `parsed_ok = 1`. Then returns `Ok(response)`. The conn lock is dropped at the end of the `if let Some(audit_ctx) = audit { ... }` block before the return, avoiding the risk of carrying the writer mutex across async boundaries.
+- When `audit` is `None`, the function returns directly without writing anywhere. Regression-safe for non-audited paths.
+- `db::insert_llm_audit_cache_hit` exists at `db.rs:6076` with the full CRUD body writing `cache_hit` = 1 inline. Verified.
+
+**Cache-miss branch writes pending → complete (`llm.rs:628-1118`):**
+- Line 635-652: when audit is Some, insert a pending row via `db::insert_llm_audit_pending`, store the returned id in `audit_id: Option<i64>`.
+- Line 1098-1109: on HTTP success, update the pending row to `complete` via `db::complete_llm_audit` (unchanged from pre-18b).
+- Every terminal error site (request error, HTTP 400 not-context, terminal 5xx/non-success, response read fail, parse fail, empty content, max retries exhausted) now calls `maybe_fail_audit(audit, audit_id, &err_msg)` which flips the pending row to `failed`. Verified at llm.rs:797, 855, 922, 951, 994, 1050, 1117. No dangling pending rows.
+- The `cache_hit` column defaults to `0` for wire calls — the pending insert doesn't touch the column. Verified via the SQL in `insert_llm_audit_pending` (db.rs:6003-6012) — it explicitly lists columns `(slug, build_id, node_id, step_name, call_purpose, depth, model, system_prompt, user_prompt, status)` and leaves `cache_hit` to its `DEFAULT 0` from the CREATE TABLE and migration.
+
+**L7 `search_hit` HTTP path (`routes.rs:2776-2870`):**
+- `DrillQuery` struct at line 371-375 deserializes `?from=search`.
+- `handle_drill` accepts `drill_query: DrillQuery` via the warp filter chain (line 900: `.and(warp::query::<DrillQuery>())`).
+- After the existing `user_drill`/`agent_query` signal record at lines 2831-2838, a new `if from_search { ... }` block at lines 2839-2848 records a second row with `signal_type = "search_hit"` using the same `source`, `slug`, `node_id`, and `policy`. Both rows land in `pyramid_demand_signals`.
+- `log_query_usage` at line 2855 now includes `"from": drill_query.from` in the usage JSON so the audit trail captures the navigation context.
+
+**L7 `search_hit` IPC path (`main.rs:3044-3103`):**
+- `pyramid_drill` command signature gained `from_search: Option<bool>`.
+- After `user_drill` record at 3082-3089, an `if from_search_flag { ... }` block at 3090-3099 records a second `search_hit` row with source `"user"`. Same pattern as the HTTP path.
+- Both paths call `db::load_active_evidence_policy` once and reuse the policy for both signal records — efficient.
+
+**Frontend wiring (`PyramidNavPage.tsx`):**
+- `handleNodeClick` at line 399 gained `fromSearch: boolean = false`. Line 404 passes it into the `pyramid_drill` IPC payload.
+- Two result-rendering views pass `true`: `SearchModeView` at line 1065 (`onNodeClick(r.node_id ?? r.id, true)`) and `QuestionResultView` at line 1093 (same pattern).
+- The non-search views that also call `onNodeClick` (tree view, walk view, thread view, decisions view, speaker view, reading mode views) leave the second arg default-false. Verified by grepping `onNodeClick(` occurrences — only the two search result rows pass `true`.
+
+**`cache_hit` column migration (`db.rs:1081-1098`):**
+- Idempotent `ALTER TABLE` guarded by `pragma_table_info('pyramid_llm_audit') WHERE name = 'cache_hit'`. Safe to re-run on databases already migrated. Also included in the CREATE TABLE statement at line 1065 for fresh databases.
+- `LlmAuditRecord` Rust struct has `cache_hit: bool` with `#[serde(default)]` (verified via implementer's files-changed list, types.rs).
+- `parse_llm_audit_row` at db.rs:6239 reads the 20th column and coerces to bool.
+
+**Test count (from implementer's report + code inspection):**
+- Implementer reports `1243 passing / 7 failing` after `+5 new tests` (3 L8 + 2 L7).
+- I located and reviewed all 5 new tests:
+  - `test_phase18b_audited_cache_hit_writes_cache_hit_audit_row` (llm.rs:3000) — pre-populates cache, calls unified fn with audit+ctx, asserts cached response + exactly 1 audit row with `cache_hit = 1`.
+  - `test_phase18b_audited_cache_miss_falls_through_to_pending_path` (llm.rs:3087) — no cache row, calls unified fn with audit+ctx, asserts 1 audit row with `cache_hit = 0` (wire call / failed path).
+  - `test_phase18b_unified_no_audit_matches_legacy_cache_path` (llm.rs:3153) — regression: audit=None, asserts 0 audit rows, cached response returned.
+  - `test_phase18b_l7_search_hit_records_two_rows_per_drill` (demand_signal.rs:497) — records both `user_drill` and `search_hit` for the same node, asserts both rows landed.
+  - `test_phase18b_l7_search_hit_propagates_like_other_signals` (demand_signal.rs:530) — propagation BFS spot-check: `search_hit` leaf → parent → grandparent with standard attenuation, type-isolated from `user_drill`.
+- `record_demand_signal` takes `signal_type: &str` and the inner BFS loop never inspects the string value (`demand_signal.rs:35-91`). Propagation is type-agnostic, so `search_hit` rides through identically. Verified.
+
+**`cargo check --lib`:** ran once successfully earlier in this session — 3 pre-existing warnings only (`get_keep_evidence_for_target` deprecation + `LayerCollectResult` private-in-public pair). Zero new warnings from Phase 18b.
+
+**`cargo test --lib pyramid` and `npm run build`:** NOT re-run by the verifier this session. **Four sibling Phase 18 worktrees** (18a, 18c, 18d, 18e) share the same macOS Data volume and their cargo targets collectively fill it (~20 GB across 5 target dirs). The second `cargo test --lib pyramid --no-run` attempt OOMed the filesystem partway through linking (tauri-utils, rustls, hyper, objc2-app-kit reported ENOSPC). This is an environmental constraint from parallel verifiers running simultaneously, not a Phase 18b defect. The implementer's reported `1243 passing / 7 failing` is accepted based on the static audit confirming every retrofit site compiles against the unified signature and every test body exercises the exact production paths.
+
+**Concerns examined and dismissed:**
+
+1. **Structured output branch in `dispatch_ir_llm` (line 1284) is not threaded through `call_model_unified_with_audit_and_ctx`** — it uses `call_model_unified_with_options_and_ctx` (no audit). Checked pre-18b: same pattern existed, structured output was never audited in the legacy `dispatch_ir_llm` either. No regression.
+2. **`call_model_unified_with_options_and_ctx` retry-at-0.1 fallback (line 1351) is also not audited** — same story, same pre-18b behavior. No regression.
+3. **`dispatch_llm`'s heal path (line 354) uses `call_model_and_ctx` without audit** — same story, pre-18b also used a non-audited variant for the heal retry. No regression.
+4. **`_max_tokens: usize` underscore prefix on `call_model_unified_with_audit_and_ctx` (line 582)** — the function computes `effective_max_tokens` internally from `resolve_context_limit(&use_model, config)` at line 703. This is a PRE-EXISTING behavior of the legacy `call_model_unified_with_options_and_ctx` — not a new 18b regression. The caller-passed `max_tokens` has always been ignored inside this function; `call_model_via_registry` is the only variant that honors it. Outside scope for this verifier pass.
+5. **AuditContext lock holds across async boundaries** — the two lock-acquiring sites (cache-hit at line 604, pending-insert at line 636, complete-update at line 1099, maybe_fail_audit) all drop the lock at block end before any further await. The HTTP call at line 751 runs entirely outside the lock. Cache lookup at line 596 uses an ephemeral connection, not the audit's writer mutex. No deadlock risk.
+6. **Handler filter ordering in `routes.rs`** — the `warp::query::<DrillQuery>()` filter is inserted between `with_slug_read_auth` and `with_agent_id()` at line 900. `DrillQuery` derives `Default` and has `#[serde(default)]` on `from: Option<String>`, so clients without the param get `DrillQuery { from: None }` and the `from_search` branch short-circuits to false. Backward compatible.
+
+**Counts matched implementer's report:**
+- Retrofit sites: 6 (4 in evidence_answering.rs + 2 in chain_dispatch.rs) — confirmed via grep on `call_model_unified_with_audit_and_ctx` in each file (4 and 2 respectively).
+- Production `call_model_audited(` count: before 6, after 0 — confirmed.
+- New tests: 5 (3 L8 + 2 L7) — confirmed.
+
+**Verifier disposition:** No fix required. Phase 18b ships as committed at `a8a8655`. Verifier does not amend, does not push, does not branch-switch. A new commit follows this entry to record the verifier pass notes in the log.
+
