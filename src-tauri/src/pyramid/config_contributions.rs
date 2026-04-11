@@ -1776,6 +1776,52 @@ mod tests {
         assert!(loaded.slug.is_none());
     }
 
+    /// Phase 17: the folder_ingestion_heuristics sync branch must round-trip
+    /// the extended fields (code/document extensions, Claude Code knobs,
+    /// default scan interval) from YAML into the operational table.
+    #[test]
+    fn test_sync_folder_ingestion_heuristics_with_new_fields() {
+        let conn = mem_conn();
+        let bus = mem_bus();
+        let yaml = "schema_type: folder_ingestion_heuristics\n\
+                    min_files_for_pyramid: 4\n\
+                    max_recursion_depth: 6\n\
+                    max_file_size_bytes: 5000000\n\
+                    default_scan_interval_secs: 60\n\
+                    code_extensions: [\".rs\", \".ts\"]\n\
+                    document_extensions: [\".md\"]\n\
+                    ignore_patterns:\n  - node_modules/\n  - target/\n\
+                    claude_code_auto_include: false\n\
+                    claude_code_conversation_path: /tmp/my-cc\n";
+        let id = create_config_contribution(
+            &conn,
+            "folder_ingestion_heuristics",
+            None,
+            yaml,
+            Some("phase 17 extended sync"),
+            "local",
+            Some("user"),
+            "active",
+        )
+        .unwrap();
+        let contribution = load_contribution_by_id(&conn, &id).unwrap().unwrap();
+        sync_config_to_operational(&conn, &bus, &contribution).unwrap();
+
+        let config = crate::pyramid::db::load_active_folder_ingestion_heuristics(&conn).unwrap();
+        assert_eq!(config.min_files_for_pyramid, 4);
+        assert_eq!(config.max_recursion_depth, 6);
+        assert_eq!(config.max_file_size_bytes, 5_000_000);
+        assert_eq!(config.default_scan_interval_secs, 60);
+        assert_eq!(config.code_extensions, vec![".rs".to_string(), ".ts".to_string()]);
+        assert_eq!(config.document_extensions, vec![".md".to_string()]);
+        assert!(!config.claude_code_auto_include);
+        assert_eq!(config.claude_code_conversation_path, "/tmp/my-cc");
+        assert!(config
+            .ignore_patterns
+            .iter()
+            .any(|p| p == "node_modules/"));
+    }
+
     #[test]
     fn test_double_accept_errors() {
         let mut conn = mem_conn();

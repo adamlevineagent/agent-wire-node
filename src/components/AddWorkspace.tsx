@@ -11,7 +11,60 @@ interface AddWorkspaceProps {
     onCancel: () => void;
 }
 
-type Step = 'directory' | 'content-type' | 'conversation-preset' | 'vine-dirs' | 'configure' | 'question' | 'preview' | 'confirm' | 'building';
+type Step =
+    | 'directory'
+    | 'content-type'
+    | 'conversation-preset'
+    | 'vine-dirs'
+    | 'configure'
+    | 'question'
+    | 'preview'
+    | 'confirm'
+    | 'building'
+    // Phase 17: recursive folder ingestion wizard
+    | 'folder-ingest-pick'
+    | 'folder-ingest-review';
+
+// Phase 17 IPC shapes — must match `folder_ingestion.rs`.
+interface ClaudeCodeConversationDir {
+    encoded_path: string;
+    absolute_path: string;
+    jsonl_count: number;
+    earliest_mtime: string | null;
+    latest_mtime: string | null;
+    is_main: boolean;
+    is_worktree: boolean;
+}
+
+type IngestionOperation =
+    | { op: 'create_pyramid'; slug: string; content_type: string; source_path: string }
+    | { op: 'create_vine'; slug: string; source_path: string }
+    | { op: 'add_child_to_vine'; vine_slug: string; child_slug: string; position: number; child_type: string }
+    | { op: 'register_dadbear_config'; slug: string; source_path: string; content_type: string; scan_interval_secs: number }
+    | { op: 'register_claude_code_pyramid'; slug: string; source_path: string; is_main: boolean; is_worktree: boolean };
+
+interface IngestionPlan {
+    operations: IngestionOperation[];
+    root_slug: string | null;
+    root_source_path: string;
+    total_files: number;
+    total_ignored: number;
+}
+
+interface IngestionResult {
+    pyramids_created: string[];
+    vines_created: string[];
+    dadbear_configs: string[];
+    claude_code_pyramids: string[];
+    compositions_added: number;
+    root_slug: string | null;
+    errors: string[];
+}
+
+interface IngestFolderOutput {
+    plan: IngestionPlan;
+    result: IngestionResult | null;
+}
 
 const PYRAMID_API_BASE = 'http://localhost:8765';
 
@@ -129,6 +182,15 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
     const [previewLoading, setPreviewLoading] = useState(false);
     const [previewResult, setPreviewResult] = useState<BuildPreviewResult | null>(null);
     const [committing, setCommitting] = useState(false);
+    // Phase 17: folder ingestion wizard state
+    const [folderIngestPath, setFolderIngestPath] = useState<string>('');
+    const [ccDirs, setCcDirs] = useState<ClaudeCodeConversationDir[]>([]);
+    const [ccLoading, setCcLoading] = useState(false);
+    const [includeClaudeCode, setIncludeClaudeCode] = useState(true);
+    const [folderPlan, setFolderPlan] = useState<IngestionPlan | null>(null);
+    const [folderPlanLoading, setFolderPlanLoading] = useState(false);
+    const [folderIngestResult, setFolderIngestResult] = useState<IngestionResult | null>(null);
+    const [folderIngestError, setFolderIngestError] = useState<string | null>(null);
     // Model profile selector
     const [profiles, setProfiles] = useState<string[]>([]);
     const [selectedProfile, setSelectedProfile] = useState<string>('');
@@ -192,6 +254,113 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
             setError(String(err));
         }
     }, []);
+
+    // ── Phase 17: Folder ingestion wizard handlers ──────────────────────
+
+    const handlePickFolderForIngestion = useCallback(async () => {
+        try {
+            setFolderIngestError(null);
+            const selected = await open({
+                directory: true,
+                title: 'Select a folder to ingest recursively',
+            });
+            if (!selected) return;
+            const path = selected as string;
+            setFolderIngestPath(path);
+            setFolderPlan(null);
+            setFolderIngestResult(null);
+
+            // Fetch Claude Code conversation dirs for this folder.
+            setCcLoading(true);
+            try {
+                const dirs = await invoke<ClaudeCodeConversationDir[]>(
+                    'pyramid_find_claude_code_conversations',
+                    { targetFolder: path },
+                );
+                setCcDirs(dirs);
+                // Spec: default ON only when at least one match is found.
+                setIncludeClaudeCode(dirs.length > 0);
+            } catch (e) {
+                setCcDirs([]);
+                setIncludeClaudeCode(false);
+                console.warn('find_claude_code_conversations failed', e);
+            } finally {
+                setCcLoading(false);
+            }
+
+            // Run a dry-run plan.
+            setFolderPlanLoading(true);
+            try {
+                const output = await invoke<IngestFolderOutput>('pyramid_ingest_folder', {
+                    input: {
+                        target_folder: path,
+                        include_claude_code: true,
+                        dry_run: true,
+                    },
+                });
+                setFolderPlan(output.plan);
+            } catch (e) {
+                setFolderIngestError(String(e));
+            } finally {
+                setFolderPlanLoading(false);
+            }
+
+            setStep('folder-ingest-review');
+        } catch (err) {
+            setFolderIngestError(String(err));
+        }
+    }, []);
+
+    // Re-plan when includeClaudeCode toggle changes, so the user
+    // sees the CC pyramids land/disappear in the preview.
+    const handleToggleIncludeClaudeCode = useCallback(
+        async (next: boolean) => {
+            setIncludeClaudeCode(next);
+            if (!folderIngestPath) return;
+            setFolderPlanLoading(true);
+            setFolderIngestError(null);
+            try {
+                const output = await invoke<IngestFolderOutput>('pyramid_ingest_folder', {
+                    input: {
+                        target_folder: folderIngestPath,
+                        include_claude_code: next,
+                        dry_run: true,
+                    },
+                });
+                setFolderPlan(output.plan);
+            } catch (e) {
+                setFolderIngestError(String(e));
+            } finally {
+                setFolderPlanLoading(false);
+            }
+        },
+        [folderIngestPath],
+    );
+
+    const handleStartFolderIngestion = useCallback(async () => {
+        if (!folderIngestPath) return;
+        setCommitting(true);
+        setFolderIngestError(null);
+        try {
+            const output = await invoke<IngestFolderOutput>('pyramid_ingest_folder', {
+                input: {
+                    target_folder: folderIngestPath,
+                    include_claude_code: includeClaudeCode,
+                    dry_run: false,
+                },
+            });
+            setFolderPlan(output.plan);
+            setFolderIngestResult(output.result);
+            // If everything succeeded, close the wizard.
+            if (output.result && output.result.errors.length === 0) {
+                onComplete();
+            }
+        } catch (e) {
+            setFolderIngestError(String(e));
+        } finally {
+            setCommitting(false);
+        }
+    }, [folderIngestPath, includeClaudeCode, onComplete]);
 
     const handleAddDirectory = useCallback(async () => {
         try {
@@ -536,6 +705,10 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
 
     // Compute step sequence for the step indicator
     const getStepSequence = (): Step[] => {
+        // Phase 17 folder-ingestion path has its own two-step flow.
+        if (step === 'folder-ingest-pick' || step === 'folder-ingest-review') {
+            return ['directory', 'folder-ingest-review'];
+        }
         if (contentType === 'vine') {
             return ['directory', 'content-type', 'vine-dirs', 'confirm'];
         }
@@ -555,6 +728,8 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
         'preview': 'Preview',
         'confirm': 'Confirm',
         'building': 'Building',
+        'folder-ingest-pick': 'Pick folder',
+        'folder-ingest-review': 'Review',
     };
 
     return (
@@ -645,6 +820,370 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
                     <button className="btn btn-ghost" onClick={onCancel}>
                         Cancel
                     </button>
+
+                    {/* Phase 17: recursive folder ingestion entry point */}
+                    <div
+                        style={{
+                            marginTop: '24px',
+                            paddingTop: '16px',
+                            borderTop: '1px solid var(--border-color, #ddd)',
+                        }}
+                    >
+                        <div
+                            style={{
+                                fontSize: '0.85em',
+                                opacity: 0.7,
+                                marginBottom: '6px',
+                                textTransform: 'uppercase',
+                                letterSpacing: '0.05em',
+                            }}
+                        >
+                            Or
+                        </div>
+                        <button
+                            className="btn btn-secondary"
+                            onClick={handlePickFolderForIngestion}
+                            style={{ marginRight: '8px' }}
+                        >
+                            Point at folder (recursive)
+                        </button>
+                        <p className="hint" style={{ marginTop: '6px', fontSize: '0.85em', opacity: 0.75 }}>
+                            Walk a folder, auto-detect content types, and create a
+                            topical vine hierarchy with one ingest. Claude Code
+                            conversations for the folder are detected and attached
+                            automatically.
+                        </p>
+                    </div>
+                </div>
+            )}
+
+            {/* Phase 17: Folder Ingestion Review */}
+            {step === 'folder-ingest-review' && (
+                <div className="workspace-step-content">
+                    <h2>Review Folder Ingestion</h2>
+
+                    <div className="confirm-field" style={{ marginBottom: '12px' }}>
+                        <label className="field-label">Target folder:</label>
+                        <div className="summary-path" style={{ marginTop: '4px' }}>
+                            {folderIngestPath || '(none selected)'}
+                        </div>
+                    </div>
+
+                    {folderIngestError && (
+                        <div className="workspace-error" style={{ marginBottom: '12px' }}>
+                            {folderIngestError}
+                            <button
+                                className="workspace-error-dismiss"
+                                onClick={() => setFolderIngestError(null)}
+                            >
+                                Dismiss
+                            </button>
+                        </div>
+                    )}
+
+                    {/* Claude Code detection */}
+                    <div
+                        className="confirm-field"
+                        style={{
+                            marginBottom: '16px',
+                            padding: '12px',
+                            border: '1px solid var(--border-color, #ddd)',
+                            borderRadius: '6px',
+                        }}
+                    >
+                        <label
+                            style={{
+                                display: 'flex',
+                                alignItems: 'center',
+                                gap: '8px',
+                                cursor: ccDirs.length > 0 ? 'pointer' : 'not-allowed',
+                                opacity: ccDirs.length > 0 ? 1 : 0.5,
+                            }}
+                        >
+                            <input
+                                type="checkbox"
+                                checked={includeClaudeCode}
+                                disabled={ccDirs.length === 0 || ccLoading || folderPlanLoading}
+                                onChange={(e) => handleToggleIncludeClaudeCode(e.target.checked)}
+                            />
+                            <span style={{ fontWeight: 500 }}>
+                                Include Claude Code conversations related to this folder
+                            </span>
+                        </label>
+                        {ccLoading ? (
+                            <p className="hint" style={{ marginTop: '8px', fontSize: '0.85em' }}>
+                                Scanning ~/.claude/projects...
+                            </p>
+                        ) : ccDirs.length === 0 ? (
+                            <p className="hint" style={{ marginTop: '8px', fontSize: '0.85em' }}>
+                                No matching Claude Code conversation directories were found for
+                                this folder. (Checked ~/.claude/projects for entries whose
+                                encoded path matches the target.)
+                            </p>
+                        ) : (
+                            <div style={{ marginTop: '8px' }}>
+                                <p className="hint" style={{ fontSize: '0.85em' }}>
+                                    Found {ccDirs.length} matching conversation
+                                    {ccDirs.length === 1 ? ' directory' : ' directories'} in
+                                    {' ~/.claude/projects'}:
+                                </p>
+                                <ul
+                                    style={{
+                                        margin: '6px 0 0 16px',
+                                        padding: 0,
+                                        fontSize: '0.85em',
+                                        opacity: 0.85,
+                                        fontFamily: 'var(--font-mono, monospace)',
+                                    }}
+                                >
+                                    {ccDirs.map((dir) => (
+                                        <li
+                                            key={dir.encoded_path}
+                                            style={{ marginBottom: '2px', listStyle: 'disc' }}
+                                        >
+                                            {dir.encoded_path}
+                                            {dir.is_main && (
+                                                <span
+                                                    style={{
+                                                        marginLeft: '6px',
+                                                        padding: '1px 6px',
+                                                        borderRadius: '3px',
+                                                        background: 'var(--accent-color, #4a90e2)',
+                                                        color: '#fff',
+                                                        fontSize: '0.8em',
+                                                    }}
+                                                >
+                                                    main
+                                                </span>
+                                            )}
+                                            {dir.is_worktree && (
+                                                <span
+                                                    style={{
+                                                        marginLeft: '6px',
+                                                        padding: '1px 6px',
+                                                        borderRadius: '3px',
+                                                        background: 'var(--warning-color, #e2a04a)',
+                                                        color: '#fff',
+                                                        fontSize: '0.8em',
+                                                    }}
+                                                >
+                                                    worktree
+                                                </span>
+                                            )}
+                                            <span
+                                                style={{
+                                                    marginLeft: '6px',
+                                                    opacity: 0.6,
+                                                    fontSize: '0.9em',
+                                                }}
+                                            >
+                                                ({dir.jsonl_count} jsonl)
+                                            </span>
+                                        </li>
+                                    ))}
+                                </ul>
+                            </div>
+                        )}
+                    </div>
+
+                    {/* Plan summary */}
+                    {folderPlanLoading ? (
+                        <div className="hint" style={{ marginBottom: '16px' }}>
+                            Planning ingestion...
+                        </div>
+                    ) : folderPlan ? (
+                        <div className="preview-display" style={{ marginBottom: '16px' }}>
+                            <div className="preview-header">Ingestion Plan</div>
+                            <div className="preview-divider" />
+                            <div className="preview-grid">
+                                <div className="preview-row">
+                                    <span className="preview-label">Files scanned</span>
+                                    <span className="preview-value">
+                                        {folderPlan.total_files}{' '}
+                                        {folderPlan.total_ignored > 0 && (
+                                            <span style={{ opacity: 0.6 }}>
+                                                ({folderPlan.total_ignored} ignored)
+                                            </span>
+                                        )}
+                                    </span>
+                                </div>
+                                <div className="preview-row">
+                                    <span className="preview-label">Pyramids</span>
+                                    <span className="preview-value">
+                                        {
+                                            folderPlan.operations.filter(
+                                                (op) => op.op === 'create_pyramid',
+                                            ).length
+                                        }
+                                    </span>
+                                </div>
+                                <div className="preview-row">
+                                    <span className="preview-label">Topical vines</span>
+                                    <span className="preview-value">
+                                        {
+                                            folderPlan.operations.filter(
+                                                (op) => op.op === 'create_vine',
+                                            ).length
+                                        }
+                                    </span>
+                                </div>
+                                <div className="preview-row">
+                                    <span className="preview-label">CC pyramids</span>
+                                    <span className="preview-value">
+                                        {
+                                            folderPlan.operations.filter(
+                                                (op) => op.op === 'register_claude_code_pyramid',
+                                            ).length
+                                        }
+                                    </span>
+                                </div>
+                                <div className="preview-row">
+                                    <span className="preview-label">DADBEAR configs</span>
+                                    <span className="preview-value">
+                                        {
+                                            folderPlan.operations.filter(
+                                                (op) => op.op === 'register_dadbear_config',
+                                            ).length
+                                        }
+                                    </span>
+                                </div>
+                                {folderPlan.root_slug && (
+                                    <div className="preview-row">
+                                        <span className="preview-label">Root slug</span>
+                                        <span className="preview-value">
+                                            <code>{folderPlan.root_slug}</code>
+                                        </span>
+                                    </div>
+                                )}
+                            </div>
+                            <details
+                                style={{ marginTop: '12px', fontSize: '0.85em', opacity: 0.85 }}
+                            >
+                                <summary style={{ cursor: 'pointer' }}>
+                                    Show full operation list
+                                </summary>
+                                <ul
+                                    style={{
+                                        margin: '8px 0 0 16px',
+                                        padding: 0,
+                                        fontFamily: 'var(--font-mono, monospace)',
+                                        maxHeight: '240px',
+                                        overflowY: 'auto',
+                                    }}
+                                >
+                                    {folderPlan.operations.map((op, idx) => {
+                                        let label = '';
+                                        if (op.op === 'create_pyramid') {
+                                            label = `+ pyramid  ${op.slug} (${op.content_type})`;
+                                        } else if (op.op === 'create_vine') {
+                                            label = `+ vine     ${op.slug}`;
+                                        } else if (op.op === 'add_child_to_vine') {
+                                            label = `    attach ${op.child_slug} (${op.child_type}) → ${op.vine_slug}`;
+                                        } else if (op.op === 'register_dadbear_config') {
+                                            label = `    dadbear ${op.slug} every ${op.scan_interval_secs}s`;
+                                        } else if (op.op === 'register_claude_code_pyramid') {
+                                            label = `+ cc       ${op.slug}${op.is_main ? ' (main)' : op.is_worktree ? ' (worktree)' : ''}`;
+                                        }
+                                        return (
+                                            <li
+                                                key={idx}
+                                                style={{
+                                                    listStyle: 'none',
+                                                    fontSize: '0.9em',
+                                                    whiteSpace: 'pre',
+                                                }}
+                                            >
+                                                {label}
+                                            </li>
+                                        );
+                                    })}
+                                </ul>
+                            </details>
+                        </div>
+                    ) : (
+                        <div className="hint" style={{ marginBottom: '16px' }}>
+                            No plan generated yet.
+                        </div>
+                    )}
+
+                    {folderIngestResult && (
+                        <div
+                            className="confirm-summary"
+                            style={{
+                                marginBottom: '16px',
+                                padding: '12px',
+                                border: '1px solid var(--border-color, #ddd)',
+                                borderRadius: '6px',
+                            }}
+                        >
+                            <div className="summary-row">
+                                <span className="summary-label">Pyramids created:</span>
+                                <span className="summary-value">
+                                    {folderIngestResult.pyramids_created.length}
+                                </span>
+                            </div>
+                            <div className="summary-row">
+                                <span className="summary-label">Vines created:</span>
+                                <span className="summary-value">
+                                    {folderIngestResult.vines_created.length}
+                                </span>
+                            </div>
+                            <div className="summary-row">
+                                <span className="summary-label">CC pyramids:</span>
+                                <span className="summary-value">
+                                    {folderIngestResult.claude_code_pyramids.length}
+                                </span>
+                            </div>
+                            <div className="summary-row">
+                                <span className="summary-label">DADBEAR configs:</span>
+                                <span className="summary-value">
+                                    {folderIngestResult.dadbear_configs.length}
+                                </span>
+                            </div>
+                            <div className="summary-row">
+                                <span className="summary-label">Compositions added:</span>
+                                <span className="summary-value">
+                                    {folderIngestResult.compositions_added}
+                                </span>
+                            </div>
+                            {folderIngestResult.errors.length > 0 && (
+                                <div className="summary-row">
+                                    <span className="summary-label">Errors:</span>
+                                    <span className="summary-value" style={{ color: '#ef4444' }}>
+                                        {folderIngestResult.errors.length}
+                                    </span>
+                                </div>
+                            )}
+                        </div>
+                    )}
+
+                    <div className="step-nav">
+                        <button
+                            className="btn btn-ghost"
+                            onClick={() => {
+                                setStep('directory');
+                                setFolderPlan(null);
+                                setFolderIngestResult(null);
+                                setCcDirs([]);
+                                setFolderIngestPath('');
+                            }}
+                        >
+                            Back
+                        </button>
+                        <button
+                            className="btn btn-primary"
+                            onClick={handleStartFolderIngestion}
+                            disabled={
+                                committing ||
+                                folderPlanLoading ||
+                                !folderPlan ||
+                                folderPlan.operations.length === 0 ||
+                                folderIngestResult !== null
+                            }
+                        >
+                            {committing ? 'Creating...' : 'Start ingestion'}
+                        </button>
+                    </div>
                 </div>
             )}
 

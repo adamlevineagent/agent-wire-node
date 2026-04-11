@@ -1720,6 +1720,13 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
             respect_gitignore INTEGER NOT NULL DEFAULT 1,
             respect_pyramid_ignore INTEGER NOT NULL DEFAULT 1,
             vine_collapse_single_child INTEGER NOT NULL DEFAULT 1,
+            -- Phase 17: code/document extension lists, DADBEAR default scan
+            -- interval, and Claude Code auto-include knobs.
+            default_scan_interval_secs INTEGER NOT NULL DEFAULT 30,
+            code_extensions_json TEXT NOT NULL DEFAULT '[]',
+            document_extensions_json TEXT NOT NULL DEFAULT '[]',
+            claude_code_auto_include INTEGER NOT NULL DEFAULT 1,
+            claude_code_conversation_path TEXT NOT NULL DEFAULT '~/.claude/projects',
             contribution_id TEXT NOT NULL
                 REFERENCES pyramid_config_contributions(contribution_id),
             updated_at TEXT DEFAULT (datetime('now')),
@@ -1793,6 +1800,50 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
             ON pyramid_wire_update_cache(acknowledged_at);
         ",
     )?;
+
+    // Phase 17: idempotent ALTER TABLE for folder_ingestion_heuristics to add
+    // the new Claude Code / extensions / scan-interval columns for databases
+    // that pre-date Phase 17. The CREATE TABLE above already ships the Phase 17
+    // shape, but an older DB with the Phase 4 shape needs ALTERs run before
+    // any Phase 17 reader touches the table.
+    {
+        let check_and_add = |col: &str, ddl: &str| -> Result<()> {
+            let exists: bool = conn
+                .prepare(
+                    "SELECT 1 FROM pragma_table_info('pyramid_folder_ingestion_heuristics') WHERE name = ?1",
+                )?
+                .exists(rusqlite::params![col])?;
+            if !exists {
+                conn.execute(ddl, [])?;
+            }
+            Ok(())
+        };
+        check_and_add(
+            "default_scan_interval_secs",
+            "ALTER TABLE pyramid_folder_ingestion_heuristics
+             ADD COLUMN default_scan_interval_secs INTEGER NOT NULL DEFAULT 30",
+        )?;
+        check_and_add(
+            "code_extensions_json",
+            "ALTER TABLE pyramid_folder_ingestion_heuristics
+             ADD COLUMN code_extensions_json TEXT NOT NULL DEFAULT '[]'",
+        )?;
+        check_and_add(
+            "document_extensions_json",
+            "ALTER TABLE pyramid_folder_ingestion_heuristics
+             ADD COLUMN document_extensions_json TEXT NOT NULL DEFAULT '[]'",
+        )?;
+        check_and_add(
+            "claude_code_auto_include",
+            "ALTER TABLE pyramid_folder_ingestion_heuristics
+             ADD COLUMN claude_code_auto_include INTEGER NOT NULL DEFAULT 1",
+        )?;
+        check_and_add(
+            "claude_code_conversation_path",
+            "ALTER TABLE pyramid_folder_ingestion_heuristics
+             ADD COLUMN claude_code_conversation_path TEXT NOT NULL DEFAULT '~/.claude/projects'",
+        )?;
+    }
 
     // Idempotent column addition — adds `contribution_id` to the existing
     // `pyramid_dadbear_config` rows so DADBEAR gains the same provenance
@@ -13503,7 +13554,13 @@ pub fn upsert_custom_prompts(
     Ok(())
 }
 
-/// Minimal folder ingestion heuristics YAML struct. Extended in Phase 17.
+/// Folder ingestion heuristics YAML struct.
+///
+/// Phase 4 introduced the core fields. Phase 17 extends it with the
+/// Claude Code auto-include toggle, extension lists, and the DADBEAR
+/// default scan interval. Every field is optional so a minimal YAML
+/// (only `schema_type`) validates cleanly and picks up the loader
+/// defaults.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct FolderIngestionHeuristicsYaml {
     #[serde(default = "default_min_files_for_pyramid")]
@@ -13522,6 +13579,17 @@ pub struct FolderIngestionHeuristicsYaml {
     pub respect_pyramid_ignore: bool,
     #[serde(default = "default_true")]
     pub vine_collapse_single_child: bool,
+    // ── Phase 17 extensions ──
+    #[serde(default = "default_scan_interval_secs")]
+    pub default_scan_interval_secs: i64,
+    #[serde(default)]
+    pub code_extensions: Option<Vec<String>>,
+    #[serde(default)]
+    pub document_extensions: Option<Vec<String>>,
+    #[serde(default = "default_true")]
+    pub claude_code_auto_include: bool,
+    #[serde(default = "default_claude_code_conversation_path")]
+    pub claude_code_conversation_path: String,
 }
 
 fn default_min_files_for_pyramid() -> i64 {
@@ -13536,8 +13604,188 @@ fn default_max_recursion_depth() -> i64 {
 fn default_true() -> bool {
     true
 }
+fn default_scan_interval_secs() -> i64 {
+    30
+}
+fn default_claude_code_conversation_path() -> String {
+    "~/.claude/projects".to_string()
+}
+
+/// Phase 17: fully-resolved folder ingestion config, with every field
+/// defaulted. Returned by `load_active_folder_ingestion_heuristics`.
+#[derive(Debug, Clone)]
+pub struct FolderIngestionConfig {
+    pub min_files_for_pyramid: usize,
+    pub max_file_size_bytes: u64,
+    pub max_recursion_depth: usize,
+    pub default_scan_interval_secs: u64,
+    pub code_extensions: Vec<String>,
+    pub document_extensions: Vec<String>,
+    pub ignore_patterns: Vec<String>,
+    pub respect_gitignore: bool,
+    pub respect_pyramid_ignore: bool,
+    pub vine_collapse_single_child: bool,
+    pub claude_code_auto_include: bool,
+    pub claude_code_conversation_path: String,
+}
+
+impl Default for FolderIngestionConfig {
+    fn default() -> Self {
+        Self {
+            min_files_for_pyramid: 3,
+            max_file_size_bytes: 10_485_760,
+            max_recursion_depth: 10,
+            default_scan_interval_secs: 30,
+            code_extensions: default_code_extensions(),
+            document_extensions: default_document_extensions(),
+            ignore_patterns: default_ignore_patterns(),
+            respect_gitignore: true,
+            respect_pyramid_ignore: true,
+            vine_collapse_single_child: true,
+            claude_code_auto_include: true,
+            claude_code_conversation_path: "~/.claude/projects".to_string(),
+        }
+    }
+}
+
+/// Phase 17: seed list of code file extensions (lowercase, with leading dot).
+pub fn default_code_extensions() -> Vec<String> {
+    [
+        ".rs", ".ts", ".tsx", ".py", ".go", ".js", ".jsx", ".java", ".rb",
+        ".c", ".cpp", ".h", ".hpp", ".cs", ".swift", ".kt",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+/// Phase 17: seed list of document file extensions (lowercase, with leading dot).
+pub fn default_document_extensions() -> Vec<String> {
+    [".md", ".txt", ".pdf", ".doc", ".docx", ".rst", ".org"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// Phase 17: seed list of bundled ignore patterns.
+pub fn default_ignore_patterns() -> Vec<String> {
+    [
+        "node_modules/",
+        "target/",
+        ".git/",
+        "*.lock",
+        "*.bin",
+        "*.exe",
+        "*.dylib",
+        ".DS_Store",
+        "__pycache__/",
+        "dist/",
+        "build/",
+        ".venv/",
+        "venv/",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+/// Phase 17: load the active `folder_ingestion_heuristics` contribution and
+/// return a `FolderIngestionConfig` with every field resolved.
+///
+/// Resolution order:
+/// 1. Row in `pyramid_folder_ingestion_heuristics` for `slug = NULL` (the
+///    global default written on contribution sync).
+/// 2. If absent, returns `FolderIngestionConfig::default()` so the folder
+///    ingester always has a workable config even on a pristine DB.
+pub fn load_active_folder_ingestion_heuristics(conn: &Connection) -> Result<FolderIngestionConfig> {
+    let row: Option<(
+        i64, i64, i64, String, String, i64, i64, i64, i64, String, String, String,
+    )> = conn
+        .query_row(
+            "SELECT min_files_for_pyramid, max_file_size_bytes, max_recursion_depth,
+                    code_extensions_json, document_extensions_json,
+                    default_scan_interval_secs, respect_gitignore, respect_pyramid_ignore,
+                    vine_collapse_single_child, ignore_patterns_json,
+                    claude_code_conversation_path, '' || claude_code_auto_include
+             FROM pyramid_folder_ingestion_heuristics
+             WHERE slug IS NULL",
+            [],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, i64>(5)?,
+                    r.get::<_, i64>(6)?,
+                    r.get::<_, i64>(7)?,
+                    r.get::<_, i64>(8)?,
+                    r.get::<_, String>(9)?,
+                    r.get::<_, String>(10)?,
+                    r.get::<_, String>(11)?,
+                ))
+            },
+        )
+        .optional()?;
+
+    let defaults = FolderIngestionConfig::default();
+    let Some((
+        min_files,
+        max_size,
+        max_depth,
+        code_ext_json,
+        doc_ext_json,
+        scan_interval,
+        respect_git,
+        respect_pyramid,
+        collapse_single,
+        ignore_json,
+        cc_path,
+        cc_auto,
+    )) = row
+    else {
+        return Ok(defaults);
+    };
+
+    let code_extensions: Vec<String> = match serde_json::from_str::<Vec<String>>(&code_ext_json) {
+        Ok(v) if !v.is_empty() => v,
+        _ => defaults.code_extensions,
+    };
+    let document_extensions: Vec<String> = match serde_json::from_str::<Vec<String>>(&doc_ext_json)
+    {
+        Ok(v) if !v.is_empty() => v,
+        _ => defaults.document_extensions,
+    };
+    let ignore_patterns: Vec<String> = match serde_json::from_str::<Vec<String>>(&ignore_json) {
+        Ok(v) if !v.is_empty() => v,
+        _ => defaults.ignore_patterns,
+    };
+
+    Ok(FolderIngestionConfig {
+        min_files_for_pyramid: min_files.max(1) as usize,
+        max_file_size_bytes: max_size.max(1) as u64,
+        max_recursion_depth: max_depth.max(1) as usize,
+        default_scan_interval_secs: scan_interval.max(1) as u64,
+        code_extensions,
+        document_extensions,
+        ignore_patterns,
+        respect_gitignore: respect_git != 0,
+        respect_pyramid_ignore: respect_pyramid != 0,
+        vine_collapse_single_child: collapse_single != 0,
+        claude_code_auto_include: cc_auto.trim() != "0",
+        claude_code_conversation_path: if cc_path.is_empty() {
+            defaults.claude_code_conversation_path
+        } else {
+            cc_path
+        },
+    })
+}
 
 /// UPSERT a folder ingestion heuristics row keyed on slug.
+///
+/// Phase 17: writes the extended columns (code/document extension lists,
+/// DADBEAR scan interval, Claude Code auto-include toggle + path).
 pub fn upsert_folder_ingestion_heuristics(
     conn: &Connection,
     slug: &Option<String>,
@@ -13554,14 +13802,26 @@ pub fn upsert_folder_ingestion_heuristics(
         .as_ref()
         .and_then(|v| serde_json::to_string(v).ok())
         .unwrap_or_else(|| "[]".into());
+    let code_extensions_json = yaml
+        .code_extensions
+        .as_ref()
+        .and_then(|v| serde_json::to_string(v).ok())
+        .unwrap_or_else(|| "[]".into());
+    let document_extensions_json = yaml
+        .document_extensions
+        .as_ref()
+        .and_then(|v| serde_json::to_string(v).ok())
+        .unwrap_or_else(|| "[]".into());
 
     conn.execute(
         "INSERT OR REPLACE INTO pyramid_folder_ingestion_heuristics (
             slug, min_files_for_pyramid, max_file_size_bytes, max_recursion_depth,
             content_type_rules_json, ignore_patterns_json,
             respect_gitignore, respect_pyramid_ignore, vine_collapse_single_child,
+            default_scan_interval_secs, code_extensions_json, document_extensions_json,
+            claude_code_auto_include, claude_code_conversation_path,
             contribution_id, updated_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, datetime('now'))",
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, datetime('now'))",
         rusqlite::params![
             slug,
             yaml.min_files_for_pyramid,
@@ -13572,6 +13832,11 @@ pub fn upsert_folder_ingestion_heuristics(
             yaml.respect_gitignore as i64,
             yaml.respect_pyramid_ignore as i64,
             yaml.vine_collapse_single_child as i64,
+            yaml.default_scan_interval_secs,
+            code_extensions_json,
+            document_extensions_json,
+            yaml.claude_code_auto_include as i64,
+            yaml.claude_code_conversation_path,
             contribution_id,
         ],
     )?;
@@ -16506,5 +16771,150 @@ mod phase16_tests {
         assert_eq!(comps.len(), 1);
         assert_eq!(comps[0].child_type, "vine");
         assert_eq!(comps[0].position, 5);
+    }
+}
+
+#[cfg(test)]
+mod phase17_tests {
+    //! Phase 17 tests: extended folder_ingestion_heuristics schema
+    //! + config loader.
+    use super::*;
+
+    fn mem_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        init_pyramid_db(&conn).unwrap();
+        conn
+    }
+
+    fn seed_config_contribution(conn: &Connection, contribution_id: &str, schema_type: &str) {
+        conn.execute(
+            "INSERT INTO pyramid_config_contributions
+                (contribution_id, schema_type, slug, yaml_content, wire_native_metadata_json,
+                 source, status, created_at)
+             VALUES (?1, ?2, NULL, 'schema_type: folder_ingestion_heuristics',
+                 '{}', 'bundled', 'active', datetime('now'))",
+            rusqlite::params![contribution_id, schema_type],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_folder_ingestion_heuristics_schema_has_new_columns() {
+        let conn = mem_conn();
+        for col in [
+            "default_scan_interval_secs",
+            "code_extensions_json",
+            "document_extensions_json",
+            "claude_code_auto_include",
+            "claude_code_conversation_path",
+        ] {
+            let exists: bool = conn
+                .prepare(
+                    "SELECT 1 FROM pragma_table_info('pyramid_folder_ingestion_heuristics')
+                     WHERE name = ?1",
+                )
+                .unwrap()
+                .exists(rusqlite::params![col])
+                .unwrap();
+            assert!(exists, "missing column: {}", col);
+        }
+    }
+
+    #[test]
+    fn test_folder_ingestion_heuristics_yaml_roundtrip_with_new_fields() {
+        let conn = mem_conn();
+        seed_config_contribution(&conn, "cb-1", "folder_ingestion_heuristics");
+
+        let yaml = FolderIngestionHeuristicsYaml {
+            min_files_for_pyramid: 5,
+            max_file_size_bytes: 20_000,
+            max_recursion_depth: 4,
+            content_type_rules: None,
+            ignore_patterns: Some(serde_yaml::Value::Sequence(vec![
+                serde_yaml::Value::String("node_modules/".to_string()),
+                serde_yaml::Value::String("target/".to_string()),
+            ])),
+            respect_gitignore: true,
+            respect_pyramid_ignore: true,
+            vine_collapse_single_child: false,
+            default_scan_interval_secs: 45,
+            code_extensions: Some(vec![".rs".to_string(), ".ts".to_string()]),
+            document_extensions: Some(vec![".md".to_string()]),
+            claude_code_auto_include: false,
+            claude_code_conversation_path: "/tmp/cc".to_string(),
+        };
+
+        upsert_folder_ingestion_heuristics(&conn, &None, &yaml, "cb-1").unwrap();
+
+        let config = load_active_folder_ingestion_heuristics(&conn).unwrap();
+        assert_eq!(config.min_files_for_pyramid, 5);
+        assert_eq!(config.max_file_size_bytes, 20_000);
+        assert_eq!(config.max_recursion_depth, 4);
+        assert_eq!(config.default_scan_interval_secs, 45);
+        assert_eq!(config.code_extensions, vec![".rs".to_string(), ".ts".to_string()]);
+        assert_eq!(config.document_extensions, vec![".md".to_string()]);
+        assert!(!config.claude_code_auto_include);
+        assert_eq!(config.claude_code_conversation_path, "/tmp/cc");
+        assert_eq!(
+            config.ignore_patterns,
+            vec!["node_modules/".to_string(), "target/".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_load_active_folder_ingestion_heuristics_defaults_when_empty() {
+        let conn = mem_conn();
+        // No row in the table at all — loader should return the
+        // bundled defaults instead of erroring.
+        let config = load_active_folder_ingestion_heuristics(&conn).unwrap();
+        assert_eq!(config.min_files_for_pyramid, 3);
+        assert_eq!(config.max_recursion_depth, 10);
+        assert_eq!(config.default_scan_interval_secs, 30);
+        assert!(config.claude_code_auto_include);
+        assert_eq!(
+            config.claude_code_conversation_path,
+            "~/.claude/projects".to_string()
+        );
+        assert!(config.code_extensions.contains(&".rs".to_string()));
+        assert!(config.document_extensions.contains(&".md".to_string()));
+        assert!(config.ignore_patterns.iter().any(|p| p == "node_modules/"));
+    }
+
+    #[test]
+    fn test_load_active_folder_ingestion_heuristics_empty_lists_fall_back() {
+        // If the stored row has empty JSON arrays, the loader should
+        // populate the lists with the seed defaults so ingestion
+        // never runs with a silently-empty extension set.
+        let conn = mem_conn();
+        seed_config_contribution(&conn, "cb-2", "folder_ingestion_heuristics");
+
+        let yaml = FolderIngestionHeuristicsYaml {
+            min_files_for_pyramid: 3,
+            max_file_size_bytes: 100,
+            max_recursion_depth: 10,
+            content_type_rules: None,
+            ignore_patterns: Some(serde_yaml::Value::Sequence(Vec::new())),
+            respect_gitignore: true,
+            respect_pyramid_ignore: true,
+            vine_collapse_single_child: true,
+            default_scan_interval_secs: 30,
+            code_extensions: Some(Vec::new()),
+            document_extensions: Some(Vec::new()),
+            claude_code_auto_include: true,
+            claude_code_conversation_path: String::new(),
+        };
+        upsert_folder_ingestion_heuristics(&conn, &None, &yaml, "cb-2").unwrap();
+
+        let config = load_active_folder_ingestion_heuristics(&conn).unwrap();
+        assert!(
+            !config.code_extensions.is_empty(),
+            "loader should hydrate empty code_extensions from defaults"
+        );
+        assert!(!config.document_extensions.is_empty());
+        assert!(!config.ignore_patterns.is_empty());
+        assert_eq!(
+            config.claude_code_conversation_path,
+            "~/.claude/projects".to_string()
+        );
     }
 }

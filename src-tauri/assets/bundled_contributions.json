@@ -145,6 +145,13 @@
     },
 
     {
+      "contribution_id": "bundled-folder_ingestion_heuristics-default-v1",
+      "schema_type": "folder_ingestion_heuristics",
+      "slug": null,
+      "yaml_content": "schema_type: folder_ingestion_heuristics\n# Phase 17 seed: defaults for recursive folder ingestion. Users can\n# override any of these via a refined contribution on the Wire.\nmin_files_for_pyramid: 3\nmax_recursion_depth: 10\nmax_file_size_bytes: 10485760\ndefault_scan_interval_secs: 30\ncode_extensions: [\".rs\", \".ts\", \".tsx\", \".py\", \".go\", \".js\", \".jsx\", \".java\", \".rb\", \".c\", \".cpp\", \".h\", \".hpp\", \".cs\", \".swift\", \".kt\"]\ndocument_extensions: [\".md\", \".txt\", \".pdf\", \".doc\", \".docx\", \".rst\", \".org\"]\nignore_patterns:\n  - \"node_modules/\"\n  - \"target/\"\n  - \".git/\"\n  - \"*.lock\"\n  - \"*.bin\"\n  - \"*.exe\"\n  - \"*.dylib\"\n  - \".DS_Store\"\n  - \"__pycache__/\"\n  - \"dist/\"\n  - \"build/\"\n  - \".venv/\"\n  - \"venv/\"\nrespect_gitignore: true\nrespect_pyramid_ignore: true\nvine_collapse_single_child: true\nclaude_code_auto_include: true\nclaude_code_conversation_path: \"~/.claude/projects\"\n",
+      "triggering_note": "Bundled default folder_ingestion_heuristics (wire-node v0.2.0)"
+    },
+    {
       "contribution_id": "bundled-wire_discovery_weights-default-v1",
       "schema_type": "wire_discovery_weights",
       "slug": null,
