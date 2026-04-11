@@ -17,6 +17,11 @@ import { invoke } from "@tauri-apps/api/core";
 import yaml from "js-yaml";
 import { LOCAL_TOOLS } from "../../config/wire-actions";
 import { useAppContext } from "../../contexts/AppContext";
+import {
+    takeToolsModePreset,
+    TOOLS_MODE_PRESET_EVENT,
+    type ToolsModePreset,
+} from "../../utils/toolsModeBridge";
 import { YamlConfigRenderer } from "../YamlConfigRenderer";
 import { useYamlRendererSources } from "../../hooks/useYamlRendererSources";
 import { PublishPreviewModal } from "../PublishPreviewModal";
@@ -67,6 +72,14 @@ interface CreateSeed {
 export function ToolsMode() {
     const [activeTab, setActiveTab] = useState<ToolsTab>("my-tools");
     const [createSeed, setCreateSeed] = useState<CreateSeed | null>(null);
+    // Phase 15: preset bridge — a one-shot "please pick this schema
+    // and jump to the intent step" signal from other parts of the
+    // app (e.g. the DADBEAR Oversight "Set Default Norms" button).
+    // Distinct from `createSeed` because the preset has no base YAML
+    // or contribution id; it just drives a `pick-schema` dispatch.
+    const [createPreset, setCreatePreset] = useState<ToolsModePreset | null>(
+        null,
+    );
 
     const openCreateFrom = useCallback((seed: CreateSeed) => {
         setCreateSeed(seed);
@@ -74,6 +87,29 @@ export function ToolsMode() {
     }, []);
 
     const clearSeed = useCallback(() => setCreateSeed(null), []);
+    const clearPreset = useCallback(() => setCreatePreset(null), []);
+
+    // Phase 15: consume any preset queued by the bridge at mount time
+    // AND subscribe to the custom event so presets queued while
+    // ToolsMode is already mounted take effect immediately.
+    useEffect(() => {
+        const existing = takeToolsModePreset();
+        if (existing) {
+            setCreatePreset(existing);
+            setActiveTab("create");
+        }
+        const handler = (e: Event) => {
+            const detail = (e as CustomEvent<ToolsModePreset>).detail;
+            if (detail) {
+                setCreatePreset(detail);
+                setActiveTab("create");
+            }
+        };
+        window.addEventListener(TOOLS_MODE_PRESET_EVENT, handler);
+        return () => {
+            window.removeEventListener(TOOLS_MODE_PRESET_EVENT, handler);
+        };
+    }, []);
 
     return (
         <div className="mode-container">
@@ -110,7 +146,12 @@ export function ToolsMode() {
                 )}
                 {activeTab === "discover" && <DiscoverPanel />}
                 {activeTab === "create" && (
-                    <CreatePanel seed={createSeed} onSeedConsumed={clearSeed} />
+                    <CreatePanel
+                        seed={createSeed}
+                        onSeedConsumed={clearSeed}
+                        preset={createPreset}
+                        onPresetConsumed={clearPreset}
+                    />
                 )}
             </div>
         </div>
@@ -1365,9 +1406,19 @@ function createReducer(state: CreateState, action: CreateAction): CreateState {
 interface CreatePanelProps {
     seed: CreateSeed | null;
     onSeedConsumed: () => void;
+    // Phase 15: one-shot preset that picks a schema and jumps to the
+    // intent step without a seeded draft. Used by the DADBEAR
+    // Oversight "Set Default Norms" button.
+    preset?: ToolsModePreset | null;
+    onPresetConsumed?: () => void;
 }
 
-function CreatePanel({ seed, onSeedConsumed }: CreatePanelProps) {
+function CreatePanel({
+    seed,
+    onSeedConsumed,
+    preset,
+    onPresetConsumed,
+}: CreatePanelProps) {
     const [state, dispatch] = useReducer(createReducer, initialCreateState);
 
     // ── Load schemas on mount ───────────────────────────────────────────────
@@ -1430,6 +1481,22 @@ function CreatePanel({ seed, onSeedConsumed }: CreatePanelProps) {
         });
         onSeedConsumed();
     }, [seed, state.schemas, onSeedConsumed]);
+
+    // ── Phase 15: Consume preset (schema-only pre-selection) ──────────────
+    //
+    // The DADBEAR Oversight "Set Default Norms" button dispatches a
+    // preset { schemaType: 'dadbear_policy', slug: null }. We jump
+    // straight to the intent step so the user can write a norm
+    // adjustment directly without picking a schema from the list.
+    useEffect(() => {
+        if (!preset || state.schemas.length === 0) return;
+        const schema = state.schemas.find(
+            (s) => s.schema_type === preset.schemaType,
+        );
+        if (!schema) return;
+        dispatch({ type: "pick-schema", schema, slug: preset.slug ?? null });
+        onPresetConsumed?.();
+    }, [preset, state.schemas, onPresetConsumed]);
 
     // ── Renderer sources hook (dynamic options + cost estimates) ───────────
 
