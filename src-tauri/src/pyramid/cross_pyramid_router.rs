@@ -132,13 +132,23 @@ impl CrossPyramidEventRouter {
     /// broadcast subscriber. Lag events (when the broadcast channel
     /// overflows) are converted into a resync hint — frontend
     /// timelines poll `pyramid_active_builds` on resync to recover.
+    ///
+    /// Uses `tauri::async_runtime::spawn` (not `tokio::spawn`)
+    /// because this is called from `tauri::Builder::setup()`, which
+    /// runs on the main thread before Tauri's managed Tokio runtime
+    /// is the ambient runtime. `tokio::spawn` panics in that
+    /// context with "there is no reactor running". Tauri's managed
+    /// runtime IS ready by `setup()` time, so routing through
+    /// `async_runtime::spawn` spawns the task on the correct
+    /// runtime. Matches the pattern Phase 14's verifier fix applied
+    /// to `spawn_wire_update_poller`.
     pub fn spawn_tauri_forwarder(
         router: Arc<Self>,
         bus: Arc<BuildEventBus>,
         app_handle: tauri::AppHandle,
     ) {
         let mut rx = bus.subscribe();
-        tokio::spawn(async move {
+        tauri::async_runtime::spawn(async move {
             use tauri::Emitter;
             loop {
                 match rx.recv().await {
