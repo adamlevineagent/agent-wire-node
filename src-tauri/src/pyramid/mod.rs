@@ -22,6 +22,7 @@ pub mod chain_registry;
 pub mod chain_resolve;
 pub mod characterize;
 pub mod collapse;
+pub mod config_contributions;
 pub mod config_helper;
 pub mod converge_expand;
 pub mod cost_model;

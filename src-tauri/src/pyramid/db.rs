@@ -1333,6 +1333,248 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
     // we don't clobber user-customized rows on subsequent boots.
     seed_default_provider_registry(conn)?;
 
+    // ── Phase 4: Config Contribution Foundation ───────────────────────────────
+    //
+    // Per `docs/specs/config-contribution-and-wire-sharing.md`. Every
+    // behavioral configuration in Wire Node is a contribution: not a
+    // separate table, but a row in `pyramid_config_contributions` with a
+    // supersession chain, a triggering note, and Wire shareability. The
+    // existing operational tables (`pyramid_dadbear_config`,
+    // `pyramid_tier_routing`, `pyramid_step_overrides`, and the four new
+    // tables below) remain as runtime caches — fast lookup for the
+    // executor's hot path, populated by
+    // `config_contributions::sync_config_to_operational()` whenever a
+    // contribution is activated.
+    //
+    // `wire_native_metadata_json` and `wire_publication_state_json` are
+    // stored as opaque JSON strings in Phase 4. Phase 5 introduces the
+    // canonical `WireNativeMetadata` struct and validates the JSON
+    // against it; Phase 4 just initializes them to `"{}"` on every new
+    // contribution.
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS pyramid_config_contributions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            contribution_id TEXT NOT NULL UNIQUE,
+            slug TEXT,
+            schema_type TEXT NOT NULL,
+            yaml_content TEXT NOT NULL,
+            wire_native_metadata_json TEXT NOT NULL DEFAULT '{}',
+            wire_publication_state_json TEXT NOT NULL DEFAULT '{}',
+            supersedes_id TEXT,
+            superseded_by_id TEXT,
+            triggering_note TEXT,
+            status TEXT NOT NULL DEFAULT 'active',
+            source TEXT NOT NULL DEFAULT 'local',
+            wire_contribution_id TEXT,
+            created_by TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            accepted_at TEXT,
+            FOREIGN KEY (supersedes_id) REFERENCES pyramid_config_contributions(contribution_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_config_contrib_slug_type
+            ON pyramid_config_contributions(slug, schema_type);
+        CREATE INDEX IF NOT EXISTS idx_config_contrib_active
+            ON pyramid_config_contributions(slug, schema_type, status)
+            WHERE status = 'active';
+        CREATE INDEX IF NOT EXISTS idx_config_contrib_supersedes
+            ON pyramid_config_contributions(supersedes_id);
+        CREATE INDEX IF NOT EXISTS idx_config_contrib_wire
+            ON pyramid_config_contributions(wire_contribution_id);
+
+        -- ── Phase 4 operational tables ─────────────────────────────────────
+        -- These are runtime caches populated by sync_config_to_operational().
+        -- They are NOT written directly; every row carries a contribution_id
+        -- FK back to pyramid_config_contributions.contribution_id so the
+        -- executor can always resolve an operational value to the
+        -- contribution that produced it.
+
+        CREATE TABLE IF NOT EXISTS pyramid_evidence_policy (
+            slug TEXT,
+            triage_rules_json TEXT NOT NULL DEFAULT '[]',
+            demand_signals_json TEXT NOT NULL DEFAULT '[]',
+            budget_json TEXT NOT NULL DEFAULT '{}',
+            contribution_id TEXT NOT NULL
+                REFERENCES pyramid_config_contributions(contribution_id),
+            updated_at TEXT DEFAULT (datetime('now')),
+            PRIMARY KEY (slug)
+        );
+
+        CREATE TABLE IF NOT EXISTS pyramid_build_strategy (
+            slug TEXT,
+            initial_build_json TEXT NOT NULL DEFAULT '{}',
+            maintenance_json TEXT NOT NULL DEFAULT '{}',
+            quality_json TEXT NOT NULL DEFAULT '{}',
+            contribution_id TEXT NOT NULL
+                REFERENCES pyramid_config_contributions(contribution_id),
+            updated_at TEXT DEFAULT (datetime('now')),
+            PRIMARY KEY (slug)
+        );
+
+        CREATE TABLE IF NOT EXISTS pyramid_custom_prompts (
+            slug TEXT,
+            extraction_focus TEXT,
+            synthesis_style TEXT,
+            vocabulary_priority_json TEXT,
+            ignore_patterns_json TEXT,
+            contribution_id TEXT NOT NULL
+                REFERENCES pyramid_config_contributions(contribution_id),
+            updated_at TEXT DEFAULT (datetime('now')),
+            PRIMARY KEY (slug)
+        );
+
+        CREATE TABLE IF NOT EXISTS pyramid_folder_ingestion_heuristics (
+            slug TEXT,
+            min_files_for_pyramid INTEGER NOT NULL DEFAULT 3,
+            max_file_size_bytes INTEGER NOT NULL DEFAULT 10485760,
+            max_recursion_depth INTEGER NOT NULL DEFAULT 10,
+            content_type_rules_json TEXT NOT NULL DEFAULT '[]',
+            ignore_patterns_json TEXT NOT NULL DEFAULT '[]',
+            respect_gitignore INTEGER NOT NULL DEFAULT 1,
+            respect_pyramid_ignore INTEGER NOT NULL DEFAULT 1,
+            vine_collapse_single_child INTEGER NOT NULL DEFAULT 1,
+            contribution_id TEXT NOT NULL
+                REFERENCES pyramid_config_contributions(contribution_id),
+            updated_at TEXT DEFAULT (datetime('now')),
+            PRIMARY KEY (slug)
+        );
+        ",
+    )?;
+
+    // Idempotent column addition — adds `contribution_id` to the existing
+    // `pyramid_dadbear_config` rows so DADBEAR gains the same provenance
+    // link as the new operational tables above. Phase 4 bootstrap
+    // migration populates this column for legacy rows. FK-to-text column
+    // intentionally: rusqlite's ALTER TABLE can't add a REFERENCES
+    // clause on an existing column, and SQLite treats the check at
+    // runtime anyway if `foreign_keys=ON`. We document the intended
+    // reference in the comment and rely on the migration path to keep
+    // it consistent. The column is nullable because SQLite ALTER TABLE
+    // does not support a REFERENCES clause on ADD COLUMN without a
+    // NULL default, and legacy rows start as NULL before migration.
+    let _ = conn.execute(
+        "ALTER TABLE pyramid_dadbear_config ADD COLUMN contribution_id TEXT DEFAULT NULL",
+        [],
+    );
+
+    // Bootstrap migration: convert legacy pyramid_dadbear_config rows
+    // to pyramid_config_contributions. Idempotent — the migration
+    // checks the `_migration_marker` contribution before running, and
+    // individual DADBEAR rows are only migrated if their
+    // `contribution_id` column is still NULL.
+    migrate_legacy_dadbear_to_contributions(conn)?;
+
+    Ok(())
+}
+
+/// Phase 4 bootstrap: convert every legacy `pyramid_dadbear_config` row
+/// to a `pyramid_config_contributions` row with `schema_type =
+/// 'dadbear_policy'`, `source = 'migration'`, `status = 'active'`, and
+/// `triggering_note = 'Migrated from legacy pyramid_dadbear_config'`.
+///
+/// Idempotent via two guards:
+///
+/// 1. A sentinel row with `schema_type = '_migration_marker'` is
+///    inserted on first run. Subsequent runs short-circuit on its
+///    presence.
+/// 2. Per-row: only DADBEAR rows whose `contribution_id` column is
+///    still NULL are migrated. Once migrated, the column points at
+///    the new contribution row so re-runs skip them.
+///
+/// Used by `init_pyramid_db` — callers should not invoke this directly
+/// unless they've already initialized the contribution table schema.
+pub fn migrate_legacy_dadbear_to_contributions(conn: &Connection) -> Result<()> {
+    // Guard 1: short-circuit if the migration marker already exists.
+    let marker_exists: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pyramid_config_contributions
+         WHERE schema_type = '_migration_marker'
+           AND source = 'migration'
+           AND created_by = 'dadbear_bootstrap'",
+        [],
+        |row| row.get(0),
+    )?;
+    if marker_exists > 0 {
+        return Ok(());
+    }
+
+    // Collect every DADBEAR row still missing a contribution_id.
+    let sql = format!(
+        "SELECT {DADBEAR_CONFIG_COLUMNS} FROM pyramid_dadbear_config
+         WHERE contribution_id IS NULL
+         ORDER BY id ASC"
+    );
+    let rows: Vec<DadbearWatchConfig> = {
+        let mut stmt = conn.prepare(&sql)?;
+        let iter = stmt.query_map([], parse_dadbear_config)?;
+        let mut out = Vec::new();
+        for row in iter {
+            out.push(row?);
+        }
+        out
+    };
+
+    for cfg in &rows {
+        // Serialize to a dadbear_policy YAML document. Schema shape:
+        //   source_path: string
+        //   content_type: string
+        //   scan_interval_secs: int
+        //   debounce_secs: int
+        //   session_timeout_secs: int
+        //   batch_size: int
+        //   enabled: bool
+        //
+        // Note: `id`, `slug`, `created_at`, and `updated_at` are
+        // operational metadata, not policy. They don't belong in the
+        // contribution YAML (slug lives on the contribution row itself).
+        let yaml = format!(
+            "source_path: {:?}\ncontent_type: {:?}\nscan_interval_secs: {}\ndebounce_secs: {}\nsession_timeout_secs: {}\nbatch_size: {}\nenabled: {}\n",
+            cfg.source_path,
+            cfg.content_type,
+            cfg.scan_interval_secs,
+            cfg.debounce_secs,
+            cfg.session_timeout_secs,
+            cfg.batch_size,
+            cfg.enabled,
+        );
+
+        let contribution_id = uuid::Uuid::new_v4().to_string();
+        conn.execute(
+            "INSERT INTO pyramid_config_contributions (
+                contribution_id, slug, schema_type, yaml_content,
+                wire_native_metadata_json, wire_publication_state_json,
+                supersedes_id, superseded_by_id, triggering_note,
+                status, source, wire_contribution_id, created_by, accepted_at
+             ) VALUES (
+                ?1, ?2, 'dadbear_policy', ?3,
+                '{}', '{}',
+                NULL, NULL, 'Migrated from legacy pyramid_dadbear_config',
+                'active', 'migration', NULL, 'dadbear_bootstrap', datetime('now')
+             )",
+            rusqlite::params![contribution_id, cfg.slug, yaml],
+        )?;
+        conn.execute(
+            "UPDATE pyramid_dadbear_config SET contribution_id = ?1 WHERE id = ?2",
+            rusqlite::params![contribution_id, cfg.id],
+        )?;
+    }
+
+    // Guard 1 writeback: insert the sentinel row so subsequent runs
+    // short-circuit. The sentinel has NULL slug + empty yaml; it is
+    // identified by the composite of (_migration_marker, migration,
+    // dadbear_bootstrap).
+    let marker_id = uuid::Uuid::new_v4().to_string();
+    conn.execute(
+        "INSERT INTO pyramid_config_contributions (
+            contribution_id, slug, schema_type, yaml_content,
+            status, source, created_by, accepted_at
+         ) VALUES (
+            ?1, NULL, '_migration_marker', '',
+            'active', 'migration', 'dadbear_bootstrap', datetime('now')
+         )",
+        rusqlite::params![marker_id],
+    )?;
+
     Ok(())
 }
 
@@ -10659,6 +10901,406 @@ pub fn seed_default_provider_registry(conn: &Connection) -> Result<()> {
     // when a local provider (Ollama) is added. Do not insert a
     // placeholder row here.
 
+    Ok(())
+}
+
+// ── Phase 4: Operational table upsert helpers ─────────────────────────────────
+//
+// Each schema_type whose `sync_config_to_operational()` writes to a dedicated
+// operational table has an upsert helper here. The YAML struct definitions
+// are minimal — enough to deserialize a valid YAML document and write it into
+// the operational row. Full schema definitions (JSON Schema validation, every
+// field) live in future phases (Phase 9 generative config seeds).
+//
+// Each upsert helper:
+// 1. Runs inside a single transaction (or an implicit transaction on the
+//    passed-in Connection).
+// 2. UPSERTs the row keyed on `slug` (NULL = global).
+// 3. Records the `contribution_id` FK back to pyramid_config_contributions.
+//
+// Notes:
+// - `slug` is `Option<String>` because global configs use NULL slug. SQLite
+//   treats NULL ≠ NULL in UNIQUE constraints, so the PK on (slug) combined
+//   with a single global row means we DELETE-then-INSERT to simulate an
+//   UPSERT that handles the NULL case. `INSERT OR REPLACE` works because
+//   the PK is (slug) alone.
+
+/// Minimal evidence policy YAML struct. Extended in Phase 9/11 (evidence
+/// triage spec).
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct EvidencePolicyYaml {
+    #[serde(default)]
+    pub triage_rules: Option<serde_yaml::Value>,
+    #[serde(default)]
+    pub demand_signals: Option<serde_yaml::Value>,
+    #[serde(default)]
+    pub budget: Option<serde_yaml::Value>,
+}
+
+/// UPSERT an evidence policy row keyed on slug.
+pub fn upsert_evidence_policy(
+    conn: &Connection,
+    slug: &Option<String>,
+    yaml: &EvidencePolicyYaml,
+    contribution_id: &str,
+) -> Result<()> {
+    let triage_json = serde_json::to_string(&yaml.triage_rules).unwrap_or_else(|_| "[]".into());
+    let demand_json = serde_json::to_string(&yaml.demand_signals).unwrap_or_else(|_| "[]".into());
+    let budget_json = serde_json::to_string(&yaml.budget).unwrap_or_else(|_| "{}".into());
+
+    // INSERT OR REPLACE keyed on slug (PK). Handles both per-slug and
+    // global (NULL slug) rows — SQLite PRIMARY KEY treats a single-NULL
+    // row as a distinct key.
+    conn.execute(
+        "INSERT OR REPLACE INTO pyramid_evidence_policy (
+            slug, triage_rules_json, demand_signals_json, budget_json,
+            contribution_id, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'))",
+        rusqlite::params![slug, triage_json, demand_json, budget_json, contribution_id],
+    )?;
+    Ok(())
+}
+
+/// Minimal build strategy YAML struct. Extended in Phase 9.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct BuildStrategyYaml {
+    #[serde(default)]
+    pub initial_build: Option<serde_yaml::Value>,
+    #[serde(default)]
+    pub maintenance: Option<serde_yaml::Value>,
+    #[serde(default)]
+    pub quality: Option<serde_yaml::Value>,
+}
+
+/// UPSERT a build strategy row keyed on slug.
+pub fn upsert_build_strategy(
+    conn: &Connection,
+    slug: &Option<String>,
+    yaml: &BuildStrategyYaml,
+    contribution_id: &str,
+) -> Result<()> {
+    let initial_json =
+        serde_json::to_string(&yaml.initial_build).unwrap_or_else(|_| "{}".into());
+    let maintenance_json =
+        serde_json::to_string(&yaml.maintenance).unwrap_or_else(|_| "{}".into());
+    let quality_json = serde_json::to_string(&yaml.quality).unwrap_or_else(|_| "{}".into());
+
+    conn.execute(
+        "INSERT OR REPLACE INTO pyramid_build_strategy (
+            slug, initial_build_json, maintenance_json, quality_json,
+            contribution_id, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'))",
+        rusqlite::params![
+            slug,
+            initial_json,
+            maintenance_json,
+            quality_json,
+            contribution_id
+        ],
+    )?;
+    Ok(())
+}
+
+/// Minimal custom prompts YAML struct. Extended in Phase 9.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct CustomPromptsYaml {
+    #[serde(default)]
+    pub extraction_focus: Option<String>,
+    #[serde(default)]
+    pub synthesis_style: Option<String>,
+    #[serde(default)]
+    pub vocabulary_priority: Option<serde_yaml::Value>,
+    #[serde(default)]
+    pub ignore_patterns: Option<serde_yaml::Value>,
+}
+
+/// UPSERT a custom prompts row keyed on slug.
+pub fn upsert_custom_prompts(
+    conn: &Connection,
+    slug: &Option<String>,
+    yaml: &CustomPromptsYaml,
+    contribution_id: &str,
+) -> Result<()> {
+    let vocab_json = yaml
+        .vocabulary_priority
+        .as_ref()
+        .and_then(|v| serde_json::to_string(v).ok());
+    let ignore_json = yaml
+        .ignore_patterns
+        .as_ref()
+        .and_then(|v| serde_json::to_string(v).ok());
+
+    conn.execute(
+        "INSERT OR REPLACE INTO pyramid_custom_prompts (
+            slug, extraction_focus, synthesis_style,
+            vocabulary_priority_json, ignore_patterns_json,
+            contribution_id, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'))",
+        rusqlite::params![
+            slug,
+            yaml.extraction_focus,
+            yaml.synthesis_style,
+            vocab_json,
+            ignore_json,
+            contribution_id,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Minimal folder ingestion heuristics YAML struct. Extended in Phase 17.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct FolderIngestionHeuristicsYaml {
+    #[serde(default = "default_min_files_for_pyramid")]
+    pub min_files_for_pyramid: i64,
+    #[serde(default = "default_max_file_size_bytes")]
+    pub max_file_size_bytes: i64,
+    #[serde(default = "default_max_recursion_depth")]
+    pub max_recursion_depth: i64,
+    #[serde(default)]
+    pub content_type_rules: Option<serde_yaml::Value>,
+    #[serde(default)]
+    pub ignore_patterns: Option<serde_yaml::Value>,
+    #[serde(default = "default_true")]
+    pub respect_gitignore: bool,
+    #[serde(default = "default_true")]
+    pub respect_pyramid_ignore: bool,
+    #[serde(default = "default_true")]
+    pub vine_collapse_single_child: bool,
+}
+
+fn default_min_files_for_pyramid() -> i64 {
+    3
+}
+fn default_max_file_size_bytes() -> i64 {
+    10_485_760
+}
+fn default_max_recursion_depth() -> i64 {
+    10
+}
+fn default_true() -> bool {
+    true
+}
+
+/// UPSERT a folder ingestion heuristics row keyed on slug.
+pub fn upsert_folder_ingestion_heuristics(
+    conn: &Connection,
+    slug: &Option<String>,
+    yaml: &FolderIngestionHeuristicsYaml,
+    contribution_id: &str,
+) -> Result<()> {
+    let content_type_rules_json = yaml
+        .content_type_rules
+        .as_ref()
+        .and_then(|v| serde_json::to_string(v).ok())
+        .unwrap_or_else(|| "[]".into());
+    let ignore_patterns_json = yaml
+        .ignore_patterns
+        .as_ref()
+        .and_then(|v| serde_json::to_string(v).ok())
+        .unwrap_or_else(|| "[]".into());
+
+    conn.execute(
+        "INSERT OR REPLACE INTO pyramid_folder_ingestion_heuristics (
+            slug, min_files_for_pyramid, max_file_size_bytes, max_recursion_depth,
+            content_type_rules_json, ignore_patterns_json,
+            respect_gitignore, respect_pyramid_ignore, vine_collapse_single_child,
+            contribution_id, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, datetime('now'))",
+        rusqlite::params![
+            slug,
+            yaml.min_files_for_pyramid,
+            yaml.max_file_size_bytes,
+            yaml.max_recursion_depth,
+            content_type_rules_json,
+            ignore_patterns_json,
+            yaml.respect_gitignore as i64,
+            yaml.respect_pyramid_ignore as i64,
+            yaml.vine_collapse_single_child as i64,
+            contribution_id,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Minimal DADBEAR policy YAML struct — mirrors the columns on the
+/// existing `pyramid_dadbear_config` table that actually represent
+/// policy (as opposed to operational metadata like `id`, `created_at`,
+/// etc.). The contribution sync path writes INTO the existing DADBEAR
+/// table rather than creating a new one, per the spec's
+/// "pyramid_dadbear_config (existing)" section.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct DadbearPolicyYaml {
+    pub source_path: String,
+    pub content_type: String,
+    #[serde(default = "dadbear_default_scan_interval")]
+    pub scan_interval_secs: i64,
+    #[serde(default = "dadbear_default_debounce")]
+    pub debounce_secs: i64,
+    #[serde(default = "dadbear_default_session_timeout")]
+    pub session_timeout_secs: i64,
+    #[serde(default = "dadbear_default_batch_size")]
+    pub batch_size: i64,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+fn dadbear_default_scan_interval() -> i64 {
+    10
+}
+fn dadbear_default_debounce() -> i64 {
+    30
+}
+fn dadbear_default_session_timeout() -> i64 {
+    1800
+}
+fn dadbear_default_batch_size() -> i64 {
+    1
+}
+
+/// UPSERT a DADBEAR policy contribution's payload into the existing
+/// `pyramid_dadbear_config` table. Writes into the existing columns
+/// (`scan_interval_secs`, `debounce_secs`, etc.) per the spec, and
+/// records the `contribution_id` FK on the existing row. A per-slug
+/// DADBEAR row is identified by (slug, source_path) — the same
+/// composite key the existing CRUD uses.
+pub fn upsert_dadbear_policy(
+    conn: &Connection,
+    slug: &Option<String>,
+    yaml: &DadbearPolicyYaml,
+    contribution_id: &str,
+) -> Result<()> {
+    // DADBEAR policy is per-pyramid — a global slug doesn't make sense
+    // here. If the caller passes None, we reject because the existing
+    // `pyramid_dadbear_config.slug` column is NOT NULL.
+    let slug_str = slug
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("dadbear_policy requires a slug (per-pyramid scope)"))?;
+
+    conn.execute(
+        "INSERT INTO pyramid_dadbear_config (
+            slug, source_path, content_type, scan_interval_secs, debounce_secs,
+            session_timeout_secs, batch_size, enabled, contribution_id
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+         ON CONFLICT(slug, source_path) DO UPDATE SET
+            content_type = excluded.content_type,
+            scan_interval_secs = excluded.scan_interval_secs,
+            debounce_secs = excluded.debounce_secs,
+            session_timeout_secs = excluded.session_timeout_secs,
+            batch_size = excluded.batch_size,
+            enabled = excluded.enabled,
+            contribution_id = excluded.contribution_id,
+            updated_at = datetime('now')",
+        rusqlite::params![
+            slug_str,
+            yaml.source_path,
+            yaml.content_type,
+            yaml.scan_interval_secs,
+            yaml.debounce_secs,
+            yaml.session_timeout_secs,
+            yaml.batch_size,
+            yaml.enabled as i64,
+            contribution_id,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Minimal tier routing YAML struct — a list of tier entries. Used by
+/// the `tier_routing` schema_type sync dispatcher. The real
+/// `TierRoutingEntry` lives in `provider.rs` with richer fields; this
+/// struct is the YAML-serializable surface.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct TierRoutingYaml {
+    pub tiers: Vec<TierRoutingYamlEntry>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TierRoutingYamlEntry {
+    pub tier_name: String,
+    pub provider_id: String,
+    pub model_id: String,
+    #[serde(default)]
+    pub context_limit: Option<i64>,
+    #[serde(default)]
+    pub max_completion_tokens: Option<i64>,
+    #[serde(default)]
+    pub pricing_json: Option<String>,
+    #[serde(default)]
+    pub supported_parameters_json: Option<String>,
+    #[serde(default)]
+    pub notes: Option<String>,
+}
+
+/// UPSERT a bundle of tier routing entries from a contribution.
+/// Delegates to the existing `save_tier_routing` helper per entry so
+/// the Phase 3 data model stays authoritative.
+pub fn upsert_tier_routing_from_contribution(
+    conn: &Connection,
+    yaml: &TierRoutingYaml,
+    _contribution_id: &str,
+) -> Result<()> {
+    // Phase 4: we don't record contribution_id on individual
+    // tier_routing rows — the existing schema doesn't have that column.
+    // The contribution→tier linkage lives on
+    // pyramid_config_contributions itself. Phase 14 can add a back-ref
+    // column if the executor needs to trace tier → contribution.
+    for entry in &yaml.tiers {
+        let tier = TierRoutingEntry {
+            tier_name: entry.tier_name.clone(),
+            provider_id: entry.provider_id.clone(),
+            model_id: entry.model_id.clone(),
+            context_limit: entry.context_limit.map(|n| n as usize),
+            max_completion_tokens: entry.max_completion_tokens.map(|n| n as usize),
+            pricing_json: entry.pricing_json.clone().unwrap_or_else(|| "{}".into()),
+            supported_parameters_json: entry.supported_parameters_json.clone(),
+            notes: entry.notes.clone(),
+        };
+        save_tier_routing(conn, &tier)?;
+    }
+    Ok(())
+}
+
+/// Minimal step overrides bundle YAML struct.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct StepOverridesBundleYaml {
+    pub slug: String,
+    pub chain_id: String,
+    pub overrides: Vec<StepOverrideYamlEntry>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct StepOverrideYamlEntry {
+    pub step_name: String,
+    pub field_name: String,
+    pub value_json: String,
+}
+
+/// DELETE all existing step overrides for a (slug, chain_id) pair,
+/// then INSERT one row per entry in the bundle. The whole bundle is
+/// accepted/superseded as a unit per the spec. contribution_id is not
+/// recorded on individual rows — the linkage lives on
+/// pyramid_config_contributions (same rationale as tier_routing).
+pub fn replace_step_overrides_bundle(
+    conn: &Connection,
+    bundle: &StepOverridesBundleYaml,
+    _contribution_id: &str,
+) -> Result<()> {
+    // DELETE-then-INSERT under the caller's transaction context.
+    conn.execute(
+        "DELETE FROM pyramid_step_overrides WHERE slug = ?1 AND chain_id = ?2",
+        rusqlite::params![bundle.slug, bundle.chain_id],
+    )?;
+    for entry in &bundle.overrides {
+        let row = StepOverride {
+            slug: bundle.slug.clone(),
+            chain_id: bundle.chain_id.clone(),
+            step_name: entry.step_name.clone(),
+            field_name: entry.field_name.clone(),
+            value_json: entry.value_json.clone(),
+        };
+        save_step_override(conn, &row)?;
+    }
     Ok(())
 }
 

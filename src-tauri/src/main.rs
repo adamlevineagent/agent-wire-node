@@ -6226,15 +6226,20 @@ async fn pyramid_auto_update_run_now(
     state: tauri::State<'_, SharedState>,
     slug: String,
 ) -> Result<serde_json::Value, String> {
-    // Extract what we need from the engine while briefly holding the lock, then release
-    let (db_path, api_key, model, semaphore, phase_arc, detail_arc, summary_arc) = {
+    // Extract what we need from the engine while briefly holding the lock, then release.
+    // Phase 3 retired `api_key` from PyramidStaleEngine in favor of
+    // `base_config: LlmConfig`, which preserves the provider_registry
+    // + credential_store runtime handles. The old `api_key`/`model`
+    // call into drain_and_dispatch was left dead by the fix pass;
+    // Phase 4 picks it up here under the "fix all bugs found" rule.
+    let (db_path, base_config, model, semaphore, phase_arc, detail_arc, summary_arc) = {
         let engines = state.pyramid.stale_engines.lock().await;
         let engine = engines
             .get(&slug)
             .ok_or("No active stale engine for this pyramid")?;
         (
             engine.db_path.clone(),
-            engine.api_key.clone(),
+            engine.base_config.clone(),
             engine.model.clone(),
             engine.concurrent_helpers.clone(),
             engine.current_phase.clone(),
@@ -6252,7 +6257,7 @@ async fn pyramid_auto_update_run_now(
             0,
             &db_path,
             semaphore.clone(),
-            &api_key,
+            &base_config,
             &model,
             phase_arc.clone(),
             detail_arc.clone(),
@@ -6293,14 +6298,15 @@ async fn pyramid_auto_update_l0_sweep(
         )
     };
 
-    let (db_path, api_key, model, semaphore, phase_arc, detail_arc, summary_arc) = {
+    // Phase 3 fix — `engine.api_key` is retired; use `base_config`.
+    let (db_path, base_config, model, semaphore, phase_arc, detail_arc, summary_arc) = {
         let engines = state.pyramid.stale_engines.lock().await;
         let engine = engines
             .get(&slug)
             .ok_or("No active stale engine for this pyramid")?;
         (
             engine.db_path.clone(),
-            engine.api_key.clone(),
+            engine.base_config.clone(),
             engine.model.clone(),
             engine.concurrent_helpers.clone(),
             engine.current_phase.clone(),
@@ -6316,7 +6322,7 @@ async fn pyramid_auto_update_l0_sweep(
             0,
             &db_path,
             semaphore.clone(),
-            &api_key,
+            &base_config,
             &model,
             phase_arc.clone(),
             detail_arc.clone(),
@@ -6748,6 +6754,323 @@ async fn pyramid_delete_step_override(
         .provider_registry
         .delete_step_override(&writer, &slug, &chain_id, &step_name, &field_name)
         .map_err(|e| e.to_string())
+}
+
+// --- Phase 4: Config Contribution Foundation IPC commands -------------------
+//
+// Per `docs/specs/config-contribution-and-wire-sharing.md`. These
+// endpoints cover the contribution lifecycle (create, supersede,
+// read, version history, rollback) and the agent-proposal flow
+// (propose, pending, accept, reject). Wire publication endpoints
+// (`pyramid_publish_to_wire`, `pyramid_pull_wire_config`,
+// `pyramid_search_wire_configs`) are Phase 5 / Phase 10 scope.
+// Generative config endpoints (`pyramid_generate_config`,
+// `pyramid_refine_config`, `pyramid_reroll_config`) are Phase 9 / 13.
+//
+// Notes enforcement is per the spec's Notes Capture Lifecycle table:
+// `pyramid_supersede_config`, `pyramid_propose_config`, and
+// `pyramid_rollback_config` all require a non-empty, non-whitespace
+// note. Empty notes are rejected at the IPC boundary with a clear
+// error string.
+
+#[derive(serde::Serialize)]
+struct CreateConfigContributionResponse {
+    contribution_id: String,
+}
+
+#[derive(serde::Serialize)]
+struct SupersedeConfigResponse {
+    new_contribution_id: String,
+}
+
+#[derive(serde::Serialize)]
+struct RejectProposalResponse {
+    ok: bool,
+}
+
+#[tauri::command]
+async fn pyramid_create_config_contribution(
+    state: tauri::State<'_, SharedState>,
+    schema_type: String,
+    slug: Option<String>,
+    yaml_content: String,
+    note: Option<String>,
+    source: Option<String>,
+) -> Result<CreateConfigContributionResponse, String> {
+    let writer = state.pyramid.writer.lock().await;
+    let source_val = source.unwrap_or_else(|| "local".to_string());
+    let contribution_id =
+        wire_node_lib::pyramid::config_contributions::create_config_contribution(
+            &writer,
+            &schema_type,
+            slug.as_deref(),
+            &yaml_content,
+            note.as_deref(),
+            &source_val,
+            Some("user"),
+            "active",
+        )
+        .map_err(|e| e.to_string())?;
+
+    // Phase 4 invariant: every write path to pyramid_config_contributions
+    // that lands as `active` MUST sync to operational tables immediately.
+    // Per the spec: "Write path: always write to pyramid_config_contributions
+    // first, then sync to operational tables." Without this call the
+    // operational tables stay stale and the executor reads prior values.
+    let contribution =
+        wire_node_lib::pyramid::config_contributions::load_contribution_by_id(
+            &writer,
+            &contribution_id,
+        )
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "contribution disappeared immediately after create".to_string())?;
+    wire_node_lib::pyramid::config_contributions::sync_config_to_operational(
+        &writer,
+        &state.pyramid.build_event_bus,
+        &contribution,
+    )
+    .map_err(|e| e.to_string())?;
+
+    Ok(CreateConfigContributionResponse { contribution_id })
+}
+
+#[tauri::command]
+async fn pyramid_supersede_config(
+    state: tauri::State<'_, SharedState>,
+    contribution_id: String,
+    new_yaml_content: String,
+    note: String,
+) -> Result<SupersedeConfigResponse, String> {
+    // Notes enforcement per Notes Capture Lifecycle: reject empty
+    // or whitespace-only notes at the IPC boundary.
+    wire_node_lib::pyramid::config_contributions::validate_note(&note)?;
+
+    let mut writer = state.pyramid.writer.lock().await;
+    let new_contribution_id =
+        wire_node_lib::pyramid::config_contributions::supersede_config_contribution(
+            &mut writer,
+            &contribution_id,
+            &new_yaml_content,
+            &note,
+            "local",
+            Some("user"),
+        )
+        .map_err(|e| e.to_string())?;
+
+    // Phase 4 invariant: sync the newly-active contribution to its
+    // operational table so the executor sees the new value on its
+    // next read. See `pyramid_create_config_contribution` for the
+    // rationale — same invariant applies to every write path that
+    // produces an `active` contribution.
+    let contribution =
+        wire_node_lib::pyramid::config_contributions::load_contribution_by_id(
+            &writer,
+            &new_contribution_id,
+        )
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "contribution disappeared immediately after supersede".to_string())?;
+    wire_node_lib::pyramid::config_contributions::sync_config_to_operational(
+        &writer,
+        &state.pyramid.build_event_bus,
+        &contribution,
+    )
+    .map_err(|e| e.to_string())?;
+
+    Ok(SupersedeConfigResponse { new_contribution_id })
+}
+
+#[tauri::command]
+async fn pyramid_active_config_contribution(
+    state: tauri::State<'_, SharedState>,
+    schema_type: String,
+    slug: Option<String>,
+) -> Result<Option<wire_node_lib::pyramid::config_contributions::ConfigContribution>, String> {
+    let reader = state.pyramid.reader.lock().await;
+    wire_node_lib::pyramid::config_contributions::load_active_config_contribution(
+        &reader,
+        &schema_type,
+        slug.as_deref(),
+    )
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn pyramid_config_version_history(
+    state: tauri::State<'_, SharedState>,
+    schema_type: String,
+    slug: Option<String>,
+) -> Result<Vec<wire_node_lib::pyramid::config_contributions::ConfigContribution>, String> {
+    let reader = state.pyramid.reader.lock().await;
+    wire_node_lib::pyramid::config_contributions::load_config_version_history(
+        &reader,
+        &schema_type,
+        slug.as_deref(),
+    )
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn pyramid_propose_config(
+    state: tauri::State<'_, SharedState>,
+    schema_type: String,
+    slug: Option<String>,
+    yaml_content: String,
+    note: String,
+    agent_name: String,
+) -> Result<CreateConfigContributionResponse, String> {
+    // Agent proposals require a non-empty note per the spec.
+    wire_node_lib::pyramid::config_contributions::validate_note(&note)?;
+
+    let writer = state.pyramid.writer.lock().await;
+    let contribution_id =
+        wire_node_lib::pyramid::config_contributions::create_config_contribution(
+            &writer,
+            &schema_type,
+            slug.as_deref(),
+            &yaml_content,
+            Some(&note),
+            "agent",
+            Some(&agent_name),
+            "proposed",
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(CreateConfigContributionResponse { contribution_id })
+}
+
+#[tauri::command]
+async fn pyramid_pending_proposals(
+    state: tauri::State<'_, SharedState>,
+    slug: Option<String>,
+) -> Result<Vec<wire_node_lib::pyramid::config_contributions::ConfigContribution>, String> {
+    let reader = state.pyramid.reader.lock().await;
+    wire_node_lib::pyramid::config_contributions::list_pending_proposals(
+        &reader,
+        slug.as_deref(),
+    )
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn pyramid_accept_proposal(
+    state: tauri::State<'_, SharedState>,
+    contribution_id: String,
+) -> Result<CreateConfigContributionResponse, String> {
+    let mut writer = state.pyramid.writer.lock().await;
+    wire_node_lib::pyramid::config_contributions::accept_proposal(&mut writer, &contribution_id)
+        .map_err(|e| e.to_string())?;
+
+    // Phase 4 invariant: accept transitions the proposal to `active`.
+    // Sync the now-active contribution to its operational table so the
+    // executor sees the newly-accepted value. Without this the
+    // operational table keeps returning the prior (now-superseded)
+    // row — which is exactly the bug the contribution pattern was
+    // meant to eliminate.
+    let contribution =
+        wire_node_lib::pyramid::config_contributions::load_contribution_by_id(
+            &writer,
+            &contribution_id,
+        )
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "contribution disappeared immediately after accept".to_string())?;
+    wire_node_lib::pyramid::config_contributions::sync_config_to_operational(
+        &writer,
+        &state.pyramid.build_event_bus,
+        &contribution,
+    )
+    .map_err(|e| e.to_string())?;
+
+    Ok(CreateConfigContributionResponse {
+        contribution_id,
+    })
+}
+
+#[tauri::command]
+async fn pyramid_reject_proposal(
+    state: tauri::State<'_, SharedState>,
+    contribution_id: String,
+    reason: Option<String>,
+) -> Result<RejectProposalResponse, String> {
+    let writer = state.pyramid.writer.lock().await;
+    wire_node_lib::pyramid::config_contributions::reject_proposal(
+        &writer,
+        &contribution_id,
+        reason.as_deref(),
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(RejectProposalResponse { ok: true })
+}
+
+#[tauri::command]
+async fn pyramid_rollback_config(
+    state: tauri::State<'_, SharedState>,
+    contribution_id: String,
+    note: String,
+) -> Result<SupersedeConfigResponse, String> {
+    // Rollback creates a NEW version with the rolled-back content.
+    // Per the spec's Notes Capture Lifecycle, rollback requires a
+    // non-empty note to preserve supersession provenance.
+    wire_node_lib::pyramid::config_contributions::validate_note(&note)?;
+
+    // Load the target contribution to get its yaml_content.
+    let target = {
+        let reader = state.pyramid.reader.lock().await;
+        wire_node_lib::pyramid::config_contributions::load_contribution_by_id(
+            &reader,
+            &contribution_id,
+        )
+        .map_err(|e| e.to_string())?
+    };
+    let target = target.ok_or_else(|| format!("contribution {contribution_id} not found"))?;
+
+    // Find the current active contribution for this (slug, schema_type).
+    let current_active = {
+        let reader = state.pyramid.reader.lock().await;
+        wire_node_lib::pyramid::config_contributions::load_active_config_contribution(
+            &reader,
+            &target.schema_type,
+            target.slug.as_deref(),
+        )
+        .map_err(|e| e.to_string())?
+    };
+    let current_active = current_active
+        .ok_or_else(|| "no active contribution to roll back from".to_string())?;
+
+    // Supersede the current active with a new version carrying the
+    // target's yaml_content. The new row gets its own contribution_id;
+    // the supersedes chain walks: new → current_active → … → target.
+    let mut writer = state.pyramid.writer.lock().await;
+    let new_id = wire_node_lib::pyramid::config_contributions::supersede_config_contribution(
+        &mut writer,
+        &current_active.contribution_id,
+        &target.yaml_content,
+        &note,
+        "local",
+        Some("user"),
+    )
+    .map_err(|e| e.to_string())?;
+
+    // Phase 4 invariant: rollback produces a new `active` contribution
+    // carrying the target's YAML. Sync it to the operational table so
+    // the executor picks up the rolled-back value. Without this, the
+    // rollback is cosmetic — the audit trail shows a rollback but the
+    // runtime keeps using the pre-rollback value.
+    let new_contribution =
+        wire_node_lib::pyramid::config_contributions::load_contribution_by_id(
+            &writer,
+            &new_id,
+        )
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "rollback contribution disappeared immediately after create".to_string())?;
+    wire_node_lib::pyramid::config_contributions::sync_config_to_operational(
+        &writer,
+        &state.pyramid.build_event_bus,
+        &new_contribution,
+    )
+    .map_err(|e| e.to_string())?;
+
+    Ok(SupersedeConfigResponse {
+        new_contribution_id: new_id,
+    })
 }
 
 // --- App Setup --------------------------------------------------------------
@@ -7889,6 +8212,16 @@ fn main() {
             pyramid_get_step_overrides,
             pyramid_save_step_override,
             pyramid_delete_step_override,
+            // Phase 4: Config Contribution Foundation
+            pyramid_create_config_contribution,
+            pyramid_supersede_config,
+            pyramid_active_config_contribution,
+            pyramid_config_version_history,
+            pyramid_propose_config,
+            pyramid_pending_proposals,
+            pyramid_accept_proposal,
+            pyramid_reject_proposal,
+            pyramid_rollback_config,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Wire Node");
