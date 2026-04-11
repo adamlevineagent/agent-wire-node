@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use crate::pyramid::config_contributions::{
     create_config_contribution_with_metadata, load_contribution_by_id,
-    sync_config_to_operational, ConfigContribution,
+    sync_config_to_operational,
 };
 use crate::pyramid::credentials::{CredentialStore, SharedCredentialStore};
 use crate::pyramid::event_bus::BuildEventBus;
@@ -190,39 +190,38 @@ pub async fn pull_wire_contribution(
         )
     };
 
-    // If we're activating AND superseding, do the full supersession
-    // transaction (mark prior superseded + insert new active +
-    // supersedes_id pointer). Otherwise just insert a fresh row.
+    // Wanderer fix (phase-14): the activate path MUST resolve the
+    // current active row for (schema_type, slug) inside the same
+    // transaction as the insert, so that:
+    //
+    //   (a) Pulling a Wire version via `pyramid_pull_wire_config` with
+    //       `activate=true` correctly supersedes any existing active
+    //       row — previously the fresh-insert branch would leave the
+    //       old active untouched and two `status='active'` rows would
+    //       accumulate (bug #1: direct Discover "Pull and activate").
+    //
+    //   (b) The poller→user concurrent race where a manual pull races
+    //       with an auto-update can't leave an orphaned active row.
+    //       The explicit `local_contribution_id_to_supersede` hint may
+    //       point at a row the auto-updater has already flipped to
+    //       `superseded`; we fall through to the real current active
+    //       instead of clobbering the supersession chain (bug #2:
+    //       supersede_with_pulled's unconditional UPDATE).
+    //
+    // The hint passed in `options.local_contribution_id_to_supersede`
+    // is still honored as a sanity check, but the authoritative prior
+    // is the row that satisfies the `load_active_config_contribution`
+    // predicate AT TRANSACTION TIME — never an externally-captured ID.
     let new_id = if options.activate {
-        if let Some(prior_id) = options.local_contribution_id_to_supersede {
-            // Ensure the prior row exists before we touch anything.
-            let prior = load_contribution_by_id(conn, prior_id)
-                .map_err(|e| PullError::Other(e))?
-                .ok_or_else(|| {
-                    PullError::Other(anyhow!(
-                        "prior local contribution {prior_id} not found — cannot supersede"
-                    ))
-                })?;
-            supersede_with_pulled(
-                conn,
-                &prior,
-                &full.yaml_content,
-                &triggering_note,
-                &metadata,
-                options.latest_wire_contribution_id,
-            )?
-        } else {
-            insert_pulled_contribution(
-                conn,
-                &schema_type,
-                options.slug,
-                &full.yaml_content,
-                &triggering_note,
-                &metadata,
-                options.latest_wire_contribution_id,
-                initial_status,
-            )?
-        }
+        commit_pulled_active(
+            conn,
+            &schema_type,
+            options.slug,
+            &full.yaml_content,
+            &triggering_note,
+            &metadata,
+            options.latest_wire_contribution_id,
+        )?
     } else {
         insert_pulled_contribution(
             conn,
@@ -306,13 +305,38 @@ fn insert_pulled_contribution(
     Ok(new_id)
 }
 
-/// Supersede a prior local contribution with a pulled version.
-/// Atomic transaction: marks the prior as superseded + inserts the
-/// new active row with `supersedes_id` pointing at the prior +
-/// `wire_contribution_id` set to the pulled ID.
-fn supersede_with_pulled(
+/// Atomically commit a pulled contribution as the new active row for
+/// `(schema_type, slug)`. Resolves the current active row inside the
+/// transaction so concurrent writers (e.g. the poller + a manual pull)
+/// can't race into two `status='active'` rows with corrupted
+/// supersession chains.
+///
+/// Behavior:
+/// * If an active row exists for `(schema_type, slug)` at transaction
+///   time, mark it `superseded` and insert the new row with
+///   `supersedes_id` pointing at it.
+/// * If no active row exists, insert the new row fresh.
+/// * In both cases, the new row has `status='active'`, `source='wire'`,
+///   and `wire_contribution_id` set.
+///
+/// Wanderer fix (phase-14):
+/// * Bug #1: `pyramid_pull_wire_config` with `activate=true` used to
+///   call `insert_pulled_contribution` unconditionally whenever no
+///   explicit prior was passed, leaving any existing active row
+///   untouched. Every Discover-tab "Pull and activate" on a schema
+///   type with a bundled default accumulated a duplicate active row.
+/// * Bug #2: the old `supersede_with_pulled` unconditionally flipped
+///   a caller-supplied `prior` to `superseded` even if it was ALREADY
+///   superseded — e.g. by an earlier auto-update cycle that raced with
+///   a manual pull. The UPDATE clobbered the prior's `superseded_by_id`
+///   pointer and the new active row became a dangling second active.
+///
+/// Both failure modes are eliminated by looking up the current active
+/// row inside the same SQLite transaction as the insert.
+fn commit_pulled_active(
     conn: &mut Connection,
-    prior: &ConfigContribution,
+    schema_type: &str,
+    slug: Option<&str>,
     new_yaml_content: &str,
     triggering_note: &str,
     metadata: &WireNativeMetadata,
@@ -323,6 +347,34 @@ fn supersede_with_pulled(
         .map_err(|e| PullError::Other(anyhow!("serialize metadata: {e}")))?;
 
     let tx = conn.transaction()?;
+
+    // Resolve the current active row INSIDE the transaction. Same
+    // predicate as `load_active_config_contribution`. Holding the
+    // writer lock across this query guarantees no concurrent writer
+    // can insert/update between lookup and supersede.
+    let prior_active_id: Option<String> = if let Some(slug_val) = slug {
+        tx.query_row(
+            "SELECT contribution_id FROM pyramid_config_contributions
+             WHERE slug = ?1 AND schema_type = ?2
+               AND status = 'active' AND superseded_by_id IS NULL
+             ORDER BY created_at DESC, id DESC
+             LIMIT 1",
+            rusqlite::params![slug_val, schema_type],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+    } else {
+        tx.query_row(
+            "SELECT contribution_id FROM pyramid_config_contributions
+             WHERE slug IS NULL AND schema_type = ?1
+               AND status = 'active' AND superseded_by_id IS NULL
+             ORDER BY created_at DESC, id DESC
+             LIMIT 1",
+            rusqlite::params![schema_type],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+    };
 
     let new_id = uuid::Uuid::new_v4().to_string();
     tx.execute(
@@ -339,22 +391,29 @@ fn supersede_with_pulled(
          )",
         rusqlite::params![
             new_id,
-            prior.slug,
-            prior.schema_type,
+            slug,
+            schema_type,
             new_yaml_content,
             metadata_json,
-            prior.contribution_id,
+            prior_active_id,
             triggering_note,
             wire_contribution_id,
         ],
     )?;
 
-    tx.execute(
-        "UPDATE pyramid_config_contributions
-         SET status = 'superseded', superseded_by_id = ?1
-         WHERE contribution_id = ?2",
-        rusqlite::params![new_id, prior.contribution_id],
-    )?;
+    if let Some(prior_id) = &prior_active_id {
+        // Flip the prior to superseded. Predicate includes the
+        // `status='active'` guard so a re-run from a retry path is a
+        // no-op rather than clobbering an already-superseded row.
+        tx.execute(
+            "UPDATE pyramid_config_contributions
+             SET status = 'superseded', superseded_by_id = ?1
+             WHERE contribution_id = ?2
+               AND status = 'active'
+               AND superseded_by_id IS NULL",
+            rusqlite::params![new_id, prior_id],
+        )?;
+    }
 
     tx.commit()?;
     Ok(new_id)
@@ -409,5 +468,334 @@ mod phase14_tests {
         let yaml = "schema_type: custom_prompts\nextraction_focus: plain text\n";
         let refs = credential_safety_gate(yaml, &store).unwrap();
         assert!(refs.is_empty());
+    }
+
+    // ── Wanderer-fix regression tests ─────────────────────────────────
+
+    /// Set up an in-memory pyramid DB for the wanderer-fix tests.
+    fn mem_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::pyramid::db::init_pyramid_db(&conn).unwrap();
+        conn
+    }
+
+    fn seed_active_contribution(
+        conn: &Connection,
+        schema_type: &str,
+        slug: Option<&str>,
+        yaml: &str,
+        wire_id: Option<&str>,
+    ) -> String {
+        let id = uuid::Uuid::new_v4().to_string();
+        conn.execute(
+            "INSERT INTO pyramid_config_contributions (
+                contribution_id, slug, schema_type, yaml_content,
+                wire_native_metadata_json, wire_publication_state_json,
+                supersedes_id, superseded_by_id, triggering_note,
+                status, source, wire_contribution_id, created_by, accepted_at
+             ) VALUES (
+                ?1, ?2, ?3, ?4,
+                '{}', '{}',
+                NULL, NULL, 'seed',
+                'active', 'bundled', ?5, 'bootstrap', datetime('now')
+             )",
+            rusqlite::params![id, slug, schema_type, yaml, wire_id],
+        )
+        .unwrap();
+        id
+    }
+
+    fn count_active_rows(
+        conn: &Connection,
+        schema_type: &str,
+        slug: Option<&str>,
+    ) -> i64 {
+        if let Some(slug_val) = slug {
+            conn.query_row(
+                "SELECT COUNT(*) FROM pyramid_config_contributions
+                 WHERE slug = ?1 AND schema_type = ?2
+                   AND status = 'active' AND superseded_by_id IS NULL",
+                rusqlite::params![slug_val, schema_type],
+                |row| row.get(0),
+            )
+            .unwrap()
+        } else {
+            conn.query_row(
+                "SELECT COUNT(*) FROM pyramid_config_contributions
+                 WHERE slug IS NULL AND schema_type = ?1
+                   AND status = 'active' AND superseded_by_id IS NULL",
+                rusqlite::params![schema_type],
+                |row| row.get(0),
+            )
+            .unwrap()
+        }
+    }
+
+    /// Wanderer bug #1 regression: `pyramid_pull_wire_config` with
+    /// `activate=true` used to call `insert_pulled_contribution`
+    /// unconditionally when no explicit supersession hint was passed.
+    /// That left existing active rows untouched, so every Discover-tab
+    /// "Pull and activate" over a schema_type with a bundled default
+    /// accumulated a duplicate active row.
+    ///
+    /// After the fix, `commit_pulled_active` resolves the current
+    /// active row inside the transaction and supersedes it atomically.
+    /// Only one active row should exist after a pull.
+    #[test]
+    fn test_commit_pulled_active_supersedes_existing_active() {
+        let mut conn = mem_conn();
+        let prior_id = seed_active_contribution(
+            &conn,
+            "custom_prompts",
+            None,
+            "schema_type: custom_prompts\nextraction_focus: old\n",
+            None,
+        );
+        assert_eq!(count_active_rows(&conn, "custom_prompts", None), 1);
+
+        let metadata = default_wire_native_metadata("custom_prompts", None);
+        let new_id = commit_pulled_active(
+            &mut conn,
+            "custom_prompts",
+            None,
+            "schema_type: custom_prompts\nextraction_focus: new\n",
+            "Pulled from Wire (wire-123)",
+            &metadata,
+            "wire-123",
+        )
+        .unwrap();
+
+        // Exactly one active row — the pulled version.
+        assert_eq!(
+            count_active_rows(&conn, "custom_prompts", None),
+            1,
+            "pull must produce exactly one active row, not accumulate duplicates"
+        );
+
+        // Prior is now superseded, chain pointer is set.
+        let (prior_status, prior_superseded_by): (String, Option<String>) = conn
+            .query_row(
+                "SELECT status, superseded_by_id FROM pyramid_config_contributions
+                 WHERE contribution_id = ?1",
+                rusqlite::params![prior_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(prior_status, "superseded");
+        assert_eq!(prior_superseded_by.as_deref(), Some(new_id.as_str()));
+
+        // New row points back at the prior via supersedes_id and
+        // carries the wire_contribution_id.
+        let (new_supersedes, new_wire, new_status): (
+            Option<String>,
+            Option<String>,
+            String,
+        ) = conn
+            .query_row(
+                "SELECT supersedes_id, wire_contribution_id, status FROM pyramid_config_contributions
+                 WHERE contribution_id = ?1",
+                rusqlite::params![new_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(new_supersedes.as_deref(), Some(prior_id.as_str()));
+        assert_eq!(new_wire.as_deref(), Some("wire-123"));
+        assert_eq!(new_status, "active");
+    }
+
+    /// Wanderer bug #2 regression: the old `supersede_with_pulled`
+    /// unconditionally flipped a caller-supplied `prior` to
+    /// `superseded`, overwriting its `superseded_by_id` pointer even if
+    /// the prior had already been superseded by an earlier auto-update.
+    /// The result was two active rows and a corrupted chain.
+    ///
+    /// The fix resolves the current active INSIDE the transaction and
+    /// only touches THAT row, so a stale prior hint can't clobber the
+    /// chain built by a racing writer.
+    ///
+    /// Scenario: original active row L1 exists. An auto-update pull
+    /// (simulated via a direct `commit_pulled_active` call) supersedes
+    /// it with L2. Then a racing manual pull arrives with a stale view
+    /// of L1 as active. The manual pull must supersede L2 (the real
+    /// current active), NOT clobber L1's supersession pointer or leave
+    /// both L2 and L3 as active.
+    #[test]
+    fn test_commit_pulled_active_ignores_stale_prior_hint() {
+        let mut conn = mem_conn();
+        let l1 = seed_active_contribution(
+            &conn,
+            "custom_prompts",
+            None,
+            "schema_type: custom_prompts\nextraction_focus: v1\n",
+            Some("wire-v1"),
+        );
+
+        // First pull (simulates the auto-updater winning the race).
+        let metadata = default_wire_native_metadata("custom_prompts", None);
+        let l2 = commit_pulled_active(
+            &mut conn,
+            "custom_prompts",
+            None,
+            "schema_type: custom_prompts\nextraction_focus: v2\n",
+            "Pulled from Wire (wire-v2)",
+            &metadata,
+            "wire-v2",
+        )
+        .unwrap();
+
+        // Invariant holds after the first pull.
+        assert_eq!(count_active_rows(&conn, "custom_prompts", None), 1);
+
+        // Second pull (simulates the user's manual pull arriving with
+        // a stale view — their UI captured L1 as the prior before the
+        // auto-update superseded it). `commit_pulled_active` takes no
+        // explicit prior hint; the authoritative prior is L2.
+        let l3 = commit_pulled_active(
+            &mut conn,
+            "custom_prompts",
+            None,
+            "schema_type: custom_prompts\nextraction_focus: v3\n",
+            "Pulled from Wire (wire-v3)",
+            &metadata,
+            "wire-v3",
+        )
+        .unwrap();
+
+        // Exactly one active row (L3), not two.
+        assert_eq!(
+            count_active_rows(&conn, "custom_prompts", None),
+            1,
+            "race between auto-update and manual pull must not leave two active rows"
+        );
+
+        // L1's supersession chain is INTACT — still points at L2, not
+        // overwritten to L3.
+        let l1_superseded_by: Option<String> = conn
+            .query_row(
+                "SELECT superseded_by_id FROM pyramid_config_contributions
+                 WHERE contribution_id = ?1",
+                rusqlite::params![l1],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            l1_superseded_by.as_deref(),
+            Some(l2.as_str()),
+            "L1's superseded_by_id must remain pointed at L2 — the manual pull must not clobber it"
+        );
+
+        // L2 is the row that got superseded by L3.
+        let (l2_status, l2_superseded_by): (String, Option<String>) = conn
+            .query_row(
+                "SELECT status, superseded_by_id FROM pyramid_config_contributions
+                 WHERE contribution_id = ?1",
+                rusqlite::params![l2],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(l2_status, "superseded");
+        assert_eq!(l2_superseded_by.as_deref(), Some(l3.as_str()));
+
+        // L3's supersedes_id points at L2 (the real prior).
+        let l3_supersedes: Option<String> = conn
+            .query_row(
+                "SELECT supersedes_id FROM pyramid_config_contributions
+                 WHERE contribution_id = ?1",
+                rusqlite::params![l3],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(l3_supersedes.as_deref(), Some(l2.as_str()));
+    }
+
+    /// First-pull edge case: when no active row exists for the
+    /// `(schema_type, slug)` pair, `commit_pulled_active` inserts the
+    /// pulled row fresh with `supersedes_id IS NULL`. The behavior
+    /// matches the legacy `insert_pulled_contribution` path for the
+    /// "brand new schema type" case.
+    #[test]
+    fn test_commit_pulled_active_inserts_fresh_when_no_prior() {
+        let mut conn = mem_conn();
+        assert_eq!(count_active_rows(&conn, "custom_prompts", None), 0);
+
+        let metadata = default_wire_native_metadata("custom_prompts", None);
+        let new_id = commit_pulled_active(
+            &mut conn,
+            "custom_prompts",
+            None,
+            "schema_type: custom_prompts\nextraction_focus: fresh\n",
+            "Pulled from Wire (wire-fresh)",
+            &metadata,
+            "wire-fresh",
+        )
+        .unwrap();
+
+        assert_eq!(count_active_rows(&conn, "custom_prompts", None), 1);
+
+        let (status, supersedes, wire_id): (String, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT status, supersedes_id, wire_contribution_id FROM pyramid_config_contributions
+                 WHERE contribution_id = ?1",
+                rusqlite::params![new_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "active");
+        assert!(supersedes.is_none());
+        assert_eq!(wire_id.as_deref(), Some("wire-fresh"));
+    }
+
+    /// Slug-scoped contributions: the resolver predicate must use `slug
+    /// = ?` not `slug IS NULL` when a slug is provided, so two active
+    /// rows with different slugs coexist peacefully.
+    #[test]
+    fn test_commit_pulled_active_isolates_by_slug() {
+        let mut conn = mem_conn();
+        // Seed a global (slug=NULL) active row.
+        let _global = seed_active_contribution(
+            &conn,
+            "custom_prompts",
+            None,
+            "schema_type: custom_prompts\nextraction_focus: global\n",
+            None,
+        );
+        // Pull a slug-scoped version.
+        conn.execute(
+            "INSERT OR IGNORE INTO pyramid_slugs (slug, content_type, source_path)
+             VALUES ('my-slug', 'document', '/tmp/my-slug')",
+            [],
+        )
+        .unwrap();
+        let metadata = default_wire_native_metadata("custom_prompts", Some("my-slug"));
+        let slug_id = commit_pulled_active(
+            &mut conn,
+            "custom_prompts",
+            Some("my-slug"),
+            "schema_type: custom_prompts\nextraction_focus: slug-scoped\n",
+            "Pulled from Wire (wire-slug)",
+            &metadata,
+            "wire-slug",
+        )
+        .unwrap();
+
+        // Global is still active.
+        assert_eq!(count_active_rows(&conn, "custom_prompts", None), 1);
+        // Slug-scoped is also active.
+        assert_eq!(count_active_rows(&conn, "custom_prompts", Some("my-slug")), 1);
+
+        // Slug row has no supersedes_id — it's a fresh insert in the
+        // slug scope, not a supersession of the global row.
+        let slug_supersedes: Option<String> = conn
+            .query_row(
+                "SELECT supersedes_id FROM pyramid_config_contributions
+                 WHERE contribution_id = ?1",
+                rusqlite::params![slug_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            slug_supersedes.is_none(),
+            "slug-scoped pull must not supersede a global contribution"
+        );
     }
 }

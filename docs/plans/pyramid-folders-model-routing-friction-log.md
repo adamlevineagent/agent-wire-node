@@ -1494,3 +1494,112 @@ Traced each of the 12 wanderer-focus questions end-to-end:
 
 ---
 
+## Phase 14 — Wire discovery + ranking + recommendations + update polling
+
+### Wanderer pass (2026-04-10)
+
+Traced all 13 wanderer questions end-to-end against the implementer commit (`de464a1`) + verifier fix commit (`ea68bdb`). Found two real bugs the verifier's punch-list audit missed, both landing on the same code path in `src-tauri/src/pyramid/wire_pull.rs`. The two bugs share a fix — an atomic transaction-scoped resolution of the current active row — so they're addressed in a single commit.
+
+### Bugs fixed
+
+**W1 — `pyramid_pull_wire_config` with `activate=true` doesn't supersede existing active rows (`src-tauri/src/pyramid/wire_pull.rs:193-240`)**
+
+The IPC takes a `wire_contribution_id + slug + activate` triple and passes `local_contribution_id_to_supersede: None` unconditionally. The implementer's `pull_wire_contribution` branched on the presence of that hint: with a hint, run `supersede_with_pulled`; without, run `insert_pulled_contribution` — which is a fresh insert with `status='active'`, `supersedes_id=NULL`. The fresh-insert path does not touch any existing active row.
+
+Reproduction (no race required, hits on every Discover-tab "Pull and activate"):
+
+1. Bundled manifest seeds `custom_prompts` with `contribution_id = bundled-custom_prompts-default-v1`, `status = 'active'`.
+2. User opens ToolsMode → Discover, picks `custom_prompts`, finds a compelling Wire contribution, clicks the "Pull and activate" button in `DiscoveryDetailDrawer`.
+3. Frontend calls `invoke('pyramid_pull_wire_config', { wireContributionId, slug: null, activate: true })` (`ToolsMode.tsx:2159-2166`).
+4. Backend `pyramid_pull_wire_config` passes `local_contribution_id_to_supersede: None` (`main.rs:8129`).
+5. `pull_wire_contribution` routes through the `else` arm at the old `wire_pull.rs:214-225` and calls `insert_pulled_contribution` with `status = "active"`.
+6. A new row lands active. The bundled row is still active with `superseded_by_id IS NULL`. `load_active_config_contribution` now has **two candidates** for `(schema_type='custom_prompts', slug=NULL)`; the `LIMIT 1 ORDER BY created_at DESC, id DESC` tiebreaker returns the newest row so runtime behavior looks fine, but the history chain is silently corrupted and every subsequent pull accumulates another orphan active row.
+
+Consequences beyond the surface symptom:
+
+- `load_config_version_history` walks `supersedes_id` starting from the "newest active" and can never see the orphaned older active rows — they're invisible in the UI's version list.
+- `pyramid_wire_update_poller::list_wire_tracked_contributions` returns every active row with a `wire_contribution_id`, including the orphans, wasting a Wire round-trip slot per orphan on every polling cycle.
+- If a user pulls the SAME Wire contribution twice (duplicate-click, browser reload), two rows land with identical `wire_contribution_id` values. The poller's `check_supersessions` input list contains the dup.
+- Rebuilds that source tier routing / evidence policy from the `pyramid_config_contributions` row (via the contribution_id FK on the operational table) silently bind to the LAST-inserted active row rather than the user's intended one.
+
+This is the "Phase 10 stub alias shipped for real" path and it trips on the most common end-to-end Discover use case. The Phase 14 workstream prompt's `pyramid_pull_wire_config` line item just says "brand-new pull, not supersession" — the implementer encoded that literally, but the frontend always routes Discover "Pull and activate" through this IPC regardless of whether a local version already exists, because the UI has no way to know the local state of every schema type at drawer-open time.
+
+**W2 — `supersede_with_pulled` has no idempotency guard; concurrent poller+user pull corrupts the chain (`src-tauri/src/pyramid/wire_pull.rs:313-361` pre-fix)**
+
+The old `supersede_with_pulled` helper was passed a `prior: &ConfigContribution` loaded BEFORE the transaction opened, then ran an unconditional `UPDATE … SET status='superseded', superseded_by_id=?` against that prior's `contribution_id` inside the transaction. No predicate checked whether the prior was still active — unlike `supersede_config_contribution` in `config_contributions.rs:267-271`, which explicitly bails with `prior contribution X is already superseded — cannot supersede a non-active version`.
+
+Reproduction (race between poller's auto-update path and user's manual pull):
+
+1. User has local `L1` active, `wire_contribution_id = W1`. Wire has published `W2` superseding it. `wire_auto_update_settings.custom_prompts = true`.
+2. Poller cycle starts, acquires writer, calls `try_auto_update` → `pull_wire_contribution(..., local_contribution_id_to_supersede: Some(L1), activate: true)`. Inside `supersede_with_pulled`: transaction opens, inserts `L2` active, UPDATEs `L1` → `status='superseded', superseded_by_id=L2`. Transaction commits. Writer released. Poller deletes the `pyramid_wire_update_cache` row for L1.
+3. **Meanwhile**, the user had opened the My Tools tab BEFORE the poller ran, so the UI had a cached `WireUpdateEntry` with `local_contribution_id=L1`. They click "Pull latest" in the drawer just after the poller releases the writer.
+4. `pyramid_wire_pull_latest(L1, W2)` acquires the writer, loads L1 via `load_contribution_by_id` — L1 exists but is now `status='superseded'`. The old code proceeds: `supersede_with_pulled(conn, prior=L1, …)` opens a new transaction and runs the unconditional UPDATE on L1.
+5. Now L1's `superseded_by_id` is overwritten from `L2` to `L3`. The transaction inserts `L3` with `supersedes_id=L1, status='active'`.
+6. Final state: L1 superseded (by L3 — L2 is orphaned from L1's perspective), L2 `status='active'` (still, because the UPDATE only touched L1), L3 `status='active'`. **Two active rows, corrupted supersession chain: L1→L3 but L2→? dangling.**
+
+The reverse interleaving (user pull wins the writer, poller follows) hits the same bug via `try_auto_update` finding L1 still in `list_wire_tracked_contributions` (it is, because it has `wire_contribution_id != NULL`) and calling `pull_wire_contribution` with `Some(L1)`. The poller's pull then clobbers L1's supersession pointer the same way.
+
+The race window is narrow (requires auto-update enabled AND the user holds a stale UI view), but the invariant break is permanent once it happens and there's no self-healing path — the orphan row lingers until the user manually deletes or supersedes it through another flow.
+
+### Fix
+
+Both W1 and W2 share a root cause: the pull flow captures an externally-supplied "which row to supersede" hint and trusts it without re-checking the real state at transaction time. The fix eliminates the hint entirely for the activate path and builds a new helper, `commit_pulled_active`, that:
+
+- Takes `(schema_type, slug, yaml, note, metadata, wire_id)` — NO prior ID, ever.
+- Opens a transaction.
+- Resolves the CURRENT active row via the same predicate as `load_active_config_contribution` (`slug = ? AND schema_type = ? AND status = 'active' AND superseded_by_id IS NULL`), using the slug-branching idiom for NULL-safety.
+- Inserts the new row with `supersedes_id = prior_active_id` (NULL when no prior exists — fresh-insert case still works).
+- UPDATEs the prior row ONLY if `prior_active_id.is_some()`, with a predicate guard (`WHERE contribution_id = ? AND status = 'active' AND superseded_by_id IS NULL`) that no-ops if the row has been flipped by a racing writer.
+- Commits.
+
+The `insert_pulled_contribution` helper is preserved for the `activate=false` (proposed) path, where the row lands with `status='proposed'` and doesn't interact with the active-row invariant.
+
+The `supersede_with_pulled` helper and the `pull_wire_contribution` branch on `options.local_contribution_id_to_supersede` are both deleted — the `local_contribution_id_to_supersede` field in `PullOptions` is still honored structurally (callers still pass it) but it's now ignored for correctness purposes. The in-transaction resolution is the authoritative source.
+
+### Findings that were NOT bugs
+
+Traced each of the 13 wanderer-focus questions end-to-end:
+
+- **Q1 — Discovery search end-to-end.** `ToolsMode.tsx:2128-2151` calls `invoke('pyramid_wire_discover', { schemaType, query, tags, limit, sortBy })`; Tauri converts camelCase → snake_case; `main.rs:7817-7851` loads weights synchronously then awaits the HTTP fetch; `wire_discovery::discover` → `rank_raw_results` → sort + score + rationale. Frontend renders `DiscoveryResultCard` with `QualityBadges` and the rationale string at `ToolsMode.tsx:2484-2495`. Sort dropdown round-trips through `from_str_lax` which handles every documented value and falls back to `Score` for unknown strings with a warning log.
+- **Q2 — Recommendations profile.** Built from REAL data: `source_type` from `pyramid_slugs.content_type` (NOT NULL CHECK-constrained at `db.rs:56`), `tier_routing_providers` from `pyramid_tier_routing.provider_id` distinct list. `build_pyramid_profile` at `wire_discovery.rs:667-702`. No placeholders.
+- **Q4 — Update poller honors per-schema auto-update toggle.** `auto_update_settings.is_enabled(schema_type)` at `wire_update_poller.rs:322` gates `try_auto_update`. Settings are loaded once per cycle at `wire_update_poller.rs:265-268` via `load_auto_update_settings(reader)`, so supersessions of the settings contribution take effect on the next cycle without restart. The spec requires this and the implementation delivers.
+- **Q5 — Update drawer end-to-end.** Badge renders when `wireUpdates.find(...)` matches a ConfigCard's schema_type AND (no active contribution OR active.contribution_id matches) at `ToolsMode.tsx:474-480`. Click opens `WireUpdateDrawer`. "Pull latest" button invokes `pyramid_wire_pull_latest` which DOES pass `local_contribution_id_to_supersede: Some(&local_contribution_id)` at `main.rs:8086` — so (before the wanderer fix) this path went through `supersede_with_pulled` which has the race issue but not the W1 always-duplicate issue. After the wanderer fix, the path routes through `commit_pulled_active` which resolves the prior inside the transaction. Badge disappears via `bumpRefresh()` refetching `pyramid_wire_update_available`, which filters by `acknowledged_at IS NULL` + checks the cache row was deleted by the pull flow.
+- **Q6 — Auto-update toggle round-trip.** Modal reads via `pyramid_wire_auto_update_status`, flips via `pyramid_wire_auto_update_toggle` which constructs a new `wire_auto_update_settings` YAML, supersedes the prior contribution via `supersede_config_contribution` (not the wire_pull path — unrelated to W1/W2), then calls `sync_config_to_operational` which invalidates caches. Next poller tick re-reads. Clean.
+- **Q7 — Weight redistribution math.** Manually walked the case: `adoption=50, freshness=30d, chain_length=2, rest None, max_adoption=100`. Normalized: `adoption ≈ 0.851, freshness = 0.833, chain = 0.2`. `present_weight_sum = 0.20+0.15+0.10 = 0.45`. Score = 0.851×(0.20/0.45) + 0.833×(0.15/0.45) + 0.2×(0.10/0.45) ≈ 0.378+0.277+0.044 ≈ 0.700. Matches the spec's "redistribute missing weights" requirement. Test `test_compute_score_with_redistributed_weights` covers the sparse-vs-full parity. Implementation caveat: `from_search_result` ALWAYS sets `adoption_count = Some(r.adoption_count)`, so the Wire's 0-adoption signal is `Some(0)`, not `None`. Brand-new-contribution redistribution only applies when the Wire actually sends NULL for a signal — a narrower case than the spec intent but documented in the struct comments.
+- **Q8 — Credential safety gate edge cases.** `CredentialStore::collect_references` is a raw-byte scanner that (a) detects `${VAR}`, (b) handles `$${NOT_A_VAR}` escape by consuming the `$$...}` block without recording it, (c) does NOT YAML-parse — comment lines like `# ${OLD_VAR}` WILL match. The verifier pass documented this as a known tradeoff: "the safety-first position is any unresolved `${VAR_NAME}` in the YAML is a blocker". Confirmed behavior in `credentials.rs:420-458`.
+- **Q9 — Concurrent poller+pull race.** See W2 above. Fixed.
+- **Q10 — Bundled idempotency.** `walk_bundled_contributions_manifest` uses `INSERT OR IGNORE` keyed on the explicit `contribution_id`. If the user has refined a bundled default, the bundled row still exists (marked `superseded`) and the INSERT OR IGNORE is a no-op. User's refinement remains active. Verified at `wire_migration.rs:978-1013`.
+- **Q11 — WireUpdatePoller sidecar lifetime.** `main.rs:9024` leaks the handle via `std::mem::forget`. The Drop impl of `WireUpdatePollerHandle` + the SidecarHandle's watchdog-clearing Drop are therefore dead code in production — the sidecar thread runs until process exit, which kills all threads. Not a leak in practice (OS cleanup), but the "graceful shutdown" machinery is effectively decorative for the production path. Documented intent in the `mem::forget` comment; not a wanderer fix.
+- **Q12 — Weights cache invalidation.** `pyramid_accept_config` → `accept_config_draft` → `sync_config_to_operational_with_registry` → `wire_discovery_weights` branch at `config_contributions.rs:751-758` → `invalidate_wire_discovery_cache()` → `wire_discovery::invalidate_weights_cache()`. Next `load_ranking_weights` cache-miss re-reads from SQLite. No stale-weight window. `ToolsMode.tsx` Discover tab's weights are read per-search inside `pyramid_wire_discover`, so the fresh weights apply on the very next search after the supersession.
+- **Q13 — Frontend error handling.** `DiscoverPanel` shows "No results. The Wire's discovery endpoint may not be live yet — …" when the IPC returns `[]` (`ToolsMode.tsx:2366-2377`). Errors surface via a red `<p>{error}</p>` banner. Pull errors detect credential-related strings and render a tailored "Pull refused — … Add the missing credentials in Settings → Credentials, then retry." message. `WireUpdateDrawer` renders errors in a red panel at `ToolsMode.tsx:1050-1062`.
+
+### Non-blocking concerns surfaced (not fixed)
+
+- **Writer lock held across HTTP in the pull path.** `pull_wire_contribution` takes `&mut Connection` and holds it across `publisher.fetch_contribution(...).await` because the Connection is borrowed from the caller's `writer.lock().await` MutexGuard. For a slow Wire response, the writer mutex is blocked for seconds, starving every other write IPC. The auto-update path in `try_auto_update` has the same pattern. A future refinement would split the fetch (no lock) from the commit (lock) and re-validate invariants before committing — shape matches the Q3 fix above but adds lock-free fetches. Out of scope for the wanderer fix.
+- **Missing-signal redistribution ineffective for `adoption_count`, `chain_length`, `freshness_days=0`, `upheld/filed_rebuttals`.** `from_search_result` treats all of these as `Some(0)` rather than `None`, so brand-new contributions with zero adoption/no chain get concrete normalized values of 0.0 instead of triggering the redistribution path. The spec's fair-shot intent applies only to `rating`, `reputation`, `internalization` (when total_pullers=0), and `freshness_days == u32::MAX`. Documented in the `RankingSignals::from_search_result` struct comment as "conservative: treat 0 adoption as `Some(0)` (tracked)". Not a bug but worth calling out if Adam's test results show new contributions ranking too low.
+- **`pyramid_pull_wire_config`'s `activate` option defaults to `false`** (`main.rs:8130`). The frontend passes `true` when the user clicks "Pull and activate" and `false` for "Pull as proposal", so the default only matters for programmatic callers. Current behavior is correct.
+- **`WireUpdatePoller` reads the Wire auth token from `PyramidState.config.auth_token` or the `WIRE_AUTH_TOKEN` env var**, NOT the canonical `AuthState` held outside `PyramidState`. The implementer documented this as a coupling shortcut. Missing auth → poller skips cycles cleanly. Future wiring task: thread the real `AuthState` through.
+- **`pyramid_wire_update_available` enriches cache rows by calling `load_contribution_by_id` per row** (`main.rs:7923-7949`). That's N+1 queries for N cache entries. Acceptable for tens of entries, gets expensive at hundreds. A single JOIN would be cleaner. Not a wanderer fix — Adam's use case has ~10s of entries per node.
+
+### Commits
+
+1. `phase-14: wanderer fix — atomic active-row resolution in wire pull flow`
+
+### Verification after fix
+
+- `cargo check --lib`: 3 pre-existing warnings only. No new warnings.
+- `cargo test --lib pyramid`: **1170 passing / 7 failing** (baseline 1166 + 4 new wanderer regression tests). Same 7 pre-existing failures.
+- `cargo test --lib pyramid::wire_pull`: **7 passing / 0 failing** (3 existing credential gate tests + 4 new wanderer regression tests: `test_commit_pulled_active_supersedes_existing_active`, `test_commit_pulled_active_ignores_stale_prior_hint`, `test_commit_pulled_active_inserts_fresh_when_no_prior`, `test_commit_pulled_active_isolates_by_slug`).
+- `npm run build`: clean, 141 modules transformed, no new TypeScript errors.
+- Code traces for Q1-Q13 recorded above with file:line citations.
+
+### Lesson for future phases
+
+**When an activate-path pull can land a row with `status='active'`, the supersession invariant (`exactly one active row per (schema_type, slug) pair`) has to be enforced INSIDE the transaction that inserts the row — never via a caller-provided "which row to supersede" hint.** Hints capture the state at the caller's call site, which may be several `.await` points ago; by the time the transaction opens, a racing writer can have flipped that exact row, and the unconditional UPDATE becomes a data-corruption primitive.
+
+The fix is mechanical: take the hint as an optional UX preference but always re-resolve the authoritative current-active via the same predicate (`status='active' AND superseded_by_id IS NULL`) inside the transaction, with a `WHERE` guard on the UPDATE that no-ops if the row was concurrently mutated. This is the pattern `accept_config_draft` in `generative_config.rs:785-852` already uses — the Phase 9 wanderer fix retrofitted the direct-YAML accept path to do exactly this. Phase 14's `supersede_with_pulled` was a regression of the same anti-pattern; the wanderer fix brings it in line.
+
+**The wanderer's value here was in seeing that the Phase 10 alias `pyramid_pull_wire_config` always passes `local_contribution_id_to_supersede: None` — the verifier's punch-list audit checked that the primary `pyramid_wire_pull_latest` IPC hit `supersede_with_pulled` (which it did), but never asked what the alias's fresh-insert branch does when an active row already exists.** Alias IPCs are a classic place for behavioral drift because the "alias" framing implies "it's just a name change" — in reality, the alias often hits a different code path with different assumptions, and that path needs its own end-to-end trace.
+
+---
+
