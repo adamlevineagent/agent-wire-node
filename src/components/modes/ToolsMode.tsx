@@ -26,6 +26,7 @@ import { YamlConfigRenderer } from "../YamlConfigRenderer";
 import { useYamlRendererSources } from "../../hooks/useYamlRendererSources";
 import { PublishPreviewModal } from "../PublishPreviewModal";
 import { ContributionDetailDrawer } from "../ContributionDetailDrawer";
+import { MigrationPanel } from "../MigrationPanel";
 import { QualityBadges } from "../QualityBadges";
 import type { SchemaAnnotation } from "../../types/yamlRenderer";
 import type {
@@ -36,13 +37,18 @@ import type {
     ConfigSchemaSummary,
     DiscoveryResult,
     GenerateConfigResponse,
+    NeedsMigrationEntry,
     PullLatestResponse,
     Recommendation,
     RefineConfigResponse,
     WireUpdateEntry,
 } from "../../types/configContributions";
 
-type ToolsTab = "my-tools" | "discover" | "create";
+// Phase 18d: add a fourth top-level tab for the schema migration
+// surface. Order: My Tools, Needs Migration (only when there are
+// flagged configs), Discover, Create. The badge on the tab label
+// shows the count of flagged configs.
+type ToolsTab = "my-tools" | "needs-migration" | "discover" | "create";
 
 const TYPE_BADGE_COLORS: Record<string, string> = {
     action: "#3b82f6",
@@ -81,6 +87,16 @@ export function ToolsMode() {
         null,
     );
 
+    // Phase 18d: count of configs flagged needing migration. Drives the
+    // tab badge AND the per-card "needs migration" chip in My Tools.
+    // Refreshed when ToolsMode mounts and whenever a migration is
+    // accepted/rejected. Stored as a Set of contribution_ids so the
+    // My Tools panel can ask "is this contribution flagged?" in O(1).
+    const [needsMigration, setNeedsMigration] = useState<Set<string>>(
+        new Set(),
+    );
+    const [migrationRefreshToken, setMigrationRefreshToken] = useState(0);
+
     const openCreateFrom = useCallback((seed: CreateSeed) => {
         setCreateSeed(seed);
         setActiveTab("create");
@@ -88,6 +104,37 @@ export function ToolsMode() {
 
     const clearSeed = useCallback(() => setCreateSeed(null), []);
     const clearPreset = useCallback(() => setCreatePreset(null), []);
+
+    const bumpMigrationRefresh = useCallback(
+        () => setMigrationRefreshToken((n) => n + 1),
+        [],
+    );
+
+    // Phase 18d: fetch the flagged-config list at mount and on every
+    // refresh bump so both the tab badge and the My Tools chip stay in
+    // sync. Best-effort — failures log + leave the set empty so the
+    // UI stays usable.
+    useEffect(() => {
+        let cancelled = false;
+        invoke<NeedsMigrationEntry[]>("pyramid_list_configs_needing_migration")
+            .then((rows) => {
+                if (cancelled) return;
+                const next = new Set<string>();
+                for (const r of rows) {
+                    next.add(r.contribution_id);
+                }
+                setNeedsMigration(next);
+            })
+            .catch((err) => {
+                console.warn(
+                    "[ToolsMode] needs migration fetch failed:",
+                    err,
+                );
+            });
+        return () => {
+            cancelled = true;
+        };
+    }, [migrationRefreshToken]);
 
     // Phase 15: consume any preset queued by the bridge at mount time
     // AND subscribe to the custom event so presets queued while
@@ -111,6 +158,8 @@ export function ToolsMode() {
         };
     }, []);
 
+    const migrationCount = needsMigration.size;
+
     return (
         <div className="mode-container">
             <nav className="node-tabs">
@@ -121,6 +170,41 @@ export function ToolsMode() {
                     onClick={() => setActiveTab("my-tools")}
                 >
                     My Tools
+                </button>
+                <button
+                    className={`node-tab ${
+                        activeTab === "needs-migration"
+                            ? "node-tab-active"
+                            : ""
+                    }`}
+                    onClick={() => setActiveTab("needs-migration")}
+                    title="Configs flagged for LLM-assisted migration after a schema change"
+                    style={{
+                        display: "inline-flex",
+                        alignItems: "center",
+                        gap: 6,
+                    }}
+                >
+                    Needs Migration
+                    {migrationCount > 0 && (
+                        <span
+                            style={{
+                                display: "inline-flex",
+                                alignItems: "center",
+                                justifyContent: "center",
+                                minWidth: 18,
+                                height: 18,
+                                padding: "0 6px",
+                                fontSize: 10,
+                                fontWeight: 700,
+                                color: "#1a1a2e",
+                                background: "#f59e0b",
+                                borderRadius: 9,
+                            }}
+                        >
+                            {migrationCount}
+                        </span>
+                    )}
                 </button>
                 <button
                     className={`node-tab ${
@@ -142,7 +226,16 @@ export function ToolsMode() {
 
             <div className="node-tab-content">
                 {activeTab === "my-tools" && (
-                    <MyToolsPanel onEdit={openCreateFrom} />
+                    <MyToolsPanel
+                        onEdit={openCreateFrom}
+                        flaggedContributionIds={needsMigration}
+                    />
+                )}
+                {activeTab === "needs-migration" && (
+                    <MigrationPanel
+                        refreshToken={migrationRefreshToken}
+                        onMigrationChanged={bumpMigrationRefresh}
+                    />
                 )}
                 {activeTab === "discover" && <DiscoverPanel />}
                 {activeTab === "create" && (
@@ -162,9 +255,18 @@ export function ToolsMode() {
 
 interface MyToolsPanelProps {
     onEdit: (seed: CreateSeed) => void;
+    /** Phase 18d: contribution_ids that are flagged needs_migration = 1.
+     *  Each ConfigCard gets a "needs migration" chip when its active
+     *  contribution_id is in this set. Allows discovery of the flag from
+     *  the existing My Tools surface even if the user never opens the
+     *  Needs Migration tab. */
+    flaggedContributionIds?: Set<string>;
 }
 
-function MyToolsPanel({ onEdit }: MyToolsPanelProps) {
+function MyToolsPanel({
+    onEdit,
+    flaggedContributionIds,
+}: MyToolsPanelProps) {
     const { wireApiCall } = useAppContext();
 
     // Existing Wire-published actions (Sprint 3 behavior — keep as-is).
@@ -519,12 +621,20 @@ function MyToolsPanel({ onEdit }: MyToolsPanelProps) {
                                 u.local_contribution_id ===
                                     active.contribution_id),
                     );
+                    // Phase 18d: surface the needs_migration chip when
+                    // this card's active contribution is in the flagged
+                    // set provided by ToolsMode.
+                    const needsMigration =
+                        active != null &&
+                        flaggedContributionIds != null &&
+                        flaggedContributionIds.has(active.contribution_id);
                     return (
                         <ConfigCard
                             key={schema.schema_type}
                             schema={schema}
                             active={active}
                             update={update}
+                            needsMigration={needsMigration}
                             onView={() => handleOpenDetail(schema.schema_type)}
                             onHistory={() =>
                                 handleOpenHistory(schema.schema_type)
@@ -691,6 +801,7 @@ function ConfigCard({
     onHistory,
     onPublish,
     onOpenUpdate,
+    needsMigration,
 }: {
     schema: ConfigSchemaSummary;
     active: ActiveConfigResponse | null | undefined;
@@ -699,6 +810,10 @@ function ConfigCard({
     onHistory: () => void;
     onPublish: () => void;
     onOpenUpdate?: () => void;
+    /** Phase 18d: render the "needs migration" chip when this card's
+     *  active contribution is flagged. The user can click the chip to
+     *  hop to the Needs Migration tab via the toolsModeBridge. */
+    needsMigration?: boolean;
 }) {
     const hasActive = !!active;
     const version = active?.version_chain_length ?? 0;
@@ -787,6 +902,24 @@ function ConfigCard({
                     >
                         Update available ({update.chain_length_delta})
                     </button>
+                )}
+                {needsMigration && (
+                    <span
+                        style={{
+                            fontSize: 10,
+                            padding: "2px 8px",
+                            borderRadius: 4,
+                            background: "rgba(245, 158, 11, 0.18)",
+                            color: "#f59e0b",
+                            fontWeight: 600,
+                            border: "1px solid rgba(245, 158, 11, 0.4)",
+                            textTransform: "uppercase",
+                            letterSpacing: "0.04em",
+                        }}
+                        title="The schema this config was written against has been refined — open the Needs Migration tab to review the LLM-assisted migration"
+                    >
+                        Migration needed
+                    </span>
                 )}
             </div>
             <p

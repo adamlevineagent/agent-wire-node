@@ -216,3 +216,61 @@ export interface AutoUpdateSettingEntry {
     schema_type: string;
     enabled: boolean;
 }
+
+// ─── Phase 18d: Schema Migration UI ─────────────────────────────────────────
+
+/** Phase 18d `NeedsMigrationEntry` — one row returned by
+ *  `pyramid_list_configs_needing_migration`. Carries the flagged config's
+ *  identity, its current YAML, and the schema_definition contribution_ids
+ *  that bracket the migration. */
+export interface NeedsMigrationEntry {
+    contribution_id: string;
+    schema_type: string;
+    slug: string | null;
+    current_yaml: string;
+    /** contribution_id of the active schema_definition for this schema_type. */
+    current_schema_contribution_id: string;
+    /** contribution_id of the prior schema_definition the YAML was written
+     *  against, when resolvable via the supersession chain walk. */
+    prior_schema_contribution_id: string | null;
+    flagged_at: string;
+    /** triggering_note from the active schema_definition contribution that
+     *  caused the flag — the rationale the user reads to decide whether
+     *  to migrate. */
+    supersession_note: string | null;
+}
+
+/** Phase 18d `MigrationProposal` — returned by
+ *  `pyramid_propose_config_migration`. Contains the LLM's proposed
+ *  migration as a draft contribution + everything the review modal needs
+ *  to render side-by-side. */
+export interface MigrationProposal {
+    /** contribution_id of the freshly-created draft row holding the
+     *  migrated YAML. */
+    draft_id: string;
+    /** Original YAML (against the prior schema). */
+    old_yaml: string;
+    /** LLM's migrated YAML (against the new schema). */
+    new_yaml: string;
+    schema_type: string;
+    /** JSON schema body of the prior schema_definition. */
+    schema_from: string;
+    /** JSON schema body of the new schema_definition. */
+    schema_to: string;
+}
+
+/** Phase 18d `AcceptMigrationOutcome` — returned by
+ *  `pyramid_accept_config_migration`. */
+export interface AcceptMigrationOutcome {
+    new_contribution_id: string;
+    schema_type: string;
+    slug: string | null;
+    sync_succeeded: boolean;
+}
+
+/** Phase 18d `RejectMigrationOutcome` — returned by
+ *  `pyramid_reject_config_migration`. */
+export interface RejectMigrationOutcome {
+    deleted_draft_id: string;
+    original_contribution_id: string;
+}
