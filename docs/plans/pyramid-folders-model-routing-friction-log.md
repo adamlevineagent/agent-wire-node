@@ -2147,3 +2147,66 @@ Documented inline at `folder_ingestion.rs::prepopulate_chunks_for`.
 
 ---
 
+## Phase 18b wanderer pass (2026-04-11)
+
+1. **When the verifier can't run tests, the wanderer must be the
+   guaranteed backstop.** Phase 18b's verifier explicitly punted
+   runtime verification (`cargo test --lib pyramid` + `npm run build`)
+   because 4 sibling Phase 18 worktrees had filled the shared Data
+   volume. The verifier's static audit was thorough, but "pre-release
+   test count matches a static code review" is a weaker guarantee than
+   "I ran the tests and they pass." The wanderer started with runtime
+   verification as job #1 before the 12 failure-mode trace. All three
+   runtime checks passed cleanly on this worktree (111 GB free).
+
+2. **Pre-existing test failures need a clear provenance trail.** The 7
+   failures in `cargo test --lib pyramid` are all from schema drift in
+   `pyramid::staleness::tests::*` where a local `setup_test_db` helper
+   creates `pyramid_evidence` without the `build_id` column that
+   production code expects. These have existed since Phase 17 (last
+   touch on staleness.rs was `4177152`). The wanderer documented this
+   chain of provenance in the log so a future reader doesn't think the
+   count drift is a new regression.
+
+3. **"Verifier clean" != "Wanderer clean" — but for 18b, both passed.**
+   The meta-lesson from 17/18 prior phases is that wanderers catch
+   bugs verifiers miss. Phase 18b is the exception: the implementer's
+   work was tight enough that 12 deep failure-mode traces, an
+   end-to-end runtime verification, and a lock-contention/deadlock
+   analysis all cleared with zero code fixes required. The architecture
+   is sound (Option A fully consummated, single-source-of-truth unified
+   function), the retrofit is exhaustive (6/6 production sites flipped),
+   the deprecation is explicit, the schema migration is idempotent, and
+   the test bodies exercise production paths not shapes. One phase in
+   eighteen is a believable rate for "wanderer finds nothing real."
+
+4. **Cost-log double-counting on cache hits is a pre-existing design
+   observation, NOT a Phase 18b bug.** Worth flagging for a future
+   phase: `chain_executor.rs::execute_ir_single` unconditionally calls
+   `log_cost_synchronous` with the cached `LlmResponse.actual_cost_usd`
+   on every dispatch, including cache hits. Phase 12's non-audited
+   retrofit had the same behavior. The user sees "second build cost
+   $X" in the cost ledger even on a full cache-hit re-run. The fix is
+   small but out of 18b scope — either filter by cache_hit at the
+   ledger boundary, or zero out the cost when serving from cache. This
+   is a dashboard-correctness issue, not a billing issue (OpenRouter
+   only actually charges for wire calls).
+
+5. **Cache-hit audit rows now show up in `cost_model.rs::recompute_
+   from_audit` averages but the math works out.** Cache hit rows
+   preserve the original call's `prompt_tokens` / `completion_tokens`,
+   and `calls_per_conversation = total_calls / distinct_builds` stays
+   stable across re-runs (2N/2 = N). Per-call cost estimate is
+   unchanged. The cost model reports approximately the first build's
+   actual cost, which IS what the user paid. Not a regression.
+
+6. **No frontend UI surfaces `cache_hit` from the audit table yet.**
+   Phase 13's build viz shows cache hits via the event bus path
+   (`TaggedKind::CacheHit` → `useBuildRowState.ts:323`), not by
+   querying `pyramid_llm_audit.cache_hit`. Phase 18b's contribution
+   is the durable record — DADBEAR Oversight surfacing cache savings
+   from the audit column is a separate workstream. This matches the
+   workstream prompt's framing and isn't a gap.
+
+---
+
