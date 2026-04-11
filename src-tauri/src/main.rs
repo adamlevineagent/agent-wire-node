@@ -7238,6 +7238,158 @@ async fn pyramid_publish_to_wire(
     })
 }
 
+// ── Phase 7: Cache warming on pyramid import IPC commands ─────────────────
+//
+// Per `docs/specs/cache-warming-and-import.md` "IPC Contract" section
+// (~line 374). Three commands cover the import lifecycle:
+//
+//   pyramid_import_pyramid(wire_pyramid_id, target_slug, source_path,
+//                          manifest_json)
+//     Kicks off the staleness-check + cache-population flow. Returns an
+//     ImportReport with the four counters ToolsMode renders in its
+//     "first build will cost ~$X" preview.
+//
+//   pyramid_import_progress(target_slug)
+//     Polled by the frontend during long imports. Returns the current
+//     ImportState row fields + a 0.0..=1.0 progress ratio derived from
+//     (nodes_processed, cache_entries_validated).
+//
+//   pyramid_import_cancel(target_slug)
+//     Rolls back the import: deletes any cache rows the import wrote
+//     (filtered by `build_id LIKE 'import:%'`) and the in-flight state
+//     row. Idempotent — cancelling a slug that was never imported is a
+//     no-op. Per spec "Cleanup" section ~line 345.
+//
+// The manifest is supplied by the caller rather than downloaded here.
+// Phase 10's ImportPyramidWizard will own the manifest download via
+// the existing WireImportClient + a new pyramid-manifest endpoint.
+
+#[derive(serde::Serialize)]
+struct ImportPyramidResponse {
+    imported_nodes: u64,
+    cache_entries_valid: u64,
+    cache_entries_stale: u64,
+    nodes_needing_rebuild: u64,
+    nodes_with_valid_cache: u64,
+}
+
+#[derive(serde::Serialize)]
+struct ImportProgressResponse {
+    status: String,
+    progress: f64,
+    nodes_imported: i64,
+    cache_entries_validated: i64,
+    cache_entries_inserted: i64,
+    error_message: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct ImportCancelResponse {
+    cancelled: bool,
+    /// Whether any partial state existed for the slug at cancel time.
+    /// `false` is an idempotent no-op cancel.
+    state_row_existed: bool,
+    /// Number of `pyramid_step_cache` rows the rollback deleted. Counts
+    /// only rows whose `build_id` matches the import's synthetic
+    /// `import:` prefix — locally-built rows are not touched.
+    cache_rows_rolled_back: u64,
+}
+
+#[tauri::command]
+async fn pyramid_import_pyramid(
+    state: tauri::State<'_, SharedState>,
+    wire_pyramid_id: String,
+    target_slug: String,
+    source_path: String,
+    manifest_json: String,
+) -> Result<ImportPyramidResponse, String> {
+    // Parse the manifest up-front so we fail fast on bad input without
+    // touching the DB.
+    let manifest: wire_node_lib::pyramid::pyramid_import::CacheManifest =
+        serde_json::from_str(&manifest_json)
+            .map_err(|e| format!("failed to parse cache manifest JSON: {e}"))?;
+
+    let writer = state.pyramid.writer.lock().await;
+
+    let report = wire_node_lib::pyramid::pyramid_import::import_pyramid(
+        &writer,
+        &state.pyramid.build_event_bus,
+        &wire_pyramid_id,
+        &target_slug,
+        &source_path,
+        &manifest,
+    )
+    .map_err(|e| e.to_string())?;
+
+    Ok(ImportPyramidResponse {
+        imported_nodes: report.nodes_with_valid_cache,
+        cache_entries_valid: report.cache_entries_valid,
+        cache_entries_stale: report.cache_entries_stale,
+        nodes_needing_rebuild: report.nodes_needing_rebuild,
+        nodes_with_valid_cache: report.nodes_with_valid_cache,
+    })
+}
+
+#[tauri::command]
+async fn pyramid_import_progress(
+    state: tauri::State<'_, SharedState>,
+    target_slug: String,
+) -> Result<Option<ImportProgressResponse>, String> {
+    let reader = state.pyramid.reader.lock().await;
+    let state_row = wire_node_lib::pyramid::db::load_import_state(&reader, &target_slug)
+        .map_err(|e| e.to_string())?;
+
+    let Some(row) = state_row else {
+        return Ok(None);
+    };
+
+    // Progress semantics per the spec: weight node progress and
+    // cache-entry progress equally. Either total may be None while the
+    // manifest is still downloading — in that case progress is 0.
+    let progress = {
+        let node_frac = match row.nodes_total {
+            Some(total) if total > 0 => {
+                (row.nodes_processed as f64) / (total as f64)
+            }
+            _ => 0.0,
+        };
+        let entry_frac = match row.cache_entries_total {
+            Some(total) if total > 0 => {
+                (row.cache_entries_validated as f64) / (total as f64)
+            }
+            _ => 0.0,
+        };
+        (node_frac * 0.5 + entry_frac * 0.5).clamp(0.0, 1.0)
+    };
+
+    Ok(Some(ImportProgressResponse {
+        status: row.status,
+        progress,
+        nodes_imported: row.nodes_processed,
+        cache_entries_validated: row.cache_entries_validated,
+        cache_entries_inserted: row.cache_entries_inserted,
+        error_message: row.error_message,
+    }))
+}
+
+#[tauri::command]
+async fn pyramid_import_cancel(
+    state: tauri::State<'_, SharedState>,
+    target_slug: String,
+) -> Result<ImportCancelResponse, String> {
+    let writer = state.pyramid.writer.lock().await;
+    let report = wire_node_lib::pyramid::pyramid_import::cancel_pyramid_import(
+        &writer,
+        &target_slug,
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(ImportCancelResponse {
+        cancelled: true,
+        state_row_existed: report.state_row_existed,
+        cache_rows_rolled_back: report.cache_rows_rolled_back,
+    })
+}
+
 // --- App Setup --------------------------------------------------------------
 
 fn main() {
@@ -8442,6 +8594,10 @@ fn main() {
             // Phase 5: Wire Contribution Publication
             pyramid_dry_run_publish,
             pyramid_publish_to_wire,
+            // Phase 7: Cache Warming on Pyramid Import
+            pyramid_import_pyramid,
+            pyramid_import_progress,
+            pyramid_import_cancel,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Wire Node");

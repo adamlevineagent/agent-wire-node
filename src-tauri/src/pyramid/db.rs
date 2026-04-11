@@ -990,6 +990,37 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
         ",
     )?;
 
+    // ── Phase 7: Cache warming on pyramid import (pyramid_import_state) ───────
+    //
+    // Tracks the in-flight state of a `pyramid_import_pyramid` call so a
+    // partially completed import (network drop, crash, user-cancel) can be
+    // resumed from the cursor on the next attempt without re-validating the
+    // already-inserted entries.
+    //
+    // See `docs/specs/cache-warming-and-import.md` ("Import Resumability"
+    // section ~line 297) for the column-by-column rationale.
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS pyramid_import_state (
+            target_slug TEXT PRIMARY KEY,
+            wire_pyramid_id TEXT NOT NULL,
+            source_path TEXT NOT NULL,
+            status TEXT NOT NULL,
+            nodes_total INTEGER,
+            nodes_processed INTEGER DEFAULT 0,
+            cache_entries_total INTEGER,
+            cache_entries_validated INTEGER DEFAULT 0,
+            cache_entries_inserted INTEGER DEFAULT 0,
+            last_node_id_processed TEXT,
+            error_message TEXT,
+            started_at TEXT DEFAULT (datetime('now')),
+            updated_at TEXT DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_pyramid_import_state_status
+            ON pyramid_import_state(status);
+        ",
+    )?;
+
     // ── Schema Prep Migration for Wire Online push ──────────────────────────
     migrate_online_push_columns(conn)?;
 
@@ -5886,6 +5917,78 @@ pub fn store_cache(conn: &Connection, entry: &CacheEntry) -> Result<()> {
     Ok(())
 }
 
+/// Phase 7: idempotent cache insert for `populate_from_import`.
+///
+/// Uses `INSERT ... ON CONFLICT(slug, cache_key) DO NOTHING`, which is the
+/// SQLite equivalent of `INSERT OR IGNORE` on a conflict. Unlike
+/// [`store_cache`], this helper will NEVER overwrite an existing row — it
+/// silently leaves pre-existing rows untouched and reports whether the new
+/// row landed.
+///
+/// This is the exact semantic `docs/specs/cache-warming-and-import.md`
+/// mandates for the import path (see "Idempotency" section ~line 341):
+///
+/// > Cache entries are content-addressable. Re-importing the same entry is
+/// > a no-op because `pyramid_step_cache` has `UNIQUE(slug, cache_key)` and
+/// > the import uses `INSERT OR IGNORE`. A partial import's inserted
+/// > entries are not duplicated on resume.
+///
+/// The reason we need `DO NOTHING` specifically (and not `DO UPDATE`) is
+/// the reroll + resume scenario: if a user imports a pyramid, then
+/// force-rerolls a step locally (which writes a fresh row through
+/// `supersede_cache_entry` at the same content-addressable key with
+/// `force_fresh = 1` and a `supersedes_cache_id` pointing at the archival
+/// row), and then for any reason re-runs the import (network failure,
+/// crash recovery, explicit resume), `store_cache`'s `DO UPDATE` branch
+/// would clobber the rerolled row: the `output_json`, `force_fresh` flag,
+/// and `supersedes_cache_id` link would all be overwritten by the
+/// imported values. That silently undoes the user's reroll.
+///
+/// With `DO NOTHING`, the rerolled row is preserved and the re-imported
+/// row is simply skipped. Returns `true` if the row was actually inserted,
+/// `false` if a prior row occupied the slot.
+///
+/// Force-fresh writes should NEVER go through this helper — they go
+/// through `supersede_cache_entry` which preserves supersession history.
+pub fn store_cache_if_absent(conn: &Connection, entry: &CacheEntry) -> Result<bool> {
+    let affected = conn
+        .execute(
+            "INSERT INTO pyramid_step_cache
+                (slug, build_id, step_name, chunk_index, depth, cache_key,
+                 inputs_hash, prompt_hash, model_id, output_json, token_usage_json,
+                 cost_usd, latency_ms, created_at, force_fresh, supersedes_cache_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                     datetime('now'), ?14, ?15)
+             ON CONFLICT(slug, cache_key) DO NOTHING",
+            rusqlite::params![
+                entry.slug,
+                entry.build_id,
+                entry.step_name,
+                entry.chunk_index,
+                entry.depth,
+                entry.cache_key,
+                entry.inputs_hash,
+                entry.prompt_hash,
+                entry.model_id,
+                entry.output_json,
+                entry.token_usage_json,
+                entry.cost_usd,
+                entry.latency_ms,
+                if entry.force_fresh { 1_i64 } else { 0_i64 },
+                entry.supersedes_cache_id,
+            ],
+        )
+        .with_context(|| {
+            format!(
+                "store_cache_if_absent(slug={}, cache_key={})",
+                entry.slug, entry.cache_key
+            )
+        })?;
+    // SQLite returns the number of rows actually affected. DO NOTHING
+    // means a conflict yields 0 rows affected.
+    Ok(affected == 1)
+}
+
 /// Delete a cache row by its content-addressable key. Used by the
 /// verification-failure path in `call_model_unified_with_options` — when
 /// `verify_cache_hit` returns `Mismatch*` or `CorruptedOutput`, the
@@ -5968,6 +6071,162 @@ pub fn supersede_cache_entry(
         return Err(e);
     }
 
+    Ok(())
+}
+
+// ── Phase 7: Cache warming on import — pyramid_import_state CRUD ─────────────
+//
+// In-flight tracking for `pyramid_import_pyramid` calls. The row is the
+// resumption cursor: a fresh import inserts a row with status
+// `downloading_manifest`, the staleness pass updates progress fields and
+// `last_node_id_processed`, and a successful run flips status to `complete`.
+// On crash or user-cancel the row is left behind so a subsequent call can
+// either resume from the cursor or be explicitly cancelled.
+//
+// See `docs/specs/cache-warming-and-import.md` "Import Resumability" section.
+
+/// In-memory representation of a `pyramid_import_state` row.
+///
+/// Optional `nodes_total` / `cache_entries_total` fields reflect the column
+/// nullability — both are initially NULL and only populated after the manifest
+/// download phase has counted them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImportState {
+    pub target_slug: String,
+    pub wire_pyramid_id: String,
+    pub source_path: String,
+    pub status: String,
+    pub nodes_total: Option<i64>,
+    pub nodes_processed: i64,
+    pub cache_entries_total: Option<i64>,
+    pub cache_entries_validated: i64,
+    pub cache_entries_inserted: i64,
+    pub last_node_id_processed: Option<String>,
+    pub error_message: Option<String>,
+    pub started_at: Option<String>,
+    pub updated_at: Option<String>,
+}
+
+fn import_state_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ImportState> {
+    Ok(ImportState {
+        target_slug: row.get(0)?,
+        wire_pyramid_id: row.get(1)?,
+        source_path: row.get(2)?,
+        status: row.get(3)?,
+        nodes_total: row.get(4)?,
+        nodes_processed: row.get(5)?,
+        cache_entries_total: row.get(6)?,
+        cache_entries_validated: row.get(7)?,
+        cache_entries_inserted: row.get(8)?,
+        last_node_id_processed: row.get(9)?,
+        error_message: row.get(10)?,
+        started_at: row.get(11)?,
+        updated_at: row.get(12)?,
+    })
+}
+
+/// Insert a fresh import state row. Fails if a row already exists for the
+/// `target_slug` — callers MUST first call `load_import_state` and decide
+/// whether to resume or `delete_import_state` before re-creating.
+pub fn create_import_state(
+    conn: &Connection,
+    target_slug: &str,
+    wire_pyramid_id: &str,
+    source_path: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO pyramid_import_state (
+            target_slug, wire_pyramid_id, source_path, status,
+            nodes_total, nodes_processed,
+            cache_entries_total, cache_entries_validated, cache_entries_inserted,
+            last_node_id_processed, error_message, started_at, updated_at
+         ) VALUES (?1, ?2, ?3, 'downloading_manifest', NULL, 0, NULL, 0, 0,
+                   NULL, NULL, datetime('now'), datetime('now'))",
+        rusqlite::params![target_slug, wire_pyramid_id, source_path],
+    )
+    .with_context(|| {
+        format!(
+            "create_import_state(target_slug={target_slug}, wire_pyramid_id={wire_pyramid_id})"
+        )
+    })?;
+    Ok(())
+}
+
+/// Load the import state for a given target slug. Returns `None` if no row
+/// exists (i.e. no in-flight or completed import for this slug).
+pub fn load_import_state(
+    conn: &Connection,
+    target_slug: &str,
+) -> Result<Option<ImportState>> {
+    let mut stmt = conn.prepare(
+        "SELECT target_slug, wire_pyramid_id, source_path, status,
+                nodes_total, nodes_processed,
+                cache_entries_total, cache_entries_validated, cache_entries_inserted,
+                last_node_id_processed, error_message, started_at, updated_at
+         FROM pyramid_import_state
+         WHERE target_slug = ?1",
+    )?;
+    let row = stmt
+        .query_row(rusqlite::params![target_slug], import_state_from_row)
+        .optional()?;
+    Ok(row)
+}
+
+/// Progress fields the resumable import passes update on each tick.
+#[derive(Debug, Clone, Default)]
+pub struct ImportStateProgress {
+    pub status: Option<String>,
+    pub nodes_total: Option<i64>,
+    pub nodes_processed: Option<i64>,
+    pub cache_entries_total: Option<i64>,
+    pub cache_entries_validated: Option<i64>,
+    pub cache_entries_inserted: Option<i64>,
+    pub last_node_id_processed: Option<String>,
+    pub error_message: Option<String>,
+}
+
+/// Update the progress fields on an existing import state row. Only the
+/// supplied fields are written; the rest are left untouched. Always bumps
+/// `updated_at`.
+pub fn update_import_state(
+    conn: &Connection,
+    target_slug: &str,
+    progress: &ImportStateProgress,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE pyramid_import_state SET
+            status = COALESCE(?2, status),
+            nodes_total = COALESCE(?3, nodes_total),
+            nodes_processed = COALESCE(?4, nodes_processed),
+            cache_entries_total = COALESCE(?5, cache_entries_total),
+            cache_entries_validated = COALESCE(?6, cache_entries_validated),
+            cache_entries_inserted = COALESCE(?7, cache_entries_inserted),
+            last_node_id_processed = COALESCE(?8, last_node_id_processed),
+            error_message = COALESCE(?9, error_message),
+            updated_at = datetime('now')
+         WHERE target_slug = ?1",
+        rusqlite::params![
+            target_slug,
+            progress.status,
+            progress.nodes_total,
+            progress.nodes_processed,
+            progress.cache_entries_total,
+            progress.cache_entries_validated,
+            progress.cache_entries_inserted,
+            progress.last_node_id_processed,
+            progress.error_message,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Delete the import state row for a target slug. Used by `cancel` and by
+/// `complete` cleanup paths. Idempotent — deleting a missing row is a no-op.
+pub fn delete_import_state(conn: &Connection, target_slug: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM pyramid_import_state WHERE target_slug = ?1",
+        rusqlite::params![target_slug],
+    )?;
     Ok(())
 }
 
@@ -12060,5 +12319,197 @@ mod step_cache_tests {
         // Just confirm the fields round-trip — the assertion above is
         // enough; this test exists to lock down the SELECT shape.
         assert_eq!(fetched.cache_key, entry.cache_key);
+    }
+
+    #[test]
+    fn test_store_cache_if_absent_returns_true_on_fresh_insert() {
+        // `store_cache_if_absent` with no prior row should return `true`
+        // (row was actually inserted) and the row should be present in
+        // the table afterward.
+        let conn = mem_conn();
+        let entry = make_entry("ts", "fresh");
+        let inserted = store_cache_if_absent(&conn, &entry).unwrap();
+        assert!(inserted, "expected true for a fresh insert");
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pyramid_step_cache
+                 WHERE slug = 'ts' AND cache_key = ?1",
+                [&entry.cache_key],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_store_cache_if_absent_returns_false_on_conflict_and_preserves_row() {
+        // Phase 7 contract (spec "Idempotency" section ~line 341):
+        // `INSERT OR IGNORE` semantics must leave pre-existing rows
+        // untouched on conflict. This is the spec mandate the Phase 7
+        // import flow relies on to protect local rerolls during resume.
+        let conn = mem_conn();
+
+        // Plant a row that looks like a local force-reroll — same
+        // cache_key as what the import will bring, but with `force_fresh`
+        // set and a distinct output_json.
+        let mut rerolled = make_entry("ts", "conflict");
+        rerolled.output_json =
+            serde_json::json!({"content":"LOCAL_REROLL","usage":{}}).to_string();
+        rerolled.force_fresh = true;
+        rerolled.build_id = "local-reroll".into();
+        store_cache(&conn, &rerolled).unwrap();
+
+        // Now attempt to import a row at the same cache_key with the
+        // imported-style payload. Under `INSERT OR IGNORE` semantics
+        // this must NOT clobber the rerolled row.
+        let mut imported = make_entry("ts", "conflict");
+        imported.output_json =
+            serde_json::json!({"content":"IMPORTED","usage":{}}).to_string();
+        imported.force_fresh = false;
+        imported.build_id = "import:wire:p1".into();
+        let inserted = store_cache_if_absent(&conn, &imported).unwrap();
+        assert!(!inserted, "expected false because a prior row exists");
+
+        // Row count is still 1 — no duplicate.
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pyramid_step_cache
+                 WHERE slug = 'ts' AND cache_key = ?1",
+                [&rerolled.cache_key],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+
+        // The active row is STILL the local reroll, not the import.
+        let (active_output, active_force_fresh, active_build_id): (
+            String,
+            i64,
+            String,
+        ) = conn
+            .query_row(
+                "SELECT output_json, force_fresh, build_id FROM pyramid_step_cache
+                 WHERE slug = 'ts' AND cache_key = ?1",
+                [&rerolled.cache_key],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert!(
+            active_output.contains("LOCAL_REROLL"),
+            "store_cache_if_absent clobbered the local reroll output_json: {active_output}"
+        );
+        assert_eq!(active_force_fresh, 1, "force_fresh flag was cleared");
+        assert_eq!(
+            active_build_id, "local-reroll",
+            "build_id was overwritten"
+        );
+    }
+}
+
+// ── Phase 7: pyramid_import_state CRUD tests ────────────────────────────────
+
+#[cfg(test)]
+mod import_state_tests {
+    use super::*;
+
+    fn mem_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        init_pyramid_db(&conn).unwrap();
+        conn
+    }
+
+    #[test]
+    fn test_create_and_load_import_state() {
+        let conn = mem_conn();
+        create_import_state(&conn, "test-slug", "wire:pyr-abc", "/tmp/src").unwrap();
+        let state = load_import_state(&conn, "test-slug").unwrap().unwrap();
+        assert_eq!(state.target_slug, "test-slug");
+        assert_eq!(state.wire_pyramid_id, "wire:pyr-abc");
+        assert_eq!(state.source_path, "/tmp/src");
+        assert_eq!(state.status, "downloading_manifest");
+        assert_eq!(state.nodes_total, None);
+        assert_eq!(state.nodes_processed, 0);
+        assert_eq!(state.cache_entries_inserted, 0);
+    }
+
+    #[test]
+    fn test_load_missing_import_state_returns_none() {
+        let conn = mem_conn();
+        let state = load_import_state(&conn, "missing").unwrap();
+        assert!(state.is_none());
+    }
+
+    #[test]
+    fn test_create_duplicate_import_state_fails() {
+        let conn = mem_conn();
+        create_import_state(&conn, "dup", "wire:a", "/tmp/a").unwrap();
+        let err = create_import_state(&conn, "dup", "wire:a", "/tmp/a");
+        assert!(err.is_err(), "second create should fail on PRIMARY KEY");
+    }
+
+    #[test]
+    fn test_update_import_state_coalesces_nulls() {
+        let conn = mem_conn();
+        create_import_state(&conn, "upd", "wire:x", "/tmp").unwrap();
+
+        // Update only the status — other fields should be left alone.
+        update_import_state(
+            &conn,
+            "upd",
+            &ImportStateProgress {
+                status: Some("validating_sources".into()),
+                nodes_total: Some(10),
+                cache_entries_total: Some(50),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let state = load_import_state(&conn, "upd").unwrap().unwrap();
+        assert_eq!(state.status, "validating_sources");
+        assert_eq!(state.nodes_total, Some(10));
+        assert_eq!(state.cache_entries_total, Some(50));
+        // Unchanged fields stay at their defaults.
+        assert_eq!(state.nodes_processed, 0);
+        assert_eq!(state.cache_entries_inserted, 0);
+
+        // Second update bumps counters without touching the totals.
+        update_import_state(
+            &conn,
+            "upd",
+            &ImportStateProgress {
+                status: Some("populating_cache".into()),
+                nodes_processed: Some(7),
+                cache_entries_validated: Some(35),
+                cache_entries_inserted: Some(30),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let state = load_import_state(&conn, "upd").unwrap().unwrap();
+        assert_eq!(state.status, "populating_cache");
+        // Totals were NOT in this progress → they stay.
+        assert_eq!(state.nodes_total, Some(10));
+        assert_eq!(state.cache_entries_total, Some(50));
+        assert_eq!(state.nodes_processed, 7);
+        assert_eq!(state.cache_entries_validated, 35);
+        assert_eq!(state.cache_entries_inserted, 30);
+    }
+
+    #[test]
+    fn test_delete_import_state_is_idempotent() {
+        let conn = mem_conn();
+        // Deleting a missing row is a no-op.
+        delete_import_state(&conn, "gone").unwrap();
+
+        // Create + delete + re-create should work.
+        create_import_state(&conn, "roundtrip", "wire:a", "/tmp").unwrap();
+        assert!(load_import_state(&conn, "roundtrip").unwrap().is_some());
+        delete_import_state(&conn, "roundtrip").unwrap();
+        assert!(load_import_state(&conn, "roundtrip").unwrap().is_none());
+        create_import_state(&conn, "roundtrip", "wire:b", "/tmp").unwrap();
+        assert!(load_import_state(&conn, "roundtrip").unwrap().is_some());
     }
 }
