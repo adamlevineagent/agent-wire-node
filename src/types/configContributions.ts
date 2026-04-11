@@ -152,3 +152,61 @@ export interface CreateConfigContributionResponse {
 export interface RejectProposalResponse {
     ok: boolean;
 }
+
+// ─── Phase 14: Wire Discovery + Ranking + Update Polling ────────────────────
+
+/** Phase 14 `DiscoveryResult` — one ranked search result from
+ *  `pyramid_wire_discover` / `pyramid_search_wire_configs`. */
+export interface DiscoveryResult {
+    wire_contribution_id: string;
+    title: string;
+    description: string;
+    tags: string[];
+    author_handle: string | null;
+    rating: number | null;
+    adoption_count: number;
+    open_rebuttals: number;
+    chain_length: number;
+    freshness_days: number;
+    /** Computed composite score in [0, 1]. */
+    score: number;
+    rationale: string | null;
+    schema_type: string | null;
+}
+
+/** Phase 14 `Recommendation` — one similarity-ranked recommendation
+ *  from `pyramid_wire_recommendations`. */
+export interface Recommendation {
+    wire_contribution_id: string;
+    title: string;
+    description: string;
+    rationale: string;
+    score: number;
+}
+
+/** Phase 14 `WireUpdateEntry` — one pending Wire supersession update
+ *  returned by `pyramid_wire_update_available`. */
+export interface WireUpdateEntry {
+    local_contribution_id: string;
+    schema_type: string;
+    slug: string | null;
+    latest_wire_contribution_id: string;
+    chain_length_delta: number;
+    changes_summary: string | null;
+    author_handles: string[];
+    checked_at: string;
+}
+
+/** Phase 14 `PullLatestResponse` — returned by `pyramid_wire_pull_latest`
+ *  and `pyramid_pull_wire_config`. */
+export interface PullLatestResponse {
+    new_local_contribution_id: string;
+    activated: boolean;
+}
+
+/** Phase 14 `AutoUpdateSettingEntry` — one row returned by
+ *  `pyramid_wire_auto_update_status`. */
+export interface AutoUpdateSettingEntry {
+    schema_type: string;
+    enabled: boolean;
+}

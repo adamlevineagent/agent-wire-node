@@ -750,12 +750,27 @@ pub fn sync_config_to_operational_with_registry(
         }
         "wire_discovery_weights" => {
             // Phase 14: Wire discovery ranking cache invalidation.
+            // No operational table — the ranking engine reads the
+            // contribution on demand via `load_ranking_weights` which
+            // maintains its own 5-minute TTL cache. Clearing the
+            // cache on supersession is the only side effect.
             invalidate_wire_discovery_cache();
         }
         "wire_auto_update_settings" => {
-            // Phase 14: per-schema_type auto-update scheduler
-            // reconfiguration.
+            // Phase 14: per-schema_type auto-update toggles. No
+            // operational table — the background update poller reads
+            // the active contribution on every run via
+            // `load_auto_update_settings`. No reload hook needed
+            // (the poller picks up new values on its next cycle).
             reconfigure_wire_update_scheduler(conn)?;
+        }
+        "wire_update_polling" => {
+            // Phase 14: polling interval contribution. No operational
+            // table — the background update poller reads the active
+            // contribution via `load_update_polling_interval` on every
+            // iteration of its loop, so a supersession takes effect
+            // on the next cycle automatically.
+            debug!("wire_update_polling synced; poller will pick up new interval on next cycle");
         }
         other => {
             // Per the spec: unknown types are a bug — fail loudly
@@ -867,14 +882,28 @@ fn invalidate_schema_annotation_cache() {
 }
 
 /// Phase 14: invalidate the Wire discovery ranking cache.
+///
+/// Clears the in-memory 5-minute TTL cache held by
+/// `wire_discovery::WEIGHTS_CACHE`. The next discovery call re-reads
+/// the active `wire_discovery_weights` contribution from the DB and
+/// re-populates the cache with the updated weights.
 fn invalidate_wire_discovery_cache() {
-    debug!("invalidate_wire_discovery_cache: Phase 4 stub (Phase 14 wires this up)");
+    crate::pyramid::wire_discovery::invalidate_weights_cache();
+    debug!("invalidate_wire_discovery_cache: weights cache cleared");
 }
 
 /// Phase 14: reconfigure the Wire update scheduler after
-/// wire_auto_update_settings changes.
+/// `wire_auto_update_settings` changes.
+///
+/// The Wire update poller re-reads the auto-update settings
+/// contribution on every cycle via `load_auto_update_settings`, so a
+/// supersession automatically takes effect on the next cycle. No
+/// explicit reload is required — this function exists as a hook point
+/// for future phases that may add a push-based reconfig signal.
 fn reconfigure_wire_update_scheduler(_conn: &Connection) -> Result<()> {
-    debug!("reconfigure_wire_update_scheduler: Phase 4 stub (Phase 14 wires this up)");
+    debug!(
+        "reconfigure_wire_update_scheduler: poller will re-read settings on next cycle"
+    );
     Ok(())
 }
 
@@ -2259,5 +2288,73 @@ mod tests {
             )
             .unwrap();
         assert_eq!(after, 1, "flag_configs_for_migration should have set the flag");
+    }
+
+    // ── Phase 14: new schema_type dispatcher branches ──────────────────
+
+    #[test]
+    fn test_sync_wire_discovery_weights_no_operational_table() {
+        let conn = mem_conn();
+        let bus = mem_bus();
+        let metadata = default_wire_native_metadata("wire_discovery_weights", None);
+        let id = create_config_contribution_with_metadata(
+            &conn,
+            "wire_discovery_weights",
+            None,
+            "schema_type: wire_discovery_weights\nfields:\n  w_rating: 0.3\n",
+            Some("tune ranking"),
+            "local",
+            Some("user"),
+            "active",
+            &metadata,
+        )
+        .unwrap();
+        let contribution = load_contribution_by_id(&conn, &id).unwrap().unwrap();
+        // Should succeed with no operational table write — the
+        // ranking engine reads the contribution on demand via its
+        // in-memory TTL cache.
+        sync_config_to_operational(&conn, &bus, &contribution).unwrap();
+    }
+
+    #[test]
+    fn test_sync_wire_auto_update_settings() {
+        let conn = mem_conn();
+        let bus = mem_bus();
+        let metadata = default_wire_native_metadata("wire_auto_update_settings", None);
+        let id = create_config_contribution_with_metadata(
+            &conn,
+            "wire_auto_update_settings",
+            None,
+            "schema_type: wire_auto_update_settings\nauto_update:\n  custom_prompts: true\n",
+            Some("enable auto-update for custom prompts"),
+            "local",
+            Some("user"),
+            "active",
+            &metadata,
+        )
+        .unwrap();
+        let contribution = load_contribution_by_id(&conn, &id).unwrap().unwrap();
+        sync_config_to_operational(&conn, &bus, &contribution).unwrap();
+    }
+
+    #[test]
+    fn test_sync_wire_update_polling() {
+        let conn = mem_conn();
+        let bus = mem_bus();
+        let metadata = default_wire_native_metadata("wire_update_polling", None);
+        let id = create_config_contribution_with_metadata(
+            &conn,
+            "wire_update_polling",
+            None,
+            "schema_type: wire_update_polling\ninterval_secs: 3600\n",
+            Some("poll hourly"),
+            "local",
+            Some("user"),
+            "active",
+            &metadata,
+        )
+        .unwrap();
+        let contribution = load_contribution_by_id(&conn, &id).unwrap().unwrap();
+        sync_config_to_operational(&conn, &bus, &contribution).unwrap();
     }
 }

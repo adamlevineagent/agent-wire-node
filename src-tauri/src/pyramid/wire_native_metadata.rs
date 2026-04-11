@@ -860,6 +860,14 @@ pub fn resolve_wire_type(schema_type: &str) -> Result<(WireContributionType, Vec
                 "auto_update".to_string(),
             ],
         )),
+        "wire_update_polling" => Ok((
+            WireContributionType::Template,
+            vec![
+                "config".to_string(),
+                "wire-node".to_string(),
+                "update_polling".to_string(),
+            ],
+        )),
         other => Err(format!(
             "unknown schema_type {other:?}; cannot resolve to Wire contribution type"
         )),
@@ -1405,6 +1413,7 @@ wire:
             ("custom_chain", WireContributionType::Action),
             ("wire_discovery_weights", WireContributionType::Template),
             ("wire_auto_update_settings", WireContributionType::Template),
+            ("wire_update_polling", WireContributionType::Template),
         ];
         for (schema_type, expected) in cases {
             let (actual, tags) = resolve_wire_type(schema_type).unwrap();

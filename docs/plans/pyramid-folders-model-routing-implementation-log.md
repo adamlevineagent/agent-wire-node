@@ -2696,3 +2696,332 @@ Fix: route the DB write manually. The new `write_reroll_cache_entry` helper:
 
 `awaiting-wanderer-verification` — Phase 13 has now passed implementer, verifier, AND wanderer audit. Two wanderer commits on the same branch: the W1/W2 fix + regression tests. Ready for merge review pending a sanity check that nothing else in Phase 13 surfaces a new issue from the wanderer trace.
 
+---
+
+## Phase 14 — Wire Discovery + Ranking + Recommendations + Update Polling
+
+**Branch:** `phase-14-wire-discovery-ranking` (based on `phase-13-build-viz-expansion`)
+**Spec:** `docs/specs/wire-discovery-ranking.md`
+**Scope per plan:** Phase 14 — Wire discovery + ranking layer, recommendations engine, supersession notification/update system, quality badges UI, Phase 10's stubbed search/pull IPCs shipped for real.
+
+### Modules added
+
+1. **`src-tauri/src/pyramid/wire_discovery.rs`** — Ranking engine + recommendations engine. Owns `RankingSignals`, `NormalizedSignals`, `RankingWeights`, `normalize_signals()`, `compute_score()`, `explain_ranking()`, `discover()` (async HTTP fetch), `rank_raw_results()` (sync ranking helper), `build_pyramid_profile()`, `compute_similarity()`, `compute_recommendations()`, `load_ranking_weights()` (5-min TTL cache), `invalidate_weights_cache()`, `load_auto_update_settings()`, `load_update_polling_interval()`. 14 new unit tests.
+2. **`src-tauri/src/pyramid/wire_pull.rs`** — Pull flow with credential safety gate. Owns `pull_wire_contribution()`, `credential_safety_gate()`, `PullOptions`, `PullOutcome`, `PullError`. 3 new unit tests covering the credential safety gate pass/fail paths.
+3. **`src-tauri/src/pyramid/wire_update_poller.rs`** — Background tokio worker. Owns `spawn_wire_update_poller()`, `run_once()`, `WireUpdatePollerHandle` (aborts task on drop). Reads auto-update settings + poll interval from their respective bundled contributions on every cycle so supersessions take effect without a restart. 4 new tests.
+
+### Wire HTTP client extensions (`wire_publish.rs`)
+
+Extended `PyramidPublisher` with three new methods:
+
+```rust
+pub async fn search_contributions(
+    &self,
+    schema_type: &str,
+    query: Option<&str>,
+    tags: Option<&[String]>,
+    limit: u32,
+) -> Result<Vec<WireContributionSearchResult>>
+
+pub async fn fetch_contribution(
+    &self,
+    wire_contribution_id: &str,
+) -> Result<WireContributionFull>
+
+pub async fn check_supersessions(
+    &self,
+    contribution_ids: &[String],
+) -> Result<Vec<SupersessionCheckEntry>>
+```
+
+New types: `WireContributionSearchResult` (with `rating`, `adoption_count`, `freshness_days`, `chain_length`, `upheld_rebuttals`, `filed_rebuttals`, `open_rebuttals`, `kept_count`, `total_pullers`, `author_reputation`, `adopter_provider_ids`, `adopter_source_types`), `WireContributionFull`, `WireContributionChainEntry`, `SupersessionCheckEntry`. **Deviation:** the Wire server's `/api/v1/contributions/search`, `/api/v1/contributions/{id}`, and `/api/v1/contributions/check_supersessions` endpoints do not exist yet in the `GoodNewsEveryone` repo. The client gracefully handles `404 Not Found` / `501 Not Implemented` by returning empty result sets so the UI renders an empty state rather than crashing. Server-side implementation is tracked as a cross-repo dependency.
+
+### Ranking engine
+
+**Missing-signal redistribution is mandatory** (verified by `test_compute_score_with_redistributed_weights`). `RankingSignals` stores every field as `Option<...>`; `normalize_signals()` produces `None` for missing fields, and `compute_score()` renormalizes the present weights so brand-new contributions with only a rating+freshness signal get the same normalized score as a signal-complete contribution with the same values. New contributions get a fair shot at being discovered.
+
+**Normalization formulas** (from the spec table):
+- `rating: rating / 5.0`
+- `adoption: log1p(count) / log1p(max_adoption_in_result_set)` — log-scaled against the result set max, NOT a global max
+- `freshness: max(0, 1 - days / 180)` — linear decay over 180 days
+- `chain_length: min(chain / 10, 1.0)`
+- `reputation: already [0,1]`
+- `challenge: 1 - upheld / (filed + 1)`
+- `internalization: kept / max(1, total_pullers)`
+
+**Weights cache**: process-wide `LazyLock<Mutex<Option<WeightsCacheEntry>>>` with a 5-minute TTL. `load_ranking_weights()` reads from the cache; a cache miss pulls the active `wire_discovery_weights` contribution from SQLite, parses the YAML with `RankingWeights::from_yaml()`, and repopulates the cache. `invalidate_weights_cache()` is called by the `wire_discovery_weights` branch of `sync_config_to_operational` on supersession.
+
+**Rationale generation** (`explain_ranking()`): returns `Some("Highly rated (4.7⭐) with 200 adopters • Refined over 7 versions • Updated 3d ago")` when signals warrant it, otherwise `None` so the UI hides the rationale line.
+
+### Recommendations engine
+
+V1 signals (spec line 131-133):
+- **Source type overlap** (weight 0.6): 1.0 if any adopter pyramid matches the user's `source_type`, 0.0 otherwise.
+- **Tier routing similarity** (weight 0.4): Jaccard index of the user's `pyramid_tier_routing` provider set vs the contribution's `adopter_provider_ids`.
+
+Apex embedding similarity and cross-schema recommendations are deferred to v2 per spec.
+
+**Pyramid profile build** (`build_pyramid_profile`): reads `pyramid_slugs.content_type` for `source_type`, reads distinct `provider_id` from `pyramid_tier_routing` for the provider set. Tier routing is global (not per-slug), so the signal measures "does this Wire contribution fit my node's provider setup".
+
+**Rationale strings**: `"Used by N {source_type}-pyramids with matching tier routing"`, `"Top-rated for {source_type} pyramids"`, `"Pulled by N users with matching tier routing"`, or `"Popular {schema_type}"`.
+
+### Pull flow + credential safety gate
+
+`pull_wire_contribution()` orchestrates the full flow:
+
+1. `publisher.fetch_contribution(wire_id)` — pulls the full yaml_content + metadata
+2. `credential_safety_gate(yaml, store)` — scans for `${VAR_NAME}` refs via `CredentialStore::collect_references()`, checks each against the user's store; returns `PullError::MissingCredentials(vec!["MISSING_VAR", ...])` on failure
+3. Build `WireNativeMetadata` from the pulled payload (maturity reset to `Draft`)
+4. Insert a new contribution row with `source = "wire"`, `wire_contribution_id = <latest_id>`, `supersedes_id = <prior_local_id>` when superseding
+5. If `activate = true`, run `sync_config_to_operational` to propagate to runtime tables
+6. Delete the corresponding `pyramid_wire_update_cache` row
+
+The credential safety gate is a hard stop: auto-update refuses and surfaces a manual-review banner in the UI.
+
+### Supersession polling
+
+`WireUpdatePoller` runs as a tokio background task (matching `start_dadbear_extend_loop` pattern). Every cycle:
+
+1. Read `wire_update_polling.interval_secs` (fallback 6h) from the active contribution
+2. Sleep for the interval
+3. `db::list_wire_tracked_contributions` — grab all active contributions with a `wire_contribution_id`
+4. `publisher.check_supersessions(ids)` — ask the Wire which have newer versions
+5. `db::upsert_wire_update_cache` for each supersession found
+6. Emit `TaggedKind::WireUpdateAvailable` events so the UI refreshes badges
+7. If `wire_auto_update_settings.is_enabled(schema_type)`, call `pull_wire_contribution` with the credential safety gate; on success emit `TaggedKind::WireAutoUpdateApplied`
+
+Spawned from `main.rs` in the app setup block right after the broadcast leak sweep. Handle is `std::mem::forget`'d matching the other background workers (task aborts on app exit via tokio shutdown).
+
+### Event bus extensions (`event_bus.rs`)
+
+Two new `TaggedKind` variants:
+- `WireUpdateAvailable { local_contribution_id, schema_type, latest_wire_contribution_id, chain_length_delta }`
+- `WireAutoUpdateApplied { local_contribution_id, schema_type, new_local_contribution_id, chain_length_delta }`
+
+### DB schema: `pyramid_wire_update_cache`
+
+Added to `db::init_pyramid_db` (idempotent `CREATE TABLE IF NOT EXISTS`):
+
+```sql
+CREATE TABLE IF NOT EXISTS pyramid_wire_update_cache (
+    local_contribution_id TEXT PRIMARY KEY
+        REFERENCES pyramid_config_contributions(contribution_id),
+    latest_wire_contribution_id TEXT NOT NULL,
+    chain_length_delta INTEGER NOT NULL,
+    changes_summary TEXT,
+    author_handles_json TEXT,
+    checked_at TEXT NOT NULL DEFAULT (datetime('now')),
+    acknowledged_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_wire_update_cache_ack
+    ON pyramid_wire_update_cache(acknowledged_at);
+```
+
+Plus helpers in `db.rs`:
+- `upsert_wire_update_cache` (INSERT OR REPLACE — idempotent)
+- `list_pending_wire_updates(slug: Option<&str>)` (filters `acknowledged_at IS NULL`, joins against contribution table when slug is provided)
+- `acknowledge_wire_update(local_id)` (sets `acknowledged_at = now()`; the row is preserved so the next sweep can re-trigger if an even-newer version arrives)
+- `delete_wire_update_cache(local_id)` (called when the user pulls the latest)
+- `list_wire_tracked_contributions()` (returns `(local_id, wire_id, schema_type)` tuples for every active contribution with a non-null `wire_contribution_id` — the poller's input set)
+
+Four new db tests: `test_upsert_wire_update_cache_idempotent`, `test_list_pending_wire_updates_filters_acknowledged`, `test_delete_wire_update_cache`, `test_list_wire_tracked_contributions`. All in the existing `phase13_tests` module (uses the existing `mem_conn()` helper).
+
+### Bundled contributions (3 new)
+
+Added to `src-tauri/assets/bundled_contributions.json`:
+
+1. **`bundled-wire_discovery_weights-default-v1`** — seed weights from the spec (`w_rating: 0.25`, `w_adoption: 0.20`, `w_freshness: 0.15`, `w_chain: 0.10`, `w_reputation: 0.10`, `w_challenge: 0.10`, `w_internalization: 0.10`)
+2. **`bundled-wire_auto_update_settings-default-v1`** — every schema_type set to `false` by default. The user opts in per category.
+3. **`bundled-wire_update_polling-default-v1`** — `interval_secs: 21600` (6 hours).
+
+All three use `default_wire_native_metadata` — `resolve_wire_type` in `wire_native_metadata.rs` already handles `wire_discovery_weights` and `wire_auto_update_settings` (Phase 4 stubs); `wire_update_polling` added to the mapping table and to the `resolve_wire_type_maps_every_known_schema_type` test.
+
+### `sync_config_to_operational` dispatcher
+
+Extended from 14 to 17 branches. The existing `wire_discovery_weights` and `wire_auto_update_settings` stubs (from Phase 4) were wired up:
+
+- `wire_discovery_weights` → `invalidate_wire_discovery_cache()` now calls `wire_discovery::invalidate_weights_cache()` to clear the 5-min TTL so the next discovery call reloads the weights.
+- `wire_auto_update_settings` → `reconfigure_wire_update_scheduler()` logs that the poller will re-read on next cycle (no push signal needed — the poller reads on every iteration).
+- `wire_update_polling` → new branch, no operational table, logs that the poller will pick up the new interval on its next cycle.
+
+Three new sync tests in `config_contributions.rs`: `test_sync_wire_discovery_weights_no_operational_table`, `test_sync_wire_auto_update_settings`, `test_sync_wire_update_polling`.
+
+### IPC commands (9 registered in `main.rs`)
+
+| Command | Alias for Phase 10 stub |
+|---|---|
+| `pyramid_wire_discover` | (primary) |
+| `pyramid_search_wire_configs` | alias of `pyramid_wire_discover` |
+| `pyramid_wire_recommendations` | — |
+| `pyramid_wire_update_available` | — |
+| `pyramid_wire_auto_update_toggle` | — |
+| `pyramid_wire_auto_update_status` | — |
+| `pyramid_wire_pull_latest` | — |
+| `pyramid_pull_wire_config` | alias of `pyramid_wire_pull_latest` (brand-new pull, not supersession) |
+| `pyramid_wire_acknowledge_update` | — |
+
+All 9 registered in the `invoke_handler!` list. Both Phase 10 stub name aliases (`pyramid_search_wire_configs`, `pyramid_pull_wire_config`) ship so Phase 10's Discover placeholder can be rewritten without a rename.
+
+**Send-safety constraint**: the `discover()` async function previously took `&Connection` and held it across the HTTP await, which failed the Tauri command's `Send` bound (SQLite `Connection` is `!Send`). Refactored into `discover(publisher, weights, ...)` + `rank_raw_results(results, weights, sort_by)` — the IPC layer loads weights synchronously, drops the reader, then awaits the HTTP call. Same fix applied implicitly by block-scoping the reader in `pyramid_wire_recommendations`.
+
+`pyramid_wire_auto_update_toggle` writes a new `wire_auto_update_settings` contribution (the toggle state is itself a contribution per the spec). If a prior active settings contribution exists, uses `supersede_config_contribution`; otherwise creates fresh. Then runs `sync_config_to_operational` which invalidates caches and signals the poller.
+
+### Frontend components
+
+1. **`src/components/QualityBadges.tsx`** — shared badge row (rating, adoption, open rebuttals, chain length, freshness). Text-based glyphs (no new icon library dependency). Rendered by both the Discover results list and the detail drawer.
+2. **`src/components/modes/ToolsMode.tsx` — DiscoverPanel rewrite** — full search UI with schema_type dropdown, free-text query, tag input, sort-by dropdown (`score | rating | adoption | fresh | chain_length`), recommendations banner (fetched on-mount when a slug is selected), results list with `QualityBadges` + rationale strings, detail drawer with "Pull as proposal" / "Pull and activate" buttons, auto-update toggles modal.
+3. **`src/components/modes/ToolsMode.tsx` — MyToolsPanel extension** — fetches pending Wire updates on-mount via `pyramid_wire_update_available`, indexes them by contribution_id, passes matching update to each `ConfigCard`. `ConfigCard` renders an "Update available (N)" badge that opens a `WireUpdateDrawer` showing the chain_length_delta, author list, changes_summary, and "Pull latest" / "Dismiss" actions.
+4. **`AutoUpdateSettingsModal`** (inside ToolsMode.tsx) — per-schema_type toggles loaded via `pyramid_wire_auto_update_status`, toggled via `pyramid_wire_auto_update_toggle`, with a warning banner about the credential safety gate. Accessible from the Discover tab header; no separate Settings modification needed.
+
+**Deviation:** Settings.tsx exists but is focused on app-level settings (storage cap, mesh hosting, auto-update for app itself). Rather than muddle it with the per-schema_type Wire auto-update toggles, the toggles live in a modal reachable from the Discover tab header. This follows the spec's fallback option and keeps app settings separate from Wire contribution settings.
+
+### TypeScript types (`src/types/configContributions.ts`)
+
+Added `DiscoveryResult`, `Recommendation`, `WireUpdateEntry`, `PullLatestResponse`, `AutoUpdateSettingEntry`.
+
+### Tests (+28 passing)
+
+Rust tests added (all passing):
+
+- `wire_discovery.rs`: 14 tests covering signal normalization, weight redistribution, score computation, rationale generation, sorting, recommendations (source_type + tier_routing), auto-update settings parsing, ranking weights YAML parsing (flat + nested)
+- `wire_pull.rs`: 3 tests covering the credential safety gate pass/fail paths
+- `wire_update_poller.rs`: 4 tests covering supersession filter, run-once report shape, and the extended search result struct
+- `db.rs` (phase13_tests module): 4 tests covering wire_update_cache CRUD (upsert, list with filter, delete, tracked contributions)
+- `config_contributions.rs`: 3 sync dispatcher tests for the new schema types
+
+**Test count**: Phase 13 baseline 1137 passed / 7 failed (pre-existing) → Phase 14 **1165 passed / 7 failed** (+28 new, same 7 pre-existing failures).
+
+### Verification
+
+- `cargo check --lib` from `src-tauri/` — clean, 3 pre-existing warnings unchanged
+- `cargo check --lib --tests` — clean
+- `cargo test --lib pyramid` — 1165 passed / 7 failed (same 7 pre-existing unrelated failures)
+- `npm run build` — clean, no new TypeScript errors
+
+### Manual verification steps
+
+1. Launch dev (`npm run tauri dev`), sign in, open ToolsMode.
+2. Switch to the Discover tab. Pick a schema_type from the dropdown (e.g. `custom_prompts`). Click Search. Verify:
+   - If the Wire server hasn't shipped discovery yet, the empty-state message appears ("The Wire's discovery endpoint may not be live yet…") — no error banner.
+   - If mocked results come back, each result card renders the QualityBadges row (rating if present, adoption count, chain length, freshness glyph), description, and rationale line when signals warrant one.
+3. (When Wire server ships) Pick a slug from the "Recommend for pyramid" dropdown. Verify the recommendations banner appears with up to 5 cards + rationale strings.
+4. Click "View details" on a result → detail drawer opens → click "Pull as proposal" → verify the "Pulled as proposal" banner appears and the new row lands in My Tools under `status = 'proposed'` (appears in the Pending Proposals section).
+5. Switch back to the Discover tab, click "Auto-update settings" → modal opens → toggle `custom_prompts` to enabled. Verify the call succeeds and the toggle persists (close and reopen modal — the toggle state is preserved).
+6. Check Settings → Credentials doesn't have the missing-cred reference. Attempt to pull a contribution that references `${MISSING_VAR}` (manually construct one server-side or mock); verify the IPC returns an error message listing the missing var and the UI surfaces "Pull refused — … Add the missing credentials in Settings → Credentials, then retry."
+7. Launch the app with `RUST_LOG=wire_node_lib::pyramid::wire_update_poller=debug` and wait at least the polling interval (default 6h; set `wire_update_polling.interval_secs` to 60 via the contributions API to speed this up). Verify `wire update poller: started` appears in the log at boot and `wire update poller: next run in Ns` appears on every cycle. If any contributions have newer versions on Wire, verify the `pyramid_wire_update_cache` table populates (`sqlite3 ~/.../pyramid.db "SELECT * FROM pyramid_wire_update_cache"`).
+8. Verify `pyramid_wire_update_available` returns the cached row via an IPC call from the JS console or by opening the My Tools tab — a card with a matching Wire update should render an "Update available (N)" badge. Click the badge → drawer opens with "Pull latest" + "Dismiss" buttons.
+
+### Deviations
+
+1. **Wire server discovery endpoints not yet live** — the client code gracefully handles `404` / `501` by returning empty result sets. Cross-repo dependency tracked in the GoodNewsEveryone repo. Integration tests against a mock HTTP server are deferred to a follow-up once the server-side endpoints exist (no mockito harness currently set up in `src-tauri`).
+2. **Settings.tsx not modified** — the Auto-Update section lives in a modal reachable from the Discover tab header instead of extending the app Settings page, which keeps app-level settings (storage cap, app updater) separate from Wire-specific contribution settings. Documented in the spec's fallback branch.
+3. **Apex embedding similarity deferred to v2** — per spec line 131-133. Cross-schema recommendations also deferred to v2.
+4. **Poller auth token discovery shim** — the `WireUpdatePoller` reads the session API token from `PyramidState.config.auth_token` (existing `LlmConfig` field populated at startup) or falls back to the `WIRE_AUTH_TOKEN` env var. The app-level `AuthState` lives outside `PyramidState` and would require main.rs plumbing to inject; kept the coupling minimal for Phase 14 and documented here. The poller cleanly skips cycles when no token is available (logs a debug line — doesn't error-loop).
+5. **Frontend icon library not added** — `QualityBadges.tsx` uses text labels for each badge (no emoji, no icon library) to match the existing frontend's avoid-new-dependencies convention. The spec's emoji shorthand is for intent only.
+6. **Credential safety gate regex** — reuses `CredentialStore::collect_references()` which already handles `${VAR_NAME}` scanning + `$$` escape sequences. No new regex.
+
+### Status
+
+`awaiting-verification` — Phase 14 implementer pass complete. All scope items shipped: ranking engine (with mandatory missing-signal redistribution), recommendations engine (source_type + tier_routing similarity), supersession polling worker, pull flow with credential safety gate, `pyramid_wire_update_cache` table + CRUD helpers, 9 new/aliased IPCs, 3 new bundled contributions, event bus variants, ToolsMode Discover rewrite, My Tools update badges + drawer, QualityBadges component, auto-update toggles modal, 28 new Rust tests. Cargo check clean, cargo test at 1165/7 (7 pre-existing), npm build clean.
+
+### Verifier pass (2026-04-10)
+
+Fresh audit against the Phase 14 workstream prompt's 12 failure modes. The implementer's scope is well-represented in code — ranking engine redistribution, recommendations signals, supersession polling, credential safety gate, 9 IPC registrations, 3 bundled contributions, frontend components with real IPC calls, and event emission from the poller all land cleanly and pass their tests.
+
+Two real bugs found and fixed in place (no amend — new commit):
+
+1. **`spawn_wire_update_poller` would panic at app startup** — `src-tauri/src/pyramid/wire_update_poller.rs` used `tokio::spawn` at the top of `spawn_wire_update_poller`, but `main.rs` calls it from synchronous init code BEFORE `tauri::Builder::default().run()` starts the tokio runtime. At that point, `tokio::spawn` panics with "there is no reactor running, must be called from the context of a Tokio 1.x runtime". The implementer's sibling workers (DADBEAR tick loop at main.rs:8941, broadcast leak sweep at main.rs:8969) explicitly use `tauri::async_runtime::spawn` with the comment "Deferred via tauri::async_runtime::spawn because Tauri's setup() callback runs before the Tokio runtime is fully available for tokio::spawn". The Phase 14 spawn site (main.rs:9010) missed that pattern. Nothing in the Phase 14 tests exercised the spawn path — the 4 poller tests only validate `RunOnceReport` shape and `SupersessionCheckEntry` filter logic. This is exactly the "dead code / broken wiring" failure mode the workstream prompt flagged (the poller is constructed but would crash the app on first launch).
+
+   **Fix**: rewrote `spawn_wire_update_poller` in `src-tauri/src/pyramid/wire_update_poller.rs:72-177` to mirror the `web_sessions::spawn_sweeper` pattern. The helper now:
+   - Checks `tokio::runtime::Handle::try_current()` first — when a runtime is already active (tests, runtime-alive call sites) it spawns directly on it and returns a `JoinHandle` (fast path).
+   - Falls back to building a current-thread sidecar runtime on a dedicated OS thread when no runtime is present (slow path — what `main()` actually hits). The sidecar uses `tokio::select!` with a 5-second watchdog tick so dropping the returned handle cleanly signals the sidecar to exit within ~5 seconds via a shared `AtomicBool`.
+   - `WireUpdatePollerHandle` now holds `Option<JoinHandle>` (fast path) OR `Option<SidecarHandle>` (slow path); its `Drop` aborts the task / clears the watchdog as appropriate.
+
+   **Regression test**: new `test_spawn_wire_update_poller_from_sync_context_does_not_panic` in `phase14_tests` constructs a minimal in-memory `PyramidState` and calls `spawn_wire_update_poller` from a `#[test]` (not `#[tokio::test]`) — proving the sidecar path works without a panic. The prior implementation would panic here.
+
+2. **`pyramid_wire_recommendations` accepted empty slug** — `src-tauri/src/main.rs:7866-7887` took `slug: String` (non-optional at the Tauri boundary, which correctly rejects `null` from JS) but did not check for empty string. The spec §Validation at the IPC boundary line 288 is explicit: "pyramid_wire_recommendations requires an existing slug (not NULL) — global recommendations are not meaningful because similarity needs a pyramid profile". An empty-slug call would fall through to `build_pyramid_profile("")` which silently returns an empty profile (no `source_type`, empty providers list), resulting in silently-degraded recommendations.
+
+   **Fix**: added `if slug.trim().is_empty() { return Err("slug is required …") }` at the top of `pyramid_wire_recommendations` in `src-tauri/src/main.rs:7872-7880`. The frontend's `DiscoverPanel` already guards against empty `recSlug` before calling, so this doesn't break the happy path — it just hardens the IPC contract for any future caller.
+
+**Verified clean** (no fix needed):
+- All 9 Phase 14 IPCs registered in `invoke_handler!` AND defined as `#[tauri::command]` functions in main.rs — greps match the expected 2× appearance each.
+- Phase 10 stub aliases `pyramid_search_wire_configs` + `pyramid_pull_wire_config` correctly delegate to the new primary IPCs with matching argument shapes.
+- Missing-signal redistribution in `compute_score` — `test_compute_score_with_redistributed_weights` proves the sparse-signal case produces the same score as the full-signal case when normalized values match; `test_compute_score_all_missing_is_zero` covers the edge case.
+- Weight redistribution handles the `rating=None, adoption=Some(0)` distinction correctly via `Option<f64>` threading, per the explicit struct field comments.
+- Credential safety gate regex reuses `CredentialStore::collect_references()` which handles `${VAR_NAME}` + `$$` escape + YAML comments are scanned as plain text (comments like `# ${commented}` WILL match — but that's a known tradeoff documented in `CredentialStore`, not a Phase 14 concern; the safety-first position is "any unresolved `${VAR_NAME}` in the YAML is a blocker").
+- 3 new bundled contributions present in `bundled_contributions.json` with the expected seed shapes; `sync_config_to_operational` dispatcher covers all 3 new schema_types (dispatcher grew from 14 to 17 branches as promised).
+- `WireUpdateAvailable` and `WireAutoUpdateApplied` events ARE emitted from `run_once` (lines 200 and 216 in wire_update_poller.rs), not just defined in the enum.
+- ToolsMode's `DiscoverPanel` calls `invoke('pyramid_wire_discover', ...)` on search (line 2137), `invoke('pyramid_wire_recommendations', ...)` in an effect (line 2109), and `invoke('pyramid_pull_wire_config', ...)` on Pull (line 2160) — no stubs or TODOs.
+- `AutoUpdateSettingsModal` is mounted from `DiscoverPanel` at line 2400 via the `showAutoUpdate` state + header button — reachable from the UI.
+- `QualityBadges` handles `undefined` rating (early return from the rating block), `0` adoptionCount ("0 users"), `0` chainLength (suppressed), and `0` openRebuttals (suppressed) — no crashes on missing props.
+- `pyramid_wire_pull_latest`'s credential-gate-refused path keeps the cache entry intact (the `?` on the pull result returns the error BEFORE `delete_wire_update_cache` is called).
+- `PyramidPublisher::search_contributions` + `check_supersessions` gracefully return empty results on 404/501 (Wire server endpoints don't ship yet); `fetch_contribution` surfaces the 404 as a real error (correct — you can't construct a contribution from nothing).
+
+**Verification commands re-run after fixes:**
+- `cargo check --lib` — clean, 3 pre-existing warnings only
+- `cargo test --lib pyramid::wire_update_poller` — 5 tests pass (4 existing + 1 new sync-spawn test)
+- `cargo test --lib pyramid::wire_discovery::phase14_tests` — 14 tests pass
+- `cargo test --lib pyramid::wire_pull::phase14_tests` — 3 tests pass
+- `cargo test --lib pyramid` — 1166 passed, 7 pre-existing failures (1165 → 1166, +1 for new sync-spawn test)
+- `npm run build` — clean, no new TypeScript errors
+
+**Commit**: `phase-14: verifier fix — runtime-safe poller spawn + empty-slug IPC guard`. NOT amending the implementer's commit. Branch remains `phase-14-wire-discovery-ranking`.
+
+### Wanderer pass (2026-04-10)
+
+Traced all 13 wanderer-focus questions end-to-end against HEAD `ea68bdb` (implementer + verifier fixes). The verifier's punch-list caught the two failure modes scoped to its audit (runtime-spawn panic + empty-slug IPC). The wanderer's remit was end-to-end flow + subtle interaction bugs — exactly where two more real bugs landed.
+
+**Two real bugs fixed, both in `src-tauri/src/pyramid/wire_pull.rs`:**
+
+1. **W1 — `pyramid_pull_wire_config` with `activate=true` doesn't supersede the existing active row (bug #1)**
+
+   The Phase 10 stub alias `pyramid_pull_wire_config` is the IPC the Discover tab's "Pull and activate" button calls (`ToolsMode.tsx:2160`). The backend passes `local_contribution_id_to_supersede: None` unconditionally (`main.rs:8129`). The old `pull_wire_contribution` branch at `wire_pull.rs:196-236` treated `(activate=true, hint=None)` as "brand-new fresh insert" and called `insert_pulled_contribution` with `status='active'` — leaving any existing active row untouched.
+
+   Reproduction (hits on every Discover "Pull and activate" over a schema type with a bundled default): bundled `custom_prompts` exists as `status='active'`. User pulls a Wire contribution for `custom_prompts` via Discover with "Pull and activate". Two rows end up `status='active' AND superseded_by_id IS NULL` for the same (schema_type=custom_prompts, slug=NULL) pair. `load_active_config_contribution`'s `ORDER BY created_at DESC, id DESC LIMIT 1` masks the damage at runtime, but `load_config_version_history` loses visibility of the orphan, the poller wastes an extra `check_supersessions` slot per orphan, and `pyramid_config_contributions.contribution_id` FK references on operational tables become non-deterministic.
+
+2. **W2 — `supersede_with_pulled` has no idempotency guard; concurrent poller+user pull corrupts the chain (bug #2)**
+
+   The old `supersede_with_pulled` (`wire_pull.rs:313-361` pre-fix) was passed a `prior: &ConfigContribution` loaded BEFORE the transaction opened, then ran an unconditional `UPDATE … SET status='superseded', superseded_by_id=?` on that prior inside the transaction. Unlike `config_contributions::supersede_config_contribution` at `config_contributions.rs:267-271` (which bails with `"prior contribution … is already superseded — cannot supersede a non-active version"`), this helper had no guard.
+
+   Reproduction: auto-update enabled for `custom_prompts`. User holds a stale UI view of L1 as active. Poller fires first, atomically L1→L2 (supersedes cleanly). Writer released. User clicks "Pull latest"; backend passes `Some(L1)` as the supersession hint. Inside `supersede_with_pulled`: L1 is already `status='superseded'`, but the UPDATE runs anyway, clobbering L1's `superseded_by_id` from L2 to L3. L2 is still `status='active'` (the UPDATE only touched L1), L3 lands `status='active'`. Two active rows, and L1's chain pointer now dangles at L3 with L2 orphaned.
+
+   The reverse interleaving (user wins, poller follows) hits the same bug via `try_auto_update` finding L1 still in `list_wire_tracked_contributions` (it is — `wire_contribution_id` is still non-null on the superseded row) and calling `pull_wire_contribution` with `Some(L1)`. Same clobber.
+
+**Fix** (single commit, single file):
+
+Both W1 and W2 share a root cause: the pull flow captures an externally-supplied "which row to supersede" hint and trusts it without re-validating against the real DB state at transaction time. The fix replaces `supersede_with_pulled` with a new `commit_pulled_active` helper that:
+
+- Takes `(schema_type, slug, yaml, note, metadata, wire_id)` — NO prior ID.
+- Opens a transaction.
+- Resolves the CURRENT active row via the same predicate `load_active_config_contribution` uses (`status='active' AND superseded_by_id IS NULL`) with NULL-safe slug branching.
+- Inserts the new row with `supersedes_id = prior_active_id` (NULL when no prior exists — preserves the fresh-insert case for brand-new schema types).
+- UPDATEs the prior row only if found, with a predicate guard (`WHERE contribution_id = ? AND status = 'active' AND superseded_by_id IS NULL`) that no-ops if a racing writer has already flipped the row.
+- Commits.
+
+`pull_wire_contribution`'s activate branch now calls `commit_pulled_active` unconditionally — the `options.local_contribution_id_to_supersede` field is still present in `PullOptions` (callers still pass it) but it's ignored for correctness. The transaction-scoped resolution is the authoritative source. `insert_pulled_contribution` is kept for the `activate=false` (proposed) path; proposed rows don't interact with the active-row invariant.
+
+**Pattern match**: this is the same anti-pattern Phase 9's wanderer fix retrofitted in `accept_config_draft` at `generative_config.rs:785-852`. The Phase 14 `supersede_with_pulled` helper was written without borrowing that lesson; the wanderer fix aligns it.
+
+**Regression tests added** (`wire_pull.rs` phase14_tests, all in-memory SQLite):
+
+1. `test_commit_pulled_active_supersedes_existing_active` — seeds a bundled active row, calls `commit_pulled_active`, asserts exactly one active row after, chain pointers correctly set (prior superseded_by_id → new; new supersedes_id → prior; wire_contribution_id set on new).
+2. `test_commit_pulled_active_ignores_stale_prior_hint` — simulates the W2 race: seeds L1, runs `commit_pulled_active` twice in sequence (without any external hint), asserts L1's chain pointer is intact (L1 → L2, never clobbered), L2 → L3, only L3 is active. Proves the idempotency guard holds against the stale-prior scenario.
+3. `test_commit_pulled_active_inserts_fresh_when_no_prior` — brand-new schema type case: no prior active, expects a fresh insert with `supersedes_id IS NULL, status='active'`.
+4. `test_commit_pulled_active_isolates_by_slug` — slug-scoped vs global: a slug-scoped pull must not supersede a global active row for the same schema type. Exercises the NULL-safe slug branching in the predicate.
+
+**Verification commands after the wanderer fix:**
+
+- `cargo check --lib` — clean, 3 pre-existing warnings only
+- `cargo test --lib pyramid::wire_pull` — 7 passing (3 existing credential gate + 4 new wanderer regression tests)
+- `cargo test --lib pyramid` — **1170 passing / 7 failing** (baseline 1166 + 4 new tests; same 7 pre-existing failures)
+- `npm run build` — clean, 141 modules transformed, no new TypeScript errors
+
+**Non-blocking concerns surfaced (not fixed)** — documented in the friction log for future phases:
+
+1. Writer lock held across HTTP in `pull_wire_contribution` (`&mut Connection` borrowed from the MutexGuard across `publisher.fetch_contribution().await`). Slow Wire responses block every other writer IPC. Future refinement: split the fetch (no lock) from the commit (lock) and re-validate invariants at commit time.
+2. Missing-signal redistribution is ineffective for `adoption_count`, `chain_length`, `freshness_days=0`, `upheld/filed_rebuttals` — `RankingSignals::from_search_result` treats them as `Some(0)` per documented conservative choice, so the spec's "fair shot for new contributions" intent applies only to a narrower set of signals (rating, reputation, internalization when total_pullers=0, freshness_days when u32::MAX).
+3. `WireUpdatePollerHandle` is `mem::forget`'d in `main.rs:9024`, making its Drop impl (and the sidecar's watchdog-clearing Drop) dead code in production. Not a leak in practice (process exit kills all threads) but the graceful-shutdown machinery is decorative on the prod path.
+4. `pyramid_wire_update_available` does N+1 `load_contribution_by_id` calls per cache row (`main.rs:7923-7949`). Acceptable at ~10s of entries; a JOIN would scale.
+5. `WireUpdatePoller` reads the Wire auth token from `PyramidState.config.auth_token` or `WIRE_AUTH_TOKEN` env var — NOT the canonical `AuthState`. Documented implementer coupling shortcut; missing auth → poller skips cycles cleanly.
+
+**Commit**: `phase-14: wanderer fix — atomic active-row resolution in wire pull flow`. NOT amending. Branch remains `phase-14-wire-discovery-ranking`.

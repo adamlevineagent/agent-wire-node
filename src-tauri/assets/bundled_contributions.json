@@ -142,6 +142,28 @@
       "slug": null,
       "yaml_content": "schema_type: custom_prompts\nextraction_focus: \"the structure and meaning of the source material\"\nsynthesis_style: \"concise, decision-oriented\"\nvocabulary_priority: []\nignore_patterns:\n  - \"boilerplate\"\n  - \"generated code\"\n  - \"test fixtures\"\n",
       "triggering_note": "Bundled default custom_prompts (wire-node v0.2.0)"
+    },
+
+    {
+      "contribution_id": "bundled-wire_discovery_weights-default-v1",
+      "schema_type": "wire_discovery_weights",
+      "slug": null,
+      "yaml_content": "schema_type: wire_discovery_weights\nfields:\n  # Wire discovery ranking weights — tuned for trust quality signals,\n  # penalize staleness, but don't let network effects dominate. See\n  # docs/specs/wire-discovery-ranking.md for the full rationale.\n  w_rating: 0.25\n  w_adoption: 0.20\n  w_freshness: 0.15\n  w_chain: 0.10\n  w_reputation: 0.10\n  w_challenge: 0.10\n  w_internalization: 0.10\n",
+      "triggering_note": "Bundled default wire_discovery_weights (wire-node v0.2.0)"
+    },
+    {
+      "contribution_id": "bundled-wire_auto_update_settings-default-v1",
+      "schema_type": "wire_auto_update_settings",
+      "slug": null,
+      "yaml_content": "schema_type: wire_auto_update_settings\n# Per-schema_type auto-update toggles. All disabled by default —\n# users opt in per category. Auto-pulls are refused for any\n# contribution that introduces new credential references.\nauto_update:\n  dadbear_policy: false\n  evidence_policy: false\n  build_strategy: false\n  tier_routing: false\n  custom_prompts: false\n  step_overrides: false\n  folder_ingestion_heuristics: false\n  custom_chains: false\n  skill: false\n  schema_definition: false\n  schema_annotation: false\n  wire_discovery_weights: false\n",
+      "triggering_note": "Bundled default wire_auto_update_settings (wire-node v0.2.0)"
+    },
+    {
+      "contribution_id": "bundled-wire_update_polling-default-v1",
+      "schema_type": "wire_update_polling",
+      "slug": null,
+      "yaml_content": "schema_type: wire_update_polling\n# Interval between supersession-check polls in seconds. Default is\n# 21600 (6 hours) — the Wire doesn't change very fast and we'd\n# rather let updates arrive on the next cycle than waste bandwidth.\ninterval_secs: 21600\n",
+      "triggering_note": "Bundled default wire_update_polling (wire-node v0.2.0)"
     }
   ]
 }

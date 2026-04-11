@@ -7780,6 +7780,382 @@ async fn pyramid_publish_to_wire(
     })
 }
 
+// --- Phase 14: Wire discovery + recommendations + update polling IPC -------
+//
+// Per `docs/specs/wire-discovery-ranking.md` → "IPC Contract" (line 216).
+// Phase 14 ships seven new IPC commands + two aliases for the
+// Phase 10 stub names so the existing Discover placeholder can be
+// swapped to the real call without a rename.
+//
+//   pyramid_wire_discover              — ranked search (alias: pyramid_search_wire_configs)
+//   pyramid_wire_recommendations       — per-pyramid similarity suggestions
+//   pyramid_wire_update_available      — list pending Wire supersession updates
+//   pyramid_wire_auto_update_toggle    — set per-schema_type auto-update flag
+//   pyramid_wire_auto_update_status    — read current auto-update flags
+//   pyramid_wire_pull_latest           — pull a superseding contribution
+//   pyramid_wire_acknowledge_update    — dismiss an update badge
+//   pyramid_search_wire_configs        — Phase 10 stub alias for pyramid_wire_discover
+//   pyramid_pull_wire_config           — Phase 10 stub alias for pyramid_wire_pull_latest
+//
+// All IPCs use the same auth pattern as Phase 5's publish flow
+// (`get_api_token(&state.auth)` + `WIRE_URL` env). Discovery endpoints
+// that fall through to a Wire 404 / 501 return empty results, so the
+// UI renders an empty state instead of crashing when the Wire server
+// hasn't shipped discovery endpoints yet.
+
+fn wire_publisher_from_state(
+    state: &SharedState,
+    wire_auth: String,
+) -> wire_node_lib::pyramid::wire_publish::PyramidPublisher {
+    let wire_url =
+        std::env::var("WIRE_URL").unwrap_or_else(|_| "https://newsbleach.com".to_string());
+    let _ = state; // keep the state borrow explicit so this fn reads like the other helpers
+    wire_node_lib::pyramid::wire_publish::PyramidPublisher::new(wire_url, wire_auth)
+}
+
+#[tauri::command]
+async fn pyramid_wire_discover(
+    state: tauri::State<'_, SharedState>,
+    schema_type: String,
+    query: Option<String>,
+    tags: Option<Vec<String>>,
+    limit: Option<u32>,
+    sort_by: Option<String>,
+) -> Result<Vec<wire_node_lib::pyramid::wire_discovery::DiscoveryResult>, String> {
+    let wire_auth = get_api_token(&state.auth).await.unwrap_or_default();
+    let publisher = wire_publisher_from_state(&state, wire_auth);
+    let sort = wire_node_lib::pyramid::wire_discovery::DiscoverSortBy::from_str_lax(
+        sort_by.as_deref(),
+    );
+    let tags_ref: Option<&[String]> = tags.as_deref();
+
+    // Load the weights synchronously, then drop the reader BEFORE the
+    // HTTP await — Connection is !Send, so holding it across an await
+    // fails the Tauri command Send bound.
+    let weights = {
+        let reader = state.pyramid.reader.lock().await;
+        wire_node_lib::pyramid::wire_discovery::load_ranking_weights(&reader)
+    };
+
+    wire_node_lib::pyramid::wire_discovery::discover(
+        &publisher,
+        weights,
+        &schema_type,
+        query.as_deref(),
+        tags_ref,
+        limit.unwrap_or(20),
+        sort,
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// Phase 10 stub name. Shipped as an alias so the existing Discover
+/// placeholder can call the real IPC without a rename.
+#[tauri::command]
+async fn pyramid_search_wire_configs(
+    state: tauri::State<'_, SharedState>,
+    schema_type: String,
+    query: Option<String>,
+    tags: Option<Vec<String>>,
+) -> Result<Vec<wire_node_lib::pyramid::wire_discovery::DiscoveryResult>, String> {
+    pyramid_wire_discover(state, schema_type, query, tags, Some(20), None).await
+}
+
+#[tauri::command]
+async fn pyramid_wire_recommendations(
+    state: tauri::State<'_, SharedState>,
+    slug: String,
+    schema_type: String,
+    limit: Option<u32>,
+) -> Result<Vec<wire_node_lib::pyramid::wire_discovery::Recommendation>, String> {
+    // Spec §Validation at the IPC boundary (line 288):
+    // "pyramid_wire_recommendations requires an existing slug (not NULL)
+    // — global recommendations are not meaningful because similarity
+    // needs a pyramid profile". Tauri deserializes a missing JS field
+    // or an empty string to an empty String here, so we reject both.
+    if slug.trim().is_empty() {
+        return Err(
+            "slug is required — recommendations need a pyramid profile to compute similarity"
+                .to_string(),
+        );
+    }
+    let wire_auth = get_api_token(&state.auth).await.unwrap_or_default();
+    let publisher = wire_publisher_from_state(&state, wire_auth);
+    let profile = {
+        let reader = state.pyramid.reader.lock().await;
+        wire_node_lib::pyramid::wire_discovery::build_pyramid_profile(&reader, &slug)
+            .map_err(|e| e.to_string())?
+    };
+    wire_node_lib::pyramid::wire_discovery::compute_recommendations(
+        &publisher,
+        &profile,
+        &schema_type,
+        limit.unwrap_or(5),
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+#[derive(serde::Serialize)]
+struct WireUpdateEntry {
+    local_contribution_id: String,
+    schema_type: String,
+    slug: Option<String>,
+    latest_wire_contribution_id: String,
+    chain_length_delta: i64,
+    changes_summary: Option<String>,
+    author_handles: Vec<String>,
+    checked_at: String,
+}
+
+#[tauri::command]
+async fn pyramid_wire_update_available(
+    state: tauri::State<'_, SharedState>,
+    slug: Option<String>,
+) -> Result<Vec<WireUpdateEntry>, String> {
+    let reader = state.pyramid.reader.lock().await;
+    let rows = wire_node_lib::pyramid::db::list_pending_wire_updates(&reader, slug.as_deref())
+        .map_err(|e| e.to_string())?;
+
+    // Enrich each row with the matching schema_type + slug from the
+    // contribution table (the cache row doesn't carry them directly).
+    let mut out: Vec<WireUpdateEntry> = Vec::with_capacity(rows.len());
+    for row in rows {
+        let contribution =
+            wire_node_lib::pyramid::config_contributions::load_contribution_by_id(
+                &reader,
+                &row.local_contribution_id,
+            )
+            .map_err(|e| e.to_string())?;
+        let Some(c) = contribution else {
+            continue;
+        };
+        let author_handles: Vec<String> = row
+            .author_handles_json
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_default();
+        out.push(WireUpdateEntry {
+            local_contribution_id: row.local_contribution_id,
+            schema_type: c.schema_type,
+            slug: c.slug,
+            latest_wire_contribution_id: row.latest_wire_contribution_id,
+            chain_length_delta: row.chain_length_delta,
+            changes_summary: row.changes_summary,
+            author_handles,
+            checked_at: row.checked_at,
+        });
+    }
+    Ok(out)
+}
+
+#[derive(serde::Serialize)]
+struct ToggleOk {
+    ok: bool,
+}
+
+#[tauri::command]
+async fn pyramid_wire_auto_update_toggle(
+    state: tauri::State<'_, SharedState>,
+    schema_type: String,
+    enabled: bool,
+) -> Result<ToggleOk, String> {
+    // Load current settings (or default to empty when none exists yet).
+    let current = {
+        let reader = state.pyramid.reader.lock().await;
+        wire_node_lib::pyramid::wire_discovery::load_auto_update_settings(&reader)
+    };
+    let mut next = current.clone();
+    next.enabled_by_schema.insert(schema_type.clone(), enabled);
+    let new_yaml = next.to_yaml();
+
+    // Write a new contribution. Use supersede if an active one exists,
+    // otherwise create fresh.
+    let prior_id: Option<String> = {
+        let reader = state.pyramid.reader.lock().await;
+        wire_node_lib::pyramid::config_contributions::load_active_config_contribution(
+            &reader,
+            "wire_auto_update_settings",
+            None,
+        )
+        .map_err(|e| e.to_string())?
+        .map(|c| c.contribution_id)
+    };
+
+    let mut writer = state.pyramid.writer.lock().await;
+    let note = format!(
+        "Set auto-update for {} = {}",
+        schema_type, enabled
+    );
+    let new_contribution_id = if let Some(prior) = prior_id {
+        wire_node_lib::pyramid::config_contributions::supersede_config_contribution(
+            &mut writer,
+            &prior,
+            &new_yaml,
+            &note,
+            "local",
+            Some("user"),
+        )
+        .map_err(|e| e.to_string())?
+    } else {
+        wire_node_lib::pyramid::config_contributions::create_config_contribution(
+            &writer,
+            "wire_auto_update_settings",
+            None,
+            &new_yaml,
+            Some(&note),
+            "local",
+            Some("user"),
+            "active",
+        )
+        .map_err(|e| e.to_string())?
+    };
+
+    // Sync to operational tables (invalidates caches, signals the poller).
+    if let Some(contribution) =
+        wire_node_lib::pyramid::config_contributions::load_contribution_by_id(
+            &writer,
+            &new_contribution_id,
+        )
+        .map_err(|e| e.to_string())?
+    {
+        wire_node_lib::pyramid::config_contributions::sync_config_to_operational(
+            &writer,
+            &state.pyramid.build_event_bus,
+            &contribution,
+        )
+        .map_err(|e| e.to_string())?;
+    }
+
+    Ok(ToggleOk { ok: true })
+}
+
+#[derive(serde::Serialize)]
+struct AutoUpdateSettingEntry {
+    schema_type: String,
+    enabled: bool,
+}
+
+#[tauri::command]
+async fn pyramid_wire_auto_update_status(
+    state: tauri::State<'_, SharedState>,
+) -> Result<Vec<AutoUpdateSettingEntry>, String> {
+    let reader = state.pyramid.reader.lock().await;
+    let settings = wire_node_lib::pyramid::wire_discovery::load_auto_update_settings(&reader);
+    let entries: Vec<AutoUpdateSettingEntry> = settings
+        .enabled_by_schema
+        .iter()
+        .map(|(schema_type, enabled)| AutoUpdateSettingEntry {
+            schema_type: schema_type.clone(),
+            enabled: *enabled,
+        })
+        .collect();
+    Ok(entries)
+}
+
+#[derive(serde::Serialize)]
+struct PullLatestResponse {
+    new_local_contribution_id: String,
+    activated: bool,
+}
+
+#[tauri::command]
+async fn pyramid_wire_pull_latest(
+    state: tauri::State<'_, SharedState>,
+    local_contribution_id: String,
+    latest_wire_contribution_id: String,
+) -> Result<PullLatestResponse, String> {
+    let wire_auth = get_api_token(&state.auth).await?;
+    let publisher = wire_publisher_from_state(&state, wire_auth);
+
+    // Resolve the prior local contribution for slug info.
+    let slug: Option<String> = {
+        let reader = state.pyramid.reader.lock().await;
+        let row = wire_node_lib::pyramid::config_contributions::load_contribution_by_id(
+            &reader,
+            &local_contribution_id,
+        )
+        .map_err(|e| e.to_string())?;
+        row.and_then(|c| c.slug)
+    };
+
+    let mut writer = state.pyramid.writer.lock().await;
+    let options = wire_node_lib::pyramid::wire_pull::PullOptions {
+        latest_wire_contribution_id: &latest_wire_contribution_id,
+        local_contribution_id_to_supersede: Some(&local_contribution_id),
+        activate: true,
+        slug: slug.as_deref(),
+    };
+    let outcome = wire_node_lib::pyramid::wire_pull::pull_wire_contribution(
+        &mut writer,
+        &publisher,
+        &state.pyramid.credential_store,
+        &state.pyramid.build_event_bus,
+        options,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    // Delete the cache entry — the pull is done, no further badge needed.
+    let _ = wire_node_lib::pyramid::db::delete_wire_update_cache(
+        &writer,
+        &local_contribution_id,
+    );
+
+    Ok(PullLatestResponse {
+        new_local_contribution_id: outcome.new_local_contribution_id,
+        activated: outcome.activated,
+    })
+}
+
+/// Phase 10 stub name. Shipped as an alias so the Discover placeholder
+/// can call the real pull IPC without a rename. Takes a
+/// `wire_contribution_id` + an optional slug and pulls a fresh
+/// contribution (no supersession — for brand-new schema types).
+#[tauri::command]
+async fn pyramid_pull_wire_config(
+    state: tauri::State<'_, SharedState>,
+    wire_contribution_id: String,
+    slug: Option<String>,
+    activate: Option<bool>,
+) -> Result<PullLatestResponse, String> {
+    let wire_auth = get_api_token(&state.auth).await?;
+    let publisher = wire_publisher_from_state(&state, wire_auth);
+
+    let mut writer = state.pyramid.writer.lock().await;
+    let options = wire_node_lib::pyramid::wire_pull::PullOptions {
+        latest_wire_contribution_id: &wire_contribution_id,
+        local_contribution_id_to_supersede: None,
+        activate: activate.unwrap_or(false),
+        slug: slug.as_deref(),
+    };
+    let outcome = wire_node_lib::pyramid::wire_pull::pull_wire_contribution(
+        &mut writer,
+        &publisher,
+        &state.pyramid.credential_store,
+        &state.pyramid.build_event_bus,
+        options,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(PullLatestResponse {
+        new_local_contribution_id: outcome.new_local_contribution_id,
+        activated: outcome.activated,
+    })
+}
+
+#[tauri::command]
+async fn pyramid_wire_acknowledge_update(
+    state: tauri::State<'_, SharedState>,
+    local_contribution_id: String,
+) -> Result<ToggleOk, String> {
+    let writer = state.pyramid.writer.lock().await;
+    wire_node_lib::pyramid::db::acknowledge_wire_update(&writer, &local_contribution_id)
+        .map_err(|e| e.to_string())?;
+    Ok(ToggleOk { ok: true })
+}
+
 // --- Phase 8: YAML-to-UI renderer IPC ---------------------------------------
 //
 // Per `docs/specs/yaml-to-ui-renderer.md` → "Backend Contract" section
@@ -8619,6 +8995,34 @@ fn main() {
                 tokio::time::sleep(interval).await;
             }
         });
+    }
+
+    // Phase 14: spawn the Wire update poller.
+    //
+    // Runs as a background tokio task that periodically asks the Wire
+    // for supersession updates against every locally-pulled
+    // contribution. Writes new entries to `pyramid_wire_update_cache`,
+    // emits `WireUpdateAvailable` events, and auto-pulls updates for
+    // schema types with auto-update enabled (subject to the credential
+    // safety gate).
+    //
+    // The poller reads its interval from the `wire_update_polling`
+    // bundled contribution (default 6 hours) on every iteration, so a
+    // supersession of that contribution takes effect without a
+    // restart. The task handle is held in-scope for the lifetime of
+    // the app — it aborts on app exit.
+    {
+        let ps = pyramid_state.clone();
+        let wire_url = std::env::var("WIRE_URL")
+            .unwrap_or_else(|_| "https://newsbleach.com".to_string());
+        // We intentionally leak the handle here (forget) — the
+        // background task lives for the whole app lifetime, matching
+        // the other background workers above (dadbear, leak sweep).
+        let handle = wire_node_lib::pyramid::wire_update_poller::spawn_wire_update_poller(
+            ps, wire_url,
+        );
+        std::mem::forget(handle);
+        tracing::info!("Phase 14 Wire update poller spawned");
     }
 
     // WS-E: spawn the web_sessions sweeper (idempotent OnceLock guard).
@@ -9522,6 +9926,16 @@ fn main() {
             // Phase 5: Wire Contribution Publication
             pyramid_dry_run_publish,
             pyramid_publish_to_wire,
+            // Phase 14: Wire Discovery + Ranking + Update Polling
+            pyramid_wire_discover,
+            pyramid_search_wire_configs,
+            pyramid_wire_recommendations,
+            pyramid_wire_update_available,
+            pyramid_wire_auto_update_toggle,
+            pyramid_wire_auto_update_status,
+            pyramid_wire_pull_latest,
+            pyramid_pull_wire_config,
+            pyramid_wire_acknowledge_update,
             // Phase 8: YAML-to-UI renderer
             pyramid_get_schema_annotation,
             yaml_renderer_resolve_options,

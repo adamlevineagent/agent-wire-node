@@ -21,14 +21,20 @@ import { YamlConfigRenderer } from "../YamlConfigRenderer";
 import { useYamlRendererSources } from "../../hooks/useYamlRendererSources";
 import { PublishPreviewModal } from "../PublishPreviewModal";
 import { ContributionDetailDrawer } from "../ContributionDetailDrawer";
+import { QualityBadges } from "../QualityBadges";
 import type { SchemaAnnotation } from "../../types/yamlRenderer";
 import type {
     AcceptConfigResponse,
     ActiveConfigResponse,
+    AutoUpdateSettingEntry,
     ConfigContribution,
     ConfigSchemaSummary,
+    DiscoveryResult,
     GenerateConfigResponse,
+    PullLatestResponse,
+    Recommendation,
     RefineConfigResponse,
+    WireUpdateEntry,
 } from "../../types/configContributions";
 
 type ToolsTab = "my-tools" | "discover" | "create";
@@ -150,6 +156,11 @@ function MyToolsPanel({ onEdit }: MyToolsPanelProps) {
         undefined,
     );
 
+    // Phase 14: Wire update badges.
+    const [wireUpdates, setWireUpdates] = useState<WireUpdateEntry[]>([]);
+    const [selectedUpdate, setSelectedUpdate] =
+        useState<WireUpdateEntry | null>(null);
+
     // Bump this to refresh config fetches after accept/reject/publish.
     const [refreshToken, setRefreshToken] = useState(0);
 
@@ -263,6 +274,25 @@ function MyToolsPanel({ onEdit }: MyToolsPanelProps) {
             });
 
         return () => { cancelled = true; };
+    }, [refreshToken]);
+
+    // ── Phase 14: fetch pending Wire updates ───────────────────────────────
+    useEffect(() => {
+        let cancelled = false;
+        invoke<WireUpdateEntry[]>("pyramid_wire_update_available", {
+            slug: null,
+        })
+            .then((rows) => {
+                if (cancelled) return;
+                setWireUpdates(rows);
+            })
+            .catch((err) => {
+                if (cancelled) return;
+                console.warn("[MyToolsPanel] wire updates failed:", err);
+            });
+        return () => {
+            cancelled = true;
+        };
     }, [refreshToken]);
 
     // ── Handlers ────────────────────────────────────────────────────────────
@@ -439,16 +469,29 @@ function MyToolsPanel({ onEdit }: MyToolsPanelProps) {
 
                 {schemas.map((schema) => {
                     const active = activeConfigs[schema.schema_type];
+                    // Phase 14: find a matching update (if any) for this
+                    // schema_type's active contribution.
+                    const update = wireUpdates.find(
+                        (u) =>
+                            u.schema_type === schema.schema_type &&
+                            (!active ||
+                                u.local_contribution_id ===
+                                    active.contribution_id),
+                    );
                     return (
                         <ConfigCard
                             key={schema.schema_type}
                             schema={schema}
                             active={active}
+                            update={update}
                             onView={() => handleOpenDetail(schema.schema_type)}
                             onHistory={() =>
                                 handleOpenHistory(schema.schema_type)
                             }
                             onPublish={() => handlePublish(schema.schema_type)}
+                            onOpenUpdate={() =>
+                                update && setSelectedUpdate(update)
+                            }
                         />
                     );
                 })}
@@ -546,6 +589,16 @@ function MyToolsPanel({ onEdit }: MyToolsPanelProps) {
                     onPublished={handlePublishSuccess}
                 />
             )}
+            {selectedUpdate && (
+                <WireUpdateDrawer
+                    update={selectedUpdate}
+                    onClose={() => setSelectedUpdate(null)}
+                    onPulled={() => {
+                        setSelectedUpdate(null);
+                        bumpRefresh();
+                    }}
+                />
+            )}
         </div>
     );
 }
@@ -592,15 +645,19 @@ function SectionHeader({
 function ConfigCard({
     schema,
     active,
+    update,
     onView,
     onHistory,
     onPublish,
+    onOpenUpdate,
 }: {
     schema: ConfigSchemaSummary;
     active: ActiveConfigResponse | null | undefined;
+    update?: WireUpdateEntry;
     onView: () => void;
     onHistory: () => void;
     onPublish: () => void;
+    onOpenUpdate?: () => void;
 }) {
     const hasActive = !!active;
     const version = active?.version_chain_length ?? 0;
@@ -670,6 +727,25 @@ function ConfigCard({
                     >
                         No active config
                     </span>
+                )}
+                {update && (
+                    <button
+                        type="button"
+                        onClick={onOpenUpdate}
+                        style={{
+                            fontSize: 10,
+                            padding: "2px 8px",
+                            borderRadius: 4,
+                            background: "rgba(59, 130, 246, 0.18)",
+                            color: "#60a5fa",
+                            fontWeight: 600,
+                            border: "1px solid rgba(59, 130, 246, 0.4)",
+                            cursor: "pointer",
+                        }}
+                        title={`${update.chain_length_delta} version${update.chain_length_delta === 1 ? "" : "s"} ahead on the Wire`}
+                    >
+                        Update available ({update.chain_length_delta})
+                    </button>
                 )}
             </div>
             <p
@@ -821,6 +897,193 @@ function ProposalCard({
                     onClick={onReject}
                 >
                     Reject
+                </button>
+            </div>
+        </div>
+    );
+}
+
+function WireUpdateDrawer({
+    update,
+    onClose,
+    onPulled,
+}: {
+    update: WireUpdateEntry;
+    onClose: () => void;
+    onPulled: () => void;
+}) {
+    const [busy, setBusy] = useState(false);
+    const [error, setError] = useState<string | null>(null);
+
+    const handlePull = useCallback(async () => {
+        setBusy(true);
+        setError(null);
+        try {
+            await invoke<PullLatestResponse>("pyramid_wire_pull_latest", {
+                localContributionId: update.local_contribution_id,
+                latestWireContributionId: update.latest_wire_contribution_id,
+            });
+            onPulled();
+        } catch (err) {
+            setError(String(err));
+        } finally {
+            setBusy(false);
+        }
+    }, [update, onPulled]);
+
+    const handleDismiss = useCallback(async () => {
+        setBusy(true);
+        setError(null);
+        try {
+            await invoke("pyramid_wire_acknowledge_update", {
+                localContributionId: update.local_contribution_id,
+            });
+            onClose();
+        } catch (err) {
+            setError(String(err));
+        } finally {
+            setBusy(false);
+        }
+    }, [update, onClose]);
+
+    return (
+        <div
+            role="dialog"
+            aria-label="Wire update"
+            style={{
+                position: "fixed",
+                top: 0,
+                right: 0,
+                bottom: 0,
+                width: 480,
+                background: "var(--bg-primary, #0b0b1a)",
+                borderLeft: "1px solid var(--border-primary, #2a2a4a)",
+                boxShadow: "-8px 0 32px rgba(0, 0, 0, 0.4)",
+                display: "flex",
+                flexDirection: "column",
+                zIndex: 400,
+            }}
+        >
+            <div
+                style={{
+                    padding: 16,
+                    borderBottom: "1px solid var(--border-primary, #2a2a4a)",
+                    display: "flex",
+                    justifyContent: "space-between",
+                    alignItems: "center",
+                }}
+            >
+                <h3 style={{ margin: 0, fontSize: 14, color: "var(--text-primary)" }}>
+                    Wire update for {update.schema_type}
+                </h3>
+                <button
+                    type="button"
+                    className="btn btn-ghost btn-small"
+                    onClick={onClose}
+                >
+                    Close
+                </button>
+            </div>
+            <div
+                style={{
+                    padding: 16,
+                    overflowY: "auto",
+                    display: "flex",
+                    flexDirection: "column",
+                    gap: 12,
+                }}
+            >
+                <div
+                    style={{
+                        fontSize: 12,
+                        color: "var(--text-secondary)",
+                    }}
+                >
+                    {update.chain_length_delta}{" "}
+                    {update.chain_length_delta === 1 ? "version" : "versions"} ahead on
+                    the Wire
+                    {update.slug && <> · scope: {update.slug}</>}
+                </div>
+                <div
+                    style={{
+                        fontSize: 11,
+                        fontFamily: "var(--font-mono, monospace)",
+                        color: "var(--text-secondary)",
+                    }}
+                >
+                    Latest: {update.latest_wire_contribution_id}
+                </div>
+                {update.author_handles.length > 0 && (
+                    <div
+                        style={{
+                            fontSize: 12,
+                            color: "var(--text-secondary)",
+                        }}
+                    >
+                        Authors:{" "}
+                        {update.author_handles.join(", ")}
+                    </div>
+                )}
+                {update.changes_summary && (
+                    <div
+                        style={{
+                            padding: 10,
+                            background: "rgba(59, 130, 246, 0.06)",
+                            borderRadius: 6,
+                            fontSize: 12,
+                            color: "var(--text-primary)",
+                            lineHeight: 1.5,
+                            whiteSpace: "pre-wrap",
+                        }}
+                    >
+                        {update.changes_summary}
+                    </div>
+                )}
+                <div
+                    style={{
+                        fontSize: 11,
+                        color: "var(--text-secondary)",
+                    }}
+                >
+                    Checked at {new Date(update.checked_at).toLocaleString()}
+                </div>
+                {error && (
+                    <div
+                        style={{
+                            padding: 10,
+                            background: "rgba(239, 68, 68, 0.1)",
+                            borderRadius: 6,
+                            fontSize: 12,
+                            color: "#fca5a5",
+                        }}
+                    >
+                        {error}
+                    </div>
+                )}
+            </div>
+            <div
+                style={{
+                    padding: 16,
+                    borderTop: "1px solid var(--border-primary, #2a2a4a)",
+                    display: "flex",
+                    gap: 8,
+                }}
+            >
+                <button
+                    type="button"
+                    className="btn btn-ghost btn-small"
+                    onClick={handleDismiss}
+                    disabled={busy}
+                >
+                    Dismiss
+                </button>
+                <button
+                    type="button"
+                    className="btn btn-primary btn-small"
+                    onClick={handlePull}
+                    disabled={busy}
+                >
+                    {busy ? "Pulling…" : "Pull latest"}
                 </button>
             </div>
         </div>
@@ -1772,58 +2035,873 @@ function FallbackActions({
 }
 
 // ─── Discover tab ────────────────────────────────────────────────────────────
+//
+// Phase 14: Wire discovery + ranking + recommendations surface.
+// Replaces the Phase 10 placeholder with a real search UI backed by
+// `pyramid_wire_discover` + `pyramid_wire_recommendations` +
+// `pyramid_pull_wire_config`. Renders results with the shared
+// QualityBadges component and wires a detail drawer for preview +
+// pull. Auto-update toggles live in a modal reachable from the tab
+// header.
+
+type DiscoverSortBy = "score" | "rating" | "adoption" | "fresh" | "chain_length";
 
 function DiscoverPanel() {
+    const [schemas, setSchemas] = useState<ConfigSchemaSummary[]>([]);
+    const [schemaType, setSchemaType] = useState<string>("");
+    const [query, setQuery] = useState("");
+    const [tags, setTags] = useState("");
+    const [sortBy, setSortBy] = useState<DiscoverSortBy>("score");
+    const [results, setResults] = useState<DiscoveryResult[]>([]);
+    const [loading, setLoading] = useState(false);
+    const [error, setError] = useState<string | null>(null);
+    const [recommendations, setRecommendations] = useState<Recommendation[]>([]);
+    const [recSlug, setRecSlug] = useState<string>("");
+    const [slugs, setSlugs] = useState<string[]>([]);
+    const [selectedResult, setSelectedResult] = useState<DiscoveryResult | null>(
+        null,
+    );
+    const [pullBusy, setPullBusy] = useState(false);
+    const [pullMessage, setPullMessage] = useState<string | null>(null);
+    const [showAutoUpdate, setShowAutoUpdate] = useState(false);
+
+    // ── Load schema list + slug list on mount.
+    useEffect(() => {
+        (async () => {
+            try {
+                const list = await invoke<ConfigSchemaSummary[]>(
+                    "pyramid_config_schemas",
+                );
+                setSchemas(list);
+                if (list.length > 0 && !schemaType) {
+                    setSchemaType(list[0].schema_type);
+                }
+            } catch (err) {
+                console.warn("Failed to load schemas:", err);
+            }
+            try {
+                const s = await invoke<Array<{ slug: string }> | string[]>(
+                    "pyramid_list_slugs",
+                );
+                const normalized = Array.isArray(s)
+                    ? (s as unknown[]).map((entry) =>
+                          typeof entry === "string"
+                              ? entry
+                              : typeof entry === "object" && entry !== null && "slug" in entry
+                              ? String((entry as { slug: unknown }).slug)
+                              : "",
+                      ).filter(Boolean)
+                    : [];
+                setSlugs(normalized);
+            } catch (err) {
+                console.warn("Failed to load slugs:", err);
+            }
+        })();
+    }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+    // ── Fetch recommendations when slug + schema_type selected.
+    useEffect(() => {
+        if (!recSlug || !schemaType) {
+            setRecommendations([]);
+            return;
+        }
+        let cancelled = false;
+        invoke<Recommendation[]>("pyramid_wire_recommendations", {
+            slug: recSlug,
+            schemaType,
+            limit: 5,
+        })
+            .then((r) => {
+                if (!cancelled) setRecommendations(r);
+            })
+            .catch((err) => {
+                if (!cancelled) {
+                    console.warn("Failed to fetch recommendations:", err);
+                    setRecommendations([]);
+                }
+            });
+        return () => {
+            cancelled = true;
+        };
+    }, [recSlug, schemaType]);
+
+    const runSearch = useCallback(async () => {
+        if (!schemaType) return;
+        setLoading(true);
+        setError(null);
+        try {
+            const tagList = tags
+                .split(",")
+                .map((t) => t.trim())
+                .filter(Boolean);
+            const r = await invoke<DiscoveryResult[]>("pyramid_wire_discover", {
+                schemaType,
+                query: query.trim() ? query.trim() : null,
+                tags: tagList.length > 0 ? tagList : null,
+                limit: 20,
+                sortBy,
+            });
+            setResults(r);
+        } catch (err) {
+            setError(String(err));
+            setResults([]);
+        } finally {
+            setLoading(false);
+        }
+    }, [schemaType, query, tags, sortBy]);
+
+    const handlePull = useCallback(
+        async (wire_contribution_id: string, activate: boolean) => {
+            if (pullBusy) return;
+            setPullBusy(true);
+            setPullMessage(null);
+            try {
+                const outcome = await invoke<PullLatestResponse>(
+                    "pyramid_pull_wire_config",
+                    {
+                        wireContributionId: wire_contribution_id,
+                        slug: recSlug || null,
+                        activate,
+                    },
+                );
+                setPullMessage(
+                    outcome.activated
+                        ? `Pulled & activated — new contribution_id ${outcome.new_local_contribution_id.slice(0, 8)}…`
+                        : `Pulled as proposal — review in My Tools (id ${outcome.new_local_contribution_id.slice(0, 8)}…)`,
+                );
+                setSelectedResult(null);
+            } catch (err) {
+                const message = String(err);
+                // Surface credential safety gate errors clearly.
+                if (message.includes("credential")) {
+                    setPullMessage(
+                        `Pull refused — ${message}. Add the missing credentials in Settings → Credentials, then retry.`,
+                    );
+                } else {
+                    setPullMessage(`Pull failed: ${message}`);
+                }
+            } finally {
+                setPullBusy(false);
+            }
+        },
+        [pullBusy, recSlug],
+    );
+
+    return (
+        <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+            {/* ── Header with auto-update button ─────────────────────────── */}
+            <div
+                style={{
+                    display: "flex",
+                    justifyContent: "space-between",
+                    alignItems: "flex-start",
+                    gap: 12,
+                }}
+            >
+                <SectionHeader
+                    title="Discover on the Wire"
+                    subtitle="Search Wire-published contributions, ranked by quality, adoption, and freshness. Pull matching configs into your local contribution store."
+                />
+                <button
+                    type="button"
+                    className="btn btn-ghost btn-small"
+                    onClick={() => setShowAutoUpdate(true)}
+                >
+                    Auto-update settings
+                </button>
+            </div>
+
+            {/* ── Search bar ────────────────────────────────────────────── */}
+            <div
+                style={{
+                    display: "grid",
+                    gridTemplateColumns: "160px 1fr 200px 120px auto",
+                    gap: 8,
+                    alignItems: "center",
+                }}
+            >
+                <select
+                    value={schemaType}
+                    onChange={(e) => setSchemaType(e.target.value)}
+                    className="settings-input"
+                    style={{ padding: "6px 8px", fontSize: 12 }}
+                >
+                    {schemas.map((s) => (
+                        <option key={s.schema_type} value={s.schema_type}>
+                            {s.display_name}
+                        </option>
+                    ))}
+                </select>
+                <input
+                    type="text"
+                    value={query}
+                    onChange={(e) => setQuery(e.target.value)}
+                    onKeyDown={(e) => {
+                        if (e.key === "Enter") runSearch();
+                    }}
+                    placeholder="Search text (optional)"
+                    className="settings-input"
+                    style={{ padding: "6px 8px", fontSize: 12 }}
+                />
+                <input
+                    type="text"
+                    value={tags}
+                    onChange={(e) => setTags(e.target.value)}
+                    onKeyDown={(e) => {
+                        if (e.key === "Enter") runSearch();
+                    }}
+                    placeholder="tags (comma-separated)"
+                    className="settings-input"
+                    style={{ padding: "6px 8px", fontSize: 12 }}
+                />
+                <select
+                    value={sortBy}
+                    onChange={(e) => setSortBy(e.target.value as DiscoverSortBy)}
+                    className="settings-input"
+                    style={{ padding: "6px 8px", fontSize: 12 }}
+                >
+                    <option value="score">Score</option>
+                    <option value="rating">Rating</option>
+                    <option value="adoption">Adoption</option>
+                    <option value="fresh">Freshest</option>
+                    <option value="chain_length">Chain length</option>
+                </select>
+                <button
+                    type="button"
+                    className="btn btn-primary btn-small"
+                    onClick={runSearch}
+                    disabled={loading || !schemaType}
+                >
+                    {loading ? "Searching…" : "Search"}
+                </button>
+            </div>
+
+            {/* ── Pyramid selector for recommendations ──────────────────── */}
+            {slugs.length > 0 && (
+                <div
+                    style={{
+                        display: "flex",
+                        alignItems: "center",
+                        gap: 8,
+                        fontSize: 12,
+                        color: "var(--text-secondary)",
+                    }}
+                >
+                    <span>Recommend for pyramid:</span>
+                    <select
+                        value={recSlug}
+                        onChange={(e) => setRecSlug(e.target.value)}
+                        className="settings-input"
+                        style={{ padding: "4px 8px", fontSize: 12, maxWidth: 220 }}
+                    >
+                        <option value="">— none —</option>
+                        {slugs.map((s) => (
+                            <option key={s} value={s}>
+                                {s}
+                            </option>
+                        ))}
+                    </select>
+                </div>
+            )}
+
+            {/* ── Pull outcome banner ───────────────────────────────────── */}
+            {pullMessage && (
+                <div
+                    style={{
+                        padding: "8px 12px",
+                        borderRadius: 6,
+                        background: "rgba(59, 130, 246, 0.1)",
+                        border: "1px solid rgba(59, 130, 246, 0.2)",
+                        fontSize: 12,
+                        color: "var(--text-primary)",
+                    }}
+                >
+                    {pullMessage}
+                </div>
+            )}
+
+            {/* ── Recommendations banner ────────────────────────────────── */}
+            {recommendations.length > 0 && (
+                <section
+                    style={{
+                        display: "flex",
+                        flexDirection: "column",
+                        gap: 8,
+                    }}
+                >
+                    <SectionHeader
+                        title="Recommended for this pyramid"
+                        subtitle={`Based on ${recSlug} — source type overlap + tier routing similarity.`}
+                    />
+                    {recommendations.map((r) => (
+                        <RecommendationCard
+                            key={r.wire_contribution_id}
+                            rec={r}
+                            onView={() =>
+                                setSelectedResult({
+                                    wire_contribution_id: r.wire_contribution_id,
+                                    title: r.title,
+                                    description: r.description,
+                                    tags: [],
+                                    author_handle: null,
+                                    rating: null,
+                                    adoption_count: 0,
+                                    open_rebuttals: 0,
+                                    chain_length: 0,
+                                    freshness_days: 0,
+                                    score: r.score,
+                                    rationale: r.rationale,
+                                    schema_type: schemaType,
+                                })
+                            }
+                        />
+                    ))}
+                </section>
+            )}
+
+            {/* ── Main results list ─────────────────────────────────────── */}
+            {error && (
+                <p style={{ color: "#fca5a5", fontSize: 13 }}>{error}</p>
+            )}
+            {!loading && results.length === 0 && !error && (
+                <p
+                    style={{
+                        color: "var(--text-secondary)",
+                        fontSize: 12,
+                        fontStyle: "italic",
+                    }}
+                >
+                    No results. The Wire's discovery endpoint may not be live yet — try
+                    different search terms, or check back once server-side search ships.
+                </p>
+            )}
+            {results.map((r) => (
+                <DiscoveryResultCard
+                    key={r.wire_contribution_id}
+                    result={r}
+                    onView={() => setSelectedResult(r)}
+                />
+            ))}
+
+            {/* ── Detail drawer ─────────────────────────────────────────── */}
+            {selectedResult && (
+                <DiscoveryDetailDrawer
+                    result={selectedResult}
+                    onClose={() => setSelectedResult(null)}
+                    onPull={(activate) =>
+                        handlePull(selectedResult.wire_contribution_id, activate)
+                    }
+                    pullBusy={pullBusy}
+                />
+            )}
+
+            {/* ── Auto-update toggles modal ──────────────────────────────── */}
+            {showAutoUpdate && (
+                <AutoUpdateSettingsModal
+                    schemas={schemas}
+                    onClose={() => setShowAutoUpdate(false)}
+                />
+            )}
+        </div>
+    );
+}
+
+function DiscoveryResultCard({
+    result,
+    onView,
+}: {
+    result: DiscoveryResult;
+    onView: () => void;
+}) {
     return (
         <div
             style={{
-                padding: "24px 16px",
+                background: "var(--bg-secondary, #1a1a2e)",
+                border: "1px solid var(--border-primary, #2a2a4a)",
+                borderRadius: 8,
+                padding: 14,
                 display: "flex",
                 flexDirection: "column",
-                gap: 12,
-                background: "rgba(139, 92, 246, 0.04)",
-                border: "1px solid rgba(139, 92, 246, 0.18)",
-                borderRadius: 8,
+                gap: 8,
             }}
         >
             <div
                 style={{
-                    fontSize: 14,
+                    display: "flex",
+                    justifyContent: "space-between",
+                    alignItems: "baseline",
+                    gap: 8,
+                }}
+            >
+                <div
+                    style={{
+                        fontSize: 14,
+                        fontWeight: 600,
+                        color: "var(--text-primary)",
+                    }}
+                >
+                    {result.title || result.wire_contribution_id.slice(0, 12)}
+                </div>
+                <div
+                    style={{
+                        fontSize: 11,
+                        fontFamily: "var(--font-mono, monospace)",
+                        color: "var(--text-secondary)",
+                    }}
+                >
+                    score {(result.score * 100).toFixed(0)}
+                </div>
+            </div>
+            {result.author_handle && (
+                <div
+                    style={{
+                        fontSize: 11,
+                        color: "var(--text-secondary)",
+                    }}
+                >
+                    by {result.author_handle}
+                </div>
+            )}
+            <QualityBadges
+                rating={result.rating ?? undefined}
+                adoptionCount={result.adoption_count}
+                openRebuttals={result.open_rebuttals}
+                chainLength={result.chain_length}
+                freshnessDays={result.freshness_days}
+            />
+            {result.description && (
+                <p
+                    style={{
+                        margin: 0,
+                        fontSize: 12,
+                        color: "var(--text-secondary)",
+                        lineHeight: 1.5,
+                    }}
+                >
+                    {result.description}
+                </p>
+            )}
+            {result.rationale && (
+                <p
+                    style={{
+                        margin: 0,
+                        fontSize: 11,
+                        color: "var(--accent-purple, #a78bfa)",
+                        fontStyle: "italic",
+                    }}
+                >
+                    {result.rationale}
+                </p>
+            )}
+            <div style={{ display: "flex", gap: 6 }}>
+                <button
+                    type="button"
+                    className="btn btn-secondary btn-small"
+                    onClick={onView}
+                >
+                    View details
+                </button>
+            </div>
+        </div>
+    );
+}
+
+function RecommendationCard({
+    rec,
+    onView,
+}: {
+    rec: Recommendation;
+    onView: () => void;
+}) {
+    return (
+        <div
+            style={{
+                background: "rgba(167, 139, 250, 0.06)",
+                border: "1px solid rgba(167, 139, 250, 0.18)",
+                borderRadius: 8,
+                padding: 12,
+                display: "flex",
+                flexDirection: "column",
+                gap: 6,
+            }}
+        >
+            <div
+                style={{
+                    fontSize: 13,
                     fontWeight: 600,
                     color: "var(--text-primary)",
                 }}
             >
-                Wire discovery — coming in Phase 14
+                {rec.title || rec.wire_contribution_id.slice(0, 12)}
             </div>
+            {rec.description && (
+                <p
+                    style={{
+                        margin: 0,
+                        fontSize: 12,
+                        color: "var(--text-secondary)",
+                        lineHeight: 1.5,
+                    }}
+                >
+                    {rec.description}
+                </p>
+            )}
             <p
                 style={{
                     margin: 0,
-                    fontSize: 13,
-                    color: "var(--text-secondary)",
-                    lineHeight: 1.6,
+                    fontSize: 11,
+                    color: "var(--accent-purple, #a78bfa)",
+                    fontStyle: "italic",
                 }}
             >
-                Browse and pull config contributions from the Wire. This tab
-                will search the marketplace by schema type and tags, preview
-                configs via the same YAML renderer, and pull them into your
-                local contribution store as pending proposals for your
-                review.
+                {rec.rationale}
             </p>
-            <p
+            <div style={{ display: "flex", gap: 6 }}>
+                <button
+                    type="button"
+                    className="btn btn-ghost btn-small"
+                    onClick={onView}
+                >
+                    View details
+                </button>
+            </div>
+        </div>
+    );
+}
+
+function DiscoveryDetailDrawer({
+    result,
+    onClose,
+    onPull,
+    pullBusy,
+}: {
+    result: DiscoveryResult;
+    onClose: () => void;
+    onPull: (activate: boolean) => void;
+    pullBusy: boolean;
+}) {
+    return (
+        <div
+            role="dialog"
+            aria-label="Contribution details"
+            style={{
+                position: "fixed",
+                top: 0,
+                right: 0,
+                bottom: 0,
+                width: 480,
+                background: "var(--bg-primary, #0b0b1a)",
+                borderLeft: "1px solid var(--border-primary, #2a2a4a)",
+                boxShadow: "-8px 0 32px rgba(0, 0, 0, 0.4)",
+                display: "flex",
+                flexDirection: "column",
+                zIndex: 400,
+            }}
+        >
+            <div
                 style={{
-                    margin: 0,
-                    fontSize: 12,
-                    color: "var(--text-secondary)",
-                    opacity: 0.75,
-                    lineHeight: 1.6,
+                    padding: 16,
+                    borderBottom: "1px solid var(--border-primary, #2a2a4a)",
+                    display: "flex",
+                    justifyContent: "space-between",
+                    alignItems: "center",
                 }}
             >
-                Phase 14 ships the ranking, recommendations, supersession
-                notifications, and quality badges. The underlying IPC
-                (<code>pyramid_search_wire_configs</code> and{" "}
-                <code>pyramid_pull_wire_config</code>) is not yet registered
-                in the node — no interactive surface to wire against yet.
-            </p>
+                <h3 style={{ margin: 0, fontSize: 14, color: "var(--text-primary)" }}>
+                    {result.title || "Untitled"}
+                </h3>
+                <button
+                    type="button"
+                    className="btn btn-ghost btn-small"
+                    onClick={onClose}
+                >
+                    Close
+                </button>
+            </div>
+            <div
+                style={{
+                    padding: 16,
+                    overflowY: "auto",
+                    display: "flex",
+                    flexDirection: "column",
+                    gap: 12,
+                }}
+            >
+                <div style={{ fontSize: 11, color: "var(--text-secondary)" }}>
+                    {result.author_handle && <>by {result.author_handle} · </>}
+                    <span
+                        style={{
+                            fontFamily: "var(--font-mono, monospace)",
+                        }}
+                    >
+                        {result.wire_contribution_id}
+                    </span>
+                </div>
+                <QualityBadges
+                    rating={result.rating ?? undefined}
+                    adoptionCount={result.adoption_count}
+                    openRebuttals={result.open_rebuttals}
+                    chainLength={result.chain_length}
+                    freshnessDays={result.freshness_days}
+                />
+                {result.description && (
+                    <p
+                        style={{
+                            margin: 0,
+                            fontSize: 13,
+                            color: "var(--text-primary)",
+                            lineHeight: 1.6,
+                        }}
+                    >
+                        {result.description}
+                    </p>
+                )}
+                {result.rationale && (
+                    <div
+                        style={{
+                            padding: 10,
+                            background: "rgba(167, 139, 250, 0.06)",
+                            borderRadius: 6,
+                            fontSize: 12,
+                            color: "var(--accent-purple, #a78bfa)",
+                        }}
+                    >
+                        {result.rationale}
+                    </div>
+                )}
+                {result.tags.length > 0 && (
+                    <div
+                        style={{
+                            display: "flex",
+                            flexWrap: "wrap",
+                            gap: 4,
+                        }}
+                    >
+                        {result.tags.map((t) => (
+                            <span
+                                key={t}
+                                style={{
+                                    padding: "2px 6px",
+                                    borderRadius: 4,
+                                    fontSize: 10,
+                                    background: "rgba(255, 255, 255, 0.05)",
+                                    color: "var(--text-secondary)",
+                                }}
+                            >
+                                {t}
+                            </span>
+                        ))}
+                    </div>
+                )}
+                <div
+                    style={{
+                        fontSize: 12,
+                        color: "var(--text-secondary)",
+                        lineHeight: 1.5,
+                    }}
+                >
+                    Score: {(result.score * 100).toFixed(0)} / 100
+                    {result.schema_type && <> · {result.schema_type}</>}
+                </div>
+            </div>
+            <div
+                style={{
+                    padding: 16,
+                    borderTop: "1px solid var(--border-primary, #2a2a4a)",
+                    display: "flex",
+                    gap: 8,
+                }}
+            >
+                <button
+                    type="button"
+                    className="btn btn-secondary btn-small"
+                    onClick={() => onPull(false)}
+                    disabled={pullBusy}
+                    title="Pull into your contribution store as a proposal"
+                >
+                    {pullBusy ? "Pulling…" : "Pull as proposal"}
+                </button>
+                <button
+                    type="button"
+                    className="btn btn-primary btn-small"
+                    onClick={() => onPull(true)}
+                    disabled={pullBusy}
+                    title="Pull and activate immediately"
+                >
+                    {pullBusy ? "Pulling…" : "Pull and activate"}
+                </button>
+            </div>
+        </div>
+    );
+}
+
+function AutoUpdateSettingsModal({
+    schemas,
+    onClose,
+}: {
+    schemas: ConfigSchemaSummary[];
+    onClose: () => void;
+}) {
+    const [settings, setSettings] = useState<Record<string, boolean>>({});
+    const [loading, setLoading] = useState(true);
+    const [savingKey, setSavingKey] = useState<string | null>(null);
+
+    useEffect(() => {
+        let cancelled = false;
+        invoke<AutoUpdateSettingEntry[]>("pyramid_wire_auto_update_status")
+            .then((rows) => {
+                if (cancelled) return;
+                const map: Record<string, boolean> = {};
+                for (const r of rows) map[r.schema_type] = r.enabled;
+                setSettings(map);
+            })
+            .catch((err) => console.warn("auto_update_status failed:", err))
+            .finally(() => {
+                if (!cancelled) setLoading(false);
+            });
+        return () => {
+            cancelled = true;
+        };
+    }, []);
+
+    const handleToggle = useCallback(
+        async (schemaType: string, enabled: boolean) => {
+            setSavingKey(schemaType);
+            try {
+                await invoke("pyramid_wire_auto_update_toggle", {
+                    schemaType,
+                    enabled,
+                });
+                setSettings((prev) => ({ ...prev, [schemaType]: enabled }));
+            } catch (err) {
+                alert(`Failed to toggle auto-update: ${String(err)}`);
+            } finally {
+                setSavingKey(null);
+            }
+        },
+        [],
+    );
+
+    return (
+        <div
+            role="dialog"
+            aria-label="Auto-update settings"
+            style={{
+                position: "fixed",
+                inset: 0,
+                background: "rgba(0, 0, 0, 0.6)",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                zIndex: 500,
+            }}
+            onClick={onClose}
+        >
+            <div
+                onClick={(e) => e.stopPropagation()}
+                style={{
+                    background: "var(--bg-primary, #0b0b1a)",
+                    border: "1px solid var(--border-primary, #2a2a4a)",
+                    borderRadius: 12,
+                    padding: 24,
+                    maxWidth: 560,
+                    width: "90%",
+                    maxHeight: "80vh",
+                    overflow: "auto",
+                    display: "flex",
+                    flexDirection: "column",
+                    gap: 12,
+                }}
+            >
+                <h3 style={{ margin: 0, color: "var(--text-primary)" }}>
+                    Auto-update from Wire
+                </h3>
+                <div
+                    style={{
+                        padding: 10,
+                        background: "rgba(245, 158, 11, 0.1)",
+                        borderRadius: 6,
+                        border: "1px solid rgba(245, 158, 11, 0.3)",
+                        fontSize: 12,
+                        color: "#fcd34d",
+                        lineHeight: 1.5,
+                    }}
+                >
+                    Auto-update pulls new versions without prompting. Contributions
+                    that reference new credentials will always require manual review.
+                </div>
+                {loading && (
+                    <p style={{ color: "var(--text-secondary)", fontSize: 13 }}>
+                        Loading…
+                    </p>
+                )}
+                {!loading && schemas.length === 0 && (
+                    <p style={{ color: "var(--text-secondary)", fontSize: 13 }}>
+                        No schema types registered yet.
+                    </p>
+                )}
+                {schemas.map((s) => {
+                    const enabled = settings[s.schema_type] ?? false;
+                    return (
+                        <label
+                            key={s.schema_type}
+                            style={{
+                                display: "flex",
+                                alignItems: "center",
+                                gap: 10,
+                                padding: "8px 10px",
+                                background: "var(--bg-secondary, #1a1a2e)",
+                                borderRadius: 6,
+                                cursor: savingKey === s.schema_type ? "wait" : "pointer",
+                                opacity: savingKey === s.schema_type ? 0.6 : 1,
+                            }}
+                        >
+                            <input
+                                type="checkbox"
+                                checked={enabled}
+                                disabled={savingKey === s.schema_type}
+                                onChange={(e) =>
+                                    handleToggle(s.schema_type, e.target.checked)
+                                }
+                            />
+                            <div style={{ flex: 1 }}>
+                                <div
+                                    style={{
+                                        fontSize: 13,
+                                        fontWeight: 600,
+                                        color: "var(--text-primary)",
+                                    }}
+                                >
+                                    {s.display_name}
+                                </div>
+                                <div
+                                    style={{
+                                        fontSize: 11,
+                                        color: "var(--text-secondary)",
+                                    }}
+                                >
+                                    {s.schema_type}
+                                </div>
+                            </div>
+                        </label>
+                    );
+                })}
+                <div
+                    style={{
+                        display: "flex",
+                        justifyContent: "flex-end",
+                        marginTop: 8,
+                    }}
+                >
+                    <button
+                        type="button"
+                        className="btn btn-primary btn-small"
+                        onClick={onClose}
+                    >
+                        Done
+                    </button>
+                </div>
+            </div>
         </div>
     );
 }

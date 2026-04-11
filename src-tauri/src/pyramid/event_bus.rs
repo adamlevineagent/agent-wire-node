@@ -363,6 +363,28 @@ pub enum TaggedKind {
         depth: i64,
         node_id: String,
     },
+
+    // ── Phase 14: Wire discovery + update notifications ──────────────
+    /// Emitted by `WireUpdatePoller::run_once` when a newer Wire
+    /// contribution is detected for a local contribution the user
+    /// has already pulled. The frontend's My Tools tab listens for
+    /// this event to refresh its update badges.
+    WireUpdateAvailable {
+        local_contribution_id: String,
+        schema_type: String,
+        latest_wire_contribution_id: String,
+        chain_length_delta: i64,
+    },
+    /// Emitted by `WireUpdatePoller::run_once` when auto-update is
+    /// enabled for a schema_type AND the poller successfully pulled +
+    /// activated the new version. The frontend uses this to surface a
+    /// non-modal toast / log entry so the user can see what changed.
+    WireAutoUpdateApplied {
+        local_contribution_id: String,
+        schema_type: String,
+        new_local_contribution_id: String,
+        chain_length_delta: i64,
+    },
 }
 
 impl TaggedKind {
