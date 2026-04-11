@@ -551,6 +551,11 @@ pub fn assemble_vine_l0(
 
 /// Run the build pipeline for a single slug, setting up all required channels.
 /// Extracted from routes.rs to be shared between HTTP builds and vine bunch builds.
+///
+/// Phase 16: takes an optional `state` reference so the `ContentType::Vine`
+/// branch can dispatch the topical-vine chain via
+/// `build::build_topical_vine`. Existing callers that build conversation
+/// bunches pass `None` because they never hit the vine branch.
 pub async fn run_build_pipeline(
     reader: Arc<Mutex<Connection>>,
     writer: Arc<Mutex<Connection>>,
@@ -559,6 +564,7 @@ pub async fn run_build_pipeline(
     content_type: ContentType,
     cancel: &CancellationToken,
     bus: Option<&super::event_bus::BuildEventBus>,
+    state: Option<&PyramidState>,
 ) -> Result<i32> {
     // Use shared writer drain helper (single implementation, not duplicated)
     let (write_tx, writer_handle) = spawn_write_drain(writer);
@@ -596,9 +602,20 @@ pub async fn run_build_pipeline(
         ContentType::Document => {
             build::build_docs(reader, &write_tx, llm_config, slug, cancel, &progress_tx).await
         }
-        ContentType::Vine => Err(anyhow!(
-            "Vine build uses vine-specific pipeline, not run_build_pipeline"
-        )),
+        ContentType::Vine => {
+            // Phase 16: vines are built by dispatching the topical vine
+            // chain through the chain executor. The executor pulls child
+            // apex data from `pyramid_vine_compositions` via the
+            // cross_build_input primitive and composes bedrock + sub-vine
+            // children uniformly.
+            match state {
+                Some(s) => build::build_topical_vine(s, slug, cancel, &progress_tx).await,
+                None => Err(anyhow!(
+                    "Vine build requires PyramidState: use run_build_from or pass state \
+                     to run_build_pipeline. Phase 16 dispatches vines via the topical-vine chain."
+                )),
+            }
+        }
         ContentType::Question => Err(anyhow!(
             "Question build uses question-driven pipeline, not run_build_pipeline"
         )),
@@ -1034,6 +1051,7 @@ pub async fn build_bunch(
             run_build_pipeline(
                 reader, writer, &llm_config, &bunch_slug,
                 ContentType::Conversation, cancel, Some(&state.build_event_bus),
+                Some(state),
             ).await?;
         }
     }

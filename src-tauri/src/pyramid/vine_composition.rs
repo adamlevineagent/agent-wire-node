@@ -30,134 +30,265 @@ use super::PyramidState;
 /// bedrock, updates the apex reference, and fires a composition delta event
 /// for each affected vine.
 ///
+/// Phase 16: this is now a thin alias for `notify_vine_of_child_completion`.
+/// The recursive walk logic lives in the unified function so bedrock and
+/// sub-vine completions share one propagation path. Existing Phase 2/13
+/// callers continue to work unchanged.
+///
 /// Callers: DADBEAR on build completion, or build_runner at the tail of a
 /// successful build.
 ///
-/// Uses `write_child_then_parent` from LockManager to acquire locks in
-/// deadlock-free order (bedrock first, then vine).
-///
-/// Returns the list of vine slugs that were notified.
+/// Returns the list of vine slugs that were notified AT THE DIRECT PARENT
+/// LEVEL. The function also recursively propagates to grandparent vines,
+/// grand-grandparent vines, etc. — but the direct-parent list is returned
+/// so existing callers that log how many vines were touched remain accurate.
 pub async fn notify_vine_of_bedrock_completion(
     state: &PyramidState,
     bedrock_slug: &str,
     bedrock_build_id: &str,
     apex_node_id: &str,
 ) -> Result<Vec<String>> {
-    // 1. Look up which vines include this bedrock
-    let vine_slugs = {
-        let conn = state.reader.lock().await;
-        db::get_vines_for_bedrock(&conn, bedrock_slug)?
-    };
+    notify_vine_of_child_completion(state, bedrock_slug, bedrock_build_id, apex_node_id)
+        .await
+}
 
-    if vine_slugs.is_empty() {
-        return Ok(vec![]);
-    }
+/// Phase 16: called when any child (bedrock OR sub-vine) build completes.
+/// Walks up the composition hierarchy: bedrock → parent vine → grandparent
+/// vine → … until either no parents remain or the cycle guard / depth cap
+/// is hit.
+///
+/// At each level the function:
+/// 1. Looks up the direct parent vines via `get_vines_for_child`.
+/// 2. For each parent, acquires the child-then-parent lock, updates the
+///    child's apex reference in the composition table, and enqueues
+///    change-manifest pending mutations for the stale engine.
+/// 3. Emits `DeltaLanded` + `SlopeChanged` events on the parent vine.
+/// 4. **Recurses upward**: for each notified parent, treats the parent vine
+///    as a newly-updated child and notifies its own parents. The parent
+///    vine's apex is its own apex (resolved from `pyramid_vine_compositions`
+///    or `pyramid_nodes`). If a parent vine has no apex yet (e.g., it was
+///    just registered and never built), the recursion skips that branch —
+///    the parent will pick up the update on its own next build.
+///
+/// **Cycle guard**: a `HashSet<String>` of visited slugs prevents infinite
+/// loops on cyclic vine-of-vine references. Max walk depth is bounded by
+/// `MAX_VINE_PROPAGATION_DEPTH` (32) as a defensive safety net even with the
+/// cycle guard in place.
+///
+/// **Fire-and-forget at each level**: SYNCHRONOUS DB writes (composition
+/// table + pending mutation enqueues) happen inline so the stale engine has
+/// the up-to-date state on its next tick. CHAIN-EXECUTOR rebuilds are
+/// ASYNCHRONOUS — enqueuing pending mutations hands the work to the stale
+/// engine, which dispatches the rebuild on its own schedule. This keeps the
+/// DADBEAR tick loop from blocking on a full recursive rebuild chain.
+///
+/// Returns the list of vine slugs notified AT THE DIRECT PARENT LEVEL
+/// (first hop only), matching the Phase 2 return contract.
+pub async fn notify_vine_of_child_completion(
+    state: &PyramidState,
+    child_slug: &str,
+    child_build_id: &str,
+    apex_node_id: &str,
+) -> Result<Vec<String>> {
+    const MAX_VINE_PROPAGATION_DEPTH: usize = 32;
 
-    info!(
-        bedrock = bedrock_slug,
-        build_id = bedrock_build_id,
-        apex = apex_node_id,
-        vine_count = vine_slugs.len(),
-        "Bedrock build complete, notifying {} vine(s)",
-        vine_slugs.len()
-    );
+    // Visited set guards against cycles. Includes the starting child so a
+    // vine that references itself at any distance cannot trigger re-entry.
+    let mut visited: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    visited.insert(child_slug.to_string());
 
-    let mut notified = Vec::new();
+    // BFS frontier — (child_slug, child_apex_node_id, child_build_id).
+    // child_build_id is informational: it feeds the change-manifest detail
+    // string. For recursive levels we generate a synthetic build id because
+    // the parent vine hasn't produced a "real" build yet — the stale engine
+    // does that asynchronously.
+    let mut frontier: std::collections::VecDeque<(String, String, String)> =
+        std::collections::VecDeque::new();
+    frontier.push_back((
+        child_slug.to_string(),
+        apex_node_id.to_string(),
+        child_build_id.to_string(),
+    ));
 
-    for vine_slug in &vine_slugs {
-        // 2. Acquire child-then-parent lock (bedrock → vine)
-        let (_bedrock_guard, _vine_guard) = LockManager::global()
-            .write_child_then_parent(bedrock_slug, vine_slug)
-            .await;
+    let mut direct_parent_notifications: Vec<String> = Vec::new();
+    let mut total_notified = 0usize;
+    let mut depth = 0usize;
 
-        // 3. Update the bedrock's apex reference in the composition table.
-        //    Also enqueue vine-level pending mutations in the same writer
-        //    lock scope so the stale engine picks up the change and routes
-        //    affected vine L1+ nodes through execute_supersession (which
-        //    uses the change-manifest flow per Phase 2).
-        let enqueue_result = {
-            let conn = state.writer.lock().await;
-            if let Err(e) =
-                db::update_bedrock_apex(&conn, vine_slug, bedrock_slug, apex_node_id)
-            {
+    while let Some((current_child, current_apex, current_build_id)) = frontier.pop_front() {
+        if depth > MAX_VINE_PROPAGATION_DEPTH {
+            warn!(
+                child_slug,
+                visited = visited.len(),
+                "notify_vine_of_child_completion: hit max depth cap, stopping recursive walk"
+            );
+            break;
+        }
+
+        // Look up direct parent vines for this level's child.
+        let vine_slugs = {
+            let conn = state.reader.lock().await;
+            db::get_vines_for_child(&conn, &current_child)?
+        };
+
+        if vine_slugs.is_empty() {
+            // Nothing to propagate at this level.
+            continue;
+        }
+
+        info!(
+            child = %current_child,
+            build_id = %current_build_id,
+            apex = %current_apex,
+            vine_count = vine_slugs.len(),
+            depth,
+            "vine propagation: notifying {} parent vine(s) at depth {}",
+            vine_slugs.len(),
+            depth
+        );
+
+        for vine_slug in &vine_slugs {
+            // Cycle guard: skip already-visited slugs. This catches both
+            // direct self-reference (vine V includes V as a child) and
+            // transitive cycles (V1 → V2 → V1).
+            if !visited.insert(vine_slug.clone()) {
                 warn!(
-                    vine = vine_slug,
-                    bedrock = bedrock_slug,
-                    error = %e,
-                    "Failed to update bedrock apex in vine composition table"
+                    vine = %vine_slug,
+                    child = %current_child,
+                    "vine propagation: cycle detected, skipping already-visited parent"
                 );
                 continue;
             }
 
-            enqueue_vine_manifest_mutations(
-                &conn,
-                vine_slug,
-                bedrock_slug,
-                apex_node_id,
-                bedrock_build_id,
-            )
-        };
+            // Acquire child-then-parent lock to stay deadlock-free.
+            let (_child_guard, _vine_guard) = LockManager::global()
+                .write_child_then_parent(&current_child, vine_slug)
+                .await;
 
-        match enqueue_result {
-            Ok(count) if count > 0 => {
-                info!(
-                    vine = vine_slug,
-                    bedrock = bedrock_slug,
-                    apex = apex_node_id,
-                    enqueued = count,
-                    "Enqueued {} vine-level change-manifest mutations for stale engine",
-                    count
-                );
+            // Update child apex in the composition table and enqueue
+            // change-manifest mutations in a single writer lock scope.
+            let enqueue_result = {
+                let conn = state.writer.lock().await;
+                if let Err(e) =
+                    db::update_child_apex(&conn, vine_slug, &current_child, &current_apex)
+                {
+                    warn!(
+                        vine = %vine_slug,
+                        child = %current_child,
+                        error = %e,
+                        "vine propagation: failed to update child apex"
+                    );
+                    continue;
+                }
+
+                enqueue_vine_manifest_mutations(
+                    &conn,
+                    vine_slug,
+                    &current_child,
+                    &current_apex,
+                    &current_build_id,
+                )
+            };
+
+            match enqueue_result {
+                Ok(count) if count > 0 => {
+                    info!(
+                        vine = %vine_slug,
+                        child = %current_child,
+                        apex = %current_apex,
+                        enqueued = count,
+                        "Enqueued {} vine-level change-manifest mutations for stale engine",
+                        count
+                    );
+                }
+                Ok(_) => {
+                    // No affected vine nodes. Not an error — the vine may
+                    // not have upper layers yet, or its evidence links
+                    // haven't been wired.
+                }
+                Err(e) => {
+                    warn!(
+                        vine = %vine_slug,
+                        child = %current_child,
+                        error = %e,
+                        "enqueue_vine_manifest_mutations failed (continuing with event emission)"
+                    );
+                }
             }
-            Ok(_) => {
-                // No affected vine nodes — the vine may not yet have upper
-                // layers built, or the evidence links haven't been wired
-                // yet. Not an error.
+
+            // Emit DeltaLanded + SlopeChanged for downstream consumers.
+            let event = TaggedBuildEvent {
+                slug: vine_slug.clone(),
+                kind: TaggedKind::DeltaLanded {
+                    depth: 0,
+                    node_id: current_apex.clone(),
+                },
+            };
+            let _ = state.build_event_bus.tx.send(event);
+
+            let slope_event = TaggedBuildEvent {
+                slug: vine_slug.clone(),
+                kind: TaggedKind::SlopeChanged {
+                    affected_layers: vec![0],
+                },
+            };
+            let _ = state.build_event_bus.tx.send(slope_event);
+
+            info!(
+                vine = %vine_slug,
+                child = %current_child,
+                apex = %current_apex,
+                depth,
+                "vine propagation: parent vine notified"
+            );
+
+            total_notified += 1;
+            if depth == 0 {
+                direct_parent_notifications.push(vine_slug.clone());
             }
-            Err(e) => {
-                warn!(
-                    vine = vine_slug,
-                    bedrock = bedrock_slug,
-                    error = %e,
-                    "enqueue_vine_manifest_mutations failed (continuing with event emission)"
-                );
+
+            // Queue the parent vine for further propagation upward. Use the
+            // parent vine's own apex (if it has one) as the apex to pass
+            // up. If the parent vine has never been built, its apex lookup
+            // returns None and we skip recursive propagation for this
+            // branch — the parent will pick up the update when its own
+            // build finishes.
+            let parent_apex: Option<String> = {
+                let conn = state.reader.lock().await;
+                // Prefer the highest-depth live node from the parent vine's
+                // own nodes table. If nothing is there, recursion for this
+                // branch is a no-op.
+                match db::get_all_live_nodes(&conn, vine_slug) {
+                    Ok(nodes) => nodes
+                        .iter()
+                        .max_by_key(|n| n.depth)
+                        .map(|n| n.id.clone()),
+                    Err(_) => None,
+                }
+            };
+
+            if let Some(pa) = parent_apex {
+                // Synthetic build_id so the manifest detail string carries a
+                // trace of the propagation hop. The actual build id of the
+                // parent vine is established by the async rebuild the stale
+                // engine will eventually dispatch.
+                let propagated_build_id = format!("vine-prop-{}-{}", vine_slug, child_build_id);
+                frontier.push_back((vine_slug.clone(), pa, propagated_build_id));
             }
         }
 
-        // 4. Emit a DeltaLanded event on the vine's build event bus so that
-        //    downstream consumers (DADBEAR, primer cache invalidation) know the
-        //    vine's L0 has changed. The actual chain-driven delta propagation
-        //    through the vine's upper layers is driven by the stale engine
-        //    processing the pending mutations enqueued above.
-        let event = TaggedBuildEvent {
-            slug: vine_slug.clone(),
-            kind: TaggedKind::DeltaLanded {
-                depth: 0,
-                node_id: apex_node_id.to_string(),
-            },
-        };
-        let _ = state.build_event_bus.tx.send(event);
-
-        // Also emit SlopeChanged since the vine's L0 layer just changed
-        let slope_event = TaggedBuildEvent {
-            slug: vine_slug.clone(),
-            kind: TaggedKind::SlopeChanged {
-                affected_layers: vec![0],
-            },
-        };
-        let _ = state.build_event_bus.tx.send(slope_event);
-
-        info!(
-            vine = vine_slug,
-            bedrock = bedrock_slug,
-            apex = apex_node_id,
-            "Vine notified of bedrock completion"
-        );
-
-        notified.push(vine_slug.clone());
+        depth = depth.saturating_add(1);
     }
 
-    Ok(notified)
+    info!(
+        starting_child = child_slug,
+        total_vines_notified = total_notified,
+        direct_parents = direct_parent_notifications.len(),
+        max_depth_reached = depth,
+        "vine propagation: recursive walk complete"
+    );
+
+    Ok(direct_parent_notifications)
 }
 
 /// Enqueue `confirmed_stale` pending mutations on the vine's L1+ nodes that
@@ -398,5 +529,89 @@ mod tests {
         let bedrocks = db::get_vine_bedrocks(&conn, "vine-1").unwrap();
         assert_eq!(bedrocks.len(), 1);
         assert_eq!(bedrocks[0].status, "active");
+    }
+
+    // ── Phase 16: vine-of-vines composition graph tests ──────────────────
+
+    #[test]
+    fn test_phase16_multi_level_vine_graph_is_walkable() {
+        // Validates the composition graph shape that
+        // notify_vine_of_child_completion walks. Builds:
+        //   v-top composes v-mid (as vine) + b-sibling (as bedrock)
+        //   v-mid composes b-leaf (as bedrock)
+        // and verifies get_parent_vines_recursive returns the full chain
+        // starting from the leaf.
+        let conn = test_db();
+
+        db::insert_vine_composition(&conn, "v-mid", "b-leaf", 0, "bedrock").unwrap();
+        db::insert_vine_composition(&conn, "v-top", "v-mid", 0, "vine").unwrap();
+        db::insert_vine_composition(&conn, "v-top", "b-sibling", 1, "bedrock").unwrap();
+
+        // b-leaf's ancestors are v-mid (direct) and v-top (grandparent).
+        let ancestors = db::get_parent_vines_recursive(&conn, "b-leaf").unwrap();
+        assert_eq!(ancestors.len(), 2);
+        assert_eq!(ancestors[0], "v-mid");
+        assert_eq!(ancestors[1], "v-top");
+
+        // b-sibling's ancestors are just v-top.
+        let sibling_ancestors = db::get_parent_vines_recursive(&conn, "b-sibling").unwrap();
+        assert_eq!(sibling_ancestors.len(), 1);
+        assert_eq!(sibling_ancestors[0], "v-top");
+
+        // v-mid is itself a child — v-top is its only ancestor.
+        let mid_ancestors = db::get_parent_vines_recursive(&conn, "v-mid").unwrap();
+        assert_eq!(mid_ancestors.len(), 1);
+        assert_eq!(mid_ancestors[0], "v-top");
+    }
+
+    #[test]
+    fn test_phase16_notification_skips_vines_with_no_apex() {
+        // Validates the composition state that
+        // notify_vine_of_child_completion checks before recursing upward.
+        // A vine with no apex node in pyramid_nodes (never built) should
+        // not cause the walk to explode; the recursive propagation
+        // simply skips that branch.
+        //
+        // This test validates the invariants the async function relies on:
+        //   1. A composition row can exist without the child ever having
+        //      a stored apex in the composition table.
+        //   2. get_all_live_nodes returns an empty vec for never-built
+        //      slugs, which the async notify function uses as the
+        //      "skip this branch" signal.
+        let conn = test_db();
+
+        db::insert_vine_composition(&conn, "v-empty-parent", "never-built-child", 0, "vine")
+            .unwrap();
+
+        // list_vine_compositions still returns the composition row.
+        let comps = db::list_vine_compositions(&conn, "v-empty-parent").unwrap();
+        assert_eq!(comps.len(), 1);
+        assert!(comps[0].bedrock_apex_node_id.is_none());
+
+        // get_all_live_nodes for a never-built slug returns empty.
+        let nodes = db::get_all_live_nodes(&conn, "never-built-child").unwrap();
+        assert!(nodes.is_empty());
+    }
+
+    #[test]
+    fn test_phase16_cycle_guard_prevents_runaway_walk() {
+        // Validates that the DB-layer cycle guard terminates on a cyclic
+        // vine-of-vine graph — the same invariant
+        // notify_vine_of_child_completion relies on in its visited set.
+        let conn = test_db();
+
+        // Indirect cycle: v-alpha → v-beta → v-gamma → v-alpha.
+        db::insert_vine_composition(&conn, "v-beta", "v-alpha", 0, "vine").unwrap();
+        db::insert_vine_composition(&conn, "v-gamma", "v-beta", 0, "vine").unwrap();
+        db::insert_vine_composition(&conn, "v-alpha", "v-gamma", 0, "vine").unwrap();
+
+        // The walk must terminate and return a bounded answer.
+        let ancestors = db::get_parent_vines_recursive(&conn, "v-alpha").unwrap();
+        // The walk discovers v-beta (direct parent of v-alpha), then
+        // v-gamma (parent of v-beta), then tries v-alpha (parent of
+        // v-gamma) which is already in visited — walk terminates.
+        assert_eq!(ancestors.len(), 2);
+        assert!(ancestors.contains(&"v-beta".to_string()));
+        assert!(ancestors.contains(&"v-gamma".to_string()));
     }
 }

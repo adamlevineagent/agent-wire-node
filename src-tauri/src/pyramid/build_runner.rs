@@ -217,12 +217,12 @@ pub async fn run_build_from_with_evidence_mode(
             .content_type
     };
 
-    // Vine builds are not supported through this path
-    if content_type == ContentType::Vine {
-        return Err(anyhow!(
-            "Vine builds use the vine-specific build endpoint, not run_build"
-        ));
-    }
+    // Phase 16: vine builds now flow through this path via the
+    // topical-vine chain. Legacy conversation-only bunch vine builds
+    // still go through vine::build_vine (session ingestion, bunches,
+    // etc.), but vine-of-vines compositions driven by the chain
+    // executor rebuild through `run_chain_build`. See
+    // docs/specs/vine-of-vines-and-folder-ingestion.md.
 
     // ── Question slug dispatch ──────────────────────────────────────────
     // Question slugs route through run_decomposed_build, loading nodes from

@@ -101,10 +101,16 @@ pub fn default_chain_id(content_type: &str) -> &'static str {
 
 /// Get the default chain ID for a content type and evidence mode.
 /// "fast" mode uses a stripped-down chain that skips evidence grounding.
+///
+/// Phase 16: vines default to the `topical-vine` chain, which composes
+/// registered bedrock + sub-vine children via the chain executor. See
+/// `chains/defaults/topical-vine.yaml` and
+/// `docs/specs/vine-of-vines-and-folder-ingestion.md`.
 pub fn default_chain_id_for_mode(content_type: &str, evidence_mode: &str) -> &'static str {
     match (content_type, evidence_mode) {
         ("conversation", "fast") => "conversation-episodic-fast",
         ("conversation", _) => "conversation-episodic",
+        ("vine", _) => "topical-vine",
         _ => "question-pipeline",
     }
 }

@@ -4549,6 +4549,11 @@ pub async fn execute_chain_from(
 /// Load all prior-build state from the DB into a single JSON value.
 /// Used by question pyramid chains to gather evidence sets, overlay answers,
 /// question tree, gaps, and L0 summary in one step.
+///
+/// Phase 16: for vine slugs, this also walks `pyramid_vine_compositions` and
+/// builds a `children` array containing one entry per registered child
+/// (bedrock or sub-vine). Each entry carries the child's apex summary so the
+/// topical-vine chain can cluster and synthesize over real child content.
 async fn execute_cross_build_input(
     state: &PyramidState,
     step: &ChainStep,
@@ -4605,6 +4610,80 @@ async fn execute_cross_build_input(
                 l0_summary
             };
 
+            // ── Phase 16: vine composition children ─────────────────────
+            // For vine slugs, surface each registered child (bedrock or
+            // sub-vine) with its apex summary. For non-vine slugs this is
+            // an empty array, so downstream steps can always address the
+            // same shape.
+            let is_vine = matches!(
+                super::slug::get_slug(conn, &s)?,
+                Some(ref info) if info.content_type == super::types::ContentType::Vine
+            );
+            let children_payload: Vec<Value> = if is_vine {
+                let compositions = db::list_vine_compositions(conn, &s)?;
+                let mut out: Vec<Value> = Vec::with_capacity(compositions.len());
+                for comp in compositions {
+                    let child_slug = comp.bedrock_slug.clone();
+                    let child_type = comp.child_type.clone();
+
+                    // Resolve the child's apex node. Prefer the stored apex
+                    // reference in the composition row; fall back to the
+                    // child's highest-depth live node if the row hasn't
+                    // been updated yet.
+                    let apex_id = match comp.bedrock_apex_node_id.clone() {
+                        Some(id) if !id.is_empty() => Some(id),
+                        _ => {
+                            // Defensive fallback: pick the highest-depth
+                            // live node for the child. For a never-built
+                            // child this returns nothing and we skip the
+                            // child cleanly.
+                            let all_nodes = db::get_all_live_nodes(conn, &child_slug)
+                                .unwrap_or_default();
+                            all_nodes
+                                .iter()
+                                .max_by_key(|n| n.depth)
+                                .map(|n| n.id.clone())
+                        }
+                    };
+
+                    let apex_node = apex_id
+                        .as_ref()
+                        .and_then(|id| {
+                            db::get_node(conn, &child_slug, id).ok().flatten()
+                        });
+
+                    // Build a compact summary payload. We intentionally
+                    // keep the shape close to what the topical clustering
+                    // prompts expect: `child_slug`, `child_type`,
+                    // `headline`, `distilled`, `topics`.
+                    let headline = apex_node
+                        .as_ref()
+                        .map(|n| n.headline.clone())
+                        .unwrap_or_default();
+                    let distilled = apex_node
+                        .as_ref()
+                        .map(|n| n.distilled.clone())
+                        .unwrap_or_default();
+                    let topics_val = apex_node
+                        .as_ref()
+                        .map(|n| serde_json::to_value(&n.topics).unwrap_or(Value::Null))
+                        .unwrap_or(Value::Null);
+
+                    out.push(serde_json::json!({
+                        "child_slug": child_slug,
+                        "child_type": child_type,
+                        "position": comp.position,
+                        "apex_node_id": apex_id,
+                        "headline": headline,
+                        "distilled": distilled,
+                        "topics": topics_val,
+                    }));
+                }
+                out
+            } else {
+                Vec::new()
+            };
+
             Ok(serde_json::json!({
                 "evidence_sets": serde_json::to_value(&evidence_sets)?,
                 "overlay_answers": serde_json::to_value(&overlay_answers)?,
@@ -4615,6 +4694,8 @@ async fn execute_cross_build_input(
                 "has_overlay": has_overlay,
                 "is_cross_slug": is_cross_slug,
                 "referenced_slugs": serde_json::to_value(&referenced_slugs)?,
+                "is_vine": is_vine,
+                "children": children_payload,
             }))
         })
         .await?
