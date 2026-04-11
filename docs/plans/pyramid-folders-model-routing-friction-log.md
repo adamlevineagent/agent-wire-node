@@ -1203,3 +1203,100 @@ Single wanderer-fix commit on `phase-9-generative-config-pattern` with message `
 
 ---
 
+## 2026-04-10 — Phase 10 wanderer found 3 UI bugs in ToolsMode drawer + publish modal
+
+**Phase / workstream:** Phase 10 wanderer pass (ToolsMode UI integration)
+
+**What hit friction:** Phase 10 wired the drawer, publish modal, and Create wizard to the Phase 4/5/8/9 IPC. A fresh-eyes trace caught three non-obvious bugs that the punch-list verifier missed, all in the React layer (zero Rust changes).
+
+### Finding A — HIGH/UX: `ContributionDetailDrawer` version history was rendered in reverse order, with inverted version labels, landing on the OLDEST row by default
+
+**Where:** `src/components/ContributionDetailDrawer.tsx` — the lazy fetch effect (~line 118) and the `activeRow` memo (~line 143).
+
+**Symptom:** User opens the drawer on a config with 3 refinements. Clicks "Version History" tab. Expects to see the CURRENT active YAML and a list with v3 (active) at the top, v1 (oldest) at the bottom. Instead:
+1. The list renders v1 at the top labeled "v3", v3 at the bottom labeled "v1" — because the display index was `versions.length - i` on an already-oldest-to-newest list.
+2. The default selection on tab-switch lands on `versions[0]`, which is the OLDEST row, so the renderer shows the yaml_content from v1 (not what the user was just looking at in the Details tab).
+3. Every version-history-related number (`v{n}` badge, the `versionInfo.version` passed to the renderer, the "which row is selected" highlight) was inverted.
+
+**Root cause:** The backend `load_config_version_history` helper in `config_contributions.rs` does `chain.reverse()` at the end of the walk and returns oldest-to-newest. The frontend drawer was written assuming the list came back newest-first — all the indexing math (`versions.length - i`, `versions.findIndex(...)`, default `versions[0]`) was correct for newest-first, wrong for oldest-to-newest. The drawer's comment even said "Default to the first version (latest chronologically — versions are returned in chain order by the Phase 9 IPC)" — the comment was wrong.
+
+**How I found it:** Read the Rust helper (`config_contributions.rs:421`) explicitly after seeing the drawer comment. The existing Rust test (`test_load_config_version_history`) asserts the order: `ids == vec![v1, v2, v3]` with `history[0].status == "superseded"` and `history[2].status == "active"`. The drawer was off by one (or rather, flipped) against that contract.
+
+**Fix:** In `ContributionDetailDrawer.tsx`, flip the list at the fetch boundary (`setVersions([...rows].reverse())`) so `versions[0]` IS the newest row through the rest of the component. That makes all the other indexing math correct by the existing code and also makes the default-selection land on the latest (which IS the row the drawer was opened with via `pyramid_active_config_contribution`). Comment updated.
+
+**Lesson for future phases:** When a React component claims to know a backend helper's ordering, read the helper source and search for its tests — don't trust the component's own comment. Also: when frontend and backend both own the same list, the contract should be unidirectional (backend decides, frontend passively renders). Both places doing transformations (backend `.reverse()`, frontend `versions.length - i`) creates the exact kind of "double-invert" bug we had here.
+
+### Finding B — MEDIUM/UX: `PublishPreviewModal` could be dismissed mid-publish, creating ghost publishes
+
+**Where:** `src/components/PublishPreviewModal.tsx` — the overlay `onClick`, the `Escape` key handler, and the `✕` close button.
+
+**Symptom:** User clicks Confirm & Publish. The button correctly disables during `publishing === true`. But the backdrop click (`onClick={onClose}`), the Escape key (`e.key === "Escape" && onClose()`), and the `✕` header button were all NOT gated on `publishing`. If the user clicked outside or hit Escape during the 2-10s publish round-trip, the modal would unmount while the publish was still in flight. The publish would still complete on the backend (writing `wire_publication_state_json`, returning a `wire_contribution_id`), but the user never sees the success confirmation — and they don't know the publish actually happened.
+
+**Root cause:** The `publishing` state flag was used to disable the Confirm button but wasn't threaded through to any of the "close the modal" paths. An easy miss: three separate close triggers, each independently coded.
+
+**Fix:** Added a `safeClose` callback that short-circuits when `publishing` is true. Wired all three close triggers (`overlay onClick`, Escape key handler, `✕` header button) to it. Also marked the `✕` button `disabled={publishing}` so the user sees the gating visually.
+
+**Lesson for future phases:** When a modal has a mid-flight async operation, the "close" primitive should be factored into a single `safeClose` that knows about the in-flight state. Every close trigger calls `safeClose`, not `onClose` directly. This is a one-function-refactor pattern; the implementer landed the `publishing` disable on the button but forgot the cancel/Escape/✕ paths.
+
+### Finding C — LOW/UX: `ContributionDetailDrawer` stayed open with stale data after a successful publish from its footer button
+
+**Where:** `src/components/modes/ToolsMode.tsx` — the `publishClose` callback in `MyToolsPanel`.
+
+**Symptom:** User opens a config's detail drawer. Clicks "Publish to Wire" in the drawer footer. `PublishPreviewModal` opens, user confirms, publish succeeds. The modal closes via `publishClose`, which calls `bumpRefresh()` (refetches My Tools configs and proposals). But the `detailContribution` state was unchanged — the drawer still showed the pre-publish `ConfigContribution` row with `wire_contribution_id: null`. The drawer's "Published" badge check (`{contribution.wire_contribution_id && ...}`) stayed false. User would need to close and reopen the drawer to see that the publish actually landed.
+
+**Root cause:** The publish modal's success path called `onClose` (which bumps `refreshToken` in the parent), but `refreshToken` only drives the schema-list and proposals refetches — not the drawer's `detailContribution` state. The drawer state is independent of the refresh cycle.
+
+**Fix:** Added a `handlePublishSuccess` callback wired to the modal's `onPublished` prop. On publish success, clear `detailContribution` (which unmounts the drawer). The user's next "View" click refetches the row via `pyramid_active_config_contribution`, which now returns the updated `wire_publication_state_json` / `wire_contribution_id`. The drawer reopens with fresh state.
+
+**Lesson for future phases:** When a modal mutates a parent's data source, the parent needs an explicit success hook, not a generic close hook. The `onClose` callback is used for both "user cancelled" AND "user confirmed and closed" — those are different semantics from the parent's perspective. Two callbacks (`onClose` for cancel, `onPublished` for success) is cleaner than branching on internal state.
+
+### Findings that were NOT bugs
+
+- **IPC argument naming:** All 13 Phase 10 IPC calls use camelCase arg keys (e.g. `{ schemaType, slug }`), matching Tauri v2's default auto-conversion to snake_case on the Rust side. Confirmed against an existing working call (`yaml_renderer_estimate_cost` at `useYamlRendererSources.ts:161` passes `avgInputTokens` to Rust's `avg_input_tokens`). No mismatches.
+- **Drawer re-open state reset:** The `[contribution?.contribution_id, initialTab]` dep on the reset effect correctly fires on close→reopen (null → uuid is a dep change), so internal state doesn't leak across open cycles.
+- **`bundled` annotations without `condition` field:** None of the three bundled schema_annotations (evidence_policy, build_strategy, custom_prompts) use `condition`, so the deferred evaluator is not exercised in Phase 10's shipped surface.
+- **Missing annotations for `dadbear_policy` / `tier_routing`:** These two schema types have a schema_definition + skill but no schema_annotation in `bundled_contributions.json`. The drawer and the Create wizard both have explicit fallback paths that render raw YAML with "No UI schema annotation available for ...". Confirmed to work without crashing.
+- **`pyramid_active_config` vs `pyramid_active_config_contribution`:** Both commands are registered in the invoke_handler and return different shapes for different consumers. MyToolsPanel uses the former for ConfigCard metadata (version_chain_length, triggering_note) and the latter for drawer/publish loads (full row including wire metadata).
+
+### Non-blocking concerns noted but not fixed
+
+- **Draft contribution accumulation:** The `handleAccept` path in the Create wizard ALWAYS passes `yaml: state.values`, so it always hits the direct-YAML branch of `pyramid_accept_config`. The alternate "promote latest draft" branch is never reached from the Phase 10 UI. This means draft rows created by `pyramid_generate_config` and `pyramid_refine_config` are never promoted or cleaned up — they accumulate as stranded `status='draft'` rows in `pyramid_config_contributions`. No UI surfaces them, so the user never sees the clutter, but the DB grows monotonically on every generate/refine. Not a Phase 10 blocker (the accepted contribution is functionally correct), but a cleanup pass in a later phase is warranted.
+- **`js-yaml` round-trip fidelity:** The `handleRefine` path serializes `state.values` to YAML via `yaml.dump({lineWidth: -1, noRefs: true})` to send to the backend for the refinement LLM call. Key ordering and comment preservation are NOT guaranteed, so the YAML sent to the refine call may not be byte-identical to the LLM's original output. Not a correctness bug — the backend parses it with `serde_yaml::from_str` which is order-independent — but it means the "what the user sees" and "what the LLM sees for refinement" may differ in layout. The refined LLM call is still correct because it operates on semantic content, not layout.
+- **YAML object serialization in accept path:** `handleAccept` passes `yaml: state.values` as a JS object. The Rust side's `Option<serde_json::Value>` accepts it and re-serializes via `serde_yaml::to_string`. The stored `yaml_content` may therefore have a different layout than what the LLM generated — not a bug, just a minor wart where the DB-stored YAML differs textually from the LLM output.
+
+### What I did fix
+
+- `src/components/ContributionDetailDrawer.tsx` — reverse the versions list at fetch time; comments updated.
+- `src/components/PublishPreviewModal.tsx` — add `safeClose`, wire it to overlay / Escape / `✕`; `✕` button gets `disabled={publishing}`.
+- `src/components/modes/ToolsMode.tsx` — add `handlePublishSuccess` callback, wire it to `PublishPreviewModal.onPublished`.
+
+### Verification after fix
+
+- `npx tsc --noEmit` — clean (no type errors)
+- `npm run build` — clean (131 modules transformed, frontend bundle builds)
+- `cargo check --all-targets` — clean (warnings only, no new issues from Phase 10)
+- Zero Rust changes.
+
+### End-to-end scenarios traced post-fix
+
+1. **Full generate → refine → accept → drawer → publish dry-run.**
+   - Create tab: pick schema (with has_generation_skill=true) → intent → Generate → LLM round-trip → edit step with version=1, triggering_note=intent. Refine with a note → LLM round-trip → edit step with version=2, triggering_note=note. Accept → accept-success with version reflecting active chain length.
+   - My Tools tab: MyToolsPanel remounts, refetches schemas + active configs via `pyramid_active_config`. ConfigCard shows the accepted version.
+   - Click View → drawer opens with active row. Click "Version History" tab → fetch fires, versions reversed so `versions[0]` is the active (matches the drawer's `contribution` prop). Version labels (v3, v2, v1 top-to-bottom) now correct.
+   - Click Publish from drawer → modal opens → dry-run fetches → user clicks Confirm → publish completes → modal success → Done → publishClose fires (refresh + handlePublishSuccess) → drawer unmounts → next View refetches and shows "Published" badge.
+2. **Accept without refinement.**
+   - Create tab: pick schema → intent → Generate → edit step → Accept immediately. `handleAccept` passes `state.values` (from the parsed generated YAML). Direct-YAML path in Rust creates a new active row with version=1 (or 2 if a prior active existed). Works.
+3. **Open My Tools with pre-existing active config, open drawer, click through version history.**
+   - Bundled defaults are inserted at `status='active'` on first run. MyToolsPanel's config cards show them. Click View → drawer opens with the active row. Click Version History → `pyramid_config_versions` returns just the one row. Drawer shows v1 labeled correctly. No crash even with versions.length === 1.
+
+### Commit
+
+- `2f77ffe phase-10: wanderer fix — drawer version order + publish race + drawer staleness` — three fixes squashed on branch `phase-10-toolsmode-ui`.
+
+### What I did not fix
+
+- Draft contribution accumulation (non-blocking; needs a dedicated cleanup pass or a UI surface for abandoned drafts).
+- YAML round-trip fidelity (not a correctness bug; layout-only).
+
+---
+
