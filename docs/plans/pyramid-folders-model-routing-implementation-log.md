@@ -4335,3 +4335,121 @@ from main; +11 over the Phase 17 baseline of 1238).
 
 **Status:** `awaiting-verification`. Single commit on branch
 `phase-18d-schema-migration-ui` (no amend, no push, no merge).
+
+### Verifier pass (2026-04-11)
+
+Second implementer joined after the primary 18d commit and audited
+against the workstream prompt's 12 failure modes plus the four
+verification criteria. All passed in place; no fixes required.
+
+**Audit findings (all verified clean):**
+
+1. **3-phase lock-drop pattern.** `pyramid_propose_config_migration`
+   in `main.rs` mirrors Phase 9's `pyramid_generate_config` exactly:
+   load inputs inside a scoped reader lock, drop the lock, run the
+   LLM await with no DB lock held, then re-acquire the writer lock
+   for persist. `grep '\.lock()\|\.await\|async fn'` inside
+   `migration_config.rs` shows only the dedicated `run_migration_llm_call`
+   async function with `.await` — no DB lock crosses an await point.
+2. **Four new IPCs registered.** `pyramid_list_configs_needing_migration`,
+   `pyramid_propose_config_migration`, `pyramid_accept_config_migration`,
+   `pyramid_reject_config_migration` are each defined as
+   `#[tauri::command]` at `main.rs` lines 9000-9085 and registered in
+   the `invoke_handler!` list at lines 10592-10595.
+3. **Serde aliases on IPC input structs.** `ProposeMigrationInput`,
+   `AcceptMigrationInput`, and `RejectMigrationInput` each use
+   `#[serde(rename = "camelCase", alias = "snake_case")]` on every
+   field (main.rs 8978-8998). Confirmed the frontend sends snake_case
+   via `MigrationReviewModal.tsx` and the alias path deserializes
+   correctly. Output structs use bare snake_case (matches Phase 9
+   convention).
+4. **Schema chain walk correctness.** `find_prior_schema_definition_id`
+   in `migration_config.rs` uses `created_at <= ?2` (inclusive, handles
+   second-precision collisions), filters on `superseded_by_id IS NOT NULL`,
+   orders by `created_at DESC, id DESC` for deterministic tiebreaking,
+   and returns `None` gracefully when no prior schema exists. Matches
+   the workstream prompt's Option B requirements exactly.
+5. **Accept path supersedes and clears the flag.** `accept_config_migration`
+   opens a transaction, TOCTOU-checks that the prior active row hasn't
+   been modified since propose, UPDATEs the draft to
+   `status='active', needs_migration=0, accepted_at=datetime('now')`,
+   UPDATEs the prior row to `status='superseded'` with forward-link,
+   commits, then runs `sync_config_to_operational_with_registry`
+   outside the transaction (so the dispatcher can run its own inner
+   transactions). Flag clearing is confirmed by
+   `test_accept_supersedes_and_clears_flag`.
+6. **Reject path deletes the draft and leaves the flag.** `reject_config_migration`
+   validates `status='draft' AND source='migration'` (so a buggy
+   frontend can't delete arbitrary rows), deletes the draft, and
+   leaves the original flagged row untouched. Confirmed by
+   `test_reject_deletes_draft_and_leaves_original` (asserts the
+   original remains `active` with `needs_migration=1`) and
+   `test_reject_refuses_non_migration_drafts` (the source filter).
+7. **Bundled migration prompt.** `chains/prompts/migration/migrate_config.md`
+   exists with the four placeholders (`{old_schema}`, `{new_schema}`,
+   `{old_yaml}`, `{if user_note}...{end}`), and
+   `src-tauri/assets/bundled_contributions.json` has
+   `bundled-skill-migration-migrate_config-v1` with the identical
+   body, `schema_type: skill`, `slug: migration/migrate_config.md`,
+   and `topics_extra: ["migration", "schema_migration", "config"]`
+   so the topic-tag fallback works even if the slug changes.
+8. **ToolsMode Needs Migration tab.** `src/components/modes/ToolsMode.tsx`
+   registers a new `"needs-migration"` tab between `"my-tools"` and
+   `"discover"` with a count badge that renders only when
+   `migrationCount > 0`. The `MigrationPanel` is mounted when the
+   tab is active, with `refreshToken` and `onMigrationChanged`
+   handlers wiring state back to the parent for the My Tools chip.
+9. **MigrationPanel + MigrationReviewModal components.**
+   `MigrationPanel.tsx` calls `pyramid_list_configs_needing_migration`
+   on mount and bumps, renders a card list + opens the review modal.
+   `MigrationReviewModal.tsx` calls `pyramid_propose_config_migration`
+   on mount (the LLM round-trip), `pyramid_accept_config_migration`
+   on accept, `pyramid_reject_config_migration` on reject. The modal
+   uses `{ input: { contribution_id, user_note } }` as the IPC
+   payload — matches the input struct's snake_case alias.
+10. **My Tools chip.** `MyToolsPanel` receives
+    `flaggedContributionIds: Set<string>` from ToolsMode, passes it
+    into `ConfigCard` as `needsMigration: boolean` (computed from
+    `flaggedContributionIds.has(active.contribution_id)`), and
+    renders the "MIGRATION NEEDED" chip at ToolsMode.tsx line 906
+    when flagged.
+11. **No JSON Schema validation of migrated YAML.** `persist_migration_proposal`
+    does only `serde_yaml::from_str::<serde_yaml::Value>(&new_yaml)`
+    as a parseability sanity check. No `jsonschema` crate use.
+    Matches the deferral documented above.
+12. **Re-propose-with-guidance instead of edit-before-accepting.**
+    `MigrationReviewModal.tsx` has a `userNote` textarea + "Re-propose
+    with guidance" button (handleRetry) that re-calls
+    `pyramid_propose_config_migration` with the same
+    `contribution_id` plus the new note. No YAML editor component
+    exists. Matches the deferral.
+
+**Verification commands (from the worktree):**
+
+- `cd src-tauri && cargo check --lib` — clean, 3 pre-existing warnings
+  unchanged.
+- `cd src-tauri && cargo test --lib pyramid::migration_config` —
+  **11 passing / 0 failing** (test_substitute_migration_prompt_*,
+  test_reject_*, test_list_*, test_accept_supersedes_and_clears_flag,
+  test_propose_*, test_load_migration_skill_finds_bundled_prompt,
+  test_chain_walk_finds_prior_schema).
+- `cd src-tauri && cargo test --lib pyramid` — **1249 passing /
+  7 failing**. The 7 failures are all pre-existing from
+  `db::tests::test_evidence_pk_cross_slug_coexistence`,
+  `defaults_adapter::tests::real_yaml_thread_clustering_preserves_response_schema`,
+  and five `staleness::tests::*`. None of these modules were touched
+  by the 18d commit (verified via `git show --stat HEAD`).
+- `npm run build` — clean (152 modules, 803.72 kB bundle, 681ms).
+
+**Disk-space recovery note:** during verification runs the shared
+`/private/tmp` volume was briefly exhausted by parallel phase-18
+verifier cargo-test compiles (each verifier worktree maintains its
+own ~3.5 GB target/). Recovered by removing this verifier's own
+`target/debug/incremental/` (cargo regenerates it next time).
+None of the other verifier worktrees were touched. No changes to
+the 18d commit's source code or assets were needed.
+
+**Verifier verdict:** 18d commit at `ec782d3` is clean and the
+end-state matches the workstream prompt exactly. No fixes in place.
+Status remains `awaiting-verification` for the next stage, but
+all four verification criteria hit their targets.
