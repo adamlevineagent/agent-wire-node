@@ -276,46 +276,47 @@ Every question_id from the input MUST appear as a key in the mappings, even if i
             questions_text, nodes_text
         );
 
-        let response = if let Some(ctx) = audit {
-            let ctx = AuditContext {
-                call_purpose: format!("pre_map_batch_{}", batch_idx),
-                step_name: "evidence_pre_map".to_string(),
-                ..ctx.clone()
-            };
-            let (resp, _) = llm::call_model_audited(
-                llm_config, &system_prompt, &user_prompt,
-                ops.tier1.pre_map_temperature, ops.tier1.pre_map_max_tokens,
-                None, &ctx,
-            ).await?;
-            resp
-        } else {
-            // Phase 12 retrofit: construct a cache-usable StepContext
-            // from the llm_config's cache_access. When cache_access is
-            // None (unit tests), this returns None and the call falls
-            // back to the legacy path.
-            let pre_map_ctx = llm_config.cache_access.as_ref().map(|ca| {
-                let mut c = StepContext::new(
-                    ca.slug.clone(),
-                    ca.build_id.clone(),
-                    format!("evidence_pre_map_{}", batch_idx),
-                    "evidence_pre_map",
-                    0,
-                    Some(batch_idx as i64),
-                    ca.db_path.to_string(),
-                )
-                .with_model_resolution("fast_extract", llm_config.primary_model.clone())
-                .with_prompt_hash(compute_prompt_hash(&system_prompt));
-                if let Some(bus) = &ca.bus {
-                    c = c.with_bus(bus.clone());
-                }
-                c
-            });
-            llm::call_model_unified_and_ctx(
-                llm_config, pre_map_ctx.as_ref(), &system_prompt, &user_prompt,
-                ops.tier1.pre_map_temperature, ops.tier1.pre_map_max_tokens,
-                None,
-            ).await?
-        };
+        // Phase 18b: build a cache-usable StepContext from llm_config's
+        // cache_access (when available) and thread it together with the
+        // optional AuditContext through the unified entry point. This
+        // collapses the previous "audit branch (no cache) vs non-audit
+        // branch (with cache)" split into a single call where audited
+        // builds also benefit from the Phase 6 content-addressable
+        // cache. Matches the Phase 18b L8 retrofit pattern.
+        let pre_map_ctx = llm_config.cache_access.as_ref().map(|ca| {
+            let mut c = StepContext::new(
+                ca.slug.clone(),
+                ca.build_id.clone(),
+                format!("evidence_pre_map_{}", batch_idx),
+                "evidence_pre_map",
+                0,
+                Some(batch_idx as i64),
+                ca.db_path.to_string(),
+            )
+            .with_model_resolution("fast_extract", llm_config.primary_model.clone())
+            .with_prompt_hash(compute_prompt_hash(&system_prompt));
+            if let Some(bus) = &ca.bus {
+                c = c.with_bus(bus.clone());
+            }
+            c
+        });
+        let pre_map_audit_ctx = audit.map(|ctx| AuditContext {
+            call_purpose: format!("pre_map_batch_{}", batch_idx),
+            step_name: "evidence_pre_map".to_string(),
+            ..ctx.clone()
+        });
+        let response = llm::call_model_unified_with_audit_and_ctx(
+            llm_config,
+            pre_map_ctx.as_ref(),
+            pre_map_audit_ctx.as_ref(),
+            &system_prompt,
+            &user_prompt,
+            ops.tier1.pre_map_temperature,
+            ops.tier1.pre_map_max_tokens,
+            None,
+            llm::LlmCallOptions::default(),
+        )
+        .await?;
 
         info!(
             batch = batch_idx,
@@ -949,41 +950,46 @@ Respond with ONLY a JSON object:
             evidence_context
         );
 
-        let response = if let Some(ctx) = audit {
-            let ctx = ctx.for_node(&node_id, &format!("answer_batch_{}", batch_idx), question.layer as i64);
-            let (resp, _) = llm::call_model_audited(
-                llm_config, &system_prompt, &user_prompt,
-                answer_temperature, answer_max_tokens,
-                None, &ctx,
-            ).await?;
-            resp
-        } else {
-            // Phase 12 retrofit: construct a cache-usable StepContext
-            // from llm_config.cache_access (populated by the build
-            // pipeline via clone_with_cache_access).
-            let answer_ctx = llm_config.cache_access.as_ref().map(|ca| {
-                let mut c = StepContext::new(
-                    ca.slug.clone(),
-                    ca.build_id.clone(),
-                    format!("evidence_answer_batch_{}", batch_idx),
-                    "evidence_answer",
-                    question.layer as i64,
-                    Some(batch_idx as i64),
-                    ca.db_path.to_string(),
-                )
-                .with_model_resolution("fast_extract", llm_config.primary_model.clone())
-                .with_prompt_hash(compute_prompt_hash(&system_prompt));
-                if let Some(bus) = &ca.bus {
-                    c = c.with_bus(bus.clone());
-                }
-                c
-            });
-            llm::call_model_unified_and_ctx(
-                llm_config, answer_ctx.as_ref(), &system_prompt, &user_prompt,
-                answer_temperature, answer_max_tokens,
-                None,
-            ).await?
-        };
+        // Phase 18b L8 retrofit: build a cache-usable StepContext from
+        // llm_config.cache_access (populated by the build pipeline via
+        // clone_with_cache_access) and thread it together with the
+        // optional AuditContext through the unified entry point. This
+        // collapses the previous "audit branch (no cache) vs non-audit
+        // branch (with cache)" split into a single call where audited
+        // builds also benefit from the Phase 6 content-addressable
+        // cache. Audited cache hits write a `cache_hit = 1` audit row
+        // so the audit trail stays contiguous.
+        let answer_ctx = llm_config.cache_access.as_ref().map(|ca| {
+            let mut c = StepContext::new(
+                ca.slug.clone(),
+                ca.build_id.clone(),
+                format!("evidence_answer_batch_{}", batch_idx),
+                "evidence_answer",
+                question.layer as i64,
+                Some(batch_idx as i64),
+                ca.db_path.to_string(),
+            )
+            .with_model_resolution("fast_extract", llm_config.primary_model.clone())
+            .with_prompt_hash(compute_prompt_hash(&system_prompt));
+            if let Some(bus) = &ca.bus {
+                c = c.with_bus(bus.clone());
+            }
+            c
+        });
+        let answer_audit_ctx = audit
+            .map(|ctx| ctx.for_node(&node_id, &format!("answer_batch_{}", batch_idx), question.layer as i64));
+        let response = llm::call_model_unified_with_audit_and_ctx(
+            llm_config,
+            answer_ctx.as_ref(),
+            answer_audit_ctx.as_ref(),
+            &system_prompt,
+            &user_prompt,
+            answer_temperature,
+            answer_max_tokens,
+            None,
+            llm::LlmCallOptions::default(),
+        )
+        .await?;
 
         info!(
             question_id = %question.question_id,
@@ -1422,39 +1428,38 @@ Respond with ONLY a JSON object:
         serde_json::to_string_pretty(items).unwrap_or_default(),
     );
 
-    let response = if let Some(ctx) = audit {
-        let ctx = ctx.for_node(node_id, "answer_merge", question.layer as i64);
-        let (resp, _) = llm::call_model_audited(
-            llm_config, &merge_system, &merge_user,
-            answer_temperature, answer_max_tokens,
-            None, &ctx,
-        ).await?;
-        resp
-    } else {
-        // Phase 12 retrofit
-        let merge_ctx = llm_config.cache_access.as_ref().map(|ca| {
-            let mut c = StepContext::new(
-                ca.slug.clone(),
-                ca.build_id.clone(),
-                "evidence_answer_merge",
-                "evidence_answer_merge",
-                question.layer as i64,
-                None,
-                ca.db_path.to_string(),
-            )
-            .with_model_resolution("fast_extract", llm_config.primary_model.clone())
-            .with_prompt_hash(compute_prompt_hash(&merge_system));
-            if let Some(bus) = &ca.bus {
-                c = c.with_bus(bus.clone());
-            }
-            c
-        });
-        llm::call_model_unified_and_ctx(
-            llm_config, merge_ctx.as_ref(), &merge_system, &merge_user,
-            answer_temperature, answer_max_tokens,
+    // Phase 18b L8 retrofit: cache + audit unified path. See pre_map
+    // and answer_batch sites above for the rationale.
+    let merge_ctx = llm_config.cache_access.as_ref().map(|ca| {
+        let mut c = StepContext::new(
+            ca.slug.clone(),
+            ca.build_id.clone(),
+            "evidence_answer_merge",
+            "evidence_answer_merge",
+            question.layer as i64,
             None,
-        ).await?
-    };
+            ca.db_path.to_string(),
+        )
+        .with_model_resolution("fast_extract", llm_config.primary_model.clone())
+        .with_prompt_hash(compute_prompt_hash(&merge_system));
+        if let Some(bus) = &ca.bus {
+            c = c.with_bus(bus.clone());
+        }
+        c
+    });
+    let merge_audit_ctx = audit.map(|ctx| ctx.for_node(node_id, "answer_merge", question.layer as i64));
+    let response = llm::call_model_unified_with_audit_and_ctx(
+        llm_config,
+        merge_ctx.as_ref(),
+        merge_audit_ctx.as_ref(),
+        &merge_system,
+        &merge_user,
+        answer_temperature,
+        answer_max_tokens,
+        None,
+        llm::LlmCallOptions::default(),
+    )
+    .await?;
 
     info!(
         question_id = %question.question_id,
@@ -1639,52 +1644,47 @@ Respond with ONLY a JSON object:
             content
         );
 
-        let response = if let Some(ctx) = audit {
-            let ctx = AuditContext {
-                call_purpose: "gap_answer".to_string(),
-                step_name: "targeted_reexamination".to_string(),
-                ..ctx.clone()
-            };
-            match llm::call_model_audited(
-                llm_config, &system_prompt, &user_prompt,
-                ops.tier1.answer_temperature, ops.tier1.answer_max_tokens,
-                None, &ctx,
-            ).await {
-                Ok((resp, _)) => resp,
-                Err(e) => {
-                    warn!(file_path = %file_path, error = %e, "targeted extraction LLM call failed, skipping file");
-                    continue;
-                }
-            }
-        } else {
-            // Phase 12 retrofit
-            let target_ctx = llm_config.cache_access.as_ref().map(|ca| {
-                let mut c = StepContext::new(
-                    ca.slug.clone(),
-                    ca.build_id.clone(),
-                    "targeted_reexamination",
-                    "evidence_answer",
-                    0,
-                    None,
-                    ca.db_path.to_string(),
-                )
-                .with_model_resolution("fast_extract", llm_config.primary_model.clone())
-                .with_prompt_hash(compute_prompt_hash(&system_prompt));
-                if let Some(bus) = &ca.bus {
-                    c = c.with_bus(bus.clone());
-                }
-                c
-            });
-            match llm::call_model_unified_and_ctx(
-                llm_config, target_ctx.as_ref(), &system_prompt, &user_prompt,
-                ops.tier1.answer_temperature, ops.tier1.answer_max_tokens,
+        // Phase 18b L8 retrofit: cache + audit unified path. See pre_map
+        // and answer_batch sites above for the rationale.
+        let target_ctx = llm_config.cache_access.as_ref().map(|ca| {
+            let mut c = StepContext::new(
+                ca.slug.clone(),
+                ca.build_id.clone(),
+                "targeted_reexamination",
+                "evidence_answer",
+                0,
                 None,
-            ).await {
-                Ok(r) => r,
-                Err(e) => {
-                    warn!(file_path = %file_path, error = %e, "targeted extraction LLM call failed, skipping file");
-                    continue;
-                }
+                ca.db_path.to_string(),
+            )
+            .with_model_resolution("fast_extract", llm_config.primary_model.clone())
+            .with_prompt_hash(compute_prompt_hash(&system_prompt));
+            if let Some(bus) = &ca.bus {
+                c = c.with_bus(bus.clone());
+            }
+            c
+        });
+        let target_audit_ctx = audit.map(|ctx| AuditContext {
+            call_purpose: "gap_answer".to_string(),
+            step_name: "targeted_reexamination".to_string(),
+            ..ctx.clone()
+        });
+        let response = match llm::call_model_unified_with_audit_and_ctx(
+            llm_config,
+            target_ctx.as_ref(),
+            target_audit_ctx.as_ref(),
+            &system_prompt,
+            &user_prompt,
+            ops.tier1.answer_temperature,
+            ops.tier1.answer_max_tokens,
+            None,
+            llm::LlmCallOptions::default(),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(file_path = %file_path, error = %e, "targeted extraction LLM call failed, skipping file");
+                continue;
             }
         };
 

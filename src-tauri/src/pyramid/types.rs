@@ -499,6 +499,13 @@ pub struct LlmAuditRecord {
     pub status: String,
     pub created_at: String,
     pub completed_at: Option<String>,
+    /// Phase 18b: distinguishes "served from cache" (`true`) from
+    /// "served by HTTP call to provider" (`false`). Cache hits still
+    /// write an audit row so the audit trail is contiguous and the
+    /// DADBEAR Oversight page / cost reconciliation can show cache
+    /// savings without losing audit-completeness.
+    #[serde(default)]
+    pub cache_hit: bool,
 }
 
 /// Lightweight node info for the Theatre's live spatial view.

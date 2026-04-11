@@ -2336,4 +2336,274 @@ break the end-to-end flow.
   extra IPC calls to make UX decisions about the publish.
 
 ---
+## Phase 18b wanderer pass (2026-04-11)
+
+1. **When the verifier can't run tests, the wanderer must be the
+   guaranteed backstop.** Phase 18b's verifier explicitly punted
+   runtime verification (`cargo test --lib pyramid` + `npm run build`)
+   because 4 sibling Phase 18 worktrees had filled the shared Data
+   volume. The verifier's static audit was thorough, but "pre-release
+   test count matches a static code review" is a weaker guarantee than
+   "I ran the tests and they pass." The wanderer started with runtime
+   verification as job #1 before the 12 failure-mode trace. All three
+   runtime checks passed cleanly on this worktree (111 GB free).
+
+2. **Pre-existing test failures need a clear provenance trail.** The 7
+   failures in `cargo test --lib pyramid` are all from schema drift in
+   `pyramid::staleness::tests::*` where a local `setup_test_db` helper
+   creates `pyramid_evidence` without the `build_id` column that
+   production code expects. These have existed since Phase 17 (last
+   touch on staleness.rs was `4177152`). The wanderer documented this
+   chain of provenance in the log so a future reader doesn't think the
+   count drift is a new regression.
+
+3. **"Verifier clean" != "Wanderer clean" — but for 18b, both passed.**
+   The meta-lesson from 17/18 prior phases is that wanderers catch
+   bugs verifiers miss. Phase 18b is the exception: the implementer's
+   work was tight enough that 12 deep failure-mode traces, an
+   end-to-end runtime verification, and a lock-contention/deadlock
+   analysis all cleared with zero code fixes required. The architecture
+   is sound (Option A fully consummated, single-source-of-truth unified
+   function), the retrofit is exhaustive (6/6 production sites flipped),
+   the deprecation is explicit, the schema migration is idempotent, and
+   the test bodies exercise production paths not shapes. One phase in
+   eighteen is a believable rate for "wanderer finds nothing real."
+
+4. **Cost-log double-counting on cache hits is a pre-existing design
+   observation, NOT a Phase 18b bug.** Worth flagging for a future
+   phase: `chain_executor.rs::execute_ir_single` unconditionally calls
+   `log_cost_synchronous` with the cached `LlmResponse.actual_cost_usd`
+   on every dispatch, including cache hits. Phase 12's non-audited
+   retrofit had the same behavior. The user sees "second build cost
+   $X" in the cost ledger even on a full cache-hit re-run. The fix is
+   small but out of 18b scope — either filter by cache_hit at the
+   ledger boundary, or zero out the cost when serving from cache. This
+   is a dashboard-correctness issue, not a billing issue (OpenRouter
+   only actually charges for wire calls).
+
+5. **Cache-hit audit rows now show up in `cost_model.rs::recompute_
+   from_audit` averages but the math works out.** Cache hit rows
+   preserve the original call's `prompt_tokens` / `completion_tokens`,
+   and `calls_per_conversation = total_calls / distinct_builds` stays
+   stable across re-runs (2N/2 = N). Per-call cost estimate is
+   unchanged. The cost model reports approximately the first build's
+   actual cost, which IS what the user paid. Not a regression.
+
+6. **No frontend UI surfaces `cache_hit` from the audit table yet.**
+   Phase 13's build viz shows cache hits via the event bus path
+   (`TaggedKind::CacheHit` → `useBuildRowState.ts:323`), not by
+   querying `pyramid_llm_audit.cache_hit`. Phase 18b's contribution
+   is the durable record — DADBEAR Oversight surfacing cache savings
+   from the audit column is a separate workstream. This matches the
+   workstream prompt's framing and isn't a gap.
+
+---
+## Phase 18a — Local Mode + Provider Management (2026-04-11)
+
+### `TierRoutingYaml` field name silently broke since Phase 4
+
+The Phase 4 dispatcher's `tier_routing` branch did:
+
+```rust
+let yaml: db::TierRoutingYaml = serde_yaml::from_str(&contribution.yaml_content)?;
+db::upsert_tier_routing_from_contribution(conn, &yaml, ...)?;
+```
+
+…where `TierRoutingYaml` was declared as `pub tiers: Vec<...>`. The
+bundled tier_routing JSON Schema (in
+`assets/bundled_contributions.json`) and the bundled default
+contribution both used `entries:`. There was no
+`#[serde(deny_unknown_fields)]`, so deserialization succeeded silently
+and produced an EMPTY `Vec`. The upsert helper iterated over zero
+rows and the operational `pyramid_tier_routing` table never picked
+up contribution-driven supersessions. The fact that nothing surfaced
+this for 14 phases suggests every test that exercised tier_routing
+either:
+- Bypassed the contribution layer and called `save_tier_routing`
+  directly (like `seed_default_provider_registry`).
+- Used a hand-rolled `tiers: []` YAML fixture that matched the
+  broken struct (like `test_global_config_with_null_slug`).
+
+No test exercised the dispatcher's tier_routing branch end-to-end
+against the canonical schema. The bug would have stayed silent
+indefinitely.
+
+**Lesson:** every dispatcher branch needs at least one test that
+parses the canonical bundled-seed YAML. Add a guard test in a future
+phase that walks every `bundled_contributions.json` entry and runs
+`sync_config_to_operational` against a fresh DB. If any branch
+silently produces empty/default state from the canonical seed, fail
+loudly.
+
+**Phase 18a fix:** struct renamed to `entries:` with
+`#[serde(default, alias = "tiers")]`, plus three previously-unknown
+fields added (`priority`, `prompt_price_per_token`,
+`completion_price_per_token`) so the canonical schema parses. Plus
+the upsert helper now DELETEs tier rows not present in the new
+contribution — required for Local Mode reversibility AND consistent
+with the rest of the dispatcher's "contribution is the source of
+truth" model.
+
+### Worktree contamination
+
+The five Phase 18 sub-workstreams (18a/18b/18c/18d/18e) were
+launched in parallel branches but only 18b/18d/18e got dedicated
+worktrees in `/private/tmp/`. The 18a and 18c agents both ended up
+operating in the main repo at different points. I (the 18a agent)
+spent the first ~30 minutes editing files in
+`/Users/adamlevine/AI Project Files/agent-wire-node` while the
+checked-out branch was actually `phase-18c-privacy-pause-all` —
+because no one had created a worktree for 18a yet. My edits to
+db.rs, mod.rs, and main.rs landed in the 18c worktree and were
+rolled back when 18c committed its own changes (the "modified
+since read" errors I kept hitting were a symptom of the harness
+detecting concurrent file mutation).
+
+**Recovery:**
+1. Created a worktree at `/private/tmp/agent-wire-phase-18a` and
+   tried to redo the work there. Hit a separate disk-space wall
+   on `/private/tmp` (the cargo target dir filled the partition).
+2. Removed the `/private/tmp` worktree, waited for 18c to commit
+   its work, then `git checkout phase-18a-local-mode-providers`
+   inside the main repo. This reused the existing target dir
+   and avoided the disk-space issue.
+3. Re-applied all Phase 18a edits in the main repo on the 18a
+   branch. Verified 18c's commit (`f674051`) was still intact
+   on its own branch.
+
+**Lesson:** when launching N parallel agents on related branches,
+spin up a worktree per agent BEFORE the agents start work. Tell
+each agent the absolute path to its worktree as the "working
+directory" override. The "checked out in main repo" path is
+fragile when multiple agents share the same repo state.
+
+### Dehydration budget scaling — deferred
+
+Spec §390 calls for deriving dehydration budgets from the detected
+context limit when local mode is enabled. The relevant constants
+live in `OperationalConfig::tier2`
+(`pre_map_prompt_budget = 80_000`, `answer_prompt_budget`, etc.) and
+are NOT currently surfaced as a contribution. They're hard-coded in
+`src-tauri/src/pyramid/mod.rs`. Scaling them at toggle-on time would
+require either:
+- Threading a mutable handle to `OperationalConfig` into
+  `local_mode::enable_local_mode` (the `OperationalConfig` is held
+  behind `Arc<OperationalConfig>` today, not `Arc<RwLock<...>>`).
+- Introducing a new `dehydration_budget` contribution schema_type
+  with its own dispatcher branch and operational reader.
+
+Both are beyond Phase 18a scope. **Deferred** with a comment in
+`local_mode::enable_local_mode` pointing here. Local mode still
+works against the default budgets; users running tiny-context
+models (e.g., Llama 3.2:1b at 4k context) may need to manually
+drop those budgets before their first build succeeds. Phase 19
+candidate.
+
+### `model_list:` resolver async refactor
+
+Phase 8's `resolve_option_source` was sync. The Phase 18a (L5)
+extension to hit Ollama's `/api/tags` for Ollama-shaped providers
+needs network async, but `&Connection` (the rusqlite handle) is
+not Send and can't cross an await point in a tauri command future.
+
+**First attempt:** make `resolve_option_source` async. Failed —
+the compiler saw `&conn` captured across the (only) await point
+and rejected the future as non-Send.
+
+**Working approach:** keep `resolve_option_source` synchronous,
+add a separate `resolve_model_list_only(provider_registry,
+provider_id) -> Vec<OptionValue>` async function that takes only
+the registry. The IPC handler in `main.rs` checks the source
+prefix and routes `model_list:` calls to the async path WITHOUT
+holding the rusqlite lock. Other branches stay on the sync path
+and hold the lock as before. This works because the model_list
+branch never touches `&conn` — it only reads from the in-memory
+registry + network.
+
+The sync `resolve_option_source` for `model_list:` consults the
+30-second cache (populated by the async path on the previous
+call) and falls back to the Phase 8 tier-table view. This means
+the renderer's mount-time fetch always returns immediately from
+the cache or fallback, and the next IPC call refreshes the
+cache. Acceptable trade-off — the user sees the previous probe
+result for 30s, then a fresh probe.
+
+### OllamaCloudProvider (L3) — re-deferred
+
+Time/scope pressure from the TierRoutingYaml repair plus the
+async resolver refactor consumed the Phase 18a headroom. The
+local Ollama path (via `ProviderType::OpenaiCompat` + bare
+localhost URL) already covers Adam's Ouro test use case
+completely. L3 (remote Ollama behind nginx with bearer auth)
+is a sharpening for users who run a hosted Ollama on a
+separate machine. Recommend the conductor re-defer L3 to a
+"Phase 18a+1 fix pass" or absorb it into Phase 19's planning.
+
+### What worked
+
+- The implementer pass caught the TierRoutingYaml mismatch
+  immediately because the workstream prompt explicitly flagged
+  it as a likely deviation. Wanderers on built systems would
+  have caught it too, but the pre-warning let me find + fix it
+  BEFORE the local mode IPC path hit it.
+- The state-table approach (Option A) is much cleaner than the
+  contribution-chain walking approach (Option B) for the same
+  reason: explicit columns are easier to verify than parsed
+  free-text triggering notes. Recommend always defaulting to
+  Option A unless there's a reason not to add a schema migration.
+- `feedback_always_scope_frontend.md` was load-bearing — the
+  Settings.tsx Local LLM section is the gate. I built it before
+  the OllamaCloudProvider deferral because Adam tests by feel
+  and the toggle is what unblocks the Ouro test.
+
+### Wanderer pass — reader lock held across `.await` in status IPC
+
+**What the wanderer caught.** The verifier's 11-point checklist
+explicitly noted at item 11 that `yaml_renderer_resolve_options`
+at `main.rs:8810` correctly drops the rusqlite reader lock
+BEFORE awaiting the async model-list resolver. But when the
+same verifier looked at `pyramid_get_local_mode_status` at
+`main.rs:7702` (item 6 in the IPC registration check), they
+only verified registration, not the lock-release pattern. The
+status IPC held the tokio reader Mutex across a 5-second
+`probe_ollama().await`, which is async-safe but blocks every
+other reader-bound IPC for the duration of the probe.
+
+**Why the verifier missed it.** Verifier was working off a
+punch list of "11 failure modes" that the workstream prompt
+flagged. Lock-hold patterns across `.await` wasn't one of the
+11 items. The verifier did a surface-level check that the 5
+IPCs were registered (they were) and moved on. The wanderer,
+following a different prompt about tracing end-to-end execution
+and looking for wiring bugs, landed on the same code but asked
+a different question: "how long can the reader lock be held
+here, and does anything concurrent care?"
+
+**The fix.** Split `get_local_mode_status` into
+`load_status_snapshot` (sync, DB-only) and
+`refresh_status_reachability` (async, no DB/mutex), then have
+the IPC handler drop the reader lock between them via an
+explicit scoped block. The legacy `get_local_mode_status`
+wrapper stays for enable/disable return paths where the probe
+latency is already baked into the writer lock's span.
+
+**Lesson.** When a verifier punch list exists, wanderer passes
+still need to ask "what ISN'T on this list?" Look for the
+same anti-pattern the verifier explicitly called out elsewhere
+and check it in every other IPC handler in the touched file.
+If the verifier flagged "IPC X drops the lock correctly", the
+wanderer should grep for every OTHER IPC that takes a reader
+lock + awaits and confirm each one. The verifier's "good"
+citation is a template for the wanderer's sweep.
+
+**Meta-lesson.** Verifiers working from an explicit punch list
+are necessary but not sufficient. The wanderer's job is
+exactly to look at what the punch list doesn't cover. This
+matches the 17/18 wanderer-catch rate from earlier phases —
+the bug is always in the space the verifier didn't enumerate.
+
+**Tests added.** 4 unit tests pinning the split-function
+contract: snapshot is sync and DB-only, refresh is async and
+no-op when disabled. Test count 1254 → 1258 passing. Same 7
+pre-existing failures.
 

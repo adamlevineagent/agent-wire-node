@@ -484,4 +484,74 @@ mod tests {
         assert!(ids.contains(&"q-h2".to_string()));
         assert!(!ids.contains(&"q-h3".to_string()));
     }
+
+    // ── Phase 18b L7: search_hit signal recording + propagation ─────────
+
+    /// Helper that mirrors the production wiring used by
+    /// `routes::handle_drill` and the `pyramid_drill` IPC: when a drill
+    /// is launched from a search result, BOTH `user_drill` and
+    /// `search_hit` are recorded for the same node. This test confirms
+    /// the two-row outcome and that propagation works for `search_hit`
+    /// the same way it does for the other signal types.
+    #[test]
+    fn test_phase18b_l7_search_hit_records_two_rows_per_drill() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_pyramid_db(&conn).unwrap();
+        // Mirror what handle_drill does on the from=search path:
+        // emit `user_drill` then `search_hit` for the same node.
+        let policy = make_policy(0.0, 0.0, 100); // factor=0 → no propagation
+        record_demand_signal(&conn, "p18b", "L1-001", "user_drill", Some("user"), &policy)
+            .unwrap();
+        record_demand_signal(&conn, "p18b", "L1-001", "search_hit", Some("user"), &policy)
+            .unwrap();
+
+        // Both rows landed at the leaf node, with distinct signal types.
+        let user_drill_total =
+            db::sum_demand_weight(&conn, "p18b", "L1-001", "user_drill", "-1 day").unwrap();
+        let search_hit_total =
+            db::sum_demand_weight(&conn, "p18b", "L1-001", "search_hit", "-1 day").unwrap();
+        assert!(
+            (user_drill_total - 1.0).abs() < 1e-9,
+            "exactly one user_drill row at weight 1.0"
+        );
+        assert!(
+            (search_hit_total - 1.0).abs() < 1e-9,
+            "exactly one search_hit row at weight 1.0 (the L7 fix)"
+        );
+    }
+
+    /// Phase 18b L7: spot-check that `search_hit` propagation through
+    /// the evidence graph behaves identically to the other signal
+    /// types. The propagation engine is type-agnostic — the leaf
+    /// signal type rides along through the BFS — so this is mostly
+    /// regression coverage that the new signal_type doesn't get
+    /// special-cased anywhere.
+    #[test]
+    fn test_phase18b_l7_search_hit_propagates_like_other_signals() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_pyramid_db(&conn).unwrap();
+        // Chain: leaf → p1 → p2.
+        insert_keep_edge(&conn, "p18b", "leaf", "p1");
+        insert_keep_edge(&conn, "p18b", "p1", "p2");
+
+        // factor 0.5, floor 0.0 → leaf=1.0, p1=0.5, p2=0.25.
+        let policy = make_policy(0.5, 0.0, 100);
+        record_demand_signal(&conn, "p18b", "leaf", "search_hit", Some("user"), &policy)
+            .unwrap();
+
+        let leaf =
+            db::sum_demand_weight(&conn, "p18b", "leaf", "search_hit", "-1 day").unwrap();
+        let p1 = db::sum_demand_weight(&conn, "p18b", "p1", "search_hit", "-1 day").unwrap();
+        let p2 = db::sum_demand_weight(&conn, "p18b", "p2", "search_hit", "-1 day").unwrap();
+        assert!((leaf - 1.0).abs() < 1e-9, "leaf at full weight");
+        assert!((p1 - 0.5).abs() < 1e-9, "p1 at attenuated 0.5 weight");
+        assert!((p2 - 0.25).abs() < 1e-9, "p2 at attenuated 0.25 weight");
+
+        // The search_hit signal is type-isolated: a sum on a
+        // different signal type returns 0 even though the same nodes
+        // received search_hit weight.
+        let user_drill_at_leaf =
+            db::sum_demand_weight(&conn, "p18b", "leaf", "user_drill", "-1 day").unwrap();
+        assert!(user_drill_at_leaf < 1e-9, "user_drill is a separate type");
+    }
 }

@@ -1061,7 +1061,8 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
             generation_id TEXT,
             status TEXT NOT NULL DEFAULT 'pending',
             created_at TEXT NOT NULL DEFAULT (datetime('now')),
-            completed_at TEXT
+            completed_at TEXT,
+            cache_hit INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS idx_llm_audit_slug_build ON pyramid_llm_audit(slug, build_id);
         CREATE INDEX IF NOT EXISTS idx_llm_audit_node ON pyramid_llm_audit(slug, node_id);
@@ -1076,6 +1077,25 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
         );
         ",
     )?;
+
+    // Phase 18b: idempotent migration adding the `cache_hit` distinction to
+    // pyramid_llm_audit. Pre-Phase-18b rows default to `0` (treated as
+    // wire-served). Audited cache hits write a row with `cache_hit = 1` so
+    // the audit trail / DADBEAR Oversight page / cost reconciliation can
+    // distinguish "served from cache" from "served by HTTP call to model X".
+    {
+        let has_cache_hit: bool = conn
+            .prepare(
+                "SELECT 1 FROM pragma_table_info('pyramid_llm_audit') WHERE name = 'cache_hit'",
+            )?
+            .exists([])?;
+        if !has_cache_hit {
+            conn.execute(
+                "ALTER TABLE pyramid_llm_audit ADD COLUMN cache_hit INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+    }
 
     // ── Phase 6: LLM output cache (pyramid_step_cache) ─────────────────────
     //
@@ -1618,6 +1638,41 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
     // First-run seeding. Only fires when pyramid_providers is empty so
     // we don't clobber user-customized rows on subsequent boots.
     seed_default_provider_registry(conn)?;
+
+    // ── Phase 18a: Local Mode state row ───────────────────────────────────────
+    //
+    // Per `docs/specs/provider-registry.md` §382-395, the Local LLM
+    // (Ollama) toggle is a single conceptual switch. The state behind
+    // it lives here so toggle-off can restore the prior tier_routing
+    // and build_strategy contributions verbatim. The table is
+    // single-row (id = 1 PRIMARY KEY); existing installs see the row
+    // appear with `enabled = 0` on next boot.
+    //
+    // Two restore columns because Phase 18a supersedes BOTH the active
+    // tier_routing contribution (route every tier through Ollama) AND
+    // the active build_strategy contribution (set concurrency to 1).
+    // Disable must restore both, otherwise toggling off would leave
+    // the user pinned at concurrency 1 against OpenRouter — slow and
+    // expensive.
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS pyramid_local_mode_state (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            enabled INTEGER NOT NULL DEFAULT 0,
+            ollama_base_url TEXT,
+            ollama_model TEXT,
+            detected_context_limit INTEGER,
+            restore_from_contribution_id TEXT,
+            restore_build_strategy_contribution_id TEXT,
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        ",
+    )?;
+    // Idempotent: insert the singleton row if missing.
+    conn.execute(
+        "INSERT OR IGNORE INTO pyramid_local_mode_state (id, enabled) VALUES (1, 0)",
+        [],
+    )?;
 
     // ── Phase 4: Config Contribution Foundation ───────────────────────────────
     //
@@ -6044,6 +6099,58 @@ pub fn fail_llm_audit(
     Ok(())
 }
 
+/// Phase 18b: insert a fully-formed audit row stamped as a cache hit in
+/// a single statement. Cache hits don't go through the pending → complete
+/// dance because there is no LLM call to "fail mid-flight" — the cached
+/// result is read in microseconds. The row carries `parsed_ok = true`
+/// (the cached output already parsed once when it was stored) and
+/// `cache_hit = 1` so the audit trail can distinguish it from wire calls.
+///
+/// Returns the inserted audit row id.
+#[allow(clippy::too_many_arguments)]
+pub fn insert_llm_audit_cache_hit(
+    conn: &Connection,
+    slug: &str,
+    build_id: &str,
+    node_id: Option<&str>,
+    step_name: &str,
+    call_purpose: &str,
+    depth: Option<i64>,
+    model: &str,
+    system_prompt: &str,
+    user_prompt: &str,
+    raw_response: &str,
+    prompt_tokens: i64,
+    completion_tokens: i64,
+    latency_ms: i64,
+    generation_id: Option<&str>,
+) -> Result<i64> {
+    // Deduplicate system prompt via hash, matching insert_llm_audit_pending.
+    let sys_hash = prompt_hash(system_prompt);
+    let _ = conn.execute(
+        "INSERT OR IGNORE INTO pyramid_prompt_store (hash, content, char_count)
+         VALUES (?1, ?2, ?3)",
+        rusqlite::params![sys_hash, system_prompt, system_prompt.len() as i64],
+    );
+    let sys_ref = format!("@@hash:{}", sys_hash);
+
+    conn.execute(
+        "INSERT INTO pyramid_llm_audit
+         (slug, build_id, node_id, step_name, call_purpose, depth, model,
+          system_prompt, user_prompt, raw_response, parsed_ok,
+          prompt_tokens, completion_tokens, latency_ms, generation_id,
+          status, completed_at, cache_hit)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1,
+                 ?11, ?12, ?13, ?14, 'complete', datetime('now'), 1)",
+        rusqlite::params![
+            slug, build_id, node_id, step_name, call_purpose, depth,
+            model, sys_ref, user_prompt, raw_response,
+            prompt_tokens, completion_tokens, latency_ms, generation_id,
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
 /// Get all audit records for a specific node in a build.
 /// Hash-referenced system prompts are resolved to full text.
 pub fn get_node_audit_records(
@@ -6055,7 +6162,7 @@ pub fn get_node_audit_records(
         "SELECT id, slug, build_id, node_id, step_name, call_purpose, depth, model,
                 system_prompt, user_prompt, raw_response, parsed_ok,
                 prompt_tokens, completion_tokens, latency_ms, generation_id,
-                status, created_at, completed_at
+                status, created_at, completed_at, cache_hit
          FROM pyramid_llm_audit
          WHERE slug = ?1 AND node_id = ?2
          ORDER BY id ASC",
@@ -6078,7 +6185,7 @@ pub fn get_llm_audit_by_id(
         "SELECT id, slug, build_id, node_id, step_name, call_purpose, depth, model,
                 system_prompt, user_prompt, raw_response, parsed_ok,
                 prompt_tokens, completion_tokens, latency_ms, generation_id,
-                status, created_at, completed_at
+                status, created_at, completed_at, cache_hit
          FROM pyramid_llm_audit WHERE id = ?1",
     )?;
     let mut rows: Vec<LlmAuditRecord> = stmt
@@ -6164,6 +6271,11 @@ fn parse_llm_audit_row(row: &rusqlite::Row) -> rusqlite::Result<LlmAuditRecord> 
         status: row.get(16)?,
         created_at: row.get(17)?,
         completed_at: row.get(18)?,
+        // Phase 18b: cache_hit is the 20th column. Default to false on
+        // pre-Phase-18b rows that haven't been touched by the migration
+        // (the migration is idempotent + run on init, but defensively
+        // handle row.get errors with `unwrap_or(0)`).
+        cache_hit: row.get::<_, i32>(19).unwrap_or(0) != 0,
     })
 }
 
@@ -12883,6 +12995,94 @@ pub fn seed_default_provider_registry(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+// ── Phase 18a: Local Mode state row helpers ───────────────────────────────────
+
+/// Snapshot of `pyramid_local_mode_state`. Mirrors the table 1:1 and
+/// is consumed by the IPC handlers in `main.rs`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct LocalModeStateRow {
+    pub enabled: bool,
+    pub ollama_base_url: Option<String>,
+    pub ollama_model: Option<String>,
+    pub detected_context_limit: Option<i64>,
+    pub restore_from_contribution_id: Option<String>,
+    pub restore_build_strategy_contribution_id: Option<String>,
+    pub updated_at: String,
+}
+
+/// Read the singleton `pyramid_local_mode_state` row. Returns a row
+/// initialized with the table defaults if the singleton was never
+/// inserted (defensive — `init_pyramid_db` always inserts it).
+pub fn load_local_mode_state(conn: &Connection) -> Result<LocalModeStateRow> {
+    let row = conn
+        .query_row(
+            "SELECT enabled, ollama_base_url, ollama_model,
+                    detected_context_limit,
+                    restore_from_contribution_id,
+                    restore_build_strategy_contribution_id,
+                    updated_at
+             FROM pyramid_local_mode_state
+             WHERE id = 1",
+            [],
+            |row| {
+                Ok(LocalModeStateRow {
+                    enabled: row.get::<_, i64>(0)? != 0,
+                    ollama_base_url: row.get(1)?,
+                    ollama_model: row.get(2)?,
+                    detected_context_limit: row.get(3)?,
+                    restore_from_contribution_id: row.get(4)?,
+                    restore_build_strategy_contribution_id: row.get(5)?,
+                    updated_at: row.get(6)?,
+                })
+            },
+        )
+        .optional()?;
+    Ok(row.unwrap_or_else(|| LocalModeStateRow {
+        enabled: false,
+        ollama_base_url: None,
+        ollama_model: None,
+        detected_context_limit: None,
+        restore_from_contribution_id: None,
+        restore_build_strategy_contribution_id: None,
+        updated_at: String::new(),
+    }))
+}
+
+/// Write the singleton `pyramid_local_mode_state` row. The `id = 1`
+/// row is created on first call (or by `init_pyramid_db`'s
+/// `INSERT OR IGNORE`).
+pub fn save_local_mode_state(conn: &Connection, state: &LocalModeStateRow) -> Result<()> {
+    conn.execute(
+        "INSERT INTO pyramid_local_mode_state (
+            id, enabled, ollama_base_url, ollama_model,
+            detected_context_limit,
+            restore_from_contribution_id,
+            restore_build_strategy_contribution_id,
+            updated_at
+         ) VALUES (
+            1, ?1, ?2, ?3, ?4, ?5, ?6, datetime('now')
+         )
+         ON CONFLICT(id) DO UPDATE SET
+            enabled = excluded.enabled,
+            ollama_base_url = excluded.ollama_base_url,
+            ollama_model = excluded.ollama_model,
+            detected_context_limit = excluded.detected_context_limit,
+            restore_from_contribution_id = excluded.restore_from_contribution_id,
+            restore_build_strategy_contribution_id = excluded.restore_build_strategy_contribution_id,
+            updated_at = datetime('now')
+        ",
+        rusqlite::params![
+            state.enabled as i64,
+            state.ollama_base_url,
+            state.ollama_model,
+            state.detected_context_limit,
+            state.restore_from_contribution_id,
+            state.restore_build_strategy_contribution_id,
+        ],
+    )?;
+    Ok(())
+}
+
 // ── Phase 4: Operational table upsert helpers ─────────────────────────────────
 //
 // Each schema_type whose `sync_config_to_operational()` writes to a dedicated
@@ -14130,9 +14330,22 @@ pub fn upsert_dadbear_policy(
 /// the `tier_routing` schema_type sync dispatcher. The real
 /// `TierRoutingEntry` lives in `provider.rs` with richer fields; this
 /// struct is the YAML-serializable surface.
+///
+/// **Phase 18a fix:** the canonical field name is `entries:` per the
+/// bundled `tier_routing` JSON Schema (see
+/// `assets/bundled_contributions.json` →
+/// `bundled-schema_definition-tier_routing-v1`) and the bundled
+/// default tier_routing seed. Phase 4 originally declared this struct
+/// as `tiers:`, so the bundled seed parsed silently into an empty
+/// list and never reached the operational `pyramid_tier_routing`
+/// table during contribution-driven supersessions. The struct now
+/// uses `entries:` (matching the schema_definition + the seed) and
+/// accepts the legacy `tiers:` alias so any in-flight contributions
+/// written against the broken shape still deserialize cleanly.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct TierRoutingYaml {
-    pub tiers: Vec<TierRoutingYamlEntry>,
+    #[serde(default, alias = "tiers")]
+    pub entries: Vec<TierRoutingYamlEntry>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -14150,29 +14363,101 @@ pub struct TierRoutingYamlEntry {
     pub supported_parameters_json: Option<String>,
     #[serde(default)]
     pub notes: Option<String>,
+    /// Phase 18a: bundled `tier_routing` schema_definition exposes a
+    /// per-entry `priority` integer for fallback ordering inside a
+    /// single contribution. Phase 18a does not yet thread priority
+    /// into the operational table — Phase 19 will. Carrying it on
+    /// the YAML struct lets bundled + pulled-from-Wire contributions
+    /// parse without an unknown-field error.
+    #[serde(default)]
+    pub priority: Option<i64>,
+    /// Phase 18a: bundled `tier_routing` schema accepts pricing as
+    /// flat per-token numbers in addition to the structured
+    /// `pricing_json` blob. We accept both — flat numbers are
+    /// synthesized into a `pricing_json` blob in the upsert.
+    #[serde(default)]
+    pub prompt_price_per_token: Option<f64>,
+    #[serde(default)]
+    pub completion_price_per_token: Option<f64>,
 }
 
 /// UPSERT a bundle of tier routing entries from a contribution.
 /// Delegates to the existing `save_tier_routing` helper per entry so
 /// the Phase 3 data model stays authoritative.
+///
+/// **Phase 18a:** also DELETEs any existing `pyramid_tier_routing`
+/// rows whose `tier_name` is NOT in the new contribution. Without
+/// this, an active local-mode contribution listing only
+/// `fast_extract`/`synth_heavy`/etc. would leave a stale `web` row
+/// pointing at OpenRouter, and a chain step asking for the `web`
+/// tier would silently route to OpenRouter even though local mode is
+/// on. The DELETE matches the rest of the dispatcher's
+/// "contribution is the source of truth" model.
 pub fn upsert_tier_routing_from_contribution(
     conn: &Connection,
     yaml: &TierRoutingYaml,
     _contribution_id: &str,
 ) -> Result<()> {
+    // Phase 18a: drop tiers not present in the incoming contribution.
+    let incoming_names: Vec<String> =
+        yaml.entries.iter().map(|e| e.tier_name.clone()).collect();
+    if incoming_names.is_empty() {
+        // Empty contribution = wipe the table.
+        conn.execute("DELETE FROM pyramid_tier_routing", [])?;
+    } else {
+        let placeholders = incoming_names
+            .iter()
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "DELETE FROM pyramid_tier_routing WHERE tier_name NOT IN ({placeholders})"
+        );
+        let params: Vec<&dyn rusqlite::ToSql> = incoming_names
+            .iter()
+            .map(|s| s as &dyn rusqlite::ToSql)
+            .collect();
+        conn.execute(&sql, params.as_slice())?;
+    }
+
     // Phase 4: we don't record contribution_id on individual
     // tier_routing rows — the existing schema doesn't have that column.
     // The contribution→tier linkage lives on
     // pyramid_config_contributions itself. Phase 14 can add a back-ref
     // column if the executor needs to trace tier → contribution.
-    for entry in &yaml.tiers {
+    for entry in &yaml.entries {
+        // Phase 18a: synthesize a pricing_json blob from the flat
+        // per-token rate fields when the contribution didn't supply
+        // its own pricing_json. Keeps the canonical bundled schema
+        // (which expresses pricing as flat numbers) and the
+        // structured-blob form interoperable.
+        let pricing_json = entry
+            .pricing_json
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| {
+                if entry.prompt_price_per_token.is_some()
+                    || entry.completion_price_per_token.is_some()
+                {
+                    let prompt = entry.prompt_price_per_token.unwrap_or(0.0);
+                    let completion = entry.completion_price_per_token.unwrap_or(0.0);
+                    serde_json::json!({
+                        "prompt": prompt.to_string(),
+                        "completion": completion.to_string(),
+                        "request": "0"
+                    })
+                    .to_string()
+                } else {
+                    "{}".to_string()
+                }
+            });
         let tier = TierRoutingEntry {
             tier_name: entry.tier_name.clone(),
             provider_id: entry.provider_id.clone(),
             model_id: entry.model_id.clone(),
             context_limit: entry.context_limit.map(|n| n as usize),
             max_completion_tokens: entry.max_completion_tokens.map(|n| n as usize),
-            pricing_json: entry.pricing_json.clone().unwrap_or_else(|| "{}".into()),
+            pricing_json,
             supported_parameters_json: entry.supported_parameters_json.clone(),
             notes: entry.notes.clone(),
         };

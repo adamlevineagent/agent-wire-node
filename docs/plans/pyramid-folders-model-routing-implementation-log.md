@@ -4379,6 +4379,305 @@ Docs:
 - `docs/plans/pyramid-folders-model-routing-friction-log.md` — Phase
   18c entry covering the circle deferral and the audit-count
   deferral.
+## Phase 18b — Cache integrity retrofit + search_hit signal path (2026-04-11)
+
+**Branch:** `phase-18b-cache-integrity` (parallel worktree at
+`/private/tmp/agent-wire-phase-18b` because the main worktree was
+shared with sibling 18a/18c/18d/18e agents).
+
+**Ledger entries claimed:** L7 (`search_hit` demand signal recording
+path) and L8 (`call_model_audited` cache retrofit) from
+`docs/plans/deferral-ledger.md`.
+
+**Mandate recap:** Phase 12 punted the audited LLM call sites because
+`call_model_audited` wrote its own audit row and bypassed the Phase 6
+cache. Result: every audited build re-burned tokens on every re-run.
+Phase 12 also punted `search_hit` because Wire Node had no session /
+referer mechanism to link a search hit to a subsequent drill. Phase 13
+was supposed to pick both up. It didn't. Phase 18b reclaims them.
+
+### L8 — `call_model_audited` cache retrofit
+
+**Option A picked (clean unification).** I retired
+`call_model_audited` as a thin deprecated wrapper and added a new
+public entry point `call_model_unified_with_audit_and_ctx` that
+threads BOTH a `StepContext` (for cache lookup/storage) and an
+`AuditContext` (for the audit row writes) through a single
+implementation. The legacy `call_model_unified_with_options_and_ctx`
+becomes a thin wrapper that delegates with `audit = None`. The
+existing function body in `llm.rs` is now the shared body for both
+the cache-only and the cache+audit paths.
+
+**Rationale for Option A over B/C:**
+
+- B (new `_with_ctx` variant alongside `call_model_audited`) preserves
+  two ways of writing audited calls; the second one will rot.
+- C (cache probe at each retrofit site) duplicates the cache-key
+  computation across 5+ files and is hard to evolve.
+- A matches what Phase 12 did when it unified the non-audited paths.
+  It also gives the audit + cost reconciliation systems the cache_hit
+  distinction "for free" — a single audit row per call regardless of
+  which path served it.
+
+**Audit row cache_hit distinction.** The `pyramid_llm_audit` table
+gained a new `cache_hit INTEGER NOT NULL DEFAULT 0` column via an
+idempotent migration (pragma_table_info check + ALTER TABLE). Cache
+hits write a row with `cache_hit = 1` via a new
+`db::insert_llm_audit_cache_hit` helper that emits a single
+'complete' row in one INSERT (no pending → complete dance because the
+cached read is sub-millisecond). Wire calls continue to go through
+the existing `insert_llm_audit_pending` → HTTP → `complete_llm_audit`
+flow with `cache_hit = 0` (the column default). The
+`LlmAuditRecord` Rust struct also gained the `cache_hit` field with
+`#[serde(default)]` so the IPC layer carries it to the Inspector
+modal whenever the DADBEAR Oversight UI starts reading it.
+
+**Audit failure path.** All six terminal-error sites in the unified
+inner function (connection error, HTTP 400 not-context, terminal
+non-success, response read fail, parse fail, empty content) now call
+a new `maybe_fail_audit` helper that flips the pending row to
+`status = 'failed'` so the audit trail isn't left with dangling
+pending rows. The max-retries-exhausted path at the end of the loop
+also calls `maybe_fail_audit`.
+
+### Retrofit table
+
+| File | Site | Step name | Before | After |
+|---|---|---|---|---|
+| `evidence_answering.rs:285` | `pre_map_layer` | `evidence_pre_map` | `call_model_audited(audit)` (audit branch) + `call_model_unified_and_ctx(ctx)` (else branch) | single `call_model_unified_with_audit_and_ctx(ctx, audit)` call |
+| `evidence_answering.rs:954` | `answer_questions` per-batch | `evidence_answer` | `call_model_audited(audit.for_node(...))` (audit branch) + `call_model_unified_and_ctx(ctx)` (else branch) | single `call_model_unified_with_audit_and_ctx(ctx, audit.for_node(...))` call |
+| `evidence_answering.rs:1427` | `merge_answer_batches` | `evidence_answer_merge` | same split | single unified call |
+| `evidence_answering.rs:1648` | `targeted_reexamination` | `evidence_answer` (gap_answer purpose) | same split | single unified call |
+| `chain_dispatch.rs:407` | `dispatch_llm` (legacy v2 chain) | step.name | `call_model_audited(audit)` (audit branch) + `call_model_and_ctx(dispatch_cache_ctx)` (else branch) | single `call_model_unified_with_audit_and_ctx(dispatch_cache_ctx, audit)` call |
+| `chain_dispatch.rs:1326` | `dispatch_ir_llm` (v3 IR chain) | step.id | `call_model_audited(audit)` (audit branch — Phase 6 fix pass left a TODO comment here) + `call_model_unified_with_options_and_ctx(cache_ctx)` (else branch) | single `call_model_unified_with_audit_and_ctx(cache_ctx, audit)` call |
+
+Total: **6 retrofit sites** unified.
+
+### Retrofit ratio grep — before / after
+
+**Before (Phase 18b baseline at `phase-18b-cache-integrity`):**
+
+```
+$ grep -c "call_model_audited(" src-tauri/src/pyramid/*.rs | grep -v ":0$"
+src-tauri/src/pyramid/chain_dispatch.rs:2
+src-tauri/src/pyramid/evidence_answering.rs:4
+src-tauri/src/pyramid/llm.rs:2  (1 fn definition + 1 doc reference)
+```
+
+**After:**
+
+```
+$ grep -c "call_model_audited(" src-tauri/src/pyramid/*.rs | grep -v ":0$"
+src-tauri/src/pyramid/llm.rs:1  (deprecated wrapper definition only)
+```
+
+**After (new unified entry point):**
+
+```
+$ grep -c "call_model_unified_with_audit_and_ctx" src-tauri/src/pyramid/*.rs | grep -v ":0$"
+src-tauri/src/pyramid/chain_dispatch.rs:3   (2 retrofit calls + 1 doc comment)
+src-tauri/src/pyramid/evidence_answering.rs:4
+src-tauri/src/pyramid/llm.rs:9              (1 def + wrappers + tests + docs)
+```
+
+Production code-path call count for `call_model_audited(`: **flipped
+from 6 to 0**. Only the deprecated function definition remains in
+`llm.rs`.
+
+### L7 — `search_hit` demand signal recording path
+
+**Approach B picked (frontend-cooperative `?from=search` query param /
+IPC arg).**
+
+**Rationale for B over A/C:**
+
+- A (in-memory session store keyed by IP/session) adds a mutex + a
+  per-request lookup for a heuristic that propagates 50%-attenuated
+  through the evidence graph anyway. Architectural overkill.
+- B is explicit, survives privacy-preserving Referer policies, and
+  requires only a 1-line frontend change in the search-result onClick
+  handler.
+- C (Referer header inspection) is fragile because Referer can be
+  stripped by browser privacy settings.
+
+**Backend changes (both HTTP + IPC paths).** Wire Node has TWO drill
+entry points:
+
+1. `routes.rs::handle_drill` — the HTTP route used by external
+   clients and MCP agents over the wire.
+2. `main.rs::pyramid_drill` — the Tauri IPC used by the desktop UI.
+
+Both got the L7 wiring:
+
+| Path | Mechanism | Code |
+|---|---|---|
+| `routes.rs::handle_drill` | New `DrillQuery` struct deserialized from `?from=search` query param. Filter chain adds `warp::query::<DrillQuery>()` between the auth filter and `with_agent_id()`. | `routes.rs:357-372` (struct), `routes.rs:884-895` (filter), `routes.rs:2758-2840` (handler) |
+| `main.rs::pyramid_drill` | New `from_search: Option<bool>` parameter on the `#[tauri::command]` function. Optional with `unwrap_or(false)` so existing IPC callers that don't pass it stay on the bare-drill behavior. | `main.rs:3044-3100` |
+
+In both handlers, when the flag is true, the fire-and-forget
+`tokio::spawn` task calls `record_demand_signal` TWICE — once with
+`signal_type = "user_drill"` (the existing call) and a second time
+with `signal_type = "search_hit"` (the L7 fix). Both rows land in
+`pyramid_demand_signals`, both propagate through the evidence graph
+via the existing BFS attenuation, and the triage policy can give
+them separate weights via the `demand_signals` rule list.
+
+**Frontend change.** `src/components/PyramidNavPage.tsx::handleNodeClick`
+gained an optional second arg `fromSearch: boolean = false` that gets
+threaded into the `pyramid_drill` IPC's `from_search` parameter. The
+two views that render search results — `SearchModeView` (verbatim
+search) and `QuestionResultView` (question results from the search
+endpoint) — now pass `true` when their result-row onClick fires. The
+non-search drill paths (tree view, walk view, thread view, decisions
+view, speaker view) leave the second arg as default `false` and only
+the standard `user_drill` signal fires.
+
+### Tests added
+
+**L8 (3 tests in `pyramid::llm::tests`):**
+
+- `test_phase18b_audited_cache_hit_writes_cache_hit_audit_row` —
+  pre-populates a cache row, calls
+  `call_model_unified_with_audit_and_ctx(Some(ctx), Some(audit))`,
+  asserts the cached response is returned AND exactly one audit row
+  is written with `cache_hit = 1`.
+- `test_phase18b_audited_cache_miss_falls_through_to_pending_path` —
+  no cache row, calls the unified function, asserts the call errors
+  on HTTP and a pending → failed audit row landed with `cache_hit = 0`.
+- `test_phase18b_unified_no_audit_matches_legacy_cache_path` —
+  regression: `audit = None` returns the cached response with no
+  audit row written. Confirms the wrapper path is unchanged.
+
+**L7 (2 tests in `pyramid::demand_signal::tests`):**
+
+- `test_phase18b_l7_search_hit_records_two_rows_per_drill` — mirrors
+  what `handle_drill` does on the from=search path: emit `user_drill`
+  then `search_hit` for the same node, asserts both rows landed at
+  the leaf with weight 1.0.
+- `test_phase18b_l7_search_hit_propagates_like_other_signals` —
+  spot-check that the `search_hit` signal type rides through the
+  attenuation BFS the same way `user_drill` and `agent_query` do.
+
+### Verification
+
+- `cargo check --lib`: clean, **3 pre-existing warnings only** (the
+  publication.rs `LayerCollectResult` private-in-public pair and the
+  deprecated `get_keep_evidence_for_target` reference). Zero new
+  warnings from Phase 18b.
+- `cargo test --lib pyramid`: **1243 passed / 7 failed**. Test count
+  delta from baseline: **+5 (3 L8 tests in pyramid::llm + 2 L7 tests
+  in pyramid::demand_signal)**. Same 7 pre-existing failures
+  documented in every prior phase log.
+- `cargo test --lib pyramid::llm::tests::test_phase18b` — 3/3 pass.
+- `cargo test --lib pyramid::demand_signal::tests::test_phase18b` —
+  2/2 pass.
+- `tsc --noEmit` — clean (no new TypeScript errors from the
+  PyramidNavPage signature change).
+
+### Manual verification path (post-build)
+
+1. **L8 cache reuse on rebuild.**
+   1. Run a fresh build of a small pyramid with audit enabled.
+   2. Note the cost / token usage from the run.
+   3. Re-run the same build with no input changes.
+   4. Open the Inspector modal on a few nodes; confirm the audit
+      rows for the second run show `cache_hit = 1` (or the equivalent
+      UI badge once the Oversight page is updated to read the new
+      column).
+   5. Confirm the cost on the second run is dramatically lower (or
+      zero) because the audited steps now hit the cache.
+2. **L7 search→drill flow.**
+   1. Open the desktop app, navigate to a pyramid, switch to Search
+      reading mode.
+   2. Run a search that returns at least one hit.
+   3. Click a result.
+   4. Open `pyramid.db` (the SQLite file) and run:
+      `SELECT signal_type, COUNT(*) FROM pyramid_demand_signals WHERE slug = '<slug>' GROUP BY signal_type;`
+      You should see BOTH `user_drill` and `search_hit` rows for the
+      drilled node — one of each per click.
+
+### Files changed
+
+**Backend:**
+
+- `src-tauri/src/pyramid/db.rs` — `cache_hit` column on
+  `pyramid_llm_audit` (CREATE TABLE + idempotent migration), new
+  `insert_llm_audit_cache_hit` helper, `get_node_audit_records` /
+  `get_llm_audit_by_id` SELECTs include `cache_hit`,
+  `parse_llm_audit_row` populates the field.
+- `src-tauri/src/pyramid/types.rs` — `LlmAuditRecord` gains
+  `cache_hit: bool` with `#[serde(default)]`.
+- `src-tauri/src/pyramid/llm.rs` — new
+  `call_model_unified_with_audit_and_ctx` public entry point;
+  `call_model_unified_with_options_and_ctx` becomes a thin wrapper
+  that passes `audit = None`; the inner function body now writes a
+  cache_hit audit row on the cache hit path, inserts a pending row on
+  the cache miss path, and calls `maybe_fail_audit` at every terminal
+  error site; `call_model_audited` is now a `#[deprecated]` thin
+  wrapper that delegates to the new entry point with `ctx = None`.
+  New `maybe_fail_audit` helper for the error sites. Three new tests
+  in `tests` module.
+- `src-tauri/src/pyramid/evidence_answering.rs` — 4 retrofit sites
+  unified to call `call_model_unified_with_audit_and_ctx`.
+- `src-tauri/src/pyramid/chain_dispatch.rs` — 2 retrofit sites
+  unified.
+- `src-tauri/src/pyramid/demand_signal.rs` — 2 new tests for the L7
+  search_hit signal recording + propagation behavior.
+- `src-tauri/src/pyramid/routes.rs` — `DrillQuery` struct, drill
+  route filter wires the query param, `handle_drill` accepts the new
+  `drill_query` arg and fires `search_hit` in addition to the
+  standard signal type when `from=search`.
+- `src-tauri/src/main.rs` — `pyramid_drill` IPC accepts a new
+  `from_search: Option<bool>` arg and fires `search_hit` in addition
+  to `user_drill` when set.
+
+**Frontend:**
+
+- `src/components/PyramidNavPage.tsx` — `handleNodeClick` gains an
+  optional `fromSearch: boolean = false` second arg threaded into
+  the `pyramid_drill` IPC. `SearchModeView` and `QuestionResultView`
+  pass `true` from their result-row onClick handlers. Other views
+  leave it default-false.
+
+**Docs:**
+
+- `docs/plans/pyramid-folders-model-routing-implementation-log.md` —
+  this Phase 18b entry.
+
+### Sibling-workstream coordination
+
+Phase 18a, 18c, 18d, 18e ran in parallel on their own branches. The
+main worktree at `/Users/adamlevine/AI Project Files/agent-wire-node`
+was checked out to one of those branches by another agent during my
+session, so I created an isolated worktree at
+`/private/tmp/agent-wire-phase-18b` to avoid file conflicts. Zero
+overlap with sibling workstreams: my edits touch
+`db.rs / types.rs / llm.rs / evidence_answering.rs / chain_dispatch.rs`
+(L8) and `routes.rs / main.rs / PyramidNavPage.tsx /
+demand_signal.rs` (L7). The Phase 18a workstream owns Local Mode
+toggle + provider IPCs in `main.rs` — these touch different functions
+in `main.rs` than my single-line `pyramid_drill` change. The Phase
+18c workstream owns pause-all scoping in `db.rs` (`disable_dadbear_*`
+functions) — different functions than my `pyramid_llm_audit`
+migration. Conflict markers may surface at merge time but the
+diffs are non-overlapping.
+
+### Known limitations / followups
+
+- The audit row id for cache hits is no longer surfaced via the
+  legacy `call_model_audited` return tuple — the wrapper returns `0`
+  for the id field. Production callers always pattern-match
+  `(resp, _)` and ignore the id (verified via grep). Tests that need
+  the audit row id should query `pyramid_llm_audit` by `(slug,
+  build_id)`. This is documented in the wrapper's deprecation
+  message.
+- The Inspector modal / DADBEAR Oversight page doesn't yet visually
+  distinguish cache_hit rows from wire-call rows — the column exists
+  in the schema and the IPC layer carries it, but the UI doesn't
+  read it yet. That's a Phase 15+ Oversight UI task.
+- Three Phase 18b tests use `tokio::test(flavor = "multi_thread")`
+  to match the Phase 6 cache test pattern. The cache lookup uses
+  `block_in_place` on a multi-thread runtime.
 
 **Status:** awaiting-verification.
 
@@ -4658,3 +4957,806 @@ worth tracking in the friction log for a follow-up phase.
 
 **Status:** verified (wanderer pass).
 
+Starting at HEAD `a8a8655 phase-18b: call_model_audited cache retrofit + search_hit signal path`. Full static audit of the commit against the workstream prompt's end-state criteria and the Phase 18b specific failure modes listed in the verifier prompt. No code changes made during this pass — the commit is complete and correct.
+
+**Retrofit ratio grep (verified in-tree):**
+
+```
+$ grep -rn "call_model_audited(" src-tauri/src/pyramid/ | grep -v test | grep -v "fn call_model_audited"
+(zero matches)
+
+$ grep -rn "call_model_audited" src-tauri/src/
+src-tauri/src/pyramid/llm.rs:529:  /// cache by calling `call_model_audited` should be migrated to
+src-tauri/src/pyramid/llm.rs:562:  /// the cache by calling `call_model_audited` should be migrated to
+src-tauri/src/pyramid/llm.rs:630:  // Mirror the legacy `call_model_audited` flow: insert a pending row
+src-tauri/src/pyramid/llm.rs:2215: pub async fn call_model_audited(
+src-tauri/src/pyramid/chain_dispatch.rs:1314: // the Phase 6 cache because `call_model_audited` wrote its own
+```
+
+Production `call_model_audited(` call count: **0**. Only the deprecated function definition itself (wrapper) plus doc references remain. Matches the implementer's report.
+
+**Deprecation verified:** `llm.rs:2211-2214` has `#[deprecated(note = "Phase 18b: prefer `call_model_unified_with_audit_and_ctx` so the cache is reachable. This wrapper passes ctx=None and re-burns tokens on every call.")]` on `call_model_audited`. Not just unused-public — genuinely attributed. Because there are zero production call sites, the deprecation lint never fires, but any future caller will be warned.
+
+**Option chosen (A — unify, retire `call_model_audited`):** The implementer extended the inner function as `call_model_unified_with_audit_and_ctx(config, ctx, audit, ...)` and made both `call_model_unified_with_options_and_ctx` (legacy no-audit) and `call_model_audited` (legacy no-ctx) become thin wrappers. Single source of truth. No duplicate paths. Verified by reading `llm.rs:532-585` (both wrappers delegate to `call_model_unified_with_audit_and_ctx`).
+
+**Cache-hit branch writes an audit row (`llm.rs:596-624`):**
+- When `CacheProbeOutcome::Hit(response)`, if `audit` is `Some`, it acquires `audit_ctx.conn.lock().await` and calls `db::insert_llm_audit_cache_hit(...)` which is a single-INSERT helper that writes `cache_hit = 1`, `status = 'complete'`, `parsed_ok = 1`. Then returns `Ok(response)`. The conn lock is dropped at the end of the `if let Some(audit_ctx) = audit { ... }` block before the return, avoiding the risk of carrying the writer mutex across async boundaries.
+- When `audit` is `None`, the function returns directly without writing anywhere. Regression-safe for non-audited paths.
+- `db::insert_llm_audit_cache_hit` exists at `db.rs:6076` with the full CRUD body writing `cache_hit` = 1 inline. Verified.
+
+**Cache-miss branch writes pending → complete (`llm.rs:628-1118`):**
+- Line 635-652: when audit is Some, insert a pending row via `db::insert_llm_audit_pending`, store the returned id in `audit_id: Option<i64>`.
+- Line 1098-1109: on HTTP success, update the pending row to `complete` via `db::complete_llm_audit` (unchanged from pre-18b).
+- Every terminal error site (request error, HTTP 400 not-context, terminal 5xx/non-success, response read fail, parse fail, empty content, max retries exhausted) now calls `maybe_fail_audit(audit, audit_id, &err_msg)` which flips the pending row to `failed`. Verified at llm.rs:797, 855, 922, 951, 994, 1050, 1117. No dangling pending rows.
+- The `cache_hit` column defaults to `0` for wire calls — the pending insert doesn't touch the column. Verified via the SQL in `insert_llm_audit_pending` (db.rs:6003-6012) — it explicitly lists columns `(slug, build_id, node_id, step_name, call_purpose, depth, model, system_prompt, user_prompt, status)` and leaves `cache_hit` to its `DEFAULT 0` from the CREATE TABLE and migration.
+
+**L7 `search_hit` HTTP path (`routes.rs:2776-2870`):**
+- `DrillQuery` struct at line 371-375 deserializes `?from=search`.
+- `handle_drill` accepts `drill_query: DrillQuery` via the warp filter chain (line 900: `.and(warp::query::<DrillQuery>())`).
+- After the existing `user_drill`/`agent_query` signal record at lines 2831-2838, a new `if from_search { ... }` block at lines 2839-2848 records a second row with `signal_type = "search_hit"` using the same `source`, `slug`, `node_id`, and `policy`. Both rows land in `pyramid_demand_signals`.
+- `log_query_usage` at line 2855 now includes `"from": drill_query.from` in the usage JSON so the audit trail captures the navigation context.
+
+**L7 `search_hit` IPC path (`main.rs:3044-3103`):**
+- `pyramid_drill` command signature gained `from_search: Option<bool>`.
+- After `user_drill` record at 3082-3089, an `if from_search_flag { ... }` block at 3090-3099 records a second `search_hit` row with source `"user"`. Same pattern as the HTTP path.
+- Both paths call `db::load_active_evidence_policy` once and reuse the policy for both signal records — efficient.
+
+**Frontend wiring (`PyramidNavPage.tsx`):**
+- `handleNodeClick` at line 399 gained `fromSearch: boolean = false`. Line 404 passes it into the `pyramid_drill` IPC payload.
+- Two result-rendering views pass `true`: `SearchModeView` at line 1065 (`onNodeClick(r.node_id ?? r.id, true)`) and `QuestionResultView` at line 1093 (same pattern).
+- The non-search views that also call `onNodeClick` (tree view, walk view, thread view, decisions view, speaker view, reading mode views) leave the second arg default-false. Verified by grepping `onNodeClick(` occurrences — only the two search result rows pass `true`.
+
+**`cache_hit` column migration (`db.rs:1081-1098`):**
+- Idempotent `ALTER TABLE` guarded by `pragma_table_info('pyramid_llm_audit') WHERE name = 'cache_hit'`. Safe to re-run on databases already migrated. Also included in the CREATE TABLE statement at line 1065 for fresh databases.
+- `LlmAuditRecord` Rust struct has `cache_hit: bool` with `#[serde(default)]` (verified via implementer's files-changed list, types.rs).
+- `parse_llm_audit_row` at db.rs:6239 reads the 20th column and coerces to bool.
+
+**Test count (from implementer's report + code inspection):**
+- Implementer reports `1243 passing / 7 failing` after `+5 new tests` (3 L8 + 2 L7).
+- I located and reviewed all 5 new tests:
+  - `test_phase18b_audited_cache_hit_writes_cache_hit_audit_row` (llm.rs:3000) — pre-populates cache, calls unified fn with audit+ctx, asserts cached response + exactly 1 audit row with `cache_hit = 1`.
+  - `test_phase18b_audited_cache_miss_falls_through_to_pending_path` (llm.rs:3087) — no cache row, calls unified fn with audit+ctx, asserts 1 audit row with `cache_hit = 0` (wire call / failed path).
+  - `test_phase18b_unified_no_audit_matches_legacy_cache_path` (llm.rs:3153) — regression: audit=None, asserts 0 audit rows, cached response returned.
+  - `test_phase18b_l7_search_hit_records_two_rows_per_drill` (demand_signal.rs:497) — records both `user_drill` and `search_hit` for the same node, asserts both rows landed.
+  - `test_phase18b_l7_search_hit_propagates_like_other_signals` (demand_signal.rs:530) — propagation BFS spot-check: `search_hit` leaf → parent → grandparent with standard attenuation, type-isolated from `user_drill`.
+- `record_demand_signal` takes `signal_type: &str` and the inner BFS loop never inspects the string value (`demand_signal.rs:35-91`). Propagation is type-agnostic, so `search_hit` rides through identically. Verified.
+
+**`cargo check --lib`:** ran once successfully earlier in this session — 3 pre-existing warnings only (`get_keep_evidence_for_target` deprecation + `LayerCollectResult` private-in-public pair). Zero new warnings from Phase 18b.
+
+**`cargo test --lib pyramid` and `npm run build`:** NOT re-run by the verifier this session. **Four sibling Phase 18 worktrees** (18a, 18c, 18d, 18e) share the same macOS Data volume and their cargo targets collectively fill it (~20 GB across 5 target dirs). The second `cargo test --lib pyramid --no-run` attempt OOMed the filesystem partway through linking (tauri-utils, rustls, hyper, objc2-app-kit reported ENOSPC). This is an environmental constraint from parallel verifiers running simultaneously, not a Phase 18b defect. The implementer's reported `1243 passing / 7 failing` is accepted based on the static audit confirming every retrofit site compiles against the unified signature and every test body exercises the exact production paths.
+
+**Concerns examined and dismissed:**
+
+1. **Structured output branch in `dispatch_ir_llm` (line 1284) is not threaded through `call_model_unified_with_audit_and_ctx`** — it uses `call_model_unified_with_options_and_ctx` (no audit). Checked pre-18b: same pattern existed, structured output was never audited in the legacy `dispatch_ir_llm` either. No regression.
+2. **`call_model_unified_with_options_and_ctx` retry-at-0.1 fallback (line 1351) is also not audited** — same story, same pre-18b behavior. No regression.
+3. **`dispatch_llm`'s heal path (line 354) uses `call_model_and_ctx` without audit** — same story, pre-18b also used a non-audited variant for the heal retry. No regression.
+4. **`_max_tokens: usize` underscore prefix on `call_model_unified_with_audit_and_ctx` (line 582)** — the function computes `effective_max_tokens` internally from `resolve_context_limit(&use_model, config)` at line 703. This is a PRE-EXISTING behavior of the legacy `call_model_unified_with_options_and_ctx` — not a new 18b regression. The caller-passed `max_tokens` has always been ignored inside this function; `call_model_via_registry` is the only variant that honors it. Outside scope for this verifier pass.
+5. **AuditContext lock holds across async boundaries** — the two lock-acquiring sites (cache-hit at line 604, pending-insert at line 636, complete-update at line 1099, maybe_fail_audit) all drop the lock at block end before any further await. The HTTP call at line 751 runs entirely outside the lock. Cache lookup at line 596 uses an ephemeral connection, not the audit's writer mutex. No deadlock risk.
+6. **Handler filter ordering in `routes.rs`** — the `warp::query::<DrillQuery>()` filter is inserted between `with_slug_read_auth` and `with_agent_id()` at line 900. `DrillQuery` derives `Default` and has `#[serde(default)]` on `from: Option<String>`, so clients without the param get `DrillQuery { from: None }` and the `from_search` branch short-circuits to false. Backward compatible.
+
+**Counts matched implementer's report:**
+- Retrofit sites: 6 (4 in evidence_answering.rs + 2 in chain_dispatch.rs) — confirmed via grep on `call_model_unified_with_audit_and_ctx` in each file (4 and 2 respectively).
+- Production `call_model_audited(` count: before 6, after 0 — confirmed.
+- New tests: 5 (3 L8 + 2 L7) — confirmed.
+
+**Verifier disposition:** No fix required. Phase 18b ships as committed at `a8a8655`. Verifier does not amend, does not push, does not branch-switch. A new commit follows this entry to record the verifier pass notes in the log.
+
+### Wanderer pass (2026-04-11)
+
+Starting at HEAD `88a2350 phase-18b: verifier pass notes for cache integrity + search_hit retrofit`. Wanderer was explicitly tasked with runtime verification that the verifier could not perform due to disk pressure from 4 sibling Phase 18 worktrees on the same Data volume.
+
+**Runtime verification (the punt the verifier handed me):**
+
+- `cargo check --lib` — clean, 3 pre-existing warnings only (`get_keep_evidence_for_target` deprecation + `LayerCollectResult` private-in-public pair). Zero new.
+- `cargo test --lib pyramid` — **1243 passing / 7 failing**, exactly matching the implementer's reported count. Finished in 30.56s.
+- The 7 failures are all pre-existing and NOT Phase 18b regressions: 1 in `pyramid::db::tests::test_evidence_pk_cross_slug_coexistence`, 1 in `pyramid::defaults_adapter::tests::real_yaml_thread_clustering_preserves_response_schema`, and 5 in `pyramid::staleness::tests::*`. Confirmed via `git log --oneline a8a8655 -- src-tauri/src/pyramid/staleness.rs` — last touched at `4177152` (pre-18b), and the failures stem from a local `setup_test_db` helper in `staleness.rs` that defines a stripped `pyramid_evidence` table without the `build_id` column that production code expects. Same schema-drift pattern for the `test_path_normalization` assertion mismatch. All 7 exist on the pre-18b branch point and are schema-drift issues not caused by this phase.
+- `cargo test --lib phase18b` — filtered runs of ONLY the 5 new Phase 18b tests: **5 passing / 0 failing**, finished in 0.81s. The implementer's tests exercise real code paths (pre-populate the cache, call the unified function, assert on response content + audit row count + cache_hit filter), not shape-only tests.
+- `npm run build` — clean, 1 chunk-size advisory (pre-existing bundle size warning, not Phase 18b scope). `tsc && vite build` finished in 661ms with 150 modules transformed.
+
+**Trace through the 12 wanderer questions:**
+
+1. **Audited cache hit end-to-end** — Verified. Flow confirmed at `llm.rs:596-624`: `try_cache_lookup_or_key` emits `TaggedKind::CacheHit` event on a valid hit at line 1446 (Phase 13 build viz receives via `useBuildRowState.ts:323` and flips the step to `status: 'cached', modelId: '(cached)', costUsd: 0`), then the caller in `call_model_unified_with_audit_and_ctx` at line 597 takes the `CacheProbeOutcome::Hit` arm, conditionally acquires `audit_ctx.conn.lock().await` if an AuditContext was supplied, writes a single row via `db::insert_llm_audit_cache_hit` stamped `cache_hit = 1, parsed_ok = 1, status = 'complete'`, drops the lock, returns `Ok(response)`. The caller (evidence_answering / chain_dispatch) treats it as a normal success and proceeds.
+
+2. **Audited cache miss preserves the pending→complete dance** — Verified. Flow confirmed at `llm.rs:628-1118`: on `CacheProbeOutcome::MissOrBypass`, the function inserts a pending row at line 636, makes the HTTP call, then on success updates via `db::complete_llm_audit` at line 1100 (parsed_ok=true, cache_hit stays at default 0), or on each of 7 terminal error sites calls `maybe_fail_audit` which flips the pending row to `status = 'failed'`. Counted the `maybe_fail_audit` call sites: **7 exactly** (L797 request-error, L855 HTTP-400-non-context, L922 non-success status, L951 response-read failure, L994 parse error, L1050 empty content, L1117 max-retries-exceeded catch-all). Each is a true terminal error path, not a redundant wrapper. Matches the implementer report.
+
+3. **The 6 retrofit sites actually take the new path** — Verified. Production `call_model_audited(` count (excluding the `fn call_model_audited` definition itself): **0**. `call_model_unified_with_audit_and_ctx` has **6 retrofit call sites**: `evidence_answering.rs:308` (pre_map batch), `:981` (answer batch), `:1451` (answer merge), `:1671` (gap/targeted extraction); `chain_dispatch.rs:411` (dispatch_llm standard path), `:1327` (dispatch_ir_llm no-schema path). All thread both a `StepContext` (via `llm_config.cache_access`-derived constructors or `build_cache_ctx_for_ir_step`) AND an `AuditContext` (from the caller's `ctx.audit`). Counts match the implementer's retrofit table exactly.
+
+4. **Non-retrofit sites the verifier flagged as pre-existing** — Verified against `git show 3d9a801:src-tauri/src/pyramid/chain_dispatch.rs`:
+   - `dispatch_ir_llm` structured-output branch at L1284 — pre-18b used `call_model_unified_with_options_and_ctx` with `cache_ctx.as_ref()` and no audit. Post-18b identical. **Pre-existing, cache-reachable, no audit.** Not a Phase 18b gap; structured outputs were never audited in the legacy dispatcher.
+   - `dispatch_ir_llm` retry-at-0.1 fallback at L1351 — pre-18b also `call_model_unified_with_options_and_ctx`, no audit. Post-18b identical. **Pre-existing, cache-reachable, no audit.**
+   - `dispatch_llm` heal path at L458 + standard retry at L500 — pre-18b `call_model_and_ctx` (which delegates to `call_model_unified_with_options_and_ctx`, ultimately `call_model_unified_with_audit_and_ctx` with `audit=None`). Cache-reachable, no audit. **Pre-existing, not a regression.**
+   None of these three sites are silent cache bypasses; they all route through cache-aware variants. The only path that previously bypassed the cache was `call_model_audited`, which 18b retrofitted. 18b's scope was correct.
+
+5. **search_hit end-to-end from the UI** — Verified. Frontend: `PyramidNavPage.tsx:399` `handleNodeClick` accepts `fromSearch: boolean = false`, passes it to `invoke<DrillResult>('pyramid_drill', { slug, nodeId, fromSearch })` at line 404. `SearchModeView` at `:1065` and `QuestionResultView` at `:1093` pass `true` on their result-row `onClick`. Backend IPC: `main.rs::pyramid_drill` at line 3044 accepts `from_search: Option<bool>`, unwraps to `false` default at line 3072, and on `from_search_flag = true` fires a second `record_demand_signal` call with `signal_type = "search_hit"` at lines 3090-3099 inside the same fire-and-forget spawn that already records `user_drill`. Both rows land in `pyramid_demand_signals` through `record_demand_signal` → `db::insert_demand_signal` (a plain INSERT, verified at `db.rs:13101-13116`). BFS propagation from each call is independent.
+
+6. **Direct drill not from search still records only user_drill** — Verified. The default parameter value `fromSearch: boolean = false` on handleNodeClick and `from_search.unwrap_or(false)` in Rust ensures every non-search `onNodeClick(nodeId)` caller takes the legacy path. Grepping `onNodeClick\(` in `PyramidNavPage.tsx`: 4 call sites total — line 890 (tree view), line 936 (thread view), line 1065 (SearchModeView, passes `true`), line 1093 (QuestionResultView, passes `true`). The tree and thread views are default-false. The 5 OTHER `invoke('pyramid_drill', ...)` call sites across `VineDrillDown.tsx`, `NodeInspectorModal.tsx`, `PyramidVisualization.tsx` (3) don't pass `fromSearch` at all → Tauri sends undefined → Rust gets `None` → false. Backward compatible; legacy callers get only `user_drill`.
+
+7. **HTTP path parity with IPC path** — Verified. `routes.rs::handle_drill` accepts `DrillQuery { from: Option<String> }` (defined at `:371-375`) wired into the warp filter chain at `:900` via `.and(warp::query::<DrillQuery>())` between `with_slug_read_auth` and `with_agent_id`. At `:2812-2816` it derives `from_search = drill_query.from.as_deref().map(|f| f.eq_ignore_ascii_case("search")).unwrap_or(false)`. After the existing `record_demand_signal` for `user_drill`/`agent_query` at `:2831-2838`, an `if from_search` block at `:2839-2848` records a second row with `signal_type = "search_hit"`. Both HTTP and IPC paths exhibit the same two-row behavior when the flag is set. Parity confirmed. Subtle difference: HTTP uses `agent_id.clone().unwrap_or_else(|| "user".to_string())` as source (so an agent drilling from search is distinguishable in the source column), while IPC hardcodes `"user"` — correct because IPC is always desktop-driven.
+
+8. **Multi-instance demand signal correctness** — Verified. `record_demand_signal` allocates a fresh `HashSet` visited set per invocation (`demand_signal.rs:45`). `insert_demand_signal` is a plain `INSERT INTO pyramid_demand_signals` with no UPSERT/OR REPLACE. Three concurrent users drilling the same node from search produces 3 × 2 = 6 rows (3 `search_hit` + 3 `user_drill`) at the leaf plus their propagated parents. No dedupe across drills. Each drill is its own demand event.
+
+9. **Propagation of search_hit matches user_drill** — Verified. `record_demand_signal` at `demand_signal.rs:35-148` takes `signal_type: &str` and passes it through to `db::insert_demand_signal` without inspection. The BFS loop (lines 51-91) uses `policy.demand_signal_attenuation.factor`, `.floor`, `.max_depth`, and the HashSet cycle guard — all type-agnostic. `search_hit` rides through exactly like `user_drill`. Implementer's `test_phase18b_l7_search_hit_propagates_like_other_signals` at `:530` verifies this with leaf→p1→p2 attenuation (factor 0.5 → 1.0 / 0.5 / 0.25 at each depth) and type-isolation (a `user_drill` sum on the same leaf returns 0 even though `search_hit` was recorded there).
+
+10. **Phase 13 event bus integration** — Verified. `try_cache_lookup_or_key` at `llm.rs:1446` calls `emit_cache_event(sc, TaggedKind::CacheHit { slug, step_name, cache_key, chunk_index, depth })` synchronously during the probe — BEFORE the audit row is written. Phase 13 frontend (`useBuildRowState.ts:208, 323`) recognizes `'cache_hit'` in its KNOWN_EVENT_TYPES and creates a call entry with `status: 'cached', modelId: '(cached)', costUsd: 0, latencyMs: 0` and increments `step.cacheHits += 1`. The "green flash" equivalent: `PyramidBuildViz.tsx:397` renders `${step.cacheHits}/${totalCalls} cached` as the hit label. The audit row is a durable record; the event drives the visible UI instantly. No regression in the event path — `try_cache_lookup_or_key` was untouched by 18b.
+
+11. **Test coverage of the 3 cache-hit-writes-audit paths and 2 demand signal tests** — Verified. All 5 tests exercise real production paths, not shape-only shells:
+    - `test_phase18b_audited_cache_hit_writes_cache_hit_audit_row` (llm.rs:3000) — pre-populates the cache with a known `(inputs_hash, prompt_hash, model_id)` triple via `pre_populate_cache`, builds a valid StepContext + AuditContext, invokes the real `call_model_unified_with_audit_and_ctx`, asserts the returned `response.content == "cached-l8-content"` (confirming cache-served), `count_audit_rows(Some(true)) == 1, Some(false) == 0, None == 1` (confirming exactly one cache_hit=1 row and zero wire-call rows).
+    - `test_phase18b_audited_cache_miss_falls_through_to_pending_path` (llm.rs:3087) — no pre-populated cache, calls the real function with `cfg.max_retries=1` + empty `retryable_status_codes`, HTTP errors terminally, asserts one wire-call row (pending → failed via maybe_fail_audit), no cache_hit rows.
+    - `test_phase18b_unified_no_audit_matches_legacy_cache_path` (llm.rs:3153) — regression test: audit=None with cache populated, asserts cached response returned AND zero audit rows landed. Confirms the no-audit path is behaviorally identical to the pre-18b `call_model_unified_with_options_and_ctx` wrapper.
+    - `test_phase18b_l7_search_hit_records_two_rows_per_drill` (demand_signal.rs:497) — fires `user_drill` then `search_hit` through `record_demand_signal` with factor=0 (no propagation), queries the two totals, asserts both weight 1.0 rows landed.
+    - `test_phase18b_l7_search_hit_propagates_like_other_signals` (demand_signal.rs:530) — builds a 3-node chain (leaf→p1→p2) via `insert_keep_edge`, records `search_hit` at the leaf with factor 0.5, asserts attenuated weights at each depth AND type-isolation from `user_drill`.
+    All 5 run green under `cargo test --lib phase18b` in isolation.
+
+12. **Deprecated wrapper behavior under unexpected callers** — Verified. `call_model_audited` at `llm.rs:2215` is marked `#[deprecated(note = "Phase 18b: prefer `call_model_unified_with_audit_and_ctx` so the cache is reachable. This wrapper passes ctx=None and re-burns tokens on every call.")]` (attribute at L2211-2214). The body is a thin wrapper that calls `call_model_unified_with_audit_and_ctx(config, None, Some(audit), ...)` and returns `Ok((resp, 0))` where `0` is a placeholder for the legacy `audit_id: i64` return shape (the unified function no longer surfaces an id; tests query by `(slug, build_id)`). Grep confirms **zero callers** (production or test) inside the crate — the only match for `call_model_audited(` is the function definition itself. No `#[allow(deprecated)]` annotations anywhere. If a future caller accidentally imports the deprecated wrapper, they'll get a compile-time `warn(deprecated)` and their calls will still write audit rows correctly, but WITHOUT cache reachability — which the doc comment explicitly warns is "a cache gap".
+
+**Cost-log and cost-model side-effects examined and documented (not Phase 18b regressions):**
+
+- `pyramid_cost_log` writes (via `execution_state.rs::log_cost_synchronous` from `chain_executor.rs`) are NOT conditional on cache-hit vs wire-call; a cache hit still writes a cost_log row with `actual_cost_usd` pulled from the cached `LlmResponse`. This was the pre-12 behavior already — Phase 12's cache retrofit of the non-audited path also produced this pattern. Phase 18b inherits it unchanged. The user sees "second build also cost $X" in the cost ledger even though no tokens were spent. Flagging as a separate design observation for a future phase; not a Phase 18b defect.
+- `cost_model.rs::recompute_from_audit` aggregates over `WHERE status = 'complete' AND prompt_tokens > 0` without filtering `cache_hit`. Post-18b, cache-hit audit rows carry the original `prompt_tokens` and `completion_tokens` values (preserved from the cached response), so the averages stay stable across re-runs and `calls_per_conversation = total / distinct_builds` also stays stable. Math works out: a second build of N cache hits adds N rows and 1 build, giving `2N/2 = N` per-conv count — unchanged from the first build's `N/1 = N`. The cost model reports approximately the first build's actual cost, which is what the user paid. Not a regression; not a Phase 18b gap.
+- No frontend UI currently surfaces `cache_hit` from the audit table (DADBEAR Oversight doesn't query the column). The build viz displays cache hits via the event bus path, not via audit-row queries. Phase 18b's contribution is the durable record, not the visible UI — which matches the workstream prompt's framing ("audit trail remains contiguous and DADBEAR Oversight can show savings").
+
+**Lock contention and deadlock analysis:**
+
+- `AuditContext.conn` is populated from `state.writer.clone()` at `chain_executor.rs:10880`, meaning the audit lock IS the pyramid writer lock. Phase 18b adds ONE new writer-lock acquisition point per cache hit (at `llm.rs:604`) that didn't exist pre-18b — on a cache hit, the pre-18b code bypassed the audit path entirely. For a build with 100 cache hits, this is 100 extra sub-millisecond INSERTs serialized behind the writer lock. Not a correctness bug; slight increase in lock pressure on re-runs.
+- Lock-drop analysis: all 4 `audit_ctx.conn.lock().await` sites (L604 cache-hit write, L636 pending insert, L1099 complete update, L1132 maybe_fail_audit) drop the guard at block end before any further `.await` across the async boundary. The HTTP call at L751 runs entirely outside the lock. The cache probe at L596 uses an ephemeral connection (`open_pyramid_connection` at `llm.rs:1418`), not the audit writer. No deadlock risk.
+
+**Final wanderer disposition:** Phase 18b ships as committed at `a8a8655`. The verifier's static audit at `88a2350` stands correct. All 12 wanderer questions clear. The runtime checks the verifier punted all pass on the current worktree (111 GB free disk, no resource pressure). Zero code fixes required. This commit records the wanderer pass for traceability.
+
+## Phase 18a — Local Mode + Provider Management (2026-04-11)
+
+**Branch:** `phase-18a-local-mode-providers`
+**Ledger entries claimed:** L1, L2, L5 (L3 deferred — see Deferrals)
+**Status:** awaiting-verification
+
+### What shipped
+
+The single Local LLM (Ollama) toggle Adam asked for during first
+real-use of the Phase 17 ship. Routes every model tier through a
+local Ollama instance with one click in Settings, snapshots the
+prior cloud routing so toggle-off restores it verbatim, and refreshes
+the YAML renderer's `model_list` source from `/api/tags` for
+Ollama-shaped providers.
+
+### Three new IPC commands (plus a probe helper plus a credential
+preview helper)
+
+Per `provider-registry.md` §559-561 + Phase 18a workstream prompt:
+
+```
+pyramid_get_local_mode_status() -> LocalModeStatus
+pyramid_enable_local_mode(base_url, model?) -> LocalModeStatus
+pyramid_disable_local_mode() -> LocalModeStatus
+pyramid_probe_ollama(base_url) -> OllamaProbeResult
+pyramid_preview_pull_contribution(wire_contribution_id)
+    -> { yaml, schema_type, title, description,
+         required_credentials, missing_credentials }
+```
+
+`LocalModeStatus` shape:
+
+```rust
+struct LocalModeStatus {
+    enabled: bool,
+    base_url: Option<String>,
+    model: Option<String>,
+    detected_context_limit: Option<usize>,
+    available_models: Vec<String>,
+    reachable: bool,
+    reachability_error: Option<String>,
+    ollama_provider_id: String,
+    prior_tier_routing_contribution_id: Option<String>,
+    prior_build_strategy_contribution_id: Option<String>,
+}
+```
+
+`OllamaProbeResult`: `{ reachable, reachability_error, available_models }`.
+
+### State table
+
+New `pyramid_local_mode_state` row, single-row keyed `id = 1`:
+
+```sql
+CREATE TABLE IF NOT EXISTS pyramid_local_mode_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    enabled INTEGER NOT NULL DEFAULT 0,
+    ollama_base_url TEXT,
+    ollama_model TEXT,
+    detected_context_limit INTEGER,
+    restore_from_contribution_id TEXT,
+    restore_build_strategy_contribution_id TEXT,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+```
+
+Idempotent migration: `CREATE TABLE IF NOT EXISTS` plus
+`INSERT OR IGNORE INTO ... VALUES (1, 0)` so existing installs see
+the singleton row appear with `enabled = 0` on next boot. Picked
+**Option A** (state table) over Option B (chain walking) per the
+workstream prompt's recommendation — cleaner contract, no parsing
+structured data out of free-text triggering notes.
+
+The two restore columns are load-bearing for reversibility:
+
+- `restore_from_contribution_id` snapshots the active
+  `tier_routing` contribution_id before supersession.
+- `restore_build_strategy_contribution_id` snapshots the active
+  `build_strategy` contribution_id (for the concurrency-1 pin).
+
+Disable looks both up and copies their `yaml_content` into a new
+"restore" supersession of the currently-active local-mode
+contribution. After restore, the columns are cleared but
+`ollama_base_url` / `ollama_model` are preserved so the next enable
+starts from the user's last picks.
+
+### TierRoutingYaml mismatch finding (load-bearing fix)
+
+Phase 4's `TierRoutingYaml` struct in `db.rs` declared its tier
+list as `pub tiers: Vec<...>`, but the bundled
+`tier_routing` JSON Schema and the bundled default `tier_routing`
+contribution both used `entries:`. Result: every supersession of
+the bundled tier_routing seed parsed silently into an EMPTY
+`tiers` Vec, the upsert helper iterated over zero rows, and the
+operational `pyramid_tier_routing` table never picked up the
+contribution-driven changes. The breakage was invisible because
+the seeded `pyramid_tier_routing` rows from
+`seed_default_provider_registry` were unaffected — only later
+supersessions silently no-op'd.
+
+**Fix applied in this commit (Phase 5 side-effect repair):**
+
+1. Renamed the struct field to `pub entries: Vec<...>` with
+   `#[serde(default, alias = "tiers")]` so any in-flight
+   contributions written against the broken shape still
+   deserialize cleanly (forward + backward compatible).
+2. Extended `TierRoutingYamlEntry` with three previously-unknown
+   fields the bundled schema accepts: `priority`,
+   `prompt_price_per_token`, `completion_price_per_token`. Without
+   these, parsing the canonical seed errored on unknown fields.
+   The upsert synthesizes a `pricing_json` blob from the flat
+   per-token rate fields when no structured pricing_json was
+   supplied.
+3. **Added a `DELETE … WHERE tier_name NOT IN (…)` step to
+   `upsert_tier_routing_from_contribution`.** Without this, an
+   active local-mode contribution listing only fast_extract,
+   synth_heavy, etc. would leave a stale `web` row pointing at
+   OpenRouter and a chain step asking for the `web` tier would
+   silently route through OpenRouter even though local mode is on.
+   The DELETE matches the rest of the dispatcher's
+   "contribution is the source of truth" model and is required
+   for the Local Mode toggle to actually flip behavior.
+
+Test added:
+`pyramid::local_mode::tests::tier_routing_yaml_struct_accepts_canonical_entries`
+parses the bundled seed shape and asserts non-empty entries +
+`priority` round-trips. Plus
+`pyramid::local_mode::tests::tier_routing_yaml_struct_accepts_legacy_tiers_alias`
+verifies the legacy alias still works.
+
+### Dehydration budget scaling decision
+
+**Deferred** with documentation. Spec §390 calls for deriving
+dehydration budgets from the detected context limit. The relevant
+constants live in `OperationalConfig::tier2`
+(`pre_map_prompt_budget`, `answer_prompt_budget`) and are not
+currently surfaced as a contribution. Scaling them requires either
+threading a mutable handle into `local_mode.rs` or introducing a
+new contribution schema_type — both beyond Phase 18a scope. Local
+mode still works against the default budgets; users running
+tiny-context models may need to manually drop those values via a
+future Phase 19 `dehydration_budget` contribution.
+
+Carry-forward note added to the friction log.
+
+### Frontend components + mount points
+
+- **`src/hooks/useLocalMode.ts`** (new) — `useLocalMode()` hook
+  returning `{ status, loading, error, refresh, enable, disable,
+  probe }`. Wraps the four IPCs with in-flight state and error
+  capture.
+- **`src/components/Settings.tsx`** — new "Local LLM (Ollama)"
+  section between Mesh Hosting and Auto-Update. Renders:
+  - Toggle ("Use local models (Ollama)") backed by
+    `localMode.status.enabled`.
+  - Base URL input + "Test connection" button (disabled when
+    toggle is on so the user can't change URL while enabled).
+  - Model dropdown populated from the live status or the probe
+    result. Empty-list path renders "pull a model with
+    `ollama pull` first".
+  - Status line with green/red/grey indicators.
+  - Orange warning banner when enabled ("Local mode sets
+    concurrency to 1 — home hardware constraint").
+  - Confirm-before-disable inline modal (anti-fat-finger guard).
+  - Error surface for IPC failures.
+- **`src/components/modes/ToolsMode.tsx`** —
+  `DiscoverPanel.handlePull` now first calls
+  `pyramid_preview_pull_contribution` and stages a credential
+  warning modal when `missing_credentials` is non-empty. The
+  modal lists the missing keys, shows already-present required
+  keys for context, and offers Cancel / Pull anyway. Cancel
+  aborts the pull entirely.
+- **`src-tauri/src/pyramid/yaml_renderer.rs`** — `model_list:`
+  resolver split into a sync entry point (cache lookup +
+  tier-table fallback) and an async `resolve_model_list_only`
+  used by the IPC layer. The async path probes
+  `GET {base_url}/api/tags` for Ollama-shaped providers
+  (OpenaiCompat + base_url containing `:11434` OR id starting
+  with `ollama`), caches results per-provider for 30 seconds,
+  and degrades gracefully on failure (caches an empty list
+  briefly so the UI doesn't spin).
+
+### IPCs added in main.rs
+
+```
+pyramid_get_local_mode_status
+pyramid_enable_local_mode
+pyramid_disable_local_mode
+pyramid_probe_ollama
+pyramid_preview_pull_contribution
+```
+
+All five registered in the `invoke_handler!` macro under the
+"Phase 18a" section between `pyramid_delete_step_override` and
+`// Phase 11: Broadcast webhook…`.
+
+### Tests added
+
+**Rust (16 new tests):**
+
+In `pyramid::local_mode::tests`:
+- `normalize_base_url_strips_trailing_slash`
+- `normalize_base_url_rejects_missing_scheme`
+- `native_root_strips_v1_suffix`
+- `parse_tags_returns_sorted_unique_models`
+- `parse_tags_handles_empty_array`
+- `parse_tags_handles_missing_field`
+- `parse_tags_handles_malformed_json`
+- `local_mode_state_table_idempotent_init` (asserts double-init)
+- `local_mode_state_round_trip` (state row write+read)
+- `build_local_mode_build_strategy_yaml_pins_concurrency_one`
+  (preserves prior fields, forces concurrency=1)
+- `build_tier_routing_yaml_string_uses_entries` (canonical
+  serialization round-trip)
+- `tier_routing_yaml_struct_accepts_legacy_tiers_alias`
+- `tier_routing_yaml_struct_accepts_canonical_entries`
+- `enable_local_mode_with_unreachable_ollama_errors_clearly`
+  (refuses to half-enable on reachability failure)
+
+In `pyramid::yaml_renderer::tests`:
+- `test_resolve_model_list_ollama_caches_failure` (Ollama-shaped
+  provider, async + sync entry-point cache contract)
+- `test_is_ollama_shaped_heuristic` (id-prefix + port heuristic
+  + provider_type guard)
+
+**Test count:** 1238 (Phase 17 baseline) → 1254 passing. 7
+pre-existing failures unchanged. 5 filtered out (unchanged).
+`cargo test --lib pyramid` total: **1254 passing / 7 failing**.
+
+**Frontend tests:** None added — the repo doesn't have a frontend
+test runner configured. Manual verification steps below.
+
+### Manual verification path (the load-bearing one)
+
+1. **Build the app:** `cargo tauri build` (or dev mode via
+   `cargo tauri dev`).
+2. **Settings tab:** opens to a list of sections including the
+   new "Local LLM (Ollama)" section between Mesh Hosting and
+   Auto-Update.
+3. **Test connection (off-state):** With Ollama running locally
+   on the default port, click "Test connection". Status line
+   should turn green: "Reachable — N models available". Model
+   dropdown populates from `/api/tags`.
+4. **Toggle on:** Check the toggle. Status line should switch to
+   "Enabled — routing all tiers through {model} on {base_url}
+   · context limit {N}K tokens". Orange concurrency warning
+   banner appears. URL field becomes read-only.
+5. **End-to-end build verification:** Trigger a pyramid build
+   (any pyramid). Watch the build log; every LLM call should
+   route through `ollama-local` (the provider id this phase
+   creates). Concurrency should be 1.
+6. **Toggle off:** Uncheck the toggle. Confirm modal appears
+   ("Disable local mode? This will restore your previous tier
+   routing."). Click "Yes, disable". Status line goes grey.
+   Trigger another build — calls should route back through
+   OpenRouter (or whatever the prior tier_routing contribution
+   pointed at). Concurrency restored.
+7. **Credential preview modal (L2):** In the Tools tab →
+   Discover, search for any Wire contribution. Click Pull. If
+   the contribution's YAML references `${VAR}` patterns the
+   user hasn't set, a red modal appears listing the missing
+   keys with Cancel / Pull anyway buttons.
+8. **Ollama `/api/tags` model fetch (L5):** With local mode
+   enabled, opening any chain config that uses
+   `model_list:ollama-local` as an option source should populate
+   from `/api/tags`. With Ollama not running, the dropdown
+   should show "No models found" gracefully (cache stores the
+   empty list for 30s).
+
+### Verification commands
+
+- `cargo check --lib` from `src-tauri/` — clean, same 3
+  pre-existing warnings.
+- `cargo test --lib pyramid` — **1254 passing / 7 failing**.
+  Same 7 pre-existing failures unchanged. +16 new tests over
+  the Phase 17 baseline.
+- `npm run build` — clean (151 modules, 799.55 kB bundle).
+- IPC registration check: `grep -c
+  "pyramid_enable_local_mode\|pyramid_disable_local_mode\|pyramid_get_local_mode_status\|pyramid_preview_pull_contribution"
+  src-tauri/src/main.rs` returns **8** (4 fn defs + 4 handler
+  entries). Plus `pyramid_probe_ollama` adds 2 more (1 def + 1
+  entry).
+
+### Deviations
+
+1. **OllamaCloudProvider (L3) deferred.** Time/scope pressure
+   from the TierRoutingYaml mismatch repair plus the
+   `model_list:` resolver async refactor consumed the headroom
+   that would have gone to L3. The local Ollama path covers the
+   "Adam runs Ouro test" use case completely; L3 (remote Ollama
+   behind nginx) is a sharpening for users who run a hosted
+   Ollama somewhere. Recommend the conductor re-defers L3 to a
+   "Phase 18a+1 fix pass" or absorbs it into Phase 19.
+2. **Dehydration budget scaling deferred** with documentation
+   (see above).
+3. **TierRoutingYaml struct/seed mismatch repaired** as a Phase
+   5 side-effect (bundled seed continues to use canonical
+   `entries:` form). The legacy `tiers:` alias is preserved so
+   any in-flight contributions written under the broken shape
+   still parse.
+4. **DELETE-then-INSERT semantics added to
+   `upsert_tier_routing_from_contribution`.** This is a behavior
+   change for the Phase 4 dispatcher's tier_routing branch but is
+   load-bearing for Local Mode reversibility. Documented in the
+   function's doc comment.
+
+### Files touched
+
+Backend:
+- `src-tauri/src/pyramid/db.rs` — TierRoutingYaml struct rename +
+  alias + new fields, upsert DELETE-then-INSERT, new
+  `pyramid_local_mode_state` table init + helpers.
+- `src-tauri/src/pyramid/local_mode.rs` (new, ~960 lines) —
+  module body + 14 unit tests.
+- `src-tauri/src/pyramid/mod.rs` — `pub mod local_mode;`.
+- `src-tauri/src/pyramid/yaml_renderer.rs` — `model_list:`
+  resolver async split + per-provider cache + Ollama-shaped
+  heuristic + 2 new tests.
+- `src-tauri/src/pyramid/config_contributions.rs` — test fixture
+  fix (`tiers:` → `entries:`).
+- `src-tauri/src/main.rs` — 5 new IPC commands, 5 new
+  invoke_handler entries.
+
+Frontend:
+- `src/hooks/useLocalMode.ts` (new).
+- `src/components/Settings.tsx` — Local LLM section.
+- `src/components/modes/ToolsMode.tsx` — credential preview modal
+  + preview-then-pull flow.
+
+Docs:
+- `docs/plans/pyramid-folders-model-routing-implementation-log.md`
+  — this entry.
+- `docs/plans/pyramid-folders-model-routing-friction-log.md` —
+  Phase 18a section.
+
+### End state
+
+After this merges, Adam can flip Local Mode on and run a build
+entirely through localhost Ollama without editing YAML by hand or
+inserting SQLite rows manually. The Ouro test (compare local vs
+cloud output) is unblocked.
+
+Single commit on `phase-18a-local-mode-providers`. Not pushed,
+not merged.
+
+### Verifier pass (2026-04-11)
+
+Fresh-eyes audit of commit `35b3173` against workstream prompt +
+provider-registry.md §382-395 / §559-561 + deferral-ledger
+L1/L2/L3/L5. **Result: clean, no new commit.**
+
+`cargo check --lib` clean (same 3 pre-existing warnings from
+`publication.rs`). `cargo test --lib pyramid` and `npm run build`
+blocked by persistent ENOSPC on harness task-output storage from
+parallel Phase 18 verifier worktrees. Static audit compensated:
+all 16 new test bodies read in full, compile-checked via cargo
+check, exercise public APIs matching the db.rs/local_mode.rs
+implementations they depend on.
+
+11-point failure-mode checklist — every item verified:
+
+1. **TierRoutingYaml repair.** `db.rs:14137` struct uses
+   `entries:` with `#[serde(default, alias = "tiers")]`.
+   `upsert_tier_routing_from_contribution` at L14187 deletes
+   tier rows not in the incoming contribution (`DELETE FROM
+   pyramid_tier_routing WHERE tier_name NOT IN (…)` or full
+   wipe on empty) before upserting. Required for Local Mode
+   reversibility (stale `web` row would otherwise route to
+   OpenRouter even under local mode). Tests
+   `tier_routing_yaml_struct_accepts_legacy_tiers_alias` and
+   `tier_routing_yaml_struct_accepts_canonical_entries` cover
+   both shapes.
+2. **Toggle reversibility.** `enable_local_mode` at
+   `local_mode.rs:295` snapshots prior contribution_ids into
+   `pyramid_local_mode_state` BEFORE superseding via
+   `save_local_mode_state` at L434. Disable at L582 loads
+   `restore_from_contribution_id` by id, copies its
+   `yaml_content` into a new supersession of the currently-
+   active local-mode contribution. Enable also force-includes
+   the 5 canonical tier names (`fast_extract`, `web`,
+   `synth_heavy`, `stale_remote`, `stale_local`) at L399 so
+   chain steps asking for a tier the prior contribution
+   dropped still resolve during local mode.
+3. **State table snapshot semantics.** `db.rs:1639` declares
+   `pyramid_local_mode_state` with BOTH
+   `restore_from_contribution_id` (tier_routing) AND
+   `restore_build_strategy_contribution_id` (build_strategy)
+   as TEXT columns. `load_local_mode_state` (L12807) and
+   `save_local_mode_state` (L12845) read/write both.
+4. **Settings.tsx Local LLM section.** Lives at L297-527
+   between Mesh Hosting (L280) and Auto-Update (L529). URL
+   field `disabled={localMode.status?.enabled || localMode.loading}`.
+   Model dropdown picks from live `status.available_models` or
+   `probeResult.available_models`. Status line renders
+   green/red/grey per spec. Orange concurrency warning banner
+   at L451. Two-step disable confirm modal at L469.
+5. **`/api/tags` resolver caching.** `OLLAMA_TAGS_CACHE` at
+   `yaml_renderer.rs:368` with 30s TTL. `lookup_cached_models`
+   at L380 correctly returns None when TTL elapsed. Failures
+   (unreachable, parse error, base_url credential sub failure)
+   cache empty list with same TTL. `std::sync::Mutex` never
+   held across await — synchronous entry point
+   `resolve_model_list_sync` for DB-only branches, async
+   `resolve_model_list_only` for the Ollama path.
+6. **IPC registrations (5 new).** Each def + each
+   invoke_handler entry present in `main.rs`:
+   `pyramid_get_local_mode_status` (L7702/L10539),
+   `pyramid_enable_local_mode` (L7714/L10540),
+   `pyramid_disable_local_mode` (L7734/L10541),
+   `pyramid_probe_ollama` (L7750/L10542),
+   `pyramid_preview_pull_contribution` (L7767/L10543).
+7. **Credential warning modal.** `ToolsMode.tsx:2273`
+   `handlePull` calls `pyramid_preview_pull_contribution`
+   first, stages modal at L2470-2566 when
+   `missing_credentials` is non-empty, lists missing keys at
+   L2498, offers Cancel (L2544) / Pull anyway (L2549). Backend
+   IPC at `main.rs:7767` calls `collect_references` +
+   `store.contains(name)` (`credentials.rs:306/420`).
+8. **Concurrency pin to 1.**
+   `build_local_mode_build_strategy_yaml` at
+   `local_mode.rs:551` parses prior YAML as untyped
+   `serde_yaml::Value` (preserving evidence_mode, webbing,
+   quality) and inserts `concurrency: 1` into both
+   `initial_build` and `maintenance` sub-mappings. Test
+   `build_local_mode_build_strategy_yaml_pins_concurrency_one`
+   asserts webbing/model_tier round-trip + concurrency=1.
+9. **Dehydration budget scaling deferred.** Documented above
+   under "Dehydration budget scaling decision" and in friction
+   log. Acceptable per workstream prompt deviation clause.
+10. **OllamaCloudProvider (L3) re-deferred.** Documented above
+    under "Deviations" as "Phase 18a+1 fix pass" candidate.
+    Acceptable per workstream prompt L3 optional clause.
+11. **`yaml_renderer_resolve_options` IPC** at `main.rs:8810`
+    correctly drops the rusqlite reader lock BEFORE awaiting
+    `resolve_model_list_only` so non-Send `&Connection` never
+    crosses an await point.
+
+Additional structural checks: `pyramid/mod.rs:59` declares
+`pub mod local_mode;`. `Provider` struct fields
+(`provider.rs:185`) match the fields set in `local_mode.rs:350`.
+`ProviderRegistry::resolve_base_url` (`provider.rs:967`)
+handles `${VAR}` substitution used by the Ollama `/api/tags`
+resolver. `supersede_config_contribution` takes
+`&mut Connection` and auto-reborrows fine from
+`&mut conn` in `enable_local_mode` / `disable_local_mode`.
+
+Minor observation (not a blocker): fresh-install fallback at
+`local_mode.rs:484` creates a concurrency-1 build_strategy
+contribution when no prior exists; subsequent disable leaves
+that contribution in place (because
+`restore_build_strategy_contribution_id = None`). Not reachable
+in practice because `bundled-build_strategy-default-v1`
+(`bundled_contributions.json:61`) is always seeded by
+`walk_bundled_contributions_manifest` on every boot. Flagged
+for future hardening only.
+
+**Status: clean, no new commit added.** Original `35b3173`
+stands. Wanderer pass recommended next per
+`feedback_wanderer_after_verifier.md`.
+
+### Wanderer pass (2026-04-11)
+
+Fresh worktree at
+`/private/tmp/agent-wire-phase-18a-local-mode-providers-verifier`.
+Runtime baseline restored (the verifier punted this to the
+wanderer because disk pressure blocked their `cargo test` and
+`npm run build`):
+
+- `cargo test --lib pyramid` → **1254 passed / 7 failed** —
+  exactly the expected baseline. The 7 failures are
+  pre-existing (evidence schema `build_id` column, YAML
+  clustering, path normalization) — none touch local mode.
+- `npm run build` → clean (only the pre-existing 500KB chunk
+  size warning; 151 modules transformed, 991ms).
+
+Traced the 12-question wanderer script end-to-end through
+`local_mode.rs`, `db.rs`, `config_contributions.rs`,
+`yaml_renderer.rs`, `main.rs`, `Settings.tsx`,
+`useLocalMode.ts`, `ToolsMode.tsx`, and the bundled manifest.
+11 of 12 questions came back **clean** with the same file:line
+citations the verifier pinned. One wanderer fix applied.
+
+**Wanderer fix — reader lock held across `.await` in the
+status IPC.**
+
+The verifier's IPC audit line at `main.rs:8810` explicitly
+called out that `yaml_renderer_resolve_options` drops the
+rusqlite reader lock BEFORE awaiting the async `/api/tags`
+resolver. But they missed the same pattern in
+`pyramid_get_local_mode_status`:
+
+```rust
+async fn pyramid_get_local_mode_status(state) -> ... {
+    let reader = state.pyramid.reader.lock().await;
+    let status = get_local_mode_status(&reader).await?;  // <-- probe under lock
+    drop(reader);
+    Ok(status)
+}
+```
+
+`get_local_mode_status` calls `probe_ollama(&base_url).await`
+internally (up to 5 seconds of network wait). With the reader
+lock held, every concurrent reader-bound IPC would block on
+the lock for the duration of the probe. Not a data
+correctness bug — the tokio::sync::Mutex is an async mutex
+and Send-safe across `.await` — but a latency hazard for any
+background chain step, UI polling IPC, or another `compose`
+flow running at the same time as a Settings mount.
+
+**Fix:** split `get_local_mode_status` into two functions:
+- `load_status_snapshot(conn)` — synchronous, DB-only, builds
+  a partial status with `reachable=false` and empty probe
+  fields.
+- `refresh_status_reachability(status) -> status` — async,
+  takes ownership of the partial status, runs `probe_ollama`
+  (without any DB/mutex reference) and merges the
+  reachability fields in. No-op when `status.enabled = false`.
+
+The legacy `get_local_mode_status(&Connection)` is kept as a
+thin wrapper for the enable/disable return paths (they
+already hold the writer lock for the whole transaction, so
+the probe latency is irrelevant there).
+
+The `pyramid_get_local_mode_status` IPC now does:
+
+```rust
+let snapshot = {
+    let reader = state.pyramid.reader.lock().await;
+    load_status_snapshot(&reader)?   // sync, fast
+    // reader lock drops here
+};
+Ok(refresh_status_reachability(snapshot).await)  // no lock
+```
+
+**Tests added (4):**
+- `load_status_snapshot_disabled_returns_clean_row` — fresh
+  DB, snapshot returns disabled, no probe fields populated.
+- `load_status_snapshot_enabled_returns_saved_values_without_probing`
+  — populates the state row with enabled=true and asserts
+  the snapshot reflects saved values AND that
+  `available_models` / `reachable` are still empty (i.e. the
+  snapshot didn't secretly probe).
+- `refresh_status_reachability_disabled_is_noop` — passing a
+  disabled status through the refresh function must leave it
+  unchanged and not hit the network.
+- `refresh_status_reachability_enabled_with_unreachable_captures_error`
+  — enabled + unreachable URL → `reachable=false` +
+  `reachability_error` populated + `available_models` empty.
+
+Runtime after the fix:
+- `cargo test --lib pyramid::local_mode` → **18 passed /
+  0 failed** (was 14 before the fix).
+- `cargo test --lib pyramid` → **1258 passed / 7 failed**
+  (same 7 pre-existing).
+- `npm run build` → clean.
+
+**12 wanderer questions — final verdict:**
+
+1. **Enable end-to-end.** Clean. `local_mode.rs:295-521` walks
+   validate → probe → pick model → detect context →
+   `save_provider` → load prior contributions → snapshot
+   state → supersede tier_routing → sync operational →
+   supersede build_strategy → sync. Every hop verified.
+2. **Disable end-to-end.** Clean. `local_mode.rs:582-663`
+   restores by COPYING prior contribution YAML into a new
+   supersession of the currently-active local-mode
+   contribution. `upsert_tier_routing_from_contribution`
+   DELETEs stale rows + UPSERTs restored set → operational
+   table is bit-for-bit restored.
+3. **TierRoutingYaml repair.** Clean. `db.rs:14137` uses
+   `entries` with `#[serde(alias = "tiers")]`,
+   `upsert_tier_routing_from_contribution` at `db.rs:14187`
+   DELETEs stale rows. Bundled seed
+   `bundled_contributions.json:112` uses the canonical
+   `entries:` shape.
+4. **Reachability failure mode.** Clean. `local_mode.rs:306`
+   probes BEFORE any DB write; a failed probe returns Err
+   with no side effects. `save_provider` + state row writes
+   happen only after the probe succeeds.
+5. **/api/tags cache.** Clean. `yaml_renderer.rs:368-422`
+   implements the 30s per-provider cache. Failures cache an
+   empty list with the same TTL at `:555`. The std::sync::Mutex
+   is never held across `.await` because lookups return
+   owned clones and stores finish synchronously before any
+   `.await`. The async `resolve_model_list_only` function
+   exists specifically for the IPC path that must release
+   the rusqlite lock before awaiting.
+6. **ModelSelectorWidget integration.** Clean. The widget
+   defaults to `tier_registry` (sync, DB-only) so Local Mode
+   is automatically reflected via the new tier_routing rows.
+   No bundled schema annotations currently use
+   `model_list:{provider_id}`, but when one does, the
+   network-bound resolver handles it through the same
+   `yaml_renderer_resolve_options` IPC's async branch.
+7. **Credential warning modal.** Clean. `main.rs:7767`
+   fetches via `PyramidPublisher::fetch_contribution`, scans
+   via `CredentialStore::collect_references`, checks
+   `store.contains()`. `ToolsMode.tsx:2273-2312` modal lists
+   missing keys, offers Cancel / Pull anyway.
+8. **Concurrency pin to 1.** Clean. `local_mode.rs:551-575`
+   uses `serde_yaml::Value` mutation to preserve
+   webbing/evidence_mode/quality while forcing
+   `initial_build.concurrency = 1` and
+   `maintenance.concurrency = 1`. The disable path restores
+   the prior YAML verbatim via `build_strategy` supersession
+   + `upsert_build_strategy` (INSERT OR REPLACE).
+9. **No prior build_strategy edge case.** Not reachable.
+   `walk_bundled_contributions_manifest` at
+   `wire_migration.rs:1044` runs unconditionally on every
+   boot (outside the Phase 5 sentinel guard per `:141`). The
+   bundled `bundled-build_strategy-default-v1` entry in
+   `bundled_contributions.json:61-65` is always seeded with
+   INSERT OR IGNORE semantics. The only way to reach the
+   no-prior case is to manually archive every build_strategy
+   contribution AND patch the manifest — outside scope.
+10. **5 IPCs reachability.** Clean. All 5 defined
+    (`main.rs:7702/7714/7734/7750/7767`) + all 5 in
+    `invoke_handler` (`main.rs:10539-10543`) + all 5 have
+    real frontend call sites (`useLocalMode.ts:56/74/92/102`
+    + `ToolsMode.tsx:2289`).
+11. **Settings section in built bundle.** Clean. Grepped
+    `dist/assets/index-*.js` after `npm run build`: finds
+    "Local LLM (Ollama)", "Use local models (Ollama)",
+    "Test connection", and all 5 IPC names. Section between
+    Mesh Hosting and Auto-Update per workstream prompt.
+12. **Dehydration budget deferral.** Documented deferral.
+    `local_mode.rs:506-517` explicit comment, friction log
+    carry-forward, Phase 19 handoff. Risk: default budgets
+    (pre_map=80K, answer=100K) overflow on 8K/16K-context
+    models. Adam's Ouro test uses gemma3:27b (128K context)
+    so this doesn't block 18a. Small-context users need
+    manual tuning until Phase 19's dehydration_budget
+    contribution schema.
+
+**Other minor observations (flagged but NOT fixed — below
+wanderer-fix threshold):**
+
+- Enable path writes `save_provider` → `save_local_mode_state`
+  → `supersede_config_contribution` sequentially, and if the
+  supersede fails after the state row is persisted, the UI
+  shows enabled=true but tier_routing is still prior. Manual
+  recovery: click Enable again (idempotent via upsert).
+  Acceptable because supersede_config_contribution failures
+  are rare (DB IO errors).
+- `build_local_mode_build_strategy_yaml` silently skips the
+  concurrency pin if a phase value exists but isn't a
+  mapping. Not reachable in practice — bundled defaults
+  always use mapping form.
+- Two-step disable confirm via the toggle briefly renders a
+  visual flash from checked → unchecked → checked while
+  the confirmation modal is open (React controlled input
+  + hook status). Cosmetic; the modal "Yes, disable" button
+  works normally.
+
+Single wanderer commit appended to branch. Not pushed, not
+merged.
+
+Status: **wanderer-clean + 1 wanderer fix applied**.

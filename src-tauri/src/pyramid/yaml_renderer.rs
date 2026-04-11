@@ -288,8 +288,12 @@ pub fn load_annotation_by_contribution_id(
 ///   - `tier_registry` — tier names with provider/model/context metadata
 ///   - `provider_list` — registered providers
 ///   - `model_list:{provider_id}` — models routed through a specific
-///     provider (from tier routing; Phase 10 adds a live Ollama
-///     `/api/tags` query)
+///     provider. **Phase 18a (L5):** for Ollama-shaped providers
+///     this returns the cached snapshot from a prior network probe;
+///     the live network round trip is performed by
+///     `resolve_model_list_only` which the IPC layer awaits AFTER
+///     dropping the rusqlite lock. The sync entry point falls back
+///     to the tier-table view when no cached entry exists yet.
 ///   - `node_fields` — top-level pyramid node schema field names
 ///   - `chain_list` — custom chain contributions + their content_type
 ///   - `prompt_files` — skill contributions (paths)
@@ -297,6 +301,10 @@ pub fn load_annotation_by_contribution_id(
 /// Unknown sources return `Ok(vec![])` and log a warning — missing
 /// options are not fatal; the select widget shows an empty list and
 /// the user sees the raw value.
+///
+/// This function is fully synchronous so callers can hold a
+/// `&Connection` for the DB-only branches without crossing an await
+/// point.
 pub fn resolve_option_source(
     conn: &Connection,
     provider_registry: &ProviderRegistry,
@@ -304,7 +312,7 @@ pub fn resolve_option_source(
 ) -> Result<Vec<OptionValue>> {
     // Handle parameterized `model_list:{provider_id}` form first.
     if let Some(provider_id) = source.strip_prefix("model_list:") {
-        return Ok(resolve_model_list_for(provider_registry, provider_id));
+        return Ok(resolve_model_list_sync(provider_registry, provider_id));
     }
 
     match source {
@@ -320,6 +328,96 @@ pub fn resolve_option_source(
             );
             Ok(Vec::new())
         }
+    }
+}
+
+/// Async entry point for the network-bound `model_list:{provider_id}`
+/// branch. Used by the IPC layer so the caller can drop the rusqlite
+/// lock before the network round-trip. Same caching + Ollama-shaped
+/// detection as the main `resolve_option_source` path.
+pub async fn resolve_model_list_only(
+    provider_registry: &ProviderRegistry,
+    provider_id: &str,
+) -> Vec<OptionValue> {
+    resolve_model_list_for(provider_registry, provider_id).await
+}
+
+/// Synchronous variant of the model-list resolver: returns only the
+/// cached or tier-table data, never hits the network. Used by the
+/// sync `resolve_option_source` entry point so the rusqlite lock can
+/// be held across the call. The IPC layer hits
+/// `resolve_model_list_only` separately to refresh the cache.
+fn resolve_model_list_sync(
+    provider_registry: &ProviderRegistry,
+    provider_id: &str,
+) -> Vec<OptionValue> {
+    if let Some(cached) = lookup_cached_models(provider_id) {
+        return cached;
+    }
+    resolve_model_list_from_tier_table(provider_registry, provider_id)
+}
+
+// ── Phase 18a (L5): Ollama /api/tags resolver + per-provider cache ──────────
+
+/// Per-provider model-list cache for the `model_list:{provider_id}`
+/// resolver. Cached for 30 seconds so Phase 8's mount-time fan-out
+/// across N widgets only triggers one round-trip per provider per
+/// half-minute. Failures (unreachable Ollama, parse errors) cache an
+/// empty list with the same TTL so the UI still degrades gracefully
+/// without re-hammering the local socket.
+static OLLAMA_TAGS_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, (Vec<OptionValue>, std::time::Instant)>>,
+> = std::sync::OnceLock::new();
+
+const OLLAMA_TAGS_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn ollama_tags_cache() -> &'static std::sync::Mutex<
+    std::collections::HashMap<String, (Vec<OptionValue>, std::time::Instant)>,
+> {
+    OLLAMA_TAGS_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn lookup_cached_models(provider_id: &str) -> Option<Vec<OptionValue>> {
+    let cache = ollama_tags_cache().lock().ok()?;
+    let (models, fetched_at) = cache.get(provider_id)?;
+    if fetched_at.elapsed() <= OLLAMA_TAGS_CACHE_TTL {
+        Some(models.clone())
+    } else {
+        None
+    }
+}
+
+fn store_cached_models(provider_id: &str, models: Vec<OptionValue>) {
+    if let Ok(mut cache) = ollama_tags_cache().lock() {
+        cache.insert(provider_id.to_string(), (models, std::time::Instant::now()));
+    }
+}
+
+/// Heuristic: a provider is "Ollama-shaped" when its `provider_type`
+/// is OpenaiCompat AND either its id starts with `ollama` OR its
+/// base_url contains the default Ollama port `:11434`. Documented in
+/// the spec; users with non-default setups can override via
+/// step_overrides or by editing the provider id to start with
+/// `ollama`.
+fn is_ollama_shaped(provider: &crate::pyramid::provider::Provider) -> bool {
+    if !matches!(
+        provider.provider_type,
+        crate::pyramid::provider::ProviderType::OpenaiCompat
+    ) {
+        return false;
+    }
+    if provider.id.starts_with("ollama") {
+        return true;
+    }
+    provider.base_url.contains(":11434")
+}
+
+/// Test-only hook: clear the per-provider model cache so adjacent
+/// tests don't see each other's stored entries.
+#[cfg(test)]
+pub fn clear_ollama_tags_cache_for_tests() {
+    if let Ok(mut cache) = ollama_tags_cache().lock() {
+        cache.clear();
     }
 }
 
@@ -391,11 +489,87 @@ fn resolve_provider_list(registry: &ProviderRegistry) -> Vec<OptionValue> {
     out
 }
 
-/// `model_list:{provider_id}` resolver — returns the models the tier
-/// routing table has routed through the given provider. This is the
-/// "what's configured" view, not the "what's available on the remote"
-/// view — Phase 10 adds the Ollama `/api/tags` live query for that.
-fn resolve_model_list_for(registry: &ProviderRegistry, provider_id: &str) -> Vec<OptionValue> {
+/// `model_list:{provider_id}` resolver. For Ollama-shaped providers
+/// (Phase 18a / L5), returns the live model list from
+/// `GET {base_url}/api/tags` cached for 30 seconds. For everything
+/// else, falls back to the "models the tier routing table has routed
+/// through this provider" view that Phase 8 shipped.
+async fn resolve_model_list_for(
+    registry: &ProviderRegistry,
+    provider_id: &str,
+) -> Vec<OptionValue> {
+    // Phase 18a (L5): the Ollama path takes precedence when the
+    // provider row is OpenaiCompat + Ollama-shaped. We resolve the
+    // base_url through the registry's credential substitution path
+    // so users with `${OLLAMA_LOCAL_URL}` in the base_url field still
+    // get a working probe.
+    if let Some(provider) = registry.get_provider(provider_id) {
+        if is_ollama_shaped(&provider) {
+            if let Some(cached) = lookup_cached_models(provider_id) {
+                return cached;
+            }
+
+            // Substitute `${VAR}` references in the base_url through
+            // the credential store so the probe targets the user's
+            // actual endpoint.
+            let resolved_base = match registry.resolve_base_url(&provider) {
+                Ok(url) => url,
+                Err(err) => {
+                    warn!(
+                        provider_id,
+                        error = %err,
+                        "model_list: failed to resolve provider base_url; \
+                         falling back to tier-table view"
+                    );
+                    // Cache an empty list briefly so we don't spin on
+                    // a misconfigured base_url.
+                    store_cached_models(provider_id, Vec::new());
+                    return resolve_model_list_from_tier_table(registry, provider_id);
+                }
+            };
+
+            match crate::pyramid::local_mode::fetch_ollama_models(&resolved_base).await {
+                Ok(model_names) => {
+                    let mut out: Vec<OptionValue> = model_names
+                        .into_iter()
+                        .map(|name| OptionValue {
+                            value: name.clone(),
+                            label: name.clone(),
+                            description: Some(format!("Ollama model — {name}")),
+                            meta: Some(serde_json::json!({
+                                "provider_id": provider_id,
+                                "source": "ollama_api_tags",
+                            })),
+                        })
+                        .collect();
+                    out.sort_by(|a, b| a.label.cmp(&b.label));
+                    store_cached_models(provider_id, out.clone());
+                    return out;
+                }
+                Err(err) => {
+                    warn!(
+                        provider_id,
+                        error = %err,
+                        "model_list: Ollama /api/tags probe failed; degrading to empty list"
+                    );
+                    store_cached_models(provider_id, Vec::new());
+                    return Vec::new();
+                }
+            }
+        }
+    }
+
+    // Non-Ollama path: the Phase 8 view, returning what's already
+    // configured in tier_routing for this provider.
+    resolve_model_list_from_tier_table(registry, provider_id)
+}
+
+/// Phase 8 fallback: build a model list from tier routing rows. Used
+/// for non-Ollama providers and when the Ollama probe fails.
+fn resolve_model_list_from_tier_table(
+    registry: &ProviderRegistry,
+    provider_id: &str,
+) -> Vec<OptionValue> {
     let mut out: Vec<OptionValue> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for entry in registry.list_tier_routing() {
@@ -883,6 +1057,86 @@ fields:
         let registry = empty_registry();
         let options = resolve_option_source(&conn, &registry, "what_is_this").unwrap();
         assert!(options.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_resolve_model_list_ollama_caches_failure() {
+        // Phase 18a (L5): when the provider is Ollama-shaped and the
+        // probe fails (no Ollama running), the async resolver returns
+        // an empty list AND caches the empty result so a follow-up
+        // call doesn't re-attempt the network round trip. The sync
+        // entry point sees the cached value on the second call.
+        clear_ollama_tags_cache_for_tests();
+        let conn = mem_conn();
+        let registry = empty_registry();
+        // Insert an Ollama-shaped provider row pointing at a port
+        // that is almost certainly not listening so the probe fails
+        // fast and the test isn't flaky on machines running a real
+        // Ollama.
+        use crate::pyramid::provider::{Provider, ProviderType};
+        let provider = Provider {
+            id: "ollama-local".into(),
+            display_name: "Ollama (local)".into(),
+            provider_type: ProviderType::OpenaiCompat,
+            base_url: "http://127.0.0.1:1/v1".into(),
+            api_key_ref: None,
+            auto_detect_context: true,
+            supports_broadcast: false,
+            broadcast_config_json: None,
+            config_json: "{}".into(),
+            enabled: true,
+        };
+        crate::pyramid::db::save_provider(&conn, &provider).unwrap();
+        registry.load_from_db(&conn).unwrap();
+
+        // Async call: hits the network and caches the empty failure.
+        let _ = resolve_model_list_only(&registry, "ollama-local").await;
+        // Sync call: must see the cached empty list.
+        let cached =
+            resolve_option_source(&conn, &registry, "model_list:ollama-local").unwrap();
+        assert!(cached.is_empty(), "expected cached empty list");
+        clear_ollama_tags_cache_for_tests();
+    }
+
+    #[test]
+    fn test_is_ollama_shaped_heuristic() {
+        use crate::pyramid::provider::{Provider, ProviderType};
+        let make = |id: &str, ptype: ProviderType, base: &str| Provider {
+            id: id.into(),
+            display_name: id.into(),
+            provider_type: ptype,
+            base_url: base.into(),
+            api_key_ref: None,
+            auto_detect_context: false,
+            supports_broadcast: false,
+            broadcast_config_json: None,
+            config_json: "{}".into(),
+            enabled: true,
+        };
+        // Ollama by id prefix.
+        assert!(super::is_ollama_shaped(&make(
+            "ollama-local",
+            ProviderType::OpenaiCompat,
+            "http://localhost:11434/v1"
+        )));
+        // Ollama by port heuristic.
+        assert!(super::is_ollama_shaped(&make(
+            "my-local",
+            ProviderType::OpenaiCompat,
+            "http://127.0.0.1:11434/v1"
+        )));
+        // OpenAI-compat that isn't Ollama-shaped.
+        assert!(!super::is_ollama_shaped(&make(
+            "groq-prod",
+            ProviderType::OpenaiCompat,
+            "https://api.groq.com/openai/v1"
+        )));
+        // Wrong provider_type — never Ollama-shaped.
+        assert!(!super::is_ollama_shaped(&make(
+            "openrouter",
+            ProviderType::Openrouter,
+            "https://openrouter.ai/api/v1"
+        )));
     }
 
     #[test]
