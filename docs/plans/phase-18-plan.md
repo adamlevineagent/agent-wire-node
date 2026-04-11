@@ -43,7 +43,7 @@ See `deferral-ledger.md` for full details. Summary:
 
 ## Workstream split
 
-Four parallel workstreams, each on its own branch, each with the full implementer → verifier → wanderer ceremony. Merges are serialized into main after all four wander clean.
+Five parallel workstreams, each on its own branch, each with the full implementer → verifier → wanderer ceremony. Merges are serialized into main after all five wander clean. The first four claim the 9 dropped handoffs from the ledger; the fifth claims a Phase 17 scope gap (D1) discovered during first real use of the shipped app.
 
 ### 18a — Local Mode + Provider Management
 

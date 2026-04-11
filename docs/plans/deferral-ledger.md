@@ -42,6 +42,14 @@ This section was created retroactively on 2026-04-11 after the audit that follow
 | L-X1 | Phase 5 | Phase 10 → Phase 14 | `pyramid_search_wire_configs` / `pyramid_pull_wire_config` | PICKED UP (Phase 10 stubbed with "Coming in Phase 14" placeholder; Phase 14 shipped the real impl) |
 | L-X2 | Phase 11 | Phase 15 | Orphan broadcasts UI + red banner | PICKED UP (Phase 15 receiving prompt was framed as "aggregate Phase 11/12/13/14 primitives" which forced re-read) |
 
+### Discovered-by-use (not deferrals, scope gaps surfaced during real use)
+
+These are distinct from dropped handoffs. No earlier phase punted them — they weren't in any spec. They emerged when Adam started actually using the shipped app and noticed that a natural user flow didn't work.
+
+| ID | Discovered during | Item | Claimed by |
+|---|---|---|---|
+| D1 | Phase 17 first-use on real folder | **Claude Code `memory/*.md` subfolder pickup** — when folder ingestion attaches a Claude Code conversation directory, the `memory/` subfolder containing project-scoped `.md` files (Claude's persistent memory about that folder) is silently ignored. Only `*.jsonl` conversation files are consumed. Those memory files ARE load-bearing project knowledge and belong in the pyramid graph. | Phase 18e |
+
 ### Root cause
 
 9 of 11 cross-phase deferrals dropped silently. Of the 9 dropped, **6 landed on Phase 10** — a single receiving phase got stacked with frontend work from 5 prior phases plus its own spec scope, and the receiving prompt was written from the Phase 10 spec in isolation rather than from a deferral ledger. The only deferrals that survived were the ones where either (a) the source phase forced a visible "Coming in Phase N" placeholder in the intermediate receiving phase, or (b) the final receiving phase's prompt was structured around integration rather than from-spec implementation.
