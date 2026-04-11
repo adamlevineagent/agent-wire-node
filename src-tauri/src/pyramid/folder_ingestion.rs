@@ -503,11 +503,44 @@ pub fn generate_slug(path: &Path, existing: &HashSet<String>) -> String {
 // ── Claude Code path encoding ─────────────────────────────────────────────────
 
 /// Encode an absolute path into the form Claude Code uses for its
-/// `~/.claude/projects/` directory names. The rule is a simple
-/// `/` → `-` substitution, with the leading dash from the root
-/// preserved verbatim.
+/// `~/.claude/projects/` directory names.
+///
+/// **Phase 18a follow-up (2026-04-11):** the original Phase 17
+/// implementation was `replace('/', '-')`, which only handled slashes.
+/// That produced `/Users/adam/AI Project Files/foo` →
+/// `-Users-adam-AI Project Files-foo` (spaces and dots preserved),
+/// but Claude Code actually writes `-Users-adam-AI-Project-Files-foo`
+/// (every non-alphanumeric run collapsed to a dash).
+///
+/// The `/.claude/worktrees/` idiom is what forced us to notice:
+/// `.../GoodNewsEveryone/.claude/worktrees/...` on disk is
+/// `...GoodNewsEveryone--claude-worktrees-...` — note the double dash
+/// where the `/.claude` segment sits. That `--` is the `/` → `-` AND
+/// the `.` → `-`, not a placeholder for something else.
+///
+/// Empirical rule, verified against every entry in one user's
+/// `~/.claude/projects/`: any character that isn't an ASCII letter,
+/// digit, or existing dash becomes a dash. Runs of dashes are NOT
+/// collapsed — `/.` → `--` is load-bearing for the matching logic
+/// (otherwise `foo--bar` and `foo-bar` couldn't be distinguished).
+///
+/// Before this fix, every target folder whose absolute path
+/// contained a space (like Adam's `/Users/adamlevine/AI Project Files`)
+/// silently failed the Claude Code match-check in the folder
+/// ingestion wizard, leaving the "Include Claude Code conversations"
+/// checkbox disabled even when matching conversation directories
+/// existed on disk. The bug has been latent since Phase 17 shipped.
 pub fn encode_path_for_claude_code(path: &Path) -> String {
-    path.to_string_lossy().replace('/', "-")
+    let s = path.to_string_lossy();
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' {
+            out.push(ch);
+        } else {
+            out.push('-');
+        }
+    }
+    out
 }
 
 /// Expand a user-supplied conversation path. Accepts `~` prefixes on
@@ -526,12 +559,40 @@ pub fn expand_claude_code_projects_root(raw: &str) -> Option<PathBuf> {
     Some(PathBuf::from(trimmed))
 }
 
-/// Return the list of Claude Code project directories whose encoded
-/// name matches the target folder or any of its subfolders.
+/// Return the list of Claude Code conversation directories that
+/// should be attached to the target folder's ingestion.
 ///
-/// Matching uses the exact encoded string OR the encoded string
-/// followed by a literal `-`, which is how Claude Code writes
-/// subfolder and worktree directories (spec lines 264-269).
+/// Two detection patterns are supported:
+///
+/// **Pattern A (encoded-subdir root):** the scan location is a root
+/// directory like `~/.claude/projects/` that contains encoded-path
+/// subdirectories (e.g. `-Users-adam-my-project`). The function
+/// scans the root's direct children and returns every subdirectory
+/// whose name matches `encode_path_for_claude_code(target_folder)`
+/// exactly OR starts with that encoded string followed by a `-`
+/// (subfolder / worktree prefix match, per spec lines 264-269).
+///
+/// **Pattern B (direct conversation folder):** the scan location IS
+/// the conversation folder — it directly contains one or more
+/// `*.jsonl` files (and optionally a `memory/` subfolder with
+/// `*.md` files). Common when the user has exported a conversation
+/// history to an arbitrary directory and wants to attach it to the
+/// target folder's pyramid. When Pattern B detects jsonls at the
+/// scan location's top level, it returns the scan location itself
+/// as a single match — callers see one `ClaudeCodeConversationDir`
+/// with `is_main = true` and the scan path as both `encoded_path`
+/// and `absolute_path`.
+///
+/// Pattern A is checked first. Pattern B kicks in ONLY when
+/// Pattern A finds zero matches — otherwise a user pointing at
+/// `~/.claude/projects/` (which contains jsonls in subdirs but
+/// none at its own top level) wouldn't be affected.
+///
+/// Phase 18a follow-up (2026-04-11): Pattern B added to support
+/// users whose conversation histories live outside Claude Code's
+/// canonical `~/.claude/projects/` tree — the Change… picker in
+/// the wizard now accepts either a root-with-encoded-subdirs or a
+/// direct-jsonl folder.
 pub fn find_claude_code_conversation_dirs(
     target_folder: &Path,
     config: &FolderIngestionConfig,
@@ -552,24 +613,69 @@ pub fn find_claude_code_conversation_dirs(
     let encoded_target = encode_path_for_claude_code(&canonical_target);
     let prefix = format!("{}-", encoded_target);
 
+    // ── Pattern A: look for encoded-path subdirs inside the root ───────
     let mut matches: Vec<PathBuf> = Vec::new();
-    let Ok(iter) = std::fs::read_dir(&projects_root) else {
-        return matches;
-    };
-    for entry in iter.flatten() {
-        let Some(name) = entry.file_name().to_str().map(|s| s.to_string()) else {
-            continue;
-        };
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-        if name == encoded_target || name.starts_with(&prefix) {
-            matches.push(path);
+    if let Ok(iter) = std::fs::read_dir(&projects_root) {
+        for entry in iter.flatten() {
+            let Some(name) = entry.file_name().to_str().map(|s| s.to_string()) else {
+                continue;
+            };
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            if name == encoded_target || name.starts_with(&prefix) {
+                matches.push(path);
+            }
         }
     }
-    matches.sort();
+
+    if !matches.is_empty() {
+        matches.sort();
+        return matches;
+    }
+
+    // ── Pattern B: the scan root IS a conversation folder ────────────
+    // When Pattern A finds nothing, check whether the scan root itself
+    // looks like a direct conversation folder: has one or more jsonl
+    // files at its top level. If so, return the scan root as a single
+    // match. Otherwise return empty.
+    //
+    // We use the canonicalized form of the scan root so downstream
+    // consumers compare paths consistently.
+    let canonical_root = projects_root
+        .canonicalize()
+        .unwrap_or_else(|_| projects_root.clone());
+    if directly_contains_jsonls(&canonical_root) {
+        matches.push(canonical_root);
+    }
+
     matches
+}
+
+/// Pattern B detection helper: returns true if the given directory
+/// contains at least one `*.jsonl` file at its top level. Does NOT
+/// recurse into subdirectories — callers who want recursive counts
+/// should use `count_cc_jsonl_files`. Hidden files are ignored per
+/// the convention used by `count_memory_md_files`.
+fn directly_contains_jsonls(dir: &Path) -> bool {
+    let Ok(iter) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    for entry in iter.flatten() {
+        let name = match entry.file_name().into_string() {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        if name.starts_with('.') {
+            continue;
+        }
+        let path = entry.path();
+        if path.is_file() && path.extension().and_then(OsStr::to_str) == Some("jsonl") {
+            return true;
+        }
+    }
+    false
 }
 
 /// Build the user-facing metadata list for the pre-flight IPC. For
@@ -587,18 +693,39 @@ pub fn describe_claude_code_dirs(
         .canonicalize()
         .unwrap_or_else(|_| target_folder.to_path_buf());
     let encoded_target = encode_path_for_claude_code(&canonical_target);
+
+    // Canonicalize the configured scan root so we can compare it
+    // against each match's path to detect Pattern B (the scan root
+    // IS the conversation folder, not a parent containing encoded
+    // subdirs).
+    let pattern_b_root = expand_claude_code_projects_root(&config.claude_code_conversation_path)
+        .and_then(|p| p.canonicalize().ok());
+
     let matches = find_claude_code_conversation_dirs(target_folder, config);
     let mut out: Vec<ClaudeCodeConversationDir> = Vec::with_capacity(matches.len());
 
     for dir in matches {
+        let is_pattern_b = pattern_b_root
+            .as_ref()
+            .map(|root| &dir == root)
+            .unwrap_or(false);
+
         let encoded_path = dir
             .file_name()
             .and_then(|s| s.to_str())
             .map(|s| s.to_string())
             .unwrap_or_default();
         let absolute_path = dir.to_string_lossy().to_string();
-        let is_main = encoded_path == encoded_target;
-        let is_worktree = encoded_path.contains("--claude-worktrees-");
+        // Pattern B: the scan root IS the conversation folder, so
+        // by definition it's the "main" one (there's only one), and
+        // it's never a worktree-shaped name.
+        // Pattern A: use the encoded-name match.
+        let is_main = if is_pattern_b {
+            true
+        } else {
+            encoded_path == encoded_target
+        };
+        let is_worktree = !is_pattern_b && encoded_path.contains("--claude-worktrees-");
 
         let mut jsonl_count = 0usize;
         let mut earliest: Option<std::time::SystemTime> = None;
@@ -1960,12 +2087,31 @@ mod phase17_tests {
     }
 
     #[test]
-    fn test_encode_path_for_claude_code() {
+    fn test_encode_path_for_claude_code_spaces_and_dots() {
+        // Phase 18a follow-up: the encoding rule collapses every
+        // non-alphanumeric-non-dash character to a dash. Confirmed
+        // against real entries in ~/.claude/projects/ on a user
+        // whose target paths contained spaces.
         let path = PathBuf::from("/Users/adam/AI Project Files/agent-wire-node");
         assert_eq!(
             encode_path_for_claude_code(&path),
-            "-Users-adam-AI Project Files-agent-wire-node"
+            "-Users-adam-AI-Project-Files-agent-wire-node"
         );
+
+        // Dots collapse too — the `/.claude/` segment in a worktree
+        // path becomes `--claude-` (the `/` and the `.` both become
+        // dashes, producing the double-dash run).
+        let worktree = PathBuf::from(
+            "/Users/adam/AI Project Files/GoodNewsEveryone/.claude/worktrees/loving-clarke",
+        );
+        assert_eq!(
+            encode_path_for_claude_code(&worktree),
+            "-Users-adam-AI-Project-Files-GoodNewsEveryone--claude-worktrees-loving-clarke"
+        );
+
+        // Pre-existing dashes in the path are preserved verbatim.
+        let hyphenated = PathBuf::from("/a/hello-world/foo-bar");
+        assert_eq!(encode_path_for_claude_code(&hyphenated), "-a-hello-world-foo-bar");
     }
 
     #[test]
@@ -2023,6 +2169,125 @@ mod phase17_tests {
         assert_eq!(matches.len(), 2);
         assert!(matches.contains(&sub_dir));
         assert!(matches.contains(&worktree_dir));
+    }
+
+    #[test]
+    fn test_find_cc_dirs_pattern_b_returns_scan_root_when_it_contains_jsonls() {
+        // Phase 18a follow-up: Pattern B — when the scan root is
+        // a direct conversation folder (jsonls at the top level,
+        // no encoded-path subdirs), treat the scan root itself as
+        // a single match. This is what users who pick a custom
+        // folder via the wizard's "Change…" button typically want.
+        let tmp = TempDir::new().unwrap();
+        let convo_dir = tmp.path().join("my-exported-chats");
+        fs::create_dir_all(&convo_dir).unwrap();
+        fs::write(convo_dir.join("sess-1.jsonl"), "{}").unwrap();
+        fs::write(convo_dir.join("sess-2.jsonl"), "{}").unwrap();
+
+        // Target folder is unrelated to the convo dir's path.
+        let target = tmp.path().join("some-other-project");
+        fs::create_dir_all(&target).unwrap();
+
+        let config = FolderIngestionConfig {
+            claude_code_conversation_path: convo_dir.to_string_lossy().to_string(),
+            ..default_config()
+        };
+        let matches = find_claude_code_conversation_dirs(&target, &config);
+        assert_eq!(matches.len(), 1, "Pattern B should return the scan root as a single match");
+        assert_eq!(matches[0], convo_dir.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn test_find_cc_dirs_pattern_b_with_memory_subfolder() {
+        // Pattern B + memory subfolder: the scan root has jsonls AND
+        // a `memory/` subfolder with .md files. The planner should
+        // still emit an 8-op subplan for this dir (conversation beds
+        // + memory beds), but find_claude_code_conversation_dirs
+        // just needs to return the one match.
+        let tmp = TempDir::new().unwrap();
+        let convo_dir = tmp.path().join("foldervine-test");
+        fs::create_dir_all(&convo_dir).unwrap();
+        fs::write(convo_dir.join("sess-1.jsonl"), "{}").unwrap();
+        let memory = convo_dir.join("memory");
+        fs::create_dir_all(&memory).unwrap();
+        fs::write(memory.join("notes.md"), "# notes").unwrap();
+
+        let target = tmp.path().join("unrelated-target");
+        fs::create_dir_all(&target).unwrap();
+
+        let config = FolderIngestionConfig {
+            claude_code_conversation_path: convo_dir.to_string_lossy().to_string(),
+            ..default_config()
+        };
+        let matches = find_claude_code_conversation_dirs(&target, &config);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0], convo_dir.canonicalize().unwrap());
+
+        // describe_claude_code_dirs should mark Pattern B match as
+        // is_main=true (there's only one) and is_worktree=false.
+        let descriptions = describe_claude_code_dirs(&target, &config);
+        assert_eq!(descriptions.len(), 1);
+        assert!(descriptions[0].is_main);
+        assert!(!descriptions[0].is_worktree);
+        assert_eq!(descriptions[0].jsonl_count, 1);
+        assert!(descriptions[0].has_memory_subfolder);
+        assert_eq!(descriptions[0].memory_md_count, 1);
+    }
+
+    #[test]
+    fn test_find_cc_dirs_pattern_b_skipped_when_scan_root_has_no_jsonls() {
+        // Pattern B should NOT fire on an empty folder — the
+        // function must return Vec::new() so the wizard checkbox
+        // remains disabled and the planner doesn't emit a dead
+        // subplan.
+        let tmp = TempDir::new().unwrap();
+        let empty_dir = tmp.path().join("empty-not-a-convo-dir");
+        fs::create_dir_all(&empty_dir).unwrap();
+        // Put a non-jsonl file at the top level to show that only
+        // jsonls trigger Pattern B.
+        fs::write(empty_dir.join("readme.md"), "# not a conversation").unwrap();
+
+        let target = tmp.path().join("target");
+        fs::create_dir_all(&target).unwrap();
+
+        let config = FolderIngestionConfig {
+            claude_code_conversation_path: empty_dir.to_string_lossy().to_string(),
+            ..default_config()
+        };
+        let matches = find_claude_code_conversation_dirs(&target, &config);
+        assert!(matches.is_empty(), "Pattern B must not fire without top-level jsonls");
+    }
+
+    #[test]
+    fn test_find_cc_dirs_pattern_a_takes_precedence_over_pattern_b() {
+        // Sanity check: if the scan root contains BOTH encoded-path
+        // subdirs AND top-level jsonls (unusual but legal), Pattern A
+        // should win — we return the subdir matches, not the scan
+        // root itself. Pattern B is the fallback, not the default.
+        let tmp = TempDir::new().unwrap();
+        let cc_root = tmp.path().join("hybrid-root");
+        fs::create_dir_all(&cc_root).unwrap();
+
+        let target = tmp.path().join("myrepo");
+        fs::create_dir_all(&target).unwrap();
+        let canonical_target = target.canonicalize().unwrap();
+        let encoded = encode_path_for_claude_code(&canonical_target);
+
+        // Pattern A: encoded subdir inside the root.
+        let a_match = cc_root.join(&encoded);
+        fs::create_dir_all(&a_match).unwrap();
+        fs::write(a_match.join("sess.jsonl"), "{}").unwrap();
+
+        // Pattern B would also fire: put a jsonl at the root level.
+        fs::write(cc_root.join("stray.jsonl"), "{}").unwrap();
+
+        let config = FolderIngestionConfig {
+            claude_code_conversation_path: cc_root.to_string_lossy().to_string(),
+            ..default_config()
+        };
+        let matches = find_claude_code_conversation_dirs(&target, &config);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0], a_match, "Pattern A should win when both patterns apply");
     }
 
     #[test]
