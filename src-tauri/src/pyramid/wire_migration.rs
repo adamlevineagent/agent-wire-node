@@ -61,8 +61,11 @@ use crate::pyramid::wire_native_metadata::{
 /// vice versa.
 const PROMPT_MIGRATION_MARKER: &str = "_prompt_migration_marker";
 
-/// Report from a single migration run. Counts the number of prompts
-/// and chains successfully inserted, plus any files that were skipped.
+/// Report from a single migration run. Counts the number of prompts,
+/// chains, and schema annotations successfully inserted, plus any
+/// files that were skipped. Phase 8 added the
+/// `schema_annotations_*` fields alongside the existing prompt/chain
+/// counters.
 #[derive(Debug, Default, Clone)]
 pub struct MigrationReport {
     pub prompts_inserted: usize,
@@ -71,6 +74,13 @@ pub struct MigrationReport {
     pub chains_inserted: usize,
     pub chains_skipped_already_present: usize,
     pub chains_failed: usize,
+    /// Phase 8: schema annotation rows inserted this run.
+    pub schema_annotations_inserted: usize,
+    /// Phase 8: schema annotation rows skipped because a row with
+    /// the same slug already existed (e.g. from an interrupted run).
+    pub schema_annotations_skipped_already_present: usize,
+    /// Phase 8: schema annotation rows that failed to insert.
+    pub schema_annotations_failed: usize,
     pub marker_written: bool,
     pub ran: bool,
 }
@@ -256,13 +266,108 @@ pub fn migrate_prompts_and_chains_to_contributions(
         );
     }
 
-    // ── Step 3: write the sentinel row so subsequent runs short-circuit.
+    // ── Step 3: walk chains/schemas/**/*.schema.yaml ────────────────
+    //
+    // Phase 8 extension: schema annotation files live in
+    // `chains/schemas/` and describe how the `YamlConfigRenderer`
+    // should present each config type. On first run (same sentinel
+    // marker as the prompts+chains walks), we walk this directory and
+    // create one `schema_annotation` contribution per file. Per-file
+    // idempotency check uses the annotation's `applies_to` / fallback
+    // `schema_type` as the slug, so subsequent runs that find the row
+    // already present skip it cleanly.
+    let schemas_root = chains_dir.join("schemas");
+    if schemas_root.exists() && schemas_root.is_dir() {
+        debug!(
+            path = %schemas_root.display(),
+            "Phase 8 schema annotation migration: walking schemas directory"
+        );
+        let mut schema_files: Vec<(std::path::PathBuf, String)> = Vec::new();
+        if let Err(e) = walk_schema_files(&schemas_root, &schemas_root, &mut schema_files) {
+            warn!(
+                error = %e,
+                "Phase 8 schema annotation migration: walk failed, continuing with partial results"
+            );
+        }
+
+        for (rel_path, body) in schema_files {
+            let rel_path_str = rel_path.to_string_lossy().to_string();
+
+            // Resolve the annotation slug (= applies_to / schema_type
+            // / filename stem, in that order). Use this as the per-
+            // row uniqueness key so re-runs skip cleanly.
+            let slug = extract_annotation_slug(&body).unwrap_or_else(|| {
+                rel_path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("unknown-annotation")
+                    .trim_end_matches(".schema")
+                    .to_string()
+            });
+
+            let already: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pyramid_config_contributions
+                     WHERE schema_type = 'schema_annotation' AND slug = ?1",
+                    rusqlite::params![slug],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0);
+            if already > 0 {
+                report.schema_annotations_skipped_already_present += 1;
+                continue;
+            }
+
+            let metadata = build_schema_annotation_metadata(&slug);
+
+            match create_config_contribution_with_metadata(
+                conn,
+                "schema_annotation",
+                Some(&slug),
+                &body,
+                Some(&format!(
+                    "Phase 8 migration from chains/schemas/{rel_path_str}"
+                )),
+                "bundled",
+                Some("phase5_bootstrap"),
+                "active",
+                &metadata,
+            ) {
+                Ok(_id) => {
+                    report.schema_annotations_inserted += 1;
+                }
+                Err(e) => {
+                    warn!(
+                        schema = %slug,
+                        error = %e,
+                        "Phase 8 schema annotation migration: failed to insert contribution"
+                    );
+                    report.schema_annotations_failed += 1;
+                }
+            }
+        }
+    } else {
+        debug!(
+            path = %schemas_root.display(),
+            "Phase 8 schema annotation migration: schemas directory missing, skipping"
+        );
+    }
+
+    // Schema DEFINITION migration (JSON Schema validation bodies) is
+    // still Phase 9's scope — Phase 8 only touches annotation files.
+    debug!("Phase 5 schema definition migration: deferred to Phase 9");
+
+    // ── Step 4: write the sentinel row so subsequent runs short-circuit.
     // Only write if at least one file succeeded — otherwise a fully-
     // failed run would mark itself "done" and the next run would
-    // skip entirely.
+    // skip entirely. Phase 8 adds schema annotations to the same
+    // "succeeded" accounting so a first run that only ships schemas
+    // still marks itself done.
     if report.prompts_inserted > 0
         || report.chains_inserted > 0
-        || (report.prompts_skipped_already_present > 0 && report.chains_skipped_already_present > 0)
+        || report.schema_annotations_inserted > 0
+        || (report.prompts_skipped_already_present > 0
+            && report.chains_skipped_already_present > 0)
     {
         let marker_id = uuid::Uuid::new_v4().to_string();
         conn.execute(
@@ -279,13 +384,6 @@ pub fn migrate_prompts_and_chains_to_contributions(
         )?;
         report.marker_written = true;
     }
-
-    // JSON Schema migration (Phase 9): spec says to walk
-    // `chains/schemas/` for `.schema.yaml` and `.json` files and
-    // create `schema_annotation` + `schema_definition` contributions.
-    // Phase 9 defines the schemas; Phase 5 ships with no on-disk
-    // schemas, so this step is a TODO (Phase 9 handles it).
-    debug!("Phase 5 schema migration: no on-disk schemas yet (Phase 9 creates them)");
 
     Ok(report)
 }
@@ -578,6 +676,133 @@ fn extract_chain_id(yaml: &str) -> Option<String> {
     None
 }
 
+/// Walk `chains/schemas/` recursively and collect every `.schema.yaml`
+/// or `.schema.yml` file. Accumulates `(rel_path, body)` pairs in the
+/// output vector. Used by the Phase 8 schema annotation migration.
+fn walk_schema_files(
+    root: &Path,
+    cwd: &Path,
+    out: &mut Vec<(std::path::PathBuf, String)>,
+) -> Result<()> {
+    let entries = match std::fs::read_dir(cwd) {
+        Ok(e) => e,
+        Err(e) => {
+            warn!(path = %cwd.display(), error = %e, "failed to read schemas dir, skipping");
+            return Ok(());
+        }
+    };
+
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                warn!(error = %e, "failed to read dir entry, skipping");
+                continue;
+            }
+        };
+        let path = entry.path();
+
+        if path.is_dir() {
+            // Recurse into subdirectories; excluded `_archived/` dirs
+            // for parity with the prompt walker.
+            let dir_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if dir_name == "_archived" {
+                continue;
+            }
+            walk_schema_files(root, &path, out)?;
+            continue;
+        }
+
+        // Only `.schema.yaml` / `.schema.yml` files.
+        let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if !(filename.ends_with(".schema.yaml") || filename.ends_with(".schema.yml")) {
+            continue;
+        }
+
+        let rel_path = match path.strip_prefix(root) {
+            Ok(p) => p.to_path_buf(),
+            Err(_) => continue,
+        };
+
+        let body = match std::fs::read_to_string(&path) {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "failed to read schema annotation file, skipping"
+                );
+                continue;
+            }
+        };
+        out.push((rel_path, body));
+    }
+    Ok(())
+}
+
+/// Extract a slug for a schema annotation file. Prefers the
+/// `applies_to` field, falls back to `schema_type`. Both live at the
+/// top level of the annotation YAML. This is the same keying the
+/// Phase 8 renderer uses to look up annotations at runtime.
+fn extract_annotation_slug(yaml: &str) -> Option<String> {
+    let mut applies_to: Option<String> = None;
+    let mut schema_type: Option<String> = None;
+    for line in yaml.lines() {
+        // Only top-level scalars — indented lines belong to nested
+        // structures (e.g. fields.<name>.widget).
+        if line.starts_with(|c: char| c.is_whitespace()) {
+            continue;
+        }
+        let trimmed = line.trim_start();
+        if let Some(rest) = trimmed.strip_prefix("applies_to:") {
+            let value = rest
+                .trim()
+                .trim_start_matches('"')
+                .trim_end_matches('"')
+                .trim_start_matches('\'')
+                .trim_end_matches('\'')
+                .to_string();
+            if !value.is_empty() {
+                applies_to = Some(value);
+            }
+        } else if let Some(rest) = trimmed.strip_prefix("schema_type:") {
+            let value = rest
+                .trim()
+                .trim_start_matches('"')
+                .trim_end_matches('"')
+                .trim_start_matches('\'')
+                .trim_end_matches('\'')
+                .to_string();
+            if !value.is_empty() {
+                schema_type = Some(value);
+            }
+        }
+    }
+    applies_to.or(schema_type)
+}
+
+/// Build a `WireNativeMetadata` for a migrated schema annotation.
+/// The Wire mapping table routes `schema_annotation` →
+/// `WireContributionType::Template` with `applies_to: ui_annotation`,
+/// so canonical metadata lands as a Template contribution with
+/// `maturity: Canon` (bundled seed) and a topic tag for the target
+/// config type.
+fn build_schema_annotation_metadata(slug: &str) -> WireNativeMetadata {
+    let mut metadata = default_wire_native_metadata("schema_annotation", Some(slug));
+    metadata.contribution_type = WireContributionType::Template;
+    metadata.maturity = WireMaturity::Canon;
+    // Topic tags let Wire discovery find these by the config type
+    // they describe (e.g. "chain_step_config"). The default helper
+    // already adds the slug; add a stable "ui_annotation" tag too so
+    // browsers can filter the Wire for all annotation templates.
+    if !metadata.topics.iter().any(|t| t == "ui_annotation") {
+        metadata.topics.push("ui_annotation".to_string());
+    }
+    // Annotation files are small; price stays at the Wire minimum.
+    metadata.price = Some(1);
+    metadata
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -646,6 +871,50 @@ version: "1.0.0"
 steps:
   - name: extract
     instruction: "$prompts/code/code_extract.md"
+"#,
+        )
+        .unwrap();
+
+        // Phase 8: seed two schema annotation files under
+        // `chains/schemas/`. The migration walks this directory and
+        // creates `schema_annotation` contributions for each file.
+        fs::create_dir_all(dir.path().join("schemas")).unwrap();
+        fs::write(
+            dir.path().join("schemas").join("chain-step.schema.yaml"),
+            r#"schema_type: chain_step_config
+applies_to: chain_step_config
+version: 1
+label: "Chain Step Configuration"
+fields:
+  model_tier:
+    label: "Model Tier"
+    help: "Compute tier to use for this step"
+    widget: select
+    options_from: tier_registry
+    visibility: basic
+    show_cost: true
+  temperature:
+    label: "Temperature"
+    help: "LLM sampling temperature"
+    widget: slider
+    min: 0.0
+    max: 1.0
+    step: 0.05
+    visibility: basic
+"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("schemas").join("dadbear.schema.yaml"),
+            r#"schema_type: dadbear_policy
+applies_to: dadbear_policy
+version: 1
+fields:
+  enabled:
+    label: "Enabled"
+    help: "Run DADBEAR on this pyramid"
+    widget: toggle
+    visibility: basic
 "#,
         )
         .unwrap();
@@ -805,5 +1074,146 @@ steps:
             Some("question-pipeline".to_string())
         );
         assert_eq!(extract_chain_id("schema_version: 1\nname: x\n"), None);
+    }
+
+    #[test]
+    fn extract_annotation_slug_prefers_applies_to() {
+        let yaml = r#"schema_type: chain_step_config
+applies_to: per_step_overrides
+version: 1
+fields: {}
+"#;
+        assert_eq!(
+            extract_annotation_slug(yaml),
+            Some("per_step_overrides".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_annotation_slug_falls_back_to_schema_type() {
+        let yaml = r#"schema_type: dadbear_policy
+version: 1
+fields: {}
+"#;
+        assert_eq!(
+            extract_annotation_slug(yaml),
+            Some("dadbear_policy".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_annotation_slug_handles_quoted_values() {
+        let yaml = r#"schema_type: "chain_step_config"
+applies_to: 'chain_step_config'
+"#;
+        assert_eq!(
+            extract_annotation_slug(yaml),
+            Some("chain_step_config".to_string())
+        );
+    }
+
+    #[test]
+    fn phase8_migration_inserts_schema_annotations() {
+        let conn = mem_conn();
+        let chains = setup_chains_dir();
+
+        let report =
+            migrate_prompts_and_chains_to_contributions(&conn, chains.path()).unwrap();
+        assert!(report.ran);
+        assert_eq!(
+            report.schema_annotations_inserted, 2,
+            "expected both seeded schema annotations to land"
+        );
+        assert_eq!(report.schema_annotations_skipped_already_present, 0);
+        assert_eq!(report.schema_annotations_failed, 0);
+        assert!(report.marker_written);
+
+        // chain_step_config annotation should be present and carry
+        // Template contribution_type + Canon maturity.
+        let meta_json: String = conn
+            .query_row(
+                "SELECT wire_native_metadata_json FROM pyramid_config_contributions
+                 WHERE schema_type = 'schema_annotation' AND slug = ?1",
+                rusqlite::params!["chain_step_config"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let meta = WireNativeMetadata::from_json(&meta_json).unwrap();
+        assert_eq!(meta.contribution_type, WireContributionType::Template);
+        assert_eq!(meta.maturity, WireMaturity::Canon);
+        assert!(meta.topics.iter().any(|t| t == "chain_step_config"));
+        assert!(meta.topics.iter().any(|t| t == "ui_annotation"));
+
+        // Body must round-trip through yaml_renderer::SchemaAnnotation.
+        let body: String = conn
+            .query_row(
+                "SELECT yaml_content FROM pyramid_config_contributions
+                 WHERE schema_type = 'schema_annotation' AND slug = ?1",
+                rusqlite::params!["chain_step_config"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let parsed: crate::pyramid::yaml_renderer::SchemaAnnotation =
+            serde_yaml::from_str(&body).unwrap();
+        assert_eq!(parsed.schema_type, "chain_step_config");
+        assert_eq!(parsed.fields.len(), 2);
+    }
+
+    #[test]
+    fn phase8_schema_annotation_migration_idempotent() {
+        let conn = mem_conn();
+        let chains = setup_chains_dir();
+
+        let first =
+            migrate_prompts_and_chains_to_contributions(&conn, chains.path()).unwrap();
+        assert_eq!(first.schema_annotations_inserted, 2);
+
+        // Second run short-circuits on the sentinel — no duplicates.
+        let second =
+            migrate_prompts_and_chains_to_contributions(&conn, chains.path()).unwrap();
+        assert!(!second.ran);
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pyramid_config_contributions
+                 WHERE schema_type = 'schema_annotation'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn phase8_migration_with_schemas_only_still_writes_marker() {
+        // First-run edge case: only schemas present, no prompts/chains.
+        let conn = mem_conn();
+        let dir = TempDir::new().unwrap();
+        fs::create_dir_all(dir.path().join("schemas")).unwrap();
+        fs::write(
+            dir.path().join("schemas").join("chain-step.schema.yaml"),
+            r#"schema_type: chain_step_config
+applies_to: chain_step_config
+version: 1
+fields:
+  x:
+    label: "X"
+    help: "x field"
+    widget: text
+    visibility: basic
+"#,
+        )
+        .unwrap();
+
+        let report =
+            migrate_prompts_and_chains_to_contributions(&conn, dir.path()).unwrap();
+        assert!(report.ran);
+        assert_eq!(report.prompts_inserted, 0);
+        assert_eq!(report.chains_inserted, 0);
+        assert_eq!(report.schema_annotations_inserted, 1);
+        assert!(
+            report.marker_written,
+            "marker should be written when only schemas land"
+        );
     }
 }

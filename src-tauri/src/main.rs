@@ -7238,6 +7238,78 @@ async fn pyramid_publish_to_wire(
     })
 }
 
+// --- Phase 8: YAML-to-UI renderer IPC ---------------------------------------
+//
+// Per `docs/specs/yaml-to-ui-renderer.md` → "Backend Contract" section
+// (~line 407). Three commands cover the renderer's backend surface:
+//
+//   pyramid_get_schema_annotation(schema_type)
+//     Loads the active `schema_annotation` contribution matching the
+//     given target config type. Returns a `SchemaAnnotation` whose
+//     `fields` map describes how each field should render. Returns
+//     `None` when no annotation is present — the frontend can fall
+//     back to a generic key/value editor.
+//
+//   yaml_renderer_resolve_options(source)
+//     Resolves a named dynamic option source (`tier_registry`,
+//     `provider_list`, `model_list:{provider}`, `node_fields`,
+//     `chain_list`, `prompt_files`) to a concrete `OptionValue` list.
+//     Called once per unique source at mount time; results are cached
+//     in the frontend hook.
+//
+//   yaml_renderer_estimate_cost(provider, model, avg_input_tokens,
+//                               avg_output_tokens)
+//     Computes a per-call USD estimate from the tier routing table's
+//     pricing_json column. Returns 0.0 when the (provider, model) pair
+//     isn't found — the UI can show "cost unavailable" in that case.
+//
+// Phase 4/5 alignment: schema annotations live in
+// `pyramid_config_contributions` (not disk). Phase 8 extended
+// `wire_migration.rs` so the on-disk `chains/schemas/*.schema.yaml`
+// files are seeded as contributions on first run — from that point
+// forward, runtime reads go through the contributions table only.
+
+#[tauri::command]
+async fn pyramid_get_schema_annotation(
+    state: tauri::State<'_, SharedState>,
+    schema_type: String,
+) -> Result<Option<wire_node_lib::pyramid::yaml_renderer::SchemaAnnotation>, String> {
+    let reader = state.pyramid.reader.lock().await;
+    wire_node_lib::pyramid::yaml_renderer::load_schema_annotation_for(&reader, &schema_type)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn yaml_renderer_resolve_options(
+    state: tauri::State<'_, SharedState>,
+    source: String,
+) -> Result<Vec<wire_node_lib::pyramid::yaml_renderer::OptionValue>, String> {
+    let reader = state.pyramid.reader.lock().await;
+    wire_node_lib::pyramid::yaml_renderer::resolve_option_source(
+        &reader,
+        &state.pyramid.provider_registry,
+        &source,
+    )
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn yaml_renderer_estimate_cost(
+    state: tauri::State<'_, SharedState>,
+    provider: String,
+    model: String,
+    avg_input_tokens: u64,
+    avg_output_tokens: u64,
+) -> Result<f64, String> {
+    Ok(wire_node_lib::pyramid::yaml_renderer::estimate_cost(
+        &state.pyramid.provider_registry,
+        &provider,
+        &model,
+        avg_input_tokens,
+        avg_output_tokens,
+    ))
+}
+
 // ── Phase 7: Cache warming on pyramid import IPC commands ─────────────────
 //
 // Per `docs/specs/cache-warming-and-import.md` "IPC Contract" section
@@ -8594,6 +8666,10 @@ fn main() {
             // Phase 5: Wire Contribution Publication
             pyramid_dry_run_publish,
             pyramid_publish_to_wire,
+            // Phase 8: YAML-to-UI renderer
+            pyramid_get_schema_annotation,
+            yaml_renderer_resolve_options,
+            yaml_renderer_estimate_cost,
             // Phase 7: Cache Warming on Pyramid Import
             pyramid_import_pyramid,
             pyramid_import_progress,

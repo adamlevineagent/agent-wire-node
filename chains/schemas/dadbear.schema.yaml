@@ -1,0 +1,88 @@
+# DADBEAR policy — Phase 8 seed annotation.
+#
+# Describes how the YamlConfigRenderer presents DADBEAR's per-pyramid
+# policy. Field names mirror `DadbearPolicyYaml` in
+# `src-tauri/src/pyramid/db.rs`:
+#
+#   source_path: String
+#   content_type: String
+#   scan_interval_secs: i64
+#   debounce_secs: i64
+#   session_timeout_secs: i64
+#   batch_size: i64
+#   enabled: bool
+#
+# Keeping the annotation 1:1 with the real YAML shape means Phase 10
+# can wire a real DADBEAR config directly into the renderer without
+# any field rewiring.
+
+schema_type: dadbear_policy
+applies_to: dadbear_policy
+version: 1
+label: "DADBEAR Policy"
+description: "Controls how DADBEAR watches and maintains this pyramid."
+
+fields:
+  enabled:
+    label: "Enabled"
+    help: "Whether DADBEAR runs on this pyramid. When disabled, no maintenance or ingestion happens."
+    widget: toggle
+    visibility: basic
+    order: 1
+
+  source_path:
+    label: "Source Path"
+    help: "Absolute path to the directory DADBEAR watches for new files."
+    widget: text
+    visibility: basic
+    order: 2
+
+  content_type:
+    label: "Content Type"
+    help: "Which chain pipeline to dispatch for newly-discovered files (e.g. document, code, conversation)."
+    widget: select
+    options_from: chain_list
+    visibility: basic
+    order: 3
+
+  scan_interval_secs:
+    label: "Scan Interval"
+    help: "How often DADBEAR polls the source folder for new files (seconds)."
+    widget: number
+    min: 1
+    max: 3600
+    step: 1
+    suffix: "sec"
+    visibility: basic
+    order: 4
+
+  debounce_secs:
+    label: "Debounce Window"
+    help: "Seconds a file must be stable before a provisional build fires."
+    widget: number
+    min: 1
+    max: 600
+    step: 1
+    suffix: "sec"
+    visibility: advanced
+    order: 10
+
+  session_timeout_secs:
+    label: "Session Timeout"
+    help: "Seconds of inactivity on a conversation file before session promotion."
+    widget: number
+    min: 60
+    max: 7200
+    step: 30
+    suffix: "sec"
+    visibility: advanced
+    order: 11
+
+  batch_size:
+    label: "Batch Size"
+    help: "How many pending ingest records DADBEAR dispatches per tick."
+    widget: number
+    min: 1
+    max: 32
+    visibility: advanced
+    order: 12
