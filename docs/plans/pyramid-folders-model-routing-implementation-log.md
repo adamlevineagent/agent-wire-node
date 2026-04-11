@@ -3395,3 +3395,34 @@ The following scenarios should be executed by a human verifier before marking Ph
 - Production wiring of `notify_vine_of_child_completion` to a build-completion hook. The function is still only called from the manual HTTP trigger in `routes.rs::handle_vine_trigger_delta`. Wiring it to the DADBEAR build completion path (or `build_runner`'s post-build referrer-notification block) is a follow-up that should land before the manual end-to-end verification scenario in the implementer's log can pass without manual triggering. Noted here rather than fixed because the verifier prompt's scope was auditing the commit against Phase 16 end-state criteria, and hooking a new caller exceeds "fix issues in place".
 
 **Status:** verifier pass → awaiting-verification. Verifier commit is separate from the implementer commit (no amend, no push).
+
+### Wanderer pass (2026-04-10)
+
+**Wanderer:** solo wanderer, fresh end-to-end trace of the vine build flow against the current HEAD (`203ff93`). No punch list — just the 12 wanderer questions traced through the actual source. Four bugs found, all fixed in place. Detailed friction notes landed in `pyramid-folders-model-routing-friction-log.md` under "2026-04-10 — Phase 16 wanderer pass".
+
+**Bugs found and fixed:**
+
+1. **`execute_chain_from` rejected every vine build at the chunk count check.** Line 3849 errored on `num_chunks == 0` unless `content_type == "question"`. Vines never have chunks — they compose children via `pyramid_vine_compositions` — so the chain executor refused to run the topical-vine chain. Extracted the exemption into a `content_type_allows_zero_chunks(&str) -> bool` helper that returns true for `"question"` and `"vine"`. The helper sits next to `step_saves_node` near the top of `chain_executor.rs` so the next content type that legitimately has zero chunks gets a one-line change in an obvious place. Added `tests::test_content_type_allows_zero_chunks_gate` to pin the set.
+
+2. **`topical-vine.yaml::upper_synthesis.depth` was `2` but should have been `1`.** `execute_recursive_pair` treats `step.depth.unwrap_or(1)` as the SOURCE depth (the layer it reads nodes from and pairs upward), not the output depth. `cluster_synthesis` writes L1 cluster nodes, so `upper_synthesis` should start pairing from L1. `depth: 2` caused the loop to read `get_nodes_at_depth(slug, 2)` which is always empty after cluster_synthesis — the loop exited immediately with an empty apex id and the `execute_chain_from` fallback at line 4504 picked an L1 cluster node as the "apex". Corrected to `depth: 1` with an expanded comment in the YAML explaining the starting_depth semantics. Added `phase16_tests::test_topical_vine_upper_synthesis_starts_from_depth_1` as a regression.
+
+3. **`cluster_synthesis.input` was missing `cluster: "$item"`**, so the per-cluster synthesis prompt received `{children: [all_children_array]}` with no cluster context. The for_each primitive sets `ctx.current_item = cluster` but `ctx.resolve_value(input)` only resolves refs that appear in the input block. Because the step had an explicit input block that only referenced `$collect_children.children`, the current cluster was silently dropped — the auto-inject fallback (`enrich_group_item_input`) only fires when the step has no input block. Added `cluster: "$item"` to the input map. Updated `topical_synthesis.md` to document the new input shape (`cluster` + `children`) and added an explicit instruction to filter `children` by `cluster.child_slugs` (since the chain passes the full children array). Added `phase16_tests::test_topical_vine_cluster_synthesis_passes_cluster_via_item_ref` as a regression.
+
+4. **`notify_vine_of_child_completion` had no production caller** — the verifier's deferred item. Fixed by extracting the post-build notification block in `run_build_from_with_evidence_mode` into a new `run_post_build_hooks(state, slug_name, &result)` helper, then calling that helper from the main build path AND from the Question and Conversation slug early-return paths. The helper now runs three things on successful builds: WS8-F cross-slug referrer notification (pre-existing), Phase 16 vine-of-vines propagation via `notify_vine_of_child_completion` (new), and WS-ONLINE-F remote web edge resolution (pre-existing). The Question/Conversation paths used to bypass ALL post-build hooks, which meant a conversation/question that was a child of a vine would never trigger upward propagation — that gap is closed by the refactor. Added two async integration tests in `vine_composition.rs` that construct a real `PyramidState`, install a 2-level vine-of-vines, call `notify_vine_of_child_completion` directly, and assert that both the direct parent AND the grandparent got composition updates plus DeltaLanded events on the build event bus. A second async test exercises a 3-node cycle to confirm the walk terminates and returns the correct direct-parent list without corrupting any state.
+
+**Files changed by wanderer:**
+
+- `src-tauri/src/pyramid/chain_executor.rs` — added `content_type_allows_zero_chunks` helper + unit test; `execute_chain_from` uses the helper.
+- `chains/defaults/topical-vine.yaml` — `upper_synthesis.depth: 1` (was 2), `cluster_synthesis.input` gains `cluster: "$item"`, expanded comments on both.
+- `chains/prompts/vine/topical_synthesis.md` — INPUT SHAPE section rewritten for the two-field payload, "cluster reason" bullet updated.
+- `src-tauri/src/pyramid/build_runner.rs` — added `vine_composition` import; extracted post-build hooks into `run_post_build_hooks`; wired it into the main build path AND the Question/Conversation early-return paths (previously both skipped all post-build hooks).
+- `src-tauri/src/pyramid/chain_loader.rs` — two new regression tests for YAML structure (`upper_synthesis` depth + `cluster_synthesis` item ref).
+- `src-tauri/src/pyramid/vine_composition.rs` — two new async integration tests exercising `notify_vine_of_child_completion` end-to-end with a real PyramidState + event-bus assertions; added `make_propagation_test_state` and `install_vine_with_apex` local helpers.
+
+**Post-wanderer verification:**
+- `cargo check --lib` clean, 3 pre-existing warnings.
+- `cargo test --lib phase16` — **21 passing / 0 failing** (was 17; +4 new regression tests; the 2 async tests and the 2 chain_loader YAML tests for the fixes).
+- `cargo test --lib pyramid` — **1205 passing / 7 failing** (+5 from verifier baseline of 1200 — the 4 phase16 regression tests plus the chain_executor content-type unit test; none are phase16-scoped filter).
+- `npm run build` clean (150 modules, 779.37 kB bundle, unchanged).
+
+**Status:** wanderer pass → awaiting-verification. Wanderer commit is separate from the verifier commit (no amend, no push).

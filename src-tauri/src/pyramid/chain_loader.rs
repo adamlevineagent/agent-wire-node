@@ -505,4 +505,85 @@ mod phase16_tests {
             "topical-vine must include a recursive_pair step that synthesizes up to apex"
         );
     }
+
+    /// Wanderer fix regression test: the `upper_synthesis` recursive_pair
+    /// step must declare `depth: 1` (source depth for pairing). The
+    /// previous value of `2` caused `execute_recursive_pair` to read
+    /// `get_nodes_at_depth(slug, 2)` which returns 0 nodes — because
+    /// `cluster_synthesis` writes its cluster nodes at depth 1, not 2.
+    /// With `depth: 2` the recursive_pair loop exits immediately with an
+    /// empty apex id and the vine build silently completes with no apex.
+    /// See chain_executor::execute_recursive_pair for the `starting_depth`
+    /// semantics: `starting_depth = step.depth.unwrap_or(1)`, target
+    /// depth is `starting_depth + 1`.
+    #[test]
+    fn test_topical_vine_upper_synthesis_starts_from_depth_1() {
+        let bundled = include_str!("../../../chains/defaults/topical-vine.yaml");
+        let def: ChainDefinition = serde_yaml::from_str(bundled).unwrap();
+        let upper = def
+            .steps
+            .iter()
+            .find(|s| s.recursive_pair)
+            .expect("topical-vine must have a recursive_pair step (upper_synthesis)");
+        assert_eq!(
+            upper.depth,
+            Some(1),
+            "upper_synthesis must declare depth: 1 (source depth for pairing) — \
+             cluster_synthesis writes L1 nodes, so recursive_pair starts at L1 \
+             and pairs upward to the apex. depth: 2 would read an empty layer."
+        );
+    }
+
+    /// Wanderer fix regression test: the `cluster_synthesis` step's input
+    /// block must expose the current cluster to the synthesis prompt via
+    /// `cluster: "$item"`. Previously the input only carried `children:
+    /// "$collect_children.children"`, so the prompt received the full
+    /// children array with no cluster context — the LLM could not know
+    /// which subset of children to synthesize over.
+    ///
+    /// `for_each: "$cluster_children.clusters"` sets `ctx.current_item =
+    /// cluster`, but `ctx.resolve_value(input)` only substitutes refs
+    /// that appear in the input map. Without an explicit `$item`
+    /// reference the cluster is invisible to the prompt.
+    #[test]
+    fn test_topical_vine_cluster_synthesis_passes_cluster_via_item_ref() {
+        let bundled = include_str!("../../../chains/defaults/topical-vine.yaml");
+        let def: ChainDefinition = serde_yaml::from_str(bundled).unwrap();
+        let cs = def
+            .steps
+            .iter()
+            .find(|s| s.name == "cluster_synthesis")
+            .expect("topical-vine must have a cluster_synthesis step");
+        assert_eq!(
+            cs.for_each.as_deref(),
+            Some("$cluster_children.clusters"),
+            "cluster_synthesis must iterate over clusters from cluster_children"
+        );
+
+        let input = cs
+            .input
+            .as_ref()
+            .expect("cluster_synthesis must declare an input block");
+        let input_obj = input
+            .as_object()
+            .expect("cluster_synthesis input must be an object");
+
+        let cluster_ref = input_obj
+            .get("cluster")
+            .and_then(|v| v.as_str())
+            .expect("cluster_synthesis input must pass `cluster: $item` to the prompt");
+        assert_eq!(
+            cluster_ref, "$item",
+            "cluster_synthesis must expose the current cluster to the prompt via $item"
+        );
+
+        let children_ref = input_obj
+            .get("children")
+            .and_then(|v| v.as_str())
+            .expect("cluster_synthesis input must also pass the full children array");
+        assert_eq!(
+            children_ref, "$collect_children.children",
+            "cluster_synthesis must pass the full children array so the prompt can look up cluster members"
+        );
+    }
 }

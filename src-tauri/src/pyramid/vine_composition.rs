@@ -775,4 +775,256 @@ mod tests {
             "DISCONNECT evidence must never be promoted to a pending mutation"
         );
     }
+
+    // ── Wanderer fix: end-to-end propagation test ──────────────────────
+    //
+    // Phase 16 verifier caught that `notify_vine_of_child_completion` had
+    // no production caller. Phase 16 wanderer pass wired it into
+    // `build_runner::run_build_from_with_evidence_mode` post-build hook.
+    //
+    // These tests exercise the async function end-to-end with a real
+    // PyramidState so the next regression can catch a wire cut without
+    // having to actually run a full chain build.
+
+    use std::collections::HashMap;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    use tokio::sync::Mutex as TokioMutex;
+
+    /// Build a minimal PyramidState with an in-memory-ish on-disk DB
+    /// suitable for exercising `notify_vine_of_child_completion`. The
+    /// only subsystems that need to work are the reader/writer sqlite
+    /// connections, the build event bus, and the lock manager.
+    fn make_propagation_test_state() -> (Arc<PyramidState>, tempfile::TempDir) {
+        use crate::pyramid::event_bus::BuildEventBus;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let data_dir = dir.path().to_path_buf();
+        let db_path = data_dir.join("pyramid.db");
+        let writer_conn = db::open_pyramid_db(&db_path).unwrap();
+        let reader_conn = db::open_pyramid_connection(&db_path).unwrap();
+
+        let llm_config = crate::pyramid::llm::LlmConfig::default();
+        let credential_store = Arc::new(
+            crate::pyramid::credentials::CredentialStore::load(&data_dir).unwrap(),
+        );
+
+        let state = Arc::new(PyramidState {
+            reader: Arc::new(TokioMutex::new(reader_conn)),
+            writer: Arc::new(TokioMutex::new(writer_conn)),
+            config: Arc::new(tokio::sync::RwLock::new(llm_config)),
+            active_build: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            data_dir: Some(data_dir.clone()),
+            stale_engines: Arc::new(TokioMutex::new(HashMap::new())),
+            file_watchers: Arc::new(TokioMutex::new(HashMap::new())),
+            vine_builds: Arc::new(TokioMutex::new(HashMap::new())),
+            use_chain_engine: AtomicBool::new(false),
+            use_ir_executor: AtomicBool::new(false),
+            event_bus: Arc::new(crate::pyramid::event_chain::LocalEventBus::new()),
+            operational: Arc::new(crate::pyramid::OperationalConfig::default()),
+            chains_dir: data_dir.join("chains"),
+            remote_query_rate_limiter: Arc::new(TokioMutex::new(HashMap::new())),
+            absorption_gate: Arc::new(TokioMutex::new(
+                crate::pyramid::AbsorptionGate::new(),
+            )),
+            build_event_bus: Arc::new(BuildEventBus::new()),
+            supabase_url: None,
+            supabase_anon_key: None,
+            csrf_secret: [0u8; 32],
+            dadbear_handle: Arc::new(TokioMutex::new(None)),
+            dadbear_in_flight: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            provider_registry: Arc::new(
+                crate::pyramid::provider::ProviderRegistry::new(credential_store.clone()),
+            ),
+            credential_store,
+            schema_registry: Arc::new(
+                crate::pyramid::schema_registry::SchemaRegistry::new(),
+            ),
+            cross_pyramid_router: Arc::new(
+                crate::pyramid::cross_pyramid_router::CrossPyramidEventRouter::new(),
+            ),
+        });
+        (state, dir)
+    }
+
+    /// Install a vine slug + a single apex node so the propagation walk
+    /// has a live apex it can lift out of `pyramid_nodes` when it
+    /// re-enters the function for the next hop. Async-safe: acquires
+    /// the tokio writer lock the normal way.
+    async fn install_vine_with_apex(
+        state: &PyramidState,
+        slug: &str,
+        apex_id: &str,
+        depth: i64,
+    ) {
+        use crate::pyramid::types::{ContentType, PyramidNode};
+
+        let writer = state.writer.lock().await;
+        db::create_slug(&writer, slug, &ContentType::Vine, "").unwrap();
+
+        let node = PyramidNode {
+            id: apex_id.to_string(),
+            slug: slug.to_string(),
+            depth,
+            chunk_index: None,
+            headline: format!("{slug} apex"),
+            distilled: format!("apex of {slug}"),
+            topics: vec![],
+            corrections: vec![],
+            decisions: vec![],
+            terms: vec![],
+            dead_ends: vec![],
+            self_prompt: String::new(),
+            children: vec![],
+            parent_id: None,
+            superseded_by: None,
+            build_id: None,
+            created_at: String::new(),
+            ..Default::default()
+        };
+        db::save_node(&writer, &node, None).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_phase16_notify_vine_of_child_completion_walks_two_levels() {
+        // Setup:
+        //   bedrock L0  →  v-mid  (vine child of v-top)  →  v-top
+        //
+        // Triggering notify on the bedrock's apex should walk one level to
+        // v-mid and a second level to v-top. We verify by peeking at the
+        // direct-parent return list AND at a second-hop probe. The walk's
+        // recursion is a BFS; the bug Phase 16 verifier left behind was
+        // that no production code called this at all, so an end-to-end
+        // test anchors the wire.
+        let (state, _guard) = make_propagation_test_state();
+
+        // Register v-top + v-mid as built vines with their own apexes so
+        // the walk can lift the parent apex on each hop.
+        install_vine_with_apex(&state, "v-mid", "v-mid-apex", 2).await;
+        install_vine_with_apex(&state, "v-top", "v-top-apex", 3).await;
+
+        // Wire the composition: v-mid composes the bedrock, v-top
+        // composes v-mid.
+        {
+            let conn = state.writer.lock().await;
+            db::insert_vine_composition(&conn, "v-mid", "b-leaf", 0, "bedrock").unwrap();
+            db::insert_vine_composition(&conn, "v-top", "v-mid", 0, "vine").unwrap();
+        }
+
+        // Subscribe to the build event bus so we can assert the walk
+        // actually emitted DeltaLanded for each parent vine.
+        let mut rx = state.build_event_bus.tx.subscribe();
+
+        // Run the notify — this is the call the build completion hook
+        // makes in production (wanderer fix in build_runner.rs).
+        let notified = notify_vine_of_child_completion(
+            &state,
+            "b-leaf",
+            "bedrock-build-1",
+            "bedrock-apex",
+        )
+        .await
+        .expect("notify_vine_of_child_completion should succeed");
+
+        // Direct-parent return list: only v-mid (the direct parent of
+        // b-leaf). v-top is a second-hop ancestor and is NOT included in
+        // the return list — the function returns the first-hop vines
+        // per the Phase 2 contract.
+        assert_eq!(notified, vec!["v-mid".to_string()]);
+
+        // Composition rows: v-mid's apex reference for b-leaf now
+        // points at bedrock-apex. v-top's apex reference for v-mid
+        // points at v-mid's own apex (v-mid-apex).
+        let comps_mid = {
+            let conn = state.reader.lock().await;
+            db::list_vine_compositions(&conn, "v-mid").unwrap()
+        };
+        assert_eq!(comps_mid.len(), 1);
+        assert_eq!(comps_mid[0].bedrock_slug, "b-leaf");
+        assert_eq!(
+            comps_mid[0].bedrock_apex_node_id.as_deref(),
+            Some("bedrock-apex"),
+            "v-mid should have b-leaf's apex set after the walk"
+        );
+
+        let comps_top = {
+            let conn = state.reader.lock().await;
+            db::list_vine_compositions(&conn, "v-top").unwrap()
+        };
+        assert_eq!(comps_top.len(), 1);
+        assert_eq!(comps_top[0].bedrock_slug, "v-mid");
+        assert_eq!(
+            comps_top[0].bedrock_apex_node_id.as_deref(),
+            Some("v-mid-apex"),
+            "v-top should have v-mid's apex set after the walk — \
+             this is the recursive hop the Phase 16 verifier left unverified"
+        );
+
+        // Drain the event bus and look for DeltaLanded events on both
+        // parent vines.
+        let mut delta_slugs: Vec<String> = Vec::new();
+        while let Ok(evt) = rx.try_recv() {
+            if matches!(
+                evt.kind,
+                crate::pyramid::event_bus::TaggedKind::DeltaLanded { .. }
+            ) {
+                delta_slugs.push(evt.slug);
+            }
+        }
+        assert!(
+            delta_slugs.contains(&"v-mid".to_string()),
+            "expected DeltaLanded for v-mid, got: {:?}",
+            delta_slugs
+        );
+        assert!(
+            delta_slugs.contains(&"v-top".to_string()),
+            "expected DeltaLanded for v-top (second hop) — \
+             got: {:?}. If v-top is missing the recursive walk did not \
+             reach the grandparent, which is the specific Phase 16 failure \
+             mode the wanderer fix is meant to catch.",
+            delta_slugs
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_phase16_notify_vine_of_child_completion_handles_three_level_cycle() {
+        // Wanderer stress test for Q5: the BFS walk must terminate on a
+        // 3-node cycle v-a → v-b → v-c → v-a.
+        let (state, _guard) = make_propagation_test_state();
+        install_vine_with_apex(&state, "v-a", "a-apex", 2).await;
+        install_vine_with_apex(&state, "v-b", "b-apex", 2).await;
+        install_vine_with_apex(&state, "v-c", "c-apex", 2).await;
+
+        {
+            let conn = state.writer.lock().await;
+            // v-b lists v-a as a child (so v-b is a parent of v-a)
+            db::insert_vine_composition(&conn, "v-b", "v-a", 0, "vine").unwrap();
+            // v-c lists v-b as a child (so v-c is a parent of v-b)
+            db::insert_vine_composition(&conn, "v-c", "v-b", 0, "vine").unwrap();
+            // v-a lists v-c as a child (so v-a is a parent of v-c) — cycle
+            db::insert_vine_composition(&conn, "v-a", "v-c", 0, "vine").unwrap();
+        }
+
+        // Starting from v-a: the cycle guard should allow visiting v-b
+        // and v-c (via the recursive walk) but refuse to re-enter v-a.
+        let notified = notify_vine_of_child_completion(
+            &state,
+            "v-a",
+            "build-1",
+            "a-apex",
+        )
+        .await
+        .expect("cycle walk must terminate, not hang");
+
+        // Direct parents of v-a: only v-b.
+        assert_eq!(notified, vec!["v-b".to_string()]);
+
+        // All comp rows should be intact — the cycle guard prevents
+        // duplicate writes during the walk but does not corrupt any
+        // existing state.
+        let conn = state.reader.lock().await;
+        assert_eq!(db::list_vine_compositions(&conn, "v-a").unwrap().len(), 1);
+        assert_eq!(db::list_vine_compositions(&conn, "v-b").unwrap().len(), 1);
+        assert_eq!(db::list_vine_compositions(&conn, "v-c").unwrap().len(), 1);
+    }
 }

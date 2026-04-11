@@ -16,11 +16,15 @@ Restatement vs. abstraction is the only length test. If your distilled prose is 
 
 ## INPUT SHAPE
 
-The input is a single cluster object, containing:
+Your input is an object with two top-level fields:
 
-- `name` — the cluster name from the clustering step
-- `reason` — one or two sentences explaining why the children were grouped together
-- `children` — an array of child apex summaries. Each child has, at minimum, `child_slug`, `child_type`, `headline`, and `distilled` (or `narrative`). Other fields like `topics`, `entities`, and `claims` may be present and may have been dehydrated.
+- `cluster` — the cluster you are synthesizing. It contains:
+  - `name` — the cluster name from the clustering step
+  - `reason` — one or two sentences explaining why the children were grouped together
+  - `child_slugs` — the list of slugs that belong to this cluster
+- `children` — the full array of every child apex summary in the vine. Each child has, at minimum, `child_slug`, `child_type`, `headline`, and `distilled` (or `narrative`). Other fields like `topics`, `entities`, and `claims` may be present and may have been dehydrated.
+
+Your job is to synthesize over ONLY the children whose `child_slug` appears in `cluster.child_slugs`. Ignore the rest of the `children` array. Do not synthesize over the whole vine — that is a later step.
 
 Work with what you have. If a field is missing on a child, do not assume the underlying material had no such content — it may have been dropped under compression.
 
@@ -33,7 +37,7 @@ These rules override all other instructions when they conflict.
 - **No dramatization.** This is a work log at a higher zoom level, not a story. State what the cluster covers, what shared entities and decisions run through it, and what it forms at the cluster scale.
 - **No significance inflation.** Report what the cluster covers. Do not editorialize about why it matters or what it implies. A successor reader will judge significance from the facts.
 - **Preserve conflict.** When children disagree about a fact, decision, or direction, surface the disagreement explicitly — do not smooth it over. The reader needs to see the disagreement.
-- **Reuse the cluster reason.** The `reason` field you received explains why these children belong together. Incorporate its substance into your headline and distilled prose so the parent and child framings agree.
+- **Reuse the cluster reason.** The `cluster.reason` field explains why these children belong together. Incorporate its substance into your headline and distilled prose so the parent and child framings agree.
 
 ## OUTPUT SCHEMA
 

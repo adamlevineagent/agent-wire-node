@@ -39,14 +39,20 @@ steps:
   # ── Phase 2: Per-cluster synthesis (L1 nodes) ────────────────────────
   # For every cluster, synthesize a single node describing the cluster at
   # one level of abstraction above its members. These become the vine's
-  # depth-1 nodes. The cluster's `child_slugs` list is handed to the
-  # synthesis prompt so it can fetch the right child summaries from the
-  # previously-collected `children` payload.
+  # depth-1 nodes.
+  #
+  # The iterator item is the current cluster object `{name, reason,
+  # child_slugs}`; the prompt also needs the full children payload so it
+  # can look up each member's apex summary by slug. `cluster: "$item"`
+  # exposes the current cluster to the prompt via resolve_value, and
+  # `children: "$collect_children.children"` passes the full child-apex
+  # array the clustering step already saw.
   - name: cluster_synthesis
     primitive: extract
     instruction: "$prompts/vine/topical_synthesis.md"
     for_each: "$cluster_children.clusters"
     input:
+      cluster: "$item"
       children: "$collect_children.children"
     max_input_tokens: 80000
     depth: 1
@@ -80,11 +86,16 @@ steps:
   # is "zoom one step outward", and the zoom is relative to the inputs
   # at each layer. Dehydration drops low-priority fields if input budget
   # is tight.
+  #
+  # `depth: 1` = source depth. recursive_pair reads nodes at this depth
+  # and writes the next layer at depth+1, continuing upward until a
+  # single node remains (the vine apex). Cluster synthesis produced
+  # the L1 nodes; this step pairs L1 → L2 → … → apex.
   - name: upper_synthesis
     primitive: extract
     instruction: "$prompts/vine/topical_apex.md"
     recursive_pair: true
-    depth: 2
+    depth: 1
     node_id_pattern: "TV-L{depth}-{index:03}"
     save_as: node
     max_input_tokens: 80000

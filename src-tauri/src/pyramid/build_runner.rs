@@ -29,6 +29,7 @@ use super::types::{
     BuildProgress, CharacterizationResult, ContentType, HandlePath, LayerEvent,
     RemoteWebEdge,
 };
+use super::vine_composition;
 use super::wire_import::RemotePyramidClient;
 use super::PyramidState;
 
@@ -246,7 +247,7 @@ pub async fn run_build_from_with_evidence_mode(
             )
         };
 
-        return Box::pin(run_decomposed_build(
+        let result = Box::pin(run_decomposed_build(
             state,
             slug_name,
             &apex_question,
@@ -260,6 +261,13 @@ pub async fn run_build_from_with_evidence_mode(
             layer_tx,
         ))
         .await;
+
+        // Phase 16 wanderer fix: question builds also get the post-build
+        // hooks. A question pyramid may be a child of a vine (via
+        // pyramid_vine_compositions), and its referrers need stale-mark
+        // notifications too.
+        run_post_build_hooks(state, slug_name, &result).await;
+        return result;
     }
 
     // ── Conversation dispatch ──────────────────────────────────────────
@@ -293,7 +301,7 @@ pub async fn run_build_from_with_evidence_mode(
             }
         };
 
-        return Box::pin(run_decomposed_build(
+        let result = Box::pin(run_decomposed_build(
             state,
             slug_name,
             &apex_question,
@@ -307,6 +315,12 @@ pub async fn run_build_from_with_evidence_mode(
             layer_tx,
         ))
         .await;
+
+        // Phase 16 wanderer fix: conversation builds also get the
+        // post-build hooks. A conversation pyramid can be a child of a
+        // vine (a vine composed of per-session conversation bedrocks).
+        run_post_build_hooks(state, slug_name, &result).await;
+        return result;
     }
 
     // ── 2. Check feature flags ───────────────────────────────────────────
@@ -356,13 +370,38 @@ pub async fn run_build_from_with_evidence_mode(
         .map(|(apex, failures)| (apex, failures, vec![]))
     };
 
+    run_post_build_hooks(state, slug_name, &result).await;
+    result
+}
+
+/// Post-build hooks shared by every content type's build path.
+///
+/// 1. **WS8-F**: Cross-slug referrer notification. If the just-built slug
+///    is referenced by other slugs via `pyramid_slug_references`, those
+///    referrers get a `confirmed_stale` pending mutation so the stale
+///    engine picks up the changes on its next tick.
+/// 2. **Phase 16 wanderer fix**: Vine-of-vines propagation. If the
+///    just-built slug is a child (bedrock or sub-vine) of any vine,
+///    `notify_vine_of_child_completion` walks the composition hierarchy
+///    recursively, updates each parent vine's apex reference, enqueues
+///    change-manifest pending mutations, and emits DeltaLanded +
+///    SlopeChanged on the event bus. Cycle-guarded and depth-capped.
+///    Without this wire, a bedrock rebuild would not propagate to any
+///    parent vine until an operator manually triggered
+///    `/pyramid/:slug/vine/trigger-delta`.
+/// 3. **WS-ONLINE-F**: Remote web edge resolution.
+///
+/// All three hooks are gated on `result.1 == 0` (zero failures) so only
+/// clean builds trigger downstream work. All three are best-effort and
+/// non-fatal — a hook failure is logged but does not fail the build.
+async fn run_post_build_hooks(
+    state: &PyramidState,
+    slug_name: &str,
+    result: &Result<(String, i32, Vec<super::types::StepActivity>)>,
+) {
     // ── WS8-F: Notify cross-slug referrers on successful build ──────────
-    // After a base slug rebuild completes, any slug that references this one
-    // may have stale evidence. Insert confirmed_stale mutations so those
-    // slugs pick up the changes on their next stale-engine cycle.
     if let Ok(ref res) = result {
         if res.1 == 0 {
-            // Build succeeded with zero failures — notify referrers
             let writer = state.writer.clone();
             let slug_owned = slug_name.to_string();
             let notify_result = tokio::task::spawn_blocking(move || {
@@ -405,10 +444,29 @@ pub async fn run_build_from_with_evidence_mode(
         }
     }
 
+    // ── Phase 16: Vine-of-vines propagation ──────────────────────────────
+    if let Ok(ref res) = result {
+        if res.1 == 0 && !res.0.is_empty() {
+            let apex_id = res.0.clone();
+            if let Err(e) = vine_composition::notify_vine_of_child_completion(
+                state,
+                slug_name,
+                &format!("build-{}-{}", slug_name, chrono::Utc::now().timestamp()),
+                &apex_id,
+            )
+            .await
+            {
+                warn!(
+                    slug = slug_name,
+                    apex = %apex_id,
+                    error = %e,
+                    "failed to propagate vine-of-vines change (non-fatal)"
+                );
+            }
+        }
+    }
+
     // ── WS-ONLINE-F: Resolve remote web edges ─────────────────────────────
-    // After a successful build, fetch content for any remote web edges created
-    // during this build. The fetched data is cached locally so downstream
-    // consumers (publication, drill view) have the remote content available.
     if let Ok(ref res) = result {
         if res.1 == 0 {
             if let Err(e) = resolve_remote_web_edges(state, slug_name).await {
@@ -420,8 +478,6 @@ pub async fn run_build_from_with_evidence_mode(
             }
         }
     }
-
-    result
 }
 
 /// WS-ONLINE-F: Resolve remote web edges created during a build.

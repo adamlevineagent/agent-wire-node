@@ -2982,6 +2982,25 @@ fn step_saves_node(step: &ChainStep) -> bool {
     step.save_as.as_deref() == Some("node")
 }
 
+/// Content types that are allowed to run a chain pipeline with zero chunks.
+///
+/// Most content types (conversation, code, document) draw their L0 nodes
+/// from `pyramid_chunks` and cannot run without chunks. Two content types
+/// are exceptions:
+///
+/// * **question** — question pyramids derive from cross-slug evidence
+///   (question tree decomposition + evidence loop), not from chunks.
+/// * **vine** — vine pyramids compose registered child pyramids via
+///   `pyramid_vine_compositions` and the `cross_build_input` primitive;
+///   the chain reads children, not chunks. (Phase 16)
+///
+/// Keep this list in sync with `chain_engine::VALID_CONTENT_TYPES` — when
+/// new content types are added that legitimately have zero chunks, they
+/// go here so `execute_chain_from` doesn't reject them at startup.
+fn content_type_allows_zero_chunks(content_type: &str) -> bool {
+    matches!(content_type, "question" | "vine")
+}
+
 fn estimate_for_each_count(step: &ChainStep, ctx: &ChainContext, num_chunks: i64) -> i64 {
     let resolved_ref = normalize_context_ref(step.for_each.as_deref().unwrap_or("$chunks"));
     if resolved_ref == "$chunks" {
@@ -3847,11 +3866,15 @@ pub async fn execute_chain_from(
     .await?;
 
     if num_chunks == 0 {
-        if chain.content_type != "question" {
-            return Err(anyhow!("No chunks found for slug '{}' — cannot run non-question pipeline with zero chunks", slug));
+        if !content_type_allows_zero_chunks(&chain.content_type) {
+            return Err(anyhow!(
+                "No chunks found for slug '{}' — cannot run {} pipeline with zero chunks",
+                slug,
+                chain.content_type
+            ));
         }
-        warn!(slug, "No chunks found — steps requiring $chunks will be skipped or fail");
-        // Question pipelines can proceed without chunks.
+        warn!(slug, content_type = %chain.content_type, "No chunks found — steps requiring $chunks will be skipped or fail");
+        // Question and vine pipelines can proceed without chunks.
         // Steps with for_each: "$chunks" will get an empty array and produce no nodes.
     }
 
@@ -12515,6 +12538,32 @@ mod tests {
             primitive: "synthesize".to_string(),
             ..Default::default()
         }
+    }
+
+    /// Wanderer fix regression test for the chunk-count gate at the top
+    /// of `execute_chain_from`. `content_type_allows_zero_chunks` decides
+    /// whether a pipeline can proceed when `pyramid_chunks` is empty.
+    ///
+    /// Before the wanderer fix, only `"question"` was exempt, so every
+    /// vine build hard-errored at the gate because vines have no chunks
+    /// — they compose child pyramids via `pyramid_vine_compositions`.
+    /// Phase 16 also exempts `"vine"`. All other content types must
+    /// still require chunks.
+    #[test]
+    fn test_content_type_allows_zero_chunks_gate() {
+        // Exempt: derive from cross-slug / composition state, not chunks.
+        assert!(content_type_allows_zero_chunks("question"));
+        assert!(content_type_allows_zero_chunks("vine"));
+
+        // Not exempt: always need chunks.
+        assert!(!content_type_allows_zero_chunks("conversation"));
+        assert!(!content_type_allows_zero_chunks("code"));
+        assert!(!content_type_allows_zero_chunks("document"));
+
+        // Unknown content types are rejected too — new types opt in
+        // explicitly when they land.
+        assert!(!content_type_allows_zero_chunks(""));
+        assert!(!content_type_allows_zero_chunks("bogus"));
     }
 
     #[test]
