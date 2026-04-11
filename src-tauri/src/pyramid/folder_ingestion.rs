@@ -43,6 +43,28 @@ use super::PyramidState;
 // ── Public types ──────────────────────────────────────────────────────────────
 
 /// A single unit of work in an ingestion plan.
+///
+/// Phase 18e (D1) retired the `RegisterClaudeCodePyramid` variant
+/// (Option A from the workstream prompt). Phase 17 emitted a single
+/// `RegisterClaudeCodePyramid` per CC dir; Phase 18e replaces that
+/// with a mini-subplan made of the existing primitives:
+///
+///   1. `CreateVine`             — the CC vine slug
+///   2. `CreatePyramid`          — the conversation bedrock
+///   3. `AddChildToVine`         — attach the conversation bedrock to
+///                                  the CC vine (`child_type='bedrock'`)
+///   4. `RegisterDadbearConfig`  — DADBEAR for the conversation pyramid
+///   5. `CreatePyramid` (opt.)   — the memory document bedrock
+///   6. `AddChildToVine` (opt.)  — attach memory bedrock to CC vine
+///   7. `RegisterDadbearConfig` (opt.) — DADBEAR for the memory pyramid
+///   8. `AddChildToVine`         — attach the CC vine to the root vine
+///                                  with `child_type='vine'`
+///
+/// Step 8 makes the CC vine a peer of every other folder child of the
+/// root vine, exactly per Phase 16's vine-of-vines composition pattern.
+/// `RegisterClaudeCodePyramid` had no external callers (Phase 17 was
+/// less than two weeks old at the time of retirement), so the variant
+/// was deleted outright rather than carried as a deprecation shim.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum IngestionOperation {
@@ -67,15 +89,14 @@ pub enum IngestionOperation {
         content_type: String,
         scan_interval_secs: u64,
     },
-    RegisterClaudeCodePyramid {
-        slug: String,
-        source_path: String,
-        is_main: bool,
-        is_worktree: bool,
-    },
 }
 
 /// A complete ingestion plan. Returned by `plan_ingestion`.
+///
+/// Phase 18e adds three classification sets so the executor can
+/// surface CC vine/bedrock counts in the result without re-parsing
+/// the operation list. The sets are populated during planning and
+/// stay synchronized with the actual ops emitted by `plan_recursive`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct IngestionPlan {
     pub operations: Vec<IngestionOperation>,
@@ -83,22 +104,63 @@ pub struct IngestionPlan {
     pub root_source_path: String,
     pub total_files: usize,
     pub total_ignored: usize,
+    /// Phase 18e: slugs the planner emitted as CC vines (one per CC
+    /// dir). Listed in the operation list as `CreateVine`.
+    #[serde(default)]
+    pub claude_code_vine_slugs: Vec<String>,
+    /// Phase 18e: slugs the planner emitted as CC conversation
+    /// bedrocks. One per CC dir; listed as `CreatePyramid` with
+    /// `content_type = conversation`.
+    #[serde(default)]
+    pub claude_code_conversation_slugs: Vec<String>,
+    /// Phase 18e: slugs the planner emitted as CC memory document
+    /// bedrocks. Zero or one per CC dir; listed as `CreatePyramid`
+    /// with `content_type = document`.
+    #[serde(default)]
+    pub claude_code_memory_slugs: Vec<String>,
 }
 
 /// Result of executing an ingestion plan. Lists what was actually
 /// created so the UI can render a post-commit summary.
+///
+/// Phase 18e additions: `claude_code_vines`,
+/// `claude_code_conversation_pyramids`, and
+/// `claude_code_memory_pyramids` so the wizard can break the CC
+/// summary into "CC vines / conversation beds / memory beds". The
+/// legacy `claude_code_pyramids` field stays around as the union of
+/// the conversation + memory bedrocks to keep older callers happy
+/// during the same release.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct IngestionResult {
     pub pyramids_created: Vec<String>,
     pub vines_created: Vec<String>,
     pub dadbear_configs: Vec<String>,
+    /// Phase 17 / Phase 18e: every conversation OR memory bedrock
+    /// created from a Claude Code dir. Useful for the legacy
+    /// "CC pyramids: N" summary line.
     pub claude_code_pyramids: Vec<String>,
+    /// Phase 18e: only the conversation bedrock slugs.
+    #[serde(default)]
+    pub claude_code_conversation_pyramids: Vec<String>,
+    /// Phase 18e: only the memory document bedrock slugs.
+    #[serde(default)]
+    pub claude_code_memory_pyramids: Vec<String>,
+    /// Phase 18e: the CC vine slugs themselves (one per CC dir,
+    /// independent of how many bedrocks the vine ended up containing).
+    #[serde(default)]
+    pub claude_code_vines: Vec<String>,
     pub compositions_added: usize,
     pub root_slug: Option<String>,
     pub errors: Vec<String>,
 }
 
 /// Shape returned by `pyramid_find_claude_code_conversations`.
+///
+/// Phase 18e (D1) extends this with memory-subfolder metadata so the
+/// wizard preview and the planner both know whether a CC dir has a
+/// `memory/` subfolder full of `.md` files. A CC dir with a populated
+/// memory subfolder produces a memory document bedrock alongside the
+/// conversation bedrock during ingestion.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClaudeCodeConversationDir {
     pub encoded_path: String,
@@ -108,6 +170,23 @@ pub struct ClaudeCodeConversationDir {
     pub latest_mtime: Option<String>,
     pub is_main: bool,
     pub is_worktree: bool,
+    /// Phase 18e: true when `{absolute_path}/memory` exists as a
+    /// subdirectory. Independent of whether it has any `.md` files —
+    /// callers should check `memory_md_count > 0` before deciding to
+    /// emit a memory bedrock.
+    #[serde(default)]
+    pub has_memory_subfolder: bool,
+    /// Phase 18e: count of `.md` files anywhere under the `memory/`
+    /// subfolder (recursive). Zero when the subfolder is missing or
+    /// empty. The recursive walk matches `ingest_docs`'s walker, which
+    /// the memory bedrock pre-pop ultimately uses.
+    #[serde(default)]
+    pub memory_md_count: usize,
+    /// Phase 18e: absolute path to `{absolute_path}/memory` when the
+    /// subfolder exists, otherwise None. The planner uses this as the
+    /// `source_path` for the memory document pyramid + DADBEAR config.
+    #[serde(default)]
+    pub memory_subfolder_path: Option<String>,
 }
 
 /// The raw result of scanning a single directory (non-recursive).
@@ -496,6 +575,10 @@ pub fn find_claude_code_conversation_dirs(
 /// Build the user-facing metadata list for the pre-flight IPC. For
 /// each matching directory, counts the `*.jsonl` files and reports
 /// the earliest/latest modification time if available.
+///
+/// Phase 18e: also populates the `memory/` subfolder metadata so
+/// downstream callers (the wizard preview, the planner) can decide
+/// whether to emit a memory document bedrock for the CC vine.
 pub fn describe_claude_code_dirs(
     target_folder: &Path,
     config: &FolderIngestionConfig,
@@ -543,6 +626,21 @@ pub fn describe_claude_code_dirs(
         let earliest_mtime = earliest.map(system_time_to_iso);
         let latest_mtime = latest.map(system_time_to_iso);
 
+        // ── Phase 18e: memory subfolder discovery ────────────────────
+        // Claude Code's per-project memory lives at `<cc_dir>/memory/`
+        // and may contain arbitrarily-nested markdown files. We probe
+        // the subfolder once here so the wizard preview and the
+        // planner can both make decisions based on a single scan.
+        let memory_dir = dir.join("memory");
+        let (has_memory_subfolder, memory_md_count, memory_subfolder_path) =
+            if memory_dir.is_dir() {
+                let count = count_memory_md_files(&memory_dir);
+                let path_str = memory_dir.to_string_lossy().to_string();
+                (true, count, Some(path_str))
+            } else {
+                (false, 0usize, None)
+            };
+
         out.push(ClaudeCodeConversationDir {
             encoded_path,
             absolute_path,
@@ -551,9 +649,58 @@ pub fn describe_claude_code_dirs(
             latest_mtime,
             is_main,
             is_worktree,
+            has_memory_subfolder,
+            memory_md_count,
+            memory_subfolder_path,
         });
     }
     out
+}
+
+/// Phase 18e: recursively count `.md` files under a CC `memory/`
+/// directory. Mirrors what `ingest_docs` walks: it descends into all
+/// subdirectories, skips hidden directories (matching the
+/// `walk_dir(skip_hidden = true)` call inside `ingest_docs`), and
+/// counts files whose extension is exactly `.md` (case-insensitive).
+///
+/// The count is conservative — `ingest_docs` itself classifies a
+/// broader set of doc extensions, but the wizard label says
+/// "memory md" so we only count `.md` to keep the displayed number
+/// honest. The actual ingest at build time will pick up whatever
+/// `ingest_docs` finds.
+pub(crate) fn count_memory_md_files(memory_dir: &Path) -> usize {
+    let mut total = 0usize;
+    let mut stack: Vec<PathBuf> = vec![memory_dir.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let entries = match std::fs::read_dir(&current) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name_os = entry.file_name();
+            let name = name_os.to_string_lossy();
+            // Match `walk_dir`'s `skip_hidden = true` semantics: skip
+            // entries whose name starts with `.`. This keeps `.git`,
+            // `.DS_Store`, etc. out of the count.
+            if name.starts_with('.') {
+                continue;
+            }
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path
+                .extension()
+                .and_then(OsStr::to_str)
+                .map(|e| e.eq_ignore_ascii_case("md"))
+                .unwrap_or(false)
+            {
+                total += 1;
+            }
+        }
+    }
+    total
 }
 
 fn system_time_to_iso(t: std::time::SystemTime) -> String {
@@ -583,11 +730,8 @@ pub fn plan_ingestion(
     }
 
     let mut plan = IngestionPlan {
-        operations: Vec::new(),
-        root_slug: None,
         root_source_path: root_canonical.to_string_lossy().to_string(),
-        total_files: 0,
-        total_ignored: 0,
+        ..Default::default()
     };
     let mut existing: HashSet<String> = HashSet::new();
 
@@ -783,55 +927,166 @@ fn plan_recursive(
     // encoded-path prefix match covers subfolders, so we don't need
     // to revisit it at deeper recursion levels (spec lines 294-296).
     // `cc_matches` was populated up front so the scan happens once.
+    //
+    // Phase 18e (D1): each CC dir now produces a mini-subplan instead
+    // of a single op. The subplan looks like:
+    //
+    //   1. CreateVine for the CC vine slug
+    //   2. CreatePyramid (conversation) for the conversation bedrock
+    //   3. AddChildToVine attaching #2 to #1 (child_type='bedrock')
+    //   4. RegisterDadbearConfig for the conversation pyramid
+    //   5. CreatePyramid (document) for the memory bedrock          (optional)
+    //   6. AddChildToVine attaching #5 to #1 (child_type='bedrock')  (optional)
+    //   7. RegisterDadbearConfig for the memory pyramid              (optional)
+    //   8. AddChildToVine attaching #1 to the parent vine
+    //      (child_type='vine') so the CC vine sits as a peer of real
+    //      folder children inside the root vine.
+    //
+    // Slug shape: keep the Phase 17 "cc-N" suffix convention but
+    // treat that as the CC VINE slug. The bedrocks underneath get
+    // `-conversations` and `-memory` suffixes so they're easy to
+    // identify in the slug table later.
     if is_top_level && include_claude_code && config.claude_code_auto_include {
         for (idx, cc_dir) in cc_matches.iter().enumerate() {
-            let encoded = cc_dir
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("cc-unknown");
-            let is_main = {
-                let canonical_target =
-                    path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-                encode_path_for_claude_code(&canonical_target) == encoded
-            };
-            let is_worktree = encoded.contains("--claude-worktrees-");
-
-            // Build a stable, non-colliding slug for the CC pyramid.
+            // Mint the CC vine slug. Slug naming preserves the
+            // Phase 17 `{root_vine}-cc-{N}` convention so existing
+            // automation expecting that prefix still finds the CC
+            // hierarchy. Collision resolution mirrors the rest of
+            // the planner: sluggify, then suffix-bump until unique.
             let suffix = format!("cc-{}", idx + 1);
             let base_slug = format!("{}-{}", vine_slug, suffix);
-            let mut cc_slug = super::slug::slugify(&base_slug);
-            if cc_slug.is_empty() {
-                cc_slug = format!("cc-{}", idx + 1);
+            let mut cc_vine_slug = super::slug::slugify(&base_slug);
+            if cc_vine_slug.is_empty() {
+                cc_vine_slug = format!("cc-{}", idx + 1);
             }
-            // Collision resolution if the caller already minted an
-            // identical slug for something else.
             let mut dedup_suffix = 2usize;
-            while existing.contains(&cc_slug) {
-                cc_slug = super::slug::slugify(&format!("{}-{}", base_slug, dedup_suffix));
+            while existing.contains(&cc_vine_slug) {
+                cc_vine_slug =
+                    super::slug::slugify(&format!("{}-{}", base_slug, dedup_suffix));
                 dedup_suffix += 1;
             }
-            existing.insert(cc_slug.clone());
+            existing.insert(cc_vine_slug.clone());
 
             let cc_path = cc_dir.to_string_lossy().to_string();
-            plan.operations
-                .push(IngestionOperation::RegisterClaudeCodePyramid {
-                    slug: cc_slug.clone(),
-                    source_path: cc_path.clone(),
-                    is_main,
-                    is_worktree,
-                });
+
+            // ── Op 1: Create the CC vine ─────────────────────────
+            plan.operations.push(IngestionOperation::CreateVine {
+                slug: cc_vine_slug.clone(),
+                source_path: cc_path.clone(),
+            });
+            plan.claude_code_vine_slugs.push(cc_vine_slug.clone());
+
+            // Mint the conversation bedrock slug. Use the
+            // `{cc_vine_slug}-conversations` suffix; collision-resolve
+            // by suffix-bump if anything already claimed it.
+            let mut convo_slug =
+                super::slug::slugify(&format!("{}-conversations", cc_vine_slug));
+            if convo_slug.is_empty() {
+                convo_slug = format!("{}-conversations", cc_vine_slug);
+            }
+            let mut convo_dedup = 2usize;
+            while existing.contains(&convo_slug) {
+                convo_slug = super::slug::slugify(&format!(
+                    "{}-conversations-{}",
+                    cc_vine_slug, convo_dedup
+                ));
+                convo_dedup += 1;
+            }
+            existing.insert(convo_slug.clone());
+
+            // ── Op 2: Create the conversation bedrock ────────────
+            plan.operations.push(IngestionOperation::CreatePyramid {
+                slug: convo_slug.clone(),
+                content_type: ContentType::Conversation.as_str().to_string(),
+                source_path: cc_path.clone(),
+            });
+            plan.claude_code_conversation_slugs.push(convo_slug.clone());
+
+            // ── Op 3: Attach conversation bedrock to CC vine ────
+            plan.operations.push(IngestionOperation::AddChildToVine {
+                vine_slug: cc_vine_slug.clone(),
+                child_slug: convo_slug.clone(),
+                position: child_position(plan, &cc_vine_slug),
+                child_type: "bedrock".to_string(),
+            });
+
+            // ── Op 4: DADBEAR config for the conversation pyramid
             plan.operations
                 .push(IngestionOperation::RegisterDadbearConfig {
-                    slug: cc_slug.clone(),
-                    source_path: cc_path,
+                    slug: convo_slug.clone(),
+                    source_path: cc_path.clone(),
                     content_type: ContentType::Conversation.as_str().to_string(),
                     scan_interval_secs: config.default_scan_interval_secs,
                 });
+
+            // ── Optional Ops 5-7: memory document bedrock ────────
+            // Probe `<cc_dir>/memory/` for `.md` files. Only emit
+            // the memory bedrock when the subfolder exists AND has
+            // at least one `.md` file. An empty memory/ subfolder is
+            // treated as if it doesn't exist — the document chain
+            // would fail with "No documents found in {dir}" so it
+            // is safer to skip the bedrock entirely.
+            let memory_dir = cc_dir.join("memory");
+            let memory_md_count = if memory_dir.is_dir() {
+                count_memory_md_files(&memory_dir)
+            } else {
+                0
+            };
+            if memory_md_count > 0 {
+                let mut memory_slug =
+                    super::slug::slugify(&format!("{}-memory", cc_vine_slug));
+                if memory_slug.is_empty() {
+                    memory_slug = format!("{}-memory", cc_vine_slug);
+                }
+                let mut memory_dedup = 2usize;
+                while existing.contains(&memory_slug) {
+                    memory_slug = super::slug::slugify(&format!(
+                        "{}-memory-{}",
+                        cc_vine_slug, memory_dedup
+                    ));
+                    memory_dedup += 1;
+                }
+                existing.insert(memory_slug.clone());
+
+                let memory_path = memory_dir.to_string_lossy().to_string();
+
+                // Op 5: Create the memory document bedrock
+                plan.operations.push(IngestionOperation::CreatePyramid {
+                    slug: memory_slug.clone(),
+                    content_type: ContentType::Document.as_str().to_string(),
+                    source_path: memory_path.clone(),
+                });
+                plan.claude_code_memory_slugs.push(memory_slug.clone());
+
+                // Op 6: Attach memory bedrock to CC vine
+                plan.operations.push(IngestionOperation::AddChildToVine {
+                    vine_slug: cc_vine_slug.clone(),
+                    child_slug: memory_slug.clone(),
+                    position: child_position(plan, &cc_vine_slug),
+                    child_type: "bedrock".to_string(),
+                });
+
+                // Op 7: DADBEAR config for the memory pyramid
+                plan.operations
+                    .push(IngestionOperation::RegisterDadbearConfig {
+                        slug: memory_slug,
+                        source_path: memory_path,
+                        content_type: ContentType::Document.as_str().to_string(),
+                        scan_interval_secs: config.default_scan_interval_secs,
+                    });
+            }
+
+            // ── Op 8: Attach the CC vine to the root vine ────────
+            // The CC vine sits alongside real folder children of
+            // the root vine, with `child_type='vine'` per Phase 16's
+            // composition pattern. This is the load-bearing line —
+            // without it the CC vine would orphan and never get
+            // dispatched as part of the root vine cascade.
             plan.operations.push(IngestionOperation::AddChildToVine {
                 vine_slug: vine_slug.clone(),
-                child_slug: cc_slug,
+                child_slug: cc_vine_slug,
                 position: child_position(plan, &vine_slug),
-                child_type: "bedrock".to_string(),
+                child_type: "vine".to_string(),
             });
         }
     }
@@ -901,6 +1156,26 @@ pub async fn execute_plan(
         ..Default::default()
     };
 
+    // Phase 18e: capture the CC slug classifications up front so the
+    // executor can push slugs into the right `claude_code_*` buckets
+    // as it processes ops. We use HashSets so the lookups are O(1)
+    // even on large plans.
+    let cc_vine_set: HashSet<String> = plan
+        .claude_code_vine_slugs
+        .iter()
+        .cloned()
+        .collect();
+    let cc_conversation_set: HashSet<String> = plan
+        .claude_code_conversation_slugs
+        .iter()
+        .cloned()
+        .collect();
+    let cc_memory_set: HashSet<String> = plan
+        .claude_code_memory_slugs
+        .iter()
+        .cloned()
+        .collect();
+
     let conn = state.writer.lock().await;
 
     for op in plan.operations {
@@ -917,11 +1192,37 @@ pub async fn execute_plan(
                     continue;
                 };
                 match db::create_slug(&conn, &slug, &ct, &source_path) {
-                    Ok(_) => result.pyramids_created.push(slug),
+                    Ok(_) => {
+                        // Phase 18e: route CC bedrock slugs into the
+                        // dedicated tracking buckets in addition to
+                        // the regular pyramid list, so the wizard can
+                        // surface a per-category breakdown.
+                        if cc_conversation_set.contains(&slug) {
+                            result
+                                .claude_code_conversation_pyramids
+                                .push(slug.clone());
+                            result.claude_code_pyramids.push(slug.clone());
+                        } else if cc_memory_set.contains(&slug) {
+                            result.claude_code_memory_pyramids.push(slug.clone());
+                            result.claude_code_pyramids.push(slug.clone());
+                        }
+                        result.pyramids_created.push(slug);
+                    }
                     Err(e) => {
                         let msg = e.to_string();
                         if msg.contains("already exists") {
                             // Idempotent: treat existing slugs as success.
+                            if cc_conversation_set.contains(&slug) {
+                                result
+                                    .claude_code_conversation_pyramids
+                                    .push(slug.clone());
+                                result.claude_code_pyramids.push(slug.clone());
+                            } else if cc_memory_set.contains(&slug) {
+                                result
+                                    .claude_code_memory_pyramids
+                                    .push(slug.clone());
+                                result.claude_code_pyramids.push(slug.clone());
+                            }
                             result.pyramids_created.push(slug);
                         } else {
                             result.errors.push(format!("create_slug {}: {}", slug, msg));
@@ -931,10 +1232,22 @@ pub async fn execute_plan(
             }
             IngestionOperation::CreateVine { slug, source_path } => {
                 match db::create_slug(&conn, &slug, &ContentType::Vine, &source_path) {
-                    Ok(_) => result.vines_created.push(slug),
+                    Ok(_) => {
+                        // Phase 18e: CC vines go into the dedicated
+                        // bucket so the wizard knows how many CC
+                        // dirs were processed independently of how
+                        // many bedrocks were created underneath them.
+                        if cc_vine_set.contains(&slug) {
+                            result.claude_code_vines.push(slug.clone());
+                        }
+                        result.vines_created.push(slug);
+                    }
                     Err(e) => {
                         let msg = e.to_string();
                         if msg.contains("already exists") {
+                            if cc_vine_set.contains(&slug) {
+                                result.claude_code_vines.push(slug.clone());
+                            }
                             result.vines_created.push(slug);
                         } else {
                             result.errors.push(format!("create_vine {}: {}", slug, msg));
@@ -988,35 +1301,6 @@ pub async fn execute_plan(
                         .push(format!("save_dadbear_config {}: {}", slug, e)),
                 }
             }
-            IngestionOperation::RegisterClaudeCodePyramid {
-                slug,
-                source_path,
-                is_main,
-                is_worktree,
-            } => {
-                match db::create_slug(&conn, &slug, &ContentType::Conversation, &source_path) {
-                    Ok(_) => {
-                        info!(
-                            slug = %slug,
-                            source_path = %source_path,
-                            is_main,
-                            is_worktree,
-                            "folder_ingestion: created Claude Code conversation pyramid"
-                        );
-                        result.claude_code_pyramids.push(slug);
-                    }
-                    Err(e) => {
-                        let msg = e.to_string();
-                        if msg.contains("already exists") {
-                            result.claude_code_pyramids.push(slug);
-                        } else {
-                            result
-                                .errors
-                                .push(format!("create_cc_pyramid {}: {}", slug, msg));
-                        }
-                    }
-                }
-            }
         }
     }
 
@@ -1025,7 +1309,9 @@ pub async fn execute_plan(
         root_slug = ?result.root_slug,
         pyramids = result.pyramids_created.len(),
         vines = result.vines_created.len(),
-        cc_pyramids = result.claude_code_pyramids.len(),
+        cc_vines = result.claude_code_vines.len(),
+        cc_conversation_beds = result.claude_code_conversation_pyramids.len(),
+        cc_memory_beds = result.claude_code_memory_pyramids.len(),
         dadbear_configs = result.dadbear_configs.len(),
         compositions = result.compositions_added,
         errors = result.errors.len(),
@@ -1073,6 +1359,12 @@ struct BuildDispatch {
 /// Extract build dispatches from a plan. Returns two lists:
 ///   1. leaves — non-vine slugs that need a first build
 ///   2. vines — vine slugs that need a first build AFTER their children
+///
+/// Phase 18e: with `RegisterClaudeCodePyramid` retired, every CC dir
+/// now contributes a CC vine (via `CreateVine`) and one or two CC
+/// bedrocks (via `CreatePyramid`). Both flow through the existing
+/// `CreatePyramid` / `CreateVine` arms below — the partitioning is
+/// the same as for ordinary folder children.
 fn extract_build_dispatches(plan: &IngestionPlan) -> (Vec<BuildDispatch>, Vec<BuildDispatch>) {
     let mut leaves: Vec<BuildDispatch> = Vec::new();
     let mut vines: Vec<BuildDispatch> = Vec::new();
@@ -1095,15 +1387,6 @@ fn extract_build_dispatches(plan: &IngestionPlan) -> (Vec<BuildDispatch>, Vec<Bu
                 vines.push(BuildDispatch {
                     slug: slug.clone(),
                     content_type: ContentType::Vine,
-                    source_path: source_path.clone(),
-                });
-            }
-            IngestionOperation::RegisterClaudeCodePyramid {
-                slug, source_path, ..
-            } => {
-                leaves.push(BuildDispatch {
-                    slug: slug.clone(),
-                    content_type: ContentType::Conversation,
                     source_path: source_path.clone(),
                 });
             }
@@ -1821,12 +2104,34 @@ mod phase17_tests {
         };
 
         let plan = plan_ingestion(&target, &config, true).unwrap();
-        let cc_ops: Vec<_> = plan
+        // Phase 18e: each CC dir now produces exactly one CC vine
+        // (visible via `claude_code_vine_slugs`) and at least one
+        // conversation bedrock (visible via
+        // `claude_code_conversation_slugs`).
+        assert_eq!(
+            plan.claude_code_vine_slugs.len(),
+            1,
+            "expected one CC vine slug"
+        );
+        assert_eq!(
+            plan.claude_code_conversation_slugs.len(),
+            1,
+            "expected one CC conversation bedrock"
+        );
+        // The conversation bedrock should be a CreatePyramid op with
+        // content_type=conversation.
+        let convo_creates: Vec<_> = plan
             .operations
             .iter()
-            .filter(|o| matches!(o, IngestionOperation::RegisterClaudeCodePyramid { .. }))
+            .filter(|o| {
+                matches!(
+                    o,
+                    IngestionOperation::CreatePyramid { content_type, .. }
+                        if content_type == "conversation"
+                )
+            })
             .collect();
-        assert_eq!(cc_ops.len(), 1, "expected one CC pyramid op");
+        assert_eq!(convo_creates.len(), 1);
     }
 
     /// Regression test for the verifier-pass fix: below-threshold folder
@@ -1834,6 +2139,10 @@ mod phase17_tests {
     /// so the CC pyramids have a parent. Without the `force_vine_for_cc`
     /// bypass, the empty-vine guard would drop the CC pyramids on the
     /// floor.
+    ///
+    /// Phase 18e: under the new model the same below-threshold-with-CC
+    /// path produces a root vine + a CC vine + a conversation bedrock,
+    /// so we now expect TWO `CreateVine` ops (root + CC) instead of one.
     #[test]
     fn test_plan_ingestion_below_threshold_with_cc_still_creates_vine() {
         let tmp = TempDir::new().unwrap();
@@ -1862,14 +2171,16 @@ mod phase17_tests {
             .iter()
             .filter(|o| matches!(o, IngestionOperation::CreateVine { .. }))
             .collect();
-        assert_eq!(vines.len(), 1, "below-threshold + CC must still create a vine");
+        assert_eq!(
+            vines.len(),
+            2,
+            "below-threshold + CC must create root vine + CC vine"
+        );
 
-        let cc_ops: Vec<_> = plan
-            .operations
-            .iter()
-            .filter(|o| matches!(o, IngestionOperation::RegisterClaudeCodePyramid { .. }))
-            .collect();
-        assert_eq!(cc_ops.len(), 1, "CC pyramid must still be attached");
+        // CC bedrock is still attached, but now via the conversation
+        // CreatePyramid op stored on the plan's CC tracking lists.
+        assert_eq!(plan.claude_code_vine_slugs.len(), 1);
+        assert_eq!(plan.claude_code_conversation_slugs.len(), 1);
 
         assert!(plan.root_slug.is_some(), "root_slug must be set for CC attachment");
     }
@@ -1928,9 +2239,15 @@ mod phase17_tests {
 
     // ── Wanderer fix tests: initial-build dispatch planning ─────────────────
 
-    /// `extract_build_dispatches` should separate CreatePyramid / CreateVine
-    /// / RegisterClaudeCodePyramid ops into leaves vs vines, preserving the
-    /// plan order so dependency-order dispatch works.
+    /// `extract_build_dispatches` should separate CreatePyramid /
+    /// CreateVine ops into leaves vs vines, preserving the plan order
+    /// so dependency-order dispatch works.
+    ///
+    /// Phase 18e: with `RegisterClaudeCodePyramid` retired, the test
+    /// fixture no longer needs a special CC variant — the new CC
+    /// model uses standard `CreatePyramid(conversation)` plus
+    /// `CreateVine` ops, both of which already flow through the
+    /// existing partitioner arms.
     #[test]
     fn test_extract_build_dispatches_partitions_leaves_and_vines() {
         let plan = IngestionPlan {
@@ -1956,11 +2273,18 @@ mod phase17_tests {
                     content_type: "code".to_string(),
                     scan_interval_secs: 30,
                 },
-                IngestionOperation::RegisterClaudeCodePyramid {
+                // Phase 18e: a CC vine + CC conversation bedrock now
+                // takes the place of the old RegisterClaudeCodePyramid
+                // op. Note both flow through the standard CreatePyramid
+                // / CreateVine arms.
+                IngestionOperation::CreateVine {
                     slug: "root-vine-cc-1".to_string(),
                     source_path: "/home/me/.claude/projects/-tmp-root".to_string(),
-                    is_main: true,
-                    is_worktree: false,
+                },
+                IngestionOperation::CreatePyramid {
+                    slug: "root-vine-cc-1-conversations".to_string(),
+                    content_type: "conversation".to_string(),
+                    source_path: "/home/me/.claude/projects/-tmp-root".to_string(),
                 },
                 IngestionOperation::CreatePyramid {
                     slug: "root-docs".to_string(),
@@ -1970,17 +2294,19 @@ mod phase17_tests {
             ],
             root_slug: Some("root-vine".to_string()),
             root_source_path: "/tmp/root".to_string(),
-            total_files: 0,
-            total_ignored: 0,
+            ..Default::default()
         };
         let (leaves, vines) = extract_build_dispatches(&plan);
-        assert_eq!(vines.len(), 1);
+        // Two vines: the root vine + the CC vine.
+        assert_eq!(vines.len(), 2);
         assert_eq!(vines[0].slug, "root-vine");
+        assert_eq!(vines[1].slug, "root-vine-cc-1");
+        // Three leaves: code, conversation bedrock, docs (in plan
+        // order, since extraction preserves the source order).
         assert_eq!(leaves.len(), 3);
-        // Order follows plan order: code, cc, docs.
         assert_eq!(leaves[0].slug, "root-code");
         assert!(matches!(leaves[0].content_type, ContentType::Code));
-        assert_eq!(leaves[1].slug, "root-vine-cc-1");
+        assert_eq!(leaves[1].slug, "root-vine-cc-1-conversations");
         assert!(matches!(leaves[1].content_type, ContentType::Conversation));
         assert_eq!(leaves[2].slug, "root-docs");
         assert!(matches!(leaves[2].content_type, ContentType::Document));
@@ -2007,8 +2333,8 @@ mod phase17_tests {
         }
     }
 
-    /// A plan containing only unrelated ops (no CreatePyramid, CreateVine,
-    /// RegisterClaudeCodePyramid) must produce empty leaves/vines lists so
+    /// A plan containing only unrelated ops (no CreatePyramid,
+    /// CreateVine) must produce empty leaves/vines lists so
     /// `spawn_initial_builds` can short-circuit.
     #[test]
     fn test_extract_build_dispatches_empty_for_plan_without_creates() {
@@ -2019,13 +2345,432 @@ mod phase17_tests {
                 position: 0,
                 child_type: "bedrock".to_string(),
             }],
-            root_slug: None,
-            root_source_path: String::new(),
-            total_files: 0,
-            total_ignored: 0,
+            ..Default::default()
         };
         let (leaves, vines) = extract_build_dispatches(&plan);
         assert!(leaves.is_empty());
         assert!(vines.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod phase18e_tests {
+    //! Phase 18e (D1): tests for the CC-dir-as-vine restructure +
+    //! `memory/` subfolder pickup. Each CC dir now produces a CC vine,
+    //! a conversation bedrock, and (optionally) a memory document
+    //! bedrock instead of a single `RegisterClaudeCodePyramid` op.
+    //!
+    //! See `docs/plans/phase-18e-workstream-prompt.md` and the
+    //! `Discovered-by-use` section of `docs/plans/deferral-ledger.md`
+    //! for context.
+
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    fn default_config() -> FolderIngestionConfig {
+        FolderIngestionConfig::default()
+    }
+
+    fn make_file(dir: &Path, name: &str, size_bytes: usize) {
+        let content = "a".repeat(size_bytes);
+        fs::write(dir.join(name), content).unwrap();
+    }
+
+    /// Set up a fake target folder + a fake `~/.claude/projects/`
+    /// matching CC dir, optionally with a `memory/` subfolder
+    /// containing the requested number of `.md` files. Returns the
+    /// target folder, the fake CC root, and a config that points
+    /// `claude_code_conversation_path` at the fake root.
+    fn setup_target_with_cc(
+        with_memory: bool,
+        memory_md_count: usize,
+        target_files: &[(&str, &str)],
+    ) -> (TempDir, PathBuf, PathBuf, FolderIngestionConfig) {
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("myrepo");
+        fs::create_dir_all(&target).unwrap();
+        for (name, body) in target_files {
+            fs::write(target.join(name), body).unwrap();
+        }
+
+        let cc_root = tmp.path().join(".claude").join("projects");
+        fs::create_dir_all(&cc_root).unwrap();
+        let canonical_target = target.canonicalize().unwrap();
+        let encoded = encode_path_for_claude_code(&canonical_target);
+        let cc_dir = cc_root.join(&encoded);
+        fs::create_dir_all(&cc_dir).unwrap();
+        // Always drop a single jsonl so the conversation bedrock has
+        // something to point at.
+        fs::write(cc_dir.join("sess-1.jsonl"), "{}").unwrap();
+
+        if with_memory {
+            let memory = cc_dir.join("memory");
+            fs::create_dir_all(&memory).unwrap();
+            for i in 0..memory_md_count {
+                fs::write(
+                    memory.join(format!("note-{}.md", i + 1)),
+                    format!("# note {}\n", i + 1),
+                )
+                .unwrap();
+            }
+        }
+
+        let config = FolderIngestionConfig {
+            claude_code_conversation_path: cc_root.to_string_lossy().to_string(),
+            ..default_config()
+        };
+        (tmp, target, cc_dir, config)
+    }
+
+    /// `describe_claude_code_dirs` must populate the new memory
+    /// metadata fields when a `memory/` subfolder is present.
+    #[test]
+    fn test_find_cc_dirs_populates_memory_subfolder_metadata() {
+        let (_tmp, target, cc_dir, config) =
+            setup_target_with_cc(true, 3, &[]);
+        let dirs = describe_claude_code_dirs(&target, &config);
+        assert_eq!(dirs.len(), 1, "expected exactly one matched CC dir");
+        let dir = &dirs[0];
+        assert!(dir.has_memory_subfolder, "memory subfolder should be detected");
+        assert_eq!(dir.memory_md_count, 3, "expected 3 .md files in memory/");
+        assert_eq!(
+            dir.memory_subfolder_path.as_deref(),
+            Some(cc_dir.join("memory").to_string_lossy().as_ref())
+        );
+    }
+
+    /// When the CC dir has no `memory/` subfolder, the new fields
+    /// should reflect the absence: `has_memory_subfolder = false`,
+    /// `memory_md_count = 0`, `memory_subfolder_path = None`.
+    #[test]
+    fn test_find_cc_dirs_memory_absent_returns_false() {
+        let (_tmp, target, _cc_dir, config) =
+            setup_target_with_cc(false, 0, &[]);
+        let dirs = describe_claude_code_dirs(&target, &config);
+        assert_eq!(dirs.len(), 1);
+        let dir = &dirs[0];
+        assert!(!dir.has_memory_subfolder);
+        assert_eq!(dir.memory_md_count, 0);
+        assert!(dir.memory_subfolder_path.is_none());
+    }
+
+    /// `count_memory_md_files` should descend into nested directories
+    /// and count `.md` files at any depth, since `ingest_docs` walks
+    /// recursively. Hidden directories should be skipped to match
+    /// `walk_dir`'s `skip_hidden = true` semantics.
+    #[test]
+    fn test_count_memory_md_files_walks_recursively_skipping_hidden() {
+        let tmp = TempDir::new().unwrap();
+        let mem = tmp.path().join("memory");
+        fs::create_dir_all(&mem).unwrap();
+        make_file(&mem, "top1.md", 5);
+        make_file(&mem, "top2.md", 5);
+
+        let nested = mem.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        make_file(&nested, "n1.md", 5);
+        make_file(&nested, "n2.txt", 5); // not .md
+
+        let hidden = mem.join(".hidden");
+        fs::create_dir_all(&hidden).unwrap();
+        make_file(&hidden, "secret.md", 5); // skipped — hidden parent
+
+        // Hidden file at the top level should also be skipped.
+        make_file(&mem, ".dotfile.md", 5);
+
+        let count = count_memory_md_files(&mem);
+        assert_eq!(count, 3, "expected top1, top2, nested/n1");
+    }
+
+    /// CC dir with jsonls only (no memory/ subfolder): the planner
+    /// should emit
+    ///   - the root vine (existing behavior)
+    ///   - a CC vine
+    ///   - a conversation bedrock + DADBEAR config
+    ///   - an AddChildToVine attaching the conversation bedrock to
+    ///     the CC vine (`child_type='bedrock'`)
+    ///   - an AddChildToVine attaching the CC vine to the root vine
+    ///     (`child_type='vine'`)
+    /// and NOTHING for memory.
+    #[test]
+    fn test_plan_generates_cc_vine_plus_conversation_bedrock() {
+        let (_tmp, target, _cc_dir, config) = setup_target_with_cc(
+            false,
+            0,
+            &[("a.md", "x"), ("b.md", "y"), ("c.md", "z")],
+        );
+        let plan = plan_ingestion(&target, &config, true).unwrap();
+
+        // CC vines + conversation slugs are the canonical signal.
+        assert_eq!(plan.claude_code_vine_slugs.len(), 1);
+        assert_eq!(plan.claude_code_conversation_slugs.len(), 1);
+        assert!(plan.claude_code_memory_slugs.is_empty());
+
+        let cc_vine_slug = plan.claude_code_vine_slugs[0].clone();
+        let convo_slug = plan.claude_code_conversation_slugs[0].clone();
+
+        // The conversation bedrock slug must be derived from the CC
+        // vine slug + the `-conversations` suffix.
+        assert_eq!(convo_slug, format!("{}-conversations", cc_vine_slug));
+
+        // Verify the CC vine attaches to the root vine with
+        // child_type='vine'.
+        let root_vine_slug = plan.root_slug.clone().unwrap();
+        let attach_cc_to_root = plan.operations.iter().any(|op| {
+            matches!(op, IngestionOperation::AddChildToVine {
+                vine_slug, child_slug, child_type, ..
+            } if vine_slug == &root_vine_slug
+                && child_slug == &cc_vine_slug
+                && child_type == "vine")
+        });
+        assert!(
+            attach_cc_to_root,
+            "CC vine must attach to root vine with child_type='vine'"
+        );
+
+        // Verify the conversation bedrock attaches to the CC vine
+        // with child_type='bedrock'.
+        let attach_convo_to_cc = plan.operations.iter().any(|op| {
+            matches!(op, IngestionOperation::AddChildToVine {
+                vine_slug, child_slug, child_type, ..
+            } if vine_slug == &cc_vine_slug
+                && child_slug == &convo_slug
+                && child_type == "bedrock")
+        });
+        assert!(
+            attach_convo_to_cc,
+            "conversation bedrock must attach to CC vine with child_type='bedrock'"
+        );
+
+        // Verify the conversation pyramid has a DADBEAR config.
+        let convo_dadbear = plan.operations.iter().any(|op| {
+            matches!(op, IngestionOperation::RegisterDadbearConfig {
+                slug, content_type, ..
+            } if slug == &convo_slug && content_type == "conversation")
+        });
+        assert!(convo_dadbear, "conversation pyramid must have a DADBEAR config");
+
+        // No memory bedrock at all.
+        let memory_creates = plan.operations.iter().filter(|op| {
+            matches!(op, IngestionOperation::CreatePyramid { content_type, slug, .. }
+                if content_type == "document" && slug.ends_with("-memory"))
+        }).count();
+        assert_eq!(memory_creates, 0);
+    }
+
+    /// CC dir with jsonls AND a populated memory/ subfolder: the
+    /// planner should additionally emit a memory document bedrock
+    /// hung off the CC vine with its own DADBEAR config.
+    #[test]
+    fn test_plan_generates_cc_vine_plus_both_bedrocks_when_memory_present() {
+        let (_tmp, target, cc_dir, config) = setup_target_with_cc(
+            true,
+            5,
+            &[("a.md", "x"), ("b.md", "y"), ("c.md", "z")],
+        );
+        let plan = plan_ingestion(&target, &config, true).unwrap();
+
+        assert_eq!(plan.claude_code_vine_slugs.len(), 1);
+        assert_eq!(plan.claude_code_conversation_slugs.len(), 1);
+        assert_eq!(plan.claude_code_memory_slugs.len(), 1);
+
+        let cc_vine_slug = plan.claude_code_vine_slugs[0].clone();
+        let convo_slug = plan.claude_code_conversation_slugs[0].clone();
+        let memory_slug = plan.claude_code_memory_slugs[0].clone();
+        assert_eq!(memory_slug, format!("{}-memory", cc_vine_slug));
+
+        // Memory bedrock must be a CreatePyramid op pointing at
+        // `<cc_dir>/memory` with content_type=document.
+        let expected_memory_path =
+            cc_dir.join("memory").to_string_lossy().to_string();
+        let memory_create = plan.operations.iter().find(|op| {
+            matches!(op, IngestionOperation::CreatePyramid {
+                slug, content_type, source_path
+            } if slug == &memory_slug
+                && content_type == "document"
+                && source_path == &expected_memory_path)
+        });
+        assert!(memory_create.is_some(), "memory bedrock CreatePyramid op missing");
+
+        // Memory bedrock attaches to the CC vine with child_type='bedrock'.
+        let attach_memory_to_cc = plan.operations.iter().any(|op| {
+            matches!(op, IngestionOperation::AddChildToVine {
+                vine_slug, child_slug, child_type, ..
+            } if vine_slug == &cc_vine_slug
+                && child_slug == &memory_slug
+                && child_type == "bedrock")
+        });
+        assert!(attach_memory_to_cc);
+
+        // Memory pyramid has a DADBEAR config too.
+        let memory_dadbear = plan.operations.iter().any(|op| {
+            matches!(op, IngestionOperation::RegisterDadbearConfig {
+                slug, content_type, source_path, ..
+            } if slug == &memory_slug
+                && content_type == "document"
+                && source_path == &expected_memory_path)
+        });
+        assert!(memory_dadbear);
+
+        // CC vine still attaches to root vine as child_type='vine'.
+        let root_vine_slug = plan.root_slug.clone().unwrap();
+        let cc_attaches_to_root = plan.operations.iter().any(|op| {
+            matches!(op, IngestionOperation::AddChildToVine {
+                vine_slug, child_slug, child_type, ..
+            } if vine_slug == &root_vine_slug
+                && child_slug == &cc_vine_slug
+                && child_type == "vine")
+        });
+        assert!(cc_attaches_to_root);
+
+        // The conversation bedrock attaches at position 0; the
+        // memory bedrock attaches at position 1 (deterministic
+        // ordering relative to the CC vine).
+        let mut child_attachments: Vec<&IngestionOperation> = plan
+            .operations
+            .iter()
+            .filter(|op| matches!(op, IngestionOperation::AddChildToVine {
+                vine_slug, ..
+            } if vine_slug == &cc_vine_slug))
+            .collect();
+        // Sort by position to make the assertion order-independent.
+        child_attachments.sort_by_key(|op| match op {
+            IngestionOperation::AddChildToVine { position, .. } => *position,
+            _ => 0,
+        });
+        assert_eq!(child_attachments.len(), 2);
+        if let IngestionOperation::AddChildToVine { child_slug: cs0, position: p0, .. } =
+            child_attachments[0]
+        {
+            assert_eq!(*p0, 0);
+            assert_eq!(cs0, &convo_slug);
+        }
+        if let IngestionOperation::AddChildToVine { child_slug: cs1, position: p1, .. } =
+            child_attachments[1]
+        {
+            assert_eq!(*p1, 1);
+            assert_eq!(cs1, &memory_slug);
+        }
+    }
+
+    /// An empty `memory/` subfolder (exists but contains zero `.md`
+    /// files) must NOT trigger a memory bedrock — `ingest_docs`
+    /// would fail with "No documents found in {dir}" so the safer
+    /// option is to skip the bedrock entirely.
+    #[test]
+    fn test_plan_skips_memory_bedrock_when_no_md_files() {
+        let (_tmp, target, _cc_dir, config) = setup_target_with_cc(
+            true,
+            0, // empty memory/
+            &[("a.md", "x"), ("b.md", "y"), ("c.md", "z")],
+        );
+        let plan = plan_ingestion(&target, &config, true).unwrap();
+        assert_eq!(plan.claude_code_vine_slugs.len(), 1);
+        assert_eq!(plan.claude_code_conversation_slugs.len(), 1);
+        assert!(
+            plan.claude_code_memory_slugs.is_empty(),
+            "empty memory/ subfolder should NOT produce a memory bedrock"
+        );
+    }
+
+    /// `extract_build_dispatches` must partition the new mini-subplan
+    /// correctly: each CC vine -> vine bucket, each conversation
+    /// bedrock -> leaf bucket (Conversation), each memory bedrock ->
+    /// leaf bucket (Document). Since the new model uses standard
+    /// `CreatePyramid` / `CreateVine` ops, the partitioner naturally
+    /// handles them — this test guards against regression.
+    #[test]
+    fn test_extract_build_dispatches_partitions_cc_vines_and_bedrocks_correctly()
+    {
+        let (_tmp, target, _cc_dir, config) = setup_target_with_cc(
+            true,
+            2,
+            &[("a.md", "x"), ("b.md", "y"), ("c.md", "z")],
+        );
+        let plan = plan_ingestion(&target, &config, true).unwrap();
+
+        let (leaves, vines) = extract_build_dispatches(&plan);
+
+        // The plan emits:
+        //   - root vine (CreateVine)
+        //   - root document pyramid (the 3 .md files in target)
+        //   - CC vine (CreateVine)
+        //   - conversation bedrock (CreatePyramid conversation)
+        //   - memory bedrock (CreatePyramid document)
+        // → 2 vines, 3 leaves.
+        assert_eq!(vines.len(), 2, "expected root vine + CC vine");
+        assert_eq!(
+            leaves.len(),
+            3,
+            "expected root doc bedrock + conversation bedrock + memory bedrock"
+        );
+
+        // Both CC pyramids must be in the leaves bucket with the
+        // right content types.
+        let convo_leaf = leaves.iter().find(|l| {
+            l.slug == plan.claude_code_conversation_slugs[0]
+        });
+        assert!(convo_leaf.is_some());
+        assert!(matches!(
+            convo_leaf.unwrap().content_type,
+            ContentType::Conversation
+        ));
+
+        let memory_leaf = leaves.iter().find(|l| {
+            l.slug == plan.claude_code_memory_slugs[0]
+        });
+        assert!(memory_leaf.is_some());
+        assert!(matches!(
+            memory_leaf.unwrap().content_type,
+            ContentType::Document
+        ));
+
+        // CC vine must be in the vines bucket.
+        let cc_vine = vines.iter().find(|v| {
+            v.slug == plan.claude_code_vine_slugs[0]
+        });
+        assert!(cc_vine.is_some());
+        assert!(matches!(cc_vine.unwrap().content_type, ContentType::Vine));
+    }
+
+    /// The CC vine slug + bedrock slugs must be properly tracked in
+    /// `IngestionPlan`'s classification sets so the executor can
+    /// surface them in the result. Tests the ordering invariants too:
+    /// the conversation bedrock must come before the memory bedrock
+    /// in the plan, and the CC vine must come before its bedrocks.
+    #[test]
+    fn test_plan_records_cc_classification_sets_in_order() {
+        let (_tmp, target, _cc_dir, config) = setup_target_with_cc(
+            true,
+            1,
+            &[("a.md", "x"), ("b.md", "y"), ("c.md", "z")],
+        );
+        let plan = plan_ingestion(&target, &config, true).unwrap();
+
+        // Verify the CC vine slug appears in operations BEFORE its
+        // child bedrocks (the executor cares about this ordering).
+        let cc_vine_slug = &plan.claude_code_vine_slugs[0];
+        let convo_slug = &plan.claude_code_conversation_slugs[0];
+        let memory_slug = &plan.claude_code_memory_slugs[0];
+
+        let cc_vine_idx = plan
+            .operations
+            .iter()
+            .position(|op| matches!(op, IngestionOperation::CreateVine { slug, .. } if slug == cc_vine_slug))
+            .expect("CC vine CreateVine op missing");
+        let convo_idx = plan
+            .operations
+            .iter()
+            .position(|op| matches!(op, IngestionOperation::CreatePyramid { slug, content_type, .. } if slug == convo_slug && content_type == "conversation"))
+            .expect("conversation bedrock missing");
+        let memory_idx = plan
+            .operations
+            .iter()
+            .position(|op| matches!(op, IngestionOperation::CreatePyramid { slug, content_type, .. } if slug == memory_slug && content_type == "document"))
+            .expect("memory bedrock missing");
+
+        assert!(cc_vine_idx < convo_idx, "CC vine must precede conversation bedrock");
+        assert!(convo_idx < memory_idx, "conversation bedrock must precede memory bedrock");
     }
 }

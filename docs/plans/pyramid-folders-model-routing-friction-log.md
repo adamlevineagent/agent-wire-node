@@ -2147,3 +2147,76 @@ Documented inline at `folder_ingestion.rs::prepopulate_chunks_for`.
 
 ---
 
+### 2026-04-11 — Phase 18e: CC dir → vine restructure (D1)
+
+**Phase / workstream:** Phase 18e (claims discovery item D1 from
+`docs/plans/deferral-ledger.md` Discovered-by-use section)
+
+**What hit friction:** Working copy contention with the other parallel
+Phase 18 agents. The user instructed me to switch to branch
+`phase-18e-cc-memory-subfolder` in the main checkout, but the working
+tree was getting branch-switched out from under me by another agent
+running 18a/18b/18c/18d in parallel against the same checkout. My
+first round of edits to `folder_ingestion.rs` was clobbered when the
+working tree state was stashed and replaced with content from a
+different phase's branch.
+
+**Root cause:** Multiple parallel agents sharing one git checkout
+without explicit worktree isolation. When one agent calls `git
+checkout other-branch`, every other agent's in-flight uncommitted
+edits land in a stash with no recovery prompt.
+
+**What we did about it:** Created a dedicated git worktree at
+`/tmp/agent-wire-phase-18e` pinned to `phase-18e-cc-memory-subfolder`,
+symlinked `node_modules` from the main checkout (the worktree shares
+everything except git state), and worked there exclusively for the
+rest of the implementation. The branch state is identical and the
+commit lands on `phase-18e-cc-memory-subfolder` as the prompt
+specified.
+
+**Lesson for future phases:** When parallel workstream prompts run
+on different branches against the same shared checkout, the
+workstream prompt should explicitly recommend `git worktree add` or
+the harness's `EnterWorktree` tool. Better yet: spin up a worktree
+per workstream as part of the conductor's parallel-launch step so
+agents never collide. The `feedback_concurrent_phase_swarms` memory
+should probably mention worktree isolation as a default for any
+multi-workstream phase.
+
+**Other observations:**
+
+1. **Empty `memory/` subfolder edge case caught early.** First draft
+   emitted the memory bedrock unconditionally when `memory_dir.is_dir()`
+   returned true. Realized `ingest_docs` would fail at build time
+   with "No documents found in {dir}" if the directory has zero
+   `.md` files. Fix: count `.md` files in the planner, skip ops 5-7
+   when count is zero. Test guards this. Same logic protects
+   directories that contain only hidden files or non-`.md` files.
+
+2. **Slug naming convention `{cc_vine}-conversations` /
+   `{cc_vine}-memory` worked first try.** No collisions in any
+   test scenario because the two suffixes are sufficient
+   discriminators. The defensive collision-resolve loops are still
+   useful for the case of two CC dirs with the same sluggified base.
+
+3. **`#[derive(Default)]` + `#[serde(default)]` made adding three
+   new fields to `IngestionPlan` painless.** Only had to update one
+   struct literal in `plan_ingestion`. Every other construction site
+   was already using `..Default::default()` because of an earlier
+   refactor. Reinforces previous friction-log guidance: always use
+   `Default` + struct update syntax in test fixtures so adding fields
+   doesn't require touching every test.
+
+**Deviations from the workstream prompt:**
+
+- **None on substance.** Picked Option A (delete the variant) per the
+  prompt's recommendation. Used Phase 16's `child_type='vine'`
+  composition for the root attachment. Skipped Phase 0b chunk-collision
+  per the prompt's permanent out-of-scope list. Frontend wizard preview
+  was updated alongside the backend per `feedback_always_scope_frontend.md`.
+- **One mechanical deviation:** worked in a dedicated worktree at
+  `/tmp/agent-wire-phase-18e` rather than the main checkout, forced
+  by the parallel-agent contention described above.
+
+---
+

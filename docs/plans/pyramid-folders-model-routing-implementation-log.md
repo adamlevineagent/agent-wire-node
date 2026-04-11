@@ -4059,3 +4059,274 @@ failure-mode writeup.
 **Status:** wanderer pass complete → phase 17 complete → full
 17-phase initiative complete. New commit on branch
 `phase-17-recursive-folder-ingestion` (no amend, no push).
+
+---
+
+## Phase 18e — CC dir → vine with conversation + memory bedrocks
+
+**Discovery item claimed:** D1 from `docs/plans/deferral-ledger.md`
+"Discovered-by-use" section. Surfaced when Adam ran the shipped
+folder ingestion against `/Users/adamlevine/AI Project Files/agent-wire-node`
+and noticed that Claude Code's `memory/*.md` subfolders (which hold
+the per-project persistent memory the assistant builds up over time)
+were being silently ignored. Only `*.jsonl` conversation files were
+making it into the pyramid graph; load-bearing project knowledge in
+`<cc_dir>/memory/*.md` was sitting on disk untouched.
+
+**The restructure**
+
+Phase 17 emitted a single `RegisterClaudeCodePyramid` op per CC dir
+and attached it as a bedrock child of the target folder's root vine.
+Phase 18e replaces that with a mini-subplan that turns each CC dir
+into a vine of two bedrocks, all flowing through the existing
+Phase 16 vine-of-vines composition primitives.
+
+**New op shape (per CC dir):**
+
+```
+1. CreateVine            cc_vine_slug                = {root_vine}-cc-{N}
+2. CreatePyramid         {cc_vine_slug}-conversations  (content_type=conversation)
+3. AddChildToVine        cc_vine → conversations       (child_type='bedrock', position 0)
+4. RegisterDadbearConfig {cc_vine_slug}-conversations  (content_type='conversation')
+5. CreatePyramid         {cc_vine_slug}-memory         (content_type=document) [optional]
+6. AddChildToVine        cc_vine → memory              (child_type='bedrock', position 1) [optional]
+7. RegisterDadbearConfig {cc_vine_slug}-memory         (content_type='document') [optional]
+8. AddChildToVine        root_vine → cc_vine           (child_type='vine', position N)
+```
+
+Ops 5-7 are emitted only when `<cc_dir>/memory/` exists AND contains
+at least one `.md` file (a recursive walk via `count_memory_md_files`,
+which mirrors `ingest_docs`'s `walk_dir(skip_hidden=true)` semantics).
+An empty `memory/` subfolder is treated as if it doesn't exist —
+`ingest_docs` would otherwise fail at build time with
+"No documents found in {dir}", so it's safer to skip the bedrock
+entirely. Phase 18e test `test_plan_skips_memory_bedrock_when_no_md_files`
+guards this.
+
+**Op 8 is the load-bearing line.** The CC vine attaches to the root
+vine with `child_type='vine'` per Phase 16's vine-of-vines composition.
+That makes the CC vine a peer of every other folder child of the root
+vine — exactly what Adam asked for: "as if the CC vine were another
+folder/pyramid in the root `/agent-wire-node` directory." Without
+that line, the CC vine would orphan and never be dispatched as part
+of the root vine's notification cascade.
+
+**Slug naming:** the CC vine keeps the Phase 17 `{root_vine}-cc-{N}`
+convention. Bedrocks underneath gain `-conversations` / `-memory`
+suffixes so they're easy to spot in the slug table. Collision
+resolution mirrors the rest of the planner: sluggify, then
+suffix-bump until unique.
+
+**Option A vs B for `RegisterClaudeCodePyramid` retirement**
+
+I picked **Option A** (delete the variant outright) per the workstream
+prompt's recommendation. Justification:
+
+- Phase 17 was less than two weeks old at the time of Phase 18e and
+  had no external callers (verified via grep — the only references
+  to `RegisterClaudeCodePyramid` lived inside `folder_ingestion.rs`
+  itself plus the wizard preview's TS type union).
+- Cleaner long-term: the new model uses standard `CreatePyramid`
+  + `CreateVine` + `AddChildToVine` ops everywhere, so the executor,
+  partitioner, and dispatcher all converge on a single op vocabulary.
+- The diff was manageable: I retired the variant, removed the
+  `execute_plan` arm, removed the `extract_build_dispatches` arm,
+  and updated three existing tests.
+
+**`extract_build_dispatches` change**
+
+The Phase 17 wanderer's partitioner had a dedicated arm for
+`RegisterClaudeCodePyramid` that pushed the slug into the leaves
+bucket as a `Conversation` content type. With the variant retired,
+that arm is gone — both the CC vine and the CC bedrocks now flow
+through the standard `CreatePyramid` / `CreateVine` arms. Net effect:
+the function is shorter, AND it correctly partitions the new ops
+without any extra branching:
+
+- CC conversation bedrock → leaves (content_type=Conversation,
+  pre-pop via `ingest_conversation` on the latest jsonl)
+- CC memory bedrock → leaves (content_type=Document, pre-pop via
+  `ingest_docs` walking `<cc_dir>/memory/`)
+- CC vine → vines (no pre-pop, dispatched via `topical-vine.yaml`
+  after the 2-second leaf-settle delay)
+
+Test `test_extract_build_dispatches_partitions_cc_vines_and_bedrocks_correctly`
+verifies all three partitioning paths against a fresh planner output
+that includes both bedrock types.
+
+**`spawn_initial_builds` dispatch verification**
+
+`spawn_initial_builds` works without changes. It walks
+`extract_build_dispatches`'s leaves first (each gets a
+`prepopulate_chunks_for` call followed by `spawn_question_build`),
+then pauses for two seconds to let leaf builds start writing apex
+nodes, then dispatches each vine. Under the new model the leaves
+list now contains the conversation bedrock (which pre-pops via the
+existing single-jsonl Phase 0b path) AND the memory document bedrock
+(which pre-pops via `ingest_docs` on the memory subfolder), and the
+vines list contains both the root vine AND the CC vine. The CC vine
+inherits Phase 16's `notify_vine_of_child_completion` cascade so
+once its bedrocks finish their first build, the CC vine refines its
+own apex; once the CC vine refines, the root vine refines.
+
+**Inherited Phase 0b limitation (out of scope)**
+
+The conversation bedrock pre-pop still uses the `prepopulate_chunks_for`
+single-jsonl workaround Phase 17 documented at implementation log
+line 219: `ingest_conversation` is single-file and reuses
+`chunk_index = 0..N` per call, so calling it multiple times for the
+same slug collides on the `UNIQUE(slug, chunk_index)` constraint.
+The Phase 17 fix bootstraps the pyramid with the most-recently-modified
+jsonl and leaves older sessions for DADBEAR Pipeline B to surface
+on subsequent ticks. **Phase 18e does not change this behavior.**
+Fixing it requires adding a `chunk_offset` parameter to
+`ingest_conversation` and threading it through the per-jsonl loop.
+Documented as inherited and out-of-scope per the workstream prompt's
+"Out of scope permanently (inherited from Phase 17)" section.
+
+The memory bedrock IS additive value that lands today, even with the
+conversation bedrock still consuming only the latest jsonl. Adam's
+project memory `.md` files become part of the pyramid graph on the
+first ingest pass, surfaced through the standard document ingest
+chain, no Phase 0b dependency.
+
+**`ingest_docs` recursion verification**
+
+I verified that `ingest_docs` calls `walk_dir(dir_path, &empty_skip,
+/*skip_hidden=*/true)` (`src-tauri/src/pyramid/ingest.rs:610`), which
+recurses through ALL subdirectories of the input path, sorts entries
+deterministically, and skips hidden directories. So users with
+`memory/<topic>/notes.md` style nested layouts get their files
+walked correctly without any special handling — the `count_memory_md_files`
+helper mirrors that semantics so the wizard preview count and the
+actual ingest agree.
+
+**Frontend preview updates** (`src/components/AddWorkspace.tsx`)
+
+The wizard preview was updated in four places per
+`feedback_always_scope_frontend.md`:
+
+1. **Type definitions** — `ClaudeCodeConversationDir` gained the new
+   memory metadata fields (`has_memory_subfolder`, `memory_md_count`,
+   `memory_subfolder_path`), the `IngestionOperation` union dropped
+   `register_claude_code_pyramid`, and both `IngestionPlan` and
+   `IngestionResult` gained the new CC slug tracking lists.
+
+2. **CC dirs found list** — the per-dir line now reads
+   `(215 jsonl, 8 memory md)` when the dir has a populated memory
+   subfolder, with the memory count highlighted in the accent color
+   so the eye lands on it.
+
+3. **Plan summary** — the old "CC pyramids: N" row was replaced with
+   a three-row breakdown: "CC vines / ↳ Conversation beds / ↳ Memory
+   doc beds". The same three-row breakdown was added to the
+   post-execution result summary so the same numbers reappear after
+   Start Ingestion.
+
+4. **Operation list** — items in the plan that belong to a CC
+   subplan are now tagged `+ cc-vine`, `+ cc-bed (conversation)`,
+   `+ cc-bed (memory document)` so the user can visually distinguish
+   them from ordinary folder children.
+
+**Tests added** (8 new in `pyramid::folder_ingestion::phase18e_tests`)
+
+| Test | Purpose |
+|---|---|
+| `test_find_cc_dirs_populates_memory_subfolder_metadata` | Confirms `describe_claude_code_dirs` populates the new fields when a `memory/` subfolder exists with `.md` files. |
+| `test_find_cc_dirs_memory_absent_returns_false` | Confirms the absent-subfolder case returns `false`/0/None. |
+| `test_count_memory_md_files_walks_recursively_skipping_hidden` | Verifies the recursive walker descends into nested subdirs and skips hidden directories (matching `ingest_docs` semantics). |
+| `test_plan_generates_cc_vine_plus_conversation_bedrock` | CC dir with jsonls only → CC vine + conversation bedrock + DADBEAR config + child_type='vine' attachment to root vine, with NO memory bedrock. |
+| `test_plan_generates_cc_vine_plus_both_bedrocks_when_memory_present` | CC dir with jsonls + memory `.md` files → all 8 ops emitted, including position-ordered child attachments inside the CC vine. |
+| `test_plan_skips_memory_bedrock_when_no_md_files` | Empty `memory/` subfolder produces NO memory bedrock (avoids `ingest_docs` "No documents found" failure). |
+| `test_extract_build_dispatches_partitions_cc_vines_and_bedrocks_correctly` | Round-trip: planner → partitioner → leaves/vines lists with correct content types. |
+| `test_plan_records_cc_classification_sets_in_order` | Verifies the plan's CC classification sets stay synchronized with the operation list and that the CC vine op precedes its bedrock ops in the operation list. |
+
+Three existing tests were updated to use the new op shape:
+`test_plan_ingestion_with_claude_code_attaches_cc_pyramids` and
+`test_plan_ingestion_below_threshold_with_cc_still_creates_vine`
+now check `claude_code_vine_slugs` / `claude_code_conversation_slugs`
+instead of filtering for `RegisterClaudeCodePyramid`. The wanderer
+test `test_extract_build_dispatches_partitions_leaves_and_vines`
+was updated to use a `CreateVine` + `CreatePyramid(conversation)`
+pair instead of the obsolete CC variant.
+
+**Manual verification trace**
+
+For a target folder `/Users/adam/AI Project Files/agent-wire-node`
+that has Claude Code conversations at
+`~/.claude/projects/-Users-adam-AI Project Files-agent-wire-node`
+with both `*.jsonl` and `memory/*.md`, the planner emits:
+
+```
++ vine     agent-wire-node                                # root vine
++ pyramid  agent-wire-node-src (code)                     # ordinary folder children
+    dadbear agent-wire-node-src every 30s
+    attach agent-wire-node-src (bedrock) → agent-wire-node
++ pyramid  agent-wire-node-docs (document)
+    dadbear agent-wire-node-docs every 30s
+    attach agent-wire-node-docs (bedrock) → agent-wire-node
+... (other folder children) ...
++ cc-vine agent-wire-node-cc-1                            # CC vine
++ cc-bed  agent-wire-node-cc-1-conversations (conversation)
+    attach agent-wire-node-cc-1-conversations (bedrock) → agent-wire-node-cc-1
+    dadbear agent-wire-node-cc-1-conversations every 30s
++ cc-bed  agent-wire-node-cc-1-memory (memory document)
+    attach agent-wire-node-cc-1-memory (bedrock) → agent-wire-node-cc-1
+    dadbear agent-wire-node-cc-1-memory every 30s
+    attach agent-wire-node-cc-1 (vine) → agent-wire-node       # ← op 8, the load-bearing line
+```
+
+After `execute_plan`, `pyramid_vine_compositions` should hold:
+- `(agent-wire-node, agent-wire-node-src, child_type='bedrock')`
+- `(agent-wire-node, agent-wire-node-docs, child_type='bedrock')`
+- ...
+- `(agent-wire-node, agent-wire-node-cc-1, child_type='vine')` ← NEW
+- `(agent-wire-node-cc-1, agent-wire-node-cc-1-conversations, child_type='bedrock')` ← NEW
+- `(agent-wire-node-cc-1, agent-wire-node-cc-1-memory, child_type='bedrock')` ← NEW
+
+The CC vine dispatches via `topical-vine.yaml` after the 2-second
+leaf-settle delay; the conversation + memory bedrocks dispatch in
+the leaves loop with their content-type-appropriate apex questions
+and pre-populated chunks.
+
+**Verification commands run**
+
+- ✅ `cargo check --lib` — clean (3 pre-existing warnings, 0 errors).
+- ✅ `cargo test --lib pyramid::folder_ingestion` — **36 passed,
+  0 failed** (28 phase17_tests + 8 new phase18e_tests).
+- ✅ `cargo test --lib pyramid` — **1246 passed, 7 failed**. The 7
+  failures are the same pre-existing schema-drift unrelated tests
+  documented from Phase 2 onward (`test_evidence_pk_cross_slug_coexistence`,
+  `real_yaml_thread_clustering_preserves_response_schema`, 5 ×
+  `pyramid::staleness::tests::*`). Test count is +8 over the
+  Phase 17 wanderer baseline (1238 → 1246) from the 8 new Phase 18e
+  tests. Zero regressions.
+- ✅ `npm run build` — clean (150 modules, 792.53 kB bundle).
+
+**Files changed**
+
+- `src-tauri/src/pyramid/folder_ingestion.rs` — retired
+  `IngestionOperation::RegisterClaudeCodePyramid`, extended
+  `ClaudeCodeConversationDir` with memory metadata, extended
+  `IngestionPlan` with CC classification sets, extended
+  `IngestionResult` with per-category CC tracking, added
+  `count_memory_md_files` helper, restructured the CC emission
+  block in `plan_recursive` into the 8-op subplan, updated
+  `execute_plan` to route slugs into CC buckets, simplified
+  `extract_build_dispatches`, updated three legacy tests, added
+  new `phase18e_tests` module with 8 tests.
+- `src/components/AddWorkspace.tsx` — extended TS types, dropped
+  the `register_claude_code_pyramid` op variant, replaced "CC
+  pyramids: N" preview row with the three-row CC vines/Conversation
+  beds/Memory doc beds breakdown, updated CC dirs found list to
+  show memory md count when present, tagged CC ops in the operation
+  list with `cc-vine`/`cc-bed` labels, mirrored the new breakdown
+  in the post-execution result summary.
+- `docs/plans/pyramid-folders-model-routing-implementation-log.md` —
+  this Phase 18e entry.
+
+**Status:** `awaiting-verification`. The phase ships on a fresh
+commit on branch `phase-18e-cc-memory-subfolder`. Other Phase 18
+workstreams (18a/18b/18c/18d) run in parallel on their own branches
+and do not touch the files Phase 18e modifies. No amend, no push,
+no merge.
