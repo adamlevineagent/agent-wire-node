@@ -2147,3 +2147,115 @@ Documented inline at `folder_ingestion.rs::prepopulate_chunks_for`.
 
 ---
 
+### 2026-04-11 — Phase 18c: circle scope deferral + cache audit-count deferral
+
+**Phase / workstream:** Phase 18c (privacy opt-in + pause-all
+scoping). Claims L4 and L9 from the deferral ledger.
+
+**What hit friction**
+
+The L9 spec defines three scopes for `pyramid_pause_dadbear_all`:
+`all`, `folder`, and `circle`. The `circle` scope is supposed to
+pause every pyramid in a specific Wire circle via:
+
+```sql
+UPDATE pyramid_dadbear_config SET enabled = 0
+WHERE enabled = 1 AND slug IN (
+  SELECT slug FROM pyramid_metadata WHERE circle_id = ?1
+);
+```
+
+But `pyramid_metadata` is not a real table in the local DB. Searching
+the schema turned up no `circle_id` column on any pyramid table. The
+only place `circle_id` lives is in the JWT claim layer
+(`server.rs::JwtClaims`, `auth.rs::PublicAuthSource`, etc.) — Wire's
+auth side knows what circle a request is from, but Wire Node has no
+local per-pyramid record of "this pyramid was published into circle
+X."
+
+The L4 spec calls for an inline preview of "N L0 nodes / M reference
+private corpus docs" alongside the cache opt-in checkbox. Computing
+this would need a join against `wire_source_documents.visibility`,
+which is not consistently populated for every L0 node's source
+document on the local DB. The visibility field is part of the import
+flow but not the publish flow, so the "audit count" preview would be
+non-trivial backend work that didn't fit the L4 time budget.
+
+**Root cause**
+
+Two cases of the same shape: a spec field that depends on schema
+that hasn't been built yet OR data that hasn't been routed to the
+right place for the consumer. This isn't a Phase 18c bug — both
+features are real follow-ups for whoever lands the
+`pyramid_metadata` table or extends the publish path with source
+visibility tracking.
+
+**What we did about it**
+
+Per the deviation protocol in the workstream prompt:
+
+- **Circle scope:** ship `all` + `folder` only. The IPC returns an
+  explicit error for `scope = "circle"` pointing at this friction
+  log entry. The frontend renders the circle radio as disabled with
+  a tooltip explaining the deferral. The `count_dadbear_scope`
+  helper returns `Ok(0)` for circle so the UI can render the
+  disabled state without crashing on a backend error.
+- **Audit count:** ship the checkbox with the warning text only.
+  The user must review their source visibility manually before
+  checking the box. The warning text covers the privacy story; the
+  audit count is documented as a follow-up here so it can be picked
+  up alongside whatever lands `wire_source_documents.visibility` on
+  the publish path.
+
+**Lesson for future phases**
+
+Two takeaways:
+
+1. **Spec SQL that references tables-that-don't-exist is a flag.**
+   When the spec writes a SQL statement that uses a column the
+   schema doesn't have, that's a deferred dependency, not a missing
+   detail. The Phase 18c workstream prompt called this out
+   explicitly ("If `pyramid_metadata.circle_id` doesn't exist
+   ... defer circle scope") which was the right move — naming the
+   deferral upfront kept it from sliding into a half-built feature.
+
+2. **The "deferred radio" pattern is genuinely useful.** Rendering
+   the circle radio as disabled with "coming soon" instead of
+   hiding it tells the user (a) the feature exists conceptually, and
+   (b) it's a planned addition, not a bug. Compare with hiding it
+   entirely, which would silently surprise the user when they find
+   the spec mentioning circle scoping.
+
+### Phase 18c — additional notes
+
+**Folder canonicalization decision:** the Phase 18c db.rs helpers
+use a simple lexical match: strip a single trailing slash from the
+input, then SQL `(source_path = ?1 OR source_path LIKE ?1 || '/%')`.
+No filesystem resolution. No symlink handling. The DB stores
+whatever `source_path` the user originally configured, and we match
+against that text. If a user has DADBEAR configs at both
+`/home/user/project` and `/Users/user/project` because of
+case-insensitive HFS+ vs case-sensitive APFS quirks, they're treated
+as different folders. That's the correct behavior for the
+"intentional groupings" use case the spec describes — users who
+want to pause "all my work pyramids" should pick one canonical
+prefix. Symlink resolution would be the wrong layer for this.
+
+**Concurrent workstream contamination:** while implementing 18c,
+the working tree picked up file modifications from concurrent
+18a/18b/18d/18e workstreams that share the same git checkout
+location. db.rs, event_bus.rs, mod.rs, llm.rs, folder_ingestion.rs,
+yaml_renderer.rs, and bundled_contributions.json all picked up
+spurious modifications at various points during the session,
+forcing extra `git checkout HEAD --` cleanup. The 18c branch only
+ships its own changes (main.rs, db.rs, wire_publish.rs,
+PublishPreviewModal.tsx, CrossPyramidTimeline.tsx,
+DadbearOversightPage.tsx, DadbearPauseScopeModal.tsx,
+configContributions.ts) — but the cross-workstream interference was
+the single biggest friction point in the session. **Lesson:**
+parallel workstreams on the same checkout directory need either
+git worktrees or sequential execution; git stash routinely picked
+up changes from sister branches when the agent didn't intend it.
+
+---
+

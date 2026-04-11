@@ -11166,6 +11166,138 @@ pub fn enable_dadbear_all(conn: &Connection) -> Result<usize> {
     Ok(count)
 }
 
+// ── Phase 18c (L9): Scoped pause/resume for DADBEAR ──────────────────────────
+//
+// Phase 13 shipped only `scope: "all"`. Phase 18c adds the folder scope
+// per `cross-pyramid-observability.md` "Pause-All Semantics" section
+// (~line 286). The circle scope referenced in the spec depends on a
+// `pyramid_metadata.circle_id` table that does not currently exist in
+// the local DB schema (circle membership lives only in the Wire JWT
+// claim layer, not in the local pyramid DB), so the circle scope is
+// deferred to a later phase. See `deferral-ledger.md` for the deferral
+// note.
+//
+// Folder canonicalization strategy: lexical only. The input folder
+// has any trailing slash stripped before matching, then SQL uses
+// `(source_path = ?1 OR source_path LIKE ?1 || '/%')` to match both
+// the exact path and any descendant. No filesystem resolution, no
+// symlink handling — the DB stores whatever the user originally
+// configured, and we match against that text. Trailing-slash
+// equivalence is preserved by the input normalization.
+
+/// Strip a single trailing slash from a folder path so the LIKE match
+/// works consistently for inputs like `/a/` vs `/a`. The root path `/`
+/// is preserved as-is so it doesn't collapse to an empty string.
+fn normalize_dadbear_folder(folder: &str) -> String {
+    if folder.len() > 1 && folder.ends_with('/') {
+        folder[..folder.len() - 1].to_string()
+    } else {
+        folder.to_string()
+    }
+}
+
+/// Phase 18c: bulk-pause DADBEAR for every config whose `source_path`
+/// is exactly the given folder or is a descendant of it. Idempotent —
+/// already-disabled rows do not contribute to the affected count.
+/// Returns the number of rows that flipped from `enabled = 1` to
+/// `enabled = 0`.
+pub fn disable_dadbear_by_folder(conn: &Connection, folder: &str) -> Result<usize> {
+    let normalized = normalize_dadbear_folder(folder);
+    let count = conn.execute(
+        "UPDATE pyramid_dadbear_config
+            SET enabled = 0, updated_at = datetime('now')
+          WHERE enabled = 1
+            AND (source_path = ?1 OR source_path LIKE ?1 || '/%')",
+        rusqlite::params![normalized],
+    )?;
+    Ok(count)
+}
+
+/// Phase 18c: mirror of `disable_dadbear_by_folder`. Resumes DADBEAR
+/// on every config whose `source_path` is the given folder or a
+/// descendant. Returns the number of rows that flipped from
+/// `enabled = 0` to `enabled = 1`.
+pub fn enable_dadbear_by_folder(conn: &Connection, folder: &str) -> Result<usize> {
+    let normalized = normalize_dadbear_folder(folder);
+    let count = conn.execute(
+        "UPDATE pyramid_dadbear_config
+            SET enabled = 1, updated_at = datetime('now')
+          WHERE enabled = 0
+            AND (source_path = ?1 OR source_path LIKE ?1 || '/%')",
+        rusqlite::params![normalized],
+    )?;
+    Ok(count)
+}
+
+/// Phase 18c: distinct list of `source_path` values across all
+/// DADBEAR configs. Used by the frontend scope picker to populate the
+/// folder dropdown. Sorted alphabetically; duplicates removed at the
+/// SQL level via `DISTINCT`.
+pub fn list_dadbear_source_paths(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT source_path FROM pyramid_dadbear_config
+         ORDER BY source_path ASC",
+    )?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// Phase 18c: count rows that WOULD be flipped by a pause-all call
+/// with the given scope, without actually mutating any rows. Used by
+/// the frontend scope picker to show the live count as the user
+/// changes scope. The `target_state` parameter selects whether we
+/// count rows currently enabled (would-pause) or currently disabled
+/// (would-resume). Returns 0 for unknown scopes (the IPC layer
+/// validates the scope name and returns an error in that case).
+///
+/// Folder canonicalization matches `disable_dadbear_by_folder` /
+/// `enable_dadbear_by_folder` exactly so the preview count and the
+/// real action agree on which rows match.
+pub fn count_dadbear_scope(
+    conn: &Connection,
+    scope: &str,
+    scope_value: Option<&str>,
+    target_state: bool,
+) -> Result<usize> {
+    // `target_state = true` means "would-pause" — we count rows that
+    // are currently `enabled = 1` (they will flip to disabled). The
+    // resume preview is the inverse: `enabled = 0` rows that will
+    // flip to enabled.
+    let current_enabled: i64 = if target_state { 1 } else { 0 };
+    match scope {
+        "all" => {
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM pyramid_dadbear_config WHERE enabled = ?1",
+                rusqlite::params![current_enabled],
+                |r| r.get(0),
+            )?;
+            Ok(count as usize)
+        }
+        "folder" => {
+            let folder = match scope_value {
+                Some(f) if !f.is_empty() => normalize_dadbear_folder(f),
+                _ => return Ok(0),
+            };
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM pyramid_dadbear_config
+                  WHERE enabled = ?1
+                    AND (source_path = ?2 OR source_path LIKE ?2 || '/%')",
+                rusqlite::params![current_enabled, folder],
+                |r| r.get(0),
+            )?;
+            Ok(count as usize)
+        }
+        // "circle" is deferred — no schema to query. Return 0 so the
+        // IPC layer can show "Circle scoping not yet available".
+        "circle" => Ok(0),
+        _ => Ok(0),
+    }
+}
+
 /// Phase 13: Cost-rollup helper. Aggregates `pyramid_cost_log` across
 /// all slugs within the given ISO date range, grouped by
 /// `(slug, provider, operation)`. Callers pivot the result client-side
@@ -15767,6 +15899,209 @@ mod phase13_tests {
             )
             .unwrap();
         assert_eq!(disabled_count, 0);
+    }
+
+    // ── Phase 18c (L9) — Folder-scoped pause/resume + count ─────────────────
+
+    /// Helper for the Phase 18c folder-scope tests: seeds a path
+    /// hierarchy where /a, /a/b, and /a/b/c are all enabled descendants
+    /// of /a, plus /d as a sibling that should never be touched by
+    /// /a-scoped operations.
+    fn seed_dadbear_folder_hierarchy(conn: &Connection) {
+        conn.execute(
+            "INSERT INTO pyramid_dadbear_config (slug, source_path, content_type, enabled)
+             VALUES ('p18c-a',     '/a',     'document', 1),
+                    ('p18c-ab',    '/a/b',   'document', 1),
+                    ('p18c-abc',   '/a/b/c', 'document', 1),
+                    ('p18c-d',     '/d',     'document', 1)",
+            [],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_disable_dadbear_by_folder_matches_subtree() {
+        let conn = mem_conn();
+        seed_dadbear_folder_hierarchy(&conn);
+
+        // /a should match /a, /a/b, /a/b/c — three rows. /d is a
+        // sibling and must NOT be touched.
+        let affected = disable_dadbear_by_folder(&conn, "/a").unwrap();
+        assert_eq!(affected, 3, "expected /a + /a/b + /a/b/c, sibling /d untouched");
+
+        let still_enabled: Vec<String> = conn
+            .prepare(
+                "SELECT source_path FROM pyramid_dadbear_config
+                  WHERE enabled = 1 ORDER BY source_path",
+            )
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(still_enabled, vec!["/d".to_string()]);
+    }
+
+    #[test]
+    fn test_disable_dadbear_by_folder_handles_trailing_slash() {
+        let conn = mem_conn();
+        seed_dadbear_folder_hierarchy(&conn);
+
+        // Trailing-slash variant should match the same set as the
+        // no-slash variant. Canonicalization strips the trailing slash
+        // before matching.
+        let affected = disable_dadbear_by_folder(&conn, "/a/").unwrap();
+        assert_eq!(affected, 3);
+    }
+
+    #[test]
+    fn test_disable_dadbear_by_folder_idempotent() {
+        let conn = mem_conn();
+        seed_dadbear_folder_hierarchy(&conn);
+
+        let first = disable_dadbear_by_folder(&conn, "/a").unwrap();
+        assert_eq!(first, 3);
+        // Second call hits zero matching rows because they're all
+        // already disabled.
+        let second = disable_dadbear_by_folder(&conn, "/a").unwrap();
+        assert_eq!(second, 0);
+    }
+
+    #[test]
+    fn test_enable_dadbear_by_folder_mirrors_disable() {
+        let conn = mem_conn();
+        seed_dadbear_folder_hierarchy(&conn);
+        // Disable everything first.
+        disable_dadbear_all(&conn).unwrap();
+
+        let affected = enable_dadbear_by_folder(&conn, "/a").unwrap();
+        assert_eq!(affected, 3, "/a + /a/b + /a/b/c should re-enable");
+
+        // /d is still disabled.
+        let still_disabled: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pyramid_dadbear_config WHERE enabled = 0",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(still_disabled, 1);
+    }
+
+    #[test]
+    fn test_disable_dadbear_by_folder_does_not_match_partial_prefix() {
+        let conn = mem_conn();
+        // /alpha and /a are siblings — pausing /a must NOT match
+        // /alpha because the LIKE match uses '/%' as the suffix.
+        conn.execute(
+            "INSERT INTO pyramid_dadbear_config (slug, source_path, content_type, enabled)
+             VALUES ('p18c-a',     '/a',     'document', 1),
+                    ('p18c-alpha', '/alpha', 'document', 1)",
+            [],
+        )
+        .unwrap();
+
+        let affected = disable_dadbear_by_folder(&conn, "/a").unwrap();
+        assert_eq!(affected, 1, "only /a should match, not /alpha");
+
+        let alpha_enabled: i64 = conn
+            .query_row(
+                "SELECT enabled FROM pyramid_dadbear_config WHERE source_path = '/alpha'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(alpha_enabled, 1, "/alpha must still be enabled");
+    }
+
+    #[test]
+    fn test_list_dadbear_source_paths_returns_distinct_sorted() {
+        let conn = mem_conn();
+        conn.execute(
+            "INSERT INTO pyramid_dadbear_config (slug, source_path, content_type, enabled)
+             VALUES ('p18c-a',  '/zeta',  'document', 1),
+                    ('p18c-b',  '/alpha', 'document', 1),
+                    ('p18c-c',  '/alpha', 'document', 0),
+                    ('p18c-d',  '/mid',   'document', 1)",
+            [],
+        )
+        .unwrap();
+
+        let paths = list_dadbear_source_paths(&conn).unwrap();
+        // /alpha appears twice in the table but DISTINCT collapses
+        // to one entry. Result is alphabetically sorted.
+        assert_eq!(
+            paths,
+            vec!["/alpha".to_string(), "/mid".to_string(), "/zeta".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_count_dadbear_scope_all_returns_currently_enabled() {
+        let conn = mem_conn();
+        seed_dadbear_folder_hierarchy(&conn);
+        // Pause one row so the seeded hierarchy has 3 enabled / 1 disabled.
+        conn.execute(
+            "UPDATE pyramid_dadbear_config SET enabled = 0 WHERE source_path = '/d'",
+            [],
+        )
+        .unwrap();
+
+        // target_state=true means "would-pause" — count rows that are
+        // currently enabled (i.e. would flip to disabled).
+        let pause_count = count_dadbear_scope(&conn, "all", None, true).unwrap();
+        assert_eq!(pause_count, 3);
+
+        // target_state=false means "would-resume" — count rows that are
+        // currently disabled.
+        let resume_count = count_dadbear_scope(&conn, "all", None, false).unwrap();
+        assert_eq!(resume_count, 1);
+    }
+
+    #[test]
+    fn test_count_dadbear_scope_folder_matches_disable_helper() {
+        let conn = mem_conn();
+        seed_dadbear_folder_hierarchy(&conn);
+
+        // Preview should agree with the real action — both must say 3
+        // rows under /a.
+        let preview = count_dadbear_scope(&conn, "folder", Some("/a"), true).unwrap();
+        assert_eq!(preview, 3);
+
+        // After actually disabling, the preview drops to 0.
+        disable_dadbear_by_folder(&conn, "/a").unwrap();
+        let after = count_dadbear_scope(&conn, "folder", Some("/a"), true).unwrap();
+        assert_eq!(after, 0);
+
+        // And the resume preview now sees the 3 disabled rows.
+        let resume_preview = count_dadbear_scope(&conn, "folder", Some("/a"), false).unwrap();
+        assert_eq!(resume_preview, 3);
+    }
+
+    #[test]
+    fn test_count_dadbear_scope_folder_handles_missing_or_empty_value() {
+        let conn = mem_conn();
+        seed_dadbear_folder_hierarchy(&conn);
+
+        // Missing or empty scope_value returns 0 instead of matching
+        // every row — this prevents UI from accidentally implying a
+        // dangerous "everything" preview when the user hasn't typed
+        // a path yet.
+        assert_eq!(count_dadbear_scope(&conn, "folder", None, true).unwrap(), 0);
+        assert_eq!(count_dadbear_scope(&conn, "folder", Some(""), true).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_count_dadbear_scope_circle_returns_zero_pending_schema() {
+        let conn = mem_conn();
+        seed_dadbear_folder_hierarchy(&conn);
+
+        // The circle scope has no backing schema yet (deferred per
+        // Phase 18c deviation note). The count helper returns 0 so
+        // the UI can render "Circle scoping not yet available".
+        let count =
+            count_dadbear_scope(&conn, "circle", Some("any-circle"), true).unwrap();
+        assert_eq!(count, 0);
     }
 
     #[test]

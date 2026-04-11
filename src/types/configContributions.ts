@@ -141,6 +141,12 @@ export interface PublishToWireResponse {
     handle_path: string | null;
     wire_type: string;
     sections_published: string[];
+    /** Phase 18c (L4): set to the number of cache entries attached when
+     *  the user opted in to `include_cache_manifest`; `null` means the
+     *  user did not opt in (default-OFF privacy gate). The frontend
+     *  uses this to render "cache manifest included (N entries)" in
+     *  the success state. */
+    cache_manifest_entries: number | null;
 }
 
 /** Phase 4 `CreateConfigContributionResponse` — returned by accept_proposal. */

@@ -4059,3 +4059,325 @@ failure-mode writeup.
 **Status:** wanderer pass complete → phase 17 complete → full
 17-phase initiative complete. New commit on branch
 `phase-17-recursive-folder-ingestion` (no amend, no push).
+
+---
+
+## Phase 18c — Privacy Opt-in + Pause-all Scoping (2026-04-11)
+
+**Workstream:** 18c of the Phase 18 dropped-handoff fix bundle.
+**Branch:** `phase-18c-privacy-pause-all`.
+**Claims:** L4 (cache-publish privacy opt-in checkbox) and L9
+(folder/circle-scoped pause-all DADBEAR) from
+`docs/plans/deferral-ledger.md`.
+
+### L4: Cache manifest opt-in checkbox
+
+**Backend:**
+
+- `pyramid_publish_to_wire` IPC gained an optional
+  `include_cache_manifest: bool` parameter (default false). When set,
+  the handler reads the contribution's slug, calls
+  `publisher.export_cache_manifest(...)` (Phase 7's existing
+  default-OFF method) with `include_cache=true`, and threads the
+  resulting `CacheManifest` into the publish payload via the new
+  `publish_contribution_with_metadata_and_cache` method on
+  `PyramidPublisher`. The legacy `publish_contribution_with_metadata`
+  is now a thin backwards-compatible wrapper that passes `None` for
+  the cache manifest, so existing call sites are unchanged.
+- `wire_publish.rs` extracted a private `build_contribution_publish_payload`
+  free function so the payload-shape logic (including the optional
+  `cache_manifest_json` field) can be unit-tested without requiring an
+  HTTP round trip. Both `publish_contribution_with_metadata` and the
+  new cache-aware variant call it.
+- `PublishToWireResponse` gained a `cache_manifest_entries:
+  Option<u64>` field. `None` means the user did not opt in (the safe
+  default); `Some(N)` means the manifest was attached with N total
+  cache entries across all nodes. The frontend surfaces this in the
+  publish success state.
+
+**Frontend:**
+
+- `src/components/PublishPreviewModal.tsx` gained a new "Advanced
+  publishing options" section above the action buttons. The section
+  contains a labeled checkbox ("Include cache manifest"), a
+  description of the cache-warming benefit, an amber-colored privacy
+  warning, and an inline acknowledgement strip that appears once the
+  user checks the box. The local state defaults to `false` and is
+  passed through to `pyramid_publish_to_wire` as
+  `includeCacheManifest`.
+- The success state was extended to render a `Cache manifest:
+  N entries attached` row when the backend returns
+  `cache_manifest_entries !== null`. When the user did not opt in,
+  the row is omitted entirely (no clutter for the default path).
+- `src/types/configContributions.ts` updated the
+  `PublishToWireResponse` interface to include
+  `cache_manifest_entries: number | null`.
+
+**Audit count deferral:** the workstream prompt called for an inline
+"N L0 nodes / M reference private corpus docs" preview alongside the
+checkbox. Computing this requires a second backend pass over the
+pyramid's L0 nodes joined against `wire_source_documents.visibility`,
+and the local DB does not yet have the `wire_source_documents`
+visibility column on every row. Per the deviation protocol, the
+checkbox ships with the warning text only and the audit count is
+documented as a follow-up. The user is expected to review their
+source visibility manually before checking the box.
+
+### L9: Folder/circle-scoped pause-all DADBEAR
+
+**Backend SQL helpers (in `src-tauri/src/pyramid/db.rs`):**
+
+- `disable_dadbear_by_folder(conn, folder)` — flips `enabled = 1 → 0`
+  for every config whose `source_path` is exactly `folder` or any
+  descendant. Uses `(source_path = ?1 OR source_path LIKE ?1 || '/%')`
+  per the spec.
+- `enable_dadbear_by_folder(conn, folder)` — mirror operation,
+  flipping `0 → 1`.
+- `list_dadbear_source_paths(conn)` — returns the distinct
+  `source_path` values across the table, sorted alphabetically.
+  Powers the folder dropdown in the scope picker.
+- `count_dadbear_scope(conn, scope, scope_value, target_state)` —
+  pure-SELECT preview that returns how many rows WOULD be flipped by
+  a pause/resume call with the given scope. `target_state = true`
+  counts rows currently enabled (would-pause); `false` counts rows
+  currently disabled (would-resume). Used by the frontend to render
+  the live count next to the confirm button.
+- `normalize_dadbear_folder(folder)` private helper — strips a single
+  trailing slash so `/a` and `/a/` match the same set. Documented as
+  the canonicalization strategy: lexical match only, no filesystem
+  resolution, no symlink handling.
+
+**Backend IPCs (in `src-tauri/src/main.rs`):**
+
+- `pyramid_pause_dadbear_all(scope, scope_value)` extended to dispatch
+  on `"all" | "folder" | "circle"`. The `"folder"` branch requires a
+  non-empty `scope_value` and forwards to `disable_dadbear_by_folder`.
+  The `"circle"` branch returns an explicit error pointing the caller
+  at the deferral note (see "Circle deferral" below).
+- `pyramid_resume_dadbear_all(scope, scope_value)` mirror — same
+  scopes, same SQL shape, same error handling.
+- `pyramid_list_dadbear_source_paths()` — new IPC backing the folder
+  dropdown.
+- `pyramid_count_dadbear_scope(scope, scope_value, target_state)` —
+  new IPC backing the live count preview. The `target_state`
+  parameter is `"pause"` or `"resume"`. Returns
+  `{ count: u64 }`.
+
+All four are registered in the `invoke_handler!` list in `main.rs`.
+
+**Circle scope deferral:** the spec's `"circle"` branch references a
+`pyramid_metadata.circle_id` column that does not exist in the local
+DB schema. Circle membership is currently tracked only in the Wire
+JWT claim layer (auth-side), not in the local pyramid DB. Per the
+deviation protocol, the circle scope:
+
+- The IPCs return an error string explaining the deferral and
+  pointing at `deferral-ledger.md`.
+- The `count_dadbear_scope` helper returns `Ok(0)` for circle
+  (rather than erroring) so the UI can render a disabled radio
+  with "Coming soon" instead of crashing.
+- The frontend renders the circle radio as disabled with a tooltip:
+  "Circle scoping is deferred — local DB has no circle_id schema yet."
+
+This decision is recorded as a follow-up in the friction log so the
+schema work can be picked up alongside whatever lands the
+`pyramid_metadata` table.
+
+**Folder canonicalization decision:** lexical match only.
+`normalize_dadbear_folder` strips a single trailing slash and the SQL
+match uses `(source_path = ?1 OR source_path LIKE ?1 || '/%')`. No
+filesystem resolution. No symlink handling. The DB stores whatever
+`source_path` the user originally configured, and we match against
+that text. Tests cover trailing-slash equivalence (`/a` == `/a/`),
+the partial-prefix non-match (`/a` does NOT match `/alpha`), and the
+exact-vs-descendant distinction.
+
+**Frontend (new file + two updated callers):**
+
+- `src/components/DadbearPauseScopeModal.tsx` — NEW reusable scope
+  picker modal. Three radios: All / Folder (with autocomplete from
+  `pyramid_list_dadbear_source_paths` via a native `<datalist>`) /
+  Circle (disabled with "coming soon" hint). Live count preview
+  next to the confirm button — the count refreshes via
+  `pyramid_count_dadbear_scope` whenever the user changes the scope
+  or types in the folder field. Confirm button is disabled when the
+  count is 0 (e.g. empty folder input, all rows already in target
+  state).
+- `src/components/CrossPyramidTimeline.tsx` — replaced the inline
+  `PauseAllConfirmModal` with the shared scope picker. The "Pause All
+  DADBEAR" button is now labeled "Pause..." (with ellipsis per the
+  spec) to signal the picker opens. The Resume button on the
+  paused-banner still uses scope=all because the banner is short-hand
+  for "I just paused everything"; users who pause via a more specific
+  scope can re-open the picker on the DADBEAR Oversight page.
+- `src/components/DadbearOversightPage.tsx` — replaced
+  `handlePauseAll`/`handleResumeAll` with `handlePauseWithScope`/
+  `handleResumeWithScope` and renders the same shared scope picker.
+  Both buttons (`Pause...` / `Resume...`) open the modal in the
+  appropriate action mode.
+
+### Tests added
+
+**db.rs phase13_tests module (10 new tests):**
+
+- `test_disable_dadbear_by_folder_matches_subtree` — `/a` matches
+  `/a`, `/a/b`, `/a/b/c` and leaves `/d` untouched.
+- `test_disable_dadbear_by_folder_handles_trailing_slash` — `/a/` and
+  `/a` produce the same result.
+- `test_disable_dadbear_by_folder_idempotent` — second call returns
+  `affected = 0`.
+- `test_enable_dadbear_by_folder_mirrors_disable` — symmetric with
+  the disable helper.
+- `test_disable_dadbear_by_folder_does_not_match_partial_prefix` —
+  `/a` does NOT match `/alpha`.
+- `test_list_dadbear_source_paths_returns_distinct_sorted` —
+  duplicates collapse via DISTINCT, results sorted alphabetically.
+- `test_count_dadbear_scope_all_returns_currently_enabled` —
+  pause/resume target_state is honored correctly.
+- `test_count_dadbear_scope_folder_matches_disable_helper` — preview
+  count and real action agree.
+- `test_count_dadbear_scope_folder_handles_missing_or_empty_value` —
+  empty/missing scope_value returns 0 (no accidental "everything").
+- `test_count_dadbear_scope_circle_returns_zero_pending_schema` —
+  circle scope returns 0 instead of erroring (so the UI can render
+  the disabled radio).
+
+**wire_publish.rs tests module (4 new tests):**
+
+- `test_build_publish_payload_default_omits_cache_manifest_field` —
+  backwards-compat: no manifest passed → no `cache_manifest_json`
+  field in the payload.
+- `test_build_publish_payload_opt_in_attaches_cache_manifest` —
+  primary path: manifest passed → `cache_manifest_json` field
+  serializes and round-trips back to `CacheManifest`.
+- `test_build_publish_payload_empty_manifest_still_attaches` — edge
+  case: opted-in publish for a pyramid with no cached LLM outputs
+  still attaches a `Some(empty)` manifest (different from
+  `None = withheld for privacy`).
+- `test_export_cache_manifest_default_off_returns_none_for_publish`
+  — confirms the upstream gate (export with `include_cache=false`)
+  funnels into a payload with no `cache_manifest_json` field.
+
+### Verification
+
+- `cargo check --lib` from `src-tauri/` — clean. 3 pre-existing
+  warnings (the same 3 from main: `get_keep_evidence_for_target`
+  deprecation in routes.rs, two `LayerCollectResult` private interface
+  warnings in publication.rs).
+- `cargo test --lib pyramid` — **1252 passing / 7 failing**. Same 7
+  pre-existing failures (`test_evidence_pk_cross_slug_coexistence`,
+  the staleness test family, `real_yaml_thread_clustering_preserves_response_schema`).
+  Test count is +14 over the Phase 17 baseline (1238 → 1252) from
+  the 14 new Phase 18c tests (10 db.rs + 4 wire_publish.rs).
+- `npm run build` from repo root — clean. 151 modules transformed,
+  795.77 kB bundle (up from 788 kB at Phase 17 — the new
+  `DadbearPauseScopeModal.tsx` accounts for the delta).
+
+### Manual verification steps
+
+**L4 (cache opt-in checkbox):**
+
+1. Open ToolsMode, generate or pick a config contribution that has a
+   slug.
+2. Click "Publish to Wire" → the PublishPreviewModal opens with the
+   dry-run report.
+3. Scroll to the "Advanced publishing options" section near the
+   bottom.
+4. Verify the checkbox is unchecked by default.
+5. Check the box → an italic acknowledgement strip appears in
+   accent-cyan confirming the opt-in.
+6. Click "Confirm & Publish" → the publish IPC is called with
+   `includeCacheManifest: true`.
+7. After success, verify the success view shows a "Cache manifest:
+   N entries attached" row.
+8. Backend log line `phase 18c L4: contribution published with cache
+   opt-in state recorded` confirms the opt-in flowed through.
+
+**L9 (scope picker):**
+
+1. Open the DADBEAR Oversight page (or Cross-Pyramid Build Timeline).
+2. Click "Pause..." → the scope picker modal opens.
+3. Verify three radios: "All pyramids", "Pyramids under folder", and
+   "Pyramids in circle (coming soon)" (disabled).
+4. With "All pyramids" selected, the count next to the Pause button
+   reflects the number of currently-enabled DADBEAR configs.
+5. Click "Pyramids under folder" → focus shifts to the text input.
+6. Type a folder path that matches some configs OR pick from the
+   autocomplete dropdown (sourced from
+   `pyramid_list_dadbear_source_paths`).
+7. As you type, the count updates live via
+   `pyramid_count_dadbear_scope`.
+8. Click "Pause N" → only configs matching the folder scope flip.
+9. Open SQLite (`open_sqlite_dev_db.sh` or equivalent) and run
+   `SELECT slug, source_path, enabled FROM pyramid_dadbear_config;`
+   to confirm only the matching subset has `enabled = 0`.
+10. Re-open the picker, switch to "Resume...", verify the resume
+    preview now shows the paused subset, and confirm.
+
+### Deviations
+
+- **L4 audit count deferred** — see the L4 backend section above. The
+  inline preview of "N L0 nodes reference private docs" requires a
+  second backend pass that depends on a join against
+  `wire_source_documents.visibility` which is not consistently
+  populated across the local DB. The checkbox ships with warning
+  text only; the audit count is a follow-up.
+- **L9 circle scope deferred** — see the L9 backend section above.
+  The local DB has no `pyramid_metadata.circle_id` schema; circle
+  membership lives only in the Wire JWT claim layer. The IPC returns
+  an explicit error for `scope = "circle"`; the frontend renders the
+  radio as disabled with a "coming soon" hint. Documented in
+  `pyramid-folders-model-routing-friction-log.md`.
+- **Folder canonicalization is lexical** — see the L9 helpers
+  section. No filesystem resolution, no symlink handling. The
+  decision is documented in db.rs comments and tested with a
+  trailing-slash test + a partial-prefix non-match test.
+
+### Files changed
+
+Backend:
+- `src-tauri/src/pyramid/db.rs` — added 5 helper functions
+  (`normalize_dadbear_folder`, `disable_dadbear_by_folder`,
+  `enable_dadbear_by_folder`, `list_dadbear_source_paths`,
+  `count_dadbear_scope`) + 10 tests in the `phase13_tests` module.
+- `src-tauri/src/pyramid/wire_publish.rs` — new
+  `publish_contribution_with_metadata_and_cache` method, refactored
+  the existing `publish_contribution_with_metadata` to call it with
+  `None`, extracted `build_contribution_publish_payload` free
+  function, added 4 tests.
+- `src-tauri/src/main.rs` — extended
+  `pyramid_pause_dadbear_all`/`pyramid_resume_dadbear_all` IPCs to
+  dispatch on `all|folder|circle`, added
+  `pyramid_list_dadbear_source_paths` and `pyramid_count_dadbear_scope`
+  IPCs, registered both in `invoke_handler!`. Extended
+  `pyramid_publish_to_wire` IPC with `include_cache_manifest` parameter
+  and the cache manifest export pipeline. Extended
+  `PublishToWireResponse` with `cache_manifest_entries`.
+
+Frontend:
+- `src/components/PublishPreviewModal.tsx` — added
+  `includeCacheManifest` state, "Advanced publishing options"
+  section with the opt-in checkbox + warning, success-state row
+  for `cache_manifest_entries`.
+- `src/types/configContributions.ts` — extended
+  `PublishToWireResponse` interface with `cache_manifest_entries:
+  number | null`.
+- `src/components/DadbearPauseScopeModal.tsx` — NEW reusable scope
+  picker modal with all/folder/circle radios, autocomplete via
+  `<datalist>`, live count preview, action-mode parameter.
+- `src/components/CrossPyramidTimeline.tsx` — switched the inline
+  `PauseAllConfirmModal` for the shared scope picker, renamed the
+  Pause All button to "Pause...", split pause/resume into
+  `doPauseWithScope`/`doResumeWithScope` handlers.
+- `src/components/DadbearOversightPage.tsx` — same swap: replaced
+  `handlePauseAll`/`handleResumeAll` with the scoped variants, both
+  buttons now open the picker.
+
+Docs:
+- `docs/plans/pyramid-folders-model-routing-implementation-log.md` —
+  this entry.
+- `docs/plans/pyramid-folders-model-routing-friction-log.md` — Phase
+  18c entry covering the circle deferral and the audit-count
+  deferral.
+
+**Status:** awaiting-verification.
