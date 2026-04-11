@@ -249,6 +249,11 @@ function FieldRow({
         flexDirection: "column",
         gap: 4,
         padding: "8px 0",
+        // Visual cue that this row is read-only / inspection-only.
+        // Native `disabled` styling on form elements is too subtle on
+        // the dark theme — tinting the whole row makes the state
+        // unmistakable.
+        opacity: disabled ? 0.55 : 1,
       }}
     >
       <div
@@ -399,6 +404,7 @@ export function YamlConfigRenderer({
   optionSources,
   costEstimates = {},
   readOnly = false,
+  onRefine,
   versionInfo,
 }: YamlConfigRendererProps) {
   const [notesOpen, setNotesOpen] = useState(false);
@@ -505,6 +511,59 @@ export function YamlConfigRenderer({
           </div>
         )}
       </div>
+
+      {/* Read-only preview banner — widgets below are disabled.
+          Surfaces the refine entry point so the user doesn't have
+          to scroll to the drawer footer to find it. */}
+      {readOnly && (
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            gap: 10,
+            padding: "8px 12px",
+            borderRadius: "var(--radius-sm)",
+            background: "rgba(251, 191, 36, 0.08)",
+            border: "1px solid rgba(251, 191, 36, 0.25)",
+            color: "var(--text-primary)",
+            fontSize: 12,
+          }}
+        >
+          <div
+            style={{
+              display: "flex",
+              flexDirection: "column",
+              gap: 2,
+            }}
+          >
+            <div style={{ fontWeight: 600, color: "#fbbf24" }}>
+              Read-only preview
+            </div>
+            <div
+              style={{
+                color: "var(--text-secondary)",
+                fontSize: 11,
+                lineHeight: 1.4,
+              }}
+            >
+              Every change is a new version with a note. Click Edit to
+              refine this config via the generative flow — direct field
+              edits are intentionally disabled.
+            </div>
+          </div>
+          {onRefine && (
+            <button
+              type="button"
+              className="btn btn-primary btn-small"
+              onClick={onRefine}
+              style={{ flexShrink: 0 }}
+            >
+              Edit
+            </button>
+          )}
+        </div>
+      )}
 
       {/* Basic fields */}
       <div

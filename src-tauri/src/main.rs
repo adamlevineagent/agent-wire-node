@@ -4202,6 +4202,16 @@ struct IngestFolderInput {
     target_folder: String,
     include_claude_code: bool,
     dry_run: bool,
+    /// Optional override for the conversation scan root. When `None`,
+    /// the active `folder_ingestion_heuristics` contribution's
+    /// `claude_code_conversation_path` is used (seed default:
+    /// `~/.claude/projects`). When `Some`, the provided path replaces
+    /// it for this ingest only — the contribution is NOT modified.
+    /// Lets a user point at Cursor's conversation cache, a backup,
+    /// or any other directory that follows the same encoded-subdir
+    /// naming convention.
+    #[serde(default)]
+    conversation_path_override: Option<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -4229,11 +4239,21 @@ async fn pyramid_ingest_folder(
 
     // Load the active folder_ingestion_heuristics contribution (or
     // fall back to bundled defaults if no contribution is synced).
-    let config = {
+    let mut config = {
         let conn = state.pyramid.reader.lock().await;
         wire_node_lib::pyramid::db::load_active_folder_ingestion_heuristics(&conn)
             .map_err(|e| format!("load_active_folder_ingestion_heuristics: {}", e))?
     };
+
+    // Apply per-call conversation-path override without mutating the
+    // persisted contribution. Trimmed-empty values are ignored so the
+    // frontend can send empty strings safely.
+    if let Some(override_path) = input.conversation_path_override.as_ref() {
+        let trimmed = override_path.trim();
+        if !trimmed.is_empty() {
+            config.claude_code_conversation_path = trimmed.to_string();
+        }
+    }
 
     let plan = folder_ingestion::plan_ingestion(&target, &config, input.include_claude_code)
         .map_err(|e| format!("plan_ingestion: {}", e))?;
@@ -4273,6 +4293,7 @@ async fn pyramid_ingest_folder(
 async fn pyramid_find_claude_code_conversations(
     state: tauri::State<'_, SharedState>,
     target_folder: String,
+    conversation_path_override: Option<String>,
 ) -> Result<Vec<wire_node_lib::pyramid::folder_ingestion::ClaudeCodeConversationDir>, String> {
     use wire_node_lib::pyramid::folder_ingestion;
 
@@ -4281,11 +4302,20 @@ async fn pyramid_find_claude_code_conversations(
         return Err(format!("target folder does not exist: {}", target_folder));
     }
 
-    let config = {
+    let mut config = {
         let conn = state.pyramid.reader.lock().await;
         wire_node_lib::pyramid::db::load_active_folder_ingestion_heuristics(&conn)
             .map_err(|e| format!("load_active_folder_ingestion_heuristics: {}", e))?
     };
+
+    // Same per-call override as `pyramid_ingest_folder`. Empty/whitespace
+    // strings fall through to the persisted setting.
+    if let Some(override_path) = conversation_path_override.as_ref() {
+        let trimmed = override_path.trim();
+        if !trimmed.is_empty() {
+            config.claude_code_conversation_path = trimmed.to_string();
+        }
+    }
 
     Ok(folder_ingestion::describe_claude_code_dirs(&target, &config))
 }

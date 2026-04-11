@@ -183,6 +183,16 @@ export interface YamlConfigRendererProps {
   costEstimates?: Record<string, number>;
   /** View-only mode (for history inspection). */
   readOnly?: boolean;
+  /**
+   * When `readOnly=true`, the renderer shows a prominent "Read-only
+   * preview — Edit to refine" banner. If `onRefine` is provided, the
+   * banner includes an inline Edit button that calls it. Without
+   * `onRefine`, the banner still renders but the button is hidden.
+   *
+   * The refine flow itself (generative config loop) lives upstream —
+   * this prop is just the entry point.
+   */
+  onRefine?: () => void;
   /** Version context for the notes paradigm. */
   versionInfo?: VersionInfo;
 }

@@ -438,6 +438,9 @@ export function ContributionDetailDrawer({
                         optionSources={optionSources}
                         costEstimates={costEstimates}
                         readOnly
+                        onRefine={
+                            onEdit ? () => onEdit(contribution) : undefined
+                        }
                         versionInfo={
                             tab === "history" && activeRow.triggering_note
                                 ? {

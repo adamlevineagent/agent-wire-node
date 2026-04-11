@@ -187,6 +187,12 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
     const [ccDirs, setCcDirs] = useState<ClaudeCodeConversationDir[]>([]);
     const [ccLoading, setCcLoading] = useState(false);
     const [includeClaudeCode, setIncludeClaudeCode] = useState(true);
+    // Per-call override for the conversation scan root. `null` means
+    // "use the active folder_ingestion_heuristics contribution's
+    // default" (typically `~/.claude/projects`). Set via the "Change…"
+    // button; cleared via "Reset to default" so users can flip back
+    // without remembering the default path.
+    const [ccOverridePath, setCcOverridePath] = useState<string | null>(null);
     const [folderPlan, setFolderPlan] = useState<IngestionPlan | null>(null);
     const [folderPlanLoading, setFolderPlanLoading] = useState(false);
     const [folderIngestResult, setFolderIngestResult] = useState<IngestionResult | null>(null);
@@ -269,13 +275,15 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
             setFolderIngestPath(path);
             setFolderPlan(null);
             setFolderIngestResult(null);
+            // Fresh target — reset any stale override from a prior folder.
+            setCcOverridePath(null);
 
             // Fetch Claude Code conversation dirs for this folder.
             setCcLoading(true);
             try {
                 const dirs = await invoke<ClaudeCodeConversationDir[]>(
                     'pyramid_find_claude_code_conversations',
-                    { targetFolder: path },
+                    { targetFolder: path, conversationPathOverride: null },
                 );
                 setCcDirs(dirs);
                 // Spec: default ON only when at least one match is found.
@@ -296,6 +304,7 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
                         target_folder: path,
                         include_claude_code: true,
                         dry_run: true,
+                        conversation_path_override: null,
                     },
                 });
                 setFolderPlan(output.plan);
@@ -311,6 +320,83 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
         }
     }, []);
 
+    /**
+     * Re-scan Claude Code conversation dirs and re-plan after the user
+     * changes (or resets) the conversation-path override. Shared by the
+     * "Change…" picker and the "Reset to default" button.
+     */
+    const rescanClaudeCodeWithOverride = useCallback(
+        async (overridePath: string | null) => {
+            if (!folderIngestPath) return;
+            setCcLoading(true);
+            setFolderIngestError(null);
+            let nextDirs: ClaudeCodeConversationDir[] = [];
+            try {
+                nextDirs = await invoke<ClaudeCodeConversationDir[]>(
+                    'pyramid_find_claude_code_conversations',
+                    {
+                        targetFolder: folderIngestPath,
+                        conversationPathOverride: overridePath,
+                    },
+                );
+                setCcDirs(nextDirs);
+                // Default ON only if the new scan found matches.
+                setIncludeClaudeCode(nextDirs.length > 0);
+            } catch (e) {
+                setCcDirs([]);
+                setIncludeClaudeCode(false);
+                setFolderIngestError(
+                    `find_claude_code_conversations failed: ${String(e)}`,
+                );
+            } finally {
+                setCcLoading(false);
+            }
+
+            // Replan with the new override so the UI preview reflects
+            // which CC pyramids will actually land.
+            setFolderPlanLoading(true);
+            try {
+                const output = await invoke<IngestFolderOutput>(
+                    'pyramid_ingest_folder',
+                    {
+                        input: {
+                            target_folder: folderIngestPath,
+                            include_claude_code: nextDirs.length > 0,
+                            dry_run: true,
+                            conversation_path_override: overridePath,
+                        },
+                    },
+                );
+                setFolderPlan(output.plan);
+            } catch (e) {
+                setFolderIngestError(String(e));
+            } finally {
+                setFolderPlanLoading(false);
+            }
+        },
+        [folderIngestPath],
+    );
+
+    const handlePickCcOverrideFolder = useCallback(async () => {
+        try {
+            const selected = await open({
+                directory: true,
+                title: 'Select conversation folder',
+            });
+            if (!selected) return;
+            const path = selected as string;
+            setCcOverridePath(path);
+            await rescanClaudeCodeWithOverride(path);
+        } catch (err) {
+            setFolderIngestError(String(err));
+        }
+    }, [rescanClaudeCodeWithOverride]);
+
+    const handleResetCcOverride = useCallback(async () => {
+        setCcOverridePath(null);
+        await rescanClaudeCodeWithOverride(null);
+    }, [rescanClaudeCodeWithOverride]);
+
     // Re-plan when includeClaudeCode toggle changes, so the user
     // sees the CC pyramids land/disappear in the preview.
     const handleToggleIncludeClaudeCode = useCallback(
@@ -325,6 +411,7 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
                         target_folder: folderIngestPath,
                         include_claude_code: next,
                         dry_run: true,
+                        conversation_path_override: ccOverridePath,
                     },
                 });
                 setFolderPlan(output.plan);
@@ -334,7 +421,7 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
                 setFolderPlanLoading(false);
             }
         },
-        [folderIngestPath],
+        [folderIngestPath, ccOverridePath],
     );
 
     const handleStartFolderIngestion = useCallback(async () => {
@@ -347,6 +434,7 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
                     target_folder: folderIngestPath,
                     include_claude_code: includeClaudeCode,
                     dry_run: false,
+                    conversation_path_override: ccOverridePath,
                 },
             });
             setFolderPlan(output.plan);
@@ -360,7 +448,7 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
         } finally {
             setCommitting(false);
         }
-    }, [folderIngestPath, includeClaudeCode, onComplete]);
+    }, [folderIngestPath, includeClaudeCode, ccOverridePath, onComplete]);
 
     const handleAddDirectory = useCallback(async () => {
         try {
@@ -910,22 +998,74 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
                                 Include Claude Code conversations related to this folder
                             </span>
                         </label>
+
+                        {/* Scan-location row — lets the user point at a
+                            different conversation root (Cursor cache,
+                            a backup, etc.) without editing the
+                            folder_ingestion_heuristics contribution. */}
+                        <div
+                            style={{
+                                marginTop: '8px',
+                                display: 'flex',
+                                alignItems: 'center',
+                                flexWrap: 'wrap',
+                                gap: '8px',
+                                fontSize: '0.85em',
+                            }}
+                        >
+                            <span style={{ opacity: 0.7 }}>Scan location:</span>
+                            <code
+                                style={{
+                                    padding: '2px 6px',
+                                    borderRadius: '3px',
+                                    background: 'rgba(255,255,255,0.05)',
+                                    fontFamily: 'var(--font-mono, monospace)',
+                                    fontSize: '0.95em',
+                                    wordBreak: 'break-all',
+                                }}
+                            >
+                                {ccOverridePath ?? '~/.claude/projects'}
+                            </code>
+                            <button
+                                type="button"
+                                className="btn btn-ghost btn-small"
+                                onClick={handlePickCcOverrideFolder}
+                                disabled={ccLoading || folderPlanLoading}
+                                style={{ padding: '2px 10px', fontSize: '0.9em' }}
+                            >
+                                Change…
+                            </button>
+                            {ccOverridePath && (
+                                <button
+                                    type="button"
+                                    className="btn btn-ghost btn-small"
+                                    onClick={handleResetCcOverride}
+                                    disabled={ccLoading || folderPlanLoading}
+                                    style={{ padding: '2px 10px', fontSize: '0.9em' }}
+                                >
+                                    Reset to default
+                                </button>
+                            )}
+                        </div>
+
                         {ccLoading ? (
                             <p className="hint" style={{ marginTop: '8px', fontSize: '0.85em' }}>
-                                Scanning ~/.claude/projects...
+                                Scanning {ccOverridePath ?? '~/.claude/projects'}…
                             </p>
                         ) : ccDirs.length === 0 ? (
                             <p className="hint" style={{ marginTop: '8px', fontSize: '0.85em' }}>
-                                No matching Claude Code conversation directories were found for
-                                this folder. (Checked ~/.claude/projects for entries whose
-                                encoded path matches the target.)
+                                No matching conversation directories were found for
+                                this folder. (Checked{' '}
+                                <code>{ccOverridePath ?? '~/.claude/projects'}</code>{' '}
+                                for entries whose encoded path matches the target. Use
+                                Change… to point at a different source.)
                             </p>
                         ) : (
                             <div style={{ marginTop: '8px' }}>
                                 <p className="hint" style={{ fontSize: '0.85em' }}>
                                     Found {ccDirs.length} matching conversation
-                                    {ccDirs.length === 1 ? ' directory' : ' directories'} in
-                                    {' ~/.claude/projects'}:
+                                    {ccDirs.length === 1 ? ' directory' : ' directories'} in{' '}
+                                    <code>{ccOverridePath ?? '~/.claude/projects'}</code>:
                                 </p>
                                 <ul
                                     style={{
