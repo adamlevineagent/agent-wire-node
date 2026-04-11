@@ -4461,3 +4461,200 @@ both timeline + oversight surfaces.
 
 **Status:** verified.
 
+### Wanderer pass (2026-04-11)
+
+Wanderer run against `519df13` (verifier pass on top of `f674051`).
+Took the 12-question end-to-end trace from the Phase 18c workstream
+prompt and followed each flow through the code instead of re-running
+the punch list. No bugs that break end-to-end flow; a handful of UX
+polish items surfaced that don't block the phase.
+
+**Runtime sanity re-verified:**
+
+- `cargo check --lib`: clean, 3 pre-existing warnings.
+- `cargo test --lib pyramid`: 1252 / 7 (same pre-existing failures as
+  implementer + verifier reports).
+- `npm run build`: clean (795.77 kB bundle).
+
+**Traces confirmed working:**
+
+1. **Q1 L4 opt-in end-to-end:** `PublishPreviewModal`
+   checkbox → `invoke('pyramid_publish_to_wire',
+   { includeCacheManifest: true })` → `opt_in_cache = true` →
+   `export_cache_manifest(..., include_cache = true)` returns
+   `Some(manifest)` →
+   `publish_contribution_with_metadata_and_cache(...,
+   cache_manifest.as_ref())` →
+   `build_contribution_publish_payload` inserts
+   `cache_manifest_json` into the payload (covered by
+   `test_build_publish_payload_opt_in_attaches_cache_manifest`)
+   → `PublishToWireResponse.cache_manifest_entries = Some(N)`
+   → modal success state renders "Cache manifest: N entries
+   attached". Every hop intact.
+
+2. **Q2 L4 default-OFF negative path:** unchecking the box sends
+   `includeCacheManifest: false` → `opt_in_cache = false` → the
+   `if opt_in_cache` branch at main.rs line 8360 is skipped →
+   `cache_manifest = None` → `cache_manifest_entry_count = None`
+   → payload has no `cache_manifest_json` field (covered by
+   `test_build_publish_payload_default_omits_cache_manifest_field`)
+   → response returns `cache_manifest_entries: null` → modal
+   suppresses the KeyValue row. Negative path clean.
+
+3. **Q3 L4 audit count deferred:** the checkbox ships with
+   warning text and a secondary cyan "Audit count of L0 nodes
+   referencing private sources is a follow-up" line when checked.
+   The user has enough information to make the decision (clear
+   warning about cached outputs containing excerpts of source
+   material), even without the dynamic count.
+
+4. **Q4 L4 warning copy:** the rendered text matches the spec's
+   "Privacy Consideration" language almost verbatim —
+   "cached outputs may contain excerpts from your source material;
+   only enable for pyramids whose source is already public..." The
+   copy clearly communicates the risk.
+
+5. **Q5 L4 slug-bound gating:** at main.rs line 8360-8389, the
+   backend skips manifest export when `opt_in_cache && slug ==
+   None`, logs a warning via `tracing::warn!`, and returns
+   `cache_manifest = None` → response `cache_manifest_entries:
+   null`. The publish itself still succeeds (safe behavior), but
+   the user sees exactly the same success state as if they hadn't
+   opted in — the checkbox action is silently dropped. See
+   wanderer finding W1 below.
+
+6. **Q6 L9 scope=folder end-to-end:** `CrossPyramidTimeline` →
+   "Pause..." → `DadbearPauseScopeModal` opens → folder radio +
+   text input → `pyramid_count_dadbear_scope` called on every
+   input change → preview count updates → Confirm calls
+   `pyramid_pause_dadbear_all` → `disable_dadbear_by_folder` runs
+   the `UPDATE ... WHERE enabled = 1 AND (source_path = ?1 OR
+   source_path LIKE ?1 || '/%')` SQL → returns affected count →
+   UI shows banner + toast. Complete.
+
+7. **Q7 folder path edge cases:** trailing slash handled by
+   `normalize_dadbear_folder` (stripped unless root `/`); partial
+   prefix `/a` vs `/alpha` handled by the SQL's `'/%'` suffix
+   (tested by `test_disable_dadbear_by_folder_does_not_match_partial_prefix`);
+   symlinks are lexical-only per the backend comment and not
+   surfaced to the user (mild UX gap); empty string returns
+   `Ok(0)` at both the count helper and the dispatch IPC;
+   whitespace-only input would make it past the
+   `.filter(|v| !v.is_empty())` guard but returns 0 from SQL and
+   the confirm button is disabled via `folderInput.trim().length
+   === 0`.
+
+8. **Q8 circle graceful deferral:** `DadbearPauseScopeModal`
+   renders the circle radio with the native `disabled` attribute
+   on the `<input>`, a `cursor: not-allowed` on the label, and a
+   "coming soon" tooltip. Clicking the label does not fire the
+   radio's `onChange` because the control is disabled. Backend
+   `pyramid_pause_dadbear_all` and `pyramid_resume_dadbear_all`
+   both return an error for `scope = "circle"` pointing at the
+   deferral note. `count_dadbear_scope` returns `Ok(0)` so the UI
+   can render the disabled state without a spurious error.
+
+9. **Q9 Resume symmetry:** both pause and resume use the same
+   `DadbearPauseScopeModal` component parameterized by
+   `action: "pause" | "resume"`; the `count_dadbear_scope` helper
+   flips `target_state = true/false` so the preview counts "rows
+   currently enabled" for pause or "rows currently disabled" for
+   resume; `enable_dadbear_by_folder` mirrors
+   `disable_dadbear_by_folder` exactly (same SQL shape, enabled
+   flag flipped). The only asymmetry is in the
+   `CrossPyramidTimeline` banner's Resume button, which
+   short-circuits to `scope = "all"` regardless of the prior
+   pause's scope — see wanderer finding W3 below.
+
+10. **Q10 idempotency under concurrent clicks:** the modal's
+    `onConfirm` handler (e.g., `doPauseWithScope`) calls
+    `setScopeModalAction(null)` synchronously before awaiting
+    the IPC, so the modal unmounts on the next React render and
+    a double-click on the confirm button can't fire twice. The
+    DB-side pause/resume helpers are idempotent via `WHERE
+    enabled = 1` / `WHERE enabled = 0` predicates (covered by
+    `test_disable_dadbear_by_folder_idempotent`). Worst-case a
+    programmatic double-dispatch would show a harmless
+    `affected = 0` toast on the second call.
+
+11. **Q11 parity between pages:** both `CrossPyramidTimeline.tsx`
+    and `DadbearOversightPage.tsx` import `DadbearPauseScopeModal`,
+    mount it behind a `{scopeModalAction && ...}` guard, and pass
+    the correct `action` + `onConfirm`. Both wire their
+    pause/resume handlers to the shared IPCs. The one difference
+    is that `DadbearOversightPage` calls `refetchOverview()`
+    after the IPC while `CrossPyramidTimeline` does not — see
+    wanderer finding W4 below.
+
+12. **Q12 datalist autocomplete:** `DadbearPauseScopeModal` calls
+    `pyramid_list_dadbear_source_paths` on mount, silently falls
+    through to an empty list on error, and feeds the result into
+    a `<datalist id="dadbear-source-paths">` bound to the input
+    via `list="dadbear-source-paths"`. Native HTML
+    autocompletion, no extra component.
+
+**Wanderer findings (UX polish, not blockers):**
+
+- **W1 — L4 silent fallback for slug=null contributions.** When
+  the user opts in but the contribution is not slug-bound
+  (global config contribution with `slug = None`), the backend
+  logs a warning and sets `cache_manifest_entries = None`. The
+  modal's success state renders exactly as if the user had not
+  opted in — no indication the opt-in action was dropped. A
+  follow-up could either (a) add a `cache_manifest_warning:
+  Option<String>` response field, (b) hide/disable the
+  checkbox when the contribution has no slug, or (c) reject the
+  publish with an explicit "contribution is not slug-bound; uncheck
+  Include cache manifest" error. Deferred.
+- **W2 — DryRunReport does not expose `slug`.** The frontend
+  has no way to conditionally show/hide the cache-manifest
+  opt-in based on whether the contribution is slug-bound
+  without an extra IPC round trip. Enabling W1's option (b)
+  would require adding `slug: Option<String>` to the dry-run
+  report. Deferred.
+- **W3 — `CrossPyramidTimeline` banner Resume forces scope=all.**
+  The banner's Resume button always calls `pyramid_resume_dadbear_all`
+  with `scope = "all"` regardless of the prior pause's scope.
+  If the user paused via folder scope, clicking Resume from the
+  banner could re-enable other pyramids that were paused in a
+  prior session. The implementer flagged this in a code comment
+  with the workaround "use the DADBEAR Oversight page for
+  scoped resume." The banner state only remembers the affected
+  count, not the scope. Deferred (design call). Potential fix:
+  store `{ count, scope, scopeValue }` instead of just `count`
+  and pass the same scope back on Resume.
+- **W4 — `CrossPyramidTimeline` doesn't refetch build state after
+  pause/resume.** Only sets the banner + toast. The
+  `useCrossPyramidTimeline` hook eventually refreshes on its own
+  poll interval, but the user won't see paused pyramids reflected
+  in the active builds list immediately. `DadbearOversightPage`
+  correctly calls `refetchOverview()` after the IPC. Minor
+  parity wart.
+- **W5 — Whitespace-only folder input reaches the count IPC.**
+  The frontend short-circuits on empty string but not on `"   "`,
+  so the IPC is called with a whitespace payload that returns 0
+  from SQL. The confirm button is disabled via `trim().length
+  === 0` so the user can't act on a stale count. Wasted round
+  trip; not broken.
+- **W6 — Shared `datalist id="dadbear-source-paths"`.** Hardcoded
+  ID on the modal's datalist element. Today only one modal can
+  be mounted at a time so there's no collision. If the modal is
+  ever reused in parallel (e.g., two separate dialogs) the
+  datalist ID would collide. Latent.
+
+**Cross-cutting checks:**
+
+- **Local Mode interaction:** Local Mode is implemented on the
+  18a branch, not this one. No conflict possible in 18c.
+- **Pause during active ingestion:** DADBEAR reads configs at the
+  start of each tick via `db::get_enabled_dadbear_configs` and
+  processes them; a pause-all call flipping `enabled = 0`
+  mid-tick does not affect the already-loaded config. This
+  matches the modal text "In-flight builds are not affected."
+
+**Verdict:** no wanderer fixes committed. The phase is
+functionally complete. The W1-W6 findings are UX polish items
+worth tracking in the friction log for a follow-up phase.
+
+**Status:** verified (wanderer pass).
+

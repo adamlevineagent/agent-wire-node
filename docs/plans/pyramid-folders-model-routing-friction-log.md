@@ -2259,3 +2259,81 @@ up changes from sister branches when the agent didn't intend it.
 
 ---
 
+### 2026-04-11 — Phase 18c wanderer: UX papercuts surfaced by end-to-end trace
+
+**Phase / workstream:** Phase 18c wanderer pass (no fixes, log
+commit for traceability).
+
+**What hit friction**
+
+Six UX polish items surfaced while tracing the 12 questions in the
+wanderer prompt end-to-end. None block the phase — every primary
+flow works correctly — but they're the kind of edge-case behavior
+a punch-list audit won't catch without actually walking the flow.
+
+- **W1 — L4 silent fallback for slug=null contributions.**
+  Publishing a global config contribution (no pyramid slug) with
+  the cache manifest opt-in checked falls through a
+  `tracing::warn!` path that leaves the user's opt-in silently
+  dropped. The success state looks identical to not opting in.
+- **W2 — DryRunReport lacks `slug`.** The frontend can't gate the
+  cache-manifest opt-in on slug presence without an extra IPC.
+  W1 and W2 would be fixed by the same change.
+- **W3 — CrossPyramidTimeline banner Resume forces `scope="all"`.**
+  Clicking Resume on the banner after a folder-scoped pause can
+  re-enable other pyramids that were paused in a prior session.
+  The implementer's in-code comment explicitly acknowledges this
+  and recommends the DADBEAR Oversight page for scoped resume.
+- **W4 — CrossPyramidTimeline doesn't refetch after pause/resume.**
+  Only sets the banner + toast; the active-builds list stays
+  stale until the hook polls. DadbearOversightPage correctly
+  calls `refetchOverview()`.
+- **W5 — Whitespace-only folder input reaches the count IPC.**
+  The frontend short-circuits on empty string but not on
+  whitespace. Not broken (the confirm button is disabled via
+  `trim().length === 0`), just a wasted round trip.
+- **W6 — Shared `datalist id="dadbear-source-paths"`.** Latent ID
+  collision if the modal is ever reused in parallel. Fine today.
+
+**Root cause**
+
+Two patterns:
+
+1. **W1, W2, W3** — the backend ships a correct default-safe path,
+   but the frontend success state doesn't distinguish
+   "completed as requested" from "silently adjusted". The user
+   opts in or clicks Resume and gets a success toast that hides
+   the behavior change.
+2. **W4, W5, W6** — parity and hygiene gaps between the two
+   consumer surfaces (CrossPyramidTimeline and
+   DadbearOversightPage) because the shared component was
+   introduced mid-phase and the host pages were refactored
+   around it without a final diff review.
+
+**What we did about it**
+
+Nothing. The findings are logged here for a follow-up phase; none
+break the end-to-end flow.
+
+**Lesson for future phases**
+
+- **Silent backend fallbacks need frontend-visible signals.** If
+  the backend decides "I can't do what you asked but I won't
+  error either," the user needs to see that. The pattern is
+  `response_field: Option<T>` plus an optional
+  `reason_skipped: Option<String>` that the UI surfaces when
+  populated. Adding a warning field is cheap; carrying opaque
+  silence forward isn't.
+- **Reusable modals need parity tests on both hosts.** When
+  18c introduced `DadbearPauseScopeModal` used by two different
+  pages, the per-page follow-up behavior (refetching, banner
+  state, scope memory) diverged. A mini parity checklist for
+  "what does each host do after the IPC returns" would have
+  caught W3 and W4 during the verifier pass.
+- **DryRunReport is the right place for publish-time
+  state the modal needs.** Adding fields like `slug` to the
+  dry-run report is cheap and means the modal doesn't need
+  extra IPC calls to make UX decisions about the publish.
+
+---
+
