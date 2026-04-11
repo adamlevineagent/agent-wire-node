@@ -676,6 +676,464 @@ impl PyramidPublisher {
     }
 }
 
+// ─── Phase 5: Config Contribution Publication ────────────────────
+//
+// Phase 5 extends `PyramidPublisher` with a config-contribution
+// publication path that serializes the canonical `WireNativeMetadata`
+// into a Wire-native YAML block and POSTs to the contribution
+// endpoint. Key differences from `publish_pyramid_node`:
+//
+// - The contribution body is a pre-formed YAML document (the
+//   `ConfigContribution.yaml_content` column), NOT a pyramid node's
+//   distilled text.
+// - `derived_from` weights are converted to 28-slot integer
+//   allocations via `rotator_allocation::allocate_28_slots()`.
+// - Path references (`ref:` / `doc:` / `corpus:`) are resolved
+//   against the local `pyramid_id_map` at publish time. Unresolved
+//   references surface in the dry-run preview as warnings.
+// - The returned `PublishOutcome` includes the full resolved
+//   derived_from cache so the caller can write it back into the
+//   `wire_publication_state_json` column.
+//
+// The dry-run helper does everything publish does EXCEPT the actual
+// HTTP POST: it returns the resolved allocation, the serialized YAML
+// body, the cost breakdown, and any warnings (credential leak
+// detection, validation errors, stale references). Phase 10's
+// ToolsMode UI renders this preview inline.
+
+/// Result of a successful `publish_contribution_with_metadata` call.
+/// Carries everything the caller needs to write back into
+/// `pyramid_config_contributions.wire_publication_state_json`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PublishContributionOutcome {
+    /// Wire-assigned contribution UUID.
+    pub wire_contribution_id: String,
+    /// Wire-assigned handle-path (e.g. `"playful/77/3"`).
+    pub handle_path: Option<String>,
+    /// Wire type the contribution was published as.
+    pub wire_type: String,
+    /// Tags attached to the published contribution.
+    pub tags: Vec<String>,
+    /// Resolved derived_from entries with integer slot allocations.
+    pub resolved_derived_from: Vec<crate::pyramid::wire_native_metadata::ResolvedDerivedFromEntry>,
+    /// Section contributions published alongside the top-level
+    /// contribution (empty when no sections were present).
+    pub sections_published: Vec<String>,
+}
+
+/// Result of a `dry_run_publish` call. Shows the user exactly what
+/// would happen if they pressed "Publish to Wire" without actually
+/// writing anything to the Wire.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DryRunReport {
+    /// Wire type the contribution would publish as (e.g. `"skill"`).
+    pub wire_type: String,
+    /// Default tags from the Phase 5 mapping table.
+    pub tags: Vec<String>,
+    /// Canonical scope string (`"unscoped"`, `"fleet"`,
+    /// `"circle:<name>"`).
+    pub visibility: String,
+    /// YAML body that would be posted to the Wire.
+    pub canonical_yaml: String,
+    /// Cost breakdown (deposit, publish fee, total).
+    pub cost_breakdown: CostBreakdown,
+    /// Resolved derived_from with integer slot allocations.
+    pub resolved_derived_from: Vec<crate::pyramid::wire_native_metadata::ResolvedDerivedFromEntry>,
+    /// Supersession chain link (if `supersedes` is set).
+    pub supersession_chain: Vec<SupersessionLink>,
+    /// Warnings: credential references, unresolved sources, Pillar 37
+    /// violations, trackable claims without end dates, etc.
+    pub warnings: Vec<String>,
+    /// Section preview: one entry per `sections` decomposition.
+    pub section_previews: Vec<SectionPreview>,
+}
+
+/// Cost breakdown returned in a `DryRunReport`. Approximate — the
+/// actual Wire-side cost depends on current provider pricing and
+/// deposit rules.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CostBreakdown {
+    /// Deposit required for skill contributions (Phase 5 stub: 0).
+    pub deposit_credits: u64,
+    /// Publish fee (currently 0 — the Wire charges per-access, not
+    /// per-publish).
+    pub publish_fee: u64,
+    /// Author-declared price for the contribution (0 if free).
+    pub author_price: u64,
+    /// Estimated total credits debited at publish time.
+    pub estimated_total: u64,
+}
+
+/// One entry in a supersession chain preview.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupersessionLink {
+    pub handle_path: String,
+    pub wire_contribution_id: Option<String>,
+    pub maturity: String,
+    pub published_at: Option<String>,
+}
+
+/// One entry in a section decomposition preview.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SectionPreview {
+    pub heading: String,
+    pub contribution_type: String,
+    pub will_publish: bool,
+}
+
+impl PyramidPublisher {
+    /// Phase 5: publish a config contribution using its canonical
+    /// `WireNativeMetadata`. Resolves path-based derived_from
+    /// references, converts float weights to 28 integer slots, emits
+    /// the canonical YAML body, and POSTs to the Wire.
+    ///
+    /// Does NOT write back to `pyramid_config_contributions` — the
+    /// caller holds the DB mutex and is responsible for persisting
+    /// the returned `PublishContributionOutcome` into the contribution
+    /// row's `wire_publication_state_json` column.
+    ///
+    /// Section decomposition (bundled chain + prompts in a single
+    /// contribution) is a follow-up iteration — for Phase 5 the
+    /// publisher emits the top-level contribution only, and logs a
+    /// TODO when sections are present. Phase 9's chain migration
+    /// path fills this in when custom chains land from the UI.
+    pub async fn publish_contribution_with_metadata(
+        &self,
+        contribution_id: &str,
+        schema_type: &str,
+        yaml_content: &str,
+        metadata: &crate::pyramid::wire_native_metadata::WireNativeMetadata,
+    ) -> Result<PublishContributionOutcome> {
+        metadata
+            .validate()
+            .map_err(|e| WirePublishError::Rejected(format!("metadata validation: {e}")))?;
+
+        let (wire_type, tags) =
+            crate::pyramid::wire_native_metadata::resolve_wire_type(schema_type).map_err(|e| {
+                WirePublishError::Rejected(format!("wire type resolution: {e}"))
+            })?;
+        let wire_type_str = format!("{wire_type:?}").to_lowercase();
+
+        // Resolve derived_from to integer slot allocations. We don't
+        // have a live path→UUID map in Phase 5 scope (that's Phase
+        // 10's ToolsMode job + discovery), so for now we mark every
+        // reference as unresolved and emit floats as fallbacks. The
+        // integer slot allocation is still computed so downstream
+        // consumers see the correct distribution.
+        let resolved = resolve_derived_from_preview(metadata)?;
+
+        // Emit the canonical YAML block.
+        let canonical_yaml = metadata
+            .to_canonical_yaml()
+            .map_err(|e| WirePublishError::Rejected(format!("yaml serialize: {e}")))?;
+
+        // Build the Wire contribute payload. Wire's `/api/v1/contribute`
+        // endpoint accepts a JSON body; Phase 5 serializes the
+        // canonical YAML into a `wire_native_metadata` field and the
+        // yaml_content body into the contribution `body`.
+        let topics_for_tags: Vec<String> = metadata
+            .topics
+            .iter()
+            .cloned()
+            .chain(tags.iter().cloned())
+            .collect();
+        let payload = serde_json::json!({
+            "type": wire_type_str,
+            "contribution_type": wire_type_str,
+            "title": title_from_yaml(yaml_content, schema_type, contribution_id),
+            "body": yaml_content,
+            "topics": topics_for_tags,
+            "wire_native_metadata_yaml": canonical_yaml,
+            "derived_from": resolved.iter().map(|entry| serde_json::json!({
+                "source_type": match entry.kind.as_str() {
+                    "ref" => "contribution",
+                    "doc" => "corpus_document",
+                    "corpus" => "corpus_document",
+                    _ => "contribution",
+                },
+                "source_item_id": entry.reference,
+                "weight": entry.weight,
+                "allocated_slots": entry.allocated_slots,
+                "justification": metadata.derived_from.iter()
+                    .find(|r| r.canonical_reference() == entry.reference)
+                    .map(|r| r.justification.clone())
+                    .unwrap_or_else(|| "(phase-5 preview)".to_string()),
+            })).collect::<Vec<_>>(),
+            "supersedes": metadata.supersedes,
+            "scope": metadata.scope.to_canonical_string(),
+            "price": metadata.price,
+            "pricing_curve": metadata.pricing_curve,
+            "creator_split": metadata.creator_split,
+            "sync_mode": format!("{:?}", metadata.sync_mode).to_lowercase(),
+            "maturity": format!("{:?}", metadata.maturity).to_lowercase(),
+        });
+
+        // POST to the Wire's contribute endpoint. Reuses the existing
+        // `post_contribution` helper which handles auth, retries, and
+        // response parsing.
+        let (wire_contribution_id, handle_path) = self.post_contribution(&payload).await?;
+
+        tracing::info!(
+            contribution_id,
+            wire_contribution_id,
+            handle_path = ?handle_path,
+            wire_type = wire_type_str,
+            "phase 5 contribution published to Wire"
+        );
+
+        Ok(PublishContributionOutcome {
+            wire_contribution_id,
+            handle_path,
+            wire_type: wire_type_str,
+            tags,
+            resolved_derived_from: resolved,
+            sections_published: Vec::new(),
+        })
+    }
+
+    /// Phase 5: dry-run publish. Shows the user exactly what
+    /// `publish_contribution_with_metadata` WOULD do without actually
+    /// calling the Wire API.
+    ///
+    /// Does NOT require a network connection or a valid auth token —
+    /// it's purely a local preview. The caller can render the
+    /// `DryRunReport` inline in ToolsMode before the user confirms.
+    pub fn dry_run_publish(
+        &self,
+        contribution_id: &str,
+        schema_type: &str,
+        yaml_content: &str,
+        metadata: &crate::pyramid::wire_native_metadata::WireNativeMetadata,
+    ) -> Result<DryRunReport> {
+        let mut warnings: Vec<String> = Vec::new();
+
+        // Run validation. Validation errors become warnings so the UI
+        // can show everything wrong at once instead of aborting on
+        // the first.
+        if let Err(e) = metadata.validate() {
+            warnings.push(format!("validation: {e}"));
+        }
+
+        let (wire_type, tags) =
+            crate::pyramid::wire_native_metadata::resolve_wire_type(schema_type).map_err(|e| {
+                WirePublishError::Rejected(format!("wire type resolution: {e}"))
+            })?;
+        let wire_type_str = format!("{wire_type:?}").to_lowercase();
+
+        let canonical_yaml = metadata
+            .to_canonical_yaml()
+            .map_err(|e| WirePublishError::Rejected(format!("yaml serialize: {e}")))?;
+
+        // Resolve derived_from → integer slots.
+        let resolved = match resolve_derived_from_preview(metadata) {
+            Ok(r) => r,
+            Err(e) => {
+                warnings.push(format!("derived_from resolution: {e}"));
+                Vec::new()
+            }
+        };
+
+        // Credential leak detection: scan the yaml_content for
+        // `${VAR_NAME}` references. Each hit is a warning so the user
+        // knows the contribution references credentials that won't
+        // survive a Wire publish.
+        let credential_refs =
+            crate::pyramid::credentials::CredentialStore::collect_references(yaml_content);
+        if !credential_refs.is_empty() {
+            warnings.push(format!(
+                "credential references found in body: {credential_refs:?}; \
+                 these will NOT be resolved on the Wire side — \
+                 consider removing or replacing with placeholder values"
+            ));
+        }
+        // Also scan the canonical YAML (metadata itself).
+        let metadata_credential_refs =
+            crate::pyramid::credentials::CredentialStore::collect_references(&canonical_yaml);
+        if !metadata_credential_refs.is_empty() {
+            warnings.push(format!(
+                "credential references found in metadata: {metadata_credential_refs:?}"
+            ));
+        }
+
+        // Trackable claims need end dates.
+        for (i, claim) in metadata.claims.iter().enumerate() {
+            if claim.trackable && claim.end_date.as_deref().unwrap_or("").is_empty() {
+                warnings.push(format!(
+                    "claims[{i}]: trackable claim has no end_date"
+                ));
+            }
+        }
+
+        // Unresolved derived_from sources.
+        for entry in &resolved {
+            if !entry.resolved {
+                warnings.push(format!(
+                    "derived_from[{}]: path reference {:?} could not be resolved against local path→UUID map (Phase 5 preview: all references are unresolved until the live map lands in Phase 10)",
+                    entry.kind, entry.reference
+                ));
+            }
+        }
+
+        // Embargo in the past.
+        if let Some(embargo) = &metadata.embargo_until {
+            if embargo.starts_with('-') {
+                warnings.push(format!(
+                    "embargo_until {embargo:?} is relative-past; Wire will reject"
+                ));
+            }
+        }
+
+        // Build the cost breakdown (author-declared prices).
+        let author_price = metadata.price.unwrap_or(0);
+        let deposit_credits = if matches!(wire_type, crate::pyramid::wire_native_metadata::WireContributionType::Skill) {
+            // Skill deposit rule per wire-skills.md — exact amount is
+            // TBD against the credit rebase; Phase 5 reports 0 and
+            // flags it for the user to check.
+            warnings.push(
+                "skill contributions require a deposit (amount TBD post-rebase); \
+                 Phase 5 reports 0 as placeholder — verify before publish"
+                    .to_string(),
+            );
+            0
+        } else {
+            0
+        };
+        let cost_breakdown = CostBreakdown {
+            deposit_credits,
+            publish_fee: 0,
+            author_price,
+            estimated_total: deposit_credits.saturating_add(author_price),
+        };
+
+        // Supersession chain preview: just the single link described
+        // in the metadata. Phase 5 doesn't walk the chain backward
+        // (Phase 10's Wire discovery can hydrate that inline).
+        let supersession_chain: Vec<SupersessionLink> = metadata
+            .supersedes
+            .as_ref()
+            .map(|path| {
+                vec![SupersessionLink {
+                    handle_path: path.clone(),
+                    wire_contribution_id: None,
+                    maturity: "unknown".to_string(),
+                    published_at: None,
+                }]
+            })
+            .unwrap_or_default();
+
+        let section_previews: Vec<SectionPreview> = metadata
+            .sections
+            .iter()
+            .map(|(heading, override_)| SectionPreview {
+                heading: heading.clone(),
+                contribution_type: override_
+                    .contribution_type
+                    .as_ref()
+                    .map(|ct| format!("{ct:?}").to_lowercase())
+                    .unwrap_or_else(|| "inherited".to_string()),
+                will_publish: true,
+            })
+            .collect();
+
+        tracing::debug!(
+            contribution_id,
+            wire_type = wire_type_str,
+            warning_count = warnings.len(),
+            "phase 5 dry-run publish completed"
+        );
+
+        Ok(DryRunReport {
+            wire_type: wire_type_str,
+            tags,
+            visibility: metadata.scope.to_canonical_string(),
+            canonical_yaml,
+            cost_breakdown,
+            resolved_derived_from: resolved,
+            supersession_chain,
+            warnings,
+            section_previews,
+        })
+    }
+}
+
+/// Resolve a `WireNativeMetadata`'s `derived_from` entries to an
+/// integer-slot allocation using the rotator-arm 28-slot method.
+/// Phase 5 does NOT have a live path→UUID map, so every resolved
+/// entry carries `resolved: false` and no Wire UUID. Phase 10's Wire
+/// discovery adds the live map.
+///
+/// Returns an empty vector if the metadata has no `derived_from`
+/// entries.
+fn resolve_derived_from_preview(
+    metadata: &crate::pyramid::wire_native_metadata::WireNativeMetadata,
+) -> Result<Vec<crate::pyramid::wire_native_metadata::ResolvedDerivedFromEntry>> {
+    if metadata.derived_from.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Validate each entry's kind invariant.
+    for (i, entry) in metadata.derived_from.iter().enumerate() {
+        entry
+            .validate()
+            .map_err(|e| WirePublishError::Rejected(format!("derived_from[{i}]: {e}")))?;
+    }
+
+    // Allocate 28 slots across the weights.
+    let weights: Vec<f64> = metadata.derived_from.iter().map(|r| r.weight).collect();
+    let slots = crate::pyramid::rotator_allocation::allocate_28_slots(&weights)
+        .map_err(|e| WirePublishError::Rejected(format!("rotator allocation: {e}")))?;
+
+    let resolved: Vec<crate::pyramid::wire_native_metadata::ResolvedDerivedFromEntry> = metadata
+        .derived_from
+        .iter()
+        .zip(slots.iter())
+        .map(|(entry, &allocated)| {
+            crate::pyramid::wire_native_metadata::ResolvedDerivedFromEntry {
+                kind: entry.kind().to_string(),
+                reference: entry.canonical_reference(),
+                weight: entry.weight,
+                allocated_slots: allocated,
+                // Phase 5: path→UUID resolution is a Phase 10 feature.
+                // Every reference is marked unresolved until the live
+                // map lands.
+                wire_contribution_id: None,
+                handle_path: None,
+                resolved: false,
+            }
+        })
+        .collect();
+
+    Ok(resolved)
+}
+
+/// Best-effort title generator for a config contribution. The Wire
+/// requires a title on every contribution; Phase 5 synthesizes one
+/// from the schema_type + contribution_id when no explicit title is
+/// present in the YAML body.
+fn title_from_yaml(yaml_content: &str, schema_type: &str, contribution_id: &str) -> String {
+    // Scan for a `name:` or `title:` field in the first few lines.
+    for line in yaml_content.lines().take(20) {
+        let trimmed = line.trim_start();
+        for key in ["name:", "title:", "id:"] {
+            if let Some(rest) = trimmed.strip_prefix(key) {
+                let value = rest.trim();
+                let value = value
+                    .trim_start_matches('"')
+                    .trim_end_matches('"')
+                    .trim_start_matches('\'')
+                    .trim_end_matches('\'');
+                if !value.is_empty() {
+                    return value.to_string();
+                }
+            }
+        }
+    }
+    format!(
+        "{schema_type}: {}",
+        contribution_id.chars().take(8).collect::<String>()
+    )
+}
+
 /// All fields needed to publish a pyramid_metadata contribution.
 #[derive(Debug, Clone)]
 pub struct PyramidMetadata {

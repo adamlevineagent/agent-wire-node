@@ -45,13 +45,32 @@ pub fn load_chain(yaml_path: &Path, chains_dir: &Path) -> Result<ChainDefinition
 
 /// Resolve prompt file references in a chain definition.
 ///
-/// Any step instruction starting with `$prompts/` is treated as a file
-/// reference relative to `chains_dir`. The reference is replaced with the
-/// file's contents so the executor can use it directly.
+/// Any step instruction starting with `$prompts/` is treated as a
+/// reference that should be resolved against the Phase 5
+/// `pyramid_config_contributions` store first (via the global prompt
+/// cache), with a disk fallback for prompts that weren't migrated or
+/// for tests that never stashed a DB path.
 ///
-/// Example: `"$prompts/conversation/forward.md"` resolves to
-/// `"{chains_dir}/prompts/conversation/forward.md"` and is replaced with
-/// the file content.
+/// **Phase 5 resolution order** (per `docs/specs/wire-contribution-mapping.md`
+/// → "Prompt lookup cache (runtime resolution from contributions)"):
+///
+/// 1. Try the global prompt cache (`prompt_cache::resolve_prompt_global`).
+///    On a cache hit, return the contribution body directly. On a
+///    cache miss, the cache opens a short-lived reader connection to
+///    the stashed pyramid.db path, queries the active skill
+///    contribution, and warms the cache.
+/// 2. On any not-found outcome (path not stashed, DB error, no active
+///    skill contribution matching the normalized path), fall back to
+///    reading the on-disk prompt file at
+///    `{chains_dir}/prompts/<rel_path>`. This preserves compatibility
+///    with tests and the pre-migration state.
+///
+/// Example: `"$prompts/conversation/forward.md"` first asks the
+/// global prompt cache for `"conversation/forward.md"`; if the Phase
+/// 5 migration ran, this hits the migrated `skill` contribution and
+/// returns the body. If the cache has no row (fresh test DB, or a
+/// prompt added after first-run migration), the loader falls back to
+/// `"{chains_dir}/prompts/conversation/forward.md"`.
 fn resolve_prompt_refs(def: &mut ChainDefinition, chains_dir: &Path) -> Result<()> {
     resolve_step_refs(&mut def.steps, chains_dir)
 }
@@ -59,6 +78,38 @@ fn resolve_prompt_refs(def: &mut ChainDefinition, chains_dir: &Path) -> Result<(
 fn resolve_step_refs(steps: &mut [crate::pyramid::chain_engine::ChainStep], chains_dir: &Path) -> Result<()> {
     let resolve_prompt = |prompt_ref: &str, step_name: &str, field_name: &str| -> Result<String> {
         if let Some(rel_path) = prompt_ref.strip_prefix("$prompts/") {
+            // Phase 5: try the contribution store first via the
+            // global prompt cache. On hit, return the contribution
+            // body directly; on miss, fall back to disk.
+            match crate::pyramid::prompt_cache::resolve_prompt_global(prompt_ref) {
+                Ok(Some(body)) => {
+                    tracing::trace!(
+                        step = step_name,
+                        field = field_name,
+                        prompt = rel_path,
+                        "resolved prompt from contribution store (Phase 5 cache hit)"
+                    );
+                    return Ok(body);
+                }
+                Ok(None) => {
+                    tracing::trace!(
+                        step = step_name,
+                        field = field_name,
+                        prompt = rel_path,
+                        "prompt cache miss — falling back to disk"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        step = step_name,
+                        field = field_name,
+                        prompt = rel_path,
+                        error = %e,
+                        "prompt cache errored — falling back to disk"
+                    );
+                }
+            }
+
             let prompt_path = chains_dir.join("prompts").join(rel_path);
             return std::fs::read_to_string(&prompt_path).with_context(|| {
                 format!(

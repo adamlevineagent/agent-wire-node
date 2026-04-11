@@ -482,3 +482,87 @@ The bootstrap migration's idempotency guards (sentinel marker + per-row `contrib
 > Finally: the Phase 4 bootstrap migration's idempotency guard (sentinel marker) is a one-way latch. Once the marker exists, any direct-write DADBEAR row that lands afterward never gets a contribution. If Phase 4.5/9 adopts option (c) above, the marker needs to be per-row rather than global.
 
 ---
+
+## Phase 5 wanderer pass — 2026-04-10
+
+**Context:** Joined phase-5-wire-contribution-mapping after 45b440a + d18a495 (implementer + verifier commits) to trace end-to-end execution with fresh eyes and catch anything a punch-list verifier would miss. Phase 4's wanderer caught `sync_config_to_operational` being dead code (9 IPC handlers, zero callers); the assignment was to look for the same pattern in Phase 5.
+
+### Finding A — CRITICAL: `PromptCache` was entirely dead code (FIXED)
+
+**What it was:** Phase 5 shipped four new modules, ~4,300 lines of code, 65 new tests. The stated goal per the workstream prompt:
+
+> "The existing `chain_loader::load_prompt` path should transparently hit the cache first, falling back to disk for files not yet migrated (rare — should only happen for chains that land AFTER first-run migration)."
+
+**Reality:** `src-tauri/src/pyramid/chain_loader.rs:55` (`resolve_prompt_refs`) still read prompts straight from disk via `std::fs::read_to_string(&prompt_path)`, unchanged since before Phase 5. The `PromptCache` module existed, had tests, was invalidated by the dispatcher on skill contribution sync — but zero production code ever called `PromptCache::get()` or `resolve_prompt_from_store()`. A repo-wide grep for `prompt_cache::` turned up only:
+
+- `config_contributions.rs:775` — the `invalidate_prompt_cache()` hook (which cleared a cache nobody read from)
+- `prompt_cache.rs` itself and its tests
+- `wire_migration.rs:51` — a `use` statement pulling in `normalize_prompt_path`
+
+The chain executor, chain loader, build runner, parity module, preview module, and chain publish module all called `chain_loader::load_chain()` which called `resolve_prompt_refs()` which hit disk. The Phase 5 migration successfully wrote `skill` contributions to `pyramid_config_contributions` on first run, and those rows were completely unused by the runtime. The entire 4,300-line Phase 5 effort was cosmetic from the chain execution perspective.
+
+**How this happened:** The implementer wrote `PromptCache`, wrote the migration that populates it, wrote the dispatcher invalidation hook, wrote comprehensive tests for each piece, and wrote their own wanderer prompt that said "populate the prompt cache on first lookup, serve a skill contribution's body through the chain loader". They never actually modified `chain_loader::resolve_prompt_refs` to consult the cache. The punch-list verifier focused on spec compliance (canonical parity, round-trip tests, 28-slot allocation edge cases, migration idempotency) and didn't trace the hot path: "what line of code reads a prompt on chain execution?"
+
+**Root cause:** Same Phase 4 wanderer-caught pattern. Helper function exists and is tested → punch list passes → helper never gets called from production → entire phase is cosmetic. The verifier validated every module in isolation but not the boundary between them.
+
+**Fix:** Added `set_global_prompt_cache_db_path()` + `resolve_prompt_global()` to `prompt_cache.rs`. The global resolver opens ephemeral reader connections from a stashed `pyramid.db` path on cache miss, warms the cache, and returns the body. This keeps the chain loader signature unchanged (no `&Connection` threading through 9+ call sites). `main.rs` stashes the path once during app setup after `init_pyramid_db`. `chain_loader::resolve_prompt_refs` now consults the global resolver first and falls back to disk on not-found/error. Added 2 new tests: `global_resolver_returns_none_when_path_unset` and `global_resolver_hits_stashed_db_when_set`.
+
+**Detection method:** Grep for `prompt_cache` across all Rust files in `src-tauri/src/pyramid/`. Expected: chain_executor and chain_loader would import prompt_cache. Actual: neither file contained the string "prompt_cache". That was the smoking gun.
+
+**Lesson for future phases:** When a phase ships a new cache or lookup layer, the verifier MUST grep for imports of the new module in every plausible hot path file. If the new module is only imported by its own tests and one dispatcher hook, it's dead code. A "does it test cleanly in isolation" pass does not catch this.
+
+### Finding B — MEDIUM: Phase 4 DADBEAR bootstrap migration wrote `'{}'` metadata (FIXED)
+
+**What it was:** `src-tauri/src/pyramid/db.rs:1543` — the Phase 4 DADBEAR migration path that converts legacy `pyramid_dadbear_config` rows to `pyramid_config_contributions` rows — hardcoded `wire_native_metadata_json = '{}'` in a direct SQL INSERT. This bypassed the `config_contributions.rs` helpers that Phase 5 updated to write canonical metadata.
+
+**Spec violation:** `docs/specs/wire-contribution-mapping.md` → Creation-Time Capture table, line 361:
+
+> "Bootstrap migration from legacy tables | Empty defaults. `maturity` = `canon`. `description` via prepare LLM on first publish."
+
+Phase 5's implementation log claimed:
+
+> "Phase 4's creation paths in `config_contributions.rs` now populate `wire_native_metadata_json` with schema-type-appropriate canonical defaults instead of the `'{}'` stub."
+
+The claim is half-true: the helpers in `config_contributions.rs` were updated, but `db.rs:1543` (which predates the helpers and is a direct INSERT) was never touched. The Phase 5 implementer missed this because they only searched for `'{}'` inside `config_contributions.rs`, not the whole repo.
+
+**Effect at runtime:** Legacy DADBEAR rows migrated during Phase 4 bootstrap land in `pyramid_config_contributions` with placeholder metadata. `WireNativeMetadata::from_json("{}")` gracefully falls back to `default_wire_native_metadata()` which sets `maturity: Draft`. As a result, `pyramid_publish_to_wire` refuses to publish these rows with the error "contribution maturity is `draft` — promote to design/canon before publishing". The degradation is graceful (no panics, no data loss) but the spec's intent is violated — bootstrap-migrated contributions should be immediately publishable with `maturity: canon`.
+
+**Fix:** Updated `migrate_legacy_dadbear_to_contributions` to build a canonical `WireNativeMetadata` via `default_wire_native_metadata("dadbear_policy", Some(slug))`, override `maturity` to `Canon`, serialize to JSON, and use the serialized JSON in the INSERT. Added a test `phase5_dadbear_migration_writes_canonical_metadata_not_empty_json` that inserts a legacy DADBEAR row, runs the migration, and asserts the resulting contribution has canonical metadata with `maturity: Canon` and `contribution_type: Template`.
+
+**Detection method:** Repo-wide grep for `INSERT INTO pyramid_config_contributions`, then read each match and check whether it writes `wire_native_metadata_json = '{}'`. Expected: zero matches. Actual: 2 matches outside test code — one in `wire_migration.rs:269` (the Phase 5 sentinel write, which is correct — sentinel rows don't need metadata) and one in `db.rs:1543` (the Phase 4 DADBEAR migration, which is wrong).
+
+**Lesson for future phases:** When a phase says "every creation path now writes canonical metadata", the verifier must grep for ALL direct `INSERT INTO pyramid_config_contributions` statements, not just check the helpers in the expected file. Legacy direct-insert paths are the places where half-fixes hide.
+
+### Finding C — NON-BLOCKING: Spec file still has old incorrect struct definitions
+
+**What it is:** `docs/specs/wire-contribution-mapping.md` has Rust struct definitions (e.g., `WireScope` as tagged enum, `WireRef` with a tagged enum of reference kinds, `supersedes: Option<WireRefKey>`) that diverge from the canonical YAML schema in `GoodNewsEveryone/docs/wire-native-documents.md`. The Phase 5 implementer correctly flagged three divergences in the implementation log and implemented the canonical-correct shapes in Rust, but left the spec file unchanged.
+
+**Risk:** A future implementer who reads `docs/specs/wire-contribution-mapping.md` instead of the canonical will reintroduce the drift. The spec-as-source-of-truth assumption is broken for these struct shapes.
+
+**Severity:** Non-blocking for runtime, blocking for future implementation correctness. Not fixed in this wanderer pass because the spec correction is a standalone editing task (no code change, no test) and the implementer explicitly flagged it for a follow-up pass.
+
+**Recommendation:** A small spec correction PR should update the three struct definitions in the spec file to match the canonical + the Rust implementation. The impl log already contains the canonical-wins rationale for each divergence (log lines 968-977).
+
+### What I did not fix
+
+1. **Section decomposition publish path** — Phase 5 ships the `WireSectionOverride` type and the dry-run preview, but `publish_contribution_with_metadata` only publishes the top-level contribution. The impl log flagged this for a Phase 5.5 / Phase 9 follow-up. Since the spec explicitly carves this out for later and the economic graph is correct today (separate skill contributions + custom_chain with derived_from pointing at them), I left it alone.
+
+2. **Live path→UUID resolution at publish time** — Phase 5's `resolve_derived_from_preview` computes the 28-slot allocation but marks every entry as `resolved: false`. The live path→UUID map is Phase 10's Wire discovery scope per the impl log. Left alone.
+
+3. **JSON Schema validation of metadata** — Phase 5's `validate()` checks structural invariants (price/curve exclusion, 28-source cap, etc.) but does NOT run a JSON Schema check against the `schema_definition` contribution. Phase 9 provides the schemas per impl log. Left alone.
+
+4. **Other legacy direct-insert paths** — Phase 4's wanderer pass (entry above) already enumerated 8 other direct-write paths that bypass the contribution table entirely. Those are out of Phase 5 scope and belong to Phase 4.5 / Phase 9 per the planner escalation.
+
+### Commit
+
+Single commit on `phase-5-wire-contribution-mapping` with message `phase-5: wanderer fix — PromptCache wire-up + DADBEAR canonical metadata`. Modifies 4 files (`chain_loader.rs`, `prompt_cache.rs`, `main.rs`, `db.rs`) and adds 3 new tests. No other changes.
+
+### Verification after fix
+
+- `cargo check --lib` — clean, 3 pre-existing warnings.
+- `cargo test --lib pyramid::prompt_cache` — 8/8 passing (6 existing + 2 new).
+- `cargo test --lib pyramid::wire_migration` — 6/6 passing (unchanged).
+- `cargo test --lib pyramid::db::provider_registry_tests::phase5_dadbear_migration_writes_canonical_metadata_not_empty_json` — 1/1 passing (new).
+- `cargo test --lib pyramid` — **923 passed, 7 failed** (same 7 pre-existing failures documented in Phase 2/3/4). Phase 5 implementer reported 919 passing post-implementation (854 → 919, +65 tests); verifier commit d18a495 added 1 test (920); wanderer fix adds 3 new tests (923). Zero regressions.
+
+---

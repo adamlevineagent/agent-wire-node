@@ -7073,6 +7073,171 @@ async fn pyramid_rollback_config(
     })
 }
 
+// --- Phase 5: Wire Contribution Publication IPC ----------------------------
+//
+// Per `docs/specs/wire-contribution-mapping.md` → "Publish IPC" section.
+// Two commands ship in Phase 5:
+//
+//   pyramid_dry_run_publish — build a DryRunReport for ToolsMode to
+//     render inline. Pure local call; no network, no auth required.
+//
+//   pyramid_publish_to_wire — call the Wire's `/api/v1/contribute`
+//     endpoint with the canonical YAML metadata + derived_from
+//     allocation. Requires `confirm: true`. Writes the
+//     `WirePublicationState` back to the contribution row on success.
+//
+// Both commands operate on a single `contribution_id` — the caller
+// looks up the row, builds the metadata from its
+// `wire_native_metadata_json` column, and dispatches to `wire_publish.rs`.
+
+#[tauri::command]
+async fn pyramid_dry_run_publish(
+    state: tauri::State<'_, SharedState>,
+    contribution_id: String,
+) -> Result<wire_node_lib::pyramid::wire_publish::DryRunReport, String> {
+    // Load the contribution.
+    let contribution = {
+        let reader = state.pyramid.reader.lock().await;
+        wire_node_lib::pyramid::config_contributions::load_contribution_by_id(
+            &reader,
+            &contribution_id,
+        )
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("contribution {contribution_id} not found"))?
+    };
+
+    // Deserialize canonical metadata from the JSON column.
+    let metadata =
+        wire_node_lib::pyramid::wire_native_metadata::WireNativeMetadata::from_json(
+            &contribution.wire_native_metadata_json,
+        )
+        .map_err(|e| format!("failed to parse wire_native_metadata_json: {e}"))?;
+
+    // The publisher only needs the URL + auth for the real publish
+    // path; dry-run is purely local. Construct a zero-auth publisher
+    // so we don't require the user to be signed in just to preview.
+    let publisher = wire_node_lib::pyramid::wire_publish::PyramidPublisher::new(
+        "https://dry-run.invalid".to_string(),
+        String::new(),
+    );
+
+    publisher
+        .dry_run_publish(
+            &contribution.contribution_id,
+            &contribution.schema_type,
+            &contribution.yaml_content,
+            &metadata,
+        )
+        .map_err(|e| e.to_string())
+}
+
+#[derive(serde::Serialize)]
+struct PublishToWireResponse {
+    wire_contribution_id: String,
+    handle_path: Option<String>,
+    wire_type: String,
+    sections_published: Vec<String>,
+}
+
+#[tauri::command]
+async fn pyramid_publish_to_wire(
+    state: tauri::State<'_, SharedState>,
+    contribution_id: String,
+    confirm: bool,
+) -> Result<PublishToWireResponse, String> {
+    if !confirm {
+        return Err(
+            "publish_to_wire called with confirm=false; require explicit user confirmation"
+                .to_string(),
+        );
+    }
+
+    // Load the contribution.
+    let contribution = {
+        let reader = state.pyramid.reader.lock().await;
+        wire_node_lib::pyramid::config_contributions::load_contribution_by_id(
+            &reader,
+            &contribution_id,
+        )
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("contribution {contribution_id} not found"))?
+    };
+
+    // Deserialize canonical metadata.
+    let metadata =
+        wire_node_lib::pyramid::wire_native_metadata::WireNativeMetadata::from_json(
+            &contribution.wire_native_metadata_json,
+        )
+        .map_err(|e| format!("failed to parse wire_native_metadata_json: {e}"))?;
+
+    // Refuse to publish draft metadata without an explicit force flag.
+    // (Phase 5 ships the hard refusal; Phase 10's UI can add the
+    // "publish as draft" override.)
+    if matches!(
+        metadata.maturity,
+        wire_node_lib::pyramid::wire_native_metadata::WireMaturity::Draft
+    ) {
+        return Err(
+            "contribution maturity is `draft` — promote to design/canon before publishing (Phase 5 refuses draft publishes; Phase 10 adds the override)"
+                .to_string(),
+        );
+    }
+
+    // Build the publisher. Uses the session API token for Wire auth,
+    // same pattern as pyramid publication paths elsewhere in main.rs.
+    let wire_url =
+        std::env::var("WIRE_URL").unwrap_or_else(|_| "https://newsbleach.com".to_string());
+    let wire_auth = get_api_token(&state.auth).await?;
+    let publisher =
+        wire_node_lib::pyramid::wire_publish::PyramidPublisher::new(wire_url, wire_auth);
+
+    let outcome = publisher
+        .publish_contribution_with_metadata(
+            &contribution.contribution_id,
+            &contribution.schema_type,
+            &contribution.yaml_content,
+            &metadata,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // Write the publication state back into the contribution row.
+    let pub_state = wire_node_lib::pyramid::wire_native_metadata::WirePublicationState {
+        wire_contribution_id: Some(outcome.wire_contribution_id.clone()),
+        handle_path: outcome.handle_path.clone(),
+        chain_root: None,
+        chain_head: None,
+        published_at: Some(chrono::Utc::now().to_rfc3339()),
+        last_resolved_derived_from: outcome.resolved_derived_from.clone(),
+    };
+    let pub_state_json = serde_json::to_string(&pub_state)
+        .map_err(|e| format!("failed to serialize wire_publication_state: {e}"))?;
+
+    {
+        let writer = state.pyramid.writer.lock().await;
+        writer
+            .execute(
+                "UPDATE pyramid_config_contributions
+                 SET wire_publication_state_json = ?1,
+                     wire_contribution_id = ?2
+                 WHERE contribution_id = ?3",
+                rusqlite::params![
+                    pub_state_json,
+                    outcome.wire_contribution_id,
+                    contribution.contribution_id
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+    }
+
+    Ok(PublishToWireResponse {
+        wire_contribution_id: outcome.wire_contribution_id,
+        handle_path: outcome.handle_path,
+        wire_type: outcome.wire_type,
+        sections_published: outcome.sections_published,
+    })
+}
+
 // --- App Setup --------------------------------------------------------------
 
 fn main() {
@@ -7157,6 +7322,20 @@ fn main() {
     wire_node_lib::pyramid::db::init_pyramid_db(&pyramid_reader)
         .expect("Failed to initialize pyramid schema on reader");
 
+    // ── Phase 5 wanderer fix: stash pyramid.db path for prompt cache ──
+    //
+    // The Phase 5 PromptCache uses ephemeral reader connections opened
+    // from this stashed path whenever `chain_loader::resolve_prompt_refs`
+    // needs to fault a prompt in from the contribution store. Without
+    // this call the cache stays cold and `chain_loader` would fall
+    // through to disk on every lookup — the Phase 5 contribution-backed
+    // prompt lookup would be dead code. Must be set BEFORE any chain
+    // load attempt, which is safe here because the migration and
+    // subsequent chain execution both happen after this point.
+    wire_node_lib::pyramid::prompt_cache::set_global_prompt_cache_db_path(
+        pyramid_db_path.clone(),
+    );
+
     // Load pyramid config from disk (or use defaults)
     let pyramid_config = wire_node_lib::pyramid::PyramidConfig::load(&config.data_dir());
     tracing::info!(
@@ -7195,6 +7374,44 @@ fn main() {
         source_chains_for_sync.as_deref(),
     ) {
         tracing::warn!("Failed to sync chain files: {e}");
+    }
+
+    // ── Phase 5: migrate on-disk prompts + chains to contributions ──────
+    //
+    // Phase 5 replaces the on-disk prompt/chain resolution path with
+    // `pyramid_config_contributions` rows + a PromptCache. On first run
+    // (or the first run after a Phase 5 upgrade), this walks the chains
+    // directory above and inserts one `skill` row per `.md` prompt and
+    // one `custom_chain` row per chain YAML. Idempotent via a sentinel
+    // row — subsequent runs short-circuit on its presence.
+    //
+    // Failure mode: per-file failures are logged and the run proceeds.
+    // A whole-run failure (e.g. DB error) is logged at WARN but the
+    // app still boots — the chain loader's on-disk fallback path keeps
+    // the executor working until the migration can be re-run.
+    match wire_node_lib::pyramid::wire_migration::migrate_prompts_and_chains_to_contributions(
+        &pyramid_writer,
+        &chains_dir,
+    ) {
+        Ok(report) if report.ran => {
+            tracing::info!(
+                prompts_inserted = report.prompts_inserted,
+                chains_inserted = report.chains_inserted,
+                prompts_failed = report.prompts_failed,
+                chains_failed = report.chains_failed,
+                marker_written = report.marker_written,
+                "Phase 5 prompt+chain migration completed"
+            );
+        }
+        Ok(_report) => {
+            tracing::debug!("Phase 5 prompt+chain migration: already migrated (sentinel present)");
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "Phase 5 prompt+chain migration failed; on-disk fallback still active"
+            );
+        }
     }
 
     // ── Phase 3: credential store + provider registry ────────────────────
@@ -8222,6 +8439,9 @@ fn main() {
             pyramid_accept_proposal,
             pyramid_reject_proposal,
             pyramid_rollback_config,
+            // Phase 5: Wire Contribution Publication
+            pyramid_dry_run_publish,
+            pyramid_publish_to_wire,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Wire Node");
