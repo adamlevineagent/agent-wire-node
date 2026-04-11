@@ -4381,3 +4381,83 @@ Docs:
   deferral.
 
 **Status:** awaiting-verification.
+
+### Verifier pass (2026-04-11)
+
+Serial verifier run against commit `f674051 phase-18c: cache-publish
+privacy opt-in + pause-all scoping`. Audited every failure mode in the
+Phase 18c workstream prompt. No in-place fixes required — the
+implementer landed all ten load-bearing checks correctly.
+
+**L4 audits (all clean):**
+
+- Checkbox state in `PublishPreviewModal.tsx` defaults to `false`,
+  no auto-check heuristic. Passes through as `includeCacheManifest`
+  to `pyramid_publish_to_wire`, which unwraps to `opt_in_cache` and
+  only calls `export_cache_manifest(..., include_cache = true)` when
+  the flag is set AND the contribution is slug-bound. The Phase 7
+  default-OFF gate at line 1447 of `wire_publish.rs` is unchanged.
+- `build_contribution_publish_payload` is a free function at
+  `wire_publish.rs` line 1097 taking an optional
+  `&CacheManifest`. Both `publish_contribution_with_metadata` and
+  `publish_contribution_with_metadata_and_cache` call into it, and
+  the four new payload tests exercise it without an HTTP round trip.
+- `PublishToWireResponse.cache_manifest_entries` is
+  `Option<u64>` on the Rust side and `number | null` in the TS
+  mirror. Modal renders `Cache manifest: N entries attached` only
+  when the field is non-null; the `null` path renders nothing.
+- `test_export_cache_manifest_privacy_gate_default_off` and
+  `test_export_cache_manifest_default_off_returns_none_for_publish`
+  both green.
+
+**L9 audits (all clean):**
+
+- `disable_dadbear_by_folder` SQL uses
+  `(source_path = ?1 OR source_path LIKE ?1 || '/%')` per spec.
+  `normalize_dadbear_folder` strips one trailing slash with a
+  `len() > 1` guard so root `/` survives.
+- Tests cover subtree match (`/a` hits `/a`, `/a/b`, `/a/b/c`,
+  leaves `/d`), trailing slash (`/a/` == `/a`), partial-prefix
+  non-match (`/a` does NOT match `/alpha`), idempotency (second
+  call returns 0), and enable/disable symmetry.
+- Circle scope: `count_dadbear_scope` returns `Ok(0)` for
+  `"circle"` (no SQL against the missing column); the pause/resume
+  IPCs return an explicit error; the frontend radio is `disabled`
+  with a "coming soon" tooltip. Locked in by
+  `test_count_dadbear_scope_circle_returns_zero_pending_schema`.
+- `DadbearPauseScopeModal.tsx` is imported and mounted in both
+  `CrossPyramidTimeline.tsx` and `DadbearOversightPage.tsx`. Both
+  buttons relabeled `Pause...` / `Resume...` with ellipsis.
+- Live count preview: `DadbearPauseScopeModal.tsx` `useEffect`
+  keyed on `[scope, folderInput, action]` calls
+  `pyramid_count_dadbear_scope` and updates the confirm button
+  label. Short-circuits for empty folder input and the deferred
+  circle scope.
+- `pyramid_list_dadbear_source_paths` and
+  `pyramid_count_dadbear_scope` both defined as `#[tauri::command]`
+  and registered in `invoke_handler!` at main.rs line 10634-10636.
+
+**Verification commands:**
+
+- `cargo check --lib` (src-tauri): clean, 3 pre-existing warnings
+  (LayerCollectResult private interface x2 plus a rusqlite
+  deprecation in routes.rs) — none touched by this workstream.
+- `cargo test --lib pyramid`: **1252 passing / 7 failing**, matching
+  the implementer's report. The 7 failures are all pre-existing
+  (staleness tests missing the `build_id` column on
+  `pyramid_evidence`, `test_evidence_pk_cross_slug_coexistence`,
+  `real_yaml_thread_clustering_preserves_response_schema` in the
+  defaults adapter) — none introduced by Phase 18c.
+- `cargo test --lib pyramid::wire_publish::tests`: 24/24 green,
+  including all 4 new L4 payload tests.
+- `cargo test --lib -- phase13_tests`: 34/34 green, including all
+  10 new L9 folder-scope tests.
+- `npm run build`: clean (151 modules, 795.77 kB bundle).
+
+**Verdict:** no fixes required. Phase 18c commit `f674051` ships
+everything the workstream prompt asked for, tests cover the
+load-bearing edges, and the shared scope-picker modal is wired into
+both timeline + oversight surfaces.
+
+**Status:** verified.
+
