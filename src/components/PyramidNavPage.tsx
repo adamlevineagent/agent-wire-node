@@ -391,12 +391,17 @@ export function PyramidNavPage({ initialSlug, onBack }: PyramidNavPageProps) {
 
     // ─── Node drill ────────────────────────────────────────────────────
 
-    const handleNodeClick = useCallback((nodeId: string) => {
+    // Phase 18b L7: `fromSearch` flags drills initiated by clicking a
+    // search result, so the IPC fires `search_hit` IN ADDITION TO the
+    // standard `user_drill` demand signal. The default-callsite
+    // (e.g. drill from the tree view) leaves it `false` and only the
+    // standard signal fires.
+    const handleNodeClick = useCallback((nodeId: string, fromSearch: boolean = false) => {
         if (!selectedSlug) return;
         setSelectedNodeId(nodeId);
         setDrillLoading(true);
 
-        invoke<DrillResult>('pyramid_drill', { slug: selectedSlug, nodeId })
+        invoke<DrillResult>('pyramid_drill', { slug: selectedSlug, nodeId, fromSearch })
             .then(setDrillResult)
             .catch((err) => {
                 setError(`Failed to drill: ${err}`);
@@ -1028,7 +1033,9 @@ function SearchModeView({
     results: any[];
     loading: boolean;
     onSearch: () => void;
-    onNodeClick: (nodeId: string) => void;
+    // Phase 18b L7: the second arg flags drills launched from a search
+    // result so the IPC fires `search_hit` in addition to `user_drill`.
+    onNodeClick: (nodeId: string, fromSearch?: boolean) => void;
 }) {
     return (
         <div className="pnav-search-mode">
@@ -1052,7 +1059,10 @@ function SearchModeView({
             {results.length > 0 && (
                 <div className="pnav-search-results">
                     {results.map((r: any, i: number) => (
-                        <div key={i} className="pnav-search-result" onClick={() => (r.node_id ?? r.id) && onNodeClick(r.node_id ?? r.id)}>
+                        // Phase 18b L7: pass `true` so the drill records
+                        // a `search_hit` demand signal in addition to
+                        // the standard `user_drill`.
+                        <div key={i} className="pnav-search-result" onClick={() => (r.node_id ?? r.id) && onNodeClick(r.node_id ?? r.id, true)}>
                             <div className="pnav-search-result-headline">
                                 {r.headline ?? r.title ?? r.id ?? `Result ${i + 1}`}
                             </div>
@@ -1068,7 +1078,7 @@ function SearchModeView({
 
 // ── Question Result View ───────────────────────────────────────────────
 
-function QuestionResultView({ data, onNodeClick }: { data: any; onNodeClick: (nodeId: string) => void }) {
+function QuestionResultView({ data, onNodeClick }: { data: any; onNodeClick: (nodeId: string, fromSearch?: boolean) => void }) {
     if (!data) return null;
 
     // Handle various shapes the search endpoint can return
@@ -1077,7 +1087,10 @@ function QuestionResultView({ data, onNodeClick }: { data: any; onNodeClick: (no
     return (
         <div className="pnav-question-results">
             {results.map((r: any, i: number) => (
-                <div key={i} className="pnav-question-result-item" onClick={() => (r.node_id ?? r.id) && onNodeClick(r.node_id ?? r.id)}>
+                // Phase 18b L7: question results are also routed through
+                // the search endpoint, so a click here is conceptually a
+                // search→drill — flag it so the IPC records `search_hit`.
+                <div key={i} className="pnav-question-result-item" onClick={() => (r.node_id ?? r.id) && onNodeClick(r.node_id ?? r.id, true)}>
                     <div className="pnav-question-result-headline">
                         {r.headline ?? r.title ?? r.id ?? `Result ${i + 1}`}
                     </div>

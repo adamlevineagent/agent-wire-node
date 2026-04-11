@@ -361,6 +361,19 @@ struct SearchQuery {
     semantic: Option<bool>,
 }
 
+/// Phase 18b L7: optional `from` query param on `/pyramid/:slug/drill/:id`.
+/// When `from = "search"` the drill is interpreted as the second half
+/// of a search→drill flow, and the demand signal recording fires both
+/// `user_drill` (the existing signal) AND `search_hit` (the new
+/// signal type). The frontend appends `?from=search` to the drill URL
+/// when the user clicks a search result. Other values of `from` are
+/// ignored — only `search` carries semantics today.
+#[derive(Deserialize, Default)]
+struct DrillQuery {
+    #[serde(default)]
+    from: Option<String>,
+}
+
 #[derive(Deserialize)]
 struct AnnotateBody {
     node_id: String,
@@ -872,7 +885,11 @@ pub fn pyramid_routes(
         .and(with_slug_read_auth(state.clone(), jwt_public_key.clone()))
         .and_then(handle_tree));
 
-    // REMOTE-SAFE: GET /pyramid/:slug/drill/:id — read-only, dual auth + access tier (WS-ONLINE-E)
+    // REMOTE-SAFE: GET /pyramid/:slug/drill/:id?from=search — read-only,
+    // dual auth + access tier (WS-ONLINE-E). Phase 18b L7 added the
+    // optional `from` query param so the frontend can flag a drill as
+    // originating from a search result, which triggers `search_hit`
+    // demand signal recording in addition to the standard `user_drill`.
     let drill = route!(prefix
         .and(warp::path::param::<String>())
         .and(warp::path("drill"))
@@ -880,6 +897,7 @@ pub fn pyramid_routes(
         .and(warp::path::end())
         .and(warp::get())
         .and(with_slug_read_auth(state.clone(), jwt_public_key.clone()))
+        .and(warp::query::<DrillQuery>())
         .and(with_agent_id())
         .and_then(handle_drill));
 
@@ -2759,6 +2777,7 @@ async fn handle_drill(
     slug_name: String,
     node_id: String,
     (state, auth_source): (Arc<PyramidState>, AuthSource),
+    drill_query: DrillQuery,
     agent_id: Option<String>,
 ) -> Result<warp::reply::Response, warp::Rejection> {
     let conn = state.reader.lock().await;
@@ -2783,6 +2802,18 @@ async fn handle_drill(
             } else {
                 "agent_query"
             };
+            // Phase 18b L7: detect search→drill flow via the optional
+            // `?from=search` query param the frontend appends when
+            // navigating from a search result. When present, the
+            // demand signal subsystem fires `search_hit` IN ADDITION
+            // TO the standard `user_drill` (or `agent_query`) signal —
+            // both rows land in `pyramid_demand_signals` and the
+            // triage policy can give them separate weights.
+            let from_search = drill_query
+                .from
+                .as_deref()
+                .map(|f| f.eq_ignore_ascii_case("search"))
+                .unwrap_or(false);
             let source = agent_id.clone().unwrap_or_else(|| "user".to_string());
             let writer_clone = state.writer.clone();
             let slug_for_signal = slug_name.clone();
@@ -2805,13 +2836,23 @@ async fn handle_drill(
                     Some(&source),
                     &policy,
                 );
+                if from_search {
+                    let _ = crate::pyramid::demand_signal::record_demand_signal(
+                        &conn,
+                        &slug_for_signal,
+                        &node_for_signal,
+                        "search_hit",
+                        Some(&source),
+                        &policy,
+                    );
+                }
             });
 
             log_query_usage(
                 state.writer.clone(),
                 slug_name,
                 "drill".to_string(),
-                serde_json::json!({"node_id": node_id}).to_string(),
+                serde_json::json!({"node_id": node_id, "from": drill_query.from}).to_string(),
                 ids,
                 agent_id,
             );

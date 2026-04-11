@@ -397,28 +397,30 @@ async fn dispatch_llm(
         c
     });
 
-    // Standard path: call model, parse JSON, retry at temp 0.1 on failure
-    let response = if let Some(ref audit) = ctx.audit {
-        let audit = AuditContext {
-            step_name: step.name.clone(),
-            call_purpose: "chain_dispatch".to_string(),
-            ..audit.clone()
-        };
-        let (resp, _) = llm::call_model_audited(
-            config_ref, system_prompt, &user_prompt, temperature, max_tokens, None, &audit,
-        ).await?;
-        resp.content
-    } else {
-        llm::call_model_and_ctx(
-            config_ref,
-            dispatch_cache_ctx.as_ref(),
-            system_prompt,
-            &user_prompt,
-            temperature,
-            max_tokens,
-        )
-        .await?
-    };
+    // Phase 18b L8 retrofit: cache + audit unified path. Previously the
+    // audited branch bypassed the Phase 6 cache; now both audit and
+    // cache thread through the unified entry point so audited builds
+    // also benefit from the content-addressable cache. The dispatch
+    // ctx already builds a `dispatch_cache_ctx` above for the
+    // non-audited path; we reuse it for both branches now.
+    let dispatch_audit_ctx = ctx.audit.as_ref().map(|audit| AuditContext {
+        step_name: step.name.clone(),
+        call_purpose: "chain_dispatch".to_string(),
+        ..audit.clone()
+    });
+    let resp = llm::call_model_unified_with_audit_and_ctx(
+        config_ref,
+        dispatch_cache_ctx.as_ref(),
+        dispatch_audit_ctx.as_ref(),
+        system_prompt,
+        &user_prompt,
+        temperature,
+        max_tokens,
+        None,
+        llm::LlmCallOptions::default(),
+    )
+    .await?;
+    let response = resp.content;
 
     match llm::extract_json(&response) {
         Ok(json) => {
@@ -1308,36 +1310,32 @@ pub async fn dispatch_ir_llm(
 
     // Standard path: call model, parse JSON, retry at temp 0.1 on failure.
     //
-    // The audited path does NOT thread the cache_ctx through today: the
-    // existing `call_model_audited` writes its own audit row and delegates
-    // to the non-ctx `call_model_unified` path. Phase 12's broader retrofit
-    // will either (a) add an `_audited_and_ctx` variant or (b) merge the
-    // audit into the cache's event bus stream. For this fix pass we keep
-    // the audit path untouched but route the non-audit path through the
-    // cache so that build runs without Theatre audit still benefit.
-    let response = if let Some(ref audit) = ctx.audit {
-        let audit = AuditContext {
-            step_name: step.id.clone(),
-            call_purpose: "ir_dispatch".to_string(),
-            ..audit.clone()
-        };
-        let (resp, _) = llm::call_model_audited(
-            config_ref, system_prompt, &user_prompt, temperature, max_tokens, None, &audit,
-        ).await?;
-        resp
-    } else {
-        llm::call_model_unified_with_options_and_ctx(
-            config_ref,
-            cache_ctx.as_ref(),
-            system_prompt,
-            &user_prompt,
-            temperature,
-            max_tokens,
-            None,
-            llm_options,
-        )
-        .await?
-    };
+    // Phase 18b L8 retrofit: previously the audited branch bypassed
+    // the Phase 6 cache because `call_model_audited` wrote its own
+    // audit row and delegated to the non-ctx `call_model_unified`
+    // path. Phase 18b unified the cache + audit paths via
+    // `call_model_unified_with_audit_and_ctx`, which threads BOTH a
+    // StepContext (for cache lookup/storage) and an AuditContext (for
+    // the Theatre audit trail) through a single call. Audited cache
+    // hits now write a `cache_hit = 1` audit row so the audit trail
+    // stays contiguous and DADBEAR Oversight can show savings.
+    let ir_audit_ctx = ctx.audit.as_ref().map(|audit| AuditContext {
+        step_name: step.id.clone(),
+        call_purpose: "ir_dispatch".to_string(),
+        ..audit.clone()
+    });
+    let response = llm::call_model_unified_with_audit_and_ctx(
+        config_ref,
+        cache_ctx.as_ref(),
+        ir_audit_ctx.as_ref(),
+        system_prompt,
+        &user_prompt,
+        temperature,
+        max_tokens,
+        None,
+        llm_options,
+    )
+    .await?;
 
     match llm::extract_json(&response.content) {
         Ok(json) => {

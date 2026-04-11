@@ -3046,6 +3046,12 @@ async fn pyramid_drill(
     state: tauri::State<'_, SharedState>,
     slug: String,
     node_id: String,
+    // Phase 18b L7: optional flag the frontend sets when the drill is
+    // launched from a search result. When true, the IPC fires
+    // `search_hit` IN ADDITION TO the standard `user_drill` so the
+    // demand signal subsystem can distinguish a direct drill from a
+    // search-then-drill flow. Defaults to `false` (the bare drill).
+    from_search: Option<bool>,
 ) -> Result<DrillResult, String> {
     let result = {
         let conn = state.pyramid.reader.lock().await;
@@ -3057,9 +3063,13 @@ async fn pyramid_drill(
     // Phase 12: fire-and-forget user_drill demand signal recording.
     // The IPC drill is always user-initiated (desktop UI), so we
     // always record `user_drill` with source "user".
+    //
+    // Phase 18b L7: when `from_search = true`, also record `search_hit`
+    // so the search→drill flow shows up as a distinct demand signal.
     let writer = state.pyramid.writer.clone();
     let slug_for_signal = slug.clone();
     let node_for_signal = node_id.clone();
+    let from_search_flag = from_search.unwrap_or(false);
     tokio::spawn(async move {
         let conn = writer.lock().await;
         let policy = match wire_node_lib::pyramid::db::load_active_evidence_policy(
@@ -3077,6 +3087,16 @@ async fn pyramid_drill(
             Some("user"),
             &policy,
         );
+        if from_search_flag {
+            let _ = wire_node_lib::pyramid::demand_signal::record_demand_signal(
+                &conn,
+                &slug_for_signal,
+                &node_for_signal,
+                "search_hit",
+                Some("user"),
+                &policy,
+            );
+        }
     });
 
     Ok(result)
