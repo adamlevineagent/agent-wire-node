@@ -2982,6 +2982,25 @@ fn step_saves_node(step: &ChainStep) -> bool {
     step.save_as.as_deref() == Some("node")
 }
 
+/// Content types that are allowed to run a chain pipeline with zero chunks.
+///
+/// Most content types (conversation, code, document) draw their L0 nodes
+/// from `pyramid_chunks` and cannot run without chunks. Two content types
+/// are exceptions:
+///
+/// * **question** — question pyramids derive from cross-slug evidence
+///   (question tree decomposition + evidence loop), not from chunks.
+/// * **vine** — vine pyramids compose registered child pyramids via
+///   `pyramid_vine_compositions` and the `cross_build_input` primitive;
+///   the chain reads children, not chunks. (Phase 16)
+///
+/// Keep this list in sync with `chain_engine::VALID_CONTENT_TYPES` — when
+/// new content types are added that legitimately have zero chunks, they
+/// go here so `execute_chain_from` doesn't reject them at startup.
+fn content_type_allows_zero_chunks(content_type: &str) -> bool {
+    matches!(content_type, "question" | "vine")
+}
+
 fn estimate_for_each_count(step: &ChainStep, ctx: &ChainContext, num_chunks: i64) -> i64 {
     let resolved_ref = normalize_context_ref(step.for_each.as_deref().unwrap_or("$chunks"));
     if resolved_ref == "$chunks" {
@@ -3847,11 +3866,15 @@ pub async fn execute_chain_from(
     .await?;
 
     if num_chunks == 0 {
-        if chain.content_type != "question" {
-            return Err(anyhow!("No chunks found for slug '{}' — cannot run non-question pipeline with zero chunks", slug));
+        if !content_type_allows_zero_chunks(&chain.content_type) {
+            return Err(anyhow!(
+                "No chunks found for slug '{}' — cannot run {} pipeline with zero chunks",
+                slug,
+                chain.content_type
+            ));
         }
-        warn!(slug, "No chunks found — steps requiring $chunks will be skipped or fail");
-        // Question pipelines can proceed without chunks.
+        warn!(slug, content_type = %chain.content_type, "No chunks found — steps requiring $chunks will be skipped or fail");
+        // Question and vine pipelines can proceed without chunks.
         // Steps with for_each: "$chunks" will get an empty array and produce no nodes.
     }
 
@@ -4549,6 +4572,11 @@ pub async fn execute_chain_from(
 /// Load all prior-build state from the DB into a single JSON value.
 /// Used by question pyramid chains to gather evidence sets, overlay answers,
 /// question tree, gaps, and L0 summary in one step.
+///
+/// Phase 16: for vine slugs, this also walks `pyramid_vine_compositions` and
+/// builds a `children` array containing one entry per registered child
+/// (bedrock or sub-vine). Each entry carries the child's apex summary so the
+/// topical-vine chain can cluster and synthesize over real child content.
 async fn execute_cross_build_input(
     state: &PyramidState,
     step: &ChainStep,
@@ -4605,6 +4633,80 @@ async fn execute_cross_build_input(
                 l0_summary
             };
 
+            // ── Phase 16: vine composition children ─────────────────────
+            // For vine slugs, surface each registered child (bedrock or
+            // sub-vine) with its apex summary. For non-vine slugs this is
+            // an empty array, so downstream steps can always address the
+            // same shape.
+            let is_vine = matches!(
+                super::slug::get_slug(conn, &s)?,
+                Some(ref info) if info.content_type == super::types::ContentType::Vine
+            );
+            let children_payload: Vec<Value> = if is_vine {
+                let compositions = db::list_vine_compositions(conn, &s)?;
+                let mut out: Vec<Value> = Vec::with_capacity(compositions.len());
+                for comp in compositions {
+                    let child_slug = comp.bedrock_slug.clone();
+                    let child_type = comp.child_type.clone();
+
+                    // Resolve the child's apex node. Prefer the stored apex
+                    // reference in the composition row; fall back to the
+                    // child's highest-depth live node if the row hasn't
+                    // been updated yet.
+                    let apex_id = match comp.bedrock_apex_node_id.clone() {
+                        Some(id) if !id.is_empty() => Some(id),
+                        _ => {
+                            // Defensive fallback: pick the highest-depth
+                            // live node for the child. For a never-built
+                            // child this returns nothing and we skip the
+                            // child cleanly.
+                            let all_nodes = db::get_all_live_nodes(conn, &child_slug)
+                                .unwrap_or_default();
+                            all_nodes
+                                .iter()
+                                .max_by_key(|n| n.depth)
+                                .map(|n| n.id.clone())
+                        }
+                    };
+
+                    let apex_node = apex_id
+                        .as_ref()
+                        .and_then(|id| {
+                            db::get_node(conn, &child_slug, id).ok().flatten()
+                        });
+
+                    // Build a compact summary payload. We intentionally
+                    // keep the shape close to what the topical clustering
+                    // prompts expect: `child_slug`, `child_type`,
+                    // `headline`, `distilled`, `topics`.
+                    let headline = apex_node
+                        .as_ref()
+                        .map(|n| n.headline.clone())
+                        .unwrap_or_default();
+                    let distilled = apex_node
+                        .as_ref()
+                        .map(|n| n.distilled.clone())
+                        .unwrap_or_default();
+                    let topics_val = apex_node
+                        .as_ref()
+                        .map(|n| serde_json::to_value(&n.topics).unwrap_or(Value::Null))
+                        .unwrap_or(Value::Null);
+
+                    out.push(serde_json::json!({
+                        "child_slug": child_slug,
+                        "child_type": child_type,
+                        "position": comp.position,
+                        "apex_node_id": apex_id,
+                        "headline": headline,
+                        "distilled": distilled,
+                        "topics": topics_val,
+                    }));
+                }
+                out
+            } else {
+                Vec::new()
+            };
+
             Ok(serde_json::json!({
                 "evidence_sets": serde_json::to_value(&evidence_sets)?,
                 "overlay_answers": serde_json::to_value(&overlay_answers)?,
@@ -4615,6 +4717,8 @@ async fn execute_cross_build_input(
                 "has_overlay": has_overlay,
                 "is_cross_slug": is_cross_slug,
                 "referenced_slugs": serde_json::to_value(&referenced_slugs)?,
+                "is_vine": is_vine,
+                "children": children_payload,
             }))
         })
         .await?
@@ -12434,6 +12538,32 @@ mod tests {
             primitive: "synthesize".to_string(),
             ..Default::default()
         }
+    }
+
+    /// Wanderer fix regression test for the chunk-count gate at the top
+    /// of `execute_chain_from`. `content_type_allows_zero_chunks` decides
+    /// whether a pipeline can proceed when `pyramid_chunks` is empty.
+    ///
+    /// Before the wanderer fix, only `"question"` was exempt, so every
+    /// vine build hard-errored at the gate because vines have no chunks
+    /// — they compose child pyramids via `pyramid_vine_compositions`.
+    /// Phase 16 also exempts `"vine"`. All other content types must
+    /// still require chunks.
+    #[test]
+    fn test_content_type_allows_zero_chunks_gate() {
+        // Exempt: derive from cross-slug / composition state, not chunks.
+        assert!(content_type_allows_zero_chunks("question"));
+        assert!(content_type_allows_zero_chunks("vine"));
+
+        // Not exempt: always need chunks.
+        assert!(!content_type_allows_zero_chunks("conversation"));
+        assert!(!content_type_allows_zero_chunks("code"));
+        assert!(!content_type_allows_zero_chunks("document"));
+
+        // Unknown content types are rejected too — new types opt in
+        // explicitly when they land.
+        assert!(!content_type_allows_zero_chunks(""));
+        assert!(!content_type_allows_zero_chunks("bogus"));
     }
 
     #[test]

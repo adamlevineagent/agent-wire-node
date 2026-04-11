@@ -1572,21 +1572,53 @@ pub struct SubQuestionResult {
 // ── WS-VINE-UNIFY (Phase 2b): Vine composition tracking ──────────────────────
 
 /// A row from `pyramid_vine_compositions` tracking the relationship between
-/// a vine pyramid and one of its bedrock pyramids.
+/// a vine pyramid and one of its children (bedrocks or sub-vines).
+///
+/// Phase 16 added `child_type` to support vine-of-vines composition. The
+/// `bedrock_slug` column name is retained for backwards compatibility; it
+/// holds a bedrock slug when `child_type == "bedrock"` and a child vine slug
+/// when `child_type == "vine"`. New code should read `child_slug()` /
+/// `child_type` rather than referencing `bedrock_slug` directly.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VineComposition {
     pub id: i64,
     pub vine_slug: String,
+    /// Child slug — either a bedrock or a child vine depending on `child_type`.
+    /// Column retained as `bedrock_slug` in the database for backwards compat.
     pub bedrock_slug: String,
-    /// Ordering of bedrocks in the vine (0 = leftmost / most recent).
+    /// Ordering of children in the vine (0 = leftmost / most recent).
     pub position: i32,
-    /// Current apex node ID of the bedrock pyramid, updated after each build.
+    /// Current apex node ID of the child pyramid, updated after each build.
+    /// For vine children this is the child vine's own apex.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bedrock_apex_node_id: Option<String>,
     /// active, stale, or removed.
     pub status: String,
+    /// Phase 16: `'bedrock'` or `'vine'`. Defaults to `'bedrock'` for
+    /// rows that existed before the migration.
+    #[serde(default = "default_child_type_bedrock")]
+    pub child_type: String,
     pub created_at: String,
     pub updated_at: String,
+}
+
+fn default_child_type_bedrock() -> String {
+    "bedrock".to_string()
+}
+
+impl VineComposition {
+    /// Alias for `bedrock_slug`. Use this in new code so the intent — "the
+    /// slug of whatever child the vine composes here" — is clear regardless
+    /// of whether the child is a bedrock or another vine.
+    pub fn child_slug(&self) -> &str {
+        &self.bedrock_slug
+    }
+
+    /// True when this composition row references a child vine rather than a
+    /// bedrock pyramid.
+    pub fn is_vine_child(&self) -> bool {
+        self.child_type == "vine"
+    }
 }
 
 // ── WS-CHAIN-PUBLISH (Phase 3): Chain publication tracking ─────────────────────

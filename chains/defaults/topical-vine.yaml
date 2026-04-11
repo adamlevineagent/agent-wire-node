@@ -1,0 +1,107 @@
+schema_version: 1
+id: topical-vine
+name: Topical Vine
+description: "Organizes a vine's children (bedrocks and sub-vines) by topic, dependency, and entity overlap. The recipe for vine-of-vines composition and folder ingestion."
+content_type: vine
+version: "1.0.0"
+author: "wire-node"
+
+defaults:
+  model_tier: synth_heavy
+  temperature: 0.3
+  on_error: "retry(2)"
+
+steps:
+  # ── Phase 0: Load children ───────────────────────────────────────────
+  # Pull apex summaries for every child registered in
+  # pyramid_vine_compositions. Children may be bedrocks or sub-vines —
+  # cross_build_input handles both uniformly (Phase 16 extension). The
+  # output is a structured payload with a `children` array that every
+  # downstream step can reference.
+  - name: collect_children
+    primitive: cross_build_input
+    save_as: step_only
+
+  # ── Phase 1: Topical clustering ──────────────────────────────────────
+  # Cluster the children by shared topics, entities, and dependencies.
+  # The prompt explicitly rejects trivial taxonomies (folder path, file
+  # extension) in favor of thematic structure. Output is a JSON object
+  # with a `clusters` array.
+  - name: cluster_children
+    primitive: extract
+    instruction: "$prompts/vine/topical_cluster.md"
+    input:
+      children: "$collect_children.children"
+    max_input_tokens: 80000
+    save_as: step_only
+    model_tier: synth_heavy
+
+  # ── Phase 2: Per-cluster synthesis (L1 nodes) ────────────────────────
+  # For every cluster, synthesize a single node describing the cluster at
+  # one level of abstraction above its members. These become the vine's
+  # depth-1 nodes.
+  #
+  # The iterator item is the current cluster object `{name, reason,
+  # child_slugs}`; the prompt also needs the full children payload so it
+  # can look up each member's apex summary by slug. `cluster: "$item"`
+  # exposes the current cluster to the prompt via resolve_value, and
+  # `children: "$collect_children.children"` passes the full child-apex
+  # array the clustering step already saw.
+  - name: cluster_synthesis
+    primitive: extract
+    instruction: "$prompts/vine/topical_synthesis.md"
+    for_each: "$cluster_children.clusters"
+    input:
+      cluster: "$item"
+      children: "$collect_children.children"
+    max_input_tokens: 80000
+    depth: 1
+    node_id_pattern: "TV-L1-{index:03}"
+    save_as: node
+    model_tier: synth_heavy
+    on_error: "retry(3)"
+
+  # ── Phase 3: Cluster-level webbing ───────────────────────────────────
+  # Cross-links between clusters based on shared entities, topics, and
+  # dependency relationships. The question_web prompt is content-type
+  # neutral and works equally well at cluster scale.
+  - name: l1_webbing
+    primitive: web
+    instruction: "$prompts/question/question_web.md"
+    max_input_tokens: 80000
+    batch_size: 50
+    concurrency: 4
+    dehydrate:
+      - drop: entities
+    compact_inputs: true
+    depth: 1
+    save_as: web_edges
+    model_tier: web
+    temperature: 0.2
+    on_error: "skip"
+
+  # ── Phase 4: Recursive pair-adjacent synthesis up to apex ────────────
+  # Pair clusters upward using the topical apex prompt until a single
+  # apex remains. Same prompt runs at every upper layer — the operation
+  # is "zoom one step outward", and the zoom is relative to the inputs
+  # at each layer. Dehydration drops low-priority fields if input budget
+  # is tight.
+  #
+  # `depth: 1` = source depth. recursive_pair reads nodes at this depth
+  # and writes the next layer at depth+1, continuing upward until a
+  # single node remains (the vine apex). Cluster synthesis produced
+  # the L1 nodes; this step pairs L1 → L2 → … → apex.
+  - name: upper_synthesis
+    primitive: extract
+    instruction: "$prompts/vine/topical_apex.md"
+    recursive_pair: true
+    depth: 1
+    node_id_pattern: "TV-L{depth}-{index:03}"
+    save_as: node
+    max_input_tokens: 80000
+    dehydrate:
+      - drop: supporting_child_slugs
+    model_tier: synth_heavy
+    on_error: "retry(3)"
+
+post_build: []

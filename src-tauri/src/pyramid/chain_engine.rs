@@ -372,7 +372,7 @@ pub struct ValidationResult {
     pub warnings: Vec<String>,
 }
 
-const VALID_CONTENT_TYPES: &[&str] = &["conversation", "code", "document", "question"];
+const VALID_CONTENT_TYPES: &[&str] = &["conversation", "code", "document", "question", "vine"];
 // Includes the legacy numeric tiers (low/mid/high/max) plus the semantic
 // aliases used by the LLM-profile system (extractor/synth_heavy/web).
 // See docs/semantic_aliasing_audit_results.md for the rationale.

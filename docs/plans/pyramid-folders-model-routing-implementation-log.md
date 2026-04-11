@@ -3227,3 +3227,202 @@ Added tests:
 - **`pyramid_dadbear_config.slug` FK constraint.** Unchanged. The slug column still requires a valid `pyramid_slugs` row, as the per-slug path needs.
 
 **Status:** verifier → **wanderer-clean**. All 12 traces verified, 4 bugs fixed in place, test count +4. Single new commit on branch `phase-15-dadbear-oversight`: `phase-15: wanderer fix — reconciliation pending bucket + default norms no-op + provider down state`. Not amended. Not pushed.
+
+---
+
+## Phase 16 — Vine-of-Vines + Topical Vine Recipe
+
+**Workstream:** solo implementer
+**Started:** 2026-04-10
+**Completed:** 2026-04-10
+**Verified by:** _awaiting verification_
+**Status:** awaiting-verification
+**Branch:** `phase-16-vine-of-vines`
+
+Phase 16 extends vine composition so a vine can compose other vines (not just bedrocks), ships the topical vine chain recipe YAML, and wires recursive change propagation up through the vine hierarchy with a cycle guard. Unblocks Phase 17 (recursive folder ingestion): a folder becomes a vine of (bedrock for files, sub-vine for subfolders) tree.
+
+### Files touched
+
+- `src-tauri/src/pyramid/types.rs` — `VineComposition` struct gains a `child_type` field (with `#[serde(default)]` bedrock fallback), plus `child_slug()` / `is_vine_child()` accessor methods. Comment reshapes the doc so new readers understand the column-name retention.
+- `src-tauri/src/pyramid/db.rs`
+  - `pyramid_vine_compositions` table definition gains a `child_type TEXT NOT NULL DEFAULT 'bedrock'` column (new databases) plus an idempotent `pragma_table_info`-gated `ALTER TABLE ADD COLUMN` for pre-Phase-16 databases.
+  - `VINE_COMP_COLUMNS` + `parse_vine_composition` updated to surface `child_type` (COALESCE'd to `'bedrock'`).
+  - `add_bedrock_to_vine` becomes a thin alias for the new `insert_vine_composition(conn, vine_slug, child_slug, position, child_type)`. `get_vine_bedrocks` becomes an alias for `list_vine_compositions`. `update_bedrock_apex` becomes an alias for `update_child_apex`. `get_vines_for_bedrock` becomes an alias for `get_vines_for_child`. All four legacy names preserved for Phase 2 / Phase 13 callers.
+  - New `get_parent_vines_recursive(conn, child_slug)` — iterative BFS walk with visited-set cycle guard and max-depth safety net (32 levels + total-ancestors cap at 64). Returns ancestors in BFS order, starting child excluded.
+  - New `phase16_tests` module (10 tests): schema column presence, idempotent migration, insert with vine child_type, invalid child_type rejected, mixed bedrock+vine listing, legacy alias defaults, parent lookup for both child types, recursive multi-level walk, cycle guard (self-reference + indirect), update_child_apex on vine children, upsert child_type mutation.
+- `src-tauri/src/pyramid/chain_engine.rs` — added `"vine"` to `VALID_CONTENT_TYPES`. Required so `validate_chain(topical-vine.yaml)` succeeds.
+- `src-tauri/src/pyramid/chain_registry.rs` — `default_chain_id_for_mode` returns `"topical-vine"` for `content_type = "vine"`. Doc comment points at the spec.
+- `src-tauri/src/pyramid/chain_executor.rs` — `execute_cross_build_input` extended so when the slug is a vine, the output payload also contains `is_vine: true` and a `children` array: one entry per row in `pyramid_vine_compositions`, with `child_slug`, `child_type`, `position`, resolved `apex_node_id`, `headline`, `distilled`, and `topics`. The apex is resolved from the composition row's `bedrock_apex_node_id` first, with a fallback to the highest-depth live node in `pyramid_nodes` for the child. Non-vine slugs get an empty children array. Downstream steps (topical clustering, cluster synthesis) reference `$collect_children.children` as the shared input.
+- `src-tauri/src/pyramid/chain_loader.rs`
+  - `ensure_default_chains` now creates `prompts/vine` in the runtime data dir and bootstraps `topical-vine.yaml` plus the three vine prompts (`topical_cluster.md`, `topical_synthesis.md`, `topical_apex.md`) via `include_str!` for release (Tier 2) builds. Dev (Tier 1) mode still does a full directory copy from source.
+  - New `phase16_tests` module (2 tests): parse+validate the bundled topical-vine.yaml, and verify at least one step is `recursive_pair`.
+- `src-tauri/src/pyramid/build_runner.rs` — removed the `ContentType::Vine` rejection in `run_build_from_with_evidence_mode` so vine slugs now flow through `run_chain_build`, which looks up `topical-vine` via `chain_registry::default_chain_id_for_mode` and dispatches the chain executor. `run_legacy_build` still rejects `ContentType::Vine` (the legacy path was never state-aware enough to run the chain executor; all new vine builds go through the chain path).
+- `src-tauri/src/pyramid/build.rs` — new public `build_topical_vine(state, slug, cancel, progress_tx)` function that loads the topical-vine chain via `chain_loader::discover_chains` + `chain_loader::load_chain` and invokes `chain_executor::execute_chain_from`. Returns `Result<i32>` matching the other `build_*` shape. This is the function `vine.rs::run_build_pipeline` dispatches for `ContentType::Vine` in Phase 16.
+- `src-tauri/src/pyramid/vine.rs` — `run_build_pipeline` signature gains an optional `state: Option<&PyramidState>` parameter. Its `ContentType::Vine` branch now calls `build::build_topical_vine(state, slug, cancel, &progress_tx)` when state is Some, and returns a clearer error when None. The one existing caller (the conversation-bunch fallback at line ~1034) is updated to pass `Some(state)` — that caller passes `ContentType::Conversation`, so the vine branch is never hit from legacy call sites, but the parameter is threaded through consistently.
+- `src-tauri/src/pyramid/vine_composition.rs`
+  - `notify_vine_of_bedrock_completion` is now a thin async alias for the new `notify_vine_of_child_completion`. Phase 2 / Phase 13 callers in `routes.rs` and `recovery.rs` continue to work unchanged.
+  - `notify_vine_of_child_completion` is the new unified propagation path: iterative BFS walk over the composition graph, fire-and-forget at each level. At each level it acquires the child-then-parent lock, updates the composition row's apex via `update_child_apex`, enqueues change-manifest pending mutations via the existing `enqueue_vine_manifest_mutations`, emits `DeltaLanded` + `SlopeChanged` on the event bus, then queues the parent vine for further upward propagation (using the parent's own highest-depth live node as its apex). Cycle guard via a visited `HashSet<String>` catches both direct self-reference and transitive cycles. Max walk depth is bounded by `MAX_VINE_PROPAGATION_DEPTH = 32`. Branches where the parent vine has no apex yet are skipped cleanly — the parent picks up the update on its own next build.
+  - New Phase 16 tests (3): multi-level vine graph walk via `get_parent_vines_recursive`, notification-skips-vines-with-no-apex invariant, indirect cycle guard termination.
+- `chains/defaults/topical-vine.yaml` — new chain recipe. `content_type: vine`, 5 steps: `collect_children` (cross_build_input), `cluster_children` (extract via $prompts/vine/topical_cluster.md), `cluster_synthesis` (extract for_each on `$cluster_children.clusters`, depth 1, save_as node), `l1_webbing` (web on the L1 nodes, reusing `$prompts/question/question_web.md`), `upper_synthesis` (extract with `recursive_pair: true` via $prompts/vine/topical_apex.md).
+- `chains/prompts/vine/topical_cluster.md` — LLM prompt for clustering vine children by shared topics, entities, and dependencies. Explicitly rejects trivial taxonomies (folder path, file extension). Zero-orphans rule. Caps at 2–6 clusters.
+- `chains/prompts/vine/topical_synthesis.md` — per-cluster synthesis prompt. Produces a single node per cluster at one level of abstraction above the cluster's members.
+- `chains/prompts/vine/topical_apex.md` — recursive pair-adjacent synthesis prompt. Same prompt runs at every upper layer of the vine; the operation is always "zoom one step outward" relative to the inputs at that layer. No temporal inference (topical vines are not chronological).
+
+### Spec adherence
+
+- ✅ `pyramid_vine_compositions.child_type` column added with idempotent migration gated on `pragma_table_info`.
+- ✅ `ContentType::Vine` now routes through `run_build_pipeline` via `build::build_topical_vine`, and through `build_runner::run_build_from_with_evidence_mode` via `run_chain_build` → `topical-vine` via the updated `chain_registry`.
+- ✅ `chains/defaults/topical-vine.yaml` ships and loads cleanly (validated in a unit test that parses the bundled content).
+- ✅ Three vine prompts shipped under `chains/prompts/vine/`.
+- ✅ `cross_build_input` primitive extended to surface `children` for vine slugs, drawn from `pyramid_vine_compositions` (both bedrock and vine children, uniformly).
+- ✅ `notify_vine_of_child_completion` walks the hierarchy with an explicit cycle guard + depth cap.
+- ✅ Fire-and-forget propagation: synchronous DB writes at each level (composition table + pending mutations) but async chain rebuilds (the stale engine picks up the mutations on its next tick — the DADBEAR tick loop is not blocked).
+- ✅ Legacy names (`add_bedrock_to_vine`, `get_vine_bedrocks`, `update_bedrock_apex`, `get_vines_for_bedrock`, `notify_vine_of_bedrock_completion`) preserved as aliases so Phase 2 / Phase 13 callers continue to work without edits.
+- ⚠️ `build::build_topical_vine` takes a `&PyramidState` reference. This is a deliberate convention break from `build_conversation` / `build_code` / `build_docs` (which take only `db` + `writer_tx`), because the chain executor owns all of the pipeline state (reader, writer, operational config, cache access, event bus) and there is no clean way to invoke it without state. The workstream prompt's illustrative signature sketch did not include state; the real function needs it. Documented inline in the function comment. No deviation in outcome — the function still returns `Result<i32>` matching the other build shapes.
+- ⚠️ The workstream spec's proposed topical-vine.yaml mentions heuristics like "import graph signals" for clustering. The import graph isn't computed at the composition layer (it's a code-pyramid artifact). Simplified the prompt to cluster by shared entities and topics, which are available on every apex summary regardless of content type. Documented in the prompt itself.
+
+### Tests added (16)
+
+**db.rs phase16_tests (10)**
+- `test_vine_compositions_schema_includes_child_type`
+- `test_child_type_migration_is_idempotent`
+- `test_insert_vine_composition_with_child_type_vine`
+- `test_insert_vine_composition_rejects_invalid_child_type`
+- `test_list_vine_compositions_returns_both_bedrock_and_vine_children`
+- `test_add_bedrock_to_vine_backcompat_alias_defaults_to_bedrock`
+- `test_get_vines_for_child_returns_parents_regardless_of_type`
+- `test_get_parent_vines_recursive_walks_multi_level_hierarchy`
+- `test_get_parent_vines_recursive_cycle_guard`
+- `test_update_child_apex_works_for_vine_children`
+- `test_upsert_changes_child_type`
+
+**vine_composition.rs phase16 (3)**
+- `test_phase16_multi_level_vine_graph_is_walkable`
+- `test_phase16_notification_skips_vines_with_no_apex`
+- `test_phase16_cycle_guard_prevents_runaway_walk`
+
+**chain_loader.rs phase16_tests (2)**
+- `test_topical_vine_bundled_chain_parses_and_validates`
+- `test_topical_vine_has_recursive_pair_step`
+
+### Verification results
+
+- `cd src-tauri && cargo check --lib` — clean. Exactly 3 pre-existing warnings (same as Phase 15 baseline: the deprecated `get_keep_evidence_for_target` call in routes.rs plus two private `LayerCollectResult` warnings in publication.rs).
+- `cd src-tauri && cargo build --lib` — clean. Same 3 warnings.
+- `cd src-tauri && cargo test --lib phase16` — **16 passing / 0 failing**.
+- `cd src-tauri && cargo test --lib pyramid` — **1199 passing / 7 failing**. Test count up by exactly +16 from Phase 15's 1183 baseline. Same 7 pre-existing failures (`pyramid_evidence.build_id` drift in `test_evidence_pk_cross_slug_coexistence`, the five `staleness::tests::*` failures, and `defaults_adapter::real_yaml_thread_clustering_preserves_response_schema`). None of the pre-existing failures are in Phase 16 scope.
+- `npm run build` — clean. 150 modules, 779.37 kB bundle (unchanged from Phase 15).
+
+### Manual verification steps
+
+The following scenarios should be executed by a human verifier before marking Phase 16 as `verified`:
+
+1. **Schema inspect.** Launch the dev build; open the runtime pyramid.db via sqlite3 and run:
+   ```sql
+   SELECT name, type, "notnull", dflt_value
+     FROM pragma_table_info('pyramid_vine_compositions');
+   ```
+   Confirm `child_type` is present with default `'bedrock'` and `notnull = 1`.
+
+2. **Chain discovery.** Launch dev and check the app logs on first run. Confirm a log line like `bootstrapped default chain file: chains/defaults/topical-vine.yaml` (Tier 2) or the copy-recursive log (Tier 1), and no chain-loader warning about `topical-vine.yaml` failing to parse.
+
+3. **Vine-of-vine propagation end-to-end.**
+   - Create two bedrock pyramids `bedrock-a` and `bedrock-b` with trivial source files, build them.
+   - Create a vine `vine-1` that includes `bedrock-a` via `pyramid_add_bedrock_to_vine({ vine_slug: "vine-1", bedrock_slug: "bedrock-a" })`. Build it (triggering the topical-vine chain via `run_build_from`).
+   - Create a vine `vine-2`. Add `vine-1` to it as a child via a direct DB write or a new IPC (if wired): `INSERT INTO pyramid_vine_compositions (vine_slug, bedrock_slug, position, child_type) VALUES ('vine-2', 'vine-1', 0, 'vine');`. Also add `bedrock-b` via `pyramid_add_bedrock_to_vine({ vine_slug: "vine-2", bedrock_slug: "bedrock-b" })`. Build `vine-2`.
+   - Touch the source file for `bedrock-a`, trigger a rebuild. After it lands, verify:
+     - `vine-1` receives a `DeltaLanded` event on the event bus (visible in the build event log or via the `/ws` build event stream).
+     - `pyramid_pending_mutations` has a fresh row for `vine-1` with `mutation_type = 'confirmed_stale'`.
+     - `vine-2` ALSO receives a `DeltaLanded` event (the recursive walk reached it).
+     - `pyramid_pending_mutations` has a fresh row for `vine-2` as well.
+   - This exercises the recursive propagation walk and confirms the cycle guard does not get in the way of legitimate multi-level propagation.
+
+4. **Cycle guard live test.** Write a direct SQL INSERT creating a cyclic composition (vine-x referencing vine-y, vine-y referencing vine-x). Trigger a rebuild on any pyramid in the cycle. Confirm the server does not deadlock or loop — the log should show the "cycle detected, skipping already-visited parent" warning and the tick loop should continue normally.
+
+### Notes
+
+- **cross_build_input + vine slug interaction.** The extension makes cross_build_input dual-purpose: it now serves both question pyramids (evidence sets, overlay answers, question tree, gaps) and vine pyramids (child apex summaries). Non-vine slugs get an empty `children` array so the step's output always has a consistent shape. If a future caller wants to address `children` on a non-vine slug, they get an empty array instead of an error, which is the desired behavior.
+- **Vine chain executor path requires the slug to exist in `pyramid_slugs` first.** The topical-vine chain expects `slug::get_slug(slug)` to return `Some(info)` with `content_type = "vine"`. The caller (whoever triggers a vine build) is responsible for registering the slug first via the normal slug-creation IPCs. No Phase 16 change is needed here — this is the same contract the other content types already follow.
+- **Per-layer event emission.** The current recursive walk emits `DeltaLanded` + `SlopeChanged` once per parent vine per level, including recursive ancestors. A grandparent vine gets one DeltaLanded for its own propagation and potentially another from the direct L0 path if it also references the same bedrock directly. This is intentional — each hop is a separate event the downstream consumers (DADBEAR, primer cache invalidation) can act on. No double-handling happens because the stale engine uses the `pyramid_pending_mutations` table as its single source of truth and idempotently resolves duplicates at the mutation layer.
+- **Frontend touches.** None. Phase 16 is backend-only as the spec directed. The existing vine display in PyramidBuildViz and the dashboard queries `pyramid_vine_compositions` via IPC paths that read the `bedrock_slug` column directly — adding `child_type` does not break them. They simply don't yet render the distinction between bedrock and vine children. That rendering is a Phase 17 concern (folder ingestion UI) or a follow-up polish pass.
+- **Deviations to flag to the planner (non-blocking):**
+  1. `build::build_topical_vine` takes `&PyramidState`, which the workstream prompt's illustrative signature did not show. This is an unavoidable constraint of the chain executor's API shape.
+  2. The topical clustering prompt simplifies "entity overlap + import graph signals" to "shared entities and topics" because the import graph isn't computed at the composition layer.
+
+**Status:** implementer → awaiting-verification. Single commit on branch `phase-16-vine-of-vines`: `phase-16: vine-of-vines + topical vine recipe`. Not amended. Not pushed.
+
+### Verifier pass (2026-04-10)
+
+**Verifier:** solo verifier, fresh read of the workstream prompt + Part 1 of the vine-of-vines spec, full audit of commit `76740ca`.
+
+**Punch list audited:**
+- Schema migration idempotency (pragma_table_info gated ALTER TABLE) — ✅ clean.
+- `child_type` column + helpers (insert_vine_composition, list_vine_compositions, update_child_apex, get_vines_for_child, get_parent_vines_recursive) — ✅ clean.
+- Legacy aliases preserved for Phase 2/13 callers — ✅ routes.rs and recovery.rs still compile + call through without edits.
+- `notify_vine_of_child_completion` BFS with visited set keyed by slug + cycle guard + depth cap — ✅ clean.
+- Fire-and-forget: sync DB writes + async rebuilds via stale engine pending_mutations — ✅ clean.
+- Chain YAML loads, bundled in `include_str!` for release builds, prompts bundled — ✅ clean.
+- `cross_build_input` primitive extension for vine children (bedrock + sub-vine uniform handling, empty array for bedrock-only vines, defensive fallback to `get_all_live_nodes` highest-depth when composition row has no stored apex) — ✅ clean.
+- `chain_registry::default_chain_id_for_mode("vine", _) = "topical-vine"` — ✅ clean.
+- Chain engine `VALID_CONTENT_TYPES` includes `"vine"` — ✅ clean.
+
+**Issues found and fixed in verifier commit:**
+
+1. **Pillar 37 violations in vine prompts.** `topical_cluster.md` hard-capped output at 2–6 clusters ("no more than 6", "at least 2") and `topical_synthesis.md` + `topical_apex.md` constrained distilled length to "must not exceed half the combined length of children's distilled prose". Per `feedback_pillar37_no_hedging.md`, any number constraining LLM output is a Pillar 37 violation with no exceptions. Rewrote the clustering prompt to let thematic structure decide cluster count (with a single-cluster degeneracy guard based on "pick the strongest secondary axis the material supports" rather than a numeric floor). Rewrote both length-constraint blocks to frame the test as "restatement vs. abstraction" — if the output retraces the inputs in the same sequence, it's restated rather than abstracted, step further outward. Also removed a secondary numeric constraint in `topical_synthesis.md` ("topics must recur across at least two children") to "topics must recur across the cluster's children, not be mentioned by only a single child".
+
+2. **Legacy build_runner still rejected `ContentType::Vine`.** Failure mode #10 in the verifier prompt: the implementer claimed both rejections were flipped but `build_runner::run_legacy_build` at line 717 still errored. For installs with `use_chain_engine = false` (the `PyramidConfig::default`), all vine builds were failing. Rewrote the `ContentType::Vine` arm of `run_legacy_build` to delegate to `build::build_topical_vine`, which gives the legacy path the same topical-vine chain dispatch as `run_chain_build`.
+
+3. **`build::build_topical_vine` was unreachable dead code.** Failure mode #1 in the verifier prompt: traced `run_build_pipeline → ContentType::Vine → build_topical_vine` and confirmed the only caller of `run_build_pipeline` (the conversation-bunch fallback at `vine.rs:1051`) passes `ContentType::Conversation`, so the Vine arm was never hit. Fixed in the same motion as #2 — now `run_legacy_build` dispatches vines through `build::build_topical_vine`, so the function has a real production caller. The `vine.rs::run_build_pipeline` Vine arm remains as a secondary reachable entry for any future caller that routes through it.
+
+4. **Shallow test coverage of the per-level DB work.** `notify_vine_of_child_completion`'s helper `enqueue_vine_manifest_mutations` had no dedicated test — only indirect coverage via the DB-layer graph-walk tests. Added `test_phase16_enqueue_mutations_scopes_to_vine_and_kept_evidence`: sets up a parent vine with two vine nodes at depth 2, one backed by KEEP evidence and one by DISCONNECT, runs the enqueue helper twice, and asserts that only the KEEP row produces a pending mutation scoped to the correct vine, layer, and target node. The DISCONNECT row is verified never-touched.
+
+**Files touched by verifier:**
+- `chains/prompts/vine/topical_cluster.md` — removed 2–6 cluster cap/floor, reworked to thematic-structure guidance.
+- `chains/prompts/vine/topical_synthesis.md` — removed "half combined length" numeric constraint, reworked to restatement-vs-abstraction framing; softened "at least two children" to "across the cluster's children".
+- `chains/prompts/vine/topical_apex.md` — removed "half combined length" numeric constraint, reworked to restatement-vs-abstraction framing.
+- `src-tauri/src/pyramid/build_runner.rs` — `run_legacy_build` Vine arm now delegates to `build::build_topical_vine`.
+- `src-tauri/src/pyramid/vine_composition.rs` — added `test_phase16_enqueue_mutations_scopes_to_vine_and_kept_evidence` (+1 test).
+
+**Post-verifier verification:**
+- `cargo check --lib` clean, 3 pre-existing warnings.
+- `cargo test --lib phase16` — 17 passing (was 16, +1 new enqueue test).
+- `cargo test --lib pyramid` — 1200 passing / 7 pre-existing failing. Test count +1 from 1199.
+- `npm run build` clean (150 modules, 779.37 kB bundle).
+- `grep -rn "ContentType::Vine => Err" src-tauri/src/ --include="*.rs"` — empty. Both legacy and chain paths accept vines.
+- `chains/defaults/topical-vine.yaml` and `chains/prompts/vine/{topical_cluster,topical_synthesis,topical_apex}.md` all present and bundled via `include_str!` in `chain_loader::ensure_default_chains`.
+
+**Deferred / not fixed (out of verifier scope):**
+- Production wiring of `notify_vine_of_child_completion` to a build-completion hook. The function is still only called from the manual HTTP trigger in `routes.rs::handle_vine_trigger_delta`. Wiring it to the DADBEAR build completion path (or `build_runner`'s post-build referrer-notification block) is a follow-up that should land before the manual end-to-end verification scenario in the implementer's log can pass without manual triggering. Noted here rather than fixed because the verifier prompt's scope was auditing the commit against Phase 16 end-state criteria, and hooking a new caller exceeds "fix issues in place".
+
+**Status:** verifier pass → awaiting-verification. Verifier commit is separate from the implementer commit (no amend, no push).
+
+### Wanderer pass (2026-04-10)
+
+**Wanderer:** solo wanderer, fresh end-to-end trace of the vine build flow against the current HEAD (`203ff93`). No punch list — just the 12 wanderer questions traced through the actual source. Four bugs found, all fixed in place. Detailed friction notes landed in `pyramid-folders-model-routing-friction-log.md` under "2026-04-10 — Phase 16 wanderer pass".
+
+**Bugs found and fixed:**
+
+1. **`execute_chain_from` rejected every vine build at the chunk count check.** Line 3849 errored on `num_chunks == 0` unless `content_type == "question"`. Vines never have chunks — they compose children via `pyramid_vine_compositions` — so the chain executor refused to run the topical-vine chain. Extracted the exemption into a `content_type_allows_zero_chunks(&str) -> bool` helper that returns true for `"question"` and `"vine"`. The helper sits next to `step_saves_node` near the top of `chain_executor.rs` so the next content type that legitimately has zero chunks gets a one-line change in an obvious place. Added `tests::test_content_type_allows_zero_chunks_gate` to pin the set.
+
+2. **`topical-vine.yaml::upper_synthesis.depth` was `2` but should have been `1`.** `execute_recursive_pair` treats `step.depth.unwrap_or(1)` as the SOURCE depth (the layer it reads nodes from and pairs upward), not the output depth. `cluster_synthesis` writes L1 cluster nodes, so `upper_synthesis` should start pairing from L1. `depth: 2` caused the loop to read `get_nodes_at_depth(slug, 2)` which is always empty after cluster_synthesis — the loop exited immediately with an empty apex id and the `execute_chain_from` fallback at line 4504 picked an L1 cluster node as the "apex". Corrected to `depth: 1` with an expanded comment in the YAML explaining the starting_depth semantics. Added `phase16_tests::test_topical_vine_upper_synthesis_starts_from_depth_1` as a regression.
+
+3. **`cluster_synthesis.input` was missing `cluster: "$item"`**, so the per-cluster synthesis prompt received `{children: [all_children_array]}` with no cluster context. The for_each primitive sets `ctx.current_item = cluster` but `ctx.resolve_value(input)` only resolves refs that appear in the input block. Because the step had an explicit input block that only referenced `$collect_children.children`, the current cluster was silently dropped — the auto-inject fallback (`enrich_group_item_input`) only fires when the step has no input block. Added `cluster: "$item"` to the input map. Updated `topical_synthesis.md` to document the new input shape (`cluster` + `children`) and added an explicit instruction to filter `children` by `cluster.child_slugs` (since the chain passes the full children array). Added `phase16_tests::test_topical_vine_cluster_synthesis_passes_cluster_via_item_ref` as a regression.
+
+4. **`notify_vine_of_child_completion` had no production caller** — the verifier's deferred item. Fixed by extracting the post-build notification block in `run_build_from_with_evidence_mode` into a new `run_post_build_hooks(state, slug_name, &result)` helper, then calling that helper from the main build path AND from the Question and Conversation slug early-return paths. The helper now runs three things on successful builds: WS8-F cross-slug referrer notification (pre-existing), Phase 16 vine-of-vines propagation via `notify_vine_of_child_completion` (new), and WS-ONLINE-F remote web edge resolution (pre-existing). The Question/Conversation paths used to bypass ALL post-build hooks, which meant a conversation/question that was a child of a vine would never trigger upward propagation — that gap is closed by the refactor. Added two async integration tests in `vine_composition.rs` that construct a real `PyramidState`, install a 2-level vine-of-vines, call `notify_vine_of_child_completion` directly, and assert that both the direct parent AND the grandparent got composition updates plus DeltaLanded events on the build event bus. A second async test exercises a 3-node cycle to confirm the walk terminates and returns the correct direct-parent list without corrupting any state.
+
+**Files changed by wanderer:**
+
+- `src-tauri/src/pyramid/chain_executor.rs` — added `content_type_allows_zero_chunks` helper + unit test; `execute_chain_from` uses the helper.
+- `chains/defaults/topical-vine.yaml` — `upper_synthesis.depth: 1` (was 2), `cluster_synthesis.input` gains `cluster: "$item"`, expanded comments on both.
+- `chains/prompts/vine/topical_synthesis.md` — INPUT SHAPE section rewritten for the two-field payload, "cluster reason" bullet updated.
+- `src-tauri/src/pyramid/build_runner.rs` — added `vine_composition` import; extracted post-build hooks into `run_post_build_hooks`; wired it into the main build path AND the Question/Conversation early-return paths (previously both skipped all post-build hooks).
+- `src-tauri/src/pyramid/chain_loader.rs` — two new regression tests for YAML structure (`upper_synthesis` depth + `cluster_synthesis` item ref).
+- `src-tauri/src/pyramid/vine_composition.rs` — two new async integration tests exercising `notify_vine_of_child_completion` end-to-end with a real PyramidState + event-bus assertions; added `make_propagation_test_state` and `install_vine_with_apex` local helpers.
+
+**Post-wanderer verification:**
+- `cargo check --lib` clean, 3 pre-existing warnings.
+- `cargo test --lib phase16` — **21 passing / 0 failing** (was 17; +4 new regression tests; the 2 async tests and the 2 chain_loader YAML tests for the fixes).
+- `cargo test --lib pyramid` — **1205 passing / 7 failing** (+5 from verifier baseline of 1200 — the 4 phase16 regression tests plus the chain_executor content-type unit test; none are phase16-scoped filter).
+- `npm run build` clean (150 modules, 779.37 kB bundle, unchanged).
+
+**Status:** wanderer pass → awaiting-verification. Wanderer commit is separate from the verifier commit (no amend, no push).

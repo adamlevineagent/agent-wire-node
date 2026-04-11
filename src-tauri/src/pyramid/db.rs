@@ -1403,8 +1403,13 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
     )?;
 
     // ── WS-VINE-UNIFY (Phase 2b): Vine composition table ──────────────────────
-    // Tracks which bedrock pyramids compose each vine pyramid, their ordering,
-    // and the current apex reference for each bedrock.
+    // Tracks which child pyramids compose each vine pyramid, their ordering,
+    // and the current apex reference for each child.
+    //
+    // Phase 16 (vine-of-vines): added `child_type` column so a single vine
+    // composition row can reference either a bedrock or a sub-vine. The
+    // `bedrock_slug` column is retained as the child slug for backwards
+    // compatibility with existing rows and helpers.
     conn.execute_batch(
         "
         CREATE TABLE IF NOT EXISTS pyramid_vine_compositions (
@@ -1414,6 +1419,7 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
             position INTEGER NOT NULL,
             bedrock_apex_node_id TEXT,
             status TEXT NOT NULL DEFAULT 'active',
+            child_type TEXT NOT NULL DEFAULT 'bedrock',
             created_at TEXT NOT NULL DEFAULT (datetime('now')),
             updated_at TEXT NOT NULL DEFAULT (datetime('now')),
             UNIQUE(vine_slug, bedrock_slug)
@@ -1424,6 +1430,25 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
             ON pyramid_vine_compositions(bedrock_slug);
         ",
     )?;
+
+    // Phase 16: idempotent `child_type` column addition for databases that
+    // pre-date the vine-of-vines schema. We check pragma_table_info first so
+    // we don't rely on the migration-safe `let _ =` idiom for a NOT NULL
+    // column (SQLite's ALTER TABLE ADD COLUMN can accept a NOT NULL default,
+    // but skipping the ALTER entirely when the column already exists keeps
+    // the migration explicit and auditable).
+    {
+        let has_child_type: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('pyramid_vine_compositions') WHERE name = 'child_type'")?
+            .exists([])?;
+        if !has_child_type {
+            conn.execute(
+                "ALTER TABLE pyramid_vine_compositions
+                 ADD COLUMN child_type TEXT NOT NULL DEFAULT 'bedrock'",
+                [],
+            )?;
+        }
+    }
 
     // ── WS-CHAIN-PUBLISH (Phase 3): Chain publication metadata ──────────────────
     // Tracks chain configurations published to the Wire contribution graph.
@@ -11525,9 +11550,11 @@ pub fn delete_dadbear_config(conn: &Connection, slug: &str, source_path: &str) -
 
 /// Column list for SELECT queries on pyramid_vine_compositions.
 const VINE_COMP_COLUMNS: &str =
-    "id, vine_slug, bedrock_slug, position, bedrock_apex_node_id, status, created_at, updated_at";
+    "id, vine_slug, bedrock_slug, position, bedrock_apex_node_id, status, child_type, created_at, updated_at";
 
 /// Parse a row from `pyramid_vine_compositions` into a `VineComposition`.
+/// Phase 16: `child_type` is COALESCE'd to `'bedrock'` at query time so rows
+/// from pre-migration databases always yield a valid value.
 fn parse_vine_composition(row: &rusqlite::Row<'_>) -> rusqlite::Result<VineComposition> {
     Ok(VineComposition {
         id: row.get(0)?,
@@ -11536,34 +11563,78 @@ fn parse_vine_composition(row: &rusqlite::Row<'_>) -> rusqlite::Result<VineCompo
         position: row.get(3)?,
         bedrock_apex_node_id: row.get(4)?,
         status: row.get(5)?,
-        created_at: row.get(6)?,
-        updated_at: row.get(7)?,
+        child_type: row
+            .get::<_, Option<String>>(6)?
+            .unwrap_or_else(|| "bedrock".to_string()),
+        created_at: row.get(7)?,
+        updated_at: row.get(8)?,
     })
 }
 
 /// Add a bedrock pyramid to a vine at a given position. Inserts or updates
 /// on conflict (reactivates a previously removed bedrock).
+///
+/// Phase 16 retains this signature as a thin alias for
+/// `insert_vine_composition(conn, vine_slug, bedrock_slug, position, "bedrock")`
+/// so Phase 2 / Phase 13 callers continue to work unchanged.
 pub fn add_bedrock_to_vine(
     conn: &Connection,
     vine_slug: &str,
     bedrock_slug: &str,
     position: i32,
 ) -> Result<()> {
+    insert_vine_composition(conn, vine_slug, bedrock_slug, position, "bedrock")
+}
+
+/// Phase 16: add a child (bedrock OR sub-vine) to a vine at a given position.
+///
+/// `child_type` must be either `"bedrock"` or `"vine"`. On conflict with an
+/// existing row for the same (vine_slug, child_slug) pair, this reactivates
+/// the row and updates position + child_type.
+pub fn insert_vine_composition(
+    conn: &Connection,
+    vine_slug: &str,
+    child_slug: &str,
+    position: i32,
+    child_type: &str,
+) -> Result<()> {
+    if child_type != "bedrock" && child_type != "vine" {
+        return Err(anyhow::anyhow!(
+            "invalid child_type '{}': must be 'bedrock' or 'vine'",
+            child_type
+        ));
+    }
     conn.execute(
-        "INSERT INTO pyramid_vine_compositions (vine_slug, bedrock_slug, position, status)
-         VALUES (?1, ?2, ?3, 'active')
+        "INSERT INTO pyramid_vine_compositions (vine_slug, bedrock_slug, position, status, child_type)
+         VALUES (?1, ?2, ?3, 'active', ?4)
          ON CONFLICT(vine_slug, bedrock_slug) DO UPDATE SET
             position = excluded.position,
             status = 'active',
+            child_type = excluded.child_type,
             updated_at = datetime('now')",
-        rusqlite::params![vine_slug, bedrock_slug, position],
+        rusqlite::params![vine_slug, child_slug, position, child_type],
     )?;
     Ok(())
 }
 
 /// Get all bedrocks for a vine, ordered by position ascending. Only returns
 /// active entries by default.
+///
+/// Phase 16: this returns all children (including vine children) because the
+/// existing callers (vine composition propagation) treat bedrocks and sub-vines
+/// the same way at this layer. If a caller needs only bedrock-typed rows, it
+/// can filter on `composition.is_vine_child()`. A strict bedrock-only variant
+/// can be added via `list_vine_compositions` with explicit filtering.
 pub fn get_vine_bedrocks(conn: &Connection, vine_slug: &str) -> Result<Vec<VineComposition>> {
+    list_vine_compositions(conn, vine_slug)
+}
+
+/// Phase 16: list all children (bedrock + vine) for a vine, ordered by
+/// position. Active entries only.
+pub fn list_vine_compositions(
+    conn: &Connection,
+    vine_slug: &str,
+) -> Result<Vec<VineComposition>> {
     let sql = format!(
         "SELECT {VINE_COMP_COLUMNS} FROM pyramid_vine_compositions
          WHERE vine_slug = ?1 AND status = 'active'
@@ -11576,22 +11647,37 @@ pub fn get_vine_bedrocks(conn: &Connection, vine_slug: &str) -> Result<Vec<VineC
     Ok(rows)
 }
 
-/// Update the bedrock_apex_node_id for a specific bedrock within a vine.
+/// Update the apex node id for a specific bedrock within a vine.
+///
+/// Phase 16 retains this as a thin alias for `update_child_apex` so
+/// existing Phase 2 callers continue to work unchanged. New code should
+/// prefer `update_child_apex` which reads more naturally for vine children.
 pub fn update_bedrock_apex(
     conn: &Connection,
     vine_slug: &str,
     bedrock_slug: &str,
     apex_node_id: &str,
 ) -> Result<()> {
+    update_child_apex(conn, vine_slug, bedrock_slug, apex_node_id)
+}
+
+/// Phase 16: update the apex node id for a specific child (bedrock OR
+/// sub-vine) within a vine.
+pub fn update_child_apex(
+    conn: &Connection,
+    vine_slug: &str,
+    child_slug: &str,
+    apex_node_id: &str,
+) -> Result<()> {
     let count = conn.execute(
         "UPDATE pyramid_vine_compositions
          SET bedrock_apex_node_id = ?3, updated_at = datetime('now')
          WHERE vine_slug = ?1 AND bedrock_slug = ?2",
-        rusqlite::params![vine_slug, bedrock_slug, apex_node_id],
+        rusqlite::params![vine_slug, child_slug, apex_node_id],
     )?;
     if count == 0 {
         return Err(anyhow::anyhow!(
-            "No vine composition found for vine={vine_slug}, bedrock={bedrock_slug}"
+            "No vine composition found for vine={vine_slug}, child={child_slug}"
         ));
     }
     Ok(())
@@ -11618,15 +11704,87 @@ pub fn remove_bedrock_from_vine(
 }
 
 /// Get all vine slugs that include a given bedrock (active compositions only).
+///
+/// Phase 16 retains this signature; new code should prefer
+/// `get_vines_for_child` which covers sub-vine parents too. Because the
+/// bedrock_slug column is reused as child_slug, this also returns vines that
+/// include the slug as a sub-vine child — callers that need bedrock-only
+/// parents should filter on `child_type`.
 pub fn get_vines_for_bedrock(conn: &Connection, bedrock_slug: &str) -> Result<Vec<String>> {
+    get_vines_for_child(conn, bedrock_slug)
+}
+
+/// Phase 16: get all vine slugs that include a given slug as a child — bedrock
+/// OR sub-vine. Active compositions only.
+pub fn get_vines_for_child(conn: &Connection, child_slug: &str) -> Result<Vec<String>> {
     let mut stmt = conn.prepare(
         "SELECT vine_slug FROM pyramid_vine_compositions
          WHERE bedrock_slug = ?1 AND status = 'active'",
     )?;
     let rows = stmt
-        .query_map(rusqlite::params![bedrock_slug], |row| row.get(0))?
+        .query_map(rusqlite::params![child_slug], |row| row.get(0))?
         .collect::<rusqlite::Result<Vec<String>>>()?;
     Ok(rows)
+}
+
+/// Phase 16: get ALL ancestor vines (direct parents + grandparents + ...)
+/// for a given slug via iterative BFS. Includes a cycle guard so a vine
+/// referencing itself directly or transitively cannot cause infinite
+/// recursion. Includes a max-depth safety net of 32 levels so a very deep
+/// hierarchy eventually terminates cleanly; deeper hierarchies log a warning
+/// and return the ancestors walked so far.
+///
+/// Ordering is BFS — nearer ancestors come before distant ancestors. The
+/// starting `child_slug` is NOT included in the result.
+pub fn get_parent_vines_recursive(
+    conn: &Connection,
+    child_slug: &str,
+) -> Result<Vec<String>> {
+    const MAX_DEPTH: usize = 32;
+    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut order: Vec<String> = Vec::new();
+    let mut frontier: std::collections::VecDeque<String> =
+        std::collections::VecDeque::new();
+
+    visited.insert(child_slug.to_string());
+    frontier.push_back(child_slug.to_string());
+
+    let mut depth = 0usize;
+    while let Some(current) = frontier.pop_front() {
+        depth = depth.saturating_add(1);
+        if depth > MAX_DEPTH * 8 {
+            // Very defensive upper bound on total iterations to shield against
+            // pathological fan-out even inside the cycle guard.
+            tracing::warn!(
+                child_slug,
+                visited_count = visited.len(),
+                "get_parent_vines_recursive: hit iteration cap, returning partial walk"
+            );
+            break;
+        }
+        let parents = get_vines_for_child(conn, &current)?;
+        for parent in parents {
+            if visited.insert(parent.clone()) {
+                order.push(parent.clone());
+                frontier.push_back(parent);
+            }
+        }
+        // Max-depth guard: BFS breadth expands frontier entries; the
+        // iteration cap above bounds total work, but we also shortcut out
+        // when the known ancestor set gets unreasonably large. 2*MAX_DEPTH
+        // vines in a single ancestor chain indicates either a runaway graph
+        // or a misuse.
+        if order.len() >= MAX_DEPTH * 2 {
+            tracing::warn!(
+                child_slug,
+                ancestors = order.len(),
+                "get_parent_vines_recursive: hit ancestor count cap, returning partial walk"
+            );
+            break;
+        }
+    }
+
+    Ok(order)
 }
 
 // ── WS-DEMAND-GEN (Phase 3): Demand generation job DB helpers ────────────────
@@ -16130,5 +16288,223 @@ mod phase15_tests {
             .unwrap();
         assert_eq!(scan, 42);
         assert_eq!(debounce, 7);
+    }
+}
+
+#[cfg(test)]
+mod phase16_tests {
+    //! Phase 16 tests: vine-of-vines composition + recursive propagation.
+    //! Covers the `child_type` column migration, the extended DB helpers,
+    //! and the recursive ancestor walk with cycle guard.
+
+    use super::*;
+
+    fn mem_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        init_pyramid_db(&conn).unwrap();
+        conn
+    }
+
+    #[test]
+    fn test_vine_compositions_schema_includes_child_type() {
+        let conn = mem_conn();
+        let has_child_type: bool = conn
+            .prepare(
+                "SELECT 1 FROM pragma_table_info('pyramid_vine_compositions')
+                 WHERE name = 'child_type'",
+            )
+            .unwrap()
+            .exists([])
+            .unwrap();
+        assert!(
+            has_child_type,
+            "pyramid_vine_compositions must include child_type column after Phase 16 migration"
+        );
+    }
+
+    #[test]
+    fn test_child_type_migration_is_idempotent() {
+        // Running init_pyramid_db a second time on an already-migrated DB
+        // must not error even though the migration is a no-op on the
+        // pragma_table_info check.
+        let conn = mem_conn();
+        // Re-run init — should not fail.
+        init_pyramid_db(&conn).unwrap();
+
+        // Also verify the column is still present and insertable.
+        insert_vine_composition(&conn, "v1", "b1", 0, "bedrock").unwrap();
+        let comps = list_vine_compositions(&conn, "v1").unwrap();
+        assert_eq!(comps.len(), 1);
+        assert_eq!(comps[0].child_type, "bedrock");
+    }
+
+    #[test]
+    fn test_insert_vine_composition_with_child_type_vine() {
+        let conn = mem_conn();
+        insert_vine_composition(&conn, "parent-vine", "child-vine", 0, "vine").unwrap();
+        let comps = list_vine_compositions(&conn, "parent-vine").unwrap();
+        assert_eq!(comps.len(), 1);
+        assert_eq!(comps[0].bedrock_slug, "child-vine");
+        assert_eq!(comps[0].child_type, "vine");
+        assert!(comps[0].is_vine_child());
+        assert_eq!(comps[0].child_slug(), "child-vine");
+    }
+
+    #[test]
+    fn test_insert_vine_composition_rejects_invalid_child_type() {
+        let conn = mem_conn();
+        let result = insert_vine_composition(&conn, "v", "c", 0, "bogus");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_list_vine_compositions_returns_both_bedrock_and_vine_children() {
+        let conn = mem_conn();
+        // Phase 16 vine composing two bedrocks and one sub-vine.
+        insert_vine_composition(&conn, "top-vine", "bedrock-a", 0, "bedrock").unwrap();
+        insert_vine_composition(&conn, "top-vine", "sub-vine", 1, "vine").unwrap();
+        insert_vine_composition(&conn, "top-vine", "bedrock-b", 2, "bedrock").unwrap();
+
+        let comps = list_vine_compositions(&conn, "top-vine").unwrap();
+        assert_eq!(comps.len(), 3);
+        assert_eq!(comps[0].bedrock_slug, "bedrock-a");
+        assert_eq!(comps[0].child_type, "bedrock");
+        assert_eq!(comps[1].bedrock_slug, "sub-vine");
+        assert_eq!(comps[1].child_type, "vine");
+        assert_eq!(comps[2].bedrock_slug, "bedrock-b");
+        assert_eq!(comps[2].child_type, "bedrock");
+    }
+
+    #[test]
+    fn test_add_bedrock_to_vine_backcompat_alias_defaults_to_bedrock() {
+        let conn = mem_conn();
+        // Phase 2/13 callers still use `add_bedrock_to_vine` and expect
+        // child_type to default to 'bedrock'.
+        add_bedrock_to_vine(&conn, "v", "b", 0).unwrap();
+        let comps = list_vine_compositions(&conn, "v").unwrap();
+        assert_eq!(comps.len(), 1);
+        assert_eq!(comps[0].child_type, "bedrock");
+        assert!(!comps[0].is_vine_child());
+    }
+
+    #[test]
+    fn test_get_vines_for_child_returns_parents_regardless_of_type() {
+        let conn = mem_conn();
+        // A bedrock and a sub-vine both parented by multiple vines.
+        insert_vine_composition(&conn, "vine-a", "bedrock-x", 0, "bedrock").unwrap();
+        insert_vine_composition(&conn, "vine-b", "bedrock-x", 0, "bedrock").unwrap();
+        insert_vine_composition(&conn, "vine-a", "sub-vine-y", 1, "vine").unwrap();
+        insert_vine_composition(&conn, "vine-c", "sub-vine-y", 0, "vine").unwrap();
+
+        let bedrock_parents = get_vines_for_child(&conn, "bedrock-x").unwrap();
+        assert_eq!(bedrock_parents.len(), 2);
+        assert!(bedrock_parents.contains(&"vine-a".to_string()));
+        assert!(bedrock_parents.contains(&"vine-b".to_string()));
+
+        let subvine_parents = get_vines_for_child(&conn, "sub-vine-y").unwrap();
+        assert_eq!(subvine_parents.len(), 2);
+        assert!(subvine_parents.contains(&"vine-a".to_string()));
+        assert!(subvine_parents.contains(&"vine-c".to_string()));
+
+        // The legacy alias returns the same result.
+        let legacy = get_vines_for_bedrock(&conn, "bedrock-x").unwrap();
+        assert_eq!(legacy.len(), 2);
+    }
+
+    #[test]
+    fn test_get_parent_vines_recursive_walks_multi_level_hierarchy() {
+        let conn = mem_conn();
+        // Hierarchy:
+        //   v3 composes v2 (as vine child) + b-top (as bedrock)
+        //   v2 composes v1 (as vine child)
+        //   v1 composes b-leaf (as bedrock)
+        insert_vine_composition(&conn, "v1", "b-leaf", 0, "bedrock").unwrap();
+        insert_vine_composition(&conn, "v2", "v1", 0, "vine").unwrap();
+        insert_vine_composition(&conn, "v3", "v2", 0, "vine").unwrap();
+        insert_vine_composition(&conn, "v3", "b-top", 1, "bedrock").unwrap();
+
+        let ancestors = get_parent_vines_recursive(&conn, "b-leaf").unwrap();
+        // BFS order: v1 (direct), then v2 (grandparent), then v3 (great-grandparent).
+        assert_eq!(ancestors.len(), 3);
+        assert_eq!(ancestors[0], "v1");
+        assert!(ancestors.contains(&"v2".to_string()));
+        assert!(ancestors.contains(&"v3".to_string()));
+
+        // Starting from v1, we should get v2 and v3.
+        let from_v1 = get_parent_vines_recursive(&conn, "v1").unwrap();
+        assert_eq!(from_v1.len(), 2);
+        assert!(from_v1.contains(&"v2".to_string()));
+        assert!(from_v1.contains(&"v3".to_string()));
+
+        // Starting from v3 (the top), no ancestors.
+        let from_v3 = get_parent_vines_recursive(&conn, "v3").unwrap();
+        assert!(from_v3.is_empty());
+    }
+
+    #[test]
+    fn test_get_parent_vines_recursive_cycle_guard() {
+        let conn = mem_conn();
+        // Direct self-reference: v-self composes itself as a vine child.
+        // A pathological but possible state; the cycle guard must
+        // prevent infinite recursion.
+        insert_vine_composition(&conn, "v-self", "v-self", 0, "vine").unwrap();
+
+        let ancestors = get_parent_vines_recursive(&conn, "v-self").unwrap();
+        // The walk visits v-self (starting set), sees its parent is also
+        // v-self, recognizes it as already visited, and returns empty.
+        assert!(
+            ancestors.is_empty(),
+            "self-referential vine must not produce any ancestors"
+        );
+
+        // Indirect cycle: v-a → v-b → v-a.
+        insert_vine_composition(&conn, "v-a", "v-b", 0, "vine").unwrap();
+        insert_vine_composition(&conn, "v-b", "v-a", 0, "vine").unwrap();
+
+        let from_a = get_parent_vines_recursive(&conn, "v-a").unwrap();
+        // Starting from v-a, v-b is a parent (since v-b composes v-a).
+        // Then v-b's parent is v-a, which is already visited. Walk halts.
+        assert_eq!(from_a.len(), 1);
+        assert_eq!(from_a[0], "v-b");
+    }
+
+    #[test]
+    fn test_update_child_apex_works_for_vine_children() {
+        let conn = mem_conn();
+        insert_vine_composition(&conn, "parent-vine", "sub-vine", 0, "vine").unwrap();
+        update_child_apex(&conn, "parent-vine", "sub-vine", "node-apex-1").unwrap();
+
+        let comps = list_vine_compositions(&conn, "parent-vine").unwrap();
+        assert_eq!(comps.len(), 1);
+        assert_eq!(
+            comps[0].bedrock_apex_node_id.as_deref(),
+            Some("node-apex-1")
+        );
+        assert_eq!(comps[0].child_type, "vine");
+
+        // The legacy alias still works on vine children (the column name
+        // is reused and the helper doesn't care about child_type).
+        update_bedrock_apex(&conn, "parent-vine", "sub-vine", "node-apex-2").unwrap();
+        let comps = list_vine_compositions(&conn, "parent-vine").unwrap();
+        assert_eq!(
+            comps[0].bedrock_apex_node_id.as_deref(),
+            Some("node-apex-2")
+        );
+    }
+
+    #[test]
+    fn test_upsert_changes_child_type() {
+        let conn = mem_conn();
+        // Insert as bedrock first, then change to vine via re-insert. The
+        // upsert path should update the child_type alongside the position.
+        insert_vine_composition(&conn, "p", "c", 0, "bedrock").unwrap();
+        let comps = list_vine_compositions(&conn, "p").unwrap();
+        assert_eq!(comps[0].child_type, "bedrock");
+
+        insert_vine_composition(&conn, "p", "c", 5, "vine").unwrap();
+        let comps = list_vine_compositions(&conn, "p").unwrap();
+        assert_eq!(comps.len(), 1);
+        assert_eq!(comps[0].child_type, "vine");
+        assert_eq!(comps[0].position, 5);
     }
 }

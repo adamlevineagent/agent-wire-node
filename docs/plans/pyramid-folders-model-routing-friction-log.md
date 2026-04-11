@@ -1723,3 +1723,130 @@ Add to the "wanderers on built systems" memory: **When tests use enum-like value
 
 ---
 
+## 2026-04-10 — Phase 16 wanderer pass (vine-of-vines + topical vine recipe)
+
+### Context
+
+Phase 16 had already been through an implementer pass (commit `76740ca`) and a verifier fix pass (commit `203ff93`). The verifier flagged that `notify_vine_of_child_completion` had no production caller but deferred the wire-up, so the wanderer started there and then traced the full vine build flow end-to-end.
+
+### Method
+
+Traced each of the 12 flows the wanderer brief asked about, reading source files rather than trusting test output. Four flows surfaced bugs; the other eight were clean.
+
+### Bugs found (4 criticals)
+
+#### 1. `execute_chain_from` hard-rejected every vine build at line 3849 (chunk check)
+
+**Symptom:** calling `build_topical_vine` (or any path that dispatches the topical-vine chain) on a vine slug would return an immediate error: `"No chunks found for slug 'X' — cannot run non-question pipeline with zero chunks"`.
+
+**Root cause:** the chain executor counts chunks in `pyramid_chunks` at the top of `execute_chain_from` and errors out when 0. The implementer/verifier only exempted `content_type == "question"` from this rule. Vines never have chunks — they compose children via `pyramid_vine_compositions` + `cross_build_input` — so every vine build hit the rejection branch.
+
+**Failure class:** same as the "legacy path still rejects ContentType::Vine" bug the verifier caught one layer up. The rejection was moved from the dispatch to the chain executor itself, and the chain executor's chunk check inherited the old assumption. Class: **pre-existing runtime guards that hard-code content-type assumptions keep resurfacing as new content types are added to the executor.**
+
+**Fix:** extracted the logic into `content_type_allows_zero_chunks(&str) -> bool` helper at the top of `chain_executor.rs`. It returns true for `"question"` and `"vine"`. `execute_chain_from` now calls this instead of the inline check, so the next time a new zero-chunk content type lands the exemption is a one-line change in an obvious place.
+
+**Regression test:** `tests::test_content_type_allows_zero_chunks_gate` asserts both exemptions AND that conversation/code/document/empty-string/unknown strings are rejected. Keeps the list explicit.
+
+#### 2. `topical-vine.yaml::upper_synthesis.depth` was 2 (should be 1)
+
+**Symptom:** even with Bug #1 fixed, a vine build would complete with an apex pointing at an L1 cluster node (via the defensive fallback at `execute_chain_from:4504`) rather than an apex that is a true upper-layer synthesis of those clusters. The recursive_pair loop exited immediately with no work done.
+
+**Root cause:** in the chain YAML, `recursive_pair: true` steps use `depth:` as the **source** depth — the layer the loop reads nodes from and pairs upward. With `depth: 2`, the loop ran `get_nodes_at_depth(slug, 2)`, found 0 nodes (because `cluster_synthesis` writes L1 nodes at `depth: 1`), and returned an empty apex id immediately. The fallback at line 4504 then picked the highest-depth live node — one of the L1 cluster nodes — as the "apex".
+
+Pattern confirmed by comparing with `conversation-episodic.yaml`'s `recursive_synthesis` step which uses `depth: 1` after its L1-producing step. The convention: recursive_pair reads from its declared depth and writes at depth+1.
+
+**Failure class:** **semantic overload of the `depth` field across primitives.** for_each extraction uses `depth:` as the OUTPUT depth (where nodes are written). recursive_pair uses `depth:` as the SOURCE depth (where it starts reading). Both use the same YAML field. The implementer was clearly reasoning "cluster_synthesis writes L1, so upper_synthesis writes L2 and up" and set depth: 2 — treating it as output depth, not source depth. The YAML schema permits both interpretations and only the runtime semantics disambiguate.
+
+**Fix:** changed to `depth: 1` with an expanded comment in the YAML explaining the starting_depth semantics. Plus a regression test.
+
+**Regression test:** `phase16_tests::test_topical_vine_upper_synthesis_starts_from_depth_1` asserts the field is 1.
+
+**Friction takeaway for the plan:** the chain YAML guide (docs/chain-system-reference.md) should call out this dual semantics explicitly or rename the field for recursive steps (`source_depth` vs `depth`). Adding to planner friction points.
+
+#### 3. `cluster_synthesis` input block was missing `cluster: "$item"`
+
+**Symptom:** even with Bugs #1 and #2 fixed, the per-cluster synthesis prompt would receive a payload of the shape `{children: [all_children_array]}` with no hint of which cluster was being synthesized. The LLM would either synthesize over all children (wrong output) or return garbage.
+
+**Root cause:** `ctx.resolve_value(input)` only substitutes the `$refs` that appear in the input block. `for_each: "$cluster_children.clusters"` sets `ctx.current_item = cluster`, but without an explicit `cluster: "$item"` in the input block the current cluster is never surfaced to the prompt. The prompt template (`topical_synthesis.md`) explicitly documents "The input is a single cluster object, containing: name, reason, children" — so the prompt and the chain YAML disagreed on what was actually being passed.
+
+Compare with working patterns in `conversation-episodic.yaml`'s `l1_classify` / other for_each steps: they either have no `input:` block (which triggers `enrich_group_item_input(item, ctx)` fallback that injects the whole item) or explicitly reference `$item.field_name`. Our `cluster_synthesis` had an input block that silently dropped the item.
+
+**Failure class:** **implicit vs. explicit item injection asymmetry.** When a for_each step has no `input:` block, the item is auto-injected. When it has an `input:` block, the item must be explicitly named. The implementer wrote an input block (to pass `children`) and didn't realize that action alone removed the auto-injection fallback for the item itself.
+
+**Fix:**
+- chain YAML `cluster_synthesis.input` now carries both `cluster: "$item"` and `children: "$collect_children.children"`.
+- `topical_synthesis.md` prompt updated to document the new input shape (`cluster` + `children`, plus explicit instruction to filter the `children` array by `cluster.child_slugs`).
+- updated the "reuse the cluster reason" bullet to reference `cluster.reason` instead of the old top-level `reason`.
+
+**Regression test:** `phase16_tests::test_topical_vine_cluster_synthesis_passes_cluster_via_item_ref` asserts the input map has `cluster: "$item"` AND `children: "$collect_children.children"`.
+
+**Friction takeaway for the planner:** **the chain executor's input resolution should auto-inject `$item` by default unless the step explicitly opts out.** Add to friction points — the current behavior is a load-bearing footgun.
+
+#### 4. `notify_vine_of_child_completion` had no production caller (verifier deferred)
+
+**Symptom:** after a bedrock rebuild completed, no parent vines received a DeltaLanded event and no pending mutations were enqueued. Vine-of-vine updates were silently dropped unless an operator manually hit `POST /pyramid/:slug/vine/trigger-delta`.
+
+**Root cause:** the implementer wrote `notify_vine_of_child_completion` with the correct BFS walk logic, cycle guard, and per-level DB writes. But the production build-completion paths in `build_runner::run_build_from_with_evidence_mode` only called `db::get_slug_referrers` (the older cross-slug referrer notification) and skipped the vine composition hook entirely. The verifier caught this but marked it as "deferred / not fixed (out of verifier scope)".
+
+**Failure class:** **implementer built the mechanism, nobody wired the production caller.** Same failure class as Phase 4/6/12/13/14/15 — the mechanism works in unit tests that call it directly, but no production path actually invokes it. This is the class the "wanderer after verifier" memory was created to catch.
+
+**Fix:**
+1. Extracted the post-build notification block from `run_build_from_with_evidence_mode` into a new `run_post_build_hooks(state, slug_name, &result)` helper. The helper runs three things on successful builds: WS8-F cross-slug referrer notification, Phase 16 vine-of-vines propagation (`notify_vine_of_child_completion`), and WS-ONLINE-F remote web edge resolution.
+2. The `run_build_from_with_evidence_mode` early-return for Question and Conversation slugs now captures the result, calls `run_post_build_hooks`, then returns. Previously these two paths skipped the referrer notification AND the vine propagation entirely, so a conversation or question pyramid being a child of a vine never triggered any upward update.
+3. Added `use super::vine_composition;` to the build_runner imports.
+4. Gated the vine propagation on `res.1 == 0 && !res.0.is_empty()` (zero failures AND non-empty apex), since the propagation walk uses the apex id as the "what changed" signal.
+
+**Regression tests (2 async integration tests):**
+
+- `test_phase16_notify_vine_of_child_completion_walks_two_levels`: creates a real `PyramidState` with an on-disk sqlite, wires a 2-level vine-of-vines (bedrock → v-mid → v-top), calls `notify_vine_of_child_completion` on the bedrock's apex, and asserts that (a) the direct-parent return list contains only v-mid, (b) v-mid's composition row was updated to point at the bedrock's apex, (c) v-top's composition row was updated to point at v-mid's own apex (this is the second recursive hop that was silently broken), and (d) the build event bus emitted DeltaLanded events for both v-mid AND v-top.
+- `test_phase16_notify_vine_of_child_completion_handles_three_level_cycle`: creates a 3-node cycle v-a → v-b → v-c → v-a and asserts the walk terminates, returns v-b as the direct parent of v-a only, and leaves all composition rows intact. Exercises the async cycle guard end-to-end (vs. the existing tests that only exercise the DB-level cycle guard in `get_parent_vines_recursive`).
+
+### Files changed by wanderer
+
+- `src-tauri/src/pyramid/chain_executor.rs`
+  - new `content_type_allows_zero_chunks` helper at line ~2988
+  - `execute_chain_from` calls the helper instead of hard-coded content_type check
+  - new `tests::test_content_type_allows_zero_chunks_gate` unit test
+- `chains/defaults/topical-vine.yaml`
+  - `upper_synthesis.depth: 2` → `depth: 1` with expanded comment
+  - `cluster_synthesis.input` gains `cluster: "$item"` field with expanded comment
+- `chains/prompts/vine/topical_synthesis.md`
+  - INPUT SHAPE section rewritten to describe the two-field input (`cluster` + `children`) and the "filter `children` by `cluster.child_slugs`" instruction
+  - "Reuse the cluster reason" bullet references `cluster.reason` instead of the old top-level `reason`
+- `src-tauri/src/pyramid/build_runner.rs`
+  - added `use super::vine_composition;`
+  - extracted post-build hooks into `run_post_build_hooks(state, slug_name, &result)` helper
+  - `run_build_from_with_evidence_mode` calls the helper at the end of the non-early-return path (replaces the inline referrer + web edge blocks)
+  - Question slug early-return now captures the result, calls `run_post_build_hooks`, then returns (previously it skipped both hooks entirely)
+  - Conversation slug early-return now captures the result, calls `run_post_build_hooks`, then returns (previously it skipped both hooks entirely)
+  - Phase 16 hook: `run_post_build_hooks` calls `vine_composition::notify_vine_of_child_completion` on successful builds
+- `src-tauri/src/pyramid/chain_loader.rs`
+  - two new regression tests: `test_topical_vine_upper_synthesis_starts_from_depth_1` and `test_topical_vine_cluster_synthesis_passes_cluster_via_item_ref`
+- `src-tauri/src/pyramid/vine_composition.rs`
+  - two new async integration tests with a real PyramidState: `test_phase16_notify_vine_of_child_completion_walks_two_levels` and `test_phase16_notify_vine_of_child_completion_handles_three_level_cycle`
+  - new `make_propagation_test_state()` helper (local to the tests module) to build a minimal PyramidState with an on-disk sqlite DB and event bus
+  - new `install_vine_with_apex()` async helper to install a vine slug + apex node so the recursive walk can lift the parent apex on each hop
+
+### Meta lessons
+
+1. **When a verifier defers a "latent bug" because it's "out of scope," the wanderer always fixes it.** The Phase 16 verifier's own fix-pass log explicitly listed "Production wiring of `notify_vine_of_child_completion` to a build-completion hook" as deferred. That's the exact class of bug the "wanderer after verifier" memory was built to catch. The rule stays: anything in the verifier's "deferred" list that's a latent bug gets fixed in the wanderer pass.
+
+2. **Chain YAML semantics are too subtle for punch-list verification.** The verifier's punch list was things like "does the YAML exist and validate?", which it does. But "does `depth: 2` on a recursive_pair step start from the right source layer?" requires tracing the chain executor's `execute_recursive_pair` to see that depth is the SOURCE depth. That's exactly the kind of semantic gap a wanderer pass catches by tracing end-to-end. Add a friction point to the planner: **recipe correctness lives below the validator.**
+
+3. **"Prompt receives the item" is an implicit contract the for_each primitive doesn't enforce.** When a step has no input block, `enrich_group_item_input` injects the item automatically. When the step has an input block, the item is invisible unless the step explicitly references `$item`. The YAML doesn't flag this — you only notice when the LLM output is obviously wrong. Add to friction points: **the chain executor should either auto-inject $item in all paths or warn loudly when an input block is present without an $item ref on a for_each step.**
+
+4. **The "wanderer catches what the verifier misses" dynamic is strongest at chain-execution-time.** Every wanderer find this session is a failure mode that would only surface the first time a human actually built a vine — the verifier's unit tests validate the YAML schema and the DB walk, but they never run `execute_chain_from` on a vine slug. Add to memory: **phase verification should include at least one end-to-end simulation of the feature's primary user flow, even if mocked, to catch exactly this class.**
+
+### Commit
+
+1. `phase-16: wanderer fix — chain executor vine gate + recursive_pair depth + cluster item ref + production propagation wiring`
+
+### Verification after wanderer pass
+
+- `cargo check --lib`: 3 pre-existing warnings only.
+- `cargo test --lib phase16`: **21 passing / 0 failing** (17 pre-existing + 4 new wanderer regression tests: chunk-check gate in chain_executor, upper_synthesis depth assertion in chain_loader, cluster_synthesis item ref assertion in chain_loader, 2 async integration tests in vine_composition — one asserts the 2-level walk end-to-end, one asserts the cycle guard).
+- `cargo test --lib pyramid`: **1205 passing / 7 failing** (+5 new wanderer tests vs verifier baseline of 1200). Same 7 pre-existing failures.
+- `npm run build`: clean, 150 modules, 779.37 kB bundle.
+
+---
+

@@ -266,6 +266,8 @@ pub fn ensure_default_chains(
         chains_dir.join("prompts").join("question"),
         chains_dir.join("prompts").join("shared"),
         chains_dir.join("prompts").join("planner"),
+        // Phase 16: topical vine prompts for vine-of-vines composition.
+        chains_dir.join("prompts").join("vine"),
     ];
 
     for dir in &dirs_to_create {
@@ -295,6 +297,13 @@ pub fn ensure_default_chains(
         ("document.yaml", DEFAULT_DOCUMENT_CHAIN),
         ("question.yaml", include_str!("../../../chains/defaults/question.yaml")),
         ("extract-only.yaml", include_str!("../../../chains/defaults/extract-only.yaml")),
+        // Phase 16: topical vine recipe for vine-of-vines composition and
+        // folder ingestion (Phase 17). Vines route to this chain via
+        // chain_registry::default_chain_id_for_mode.
+        (
+            "topical-vine.yaml",
+            include_str!("../../../chains/defaults/topical-vine.yaml"),
+        ),
     ];
 
     for (filename, content) in defaults {
@@ -303,6 +312,32 @@ pub fn ensure_default_chains(
             std::fs::write(&path, content)
                 .with_context(|| format!("failed to write default chain: {}", path.display()))?;
             tracing::info!(path = %path.display(), "bootstrapped default chain file");
+        }
+    }
+
+    // Phase 16: bundle vine prompts for release builds so the topical
+    // vine chain can resolve its $prompts/vine/* references even when
+    // the source tree isn't present.
+    let vine_prompts: &[(&str, &str)] = &[
+        (
+            "topical_cluster.md",
+            include_str!("../../../chains/prompts/vine/topical_cluster.md"),
+        ),
+        (
+            "topical_synthesis.md",
+            include_str!("../../../chains/prompts/vine/topical_synthesis.md"),
+        ),
+        (
+            "topical_apex.md",
+            include_str!("../../../chains/prompts/vine/topical_apex.md"),
+        ),
+    ];
+    for (filename, content) in vine_prompts {
+        let path = chains_dir.join("prompts").join("vine").join(filename);
+        if !path.exists() {
+            std::fs::write(&path, content)
+                .with_context(|| format!("failed to write vine prompt: {}", path.display()))?;
+            tracing::info!(path = %path.display(), "bootstrapped bundled vine prompt");
         }
     }
 
@@ -422,3 +457,133 @@ steps:
     primitive: "extract"
     instruction: "Placeholder — will be replaced in Phase 3"
 "#;
+
+#[cfg(test)]
+mod phase16_tests {
+    //! Phase 16 chain-loader tests: ensure the bundled topical-vine chain
+    //! YAML parses cleanly and validates as a legal chain definition.
+
+    use crate::pyramid::chain_engine::{validate_chain, ChainDefinition};
+
+    /// The bundled topical-vine.yaml is compiled into the binary via
+    /// `include_str!` in `ensure_default_chains`. This test reads the same
+    /// bundled content and verifies it parses, validates, and declares the
+    /// correct `content_type`, `id`, and primitive shape.
+    #[test]
+    fn test_topical_vine_bundled_chain_parses_and_validates() {
+        let bundled = include_str!("../../../chains/defaults/topical-vine.yaml");
+        let def: ChainDefinition =
+            serde_yaml::from_str(bundled).expect("topical-vine.yaml must parse");
+
+        assert_eq!(def.id, "topical-vine");
+        assert_eq!(def.content_type, "vine");
+        assert!(def.steps.len() >= 4);
+
+        // Expect the first step to be a cross_build_input step that
+        // loads the vine's registered children.
+        assert_eq!(def.steps[0].primitive, "cross_build_input");
+
+        // Validation must pass cleanly (no errors).
+        let result = validate_chain(&def);
+        assert!(
+            result.valid,
+            "topical-vine chain must validate, got errors: {:?}",
+            result.errors
+        );
+    }
+
+    /// Verify that the chain declares at least one `recursive_pair` step —
+    /// this is the recursive pair-adjacent synthesis that builds the vine
+    /// apex from cluster summaries.
+    #[test]
+    fn test_topical_vine_has_recursive_pair_step() {
+        let bundled = include_str!("../../../chains/defaults/topical-vine.yaml");
+        let def: ChainDefinition = serde_yaml::from_str(bundled).unwrap();
+        let has_recursive_pair = def.steps.iter().any(|s| s.recursive_pair);
+        assert!(
+            has_recursive_pair,
+            "topical-vine must include a recursive_pair step that synthesizes up to apex"
+        );
+    }
+
+    /// Wanderer fix regression test: the `upper_synthesis` recursive_pair
+    /// step must declare `depth: 1` (source depth for pairing). The
+    /// previous value of `2` caused `execute_recursive_pair` to read
+    /// `get_nodes_at_depth(slug, 2)` which returns 0 nodes — because
+    /// `cluster_synthesis` writes its cluster nodes at depth 1, not 2.
+    /// With `depth: 2` the recursive_pair loop exits immediately with an
+    /// empty apex id and the vine build silently completes with no apex.
+    /// See chain_executor::execute_recursive_pair for the `starting_depth`
+    /// semantics: `starting_depth = step.depth.unwrap_or(1)`, target
+    /// depth is `starting_depth + 1`.
+    #[test]
+    fn test_topical_vine_upper_synthesis_starts_from_depth_1() {
+        let bundled = include_str!("../../../chains/defaults/topical-vine.yaml");
+        let def: ChainDefinition = serde_yaml::from_str(bundled).unwrap();
+        let upper = def
+            .steps
+            .iter()
+            .find(|s| s.recursive_pair)
+            .expect("topical-vine must have a recursive_pair step (upper_synthesis)");
+        assert_eq!(
+            upper.depth,
+            Some(1),
+            "upper_synthesis must declare depth: 1 (source depth for pairing) — \
+             cluster_synthesis writes L1 nodes, so recursive_pair starts at L1 \
+             and pairs upward to the apex. depth: 2 would read an empty layer."
+        );
+    }
+
+    /// Wanderer fix regression test: the `cluster_synthesis` step's input
+    /// block must expose the current cluster to the synthesis prompt via
+    /// `cluster: "$item"`. Previously the input only carried `children:
+    /// "$collect_children.children"`, so the prompt received the full
+    /// children array with no cluster context — the LLM could not know
+    /// which subset of children to synthesize over.
+    ///
+    /// `for_each: "$cluster_children.clusters"` sets `ctx.current_item =
+    /// cluster`, but `ctx.resolve_value(input)` only substitutes refs
+    /// that appear in the input map. Without an explicit `$item`
+    /// reference the cluster is invisible to the prompt.
+    #[test]
+    fn test_topical_vine_cluster_synthesis_passes_cluster_via_item_ref() {
+        let bundled = include_str!("../../../chains/defaults/topical-vine.yaml");
+        let def: ChainDefinition = serde_yaml::from_str(bundled).unwrap();
+        let cs = def
+            .steps
+            .iter()
+            .find(|s| s.name == "cluster_synthesis")
+            .expect("topical-vine must have a cluster_synthesis step");
+        assert_eq!(
+            cs.for_each.as_deref(),
+            Some("$cluster_children.clusters"),
+            "cluster_synthesis must iterate over clusters from cluster_children"
+        );
+
+        let input = cs
+            .input
+            .as_ref()
+            .expect("cluster_synthesis must declare an input block");
+        let input_obj = input
+            .as_object()
+            .expect("cluster_synthesis input must be an object");
+
+        let cluster_ref = input_obj
+            .get("cluster")
+            .and_then(|v| v.as_str())
+            .expect("cluster_synthesis input must pass `cluster: $item` to the prompt");
+        assert_eq!(
+            cluster_ref, "$item",
+            "cluster_synthesis must expose the current cluster to the prompt via $item"
+        );
+
+        let children_ref = input_obj
+            .get("children")
+            .and_then(|v| v.as_str())
+            .expect("cluster_synthesis input must also pass the full children array");
+        assert_eq!(
+            children_ref, "$collect_children.children",
+            "cluster_synthesis must pass the full children array so the prompt can look up cluster members"
+        );
+    }
+}

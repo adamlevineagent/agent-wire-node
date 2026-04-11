@@ -714,6 +714,96 @@ async fn get_resume_state(
     .await
 }
 
+// ── TOPICAL VINE PIPELINE (Phase 16) ─────────────────────────────────────────
+
+/// Build a topical vine by dispatching the `topical-vine` chain through the
+/// chain executor. Used by vine-of-vines composition (Phase 16) and folder
+/// ingestion (Phase 17).
+///
+/// Unlike the other `build_*` functions in this module, this function takes a
+/// `&PyramidState` reference because the chain executor owns all of the
+/// pipeline state (reader, writer, operational config, event bus, cache
+/// access, etc.). The function loads the topical-vine chain via
+/// `chain_loader::discover_chains` + `chain_loader::load_chain`, then invokes
+/// `chain_executor::execute_chain_from` exactly the way `build_runner::run_chain_build`
+/// does for non-vine content types. The shape matches the other build
+/// functions — `Result<i32>` returning the failure count — so the dispatch
+/// in `vine.rs::run_build_pipeline` matches the other arms.
+///
+/// See `docs/specs/vine-of-vines-and-folder-ingestion.md` (Part 1) and
+/// `chains/defaults/topical-vine.yaml`.
+pub async fn build_topical_vine(
+    state: &crate::pyramid::PyramidState,
+    slug: &str,
+    cancel: &CancellationToken,
+    progress_tx: &mpsc::Sender<BuildProgress>,
+) -> Result<i32> {
+    use crate::pyramid::chain_executor;
+    use crate::pyramid::chain_loader;
+    use crate::pyramid::chain_registry;
+
+    // Resolve the chain id — either a per-slug override in
+    // pyramid_chain_assignments or the `topical-vine` default.
+    let chain_id = {
+        let conn = state.reader.lock().await;
+        match chain_registry::get_assignment(&conn, slug)? {
+            Some((id, _file)) => id,
+            None => chain_registry::default_chain_id("vine").to_string(),
+        }
+    };
+
+    // Locate the chain YAML in the chains directory.
+    let chains_dir = state.chains_dir.clone();
+    let all_chains = chain_loader::discover_chains(&chains_dir)?;
+    let meta = all_chains
+        .iter()
+        .find(|m| m.id == chain_id)
+        .ok_or_else(|| {
+            anyhow!(
+                "topical-vine chain '{}' not found in chains directory ({})",
+                chain_id,
+                chains_dir.display()
+            )
+        })?;
+
+    let yaml_path = std::path::Path::new(&meta.file_path);
+    let chain = chain_loader::load_chain(yaml_path, &chains_dir)?;
+
+    info!(
+        slug,
+        chain = %chain.id,
+        steps = chain.steps.len(),
+        "build_topical_vine: dispatching topical vine chain"
+    );
+
+    // Execute. The chain executor handles cross_build_input (which returns
+    // the vine's registered children as of Phase 16), topical clustering,
+    // per-cluster synthesis, webbing, and recursive_pair up to apex.
+    let (apex_id, failures, _step_activities) = chain_executor::execute_chain_from(
+        state,
+        &chain,
+        slug,
+        0,     // from_depth
+        None,  // stop_after
+        None,  // force_from
+        cancel,
+        Some(progress_tx.clone()),
+        None,  // layer_tx
+        None,  // initial_context
+    )
+    .await?;
+
+    info!(
+        slug,
+        chain = %chain.id,
+        apex = %apex_id,
+        failures,
+        "build_topical_vine: topical vine chain complete"
+    );
+
+    Ok(failures)
+}
+
 // ── CONVERSATION PIPELINE ────────────────────────────────────────────────────
 
 /// Build a conversation pyramid (forward -> reverse -> combine -> L1 pairing -> L2 threads -> L3+).
