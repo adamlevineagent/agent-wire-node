@@ -14000,21 +14000,70 @@ pub fn default_document_extensions() -> Vec<String> {
 }
 
 /// Phase 17: seed list of bundled ignore patterns.
+///
+/// These supplement (but do NOT replace) the scanner's `.gitignore` /
+/// `.pyramid-ignore` walker. They exist for two reasons:
+///
+/// 1. Defence-in-depth: when a folder isn't inside a git repo and
+///    has no ignore file, these still keep common noise out.
+/// 2. Catching known-junk paths that escape the walker: workspace
+///    backups, AI-session state directories, and filesystem oddities
+///    like a literal `~/` dir from shell-escape mishaps. These are
+///    rarely in a `.gitignore` but pollute pyramid builds.
+///
+/// Pattern semantics (see `path_matches_any_ignore` in
+/// `pyramid/folder_ingestion.rs`):
+/// - `name/` → matches any path component named `name` at any depth
+/// - `*.ext` → case-insensitive basename suffix match
+/// - bare token → exact basename, exact component, OR substring on
+///    the full path (the substring fallback is what catches
+///    timestamped backups like `.lab.bak.1774645342/`).
 pub fn default_ignore_patterns() -> Vec<String> {
     [
+        // ── Build artifacts and vendored deps ──
         "node_modules/",
         "target/",
         ".git/",
+        "dist/",
+        "build/",
+        "out/",
+        ".next/",
+        ".nuxt/",
+        ".turbo/",
+        "coverage/",
+        ".nyc_output/",
+        // ── Language-specific caches ──
+        "__pycache__/",
+        ".pytest_cache/",
+        ".mypy_cache/",
+        ".ruff_cache/",
+        ".venv/",
+        "venv/",
+        // ── Editor / IDE state ──
+        ".idea/",
+        ".vscode/",
+        // ── Alternate VCS ──
+        ".svn/",
+        ".hg/",
+        // ── AI agent session state (handled separately via
+        //    claude_code_conversation_path, not as source docs) ──
+        ".claude/",
+        // ── Filesystem oddities ──
+        //
+        // Substring match for timestamped backup directories
+        // (`.lab.bak.1774645342/`, `.lab.bak.20260402200504/`, etc.).
+        // Users accumulate these when running experiment snapshots,
+        // and they're never knowledge the pyramid should index.
+        ".lab.bak.",
+        // A literal `~/` directory at the repo root — usually a
+        // shell-escape mishap (`mv foo ~/bar` without expansion).
+        "~/",
+        // ── Files ──
         "*.lock",
         "*.bin",
         "*.exe",
         "*.dylib",
         ".DS_Store",
-        "__pycache__/",
-        "dist/",
-        "build/",
-        ".venv/",
-        "venv/",
     ]
     .iter()
     .map(|s| s.to_string())

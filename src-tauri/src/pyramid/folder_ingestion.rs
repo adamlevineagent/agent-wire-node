@@ -287,8 +287,11 @@ pub fn is_homogeneous(files: &[PathBuf], config: &FolderIngestionConfig) -> bool
 /// Applies ignore matching in two layers:
 /// 1. The `ignore` crate's `WalkBuilder` respects `.gitignore`,
 ///    `.git/info/exclude`, and the global gitignore. A temporary
-///    `.pyramid-ignore` or `.wireignore` override file is honored via
-///    `WalkBuilder::add_custom_ignore_filename`.
+///    `.pyramid-ignore` override file is honored via
+///    `WalkBuilder::add_custom_ignore_filename`. Note: `.wireignore`
+///    is NOT honored here — it's used by the separate
+///    `sync.rs::scan_local_folder` path. Unifying the three ignore
+///    systems is tracked as Bug #16.
 /// 2. The heuristic config's `ignore_patterns` list is applied as a
 ///    post-filter using simple glob-style matching (segment-suffix +
 ///    substring + exact basename).
@@ -2603,6 +2606,66 @@ mod phase17_tests {
         let path = PathBuf::from("/repo/pkg.lock");
         let patterns = vec!["*.lock".to_string()];
         assert!(path_matches_any_ignore(&path, &patterns));
+    }
+
+    /// Regression: `.lab.bak.1774645342/` is a timestamped experiment
+    /// backup dir. The bundled `.lab.bak.` substring pattern must
+    /// catch ANY such directory at any depth without requiring the
+    /// user to enumerate each timestamp.
+    #[test]
+    fn test_path_matches_any_ignore_lab_bak_substring() {
+        let patterns = vec![".lab.bak.".to_string()];
+
+        let p1 = PathBuf::from("/repo/.lab.bak.1774645342/notes.md");
+        let p2 = PathBuf::from("/repo/.lab.bak.20260402200504/foo/bar.rs");
+        let p3 = PathBuf::from("/repo/.lab.bak.planner.20260330220504/log.md");
+        assert!(path_matches_any_ignore(&p1, &patterns));
+        assert!(path_matches_any_ignore(&p2, &patterns));
+        assert!(path_matches_any_ignore(&p3, &patterns));
+
+        // Must NOT match a plain `.lab/` directory or a legit backup
+        // file that happens to contain the word "lab".
+        let not1 = PathBuf::from("/repo/.lab/notes.md");
+        let not2 = PathBuf::from("/repo/src/lab/config.rs");
+        assert!(!path_matches_any_ignore(&not1, &patterns));
+        assert!(!path_matches_any_ignore(&not2, &patterns));
+    }
+
+    /// Regression: `.claude/` bundled pattern excludes Claude Code
+    /// workspace state (worktrees, handoff docs, settings) at any
+    /// depth. CC conversations are ingested separately via
+    /// `claude_code_conversation_path`, not as source files.
+    #[test]
+    fn test_path_matches_any_ignore_claude_directory() {
+        let patterns = vec![".claude/".to_string()];
+
+        let worktree = PathBuf::from("/repo/.claude/worktrees/pedantic-hypatia/src/foo.rs");
+        let handoff = PathBuf::from("/repo/.claude/handoff-next-session.md");
+        let nested = PathBuf::from("/repo/some/sub/.claude/settings.json");
+        assert!(path_matches_any_ignore(&worktree, &patterns));
+        assert!(path_matches_any_ignore(&handoff, &patterns));
+        assert!(path_matches_any_ignore(&nested, &patterns));
+
+        // Must NOT match a file whose name merely contains "claude".
+        let not1 = PathBuf::from("/repo/docs/claude-notes.md");
+        assert!(!path_matches_any_ignore(&not1, &patterns));
+    }
+
+    /// Regression: a literal `~/` directory at the repo root (a
+    /// common shell-escape mishap — `mv foo ~/bar` without
+    /// expansion) should be excluded by the bundled pattern. These
+    /// dirs are never knowledge the pyramid should index.
+    #[test]
+    fn test_path_matches_any_ignore_literal_tilde_directory() {
+        let patterns = vec!["~/".to_string()];
+
+        let p = PathBuf::from("/repo/~/Library/Application Support/wire-node/log.txt");
+        assert!(path_matches_any_ignore(&p, &patterns));
+
+        // Must NOT match a normal file whose name contains `~`
+        // (e.g. a tilde-denoting temp file like `file~`).
+        let not1 = PathBuf::from("/repo/src/foo~");
+        assert!(!path_matches_any_ignore(&not1, &patterns));
     }
 
     #[test]
