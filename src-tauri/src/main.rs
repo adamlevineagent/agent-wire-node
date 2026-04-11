@@ -6685,43 +6685,145 @@ fn resolve_cost_rollup_range(args: &CostRollupArgs) -> anyhow::Result<(String, S
     Ok((from.format("%Y-%m-%d %H:%M:%S").to_string(), to.format("%Y-%m-%d %H:%M:%S").to_string()))
 }
 
-/// Phase 13: bulk-pause DADBEAR across all pyramids. Idempotent —
-/// returns the number of rows whose `enabled` column flipped from
-/// 1 to 0 (rows already paused contribute 0 to the count).
+/// Phase 13 + Phase 18c: bulk-pause DADBEAR across pyramids matching
+/// the given scope. Idempotent — returns the number of rows whose
+/// `enabled` column flipped from 1 to 0 (rows already paused
+/// contribute 0 to the count).
+///
+/// Scopes (per `cross-pyramid-observability.md` "Pause-All Semantics"):
+/// - `"all"` — every enabled config (Phase 13)
+/// - `"folder"` — configs whose `source_path` is exactly `scope_value`
+///   or a descendant. `scope_value` is required. (Phase 18c L9)
+/// - `"circle"` — DEFERRED. The local DB has no `pyramid_metadata`
+///   table with `circle_id` to query against; circle membership lives
+///   only in the Wire JWT claim layer. Returns an error pointing the
+///   caller at the deferral note.
 #[tauri::command]
 async fn pyramid_pause_dadbear_all(
     state: tauri::State<'_, SharedState>,
     scope: String,
-    _scope_value: Option<String>,
+    scope_value: Option<String>,
 ) -> Result<serde_json::Value, String> {
-    if scope != "all" {
-        // Folder / circle scopes are deferred to Phase 14/15.
-        return Err(format!(
-            "pyramid_pause_dadbear_all: scope `{}` not implemented — only `all` is supported in Phase 13",
-            scope
-        ));
-    }
     let conn = state.pyramid.writer.lock().await;
-    let affected = pyramid_db::disable_dadbear_all(&conn).map_err(|e| e.to_string())?;
+    let affected = match scope.as_str() {
+        "all" => pyramid_db::disable_dadbear_all(&conn).map_err(|e| e.to_string())?,
+        "folder" => {
+            let folder = scope_value
+                .as_deref()
+                .filter(|v| !v.is_empty())
+                .ok_or_else(|| {
+                    "pyramid_pause_dadbear_all: scope `folder` requires a non-empty scope_value"
+                        .to_string()
+                })?;
+            pyramid_db::disable_dadbear_by_folder(&conn, folder).map_err(|e| e.to_string())?
+        }
+        "circle" => {
+            return Err(
+                "pyramid_pause_dadbear_all: scope `circle` is deferred — local DB has no \
+                 circle_id column on pyramid_metadata. Tracked in deferral-ledger.md as a \
+                 follow-up to Phase 18c."
+                    .to_string(),
+            )
+        }
+        other => {
+            return Err(format!(
+                "pyramid_pause_dadbear_all: unknown scope `{}` (expected all|folder|circle)",
+                other
+            ))
+        }
+    };
     Ok(serde_json::json!({ "affected": affected }))
 }
 
-/// Phase 13: mirror of `pyramid_pause_dadbear_all`.
+/// Phase 13 + Phase 18c: mirror of `pyramid_pause_dadbear_all`.
 #[tauri::command]
 async fn pyramid_resume_dadbear_all(
     state: tauri::State<'_, SharedState>,
     scope: String,
-    _scope_value: Option<String>,
+    scope_value: Option<String>,
 ) -> Result<serde_json::Value, String> {
-    if scope != "all" {
+    let conn = state.pyramid.writer.lock().await;
+    let affected = match scope.as_str() {
+        "all" => pyramid_db::enable_dadbear_all(&conn).map_err(|e| e.to_string())?,
+        "folder" => {
+            let folder = scope_value
+                .as_deref()
+                .filter(|v| !v.is_empty())
+                .ok_or_else(|| {
+                    "pyramid_resume_dadbear_all: scope `folder` requires a non-empty scope_value"
+                        .to_string()
+                })?;
+            pyramid_db::enable_dadbear_by_folder(&conn, folder).map_err(|e| e.to_string())?
+        }
+        "circle" => {
+            return Err(
+                "pyramid_resume_dadbear_all: scope `circle` is deferred — see \
+                 deferral-ledger.md for the follow-up note."
+                    .to_string(),
+            )
+        }
+        other => {
+            return Err(format!(
+                "pyramid_resume_dadbear_all: unknown scope `{}` (expected all|folder|circle)",
+                other
+            ))
+        }
+    };
+    Ok(serde_json::json!({ "affected": affected }))
+}
+
+/// Phase 18c (L9): list distinct `source_path` values across all
+/// DADBEAR configs. Powers the folder dropdown in the Pause All scope
+/// picker. Sorted alphabetically; duplicates collapsed.
+#[tauri::command]
+async fn pyramid_list_dadbear_source_paths(
+    state: tauri::State<'_, SharedState>,
+) -> Result<Vec<String>, String> {
+    let conn = state.pyramid.reader.lock().await;
+    pyramid_db::list_dadbear_source_paths(&conn).map_err(|e| e.to_string())
+}
+
+/// Phase 18c (L9): live count helper for the scope picker. Returns
+/// the number of rows that WOULD be flipped by a pause-all call with
+/// the given scope, without mutating any rows. The frontend calls
+/// this every time the user changes the scope picker so the
+/// confirmation modal can show "Pause N pyramid(s)" with the right N.
+///
+/// `target_state = "pause"` counts rows currently enabled (would
+/// flip to disabled). `target_state = "resume"` counts rows currently
+/// disabled. Anything else is an error.
+#[tauri::command]
+async fn pyramid_count_dadbear_scope(
+    state: tauri::State<'_, SharedState>,
+    scope: String,
+    scope_value: Option<String>,
+    target_state: String,
+) -> Result<serde_json::Value, String> {
+    let target_pause = match target_state.as_str() {
+        "pause" => true,
+        "resume" => false,
+        other => {
+            return Err(format!(
+                "pyramid_count_dadbear_scope: unknown target_state `{}` (expected pause|resume)",
+                other
+            ))
+        }
+    };
+    if !matches!(scope.as_str(), "all" | "folder" | "circle") {
         return Err(format!(
-            "pyramid_resume_dadbear_all: scope `{}` not implemented — only `all` is supported in Phase 13",
+            "pyramid_count_dadbear_scope: unknown scope `{}` (expected all|folder|circle)",
             scope
         ));
     }
-    let conn = state.pyramid.writer.lock().await;
-    let affected = pyramid_db::enable_dadbear_all(&conn).map_err(|e| e.to_string())?;
-    Ok(serde_json::json!({ "affected": affected }))
+    let conn = state.pyramid.reader.lock().await;
+    let count = pyramid_db::count_dadbear_scope(
+        &conn,
+        &scope,
+        scope_value.as_deref(),
+        target_pause,
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({ "count": count }))
 }
 
 // ── Phase 15: DADBEAR Oversight Page ────────────────────────────────────────
@@ -8316,6 +8418,14 @@ struct PublishToWireResponse {
     handle_path: Option<String>,
     wire_type: String,
     sections_published: Vec<String>,
+    /// Phase 18c (L4): set to the number of cache entries that were
+    /// attached to the publication when the user opted in to
+    /// `include_cache_manifest`. `None` means the user did not opt in
+    /// (the default-OFF privacy gate). `Some(0)` means they opted in
+    /// but the pyramid had no cached LLM outputs to ship. The
+    /// frontend uses this to surface "cache manifest included
+    /// (N entries)" in the success state.
+    cache_manifest_entries: Option<u64>,
 }
 
 #[tauri::command]
@@ -8323,6 +8433,12 @@ async fn pyramid_publish_to_wire(
     state: tauri::State<'_, SharedState>,
     contribution_id: String,
     confirm: bool,
+    // Phase 18c (L4): user opt-in for the cache manifest. Defaults to
+    // false so any caller that hasn't been updated still gets the
+    // Phase 7 safe-default behavior (cache manifest withheld). The
+    // PublishPreviewModal flips this to true when the "Include cache
+    // manifest" checkbox is checked.
+    #[serde(default)] include_cache_manifest: Option<bool>,
 ) -> Result<PublishToWireResponse, String> {
     if !confirm {
         return Err(
@@ -8330,6 +8446,8 @@ async fn pyramid_publish_to_wire(
                 .to_string(),
         );
     }
+
+    let opt_in_cache = include_cache_manifest.unwrap_or(false);
 
     // Load the contribution.
     let contribution = {
@@ -8370,12 +8488,59 @@ async fn pyramid_publish_to_wire(
     let publisher =
         wire_node_lib::pyramid::wire_publish::PyramidPublisher::new(wire_url, wire_auth);
 
+    // Phase 18c (L4): build the cache manifest BEFORE the network call
+    // so a manifest-build failure doesn't leave the contribution
+    // half-published. The manifest is then attached to the publish
+    // payload via the publisher (see publish_contribution_with_metadata).
+    //
+    // The slug lives on the contribution row. If the contribution is
+    // not slug-bound (a free-floating config contribution with no
+    // pyramid attached), we cannot export a cache manifest — those
+    // pyramids have no cached LLM outputs in the first place.
+    let cache_manifest = if opt_in_cache {
+        match contribution.slug.as_deref() {
+            Some(slug) if !slug.is_empty() => {
+                let conn = state.pyramid.reader.lock().await;
+                // Use the contribution_id as a synthetic wire_pyramid_id
+                // for the manifest header — this ties the manifest to the
+                // exact publication request.
+                publisher
+                    .export_cache_manifest(
+                        &conn,
+                        slug,
+                        &contribution.contribution_id,
+                        None,
+                        true,
+                    )
+                    .await
+                    .map_err(|e| format!("failed to export cache manifest: {e}"))?
+            }
+            _ => {
+                tracing::warn!(
+                    contribution_id = %contribution.contribution_id,
+                    "include_cache_manifest=true but contribution is not slug-bound; \
+                     cache manifest skipped"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let cache_manifest_entry_count = cache_manifest.as_ref().map(|m| {
+        m.nodes
+            .iter()
+            .map(|n| n.cache_entries.len() as u64)
+            .sum::<u64>()
+    });
+
     let outcome = publisher
-        .publish_contribution_with_metadata(
+        .publish_contribution_with_metadata_and_cache(
             &contribution.contribution_id,
             &contribution.schema_type,
             &contribution.yaml_content,
             &metadata,
+            cache_manifest.as_ref(),
         )
         .await
         .map_err(|e| e.to_string())?;
@@ -8409,11 +8574,20 @@ async fn pyramid_publish_to_wire(
             .map_err(|e| e.to_string())?;
     }
 
+    tracing::info!(
+        contribution_id = %contribution.contribution_id,
+        wire_contribution_id = %outcome.wire_contribution_id,
+        cache_manifest_attached = opt_in_cache && cache_manifest_entry_count.is_some(),
+        cache_manifest_entries = ?cache_manifest_entry_count,
+        "phase 18c L4: contribution published with cache opt-in state recorded"
+    );
+
     Ok(PublishToWireResponse {
         wire_contribution_id: outcome.wire_contribution_id,
         handle_path: outcome.handle_path,
         wire_type: outcome.wire_type,
         sections_published: outcome.sections_published,
+        cache_manifest_entries: cache_manifest_entry_count,
     })
 }
 
@@ -10618,6 +10792,9 @@ fn main() {
             pyramid_cost_rollup,
             pyramid_pause_dadbear_all,
             pyramid_resume_dadbear_all,
+            // Phase 18c (L9): scoped pause/resume helper IPCs
+            pyramid_list_dadbear_source_paths,
+            pyramid_count_dadbear_scope,
             // Phase 15: DADBEAR Oversight Page
             pyramid_dadbear_overview,
             pyramid_dadbear_activity_log,

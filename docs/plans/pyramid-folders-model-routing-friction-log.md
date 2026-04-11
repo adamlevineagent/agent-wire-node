@@ -2147,6 +2147,195 @@ Documented inline at `folder_ingestion.rs::prepopulate_chunks_for`.
 
 ---
 
+### 2026-04-11 — Phase 18c: circle scope deferral + cache audit-count deferral
+
+**Phase / workstream:** Phase 18c (privacy opt-in + pause-all
+scoping). Claims L4 and L9 from the deferral ledger.
+
+**What hit friction**
+
+The L9 spec defines three scopes for `pyramid_pause_dadbear_all`:
+`all`, `folder`, and `circle`. The `circle` scope is supposed to
+pause every pyramid in a specific Wire circle via:
+
+```sql
+UPDATE pyramid_dadbear_config SET enabled = 0
+WHERE enabled = 1 AND slug IN (
+  SELECT slug FROM pyramid_metadata WHERE circle_id = ?1
+);
+```
+
+But `pyramid_metadata` is not a real table in the local DB. Searching
+the schema turned up no `circle_id` column on any pyramid table. The
+only place `circle_id` lives is in the JWT claim layer
+(`server.rs::JwtClaims`, `auth.rs::PublicAuthSource`, etc.) — Wire's
+auth side knows what circle a request is from, but Wire Node has no
+local per-pyramid record of "this pyramid was published into circle
+X."
+
+The L4 spec calls for an inline preview of "N L0 nodes / M reference
+private corpus docs" alongside the cache opt-in checkbox. Computing
+this would need a join against `wire_source_documents.visibility`,
+which is not consistently populated for every L0 node's source
+document on the local DB. The visibility field is part of the import
+flow but not the publish flow, so the "audit count" preview would be
+non-trivial backend work that didn't fit the L4 time budget.
+
+**Root cause**
+
+Two cases of the same shape: a spec field that depends on schema
+that hasn't been built yet OR data that hasn't been routed to the
+right place for the consumer. This isn't a Phase 18c bug — both
+features are real follow-ups for whoever lands the
+`pyramid_metadata` table or extends the publish path with source
+visibility tracking.
+
+**What we did about it**
+
+Per the deviation protocol in the workstream prompt:
+
+- **Circle scope:** ship `all` + `folder` only. The IPC returns an
+  explicit error for `scope = "circle"` pointing at this friction
+  log entry. The frontend renders the circle radio as disabled with
+  a tooltip explaining the deferral. The `count_dadbear_scope`
+  helper returns `Ok(0)` for circle so the UI can render the
+  disabled state without crashing on a backend error.
+- **Audit count:** ship the checkbox with the warning text only.
+  The user must review their source visibility manually before
+  checking the box. The warning text covers the privacy story; the
+  audit count is documented as a follow-up here so it can be picked
+  up alongside whatever lands `wire_source_documents.visibility` on
+  the publish path.
+
+**Lesson for future phases**
+
+Two takeaways:
+
+1. **Spec SQL that references tables-that-don't-exist is a flag.**
+   When the spec writes a SQL statement that uses a column the
+   schema doesn't have, that's a deferred dependency, not a missing
+   detail. The Phase 18c workstream prompt called this out
+   explicitly ("If `pyramid_metadata.circle_id` doesn't exist
+   ... defer circle scope") which was the right move — naming the
+   deferral upfront kept it from sliding into a half-built feature.
+
+2. **The "deferred radio" pattern is genuinely useful.** Rendering
+   the circle radio as disabled with "coming soon" instead of
+   hiding it tells the user (a) the feature exists conceptually, and
+   (b) it's a planned addition, not a bug. Compare with hiding it
+   entirely, which would silently surprise the user when they find
+   the spec mentioning circle scoping.
+
+### Phase 18c — additional notes
+
+**Folder canonicalization decision:** the Phase 18c db.rs helpers
+use a simple lexical match: strip a single trailing slash from the
+input, then SQL `(source_path = ?1 OR source_path LIKE ?1 || '/%')`.
+No filesystem resolution. No symlink handling. The DB stores
+whatever `source_path` the user originally configured, and we match
+against that text. If a user has DADBEAR configs at both
+`/home/user/project` and `/Users/user/project` because of
+case-insensitive HFS+ vs case-sensitive APFS quirks, they're treated
+as different folders. That's the correct behavior for the
+"intentional groupings" use case the spec describes — users who
+want to pause "all my work pyramids" should pick one canonical
+prefix. Symlink resolution would be the wrong layer for this.
+
+**Concurrent workstream contamination:** while implementing 18c,
+the working tree picked up file modifications from concurrent
+18a/18b/18d/18e workstreams that share the same git checkout
+location. db.rs, event_bus.rs, mod.rs, llm.rs, folder_ingestion.rs,
+yaml_renderer.rs, and bundled_contributions.json all picked up
+spurious modifications at various points during the session,
+forcing extra `git checkout HEAD --` cleanup. The 18c branch only
+ships its own changes (main.rs, db.rs, wire_publish.rs,
+PublishPreviewModal.tsx, CrossPyramidTimeline.tsx,
+DadbearOversightPage.tsx, DadbearPauseScopeModal.tsx,
+configContributions.ts) — but the cross-workstream interference was
+the single biggest friction point in the session. **Lesson:**
+parallel workstreams on the same checkout directory need either
+git worktrees or sequential execution; git stash routinely picked
+up changes from sister branches when the agent didn't intend it.
+
+---
+
+### 2026-04-11 — Phase 18c wanderer: UX papercuts surfaced by end-to-end trace
+
+**Phase / workstream:** Phase 18c wanderer pass (no fixes, log
+commit for traceability).
+
+**What hit friction**
+
+Six UX polish items surfaced while tracing the 12 questions in the
+wanderer prompt end-to-end. None block the phase — every primary
+flow works correctly — but they're the kind of edge-case behavior
+a punch-list audit won't catch without actually walking the flow.
+
+- **W1 — L4 silent fallback for slug=null contributions.**
+  Publishing a global config contribution (no pyramid slug) with
+  the cache manifest opt-in checked falls through a
+  `tracing::warn!` path that leaves the user's opt-in silently
+  dropped. The success state looks identical to not opting in.
+- **W2 — DryRunReport lacks `slug`.** The frontend can't gate the
+  cache-manifest opt-in on slug presence without an extra IPC.
+  W1 and W2 would be fixed by the same change.
+- **W3 — CrossPyramidTimeline banner Resume forces `scope="all"`.**
+  Clicking Resume on the banner after a folder-scoped pause can
+  re-enable other pyramids that were paused in a prior session.
+  The implementer's in-code comment explicitly acknowledges this
+  and recommends the DADBEAR Oversight page for scoped resume.
+- **W4 — CrossPyramidTimeline doesn't refetch after pause/resume.**
+  Only sets the banner + toast; the active-builds list stays
+  stale until the hook polls. DadbearOversightPage correctly
+  calls `refetchOverview()`.
+- **W5 — Whitespace-only folder input reaches the count IPC.**
+  The frontend short-circuits on empty string but not on
+  whitespace. Not broken (the confirm button is disabled via
+  `trim().length === 0`), just a wasted round trip.
+- **W6 — Shared `datalist id="dadbear-source-paths"`.** Latent ID
+  collision if the modal is ever reused in parallel. Fine today.
+
+**Root cause**
+
+Two patterns:
+
+1. **W1, W2, W3** — the backend ships a correct default-safe path,
+   but the frontend success state doesn't distinguish
+   "completed as requested" from "silently adjusted". The user
+   opts in or clicks Resume and gets a success toast that hides
+   the behavior change.
+2. **W4, W5, W6** — parity and hygiene gaps between the two
+   consumer surfaces (CrossPyramidTimeline and
+   DadbearOversightPage) because the shared component was
+   introduced mid-phase and the host pages were refactored
+   around it without a final diff review.
+
+**What we did about it**
+
+Nothing. The findings are logged here for a follow-up phase; none
+break the end-to-end flow.
+
+**Lesson for future phases**
+
+- **Silent backend fallbacks need frontend-visible signals.** If
+  the backend decides "I can't do what you asked but I won't
+  error either," the user needs to see that. The pattern is
+  `response_field: Option<T>` plus an optional
+  `reason_skipped: Option<String>` that the UI surfaces when
+  populated. Adding a warning field is cheap; carrying opaque
+  silence forward isn't.
+- **Reusable modals need parity tests on both hosts.** When
+  18c introduced `DadbearPauseScopeModal` used by two different
+  pages, the per-page follow-up behavior (refetching, banner
+  state, scope memory) diverged. A mini parity checklist for
+  "what does each host do after the IPC returns" would have
+  caught W3 and W4 during the verifier pass.
+- **DryRunReport is the right place for publish-time
+  state the modal needs.** Adding fields like `slug` to the
+  dry-run report is cheap and means the modal doesn't need
+  extra IPC calls to make UX decisions about the publish.
+
+---
 ## Phase 18b wanderer pass (2026-04-11)
 
 1. **When the verifier can't run tests, the wanderer must be the
