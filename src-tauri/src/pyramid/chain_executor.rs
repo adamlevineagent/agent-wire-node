@@ -3794,7 +3794,17 @@ pub async fn execute_chain_from(
     layer_tx: Option<mpsc::Sender<LayerEvent>>,
     initial_context: Option<HashMap<String, Value>>,
 ) -> Result<(String, i32, Vec<super::types::StepActivity>)> {
-    let llm_config = state.config.read().await.clone();
+    // Phase 12 verifier fix: mint build_id up front and attach
+    // cache_access to the LlmConfig so every downstream retrofit
+    // site that inspects `llm_config.cache_access` finds populated
+    // plumbing. Previously the build_id was computed below (line
+    // 3932), leaving this `llm_config` clone without cache_access
+    // and every Phase 12 retrofit that reads it was dead code.
+    let chain_build_id = format!(
+        "chain-{}",
+        uuid::Uuid::new_v4().to_string().split('-').next().unwrap_or("0")
+    );
+    let llm_config = state.llm_config_with_cache(slug, &chain_build_id).await;
 
     // Count chunks
     let slug_owned = slug.to_string();
@@ -3929,7 +3939,9 @@ pub async fn execute_chain_from(
     let mut step_activities: Vec<super::types::StepActivity> = Vec::new();
 
     // Build dispatch context (from chain_dispatch)
-    let chain_build_id = format!("chain-{}", uuid::Uuid::new_v4().to_string().split('-').next().unwrap_or("0"));
+    // Phase 12 verifier fix: `chain_build_id` now comes from the top
+    // of the function so that `llm_config.cache_access` is populated
+    // consistently with the per-call CacheDispatchBase below.
     // Phase 6 fix pass: construct CacheDispatchBase so dispatch_ir_llm /
     // dispatch_llm can produce per-call StepContexts that reach the
     // content-addressable cache. Requires state.data_dir to be set
@@ -3951,7 +3963,7 @@ pub async fn execute_chain_from(
         audit: Some(super::llm::AuditContext {
             conn: state.writer.clone(),
             slug: slug.to_string(),
-            build_id: chain_build_id,
+            build_id: chain_build_id.clone(),
             node_id: None,
             step_name: String::new(),
             call_purpose: String::new(),
@@ -4592,7 +4604,10 @@ async fn execute_recursive_decompose(
     let _ = cancel; // Available for future cancellation support within decomposition
     info!(slug, step_name = %step.name, "executing recursive_decompose primitive");
 
-    let llm_config = state.config.read().await.clone();
+    // Phase 12 verifier fix: attach cache_access so question_decomposition's
+    // make_step_ctx_from_llm_config retrofits reach the step cache.
+    let decompose_build_id = format!("decompose-{}-{}", slug, step.name);
+    let llm_config = state.llm_config_with_cache(slug, &decompose_build_id).await;
 
     // ── Resolve step.input (Pillar 28: forkable wiring) ────────────────
     // Try step.input first so forked chains that rename steps still work.
@@ -4863,7 +4878,11 @@ async fn execute_evidence_loop(
 ) -> Result<Value> {
     info!(slug, "executing evidence_loop primitive");
 
-    let llm_config = state.config.read().await.clone();
+    // Phase 12 verifier fix: attach cache_access so evidence_answering's
+    // pre_map_layer, answer_questions, and triage gate all reach the
+    // step cache and the triage gate actually activates.
+    let evidence_build_id = format!("evidence-{}-{}", slug, step.name);
+    let llm_config = state.llm_config_with_cache(slug, &evidence_build_id).await;
 
     // ── Resolve step.input (Pillar 28: forkable wiring) ────────────────
     let resolved_input = if let Some(ref input) = step.input {
@@ -5498,7 +5517,11 @@ async fn execute_process_gaps(
 ) -> Result<Value> {
     info!(slug, "executing process_gaps primitive");
 
-    let llm_config = state.config.read().await.clone();
+    // Phase 12 verifier fix: attach cache_access so delta.rs and any
+    // other retrofit modules invoked during gap processing reach the
+    // step cache.
+    let gaps_build_id = format!("gaps-{}-{}", slug, step.name);
+    let llm_config = state.llm_config_with_cache(slug, &gaps_build_id).await;
 
     // ── Resolve step.input (Pillar 28: forkable wiring) ────────────────
     let resolved_input = if let Some(ref input) = step.input {
@@ -10552,7 +10575,14 @@ pub async fn execute_plan(
     cancel: &CancellationToken,
     progress_tx: Option<mpsc::Sender<BuildProgress>>,
 ) -> Result<(String, i32)> {
-    let llm_config = state.config.read().await.clone();
+    // Phase 12 verifier fix: mint the IR build_id up front and attach
+    // cache_access so every retrofit site that reads llm_config.cache_access
+    // (via make_step_ctx_from_llm_config or inline) finds populated plumbing.
+    let ir_build_id = format!(
+        "ir-{}",
+        uuid::Uuid::new_v4().to_string().split('-').next().unwrap_or("0")
+    );
+    let llm_config = state.llm_config_with_cache(slug, &ir_build_id).await;
 
     // ── 1. Load chunks ──────────────────────────────────────────────────
     let slug_owned = slug.to_string();
@@ -10613,7 +10643,9 @@ pub async fn execute_plan(
     );
 
     // ── 5. Build dispatch context ────────────────────────────────────────
-    let ir_build_id = format!("ir-{}", uuid::Uuid::new_v4().to_string().split('-').next().unwrap_or("0"));
+    // Phase 12 verifier fix: `ir_build_id` already minted at the top
+    // of the function so `llm_config.cache_access` is consistent with
+    // the per-call CacheDispatchBase.
     // Phase 6 fix pass: same as execute_chain_from — attach a
     // CacheDispatchBase so IR executor LLM calls reach the cache.
     let cache_base = state.data_dir.as_ref().map(|dir| {
@@ -10633,7 +10665,7 @@ pub async fn execute_plan(
         audit: Some(super::llm::AuditContext {
             conn: state.writer.clone(),
             slug: slug.to_string(),
-            build_id: ir_build_id,
+            build_id: ir_build_id.clone(),
             node_id: None,
             step_name: String::new(),
             call_purpose: String::new(),

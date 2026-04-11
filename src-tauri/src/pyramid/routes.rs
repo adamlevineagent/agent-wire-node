@@ -2773,6 +2773,40 @@ async fn handle_drill(
             for child in &result.children {
                 ids.push(child.id.clone());
             }
+            // Phase 12: fire-and-forget demand signal recording.
+            // `user_drill` when the request came without an agent_id
+            // (user-initiated via the node UI); `agent_query` when an
+            // agent resolved the node via MCP. The recording runs in
+            // a background task so the HTTP response is never blocked.
+            let signal_type = if agent_id.as_deref().map(str::is_empty).unwrap_or(true) {
+                "user_drill"
+            } else {
+                "agent_query"
+            };
+            let source = agent_id.clone().unwrap_or_else(|| "user".to_string());
+            let writer_clone = state.writer.clone();
+            let slug_for_signal = slug_name.clone();
+            let node_for_signal = node_id.clone();
+            tokio::spawn(async move {
+                let conn = writer_clone.lock().await;
+                // Load the policy (synchronously — cheap DB read).
+                let policy = match crate::pyramid::db::load_active_evidence_policy(
+                    &conn,
+                    Some(&slug_for_signal),
+                ) {
+                    Ok(p) => p,
+                    Err(_) => return,
+                };
+                let _ = crate::pyramid::demand_signal::record_demand_signal(
+                    &conn,
+                    &slug_for_signal,
+                    &node_for_signal,
+                    signal_type,
+                    Some(&source),
+                    &policy,
+                );
+            });
+
             log_query_usage(
                 state.writer.clone(),
                 slug_name,
@@ -3787,9 +3821,14 @@ async fn handle_annotate(
     // Phase 3 fix pass: thread the live LlmConfig (with provider_registry +
     // credential_store) through to the annotation hook so its delta + faq
     // calls keep using the registry path.
-    let base_config = state.config.read().await.clone();
-    let model = base_config.primary_model.clone();
+    // Phase 12 verifier fix: attach cache_access so delta + faq retrofit
+    // sites reach the step cache.
     let slug_clone = saved.slug.clone();
+    let annotation_build_id = format!("annotation-{}-{}", slug_clone, saved.id);
+    let base_config = state
+        .llm_config_with_cache(&slug_clone, &annotation_build_id)
+        .await;
+    let model = base_config.primary_model.clone();
     let ops_clone = state.operational.clone();
 
     tokio::spawn(async move {
@@ -4023,7 +4062,11 @@ async fn handle_meta_run(
 
     // Phase 3 fix pass: clone the live LlmConfig (with provider_registry +
     // credential_store) instead of pulling raw api_key/model strings.
-    let base_config = state.config.read().await.clone();
+    // Phase 12 verifier fix: attach cache_access so meta retrofit sites
+    // reach the step cache.
+    let base_config = state
+        .llm_config_with_cache(&slug_name, &format!("meta-{}", slug_name))
+        .await;
     let model = base_config.primary_model.clone();
 
     let reader = state.reader.clone();
@@ -4079,7 +4122,11 @@ async fn handle_match_faq(
 ) -> Result<warp::reply::Response, warp::Rejection> {
     // Phase 3 fix pass: clone the live LlmConfig (with provider_registry +
     // credential_store) so faq::match_faq stays on the registry path.
-    let base_config = state.config.read().await.clone();
+    // Phase 12 verifier fix: attach cache_access so faq retrofit sites
+    // reach the step cache.
+    let base_config = state
+        .llm_config_with_cache(&slug_name, &format!("faq-match-{}", slug_name))
+        .await;
     let model = base_config.primary_model.clone();
 
     match faq::match_faq(
@@ -4109,7 +4156,11 @@ async fn handle_faq_directory(
 ) -> Result<warp::reply::Response, warp::Rejection> {
     // Phase 3 fix pass: clone the live LlmConfig (with provider_registry +
     // credential_store) so faq::get_faq_directory stays on the registry path.
-    let base_config = state.config.read().await.clone();
+    // Phase 12 verifier fix: attach cache_access so faq retrofit sites
+    // reach the step cache.
+    let base_config = state
+        .llm_config_with_cache(&slug_name, &format!("faq-dir-{}", slug_name))
+        .await;
     let model = base_config.primary_model.clone();
 
     match faq::get_faq_directory(
@@ -5722,7 +5773,11 @@ async fn handle_characterize(
         ));
     }
 
-    let llm_config = state.config.read().await.clone();
+    // Phase 12 verifier fix: attach cache_access so characterize retrofit
+    // reaches the step cache.
+    let llm_config = state
+        .llm_config_with_cache(&slug_name, &format!("characterize-{}", slug_name))
+        .await;
 
     match characterize::characterize(
         &source_path,

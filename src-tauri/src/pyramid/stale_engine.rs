@@ -277,6 +277,118 @@ impl PyramidStaleEngine {
                     }
                 }
 
+                // ── Phase 12: deferred question scanner ────────────────
+                //
+                // Once per tick, scan `pyramid_deferred_questions` for
+                // rows whose `next_check_at <= now` AND whose
+                // `check_interval` is not "never"/"on_demand". For each
+                // expired row, re-run the triage DSL against the
+                // active policy. Outcomes:
+                //   Answer → remove_deferred (next build picks it up)
+                //   Defer  → update_deferred_next_check with new interval
+                //   Skip   → remove_deferred
+                {
+                    let db = db_path.clone();
+                    let s = slug.clone();
+                    let _ = tokio::task::spawn_blocking(move || -> Result<(), anyhow::Error> {
+                        let conn = super::db::open_pyramid_connection(Path::new(&db))?;
+                        let expired = super::db::list_expired_deferred(&conn, &s)?;
+                        if expired.is_empty() {
+                            return Ok(());
+                        }
+                        let policy = super::db::load_active_evidence_policy(&conn, Some(&s))?;
+                        info!(
+                            slug = %s,
+                            count = expired.len(),
+                            "Phase 12: deferred question scanner processing expired rows"
+                        );
+                        // Phase 12 wanderer fix: evaluate
+                        // has_demand_signals ONCE per tick at slug
+                        // granularity. Per-node aggregation by
+                        // question.question_id never matched because
+                        // question_id is a q-{sha256} hash while
+                        // demand signals land on L{layer}-{seq} node
+                        // ids. See evidence_answering::run_triage_gate
+                        // for the matching fix and rationale.
+                        let slug_has_demand_signals = policy.demand_signals.iter().any(|rule| {
+                            let w = rule.window.trim();
+                            let window = if w.starts_with('-') || w.contains(' ') {
+                                w.to_string()
+                            } else {
+                                let (num_part, unit_part): (String, String) =
+                                    w.chars().partition(|c| c.is_ascii_digit());
+                                let n: i64 = num_part.parse().unwrap_or(14);
+                                let (n, unit) = match unit_part.as_str() {
+                                    "d" => (n, "days"),
+                                    "h" => (n, "hours"),
+                                    "w" => (n * 7, "days"),
+                                    "m" => (n, "minutes"),
+                                    _ => (n, "days"),
+                                };
+                                format!("-{} {}", n, unit)
+                            };
+                            super::db::sum_slug_demand_weight(
+                                &conn,
+                                &s,
+                                &rule.r#type,
+                                &window,
+                            )
+                            .unwrap_or(0.0)
+                                >= rule.threshold
+                        });
+
+                        for row in expired {
+                            let question: super::types::LayerQuestion =
+                                match serde_json::from_str(&row.question_json) {
+                                    Ok(q) => q,
+                                    Err(_) => continue,
+                                };
+                            let has_demand_signals = slug_has_demand_signals;
+                            let facts = super::triage::TriageFacts {
+                                question: &question,
+                                target_node_distilled: None,
+                                target_node_depth: Some(question.layer),
+                                is_first_build: false,
+                                is_stale_check: true,
+                                has_demand_signals,
+                                evidence_question_trivial: None,
+                                evidence_question_high_value: None,
+                            };
+                            match super::triage::resolve_decision(&policy, &facts) {
+                                Ok(super::triage::TriageDecision::Answer { .. }) => {
+                                    let _ = super::db::remove_deferred(
+                                        &conn,
+                                        &row.slug,
+                                        &question.question_id,
+                                    );
+                                }
+                                Ok(super::triage::TriageDecision::Defer {
+                                    check_interval,
+                                    ..
+                                }) => {
+                                    let _ = super::db::update_deferred_next_check(
+                                        &conn,
+                                        &row.slug,
+                                        &question.question_id,
+                                        &check_interval,
+                                        policy.contribution_id.as_deref(),
+                                    );
+                                }
+                                Ok(super::triage::TriageDecision::Skip { .. }) => {
+                                    let _ = super::db::remove_deferred(
+                                        &conn,
+                                        &row.slug,
+                                        &question.question_id,
+                                    );
+                                }
+                                Err(_) => {}
+                            }
+                        }
+                        Ok(())
+                    })
+                    .await;
+                }
+
                 // Check if breaker was tripped during dispatch (M1 fix)
                 let breaker_tripped_in_db = {
                     let db = db_path.clone();

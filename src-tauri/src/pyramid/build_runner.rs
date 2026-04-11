@@ -660,7 +660,11 @@ async fn run_legacy_build(
     progress_tx: Option<mpsc::Sender<BuildProgress>>,
     write_tx: &mpsc::Sender<WriteOp>,
 ) -> Result<(String, i32)> {
-    let llm_config = state.config.read().await.clone();
+    // Phase 12 verifier fix: attach cache_access so build.rs retrofit
+    // sites reach the step cache.
+    let llm_config = state
+        .llm_config_with_cache(slug_name, &format!("legacy-build-{}", slug_name))
+        .await;
 
     // The legacy build functions require a progress_tx reference; create a
     // dummy one if the caller didn't supply one.
@@ -787,7 +791,11 @@ pub async fn run_decomposed_build(
         };
 
     // ── 3. Characterize if not provided ────────────────────────────
-    let llm_config = state.config.read().await.clone();
+    // Phase 12 verifier fix: attach cache_access so characterize retrofit
+    // reaches the step cache.
+    let llm_config = state
+        .llm_config_with_cache(slug_name, &format!("question-build-{}", slug_name))
+        .await;
 
     let characterization_result = match characterization {
         Some(c) => {
@@ -1039,7 +1047,11 @@ pub async fn preview_decomposed_build(
         audience: None,
     };
 
-    let llm_config = state.config.read().await.clone();
+    // Phase 12 verifier fix: attach cache_access so question_decomposition
+    // retrofit sites reach the step cache.
+    let llm_config = state
+        .llm_config_with_cache(slug_name, &format!("decompose-preview-{}", slug_name))
+        .await;
     let tree = question_decomposition::decompose_question(
         &config,
         &llm_config,

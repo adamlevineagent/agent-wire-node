@@ -1025,10 +1025,11 @@ pub async fn build_bunch(
                 state.reader.clone()
             };
             let writer = state.writer.clone();
-            let llm_config = {
-                let cfg = state.config.read().await;
-                cfg.clone()
-            };
+            // Phase 12 verifier fix: attach cache_access so build.rs retrofit
+            // sites reach the step cache.
+            let llm_config = state
+                .llm_config_with_cache(&bunch_slug, &format!("vine-fallback-{}", bunch_slug))
+                .await;
             run_build_pipeline(
                 reader, writer, &llm_config, &bunch_slug,
                 ContentType::Conversation, cancel, Some(&state.build_event_bus),
@@ -1262,10 +1263,11 @@ pub async fn build_vine_l1(
         return Ok(0);
     }
 
-    let llm_config = {
-        let cfg = state.config.read().await;
-        cfg.clone()
-    };
+    // Phase 12 verifier fix: attach cache_access so build.rs retrofit
+    // (call_and_parse) reaches the step cache.
+    let llm_config = state
+        .llm_config_with_cache(vine_slug, &format!("vine-l1-{}", vine_slug))
+        .await;
 
     // Step 1: Build inventory of bunch summaries for the clustering prompt
     let mut bunch_summaries = Vec::new();
@@ -1504,10 +1506,11 @@ pub async fn build_vine_upper(
     vine_slug: &str,
     cancel: &CancellationToken,
 ) -> Result<(String, i32)> {
-    let llm_config = {
-        let cfg = state.config.read().await;
-        cfg.clone()
-    };
+    // Phase 12 verifier fix: attach cache_access so build.rs retrofit
+    // reaches the step cache during vine upper-layer distillation.
+    let llm_config = state
+        .llm_config_with_cache(vine_slug, &format!("vine-upper-{}", vine_slug))
+        .await;
 
     // Set up write channel
     let (write_tx, writer_handle) = spawn_write_drain(state.writer.clone());
@@ -1987,10 +1990,11 @@ async fn detect_vine_eras(
         return Ok(());
     }
 
-    let llm_config = {
-        let cfg = state.config.read().await;
-        cfg.clone()
-    };
+    // Phase 12 verifier fix: attach cache_access so build::call_and_parse
+    // used by ERA detection reaches the step cache.
+    let llm_config = state
+        .llm_config_with_cache(vine_slug, &format!("vine-era-{}", vine_slug))
+        .await;
 
     // Step 1: Entity overlap sliding window (mechanical)
     let window_size: usize = 5;
@@ -2194,10 +2198,11 @@ async fn classify_vine_transitions(
     vine_slug: &str,
     cancel: &CancellationToken,
 ) -> Result<()> {
-    let llm_config = {
-        let cfg = state.config.read().await;
-        cfg.clone()
-    };
+    // Phase 12 verifier fix: attach cache_access so call_and_parse
+    // reaches the step cache.
+    let llm_config = state
+        .llm_config_with_cache(vine_slug, &format!("vine-trans-{}", vine_slug))
+        .await;
 
     // Read existing ERA annotations
     let era_annotations = {
@@ -2349,10 +2354,11 @@ async fn resolve_vine_entities(
         return Ok(());
     }
 
-    let llm_config = {
-        let cfg = state.config.read().await;
-        cfg.clone()
-    };
+    // Phase 12 verifier fix: attach cache_access so call_and_parse
+    // reaches the step cache during entity resolution.
+    let llm_config = state
+        .llm_config_with_cache(vine_slug, &format!("vine-entity-{}", vine_slug))
+        .await;
 
     // Step 3: LLM resolution
     let clusters_json = serde_json::to_string_pretty(&clusters)?;

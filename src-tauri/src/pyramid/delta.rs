@@ -20,6 +20,7 @@ use crate::pyramid::db;
 use crate::pyramid::llm;
 use crate::pyramid::llm::LlmConfig;
 use crate::pyramid::naming::{clean_headline, headline_for_node};
+use crate::pyramid::step_context::make_step_ctx_from_llm_config;
 use crate::pyramid::types::*;
 
 use super::OperationalConfig;
@@ -104,7 +105,23 @@ Output JSON:
     // Phase 3 fix pass: clone the live config (preserves provider_registry +
     // credential_store) instead of building a fresh `config_for_model`.
     let cfg = base_config.clone_with_model_override(model);
-    let raw = llm::call_model(&cfg, system_prompt, &user_prompt, 0.2, 200).await?;
+    let cache_ctx = make_step_ctx_from_llm_config(
+        &cfg,
+        "delta_thread_match",
+        "delta",
+        -1,
+        None,
+        system_prompt,
+    );
+    let raw = llm::call_model_and_ctx(
+        &cfg,
+        cache_ctx.as_ref(),
+        system_prompt,
+        &user_prompt,
+        0.2,
+        200,
+    )
+    .await?;
     let parsed = llm::extract_json(&raw)?;
 
     let match_val = parsed
@@ -277,7 +294,23 @@ Output JSON only:
     // Phase 3 fix pass: clone the live config (preserves provider_registry +
     // credential_store) instead of building a fresh `config_for_model`.
     let cfg = base_config.clone_with_model_override(model);
-    let raw = llm::call_model(&cfg, system_prompt, &user_prompt, 0.3, 500).await?;
+    let cache_ctx = make_step_ctx_from_llm_config(
+        &cfg,
+        "delta_describe_change",
+        "delta",
+        -1,
+        None,
+        system_prompt,
+    );
+    let raw = llm::call_model_and_ctx(
+        &cfg,
+        cache_ctx.as_ref(),
+        system_prompt,
+        &user_prompt,
+        0.3,
+        500,
+    )
+    .await?;
     let parsed = llm::extract_json(&raw)?;
 
     // 5. Parse response
@@ -498,7 +531,23 @@ Output JSON only:
     // Phase 3 fix pass: clone the live config (preserves provider_registry +
     // credential_store) instead of building a fresh `config_for_model`.
     let cfg = base_config.clone_with_model_override(model);
-    let raw = llm::call_model(&cfg, system_prompt, &user_prompt, 0.2, 1000).await?;
+    let cache_ctx = make_step_ctx_from_llm_config(
+        &cfg,
+        "delta_rewrite_distillation",
+        "delta",
+        -1,
+        None,
+        system_prompt,
+    );
+    let raw = llm::call_model_and_ctx(
+        &cfg,
+        cache_ctx.as_ref(),
+        system_prompt,
+        &user_prompt,
+        0.2,
+        1000,
+    )
+    .await?;
     let parsed = llm::extract_json(&raw)?;
 
     // 4. Parse response
@@ -684,7 +733,23 @@ Output valid JSON matching this schema:
     // Phase 3 fix pass: clone the live config (preserves provider_registry +
     // credential_store) instead of building a fresh `config_for_model`.
     let cfg = base_config.clone_with_model_override(collapse_model);
-    let raw = llm::call_model(&cfg, system_prompt, &user_prompt, 0.2, 4000).await?;
+    let cache_ctx = make_step_ctx_from_llm_config(
+        &cfg,
+        "delta_collapse_deltas",
+        "delta",
+        -1,
+        None,
+        system_prompt,
+    );
+    let raw = llm::call_model_and_ctx(
+        &cfg,
+        cache_ctx.as_ref(),
+        system_prompt,
+        &user_prompt,
+        0.2,
+        4000,
+    )
+    .await?;
     let parsed = llm::extract_json(&raw)?;
 
     // 5. Parse response into PyramidNode fields

@@ -1671,6 +1671,46 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
             updated_at TEXT DEFAULT (datetime('now')),
             PRIMARY KEY (slug)
         );
+
+        -- ── Phase 12 evidence triage tables ────────────────────────────────
+        --
+        -- pyramid_demand_signals: fire-and-forget log of agent queries,
+        -- user drills, and search hits that resolve to pyramid nodes.
+        -- Read at triage time (sum(weight) over a window) and propagated
+        -- upward via evidence KEEP links with attenuation.
+        CREATE TABLE IF NOT EXISTS pyramid_demand_signals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            slug TEXT NOT NULL,
+            node_id TEXT NOT NULL,
+            signal_type TEXT NOT NULL,
+            source TEXT,
+            weight REAL NOT NULL DEFAULT 1.0,
+            source_node_id TEXT,
+            created_at TEXT DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_demand_signals
+            ON pyramid_demand_signals(slug, node_id, signal_type, created_at);
+
+        -- pyramid_deferred_questions: evidence questions routed to
+        -- the defer branch by triage. The DADBEAR tick scans this
+        -- table for expired rows and re-runs triage. Demand-signal
+        -- handlers reactivate rows with check_interval IN (never, on_demand).
+        CREATE TABLE IF NOT EXISTS pyramid_deferred_questions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            slug TEXT NOT NULL,
+            question_id TEXT NOT NULL,
+            question_json TEXT NOT NULL,
+            deferred_at TEXT NOT NULL DEFAULT (datetime('now')),
+            next_check_at TEXT NOT NULL,
+            check_interval TEXT NOT NULL,
+            triage_reason TEXT,
+            contribution_id TEXT,
+            UNIQUE(slug, question_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_deferred_questions_next
+            ON pyramid_deferred_questions(slug, next_check_at);
+        CREATE INDEX IF NOT EXISTS idx_deferred_questions_interval
+            ON pyramid_deferred_questions(check_interval);
         ",
     )?;
 
@@ -11620,16 +11660,116 @@ pub fn seed_default_provider_registry(conn: &Connection) -> Result<()> {
 //   UPSERT that handles the NULL case. `INSERT OR REPLACE` works because
 //   the PK is (slug) alone.
 
-/// Minimal evidence policy YAML struct. Extended in Phase 9/11 (evidence
-/// triage spec).
+/// Phase 12 triage rule. Part of the `evidence_policy` YAML schema.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct TriageRuleYaml {
+    #[serde(default)]
+    pub condition: String,
+    #[serde(default)]
+    pub action: String,
+    #[serde(default)]
+    pub model_tier: Option<String>,
+    #[serde(default)]
+    pub check_interval: Option<String>,
+    #[serde(default)]
+    pub priority: Option<String>,
+}
+
+/// Phase 12 demand signal policy rule.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct DemandSignalRuleYaml {
+    #[serde(rename = "type", default)]
+    pub r#type: String,
+    #[serde(default)]
+    pub threshold: f64,
+    #[serde(default)]
+    pub window: String,
+}
+
+/// Phase 12 policy budget (triage model tier + max concurrency).
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct PolicyBudgetYaml {
+    #[serde(default)]
+    pub maintenance_model_tier: Option<String>,
+    #[serde(default)]
+    pub initial_build_model_tier: Option<String>,
+    #[serde(default)]
+    pub triage_model_tier: Option<String>,
+    #[serde(default)]
+    pub max_concurrent_evidence: Option<usize>,
+    #[serde(default)]
+    pub triage_batch_size: Option<usize>,
+}
+
+/// Phase 12 demand signal attenuation parameters (BFS propagation).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DemandSignalAttenuationYaml {
+    #[serde(default = "default_attenuation_factor")]
+    pub factor: f64,
+    #[serde(default = "default_attenuation_floor")]
+    pub floor: f64,
+    #[serde(default = "default_attenuation_max_depth")]
+    pub max_depth: u32,
+}
+
+fn default_attenuation_factor() -> f64 {
+    0.5
+}
+fn default_attenuation_floor() -> f64 {
+    0.1
+}
+fn default_attenuation_max_depth() -> u32 {
+    6
+}
+
+impl Default for DemandSignalAttenuationYaml {
+    fn default() -> Self {
+        Self {
+            factor: default_attenuation_factor(),
+            floor: default_attenuation_floor(),
+            max_depth: default_attenuation_max_depth(),
+        }
+    }
+}
+
+/// Minimal evidence policy YAML struct. Extended in Phase 9/11/12
+/// (evidence triage spec). All new fields carry `#[serde(default)]` so
+/// pre-Phase-12 YAML still deserializes cleanly.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct EvidencePolicyYaml {
     #[serde(default)]
-    pub triage_rules: Option<serde_yaml::Value>,
+    pub triage_rules: Option<Vec<TriageRuleYaml>>,
     #[serde(default)]
-    pub demand_signals: Option<serde_yaml::Value>,
+    pub demand_signals: Option<Vec<DemandSignalRuleYaml>>,
     #[serde(default)]
-    pub budget: Option<serde_yaml::Value>,
+    pub budget: Option<PolicyBudgetYaml>,
+    #[serde(default)]
+    pub demand_signal_attenuation: Option<DemandSignalAttenuationYaml>,
+}
+
+/// Runtime representation of an evidence policy with defaults filled
+/// in. Returned by `load_active_evidence_policy`. Callers use this to
+/// evaluate triage conditions without unwrapping `Option`s repeatedly.
+#[derive(Debug, Clone)]
+pub struct EvidencePolicy {
+    pub slug: Option<String>,
+    pub contribution_id: Option<String>,
+    pub triage_rules: Vec<TriageRuleYaml>,
+    pub demand_signals: Vec<DemandSignalRuleYaml>,
+    pub budget: PolicyBudgetYaml,
+    pub demand_signal_attenuation: DemandSignalAttenuationYaml,
+    /// SHA-256 hex of the source YAML; used as part of the triage
+    /// cache inputs_hash so policy changes invalidate cached triage
+    /// decisions.
+    pub policy_yaml_hash: String,
+}
+
+impl EvidencePolicy {
+    /// Convenience: return the triage_batch_size with a reasonable
+    /// default (15 per the spec) if unset.
+    pub fn triage_batch_size(&self) -> usize {
+        self.budget.triage_batch_size.unwrap_or(15)
+    }
 }
 
 /// UPSERT an evidence policy row keyed on slug.
@@ -11653,6 +11793,565 @@ pub fn upsert_evidence_policy(
          ) VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'))",
         rusqlite::params![slug, triage_json, demand_json, budget_json, contribution_id],
     )?;
+    Ok(())
+}
+
+/// Phase 12: load the active evidence policy for a slug (or the
+/// global default if slug is None). Returns a fully-populated
+/// `EvidencePolicy` with defaults filled in for any missing fields.
+///
+/// Resolution order:
+/// 1. Try `slug`-specific row in `pyramid_evidence_policy`.
+/// 2. Fall back to the global (`slug IS NULL`) row.
+/// 3. If neither exists, return a policy with empty rules and
+///    defaults — behaves as "triage disabled, all questions answered".
+pub fn load_active_evidence_policy(
+    conn: &Connection,
+    slug: Option<&str>,
+) -> Result<EvidencePolicy> {
+    use crate::pyramid::step_context::sha256_hex;
+
+    // Try slug-specific row first, then global.
+    let row: Option<(Option<String>, String, String, String, String)> = match slug {
+        Some(s) => conn
+            .query_row(
+                "SELECT slug, triage_rules_json, demand_signals_json, budget_json, contribution_id
+                 FROM pyramid_evidence_policy WHERE slug = ?1",
+                rusqlite::params![s],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .ok(),
+        None => None,
+    };
+    let row = match row {
+        Some(r) => Some(r),
+        None => conn
+            .query_row(
+                "SELECT slug, triage_rules_json, demand_signals_json, budget_json, contribution_id
+                 FROM pyramid_evidence_policy WHERE slug IS NULL",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .ok(),
+    };
+
+    let (row_slug, triage_json, demand_json, budget_json, contribution_id) = match row {
+        Some(r) => r,
+        None => {
+            return Ok(EvidencePolicy {
+                slug: slug.map(|s| s.to_string()),
+                contribution_id: None,
+                triage_rules: Vec::new(),
+                demand_signals: Vec::new(),
+                budget: PolicyBudgetYaml::default(),
+                demand_signal_attenuation: DemandSignalAttenuationYaml::default(),
+                policy_yaml_hash: String::new(),
+            });
+        }
+    };
+
+    // Re-parse JSON blobs into typed structs. `triage_rules_json` is
+    // an `Option<Vec<TriageRuleYaml>>` in `EvidencePolicyYaml`, so the
+    // stored JSON looks like `null`, `[]`, or `[...]`.
+    let triage_rules: Vec<TriageRuleYaml> = serde_json::from_str::<
+        Option<Vec<TriageRuleYaml>>,
+    >(&triage_json)
+    .ok()
+    .flatten()
+    .unwrap_or_default();
+    let demand_signals: Vec<DemandSignalRuleYaml> = serde_json::from_str::<
+        Option<Vec<DemandSignalRuleYaml>>,
+    >(&demand_json)
+    .ok()
+    .flatten()
+    .unwrap_or_default();
+    // Budget JSON may be `null`, `{}`, or a full object.
+    let budget_raw: Option<PolicyBudgetYaml> = serde_json::from_str::<
+        Option<PolicyBudgetYaml>,
+    >(&budget_json)
+    .ok()
+    .flatten();
+    let budget = budget_raw.unwrap_or_default();
+
+    // demand_signal_attenuation isn't stored in a dedicated column —
+    // we persist the whole `EvidencePolicyYaml` via its JSON columns
+    // only (triage_rules_json, demand_signals_json, budget_json). For
+    // Phase 12, attenuation parameters default to spec values unless
+    // the user adds an `demand_signal_attenuation` row via the
+    // budget_json envelope (we'll accept it under budget_json as a
+    // subobject in a future extension). For now: defaults.
+    let demand_signal_attenuation = DemandSignalAttenuationYaml::default();
+
+    // Hash the concatenation of all three JSON blobs — policy_yaml_hash
+    // only needs to change when the policy changes.
+    let combined = format!("{}|{}|{}", triage_json, demand_json, budget_json);
+    let policy_yaml_hash = sha256_hex(combined.as_bytes());
+
+    Ok(EvidencePolicy {
+        slug: row_slug,
+        contribution_id: Some(contribution_id),
+        triage_rules,
+        demand_signals,
+        budget,
+        demand_signal_attenuation,
+        policy_yaml_hash,
+    })
+}
+
+// ── Phase 12 demand signal helpers ──────────────────────────────────────────
+//
+// Demand signals are fire-and-forget INSERTs recorded every time an
+// agent query, user drill, or search hit resolves to a pyramid node.
+// They drive the `has_demand_signals` condition in the triage DSL and
+// support the on-demand reactivation of deferred questions.
+
+/// Insert a single demand signal row. The caller chooses `weight`
+/// (1.0 at the leaf, attenuated values on parents). Writes via the
+/// passed connection — propagation is handled by
+/// `demand_signal::record_demand_signal`.
+pub fn insert_demand_signal(
+    conn: &Connection,
+    slug: &str,
+    node_id: &str,
+    signal_type: &str,
+    source: Option<&str>,
+    weight: f64,
+    source_node_id: Option<&str>,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO pyramid_demand_signals (
+            slug, node_id, signal_type, source, weight, source_node_id, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'))",
+        rusqlite::params![slug, node_id, signal_type, source, weight, source_node_id],
+    )?;
+    Ok(())
+}
+
+/// Sum the weights of demand signals of a given type for a node
+/// within a time window. `window_modifier` is a SQLite datetime
+/// modifier such as `"-14 days"` or `"-7 days"`.
+///
+/// Returns 0.0 if no signals match (not an error).
+pub fn sum_demand_weight(
+    conn: &Connection,
+    slug: &str,
+    node_id: &str,
+    signal_type: &str,
+    window_modifier: &str,
+) -> Result<f64> {
+    let total: Option<f64> = conn
+        .query_row(
+            "SELECT SUM(weight) FROM pyramid_demand_signals
+             WHERE slug = ?1 AND node_id = ?2 AND signal_type = ?3
+               AND created_at > datetime('now', ?4)",
+            rusqlite::params![slug, node_id, signal_type, window_modifier],
+            |r| r.get(0),
+        )
+        .ok();
+    Ok(total.unwrap_or(0.0))
+}
+
+/// Phase 12 wanderer fix: sum the weights of demand signals of a
+/// given type across an ENTIRE slug within a time window. This is
+/// the helper the triage DSL's `has_demand_signals` condition uses —
+/// the per-node variant (`sum_demand_weight`) can't be used for
+/// deferred evidence questions because a `LayerQuestion.question_id`
+/// is a `q-{sha256}` hash, not the L{layer}-{seq} id that demand
+/// signals are recorded under. The two ID spaces never meet.
+///
+/// Aggregating per-slug matches the spec's intent ("drive re-check
+/// by demand") while staying correct in the only ID space we
+/// actually have at both sides of the join. When the pyramid grows
+/// a persistent q-hash → node-id map (Phase 13+), the per-node
+/// variant can be brought back for spatial precision.
+///
+/// Returns 0.0 if no signals match (not an error).
+pub fn sum_slug_demand_weight(
+    conn: &Connection,
+    slug: &str,
+    signal_type: &str,
+    window_modifier: &str,
+) -> Result<f64> {
+    let total: Option<f64> = conn
+        .query_row(
+            "SELECT SUM(weight) FROM pyramid_demand_signals
+             WHERE slug = ?1 AND signal_type = ?2
+               AND created_at > datetime('now', ?3)",
+            rusqlite::params![slug, signal_type, window_modifier],
+            |r| r.get(0),
+        )
+        .ok();
+    Ok(total.unwrap_or(0.0))
+}
+
+/// Phase 12 wanderer fix: list every distinct slug that has at
+/// least one row in `pyramid_deferred_questions`. Used by the
+/// global-policy re-evaluation path so a supersession of a global
+/// `evidence_policy` (contribution with `slug = NULL`) can walk
+/// every affected slug instead of silently matching zero rows on
+/// `slug = ''`.
+pub fn list_slugs_with_deferred_questions(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT slug FROM pyramid_deferred_questions ORDER BY slug ASC",
+    )?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// Phase 12 wanderer fix: list every deferred row for a slug with
+/// `check_interval IN ('never', 'on_demand')`. Used by the
+/// `record_demand_signal` on-demand reactivation hook. The previous
+/// `list_deferred_by_question_target` helper tried to join by
+/// question_id = node_id which never matches (q-hash vs L{}-{}),
+/// so the reactivation hook was a no-op. This helper drops the
+/// node_id filter and returns all slug-level `on_demand`/`never`
+/// rows — the demand signal handler then re-triages each with
+/// `has_demand_signals=true` and reactivates the ones whose
+/// decision flips to Answer.
+pub fn list_on_demand_deferred_for_slug(
+    conn: &Connection,
+    slug: &str,
+) -> Result<Vec<DeferredQuestion>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, slug, question_id, question_json, deferred_at, next_check_at,
+                check_interval, triage_reason, contribution_id
+         FROM pyramid_deferred_questions
+         WHERE slug = ?1 AND check_interval IN ('never', 'on_demand')
+         ORDER BY deferred_at ASC",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![slug], |r| {
+        Ok(DeferredQuestion {
+            id: r.get(0)?,
+            slug: r.get(1)?,
+            question_id: r.get(2)?,
+            question_json: r.get(3)?,
+            deferred_at: r.get(4)?,
+            next_check_at: r.get(5)?,
+            check_interval: r.get(6)?,
+            triage_reason: r.get(7)?,
+            contribution_id: r.get(8)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// Walk `pyramid_evidence` to find every parent node (target_node_id)
+/// linked via a KEEP edge from the given node_id. Used by the demand
+/// signal propagation BFS.
+///
+/// `pyramid_evidence` stores verdicts as uppercase strings (`KEEP`,
+/// `DISCONNECT`, `MISSING`) enforced by a CHECK constraint. The
+/// `live_pyramid_evidence` view adds liveness filtering by joining
+/// against the nodes table, but for propagation we want all
+/// historically-linked parents — the signal graph follows all
+/// edges regardless of whether the node is currently superseded.
+pub fn load_parents_via_evidence(
+    conn: &Connection,
+    slug: &str,
+    node_id: &str,
+) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT target_node_id FROM pyramid_evidence
+         WHERE slug = ?1 AND source_node_id = ?2 AND verdict = 'KEEP'",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![slug, node_id], |r| r.get::<_, String>(0))?;
+    let mut parents = Vec::new();
+    for row in rows {
+        parents.push(row?);
+    }
+    Ok(parents)
+}
+
+// ── Phase 12 deferred questions helpers ─────────────────────────────────────
+//
+// Deferred questions are evidence questions that the triage step
+// routed to "defer" instead of "answer" or "skip". They are stored
+// with a `next_check_at` deadline and re-evaluated by the DADBEAR
+// tick loop or by demand-signal reactivation.
+
+/// Runtime representation of a deferred question row.
+#[derive(Debug, Clone)]
+pub struct DeferredQuestion {
+    pub id: i64,
+    pub slug: String,
+    pub question_id: String,
+    pub question_json: String,
+    pub deferred_at: String,
+    pub next_check_at: String,
+    pub check_interval: String,
+    pub triage_reason: Option<String>,
+    pub contribution_id: Option<String>,
+}
+
+/// Parse a `check_interval` string into a SQLite datetime modifier and
+/// compute a `next_check_at` value as an ISO timestamp. Supports
+/// "Nd" (days), "Nh" (hours), "Nw" (weeks), "never", "on_demand".
+/// Unrecognized intervals default to 30 days.
+pub fn parse_check_interval_to_next_check_at(interval: &str) -> String {
+    let trimmed = interval.trim().to_lowercase();
+    if trimmed == "never" || trimmed == "on_demand" {
+        return "9999-12-31 00:00:00".to_string();
+    }
+    // Parse "Nd", "Nh", "Nw" forms.
+    let (num_part, unit_part) = trimmed
+        .chars()
+        .partition::<String, _>(|c| c.is_ascii_digit() || *c == '-');
+    let num: i64 = num_part.parse().unwrap_or(30);
+    let unit = unit_part.as_str();
+    let modifier = match unit {
+        "d" => format!("+{} days", num),
+        "h" => format!("+{} hours", num),
+        "w" => format!("+{} days", num * 7),
+        "m" => format!("+{} minutes", num), // minutes (test convenience)
+        _ => format!("+{} days", num),
+    };
+    modifier
+}
+
+/// UPSERT a deferred question. `question_id` is the canonical id from
+/// `LayerQuestion.question_id`. `question_json` is the full serialized
+/// payload (so the tick can re-run triage without needing the live
+/// question graph). `check_interval` is stored verbatim; the
+/// `next_check_at` column is computed via SQLite's datetime function.
+pub fn defer_question(
+    conn: &Connection,
+    slug: &str,
+    question_id: &str,
+    question_json: &str,
+    check_interval: &str,
+    triage_reason: Option<&str>,
+    contribution_id: Option<&str>,
+) -> Result<()> {
+    let trimmed = check_interval.trim().to_lowercase();
+    if trimmed == "never" || trimmed == "on_demand" {
+        conn.execute(
+            "INSERT INTO pyramid_deferred_questions (
+                slug, question_id, question_json, deferred_at, next_check_at,
+                check_interval, triage_reason, contribution_id
+             ) VALUES (?1, ?2, ?3, datetime('now'), '9999-12-31 00:00:00',
+                 ?4, ?5, ?6)
+             ON CONFLICT(slug, question_id) DO UPDATE SET
+                 question_json = excluded.question_json,
+                 deferred_at = datetime('now'),
+                 next_check_at = '9999-12-31 00:00:00',
+                 check_interval = excluded.check_interval,
+                 triage_reason = excluded.triage_reason,
+                 contribution_id = excluded.contribution_id",
+            rusqlite::params![
+                slug,
+                question_id,
+                question_json,
+                check_interval,
+                triage_reason,
+                contribution_id,
+            ],
+        )?;
+    } else {
+        let modifier = parse_check_interval_to_next_check_at(check_interval);
+        conn.execute(
+            "INSERT INTO pyramid_deferred_questions (
+                slug, question_id, question_json, deferred_at, next_check_at,
+                check_interval, triage_reason, contribution_id
+             ) VALUES (?1, ?2, ?3, datetime('now'), datetime('now', ?4),
+                 ?5, ?6, ?7)
+             ON CONFLICT(slug, question_id) DO UPDATE SET
+                 question_json = excluded.question_json,
+                 deferred_at = datetime('now'),
+                 next_check_at = datetime('now', ?4),
+                 check_interval = excluded.check_interval,
+                 triage_reason = excluded.triage_reason,
+                 contribution_id = excluded.contribution_id",
+            rusqlite::params![
+                slug,
+                question_id,
+                question_json,
+                modifier,
+                check_interval,
+                triage_reason,
+                contribution_id,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+/// List every deferred question whose `next_check_at` is on or before
+/// the current time AND whose `check_interval` is not "never" or
+/// "on_demand" (those are reactivated only by demand signals).
+pub fn list_expired_deferred(
+    conn: &Connection,
+    slug: &str,
+) -> Result<Vec<DeferredQuestion>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, slug, question_id, question_json, deferred_at, next_check_at,
+                check_interval, triage_reason, contribution_id
+         FROM pyramid_deferred_questions
+         WHERE slug = ?1
+           AND next_check_at <= datetime('now')
+           AND check_interval NOT IN ('never', 'on_demand')
+         ORDER BY next_check_at ASC",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![slug], |r| {
+        Ok(DeferredQuestion {
+            id: r.get(0)?,
+            slug: r.get(1)?,
+            question_id: r.get(2)?,
+            question_json: r.get(3)?,
+            deferred_at: r.get(4)?,
+            next_check_at: r.get(5)?,
+            check_interval: r.get(6)?,
+            triage_reason: r.get(7)?,
+            contribution_id: r.get(8)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// List ALL deferred questions for a slug, regardless of next_check_at
+/// or interval. Used by the policy-change re-evaluation flow.
+pub fn list_all_deferred(
+    conn: &Connection,
+    slug: &str,
+) -> Result<Vec<DeferredQuestion>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, slug, question_id, question_json, deferred_at, next_check_at,
+                check_interval, triage_reason, contribution_id
+         FROM pyramid_deferred_questions
+         WHERE slug = ?1
+         ORDER BY deferred_at ASC",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![slug], |r| {
+        Ok(DeferredQuestion {
+            id: r.get(0)?,
+            slug: r.get(1)?,
+            question_id: r.get(2)?,
+            question_json: r.get(3)?,
+            deferred_at: r.get(4)?,
+            next_check_at: r.get(5)?,
+            check_interval: r.get(6)?,
+            triage_reason: r.get(7)?,
+            contribution_id: r.get(8)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// List every deferred question for a node. Used by the demand-signal
+/// reactivation path: when a signal lands on (slug, node_id) we check
+/// if any deferred questions target that node and re-run triage on
+/// them.
+pub fn list_deferred_by_question_target(
+    conn: &Connection,
+    slug: &str,
+    target_node_id: &str,
+) -> Result<Vec<DeferredQuestion>> {
+    // Phase 12 verifier fix: the `LayerQuestion` type does not carry
+    // an explicit `target_node_id` field — evidence questions are
+    // identified by their `question_id`, which by convention is
+    // derived from (and matches) the target node id in the question
+    // compiler's output (see `question_decomposition::extract_layer_questions`).
+    // Match on `question_id` column directly, with a belt-and-suspenders
+    // JSON LIKE on the `question_id` payload field in case the
+    // column and payload diverge (which they shouldn't).
+    //
+    // The previous implementation matched on `"target_node_id":"..."`
+    // which never appears in the serialized LayerQuestion — so the
+    // query always returned zero rows and the on-demand reactivation
+    // hook in `demand_signal::record_demand_signal` was dead.
+    let payload_pattern = format!("%\"question_id\":\"{}\"%", target_node_id);
+    let mut stmt = conn.prepare(
+        "SELECT id, slug, question_id, question_json, deferred_at, next_check_at,
+                check_interval, triage_reason, contribution_id
+         FROM pyramid_deferred_questions
+         WHERE slug = ?1 AND (question_id = ?2 OR question_json LIKE ?3)
+         ORDER BY deferred_at ASC",
+    )?;
+    let rows = stmt.query_map(
+        rusqlite::params![slug, target_node_id, payload_pattern],
+        |r| {
+            Ok(DeferredQuestion {
+                id: r.get(0)?,
+                slug: r.get(1)?,
+                question_id: r.get(2)?,
+                question_json: r.get(3)?,
+                deferred_at: r.get(4)?,
+                next_check_at: r.get(5)?,
+                check_interval: r.get(6)?,
+                triage_reason: r.get(7)?,
+                contribution_id: r.get(8)?,
+            })
+        },
+    )?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// Remove a deferred question (called when triage decides to answer
+/// or skip it on re-evaluation).
+pub fn remove_deferred(
+    conn: &Connection,
+    slug: &str,
+    question_id: &str,
+) -> Result<()> {
+    conn.execute(
+        "DELETE FROM pyramid_deferred_questions WHERE slug = ?1 AND question_id = ?2",
+        rusqlite::params![slug, question_id],
+    )?;
+    Ok(())
+}
+
+/// Update the `next_check_at` + `contribution_id` for an existing
+/// deferred question. Called when triage on re-evaluation returns
+/// `Defer` again but the interval (or the triggering policy) has
+/// changed.
+pub fn update_deferred_next_check(
+    conn: &Connection,
+    slug: &str,
+    question_id: &str,
+    check_interval: &str,
+    contribution_id: Option<&str>,
+) -> Result<()> {
+    let trimmed = check_interval.trim().to_lowercase();
+    if trimmed == "never" || trimmed == "on_demand" {
+        conn.execute(
+            "UPDATE pyramid_deferred_questions SET
+                next_check_at = '9999-12-31 00:00:00',
+                check_interval = ?1,
+                contribution_id = ?2
+             WHERE slug = ?3 AND question_id = ?4",
+            rusqlite::params![check_interval, contribution_id, slug, question_id],
+        )?;
+    } else {
+        let modifier = parse_check_interval_to_next_check_at(check_interval);
+        conn.execute(
+            "UPDATE pyramid_deferred_questions SET
+                next_check_at = datetime('now', ?1),
+                check_interval = ?2,
+                contribution_id = ?3
+             WHERE slug = ?4 AND question_id = ?5",
+            rusqlite::params![modifier, check_interval, contribution_id, slug, question_id],
+        )?;
+    }
     Ok(())
 }
 
@@ -13334,5 +14033,246 @@ mod import_state_tests {
         assert!(load_import_state(&conn, "roundtrip").unwrap().is_none());
         create_import_state(&conn, "roundtrip", "wire:b", "/tmp").unwrap();
         assert!(load_import_state(&conn, "roundtrip").unwrap().is_some());
+    }
+}
+
+// ── Phase 12: demand signal and deferred question tests ──────────────────
+
+#[cfg(test)]
+mod phase12_tests {
+    use super::*;
+
+    fn mem_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        init_pyramid_db(&conn).unwrap();
+        conn
+    }
+
+    #[test]
+    fn test_insert_demand_signal_and_sum() {
+        let conn = mem_conn();
+        insert_demand_signal(
+            &conn,
+            "test-slug",
+            "node-1",
+            "agent_query",
+            Some("agent-alice"),
+            1.0,
+            Some("node-1"),
+        )
+        .unwrap();
+        insert_demand_signal(
+            &conn,
+            "test-slug",
+            "node-1",
+            "agent_query",
+            Some("agent-bob"),
+            0.7,
+            Some("node-1"),
+        )
+        .unwrap();
+
+        let total =
+            sum_demand_weight(&conn, "test-slug", "node-1", "agent_query", "-7 days").unwrap();
+        assert!((total - 1.7).abs() < 1e-9);
+
+        // Different signal type returns 0
+        let user_total =
+            sum_demand_weight(&conn, "test-slug", "node-1", "user_drill", "-7 days").unwrap();
+        assert_eq!(user_total, 0.0);
+    }
+
+    #[test]
+    fn test_load_parents_via_evidence_keeps_only_keep_verdicts() {
+        let conn = mem_conn();
+        // KEEP edge: child → parent
+        conn.execute(
+            "INSERT INTO pyramid_evidence
+                (slug, build_id, source_node_id, target_node_id, verdict, weight, reason)
+             VALUES (?1, '', 'child', 'parent', 'KEEP', 1.0, 'test')",
+            rusqlite::params!["s"],
+        )
+        .unwrap();
+        // DISCONNECT edge (should be filtered)
+        conn.execute(
+            "INSERT INTO pyramid_evidence
+                (slug, build_id, source_node_id, target_node_id, verdict, weight, reason)
+             VALUES (?1, '', 'child', 'other_parent', 'DISCONNECT', 0.0, 'test')",
+            rusqlite::params!["s"],
+        )
+        .unwrap();
+
+        let parents = load_parents_via_evidence(&conn, "s", "child").unwrap();
+        assert_eq!(parents, vec!["parent".to_string()]);
+    }
+
+    #[test]
+    fn test_defer_question_and_list_expired() {
+        let conn = mem_conn();
+
+        // Defer a question with a very short interval.
+        defer_question(
+            &conn,
+            "s",
+            "Q1",
+            r#"{"question_id":"Q1","question_text":"?","layer":1,"about":"","creates":""}"#,
+            "1m",
+            Some("test"),
+            Some("contrib-1"),
+        )
+        .unwrap();
+
+        // Initially `next_check_at` is 1 minute in the future → not expired.
+        let expired_now = list_expired_deferred(&conn, "s").unwrap();
+        assert_eq!(expired_now.len(), 0);
+
+        // Rewrite next_check_at to the past to simulate expiration.
+        conn.execute(
+            "UPDATE pyramid_deferred_questions SET next_check_at = '2020-01-01 00:00:00'
+             WHERE slug = 's' AND question_id = 'Q1'",
+            [],
+        )
+        .unwrap();
+
+        let expired_later = list_expired_deferred(&conn, "s").unwrap();
+        assert_eq!(expired_later.len(), 1);
+        assert_eq!(expired_later[0].question_id, "Q1");
+    }
+
+    #[test]
+    fn test_defer_question_never_is_excluded_from_expired() {
+        let conn = mem_conn();
+        defer_question(
+            &conn,
+            "s",
+            "Q_NEVER",
+            r#"{"question_id":"Q_NEVER","question_text":"?","layer":1,"about":"","creates":""}"#,
+            "never",
+            Some("skip"),
+            None,
+        )
+        .unwrap();
+
+        // Manually set next_check_at into the past.
+        conn.execute(
+            "UPDATE pyramid_deferred_questions SET next_check_at = '2020-01-01 00:00:00'
+             WHERE slug = 's' AND question_id = 'Q_NEVER'",
+            [],
+        )
+        .unwrap();
+
+        // Expired-scan should NOT include 'never' rows.
+        let expired = list_expired_deferred(&conn, "s").unwrap();
+        assert_eq!(expired.len(), 0);
+
+        // list_all_deferred SHOULD include it.
+        let all = list_all_deferred(&conn, "s").unwrap();
+        assert_eq!(all.len(), 1);
+    }
+
+    #[test]
+    fn test_remove_and_update_deferred() {
+        let conn = mem_conn();
+        defer_question(
+            &conn,
+            "s",
+            "Q",
+            r#"{"question_id":"Q","question_text":"?","layer":1,"about":"","creates":""}"#,
+            "30d",
+            Some("slow"),
+            Some("c-1"),
+        )
+        .unwrap();
+
+        // Update the interval + contribution id.
+        update_deferred_next_check(&conn, "s", "Q", "7d", Some("c-2")).unwrap();
+
+        let all = list_all_deferred(&conn, "s").unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].check_interval, "7d");
+        assert_eq!(all[0].contribution_id.as_deref(), Some("c-2"));
+
+        // Remove it.
+        remove_deferred(&conn, "s", "Q").unwrap();
+        let all = list_all_deferred(&conn, "s").unwrap();
+        assert_eq!(all.len(), 0);
+    }
+
+    #[test]
+    fn test_load_active_evidence_policy_fills_defaults_when_missing() {
+        let conn = mem_conn();
+        // No row → default policy.
+        let policy = load_active_evidence_policy(&conn, Some("nonexistent-slug")).unwrap();
+        assert!(policy.triage_rules.is_empty());
+        assert!(policy.demand_signals.is_empty());
+        assert_eq!(policy.demand_signal_attenuation.factor, 0.5);
+        assert_eq!(policy.demand_signal_attenuation.floor, 0.1);
+        assert_eq!(policy.demand_signal_attenuation.max_depth, 6);
+    }
+
+    #[test]
+    fn test_load_active_evidence_policy_parses_stored_rules() {
+        let conn = mem_conn();
+        // Insert a contribution row so the FK is satisfied.
+        conn.execute(
+            "INSERT INTO pyramid_config_contributions
+                (contribution_id, slug, schema_type, yaml_content, status)
+             VALUES ('c-pol-1', 'test', 'evidence_policy', '', 'active')",
+            [],
+        )
+        .unwrap();
+
+        let yaml = EvidencePolicyYaml {
+            triage_rules: Some(vec![TriageRuleYaml {
+                condition: "first_build AND depth == 1".into(),
+                action: "answer".into(),
+                model_tier: Some("fast_extract".into()),
+                check_interval: None,
+                priority: None,
+            }]),
+            demand_signals: Some(vec![DemandSignalRuleYaml {
+                r#type: "agent_query".into(),
+                threshold: 2.0,
+                window: "-14 days".into(),
+            }]),
+            budget: Some(PolicyBudgetYaml {
+                maintenance_model_tier: Some("stale_local".into()),
+                ..Default::default()
+            }),
+            demand_signal_attenuation: None,
+        };
+        upsert_evidence_policy(&conn, &Some("test".to_string()), &yaml, "c-pol-1").unwrap();
+
+        let loaded = load_active_evidence_policy(&conn, Some("test")).unwrap();
+        assert_eq!(loaded.triage_rules.len(), 1);
+        assert_eq!(loaded.triage_rules[0].action, "answer");
+        assert_eq!(loaded.demand_signals.len(), 1);
+        assert_eq!(loaded.demand_signals[0].threshold, 2.0);
+        assert_eq!(
+            loaded.budget.maintenance_model_tier.as_deref(),
+            Some("stale_local")
+        );
+        assert_eq!(loaded.contribution_id.as_deref(), Some("c-pol-1"));
+        assert!(!loaded.policy_yaml_hash.is_empty());
+    }
+
+    #[test]
+    fn test_parse_check_interval_never_and_on_demand() {
+        assert_eq!(
+            parse_check_interval_to_next_check_at("never"),
+            "9999-12-31 00:00:00"
+        );
+        assert_eq!(
+            parse_check_interval_to_next_check_at("on_demand"),
+            "9999-12-31 00:00:00"
+        );
+    }
+
+    #[test]
+    fn test_parse_check_interval_short_forms() {
+        assert_eq!(parse_check_interval_to_next_check_at("7d"), "+7 days");
+        assert_eq!(parse_check_interval_to_next_check_at("30d"), "+30 days");
+        assert_eq!(parse_check_interval_to_next_check_at("1h"), "+1 hours");
+        assert_eq!(parse_check_interval_to_next_check_at("2w"), "+14 days");
     }
 }

@@ -9,6 +9,7 @@ use tokio::sync::Mutex;
 use tracing::info;
 
 use crate::pyramid::llm::LlmConfig;
+use crate::pyramid::step_context::make_step_ctx_from_llm_config;
 use crate::pyramid::{db, llm, types::*};
 
 // ── Meta analysis passes ─────────────────────────────────────────────────────
@@ -63,7 +64,23 @@ Output the timeline as plain text (not JSON). Be concise but capture the arc."#,
     let cfg = base_config.clone_with_model_override(model);
     let system_prompt =
         "You are a meta-analysis engine for a knowledge pyramid. Produce clear, concise analysis.";
-    let result = llm::call_model(&cfg, system_prompt, &prompt, 0.3, 2000).await?;
+    let cache_ctx = make_step_ctx_from_llm_config(
+        &cfg,
+        "meta_timeline_forward",
+        "meta",
+        -1,
+        None,
+        system_prompt,
+    );
+    let result = llm::call_model_and_ctx(
+        &cfg,
+        cache_ctx.as_ref(),
+        system_prompt,
+        &prompt,
+        0.3,
+        2000,
+    )
+    .await?;
 
     // Save as META node
     save_meta_node(
@@ -105,7 +122,23 @@ Output the reverse analysis as plain text. Be concise."#,
     let cfg = base_config.clone_with_model_override(model);
     let system_prompt =
         "You are a meta-analysis engine for a knowledge pyramid. Produce clear, concise analysis.";
-    let result = llm::call_model(&cfg, system_prompt, &prompt, 0.3, 2000).await?;
+    let cache_ctx = make_step_ctx_from_llm_config(
+        &cfg,
+        "meta_timeline_backward",
+        "meta",
+        -1,
+        None,
+        system_prompt,
+    );
+    let result = llm::call_model_and_ctx(
+        &cfg,
+        cache_ctx.as_ref(),
+        system_prompt,
+        &prompt,
+        0.3,
+        2000,
+    )
+    .await?;
 
     save_meta_node(
         writer,
@@ -149,7 +182,23 @@ Output the narrative as plain text. This should read like a story, not a report.
     let cfg = base_config.clone_with_model_override(model);
     let system_prompt =
         "You are a meta-analysis engine for a knowledge pyramid. Produce clear, concise analysis.";
-    let result = llm::call_model(&cfg, system_prompt, &prompt, 0.3, 2000).await?;
+    let cache_ctx = make_step_ctx_from_llm_config(
+        &cfg,
+        "meta_narrative",
+        "meta",
+        -1,
+        None,
+        system_prompt,
+    );
+    let result = llm::call_model_and_ctx(
+        &cfg,
+        cache_ctx.as_ref(),
+        system_prompt,
+        &prompt,
+        0.3,
+        2000,
+    )
+    .await?;
 
     save_meta_node(writer, slug, "META-narrative", "Narrative", &result).await?;
 
@@ -215,7 +264,23 @@ Produce the quickstart (target: under 1500 tokens). The reader should have the s
     let cfg = base_config.clone_with_model_override(model);
     let system_prompt =
         "You are a meta-analysis engine for a knowledge pyramid. Produce clear, concise analysis.";
-    let result = llm::call_model(&cfg, system_prompt, &prompt, 0.2, 2000).await?;
+    let cache_ctx = make_step_ctx_from_llm_config(
+        &cfg,
+        "meta_quickstart",
+        "meta",
+        -1,
+        None,
+        system_prompt,
+    );
+    let result = llm::call_model_and_ctx(
+        &cfg,
+        cache_ctx.as_ref(),
+        system_prompt,
+        &prompt,
+        0.2,
+        2000,
+    )
+    .await?;
 
     save_meta_node(writer, slug, "META-quickstart", "Quickstart", &result).await?;
 

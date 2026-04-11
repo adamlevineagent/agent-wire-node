@@ -15,7 +15,8 @@ use uuid::Uuid;
 use super::config_helper::estimate_cost;
 use super::db;
 use super::llm::LlmConfig;
-use super::llm::{call_model_with_usage, extract_json};
+use super::llm::{call_model_and_ctx, call_model_with_usage_and_ctx, extract_json};
+use super::step_context::make_step_ctx_from_llm_config;
 use super::types::{FaqCategory, FaqCategoryEntry, FaqDirectory, FaqNode, PyramidAnnotation};
 
 /// Called after every annotation is saved.
@@ -88,7 +89,23 @@ pub async fn process_annotation(
     // credential_store) instead of building a fresh LlmConfig.
     let config = base_config.clone_with_model_override(model);
 
-    let response = super::llm::call_model(&config, system_prompt, &user_prompt, 0.1, 100).await?;
+    let cache_ctx = make_step_ctx_from_llm_config(
+        &config,
+        "faq_match_existing",
+        "faq",
+        -1,
+        None,
+        system_prompt,
+    );
+    let response = call_model_and_ctx(
+        &config,
+        cache_ctx.as_ref(),
+        system_prompt,
+        &user_prompt,
+        0.1,
+        100,
+    )
+    .await?;
     let response = response.trim();
 
     if let Some(faq_id) = response.strip_prefix("MATCH:") {
@@ -249,7 +266,23 @@ async fn match_faq_with_llm(
     // credential_store) instead of building a fresh LlmConfig.
     let config = base_config.clone_with_model_override(model);
 
-    let response = super::llm::call_model(&config, system_prompt, &user_prompt, 0.1, 100).await?;
+    let cache_ctx = make_step_ctx_from_llm_config(
+        &config,
+        "faq_disambiguate",
+        "faq",
+        -1,
+        None,
+        system_prompt,
+    );
+    let response = call_model_and_ctx(
+        &config,
+        cache_ctx.as_ref(),
+        system_prompt,
+        &user_prompt,
+        0.1,
+        100,
+    )
+    .await?;
     let response = response.trim();
 
     if response == "NONE" {
@@ -304,8 +337,23 @@ pub async fn update_faq_answer(
         new_annotation.question_context.as_deref().unwrap_or("(none)")
     );
 
-    let updated_answer =
-        super::llm::call_model(&config, system_prompt, &user_prompt, 0.3, 2000).await?;
+    let update_ctx = make_step_ctx_from_llm_config(
+        &config,
+        "faq_update_answer",
+        "faq",
+        -1,
+        None,
+        system_prompt,
+    );
+    let updated_answer = call_model_and_ctx(
+        &config,
+        update_ctx.as_ref(),
+        system_prompt,
+        &user_prompt,
+        0.3,
+        2000,
+    )
+    .await?;
 
     // Append the new annotation ID
     if !faq.annotation_ids.contains(&new_annotation.id) {
@@ -336,7 +384,24 @@ pub async fn update_faq_answer(
             "Current question: {}\nAccumulated triggers: {}\nNew annotation: {}",
             faq.question, triggers_list, new_annotation.content
         );
-        match super::llm::call_model(&config, regen_system, &regen_user, 0.2, 200).await {
+        let regen_ctx = make_step_ctx_from_llm_config(
+            &config,
+            "faq_regeneralize",
+            "faq",
+            -1,
+            None,
+            regen_system,
+        );
+        match call_model_and_ctx(
+            &config,
+            regen_ctx.as_ref(),
+            regen_system,
+            &regen_user,
+            0.2,
+            200,
+        )
+        .await
+        {
             Ok(regen_response) => {
                 let regen_response = regen_response.trim();
                 if regen_response != "NO_CHANGE" && !regen_response.is_empty() {
@@ -402,7 +467,24 @@ async fn create_new_faq(
             question, generalized_text
         );
 
-        match super::llm::call_model(&config, gen_system, &gen_user, 0.2, 200).await {
+        let gen_ctx = make_step_ctx_from_llm_config(
+            &config,
+            "faq_generalize",
+            "faq",
+            -1,
+            None,
+            gen_system,
+        );
+        match call_model_and_ctx(
+            &config,
+            gen_ctx.as_ref(),
+            gen_system,
+            &gen_user,
+            0.2,
+            200,
+        )
+        .await
+        {
             Ok(generalized_question) => {
                 let generalized_question = generalized_question.trim().to_string();
                 if generalized_question.is_empty() {
@@ -590,8 +672,23 @@ Return ONLY valid JSON: an array of objects with fields "name", "faq_ids", and "
     // Phase 3 fix pass: clone the live config (preserves provider_registry +
     // credential_store) instead of building a fresh `config_for_model`.
     let config = base_config.clone_with_model_override(model);
-    let (response, usage) =
-        call_model_with_usage(&config, system_prompt, &user_prompt, 0.3, 4096).await?;
+    let cat_ctx = make_step_ctx_from_llm_config(
+        &config,
+        "faq_categorize",
+        "faq",
+        -1,
+        None,
+        system_prompt,
+    );
+    let (response, usage) = call_model_with_usage_and_ctx(
+        &config,
+        cat_ctx.as_ref(),
+        system_prompt,
+        &user_prompt,
+        0.3,
+        4096,
+    )
+    .await?;
 
     // Log cost
     let cost = estimate_cost(&usage);

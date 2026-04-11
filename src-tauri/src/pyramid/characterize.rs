@@ -18,6 +18,7 @@ use tracing::{info, warn};
 
 use super::llm::{self, LlmConfig};
 use super::question_decomposition;
+use super::step_context::make_step_ctx_from_llm_config;
 use super::types::CharacterizationResult;
 use super::Tier1Config;
 
@@ -144,8 +145,17 @@ Analyze this material and produce the characterization."#,
     for attempt in 0..2u32 {
         let temp = if attempt == 0 { temperature } else { 0.1 };
 
-        let response = llm::call_model_unified(
+        let cache_ctx = make_step_ctx_from_llm_config(
             llm_config,
+            "characterize",
+            "characterize",
+            0,
+            None,
+            &system_prompt,
+        );
+        let response = llm::call_model_unified_and_ctx(
+            llm_config,
+            cache_ctx.as_ref(),
             &system_prompt,
             &user_prompt,
             temp,

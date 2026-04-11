@@ -3047,10 +3047,149 @@ async fn pyramid_drill(
     slug: String,
     node_id: String,
 ) -> Result<DrillResult, String> {
-    let conn = state.pyramid.reader.lock().await;
-    pyramid_query::drill(&conn, &slug, &node_id)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "Node not found".to_string())
+    let result = {
+        let conn = state.pyramid.reader.lock().await;
+        pyramid_query::drill(&conn, &slug, &node_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "Node not found".to_string())?
+    };
+
+    // Phase 12: fire-and-forget user_drill demand signal recording.
+    // The IPC drill is always user-initiated (desktop UI), so we
+    // always record `user_drill` with source "user".
+    let writer = state.pyramid.writer.clone();
+    let slug_for_signal = slug.clone();
+    let node_for_signal = node_id.clone();
+    tokio::spawn(async move {
+        let conn = writer.lock().await;
+        let policy = match wire_node_lib::pyramid::db::load_active_evidence_policy(
+            &conn,
+            Some(&slug_for_signal),
+        ) {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let _ = wire_node_lib::pyramid::demand_signal::record_demand_signal(
+            &conn,
+            &slug_for_signal,
+            &node_for_signal,
+            "user_drill",
+            Some("user"),
+            &policy,
+        );
+    });
+
+    Ok(result)
+}
+
+/// Phase 12: Re-evaluate all deferred evidence questions against the
+/// current active evidence_policy. Called by the ToolsMode policy
+/// editor after a supersession, or manually by the user via the
+/// "Apply to all deferred" button.
+#[tauri::command]
+async fn pyramid_reevaluate_deferred_questions(
+    state: tauri::State<'_, SharedState>,
+    slug: String,
+) -> Result<ReevaluateDeferredResult, String> {
+    use wire_node_lib::pyramid::db;
+    use wire_node_lib::pyramid::triage::{resolve_decision, TriageDecision, TriageFacts};
+    use wire_node_lib::pyramid::types::LayerQuestion;
+
+    let writer = state.pyramid.writer.clone();
+    // Acquire the writer lock OUTSIDE the spawn_blocking (async),
+    // then hold it across the sync block by passing the locked guard
+    // through an owned path. Simpler: do the whole thing in the async
+    // context by using a blocking-safe DB path read instead.
+    let conn = writer.lock().await;
+    let result = tokio::task::block_in_place(move || -> Result<ReevaluateDeferredResult, String> {
+        let policy = db::load_active_evidence_policy(&conn, Some(&slug))
+            .map_err(|e| format!("load policy: {e}"))?;
+        let deferred = db::list_all_deferred(&conn, &slug).map_err(|e| e.to_string())?;
+        let mut result = ReevaluateDeferredResult {
+            evaluated: 0,
+            activated: 0,
+            still_deferred: 0,
+            skipped: 0,
+        };
+        // Phase 12 wanderer fix: evaluate has_demand_signals once at
+        // slug granularity, not per-question. Per-node aggregation
+        // by question.question_id never matched because question_id
+        // is a q-{sha256} hash while demand signals land on
+        // L{layer}-{seq} node ids. See
+        // evidence_answering::run_triage_gate for the matching fix
+        // and rationale.
+        let slug_has_demand_signals = policy.demand_signals.iter().any(|rule| {
+            let w = rule.window.trim();
+            let window = if w.starts_with('-') || w.contains(' ') {
+                w.to_string()
+            } else {
+                let (num_part, unit_part): (String, String) =
+                    w.chars().partition(|c| c.is_ascii_digit());
+                let n: i64 = num_part.parse().unwrap_or(14);
+                let (n, unit) = match unit_part.as_str() {
+                    "d" => (n, "days"),
+                    "h" => (n, "hours"),
+                    "w" => (n * 7, "days"),
+                    "m" => (n, "minutes"),
+                    _ => (n, "days"),
+                };
+                format!("-{} {}", n, unit)
+            };
+            db::sum_slug_demand_weight(&conn, &slug, &rule.r#type, &window)
+                .unwrap_or(0.0)
+                >= rule.threshold
+        });
+
+        for row in deferred {
+            result.evaluated += 1;
+            let question: LayerQuestion = match serde_json::from_str(&row.question_json) {
+                Ok(q) => q,
+                Err(_) => continue,
+            };
+            let facts = TriageFacts {
+                question: &question,
+                target_node_distilled: None,
+                target_node_depth: Some(question.layer),
+                is_first_build: false,
+                is_stale_check: true,
+                has_demand_signals: slug_has_demand_signals,
+                evidence_question_trivial: None,
+                evidence_question_high_value: None,
+            };
+            match resolve_decision(&policy, &facts).map_err(|e| e.to_string())? {
+                TriageDecision::Answer { .. } => {
+                    if db::remove_deferred(&conn, &slug, &question.question_id).is_ok() {
+                        result.activated += 1;
+                    }
+                }
+                TriageDecision::Defer { check_interval, .. } => {
+                    let _ = db::update_deferred_next_check(
+                        &conn,
+                        &slug,
+                        &question.question_id,
+                        &check_interval,
+                        policy.contribution_id.as_deref(),
+                    );
+                    result.still_deferred += 1;
+                }
+                TriageDecision::Skip { .. } => {
+                    if db::remove_deferred(&conn, &slug, &question.question_id).is_ok() {
+                        result.skipped += 1;
+                    }
+                }
+            }
+        }
+        Ok(result)
+    });
+    result
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct ReevaluateDeferredResult {
+    evaluated: u64,
+    activated: u64,
+    still_deferred: u64,
+    skipped: u64,
 }
 
 #[tauri::command]
@@ -3300,9 +3439,15 @@ async fn post_build_seed(
     // credential_store) so PyramidStaleEngine carries the registry path
     // through every dispatched helper, instead of pulling raw api_key/model
     // strings that drop both runtime handles.
+    // Phase 12 verifier fix: attach cache_access so stale-path helpers
+    // that use make_step_ctx_from_llm_config (e.g. faq::run_faq_category_meta_pass
+    // dispatched from drain_and_dispatch) reach the step cache.
     let (base_config, model) = {
         let cfg = pyramid_state.config.read().await;
-        (cfg.clone(), cfg.primary_model.clone())
+        let base_id = format!("stale-{}", slug);
+        let with_cache = pyramid_state.attach_cache_access(cfg.clone(), slug, &base_id);
+        let model = cfg.primary_model.clone();
+        (with_cache, model)
     };
 
     let config = {
@@ -4482,7 +4627,12 @@ async fn pyramid_characterize(
         }
     };
 
-    let llm_config = state.pyramid.config.read().await.clone();
+    // Phase 12 verifier fix: attach cache_access so characterize retrofit
+    // reaches the step cache.
+    let llm_config = state
+        .pyramid
+        .llm_config_with_cache(&slug, &format!("characterize-{}", slug))
+        .await;
 
     match wire_node_lib::pyramid::characterize::characterize(
         &resolved_source_path,
@@ -4527,7 +4677,12 @@ async fn pyramid_meta_run(
     // Phase 3 fix pass: clone the live LlmConfig (with provider_registry +
     // credential_store) instead of pulling raw api_key/model strings, so
     // run_all_meta_passes stays on the registry path.
-    let base_config = state.pyramid.config.read().await.clone();
+    // Phase 12 verifier fix: attach cache_access so meta retrofit sites
+    // reach the step cache.
+    let base_config = state
+        .pyramid
+        .llm_config_with_cache(&slug, &format!("meta-{}", slug))
+        .await;
     let model = base_config.primary_model.clone();
 
     let reader = state.pyramid.reader.clone();
@@ -5962,9 +6117,16 @@ async fn pyramid_auto_update_config_init(
             // Phase 3 fix pass: clone the live LlmConfig (with provider_registry +
             // credential_store) so PyramidStaleEngine carries the registry path
             // through every dispatched helper.
+            // Phase 12 verifier fix: attach cache_access so stale helpers
+            // (faq, etc.) that read llm_config.cache_access reach the cache.
             let (base_config, model) = {
                 let cfg = state.pyramid.config.read().await;
-                (cfg.clone(), cfg.primary_model.clone())
+                let stale_build_id = format!("stale-{}", slug);
+                let with_cache = state
+                    .pyramid
+                    .attach_cache_access(cfg.clone(), &slug, &stale_build_id);
+                let model = cfg.primary_model.clone();
+                (with_cache, model)
             };
 
             let mut engine = wire_node_lib::pyramid::stale_engine::PyramidStaleEngine::new(
@@ -6449,7 +6611,12 @@ async fn pyramid_faq_directory(
 ) -> Result<serde_json::Value, String> {
     // Phase 3 fix pass: clone the live LlmConfig (with provider_registry +
     // credential_store) so faq::get_faq_directory stays on the registry path.
-    let base_config = state.pyramid.config.read().await.clone();
+    // Phase 12 verifier fix: attach cache_access so faq retrofit sites
+    // reach the step cache.
+    let base_config = state
+        .pyramid
+        .llm_config_with_cache(&slug, &format!("faq-dir-{}", slug))
+        .await;
     let model = base_config.primary_model.clone();
 
     let directory = pyramid_faq::get_faq_directory(
@@ -8942,6 +9109,7 @@ fn main() {
             pyramid_node,
             pyramid_tree,
             pyramid_drill,
+            pyramid_reevaluate_deferred_questions,
             pyramid_list_question_overlays,
             pyramid_search,
             pyramid_get_references,

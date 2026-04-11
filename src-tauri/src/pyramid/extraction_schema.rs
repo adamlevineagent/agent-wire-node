@@ -20,6 +20,7 @@ use tracing::{info, warn};
 
 use super::llm::{self, LlmConfig};
 use super::question_decomposition::{render_prompt_template, QuestionNode, QuestionTree};
+use super::step_context::make_step_ctx_from_llm_config;
 use super::types::{ExtractionSchema, SynthesisPrompts, TopicField};
 use super::Tier1Config;
 
@@ -130,8 +131,17 @@ The extraction prompt you produce will be used to describe source files. Those d
     for attempt in 0..2u32 {
         let temp = if attempt == 0 { temperature } else { 0.1 };
 
-        let response = llm::call_model_unified(
+        let cache_ctx = make_step_ctx_from_llm_config(
             llm_config,
+            "extraction_schema",
+            "extraction_schema",
+            0,
+            None,
+            &system_prompt,
+        );
+        let response = llm::call_model_unified_and_ctx(
+            llm_config,
+            cache_ctx.as_ref(),
             &system_prompt,
             &user_prompt,
             temp,
@@ -269,8 +279,17 @@ Design synthesis prompts that will combine this extracted evidence into answers 
     for attempt in 0..2u32 {
         let temp = if attempt == 0 { temperature } else { 0.1 };
 
-        let response = llm::call_model_unified(
+        let cache_ctx = make_step_ctx_from_llm_config(
             llm_config,
+            "synthesis_prompts",
+            "extraction_schema",
+            0,
+            None,
+            &system_prompt,
+        );
+        let response = llm::call_model_unified_and_ctx(
+            llm_config,
+            cache_ctx.as_ref(),
             &system_prompt,
             &user_prompt,
             temp,

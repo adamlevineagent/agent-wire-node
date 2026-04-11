@@ -258,12 +258,21 @@ pub async fn init_stale_engines(pyramid_state: &Arc<pyramid::PyramidState>) {
             continue;
         }
 
+        // Phase 12 verifier fix: attach cache_access per-slug so stale
+        // helpers that use make_step_ctx_from_llm_config (faq, etc.)
+        // reach the step cache.
+        let slug_base_config = pyramid_state.attach_cache_access(
+            base_config.clone(),
+            &slug,
+            &format!("stale-{}", slug),
+        );
+
         // Create the engine
         let mut engine = PyramidStaleEngine::new(
             &slug,
             config.clone(),
             &db_path,
-            base_config.clone(),
+            slug_base_config,
             &model,
             pyramid_state.operational.as_ref().clone(),
         );

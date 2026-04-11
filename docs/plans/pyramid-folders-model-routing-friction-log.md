@@ -1336,3 +1336,80 @@ Fix 2 (5xx rolling threshold): Added a new `pyramid_provider_error_log` table (i
 
 ---
 
+### 2026-04-10 — Phase 12 wanderer caught the ID-space mismatch + global-supersede deadzone
+
+The Phase 12 verifier pass correctly diagnosed the "retrofit was dead code" cluster and wired cache_access through every production entry point. It also fixed 4 other blocking bugs including the `is_first_build` hardcode and the `block_in_place` runtime flavor panic. What the verifier did not catch: **the entire triage-gate demand signal machinery was joining two disjoint ID spaces**, and **global evidence_policy supersessions silently dropped every re-eval**. Both bugs were structural rather than wiring-level, so the cache-plumbing audit didn't surface them.
+
+### Finding A — HIGH/CORRECTNESS: `question.question_id` is a q-hash, not a node_id (FIXED)
+
+Five call sites tried to join `pyramid_demand_signals.node_id` against `LayerQuestion.question_id`:
+
+1. `evidence_answering::run_triage_gate` (`sum_demand_weight(conn, slug, &question.question_id, ...)`) — the triage gate's `has_demand_signals` predicate.
+2. `stale_engine`'s DADBEAR deferred-question scanner.
+3. `config_contributions::reevaluate_deferred_questions` (on policy supersession).
+4. `main.rs::pyramid_reevaluate_deferred_questions` IPC handler.
+5. `demand_signal::record_demand_signal`'s on-demand reactivation hook via `list_deferred_by_question_target(conn, slug, drill_node_id)`.
+
+The ID spaces never meet:
+- `LayerQuestion.question_id` is a `q-{sha256_hex_first_12}` hash built by `question_decomposition::make_question_id(question, about, depth)` and assigned via `assign_question_ids` at decomposition time, **before** any answer exists.
+- `pyramid_demand_signals.node_id` holds the answered pyramid node's `L{layer}-{seq:03}` id assigned by `answer_single_question` at line 652 of evidence_answering.rs, **after** the question has been answered.
+- `pyramid_nodes` has no column that back-references a q-hash. No persistent q-hash → L-id mapping exists anywhere in the schema.
+
+Consequences:
+- The triage DSL's `has_demand_signals` condition always evaluated to false. The spec's canonical `"stale_check AND has_demand_signals → answer"` rule could never match.
+- The on-demand reactivation hook for `never`/`on_demand` deferred questions was a no-op on every real drill event.
+- Global/IPC/DADBEAR re-evaluation paths all had the same structural bug — they'd evaluate every question with `has_demand_signals = false`, so a demand-driven "please re-check" never took effect.
+
+The verifier's earlier fix to `list_deferred_by_question_target` corrected a column-name bug (JSON `target_node_id` → `question_id` column) but preserved the fundamental mismatch — both versions demand `question_id = drill_node_id`, which is never true in the ID space we actually have.
+
+**Fix:** switch all five sites to slug-level demand signal aggregation.
+
+- Added `db::sum_slug_demand_weight(conn, slug, signal_type, window_modifier)` that drops the `node_id` filter and sums across the entire slug.
+- Added `db::list_on_demand_deferred_for_slug(conn, slug)` that returns every `on_demand`/`never` deferred row on the slug (dropping the broken per-node join).
+- All five sites now compute `slug_has_demand_signals` once per triage pass and apply that single boolean to every question in the batch.
+- The `demand_signal::record_demand_signal` reactivation hook iterates the slug-scoped on-demand list, re-triages each with `has_demand_signals=true`, and removes rows whose decision flips to `Answer`.
+
+Per-slug aggregation loses the spatial precision the spec implies, but that precision is unimplementable without a persistent q-hash → node-id mapping (Phase 13+ scope). Per-slug is the correct semantics inside the schema we have and matches the spec's intent ("demand drives re-check").
+
+### Finding B — HIGH/CORRECTNESS: global evidence_policy supersession silently re-evaluated zero rows (FIXED)
+
+`config_contributions::reevaluate_deferred_questions(conn, slug: Option<&str>)` wrote `let slug_str = slug.unwrap_or("");` and then called `list_all_deferred(conn, slug_str)`. For a **global** evidence_policy contribution (`contribution.slug = NULL`), `contribution.slug.as_deref()` at config_contributions.rs:669 passes `None`, which collapsed to `slug_str = ""`, which matched zero rows in the `WHERE slug = ''` query. Every global-policy supersession silently dropped every deferred row re-evaluation.
+
+**Fix:** split the function into a global dispatcher and a per-slug worker. When `slug.is_none()`, the dispatcher walks `list_slugs_with_deferred_questions(conn)` (new helper) and recurses per-slug. The per-slug worker still loads policy via `load_active_evidence_policy(conn, Some(slug))` so per-slug overrides continue to win when they exist.
+
+### Findings that were NOT bugs
+
+Traced each of the 11 wanderer-focus questions end-to-end:
+
+- **Cache retrofit reaches cache in production.** Spot-checked 5 paths (evidence_answering::answer_single_question, faq::process_annotation match path, meta::timeline_forward, stale_helpers::check_file_stale, stale_helpers_upper::dispatch_node_stale_check). All build a cache-usable StepContext with non-empty `resolved_model_id` and `prompt_hash` and route through `..._and_ctx`. The verifier's cache_access plumbing is complete.
+- **No wiring gaps on cache_access clones/rebuilds.** Greped every `state.config.read().await.clone()` in the pyramid crate. Only 3 bare clones exist: (a) `chain_executor::retry_dead_letter_entry` (intentional no-cache), (b) `public_html/ascii_art.rs::ascii_handler` (intentional bypass), (c) `main.rs::get_config` (WireNodeConfig, not LlmConfig — different type). Every production LLM path goes through `llm_config_with_cache` or `attach_cache_access`.
+- **`is_first_build` DB lookup correct.** Single atomic SELECT; no TOCTOU. Depth-0 filter matches spec. SQLite errors default to `false` (safer than spurious-match `true`).
+- **DSL evaluator vocabulary complete.** Recursive-descent grammar with correct C-style precedence. `depth == N` handled specially. `evidence_question_trivial`/`_high_value` default to `false` when the classifier didn't run (safe fallback). `rule_to_decision` unknown actions fall through to Answer.
+- **Deferred question data integrity.** UPSERT on `(slug, question_id)` prevents double-defer. SQLite writer lock serializes remove vs update races to zero.
+- **Retrofit step metadata correct.** 3 spot-checked sites have distinct `(step_name, primitive, depth, chunk_index)`. Cache key is `(inputs_hash, prompt_hash, model_id)`, so two retrofit sites with identical content share a cache row — semantically correct.
+- **`block_in_place` runtime-flavor wrap correct.** Both probe and store paths dispatch on `Handle::try_current()` → `runtime_flavor()`; MultiThread donates the thread, CurrentThread runs inline. DB open + SELECT is sub-ms so inline is safe.
+- **DADBEAR scanner non-blocking.** Runs inside `spawn_blocking` with its own DB connection; doesn't hold the writer mutex.
+
+### Non-blocking concerns surfaced (not fixed)
+
+- **The `make_step_ctx_from_llm_config` helper hardcodes `with_model_resolution("primary", config.primary_model.clone())`** — every retrofit site using this helper records `tier_id = "primary"` regardless of what tier the call actually resolves through. Minor telemetry inaccuracy; doesn't affect cache correctness because `tier_id` isn't in the cache key. Fix later by threading the resolved tier through the helper.
+- **`evidence_answering::answer_single_question` at line 904 hardcodes `with_model_resolution("fast_extract", ...)`** regardless of the actual tier resolved for the answering call. Same minor telemetry inaccuracy; same fix-later note.
+- **`rule_to_decision`'s `TagForLog` trait is a no-op placeholder.** The implementer flagged it in their log as dead code. Cosmetic only; trait method is called but does nothing. Safe to delete in a cleanup pass.
+- **Phase 12's retrofit table has a `search_hit` signal recording deferral** — Wire Node can't tell "drill came from a search" without a session tracking mechanism. Phase 13+ scope per the implementer's deviation note. Not a wanderer fix.
+- **A persistent q-hash → node-id mapping would let the triage gate's demand signals go back to spatial precision** instead of slug aggregation. Proposal for Phase 13+: add `pyramid_question_node_map(slug, question_id, node_id)` populated at answer persistence time in `chain_executor.rs:5265` where `save_node` already knows both identities. Once that table exists, `sum_demand_weight` can replace `sum_slug_demand_weight` at every wanderer-fixed site, and `list_deferred_by_question_target` can do a real join through the map.
+
+### Commit
+
+`phase-12: wanderer fix — slug-level demand signal aggregation + global-policy reeval dispatcher`
+
+### Verification after fix
+
+- `cargo check --lib`: 3 pre-existing warnings only. No new warnings.
+- `cargo test --lib pyramid`: **1101 passing / 7 failing** (baseline 1099/7). Delta: +2 new tests (`test_sum_slug_demand_weight_aggregates_across_nodes`, `test_list_on_demand_deferred_for_slug`). Same 7 pre-existing failures.
+
+### Lesson for future phases
+
+**When a phase introduces a new join across two subsystems, grep for the column names on both sides and verify they share an ID space.** Phase 12's implementer and verifier both assumed `question_id == target_node_id` because of comments in `question_decomposition.rs` that set `question_id = node.id`, where `node` is a QuestionNode (q-hash), not a PyramidNode (L-id). The same identifier name across two types masked the mismatch. A grep for `question_id` usages in both `question_decomposition.rs` and `pyramid_nodes` would have surfaced that `pyramid_nodes` has no such column — which is the tell that the join can't work. The wanderer's value here is stepping outside "does the wiring connect?" to ask "do the two ends of the wire carry the same thing?"
+
+---
+

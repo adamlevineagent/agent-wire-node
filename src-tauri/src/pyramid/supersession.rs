@@ -18,6 +18,7 @@ use tracing::{info, warn};
 
 use super::db;
 use super::llm::{self, LlmConfig};
+use super::step_context::make_step_ctx_from_llm_config;
 use super::types::{AffectedNode, Contradiction, EvidenceVerdict, PyramidNode, SupersessionTrace};
 
 // ── Constants (loaded from OperationalConfig) ─────────────────────────────────
@@ -110,8 +111,17 @@ pub async fn detect_contradictions(
          existing claims."
     );
 
-    let response = llm::call_model_unified(
+    let cache_ctx = make_step_ctx_from_llm_config(
         llm_config,
+        "supersession_detect_contradictions",
+        "supersession",
+        affected_l0_node.depth,
+        None,
+        system_prompt,
+    );
+    let response = llm::call_model_unified_and_ctx(
+        llm_config,
+        cache_ctx.as_ref(),
         system_prompt,
         &user_prompt,
         0.1, // low temperature for factual analysis

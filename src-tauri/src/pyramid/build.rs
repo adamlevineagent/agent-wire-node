@@ -23,7 +23,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use super::db;
-use super::llm::{call_model, extract_json, LlmConfig};
+use super::llm::{call_model_and_ctx, extract_json, LlmConfig};
+use super::step_context::make_step_ctx_from_llm_config;
 use super::naming::headline_from_analysis;
 use super::types::*;
 
@@ -427,12 +428,46 @@ pub(crate) async fn call_and_parse(
     user: &str,
     fallback_key: &str,
 ) -> Result<Value> {
-    let resp = call_model(config, system, user, 0.3, 50_000).await?;
+    let cache_ctx = make_step_ctx_from_llm_config(
+        config,
+        fallback_key,
+        "build_call_and_parse",
+        0,
+        None,
+        system,
+    );
+    let resp = call_model_and_ctx(
+        config,
+        cache_ctx.as_ref(),
+        system,
+        user,
+        0.3,
+        50_000,
+    )
+    .await?;
     match extract_json(&resp) {
         Ok(v) => Ok(v),
         Err(_) => {
             info!("  JSON parse error on {fallback_key}, retrying at temp 0.1...");
-            let resp2 = call_model(config, system, user, 0.1, 50_000).await?;
+            // Retry at lower temperature uses the same StepContext so
+            // cache key is different but provenance is consistent.
+            let retry_ctx = make_step_ctx_from_llm_config(
+                config,
+                &format!("{}_retry", fallback_key),
+                "build_call_and_parse",
+                0,
+                None,
+                system,
+            );
+            let resp2 = call_model_and_ctx(
+                config,
+                retry_ctx.as_ref(),
+                system,
+                user,
+                0.1,
+                50_000,
+            )
+            .await?;
             extract_json(&resp2)
                 .map_err(|e| anyhow!("JSON parse failed twice for {fallback_key}: {e}"))
         }
