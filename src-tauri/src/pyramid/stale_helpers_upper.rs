@@ -1482,15 +1482,30 @@ fn load_change_manifest_prompt_body() -> String {
 /// upper-layer node. Returns the parsed manifest on success.
 ///
 /// Follows the existing `stale_helpers_upper` LLM-call pattern (single
-/// request, JSON extraction, cost log). A future refactor will route this
-/// through the unified StepContext cache path described in
-/// `docs/specs/llm-output-cache.md`.
+/// request, JSON extraction, cost log).
+///
+/// ## Phase 6: StepContext threading
+///
+/// When `ctx` is `Some(&StepContext)` and carries a resolved model id +
+/// prompt hash, the underlying LLM call consults `pyramid_step_cache`
+/// before issuing the HTTP request. On cache hit the manifest is served
+/// from the cached response without hitting the wire; on miss the HTTP
+/// call runs and its result is persisted to the cache for the next run.
+///
+/// Callers that cannot yet construct a fully-populated StepContext (e.g.
+/// during migration) may pass `None` — the cache is simply skipped and
+/// the function behaves identically to the pre-Phase-6 path.
+///
+/// This is the Phase 2 retrofit flagship per `phase-6-workstream-prompt.md`:
+/// the first code site to receive the unified StepContext threading.
+#[allow(clippy::too_many_arguments)]
 pub async fn generate_change_manifest(
     input: ManifestGenerationInput,
     db_path: &str,
     base_config: &LlmConfig,
     model: &str,
     supersession_reason_tag: &str,
+    ctx: Option<&super::step_context::StepContext>,
 ) -> Result<ChangeManifest> {
     let system_prompt = "You are a knowledge-pyramid change-manifest generator. \
         Produce a targeted JSON manifest that updates a node in place based on \
@@ -1559,9 +1574,25 @@ pub async fn generate_change_manifest(
     //
     // Phase 3 fix pass: clone the live config (preserves provider_registry +
     // credential_store) instead of building a fresh `config_for_model`.
+    //
+    // Phase 6: route through `call_model_unified_with_options_and_ctx`
+    // with the provided StepContext. The ctx carries the cache plumbing;
+    // if it is None (or not cache-ready) this function behaves exactly
+    // like the pre-Phase-6 path.
     let config = base_config.clone_with_model_override(model);
-    let (response, usage) =
-        call_model_with_usage(&config, system_prompt, &user_prompt, 0.2, 4096).await?;
+    let llm_response = super::llm::call_model_unified_with_options_and_ctx(
+        &config,
+        ctx,
+        system_prompt,
+        &user_prompt,
+        0.2,
+        4096,
+        None,
+        super::llm::LlmCallOptions::default(),
+    )
+    .await?;
+    let response = llm_response.content;
+    let usage = llm_response.usage;
 
     // Cost log
     {
@@ -2000,6 +2031,37 @@ pub async fn execute_supersession(
         stale_check_reason,
     };
 
+    // Phase 6 retrofit: build the unified StepContext for the change
+    // manifest LLM call. The context captures everything the cache layer
+    // needs: the pyramid slug, a stable build id (based on the current
+    // build_version so a repeat stale check for the same version is a
+    // cache hit), the step metadata, the resolved model id (so identical
+    // manifests under the same routing are cache-eligible), and a
+    // prompt hash so template edits invalidate correctly.
+    //
+    // Manifest generation carries no `chunk_index` — the target is a
+    // single node, not a chunk. `primitive: "manifest_generation"`
+    // distinguishes it from extract/synthesis steps in the cache's
+    // lookup indices.
+    let cache_build_id = format!(
+        "stale-{}-{}",
+        resolved_node_id,
+        node_ctx.current_build_version
+    );
+    let prompt_hash =
+        super::step_context::compute_prompt_hash(&load_change_manifest_prompt_body());
+    let cache_ctx = super::step_context::StepContext::new(
+        slug.to_string(),
+        cache_build_id,
+        "change_manifest",
+        "manifest_generation",
+        node_ctx.depth,
+        None,
+        db_path.to_string(),
+    )
+    .with_model_resolution("stale_remote", model)
+    .with_prompt_hash(prompt_hash);
+
     // Ask the LLM for a targeted change manifest. On LLM failure the spec's
     // "Manifest Validation → Failure handling" section is unambiguous:
     // "Invalid manifests are rejected (the node is left in its pre-manifest
@@ -2016,6 +2078,7 @@ pub async fn execute_supersession(
         base_config,
         model,
         reason_tag,
+        Some(&cache_ctx),
     )
     .await
     {
@@ -4293,6 +4356,77 @@ mod tests {
         let manifests =
             get_change_manifests_for_node(&conn, "test-slug", "L2-rare").unwrap();
         assert!(manifests.is_empty(), "validate should not persist rows");
+    }
+
+    // ── Phase 6: StepContext retrofit ──────────────────────────────────
+
+    /// Phase 6 retrofit type-check: `generate_change_manifest` MUST accept
+    /// an `Option<&StepContext>` parameter. This test does not call the
+    /// function (a real call would fire HTTP), it just confirms the
+    /// signature is reachable from a caller that constructs a StepContext.
+    /// A regression that drops the ctx parameter from the signature will
+    /// fail to compile this test.
+    #[test]
+    fn test_generate_change_manifest_with_step_context_compiles() {
+        use crate::pyramid::step_context::{compute_prompt_hash, StepContext};
+        use super::ChangedChild;
+
+        let ctx = StepContext::new(
+            "test-slug",
+            "build-1",
+            "change_manifest",
+            "manifest_generation",
+            2,
+            None,
+            "/tmp/pyramid.db",
+        )
+        .with_model_resolution("stale_remote", "openrouter/test-model")
+        .with_prompt_hash(compute_prompt_hash("template body"));
+
+        // Minimal `ManifestGenerationInput` to construct the call without
+        // running it. The test asserts only the function pointer
+        // type-checks against the new signature.
+        let input = super::ManifestGenerationInput {
+            slug: "test-slug".into(),
+            node_id: "L2-x".into(),
+            depth: 2,
+            headline: "h".into(),
+            distilled: "d".into(),
+            topics: vec![],
+            terms_json: "[]".into(),
+            decisions_json: "[]".into(),
+            dead_ends_json: "[]".into(),
+            expected_build_version: 2,
+            changed_children: vec![ChangedChild {
+                child_id: "child-a".into(),
+                old_summary: "old".into(),
+                new_summary: "new".into(),
+                slug_prefix: None,
+            }],
+            stale_check_reason: "test".into(),
+        };
+
+        // Build the call as a typed pointer-bound future without
+        // awaiting (to avoid HTTP). `let _fut = ...; drop(_fut);` ensures
+        // the type-check happens but the future is never polled.
+        let cfg = LlmConfig::default();
+        let _fut = super::generate_change_manifest(
+            input,
+            "/tmp/pyramid.db",
+            &cfg,
+            "openrouter/test-model",
+            "node_stale",
+            Some(&ctx),
+        );
+        drop(_fut);
+
+        // Sanity assertions on the StepContext we built — these double
+        // as a regression check that the cache fields were populated.
+        assert!(ctx.cache_is_usable());
+        assert_eq!(ctx.step_name, "change_manifest");
+        assert_eq!(ctx.primitive, "manifest_generation");
+        assert_eq!(ctx.depth, 2);
+        assert_eq!(ctx.chunk_index, None);
     }
 }
 

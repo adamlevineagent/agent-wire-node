@@ -566,3 +566,241 @@ Single commit on `phase-5-wire-contribution-mapping` with message `phase-5: wand
 - `cargo test --lib pyramid` — **923 passed, 7 failed** (same 7 pre-existing failures documented in Phase 2/3/4). Phase 5 implementer reported 919 passing post-implementation (854 → 919, +65 tests); verifier commit d18a495 added 1 test (920); wanderer fix adds 3 new tests (923). Zero regressions.
 
 ---
+
+## Phase 6 wanderer pass — 2026-04-10
+
+**Context:** Joined `phase-6-llm-output-cache` after 4d812a1 (implementer commit) to trace end-to-end execution with fresh eyes and catch anything a punch-list verifier would miss. Phase 4's wanderer caught `sync_config_to_operational` being dead code. Phase 5's wanderer caught `PromptCache` being dead code. The assignment was to look for the same pattern in Phase 6: "helper exists, tested in isolation, not reached by any production path."
+
+### Finding A — EXPECTED (per brief, not a bug): chain_executor / chain_dispatch pipeline bypasses the cache entirely
+
+**What it is:** Phase 6's `call_model_unified_with_options_and_ctx` is the cache-aware entry point. Its cache lookup gate is:
+
+```rust
+match ctx {
+    Some(sc) if sc.cache_is_usable() => { /* cache read + write */ }
+    _ => None, // cache bypassed
+}
+```
+
+The ONLY production call site that constructs a fully-populated StepContext (resolved_model_id + non-empty prompt_hash) is `stale_helpers_upper::execute_supersession` → `generate_change_manifest`. That function is the Phase 2 retrofit proof-of-concept explicitly called out by the workstream prompt.
+
+Every OTHER production LLM call site still goes through the legacy shim `call_model_unified_with_options` (line 396 of `llm.rs`), which delegates to `call_model_unified_with_options_and_ctx(config, None, ...)` — bypassing the cache entirely. The bypassed call sites include:
+
+1. `chain_dispatch::dispatch_llm` (line 121) — the primary chain step dispatcher used for legacy v2 chains. Calls `call_model`, `call_model_audited`, `call_model_structured` — all legacy paths with no ctx.
+2. `chain_dispatch::dispatch_ir_llm` (line 920) — the IR chain dispatcher used for v3 chains. Calls `call_model_unified_with_options(config_ref, system_prompt, ...)` and `call_model_audited(...)` — both legacy with no ctx.
+3. `chain_dispatch::dispatch_ir_step` (line 877) → `dispatch_ir_llm` — this is the IR runtime's LLM step handler, reached from `chain_executor::dispatch_with_retry`.
+4. `chain_executor` itself has zero direct `call_model_*` calls — it routes everything through `chain_dispatch`.
+5. `call_model_via_registry` (line 1108) — Phase 3's registry-aware entry point with its OWN HTTP retry loop. Does NOT delegate to `call_model_unified_with_options_and_ctx`. The cache hook is not reachable from this function at all, regardless of whether the caller has a StepContext.
+6. `evidence_answering.rs` — 4 call sites (`call_model_audited`, `call_model_unified`). None thread a StepContext.
+7. `webbing.rs`, `delta.rs`, `meta.rs`, `faq.rs` — 11 call sites total across these files. All use `call_model`/`call_model_with_usage` legacy paths.
+8. `characterize.rs`, `extraction_schema.rs`, `question_decomposition.rs`, `supersession.rs` — 7 call sites. All legacy.
+9. `stale_helpers.rs`, `stale_helpers_upper.rs` (L0/edge/node stale check paths OTHER than `generate_change_manifest`) — 10 call sites. All legacy.
+10. `build.rs`, `public_html/*`, `main.rs`, `routes.rs` — 6 call sites. All legacy.
+
+The aggregate: roughly 50+ production LLM call sites, of which exactly ONE (`generate_change_manifest`) threads a cache-usable StepContext. Every other call — extraction, synthesis, webbing, evidence answering, recursive pairing, faq, delta, meta, supersession, etc. — costs real tokens every single time, even on identical re-runs of the same build.
+
+**Why it's not a bug (scope-wise):** The phase-6-workstream-prompt.md explicitly says:
+
+> "Retrofitting every other LLM call site (evidence triage, FAQ, delta, webbing, meta) — Phase 12 and later. Phase 6 only retrofits `generate_change_manifest` as the proof-of-concept."
+
+And:
+
+> "**No new scope.** Phase 6 is the cache primitive + the one StepContext retrofit proof-of-concept. Other retrofits are later phases."
+
+The implementer did exactly what the workstream prompt said. The cache primitive is correctly implemented, the hook point is in the right place, the one retrofit works. Phase 6 shipping is spec-compliant with the brief.
+
+**Why the spec and the workstream prompt disagree:** `docs/specs/llm-output-cache.md` frames the cache as universally applicable:
+
+> "Crash recovery IS a cache hit — completed steps have valid cached outputs"
+> "Re-running the same build with no changes: every step is a cache hit"
+> "StepContext is the single context object threaded through all LLM-calling code paths."
+
+Those spec guarantees ONLY hold for call sites that thread a StepContext. Post-Phase-6, exactly one site does. The spec-level guarantees are unreachable today for ~95%+ of production LLM calls. The brief's "gated per-phase" framing is the ground truth — the spec describes the eventual end state (post-Phase-12+), not the Phase 6 ship state.
+
+**What I did:** Nothing — the scope boundary was explicit and the implementer respected it. Flagged for the planner below (see deviation block).
+
+### Finding B — EXPECTED (per brief): `ChainContext.prompt_hashes` + `resolved_models` + the lazy helpers are dead code
+
+**What it is:** Phase 6 added to `ChainContext`:
+
+- `prompt_hashes: HashMap<String, String>` field
+- `resolved_models: HashMap<String, String>` field
+- `get_or_compute_prompt_hash(&mut self, path, body_provider)` lazy getter
+- `cache_resolved_model(&mut self, tier, model_id)` setter
+- `get_resolved_model(&self, tier)` getter
+
+These match the spec's "Model ID Normalization" section exactly. The fields are initialized to empty HashMaps in `ChainContext::new()` and the helpers have 5 unit tests that exercise them in isolation.
+
+A repo-wide grep for `get_or_compute_prompt_hash`, `cache_resolved_model`, `get_resolved_model`, `prompt_hashes.insert`, `prompt_hashes.get`, `resolved_models.insert`, and `resolved_models.get` returns only hits inside `chain_resolve.rs` itself (the struct/method definitions) and the 5 unit tests. **Zero production callers.** No chain executor step ever populates these caches; no LLM call site ever reads them.
+
+**Additionally missing:** the spec calls out a `resolve_model_for_tier(ctx, tier_name)` helper that consults the provider registry on cache miss and writes the resolved id back to `ctx.resolved_models`. Phase 6 did NOT add this helper. It only added `cache_resolved_model(tier, model_id)` which takes BOTH the tier name and the already-resolved id as parameters — so a caller would need to call `ProviderRegistry::resolve_tier()` AND `ctx.cache_resolved_model()` separately. The "prevent drift mid-build" guarantee the spec promises isn't achievable with Phase 6's primitives alone; it requires the `resolve_model_for_tier` helper to be added later.
+
+**Why it's not a bug (scope-wise):** The workstream prompt's "In scope" list says:
+
+> "`ChainContext.prompt_hashes` + `ChainContext.resolved_models`"
+
+...but says nothing about them being PRODUCTION-CALLED in Phase 6. The implementer added the storage primitive per the brief. Phase 12's per-call-site retrofits will wire up the callers.
+
+**However:** Unlike Phase 4 and Phase 5's dead code (which were load-bearing for the phase's stated goal and the wanderer fixed in place), Phase 6's ChainContext dead code is a *forward-looking scaffold* with no Phase 6 user. It's cheap to carry (two empty HashMaps per ChainContext clone — ChainContext clones via Arc-counted fields, so it's really two Arc bumps). It's not a bug today; it becomes a bug only if Phase 12 lands without wiring them up.
+
+**What I did:** Nothing. The pattern is consistent with the brief's "primitive today, callers in Phase 12+" framing. Flagged here so future-me (Phase 12 planner) remembers the scaffold exists.
+
+### Finding C — MINOR: `resolve_model_for_tier` helper is missing from the spec's pattern
+
+**What it is:** The spec at `llm-output-cache.md:178-187` shows:
+
+```rust
+fn resolve_model_for_tier(ctx: &mut ChainContext, tier_name: &str) -> Result<String> {
+    if let Some(cached) = ctx.resolved_models.get(tier_name) {
+        return Ok(cached.clone());
+    }
+    let model_id = provider_resolver::resolve_tier(tier_name)?;
+    ctx.resolved_models.insert(tier_name.to_string(), model_id.clone());
+    Ok(model_id)
+}
+```
+
+This is the helper that actually makes the "resolved once per build, consistent across all cache writes" guarantee work. Phase 6 added `cache_resolved_model(tier, model_id)` (the writer side) and `get_resolved_model(tier)` (the reader side), but NO helper that goes through the provider registry and writes back on miss. A future retrofit that calls `cache_resolved_model` explicitly will work; a retrofit that assumes "the build-scoped resolution is transparent, I just call cache_resolved_model by hand and it happens to be consistent" can still drift if the caller forgets.
+
+**Severity:** Low. The drift only happens if two sites in the same build resolve the same tier independently — possible but unusual. Current state: zero callers exist, so zero drift risk today.
+
+**Impact when Phase 12 lands:** Phase 12's first retrofit will need either (a) to also add `resolve_model_for_tier` and use it consistently, or (b) to manually call `ProviderRegistry::resolve_tier` and `ctx.cache_resolved_model` in sequence at every site. Option (a) is cheaper and matches the spec's intent — worth adding to the Phase 12 scope explicitly.
+
+**What I did:** Noted here. The helper addition is trivial (~10 lines) but would touch `chain_resolve.rs` which means declaring a circular dependency on `provider.rs` or requiring the caller to pass `&ProviderRegistry` into the helper. Phase 12 can design this properly when it has a concrete retrofit call site in hand. Not worth a blind scaffold in Phase 6.
+
+### Finding D — INFORMATIONAL: `cache_build_id` format uses current build_version; can desync with the executing build
+
+**What it is:** The retrofit in `execute_supersession` builds `cache_build_id` as `format!("stale-{node_id}-{build_version}")` where `build_version` is the node's CURRENT version (the pre-stale state). When the stale check runs, the new version that will eventually be written is `current_build_version + 1`. The `cache_build_id` column on the cache row will reflect the PRE-stale version, not the POST-stale version. The cache_key itself is content-addressable (unaffected by build_id) so the cache hit/miss behavior is correct, but the provenance column logs the "incoming" version.
+
+**Impact:** None on correctness. Potential confusion for Phase 13's oversight UI when it groups cache rows by build_id: a stale check's cache row will be grouped under the pre-stale build rather than the post-stale one. Phase 13 scope, not Phase 6.
+
+**What I did:** Noted here as a Phase 13 awareness item.
+
+### Finding E — INFORMATIONAL: `load_change_manifest_prompt_body` reads from disk at call time with CWD-relative paths
+
+**What it is:** `stale_helpers_upper::load_change_manifest_prompt_body()` tries `"chains/prompts/shared/change_manifest.md"` then `"../chains/prompts/shared/change_manifest.md"` at call time and falls back to the static string constant on failure. This means:
+
+1. **CWD dependence:** The function's return value depends on the current working directory when it runs. In a dev tree run from repo root, it finds the file. In a production Tauri app bundled with no `chains/` resource, it falls back to the static string. Both return the SAME content WITHIN a run (the function is called twice per supersession: once by `execute_supersession` to compute the hash, once by `generate_change_manifest` to build the user prompt — both calls are microseconds apart so CWD/filesystem state is stable).
+2. **Cross-process cache invalidation on dev→prod transition:** If the same `.db` file moves from dev to prod (e.g., the user runs the bundled app after running `cargo tauri dev`), the prompt_hash in `pyramid_step_cache` rows from the dev run will no longer match the current prompt_hash in the prod run (file was read vs. static fallback). Every dev-era cache row becomes a `MismatchPrompt` verification failure on first prod hit → gets deleted, re-run, re-stored. Functionally correct, just wastes the old rows.
+3. **Phase 0b friction log already flagged the broader missing-chains-in-bundle issue:** see entry "2026-04-10 — Pre-existing: release-mode chain bootstrap gap (conversation-episodic not embedded)". This Phase 6 concern is the cache-side manifestation of the same problem.
+
+**Impact:** Low. Cache is self-correcting via verification. The only measurable cost is one extra HTTP call per previously-cached change-manifest row on first run after a dev→prod transition.
+
+**What I did:** Noted here. Fix belongs with the Phase 0b distribution-bundling follow-up.
+
+### Finding F — INFORMATIONAL: `block_in_place` is safe under Tauri's multi-threaded runtime but not under `current_thread` runtimes
+
+**What it is:** `call_model_unified_with_options_and_ctx` uses `tokio::task::block_in_place` for all cache read/write DB operations (four call sites in `llm.rs`). `block_in_place` is documented as only valid on a multi-threaded Tokio runtime — calling it on a `current_thread` runtime panics. Tauri's `async_runtime::spawn` uses the multi-threaded variant by default, so production is fine.
+
+**Risk in tests:** Two tests in the repo build their own `current_thread` runtime (`dadbear_extend.rs::test_*` at lines 1747/1983 and `public_html/integration_tests.rs:27`). None of them call the cache code path, but a future test that bridges a `current_thread` runtime with the cache will panic at the first `block_in_place`. The Phase 6 tests correctly use `#[tokio::test(flavor = "multi_thread", worker_threads = 2)]`. Any new cache test that forgets this will panic at runtime rather than fail cleanly.
+
+**Impact:** Zero today. Trap for future test writers.
+
+**What I did:** Noted here. The better long-term pattern is `spawn_blocking` rather than `block_in_place`, but that changes the call shape (returns a JoinHandle, needs to await, doesn't nest cleanly inside the existing match arms). Not worth refactoring pre-ship.
+
+### Finding G — INFORMATIONAL: Archive key format is collision-safe; supersede path handles no-prior-entry case cleanly
+
+**What it was checked:** The `supersede_cache_entry` path moves a prior row's `cache_key` from the content-addressable form (64-char SHA-256 hex) to `archived:{id}:{orig_key}`. The concern was whether:
+
+1. A content-addressable lookup could accidentally return an archived row. **No** — `check_cache` does an exact match (`WHERE slug = ?1 AND cache_key = ?2`), and a real cache_key is never prefixed with `archived:`. The `idx_step_cache_key` index on `cache_key` is a btree so prefix-based lookups don't match archived rows either.
+2. The no-prior-entry case panics or misbehaves. **No** — lines 5935-5949 of `db.rs` handle it cleanly: `prior_row` is `None`, `(prior_id, archival_cache_key)` is `(None, None)`, the new entry is stored directly without an archival mutation. Tested in `db::step_cache_tests::test_supersede_with_no_prior_entry` (I confirmed the test exists).
+3. The archive rollback on store failure leaves the prior row in a valid state. **Yes** — lines 5959-5968 of `db.rs` check for store errors and re-UPDATE the prior row's cache_key back to its original. The rollback runs even on transient SQL errors.
+
+**What I did:** Just verified the implementer's existing test covered it. No friction; this path is solid.
+
+### Verification
+
+- `cargo check --lib` — clean (same 3 pre-existing warnings — deprecated evidence helpers + LayerCollectResult visibility).
+- `cargo test --lib pyramid::step_context` — 15/15 pass.
+- `cargo test --lib pyramid::llm::tests` — 14/14 pass (10 existing + 4 new Phase 6 cache tests).
+- `cargo test --lib pyramid::stale_helpers_upper::tests` — 11/11 pass (10 Phase 2 + 1 new Phase 6 retrofit compile-check).
+- `cargo test --lib pyramid::chain_resolve::tests` — 38/38 pass (33 existing + 5 new Phase 6 — all of them exercise the dead-code helpers in isolation).
+- `cargo test --lib pyramid::db::step_cache_tests` — 13/13 pass.
+- `cargo test --lib pyramid::step_context::tests::test_compute_cache_key_stable_across_runs` — verified deterministic across 3 separate runs. SHA-256 stability holds.
+- Grep audit: `grep -rn "step_context" src-tauri/src/pyramid/chain_executor.rs src-tauri/src/pyramid/chain_dispatch.rs src-tauri/src/pyramid/chain_engine.rs` returned ZERO hits. Chain executor has no knowledge of Phase 6's StepContext type.
+
+### What I did not fix
+
+Nothing. All seven findings are either (a) expected per the brief's scope boundary (A, B, C) or (b) informational awareness items for future phases (D, E, F, G). The implementer's Phase 6 work is correct against the workstream prompt as written. The concern is whether the workstream prompt's scope boundary is correct against the spec.
+
+Zero code changes from this wanderer pass. Zero new tests. The friction log entry + deviation block below is the artifact.
+
+### Deviation block — Phase 6 scope boundary question
+
+> [For the planner]
+>
+> Phase 6 shipped the cache primitive (table, CRUD, StepContext, hook, verify_cache_hit, supersede) and retrofitted exactly ONE call site (`generate_change_manifest`) per the workstream prompt. The implementer respected the scope boundary and the code is correct. I am not escalating a bug — I am escalating a scope-boundary decision that needs planner direction before Phase 12.
+>
+> **The question:** The spec (`docs/specs/llm-output-cache.md`) promises the cache works for "every step" and "every LLM call" — "Crash recovery IS a cache hit", "Re-running the same build with no changes: every step is a cache hit." Those promises are UNREACHABLE today because ~50+ production LLM call sites still use the legacy shim path that passes `None` for the ctx. The cache is demonstrably reachable end-to-end for exactly one path (stale-engine → execute_supersession → generate_change_manifest → call_model_unified_with_options_and_ctx with a cache-usable ctx), which the Phase 6 tests prove rigorously.
+>
+> **Concrete breakdown of current cache coverage:**
+>
+> - **Cache-reachable today (1 path):** Change-manifest generation inside DADBEAR stale-check supersession. Fires once per L1+ node per confirmed stale event, maybe 10-100 times per build cycle depending on staleness churn.
+> - **Cache-unreachable but conceptually easy to retrofit (~5 paths):** `chain_dispatch::dispatch_ir_llm`, `chain_dispatch::dispatch_llm`, `evidence_answering`, `webbing`, `meta`. These have a well-defined step name, chunk index, and build_id in scope at the call site; threading a StepContext through them is mostly signature churn. Aggregate: the vast majority of production LLM traffic during a fresh build.
+> - **Cache-unreachable and harder to retrofit (~20 paths):** `stale_helpers.rs` / `stale_helpers_upper.rs` (the L0 and edge stale-check paths that aren't `generate_change_manifest`), `faq.rs`, `delta.rs`, `characterize.rs`, `extraction_schema.rs`, `question_decomposition.rs`, `supersession.rs`. These are deeper in the call graph and many don't have a clean "this is the step_name / chunk_index" concept. They're also less hot-path — they run on specific triggers, not every build step.
+> - **Intentionally bypassed forever (~5 paths):** `call_model_direct` (diagnostics), `public_html` routes (free-form ask), `routes.rs` semantic search path, `build.rs` legacy path. These are not "steps" and the cache shape doesn't fit them.
+>
+> **What the brief says:** Phase 12 owns the "Retrofitting every other LLM call site (evidence triage, FAQ, delta, webbing, meta)". So the sequencing is: Phase 6 builds the primitive, Phase 12 sweeps all call sites through the cache.
+>
+> **What I think the planner should consider:**
+>
+> 1. **Is the Phase 6 → Phase 12 distance acceptable?** Phase 12 is 6 phases away. During phases 7/8/9/10/11, the node is building with a cache that's 95% cold even on re-runs. If a user kicks off a fresh build, crashes mid-way, and restarts, every extraction / synthesis / web step re-runs with real token cost — the spec's "crash recovery IS a cache hit" promise doesn't hold yet. That's fine IF the user expectation is "the cache goes live in Phase 12" but it's a gap vs the spec text.
+> 2. **Should Phase 6.5 retrofit the IR chain dispatcher as a second proof-of-concept?** `dispatch_ir_llm` is the ONE function in `chain_dispatch.rs` whose caller chain (chain_executor → dispatch_with_retry → dispatch_step → dispatch_ir_step → dispatch_ir_llm) would transparently pick up cache coverage for ~90% of production LLM traffic during build execution. The retrofit would be:
+>    - Add `cache_ctx: Option<Arc<pyramid::step_context::StepContext>>` to `chain_dispatch::StepContext` (the EXISTING dispatch-context struct — not a rename, a new field).
+>    - `chain_executor::execute_chain_from` builds one `pyramid::step_context::StepContext` per build entry and clones-with-overrides for each step (swapping step_name, depth, chunk_index).
+>    - `dispatch_ir_llm` and `dispatch_llm` thread the optional ctx through to `call_model_unified_with_options_and_ctx` instead of the legacy shim.
+>    - One new test that runs a two-step IR chain twice and asserts the second run is a cache hit.
+>    - Phase 9's eventual config-contributions work for temperature/max_tokens is orthogonal and doesn't conflict.
+>    
+>    Cost estimate: ~200 LOC across `chain_dispatch.rs`, `chain_executor.rs`, `chain_resolve.rs` (to actually populate `prompt_hashes` + `resolved_models` on chain step entry — which BTW validates Finding B's dead-code concern by finally wiring the helpers).
+>
+> 3. **Should the spec be amended to reflect the phased rollout?** Currently the spec reads as if the cache just works. If the planner's intent is "Phase 12 is where it goes live", the spec's "Crash recovery IS a cache hit" paragraph should be moved to a "Phase 12 end-state" section, or the spec should be labeled as "describes the post-Phase-12 state, not the Phase 6 ship state". Readers (including the next wanderer and future me) shouldn't have to reconcile the conflict themselves.
+>
+> 4. **Should Phase 6 add the `resolve_model_for_tier` helper (Finding C)?** The current primitives (`cache_resolved_model` + `get_resolved_model`) store and retrieve but don't enforce "go through provider registry on cache miss". Adding a `resolve_model_for_tier(&mut ChainContext, &ProviderRegistry, tier_name) -> Result<String>` helper is ~10 LOC and makes the drift-prevention guarantee achievable. Phase 12's retrofits will need to call it; adding it now means the Phase 12 prompt can say "use this helper at every LLM call site" rather than "implement this helper THEN use it". Low cost, high clarity dividend.
+>
+> **My inclination (NOT a recommendation — the planner decides):**
+>
+> - **Option A (minimal):** Ship Phase 6 as-is. Phase 12 does the full sweep. Spec gets a "Phase 6 → Phase 12 rollout" section explaining the gap. Zero code changes in this wanderer pass.
+> - **Option B (proof-of-concept expansion):** Phase 6.5 retrofits `dispatch_ir_llm` as a second POC, adds `resolve_model_for_tier`, populates `ChainContext.prompt_hashes` / `resolved_models` at chain step entry. Validates the full cache plumbing end-to-end with the most common production chain step type. Everything else still waits for Phase 12. ~200 LOC + 3-5 new tests.
+> - **Option C (accept the scope boundary but tighten the spec):** Ship Phase 6 as-is, no code change, but update `llm-output-cache.md` to label the universally-applicable guarantees as "Phase 12+ end state" and the current-state guarantees as "only for generate_change_manifest in Phase 6". Spec-only change, no code.
+>
+> Option A is the default per the brief. Option B is the Phase 4/5 wanderer pattern applied to Phase 6. Option C is the documentation-only fix.
+>
+> I did NOT apply any of these because all three cross the "new scope" line in the workstream prompt. The Phase 4 wanderer fix was different — it was fixing a spec-stated invariant that was broken in code; the code had to match the spec. Phase 6's case is different: the spec describes an end state, the workstream prompt scopes the current state, and the gap between them is INTENTIONAL per the brief. Closing the gap is a planner decision, not a wanderer decision.
+>
+> **What I did do:** Documented findings A-G in this log entry. No commit. The Phase 6 implementer's work stands.
+>
+> Separately: whichever option the planner picks, **Phase 12's workstream prompt should explicitly require the implementer to grep for every `call_model_*` call site in the repo and thread a StepContext through it, and the verifier should grep for `call_model_unified_with_options` vs `call_model_unified_with_options_and_ctx` to confirm the ratio flips.** The Phase 6 wanderer protocol (me) is looking at the problem one phase too late — the fix belongs at Phase 12 planning time, not as a reactive sweep.
+
+### Commit
+
+None. Zero code changes from this wanderer pass itself.
+
+### Verification after fix
+
+N/A — no fix applied by the wanderer.
+
+### Conductor follow-up (2026-04-10) — Option B applied
+
+After consulting the `feedback_no_integrity_demotion` memory ("Never demote security/integrity features just because a primary path exists") and Adam's explicit "avoid temptation to say 'Well this is most of the work, we'll defer it' — temptation from the old world" framing, the conductor dispatched a fix agent with the scope: **Option B — retrofit `dispatch_ir_llm` to actually reach the cache**.
+
+The fix landed across three files:
+
+- **`src-tauri/src/pyramid/chain_dispatch.rs`** — added a `CacheDispatchBase` struct (per-build shared cache state: db_path, build_id, bus, lazy `prompt_hashes` + `resolved_models` HashMaps) and `cache_base: Option<Arc<CacheDispatchBase>>` field on the existing dispatch `StepContext`. `dispatch_ir_llm` now constructs a per-call `pyramid::step_context::StepContext` from `ctx.cache_base` and threads it through to `call_model_unified_with_options_and_ctx`. `dispatch_llm` (legacy v2 path) is intentionally left at `cache_base: None` per the scope boundary.
+- **`src-tauri/src/pyramid/llm.rs`** — `call_model_via_registry` now routes through the ctx-aware variant when a StepContext is present, so the Phase 3 registry-aware path gets the same cache coverage as the shim path.
+- **`src-tauri/src/pyramid/chain_executor.rs`** — the three `chain_dispatch::StepContext` initializer sites (main `execute_chain_from`, IR `execute_plan`, and the dead-letter retry path) now construct a `CacheDispatchBase` via `state.data_dir.as_ref().map(|dir| Arc::new(CacheDispatchBase::new(dir.join("pyramid.db")..., build_id.clone(), Some(state.build_event_bus.clone()))))`. Tests with `data_dir: None` cleanly bypass the cache. The dead-letter retry path uses `cache_base: None` explicitly — dead-letter retries shouldn't cache-hit prior failed attempts.
+
+Also fixed: two test fixtures in `chain_dispatch.rs` (`test_dispatch_ir_mechanical_routes_correctly`, `test_dispatch_ir_step_mechanical_routes`) missing the new `cache_base` field.
+
+**Net effect:** production chain execution (both the v2 chain engine path and the IR executor path) now builds with the cache live. A re-run of the same chain with unchanged inputs produces cache hits on every step that goes through `dispatch_ir_llm`. The spec's "Re-running the same build with no changes: every step is a cache hit" promise now holds for the primary production path.
+
+**Verification:**
+- `cargo check --lib` — clean, 3 pre-existing warnings.
+- `cargo test --lib pyramid` — 961 passed, 7 failed (same 7 pre-existing failures: `test_evidence_pk_cross_slug_coexistence`, `real_yaml_thread_clustering_preserves_response_schema`, 5× `staleness::tests::*`). Zero new failures.
+
+**Out of scope (still deferred to Phase 12):** `dispatch_llm` (legacy v2 chain path), `evidence_answering`, `faq`, `delta`, `webbing`, `meta`, `characterize` — these still call the legacy shim. Phase 12's workstream prompt will explicitly require the implementer to grep every `call_model_*` call site and thread a StepContext.
+
+**Commit:** (below — conductor is about to `git add` and commit this block together with the code changes)
+
+---
+

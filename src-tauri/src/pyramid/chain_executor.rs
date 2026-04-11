@@ -3718,6 +3718,9 @@ pub async fn retry_dead_letter_entry(
         tier1: state.operational.tier1.clone(),
         ops: (*state.operational).clone(),
         audit: None,
+        // Dead-letter retries skip the cache — failed attempts produced
+        // bad outputs that should not be cache-hit on retry.
+        cache_base: None,
     };
 
     match chain_dispatch::dispatch_step(
@@ -3927,6 +3930,17 @@ pub async fn execute_chain_from(
 
     // Build dispatch context (from chain_dispatch)
     let chain_build_id = format!("chain-{}", uuid::Uuid::new_v4().to_string().split('-').next().unwrap_or("0"));
+    // Phase 6 fix pass: construct CacheDispatchBase so dispatch_ir_llm /
+    // dispatch_llm can produce per-call StepContexts that reach the
+    // content-addressable cache. Requires state.data_dir to be set
+    // (production path); tests with data_dir=None cleanly bypass the cache.
+    let cache_base = state.data_dir.as_ref().map(|dir| {
+        Arc::new(chain_dispatch::CacheDispatchBase::new(
+            dir.join("pyramid.db").to_string_lossy().to_string(),
+            chain_build_id.clone(),
+            Some(state.build_event_bus.clone()),
+        ))
+    });
     let dispatch_ctx = chain_dispatch::StepContext {
         db_reader: state.reader.clone(),
         db_writer: state.writer.clone(),
@@ -3943,6 +3957,7 @@ pub async fn execute_chain_from(
             call_purpose: String::new(),
             depth: None,
         }),
+        cache_base,
     };
 
     // Set up writer channel + drain task
@@ -10599,6 +10614,15 @@ pub async fn execute_plan(
 
     // ── 5. Build dispatch context ────────────────────────────────────────
     let ir_build_id = format!("ir-{}", uuid::Uuid::new_v4().to_string().split('-').next().unwrap_or("0"));
+    // Phase 6 fix pass: same as execute_chain_from — attach a
+    // CacheDispatchBase so IR executor LLM calls reach the cache.
+    let cache_base = state.data_dir.as_ref().map(|dir| {
+        Arc::new(chain_dispatch::CacheDispatchBase::new(
+            dir.join("pyramid.db").to_string_lossy().to_string(),
+            ir_build_id.clone(),
+            Some(state.build_event_bus.clone()),
+        ))
+    });
     let dispatch_ctx = chain_dispatch::StepContext {
         db_reader: state.reader.clone(),
         db_writer: state.writer.clone(),
@@ -10615,6 +10639,7 @@ pub async fn execute_plan(
             call_purpose: String::new(),
             depth: None,
         }),
+        cache_base,
     };
 
     exec_state.send_progress().await;

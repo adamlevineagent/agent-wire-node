@@ -27,9 +27,14 @@ use tokio::sync::Mutex as TokioMutex;
 use tracing::{info, warn};
 
 use super::credentials::{CredentialStore, ResolvedSecret};
+use super::event_bus::{TaggedBuildEvent, TaggedKind};
 use super::provider::{
     LlmProvider, OpenRouterProvider, ParsedLlmResponse, ProviderRegistry, ProviderType,
     RequestMetadata, ResolvedTier,
+};
+use super::step_context::{
+    compute_cache_key, compute_inputs_hash, verify_cache_hit, CacheEntry, CacheHitResult,
+    StepContext,
 };
 use super::types::TokenUsage;
 
@@ -393,10 +398,76 @@ pub async fn call_model_unified_with_options(
     system_prompt: &str,
     user_prompt: &str,
     temperature: f32,
+    max_tokens: usize,
+    response_format: Option<&serde_json::Value>,
+    options: LlmCallOptions,
+) -> Result<LlmResponse> {
+    // Delegate to the ctx-aware variant with `None` so legacy callers
+    // (including tests and the pre-init boot window) bypass the cache
+    // entirely. The cache is opt-in via StepContext presence.
+    call_model_unified_with_options_and_ctx(
+        config,
+        None,
+        system_prompt,
+        user_prompt,
+        temperature,
+        max_tokens,
+        response_format,
+        options,
+    )
+    .await
+}
+
+/// Phase 6: StepContext-aware variant of `call_model_unified_with_options`.
+///
+/// When `ctx` is `Some(&StepContext)` AND the context carries a resolved
+/// model id + a non-empty prompt hash, this function consults
+/// `pyramid_step_cache` BEFORE making the HTTP request. On a valid cache
+/// hit the cached response is returned directly (and `CacheHit` is
+/// emitted on the event bus if one is attached). On a cache miss the
+/// HTTP retry loop runs and the successful response is persisted to the
+/// cache before returning.
+///
+/// When `ctx` is `None` (or its cache fields are unpopulated), this
+/// function is behaviorally identical to the pre-Phase-6 code path — no
+/// cache read, no cache write. This preserves backward compatibility for
+/// every call site that has not yet been retrofitted.
+///
+/// ## Correctness gates
+///
+/// * `verify_cache_hit` is checked on every hit. All four mismatch
+///   variants + corruption detection are exact per the spec. A non-Valid
+///   result deletes the stale row and falls through to HTTP (and emits
+///   `CacheHitVerificationFailed`).
+/// * `ctx.force_fresh` bypasses the cache read path entirely and routes
+///   through `supersede_cache_entry` on write so the prior row is
+///   preserved as a `supersedes_cache_id` chain link.
+/// * Cache writes use the DB path stashed on the StepContext — NOT the
+///   writer mutex — because the cache is content-addressable and
+///   `INSERT OR REPLACE` on a unique key is safe without serialization.
+#[allow(clippy::too_many_arguments)]
+pub async fn call_model_unified_with_options_and_ctx(
+    config: &LlmConfig,
+    ctx: Option<&StepContext>,
+    system_prompt: &str,
+    user_prompt: &str,
+    temperature: f32,
     _max_tokens: usize,
     response_format: Option<&serde_json::Value>,
     options: LlmCallOptions,
 ) -> Result<LlmResponse> {
+    // ── Phase 6: Cache lookup path ──────────────────────────────────
+    //
+    // Delegated to `try_cache_lookup_or_key`, which is shared with
+    // `call_model_via_registry`. When it returns `CacheProbeOutcome::Hit`
+    // the cached response short-circuits the HTTP path entirely.
+    let cache_lookup = match try_cache_lookup_or_key(ctx, system_prompt, user_prompt) {
+        CacheProbeOutcome::Hit(response) => return Ok(response),
+        CacheProbeOutcome::MissOrBypass(lookup) => lookup,
+    };
+
+    let call_started = std::time::Instant::now();
+
     // Resolve the provider trait impl + credential for this call. The
     // registry path is preferred; if no registry is attached to the
     // config we synthesize an `OpenRouterProvider` from the legacy
@@ -667,14 +738,343 @@ pub async fn call_model_unified_with_options(
             ));
         }
 
-        return Ok(LlmResponse {
+        let response = LlmResponse {
             content: parsed.content,
             usage,
             generation_id,
-        });
+        };
+
+        // ── Phase 6: Cache store path ──────────────────────────────
+        //
+        // Delegated to `try_cache_store`, which is shared with
+        // `call_model_via_registry`. No-op when no ctx was attached or
+        // when the lookup phase didn't compute a key.
+        try_cache_store(ctx, cache_lookup.as_ref(), &response, call_started);
+
+        return Ok(response);
     }
 
     Err(anyhow!("Max retries exceeded"))
+}
+
+// ── Phase 6: Cache support types and helpers ────────────────────────────────
+
+/// Components computed once per cached LLM call so the lookup + store
+/// paths share the same values.
+struct CacheLookupResult {
+    resolved_model: String,
+    inputs_hash: String,
+    cache_key: String,
+}
+
+/// Serialize an `LlmResponse` into the JSON string stored in
+/// `pyramid_step_cache.output_json`. Kept as a helper so the cache
+/// format is consistent between writes and reads, and so a future
+/// schema bump has exactly one place to touch.
+fn serialize_response_for_cache(response: &LlmResponse) -> String {
+    serde_json::json!({
+        "content": response.content,
+        "usage": {
+            "prompt_tokens": response.usage.prompt_tokens,
+            "completion_tokens": response.usage.completion_tokens,
+        },
+        "generation_id": response.generation_id,
+    })
+    .to_string()
+}
+
+/// Parse a cached row's `output_json` back into an `LlmResponse`.
+/// Returns an error if any required field is missing — the caller
+/// treats this as a corruption signal and deletes the row.
+fn parse_cached_response(cached: &super::step_context::CachedStepOutput) -> Result<LlmResponse> {
+    let value: serde_json::Value = serde_json::from_str(&cached.output_json)
+        .map_err(|e| anyhow!("cached output_json parse failed: {}", e))?;
+    let content = value
+        .get("content")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("cached entry missing `content` string"))?
+        .to_string();
+    let prompt_tokens = value
+        .get("usage")
+        .and_then(|u| u.get("prompt_tokens"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let completion_tokens = value
+        .get("usage")
+        .and_then(|u| u.get("completion_tokens"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let generation_id = value
+        .get("generation_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    Ok(LlmResponse {
+        content,
+        usage: TokenUsage {
+            prompt_tokens,
+            completion_tokens,
+        },
+        generation_id,
+    })
+}
+
+/// Emit a cache-related event on the bus attached to a StepContext, if
+/// any. No-op when the context has no bus.
+fn emit_cache_event(ctx: &StepContext, kind: TaggedKind) {
+    if let Some(bus) = ctx.bus.as_ref() {
+        let _ = bus.tx.send(TaggedBuildEvent {
+            slug: ctx.slug.clone(),
+            kind,
+        });
+    }
+}
+
+/// Result of a cache probe performed by `try_cache_lookup_or_key`.
+///
+/// `Hit` carries a fully-formed `LlmResponse` — the caller must return
+/// it without going to HTTP. `MissOrBypass` carries an optional
+/// `CacheLookupResult` that the cache-store path can use after a
+/// successful HTTP call (`None` means no StepContext was provided, or
+/// the ctx was not cache-usable).
+enum CacheProbeOutcome {
+    Hit(LlmResponse),
+    MissOrBypass(Option<CacheLookupResult>),
+}
+
+/// Shared cache probe path used by both `call_model_unified_with_options_and_ctx`
+/// and `call_model_via_registry` (Phase 6 fix pass). Keeps the cache
+/// hook point exactly once regardless of which HTTP retry loop is
+/// upstream of it.
+///
+/// Behavior:
+/// * `ctx` is `None` or not cache-usable → returns
+///   `MissOrBypass(None)` without touching the DB. The caller proceeds
+///   to HTTP with no cache write.
+/// * `ctx.force_fresh` is true → skips the read but returns
+///   `MissOrBypass(Some(lookup))` so the store path can still supersede
+///   any prior row.
+/// * Cache hit with a `Valid` verification → returns `Hit(response)`;
+///   caller returns directly to its own caller without going to HTTP.
+/// * Cache hit with a non-Valid verification → deletes the stale row,
+///   emits `CacheHitVerificationFailed`, returns
+///   `MissOrBypass(Some(lookup))` so the store path refreshes it.
+/// * Cache miss → emits `CacheMiss`, returns
+///   `MissOrBypass(Some(lookup))`.
+/// * DB probe error → logs, returns `MissOrBypass(Some(lookup))`.
+fn try_cache_lookup_or_key(
+    ctx: Option<&StepContext>,
+    system_prompt: &str,
+    user_prompt: &str,
+) -> CacheProbeOutcome {
+    let sc = match ctx {
+        Some(sc) if sc.cache_is_usable() => sc,
+        _ => return CacheProbeOutcome::MissOrBypass(None),
+    };
+
+    let resolved_model = sc
+        .resolved_model_id
+        .as_deref()
+        .unwrap_or_default()
+        .to_string();
+    let inputs_hash = compute_inputs_hash(system_prompt, user_prompt);
+    let cache_key = compute_cache_key(&inputs_hash, &sc.prompt_hash, &resolved_model);
+
+    let lookup = CacheLookupResult {
+        resolved_model,
+        inputs_hash,
+        cache_key,
+    };
+
+    if sc.force_fresh {
+        info!(
+            "[LLM-CACHE] FORCE-FRESH slug={} step={} depth={} key={}",
+            sc.slug, sc.step_name, sc.depth, &lookup.cache_key[..16]
+        );
+        return CacheProbeOutcome::MissOrBypass(Some(lookup));
+    }
+
+    // Open an ephemeral connection for the cache read. We deliberately
+    // go outside the writer mutex — the cache is content-addressable
+    // and SELECT is always safe.
+    let probe = tokio::task::block_in_place(|| {
+        let conn = super::db::open_pyramid_connection(std::path::Path::new(&sc.db_path))?;
+        super::db::check_cache(&conn, &sc.slug, &lookup.cache_key)
+    });
+
+    match probe {
+        Ok(Some(cached)) => {
+            let verdict = verify_cache_hit(
+                &cached,
+                &lookup.inputs_hash,
+                &sc.prompt_hash,
+                &lookup.resolved_model,
+            );
+            match verdict {
+                CacheHitResult::Valid => match parse_cached_response(&cached) {
+                    Ok(response) => {
+                        emit_cache_event(
+                            sc,
+                            TaggedKind::CacheHit {
+                                slug: sc.slug.clone(),
+                                step_name: sc.step_name.clone(),
+                                cache_key: lookup.cache_key.clone(),
+                                chunk_index: sc.chunk_index,
+                                depth: sc.depth,
+                            },
+                        );
+                        info!(
+                            "[LLM-CACHE] HIT slug={} step={} depth={} key={}",
+                            sc.slug,
+                            sc.step_name,
+                            sc.depth,
+                            &lookup.cache_key[..16]
+                        );
+                        CacheProbeOutcome::Hit(response)
+                    }
+                    Err(e) => {
+                        // Corruption detected at parse time — treat as
+                        // verification failure and fall through.
+                        warn!(
+                            "[LLM-CACHE] cached output_json parsed as JSON but structure was \
+                             unusable: {}",
+                            e
+                        );
+                        let _ = tokio::task::block_in_place(|| {
+                            let conn = super::db::open_pyramid_connection(std::path::Path::new(
+                                &sc.db_path,
+                            ))?;
+                            super::db::delete_cache_entry(&conn, &sc.slug, &lookup.cache_key)
+                        });
+                        emit_cache_event(
+                            sc,
+                            TaggedKind::CacheHitVerificationFailed {
+                                slug: sc.slug.clone(),
+                                step_name: sc.step_name.clone(),
+                                cache_key: lookup.cache_key.clone(),
+                                reason: "unusable_structure".to_string(),
+                            },
+                        );
+                        CacheProbeOutcome::MissOrBypass(Some(lookup))
+                    }
+                },
+                other => {
+                    let reason = other.reason_tag().to_string();
+                    warn!(
+                        "[LLM-CACHE] verification failed ({}) — deleting stale row for slug={} \
+                         cache_key={}",
+                        reason, sc.slug, lookup.cache_key
+                    );
+                    let _ = tokio::task::block_in_place(|| {
+                        let conn = super::db::open_pyramid_connection(std::path::Path::new(
+                            &sc.db_path,
+                        ))?;
+                        super::db::delete_cache_entry(&conn, &sc.slug, &lookup.cache_key)
+                    });
+                    emit_cache_event(
+                        sc,
+                        TaggedKind::CacheHitVerificationFailed {
+                            slug: sc.slug.clone(),
+                            step_name: sc.step_name.clone(),
+                            cache_key: lookup.cache_key.clone(),
+                            reason,
+                        },
+                    );
+                    CacheProbeOutcome::MissOrBypass(Some(lookup))
+                }
+            }
+        }
+        Ok(None) => {
+            emit_cache_event(
+                sc,
+                TaggedKind::CacheMiss {
+                    slug: sc.slug.clone(),
+                    step_name: sc.step_name.clone(),
+                    cache_key: lookup.cache_key.clone(),
+                    chunk_index: sc.chunk_index,
+                    depth: sc.depth,
+                },
+            );
+            CacheProbeOutcome::MissOrBypass(Some(lookup))
+        }
+        Err(e) => {
+            warn!(
+                "[LLM-CACHE] probe failed for slug={} cache_key={}: {} — falling through to HTTP",
+                sc.slug, lookup.cache_key, e
+            );
+            CacheProbeOutcome::MissOrBypass(Some(lookup))
+        }
+    }
+}
+
+/// Shared cache store path used by both
+/// `call_model_unified_with_options_and_ctx` and `call_model_via_registry`.
+/// No-op when either ctx or lookup is absent (which means the caller
+/// did not opt into the cache on this request).
+///
+/// Force-fresh writes route through `supersede_cache_entry` so the
+/// prior row is retained as a supersession chain link. Non-force-fresh
+/// writes go through `store_cache` (INSERT OR REPLACE on the
+/// content-addressable unique key).
+fn try_cache_store(
+    ctx: Option<&StepContext>,
+    lookup: Option<&CacheLookupResult>,
+    response: &LlmResponse,
+    call_started: std::time::Instant,
+) {
+    let (sc, lookup) = match (ctx, lookup) {
+        (Some(sc), Some(lookup)) => (sc, lookup),
+        _ => return,
+    };
+
+    let latency_ms = call_started.elapsed().as_millis() as i64;
+    let chunk_index = sc.chunk_index.unwrap_or(-1);
+    let token_usage_json = serde_json::to_string(&serde_json::json!({
+        "prompt_tokens": response.usage.prompt_tokens,
+        "completion_tokens": response.usage.completion_tokens,
+    }))
+    .ok();
+    let output_json = serialize_response_for_cache(response);
+    let entry = CacheEntry {
+        slug: sc.slug.clone(),
+        build_id: sc.build_id.clone(),
+        step_name: sc.step_name.clone(),
+        chunk_index,
+        depth: sc.depth,
+        cache_key: lookup.cache_key.clone(),
+        inputs_hash: lookup.inputs_hash.clone(),
+        prompt_hash: sc.prompt_hash.clone(),
+        model_id: lookup.resolved_model.clone(),
+        output_json,
+        token_usage_json,
+        cost_usd: None,
+        latency_ms: Some(latency_ms),
+        force_fresh: sc.force_fresh,
+        supersedes_cache_id: None,
+    };
+    let db_path = sc.db_path.clone();
+    let slug_for_write = sc.slug.clone();
+    let cache_key_for_write = lookup.cache_key.clone();
+    let force_fresh = sc.force_fresh;
+    let store_result = tokio::task::block_in_place(move || -> Result<()> {
+        let conn = super::db::open_pyramid_connection(std::path::Path::new(&db_path))?;
+        if force_fresh {
+            super::db::supersede_cache_entry(
+                &conn,
+                &slug_for_write,
+                &cache_key_for_write,
+                &entry,
+            )?;
+        } else {
+            super::db::store_cache(&conn, &entry)?;
+        }
+        Ok(())
+    });
+    if let Err(e) = store_result {
+        warn!(
+            "[LLM-CACHE] store failed for slug={} cache_key={}: {}",
+            sc.slug, lookup.cache_key, e
+        );
+    }
 }
 
 // ── Backward-compatible wrappers ─────────────────────────────────────────────
@@ -747,8 +1147,19 @@ pub async fn call_model_with_usage(
 /// * `config references credential ${...}` — the provider's
 ///   `api_key_ref` resolves to a variable that isn't in the
 ///   credentials file. Points the user at Settings → Credentials.
+///
+/// Phase 6 fix pass: accepts `Option<&StepContext>` and performs the
+/// same cache lookup / write that `call_model_unified_with_options_and_ctx`
+/// does via the shared `try_cache_lookup_or_key` / `try_cache_store`
+/// helpers. When the caller threads a cache-usable ctx, the
+/// content-addressable cache short-circuits the HTTP path on a hit and
+/// writes a new row on a miss. When `ctx` is `None` (or not
+/// cache-usable) this function behaves exactly like the pre-Phase-6
+/// registry path.
+#[allow(clippy::too_many_arguments)]
 pub async fn call_model_via_registry(
     config: &LlmConfig,
+    ctx: Option<&StepContext>,
     tier_name: &str,
     system_prompt: &str,
     user_prompt: &str,
@@ -757,6 +1168,18 @@ pub async fn call_model_via_registry(
     response_format: Option<&serde_json::Value>,
     metadata: RequestMetadata,
 ) -> Result<LlmResponse> {
+    // ── Phase 6 (fix pass): Cache lookup path ───────────────────────
+    //
+    // Identical entry point to `call_model_unified_with_options_and_ctx`
+    // so the two HTTP paths share a single cache hook. A valid hit
+    // short-circuits and never touches the registry or the HTTP path.
+    let cache_lookup = match try_cache_lookup_or_key(ctx, system_prompt, user_prompt) {
+        CacheProbeOutcome::Hit(response) => return Ok(response),
+        CacheProbeOutcome::MissOrBypass(lookup) => lookup,
+    };
+
+    let call_started = std::time::Instant::now();
+
     let registry = config
         .provider_registry
         .as_ref()
@@ -909,11 +1332,16 @@ pub async fn call_model_via_registry(
             parsed.actual_cost_usd,
         );
 
-        return Ok(LlmResponse {
+        let response = LlmResponse {
             content: parsed.content,
             usage: parsed.usage,
             generation_id: parsed.generation_id,
-        });
+        };
+
+        // ── Phase 6 (fix pass): Cache store path ───────────────────
+        try_cache_store(ctx, cache_lookup.as_ref(), &response, call_started);
+
+        return Ok(response);
     }
 
     Err(anyhow!("Max retries exceeded for tier `{}`", tier_name))
@@ -1452,5 +1880,280 @@ mod tests {
             defaults.timeout_increment_secs,
         );
         assert_eq!(timeout.as_secs(), 600);
+    }
+
+    // ── Phase 6: Cache hit / force-fresh end-to-end ─────────────────────
+
+    /// Build a temp pyramid DB with a slug and the cache table ready to
+    /// receive entries. Returns the path so the LLM call can re-open it.
+    fn temp_pyramid_db_with_slug(slug: &str) -> tempfile::NamedTempFile {
+        let file = tempfile::NamedTempFile::new().expect("temp db file");
+        let conn = super::super::db::open_pyramid_db(file.path()).expect("open pyramid db");
+        conn.execute(
+            "INSERT INTO pyramid_slugs (slug, content_type, source_path)
+             VALUES (?1, 'document', '/tmp/source')",
+            rusqlite::params![slug],
+        )
+        .expect("insert slug");
+        file
+    }
+
+    fn pre_populate_cache(
+        db_path: &std::path::Path,
+        slug: &str,
+        cache_key: &str,
+        inputs_hash: &str,
+        prompt_hash: &str,
+        model_id: &str,
+        content: &str,
+    ) {
+        let conn = super::super::db::open_pyramid_db(db_path).expect("reopen db");
+        let entry = super::super::step_context::CacheEntry {
+            slug: slug.into(),
+            build_id: "build-1".into(),
+            step_name: "test_step".into(),
+            chunk_index: -1,
+            depth: 0,
+            cache_key: cache_key.into(),
+            inputs_hash: inputs_hash.into(),
+            prompt_hash: prompt_hash.into(),
+            model_id: model_id.into(),
+            output_json: serde_json::json!({
+                "content": content,
+                "usage": {"prompt_tokens": 11, "completion_tokens": 22},
+                "generation_id": "gen-cached-1"
+            })
+            .to_string(),
+            token_usage_json: None,
+            cost_usd: None,
+            latency_ms: Some(7),
+            force_fresh: false,
+            supersedes_cache_id: None,
+        };
+        super::super::db::store_cache(&conn, &entry).expect("seed cache row");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_cache_hit_returns_cached_response_without_http() {
+        // The cache hit path returns BEFORE any HTTP work runs. With a
+        // pre-populated row, no provider/registry/credentials needed.
+        let db = temp_pyramid_db_with_slug("test-slug");
+        let system = "system prompt";
+        let user = "user prompt";
+        let model_id = "test/model-1";
+        let prompt_hash = "phash-test-1";
+
+        let inputs_hash = compute_inputs_hash(system, user);
+        let cache_key = compute_cache_key(&inputs_hash, prompt_hash, model_id);
+        pre_populate_cache(
+            db.path(),
+            "test-slug",
+            &cache_key,
+            &inputs_hash,
+            prompt_hash,
+            model_id,
+            "cached content (should be returned without HTTP)",
+        );
+
+        let ctx = StepContext::new(
+            "test-slug",
+            "build-1",
+            "test_step",
+            "extract",
+            0,
+            None,
+            db.path().to_string_lossy().to_string(),
+        )
+        .with_model_resolution("fast_extract", model_id)
+        .with_prompt_hash(prompt_hash);
+
+        // No provider_registry, no credentials — the cache hit short-
+        // circuits before `build_call_provider` runs, so an empty
+        // LlmConfig is fine.
+        let cfg = LlmConfig::default();
+        let response = call_model_unified_with_options_and_ctx(
+            &cfg,
+            Some(&ctx),
+            system,
+            user,
+            0.2,
+            4096,
+            None,
+            LlmCallOptions::default(),
+        )
+        .await
+        .expect("cache hit must return Ok");
+        assert_eq!(
+            response.content,
+            "cached content (should be returned without HTTP)"
+        );
+        assert_eq!(response.usage.prompt_tokens, 11);
+        assert_eq!(response.usage.completion_tokens, 22);
+        assert_eq!(response.generation_id.as_deref(), Some("gen-cached-1"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_cache_lookup_skipped_without_step_context() {
+        // When no StepContext is provided the cache layer is bypassed.
+        // We confirm this by NOT pre-populating any row and observing
+        // that the call fails on HTTP (no provider registry attached
+        // and no api_key, so the synth fallback hits a network error).
+        // The key correctness check is that the function does NOT
+        // return a 'no cached row found' error — that would mean it
+        // tried to consult the cache without a ctx.
+        let cfg = LlmConfig::default();
+        let result = call_model_unified_with_options_and_ctx(
+            &cfg,
+            None,
+            "system",
+            "user",
+            0.2,
+            4096,
+            None,
+            LlmCallOptions::default(),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "no ctx + no api key should error on HTTP path, not cache"
+        );
+        let err = result.unwrap_err().to_string();
+        // The error is from the HTTP retry loop, NOT a cache-layer
+        // error. We assert it doesn't mention cache-related words.
+        assert!(
+            !err.contains("cache_key") && !err.contains("verify_cache_hit"),
+            "no-ctx path must not consult the cache: err={}",
+            err
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_force_fresh_bypasses_cache_lookup() {
+        // With force_fresh = true, the cache lookup is skipped even
+        // when a row exists. We pre-populate a row, set force_fresh,
+        // and confirm the call falls through to HTTP (which will
+        // error because there's no real provider). The proof that we
+        // bypassed the cache: the response is NOT the cached content.
+        let db = temp_pyramid_db_with_slug("test-slug");
+        let system = "system";
+        let user = "user prompt force fresh";
+        let model_id = "test/model-1";
+        let prompt_hash = "phash-test-2";
+        let inputs_hash = compute_inputs_hash(system, user);
+        let cache_key = compute_cache_key(&inputs_hash, prompt_hash, model_id);
+        pre_populate_cache(
+            db.path(),
+            "test-slug",
+            &cache_key,
+            &inputs_hash,
+            prompt_hash,
+            model_id,
+            "stale cached content",
+        );
+
+        let ctx = StepContext::new(
+            "test-slug",
+            "build-1",
+            "test_step",
+            "extract",
+            0,
+            None,
+            db.path().to_string_lossy().to_string(),
+        )
+        .with_model_resolution("fast_extract", model_id)
+        .with_prompt_hash(prompt_hash)
+        .with_force_fresh(true);
+
+        let cfg = LlmConfig::default();
+        // Reduce retries so the test fails fast.
+        let mut cfg = cfg;
+        cfg.max_retries = 1;
+        cfg.base_timeout_secs = 1;
+        cfg.retryable_status_codes = vec![];
+        cfg.retry_base_sleep_secs = 0;
+
+        let result = call_model_unified_with_options_and_ctx(
+            &cfg,
+            Some(&ctx),
+            system,
+            user,
+            0.2,
+            4096,
+            None,
+            LlmCallOptions::default(),
+        )
+        .await;
+        // The HTTP path failed (no real provider) — that's the proof
+        // that force_fresh did NOT use the cache.
+        assert!(
+            result.is_err(),
+            "force_fresh + no real provider must hit the HTTP path and error"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_cache_hit_verification_failure_deletes_stale_row() {
+        // Pre-populate a row whose stored inputs_hash does NOT match
+        // what compute_inputs_hash will produce. The verifier rejects
+        // it and the row is deleted.
+        let db = temp_pyramid_db_with_slug("test-slug");
+        let system = "system";
+        let user = "user content for mismatch";
+        let model_id = "test/model-mm";
+        let prompt_hash = "phash-mm";
+
+        let real_inputs_hash = compute_inputs_hash(system, user);
+        let cache_key = compute_cache_key(&real_inputs_hash, prompt_hash, model_id);
+
+        // The row stores a wrong inputs_hash but matches on cache_key
+        // (we control both — this simulates the rare collision /
+        // concurrent-writer mismatch scenario).
+        pre_populate_cache(
+            db.path(),
+            "test-slug",
+            &cache_key,
+            "WRONG-INPUTS-HASH",
+            prompt_hash,
+            model_id,
+            "should-not-be-returned",
+        );
+
+        let ctx = StepContext::new(
+            "test-slug",
+            "build-1",
+            "test_step",
+            "extract",
+            0,
+            None,
+            db.path().to_string_lossy().to_string(),
+        )
+        .with_model_resolution("fast_extract", model_id)
+        .with_prompt_hash(prompt_hash);
+
+        let mut cfg = LlmConfig::default();
+        cfg.max_retries = 1;
+        cfg.base_timeout_secs = 1;
+        cfg.retryable_status_codes = vec![];
+        cfg.retry_base_sleep_secs = 0;
+
+        let _ = call_model_unified_with_options_and_ctx(
+            &cfg,
+            Some(&ctx),
+            system,
+            user,
+            0.2,
+            4096,
+            None,
+            LlmCallOptions::default(),
+        )
+        .await;
+        // After the verification-failure path, the row should be
+        // gone — re-check the DB directly.
+        let conn = super::super::db::open_pyramid_db(db.path()).unwrap();
+        let row = super::super::db::check_cache(&conn, "test-slug", &cache_key).unwrap();
+        assert!(
+            row.is_none(),
+            "verification-failed row must be deleted from the cache"
+        );
     }
 }

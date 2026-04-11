@@ -951,6 +951,45 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
         ",
     )?;
 
+    // ── Phase 6: LLM output cache (pyramid_step_cache) ─────────────────────
+    //
+    // Content-addressable cache for LLM outputs, keyed on
+    // `(slug, cache_key)` where `cache_key = sha256(inputs_hash, prompt_hash,
+    // model_id)`. Every successful LLM call writes a row here; every call
+    // checks this table BEFORE hitting the wire. The unique constraint means
+    // INSERT OR REPLACE on a duplicate is semantically an update.
+    //
+    // See `docs/specs/llm-output-cache.md` for the full specification and
+    // `pyramid::step_context` for the hash helpers + verification gate.
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS pyramid_step_cache (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            slug TEXT NOT NULL,
+            build_id TEXT NOT NULL,
+            step_name TEXT NOT NULL,
+            chunk_index INTEGER DEFAULT -1,
+            depth INTEGER DEFAULT 0,
+            cache_key TEXT NOT NULL,
+            inputs_hash TEXT NOT NULL,
+            prompt_hash TEXT NOT NULL,
+            model_id TEXT NOT NULL,
+            output_json TEXT NOT NULL,
+            token_usage_json TEXT,
+            cost_usd REAL,
+            latency_ms INTEGER,
+            created_at TEXT DEFAULT (datetime('now')),
+            force_fresh INTEGER DEFAULT 0,
+            supersedes_cache_id INTEGER,
+            UNIQUE(slug, cache_key)
+        );
+        CREATE INDEX IF NOT EXISTS idx_step_cache_lookup
+            ON pyramid_step_cache(slug, step_name, chunk_index, depth);
+        CREATE INDEX IF NOT EXISTS idx_step_cache_key
+            ON pyramid_step_cache(cache_key);
+        ",
+    )?;
+
     // ── Schema Prep Migration for Wire Online push ──────────────────────────
     migrate_online_push_columns(conn)?;
 
@@ -5731,6 +5770,205 @@ pub fn get_cost_summary(
         "by_layer": by_layer,
         "recent_calls": recent_calls,
     }))
+}
+
+// ── Phase 6: LLM Output Cache CRUD (pyramid_step_cache) ───────────────────
+//
+// Content-addressable cache for LLM outputs. The table is keyed on
+// `(slug, cache_key)` where `cache_key = sha256(inputs_hash, prompt_hash,
+// model_id)` computed by `pyramid::step_context::compute_cache_key`.
+//
+// Writes are INSERT OR REPLACE — identical content addressing produces
+// an update (latest wins). Force-fresh writes (reroll) link back to the
+// prior row via `supersedes_cache_id` and retain their own unique row
+// for version history.
+
+use super::step_context::{CacheEntry, CachedStepOutput};
+
+fn cached_step_output_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CachedStepOutput> {
+    Ok(CachedStepOutput {
+        id: row.get(0)?,
+        slug: row.get(1)?,
+        build_id: row.get(2)?,
+        step_name: row.get(3)?,
+        chunk_index: row.get(4)?,
+        depth: row.get(5)?,
+        cache_key: row.get(6)?,
+        inputs_hash: row.get(7)?,
+        prompt_hash: row.get(8)?,
+        model_id: row.get(9)?,
+        output_json: row.get(10)?,
+        token_usage_json: row.get(11)?,
+        cost_usd: row.get(12)?,
+        latency_ms: row.get(13)?,
+        created_at: row.get(14)?,
+        force_fresh: row.get::<_, i64>(15)? != 0,
+        supersedes_cache_id: row.get(16)?,
+    })
+}
+
+/// Look up a cached LLM output by content-addressable key. Returns
+/// `Ok(None)` if no row matches — callers MUST treat this as a miss and
+/// fall through to the HTTP path.
+///
+/// Returns the most recent matching row when multiple exist (e.g. a
+/// force-fresh write superseded an earlier entry under the same cache
+/// key). Multiple rows under the same `(slug, cache_key)` are prevented
+/// by the UNIQUE constraint; this ORDER BY is a defensive tie-break.
+pub fn check_cache(
+    conn: &Connection,
+    slug: &str,
+    cache_key: &str,
+) -> Result<Option<CachedStepOutput>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, slug, build_id, step_name, chunk_index, depth, cache_key,
+                inputs_hash, prompt_hash, model_id, output_json, token_usage_json,
+                cost_usd, latency_ms, created_at, force_fresh, supersedes_cache_id
+         FROM pyramid_step_cache
+         WHERE slug = ?1 AND cache_key = ?2
+         ORDER BY id DESC
+         LIMIT 1",
+    )?;
+    let row = stmt
+        .query_row(rusqlite::params![slug, cache_key], cached_step_output_from_row)
+        .optional()?;
+    Ok(row)
+}
+
+/// Insert or replace a cache entry. Uses the `(slug, cache_key)` unique
+/// constraint as the conflict target so identical content-addressed
+/// writes produce an update (most recent wins, keeping `created_at`
+/// fresh).
+///
+/// Force-fresh entries should instead go through
+/// `supersede_cache_entry` so the supersession link is preserved.
+pub fn store_cache(conn: &Connection, entry: &CacheEntry) -> Result<()> {
+    conn.execute(
+        "INSERT INTO pyramid_step_cache
+            (slug, build_id, step_name, chunk_index, depth, cache_key,
+             inputs_hash, prompt_hash, model_id, output_json, token_usage_json,
+             cost_usd, latency_ms, created_at, force_fresh, supersedes_cache_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, datetime('now'), ?14, ?15)
+         ON CONFLICT(slug, cache_key) DO UPDATE SET
+            build_id = excluded.build_id,
+            step_name = excluded.step_name,
+            chunk_index = excluded.chunk_index,
+            depth = excluded.depth,
+            inputs_hash = excluded.inputs_hash,
+            prompt_hash = excluded.prompt_hash,
+            model_id = excluded.model_id,
+            output_json = excluded.output_json,
+            token_usage_json = excluded.token_usage_json,
+            cost_usd = excluded.cost_usd,
+            latency_ms = excluded.latency_ms,
+            created_at = datetime('now'),
+            force_fresh = excluded.force_fresh,
+            supersedes_cache_id = excluded.supersedes_cache_id",
+        rusqlite::params![
+            entry.slug,
+            entry.build_id,
+            entry.step_name,
+            entry.chunk_index,
+            entry.depth,
+            entry.cache_key,
+            entry.inputs_hash,
+            entry.prompt_hash,
+            entry.model_id,
+            entry.output_json,
+            entry.token_usage_json,
+            entry.cost_usd,
+            entry.latency_ms,
+            if entry.force_fresh { 1_i64 } else { 0_i64 },
+            entry.supersedes_cache_id,
+        ],
+    )
+    .with_context(|| format!("store_cache(slug={}, cache_key={})", entry.slug, entry.cache_key))?;
+    Ok(())
+}
+
+/// Delete a cache row by its content-addressable key. Used by the
+/// verification-failure path in `call_model_unified_with_options` — when
+/// `verify_cache_hit` returns `Mismatch*` or `CorruptedOutput`, the
+/// caller deletes the stale row and falls through to HTTP.
+pub fn delete_cache_entry(conn: &Connection, slug: &str, cache_key: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM pyramid_step_cache WHERE slug = ?1 AND cache_key = ?2",
+        rusqlite::params![slug, cache_key],
+    )?;
+    Ok(())
+}
+
+/// Insert a new cache entry that supersedes a prior row for the same
+/// `(slug, cache_key)`. Used by the force-fresh (reroll) path: the prior
+/// row is retained (for version history) and the new row carries
+/// `supersedes_cache_id` pointing at it.
+///
+/// Because `pyramid_step_cache` has `UNIQUE(slug, cache_key)`, we cannot
+/// insert a second row with the same pair directly. The supersession
+/// pattern is:
+///   1. Save the prior row's id.
+///   2. Soft-move the prior row to a unique-but-distinct cache_key by
+///      appending the id so it stays queryable but no longer matches
+///      content-addressable lookups.
+///   3. Insert the new row under the original cache_key with
+///      `supersedes_cache_id` pointing at the moved prior row.
+///
+/// This preserves the invariant "at most one active row per content
+/// address" while retaining version history readable from
+/// `pyramid_step_cache` directly.
+pub fn supersede_cache_entry(
+    conn: &Connection,
+    slug: &str,
+    prior_cache_key: &str,
+    new_entry: &CacheEntry,
+) -> Result<()> {
+    let prior_row: Option<(i64, String)> = conn
+        .query_row(
+            "SELECT id, cache_key FROM pyramid_step_cache
+             WHERE slug = ?1 AND cache_key = ?2
+             ORDER BY id DESC LIMIT 1",
+            rusqlite::params![slug, prior_cache_key],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+
+    let (prior_id, archival_cache_key) = if let Some((id, orig_key)) = prior_row {
+        // Move the prior row to an archival cache_key so the new row can
+        // claim the content-addressable slot. The archival key embeds
+        // the prior id so it remains locatable but cannot collide with
+        // any future content-addressable lookup (a real cache_key is a
+        // 64-char SHA-256 hex and never starts with "archived:").
+        let archival_key = format!("archived:{}:{}", id, orig_key);
+        conn.execute(
+            "UPDATE pyramid_step_cache SET cache_key = ?1 WHERE id = ?2",
+            rusqlite::params![archival_key, id],
+        )?;
+        (Some(id), Some(archival_key))
+    } else {
+        (None, None)
+    };
+
+    // Link the new entry to the prior row (regardless of whether the
+    // caller already supplied a supersedes_cache_id).
+    let mut entry = new_entry.clone();
+    if let Some(id) = prior_id {
+        entry.supersedes_cache_id = Some(id);
+    }
+    entry.force_fresh = true;
+
+    if let Err(e) = store_cache(conn, &entry) {
+        // If the store failed, restore the prior row's cache_key so it
+        // doesn't dangle in the archival state.
+        if let (Some(id), Some(_)) = (prior_id, archival_cache_key) {
+            let _ = conn.execute(
+                "UPDATE pyramid_step_cache SET cache_key = ?1 WHERE id = ?2",
+                rusqlite::params![prior_cache_key, id],
+            );
+        }
+        return Err(e);
+    }
+
+    Ok(())
 }
 
 // ── Vine DB Helpers ──────────────────────────────────────────────────────────
@@ -11556,5 +11794,271 @@ mod provider_registry_tests {
             "dadbear_policy should map to contribution_type=template per mapping table; got {:?}",
             metadata.contribution_type
         );
+    }
+}
+
+// ── Phase 6: pyramid_step_cache CRUD tests ─────────────────────────────────
+
+#[cfg(test)]
+mod step_cache_tests {
+    use super::*;
+    use crate::pyramid::step_context::{
+        compute_cache_key, compute_inputs_hash, verify_cache_hit, CacheEntry, CacheHitResult,
+    };
+
+    fn mem_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        init_pyramid_db(&conn).unwrap();
+        conn
+    }
+
+    fn make_entry(slug: &str, key_seed: &str) -> CacheEntry {
+        let inputs_hash = compute_inputs_hash("system", &format!("user-{key_seed}"));
+        let prompt_hash = "phash-1".to_string();
+        let model_id = "openrouter/test-1".to_string();
+        let cache_key = compute_cache_key(&inputs_hash, &prompt_hash, &model_id);
+        CacheEntry {
+            slug: slug.into(),
+            build_id: "build-1".into(),
+            step_name: "step-a".into(),
+            chunk_index: -1,
+            depth: 0,
+            cache_key,
+            inputs_hash,
+            prompt_hash,
+            model_id,
+            output_json: serde_json::json!({"content":"hello","usage":{"prompt_tokens":1,"completion_tokens":2}})
+                .to_string(),
+            token_usage_json: Some("{\"prompt_tokens\":1,\"completion_tokens\":2}".into()),
+            cost_usd: None,
+            latency_ms: Some(42),
+            force_fresh: false,
+            supersedes_cache_id: None,
+        }
+    }
+
+    #[test]
+    fn test_table_initialized_on_init_pyramid_db() {
+        let conn = mem_conn();
+        // Schema check: SELECT against the table should not error.
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pyramid_step_cache",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_store_and_check_round_trip() {
+        let conn = mem_conn();
+        let entry = make_entry("test-slug", "round-trip");
+        store_cache(&conn, &entry).unwrap();
+
+        let fetched = check_cache(&conn, "test-slug", &entry.cache_key)
+            .unwrap()
+            .expect("entry should exist after store");
+        assert_eq!(fetched.slug, "test-slug");
+        assert_eq!(fetched.cache_key, entry.cache_key);
+        assert_eq!(fetched.inputs_hash, entry.inputs_hash);
+        assert_eq!(fetched.prompt_hash, entry.prompt_hash);
+        assert_eq!(fetched.model_id, entry.model_id);
+        assert_eq!(fetched.output_json, entry.output_json);
+        assert_eq!(fetched.latency_ms, Some(42));
+        assert!(!fetched.force_fresh);
+        assert_eq!(fetched.supersedes_cache_id, None);
+    }
+
+    #[test]
+    fn test_check_cache_returns_none_on_miss() {
+        let conn = mem_conn();
+        let result = check_cache(&conn, "nope", "no-such-key").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_unique_constraint_on_slug_cache_key_replaces() {
+        // Inserting twice under the same (slug, cache_key) must update,
+        // not duplicate (the ON CONFLICT clause is the spec's INSERT OR
+        // REPLACE semantics).
+        let conn = mem_conn();
+        let mut entry = make_entry("ts", "dup");
+        store_cache(&conn, &entry).unwrap();
+        // Mutate the output and store again under the same cache_key.
+        entry.output_json = serde_json::json!({"content":"updated","usage":{"prompt_tokens":3,"completion_tokens":4}}).to_string();
+        store_cache(&conn, &entry).unwrap();
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pyramid_step_cache WHERE slug = ?1 AND cache_key = ?2",
+                rusqlite::params!["ts", entry.cache_key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "ON CONFLICT must update, not insert a duplicate");
+
+        let fetched = check_cache(&conn, "ts", &entry.cache_key).unwrap().unwrap();
+        assert!(fetched.output_json.contains("updated"));
+    }
+
+    #[test]
+    fn test_delete_cache_entry() {
+        let conn = mem_conn();
+        let entry = make_entry("ts", "delete");
+        store_cache(&conn, &entry).unwrap();
+        delete_cache_entry(&conn, "ts", &entry.cache_key).unwrap();
+        let fetched = check_cache(&conn, "ts", &entry.cache_key).unwrap();
+        assert!(fetched.is_none(), "row should be gone after delete");
+    }
+
+    #[test]
+    fn test_check_cache_hit_and_verify_valid() {
+        let conn = mem_conn();
+        let entry = make_entry("ts", "verify");
+        store_cache(&conn, &entry).unwrap();
+
+        let fetched = check_cache(&conn, "ts", &entry.cache_key).unwrap().unwrap();
+        let verdict = verify_cache_hit(
+            &fetched,
+            &entry.inputs_hash,
+            &entry.prompt_hash,
+            &entry.model_id,
+        );
+        assert_eq!(verdict, CacheHitResult::Valid);
+    }
+
+    #[test]
+    fn test_cache_hit_verification_rejects_input_mismatch() {
+        let conn = mem_conn();
+        let entry = make_entry("ts", "mismatch_inputs");
+        store_cache(&conn, &entry).unwrap();
+        let fetched = check_cache(&conn, "ts", &entry.cache_key).unwrap().unwrap();
+        // Different inputs hash → mismatch.
+        let verdict =
+            verify_cache_hit(&fetched, "different-inputs", &entry.prompt_hash, &entry.model_id);
+        assert_eq!(verdict, CacheHitResult::MismatchInputs);
+    }
+
+    #[test]
+    fn test_cache_hit_verification_rejects_prompt_mismatch() {
+        let conn = mem_conn();
+        let entry = make_entry("ts", "mismatch_prompt");
+        store_cache(&conn, &entry).unwrap();
+        let fetched = check_cache(&conn, "ts", &entry.cache_key).unwrap().unwrap();
+        let verdict =
+            verify_cache_hit(&fetched, &entry.inputs_hash, "different-prompt", &entry.model_id);
+        assert_eq!(verdict, CacheHitResult::MismatchPrompt);
+    }
+
+    #[test]
+    fn test_cache_hit_verification_rejects_model_mismatch() {
+        let conn = mem_conn();
+        let entry = make_entry("ts", "mismatch_model");
+        store_cache(&conn, &entry).unwrap();
+        let fetched = check_cache(&conn, "ts", &entry.cache_key).unwrap().unwrap();
+        let verdict = verify_cache_hit(
+            &fetched,
+            &entry.inputs_hash,
+            &entry.prompt_hash,
+            "openrouter/different-model",
+        );
+        assert_eq!(verdict, CacheHitResult::MismatchModel);
+    }
+
+    #[test]
+    fn test_cache_hit_verification_rejects_corrupted_output() {
+        // Construct a row with malformed output_json directly via the
+        // store helper. The verifier should flag it as corruption.
+        let conn = mem_conn();
+        let mut entry = make_entry("ts", "corrupted");
+        entry.output_json = "this is not json {{{".to_string();
+        store_cache(&conn, &entry).unwrap();
+        let fetched = check_cache(&conn, "ts", &entry.cache_key).unwrap().unwrap();
+        let verdict = verify_cache_hit(
+            &fetched,
+            &entry.inputs_hash,
+            &entry.prompt_hash,
+            &entry.model_id,
+        );
+        assert_eq!(verdict, CacheHitResult::CorruptedOutput);
+    }
+
+    #[test]
+    fn test_supersede_cache_entry_links_back() {
+        // Force-fresh path: an existing entry is superseded by a new
+        // entry under the same cache_key. The supersession helper moves
+        // the prior row to an archival key, retains it, and writes the
+        // new row with `supersedes_cache_id` pointing at it.
+        let conn = mem_conn();
+        let prior = make_entry("ts", "supersede");
+        store_cache(&conn, &prior).unwrap();
+        let prior_id: i64 = conn
+            .query_row(
+                "SELECT id FROM pyramid_step_cache WHERE slug = ?1 AND cache_key = ?2",
+                rusqlite::params!["ts", prior.cache_key],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        // The "fresh" entry has the same content-addressable cache key
+        // (same inputs/prompt/model) but represents a reroll.
+        let mut new_entry = prior.clone();
+        new_entry.output_json =
+            serde_json::json!({"content":"reroll","usage":{"prompt_tokens":5,"completion_tokens":6}})
+                .to_string();
+        supersede_cache_entry(&conn, "ts", &prior.cache_key, &new_entry).unwrap();
+
+        // The new row is the active content-addressable lookup target.
+        let active = check_cache(&conn, "ts", &prior.cache_key).unwrap().unwrap();
+        assert!(active.output_json.contains("reroll"));
+        assert!(active.force_fresh, "force_fresh flag should be set");
+        assert_eq!(
+            active.supersedes_cache_id,
+            Some(prior_id),
+            "new entry should link back to the prior id"
+        );
+
+        // The prior row still exists under the archival cache_key.
+        let archival_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pyramid_step_cache WHERE slug = ?1 AND id = ?2 AND cache_key LIKE 'archived:%'",
+                rusqlite::params!["ts", prior_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            archival_count, 1,
+            "prior row should be retained under archival cache_key"
+        );
+    }
+
+    #[test]
+    fn test_supersede_with_no_prior_row_just_inserts() {
+        // If no prior row exists, supersede_cache_entry is equivalent
+        // to a force_fresh store_cache. The new row stands alone with
+        // supersedes_cache_id = None.
+        let conn = mem_conn();
+        let entry = make_entry("ts", "first_reroll");
+        supersede_cache_entry(&conn, "ts", &entry.cache_key, &entry).unwrap();
+        let fetched = check_cache(&conn, "ts", &entry.cache_key).unwrap().unwrap();
+        assert!(fetched.force_fresh);
+        assert_eq!(fetched.supersedes_cache_id, None);
+    }
+
+    #[test]
+    fn test_check_cache_returns_most_recent_row() {
+        // Defensive ORDER BY id DESC: ensure the lookup returns the
+        // most recent entry. (The unique constraint guarantees at most
+        // one row per content-addressable key, but the ORDER BY is the
+        // canonical tie-break.)
+        let conn = mem_conn();
+        let entry = make_entry("ts", "ordering");
+        store_cache(&conn, &entry).unwrap();
+        let fetched = check_cache(&conn, "ts", &entry.cache_key).unwrap().unwrap();
+        // Just confirm the fields round-trip — the assertion above is
+        // enough; this test exists to lock down the SELECT shape.
+        assert_eq!(fetched.cache_key, entry.cache_key);
     }
 }

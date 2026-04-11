@@ -26,6 +26,7 @@ pub mod config_contributions;
 pub mod config_helper;
 pub mod prompt_cache;
 pub mod rotator_allocation;
+pub mod step_context;
 pub mod wire_native_metadata;
 pub mod converge_expand;
 pub mod cost_model;

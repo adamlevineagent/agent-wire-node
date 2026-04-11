@@ -64,6 +64,21 @@ pub struct ChainContext {
     /// WS-CHAIN-INVOKE: current invoke_chain nesting depth. Root chain = 0.
     /// Incremented on each invoke_chain step. Execution fails if >= 8.
     pub invoke_depth: u32,
+    /// Phase 6: prompt template hashes keyed by resolved file path (or any
+    /// stable identifier for the template body). Populated lazily the first
+    /// time a step resolves a prompt in this build; every subsequent lookup
+    /// for the same path hits the cache.
+    ///
+    /// The cache lives on ChainContext (not on the global PromptCache) so
+    /// mid-build consistency is guaranteed: editing a prompt file during
+    /// a running build does not change the hash the cache key uses.
+    pub prompt_hashes: HashMap<String, String>,
+    /// Phase 6: tier_name → canonical model_id map, populated lazily via
+    /// `resolve_model_for_tier`. Guarantees all cache writes in a single
+    /// build use consistent model_ids even if the underlying tier routing
+    /// table is mutated mid-build. See `llm-output-cache.md` → "Model ID
+    /// Normalization".
+    pub resolved_models: HashMap<String, String>,
 }
 
 impl ChainContext {
@@ -86,7 +101,44 @@ impl ChainContext {
             initial_params: HashMap::new(),
             break_loop: false,
             invoke_depth: 0,
+            prompt_hashes: HashMap::new(),
+            resolved_models: HashMap::new(),
         }
+    }
+
+    /// Phase 6: look up or compute the SHA-256 prompt hash for a template
+    /// path. Stores the result on `prompt_hashes` so subsequent lookups in
+    /// this build return without rehashing. Requires `&mut self`.
+    ///
+    /// The `body_provider` closure is called only on a cache miss. It
+    /// should return the fully-resolved template body (after any static
+    /// substitutions) so the hash represents the content that will be
+    /// sent to the LLM's system/user prompt shaper.
+    pub fn get_or_compute_prompt_hash(
+        &mut self,
+        path: &str,
+        body_provider: impl FnOnce() -> String,
+    ) -> String {
+        if let Some(existing) = self.prompt_hashes.get(path) {
+            return existing.clone();
+        }
+        let body = body_provider();
+        let hash = super::step_context::compute_prompt_hash(&body);
+        self.prompt_hashes.insert(path.to_string(), hash.clone());
+        hash
+    }
+
+    /// Phase 6: cache a resolved tier → model mapping. Subsequent lookups
+    /// for the same tier return the cached id without going through the
+    /// provider registry again.
+    pub fn cache_resolved_model(&mut self, tier: &str, model_id: &str) {
+        self.resolved_models
+            .insert(tier.to_string(), model_id.to_string());
+    }
+
+    /// Phase 6: look up a previously-cached resolved model id for a tier.
+    pub fn get_resolved_model(&self, tier: &str) -> Option<&str> {
+        self.resolved_models.get(tier).map(|s| s.as_str())
     }
 
     /// Resolve a single `$reference` string against the context.
@@ -845,5 +897,60 @@ mod tests {
         let mut ctx = test_context();
         ctx.invoke_depth = 5;
         assert_eq!(ctx.invoke_depth, 5);
+    }
+
+    // ── Phase 6: prompt_hashes + resolved_models lazy caches ────────
+
+    #[test]
+    fn chain_context_new_defaults_prompt_hashes_empty() {
+        let ctx = test_context();
+        assert!(ctx.prompt_hashes.is_empty());
+    }
+
+    #[test]
+    fn chain_context_new_defaults_resolved_models_empty() {
+        let ctx = test_context();
+        assert!(ctx.resolved_models.is_empty());
+    }
+
+    #[test]
+    fn get_or_compute_prompt_hash_caches_first_call() {
+        let mut ctx = test_context();
+        let mut call_count = 0;
+        let provider = || {
+            call_count += 1;
+            "template body".to_string()
+        };
+        let hash = ctx.get_or_compute_prompt_hash("/some/path", provider);
+        assert!(!hash.is_empty());
+        assert_eq!(call_count, 1, "first call invokes provider");
+        assert!(ctx.prompt_hashes.contains_key("/some/path"));
+
+        // Second call must NOT invoke the provider again — track via
+        // a fresh closure that panics if invoked.
+        let hash2 = ctx.get_or_compute_prompt_hash("/some/path", || {
+            panic!("provider should not be re-invoked on cache hit")
+        });
+        assert_eq!(hash, hash2);
+    }
+
+    #[test]
+    fn get_or_compute_prompt_hash_distinct_paths() {
+        let mut ctx = test_context();
+        let h1 = ctx.get_or_compute_prompt_hash("/a", || "body A".into());
+        let h2 = ctx.get_or_compute_prompt_hash("/b", || "body B".into());
+        assert_ne!(h1, h2);
+        assert_eq!(ctx.prompt_hashes.len(), 2);
+    }
+
+    #[test]
+    fn cache_resolved_model_round_trip() {
+        let mut ctx = test_context();
+        ctx.cache_resolved_model("fast_extract", "inception/mercury-2");
+        assert_eq!(
+            ctx.get_resolved_model("fast_extract"),
+            Some("inception/mercury-2")
+        );
+        assert_eq!(ctx.get_resolved_model("nope"), None);
     }
 }

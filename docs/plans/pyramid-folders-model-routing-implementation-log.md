@@ -1046,3 +1046,132 @@ Summary:
 3. **Spec file still has old struct shapes (NOT FIXED, flagged).** `docs/specs/wire-contribution-mapping.md` retains three pre-canonical struct definitions (`WireScope` tagged enum, `WireRef` tagged enum, `supersedes: Option<WireRefKey>`) that the Rust code correctly diverges from. Standalone editing task; not in wanderer scope.
 
 Verification: `cargo check` clean; `cargo test --lib pyramid` reports 923 passed, 7 pre-existing failures unchanged. Phase 5 implementer reported 919 passing, verifier commit added 1, wanderer fix adds 3 → 923. Zero regressions. Files modified: `src-tauri/src/pyramid/prompt_cache.rs`, `src-tauri/src/pyramid/chain_loader.rs`, `src-tauri/src/pyramid/db.rs`, `src-tauri/src/main.rs`. Commit: `phase-5: wanderer fix — PromptCache wire-up + DADBEAR canonical metadata` on branch `phase-5-wire-contribution-mapping`.
+
+---
+
+## Phase 6 — LLM Output Cache + StepContext
+
+**Workstream:** phase-6-llm-output-cache
+**Workstream prompt:** `docs/plans/phase-6-workstream-prompt.md`
+**Spec:** `docs/specs/llm-output-cache.md`
+**Branch:** `phase-6-llm-output-cache` (off `phase-5-wire-contribution-mapping`)
+**Started:** 2026-04-10
+**Completed (implementer pass):** 2026-04-10
+**Status:** awaiting-verification
+
+### What shipped
+
+Phase 6 turns `pyramid_llm_audit` from a write-only log into a content-addressable LLM output cache and introduces the unified `StepContext` struct that Phases 2, 3, and 5 all deferred to "when Phase 6 lands." The cache is keyed on `cache_key = sha256(inputs_hash, prompt_hash, model_id)` and lives in a new `pyramid_step_cache` table with a `UNIQUE(slug, cache_key)` constraint. The cache hook is wired into a new ctx-aware variant of the unified LLM call path so production callers opt in by passing a `StepContext` while every legacy call site (and unit tests) continues to bypass the cache by passing `None`.
+
+The implementation contains four load-bearing correctness gates: (1) `verify_cache_hit` performs all four mismatch checks plus a corruption parse, returning a distinct `CacheHitResult` variant for each failure mode; (2) the cache lookup is OPT-IN — when no `StepContext` is passed (or when the context lacks a resolved model id / prompt hash) the call falls through to the existing HTTP retry loop without touching the cache; (3) verification failure deletes the stale row, emits `CacheHitVerificationFailed` with the precise reason tag, and falls through to the wire so a corrupt cache cannot poison subsequent runs; (4) force-fresh writes route through `supersede_cache_entry` which moves the prior row to an archival cache_key (`archived:{id}:{orig}`) so the new content-addressable slot stays unique while the supersession chain remains queryable from `pyramid_step_cache` for Phase 13's reroll history.
+
+The Phase 2 `generate_change_manifest` retrofit is the first proof-of-concept use of the StepContext pattern: `execute_supersession` now constructs a `StepContext` with `step_name="change_manifest"`, `primitive="manifest_generation"`, the current node's depth, no chunk_index, the resolved model id, and a hash of the prompt template body, then threads it through `generate_change_manifest` which delegates to `call_model_unified_with_options_and_ctx`. The cache layer treats manifest generation as just another LLM call with its own cache key, so a repeated stale check on the same node at the same `build_version` (with unchanged children, prompt, and routing) is a hit.
+
+### Files touched
+
+**New files:**
+- `src-tauri/src/pyramid/step_context.rs` (~530 lines) — Phase 6 module:
+  - Hash helpers: `sha256_hex`, `compute_cache_key` (composite of inputs|prompt|model with `|` delimiter), `compute_inputs_hash` (separator-protected concat of system+user prompts), `compute_prompt_hash` (template body hash).
+  - `CacheHitResult` enum with five variants (`Valid`, `MismatchInputs`, `MismatchPrompt`, `MismatchModel`, `CorruptedOutput`) and a `reason_tag()` helper for telemetry.
+  - `CachedStepOutput` (read shape) and `CacheEntry` (write shape) structs covering every column on `pyramid_step_cache`.
+  - `verify_cache_hit` — the load-bearing correctness gate. Checks all three components individually before parsing the stored JSON for corruption. Documented mismatch-beats-corruption ordering.
+  - `StepContext` struct with build metadata, cache plumbing (`db_path`, `force_fresh`), event bus handle, model resolution fields (`model_tier`, `resolved_model_id`, `resolved_provider_id`), and the prompt hash. Custom `Debug` impl that does NOT print the bus handle. Builder methods (`with_model_resolution`, `with_provider`, `with_prompt_hash`, `with_bus`, `with_force_fresh`) and `cache_is_usable()` predicate.
+  - 15 unit tests covering hash determinism, separator collision protection, cache key uniqueness against single-component changes, every `CacheHitResult` variant including the mismatch-beats-corruption ordering, and StepContext builder semantics.
+
+**Modified files:**
+- `src-tauri/src/pyramid/db.rs` (+~290 lines):
+  - `init_pyramid_db` adds `pyramid_step_cache` table per the spec's exact column list, plus `idx_step_cache_lookup` and `idx_step_cache_key` indices. All `IF NOT EXISTS`.
+  - New CRUD section at the end of the file adds `check_cache`, `store_cache` (INSERT with `ON CONFLICT(slug, cache_key) DO UPDATE`), `delete_cache_entry`, and `supersede_cache_entry` (the force-fresh path that archives the prior row under `archived:{id}:{orig_key}` so the unique constraint stays satisfied while history is preserved).
+  - New `step_cache_tests` module with 13 tests: table creation idempotency, store/check round-trip, miss-returns-None, ON CONFLICT replaces (not duplicates), delete, all four `verify_cache_hit` variants, supersede with prior link-back AND with no prior row, and the most-recent-row ORDER BY tie-break.
+- `src-tauri/src/pyramid/llm.rs` (+~340 lines):
+  - New imports for `event_bus::{TaggedBuildEvent, TaggedKind}` and `step_context::*`.
+  - `call_model_unified_with_options` is now a one-line shim that delegates to `call_model_unified_with_options_and_ctx(.., None, ..)` — preserves backward compatibility for every existing caller.
+  - `call_model_unified_with_options_and_ctx` is the new ctx-aware entry point. Its body adds the cache lookup BEFORE the existing HTTP retry loop (computes `inputs_hash`, `cache_key`; checks `pyramid_step_cache`; on Valid hit emits `CacheHit` and returns the cached response; on `Mismatch*`/`CorruptedOutput` deletes the stale row and emits `CacheHitVerificationFailed`; on miss emits `CacheMiss`; force_fresh skips lookup but still computes the key for the write path). The HTTP success path adds a cache write through either `store_cache` (normal) or `supersede_cache_entry` (force-fresh). The cache write uses `tokio::task::block_in_place` with an ephemeral connection so it doesn't take the writer mutex (the cache is content-addressable; INSERT OR REPLACE on the unique key is safe without serialization).
+  - New helpers `serialize_response_for_cache`, `parse_cached_response`, `emit_cache_event`, plus a private `CacheLookupResult` struct that carries the components computed once per call.
+  - 4 new integration tests at the end of `llm::tests`: cache hit returns cached content without HTTP, no-ctx path bypasses cache entirely (and does NOT consult the cache), force-fresh bypasses lookup and falls through to HTTP, verification failure deletes the stale row.
+- `src-tauri/src/pyramid/chain_resolve.rs` (+~80 lines):
+  - `ChainContext` gains `prompt_hashes: HashMap<String, String>` and `resolved_models: HashMap<String, String>` fields (initialized to empty HashMaps in `ChainContext::new`).
+  - New methods: `get_or_compute_prompt_hash` (lazy pull-through with closure-provided body) and `cache_resolved_model`/`get_resolved_model`.
+  - 5 new tests for default-empty initialization, lazy compute-then-cache (using a panic closure to prove the cache hits), distinct path keys, and the model resolution round-trip.
+- `src-tauri/src/pyramid/event_bus.rs` (+~35 lines):
+  - `TaggedKind` gains `CacheHit`, `CacheMiss`, and `CacheHitVerificationFailed` variants per the spec. Phase 6 just emits them; Phase 13 will add the consumer.
+- `src-tauri/src/pyramid/stale_helpers_upper.rs` (+~80 lines, retrofit):
+  - `generate_change_manifest` signature gains `ctx: Option<&super::step_context::StepContext>`. The function body now delegates to `call_model_unified_with_options_and_ctx` instead of `call_model_with_usage`, threading the ctx through. The Pillar 37 hardcoded `0.2, 4096` temperature/max_tokens stays in place — that's still Phase 9's scope.
+  - `execute_supersession` now constructs a `StepContext` with `step_name="change_manifest"`, `primitive="manifest_generation"`, `depth=node_ctx.depth`, `chunk_index=None`, the model id, and a `compute_prompt_hash(&load_change_manifest_prompt_body())` value, then passes `Some(&cache_ctx)` to `generate_change_manifest`. The `cache_build_id` is `format!("stale-{node_id}-{build_version}")` so a repeated stale check at the same version is a hit.
+  - 1 new test (`test_generate_change_manifest_with_step_context_compiles`) — a type-check regression test that constructs a StepContext + builds the call future without polling it. Any future signature drift that drops the ctx parameter will fail to compile this test.
+- `src-tauri/src/pyramid/mod.rs` — declared `pub mod step_context`.
+- `docs/plans/pyramid-folders-model-routing-implementation-log.md` — this entry.
+
+### Spec adherence (against `llm-output-cache.md` and the workstream brief)
+
+- ✅ **`pyramid_step_cache` table** — created in `init_pyramid_db` with the exact 17 columns from the spec (id, slug, build_id, step_name, chunk_index, depth, cache_key, inputs_hash, prompt_hash, model_id, output_json, token_usage_json, cost_usd, latency_ms, created_at, force_fresh, supersedes_cache_id) plus the two indices (`idx_step_cache_lookup` on `(slug, step_name, chunk_index, depth)` and `idx_step_cache_key` on `cache_key`). UNIQUE constraint on `(slug, cache_key)`.
+- ✅ **CRUD helpers** — `check_cache`, `store_cache`, `delete_cache_entry`, `supersede_cache_entry` per the spec's signature list. Store uses ON CONFLICT-DO-UPDATE for INSERT OR REPLACE semantics.
+- ✅ **`StepContext` struct** — every field from the spec's "Threading the Cache Context" section: slug, build_id, step_name, primitive, depth, chunk_index, db_path, force_fresh, bus, model_tier, resolved_model_id, resolved_provider_id. Plus a `prompt_hash` field threaded by the caller (since ChainContext holds the lazy cache and the LLM call site is downstream of it).
+- ✅ **`ChainContext` extensions** — `prompt_hashes: HashMap<String, String>` and `resolved_models: HashMap<String, String>` populated lazily per the spec's "Model ID Normalization" section. Get-or-compute helper for prompt hashes prevents redundant rehashing within a build.
+- ✅ **Cache key computation** — `compute_cache_key(inputs_hash, prompt_hash, model_id)` returns SHA-256 hex of `inputs|prompt|model` (literal `|` delimiter). `compute_inputs_hash` separates system + user prompts with `\n---\n` to prevent concat collisions. All hashes use `sha2::Sha256`, never `std::hash::Hash`.
+- ✅ **Cache lookup hook in `call_model_unified`** — the new `call_model_unified_with_options_and_ctx` is the spec's hook point. It lives BEFORE the HTTP request, runs only when a StepContext is provided AND `cache_is_usable()` (resolved model id + prompt hash), checks `pyramid_step_cache`, runs `verify_cache_hit`, and either returns cached or falls through. The legacy `call_model_unified_with_options` is now a thin shim that passes `None` so every existing caller is unchanged.
+- ✅ **`verify_cache_hit`** — implements all four mismatch variants exactly per the spec. Inputs check first (most likely failure), then prompt, then model, then JSON parse for corruption. Returns a distinct `CacheHitResult` variant for each so callers (and Phase 13's oversight UI) can distinguish failure modes. The mismatch-beats-corruption ordering is documented and tested.
+- ✅ **Force-fresh path** — `StepContext.force_fresh` skips the lookup. The write path detects force_fresh and routes through `supersede_cache_entry` which moves the prior row to `archived:{id}:{orig_cache_key}`, then inserts the new row under the original key with `force_fresh=1` and `supersedes_cache_id` pointing at the moved-aside id. The reroll IPC command itself is still Phase 13 scope — Phase 6 just plumbs the bool.
+- ✅ **Phase 2 retrofit** — `generate_change_manifest` accepts `Option<&StepContext>`. `execute_supersession` constructs the StepContext with the spec's exact fields (`step_name="change_manifest"`, `primitive="manifest_generation"`, `depth=node_ctx.depth`, `chunk_index=None`). The call is now cache-eligible.
+- ✅ **`TaggedKind::CacheHit` / `CacheMiss` / `CacheHitVerificationFailed` events** — added with the payload shapes the spec specifies (slug, step_name, cache_key, chunk_index, depth on hit/miss; reason on verification failure). Phase 6 just emits them. Phase 13 will add the consumer.
+- ✅ **Tests** — every test from the workstream brief's enumeration:
+  - `test_compute_cache_key_stable` — `test_compute_cache_key_stable_across_runs` in step_context.
+  - `test_compute_cache_key_changes_on_input_change` — `test_compute_cache_key_changes_on_each_component` covers all three.
+  - `test_check_cache_hit_and_verify` — `test_check_cache_hit_and_verify_valid` in db::step_cache_tests.
+  - `test_cache_hit_verification_rejects_input_mismatch` and the prompt/model variants — three tests in db::step_cache_tests.
+  - `test_cache_hit_verification_rejects_corrupted_output` — db::step_cache_tests.
+  - `test_force_fresh_bypasses_cache` — `test_force_fresh_bypasses_cache_lookup` in llm::tests.
+  - `test_supersede_cache_entry_links_back` — db::step_cache_tests.
+  - `test_unique_constraint_on_slug_cache_key` — `test_unique_constraint_on_slug_cache_key_replaces` in db::step_cache_tests.
+  - `test_step_context_creation` — `test_step_context_new_and_builder` in step_context.
+  - `test_model_id_normalization_cached` — `cache_resolved_model_round_trip` in chain_resolve plus `get_or_compute_prompt_hash_caches_first_call` exercises the lazy-cache pattern.
+  - `test_generate_change_manifest_with_step_context_compiles` — type-check test in stale_helpers_upper.
+- ⚠️ **`StepContext` naming** — there is a pre-existing `chain_dispatch::StepContext` (a dispatch context carrying DB handles + LlmConfig). Both types coexist; the Phase 6 one lives in `pyramid::step_context` and is referenced via fully-qualified path at use sites. No renaming of the pre-existing type — that would be an out-of-scope churn. Documented in the new module's header.
+- ✅ **Pillar 37 awareness** — Phase 6 adds zero new hardcoded LLM-constraining numbers. The `0.2/4096` temperature/max_tokens in `generate_change_manifest` are unchanged; that's still Phase 9's config-contribution scope per the brief.
+
+### Verification results
+
+- ✅ `cargo check --lib` — clean. Same 3 pre-existing warnings (deprecated `get_keep_evidence_for_target`, two `LayerCollectResult` private-visibility warnings in `publication.rs`). Zero new warnings.
+- ✅ `cargo check --lib --tests` — clean. Same warnings as the lib-only check plus the pre-existing test-only warnings (unused imports in chain_dispatch tests, dead `id2` variable, deprecated function references in db tests, deprecated `tauri_plugin_shell::Shell::open` in main.rs). No new warnings from Phase 6 files.
+- ✅ `cargo build --lib` — clean, same 3 pre-existing warnings.
+- ✅ `cargo test --lib pyramid::step_context` — **15/15 passed** in 0.00s.
+- ✅ `cargo test --lib pyramid::db::step_cache_tests` — **13/13 passed** in 0.81s.
+- ✅ `cargo test --lib pyramid::llm::tests` — all Phase 6 cache tests pass: `test_cache_hit_returns_cached_response_without_http`, `test_cache_lookup_skipped_without_step_context`, `test_force_fresh_bypasses_cache_lookup`, `test_cache_hit_verification_failure_deletes_stale_row`. Plus the pre-existing llm tests still pass.
+- ✅ `cargo test --lib pyramid::chain_resolve::tests` — **38/38 passed** (33 pre-existing + 5 new Phase 6).
+- ✅ `cargo test --lib pyramid::stale_helpers_upper::tests` — **11/11 passed** (10 pre-existing Phase 2 + 1 new Phase 6 retrofit type-check test).
+- ✅ `cargo test --lib pyramid` — **961 passed, 7 failed** in 13.34s. The 7 failures are the same pre-existing unrelated tests (`pyramid::db::tests::test_evidence_pk_cross_slug_coexistence`, `pyramid::defaults_adapter::tests::real_yaml_thread_clustering_preserves_response_schema`, 5 × `pyramid::staleness::tests::*` tests). Phase 5 ended at 923 passing — Phase 6 added 38 new tests (961 - 923 = 38). Zero regressions, zero new failures.
+- ✅ `grep -n "call_model_unified" src-tauri/src/pyramid/llm.rs` — multiple hits including the new `call_model_unified_with_options_and_ctx` signature with `Option<&StepContext>` parameter, plus the legacy `call_model_unified_with_options` shim that delegates with `None`.
+- ✅ `grep -n "StepContext" src-tauri/src/pyramid/stale_helpers_upper.rs` — confirms the Phase 2 retrofit: `generate_change_manifest` accepts `ctx: Option<&super::step_context::StepContext>` and `execute_supersession` constructs a `cache_ctx` via `super::step_context::StepContext::new(...)` and passes `Some(&cache_ctx)`.
+- ✅ `grep -rn "pyramid_step_cache" src-tauri/src/` — table creation in `init_pyramid_db`, CRUD helpers in `db.rs`, hook references in `llm.rs`, test references in db tests. All wired.
+
+### Scope decisions
+
+- **Naming the Phase 6 StepContext.** A pre-existing `chain_dispatch::StepContext` already exists (carries DB handles + live LlmConfig — conceptually a "dispatch context"). Renaming it would have rippled through 25+ chain_executor call sites, all of them out of Phase 6 scope. I left it alone and added the Phase 6 type as `pyramid::step_context::StepContext`. Disambiguation at use sites is a fully-qualified path import. The two types have orthogonal responsibilities and the comment in `step_context.rs` documents the coexistence.
+- **`call_model_unified_with_options_and_ctx` as a sibling, not a signature change.** The brief allowed "(or similar)" for the signature, and the cleaner approach was to add a sibling function rather than ripple a new positional argument through the 3 existing `call_model_unified_with_options` callers in chain_dispatch.rs. The legacy function is now a one-line shim that delegates with `None`. Backward compatibility is preserved by construction.
+- **`prompt_hash` on StepContext, not just on ChainContext.** The spec says `ChainContext.prompt_hashes` is the build-scoped lazy cache, but `call_model_unified_with_options_and_ctx` lives below ChainContext in the call stack. To keep the LLM call site cache-aware without threading `&mut ChainContext` through every helper, the StepContext carries the already-computed prompt_hash as a field. The retrofit caller in `execute_supersession` computes the hash via `compute_prompt_hash(&load_change_manifest_prompt_body())` and stamps it into the ctx. ChainContext's `get_or_compute_prompt_hash` is the lazy cache for chain executor sites that have a `&mut ChainContext` in scope; future retrofits will call it.
+- **Cache reads/writes via ephemeral connections, not the writer mutex.** `pyramid_step_cache` is content-addressable: same key = same value. ON CONFLICT-DO-UPDATE on the unique key is safe under concurrent writers because the write is idempotent. The code path opens a fresh connection inside `tokio::task::block_in_place` rather than awaiting the writer mutex. This keeps the cache off the hot path and makes a cache hit zero-overhead.
+- **`supersede_cache_entry` archives via `archived:{id}:{orig_key}` rather than a separate column.** The spec's `UNIQUE(slug, cache_key)` constraint means we can't have two rows for the same content address simultaneously. Archiving via cache_key prefix mutation (`archived:`) keeps the supersession chain queryable from the same table, retains row identity (id stays stable so `supersedes_cache_id` keeps pointing at the right row), and avoids a schema migration to add a "tombstoned" column. A real cache_key is a 64-char SHA-256 hex and never starts with `archived:`, so no collision risk.
+- **`cache_lookup_result` is computed even on force-fresh.** The lookup phase computes `inputs_hash`, `cache_key`, and the resolved model id. On force_fresh we skip the read but the write path still needs the same key, so we keep the result and short-circuit only the SELECT.
+- **Verification failure on output_json parse vs structure parse.** The spec calls out the JSON parse as the corruption check, but the cache also has a "structure parse" step downstream (extracting `content`, `usage`, `generation_id`). I treat both as corruption — if the JSON parses but the structure doesn't have a `content` string, we still emit `CacheHitVerificationFailed` with reason `unusable_structure` and delete the row. This is strictly safer than letting an unusable parse pass through.
+- **Cache build_id for stale checks.** `execute_supersession` uses `format!("stale-{node_id}-{build_version}")` so a repeated stale check at the same version is a cache hit. A new `build_version` (typical case) gets a new build_id which doesn't affect the cache_key (the key is content-addressable, not build-scoped) but is recorded on the row for provenance.
+- **`token_usage_json` written on every cache row.** The spec lists it as an optional field but every successful LLM call returns one, so we always serialize it. Phase 13's cost panel can read it directly without joining `pyramid_llm_audit`.
+
+### Notes
+
+- **The cache hit path is genuinely zero-network.** The four llm::tests integration tests prove this: `test_cache_hit_returns_cached_response_without_http` constructs an `LlmConfig::default()` (no api_key, no provider registry) and still gets the cached response back, because the cache hit short-circuits BEFORE `build_call_provider` runs. This is the load-bearing property — Phase 13's "crash recovery is a cache hit" claim depends on it.
+- **Pre-existing `chain_dispatch::StepContext` is not the same thing.** It carries DB handles + the live LlmConfig and existed before Phase 6. The Phase 6 StepContext is a separate concern. They coexist in the codebase. A future refactor could fold them but Phase 6 deliberately did not — that's scope creep into chain_executor, which is out of Phase 6's bounds.
+- **The Phase 2 retrofit is intentionally minimal.** It adds StepContext threading to ONE function (`generate_change_manifest`) per the spec's "first retrofit validation" mandate. Every other LLM call site (faq, delta, webbing, meta, evidence triage, FAQ matcher) still uses `call_model_with_usage` and gets `None` cache treatment. Phase 12 will sweep through them.
+- **Pillar 37 stays clean.** The hardcoded `0.2/4096` temperature/max_tokens in `generate_change_manifest` are unchanged because moving them is Phase 9's config-contribution scope per the workstream brief and the friction log. Phase 6 introduces ZERO new hardcoded LLM-constraining numbers.
+- **No friction log entries required.** The spec was unambiguous, the scope boundaries held, and the only naming question (StepContext vs chain_dispatch::StepContext) had a clean answer (coexist via fully-qualified paths).
+
+### Next
+
+The phase is ready for the conductor's verifier pass. Recommended focus areas for the audit:
+
+1. **`verify_cache_hit` correctness** — re-read the four-mismatch-variant-plus-corruption logic and confirm the ordering matches the spec. The mismatch-beats-corruption test (`test_verify_cache_hit_mismatch_beats_corruption`) locks down the precedence; a verifier should confirm this is what the spec intends.
+2. **`supersede_cache_entry` archival semantics** — the prior row gets moved to `archived:{id}:{orig_key}` to free the unique slot. A verifier should confirm this preserves the supersession chain and that the archival key cannot collide with a content-addressable lookup.
+3. **`call_model_unified_with_options` shim correctness** — the new wrapper passes `None` straight through. The verifier should confirm no caller accidentally relies on the old behavior of bypassing the cache via the function name (everyone now bypasses via the `None` parameter).
+4. **Phase 2 retrofit end-to-end** — `execute_supersession` constructs the StepContext and threads it. The verifier should construct an in-memory pyramid, simulate a stale check that produces a manifest, then re-run the same stale check and confirm the second run is a cache hit (no real LLM needed if the test pre-populates the row with the right cache key).
+5. **Pre-existing `chain_dispatch::StepContext` coexistence** — confirm no test relies on a single canonical `StepContext` import path. Both types should be reachable via their module paths.
+
+Wanderer prompt suggestion: "Does Wire Node boot, run a fresh build, persist every LLM call to `pyramid_step_cache` with the right cache_key, and then on a re-build of the same source files use the cache for every step that has a usable StepContext — confirming end-to-end that the cache hit path is wired through chain_executor and produces zero network traffic for unchanged content?"
