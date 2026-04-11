@@ -29,6 +29,7 @@
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use ignore::WalkBuilder;
@@ -1034,6 +1035,358 @@ pub async fn execute_plan(
     Ok(result)
 }
 
+// ── First-build dispatch (wanderer fix) ───────────────────────────────────────
+//
+// Phase 17 initially relied on Pipeline B (DADBEAR) to pick up newly-created
+// pyramids on its next scan tick. That does not work in practice:
+//
+//   1. `fire_ingest_chain` explicitly rejects `ContentType::Code` and
+//      `ContentType::Document` — see `dadbear_extend.rs:742-748`. Code and
+//      document pyramid ingest records get marked `failed` on the first
+//      dispatch.
+//   2. Topical vines created by Phase 17 are not listed in
+//      `pyramid_dadbear_config` at all (vines don't have file sources), so
+//      Pipeline B never scans them. `notify_vine_of_child_completion` only
+//      enqueues mutations against EXISTING vine nodes, so a brand-new vine
+//      with zero nodes never gets a first build.
+//   3. The DADBEAR extend loop only starts at boot when configs already
+//      exist, or after a conversation/vine build completes via the
+//      post_build_seed helper. A user running folder ingestion on a pristine
+//      DB would have no loop running at all.
+//
+// The wanderer fix adds an explicit first-build dispatch that runs AFTER
+// `execute_plan` returns. It walks the plan operations in dependency order
+// (leaves before vines), pre-populates chunks for code/document/conversation
+// pyramids, and spawns a build task for each created slug via
+// `question_build::spawn_question_build`. The function is non-blocking — it
+// returns as soon as every build is scheduled, so the IPC round-trip stays
+// fast.
+
+/// Dispatch parameters extracted from an `IngestionPlan` for a single slug.
+#[derive(Debug, Clone)]
+struct BuildDispatch {
+    slug: String,
+    content_type: ContentType,
+    source_path: String,
+}
+
+/// Extract build dispatches from a plan. Returns two lists:
+///   1. leaves — non-vine slugs that need a first build
+///   2. vines — vine slugs that need a first build AFTER their children
+fn extract_build_dispatches(plan: &IngestionPlan) -> (Vec<BuildDispatch>, Vec<BuildDispatch>) {
+    let mut leaves: Vec<BuildDispatch> = Vec::new();
+    let mut vines: Vec<BuildDispatch> = Vec::new();
+    for op in &plan.operations {
+        match op {
+            IngestionOperation::CreatePyramid {
+                slug,
+                content_type,
+                source_path,
+            } => {
+                if let Some(ct) = ContentType::from_str(content_type) {
+                    leaves.push(BuildDispatch {
+                        slug: slug.clone(),
+                        content_type: ct,
+                        source_path: source_path.clone(),
+                    });
+                }
+            }
+            IngestionOperation::CreateVine { slug, source_path } => {
+                vines.push(BuildDispatch {
+                    slug: slug.clone(),
+                    content_type: ContentType::Vine,
+                    source_path: source_path.clone(),
+                });
+            }
+            IngestionOperation::RegisterClaudeCodePyramid {
+                slug, source_path, ..
+            } => {
+                leaves.push(BuildDispatch {
+                    slug: slug.clone(),
+                    content_type: ContentType::Conversation,
+                    source_path: source_path.clone(),
+                });
+            }
+            IngestionOperation::AddChildToVine { .. }
+            | IngestionOperation::RegisterDadbearConfig { .. } => {}
+        }
+    }
+    (leaves, vines)
+}
+
+/// Content-type-appropriate default apex question used as the seed for the
+/// question pipeline. Matches the `DEFAULT_QUESTIONS` lookup in
+/// `AddWorkspace.tsx` so folder-ingested pyramids get the same starting
+/// question as the legacy single-directory flow.
+fn default_apex_question(ct: &ContentType) -> &'static str {
+    match ct {
+        ContentType::Code => {
+            "What are the key systems, patterns, and architecture of this codebase?"
+        }
+        ContentType::Document => {
+            "What are the key concepts, decisions, and relationships in these documents?"
+        }
+        ContentType::Conversation => {
+            "What happened during this conversation? What was discussed, \
+             what decisions were made, how did the discussion evolve, \
+             and what are the key takeaways?"
+        }
+        ContentType::Vine => {
+            "What are the key themes and structure across the children of this folder collection?"
+        }
+        ContentType::Question => {
+            "What are the most important answers this material can provide?"
+        }
+    }
+}
+
+/// Populate `pyramid_chunks` for a freshly-created code/document/conversation
+/// pyramid so that the question pipeline has something to `for_each: $chunks`
+/// over. Vines and question slugs skip this step — they don't own chunks.
+///
+/// For conversation slugs whose source_path is a DIRECTORY, this walks
+/// `*.jsonl` files and runs `ingest_conversation` for each one. For
+/// directories without any jsonls (or single-file paths) the ingest_conversation
+/// path accepts the parent/dir and handles it.
+async fn prepopulate_chunks_for(
+    state: &Arc<PyramidState>,
+    dispatch: &BuildDispatch,
+) -> Result<()> {
+    let writer = state.writer.clone();
+    let slug = dispatch.slug.clone();
+    let source_path = dispatch.source_path.clone();
+    let content_type = dispatch.content_type.clone();
+
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let conn = writer.blocking_lock();
+        let path = Path::new(&source_path);
+        match content_type {
+            ContentType::Code => {
+                super::ingest::ingest_code(&conn, &slug, path)
+                    .with_context(|| format!("ingest_code failed for slug '{}'", slug))?;
+            }
+            ContentType::Document => {
+                super::ingest::ingest_docs(&conn, &slug, path)
+                    .with_context(|| format!("ingest_docs failed for slug '{}'", slug))?;
+            }
+            ContentType::Conversation => {
+                // A Claude Code conversation pyramid's source_path is a
+                // directory containing one or more `.jsonl` session files.
+                // `ingest_conversation` is single-file and re-uses chunk_index
+                // 0..N per call, so calling it multiple times for the same
+                // slug collides on the `UNIQUE(slug, chunk_index)` constraint
+                // after the first file.
+                //
+                // We bootstrap the pyramid with the most-recently-modified
+                // jsonl (most likely the active session the user cares about)
+                // and leave older sessions to be surfaced by DADBEAR/Pipeline
+                // B on subsequent ticks. The per-session chunk_offset bug is
+                // the tracked Phase 0b latent issue (implementation log:219).
+                // This keeps the first build non-empty without making the
+                // latent issue worse than the existing Pipeline B flow.
+                if path.is_dir() {
+                    let newest_jsonl = if let Ok(entries) = std::fs::read_dir(path) {
+                        let mut with_mtime: Vec<(PathBuf, std::time::SystemTime)> = entries
+                            .flatten()
+                            .filter_map(|e| {
+                                let p = e.path();
+                                if !p.is_file() {
+                                    return None;
+                                }
+                                if p.extension().and_then(OsStr::to_str) != Some("jsonl") {
+                                    return None;
+                                }
+                                let mtime = e
+                                    .metadata()
+                                    .and_then(|m| m.modified())
+                                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                                Some((p, mtime))
+                            })
+                            .collect();
+                        with_mtime.sort_by_key(|(_, t)| *t);
+                        with_mtime.pop().map(|(p, _)| p)
+                    } else {
+                        None
+                    };
+                    match newest_jsonl {
+                        Some(jsonl) => {
+                            super::ingest::ingest_conversation(&conn, &slug, &jsonl)
+                                .with_context(|| {
+                                    format!(
+                                        "ingest_conversation failed for slug '{}' file '{}'",
+                                        slug,
+                                        jsonl.display()
+                                    )
+                                })?;
+                        }
+                        None => {
+                            warn!(
+                                slug = %slug,
+                                source_path = %source_path,
+                                "conversation directory had no ingestible jsonl files"
+                            );
+                        }
+                    }
+                } else if path.is_file() {
+                    super::ingest::ingest_conversation(&conn, &slug, path).with_context(
+                        || format!("ingest_conversation failed for slug '{}'", slug),
+                    )?;
+                }
+            }
+            ContentType::Vine | ContentType::Question => {
+                // Vines compose children via pyramid_vine_compositions; no
+                // chunks are needed. Question pyramids derive from cross-slug
+                // evidence, also no chunks.
+            }
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| anyhow!("prepopulate_chunks spawn_blocking join failed: {e}"))?
+}
+
+/// Ensure the DADBEAR extend loop is running. The loop is normally started
+/// at app boot when existing configs are found, or after a conversation/vine
+/// post-build seeding pass. Phase 17 creates configs directly and needs to
+/// kick the loop itself so ongoing file-change dispatch works.
+async fn ensure_dadbear_loop_running(state: &Arc<PyramidState>) {
+    let mut handle = state.dadbear_handle.lock().await;
+    if handle.is_some() {
+        return;
+    }
+    let Some(data_dir) = state.data_dir.as_ref() else {
+        warn!("folder_ingestion: cannot start DADBEAR loop — data_dir not set");
+        return;
+    };
+    let db_path = data_dir.join("pyramid.db").to_string_lossy().to_string();
+    let bus = state.build_event_bus.clone();
+    *handle = Some(super::dadbear_extend::start_dadbear_extend_loop(
+        state.clone(),
+        db_path,
+        bus,
+    ));
+    info!("folder_ingestion: DADBEAR extend loop started");
+}
+
+/// Dispatch first builds for every slug the plan just created.
+///
+/// Spawns a single background task that:
+///   1. Starts the DADBEAR extend loop if it isn't already running.
+///   2. Walks every non-vine leaf in plan order, populates chunks, and
+///      spawns a question build via `question_build::spawn_question_build`.
+///      Each build runs asynchronously — we don't await completion.
+///   3. After a short settle delay, walks every vine in plan order and
+///      spawns a vine build the same way. The topical-vine chain reads
+///      whatever apexes its children have produced so far via
+///      `cross_build_input`; if some children are still building the vine
+///      picks up stragglers on its own notification cascade later.
+///
+/// Returns immediately after spawning the background task so the folder
+/// ingestion IPC stays snappy.
+pub fn spawn_initial_builds(state: &Arc<PyramidState>, plan: &IngestionPlan) {
+    let (leaves, vines) = extract_build_dispatches(plan);
+    if leaves.is_empty() && vines.is_empty() {
+        return;
+    }
+    let state = state.clone();
+    let root_slug = plan.root_slug.clone();
+
+    tokio::spawn(async move {
+        ensure_dadbear_loop_running(&state).await;
+
+        // ── Leaves ────────────────────────────────────────────────────────
+        for dispatch in &leaves {
+            if let Err(e) = prepopulate_chunks_for(&state, dispatch).await {
+                warn!(
+                    slug = %dispatch.slug,
+                    error = %e,
+                    "folder_ingestion: prepopulate_chunks failed, skipping build"
+                );
+                continue;
+            }
+            let question = default_apex_question(&dispatch.content_type).to_string();
+            match super::question_build::spawn_question_build(
+                &state,
+                dispatch.slug.clone(),
+                question,
+                3, // granularity
+                3, // max_depth
+                0, // from_depth
+                None, // characterization: auto
+            )
+            .await
+            {
+                Ok(_) => info!(
+                    slug = %dispatch.slug,
+                    content_type = %dispatch.content_type.as_str(),
+                    "folder_ingestion: first build spawned"
+                ),
+                Err(e) => warn!(
+                    slug = %dispatch.slug,
+                    content_type = %dispatch.content_type.as_str(),
+                    error = %e,
+                    "folder_ingestion: first build spawn failed"
+                ),
+            }
+        }
+
+        // ── Vines ─────────────────────────────────────────────────────────
+        // Small delay so leaf builds have a chance to start writing apex
+        // nodes before the vine chain runs `cross_build_input`. This is
+        // best-effort — the vine will still run even if leaves aren't
+        // finished, and the regular change-propagation cascade picks up
+        // slack on leaf completion via `notify_vine_of_child_completion`
+        // (for vines that already have upper-layer nodes).
+        if !vines.is_empty() {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+
+        for dispatch in &vines {
+            let question = default_apex_question(&dispatch.content_type).to_string();
+            match super::question_build::spawn_question_build(
+                &state,
+                dispatch.slug.clone(),
+                question,
+                3,
+                3,
+                0,
+                None,
+            )
+            .await
+            {
+                Ok(_) => info!(
+                    slug = %dispatch.slug,
+                    "folder_ingestion: first vine build spawned"
+                ),
+                Err(e) => {
+                    // Treat "Build already running" as expected — a prior
+                    // dispatch may have beaten us to it. Every other error
+                    // is worth logging.
+                    if e.contains("already running") {
+                        info!(
+                            slug = %dispatch.slug,
+                            "folder_ingestion: vine build already running, skipping"
+                        );
+                    } else {
+                        warn!(
+                            slug = %dispatch.slug,
+                            error = %e,
+                            "folder_ingestion: first vine build spawn failed"
+                        );
+                    }
+                }
+            }
+        }
+
+        info!(
+            leaves = leaves.len(),
+            vines = vines.len(),
+            root_slug = ?root_slug,
+            "folder_ingestion: initial build dispatch complete"
+        );
+    });
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1571,5 +1924,108 @@ mod phase17_tests {
             let expanded = expand_claude_code_projects_root("~/.claude/projects").unwrap();
             assert_eq!(expanded, home.join(".claude").join("projects"));
         }
+    }
+
+    // ── Wanderer fix tests: initial-build dispatch planning ─────────────────
+
+    /// `extract_build_dispatches` should separate CreatePyramid / CreateVine
+    /// / RegisterClaudeCodePyramid ops into leaves vs vines, preserving the
+    /// plan order so dependency-order dispatch works.
+    #[test]
+    fn test_extract_build_dispatches_partitions_leaves_and_vines() {
+        let plan = IngestionPlan {
+            operations: vec![
+                IngestionOperation::CreateVine {
+                    slug: "root-vine".to_string(),
+                    source_path: "/tmp/root".to_string(),
+                },
+                IngestionOperation::CreatePyramid {
+                    slug: "root-code".to_string(),
+                    content_type: "code".to_string(),
+                    source_path: "/tmp/root/src".to_string(),
+                },
+                IngestionOperation::AddChildToVine {
+                    vine_slug: "root-vine".to_string(),
+                    child_slug: "root-code".to_string(),
+                    position: 0,
+                    child_type: "bedrock".to_string(),
+                },
+                IngestionOperation::RegisterDadbearConfig {
+                    slug: "root-code".to_string(),
+                    source_path: "/tmp/root/src".to_string(),
+                    content_type: "code".to_string(),
+                    scan_interval_secs: 30,
+                },
+                IngestionOperation::RegisterClaudeCodePyramid {
+                    slug: "root-vine-cc-1".to_string(),
+                    source_path: "/home/me/.claude/projects/-tmp-root".to_string(),
+                    is_main: true,
+                    is_worktree: false,
+                },
+                IngestionOperation::CreatePyramid {
+                    slug: "root-docs".to_string(),
+                    content_type: "document".to_string(),
+                    source_path: "/tmp/root/docs".to_string(),
+                },
+            ],
+            root_slug: Some("root-vine".to_string()),
+            root_source_path: "/tmp/root".to_string(),
+            total_files: 0,
+            total_ignored: 0,
+        };
+        let (leaves, vines) = extract_build_dispatches(&plan);
+        assert_eq!(vines.len(), 1);
+        assert_eq!(vines[0].slug, "root-vine");
+        assert_eq!(leaves.len(), 3);
+        // Order follows plan order: code, cc, docs.
+        assert_eq!(leaves[0].slug, "root-code");
+        assert!(matches!(leaves[0].content_type, ContentType::Code));
+        assert_eq!(leaves[1].slug, "root-vine-cc-1");
+        assert!(matches!(leaves[1].content_type, ContentType::Conversation));
+        assert_eq!(leaves[2].slug, "root-docs");
+        assert!(matches!(leaves[2].content_type, ContentType::Document));
+    }
+
+    /// `default_apex_question` must return non-empty strings for every
+    /// content type so `spawn_question_build` (which rejects empty
+    /// questions) never trips on a Phase 17 dispatch.
+    #[test]
+    fn test_default_apex_question_non_empty_for_every_content_type() {
+        for ct in [
+            ContentType::Code,
+            ContentType::Document,
+            ContentType::Conversation,
+            ContentType::Vine,
+            ContentType::Question,
+        ] {
+            let q = default_apex_question(&ct);
+            assert!(
+                !q.trim().is_empty(),
+                "default_apex_question must be non-empty for {:?}",
+                ct
+            );
+        }
+    }
+
+    /// A plan containing only unrelated ops (no CreatePyramid, CreateVine,
+    /// RegisterClaudeCodePyramid) must produce empty leaves/vines lists so
+    /// `spawn_initial_builds` can short-circuit.
+    #[test]
+    fn test_extract_build_dispatches_empty_for_plan_without_creates() {
+        let plan = IngestionPlan {
+            operations: vec![IngestionOperation::AddChildToVine {
+                vine_slug: "v".to_string(),
+                child_slug: "c".to_string(),
+                position: 0,
+                child_type: "bedrock".to_string(),
+            }],
+            root_slug: None,
+            root_source_path: String::new(),
+            total_files: 0,
+            total_ignored: 0,
+        };
+        let (leaves, vines) = extract_build_dispatches(&plan);
+        assert!(leaves.is_empty());
+        assert!(vines.is_empty());
     }
 }

@@ -4246,6 +4246,18 @@ async fn pyramid_ingest_folder(
         .await
         .map_err(|e| format!("execute_plan: {}", e))?;
 
+    // Phase 17 wanderer fix: trigger first builds for every slug the plan
+    // just created. Without this, code/document pyramids sit idle forever
+    // because Pipeline B's `fire_ingest_chain` rejects those content types,
+    // and topical vines never get a first build because
+    // `notify_vine_of_child_completion` only re-enqueues work against
+    // EXISTING vine apex nodes. See `folder_ingestion::spawn_initial_builds`
+    // for the full reasoning. The dispatch runs in a background task so
+    // the IPC returns immediately after DB writes land.
+    if result.errors.is_empty() || !result.pyramids_created.is_empty() || !result.vines_created.is_empty() {
+        folder_ingestion::spawn_initial_builds(&state.pyramid, &plan);
+    }
+
     Ok(IngestFolderOutput {
         plan,
         result: Some(result),

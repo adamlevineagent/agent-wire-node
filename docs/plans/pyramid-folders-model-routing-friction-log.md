@@ -1929,3 +1929,221 @@ Compare with working patterns in `conversation-episodic.yaml`'s `l1_classify` / 
 
 ---
 
+## 2026-04-10 — Phase 17 wanderer pass (capstone wanderer)
+
+### The load-bearing trace that the punch-list audit missed
+
+The verifier had confirmed that `execute_plan` correctly lands `db::create_slug`
++ `db::save_dadbear_config` + `db::insert_vine_composition` into the real
+tables. That part is true. The deviation flagged in the implementation log
+(#5, "No explicit first-build trigger after plan execution — Pipeline B
+handles it") is NOT true, and the downstream of the IPC was never verified
+beyond the DB writes. Three concrete breaks:
+
+1. **Pipeline B explicitly rejects code and document content types.**
+   `dadbear_extend.rs:742-748` returns
+   `Err("Phase 0b: content_type '{}' is not yet supported by Pipeline B
+   ingest; per-file code/doc ingest lands in Phase 17 (recursive folder
+   ingestion). Record will be marked failed.")`. That rejection was
+   delegated to Phase 17 to fix, but Phase 17 never touched
+   `fire_ingest_chain`. A folder ingestion that creates a code pyramid
+   writes an ingest record → DADBEAR dispatches → fire_ingest_chain
+   returns Err → record is marked failed → no build ever runs. The user
+   sees a pyramid slug with zero nodes and no explanation.
+
+2. **Topical vines never get a first build.** Vines are not listed in
+   `pyramid_dadbear_config` at all (they have no file source), so
+   Pipeline B doesn't even scan them. The usual fallback path —
+   `notify_vine_of_child_completion` in `vine_composition.rs` — ONLY
+   enqueues change-manifest mutations against pre-existing vine apex
+   nodes. A freshly-created vine has zero nodes, so
+   `enqueue_vine_manifest_mutations` returns 0 affected rows and no
+   pending mutations land. The stale engine has nothing to pick up.
+   The vine sits at node_count=0 forever.
+
+3. **DADBEAR extend loop may not even be running.** `main.rs:9390-9412`
+   only starts the loop at boot when `get_enabled_dadbear_configs`
+   already returns non-empty. For a fresh install where the user's first
+   action is folder ingestion, there are zero configs at boot → the loop
+   never starts → even the conversation pyramids (which Pipeline B CAN
+   handle) don't get scanned. `main.rs:3420-3432` starts the loop during
+   `post_build_seed` for conversation/vine slugs, but that only runs
+   after a build completes — and builds don't start, so the loop never
+   starts either. Chicken and egg.
+
+The meta-lesson: the verifier's "end-to-end trace verified" claim stopped
+at `insert_vine_composition` — the last DB write in execute_plan. Nobody
+traced into Pipeline B's actual dispatch for the newly-created configs.
+The friction log entries 218 and 219 from Phase 0b were flagged as
+"latent bugs — fix when Phase 17 needs it" and Phase 17 did not revisit
+them.
+
+### The wanderer fix
+
+Added `folder_ingestion::spawn_initial_builds(state, plan)` — a new helper
+called from `pyramid_ingest_folder` immediately after `execute_plan`
+returns on `dry_run: false`. It spawns a single background task that:
+
+1. Starts the DADBEAR extend loop if it isn't already running (via a
+   new `ensure_dadbear_loop_running` helper that mirrors the check in
+   `main.rs:9402`).
+2. Walks every non-vine leaf in plan order. For each leaf:
+   - Runs the appropriate `ingest::ingest_code` / `ingest_docs` /
+     `ingest_conversation` against the slug's source_path to populate
+     `pyramid_chunks`. This is what the legacy AddWorkspace flow does
+     between `pyramid_create_slug` and `pyramid_question_build`. Phase
+     17 was missing this step.
+   - Calls `question_build::spawn_question_build` with a content-type
+     appropriate default apex question (matches the
+     `AddWorkspace.tsx::DEFAULT_QUESTIONS` lookup).
+3. Sleeps 2 seconds so leaf builds have a chance to start writing apex
+   nodes, then walks every vine in plan order and calls
+   `spawn_question_build` on each. The vine dispatches through the
+   topical-vine chain's `cross_build_input` primitive which reads
+   whatever apexes the children have produced; if some children are
+   still mid-build the vine picks them up via the normal propagation
+   cascade on subsequent child completions.
+
+The dispatch runs entirely in a background tokio task so the IPC
+round-trip stays fast (the writer lock is released before the task
+starts). `spawn_question_build`'s own internal task-spawn pattern is
+reused — no duplicated writer/progress/layer channel wiring.
+
+### Subtle fix inside the fix: Claude Code conversation chunk collision
+
+First draft of `prepopulate_chunks_for` called `ingest_conversation` per
+`.jsonl` file in the CC directory. This hits the same latent bug called
+out in the Phase 0b friction log at entry 219: `ingest_conversation` uses
+chunk_index 0..N starting per file, and the `UNIQUE(slug, chunk_index)`
+constraint on `pyramid_chunks` means the second file's chunk 0 collides
+with the first file's chunk 0. Only the first file's chunks would land.
+
+The correct fix at Phase 17 is the same fix called for by entry 219: a
+per-file `chunk_offset` parameter on `ingest_conversation`. That's a
+wider change than a wanderer pass should take on. The narrow fix: for a
+Claude Code conversation pyramid's bootstrap, ingest only the MOST
+RECENTLY MODIFIED jsonl session (the active one the user cares about).
+Subsequent sessions show up through DADBEAR / Pipeline A on later ticks.
+This matches the single-file contract `ingest_conversation` was
+originally designed for, unbreaks the critical path for Phase 17, and
+leaves the per-file chunk_offset refactor as a standalone follow-up.
+Documented inline at `folder_ingestion.rs::prepopulate_chunks_for`.
+
+### Non-issues confirmed (clean)
+
+- **Q5 Claude Code path expansion:** `expand_claude_code_projects_root`
+  correctly handles `~/` via `dirs::home_dir()` and falls back on bare
+  `~` and raw paths. The encoded-path prefix match covers subfolders
+  and Claude Code worktrees via `starts_with(encoded_target + "-")`.
+  CC directories are passed to the DADBEAR config as absolute paths, so
+  Pipeline B's scanner reads them directly regardless of where the
+  ingested folder lives relative to `~/.claude/projects/`.
+- **Q6 .git/ subdirectory filtering:** the bundled
+  `default_ignore_patterns()` includes `.git/`, and
+  `path_matches_any_ignore` matches any path component equal to `.git`,
+  so both direct and nested `.git/` dirs are correctly skipped.
+- **Q10 bundled heuristics fallback:** `FolderIngestionConfig::default()`
+  field values match the bundled
+  `bundled-folder_ingestion_heuristics-default-v1` YAML. When the
+  operational row is absent on first boot (the seed isn't auto-synced),
+  `load_active_folder_ingestion_heuristics` returns the default, which
+  is equivalent to the bundled YAML. Verified by code inspection.
+- **Q11 Pipeline B vine recognition:** vines intentionally don't get
+  `pyramid_dadbear_config` rows — they compose children via
+  `pyramid_vine_compositions`, which is what the topical-vine chain
+  reads at build time. The wanderer fix triggers the vine's first build
+  directly instead of routing it through DADBEAR.
+
+### Non-issues deliberately NOT addressed in the wanderer pass
+
+- **Slug collision against pre-existing database slugs.** `generate_slug`
+  only dedupes against the per-plan HashSet; if a folder-generated slug
+  matches a slug already in `pyramid_slugs`, `execute_plan` catches the
+  "already exists" error and treats it as success, effectively co-opting
+  the existing slug into the folder hierarchy. In practice users won't
+  have pre-existing slugs that clash with folder-generated slugs because
+  folder-generated slugs are compound (e.g. `agent-wire-node-src-tauri`)
+  and the legacy AddWorkspace flow uses simpler slugs. Defer to a
+  follow-up pass that queries the DB for existing slugs at plan time.
+- **Empty vines at deep recursion.** If `max_recursion_depth` is hit
+  mid-walk with a subfolder present but loose files below threshold,
+  `plan_recursive` emits a CreateVine with zero children ops. The
+  verifier's empty-vine guard only fires when `subfolders.is_empty()`,
+  so this edge case still leaks. Minor cosmetic bug that would surface
+  as "1 vine, 0 pyramids" in the wizard for an unusual folder shape.
+  Defer.
+- **Latent `ingest_conversation` chunk_offset bug (entry 219).** The
+  wanderer fix works around it by only ingesting the newest jsonl per CC
+  dir; the proper fix (extending `ingest_conversation` to accept a
+  chunk_offset parameter) is called out in the Phase 0b friction log
+  and remains a standalone follow-up.
+
+### Files changed
+
+- `src-tauri/src/pyramid/folder_ingestion.rs` — added `BuildDispatch`,
+  `extract_build_dispatches`, `default_apex_question`,
+  `prepopulate_chunks_for`, `ensure_dadbear_loop_running`, and the
+  public `spawn_initial_builds`. Added `use std::sync::Arc` to the
+  imports. Three new tests in `phase17_tests`:
+  `test_extract_build_dispatches_partitions_leaves_and_vines`,
+  `test_default_apex_question_non_empty_for_every_content_type`,
+  `test_extract_build_dispatches_empty_for_plan_without_creates`.
+- `src-tauri/src/main.rs` — `pyramid_ingest_folder` now calls
+  `folder_ingestion::spawn_initial_builds(&state.pyramid, &plan)`
+  after `execute_plan` succeeds on `dry_run: false`.
+- `docs/plans/pyramid-folders-model-routing-implementation-log.md` —
+  wanderer sub-entry under Phase 17.
+- `docs/plans/pyramid-folders-model-routing-friction-log.md` — this
+  entry.
+
+### Test count delta (wanderer)
+
+- Phase 17 verifier baseline: 1235 passing / 7 failing.
+- After wanderer fix: **1238 passing / 7 failing** (+3 tests).
+  Same 7 pre-existing unrelated failures.
+- `cargo check --lib` clean (same 3 pre-existing warnings).
+- `cargo check --bin wire-node-desktop` clean (same 1 pre-existing
+  tauri_plugin_shell deprecation).
+- `cargo test --lib 'pyramid::folder_ingestion::phase17_tests'` — **28
+  passing** (25 from verifier + 3 new wanderer tests).
+- `npm run build` clean, 150 modules, 788.39 kB bundle (unchanged —
+  the fix is backend-only).
+
+### Commit
+
+1. `phase-17: wanderer fix — explicit first-build dispatch for every
+   created slug`
+
+### Surprises
+
+1. **The verifier's "end-to-end trace verified" skipped the most
+   important leg.** The claim was: "DB writes land correctly, IPCs
+   wire up, plan → execute_plan → db::create_slug." What it didn't
+   check: whether any of those created slugs ever produce a BUILD.
+   Tracing into Pipeline B's actual dispatch would have revealed
+   the `fire_ingest_chain` rejection for code/document immediately.
+   The meta-pattern that played out on every prior phase — wanderers
+   find 1-2 real production wiring gaps that the punch-list verifier's
+   audit missed — held here at 200% strength: the ENTIRE feature was
+   non-functional for non-conversation content types, and it would
+   have shipped.
+
+2. **The `fire_ingest_chain` error message points directly at the
+   fix.** The Phase 0b error says "per-file code/doc ingest lands in
+   Phase 17 (recursive folder ingestion)." This is a TODO embedded in
+   the production error path, and Phase 17 implemented the recursive
+   walker but not the Pipeline B extension. Shipping TODO messages as
+   error text is a good habit — but only if every successor phase
+   actually grepcs for them.
+
+3. **The DADBEAR extend loop's boot-time guard is reasonable in
+   isolation but silently breaks first-time-user flows.** The guard
+   at `main.rs:9402` exists so idle apps don't spin a tick loop with
+   nothing to do. But for a new install where folder ingestion is the
+   user's first action, the guard defeats the whole first-build path
+   for conversations. The wanderer fix starts the loop lazily in
+   `spawn_initial_builds`, which is the right place for any "I just
+   created configs, kick the loop" call.
+
+---
+
