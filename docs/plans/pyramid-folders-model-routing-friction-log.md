@@ -2305,3 +2305,54 @@ separate machine. Recommend the conductor re-defer L3 to a
   the OllamaCloudProvider deferral because Adam tests by feel
   and the toggle is what unblocks the Ouro test.
 
+### Wanderer pass — reader lock held across `.await` in status IPC
+
+**What the wanderer caught.** The verifier's 11-point checklist
+explicitly noted at item 11 that `yaml_renderer_resolve_options`
+at `main.rs:8810` correctly drops the rusqlite reader lock
+BEFORE awaiting the async model-list resolver. But when the
+same verifier looked at `pyramid_get_local_mode_status` at
+`main.rs:7702` (item 6 in the IPC registration check), they
+only verified registration, not the lock-release pattern. The
+status IPC held the tokio reader Mutex across a 5-second
+`probe_ollama().await`, which is async-safe but blocks every
+other reader-bound IPC for the duration of the probe.
+
+**Why the verifier missed it.** Verifier was working off a
+punch list of "11 failure modes" that the workstream prompt
+flagged. Lock-hold patterns across `.await` wasn't one of the
+11 items. The verifier did a surface-level check that the 5
+IPCs were registered (they were) and moved on. The wanderer,
+following a different prompt about tracing end-to-end execution
+and looking for wiring bugs, landed on the same code but asked
+a different question: "how long can the reader lock be held
+here, and does anything concurrent care?"
+
+**The fix.** Split `get_local_mode_status` into
+`load_status_snapshot` (sync, DB-only) and
+`refresh_status_reachability` (async, no DB/mutex), then have
+the IPC handler drop the reader lock between them via an
+explicit scoped block. The legacy `get_local_mode_status`
+wrapper stays for enable/disable return paths where the probe
+latency is already baked into the writer lock's span.
+
+**Lesson.** When a verifier punch list exists, wanderer passes
+still need to ask "what ISN'T on this list?" Look for the
+same anti-pattern the verifier explicitly called out elsewhere
+and check it in every other IPC handler in the touched file.
+If the verifier flagged "IPC X drops the lock correctly", the
+wanderer should grep for every OTHER IPC that takes a reader
+lock + awaits and confirm each one. The verifier's "good"
+citation is a template for the wanderer's sweep.
+
+**Meta-lesson.** Verifiers working from an explicit punch list
+are necessary but not sufficient. The wanderer's job is
+exactly to look at what the punch list doesn't cover. This
+matches the 17/18 wanderer-catch rate from earlier phases —
+the bug is always in the space the verifier didn't enumerate.
+
+**Tests added.** 4 unit tests pinning the split-function
+contract: snapshot is sync and DB-only, refresh is async and
+no-op when disabled. Test count 1254 → 1258 passing. Same 7
+pre-existing failures.
+

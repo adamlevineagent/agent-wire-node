@@ -236,47 +236,72 @@ pub async fn detect_ollama_context_window(base_url: &str, model: &str) -> Option
 
 // ── Status read ─────────────────────────────────────────────────────────────
 
-/// Read the current `pyramid_local_mode_state` row and (when enabled)
-/// refresh the reachability + available_models fields. The status
-/// snapshot is rebuilt fresh on every call so the UI sees the actual
-/// state of the host machine, not a cached value.
-pub async fn get_local_mode_status(conn: &Connection) -> Result<LocalModeStatus> {
+/// Synchronous DB-only fetch: snapshot the state row into a partial
+/// `LocalModeStatus`. When enabled, the caller is expected to follow
+/// up with `refresh_status_reachability` (which does the Ollama
+/// `/api/tags` probe) AFTER dropping the rusqlite lock, so a 5-second
+/// network round trip never holds the reader mutex against other
+/// concurrent IPCs. This split was the wanderer fix: the old
+/// `get_local_mode_status(&Connection)` held the reader lock across
+/// `probe_ollama().await`, blocking every other reader-bound IPC for
+/// the duration of the probe.
+pub fn load_status_snapshot(conn: &Connection) -> Result<LocalModeStatus> {
     let row = load_local_mode_state(conn)?;
 
-    if !row.enabled {
-        return Ok(LocalModeStatus {
-            enabled: false,
-            base_url: row.ollama_base_url,
-            model: row.ollama_model,
-            detected_context_limit: row.detected_context_limit.map(|n| n as usize),
-            available_models: Vec::new(),
-            reachable: false,
-            reachability_error: None,
-            ollama_provider_id: OLLAMA_LOCAL_PROVIDER_ID.to_string(),
-            prior_tier_routing_contribution_id: row.restore_from_contribution_id,
-            prior_build_strategy_contribution_id: row.restore_build_strategy_contribution_id,
-        });
-    }
-
-    // Enabled — probe reachability so the UI shows fresh state.
-    let base_url = row
-        .ollama_base_url
-        .clone()
-        .unwrap_or_else(|| "http://localhost:11434/v1".to_string());
-    let probe = probe_ollama(&base_url).await;
-
     Ok(LocalModeStatus {
-        enabled: true,
-        base_url: Some(base_url),
+        enabled: row.enabled,
+        base_url: row.ollama_base_url,
         model: row.ollama_model,
         detected_context_limit: row.detected_context_limit.map(|n| n as usize),
-        available_models: probe.available_models,
-        reachable: probe.reachable,
-        reachability_error: probe.reachability_error,
+        available_models: Vec::new(),
+        // `reachable` starts false; the probe-refresh step upgrades it
+        // to true only when the probe succeeds. The UI distinguishes
+        // "enabled + unreachable" (red X) from "disabled" (grey).
+        reachable: false,
+        reachability_error: None,
         ollama_provider_id: OLLAMA_LOCAL_PROVIDER_ID.to_string(),
         prior_tier_routing_contribution_id: row.restore_from_contribution_id,
         prior_build_strategy_contribution_id: row.restore_build_strategy_contribution_id,
     })
+}
+
+/// Async follow-up: if the status is enabled, probe Ollama (WITHOUT
+/// holding any rusqlite lock) and merge the reachability +
+/// `available_models` fields into the snapshot. No-op when disabled.
+/// Callers who hold a writer lock (enable_local_mode / disable end
+/// return) can skip calling this — the probe data isn't load-bearing
+/// when the caller already just wrote the routing rows.
+pub async fn refresh_status_reachability(mut status: LocalModeStatus) -> LocalModeStatus {
+    if !status.enabled {
+        return status;
+    }
+    let base_url = status
+        .base_url
+        .clone()
+        .unwrap_or_else(|| "http://localhost:11434/v1".to_string());
+    let probe = probe_ollama(&base_url).await;
+    status.base_url = Some(base_url);
+    status.available_models = probe.available_models;
+    status.reachable = probe.reachable;
+    status.reachability_error = probe.reachability_error;
+    status
+}
+
+/// Read the current `pyramid_local_mode_state` row and (when enabled)
+/// refresh the reachability + available_models fields. The status
+/// snapshot is rebuilt fresh on every call so the UI sees the actual
+/// state of the host machine, not a cached value.
+///
+/// **Warning:** this function holds the caller's `&Connection` across
+/// the `probe_ollama().await`. For the enable/disable return paths
+/// that's acceptable (they're inside a writer lock that already spans
+/// the whole operation). For the `pyramid_get_local_mode_status` IPC
+/// handler, use `load_status_snapshot` + `refresh_status_reachability`
+/// with an explicit lock drop in between so a 5-second probe doesn't
+/// block every concurrent reader-bound IPC.
+pub async fn get_local_mode_status(conn: &Connection) -> Result<LocalModeStatus> {
+    let snapshot = load_status_snapshot(conn)?;
+    Ok(refresh_status_reachability(snapshot).await)
 }
 
 // ── Enable ──────────────────────────────────────────────────────────────────
@@ -903,5 +928,94 @@ mod tests {
             msg.contains("Cannot reach Ollama") || msg.contains("Ollama"),
             "expected Ollama-related error, got: {msg}"
         );
+    }
+
+    #[test]
+    fn load_status_snapshot_disabled_returns_clean_row() {
+        // Wanderer fix: the synchronous snapshot path must never
+        // probe the network. On a fresh DB with enabled=false, we
+        // should return a fully-populated LocalModeStatus with
+        // enabled=false and empty probe fields.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::pyramid::db::init_pyramid_db(&conn).unwrap();
+        let snap = load_status_snapshot(&conn).unwrap();
+        assert!(!snap.enabled);
+        assert!(snap.base_url.is_none());
+        assert!(snap.model.is_none());
+        assert!(snap.available_models.is_empty());
+        assert!(!snap.reachable);
+        assert!(snap.reachability_error.is_none());
+        assert_eq!(snap.ollama_provider_id, OLLAMA_LOCAL_PROVIDER_ID);
+    }
+
+    #[test]
+    fn load_status_snapshot_enabled_returns_saved_values_without_probing() {
+        // Wanderer fix: the snapshot reads the stored base_url /
+        // model without performing the `/api/tags` probe. The probe
+        // is deferred to `refresh_status_reachability` so the
+        // `pyramid_get_local_mode_status` IPC can release its reader
+        // lock before the network round-trip.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::pyramid::db::init_pyramid_db(&conn).unwrap();
+        save_local_mode_state(
+            &conn,
+            &LocalModeStateRow {
+                enabled: true,
+                ollama_base_url: Some("http://127.0.0.1:1/v1".into()),
+                ollama_model: Some("gemma3:27b".into()),
+                detected_context_limit: Some(131_072),
+                restore_from_contribution_id: Some("prior-tier".into()),
+                restore_build_strategy_contribution_id: Some("prior-bs".into()),
+                updated_at: String::new(),
+            },
+        )
+        .unwrap();
+        let snap = load_status_snapshot(&conn).unwrap();
+        assert!(snap.enabled);
+        assert_eq!(snap.base_url.as_deref(), Some("http://127.0.0.1:1/v1"));
+        assert_eq!(snap.model.as_deref(), Some("gemma3:27b"));
+        assert_eq!(snap.detected_context_limit, Some(131_072));
+        // Probe fields remain unpopulated on the sync path — the
+        // caller is expected to run refresh_status_reachability after
+        // releasing the DB lock.
+        assert!(snap.available_models.is_empty());
+        assert!(!snap.reachable);
+        assert!(snap.reachability_error.is_none());
+        assert_eq!(
+            snap.prior_tier_routing_contribution_id.as_deref(),
+            Some("prior-tier")
+        );
+        assert_eq!(
+            snap.prior_build_strategy_contribution_id.as_deref(),
+            Some("prior-bs")
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_status_reachability_disabled_is_noop() {
+        // Wanderer fix: the probe step must no-op on a disabled
+        // snapshot so we never hit the network when local mode is off.
+        let input = LocalModeStatus::disabled_default();
+        let out = refresh_status_reachability(input.clone()).await;
+        assert!(!out.enabled);
+        assert!(out.available_models.is_empty());
+        assert!(!out.reachable);
+        assert!(out.reachability_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn refresh_status_reachability_enabled_with_unreachable_captures_error() {
+        // Wanderer fix: when enabled and the probe fails, the
+        // reachability_error field carries the diagnostic string and
+        // reachable stays false. This is what the UI renders as the
+        // red "Cannot reach Ollama" status line.
+        let mut input = LocalModeStatus::disabled_default();
+        input.enabled = true;
+        input.base_url = Some("http://127.0.0.1:1/v1".into());
+        let out = refresh_status_reachability(input).await;
+        assert!(out.enabled);
+        assert!(!out.reachable);
+        assert!(out.reachability_error.is_some());
+        assert!(out.available_models.is_empty());
     }
 }

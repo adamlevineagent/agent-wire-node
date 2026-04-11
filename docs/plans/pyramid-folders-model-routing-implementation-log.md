@@ -4521,3 +4521,202 @@ for future hardening only.
 **Status: clean, no new commit added.** Original `35b3173`
 stands. Wanderer pass recommended next per
 `feedback_wanderer_after_verifier.md`.
+
+### Wanderer pass (2026-04-11)
+
+Fresh worktree at
+`/private/tmp/agent-wire-phase-18a-local-mode-providers-verifier`.
+Runtime baseline restored (the verifier punted this to the
+wanderer because disk pressure blocked their `cargo test` and
+`npm run build`):
+
+- `cargo test --lib pyramid` → **1254 passed / 7 failed** —
+  exactly the expected baseline. The 7 failures are
+  pre-existing (evidence schema `build_id` column, YAML
+  clustering, path normalization) — none touch local mode.
+- `npm run build` → clean (only the pre-existing 500KB chunk
+  size warning; 151 modules transformed, 991ms).
+
+Traced the 12-question wanderer script end-to-end through
+`local_mode.rs`, `db.rs`, `config_contributions.rs`,
+`yaml_renderer.rs`, `main.rs`, `Settings.tsx`,
+`useLocalMode.ts`, `ToolsMode.tsx`, and the bundled manifest.
+11 of 12 questions came back **clean** with the same file:line
+citations the verifier pinned. One wanderer fix applied.
+
+**Wanderer fix — reader lock held across `.await` in the
+status IPC.**
+
+The verifier's IPC audit line at `main.rs:8810` explicitly
+called out that `yaml_renderer_resolve_options` drops the
+rusqlite reader lock BEFORE awaiting the async `/api/tags`
+resolver. But they missed the same pattern in
+`pyramid_get_local_mode_status`:
+
+```rust
+async fn pyramid_get_local_mode_status(state) -> ... {
+    let reader = state.pyramid.reader.lock().await;
+    let status = get_local_mode_status(&reader).await?;  // <-- probe under lock
+    drop(reader);
+    Ok(status)
+}
+```
+
+`get_local_mode_status` calls `probe_ollama(&base_url).await`
+internally (up to 5 seconds of network wait). With the reader
+lock held, every concurrent reader-bound IPC would block on
+the lock for the duration of the probe. Not a data
+correctness bug — the tokio::sync::Mutex is an async mutex
+and Send-safe across `.await` — but a latency hazard for any
+background chain step, UI polling IPC, or another `compose`
+flow running at the same time as a Settings mount.
+
+**Fix:** split `get_local_mode_status` into two functions:
+- `load_status_snapshot(conn)` — synchronous, DB-only, builds
+  a partial status with `reachable=false` and empty probe
+  fields.
+- `refresh_status_reachability(status) -> status` — async,
+  takes ownership of the partial status, runs `probe_ollama`
+  (without any DB/mutex reference) and merges the
+  reachability fields in. No-op when `status.enabled = false`.
+
+The legacy `get_local_mode_status(&Connection)` is kept as a
+thin wrapper for the enable/disable return paths (they
+already hold the writer lock for the whole transaction, so
+the probe latency is irrelevant there).
+
+The `pyramid_get_local_mode_status` IPC now does:
+
+```rust
+let snapshot = {
+    let reader = state.pyramid.reader.lock().await;
+    load_status_snapshot(&reader)?   // sync, fast
+    // reader lock drops here
+};
+Ok(refresh_status_reachability(snapshot).await)  // no lock
+```
+
+**Tests added (4):**
+- `load_status_snapshot_disabled_returns_clean_row` — fresh
+  DB, snapshot returns disabled, no probe fields populated.
+- `load_status_snapshot_enabled_returns_saved_values_without_probing`
+  — populates the state row with enabled=true and asserts
+  the snapshot reflects saved values AND that
+  `available_models` / `reachable` are still empty (i.e. the
+  snapshot didn't secretly probe).
+- `refresh_status_reachability_disabled_is_noop` — passing a
+  disabled status through the refresh function must leave it
+  unchanged and not hit the network.
+- `refresh_status_reachability_enabled_with_unreachable_captures_error`
+  — enabled + unreachable URL → `reachable=false` +
+  `reachability_error` populated + `available_models` empty.
+
+Runtime after the fix:
+- `cargo test --lib pyramid::local_mode` → **18 passed /
+  0 failed** (was 14 before the fix).
+- `cargo test --lib pyramid` → **1258 passed / 7 failed**
+  (same 7 pre-existing).
+- `npm run build` → clean.
+
+**12 wanderer questions — final verdict:**
+
+1. **Enable end-to-end.** Clean. `local_mode.rs:295-521` walks
+   validate → probe → pick model → detect context →
+   `save_provider` → load prior contributions → snapshot
+   state → supersede tier_routing → sync operational →
+   supersede build_strategy → sync. Every hop verified.
+2. **Disable end-to-end.** Clean. `local_mode.rs:582-663`
+   restores by COPYING prior contribution YAML into a new
+   supersession of the currently-active local-mode
+   contribution. `upsert_tier_routing_from_contribution`
+   DELETEs stale rows + UPSERTs restored set → operational
+   table is bit-for-bit restored.
+3. **TierRoutingYaml repair.** Clean. `db.rs:14137` uses
+   `entries` with `#[serde(alias = "tiers")]`,
+   `upsert_tier_routing_from_contribution` at `db.rs:14187`
+   DELETEs stale rows. Bundled seed
+   `bundled_contributions.json:112` uses the canonical
+   `entries:` shape.
+4. **Reachability failure mode.** Clean. `local_mode.rs:306`
+   probes BEFORE any DB write; a failed probe returns Err
+   with no side effects. `save_provider` + state row writes
+   happen only after the probe succeeds.
+5. **/api/tags cache.** Clean. `yaml_renderer.rs:368-422`
+   implements the 30s per-provider cache. Failures cache an
+   empty list with the same TTL at `:555`. The std::sync::Mutex
+   is never held across `.await` because lookups return
+   owned clones and stores finish synchronously before any
+   `.await`. The async `resolve_model_list_only` function
+   exists specifically for the IPC path that must release
+   the rusqlite lock before awaiting.
+6. **ModelSelectorWidget integration.** Clean. The widget
+   defaults to `tier_registry` (sync, DB-only) so Local Mode
+   is automatically reflected via the new tier_routing rows.
+   No bundled schema annotations currently use
+   `model_list:{provider_id}`, but when one does, the
+   network-bound resolver handles it through the same
+   `yaml_renderer_resolve_options` IPC's async branch.
+7. **Credential warning modal.** Clean. `main.rs:7767`
+   fetches via `PyramidPublisher::fetch_contribution`, scans
+   via `CredentialStore::collect_references`, checks
+   `store.contains()`. `ToolsMode.tsx:2273-2312` modal lists
+   missing keys, offers Cancel / Pull anyway.
+8. **Concurrency pin to 1.** Clean. `local_mode.rs:551-575`
+   uses `serde_yaml::Value` mutation to preserve
+   webbing/evidence_mode/quality while forcing
+   `initial_build.concurrency = 1` and
+   `maintenance.concurrency = 1`. The disable path restores
+   the prior YAML verbatim via `build_strategy` supersession
+   + `upsert_build_strategy` (INSERT OR REPLACE).
+9. **No prior build_strategy edge case.** Not reachable.
+   `walk_bundled_contributions_manifest` at
+   `wire_migration.rs:1044` runs unconditionally on every
+   boot (outside the Phase 5 sentinel guard per `:141`). The
+   bundled `bundled-build_strategy-default-v1` entry in
+   `bundled_contributions.json:61-65` is always seeded with
+   INSERT OR IGNORE semantics. The only way to reach the
+   no-prior case is to manually archive every build_strategy
+   contribution AND patch the manifest — outside scope.
+10. **5 IPCs reachability.** Clean. All 5 defined
+    (`main.rs:7702/7714/7734/7750/7767`) + all 5 in
+    `invoke_handler` (`main.rs:10539-10543`) + all 5 have
+    real frontend call sites (`useLocalMode.ts:56/74/92/102`
+    + `ToolsMode.tsx:2289`).
+11. **Settings section in built bundle.** Clean. Grepped
+    `dist/assets/index-*.js` after `npm run build`: finds
+    "Local LLM (Ollama)", "Use local models (Ollama)",
+    "Test connection", and all 5 IPC names. Section between
+    Mesh Hosting and Auto-Update per workstream prompt.
+12. **Dehydration budget deferral.** Documented deferral.
+    `local_mode.rs:506-517` explicit comment, friction log
+    carry-forward, Phase 19 handoff. Risk: default budgets
+    (pre_map=80K, answer=100K) overflow on 8K/16K-context
+    models. Adam's Ouro test uses gemma3:27b (128K context)
+    so this doesn't block 18a. Small-context users need
+    manual tuning until Phase 19's dehydration_budget
+    contribution schema.
+
+**Other minor observations (flagged but NOT fixed — below
+wanderer-fix threshold):**
+
+- Enable path writes `save_provider` → `save_local_mode_state`
+  → `supersede_config_contribution` sequentially, and if the
+  supersede fails after the state row is persisted, the UI
+  shows enabled=true but tier_routing is still prior. Manual
+  recovery: click Enable again (idempotent via upsert).
+  Acceptable because supersede_config_contribution failures
+  are rare (DB IO errors).
+- `build_local_mode_build_strategy_yaml` silently skips the
+  concurrency pin if a phase value exists but isn't a
+  mapping. Not reachable in practice — bundled defaults
+  always use mapping form.
+- Two-step disable confirm via the toggle briefly renders a
+  visual flash from checked → unchecked → checked while
+  the confirmation modal is open (React controlled input
+  + hook status). Cosmetic; the modal "Yes, disable" button
+  works normally.
+
+Single wanderer commit appended to branch. Not pushed, not
+merged.
+
+Status: **wanderer-clean + 1 wanderer fix applied**.

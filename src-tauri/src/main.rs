@@ -7702,12 +7702,20 @@ async fn pyramid_delete_step_override(
 async fn pyramid_get_local_mode_status(
     state: tauri::State<'_, SharedState>,
 ) -> Result<wire_node_lib::pyramid::local_mode::LocalModeStatus, String> {
-    let reader = state.pyramid.reader.lock().await;
-    let status = wire_node_lib::pyramid::local_mode::get_local_mode_status(&reader)
-        .await
-        .map_err(|e| e.to_string())?;
-    drop(reader);
-    Ok(status)
+    // Wanderer fix (Phase 18a): split the synchronous DB snapshot
+    // from the async Ollama probe so the reader lock is released
+    // BEFORE the network round-trip. Holding the tokio::sync::Mutex
+    // across `probe_ollama().await` would block every other
+    // reader-bound IPC for up to 5 seconds while the probe ran.
+    let snapshot = {
+        let reader = state.pyramid.reader.lock().await;
+        let snapshot =
+            wire_node_lib::pyramid::local_mode::load_status_snapshot(&reader)
+                .map_err(|e| e.to_string())?;
+        drop(reader);
+        snapshot
+    };
+    Ok(wire_node_lib::pyramid::local_mode::refresh_status_reachability(snapshot).await)
 }
 
 #[tauri::command]
