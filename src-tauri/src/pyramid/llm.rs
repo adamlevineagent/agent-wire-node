@@ -694,13 +694,17 @@ pub async fn call_model_unified_with_audit_and_ctx(
     let url = provider_impl.chat_completions_url();
     let built_headers = provider_impl.prepare_headers(secret.as_ref())?;
 
-    // Scale timeout with prompt size: base + increment_secs per chars_per_increment, capped at max
+    // Scale timeout with prompt size: base + increment_secs per chars_per_increment, capped at max.
+    // Local providers (Ollama) get a 5x base timeout since large models on
+    // consumer hardware are slower than cloud APIs. The semaphore already
+    // serializes calls, so longer timeouts don't cause contention.
     let prompt_chars = system_prompt.len() + user_prompt.len();
+    let local_timeout_scale = if provider_type == ProviderType::OpenaiCompat { 5 } else { 1 };
     let timeout = compute_timeout(
         prompt_chars,
         options,
-        config.base_timeout_secs,
-        config.max_timeout_secs,
+        config.base_timeout_secs * local_timeout_scale,
+        config.max_timeout_secs * local_timeout_scale,
         config.timeout_chars_per_increment,
         config.timeout_increment_secs,
     );
@@ -1885,11 +1889,12 @@ pub async fn call_model_via_registry(
     }
 
     let prompt_chars = system_prompt.len() + user_prompt.len();
+    let local_timeout_scale = if provider_type == ProviderType::OpenaiCompat { 5 } else { 1 };
     let timeout = compute_timeout(
         prompt_chars,
         LlmCallOptions::default(),
-        config.base_timeout_secs,
-        config.max_timeout_secs,
+        config.base_timeout_secs * local_timeout_scale,
+        config.max_timeout_secs * local_timeout_scale,
         config.timeout_chars_per_increment,
         config.timeout_increment_secs,
     );
@@ -2365,7 +2370,8 @@ pub async fn call_model_direct(
     let client = &*HTTP_CLIENT;
     let url = provider_impl.chat_completions_url();
     let built_headers = provider_impl.prepare_headers(secret.as_ref())?;
-    let timeout = std::time::Duration::from_secs(config.base_timeout_secs);
+    let local_timeout_scale = if provider_type == ProviderType::OpenaiCompat { 5 } else { 1 };
+    let timeout = std::time::Duration::from_secs(config.base_timeout_secs * local_timeout_scale);
 
     for attempt in 0..config.max_retries {
         let mut body = serde_json::json!({
