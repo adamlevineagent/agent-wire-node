@@ -1944,6 +1944,18 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
     // `contribution_id` column is still NULL.
     migrate_legacy_dadbear_to_contributions(conn)?;
 
+    // Ghost-engine fix: backfill pyramid_auto_update_config for ALL existing
+    // slugs that don't have a row yet. Without this, the master gate query
+    // has no row to JOIN against, and pre-existing pyramids either get
+    // fail-open ghost engines or fail-closed invisible drops.
+    conn.execute(
+        "INSERT OR IGNORE INTO pyramid_auto_update_config (slug)
+         SELECT slug FROM pyramid_slugs WHERE slug NOT IN (
+             SELECT slug FROM pyramid_auto_update_config
+         )",
+        [],
+    )?;
+
     // Ghost-engine fix: convert legacy pyramid_auto_update_config rows
     // to pyramid_config_contributions. Same pattern as DADBEAR migration.
     migrate_legacy_auto_update_to_contributions(conn)?;
@@ -9274,6 +9286,22 @@ pub fn expire_unredeemed_tokens(conn: &Connection) -> Result<usize> {
     Ok(expired)
 }
 
+/// Mark an unredeemed token as permanently failed (WS-ONLINE-H).
+///
+/// Called when a redeem attempt returns a permanent error (400, 401, 409)
+/// indicating the token is invalid, already redeemed, or expired on the server.
+/// Unlike `increment_unredeemed_retry`, this immediately marks the token as
+/// 'failed' without incrementing retry_count — no point retrying permanent errors.
+pub fn mark_unredeemed_failed(conn: &Connection, nonce: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE pyramid_unredeemed_tokens
+         SET status = 'failed', last_retry_at = datetime('now')
+         WHERE nonce = ?1 AND status = 'pending'",
+        rusqlite::params![nonce],
+    )?;
+    Ok(())
+}
+
 // ── Annotation Reactions & Agent Sessions ───────────────────────────────────
 
 /// Save an annotation reaction (up/down vote). Uses INSERT OR REPLACE to allow changing votes.
@@ -11378,11 +11406,14 @@ pub fn get_dadbear_configs(conn: &Connection, slug: &str) -> Result<Vec<DadbearW
 
 /// Get all enabled DADBEAR watch configs (across all slugs).
 ///
-/// Ghost-engine fix: LEFT JOINs `pyramid_auto_update_config` to enforce
+/// Ghost-engine fix: INNER JOINs `pyramid_auto_update_config` to enforce
 /// the master enable gate. DADBEAR configs are only returned when:
 ///   - per-path: `enabled = 1`
 ///   - master: `auto_update = 1 AND frozen = 0 AND breaker_tripped = 0`
-///              (or no master row exists — belt-and-suspenders for edge cases)
+///
+/// Fail-closed: if no master row exists, DADBEAR does NOT scan. The
+/// backfill in init_pyramid_db() ensures all existing slugs have a row,
+/// and create_slug() seeds one for new slugs.
 ///
 /// This is the single query change that prevents ghost engines.
 /// All columns are d.-qualified to avoid ambiguous `slug`.
@@ -11393,9 +11424,9 @@ pub fn get_enabled_dadbear_configs(conn: &Connection) -> Result<Vec<DadbearWatch
                 d.debounce_secs, d.session_timeout_secs, d.batch_size, d.enabled,
                 d.last_scan_at, d.created_at, d.updated_at
          FROM pyramid_dadbear_config d
-         LEFT JOIN pyramid_auto_update_config a ON d.slug = a.slug
+         JOIN pyramid_auto_update_config a ON d.slug = a.slug
          WHERE d.enabled = 1
-           AND (a.slug IS NULL OR (a.auto_update = 1 AND a.frozen = 0 AND a.breaker_tripped = 0))
+           AND a.auto_update = 1 AND a.frozen = 0 AND a.breaker_tripped = 0
          ORDER BY d.slug ASC, d.source_path ASC";
     let mut stmt = conn.prepare(sql)?;
     let rows = stmt.query_map([], parse_dadbear_config)?;
