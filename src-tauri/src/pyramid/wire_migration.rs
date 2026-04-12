@@ -48,11 +48,13 @@
 use std::path::Path;
 
 use anyhow::Result;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde::Deserialize;
 use tracing::{debug, warn};
 
+use crate::pyramid::chain_registry;
 use crate::pyramid::config_contributions::create_config_contribution_with_metadata;
+use crate::pyramid::db::ChainDefaultsYaml;
 use crate::pyramid::prompt_cache::normalize_prompt_path;
 use crate::pyramid::wire_native_metadata::{
     default_wire_native_metadata, WireContributionType, WireMaturity, WireNativeMetadata,
@@ -1085,7 +1087,86 @@ pub fn walk_bundled_contributions_manifest(
         }
     }
 
+    // ── Boot-time sync: hydrate chain_defaults operational table ─────
+    //
+    // The `insert_bundled_contribution` path above writes to
+    // `pyramid_config_contributions` but does NOT call
+    // `sync_config_to_operational` (it can't — no BuildEventBus is
+    // available at migration time). For most schema types this is fine
+    // because `init_pyramid_db` legacy-seeds their operational tables.
+    // But `pyramid_chain_defaults` has NO legacy seed — it was
+    // introduced alongside the contribution-backed chain registry and
+    // relies entirely on the sync dispatcher to populate it.
+    //
+    // Without this block, `pyramid_chain_defaults` stays empty on
+    // every boot, and the three-tier resolver in
+    // `chain_registry::resolve_chain_for_slug` always falls through
+    // to the tier 3 compile-time hardcoded fallback. Tier 2 (the
+    // contribution-driven content-type default mapping) is dead code.
+    //
+    // Fix: on every boot, read the active `chain_defaults`
+    // contribution and replay it to the operational table. This is
+    // idempotent (DELETE + re-INSERT) and fast (handful of rows).
+    sync_chain_defaults_to_operational(conn);
+
     Ok(report)
+}
+
+/// Read the active `chain_defaults` contribution and sync its
+/// mappings to `pyramid_chain_defaults`. No-op if no active
+/// contribution exists (fresh install before any chain_defaults
+/// contribution has been created — the tier 3 fallback covers this).
+fn sync_chain_defaults_to_operational(conn: &Connection) {
+    let row: Option<(String, String)> = conn
+        .prepare(
+            "SELECT contribution_id, yaml_content
+             FROM pyramid_config_contributions
+             WHERE schema_type = 'chain_defaults'
+               AND status = 'active'
+             ORDER BY accepted_at DESC
+             LIMIT 1",
+        )
+        .and_then(|mut stmt| {
+            stmt.query_row([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .optional()
+        })
+        .unwrap_or_else(|e| {
+            warn!(
+                error = %e,
+                "boot sync: failed to query active chain_defaults contribution"
+            );
+            None
+        });
+
+    if let Some((contribution_id, yaml_content)) = row {
+        match serde_yaml::from_str::<ChainDefaultsYaml>(&yaml_content) {
+            Ok(yaml) => {
+                if let Err(e) =
+                    chain_registry::upsert_chain_defaults(conn, &yaml.mappings, &contribution_id)
+                {
+                    warn!(
+                        error = %e,
+                        "boot sync: failed to upsert chain_defaults to operational table"
+                    );
+                } else {
+                    debug!(
+                        contribution_id = %contribution_id,
+                        mappings = yaml.mappings.len(),
+                        "boot sync: chain_defaults operational table hydrated"
+                    );
+                }
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    contribution_id = %contribution_id,
+                    "boot sync: failed to parse chain_defaults YAML"
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]

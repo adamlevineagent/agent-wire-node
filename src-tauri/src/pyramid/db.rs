@@ -14943,6 +14943,44 @@ pub fn replace_step_overrides_bundle(
     Ok(())
 }
 
+// ── Chain assignment / defaults YAML structs ─────────────────────────────────
+//
+// Deserialized from `chain_assignment` and `chain_defaults` contributions
+// in `sync_config_to_operational`. The operational tables
+// (`pyramid_chain_assignments`, `pyramid_chain_defaults`) are caches;
+// the contribution is the source of truth.
+
+/// Per-pyramid chain override. The `chain_id` field names the chain YAML's
+/// `id` field (e.g. `"conversation-episodic-fast"`). The special value
+/// `"default"` means "remove any override, fall back to content-type defaults."
+#[derive(Debug, serde::Deserialize)]
+pub struct ChainAssignmentYaml {
+    pub chain_id: String,
+}
+
+/// Global content-type → chain_id mapping. Ships as a bundled contribution,
+/// updatable via Wire, supersedable locally. Replaces the former hardcoded
+/// `default_chain_id()` / `default_chain_id_for_mode()` functions.
+#[derive(Debug, serde::Deserialize)]
+pub struct ChainDefaultsYaml {
+    pub mappings: Vec<ChainDefaultMapping>,
+}
+
+/// A single (content_type, evidence_mode) → chain_id entry. When
+/// `evidence_mode` is omitted or empty, it defaults to `"*"` (wildcard,
+/// matches any mode).
+#[derive(Debug, serde::Deserialize)]
+pub struct ChainDefaultMapping {
+    pub content_type: String,
+    #[serde(default = "default_wildcard")]
+    pub evidence_mode: String,
+    pub chain_id: String,
+}
+
+fn default_wildcard() -> String {
+    "*".to_string()
+}
+
 // ── Phase 11: OpenRouter Broadcast + Cost Reconciliation ────────────────────
 //
 // These helpers implement the database side of `docs/specs/

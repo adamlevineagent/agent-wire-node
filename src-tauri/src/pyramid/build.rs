@@ -742,14 +742,10 @@ pub async fn build_topical_vine(
     use crate::pyramid::chain_loader;
     use crate::pyramid::chain_registry;
 
-    // Resolve the chain id — either a per-slug override in
-    // pyramid_chain_assignments or the `topical-vine` default.
+    // Three-tier chain resolution: per-slug override → content-type default → safety net.
     let chain_id = {
         let conn = state.reader.lock().await;
-        match chain_registry::get_assignment(&conn, slug)? {
-            Some((id, _file)) => id,
-            None => chain_registry::default_chain_id("vine").to_string(),
-        }
+        chain_registry::resolve_chain_for_slug(&conn, slug, "vine", "deep")?
     };
 
     // Locate the chain YAML in the chains directory.

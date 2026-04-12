@@ -886,18 +886,28 @@ steps:
     }
 
     #[test]
-    fn chain_registry_returns_episodic_for_conversation() {
+    fn chain_resolver_fallback_returns_expected_defaults() {
+        // With an empty DB (no chain_defaults contribution bootstrapped),
+        // resolve_chain_for_slug hits the compile-time safety net, which
+        // mirrors the bundled chain_defaults contribution body.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::pyramid::db::init_pyramid_db(&conn).unwrap();
+
         assert_eq!(
-            super::super::chain_registry::default_chain_id("conversation"),
+            super::super::chain_registry::resolve_chain_for_slug(&conn, "test", "conversation", "deep").unwrap(),
             "conversation-episodic"
+        );
+        assert_eq!(
+            super::super::chain_registry::resolve_chain_for_slug(&conn, "test", "conversation", "fast").unwrap(),
+            "conversation-episodic-fast"
         );
         // Other content types still get question-pipeline
         assert_eq!(
-            super::super::chain_registry::default_chain_id("code"),
+            super::super::chain_registry::resolve_chain_for_slug(&conn, "test", "code", "deep").unwrap(),
             "question-pipeline"
         );
         assert_eq!(
-            super::super::chain_registry::default_chain_id("document"),
+            super::super::chain_registry::resolve_chain_for_slug(&conn, "test", "document", "deep").unwrap(),
             "question-pipeline"
         );
     }

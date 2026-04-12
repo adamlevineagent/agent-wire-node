@@ -299,7 +299,7 @@ pub fn ensure_default_chains(
         ("extract-only.yaml", include_str!("../../../chains/defaults/extract-only.yaml")),
         // Phase 16: topical vine recipe for vine-of-vines composition and
         // folder ingestion (Phase 17). Vines route to this chain via
-        // chain_registry::default_chain_id_for_mode.
+        // chain_registry::resolve_chain_for_slug.
         (
             "topical-vine.yaml",
             include_str!("../../../chains/defaults/topical-vine.yaml"),

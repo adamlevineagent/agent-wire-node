@@ -601,20 +601,10 @@ async fn run_chain_build(
 ) -> Result<(String, i32, Vec<super::types::StepActivity>)> {
     let ct_str = content_type.as_str();
 
-    // Determine which chain to use: slug-specific assignment or default
+    // Three-tier chain resolution: per-slug override → content-type default → safety net.
     let chain_id = {
         let conn = state.reader.lock().await;
-        match chain_registry::get_assignment(&conn, slug_name)? {
-            Some((id, _file)) => {
-                info!(slug = slug_name, chain_id = %id, "using assigned chain");
-                id
-            }
-            None => {
-                let default_id = chain_registry::default_chain_id(ct_str).to_string();
-                info!(slug = slug_name, chain_id = %default_id, "using default chain");
-                default_id
-            }
-        }
+        chain_registry::resolve_chain_for_slug(&conn, slug_name, ct_str, "deep")?
     };
 
     // Use the pre-resolved chains directory from state
@@ -658,20 +648,10 @@ async fn run_ir_build(
 ) -> Result<(String, i32)> {
     let ct_str = content_type.as_str();
 
-    // Determine which chain to use: slug-specific assignment or default
+    // Three-tier chain resolution: per-slug override → content-type default → safety net.
     let chain_id = {
         let conn = state.reader.lock().await;
-        match chain_registry::get_assignment(&conn, slug_name)? {
-            Some((id, _file)) => {
-                info!(slug = slug_name, chain_id = %id, "IR executor: using assigned chain");
-                id
-            }
-            None => {
-                let default_id = chain_registry::default_chain_id(ct_str).to_string();
-                info!(slug = slug_name, chain_id = %default_id, "IR executor: using default chain");
-                default_id
-            }
-        }
+        chain_registry::resolve_chain_for_slug(&conn, slug_name, ct_str, "deep")?
     };
 
     // Use the pre-resolved chains directory from state
@@ -908,17 +888,23 @@ pub async fn run_decomposed_build(
         }
     };
 
-    // ── 4. Load pipeline chain (content-type aware) ──────────────────
+    // ── 4. Load pipeline chain (three-tier resolution) ────────────────
+    // Previously this skipped the per-slug assignment check (tier 1) and
+    // went directly to the hardcoded default. Now uses the consolidated
+    // resolver so per-slug overrides work for decomposed builds too.
+    let chain_id = {
+        let conn = state.reader.lock().await;
+        chain_registry::resolve_chain_for_slug(&conn, slug_name, ct_str, evidence_mode)?
+    };
     let chains_dir = state.chains_dir.clone();
-    let default_chain_id = chain_registry::default_chain_id_for_mode(ct_str, evidence_mode);
     let all_chains = chain_loader::discover_chains(&chains_dir)?;
     let meta = all_chains
         .iter()
-        .find(|m| m.id == default_chain_id)
+        .find(|m| m.id == chain_id)
         .ok_or_else(|| {
             anyhow!(
                 "'{}' chain not found in chains directory ({})",
-                default_chain_id,
+                chain_id,
                 chains_dir.display()
             )
         })?;

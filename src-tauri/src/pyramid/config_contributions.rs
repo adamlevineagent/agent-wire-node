@@ -26,6 +26,7 @@ use rusqlite::{Connection, OptionalExtension};
 use std::sync::Arc;
 use tracing::{debug, warn};
 
+use crate::pyramid::chain_registry;
 use crate::pyramid::db;
 use crate::pyramid::event_bus::{BuildEventBus, TaggedBuildEvent, TaggedKind};
 use crate::pyramid::schema_registry::{flag_configs_needing_migration, SchemaRegistry};
@@ -713,6 +714,39 @@ pub fn sync_config_to_operational_with_registry(
             // auto_update off/on, or app restart). All other fields
             // (runaway_threshold, min_changed_files, auto_update) are
             // re-read per drain cycle.
+        }
+        "chain_assignment" => {
+            // Per-pyramid chain override. Syncs to the
+            // `pyramid_chain_assignments` operational table via
+            // `chain_registry::assign_chain`. The special value
+            // `chain_id: "default"` removes the override, causing the
+            // build runner to fall through to the tier 2 content-type
+            // defaults.
+            let yaml: db::ChainAssignmentYaml =
+                serde_yaml::from_str(&contribution.yaml_content)?;
+            let slug = contribution.slug.as_deref().ok_or_else(|| {
+                ConfigSyncError::ValidationFailed(
+                    "chain_assignment requires a pyramid slug".into(),
+                )
+            })?;
+            if yaml.chain_id == "default" {
+                chain_registry::remove_assignment(conn, slug)?;
+            } else {
+                chain_registry::assign_chain(conn, slug, &yaml.chain_id)?;
+            }
+        }
+        "chain_defaults" => {
+            // Global content-type → chain_id mapping. Syncs to the
+            // `pyramid_chain_defaults` operational table. Ships bundled,
+            // updatable via Wire, supersedable locally. Replaces the
+            // former hardcoded `default_chain_id()` match statement.
+            let yaml: db::ChainDefaultsYaml =
+                serde_yaml::from_str(&contribution.yaml_content)?;
+            chain_registry::upsert_chain_defaults(
+                conn,
+                &yaml.mappings,
+                &contribution.contribution_id,
+            )?;
         }
         // ── Stubbed branches ─────────────────────────────────────────
         //
