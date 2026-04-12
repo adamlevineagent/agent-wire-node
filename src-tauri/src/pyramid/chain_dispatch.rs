@@ -132,6 +132,11 @@ pub struct StepContext {
     /// bring-up paths; production executors populate it at dispatch
     /// context construction time.
     pub cache_base: Option<Arc<CacheDispatchBase>>,
+    /// Build strategy concurrency cap. Read from the `pyramid_build_strategy`
+    /// table at chain execution start. Chain step concurrency is capped to
+    /// `min(step.concurrency, concurrency_cap)`. Local mode sets this to 1
+    /// because Ollama processes one request at a time.
+    pub concurrency_cap: Option<usize>,
 }
 
 impl CacheDispatchBase {

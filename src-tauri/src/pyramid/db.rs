@@ -13884,6 +13884,28 @@ pub fn upsert_build_strategy(
     Ok(())
 }
 
+/// Read the global build strategy's initial_build concurrency cap.
+/// Returns `None` if no strategy is set or if concurrency is absent.
+/// Used by the chain executor to cap step concurrency against the
+/// build_strategy contribution (e.g., local mode sets concurrency=1).
+pub fn read_build_strategy_concurrency(conn: &Connection) -> Result<Option<usize>> {
+    let result: Option<String> = conn
+        .query_row(
+            "SELECT initial_build_json FROM pyramid_build_strategy WHERE slug IS NULL ORDER BY updated_at DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(json_str) = result {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&json_str) {
+            if let Some(c) = val.get("concurrency").and_then(|v| v.as_u64()) {
+                return Ok(Some(c as usize));
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// Minimal custom prompts YAML struct. Extended in Phase 9.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct CustomPromptsYaml {

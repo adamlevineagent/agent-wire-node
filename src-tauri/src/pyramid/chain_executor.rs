@@ -3772,6 +3772,7 @@ pub async fn retry_dead_letter_entry(
         // Dead-letter retries skip the cache — failed attempts produced
         // bad outputs that should not be cache-hit on retry.
         cache_base: None,
+        concurrency_cap: None, // dead letter retries are single-call
     };
 
     match chain_dispatch::dispatch_step(
@@ -4008,6 +4009,17 @@ pub async fn execute_chain_from(
             Some(state.build_event_bus.clone()),
         ))
     });
+    // Read the build strategy concurrency cap from the operational table.
+    // Local mode sets this to 1 so Ollama (single-request) isn't overwhelmed.
+    let concurrency_cap = db_read(&state.reader, |conn| {
+        db::read_build_strategy_concurrency(conn)
+    })
+    .await
+    .unwrap_or(None);
+    if let Some(cap) = concurrency_cap {
+        info!("[CHAIN] build_strategy concurrency cap: {cap}");
+    }
+
     let dispatch_ctx = chain_dispatch::StepContext {
         db_reader: state.reader.clone(),
         db_writer: state.writer.clone(),
@@ -4025,6 +4037,7 @@ pub async fn execute_chain_from(
             depth: None,
         }),
         cache_base,
+        concurrency_cap,
     };
 
     // Set up writer channel + drain task
@@ -6282,7 +6295,11 @@ async fn execute_for_each(
         warn!("[CHAIN] [{}] dispatch_order '{}' specified but not yet implemented — using insertion order", step.name, order);
     }
 
-    let concurrency = step.concurrency.max(1);
+    let step_concurrency = step.concurrency.max(1);
+    let concurrency = dispatch_ctx
+        .concurrency_cap
+        .map(|cap| step_concurrency.min(cap).max(1))
+        .unwrap_or(step_concurrency);
 
     if !step.sequential && concurrency > 1 {
         info!(
@@ -6821,7 +6838,11 @@ async fn execute_for_each_concurrent(
     let mut failures: i32 = 0;
     let depth = step.depth.unwrap_or(0);
     let ctx_snapshot = Arc::new(ctx.clone());
-    let concurrency = step.concurrency.max(1);
+    let step_concurrency = step.concurrency.max(1);
+    let concurrency = dispatch_ctx
+        .concurrency_cap
+        .map(|cap| step_concurrency.min(cap).max(1))
+        .unwrap_or(step_concurrency);
     let semaphore = Arc::new(Semaphore::new(concurrency));
     let (result_tx, mut result_rx) =
         mpsc::channel::<ForEachTaskOutcome>(concurrency * 4);
@@ -9186,7 +9207,11 @@ async fn web_nodes_batched(
     }
 
     // ── Concurrent batch dispatch ───────────────────────────────────────
-    let semaphore = Arc::new(Semaphore::new(step.concurrency.max(1)));
+    let batch_concurrency = dispatch_ctx
+        .concurrency_cap
+        .map(|cap| step.concurrency.max(1).min(cap).max(1))
+        .unwrap_or(step.concurrency.max(1));
+    let semaphore = Arc::new(Semaphore::new(batch_concurrency));
     let (tx, mut rx) = tokio::sync::mpsc::channel::<(usize, Result<Value>)>(batch_count);
 
     for (batch_idx, batch_value) in batches.into_iter().enumerate() {
@@ -10857,6 +10882,13 @@ pub async fn execute_plan(
     );
 
     // ── 5. Build dispatch context ────────────────────────────────────────
+    // Read build strategy concurrency cap (local mode sets to 1).
+    let concurrency_cap = db_read(&state.reader, |conn| {
+        db::read_build_strategy_concurrency(conn)
+    })
+    .await
+    .unwrap_or(None);
+
     // Phase 12 verifier fix: `ir_build_id` already minted at the top
     // of the function so `llm_config.cache_access` is consistent with
     // the per-call CacheDispatchBase.
@@ -10886,6 +10918,7 @@ pub async fn execute_plan(
             depth: None,
         }),
         cache_base,
+        concurrency_cap,
     };
 
     exec_state.send_progress().await;
@@ -11279,11 +11312,15 @@ async fn execute_ir_parallel_foreach(
         return Ok(Value::Array(vec![]));
     }
 
-    let concurrency = step
+    let step_concurrency = step
         .iteration
         .as_ref()
         .and_then(|it| it.concurrency)
         .unwrap_or(4);
+    let concurrency = dispatch_ctx
+        .concurrency_cap
+        .map(|cap| step_concurrency.min(cap).max(1))
+        .unwrap_or(step_concurrency);
     let semaphore = Arc::new(Semaphore::new(concurrency));
 
     let mut completed_outputs: Vec<Option<Value>> = vec![None; items.len()];
