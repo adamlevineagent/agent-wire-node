@@ -5,7 +5,7 @@
 **Branch:** `stabilize-main` (continuing on the same branch; SDFS supersedes the stabilize-main patch approach)
 **Checkpoint:** `a6eb1ae` on `stabilize-main-checkpoint-20260411-124944`
 **Supersedes:** `docs/plans/stabilize-main-2026-04-11.md` committed at `efec5c0` (stabilize-main plan is preserved as historical context; its bug findings inform this plan but its fix approach is abandoned)
-**Status:** Rev 3 — conversation pipeline sections rewritten after Adam corrected the "follow-up" punt. Conversation ingest is first-class MVP; `ingest_continuation` is wired up in Commit 8; filemap is the message-count cursor; orphan-bunch bug fixed as side effect. Ready for Cycle 1 audit.
+**Status:** Rev 4 — Assumption #8 (`run_build_from` incremental behavior) verified end-to-end against `build_runner.rs`, `chain_executor.rs`, `conversation-episodic.yaml`, `llm.rs`, `db.rs`, and `step_context.rs`. Verified answer moves from "open at implementation time" to "the path is `ingest_continuation` + `from_depth=0` + pyramid_step_cache handles the LLM cost savings." Ready for Cycle 1 audit.
 
 ---
 
@@ -745,8 +745,8 @@ Reuses the stabilize-main plan's design for Bug #1: new `CredentialStore::load_w
 
 **Scope:** replace `dadbear_extend.rs`'s tick loop. Pattern is unchanged; surface is swapped. Three important plumbing changes beyond the source-file retarget:
 
-1. **Incremental conversation append via `ingest_continuation`.** Stop calling `clear_chunks + ingest_conversation` on conversation change. Read `ingested_message_count` from the filemap session entry, call `ingest::ingest_continuation(conn, slug, path, skip_messages=ingested_message_count)`, write the new total back to the filemap on success. The Phase 0b shortcut at `dadbear_extend.rs:731-734` is deleted with its comment.
-2. **No new SQLite table for message-count state.** The filemap is the cursor. `.understanding/folder.md.conversation_sources[].sessions[*].ingested_message_count` is authoritative. This closes the exact schema gap the shortcut comment complained about — without adding schema.
+1. **Incremental conversation append via `ingest_continuation` + `from_depth=0` + pyramid_step_cache.** Stop calling `clear_chunks + ingest_conversation` on conversation change. Read `ingested_message_count` from the filemap session entry, call `ingest::ingest_continuation(conn, slug, path, skip_messages=ingested_message_count)` to append only the new messages to `pyramid_chunks` at `chunk_offset + i`, then call `run_build_from_with_evidence_mode(slug, from_depth=0, ..., evidence_mode="deep")`. The chain supersedes all nodes and re-runs; `pyramid_step_cache` absorbs the L0-extraction cost for old chunks (their content is byte-identical so `inputs_hash` + `prompt_hash` + `model_id` compose the same `cache_key`, cache hit, no LLM call). LLM cost for L0 extraction is proportional to new content. Upper-layer rebuild relies on step cache hits per assumption #13. Write the new total back to the filemap on success. The Phase 0b shortcut at `dadbear_extend.rs:731-734` is deleted with its comment.
+2. **No new SQLite table for message-count state.** The filemap is the cursor. `.understanding/folder.md.conversation_sources[].sessions[*].ingested_message_count` is authoritative. This closes the exact schema gap the shortcut comment complained about — without adding schema. See Core Architectural Fact #14 for the end-to-end mechanism verification.
 3. **New-session detection goes through the builder.** DADBEAR detects a new `.jsonl` appearing (filesystem poll + sha256 against filemap), writes a new `sessions[]` entry with `bunch_slug: null` and `ingested_message_count: 0`, and lets Commit 5's builder pick it up on its next pass to create the bunch and attach to the CC vine. DADBEAR itself does not create bunches — it only updates the filemap.
 
 The existing RAII `InFlightGuard` pattern is preserved for panic-safety. `batch_size` becomes `max_files_per_rebuild`. Policy source is `.understanding/configs/dadbear_policy.md`.
@@ -754,7 +754,7 @@ The existing RAII `InFlightGuard` pattern is preserved for panic-safety. `batch_
 **Files:**
 - `src-tauri/src/pyramid/understanding/dadbear.rs` — new tick loop. Reads policy from contribution file (via cache). Scans source directories AND CC dirs from the filemap's `conversation_sources[]`. Updates `folder.md` scanner fields. Computes folder-quiet timer. On debounce expiry:
   - For stale **code/document files**: fire builder's chain rebuild path.
-  - For stale **conversation sessions** (mtime/sha256 differs from filemap): fire `ingest::ingest_continuation(conn, slug, path, skip_messages=ingested_message_count)`, run the episodic chain via `run_build_from_with_evidence_mode`, write the new `message_count` + `chunk_count` back to the filemap atomically with the build completion.
+  - For stale **conversation sessions** (mtime/sha256 differs from filemap): fire `ingest::ingest_continuation(conn, slug, path, skip_messages=ingested_message_count)` — which appends only the new messages as a continuation batch at `chunk_index = chunk_offset + i` — then run the episodic chain via `run_build_from_with_evidence_mode(slug, from_depth=0, ..., evidence_mode="deep")`. The `from_depth=0` call supersedes all nodes, flipping the chain's prior-state gates back to fresh. The existing `pyramid_step_cache` absorbs re-extraction cost for old chunks because their cache_keys are stable. Write the new `message_count` + `chunk_count` back to the filemap atomically with the build completion.
   - For **new conversation sessions** in a CC dir (filemap has no matching entry): append a new `sessions[]` entry with null slug and zero cursor, fire the builder which creates the bunch on its next tick.
 - `src-tauri/src/pyramid/dadbear_extend.rs` — DELETE. Replaced by the new module.
 - `src-tauri/src/pyramid/folder_ingestion.rs` — delete the `RegisterDadbearConfig` emission sites and the `spawn_initial_builds` wanderer-fix dispatch; these are superseded by the new scanner + builder + DADBEAR retarget. Keep the `pyramid_find_claude_code_conversations` + `describe_claude_code_dirs` + `encode_path_for_claude_code` helpers — Commit 2 reuses them.
@@ -829,6 +829,14 @@ The existing RAII `InFlightGuard` pattern is preserved for panic-safety. `batch_
 3. On the next builder tick: verify the new bunch is created via `CreatePyramid`, attached to the existing CC vine via `AddChildToVine(child_type='bedrock')`, and the episodic chain runs. `bunch_slug` is written back to the filemap.
 4. Query the CC vine via CLI: assert the new bunch is listed as a child, NOT an orphan pyramid.
 
+### Empirical step-cache verification (from Commit 8, validates Core Architectural Fact #14)
+1. Build a conversation bunch (fresh, no prior state). Record the total LLM call count via `pyramid_llm_audit` rows for the build_id.
+2. Without making any changes to the source JSONL, trigger a second build of the same bunch (`pyramid_sdfs_build_from_filemap` or equivalent rebuild path).
+3. Assert the second build's `pyramid_llm_audit` rows are dominated by `cache_hit=true` entries at the L0-extraction steps (`forward_pass`, `reverse_pass`, `combine_l0`). Real LLM calls at those steps should be near zero.
+4. Assert the total LLM cost for the second build is substantially lower than the first build (target: 70%+ reduction for a slug with no new content).
+5. **If the reduction is small (< 30%):** the upper-layer step hashing is likely ID-based rather than content-based (per Assumption #13). Open a follow-up issue for `compute_inputs_hash` review; do NOT block Commit 8 on it — the correctness is unchanged.
+6. Then run the incremental-append test above: append new messages to an existing session, rebuild, assert LLM calls are proportional to new content (far less than the first build).
+
 ### Cache-rebuild verification
 1. Delete `pyramid.db` with the app running.
 2. Restart the app.
@@ -872,7 +880,7 @@ The Cycle 1/2/3 findings from stabilize-main are preserved in the earlier plan d
 
 - **Non-Claude-Code conversation sources** (ChatGPT exports, Cursor chats, Windsurf chats, GPT API usage). MVP handles Claude Code only via the existing `pyramid_find_claude_code_conversations` path. Other sources need per-source format adapters; the filemap's `conversation_sources[].source_type` field is designed to extend to new values (`chatgpt_export`, `cursor_session_dir`, etc.) without schema change.
 - **Cross-folder conversation attribution.** A Claude Code session that touches multiple workspaces lives in the first-scanned workspace's filemap. True "this session belongs to workspaces A and B" needs cross-workspace citation via published handle-paths and is out of MVP.
-- **`run_build_from` intelligent incremental rebuild.** This plan closes the incremental INGEST side (new messages only get chunked via `ingest_continuation`). Whether `run_build_from` then rebuilds only new chunks' nodes vs re-running the whole episodic chain for the whole slug is a separate question flagged in "Assumptions to verify" (#8). If the chain executor always rebuilds the full slug, a further optimization lands as a follow-up. The append is still correct; the LLM-cost savings are partial until that optimization ships.
+- **Chain-executor "rebuild only new nodes" mode.** Not needed for MVP. Assumption #8 verification (now Core Architectural Fact #14) established that `pyramid_step_cache` provides the equivalent savings: `ingest_continuation` keeps old chunks byte-identical, so re-extraction of old chunks hits the cache and costs ~0. The `from_depth=0` + supersede + re-run + cache path is correct AND economical. A future optimization could skip the superseding entirely and use a `--from-chunk-offset` flag for true surgical rebuilds, but MVP gets the LLM-cost win without it.
 - **Whole-disk scanning** from the spec (§260-301).
 - **Git integration layer** (`.gitattributes`, merge drivers, etc.) from spec §366.
 - **Cross-device sync** via git/rsync from spec §369.
@@ -914,6 +922,27 @@ The Cycle 1/2/3 findings from stabilize-main are preserved in the earlier plan d
 10. **`scan_jsonl_metadata` efficiency on large `.jsonl` files.** The existing helper reads the file to extract session_id, timestamps, and message count. On a 100MB session file, this is slow. Verify the cost on real files and, if needed, cache the session_id/mtime/sha256/file_size in the filemap so the scanner only re-parses when sha256 differs.
 11. **`ingest_continuation` message count semantics.** The function's `skip_messages` parameter counts only user+assistant messages (filtering toolUseResult), matching the same filter in the initial `ingest_conversation`. Verify the filter is identical in both paths so the cursor stays consistent. If they diverge (e.g., continuation counts tool_use as a message but initial doesn't), the cursor will drift and re-dispatches will either skip real content or re-ingest already-processed content.
 12. **`pyramid_batches.chunk_offset` persistence across app restarts.** The batch record stores the offset when the batch was created. On restart, a new continuation batch is created with a fresh `count_chunks(slug)` call — verify this returns the cumulative count (including all prior batches), not just the latest batch's chunks.
+13. **Upper-layer step cache hit rate for conversation rebuilds.** Fact #14 below establishes that the `pyramid_step_cache` handles L0-extraction cost savings (old chunks are byte-identical so `inputs_hash` matches, cache hits). Upper-layer steps (clustering, `recursive_decompose`, synthesis) depend on whether `compute_inputs_hash` for those steps hashes node CONTENT (distilled text, headline, body) or node IDs. If content-based → cache hits, LLM cost for upper layers ≈ O(new content). If ID-based → cache misses on every rebuild because `cleanup_from_depth_sync` generates new node IDs. Empirical test at Commit 8 implementation time: run a conversation build twice with zero changes in between, assert LLM call count drops substantially on the second run. If it doesn't, either adjust `compute_inputs_hash` semantics for upper-layer steps (separate follow-up) or accept O(full pyramid) upper-layer rebuild cost for MVP.
+
+## Facts verified during Assumption #8 deep-dive (2026-04-11)
+
+14. **`run_build_from` is depth-based, not chunk-offset-based, and `pyramid_step_cache` is the compensating mechanism.** Verified by reading:
+    - `build_runner.rs:172-188` — `run_build_from` signature takes `from_depth: i64`, no chunk-offset parameter.
+    - `chain_executor.rs:351-430` — `cleanup_from_depth_sync` supersedes nodes at depth ≥ `from_depth` via `db::supersede_nodes_at_and_above`, nulls parent pointers below, re-stamps pipeline_steps with the new build_id.
+    - `chain_executor.rs:3836-3905` — `execute_chain_from` calls `cleanup_from_depth` before running the chain when `from_depth > 0`.
+    - `conversation-episodic.yaml:119-125` — `combine_l0` step has `when: "$load_prior_state.l0_count == 0"`, so if any live L0 node exists the step is skipped entirely. Without supersession, new chunks sit in `pyramid_chunks` but never become L0 nodes.
+    - `chain_executor.rs:4580-4720` — `execute_cross_build_input` (the `load_prior_state` primitive) loads `l0_count = db::count_nodes_at_depth(conn, slug, 0)`, `has_overlay = db::has_existing_question_overlay(conn, slug)`. Both query `live_pyramid_nodes` (the superseded-filtered view from `db.rs:141-142`), so `cleanup_from_depth_sync(from_depth=0)` flips `l0_count` back to 0 and `has_overlay` back to false, routing the chain through the fresh `combine_l0` + `recursive_decompose` path.
+    - `db.rs:1101-1105`, `db.rs:6430-6520` — `pyramid_step_cache` is content-addressable on `cache_key = sha256(inputs_hash|prompt_hash|model_id)`, computed by `step_context::compute_cache_key` (`step_context.rs:68-71`). Cache is NOT scoped by build_id; it persists across builds until explicitly invalidated via `invalidate_cache_entries` (only called from `reroll.rs:591`, not from cleanup paths).
+    - `llm.rs:574-624` — `call_model_unified_with_audit_and_ctx` calls `try_cache_lookup_or_key(ctx, system_prompt, user_prompt)` before any HTTP call. On `CacheProbeOutcome::Hit` it returns the cached response immediately, writing an audit row stamped `cache_hit=true`. This is the canonical LLM entry point used by the chain engine.
+    - `ingest.rs:384-427` — `ingest_continuation` parses only messages after `skip_messages`, chunks them fresh, appends at `chunk_index = chunk_offset + i`. Old chunks in `pyramid_chunks` are byte-identical across re-runs — their cache_keys match.
+
+    **Synthesized flow for conversation incremental append (Commit 8):**
+    1. Append new chunks via `ingest::ingest_continuation(conn, slug, path, skip_messages=ingested_message_count)`. Old chunks stay byte-identical; only new ones are inserted.
+    2. Call `run_build_from_with_evidence_mode(slug, from_depth=0, ..., evidence_mode="deep")`. This supersedes all nodes, flipping `l0_count` and `has_overlay` to the fresh-build values.
+    3. Chain's `forward_pass`, `reverse_pass`, `combine_l0` run for each chunk. For old chunks: cache hit on every step (chunk text + prompt + model are all unchanged). For new chunks: real LLM calls. L0-extraction LLM cost ≈ O(new chunks).
+    4. Upper layers (`recursive_decompose`, clustering, synthesis, gap processing) run over the newly-built L0 set. Cache-hit behavior for these steps is documented in assumption #13 above.
+
+    **Net result for MVP:** the expensive part of conversation rebuild (L0 extraction) is proportional to new content. Upper-layer rebuild cost is bounded by pyramid size but partially cached in the common case. No chain-executor changes are needed — the existing machinery does the right thing when incremental ingest is layered on top.
 
 ---
 
