@@ -5,7 +5,7 @@
 **Branch:** `stabilize-main` (continuing on the same branch; SDFS supersedes the stabilize-main patch approach)
 **Checkpoint:** `a6eb1ae` on `stabilize-main-checkpoint-20260411-124944`
 **Supersedes:** `docs/plans/stabilize-main-2026-04-11.md` committed at `efec5c0` (stabilize-main plan is preserved as historical context; its bug findings inform this plan but its fix approach is abandoned)
-**Status:** Draft — ready for Cycle 1 audit
+**Status:** Rev 2 — open questions resolved by Adam 2026-04-11 evening. Ready for Cycle 1 audit.
 
 ---
 
@@ -45,7 +45,7 @@ This plan absorbs all of that.
    - `{ corpus: "wire-docs/wire-actions.md" }` — corpus path (remote corpus docs)
    All three resolve to internal UUIDs at publish time. Nobody types a UUID.
 
-4. **`handle_path` is NOT a rear-matter field** in `wire-native-documents.md`. Documents don't self-identify with a handle; Wire assigns one at insertion time. Local files remain without `handle_path`. After publication, a new `published_as: { handle_path: ..., published_at: ... }` field can be added to the `wire:` block so the publication is git-visible, but that's optional enrichment, not schema-required.
+4. **`handle_path` is NOT a rear-matter field** in `wire-native-documents.md`. Documents don't self-identify with a handle; Wire assigns one at insertion time. Local files remain without `handle_path`. After publication, a `local.published_as: { handle_path, published_at, published_by_build_id, signed_proof_hash }` field is added to the published version file so the publication is git-visible and queryable without touching Wire. Publication state lives in `local:` (not `wire:`) because `wire:` is what gets sent to the server on publish — putting `published_as` in `wire:` would be either a paradox or noise the server strips. `local:` is already the "operational state, stripped at publish" block by spec.
 
 5. **DADBEAR is a pattern, not a subsystem.** The existing `dadbear_extend.rs` implementation is Pipeline B of that pattern. Under SDFS, DADBEAR continues to watch source files (that's unchanged); what changes is that it writes filemap scanner fields instead of `pyramid_ingest_records`, and it reads policy from contribution files instead of a SQLite config table.
 
@@ -337,7 +337,6 @@ wire:
       weight: 0.3
       justification: "dependent module"
   sync_mode: manual
-  # published_as: null — populated after publish, absent before
 
 local:
   spec_version: 1
@@ -372,10 +371,23 @@ local:
     prior_version_path: "v2.md"              # sibling file
     refinement_note_path: "refinements/v2-to-v3.md"
     reason: "Added supersession subsystem"
+
+  # published_as — absent on local-only docs. Populated by the publish pipeline
+  # (future, out of MVP scope) after insert_contribution_atomic() assigns a handle-path.
+  # When present, the v<N>.md file is considered immutable on Wire; new content
+  # must go to v<N+1>.md and earn its own publish stamp.
+  # Example after publish:
+  # published_as:
+  #   handle_path: playful/100/42
+  #   published_at: 2026-04-11T21:00:00Z
+  #   published_by_build_id: B-2026-04-11-publish-001
+  #   signed_proof_hash: sha256:abc123...
 ---
 ```
 
 `current.md` is a physical copy of `v3.md`; scanner verifies sha256 parity on boot and auto-repairs mismatches.
+
+**Publication state is in `local:` not `wire:`.** The `wire:` block is what gets sent to the Wire backend on publish — putting `published_as` in `wire:` would be either a paradox (the contribution sending its own publication metadata back to Wire) or noise that the server has to strip. `local:` is already the "operational state, stripped at publish" block by spec, so publication metadata lives there.
 
 ### `.understanding/configs/dadbear_policy.md`
 
@@ -835,14 +847,30 @@ The Cycle 1/2/3 findings from stabilize-main are preserved in the earlier plan d
 
 ---
 
-## Open Questions for Adam
+## Resolved Decisions (previously Open Questions)
 
-1. **`published_as` field placement post-publish:** my proposal is to add `wire.published_as: { handle_path: ..., published_at: ... }` to the local file's `wire:` block after successful publication. This makes publication git-visible and portable. Alternative: track publications in a separate state file (e.g., `.understanding/.publication_log.md`) and never modify the local doc. My lean is inline (first option). Confirm or redirect.
+Adam confirmed these during plan review. They are baked into the relevant sections above; this list exists as a quick-reference for future readers.
 
-2. **Onboarding handle registration** — follow-up or MVP? My assumption is follow-up since MVP is local-only. If you want it in MVP, add another commit (9) for the Settings UI handle-registration flow.
+1. **`published_as` goes in `local:`, inline on the v<N>.md file.** NOT `wire:`, NOT a separate publication log.
 
-3. **Conversation canonical-path tail-follow** — MVP has the `conversation_sources` field in the filemap but the scanner doesn't actively tail the canonical jsonl files for new lines. That's a follow-up (probably Commit 9 or part of DADBEAR v2). Confirm that's OK for MVP.
+   Reasoning: `wire:` is what gets sent to the Wire backend on publish, so `published_as` in `wire:` is either a paradox (contribution sends its own publication metadata back to Wire) or noise the backend has to strip. The `local:` block is already spec'd as "filesystem operational state, stripped at publish time" — publication state is exactly that.
 
-4. **Pre-existing `chains/defaults/*.yaml` resources not in the app bundle** — Cycle 2 Stage 2 B found that 5 conversation chain YAMLs aren't embedded via `include_str!` and `tauri.conf.json` has no `resources` block. Commit 7's bundled config work MUST also bundle all of `chains/defaults/` or the fresh install is missing chains. Adding this to Commit 7's scope.
+   Each `v<N>.md` carries its own publication stamp for the version it represents: if v3.md publishes as `playful/100/42` and then the user edits + rebuilds to v4.md, v4.md starts with no `published_as` and gets its own stamp on its own publish. 1:1 mapping between published version and local version.
 
-5. **Workspace root detection** — `/Users/adamlevine/AI Project Files/agent-wire-node` gets treated as the workspace root when the user ingests it. Sub-folders within it inherit this root. But what if the user later points at `agent-wire-node/src-tauri` directly? Is that a sub-workspace (with its own root) or does the scanner detect the parent's `.understanding/` and use it as the root? My lean: first-scan-wins — whatever folder was scanned first becomes the workspace root, subsequent scans inside it reuse that root. Confirm.
+   Write semantics: publishing atomically rewrites the v<N>.md file to add `local.published_as: { handle_path, published_at, published_by_build_id, signed_proof_hash }`, then refreshes `current.md` to maintain sha256 parity. A v<N>.md that already carries `published_as` is immutable on Wire and cannot be re-published through the same file; new content goes to v<N+1>.md.
+
+   Cache indexing: boot-time walk of `.understanding/nodes/**/v*.md` builds a `handle_path → node_id → version_path` index for fast lookups.
+
+2. **Onboarding handle registration — follow-up, not MVP.** MVP is local-only, 8 commits, no scope bump. Onboarding lands when the publish pipeline does (its own dedicated sprint).
+
+3. **Conversation canonical-path tail-follow — follow-up, not MVP.** Definition (for reference):
+
+   Every folder the user works in has a corresponding conversation history in a canonical location — Claude Code writes one `.jsonl` per session into `~/.claude/projects/<encoded-project-path>/`, ChatGPT/Cursor/Windsurf all have similar. The filemap records these locations in `conversation_sources[]` at scan time. "Tail-follow" means `tail -f` semantics: the scanner/DADBEAR watches for new files in the canonical directory AND new lines appended to existing `.jsonl` files, treats each new chunk as a delta, never re-reads whole files.
+
+   Why it's valuable: ingesting `agent-wire-node/` gives you the code, but the *thinking* behind the code lives in the ~40 Claude Code sessions under `~/.claude/projects/-Users-...agent-wire-node/`. Building both into the same pyramid means "why does this module exist" can be answered by the conversation where the decision was made.
+
+   Why deferred: needs a conversation extractor (chain prompts tuned for chat-shaped input), append-only stale detection (different from whole-file sha256), a chunking strategy for long sessions, and cross-folder conversation attribution (one session can touch multiple folders). MVP records `conversation_sources[]` so the scanner documents where the conversations live, but the build pipeline for them is deferred.
+
+4. **`chains/defaults/*.yaml` bundling — in scope for Commit 7.** Cycle 2 Stage 2 B found 5 conversation chain YAMLs aren't embedded via `include_str!` and `tauri.conf.json` has no `resources` block. Commit 7 must bundle all of `chains/defaults/` alongside `.understanding/configs/` or the fresh install is missing chains.
+
+5. **Workspace root — first-scan-wins.** Whatever folder the user scanned first becomes the workspace root. Subsequent scans inside it reuse that root via the parent's `.understanding/folder.md` `local.workspace_root_path`. If the user scans `agent-wire-node/src-tauri` directly before ever scanning the parent, `src-tauri` becomes its own workspace root. Re-anchoring (promoting `agent-wire-node/` to root after `src-tauri/` was scanned first) is a one-shot rewrite pass and not MVP.
