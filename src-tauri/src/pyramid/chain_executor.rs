@@ -4557,10 +4557,12 @@ pub async fn execute_chain_from(
         .await;
     }
 
-    // If no recursive_pair step produced an apex, find the highest-depth node
+    // If no recursive_pair step produced an apex, find the highest-depth node.
+    // This is a best-effort lookup AFTER all real work is done — a failure here
+    // must not mark the entire build as failed (was causing "failed with 0 failures").
     if apex_node_id.is_empty() {
         let slug_owned = slug.to_string();
-        apex_node_id = db_read(&state.reader, move |conn| {
+        match db_read(&state.reader, move |conn| {
             let max_depth: i64 = conn
                 .query_row(
                     "SELECT COALESCE(MAX(depth), 0) FROM live_pyramid_nodes WHERE slug = ?1",
@@ -4571,7 +4573,13 @@ pub async fn execute_chain_from(
             let nodes = db::get_nodes_at_depth(conn, &slug_owned, max_depth)?;
             Ok(nodes.first().map(|n| n.id.clone()).unwrap_or_default())
         })
-        .await?;
+        .await
+        {
+            Ok(id) => apex_node_id = id,
+            Err(e) => {
+                warn!("[CHAIN] Failed to find apex node for '{}': {} — build itself succeeded", slug, e);
+            }
+        }
     }
 
     if !cancel.is_cancelled() {
