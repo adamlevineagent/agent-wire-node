@@ -307,6 +307,10 @@ export function PyramidPublicationStatus() {
         }
     }, [fetchStatus]);
 
+    // TODO: No UI exists to create the initial pin from discovery/search views.
+    // handleRefreshPinned only fires from the "Refresh Now" button on already-pinned
+    // pyramids. Need a "Pin this remote pyramid" action in SearchMode or a remote
+    // pyramid browser so users can reach pyramid_pin_remote for the first time.
     const handleRefreshPinned = useCallback(async (slug: string, tunnelUrl: string) => {
         setRefreshingSlug(slug);
         try {
