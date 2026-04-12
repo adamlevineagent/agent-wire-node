@@ -508,6 +508,8 @@ pub fn commit_enable_local_mode(
         "synth_heavy",
         "stale_remote",
         "stale_local",
+        "mid",        // code.yaml, document.yaml default tier
+        "extractor",  // conversation chain extraction tier
     ] {
         prior_tier_names.insert(required.to_string());
     }
@@ -521,7 +523,7 @@ pub fn commit_enable_local_mode(
             context_limit: Some(detected_context as i64),
             max_completion_tokens: None,
             pricing_json: Some("{}".to_string()),
-            supported_parameters_json: None,
+            supported_parameters_json: Some(r#"["response_format"]"#.to_string()),
             notes: Some(format!(
                 "local mode — routed via Ollama at {base_url}"
             )),
@@ -770,8 +772,18 @@ pub fn commit_disable_local_mode(
         }
     }
 
+    // Disable the local provider so active_provider_id() falls back to
+    // openrouter. Without this, the provider row stays enabled and all
+    // LLM calls continue routing to Ollama after the user toggles off.
+    if let Ok(Some(mut local_provider)) =
+        super::db::get_provider(conn, OLLAMA_LOCAL_PROVIDER_ID)
+    {
+        local_provider.enabled = false;
+        super::db::save_provider(conn, &local_provider)?;
+    }
+
     // Refresh the registry cache so subsequent resolves pick up the
-    // restored tier rows.
+    // restored tier rows + disabled provider.
     registry.load_from_db(conn)?;
 
     // Flip the state row to disabled but keep the URL/model so the

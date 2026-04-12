@@ -32,7 +32,6 @@ version: 4.0-chronological
 status: design-spec   # not yet executable — see executor-support note above
 
 defaults:
-  model: inception/mercury-2
   temperature: 0.3
   retry: 2
 
@@ -88,7 +87,7 @@ questions:
     about: all L0 topics at once
     creates: L1 thread assignments
     prompt: prompts/conversation/cluster.md
-    model: qwen/qwen3.5-flash-02-23
+    model_tier: web
     constraints:
       min_groups: 4
       max_groups: 12
@@ -118,7 +117,7 @@ questions:
       - L1 web edges
       - sibling headlines
     prompt: prompts/conversation/recluster.md
-    model: qwen/qwen3.5-flash-02-23
+    model_tier: web
     retry: 3
 
   # ── Apex ───────────────────────────────────────────────────────────

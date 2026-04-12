@@ -182,7 +182,7 @@ pub async fn dispatch_step(
 
 // ── LLM dispatch ────────────────────────────────────────────────────────────
 
-/// Resolve the model string from step overrides, tier mapping, or defaults.
+/// Resolve the model string from step overrides, tier routing, or defaults.
 fn resolve_model(step: &ChainStep, defaults: &ChainDefaults, config: &LlmConfig) -> String {
     // Direct model override on step takes highest precedence
     if let Some(ref model) = step.model {
@@ -195,27 +195,29 @@ fn resolve_model(step: &ChainStep, defaults: &ChainDefaults, config: &LlmConfig)
             return model.clone();
         }
     }
-    // Map tier or alias to actual model
     let tier = step
         .model_tier
         .as_deref()
         .unwrap_or(defaults.model_tier.as_str());
-        
-    // 1. Check custom aliases first
+
+    // Phase 3: consult provider registry tier routing (canonical source)
+    if let Some(ref registry) = config.provider_registry {
+        if let Ok(resolved) = registry.resolve_tier(tier, None, None, None) {
+            return resolved.tier.model_id;
+        }
+        warn!("[CHAIN] tier '{}' not in registry, falling back to legacy resolution", tier);
+    }
+
+    // Legacy fallback: aliases then hardcoded mapping
     if let Some(model) = config.model_aliases.get(tier) {
         return model.clone();
     }
-    
-    // 2. Fall back to standard legacy tiers
     match tier {
         "low" | "mid" => config.primary_model.clone(),
         "high" => config.fallback_model_1.clone(),
         "max" => config.fallback_model_2.clone(),
         other => {
-            warn!(
-                "[CHAIN] Unknown model_tier '{}', falling back to primary",
-                other
-            );
+            warn!("[CHAIN] unknown tier '{}', using primary_model", other);
             config.primary_model.clone()
         }
     }
@@ -244,18 +246,17 @@ async fn dispatch_llm(
 
     // Apply model override: if the resolved model differs from the config's
     // primary model, create a modified config so call_model() uses it.
-    // IMPORTANT: also override primary_context_limit so the cascade logic in
-    // call_model_unified compares against the *resolved* model's capacity.
+    // Uses clone_with_model_override to pin ALL model slots (primary +
+    // fallback_1 + fallback_2) to the resolved model, preventing the
+    // cascade from escaping to a different provider's models.
     let config_ref;
     let overridden_config;
     if resolved_model != ctx.config.primary_model
         || resolved_limit != ctx.config.primary_context_limit
     {
-        overridden_config = LlmConfig {
-            primary_model: resolved_model.clone(),
-            primary_context_limit: resolved_limit,
-            ..ctx.config.clone()
-        };
+        let mut cfg = ctx.config.clone_with_model_override(&resolved_model);
+        cfg.primary_context_limit = resolved_limit;
+        overridden_config = cfg;
         config_ref = &overridden_config;
     } else {
         config_ref = &ctx.config;
@@ -1025,22 +1026,25 @@ pub fn resolve_ir_model(reqs: &ModelRequirements, config: &LlmConfig) -> String 
     if let Some(ref model) = reqs.model {
         return model.clone();
     }
-    // Map tier to actual model
     let tier = reqs.tier.as_deref().unwrap_or("mid");
-    
+
+    // Phase 3: consult provider registry tier routing (canonical source)
+    if let Some(ref registry) = config.provider_registry {
+        if let Ok(resolved) = registry.resolve_tier(tier, None, None, None) {
+            return resolved.tier.model_id;
+        }
+        warn!("[IR] tier '{}' not in registry, falling back to legacy resolution", tier);
+    }
+
     if let Some(model) = config.model_aliases.get(tier) {
         return model.clone();
     }
-    
     match tier {
         "low" | "mid" => config.primary_model.clone(),
         "high" => config.fallback_model_1.clone(),
         "max" => config.fallback_model_2.clone(),
         other => {
-            warn!(
-                "[IR] Unknown model_tier '{}', falling back to primary",
-                other
-            );
+            warn!("[IR] unknown tier '{}', using primary_model", other);
             config.primary_model.clone()
         }
     }
@@ -1064,12 +1068,20 @@ fn resolve_ir_context_limit(
         return tier1.high_tier_context_limit;
     }
     let tier = reqs.tier.as_deref().unwrap_or("mid");
-    
-    // If it's explicitly overridden by an alias, use the high limit
+
+    // Phase 3: consult provider registry for the tier's context limit
+    if let Some(ref registry) = config.provider_registry {
+        if let Ok(resolved) = registry.resolve_tier(tier, None, None, None) {
+            if let Some(limit) = resolved.tier.context_limit {
+                return limit;
+            }
+        }
+    }
+
+    // Legacy fallback
     if config.model_aliases.contains_key(tier) {
         return tier1.high_tier_context_limit;
     }
-    
     match tier {
         "low" | "mid" => config.primary_context_limit,
         "high" => tier1.high_tier_context_limit,
@@ -1099,12 +1111,20 @@ fn resolve_context_limit(
         .model_tier
         .as_deref()
         .unwrap_or(defaults.model_tier.as_str());
-        
-    // If it's explicitly overridden by an alias, use the high limit
+
+    // Phase 3: consult provider registry for the tier's context limit
+    if let Some(ref registry) = config.provider_registry {
+        if let Ok(resolved) = registry.resolve_tier(tier, None, None, None) {
+            if let Some(limit) = resolved.tier.context_limit {
+                return limit;
+            }
+        }
+    }
+
+    // Legacy fallback
     if config.model_aliases.contains_key(tier) {
         return tier1.high_tier_context_limit;
     }
-        
     match tier {
         "low" | "mid" => config.primary_context_limit,
         "high" => tier1.high_tier_context_limit,
@@ -1208,21 +1228,17 @@ pub async fn dispatch_ir_llm(
     let max_tokens = resolve_ir_max_tokens(step, &ctx.tier1);
     let llm_options = resolve_ir_llm_call_options(step, &ctx.tier1);
 
-    // Apply model override: if the resolved model differs from the config's
-    // primary model, create a modified config so call_model_unified uses it.
-    // IMPORTANT: also override primary_context_limit so the cascade logic in
-    // call_model_unified compares against the *resolved* model's capacity,
-    // not the original config's (which may be much smaller).
+    // Apply model override: pin ALL model slots (primary + fallback_1 +
+    // fallback_2) to the resolved model so cascade stays on the same
+    // provider. Also override context limit to match the resolved tier.
     let config_ref;
     let overridden_config;
     if resolved_model != ctx.config.primary_model
         || resolved_limit != ctx.config.primary_context_limit
     {
-        overridden_config = LlmConfig {
-            primary_model: resolved_model.clone(),
-            primary_context_limit: resolved_limit,
-            ..ctx.config.clone()
-        };
+        let mut cfg = ctx.config.clone_with_model_override(&resolved_model);
+        cfg.primary_context_limit = resolved_limit;
+        overridden_config = cfg;
         config_ref = &overridden_config;
     } else {
         config_ref = &ctx.config;

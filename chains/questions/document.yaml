@@ -7,7 +7,6 @@ type: document
 version: 3.0
 
 defaults:
-  model: inception/mercury-2
   temperature: 0.3
   retry: 2
 
@@ -37,7 +36,7 @@ questions:
     context:
       - L0 classification tags
     prompt: prompts/document/doc_cluster.md
-    model: qwen/qwen3.5-flash-02-23
+    model_tier: web
     constraints:
       min_groups: 6
       max_groups: 15
@@ -51,7 +50,7 @@ questions:
     context:
       - L0 classification tags
     prompt: prompts/document/doc_web.md
-    model: qwen/qwen3.5-flash-02-23
+    model_tier: web
     optional: true
 
   # ── Layer 1: What is the current state of each topic? ────────────
@@ -80,7 +79,7 @@ questions:
       - sibling headlines
     prompt: prompts/document/doc_distill.md
     cluster_prompt: prompts/document/doc_recluster.md
-    cluster_model: qwen/qwen3.5-flash-02-23
+    cluster_model_tier: web
     retry: 3
 
   # ── Layer 2 webbing ──────────────────────────────────────────────

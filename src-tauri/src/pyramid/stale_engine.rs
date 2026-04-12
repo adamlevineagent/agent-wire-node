@@ -701,7 +701,17 @@ pub async fn drain_and_dispatch(
     let slug_owned = slug.to_string();
     let db_owned = db_path.to_string();
     let base_config_owned = base_config.clone();
-    let model_owned = model.to_string();
+    // Resolve model from tier routing at dispatch time so toggling local
+    // mode takes effect without restarting the stale engine. stale_remote
+    // exists in both modes (OpenRouter default + Ollama re-routed).
+    let model_owned = if let Some(ref registry) = base_config.provider_registry {
+        registry
+            .resolve_tier("stale_remote", Some(slug), None, None)
+            .map(|r| r.tier.model_id)
+            .unwrap_or_else(|_| model.to_string())
+    } else {
+        model.to_string()
+    };
 
     // Set phase to evaluating at entry; record start time for minimum display duration
     let phase_started_at = std::time::Instant::now();

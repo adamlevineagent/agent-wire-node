@@ -339,13 +339,13 @@ pub(crate) fn build_call_provider(
     config: &LlmConfig,
 ) -> Result<(Box<dyn LlmProvider>, Option<ResolvedSecret>, ProviderType)> {
     if let Some(registry) = &config.provider_registry {
-        // Prefer the tier-routing `fast_extract` entry's provider if
-        // present; fall back to the `openrouter` seeded row. This keeps
-        // the default path pointing at OpenRouter without hardcoding
-        // its ID again here.
+        // Use the active provider: ollama-local when local mode is on,
+        // openrouter otherwise. active_provider_id() checks which
+        // non-openrouter providers are enabled.
+        let provider_id = registry.active_provider_id();
         let provider = registry
-            .get_provider("openrouter")
-            .ok_or_else(|| anyhow!("provider `openrouter` is not registered — run DB init"))?;
+            .get_provider(&provider_id)
+            .ok_or_else(|| anyhow!("provider '{}' is not registered — run DB init", provider_id))?;
         let (impl_box, secret) = registry.instantiate_provider(&provider)?;
         let provider_type = provider.provider_type;
         return Ok((impl_box, secret, provider_type));

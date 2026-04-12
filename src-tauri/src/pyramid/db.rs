@@ -1638,6 +1638,7 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
     // First-run seeding. Only fires when pyramid_providers is empty so
     // we don't clobber user-customized rows on subsequent boots.
     seed_default_provider_registry(conn)?;
+    ensure_standard_tiers_exist(conn)?;
 
     // ── Phase 18a: Local Mode state row ───────────────────────────────────────
     //
@@ -12992,6 +12993,50 @@ pub fn seed_default_provider_registry(conn: &Connection) -> Result<()> {
     // when a local provider (Ollama) is added. Do not insert a
     // placeholder row here.
 
+    // Seed `mid` and `extractor` for fresh installs — these are used by
+    // code/document and conversation chain YAMLs respectively.
+    save_tier_routing(
+        conn,
+        &seed_tier(
+            "mid",
+            "inception/mercury-2",
+            Some(120_000),
+            "Default tier for code/document chains — same model as fast_extract (Adam's default)",
+        ),
+    )?;
+    save_tier_routing(
+        conn,
+        &seed_tier(
+            "extractor",
+            "inception/mercury-2",
+            Some(120_000),
+            "Conversation extraction tier — same model as fast_extract (Adam's default)",
+        ),
+    )?;
+
+    Ok(())
+}
+
+/// Ensure all standard tiers exist in the tier_routing table. Uses INSERT
+/// OR IGNORE so existing rows (including Ollama-routed ones) are never
+/// overwritten. Called on every boot after seed_default_provider_registry.
+pub fn ensure_standard_tiers_exist(conn: &Connection) -> Result<()> {
+    let standard_tiers: &[(&str, &str, i64, &str)] = &[
+        ("fast_extract", "inception/mercury-2", 120_000, "Default extraction tier"),
+        ("web", "x-ai/grok-4.1-fast", 2_000_000, "2M context for relational work"),
+        ("synth_heavy", "minimax/minimax-m2.7", 200_000, "Near-frontier synthesis"),
+        ("stale_remote", "minimax/minimax-m2.7", 200_000, "Upper-layer stale checks"),
+        ("mid", "inception/mercury-2", 120_000, "Default tier for code/document chains"),
+        ("extractor", "inception/mercury-2", 120_000, "Conversation extraction tier"),
+    ];
+    for &(tier_name, model_id, context_limit, notes) in standard_tiers {
+        conn.execute(
+            "INSERT OR IGNORE INTO pyramid_tier_routing
+                (tier_name, provider_id, model_id, context_limit, notes, created_at, updated_at)
+             VALUES (?1, 'openrouter', ?2, ?3, ?4, datetime('now'), datetime('now'))",
+            rusqlite::params![tier_name, model_id, context_limit, notes],
+        )?;
+    }
     Ok(())
 }
 

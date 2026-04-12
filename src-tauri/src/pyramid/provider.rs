@@ -892,6 +892,19 @@ impl ProviderRegistry {
             .cloned()
     }
 
+    /// Return the provider ID that should be used as the default for
+    /// LLM calls. When local mode is active (an enabled non-openrouter
+    /// provider exists), returns that provider. Otherwise "openrouter".
+    pub fn active_provider_id(&self) -> String {
+        let providers = self.providers.read().expect("providers RwLock poisoned");
+        for (id, provider) in providers.iter() {
+            if id != "openrouter" && provider.enabled {
+                return id.clone();
+            }
+        }
+        "openrouter".to_string()
+    }
+
     /// Resolve a tier reference to a concrete provider row + model ID +
     /// supporting metadata. Honors per-step overrides when `slug`,
     /// `chain_id`, and `step_name` are provided.

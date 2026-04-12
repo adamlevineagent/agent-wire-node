@@ -6,7 +6,6 @@ type: code
 version: 3.0
 
 defaults:
-  model: inception/mercury-2
   temperature: 0.3
   retry: 2
 

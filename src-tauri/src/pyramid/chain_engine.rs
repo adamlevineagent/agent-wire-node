@@ -379,6 +379,7 @@ const VALID_CONTENT_TYPES: &[&str] = &["conversation", "code", "document", "ques
 const VALID_MODEL_TIERS: &[&str] = &[
     "low", "mid", "high", "max",
     "extractor", "synth_heavy", "web",
+    "fast_extract", "stale_remote", "stale_local",
 ];
 
 /// Validate a chain definition, returning errors and warnings.
