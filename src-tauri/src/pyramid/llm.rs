@@ -43,6 +43,14 @@ use super::types::TokenUsage;
 static RATE_LIMITER: LazyLock<TokioMutex<VecDeque<std::time::Instant>>> =
     LazyLock::new(|| TokioMutex::new(VecDeque::new()));
 
+/// Global semaphore for local LLM providers (Ollama).
+/// All subsystems (builds, stale engines, Pipeline B) share this single
+/// bottleneck so only one HTTP request hits the local provider at a time.
+/// OpenRouter calls bypass this entirely — they use the sliding-window
+/// rate limiter above instead.
+static LOCAL_PROVIDER_SEMAPHORE: LazyLock<tokio::sync::Semaphore> =
+    LazyLock::new(|| tokio::sync::Semaphore::new(1));
+
 /// Shared HTTP client — reuses TCP connections and TLS sessions across all LLM calls.
 static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
@@ -748,11 +756,23 @@ pub async fn call_model_unified_with_audit_and_ctx(
             .unwrap_or_default();
         emit_llm_call_started(ctx, &use_model, &cache_key_for_event);
 
+        // For local providers (Ollama), acquire the global semaphore so
+        // only one HTTP request hits the local model at a time. Multiple
+        // subsystems (builds, stale engines, Pipeline B) all converge here.
+        let _local_permit = if provider_type == ProviderType::OpenaiCompat {
+            Some(LOCAL_PROVIDER_SEMAPHORE.acquire().await.map_err(|e| anyhow!("local provider semaphore closed: {e}"))?)
+        } else {
+            None
+        };
+
         let mut request = client.post(&url).timeout(timeout);
         for (k, v) in &built_headers {
             request = request.header(k, v);
         }
         let resp = request.json(&body).send().await;
+        // Drop the local provider permit after the HTTP call completes
+        // (before response parsing) so the next caller can proceed.
+        drop(_local_permit);
 
         let resp = match resp {
             Ok(r) => r,
@@ -1903,6 +1923,13 @@ pub async fn call_model_via_registry(
         // Phase 13: emit LlmCallStarted once per HTTP dispatch.
         emit_llm_call_started(ctx, &resolved.tier.model_id, &cache_key_for_event);
 
+        // Global local-provider semaphore (see call_model_unified path).
+        let _local_permit = if provider_type == ProviderType::OpenaiCompat {
+            Some(LOCAL_PROVIDER_SEMAPHORE.acquire().await.map_err(|e| anyhow!("local provider semaphore closed: {e}"))?)
+        } else {
+            None
+        };
+
         let mut request = client.post(&url).timeout(timeout);
         for (k, v) in &headers {
             request = request.header(k, v);
@@ -1948,6 +1975,8 @@ pub async fn call_model_via_registry(
                 return Err(anyhow!(err_msg));
             }
         };
+        // Release the local provider permit before response parsing.
+        drop(_local_permit);
 
         let status = resp.status().as_u16();
         if config.retryable_status_codes.contains(&status) {
@@ -2332,7 +2361,7 @@ pub async fn call_model_direct(
     user_prompt: &str,
     max_tokens: u32,
 ) -> Result<String> {
-    let (provider_impl, secret, _) = build_call_provider(config)?;
+    let (provider_impl, secret, provider_type) = build_call_provider(config)?;
     let client = &*HTTP_CLIENT;
     let url = provider_impl.chat_completions_url();
     let built_headers = provider_impl.prepare_headers(secret.as_ref())?;
@@ -2351,11 +2380,19 @@ pub async fn call_model_direct(
 
         rate_limit_wait(config.rate_limit_max_requests, config.rate_limit_window_secs).await;
 
+        // Global local-provider semaphore (see call_model_unified path).
+        let _local_permit = if provider_type == ProviderType::OpenaiCompat {
+            Some(LOCAL_PROVIDER_SEMAPHORE.acquire().await.map_err(|e| anyhow!("local provider semaphore closed: {e}"))?)
+        } else {
+            None
+        };
+
         let mut request = client.post(&url).timeout(timeout);
         for (k, v) in &built_headers {
             request = request.header(k, v);
         }
         let resp = request.json(&body).send().await;
+        drop(_local_permit);
 
         let resp = match resp {
             Ok(r) => r,
