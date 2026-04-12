@@ -4158,11 +4158,32 @@ async fn pyramid_set_config(
         tracing::info!("IR executor toggled to: {use_ir}");
     }
 
-    // Persist to disk
+    // Write API key to credential store (single source of truth).
+    // The in-memory LlmConfig.api_key was already updated above as a
+    // read-through cache for cold-path guards.
+    if let Some(ref key) = api_key {
+        if !key.is_empty() {
+            if let Err(e) = state.pyramid.credential_store.set("OPENROUTER_KEY", key) {
+                tracing::warn!("Failed to write API key to credential store: {e}");
+            }
+        }
+    }
+
+    // Keep partner module's api_key in sync so Dennis uses the new key
+    // without requiring an app restart.
+    if let Some(ref key) = api_key {
+        if !key.is_empty() {
+            let mut partner_config = state.partner.llm_config.write().await;
+            partner_config.api_key = key.clone();
+        }
+    }
+
+    // Persist non-secret config to disk. Deliberately not updating
+    // openrouter_api_key — credential store is SOT. Stale value
+    // preserved as boot-time migration source.
     if let Some(ref data_dir) = state.pyramid.data_dir {
         let mut pyramid_config = wire_node_lib::pyramid::PyramidConfig::load(data_dir);
         let config = state.pyramid.config.read().await;
-        pyramid_config.openrouter_api_key = config.api_key.clone();
         pyramid_config.auth_token = config.auth_token.clone();
         pyramid_config.primary_model = config.primary_model.clone();
         pyramid_config.fallback_model_1 = config.fallback_model_1.clone();
@@ -5687,12 +5708,15 @@ async fn pyramid_apply_profile(
 }
 
 /// Test an OpenRouter API key server-side so the key never touches the renderer.
+/// Reads directly from the credential store (single source of truth).
 #[tauri::command]
 async fn pyramid_test_api_key(state: tauri::State<'_, SharedState>) -> Result<String, String> {
-    let api_key = {
-        let config = state.pyramid.config.read().await;
-        config.api_key.clone()
-    };
+    let api_key = state
+        .pyramid
+        .credential_store
+        .resolve_var("OPENROUTER_KEY")
+        .map(|s| s.raw_clone())
+        .unwrap_or_default();
     if api_key.is_empty() {
         return Err("No API key configured".to_string());
     }
@@ -7573,7 +7597,15 @@ async fn pyramid_set_credential(
         .pyramid
         .credential_store
         .set(&key, &value)
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+
+    // Keep in-memory caches in sync when the OpenRouter key changes.
+    if key == "OPENROUTER_KEY" {
+        state.pyramid.config.write().await.api_key = value.clone();
+        state.partner.llm_config.write().await.api_key = value;
+    }
+
+    Ok(())
 }
 
 #[tauri::command]
@@ -7585,7 +7617,15 @@ async fn pyramid_delete_credential(
         .pyramid
         .credential_store
         .delete(&key)
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+
+    // Clear in-memory caches when the OpenRouter key is removed.
+    if key == "OPENROUTER_KEY" {
+        state.pyramid.config.write().await.api_key = String::new();
+        state.partner.llm_config.write().await.api_key = String::new();
+    }
+
+    Ok(())
 }
 
 #[tauri::command]
@@ -9819,6 +9859,24 @@ fn main() {
             }
         };
 
+    // ── Boot-time migration: seed .credentials from pyramid_config.json ──
+    //
+    // Users upgrading to Phase 3 have their OpenRouter API key in the old
+    // pyramid_config.json but the credential store is empty. Seed once so
+    // the provider registry can resolve it at build time.
+    if !pyramid_config.openrouter_api_key.is_empty()
+        && !credential_store.contains("OPENROUTER_KEY")
+    {
+        match credential_store.set("OPENROUTER_KEY", &pyramid_config.openrouter_api_key) {
+            Ok(()) => tracing::info!(
+                "Migrated OpenRouter API key from pyramid_config.json → .credentials"
+            ),
+            Err(e) => tracing::warn!(
+                "Failed to migrate OpenRouter API key to .credentials: {e}"
+            ),
+        }
+    }
+
     let provider_registry = std::sync::Arc::new(
         wire_node_lib::pyramid::provider::ProviderRegistry::new(credential_store.clone()),
     );
@@ -10055,7 +10113,10 @@ fn main() {
         pyramid_reader: Arc::new(tokio::sync::Mutex::new(partner_pyramid_reader)),
         partner_db: Arc::new(tokio::sync::Mutex::new(partner_db_conn)),
         llm_config: tokio::sync::RwLock::new(wire_node_lib::partner::PartnerLlmConfig {
-            api_key: pyramid_config.openrouter_api_key.clone(),
+            api_key: credential_store
+                .resolve_var("OPENROUTER_KEY")
+                .map(|s| s.raw_clone())
+                .unwrap_or_else(|_| pyramid_config.openrouter_api_key.clone()),
             partner_model: pyramid_config.partner_model.clone(),
         }),
         warm_in_progress: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),

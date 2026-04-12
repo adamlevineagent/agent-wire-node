@@ -529,7 +529,7 @@ impl Default for PyramidConfig {
             fallback_model_2: default_fallback_2(),
             partner_model: default_partner_model(),
             collapse_model: default_collapse_model(),
-            use_chain_engine: false,
+            use_chain_engine: true,
             use_ir_executor: false,
             operational: OperationalConfig::default(),
             absorption_rate_limit_per_operator: default_absorption_rate_limit(),
@@ -642,11 +642,12 @@ impl PyramidConfig {
 
     /// Convert to an LlmConfig for use with the build pipeline.
     ///
-    /// This variant builds a "legacy" LlmConfig with no provider
-    /// registry attached. Production boot paths should use
-    /// `to_llm_config_with_runtime` so every LLM call routes through
-    /// the Phase 3 provider trait. `to_llm_config` is retained so
-    /// unit tests and pre-registry boot windows still compile.
+    /// Legacy LlmConfig with no provider registry attached. The
+    /// `api_key` field here is populated from `self.openrouter_api_key`
+    /// (the on-disk pyramid_config.json value). In production,
+    /// `to_llm_config_with_runtime` overrides `api_key` from the
+    /// credential store — so this value is NOT the final word at
+    /// runtime. Retained for unit tests and pre-registry boot windows.
     pub fn to_llm_config(&self) -> LlmConfig {
         LlmConfig {
             api_key: self.openrouter_api_key.clone(),
@@ -676,6 +677,9 @@ impl PyramidConfig {
     /// Phase 3 variant: attach the provider registry + credential
     /// store so every LLM call routes through the new pluggable
     /// provider trait. Production boot paths call this one.
+    /// Also populates `api_key` from the credential store (the
+    /// canonical source) so cold-path guards that check
+    /// `config.api_key.is_empty()` reflect the real state.
     pub fn to_llm_config_with_runtime(
         &self,
         provider_registry: Arc<ProviderRegistry>,
@@ -683,7 +687,13 @@ impl PyramidConfig {
     ) -> LlmConfig {
         let mut cfg = self.to_llm_config();
         cfg.provider_registry = Some(provider_registry);
-        cfg.credential_store = Some(credential_store);
+        cfg.credential_store = Some(credential_store.clone());
+        // Populate api_key cache from credential store (canonical source).
+        // Falls back to the PyramidConfig value (already set by to_llm_config)
+        // if the credential store doesn't have the key yet.
+        if let Ok(secret) = credential_store.resolve_var("OPENROUTER_KEY") {
+            cfg.api_key = secret.raw_clone();
+        }
         cfg
     }
 }

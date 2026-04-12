@@ -3556,8 +3556,6 @@ async fn handle_ingest(
     }
 }
 
-// Retained as reference for IPC command implementations in main.rs
-#[allow(dead_code)]
 async fn handle_config(
     state: Arc<PyramidState>,
     body: ConfigBody,
@@ -3566,6 +3564,19 @@ async fn handle_config(
 
     if let Some(ref key) = body.openrouter_api_key {
         config.api_key = key.clone();
+        // Write to credential store (SOT). Guard against empty strings
+        // because credential_store.set() rejects them.
+        if !key.is_empty() {
+            if let Err(e) = state.credential_store.set("OPENROUTER_KEY", key) {
+                tracing::warn!("Failed to write API key to credential store: {e}");
+            }
+        }
+        // Known limitation: this HTTP route takes Arc<PyramidState>, not
+        // AppState, so it cannot sync the partner PartnerLlmConfig.api_key
+        // cache. If the API key is set via POST /pyramid/config, the partner
+        // uses the stale key until restart. Phase 4 (partner reads from
+        // credential store at use-time) resolves this. The primary write
+        // path (IPC pyramid_set_config) DOES sync the partner cache.
     }
     if let Some(ref model) = body.primary_model {
         config.primary_model = model.clone();
@@ -3584,11 +3595,11 @@ async fn handle_config(
         tracing::info!("IR executor toggled to: {use_ir}");
     }
 
-    // Persist to config file if data_dir is set
+    // Persist non-secret config to disk. Deliberately not updating
+    // openrouter_api_key — credential store is SOT. Stale value
+    // preserved as boot-time migration source.
     if let Some(ref data_dir) = state.data_dir {
-        // Load existing config to preserve fields not managed by this endpoint
         let mut pyramid_config = super::PyramidConfig::load(data_dir);
-        pyramid_config.openrouter_api_key = config.api_key.clone();
         pyramid_config.primary_model = config.primary_model.clone();
         pyramid_config.fallback_model_1 = config.fallback_model_1.clone();
         pyramid_config.fallback_model_2 = config.fallback_model_2.clone();
