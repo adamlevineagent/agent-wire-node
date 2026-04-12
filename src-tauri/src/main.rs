@@ -4685,8 +4685,11 @@ async fn pyramid_rebuild(
     state: tauri::State<'_, SharedState>,
     slug: String,
 ) -> Result<serde_json::Value, String> {
-    // Look up the question from the last build record
-    let (question, _build_id) = {
+    // Look up the question from the last build record, or fall back to
+    // the default apex question for the slug's content type. This makes
+    // rebuild work for pre-existing pyramids that were built before the
+    // question pipeline was introduced.
+    let question = {
         let conn = state.pyramid.reader.lock().await;
         let mut stmt = conn
             .prepare(
@@ -4700,12 +4703,37 @@ async fn pyramid_rebuild(
             |row| Ok((row.get(0)?, row.get(1)?)),
         );
         match result {
-            Ok(r) => r,
+            Ok((q, _)) => q,
             Err(_) => {
-                return Err(format!(
-                    "No previous question build found for '{}'. Use the question build flow instead.",
-                    slug
-                ));
+                // No previous question build — derive default from content type
+                let slug_info = wire_node_lib::pyramid::slug::get_slug(&conn, &slug)
+                    .map_err(|e| format!("Failed to look up slug: {e}"))?
+                    .ok_or_else(|| format!("Slug '{}' not found", slug))?;
+                let default_q = match slug_info.content_type {
+                    wire_node_lib::pyramid::types::ContentType::Code => {
+                        "What are the key systems, patterns, and architecture of this codebase?"
+                    }
+                    wire_node_lib::pyramid::types::ContentType::Document => {
+                        "What are the key concepts, decisions, and relationships in these documents?"
+                    }
+                    wire_node_lib::pyramid::types::ContentType::Conversation => {
+                        "What happened during this conversation? What was discussed, \
+                         what decisions were made, how did the discussion evolve, \
+                         and what are the key takeaways?"
+                    }
+                    wire_node_lib::pyramid::types::ContentType::Vine => {
+                        "What are the key themes and structure across the children of this folder collection?"
+                    }
+                    wire_node_lib::pyramid::types::ContentType::Question => {
+                        "What are the most important answers this material can provide?"
+                    }
+                };
+                tracing::info!(
+                    slug = %slug,
+                    content_type = ?slug_info.content_type,
+                    "pyramid_rebuild: no prior question build, using default apex question"
+                );
+                default_q.to_string()
             }
         }
     };
