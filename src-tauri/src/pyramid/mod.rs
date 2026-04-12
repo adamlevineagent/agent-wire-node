@@ -10,6 +10,7 @@
 //   slug    — Slug/namespace management
 //   routes  — Warp HTTP route handlers
 
+pub mod auto_update_ops;
 pub mod build;
 pub mod build_runner;
 pub mod chain_dispatch;

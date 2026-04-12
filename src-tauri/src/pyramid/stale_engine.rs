@@ -19,6 +19,7 @@ use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+use super::event_bus::BuildEventBus;
 use super::faq;
 use super::llm::LlmConfig;
 use super::stale_helpers;
@@ -81,6 +82,7 @@ pub struct PyramidStaleEngine {
     pub breaker_tripped: bool,
     pub frozen: bool,
     pub concurrent_helpers: Arc<Semaphore>,
+    pub event_bus: Arc<BuildEventBus>,
     pub db_path: String,
     /// Phase 3 fix pass: live LlmConfig (with provider_registry +
     /// credential_store) cloned at engine construction. Replaces the prior
@@ -121,6 +123,7 @@ impl PyramidStaleEngine {
         base_config: LlmConfig,
         model: &str,
         ops: OperationalConfig,
+        event_bus: Arc<BuildEventBus>,
     ) -> Self {
         let debounce = Duration::from_secs((config.debounce_minutes as u64) * 60);
         let mut layers = HashMap::new();
@@ -145,6 +148,7 @@ impl PyramidStaleEngine {
             frozen: config.frozen,
             config,
             concurrent_helpers: Arc::new(Semaphore::new(max_concurrent_helpers())),
+            event_bus,
             db_path: db_path.to_string(),
             base_config,
             model: model.to_string(),
@@ -186,6 +190,7 @@ impl PyramidStaleEngine {
         let summary_arc = self.last_result_summary.clone();
         let timer_fires_arc = self.timer_fires_at.clone();
         let ops_arc = self.ops.clone();
+        let event_bus = self.event_bus.clone();
 
         let handle = tokio::spawn(async move {
             loop {
@@ -270,6 +275,7 @@ impl PyramidStaleEngine {
                         detail_arc.clone(),
                         summary_arc.clone(),
                         &ops_arc,
+                        Some(&event_bus),
                     )
                     .await
                     {
@@ -482,6 +488,7 @@ impl PyramidStaleEngine {
         let tfa_arc = self.timer_fires_at.clone();
         let summary_arc = self.last_result_summary.clone();
         let ops_arc = self.ops.clone();
+        let event_bus = self.event_bus.clone();
 
         // Update timer_fires_at
         {
@@ -514,6 +521,7 @@ impl PyramidStaleEngine {
                 detail_arc,
                 summary_arc,
                 &ops_arc,
+                Some(&event_bus),
             )
             .await
             {
@@ -541,13 +549,7 @@ impl PyramidStaleEngine {
         }
 
         if let Ok(conn) = super::db::open_pyramid_connection(Path::new(&self.db_path)) {
-            let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
-            if let Err(e) = conn.execute(
-                "UPDATE pyramid_auto_update_config
-                 SET breaker_tripped = 1, breaker_tripped_at = ?1
-                 WHERE slug = ?2",
-                rusqlite::params![now, self.slug],
-            ) {
+            if let Err(e) = super::auto_update_ops::trip_breaker(&conn, &self.event_bus, &self.slug) {
                 warn!(slug = %self.slug, "Failed to persist circuit breaker trip to DB: {e}");
             }
         }
@@ -559,12 +561,7 @@ impl PyramidStaleEngine {
         self.breaker_tripped = false;
 
         if let Ok(conn) = super::db::open_pyramid_connection(Path::new(&self.db_path)) {
-            if let Err(e) = conn.execute(
-                "UPDATE pyramid_auto_update_config
-                 SET breaker_tripped = 0, breaker_tripped_at = NULL
-                 WHERE slug = ?1",
-                rusqlite::params![self.slug],
-            ) {
+            if let Err(e) = super::auto_update_ops::resume_breaker(&conn, &self.event_bus, &self.slug) {
                 warn!(slug = %self.slug, "Failed to persist circuit breaker reset to DB: {e}");
             }
 
@@ -613,6 +610,7 @@ impl PyramidStaleEngine {
             self.phase_detail.clone(),
             self.last_result_summary.clone(),
             &self.ops,
+            Some(&self.event_bus),
         )
         .await;
     }
@@ -630,13 +628,7 @@ impl PyramidStaleEngine {
         }
 
         if let Ok(conn) = super::db::open_pyramid_connection(Path::new(&self.db_path)) {
-            let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
-            if let Err(e) = conn.execute(
-                "UPDATE pyramid_auto_update_config
-                 SET frozen = 1, frozen_at = ?1
-                 WHERE slug = ?2",
-                rusqlite::params![now, self.slug],
-            ) {
+            if let Err(e) = super::auto_update_ops::freeze(&conn, &self.event_bus, &self.slug) {
                 warn!(slug = %self.slug, "Failed to persist frozen state to DB: {e}");
             }
             if let Err(e) = conn.execute(
@@ -663,12 +655,7 @@ impl PyramidStaleEngine {
         self.frozen = false;
 
         if let Ok(conn) = super::db::open_pyramid_connection(Path::new(&self.db_path)) {
-            if let Err(e) = conn.execute(
-                "UPDATE pyramid_auto_update_config
-                 SET frozen = 0, frozen_at = NULL
-                 WHERE slug = ?1",
-                rusqlite::params![self.slug],
-            ) {
+            if let Err(e) = super::auto_update_ops::unfreeze(&conn, &self.event_bus, &self.slug) {
                 warn!(slug = %self.slug, "Failed to persist unfrozen state to DB: {e}");
             }
         }
@@ -697,6 +684,7 @@ pub async fn drain_and_dispatch(
     detail_arc: Arc<std::sync::Mutex<String>>,
     summary_arc: Arc<std::sync::Mutex<Option<String>>>,
     ops: &OperationalConfig,
+    event_bus: Option<&Arc<BuildEventBus>>,
 ) -> Result<()> {
     let slug_owned = slug.to_string();
     let db_owned = db_path.to_string();
@@ -736,6 +724,7 @@ pub async fn drain_and_dispatch(
     {
         let s = slug_owned.clone();
         let db = db_owned.clone();
+        let bus_clone = event_bus.cloned();
         let runaway_tripped = tokio::task::spawn_blocking(move || -> bool {
             if let Ok(conn) = super::db::open_pyramid_connection(Path::new(&db)) {
                 // Load config from DB
@@ -761,13 +750,17 @@ pub async fn drain_and_dispatch(
 
                 if let Some(config) = config {
                     if super::watcher::check_runaway(&conn, &s, &config) {
-                        // Trip the breaker in the database
-                        let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
-                        if let Err(e) = conn.execute(
-                            "UPDATE pyramid_auto_update_config SET breaker_tripped = 1, breaker_tripped_at = ?1 WHERE slug = ?2",
-                            rusqlite::params![now, s],
-                        ) {
-                            warn!(slug = %s, "Failed to persist runaway-detected breaker trip to DB: {e}");
+                        // Trip the breaker via auto_update_ops (DB write + event emission).
+                        // All callers pass Some(event_bus) so bus_clone is always Some.
+                        // If it were ever None we'd still need the DB write, so fall
+                        // through to auto_update_ops which only needs conn + bus.
+                        if let Some(ref bus) = bus_clone {
+                            if let Err(e) = super::auto_update_ops::trip_breaker(&conn, bus, &s) {
+                                warn!(slug = %s, "Failed to persist runaway-detected breaker trip to DB: {e}");
+                            }
+                        } else {
+                            // Defensive: should be unreachable. Log loudly so we notice.
+                            warn!(slug = %s, "BUG: drain_and_dispatch called without event_bus — breaker trip NOT persisted. This is a ghost-engine violation.");
                         }
                         return true;
                     }
@@ -1730,6 +1723,7 @@ mod tests {
             test_config,
             "inception/mercury-2",
             super::OperationalConfig::default(),
+            Arc::new(BuildEventBus::new()),
         );
         assert_eq!(engine.slug, "test");
         assert_eq!(engine.layers.len(), 4);

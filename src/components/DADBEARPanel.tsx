@@ -87,6 +87,21 @@ interface EvidenceDensity {
     top_nodes: { node_id: string; headline: string; depth: number; inbound_links: number }[];
 }
 
+interface DadbearWatchConfig {
+    id: number;
+    slug: string;
+    source_path: string;
+    content_type: string;
+    scan_interval_secs: number;
+    debounce_secs: number;
+    session_timeout_secs: number;
+    batch_size: number;
+    enabled: boolean;
+    last_scan_at: string | null;
+    created_at: string;
+    updated_at: string;
+}
+
 interface DADBEARPanelProps {
     slug: string;
     contentType?: string;
@@ -141,6 +156,9 @@ export function DADBEARPanel({ slug, contentType, referencingSlugs, onBack, onNa
 
     // Node counts (independent of DADBEAR)
     const [nodeCounts, setNodeCounts] = useState<Record<number, number> | null>(null);
+
+    // DADBEAR watch configs (source paths)
+    const [dadbearConfigs, setDadbearConfigs] = useState<DadbearWatchConfig[] | null>(null);
 
     // Evidence density (loaded once on mount, manual refresh)
     const [evidenceDensity, setEvidenceDensity] = useState<EvidenceDensity | null>(null);
@@ -244,12 +262,21 @@ export function DADBEARPanel({ slug, contentType, referencingSlugs, onBack, onNa
         }
     }, [slug]);
 
+    const loadDadbearConfigs = useCallback(async () => {
+        try {
+            const data = await invoke<DadbearWatchConfig[]>('pyramid_dadbear_configs_for_slug', { slug });
+            setDadbearConfigs(data);
+        } catch {
+            // Config might not exist
+        }
+    }, [slug]);
+
     useEffect(() => {
         setLoading(true);
-        Promise.all([loadConfig(), loadStatus(), loadStaleLog(), loadCost(), loadContributions()])
+        Promise.all([loadConfig(), loadStatus(), loadStaleLog(), loadCost(), loadContributions(), loadDadbearConfigs()])
             .catch(() => setError('Failed to load DADBEAR data'))
             .finally(() => setLoading(false));
-    }, [loadConfig, loadStatus, loadStaleLog, loadCost, loadContributions]);
+    }, [loadConfig, loadStatus, loadStaleLog, loadCost, loadContributions, loadDadbearConfigs]);
 
     // ── Node counts (works independently of DADBEAR config) ─────────
 
@@ -788,6 +815,48 @@ Last check: ${lastCheckStr}
                             </div>
                         </div>
                     </div>
+
+                    {/* ── Source Paths ───────────────────────────── */}
+                    {dadbearConfigs && dadbearConfigs.length > 0 && (
+                        <div className="dadbear-source-paths">
+                            <h3>Source Paths</h3>
+                            <div className="dadbear-source-paths-list">
+                                {dadbearConfigs.map((dc) => (
+                                    <div key={dc.id} className={`dadbear-source-path-row ${dc.enabled ? 'active' : 'paused'}`}>
+                                        <div className="dadbear-source-path-info">
+                                            <span className="dadbear-source-path-name" title={dc.source_path}>
+                                                {dc.source_path.split('/').slice(-2).join('/')}
+                                            </span>
+                                            <span className="dadbear-source-path-type">{dc.content_type}</span>
+                                            <span className={`dadbear-source-path-status ${dc.enabled ? 'active' : 'paused'}`}>
+                                                {dc.enabled ? 'Active' : 'Paused'}
+                                            </span>
+                                            <span className="dadbear-source-path-scan">
+                                                {dc.last_scan_at ? formatDate(dc.last_scan_at) : 'never scanned'}
+                                            </span>
+                                        </div>
+                                        <button
+                                            className={`dadbear-action-btn ${dc.enabled ? '' : 'primary'}`}
+                                            onClick={async () => {
+                                                try {
+                                                    if (dc.enabled) {
+                                                        await invoke('pyramid_dadbear_pause', { slug: dc.slug });
+                                                    } else {
+                                                        await invoke('pyramid_dadbear_resume', { slug: dc.slug });
+                                                    }
+                                                    await loadDadbearConfigs();
+                                                } catch (err) {
+                                                    setError(String(err));
+                                                }
+                                            }}
+                                        >
+                                            {dc.enabled ? 'Pause' : 'Resume'}
+                                        </button>
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+                    )}
 
                     {/* ── Evidence Density ───────────────────────────── */}
                     <div className="dadbear-evidence-density">

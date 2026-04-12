@@ -3357,6 +3357,7 @@ async fn handle_build(
                                         session_timeout_secs: 1800,
                                         batch_size: 1,
                                         enabled: true,
+                                        last_scan_at: None,
                                         created_at: String::new(),
                                         updated_at: String::new(),
                                     };
@@ -3694,7 +3695,7 @@ async fn handle_archive_slug(
     }
 
     let conn = state.writer.lock().await;
-    let result = slug::archive_slug(&conn, &slug_name);
+    let result = slug::archive_slug(&conn, &slug_name, Some(&state.build_event_bus));
     drop(conn);
 
     match result {
@@ -4394,13 +4395,12 @@ async fn handle_auto_update_freeze(
     if let Some(engine) = engines.get_mut(&slug_name) {
         engine.freeze();
     } else {
-        // No engine in memory — update DB directly
+        // No engine in memory — use auto_update_ops for DB write + event
         let conn = state.writer.lock().await;
-        let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
-        let _ = conn.execute(
-            "UPDATE pyramid_auto_update_config SET frozen = 1, frozen_at = ?1 WHERE slug = ?2",
-            rusqlite::params![now, slug_name],
-        );
+        if let Err(e) = super::auto_update_ops::freeze(&conn, &state.build_event_bus, &slug_name) {
+            tracing::warn!(slug = %slug_name, "auto_update_ops::freeze failed: {e}");
+        }
+        // Drain pending mutations so they don't fire on unfreeze
         let _ = conn.execute(
             "UPDATE pyramid_pending_mutations SET processed = 1 WHERE processed = 0 AND slug = ?1",
             rusqlite::params![slug_name],
@@ -4428,12 +4428,11 @@ async fn handle_auto_update_unfreeze(
     if let Some(engine) = engines.get_mut(&slug_name) {
         engine.unfreeze();
     } else {
-        // No engine in memory — update DB directly
+        // No engine in memory — use auto_update_ops for DB write + event
         let conn = state.writer.lock().await;
-        let _ = conn.execute(
-            "UPDATE pyramid_auto_update_config SET frozen = 0, frozen_at = NULL WHERE slug = ?1",
-            rusqlite::params![slug_name],
-        );
+        if let Err(e) = super::auto_update_ops::unfreeze(&conn, &state.build_event_bus, &slug_name) {
+            tracing::warn!(slug = %slug_name, "auto_update_ops::unfreeze failed: {e}");
+        }
     }
     drop(engines);
 
@@ -4997,12 +4996,11 @@ async fn handle_breaker_resume(
             &serde_json::json!({"status": "resumed", "slug": slug_name}),
         ))
     } else {
-        // No engine in memory — update DB directly
+        // No engine in memory — use auto_update_ops for DB write + event
         let conn = state.writer.lock().await;
-        let _ = conn.execute(
-            "UPDATE pyramid_auto_update_config SET breaker_tripped = 0, breaker_tripped_at = NULL WHERE slug = ?1",
-            rusqlite::params![slug_name],
-        );
+        if let Err(e) = super::auto_update_ops::resume_breaker(&conn, &state.build_event_bus, &slug_name) {
+            tracing::warn!(slug = %slug_name, "auto_update_ops::resume_breaker failed: {e}");
+        }
         Ok(json_ok(
             &serde_json::json!({"status": "resumed", "slug": slug_name, "note": "No active engine, breaker cleared in DB"}),
         ))
@@ -5477,6 +5475,7 @@ async fn handle_auto_update_l0_sweep(
                 detail_arc.clone(),
                 summary_arc.clone(),
                 &state.operational,
+                Some(&state.build_event_bus),
             )
             .await;
         }
@@ -8166,6 +8165,7 @@ async fn handle_dadbear_watch(
         session_timeout_secs: body.session_timeout_secs,
         batch_size: body.batch_size,
         enabled: body.enabled,
+        last_scan_at: None,
         created_at: String::new(),
         updated_at: String::new(),
     };
@@ -9561,6 +9561,7 @@ async fn handle_preview_commit(
         session_timeout_secs: body.session_timeout_secs,
         batch_size: 1,
         enabled: true,
+        last_scan_at: None,
         created_at: String::new(),
         updated_at: String::new(),
     };

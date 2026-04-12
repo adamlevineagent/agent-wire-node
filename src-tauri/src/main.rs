@@ -3427,6 +3427,7 @@ async fn post_build_seed(
                     session_timeout_secs: 1800,
                     batch_size: 1,
                     enabled: true,
+                    last_scan_at: None,
                     created_at: String::new(),
                     updated_at: String::new(),
                 };
@@ -3501,6 +3502,7 @@ async fn post_build_seed(
         base_config,
         &model,
         pyramid_state.operational.as_ref().clone(),
+        pyramid_state.build_event_bus.clone(),
     );
     engine.start_poll_loop();
 
@@ -4382,7 +4384,7 @@ async fn pyramid_delete_slug(
 
     let conn = state.pyramid.writer.lock().await;
     let result =
-        wire_node_lib::pyramid::slug::archive_slug(&conn, &slug).map_err(|e| e.to_string());
+        wire_node_lib::pyramid::slug::archive_slug(&conn, &slug, Some(&state.pyramid.build_event_bus)).map_err(|e| e.to_string());
     drop(conn);
 
     result
@@ -4469,7 +4471,7 @@ async fn pyramid_archive_slug(
 
     let conn = state.pyramid.writer.lock().await;
     let result =
-        wire_node_lib::pyramid::slug::archive_slug(&conn, &slug).map_err(|e| e.to_string());
+        wire_node_lib::pyramid::slug::archive_slug(&conn, &slug, Some(&state.pyramid.build_event_bus)).map_err(|e| e.to_string());
     drop(conn);
 
     result
@@ -6234,12 +6236,12 @@ async fn pyramid_auto_update_config_set(
                     if config.breaker_tripped
                         && !wire_node_lib::pyramid::watcher::check_runaway(&conn, &slug, &config)
                     {
-                        let _ = conn.execute(
-                            "UPDATE pyramid_auto_update_config
-                                 SET breaker_tripped = 0, breaker_tripped_at = NULL
-                                 WHERE slug = ?1",
-                            rusqlite::params![slug],
-                        );
+                        wire_node_lib::pyramid::auto_update_ops::resume_breaker(
+                            &conn,
+                            &state.pyramid.build_event_bus,
+                            &slug,
+                        )
+                        .map_err(|e: anyhow::Error| e.to_string())?;
                         should_resume_breaker = true;
                     }
 
@@ -6335,6 +6337,7 @@ async fn pyramid_auto_update_config_init(
                 base_config,
                 &model,
                 state.pyramid.operational.as_ref().clone(),
+                state.pyramid.build_event_bus.clone(),
             );
             engine.start_poll_loop();
             engines.insert(slug.clone(), engine);
@@ -6401,11 +6404,9 @@ async fn pyramid_auto_update_freeze(
         engine.freeze();
     } else {
         let conn = state.pyramid.writer.lock().await;
-        let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
-        let _ = conn.execute(
-            "UPDATE pyramid_auto_update_config SET frozen = 1, frozen_at = ?1 WHERE slug = ?2",
-            rusqlite::params![now, slug],
-        );
+        wire_node_lib::pyramid::auto_update_ops::freeze(&conn, &state.pyramid.build_event_bus, &slug)
+            .map_err(|e: anyhow::Error| e.to_string())?;
+        // Drain pending mutations so they don't fire on unfreeze
         let _ = conn.execute(
             "UPDATE pyramid_pending_mutations SET processed = 1 WHERE processed = 0 AND slug = ?1",
             rusqlite::params![slug],
@@ -6428,10 +6429,8 @@ async fn pyramid_auto_update_unfreeze(
         engine.unfreeze();
     } else {
         let conn = state.pyramid.writer.lock().await;
-        let _ = conn.execute(
-            "UPDATE pyramid_auto_update_config SET frozen = 0, frozen_at = NULL WHERE slug = ?1",
-            rusqlite::params![slug],
-        );
+        wire_node_lib::pyramid::auto_update_ops::unfreeze(&conn, &state.pyramid.build_event_bus, &slug)
+            .map_err(|e: anyhow::Error| e.to_string())?;
     }
     drop(engines);
 
@@ -6912,6 +6911,9 @@ struct DadbearOverviewRow {
     cost_24h_actual_usd: f64,
     cost_reconciliation_status: String,
     recent_manifest_count: i64,
+    frozen: bool,
+    breaker_tripped: bool,
+    auto_update: bool,
 }
 
 #[derive(serde::Serialize)]
@@ -6923,6 +6925,8 @@ struct DadbearOverviewTotals {
     total_deferred_questions: i64,
     paused_count: i64,
     active_count: i64,
+    frozen_count: usize,
+    breaker_count: usize,
 }
 
 #[derive(serde::Serialize)]
@@ -6972,6 +6976,8 @@ async fn pyramid_dadbear_overview(
     let mut total_deferred_questions: i64 = 0;
     let mut paused_count: i64 = 0;
     let mut active_count: i64 = 0;
+    let mut frozen_count: usize = 0;
+    let mut breaker_count: usize = 0;
 
     for db_row in db_rows {
         // In-flight count: configs whose per-id flag is currently
@@ -7005,6 +7011,12 @@ async fn pyramid_dadbear_overview(
         total_pending_mutations += db_row.pending_mutations_count;
         total_in_flight_checks += in_flight_stale_checks;
         total_deferred_questions += db_row.deferred_questions_count;
+        if db_row.frozen {
+            frozen_count += 1;
+        }
+        if db_row.breaker_tripped {
+            breaker_count += 1;
+        }
 
         pyramids.push(DadbearOverviewRow {
             slug: db_row.slug.clone(),
@@ -7022,6 +7034,9 @@ async fn pyramid_dadbear_overview(
             cost_24h_actual_usd: db_row.cost_24h_actual_usd,
             cost_reconciliation_status: db_row.cost_reconciliation_status,
             recent_manifest_count: db_row.recent_manifest_count,
+            frozen: db_row.frozen,
+            breaker_tripped: db_row.breaker_tripped,
+            auto_update: db_row.auto_update,
         });
     }
 
@@ -7035,6 +7050,8 @@ async fn pyramid_dadbear_overview(
             total_deferred_questions,
             paused_count,
             active_count,
+            frozen_count,
+            breaker_count,
         },
     })
 }
@@ -7313,10 +7330,8 @@ async fn pyramid_breaker_resume(
         Ok(serde_json::json!({"status": "resumed", "slug": slug}))
     } else {
         let conn = state.pyramid.writer.lock().await;
-        let _ = conn.execute(
-            "UPDATE pyramid_auto_update_config SET breaker_tripped = 0, breaker_tripped_at = NULL WHERE slug = ?1",
-            rusqlite::params![slug],
-        );
+        wire_node_lib::pyramid::auto_update_ops::resume_breaker(&conn, &state.pyramid.build_event_bus, &slug)
+            .map_err(|e: anyhow::Error| e.to_string())?;
         Ok(
             serde_json::json!({"status": "resumed", "slug": slug, "note": "No active engine, breaker cleared in DB"}),
         )
@@ -7324,10 +7339,155 @@ async fn pyramid_breaker_resume(
 }
 
 #[tauri::command]
+async fn pyramid_freeze_all(
+    state: tauri::State<'_, SharedState>,
+    scope: String,
+    scope_value: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let affected_slugs = {
+        let conn = state.pyramid.writer.lock().await;
+        let slugs = wire_node_lib::pyramid::auto_update_ops::freeze_all(
+            &conn,
+            &state.pyramid.build_event_bus,
+            &scope,
+            scope_value.as_deref(),
+        )
+        .map_err(|e: anyhow::Error| e.to_string())?;
+        // Drain pending mutations for slugs without an in-memory engine.
+        // (Engines drain their own WAL inside engine.freeze() below.)
+        // Must happen while we still hold the writer connection.
+        let engines = state.pyramid.stale_engines.lock().await;
+        for slug in &slugs {
+            if !engines.contains_key(slug) {
+                let _ = conn.execute(
+                    "UPDATE pyramid_pending_mutations SET processed = 1 WHERE processed = 0 AND slug = ?1",
+                    rusqlite::params![slug],
+                );
+            }
+        }
+        drop(engines);
+        slugs
+        // conn (writer lock) dropped here
+    };
+
+    // Ghost-engine fix: freeze in-memory stale engines + pause file watchers
+    // for every slug that was actually frozen. Without this, the stale engine
+    // poll loop continues to fire drain_and_dispatch for already-debounced
+    // mutations despite the DB-level freeze.
+    {
+        let mut engines = state.pyramid.stale_engines.lock().await;
+        for slug in &affected_slugs {
+            if let Some(engine) = engines.get_mut(slug) {
+                engine.freeze();
+            }
+        }
+    }
+    {
+        let mut watchers = state.pyramid.file_watchers.lock().await;
+        for slug in &affected_slugs {
+            if let Some(watcher) = watchers.get_mut(slug) {
+                watcher.pause();
+            }
+        }
+    }
+
+    let affected = affected_slugs.len();
+    Ok(serde_json::json!({ "affected": affected }))
+}
+
+#[tauri::command]
+async fn pyramid_unfreeze_all(
+    state: tauri::State<'_, SharedState>,
+    scope: String,
+    scope_value: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let conn = state.pyramid.writer.lock().await;
+    let affected_slugs = wire_node_lib::pyramid::auto_update_ops::unfreeze_all(
+        &conn,
+        &state.pyramid.build_event_bus,
+        &scope,
+        scope_value.as_deref(),
+    )
+    .map_err(|e: anyhow::Error| e.to_string())?;
+    drop(conn);
+
+    // Ghost-engine fix: unfreeze in-memory stale engines + resume file
+    // watchers for every slug that was actually unfrozen. Without this,
+    // the stale engine stays frozen in memory and ignores new mutations.
+    {
+        let mut engines = state.pyramid.stale_engines.lock().await;
+        for slug in &affected_slugs {
+            if let Some(engine) = engines.get_mut(slug) {
+                engine.unfreeze();
+            }
+        }
+    }
+    {
+        let db_path = state
+            .pyramid
+            .data_dir
+            .as_ref()
+            .expect("data_dir not set")
+            .join("pyramid.db")
+            .to_string_lossy()
+            .to_string();
+        let mut watchers = state.pyramid.file_watchers.lock().await;
+        for slug in &affected_slugs {
+            if let Some(watcher) = watchers.get_mut(slug) {
+                watcher.resume(&db_path);
+            }
+        }
+    }
+
+    let affected = affected_slugs.len();
+    Ok(serde_json::json!({ "affected": affected }))
+}
+
+#[tauri::command]
+async fn pyramid_count_freeze_scope(
+    state: tauri::State<'_, SharedState>,
+    scope: String,
+    scope_value: Option<String>,
+    target_state: String,
+) -> Result<serde_json::Value, String> {
+    let target_frozen = target_state == "freeze"; // "freeze" = count unfrozen ones (would be frozen)
+    let conn = state.pyramid.reader.lock().await;
+    let count = wire_node_lib::pyramid::auto_update_ops::count_freeze_scope(
+        &conn,
+        &scope,
+        scope_value.as_deref(),
+        target_frozen,
+    )
+    .map_err(|e: anyhow::Error| e.to_string())?;
+    Ok(serde_json::json!({ "count": count }))
+}
+
+#[tauri::command]
+async fn pyramid_dadbear_configs_for_slug(
+    state: tauri::State<'_, SharedState>,
+    slug: String,
+) -> Result<serde_json::Value, String> {
+    let conn = state.pyramid.reader.lock().await;
+    let configs =
+        pyramid_db::get_dadbear_configs(&conn, &slug).map_err(|e| e.to_string())?;
+    serde_json::to_value(&configs).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 async fn pyramid_auto_update_run_now(
     state: tauri::State<'_, SharedState>,
     slug: String,
 ) -> Result<serde_json::Value, String> {
+    // Guard: reject if frozen or breaker-tripped
+    {
+        let engines = state.pyramid.stale_engines.lock().await;
+        if let Some(engine) = engines.get(&slug) {
+            if engine.frozen || engine.breaker_tripped {
+                return Err("Cannot run now: pyramid is frozen or breaker is tripped".into());
+            }
+        }
+    }
+
     // Extract what we need from the engine while briefly holding the lock, then release.
     // Phase 3 retired `api_key` from PyramidStaleEngine in favor of
     // `base_config: LlmConfig`, which preserves the provider_registry
@@ -7365,6 +7525,7 @@ async fn pyramid_auto_update_run_now(
             detail_arc.clone(),
             summary_arc.clone(),
             &state.pyramid.operational,
+            Some(&state.pyramid.build_event_bus),
         )
         .await;
     }
@@ -7430,6 +7591,7 @@ async fn pyramid_auto_update_l0_sweep(
             detail_arc.clone(),
             summary_arc.clone(),
             &state.pyramid.operational,
+            Some(&state.pyramid.build_event_bus),
         )
         .await;
     }
@@ -10995,6 +11157,10 @@ fn main() {
             pyramid_audit_by_id,
             pyramid_audit_cleanup,
             pyramid_breaker_resume,
+            pyramid_freeze_all,
+            pyramid_unfreeze_all,
+            pyramid_count_freeze_scope,
+            pyramid_dadbear_configs_for_slug,
             pyramid_auto_update_run_now,
             pyramid_auto_update_l0_sweep,
             pyramid_breaker_archive_and_rebuild,

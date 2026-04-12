@@ -275,6 +275,7 @@ pub async fn init_stale_engines(pyramid_state: &Arc<pyramid::PyramidState>) {
             slug_base_config,
             &model,
             pyramid_state.operational.as_ref().clone(),
+            pyramid_state.build_event_bus.clone(),
         );
 
         // Breaker-tripped: create engine in tripped state, log warning, no watcher

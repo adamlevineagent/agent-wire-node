@@ -90,10 +90,10 @@ export function DadbearPauseScopeModal({
         }
         setCountLoading(true);
         setCountError(null);
-        invoke<CountResponse>("pyramid_count_dadbear_scope", {
+        invoke<CountResponse>("pyramid_count_freeze_scope", {
             scope,
             scopeValue,
-            targetState: action,
+            targetState: action === "pause" ? "freeze" : "unfreeze",
         })
             .then((resp) => {
                 if (cancelled) return;
@@ -276,13 +276,13 @@ export function DadbearPauseScopeModal({
                     )}
                     {!countLoading && !countError && (
                         <>
-                            This will {action} background DADBEAR
-                            maintenance for{" "}
+                            This will {action === "pause" ? "freeze" : "unfreeze"} DADBEAR
+                            auto-update for{" "}
                             <strong>{count}</strong> pyramid
                             {count === 1 ? "" : "s"}. In-flight builds
                             are not affected. Use{" "}
                             {action === "pause" ? "Resume" : "Pause"} to
-                            re-enable.
+                            {action === "pause" ? " unfreeze" : " re-freeze"}.
                         </>
                     )}
                 </p>

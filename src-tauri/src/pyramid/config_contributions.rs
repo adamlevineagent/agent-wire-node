@@ -700,6 +700,20 @@ pub fn sync_config_to_operational_with_registry(
             )?;
             // No reload hook — read on next folder scan.
         }
+        "auto_update_policy" => {
+            // Ghost-engine fix: per-pyramid stale engine policy.
+            // This is NOT `wire_auto_update_settings` (which controls
+            // Wire discovery polling) — this governs the local stale
+            // engine's per-pyramid file-watching behavior.
+            let yaml: db::AutoUpdatePolicyYaml =
+                serde_yaml::from_str(&contribution.yaml_content)?;
+            db::upsert_auto_update_policy(conn, &slug_opt, &yaml, &contribution.contribution_id)?;
+            // Note: debounce_minutes is baked at engine construction
+            // time. Changes take effect on next engine restart (toggle
+            // auto_update off/on, or app restart). All other fields
+            // (runaway_threshold, min_changed_files, auto_update) are
+            // re-read per drain cycle.
+        }
         // ── Stubbed branches ─────────────────────────────────────────
         //
         // These schema types don't have operational tables today. The

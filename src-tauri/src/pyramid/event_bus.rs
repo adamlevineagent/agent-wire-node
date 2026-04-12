@@ -408,6 +408,18 @@ pub enum TaggedKind {
         new_local_contribution_id: String,
         chain_length_delta: i64,
     },
+
+    // ── Auto-Update Operational State ───────────────────────────────
+    //
+    // Emitted by `auto_update_ops` whenever frozen/breaker/auto_update
+    // state changes on `pyramid_auto_update_config`. Both the Oversight
+    // UI and DADBEARPanel poll for state, but this event enables
+    // real-time reactivity when wired to the Tauri event bridge.
+    AutoUpdateStateChanged {
+        frozen: bool,
+        breaker_tripped: bool,
+        auto_update: bool,
+    },
 }
 
 impl TaggedKind {

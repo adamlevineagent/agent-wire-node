@@ -225,11 +225,18 @@ pub fn list_slugs(conn: &Connection) -> Result<Vec<SlugInfo>> {
 }
 
 /// Archive a slug (soft-delete). Sets `archived_at` timestamp. Verifies the slug exists first.
-pub fn archive_slug(conn: &Connection, slug: &str) -> Result<()> {
+///
+/// Accepts an optional event bus so the freeze routes through `auto_update_ops`
+/// (ghost-engine contract). Callers with access to the bus should pass `Some(&bus)`.
+pub fn archive_slug(
+    conn: &Connection,
+    slug: &str,
+    event_bus: Option<&std::sync::Arc<crate::pyramid::event_bus::BuildEventBus>>,
+) -> Result<()> {
     if db::get_slug(conn, slug)?.is_none() {
         return Err(anyhow!("Slug '{}' not found", slug));
     }
-    db::archive_slug(conn, slug)
+    db::archive_slug(conn, slug, event_bus)
 }
 
 /// Admin-only hard delete of a slug and all associated data. Verifies the slug exists first.
@@ -332,7 +339,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         db::init_pyramid_db(&conn).unwrap();
 
-        let result = archive_slug(&conn, "nonexistent");
+        let result = archive_slug(&conn, "nonexistent", None);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("not found"));
     }

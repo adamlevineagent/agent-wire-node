@@ -25,7 +25,7 @@ import {
     type DadbearPauseScope,
 } from './DadbearPauseScopeModal';
 
-type PyramidFilter = 'all' | 'active' | 'paused';
+type PyramidFilter = 'all' | 'active' | 'paused' | 'frozen' | 'breaker';
 
 function currency(v: number): string {
     return `$${v.toFixed(2)}`;
@@ -105,12 +105,12 @@ export function DadbearOversightPage() {
             setGlobalError(null);
             try {
                 const resp = await invoke<{ affected: number }>(
-                    'pyramid_pause_dadbear_all',
+                    'pyramid_freeze_all',
                     { scope, scopeValue },
                 );
                 await refetchOverview();
                 showToast(
-                    `Paused DADBEAR on ${resp.affected} pyramid${resp.affected === 1 ? '' : 's'}`,
+                    `Froze DADBEAR on ${resp.affected} pyramid${resp.affected === 1 ? '' : 's'}`,
                 );
             } catch (e) {
                 setGlobalError(String(e));
@@ -128,12 +128,12 @@ export function DadbearOversightPage() {
             setGlobalError(null);
             try {
                 const resp = await invoke<{ affected: number }>(
-                    'pyramid_resume_dadbear_all',
+                    'pyramid_unfreeze_all',
                     { scope, scopeValue },
                 );
                 await refetchOverview();
                 showToast(
-                    `Resumed DADBEAR on ${resp.affected} pyramid${resp.affected === 1 ? '' : 's'}`,
+                    `Unfroze DADBEAR on ${resp.affected} pyramid${resp.affected === 1 ? '' : 's'}`,
                 );
             } catch (e) {
                 setGlobalError(String(e));
@@ -174,9 +174,13 @@ export function DadbearOversightPage() {
         if (!overview) return [];
         switch (filter) {
             case 'active':
-                return overview.pyramids.filter((p) => p.enabled);
+                return overview.pyramids.filter((p) => p.enabled && !p.frozen && !p.breaker_tripped && p.auto_update);
             case 'paused':
-                return overview.pyramids.filter((p) => !p.enabled);
+                return overview.pyramids.filter((p) => !p.enabled && !p.frozen && !p.breaker_tripped);
+            case 'frozen':
+                return overview.pyramids.filter((p) => p.frozen && !p.breaker_tripped);
+            case 'breaker':
+                return overview.pyramids.filter((p) => p.breaker_tripped);
             default:
                 return overview.pyramids;
         }
@@ -252,6 +256,12 @@ export function DadbearOversightPage() {
                             Paused: <strong>{overview.totals.paused_count}</strong>
                         </span>
                         <span>
+                            Frozen: <strong>{overview.totals.frozen_count}</strong>
+                        </span>
+                        <span>
+                            Breaker: <strong>{overview.totals.breaker_count}</strong>
+                        </span>
+                        <span>
                             Pending mutations:{' '}
                             <strong>{overview.totals.total_pending_mutations}</strong>
                         </span>
@@ -287,7 +297,7 @@ export function DadbearOversightPage() {
                 <div className="dadbear-oversight-pyramids-header">
                     <h3>Per-Pyramid Status</h3>
                     <div className="dadbear-oversight-filter">
-                        {(['all', 'active', 'paused'] as PyramidFilter[]).map(
+                        {(['all', 'active', 'paused', 'frozen', 'breaker'] as PyramidFilter[]).map(
                             (f) => (
                                 <button
                                     key={f}

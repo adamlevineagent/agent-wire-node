@@ -29,6 +29,9 @@ export interface DadbearOverviewRow {
         | 'broadcast_missing'
         | string;
     recent_manifest_count: number;
+    frozen: boolean;
+    breaker_tripped: boolean;
+    auto_update: boolean;
 }
 
 export interface DadbearOverviewTotals {
@@ -39,6 +42,8 @@ export interface DadbearOverviewTotals {
     total_deferred_questions: number;
     paused_count: number;
     active_count: number;
+    frozen_count: number;
+    breaker_count: number;
 }
 
 export interface DadbearOverviewResponse {

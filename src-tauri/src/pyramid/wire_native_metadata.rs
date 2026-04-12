@@ -860,6 +860,16 @@ pub fn resolve_wire_type(schema_type: &str) -> Result<(WireContributionType, Vec
                 "auto_update".to_string(),
             ],
         )),
+        // Ghost-engine fix: per-pyramid stale engine policy. NOT the same as
+        // wire_auto_update_settings (which controls Wire discovery polling).
+        "auto_update_policy" => Ok((
+            WireContributionType::Template,
+            vec![
+                "config".to_string(),
+                "wire-node".to_string(),
+                "stale_engine".to_string(),
+            ],
+        )),
         "wire_update_polling" => Ok((
             WireContributionType::Template,
             vec![
@@ -1413,6 +1423,7 @@ wire:
             ("custom_chain", WireContributionType::Action),
             ("wire_discovery_weights", WireContributionType::Template),
             ("wire_auto_update_settings", WireContributionType::Template),
+            ("auto_update_policy", WireContributionType::Template),
             ("wire_update_polling", WireContributionType::Template),
         ];
         for (schema_type, expected) in cases {

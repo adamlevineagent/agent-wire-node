@@ -568,6 +568,11 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
         "ALTER TABLE pyramid_auto_update_config ADD COLUMN ingested_config_files TEXT DEFAULT '[]'",
         [],
     );
+    // Ghost-engine fix: link auto_update_config to the contribution system.
+    let _ = conn.execute(
+        "ALTER TABLE pyramid_auto_update_config ADD COLUMN contribution_id TEXT DEFAULT NULL",
+        [],
+    );
 
     // ── WS3: build_id columns for contribution model ──
     let _ = conn.execute(
@@ -1939,6 +1944,10 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
     // `contribution_id` column is still NULL.
     migrate_legacy_dadbear_to_contributions(conn)?;
 
+    // Ghost-engine fix: convert legacy pyramid_auto_update_config rows
+    // to pyramid_config_contributions. Same pattern as DADBEAR migration.
+    migrate_legacy_auto_update_to_contributions(conn)?;
+
     Ok(())
 }
 
@@ -2066,6 +2075,124 @@ pub fn migrate_legacy_dadbear_to_contributions(conn: &Connection) -> Result<()> 
          ) VALUES (
             ?1, NULL, '_migration_marker', '',
             'active', 'migration', 'dadbear_bootstrap', datetime('now')
+         )",
+        rusqlite::params![marker_id],
+    )?;
+
+    Ok(())
+}
+
+/// Ghost-engine fix: convert every legacy `pyramid_auto_update_config` row
+/// to a `pyramid_config_contributions` row with `schema_type =
+/// 'auto_update_policy'`, `source = 'migration'`, `status = 'active'`.
+///
+/// Idempotent via the same two-guard pattern as the DADBEAR migration:
+/// 1. Sentinel row with `created_by = 'auto_update_bootstrap'`
+/// 2. Per-row: only rows whose `contribution_id` column is still NULL
+///
+/// Serializes only policy fields (auto_update, debounce_minutes,
+/// min_changed_files, runaway_threshold). Excludes runtime/derived state
+/// (frozen, breaker_tripped, timestamps, ingested_*).
+pub fn migrate_legacy_auto_update_to_contributions(conn: &Connection) -> Result<()> {
+    // Guard 1: short-circuit if the migration marker already exists.
+    let marker_exists: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pyramid_config_contributions
+         WHERE schema_type = '_migration_marker'
+           AND source = 'migration'
+           AND created_by = 'auto_update_bootstrap'",
+        [],
+        |row| row.get(0),
+    )?;
+    if marker_exists > 0 {
+        return Ok(());
+    }
+
+    // Collect every auto_update_config row still missing a contribution_id.
+    let mut stmt = conn.prepare(
+        "SELECT slug, auto_update, debounce_minutes, min_changed_files, runaway_threshold
+         FROM pyramid_auto_update_config
+         WHERE contribution_id IS NULL
+         ORDER BY slug ASC",
+    )?;
+    struct LegacyRow {
+        slug: String,
+        auto_update: bool,
+        debounce_minutes: i64,
+        min_changed_files: i64,
+        runaway_threshold: f64,
+    }
+    let rows: Vec<LegacyRow> = {
+        let iter = stmt.query_map([], |row| {
+            Ok(LegacyRow {
+                slug: row.get(0)?,
+                auto_update: row.get::<_, i32>(1)? != 0,
+                debounce_minutes: row.get(2)?,
+                min_changed_files: row.get(3)?,
+                runaway_threshold: row.get(4)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in iter {
+            out.push(row?);
+        }
+        out
+    };
+
+    for cfg in &rows {
+        // Serialize using serde_yaml for round-trip safety with the
+        // dispatcher's serde_yaml::from_str() deserialization.
+        let yaml_struct = AutoUpdatePolicyYaml {
+            auto_update: cfg.auto_update,
+            debounce_minutes: cfg.debounce_minutes,
+            min_changed_files: cfg.min_changed_files,
+            runaway_threshold: cfg.runaway_threshold,
+        };
+        let yaml = serde_yaml::to_string(&yaml_struct)
+            .unwrap_or_else(|_| format!(
+                "auto_update: {}\ndebounce_minutes: {}\nmin_changed_files: {}\nrunaway_threshold: {}\n",
+                cfg.auto_update, cfg.debounce_minutes, cfg.min_changed_files, cfg.runaway_threshold,
+            ));
+
+        // Write canonical metadata with maturity=Canon (matches DADBEAR migration pattern).
+        let mut metadata = crate::pyramid::wire_native_metadata::default_wire_native_metadata(
+            "auto_update_policy",
+            Some(cfg.slug.as_str()),
+        );
+        metadata.maturity = crate::pyramid::wire_native_metadata::WireMaturity::Canon;
+        let metadata_json = metadata
+            .to_json()
+            .unwrap_or_else(|_| "{}".to_string());
+
+        let contribution_id = uuid::Uuid::new_v4().to_string();
+        conn.execute(
+            "INSERT INTO pyramid_config_contributions (
+                contribution_id, slug, schema_type, yaml_content,
+                wire_native_metadata_json, wire_publication_state_json,
+                supersedes_id, superseded_by_id, triggering_note,
+                status, source, wire_contribution_id, created_by, accepted_at
+             ) VALUES (
+                ?1, ?2, 'auto_update_policy', ?3,
+                ?4, '{}',
+                NULL, NULL, 'Migrated from legacy pyramid_auto_update_config',
+                'active', 'migration', NULL, 'auto_update_bootstrap', datetime('now')
+             )",
+            rusqlite::params![contribution_id, cfg.slug, yaml, metadata_json],
+        )?;
+        conn.execute(
+            "UPDATE pyramid_auto_update_config SET contribution_id = ?1 WHERE slug = ?2",
+            rusqlite::params![contribution_id, cfg.slug],
+        )?;
+    }
+
+    // Sentinel row so subsequent runs short-circuit.
+    let marker_id = uuid::Uuid::new_v4().to_string();
+    conn.execute(
+        "INSERT INTO pyramid_config_contributions (
+            contribution_id, slug, schema_type, yaml_content,
+            status, source, created_by, accepted_at
+         ) VALUES (
+            ?1, NULL, '_migration_marker', '',
+            'active', 'migration', 'auto_update_bootstrap', datetime('now')
          )",
         rusqlite::params![marker_id],
     )?;
@@ -2732,6 +2859,15 @@ pub fn create_slug(
     )
     .with_context(|| format!("Failed to create slug '{slug}'"))?;
 
+    // Ghost-engine fix: ensure every pyramid has a master auto_update_config row
+    // from birth. Uses schema defaults (auto_update=0, frozen=0, breaker_tripped=0).
+    // The LEFT JOIN in get_enabled_dadbear_configs() is belt-and-suspenders for
+    // edge cases where this didn't run (e.g., pin_pyramid, archive-and-rebuild).
+    let _ = conn.execute(
+        "INSERT OR IGNORE INTO pyramid_auto_update_config (slug) VALUES (?1)",
+        rusqlite::params![slug],
+    );
+
     // Read back the row to get server-generated defaults (created_at)
     get_slug(conn, slug)?.ok_or_else(|| anyhow::anyhow!("Slug '{slug}' not found after insert"))
 }
@@ -2914,16 +3050,38 @@ pub fn has_slug_referrers(conn: &Connection, slug: &str) -> Result<bool> {
 }
 
 /// Archive a slug — sets `archived_at` timestamp. Does NOT delete.
-pub fn archive_slug(conn: &Connection, slug: &str) -> Result<()> {
+///
+/// Accepts an optional event bus so the frozen-state change routes through
+/// `auto_update_ops::freeze` (DB write + event emission) instead of a bare
+/// UPDATE, satisfying the ghost-engine contract.
+pub fn archive_slug(
+    conn: &Connection,
+    slug: &str,
+    event_bus: Option<&std::sync::Arc<crate::pyramid::event_bus::BuildEventBus>>,
+) -> Result<()> {
     conn.execute(
         "UPDATE pyramid_slugs SET archived_at = datetime('now') WHERE slug = ?1",
         rusqlite::params![slug],
     )?;
-    // Disable DADBEAR for archived slugs — prevents stale engine from monitoring them
+    // Disable DADBEAR for archived slugs — prevents stale engine from monitoring them.
+    // Policy: disable auto_update (permanent intent).
     conn.execute(
-        "UPDATE pyramid_auto_update_config SET auto_update = 0, frozen = 1, frozen_at = datetime('now') WHERE slug = ?1",
+        "UPDATE pyramid_auto_update_config SET auto_update = 0 WHERE slug = ?1",
         rusqlite::params![slug],
     )?;
+    // Freeze via auto_update_ops so the event bus is notified.
+    if let Some(bus) = event_bus {
+        if let Err(e) = crate::pyramid::auto_update_ops::freeze(conn, bus, slug) {
+            tracing::warn!(slug = %slug, "archive_slug: auto_update_ops::freeze failed: {e}");
+        }
+    } else {
+        // Fallback when no event bus available (e.g. tests). Direct write is acceptable
+        // here because archive is a terminal operation and auto_update=0 is the primary gate.
+        conn.execute(
+            "UPDATE pyramid_auto_update_config SET frozen = 1, frozen_at = datetime('now') WHERE slug = ?1",
+            rusqlite::params![slug],
+        )?;
+    }
     Ok(())
 }
 
@@ -11157,9 +11315,7 @@ const DADBEAR_CONFIG_COLUMNS: &str =
 
 /// Parse a row from `pyramid_dadbear_config` into a `DadbearWatchConfig`.
 fn parse_dadbear_config(row: &rusqlite::Row) -> rusqlite::Result<DadbearWatchConfig> {
-    // Column 9 (last_scan_at) is intentionally skipped — it's not on the struct.
-    // The status endpoint reads it via a separate query.
-    let _last_scan_at: Option<String> = row.get(9)?;
+    let last_scan_at: Option<String> = row.get(9)?;
     Ok(DadbearWatchConfig {
         id: row.get(0)?,
         slug: row.get(1)?,
@@ -11170,6 +11326,7 @@ fn parse_dadbear_config(row: &rusqlite::Row) -> rusqlite::Result<DadbearWatchCon
         session_timeout_secs: row.get::<_, i64>(6)? as u64,
         batch_size: row.get::<_, i32>(7)? as u32,
         enabled: row.get::<_, i32>(8)? != 0,
+        last_scan_at,
         created_at: row.get(10)?,
         updated_at: row.get(11)?,
     })
@@ -11220,12 +11377,27 @@ pub fn get_dadbear_configs(conn: &Connection, slug: &str) -> Result<Vec<DadbearW
 }
 
 /// Get all enabled DADBEAR watch configs (across all slugs).
+///
+/// Ghost-engine fix: LEFT JOINs `pyramid_auto_update_config` to enforce
+/// the master enable gate. DADBEAR configs are only returned when:
+///   - per-path: `enabled = 1`
+///   - master: `auto_update = 1 AND frozen = 0 AND breaker_tripped = 0`
+///              (or no master row exists — belt-and-suspenders for edge cases)
+///
+/// This is the single query change that prevents ghost engines.
+/// All columns are d.-qualified to avoid ambiguous `slug`.
+/// Column order matches `DADBEAR_CONFIG_COLUMNS` for `parse_dadbear_config()`.
 pub fn get_enabled_dadbear_configs(conn: &Connection) -> Result<Vec<DadbearWatchConfig>> {
-    let sql = format!(
-        "SELECT {DADBEAR_CONFIG_COLUMNS} FROM pyramid_dadbear_config
-         WHERE enabled = 1 ORDER BY slug ASC, source_path ASC"
-    );
-    let mut stmt = conn.prepare(&sql)?;
+    let sql =
+        "SELECT d.id, d.slug, d.source_path, d.content_type, d.scan_interval_secs,
+                d.debounce_secs, d.session_timeout_secs, d.batch_size, d.enabled,
+                d.last_scan_at, d.created_at, d.updated_at
+         FROM pyramid_dadbear_config d
+         LEFT JOIN pyramid_auto_update_config a ON d.slug = a.slug
+         WHERE d.enabled = 1
+           AND (a.slug IS NULL OR (a.auto_update = 1 AND a.frozen = 0 AND a.breaker_tripped = 0))
+         ORDER BY d.slug ASC, d.source_path ASC";
+    let mut stmt = conn.prepare(sql)?;
     let rows = stmt.query_map([], parse_dadbear_config)?;
     let mut configs = Vec::new();
     for row in rows {
@@ -11489,6 +11661,9 @@ pub struct DadbearOverviewRowDb {
     pub cost_24h_actual_usd: f64,
     pub cost_reconciliation_status: String,
     pub recent_manifest_count: i64,
+    pub frozen: bool,
+    pub breaker_tripped: bool,
+    pub auto_update: bool,
 }
 
 /// Phase 15: build every per-slug overview row from a single
@@ -11668,6 +11843,12 @@ pub fn build_dadbear_overview_rows(
             )
             .unwrap_or(0);
 
+        let (frozen, breaker_tripped, auto_update_enabled) = conn.query_row(
+            "SELECT frozen, breaker_tripped, auto_update FROM pyramid_auto_update_config WHERE slug = ?1",
+            rusqlite::params![slug],
+            |row| Ok((row.get::<_, bool>(0)?, row.get::<_, bool>(1)?, row.get::<_, bool>(2)?)),
+        ).unwrap_or((false, false, false));
+
         rows.push(DadbearOverviewRowDb {
             slug,
             config_ids: bucket.config_ids,
@@ -11682,6 +11863,9 @@ pub fn build_dadbear_overview_rows(
             cost_24h_actual_usd,
             cost_reconciliation_status,
             recent_manifest_count,
+            frozen,
+            breaker_tripped,
+            auto_update: auto_update_enabled,
         });
     }
 
@@ -14456,6 +14640,89 @@ pub fn upsert_dadbear_policy(
             yaml.session_timeout_secs,
             yaml.batch_size,
             yaml.enabled as i64,
+            contribution_id,
+        ],
+    )?;
+    Ok(())
+}
+
+// ── Auto-Update Policy (ghost-engine fix) ────────────────────────────────────
+
+fn auto_update_default_debounce() -> i64 {
+    5
+}
+fn auto_update_default_min_files() -> i64 {
+    1
+}
+fn auto_update_default_threshold() -> f64 {
+    0.5
+}
+
+/// YAML struct for the `auto_update_policy` contribution schema type.
+///
+/// Governs the per-pyramid stale engine behavior: debounce, thresholds,
+/// and the master enable flag. This is NOT `wire_auto_update_settings`
+/// (which controls Wire discovery polling) — this governs the local
+/// stale engine's file-watching behavior.
+///
+/// **Excluded from YAML (runtime/derived state):** `frozen`,
+/// `breaker_tripped`, `*_at` timestamps, `ingested_extensions`,
+/// `ingested_config_files`. Operational state is managed by
+/// `auto_update_ops.rs`; ingested_* are build-derived.
+///
+/// **Debounce limitation:** `debounce_minutes` is baked into
+/// `LayerTimer` at engine construction time. Changes via contribution
+/// take effect on next engine restart (toggle auto_update off/on, or
+/// app restart). All other fields are re-read per drain cycle.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct AutoUpdatePolicyYaml {
+    pub auto_update: bool,
+    #[serde(default = "auto_update_default_debounce")]
+    pub debounce_minutes: i64,
+    #[serde(default = "auto_update_default_min_files")]
+    pub min_changed_files: i64,
+    #[serde(default = "auto_update_default_threshold")]
+    pub runaway_threshold: f64,
+}
+
+/// UPSERT an auto-update policy contribution's payload into the existing
+/// `pyramid_auto_update_config` table. Writes only the policy fields
+/// (auto_update, debounce_minutes, min_changed_files, runaway_threshold)
+/// plus the contribution_id FK. Preserves frozen, breaker_tripped, and
+/// ingested_* columns untouched via ON CONFLICT DO UPDATE.
+///
+/// When `slug` is `None`, this is a global-defaults contribution. The
+/// `pyramid_auto_update_config` table has no global row (slug is PRIMARY
+/// KEY with NOT NULL), so we return Ok as a no-op.
+pub fn upsert_auto_update_policy(
+    conn: &Connection,
+    slug: &Option<String>,
+    yaml: &AutoUpdatePolicyYaml,
+    contribution_id: &str,
+) -> Result<()> {
+    let Some(slug_str) = slug.as_deref() else {
+        // Global defaults: contribution is the source of truth in
+        // pyramid_config_contributions. No operational row to mirror.
+        return Ok(());
+    };
+
+    conn.execute(
+        "INSERT INTO pyramid_auto_update_config
+            (slug, auto_update, debounce_minutes, min_changed_files,
+             runaway_threshold, contribution_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(slug) DO UPDATE SET
+            auto_update = excluded.auto_update,
+            debounce_minutes = excluded.debounce_minutes,
+            min_changed_files = excluded.min_changed_files,
+            runaway_threshold = excluded.runaway_threshold,
+            contribution_id = excluded.contribution_id",
+        rusqlite::params![
+            slug_str,
+            yaml.auto_update as i64,
+            yaml.debounce_minutes,
+            yaml.min_changed_files,
+            yaml.runaway_threshold,
             contribution_id,
         ],
     )?;

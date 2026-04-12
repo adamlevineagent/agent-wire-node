@@ -1532,6 +1532,7 @@ pub async fn execute_plan(
                     session_timeout_secs: 1800,
                     batch_size: 1,
                     enabled: true,
+                    last_scan_at: None,
                     created_at: String::new(),
                     updated_at: String::new(),
                 };

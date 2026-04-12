@@ -112,12 +112,20 @@ export function DadbearPyramidCard({
         row.cost_reconciliation_status === 'broadcast_missing'
             ? 'dadbear-card-alert'
             : '',
+        row.frozen ? 'dadbear-card-frozen' : '',
+        row.breaker_tripped ? 'dadbear-card-breaker' : '',
     ]
         .filter(Boolean)
         .join(' ');
 
     return (
         <div className={cardClass}>
+            {row.frozen && (
+                <div className="dadbear-card-frozen-banner">Master frozen — unfreeze from global controls</div>
+            )}
+            {row.breaker_tripped && !row.frozen && (
+                <div className="dadbear-card-breaker-banner">Breaker tripped — resume from pyramid page</div>
+            )}
             <div className="dadbear-card-header">
                 <h3 className="dadbear-card-title">{row.display_name}</h3>
                 <span
@@ -213,6 +221,9 @@ export function DadbearPyramidCard({
                         : row.enabled
                             ? 'Pause'
                             : 'Resume'}
+                    {row.frozen && (
+                        <span className="dadbear-card-frozen-indicator">takes effect on unfreeze</span>
+                    )}
                 </button>
                 <button
                     className="btn btn-secondary"

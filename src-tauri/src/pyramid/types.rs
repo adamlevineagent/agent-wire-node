@@ -1495,6 +1495,8 @@ pub struct DadbearWatchConfig {
     pub batch_size: u32,
     /// Whether this watch config is active.
     pub enabled: bool,
+    /// Timestamp of the last DADBEAR scan for this config.
+    pub last_scan_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
