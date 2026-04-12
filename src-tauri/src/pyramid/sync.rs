@@ -437,9 +437,15 @@ pub async fn pyramid_sync_tick(
 pub async fn pinned_pyramid_refresh_tick(
     pyramid_state: &super::PyramidState,
     sync_state: &Arc<Mutex<PyramidSyncState>>,
+    wire_jwt: String,
 ) {
     use super::slug;
     use super::wire_import::RemotePyramidClient;
+
+    if wire_jwt.is_empty() {
+        tracing::debug!("pinned_refresh_tick: no auth token available, skipping");
+        return;
+    }
 
     let pinned_links: Vec<PinnedPyramidLink> = {
         let state = sync_state.lock().await;
@@ -447,17 +453,6 @@ pub async fn pinned_pyramid_refresh_tick(
     };
 
     if pinned_links.is_empty() {
-        return;
-    }
-
-    // Get Wire JWT for authenticating with remote nodes
-    let wire_jwt = {
-        let config = pyramid_state.config.read().await;
-        config.auth_token.clone()
-    };
-
-    if wire_jwt.is_empty() {
-        tracing::debug!("pinned_refresh_tick: no auth_token configured, skipping");
         return;
     }
 
@@ -533,10 +528,11 @@ pub async fn pinned_pyramid_refresh_tick(
                             error = %e,
                             "pinned_refresh_tick: failed to upsert nodes"
                         );
+                        drop(writer);
                         continue;
                     }
                 }
-                // writer dropped here
+                drop(writer); // Release writer before awaiting sync_state lock
 
                 // Update last_known_build_id in sync state
                 {

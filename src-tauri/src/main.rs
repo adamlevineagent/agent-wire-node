@@ -5389,6 +5389,12 @@ async fn pyramid_pin_remote(
         .map_err(|e| format!("failed to pin pyramid: {}", e))?;
     drop(writer);
 
+    // Register in sync state so auto-refresh timer picks it up (WS-ONLINE-D)
+    {
+        let mut sync = state.pyramid_sync_state.lock().await;
+        sync.pin_pyramid(slug.clone(), tunnel_url.clone());
+    }
+
     Ok(serde_json::json!({
         "ok": true,
         "slug": slug,
@@ -5412,6 +5418,12 @@ async fn pyramid_unpin(
     wire_node_lib::pyramid::slug::unpin_pyramid(&writer, &slug)
         .map_err(|e| format!("failed to unpin pyramid: {}", e))?;
     drop(writer);
+
+    // Deregister from sync state so auto-refresh stops polling (WS-ONLINE-D)
+    {
+        let mut sync = state.pyramid_sync_state.lock().await;
+        sync.unpin_pyramid(&slug);
+    }
 
     Ok(serde_json::json!({
         "ok": true,
@@ -10369,6 +10381,27 @@ fn main() {
 
     tracing::info!("Partner (Dennis) initialized at {:?}", partner_db_path);
 
+    // Build pyramid sync state and load pinned pyramids from DB (WS-ONLINE-D)
+    let pyramid_sync_state = {
+        let mut pss = wire_node_lib::pyramid::sync::PyramidSyncState::new();
+        // Hydrate pinned pyramids from DB so auto-refresh works across restarts.
+        // Use blocking_lock() since main() is synchronous — safe at startup, no contention.
+        let reader = pyramid_state.reader.blocking_lock();
+        match wire_node_lib::pyramid::db::list_pinned_pyramids(&reader) {
+            Ok(pinned) => {
+                for (slug, tunnel_url) in pinned {
+                    tracing::info!(slug = %slug, "restoring pinned pyramid for auto-refresh");
+                    pss.pin_pyramid(slug, tunnel_url);
+                }
+            }
+            Err(e) => {
+                tracing::warn!("failed to load pinned pyramids on startup: {}", e);
+            }
+        }
+        drop(reader);
+        Arc::new(tokio::sync::Mutex::new(pss))
+    };
+
     let state = Arc::new(AppState {
         auth: Arc::new(RwLock::new(initial_auth.clone())),
         sync_state: Arc::new(RwLock::new(
@@ -10383,6 +10416,7 @@ fn main() {
         config: Arc::new(RwLock::new(config.clone())),
         pyramid: pyramid_state,
         partner: partner_state,
+        pyramid_sync_state: pyramid_sync_state,
     });
 
     tauri::Builder::default()
@@ -10579,14 +10613,10 @@ fn main() {
             // --- Pyramid Sync Timer (WS-ONLINE-A) ---
             // Ticks every 60s checking for unpublished pyramid builds.
             // If a linked pyramid has a new completed build, auto-publishes to Wire.
+            // Uses shared pyramid_sync_state from AppState (also feeds WS-ONLINE-D).
             let sync_pyramid_state = state.pyramid.clone();
             let sync_tunnel_state = state.tunnel_state.clone();
-            let pyramid_sync_state = std::sync::Arc::new(
-                tokio::sync::Mutex::new(
-                    wire_node_lib::pyramid::sync::PyramidSyncState::new()
-                )
-            );
-            let pyramid_sync_state_shared = pyramid_sync_state.clone();
+            let pyramid_sync_state_shared = state.pyramid_sync_state.clone();
             tauri::async_runtime::spawn(async move {
                 // Wait for startup to complete before starting sync timer
                 tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
@@ -10603,6 +10633,34 @@ fn main() {
                         &sync_pyramid_state,
                         &pyramid_sync_state_shared,
                         tunnel_url,
+                    )
+                    .await;
+                }
+            });
+
+            // --- Pinned Pyramid Refresh Timer (WS-ONLINE-D) ---
+            // Ticks every 5 minutes checking pinned remote pyramids for new builds.
+            // If a remote build_id changed, re-pulls the full export into local SQLite.
+            let pinned_pyramid_state = state.pyramid.clone();
+            let pinned_sync_state = state.pyramid_sync_state.clone();
+            let pinned_auth_state = state.auth.clone();
+            tauri::async_runtime::spawn(async move {
+                // Wait for startup + tunnel establishment before first pinned refresh
+                tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+
+                let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(300));
+                interval.tick().await; // consume the immediate first tick
+                loop {
+                    interval.tick().await;
+                    // Read session JWT each tick (it may be refreshed between ticks)
+                    let wire_jwt = {
+                        let auth = pinned_auth_state.read().await;
+                        auth.api_token.clone().unwrap_or_default()
+                    };
+                    wire_node_lib::pyramid::sync::pinned_pyramid_refresh_tick(
+                        &pinned_pyramid_state,
+                        &pinned_sync_state,
+                        wire_jwt,
                     )
                     .await;
                 }

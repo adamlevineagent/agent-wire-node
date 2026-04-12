@@ -39,6 +39,8 @@ pub struct AppState {
     pub config: Arc<RwLock<WireNodeConfig>>,
     pub pyramid: Arc<pyramid::PyramidState>,
     pub partner: Arc<partner::PartnerState>,
+    /// Pyramid sync state for publication (WS-ONLINE-A) and pinned refresh (WS-ONLINE-D).
+    pub pyramid_sync_state: Arc<tokio::sync::Mutex<pyramid::sync::PyramidSyncState>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
