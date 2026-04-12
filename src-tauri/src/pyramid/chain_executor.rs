@@ -4011,13 +4011,34 @@ pub async fn execute_chain_from(
     });
     // Read the build strategy concurrency cap from the operational table.
     // Local mode sets this to 1 so Ollama (single-request) isn't overwhelmed.
-    let concurrency_cap = db_read(&state.reader, |conn| {
+    // Fallback: if the DB read fails, check if we're on a local provider
+    // and default to 1 — prevents Ollama from being overwhelmed even if
+    // the build_strategy table is missing or locked.
+    let concurrency_cap = match db_read(&state.reader, |conn| {
         db::read_build_strategy_concurrency(conn)
     })
     .await
-    .unwrap_or(None);
+    {
+        Ok(cap) => cap,
+        Err(e) => {
+            warn!("[CHAIN] failed to read build_strategy concurrency: {e}");
+            None
+        }
+    };
+    let concurrency_cap = concurrency_cap.or_else(|| {
+        // Fallback: if no build_strategy cap, check if the active provider
+        // is local (non-openrouter). Local providers serialize by default.
+        if let Some(ref registry) = llm_config.provider_registry {
+            let active = registry.active_provider_id();
+            if active != "openrouter" {
+                info!("[CHAIN] local provider '{}' detected, defaulting concurrency cap to 1", active);
+                return Some(1);
+            }
+        }
+        None
+    });
     if let Some(cap) = concurrency_cap {
-        info!("[CHAIN] build_strategy concurrency cap: {cap}");
+        info!("[CHAIN] concurrency cap: {cap}");
     }
 
     let dispatch_ctx = chain_dispatch::StepContext {
@@ -10883,11 +10904,27 @@ pub async fn execute_plan(
 
     // ── 5. Build dispatch context ────────────────────────────────────────
     // Read build strategy concurrency cap (local mode sets to 1).
-    let concurrency_cap = db_read(&state.reader, |conn| {
+    let concurrency_cap = match db_read(&state.reader, |conn| {
         db::read_build_strategy_concurrency(conn)
     })
     .await
-    .unwrap_or(None);
+    {
+        Ok(cap) => cap,
+        Err(e) => {
+            warn!("[IR] failed to read build_strategy concurrency: {e}");
+            None
+        }
+    };
+    let concurrency_cap = concurrency_cap.or_else(|| {
+        if let Some(ref registry) = llm_config.provider_registry {
+            let active = registry.active_provider_id();
+            if active != "openrouter" {
+                info!("[IR] local provider '{}' detected, defaulting concurrency cap to 1", active);
+                return Some(1);
+            }
+        }
+        None
+    });
 
     // Phase 12 verifier fix: `ir_build_id` already minted at the top
     // of the function so `llm_config.cache_access` is consistent with
