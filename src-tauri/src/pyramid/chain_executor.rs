@@ -6427,19 +6427,19 @@ async fn execute_for_each(
         hydrate_chunk_stub(&mut enriched_item, &ctx.chunks).await?;
 
         // Set up forEach loop variables on the context
-        ctx.current_item = Some(enriched_item);
+        ctx.current_item = Some(enriched_item.clone());
         ctx.current_index = Some(index);
 
         // Resolve step input using the context (handles $item, $index, $running_context, etc.)
         let resolved_input = if let Some(ref input) = step.input {
             ctx.resolve_value(input)?
         } else {
-            enrich_group_item_input(item, ctx)
+            enrich_group_item_input(&enriched_item, ctx)
         };
         // Strip `header_lines` directive and truncate chunk content fields.
         let resolved_input = apply_header_lines(resolved_input);
         let resolved_input =
-            enrich_for_each_step_input(step, resolved_input, item, ctx, reader).await?;
+            enrich_for_each_step_input(step, resolved_input, &enriched_item, ctx, reader).await?;
 
         // ── Oversized chunk splitting ───────────────────────────────────────
         if let Some(max_tokens) = step.max_input_tokens {
@@ -11422,7 +11422,7 @@ async fn execute_ir_parallel_foreach(
         ctx_for_input.current_item = Some(enriched_item.clone());
         ctx_for_input.current_index = Some(i);
         let resolved_input =
-            prepare_ir_resolved_input(step, resolved_input, Some(item), &ctx_for_input);
+            prepare_ir_resolved_input(step, resolved_input, Some(&enriched_item), &ctx_for_input);
 
         // Build system prompt with item context — resolve async context loaders before spawn
         let system_prompt = if step.context.iter().any(|c| c.loader.is_some()) {
