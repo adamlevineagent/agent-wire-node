@@ -66,6 +66,7 @@ pub mod migration_config;
 pub mod multi_chain_overlay;
 pub mod naming;
 pub mod parity;
+pub mod payment_redeemer;
 pub mod preview;
 pub mod primer;
 pub mod provider;

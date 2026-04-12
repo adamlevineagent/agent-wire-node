@@ -10298,6 +10298,19 @@ fn main() {
         });
     }
 
+    // WS-ONLINE-H: spawn payment token redemption sweeper.
+    //
+    // Expires stale unredeemed payment tokens (past their JWT TTL) and
+    // retries pending tokens with exponential backoff. Runs every 30s,
+    // matching the server-side token expiry cron cadence.
+    {
+        let ps = pyramid_state.clone();
+        tauri::async_runtime::spawn(async move {
+            wire_node_lib::pyramid::payment_redeemer::spawn_redemption_sweeper(ps).await;
+        });
+        tracing::info!("WS-ONLINE-H payment redemption sweeper spawned");
+    }
+
     // Phase 14: spawn the Wire update poller.
     //
     // Runs as a background tokio task that periodically asks the Wire

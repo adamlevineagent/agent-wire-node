@@ -37,6 +37,7 @@ use super::vine;
 use super::vocabulary;
 use super::recovery;
 use super::webbing;
+use super::payment_redeemer;
 use super::wire_import;
 use super::wire_publish;
 use super::PyramidState;
@@ -243,21 +244,16 @@ fn with_slug_read_auth(
 
 // ── Access Tier Enforcement (WS-ONLINE-E) ───────────────────────────
 
-/// Enforce access tier restrictions for a Wire JWT request (WS-ONLINE-E).
+/// Sync access tier check for non-billable routes. No payment enforcement.
 ///
-/// - `public`: allow (stamp only, no access price)
-/// - `circle-scoped`: extract circle_id from JWT, check against allowed_circles
-/// - `priced`: allow (cost preview shows price, payment handled in WS-ONLINE-H)
-/// - `embargoed`: reject all Wire JWT requests with 451
-///
-/// Local auth (desktop app) always passes — access tiers only restrict remote agents.
-/// Returns `Ok(())` if access is allowed, or an error `warp::reply::Response` to return.
-fn enforce_access_tier(
+/// Used by build_status, query_cost, absorption_config — routes that need
+/// embargo/circle checks but don't involve payment. Can safely be called
+/// while holding `&Connection` since it's synchronous.
+fn check_access_tier(
     conn: &rusqlite::Connection,
     slug: &str,
     auth_source: &AuthSource,
 ) -> Result<(), warp::reply::Response> {
-    // Local auth always bypasses access tier checks
     let (operator_id, circle_id) = match auth_source {
         AuthSource::Local => return Ok(()),
         AuthSource::WireJwt {
@@ -270,15 +266,147 @@ fn enforce_access_tier(
         db::get_access_tier(conn, slug).unwrap_or(("public".to_string(), None, None));
 
     match tier.as_str() {
-        "public" => Ok(()),
-        "priced" => Ok(()), // Payment enforcement in WS-ONLINE-H
+        "public" | "priced" => Ok(()),
+        "circle-scoped" => {
+            let caller_circle = match circle_id {
+                Some(c) if !c.is_empty() => c.as_str(),
+                _ => {
+                    return Err(json_error(
+                        warp::http::StatusCode::FORBIDDEN,
+                        "Access denied: this pyramid is circle-scoped and your JWT does not include a circle_id",
+                    ));
+                }
+            };
+            let circles: Vec<String> = allowed_circles
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or_default();
+            if circles.iter().any(|c| c == caller_circle) {
+                Ok(())
+            } else {
+                Err(json_error(
+                    warp::http::StatusCode::FORBIDDEN,
+                    "Access denied: your circle is not authorized for this pyramid",
+                ))
+            }
+        }
+        "embargoed" => Err(warp::http::Response::builder()
+            .status(451)
+            .header("content-type", "application/json")
+            .body(
+                serde_json::json!({
+                    "error": "This pyramid is embargoed and not available for remote access"
+                })
+                .to_string(),
+            )
+            .unwrap()
+            .into_response()),
+        _ => Err(json_error(
+            warp::http::StatusCode::FORBIDDEN,
+            &format!("Access denied: unknown access tier '{}'", tier),
+        )),
+    }
+}
+
+/// Pre-fetched access tier info for a pyramid. Read under DB lock, then passed
+/// to `enforce_access_tier` which runs without holding the lock (avoiding the
+/// `rusqlite::Connection is not Sync` Send error).
+struct AccessTierInfo {
+    tier: String,
+    #[allow(dead_code)]
+    price: Option<i64>,
+    allowed_circles: Option<String>,
+}
+
+/// Read access tier info from the DB. Call under the reader lock, then drop
+/// the lock before calling `enforce_access_tier`.
+fn read_access_tier(conn: &rusqlite::Connection, slug: &str) -> AccessTierInfo {
+    let (tier, price, circles) =
+        db::get_access_tier(conn, slug).unwrap_or(("public".to_string(), None, None));
+    AccessTierInfo {
+        tier,
+        price,
+        allowed_circles: circles,
+    }
+}
+
+/// Unified access + payment enforcement for all pyramid query routes (WS-ONLINE-E + WS-ONLINE-H).
+///
+/// One gate, one function. Access tier and payment are two aspects of the same concern:
+/// "who can query this pyramid, and have they paid if required?"
+///
+///   `public`        → allow, no payment needed → Ok(None)
+///   `circle-scoped` → check circle_id from JWT → Ok(None) or Err(403)
+///   `priced`        → require valid payment token if `payment_info` is Some → Ok(Some(claims)) or Err(402)
+///   `embargoed`     → reject → Err(451)
+///
+/// The `payment_info` parameter controls whether payment is enforced:
+///   - `Some(info)` → billable route: priced pyramids require valid X-Payment-Token
+///   - `None`       → non-billable route (cost preview, build status, etc.): priced pyramids allow access without payment
+///
+/// Local auth (desktop app) always bypasses both access and payment checks.
+///
+/// Takes pre-fetched `AccessTierInfo` (via `read_access_tier`) instead of `&Connection`
+/// to avoid holding a `rusqlite::Connection` reference across `.await` points (which
+/// would violate Send bounds since `Connection` is not `Sync`).
+async fn enforce_access_tier(
+    tier_info: &AccessTierInfo,
+    auth_source: &AuthSource,
+    payment_info: Option<&PaymentInfo>,
+) -> Result<Option<crate::server::PaymentTokenClaims>, warp::reply::Response> {
+    // Local auth always bypasses access tier + payment checks
+    let (operator_id, circle_id) = match auth_source {
+        AuthSource::Local => return Ok(None),
+        AuthSource::WireJwt {
+            operator_id,
+            circle_id,
+        } => (operator_id, circle_id),
+    };
+
+    match tier_info.tier.as_str() {
+        "public" => Ok(None),
+        "priced" => {
+            let pi = match payment_info {
+                // Non-billable route on a priced pyramid (e.g., cost preview, build status).
+                // Access is allowed without payment.
+                None => return Ok(None),
+                Some(pi) => pi,
+            };
+
+            // Billable route on a priced pyramid — payment token required.
+            let claims = validate_payment_token(
+                &pi.token,
+                auth_source,
+                &pi.jwt_public_key,
+                &pi.node_id,
+            )
+            .await;
+
+            match claims {
+                Some(c) => Ok(Some(c)),
+                None => {
+                    let msg = if pi.token.as_ref().map_or(true, |t| t.is_empty()) {
+                        "Payment required: this pyramid requires a valid X-Payment-Token header"
+                    } else {
+                        "Invalid or expired payment token"
+                    };
+                    tracing::warn!(
+                        operator_id = %operator_id,
+                        "Priced pyramid payment enforcement: {}", msg
+                    );
+                    Err(json_error(
+                        warp::http::StatusCode::PAYMENT_REQUIRED,
+                        msg,
+                    ))
+                }
+            }
+        }
         "circle-scoped" => {
             let caller_circle = match circle_id {
                 Some(c) if !c.is_empty() => c.as_str(),
                 _ => {
                     tracing::warn!(
                         operator_id = %operator_id,
-                        slug = %slug,
                         "Circle-scoped pyramid access denied: no circle_id in JWT"
                     );
                     return Err(json_error(
@@ -289,17 +417,17 @@ fn enforce_access_tier(
             };
 
             // Parse allowed_circles as JSON array
-            let circles: Vec<String> = allowed_circles
+            let circles: Vec<String> = tier_info
+                .allowed_circles
                 .as_deref()
                 .and_then(|s| serde_json::from_str(s).ok())
                 .unwrap_or_default();
 
             if circles.iter().any(|c| c == caller_circle) {
-                Ok(())
+                Ok(None)
             } else {
                 tracing::warn!(
                     operator_id = %operator_id,
-                    slug = %slug,
                     circle_id = %caller_circle,
                     "Circle-scoped pyramid access denied: circle not in allowed_circles"
                 );
@@ -312,7 +440,6 @@ fn enforce_access_tier(
         "embargoed" => {
             tracing::info!(
                 operator_id = %operator_id,
-                slug = %slug,
                 "Embargoed pyramid access denied"
             );
             Err(warp::http::Response::builder()
@@ -330,7 +457,6 @@ fn enforce_access_tier(
         unknown => {
             tracing::warn!(
                 operator_id = %operator_id,
-                slug = %slug,
                 tier = %unknown,
                 "Unknown access tier — rejecting request"
             );
@@ -612,42 +738,55 @@ fn with_agent_id() -> impl Filter<Extract = (Option<String>,), Error = warp::Rej
     warp::header::optional::<String>("x-agent-id")
 }
 
-// ── Payment token header filter (WS-ONLINE-H) ──────────────────────
+// ── Payment token filter & context (WS-ONLINE-H) ───────────────────
 
-#[allow(dead_code)] // WS-ONLINE-H: used when payment enforcement is enabled
-fn with_payment_token() -> impl Filter<Extract = (Option<String>,), Error = warp::Rejection> + Clone
-{
-    warp::header::optional::<String>("x-payment-token")
+/// Payment context for billable query handlers.
+///
+/// Bundles the X-Payment-Token header value with the cryptographic keys needed
+/// to validate it. Passed to `enforce_access_tier` as `Some(&PaymentInfo)` for
+/// billable routes, or omitted (`None`) for non-billable routes.
+#[derive(Clone)]
+pub struct PaymentInfo {
+    pub token: Option<String>,
+    pub jwt_public_key: Arc<tokio::sync::RwLock<String>>,
+    pub node_id: Arc<tokio::sync::RwLock<String>>,
+}
+
+/// Warp filter that extracts the X-Payment-Token header and bundles it with
+/// the JWT public key and node_id needed for validation.
+fn with_payment_info(
+    jwt_public_key: Arc<tokio::sync::RwLock<String>>,
+    node_id: Arc<tokio::sync::RwLock<String>>,
+) -> impl Filter<Extract = (PaymentInfo,), Error = warp::Rejection> + Clone {
+    let key = jwt_public_key;
+    let nid = node_id;
+    warp::header::optional::<String>("x-payment-token").map(move |token: Option<String>| {
+        PaymentInfo {
+            token,
+            jwt_public_key: key.clone(),
+            node_id: nid.clone(),
+        }
+    })
 }
 
 // ── Payment token validation helper (WS-ONLINE-H) ──────────────────
 //
-// Called by billable query handlers after access tier enforcement passes.
-// For now, logs the payment token but does NOT enforce (returns Ok even on failure).
-// Full enforcement (reject queries without valid payment token) will be enabled
-// when the Wire server payment-intent/redeem endpoints are live.
+// Called by enforce_access_tier for priced pyramids on billable routes.
+// Returns Some(claims) on valid token, None if missing or invalid.
 
 /// Validate an X-Payment-Token header if present (WS-ONLINE-H).
 ///
 /// For Wire JWT authenticated requests, checks whether the request includes
-/// a payment token and logs validation results. Does NOT enforce — queries
-/// proceed regardless of payment token validity. The returned `Option<String>`
-/// contains the nonce from a valid token (for future redeem calls).
+/// a valid payment token and returns the decoded claims for downstream use
+/// (insert-before-serve replay protection + fire_and_forget_redeem).
 ///
-/// ### WS-ONLINE-H ENFORCEMENT POINT ###
-/// Payment-intent/redeem endpoints are now live on prod. This function should be
-/// activated to enforce payment for priced pyramid queries. Steps:
-/// 1. Require valid payment token for all priced pyramid queries
-/// 2. After query execution, call POST /api/v1/wire/payment-redeem with the token
-/// 3. On redeem failure, store in pyramid_unredeemed_tokens for retry
+/// Pillar 9 resolved: stamps are flat 1-credit p2p transfers (infrastructure
+/// compensation), NOT UFF-routed. Only access pricing routes through UFF
+/// via walkChainAndPay on the Wire server.
 ///
-/// TODO(Pillar-9): Verify that payment-escrow.ts:redeemToken() routes through
-/// the 80-slot rotator arm per Pillar 9, not a direct credit transfer. The p2p
-/// CDN economy (stamps) may not be part of UFF — this needs design clarity.
-///
-/// TODO(Pillar-23): Cost estimation for remote queries needs to unify local
-/// estimation with Wire-side pricing. Punt until local/wire cost model is settled.
-#[allow(dead_code)] // WS-ONLINE-H: used when payment enforcement is enabled
+/// Pillar 23 resolved: node's GET /query-cost is advisory pre-flight;
+/// Wire server's payment-intent is binding/authoritative. Pricing stays
+/// aligned via sync, not unification.
 async fn validate_payment_token(
     payment_token_header: &Option<String>,
     auth_source: &AuthSource,
@@ -663,10 +802,9 @@ async fn validate_payment_token(
     let token = match payment_token_header {
         Some(t) if !t.is_empty() => t,
         _ => {
-            // No payment token present — this is fine for now (not enforced yet)
             tracing::trace!(
                 operator_id = %operator_id,
-                "No X-Payment-Token header (WS-ONLINE-H: not yet enforced)"
+                "No X-Payment-Token header present"
             );
             return None;
         }
@@ -696,11 +834,88 @@ async fn validate_payment_token(
             tracing::warn!(
                 operator_id = %operator_id,
                 error = %e,
-                "Invalid payment token (WS-ONLINE-H: not enforced, logging only)"
+                "Invalid payment token (WS-ONLINE-H)"
             );
-            // ### WS-ONLINE-H ENFORCEMENT POINT ###
-            // When enforcing, return an error response here instead of None
             None
+        }
+    }
+}
+
+// ── Payment settlement helpers (WS-ONLINE-H) ───────────────────────
+//
+// These two helpers implement the insert-before-serve + fire-and-forget
+// pattern used by all billable handlers. Centralizing here prevents each
+// of the 11 billable handlers from duplicating the logic.
+
+/// Insert payment nonce into pyramid_unredeemed_tokens BEFORE serving the query.
+///
+/// The UNIQUE constraint on nonce prevents replay attacks — a second query with
+/// the same payment token will fail the insert and be rejected with 409 Conflict.
+///
+/// Returns `Ok(())` on first use, `Err(Response)` on replay or DB error.
+async fn payment_insert_before_serve(
+    state: &Arc<PyramidState>,
+    claims: &crate::server::PaymentTokenClaims,
+    payment_info: &PaymentInfo,
+    auth_source: &AuthSource,
+    slug: &str,
+    query_type: &str,
+) -> Result<(), warp::reply::Response> {
+    let op_id = match auth_source {
+        AuthSource::WireJwt { operator_id, .. } => operator_id.as_str(),
+        _ => "",
+    };
+    let w = state.writer.lock().await;
+    payment_redeemer::insert_before_serve(
+        &w,
+        claims,
+        payment_info.token.as_deref().unwrap_or(""),
+        op_id,
+        slug,
+        query_type,
+    )
+    .map_err(|e| json_error(warp::http::StatusCode::CONFLICT, &e))?;
+    Ok(())
+}
+
+/// Fire-and-forget: spawn async payment redemption after serving a query.
+///
+/// The token was already inserted into pyramid_unredeemed_tokens by
+/// `payment_insert_before_serve`. This function updates the status to 'redeemed'
+/// on success, or leaves it as 'pending' for the background sweeper on transient
+/// failure, or marks it 'failed' on permanent failure.
+fn payment_settle(
+    state: Arc<PyramidState>,
+    claims: crate::server::PaymentTokenClaims,
+    payment_info: &PaymentInfo,
+    slug: String,
+    query_type: &str,
+) {
+    let nonce = claims.nonce.unwrap_or_default();
+    let token = payment_info.token.clone().unwrap_or_default();
+    let wire_url =
+        std::env::var("WIRE_URL").unwrap_or_else(|_| "https://newsbleach.com".to_string());
+    let qt = query_type.to_string();
+    tokio::spawn(async move {
+        payment_redeemer::fire_and_forget_redeem(state, wire_url, nonce, token, slug, qt).await;
+    });
+}
+
+/// Abort payment when a query fails AFTER insert-before-serve recorded the nonce.
+///
+/// Marks the token as 'failed' so the sweeper won't redeem it. The buyer's
+/// credits auto-release on TTL expiry at the Wire server. Without this,
+/// the sweeper would redeem the token and the operator would collect payment
+/// for a query that returned 404 or 500.
+fn payment_abort(state: &Arc<PyramidState>, payment_claims: &Option<crate::server::PaymentTokenClaims>) {
+    if let Some(claims) = payment_claims {
+        if let Some(nonce) = &claims.nonce {
+            let nonce = nonce.clone();
+            let ps = state.clone();
+            tokio::spawn(async move {
+                let conn = ps.writer.lock().await;
+                let _ = db::mark_unredeemed_failed(&conn, &nonce);
+            });
         }
     }
 }
@@ -855,7 +1070,7 @@ pub fn pyramid_routes(
         .and(with_auth_state(state.clone()))
         .and_then(handle_build));
 
-    // REMOTE-SAFE: GET /pyramid/:slug/apex — read-only, dual auth + access tier (WS-ONLINE-E)
+    // REMOTE-SAFE: GET /pyramid/:slug/apex — read-only, dual auth + access tier + payment (WS-ONLINE-E/H)
     let apex = route!(prefix
         .and(warp::path::param::<String>())
         .and(warp::path("apex"))
@@ -863,9 +1078,10 @@ pub fn pyramid_routes(
         .and(warp::get())
         .and(with_slug_read_auth(state.clone(), jwt_public_key.clone()))
         .and(with_agent_id())
+        .and(with_payment_info(jwt_public_key.clone(), node_id.clone()))
         .and_then(handle_apex));
 
-    // REMOTE-SAFE: GET /pyramid/:slug/node/:id — read-only, dual auth + access tier (WS-ONLINE-E)
+    // REMOTE-SAFE: GET /pyramid/:slug/node/:id — read-only, dual auth + access tier + payment (WS-ONLINE-E/H)
     let node = route!(prefix
         .and(warp::path::param::<String>())
         .and(warp::path("node"))
@@ -874,19 +1090,21 @@ pub fn pyramid_routes(
         .and(warp::get())
         .and(with_slug_read_auth(state.clone(), jwt_public_key.clone()))
         .and(with_agent_id())
+        .and(with_payment_info(jwt_public_key.clone(), node_id.clone()))
         .and_then(handle_node));
 
-    // REMOTE-SAFE: GET /pyramid/:slug/tree — read-only, dual auth + access tier (WS-ONLINE-E)
+    // REMOTE-SAFE: GET /pyramid/:slug/tree — read-only, dual auth + access tier + payment (WS-ONLINE-E/H)
     let tree = route!(prefix
         .and(warp::path::param::<String>())
         .and(warp::path("tree"))
         .and(warp::path::end())
         .and(warp::get())
         .and(with_slug_read_auth(state.clone(), jwt_public_key.clone()))
+        .and(with_payment_info(jwt_public_key.clone(), node_id.clone()))
         .and_then(handle_tree));
 
     // REMOTE-SAFE: GET /pyramid/:slug/drill/:id?from=search — read-only,
-    // dual auth + access tier (WS-ONLINE-E). Phase 18b L7 added the
+    // dual auth + access tier + payment (WS-ONLINE-E/H). Phase 18b L7 added the
     // optional `from` query param so the frontend can flag a drill as
     // originating from a search result, which triggers `search_hit`
     // demand signal recording in addition to the standard `user_drill`.
@@ -899,9 +1117,10 @@ pub fn pyramid_routes(
         .and(with_slug_read_auth(state.clone(), jwt_public_key.clone()))
         .and(warp::query::<DrillQuery>())
         .and(with_agent_id())
+        .and(with_payment_info(jwt_public_key.clone(), node_id.clone()))
         .and_then(handle_drill));
 
-    // REMOTE-SAFE: GET /pyramid/:slug/search?q=term — read-only, dual auth
+    // REMOTE-SAFE: GET /pyramid/:slug/search?q=term — read-only, dual auth + payment (WS-ONLINE-E/H)
     let search = route!(prefix
         .and(warp::path::param::<String>())
         .and(warp::path("search"))
@@ -910,42 +1129,47 @@ pub fn pyramid_routes(
         .and(with_slug_read_auth(state.clone(), jwt_public_key.clone()))
         .and(warp::query::<SearchQuery>())
         .and(with_agent_id())
+        .and(with_payment_info(jwt_public_key.clone(), node_id.clone()))
         .and_then(handle_search));
 
-    // REMOTE-SAFE: GET /pyramid/:slug/entities — read-only, dual auth + access tier (WS-ONLINE-E)
+    // REMOTE-SAFE: GET /pyramid/:slug/entities — read-only, dual auth + access tier + payment (WS-ONLINE-E/H)
     let entities = route!(prefix
         .and(warp::path::param::<String>())
         .and(warp::path("entities"))
         .and(warp::path::end())
         .and(warp::get())
         .and(with_slug_read_auth(state.clone(), jwt_public_key.clone()))
+        .and(with_payment_info(jwt_public_key.clone(), node_id.clone()))
         .and_then(handle_entities));
 
-    // REMOTE-SAFE: GET /pyramid/:slug/resolved — read-only, dual auth + access tier (WS-ONLINE-E)
+    // REMOTE-SAFE: GET /pyramid/:slug/resolved — read-only, dual auth + access tier + payment (WS-ONLINE-E/H)
     let resolved = route!(prefix
         .and(warp::path::param::<String>())
         .and(warp::path("resolved"))
         .and(warp::path::end())
         .and(warp::get())
         .and(with_slug_read_auth(state.clone(), jwt_public_key.clone()))
+        .and(with_payment_info(jwt_public_key.clone(), node_id.clone()))
         .and_then(handle_resolved));
 
-    // REMOTE-SAFE: GET /pyramid/:slug/corrections — read-only, dual auth + access tier (WS-ONLINE-E)
+    // REMOTE-SAFE: GET /pyramid/:slug/corrections — read-only, dual auth + access tier + payment (WS-ONLINE-E/H)
     let corrections = route!(prefix
         .and(warp::path::param::<String>())
         .and(warp::path("corrections"))
         .and(warp::path::end())
         .and(warp::get())
         .and(with_slug_read_auth(state.clone(), jwt_public_key.clone()))
+        .and(with_payment_info(jwt_public_key.clone(), node_id.clone()))
         .and_then(handle_corrections));
 
-    // REMOTE-SAFE: GET /pyramid/:slug/terms — read-only, dual auth + access tier (WS-ONLINE-E)
+    // REMOTE-SAFE: GET /pyramid/:slug/terms — read-only, dual auth + access tier + payment (WS-ONLINE-E/H)
     let terms = route!(prefix
         .and(warp::path::param::<String>())
         .and(warp::path("terms"))
         .and(warp::path::end())
         .and(warp::get())
         .and(with_slug_read_auth(state.clone(), jwt_public_key.clone()))
+        .and(with_payment_info(jwt_public_key.clone(), node_id.clone()))
         .and_then(handle_terms));
 
     // POST /pyramid/:slug/ingest
@@ -976,13 +1200,14 @@ pub fn pyramid_routes(
         .and(with_auth_state(state.clone()))
         .and_then(handle_config_profile));
 
-    // REMOTE-SAFE: GET /pyramid/:slug/threads — read-only, dual auth
+    // REMOTE-SAFE: GET /pyramid/:slug/threads — read-only, dual auth + payment (WS-ONLINE-E/H)
     let threads = route!(prefix
         .and(warp::path::param::<String>())
         .and(warp::path("threads"))
         .and(warp::path::end())
         .and(warp::get())
         .and(with_slug_read_auth(state.clone(), jwt_public_key.clone()))
+        .and(with_payment_info(jwt_public_key.clone(), node_id.clone()))
         .and_then(handle_threads));
 
     // LOCAL-ONLY: POST /pyramid/:slug/annotate — mutation, local auth only
@@ -1452,6 +1677,7 @@ pub fn pyramid_routes(
         .and(warp::get())
         .and(with_dual_auth(state.clone(), jwt_public_key.clone()))
         .and(warp::any().map(move || export_rl.clone()))
+        .and(with_payment_info(jwt_public_key.clone(), node_id.clone()))
         .and_then(handle_export));
 
     // REMOTE-SAFE: GET /pyramid/:slug/question-tree — read-only, dual auth
@@ -2690,33 +2916,52 @@ async fn handle_apex(
     slug_name: String,
     (state, auth_source): (Arc<PyramidState>, AuthSource),
     agent_id: Option<String>,
+    payment_info: PaymentInfo,
 ) -> Result<warp::reply::Response, warp::Rejection> {
-    let conn = state.reader.lock().await;
-    // WS-ONLINE-E: Access tier enforcement for remote queries
-    if let Err(response) = enforce_access_tier(&conn, &slug_name, &auth_source) {
-        return Ok(response);
+    let tier_info = {
+        let conn = state.reader.lock().await;
+        read_access_tier(&conn, &slug_name)
+    };
+    let payment_claims = match enforce_access_tier(&tier_info, &auth_source, Some(&payment_info)).await {
+        Ok(c) => c,
+        Err(response) => return Ok(response),
+    };
+    if let Some(ref claims) = payment_claims {
+        if let Err(response) = payment_insert_before_serve(&state, claims, &payment_info, &auth_source, &slug_name, "apex").await {
+            return Ok(response);
+        }
     }
+    let conn = state.reader.lock().await;
     match query::get_apex_with_edges(&conn, &slug_name) {
         Ok(Some(node)) => {
             let response = json_ok(&node);
             log_query_usage(
                 state.writer.clone(),
-                slug_name,
+                slug_name.clone(),
                 "apex".to_string(),
                 "{}".to_string(),
                 vec![node.node.id.clone()],
                 agent_id,
             );
+            if let Some(claims) = payment_claims {
+                payment_settle(state.clone(), claims, &payment_info, slug_name, "apex");
+            }
             Ok(response)
         }
-        Ok(None) => Ok(json_error(
-            warp::http::StatusCode::NOT_FOUND,
-            "No apex node found",
-        )),
-        Err(e) => Ok(json_error(
-            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
-            &e.to_string(),
-        )),
+        Ok(None) => {
+            payment_abort(&state, &payment_claims);
+            Ok(json_error(
+                warp::http::StatusCode::NOT_FOUND,
+                "No apex node found",
+            ))
+        }
+        Err(e) => {
+            payment_abort(&state, &payment_claims);
+            Ok(json_error(
+                warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                &e.to_string(),
+            ))
+        }
     }
 }
 
@@ -2725,51 +2970,88 @@ async fn handle_node(
     node_id: String,
     (state, auth_source): (Arc<PyramidState>, AuthSource),
     agent_id: Option<String>,
+    payment_info: PaymentInfo,
 ) -> Result<warp::reply::Response, warp::Rejection> {
-    let conn = state.reader.lock().await;
-    // WS-ONLINE-E: Access tier enforcement for remote queries
-    if let Err(response) = enforce_access_tier(&conn, &slug_name, &auth_source) {
-        return Ok(response);
+    let tier_info = {
+        let conn = state.reader.lock().await;
+        read_access_tier(&conn, &slug_name)
+    };
+    let payment_claims = match enforce_access_tier(&tier_info, &auth_source, Some(&payment_info)).await {
+        Ok(c) => c,
+        Err(response) => return Ok(response),
+    };
+    if let Some(ref claims) = payment_claims {
+        if let Err(response) = payment_insert_before_serve(&state, claims, &payment_info, &auth_source, &slug_name, "node").await {
+            return Ok(response);
+        }
     }
+    let conn = state.reader.lock().await;
     match query::get_node_with_edges(&conn, &slug_name, &node_id) {
         Ok(Some(node)) => {
             let response = json_ok(&node);
             log_query_usage(
                 state.writer.clone(),
-                slug_name,
+                slug_name.clone(),
                 "node".to_string(),
                 serde_json::json!({"node_id": node_id}).to_string(),
                 vec![node.node.id.clone()],
                 agent_id,
             );
+            if let Some(claims) = payment_claims {
+                payment_settle(state.clone(), claims, &payment_info, slug_name, "node");
+            }
             Ok(response)
         }
-        Ok(None) => Ok(json_error(
-            warp::http::StatusCode::NOT_FOUND,
-            "Node not found",
-        )),
-        Err(e) => Ok(json_error(
-            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
-            &e.to_string(),
-        )),
+        Ok(None) => {
+            payment_abort(&state, &payment_claims);
+            Ok(json_error(
+                warp::http::StatusCode::NOT_FOUND,
+                "Node not found",
+            ))
+        }
+        Err(e) => {
+            payment_abort(&state, &payment_claims);
+            Ok(json_error(
+                warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                &e.to_string(),
+            ))
+        }
     }
 }
 
 async fn handle_tree(
     slug_name: String,
     (state, auth_source): (Arc<PyramidState>, AuthSource),
+    payment_info: PaymentInfo,
 ) -> Result<warp::reply::Response, warp::Rejection> {
-    let conn = state.reader.lock().await;
-    // WS-ONLINE-E: Access tier enforcement for remote queries
-    if let Err(response) = enforce_access_tier(&conn, &slug_name, &auth_source) {
-        return Ok(response);
+    let tier_info = {
+        let conn = state.reader.lock().await;
+        read_access_tier(&conn, &slug_name)
+    };
+    let payment_claims = match enforce_access_tier(&tier_info, &auth_source, Some(&payment_info)).await {
+        Ok(c) => c,
+        Err(response) => return Ok(response),
+    };
+    if let Some(ref claims) = payment_claims {
+        if let Err(response) = payment_insert_before_serve(&state, claims, &payment_info, &auth_source, &slug_name, "tree").await {
+            return Ok(response);
+        }
     }
+    let conn = state.reader.lock().await;
     match query::get_tree(&conn, &slug_name) {
-        Ok(tree) => Ok(json_ok(&tree)),
-        Err(e) => Ok(json_error(
-            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
-            &e.to_string(),
-        )),
+        Ok(tree) => {
+            if let Some(claims) = payment_claims {
+                payment_settle(state.clone(), claims, &payment_info, slug_name.clone(), "tree");
+            }
+            Ok(json_ok(&tree))
+        }
+        Err(e) => {
+            payment_abort(&state, &payment_claims);
+            Ok(json_error(
+                warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                &e.to_string(),
+            ))
+        }
     }
 }
 
@@ -2779,12 +3061,22 @@ async fn handle_drill(
     (state, auth_source): (Arc<PyramidState>, AuthSource),
     drill_query: DrillQuery,
     agent_id: Option<String>,
+    payment_info: PaymentInfo,
 ) -> Result<warp::reply::Response, warp::Rejection> {
-    let conn = state.reader.lock().await;
-    // WS-ONLINE-E: Access tier enforcement for remote queries
-    if let Err(response) = enforce_access_tier(&conn, &slug_name, &auth_source) {
-        return Ok(response);
+    let tier_info = {
+        let conn = state.reader.lock().await;
+        read_access_tier(&conn, &slug_name)
+    };
+    let payment_claims = match enforce_access_tier(&tier_info, &auth_source, Some(&payment_info)).await {
+        Ok(c) => c,
+        Err(response) => return Ok(response),
+    };
+    if let Some(ref claims) = payment_claims {
+        if let Err(response) = payment_insert_before_serve(&state, claims, &payment_info, &auth_source, &slug_name, "drill").await {
+            return Ok(response);
+        }
     }
+    let conn = state.reader.lock().await;
     match query::drill(&conn, &slug_name, &node_id) {
         Ok(Some(result)) => {
             let response = json_ok(&result);
@@ -2850,22 +3142,31 @@ async fn handle_drill(
 
             log_query_usage(
                 state.writer.clone(),
-                slug_name,
+                slug_name.clone(),
                 "drill".to_string(),
                 serde_json::json!({"node_id": node_id, "from": drill_query.from}).to_string(),
                 ids,
                 agent_id,
             );
+            if let Some(claims) = payment_claims {
+                payment_settle(state.clone(), claims, &payment_info, slug_name, "drill");
+            }
             Ok(response)
         }
-        Ok(None) => Ok(json_error(
-            warp::http::StatusCode::NOT_FOUND,
-            "Node not found",
-        )),
-        Err(e) => Ok(json_error(
-            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
-            &e.to_string(),
-        )),
+        Ok(None) => {
+            payment_abort(&state, &payment_claims);
+            Ok(json_error(
+                warp::http::StatusCode::NOT_FOUND,
+                "Node not found",
+            ))
+        }
+        Err(e) => {
+            payment_abort(&state, &payment_claims);
+            Ok(json_error(
+                warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                &e.to_string(),
+            ))
+        }
     }
 }
 
@@ -2874,17 +3175,30 @@ async fn handle_search(
     (state, auth_source): (Arc<PyramidState>, AuthSource),
     params: SearchQuery,
     agent_id: Option<String>,
+    payment_info: PaymentInfo,
 ) -> Result<warp::reply::Response, warp::Rejection> {
+    // Access tier + payment enforcement
+    let tier_info = {
+        let conn = state.reader.lock().await;
+        read_access_tier(&conn, &slug_name)
+    };
+    let payment_claims = match enforce_access_tier(&tier_info, &auth_source, Some(&payment_info)).await {
+        Ok(c) => c,
+        Err(response) => return Ok(response),
+    };
+    if let Some(ref claims) = payment_claims {
+        if let Err(response) = payment_insert_before_serve(&state, claims, &payment_info, &auth_source, &slug_name, "search").await {
+            return Ok(response);
+        }
+    }
     // Initial search with reader lock
     let hits = {
         let conn = state.reader.lock().await;
-        // WS-ONLINE-E: Access tier enforcement for remote queries
-        if let Err(response) = enforce_access_tier(&conn, &slug_name, &auth_source) {
-            return Ok(response);
-        }
         match query::search(&conn, &slug_name, &params.q) {
             Ok(h) => h,
             Err(e) => {
+                drop(conn);
+                payment_abort(&state, &payment_claims);
                 return Ok(json_error(
                     warp::http::StatusCode::INTERNAL_SERVER_ERROR,
                     &e.to_string(),
@@ -2935,12 +3249,16 @@ async fn handle_search(
 
                     log_query_usage(
                         state.writer.clone(),
-                        slug_name,
+                        slug_name.clone(),
                         "search".to_string(),
                         serde_json::json!({"q": params.q, "semantic_rewrite": true}).to_string(),
                         ids,
                         agent_id,
                     );
+
+                    if let Some(claims) = payment_claims {
+                        payment_settle(state.clone(), claims, &payment_info, slug_name, "search");
+                    }
 
                     let response_json = serde_json::json!({
                         "results": all_hits,
@@ -2962,12 +3280,15 @@ async fn handle_search(
     let ids: Vec<String> = hits.iter().map(|h| h.node_id.clone()).collect();
     log_query_usage(
         state.writer.clone(),
-        slug_name,
+        slug_name.clone(),
         "search".to_string(),
         serde_json::json!({"q": params.q}).to_string(),
         ids,
         agent_id,
     );
+    if let Some(claims) = payment_claims {
+        payment_settle(state.clone(), claims, &payment_info, slug_name, "search");
+    }
     Ok(response)
 }
 
@@ -2990,72 +3311,144 @@ async fn handle_usage(
 async fn handle_entities(
     slug_name: String,
     (state, auth_source): (Arc<PyramidState>, AuthSource),
+    payment_info: PaymentInfo,
 ) -> Result<warp::reply::Response, warp::Rejection> {
-    let conn = state.reader.lock().await;
-    // WS-ONLINE-E: Access tier enforcement for remote queries
-    if let Err(response) = enforce_access_tier(&conn, &slug_name, &auth_source) {
-        return Ok(response);
+    let tier_info = {
+        let conn = state.reader.lock().await;
+        read_access_tier(&conn, &slug_name)
+    };
+    let payment_claims = match enforce_access_tier(&tier_info, &auth_source, Some(&payment_info)).await {
+        Ok(c) => c,
+        Err(response) => return Ok(response),
+    };
+    if let Some(ref claims) = payment_claims {
+        if let Err(response) = payment_insert_before_serve(&state, claims, &payment_info, &auth_source, &slug_name, "entities").await {
+            return Ok(response);
+        }
     }
+    let conn = state.reader.lock().await;
     match query::entities(&conn, &slug_name) {
-        Ok(entries) => Ok(json_ok(&entries)),
-        Err(e) => Ok(json_error(
-            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
-            &e.to_string(),
-        )),
+        Ok(entries) => {
+            if let Some(claims) = payment_claims {
+                payment_settle(state.clone(), claims, &payment_info, slug_name.clone(), "entities");
+            }
+            Ok(json_ok(&entries))
+        }
+        Err(e) => {
+            payment_abort(&state, &payment_claims);
+            Ok(json_error(
+                warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                &e.to_string(),
+            ))
+        }
     }
 }
 
 async fn handle_resolved(
     slug_name: String,
     (state, auth_source): (Arc<PyramidState>, AuthSource),
+    payment_info: PaymentInfo,
 ) -> Result<warp::reply::Response, warp::Rejection> {
-    let conn = state.reader.lock().await;
-    // WS-ONLINE-E: Access tier enforcement for remote queries
-    if let Err(response) = enforce_access_tier(&conn, &slug_name, &auth_source) {
-        return Ok(response);
+    let tier_info = {
+        let conn = state.reader.lock().await;
+        read_access_tier(&conn, &slug_name)
+    };
+    let payment_claims = match enforce_access_tier(&tier_info, &auth_source, Some(&payment_info)).await {
+        Ok(c) => c,
+        Err(response) => return Ok(response),
+    };
+    if let Some(ref claims) = payment_claims {
+        if let Err(response) = payment_insert_before_serve(&state, claims, &payment_info, &auth_source, &slug_name, "resolved").await {
+            return Ok(response);
+        }
     }
+    let conn = state.reader.lock().await;
     match query::resolved(&conn, &slug_name) {
-        Ok(entries) => Ok(json_ok(&entries)),
-        Err(e) => Ok(json_error(
-            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
-            &e.to_string(),
-        )),
+        Ok(entries) => {
+            if let Some(claims) = payment_claims {
+                payment_settle(state.clone(), claims, &payment_info, slug_name.clone(), "resolved");
+            }
+            Ok(json_ok(&entries))
+        }
+        Err(e) => {
+            payment_abort(&state, &payment_claims);
+            Ok(json_error(
+                warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                &e.to_string(),
+            ))
+        }
     }
 }
 
 async fn handle_corrections(
     slug_name: String,
     (state, auth_source): (Arc<PyramidState>, AuthSource),
+    payment_info: PaymentInfo,
 ) -> Result<warp::reply::Response, warp::Rejection> {
-    let conn = state.reader.lock().await;
-    // WS-ONLINE-E: Access tier enforcement for remote queries
-    if let Err(response) = enforce_access_tier(&conn, &slug_name, &auth_source) {
-        return Ok(response);
+    let tier_info = {
+        let conn = state.reader.lock().await;
+        read_access_tier(&conn, &slug_name)
+    };
+    let payment_claims = match enforce_access_tier(&tier_info, &auth_source, Some(&payment_info)).await {
+        Ok(c) => c,
+        Err(response) => return Ok(response),
+    };
+    if let Some(ref claims) = payment_claims {
+        if let Err(response) = payment_insert_before_serve(&state, claims, &payment_info, &auth_source, &slug_name, "corrections").await {
+            return Ok(response);
+        }
     }
+    let conn = state.reader.lock().await;
     match query::corrections(&conn, &slug_name) {
-        Ok(entries) => Ok(json_ok(&entries)),
-        Err(e) => Ok(json_error(
-            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
-            &e.to_string(),
-        )),
+        Ok(entries) => {
+            if let Some(claims) = payment_claims {
+                payment_settle(state.clone(), claims, &payment_info, slug_name.clone(), "corrections");
+            }
+            Ok(json_ok(&entries))
+        }
+        Err(e) => {
+            payment_abort(&state, &payment_claims);
+            Ok(json_error(
+                warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                &e.to_string(),
+            ))
+        }
     }
 }
 
 async fn handle_terms(
     slug_name: String,
     (state, auth_source): (Arc<PyramidState>, AuthSource),
+    payment_info: PaymentInfo,
 ) -> Result<warp::reply::Response, warp::Rejection> {
-    let conn = state.reader.lock().await;
-    // WS-ONLINE-E: Access tier enforcement for remote queries
-    if let Err(response) = enforce_access_tier(&conn, &slug_name, &auth_source) {
-        return Ok(response);
+    let tier_info = {
+        let conn = state.reader.lock().await;
+        read_access_tier(&conn, &slug_name)
+    };
+    let payment_claims = match enforce_access_tier(&tier_info, &auth_source, Some(&payment_info)).await {
+        Ok(c) => c,
+        Err(response) => return Ok(response),
+    };
+    if let Some(ref claims) = payment_claims {
+        if let Err(response) = payment_insert_before_serve(&state, claims, &payment_info, &auth_source, &slug_name, "terms").await {
+            return Ok(response);
+        }
     }
+    let conn = state.reader.lock().await;
     match query::terms(&conn, &slug_name) {
-        Ok(entries) => Ok(json_ok(&entries)),
-        Err(e) => Ok(json_error(
-            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
-            &e.to_string(),
-        )),
+        Ok(entries) => {
+            if let Some(claims) = payment_claims {
+                payment_settle(state.clone(), claims, &payment_info, slug_name.clone(), "terms");
+            }
+            Ok(json_ok(&entries))
+        }
+        Err(e) => {
+            payment_abort(&state, &payment_claims);
+            Ok(json_error(
+                warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                &e.to_string(),
+            ))
+        }
     }
 }
 
@@ -3398,7 +3791,7 @@ async fn handle_build_status(
     // WS-ONLINE-E: Access tier enforcement for remote queries
     {
         let conn = state.reader.lock().await;
-        if let Err(response) = enforce_access_tier(&conn, &slug_name, &auth_source) {
+        if let Err(response) = check_access_tier(&conn, &slug_name, &auth_source) {
             return Ok(response);
         }
     }
@@ -3802,18 +4195,36 @@ async fn handle_composed_view(
 async fn handle_threads(
     slug_name: String,
     (state, auth_source): (Arc<PyramidState>, AuthSource),
+    payment_info: PaymentInfo,
 ) -> Result<warp::reply::Response, warp::Rejection> {
-    let conn = state.reader.lock().await;
-    // WS-ONLINE-E: Access tier enforcement for remote queries
-    if let Err(response) = enforce_access_tier(&conn, &slug_name, &auth_source) {
-        return Ok(response);
+    let tier_info = {
+        let conn = state.reader.lock().await;
+        read_access_tier(&conn, &slug_name)
+    };
+    let payment_claims = match enforce_access_tier(&tier_info, &auth_source, Some(&payment_info)).await {
+        Ok(c) => c,
+        Err(response) => return Ok(response),
+    };
+    if let Some(ref claims) = payment_claims {
+        if let Err(response) = payment_insert_before_serve(&state, claims, &payment_info, &auth_source, &slug_name, "threads").await {
+            return Ok(response);
+        }
     }
+    let conn = state.reader.lock().await;
     match db::get_threads(&conn, &slug_name) {
-        Ok(threads) => Ok(json_ok(&threads)),
-        Err(e) => Ok(json_error(
-            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
-            &e.to_string(),
-        )),
+        Ok(threads) => {
+            if let Some(claims) = payment_claims {
+                payment_settle(state.clone(), claims, &payment_info, slug_name.clone(), "threads");
+            }
+            Ok(json_ok(&threads))
+        }
+        Err(e) => {
+            payment_abort(&state, &payment_claims);
+            Ok(json_error(
+                warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                &e.to_string(),
+            ))
+        }
     }
 }
 
@@ -6836,6 +7247,7 @@ async fn handle_export(
     slug: String,
     (state, auth_source): (Arc<PyramidState>, AuthSource),
     export_rate_limiter: Arc<Mutex<std::collections::HashMap<String, (u64, std::time::Instant)>>>,
+    payment_info: PaymentInfo,
 ) -> Result<warp::reply::Response, warp::Rejection> {
     // Export rate limiting: 5/minute per operator for Wire JWT, unlimited for local
     let operator_id = match &auth_source {
@@ -6864,18 +7276,36 @@ async fn handle_export(
         }
     }
 
+    let tier_info = {
+        let conn = state.reader.lock().await;
+        read_access_tier(&conn, &slug)
+    };
+
+    // WS-ONLINE-E/H: Access tier + payment enforcement (previously missing — fixed)
+    let payment_claims = match enforce_access_tier(&tier_info, &auth_source, Some(&payment_info)).await {
+        Ok(c) => c,
+        Err(response) => return Ok(response),
+    };
+    if let Some(ref claims) = payment_claims {
+        if let Err(response) = payment_insert_before_serve(&state, claims, &payment_info, &auth_source, &slug, "export").await {
+            return Ok(response);
+        }
+    }
+
     let conn = state.reader.lock().await;
 
     // Verify slug exists
     match db::get_slug(&conn, &slug) {
         Ok(Some(_)) => {}
         Ok(None) => {
+            payment_abort(&state, &payment_claims);
             return Ok(json_error(
                 warp::http::StatusCode::NOT_FOUND,
                 &format!("slug '{}' not found", slug),
             ));
         }
         Err(e) => {
+            payment_abort(&state, &payment_claims);
             return Ok(json_error(
                 warp::http::StatusCode::INTERNAL_SERVER_ERROR,
                 &e.to_string(),
@@ -6892,16 +7322,22 @@ async fn handle_export(
                 auth = ?auth_source,
                 "pyramid export served"
             );
+            if let Some(claims) = payment_claims {
+                payment_settle(state.clone(), claims, &payment_info, slug.clone(), "export");
+            }
             Ok(json_ok(&serde_json::json!({
                 "slug": slug,
                 "nodes": nodes,
                 "node_count": nodes.len(),
             })))
         }
-        Err(e) => Ok(json_error(
-            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("export failed: {}", e),
-        )),
+        Err(e) => {
+            payment_abort(&state, &payment_claims);
+            Ok(json_error(
+                warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("export failed: {}", e),
+            ))
+        }
     }
 }
 
@@ -6915,8 +7351,9 @@ async fn handle_query_cost(
 ) -> Result<warp::reply::Response, warp::Rejection> {
     let conn = state.reader.lock().await;
 
-    // WS-ONLINE-E: Access tier enforcement — embargoed pyramids should not expose cost
-    if let Err(response) = enforce_access_tier(&conn, &slug_name, &auth_source) {
+    // Access tier enforcement — embargoed pyramids should not expose cost.
+    // Payment not enforced here (this IS the cost preview endpoint).
+    if let Err(response) = check_access_tier(&conn, &slug_name, &auth_source) {
         return Ok(response);
     }
 
@@ -7117,8 +7554,8 @@ async fn handle_remote_query(
     );
 
     // Step 2: Payment flow
-    // TODO(Pillar-9): Stamp p2p payments may not use UFF — needs design clarity.
-    // TODO(Pillar-23): Cost estimation needs local/wire unification before enforcement.
+    // Pillar 9 resolved: stamps are flat 1-credit p2p transfers (infrastructure compensation).
+    // Pillar 23 resolved: node's /query-cost is advisory; Wire payment-intent is authoritative.
     let _has_payment_confirmation = confirm_payment
         .as_ref()
         .map(|v| v.eq_ignore_ascii_case("true"))
@@ -7237,8 +7674,9 @@ async fn handle_absorption_config(
 ) -> Result<warp::reply::Response, warp::Rejection> {
     let conn = state.reader.lock().await;
 
-    // Access tier enforcement — embargoed pyramids should not expose config
-    if let Err(response) = enforce_access_tier(&conn, &slug_name, &auth_source) {
+    // Access tier enforcement — embargoed pyramids should not expose config.
+    // Payment not enforced (config is not billable content).
+    if let Err(response) = check_access_tier(&conn, &slug_name, &auth_source) {
         return Ok(response);
     }
 

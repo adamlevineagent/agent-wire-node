@@ -1281,7 +1281,7 @@ pub struct PaymentTokenClaims {
     /// Single-use nonce (UUID v4) — prevents replay
     pub nonce: Option<String>,
     /// Expiration (standard JWT exp claim)
-    #[allow(dead_code)]
+    #[serde(default)]
     pub exp: Option<u64>,
 }
 
