@@ -5,7 +5,7 @@
 **Branch:** `stabilize-main` (continuing on the same branch; SDFS supersedes the stabilize-main patch approach)
 **Checkpoint:** `a6eb1ae` on `stabilize-main-checkpoint-20260411-124944`
 **Supersedes:** `docs/plans/stabilize-main-2026-04-11.md` committed at `efec5c0` (stabilize-main plan is preserved as historical context; its bug findings inform this plan but its fix approach is abandoned)
-**Status:** Rev 2 — open questions resolved by Adam 2026-04-11 evening. Ready for Cycle 1 audit.
+**Status:** Rev 3 — conversation pipeline sections rewritten after Adam corrected the "follow-up" punt. Conversation ingest is first-class MVP; `ingest_continuation` is wired up in Commit 8; filemap is the message-count cursor; orphan-bunch bug fixed as side effect. Ready for Cycle 1 audit.
 
 ---
 
@@ -54,6 +54,22 @@ This plan absorbs all of that.
 7. **`pyramid_tier_routing` table is decorative today** because neither `resolve_ir_model` nor `resolve_model` consults it. Tier routing is therefore orphaned data. Under SDFS, tier routing lives in `.understanding/configs/tier_routing.md` as a contribution file, and the SQLite cache is hydrated from it on boot. Resolvers read the cache. The table stops being decorative and starts being an actual cache.
 
 8. **`walk_bundled_contributions_manifest` inserts but never syncs** for six schema types (`build_strategy`, `dadbear_policy`, `evidence_policy`, `folder_ingestion_heuristics`, `tier_routing`, `custom_prompts`). Five of them actually reach operational tables via the `.understanding/` canonical file path; `dadbear_policy` is a global no-op and its bundled entry should either be fixed or dropped. Under SDFS this entire code path becomes a boot-time "read bundled config files, write to `.understanding/configs/` if not present" bootstrap — much simpler.
+
+9. **Conversation ingest + chronological vines already exist, and are first-class.** Not a future extractor. Verified in the existing code:
+   - `ingest::ingest_conversation` at `ingest.rs:350` parses JSONL, filters user/assistant messages, labels PLAYFUL/CONDUCTOR with timestamps, chunks at ~100 lines.
+   - `pyramid_find_claude_code_conversations` at `folder_ingestion.rs:599+` auto-discovers `~/.claude/projects/<encoded-path>/` dirs via Pattern A (encoded-subdir match) + Pattern B (direct `.jsonl` folder), with the Phase 18a path-encoding fix so paths containing spaces work.
+   - Folder ingestion Phase 17/18e creates a CC vine per CC dir with `CreateVine`, a conversation bedrock per dir with `CreatePyramid(content_type='conversation')`, optionally a memory bedrock from any `memory/` subfolder, and `RegisterDadbearConfig` for each.
+   - `vine_bunches` table at `db.rs:779-799` stores the chronological structure: one row per session with `session_id`, `jsonl_path`, `bunch_index`, `first_ts`, `last_ts`, `message_count`, `chunk_count`, `apex_node_id`, `penultimate_node_ids`. Bunches are ordered by `first_ts ASC` with `session_id` as tiebreaker. Each bunch = one Claude Code session = one bedrock under the CC vine.
+   - `vine.rs:877-1123` builds bunches: pre-creates the bunch slug, dispatches `ingest_conversation`, then `run_build_from_with_evidence_mode` via the conversation-episodic chain (5 prompts at `chains/prompts/conversation-episodic/`: chronological_decompose, combine_l0, forward, reverse, synthesize_recursive).
+   - DADBEAR Pipeline B at `dadbear_extend.rs:702+` already handles `ContentType::Conversation` and dispatches `fire_ingest_chain` → `clear_chunks` → `ingest_conversation` → full chain rebuild.
+
+   **SDFS's job is not to introduce conversation ingest.** It already works. SDFS's job is to hoist the vine-bunch state out of SQLite into `.understanding/folder.md.conversation_sources[].sessions[]`, close the incremental-append gap (below), and fix the orphan-bunch bug (below) as a side effect.
+
+10. **`ingest_continuation` exists but has ZERO call sites.** `ingest.rs:384` defines the incremental-append primitive (skips the first N messages, writes a `"continuation"` batch with `chunk_offset = count_chunks(slug)`, appends chunks with offset). Every live call site — Pipeline B, the wizard, `vine.rs` bunch building — uses `ingest_conversation` instead, which means every conversation file change triggers a `clear_chunks + full re-ingest + full chain rebuild`. This is not an architectural choice; it's a Phase 0b shortcut. The `dadbear_extend.rs:731-734` comment names the reason: "Pipeline B's ingest record schema doesn't track per-file message offsets — the message count it would need for `skip_messages` isn't stored anywhere." The state gap is real: `pyramid_ingest_records` has file hash + mtime but no message count.
+
+    **SDFS closes this gap for free.** The cursor lives in the filemap, not in a new SQLite table. Each `conversation_sources[].sessions[].ingested_message_count` IS the `skip_messages` value. DADBEAR reads it from the filemap, calls `ingest_continuation`, and writes the new total back to the filemap on success. No schema migration, no new table, no new code path — just wire the existing `ingest_continuation` primitive into the new flow.
+
+11. **Orphan-bunch bug: new `.jsonl` in already-ingested CC dir doesn't auto-attach to the vine.** When a new Claude Code session writes a fresh `.jsonl` under a CC directory whose parent vine already exists, DADBEAR's `detect_changes` marks it as a new file and Pipeline B dispatches `fire_ingest_chain` for it, but the resulting pyramid is never attached to the existing CC vine via `AddChildToVine`. The user has to re-run the wizard for the orphan to get hooked in. SDFS fixes this: the scanner writes new sessions into `conversation_sources[].sessions[]` with `bunch_slug: null` and `ingested_message_count: 0`; Commit 5's builder sees `bunch_slug: null` on its next pass, creates the bunch, attaches it to the parent CC vine via the existing `AddChildToVine` op, and writes the assigned slug back into the filemap. Zero orphans.
 
 ---
 
@@ -283,11 +299,66 @@ local:
       last_build_node_id: C-L0-019
 
   conversation_sources:
-    - canonical_path: /Users/adamlevine/.claude/projects/-Users-adamlevine-AI-20Project-20Files-agent-wire-node/
+    # Each source is a Claude Code `~/.claude/projects/<encoded-path>/` directory
+    # discovered via pyramid_find_claude_code_conversations() against this folder's
+    # encoded path (folder_ingestion.rs:599+). Discovered once at scan time, kept in
+    # sync by DADBEAR.
+    - canonical_path: /Users/adamlevine/.claude/projects/-Users-adamlevine-AI-Project-Files-agent-wire-node/
       source_type: claude_code_dir
-      tail_follow: true
-      last_seen_file_count: 12
-      last_seen_latest_mtime: 2026-04-11T20:15:00Z
+      encoded_path: -Users-adamlevine-AI-Project-Files-agent-wire-node
+      is_main: true
+      is_worktree: false
+
+      # CC vine structure for this source. Created by Commit 5 builder on first build.
+      cc_vine_slug: agent-wire-node-cc-1
+      memory_subfolder_path: /Users/adamlevine/.claude/projects/-Users-adamlevine-AI-Project-Files-agent-wire-node/memory
+      memory_bedrock_slug: agent-wire-node-cc-1-memory   # null if memory/ is absent or empty
+
+      # Per-session state. One entry per .jsonl file in the CC dir. Each session = one
+      # conversation bunch = one bedrock under the CC vine. This is the authoritative
+      # INCREMENTAL INGEST CURSOR — `ingested_message_count` is the skip_messages value
+      # passed to ingest_continuation() on the next dispatch.
+      sessions:
+        - session_id: 01h8k2e3f4m5p6q7r8s9t0v1w2
+          jsonl_path: 01h8k2e3f4m5p6q7r8s9t0v1w2.jsonl    # relative to canonical_path
+          bunch_slug: agent-wire-node-cc-1--bunch-000
+          bunch_index: 0
+          first_ts: 2026-04-10T14:23:00Z
+          last_ts: 2026-04-11T09:45:00Z
+
+          # Change-detection fields (DADBEAR compares these against fresh filesystem reads)
+          last_seen_mtime: 2026-04-11T09:45:00Z
+          last_seen_sha256: abc123...
+          last_seen_file_size: 145230
+
+          # Incremental ingest cursor. On next dispatch, DADBEAR passes this as
+          # skip_messages to ingest_continuation(). Updated atomically after each
+          # successful continuation ingest. Starts at 0 for new sessions.
+          ingested_message_count: 127
+          ingested_chunk_count: 6
+
+          # Build state for the bunch pyramid
+          last_built_at: 2026-04-11T09:50:00Z
+          last_build_node_id: B-2026-04-11-cc-001
+          last_build_status: ok
+          last_build_cost_usd: 0.0073
+
+        # New session detected but not yet built — bunch_slug is null, cursor is 0.
+        # Commit 5 builder sees this on next pass: creates bunch, attaches to CC vine
+        # via AddChildToVine (existing op), runs episodic chain, writes bunch_slug
+        # back into this entry. No orphan pyramid.
+        - session_id: 01h8m3n4p5q6r7s8t9u0v1w2x3
+          jsonl_path: 01h8m3n4p5q6r7s8t9u0v1w2x3.jsonl
+          bunch_slug: null
+          bunch_index: 1
+          first_ts: 2026-04-11T20:10:00Z
+          last_ts: 2026-04-11T20:15:00Z
+          last_seen_mtime: 2026-04-11T20:15:00Z
+          last_seen_sha256: def456...
+          last_seen_file_size: 8420
+          ingested_message_count: 0
+          ingested_chunk_count: 0
+          last_built_at: null
 
   build_history:
     - { built_at: 2026-04-11T20:45:00Z, build_version: 3, status: complete, cost_usd: 0.0421, duration_s: 142, nodes_updated: 23, trigger: dadbear_debounce_expired }
@@ -551,22 +622,31 @@ Each commit is independently buildable and testable. Every commit advances the s
 
 ---
 
-### Commit 2 — `sdfs: scanner writes .understanding/folder.md for each scanned folder`
+### Commit 2 — `sdfs: scanner writes .understanding/folder.md for each scanned folder (code + docs + conversations)`
 
-**Scope:** adapt `folder_ingestion::scan_folder` to write filemap files. Keep existing `folder_ingestion_heuristics` logic for pattern matching. Idempotent — re-scanning an already-scanned folder merges scanner-owned fields into the existing filemap without touching user-owned fields.
+**Scope:** adapt `folder_ingestion::scan_folder` to write filemap files. Keep existing `folder_ingestion_heuristics` logic for pattern matching. Reuse the existing `pyramid_find_claude_code_conversations` + `describe_claude_code_dirs` path for conversation discovery — do NOT rewrite it. Idempotent — re-scanning an already-scanned folder merges scanner-owned fields into the existing filemap without touching user-owned fields.
 
 **Files:**
 - `src-tauri/src/pyramid/understanding/scanner.rs` — new `scan_and_write_filemap(workspace_root, folder_path, config)` function. Walks the folder, categorizes files, emits a `FolderFilemap` struct via the Commit 1 library, writes it to `<folder>/.understanding/folder.md`.
 - `src-tauri/src/pyramid/understanding/merge.rs` — field-level merge of scanner-owned fields against an existing filemap, preserving user-owned fields.
 - Tauri command `pyramid_sdfs_scan_folder(workspace_root, folder_path)` — IPC entry point so the UI can trigger a scan.
 
+**Conversation-source population** (at top-level scan only, matching existing Phase 17/18e guard):
+- Call `pyramid_find_claude_code_conversations(config, target_folder)` → `Vec<ClaudeCodeConversationDir>`.
+- For each CC dir, compute the full set of `.jsonl` files and for each read its `session_id` + `first_ts` + `last_ts` + message count via the existing `scan_jsonl_metadata` (`vine.rs:251`) helper.
+- Write to `conversation_sources[]` with one entry per CC dir and one `sessions[]` entry per `.jsonl`. New sessions (not yet in the filemap) get `bunch_slug: null` and `ingested_message_count: 0`. Existing sessions keep their `bunch_slug` + `ingested_message_count` intact — the scanner only refreshes the change-detection fields (`last_seen_mtime`, `last_seen_sha256`, `last_seen_file_size`). Builder (Commit 5) picks up the null-slug entries on its next pass.
+- Memory subfolder detection: preserved from Phase 18e. If `<cc_dir>/memory/` exists with at least one `.md` file, write `memory_subfolder_path` + compute `memory_bedrock_slug` (leave null until builder creates it).
+- Encoded path, `is_main`, `is_worktree` come directly from `ClaudeCodeConversationDir`.
+
 **Tests:**
-- Fresh scan on a test directory produces the expected filemap.
-- Re-scanning after a file change updates the scanner-owned fields only.
+- Fresh scan on a test directory with a matching CC dir produces filemap with `conversation_sources[]` populated and `sessions[]` reflecting the jsonl files.
+- Re-scanning after a new `.jsonl` appears adds a new `sessions[]` entry with `bunch_slug: null`; existing entries are unchanged.
+- Re-scanning after an existing `.jsonl` is appended refreshes that session's `last_seen_mtime`/`sha256`/`file_size` but keeps `ingested_message_count` unchanged.
 - Re-scanning after the user unchecks a file preserves `user_included: false`.
 - Symlinks and hidden files behave per the ignore patterns.
+- Fresh scan on a folder with NO matching CC dir produces filemap with empty `conversation_sources[]`.
 
-**Still no LLM calls.** Scanning is free.
+**Still no LLM calls.** Scanning is free. `scan_jsonl_metadata` reads headers only; it does not parse the full conversation content.
 
 ---
 
@@ -597,22 +677,31 @@ Reuses the stabilize-main plan's design for Bug #1: new `CredentialStore::load_w
 
 ---
 
-### Commit 5 — `sdfs: builder reads .understanding/folder.md, dispatches chain builds, writes node files`
+### Commit 5 — `sdfs: builder reads .understanding/folder.md, dispatches chain builds, writes node files (code, docs, conversation bedrocks)`
 
-**Scope:** the biggest commit. Replaces the folder_ingestion → spawn_question_build path with a builder that reads curated filemaps and writes node files via a new writer.
+**Scope:** the biggest commit. Replaces the folder_ingestion → spawn_question_build path with a builder that reads curated filemaps and writes node files via a new writer. Handles three content types: code, document, and conversation. Conversation handling reuses the existing Phase 17/18e primitives (`CreateVine`, `CreatePyramid`, `AddChildToVine`, `RegisterDadbearConfig`) — the builder is wiring, not new logic.
 
 **Files:**
-- `src-tauri/src/pyramid/understanding/builder.rs` — `build_from_filemap(workspace_root, folder_path)` reads the filemap, collects user-included entries, resolves the chain per content_type (via tier_routing contribution file), dispatches builds via the existing chain executor.
+- `src-tauri/src/pyramid/understanding/builder.rs` — `build_from_filemap(workspace_root, folder_path)` reads the filemap, collects user-included entries, dispatches:
+  - **Code/document files** → chain executor via `run_build_from` with the resolved chain for the content type.
+  - **Conversation sessions with `bunch_slug: null`** → for each CC dir, ensure a CC vine exists (create via existing `CreateVine` op if not), then for each null-slug session: pre-create the bunch slug (following the `{cc_vine_slug}--bunch-{idx:03d}` convention from `vine.rs:886-901`), call `ingest::ingest_conversation` for the initial full ingest (this is the ONE place full ingest is correct — no prior state exists), attach the bunch to the CC vine via `AddChildToVine(child_type='bedrock')`, run the conversation-episodic chain via `run_build_from_with_evidence_mode`, then write the resulting `bunch_slug` + total `message_count` + `chunk_count` back into the filemap's `sessions[]` entry.
+  - **Memory bedrocks** (when `memory_subfolder_path` is present and `memory_bedrock_slug` is null) → same pattern as conversations: create bedrock, attach to CC vine, run document chain, write slug back to filemap.
 - `src-tauri/src/pyramid/understanding/node_writer.rs` — new writer that takes chain executor output and writes `.understanding/nodes/<id>/v<N>.md` files with full Wire Native Document rear-matter including `derived_from` citations in `{ doc: workspace-relative-path }` form.
 - `src-tauri/src/pyramid/chain_executor.rs` — modify the writer drain task to support a new `WriteOp::SaveNodeFile` variant alongside the existing `SaveNode` (SQLite). The chain executor writes both. Files are authoritative; SQLite rows are cache.
 - `src-tauri/src/pyramid/build_runner.rs` — add `run_sdfs_build(filemap_path)` entry point that feeds the builder. Keeps `run_chain_build` / `run_ir_build` for backward compat until DADBEAR retarget replaces them.
 - Tauri command `pyramid_sdfs_build_from_filemap(workspace_root, folder_path)`.
 
+**Orphan-bunch fix lands here.** The "null bunch_slug → create and attach" loop means new sessions detected in later DADBEAR scans are automatically attached to the existing CC vine on the next build pass. The pre-existing bug (new `.jsonl` creates an orphan pyramid not hooked into the vine) is closed as a side effect of the filemap-driven build flow.
+
 **Tests:**
-- Builder on a test filemap with 3 user-included files produces 3 node files + SQLite cache rows.
+- Builder on a test filemap with 3 user-included code files produces 3 code node files + SQLite cache rows.
+- Builder on a test filemap with a CC dir containing 5 `.jsonl` files (all `bunch_slug: null`) creates the CC vine, creates 5 bunch bedrocks, attaches each to the vine, runs the episodic chain for each, and writes the assigned slugs + message counts back to the filemap.
+- Builder re-run with no changes: all bunch_slugs already populated, no new builds triggered.
+- Builder re-run after scanner adds a 6th null-slug session entry: only the 6th bunch gets built; existing 5 are untouched.
 - Cross-file citations in `derived_from` use correct workspace-relative paths.
 - Provenance metadata (model_tier, model_id, cost, duration) lands in the node file's `local.provenance` section.
-- Supersession: second build produces `v2.md`, refreshes `current.md`, adds a refinement note file.
+- Supersession: second build of a code file produces `v2.md`, refreshes `current.md`, adds a refinement note file.
+- Memory bedrock creation: filemap with `memory_subfolder_path` and null `memory_bedrock_slug` produces the memory pyramid attached to the CC vine.
 
 **LLM calls start here.** Commit 3 must land first for builds to succeed.
 
@@ -652,24 +741,36 @@ Reuses the stabilize-main plan's design for Bug #1: new `CredentialStore::load_w
 
 ---
 
-### Commit 8 — `sdfs: DADBEAR retargeted at source files, writes filemap, fires builder via debounce`
+### Commit 8 — `sdfs: DADBEAR retargeted at source files + conversation sessions, writes filemap, fires builder via debounce, uses ingest_continuation for incremental append`
 
-**Scope:** replace `dadbear_extend.rs`'s tick loop. Pattern is unchanged; surface is swapped. The existing RAII `InFlightGuard` pattern is preserved for panic-safety. `batch_size` becomes `max_files_per_rebuild`. Policy source is `.understanding/configs/dadbear_policy.md`.
+**Scope:** replace `dadbear_extend.rs`'s tick loop. Pattern is unchanged; surface is swapped. Three important plumbing changes beyond the source-file retarget:
+
+1. **Incremental conversation append via `ingest_continuation`.** Stop calling `clear_chunks + ingest_conversation` on conversation change. Read `ingested_message_count` from the filemap session entry, call `ingest::ingest_continuation(conn, slug, path, skip_messages=ingested_message_count)`, write the new total back to the filemap on success. The Phase 0b shortcut at `dadbear_extend.rs:731-734` is deleted with its comment.
+2. **No new SQLite table for message-count state.** The filemap is the cursor. `.understanding/folder.md.conversation_sources[].sessions[*].ingested_message_count` is authoritative. This closes the exact schema gap the shortcut comment complained about — without adding schema.
+3. **New-session detection goes through the builder.** DADBEAR detects a new `.jsonl` appearing (filesystem poll + sha256 against filemap), writes a new `sessions[]` entry with `bunch_slug: null` and `ingested_message_count: 0`, and lets Commit 5's builder pick it up on its next pass to create the bunch and attach to the CC vine. DADBEAR itself does not create bunches — it only updates the filemap.
+
+The existing RAII `InFlightGuard` pattern is preserved for panic-safety. `batch_size` becomes `max_files_per_rebuild`. Policy source is `.understanding/configs/dadbear_policy.md`.
 
 **Files:**
-- `src-tauri/src/pyramid/understanding/dadbear.rs` — new tick loop. Reads policy from contribution file (via cache). Scans source directories. Updates `folder.md` scanner fields. Computes folder-quiet timer. On debounce expiry, calls builder's `build_from_filemap` with `dadbear_stale: true` entries from the filemap.
+- `src-tauri/src/pyramid/understanding/dadbear.rs` — new tick loop. Reads policy from contribution file (via cache). Scans source directories AND CC dirs from the filemap's `conversation_sources[]`. Updates `folder.md` scanner fields. Computes folder-quiet timer. On debounce expiry:
+  - For stale **code/document files**: fire builder's chain rebuild path.
+  - For stale **conversation sessions** (mtime/sha256 differs from filemap): fire `ingest::ingest_continuation(conn, slug, path, skip_messages=ingested_message_count)`, run the episodic chain via `run_build_from_with_evidence_mode`, write the new `message_count` + `chunk_count` back to the filemap atomically with the build completion.
+  - For **new conversation sessions** in a CC dir (filemap has no matching entry): append a new `sessions[]` entry with null slug and zero cursor, fire the builder which creates the bunch on its next tick.
 - `src-tauri/src/pyramid/dadbear_extend.rs` — DELETE. Replaced by the new module.
-- `src-tauri/src/pyramid/folder_ingestion.rs` — delete the `RegisterDadbearConfig` emission sites and the `spawn_initial_builds` wanderer-fix dispatch; these are superseded by the new scanner + builder + DADBEAR retarget.
+- `src-tauri/src/pyramid/folder_ingestion.rs` — delete the `RegisterDadbearConfig` emission sites and the `spawn_initial_builds` wanderer-fix dispatch; these are superseded by the new scanner + builder + DADBEAR retarget. Keep the `pyramid_find_claude_code_conversations` + `describe_claude_code_dirs` + `encode_path_for_claude_code` helpers — Commit 2 reuses them.
 - `src-tauri/src/main.rs` — boot hook: start the new DADBEAR tick loop after all bootstraps complete.
 
 **Tests:**
-- DADBEAR detects a file modification and marks `dadbear_stale: true` in the filemap.
+- DADBEAR detects a code file modification and marks `dadbear_stale: true` in the filemap.
 - Folder quiet for `debounce_quiet_secs` triggers builder invocation.
 - Folder with continuing edits (timer keeps resetting) does NOT trigger until quiet.
 - `auto_rebuild: mark_stale_only` option fires only the filemap update, not the builder.
 - Recursive propagation: child folder build completes, parent folder's filemap shows stale marker.
+- **Conversation append: existing `.jsonl` grows by 20 messages → DADBEAR detects via sha256, reads `ingested_message_count: 127`, calls `ingest_continuation` with `skip_messages=127`, ingests 20 new messages as a continuation batch with `chunk_offset=6`, updates filemap to `ingested_message_count: 147`. SQLite chunks for that slug go from 6 to ~7 (one new chunk holding 20 messages). No `clear_chunks` call.** This is THE test.
+- **Conversation full re-ingest is never triggered.** Assert that on any conversation change, `clear_chunks` is not called and `ingest_continuation` is called instead.
+- New session: fresh `.jsonl` appears in an already-ingested CC dir → DADBEAR adds null-slug session entry → builder tick creates bunch, attaches to vine, ingests full file (as initial ingest), writes slug back.
 
-**End of MVP.** After Commit 8, folder ingest on `agent-wire-node/` works via the new architecture.
+**End of MVP.** After Commit 8, folder ingest on `agent-wire-node/` works via the new architecture with incremental conversation append and orphan-free new-session handling.
 
 ---
 
@@ -708,6 +809,25 @@ Reuses the stabilize-main plan's design for Bug #1: new `CredentialStore::load_w
 3. Verify: filemap's `dadbear_stale: true` flipped → debounce window expired → builder fired → node file updated → SQLite cache refreshed.
 4. During the 5-minute quiet window, verify no premature rebuild.
 5. Cancel test: edit the file again at minute 3, wait, verify quiet timer reset and rebuild is deferred to 8 minutes after the second edit.
+
+### Conversation incremental-append verification (from Commit 8)
+1. Scan `agent-wire-node/`; wait for Commit 5 builder to build at least one CC bunch. Note the filemap entry for that session: `ingested_message_count: N`, `chunk_count: K`.
+2. Open Claude Code, type a few new messages into the SAME session (appending to the existing `.jsonl`). Wait for the session `.jsonl` mtime to update.
+3. Wait `debounce_quiet_secs` past the last edit.
+4. Verify:
+   - DADBEAR detects the change (sha256 differs from filemap).
+   - `ingest_continuation` is called with `skip_messages=N` (check DEBUG log).
+   - `clear_chunks` is NOT called. Assert via grep of the log.
+   - The continuation batch's `source_path` ends with `:continuation:N+` (per `ingest.rs:406-410`).
+   - Filemap session entry's `ingested_message_count` is now `N + (number of new messages)`.
+   - SQLite chunk count for the slug is `K + (number of new chunks)`, not a full re-chunk.
+5. Kill the node app, restart, verify filemap cursor survives restart and a second append round picks up from the new total.
+
+### New conversation session verification (from Commit 5 + Commit 8 + orphan-bunch fix)
+1. Start a fresh Claude Code session in `agent-wire-node/`. A new `.jsonl` file appears in `~/.claude/projects/-Users-...agent-wire-node/`.
+2. DADBEAR detects the new file. Filemap scanner adds a new `sessions[]` entry with `bunch_slug: null, ingested_message_count: 0`.
+3. On the next builder tick: verify the new bunch is created via `CreatePyramid`, attached to the existing CC vine via `AddChildToVine(child_type='bedrock')`, and the episodic chain runs. `bunch_slug` is written back to the filemap.
+4. Query the CC vine via CLI: assert the new bunch is listed as a child, NOT an orphan pyramid.
 
 ### Cache-rebuild verification
 1. Delete `pyramid.db` with the app running.
@@ -750,11 +870,17 @@ The Cycle 1/2/3 findings from stabilize-main are preserved in the earlier plan d
 
 ### Architectural deferrals
 
-- **Self-Describing Filesystem extensions for node payloads**, edges/evidence as full-graph relationships, conversation co-location via canonical-path pointer watching (MVP has the POINTER field in the filemap but doesn't actively tail conversation files; that's the next layer).
+- **Non-Claude-Code conversation sources** (ChatGPT exports, Cursor chats, Windsurf chats, GPT API usage). MVP handles Claude Code only via the existing `pyramid_find_claude_code_conversations` path. Other sources need per-source format adapters; the filemap's `conversation_sources[].source_type` field is designed to extend to new values (`chatgpt_export`, `cursor_session_dir`, etc.) without schema change.
+- **Cross-folder conversation attribution.** A Claude Code session that touches multiple workspaces lives in the first-scanned workspace's filemap. True "this session belongs to workspaces A and B" needs cross-workspace citation via published handle-paths and is out of MVP.
+- **`run_build_from` intelligent incremental rebuild.** This plan closes the incremental INGEST side (new messages only get chunked via `ingest_continuation`). Whether `run_build_from` then rebuilds only new chunks' nodes vs re-running the whole episodic chain for the whole slug is a separate question flagged in "Assumptions to verify" (#8). If the chain executor always rebuilds the full slug, a further optimization lands as a follow-up. The append is still correct; the LLM-cost savings are partial until that optimization ships.
 - **Whole-disk scanning** from the spec (§260-301).
 - **Git integration layer** (`.gitattributes`, merge drivers, etc.) from spec §366.
 - **Cross-device sync** via git/rsync from spec §369.
 - **Extractor expansion to email, images, audio, messages, calendar, browser history** from spec §270-290.
+
+### Explicitly dropped (NOT preserved from current code)
+
+- **`clear_chunks + full re-ingest` on conversation change.** The Phase 0b shortcut at `dadbear_extend.rs:712-735` is deleted in Commit 8. The comment at line 731-734 names the state gap that drove the shortcut; SDFS closes the gap by putting the cursor in the filemap. No fallback, no flag to restore the old behavior — the shortcut is wrong and the proper path is available.
 
 ---
 
@@ -769,6 +895,10 @@ The Cycle 1/2/3 findings from stabilize-main are preserved in the earlier plan d
 7. `pyramid_tier_routing` is populated but unconsulted by chain execution today. Verified. Under SDFS, tier routing is hydrated into the cache from `.understanding/configs/tier_routing.md`, and both resolvers consult the cache.
 8. The `.understanding/` subdirectory name doesn't collide with anything in the user's source trees. Probably safe; worth a grep at implementation time.
 9. Workspace-root-relative paths are stable across git clones, rsync copies, and physical disk moves as long as the workspace is moved as a unit.
+10. `ingest_continuation` has zero call sites today (verified via Explore agent grep). Wiring it up is core MVP scope; the function signature at `ingest.rs:384-427` is the contract.
+11. `vine_bunches` table stores existing chronological vine state. SDFS hoists this into the filemap; the table becomes part of the derived cache rebuild path in Commit 6.
+12. Phase 17/18e planner primitives (`CreateVine`, `CreatePyramid`, `AddChildToVine`, `RegisterDadbearConfig`) are reused by Commit 5 builder for new bunches. These are existing helpers in `folder_ingestion.rs`, not new code.
+13. `encode_path_for_claude_code` at `folder_ingestion.rs:536` handles paths with spaces post-Phase 18a fix. MVP does not need to touch this.
 
 ## Assumptions to verify at implementation time
 
@@ -779,6 +909,11 @@ The Cycle 1/2/3 findings from stabilize-main are preserved in the earlier plan d
 5. **DADBEAR tick loop startup** must happen after credential bootstrap, tier routing bootstrap, and bundled config bootstrap. Order in main.rs matters.
 6. **`current.md` parity check** happens on every scanner pass (not just boot). If a user edits `v3.md` directly, the parity check auto-repairs `current.md`.
 7. **Workspace root detection** — when the user points the app at `/Users/adamlevine/AI Project Files/agent-wire-node`, is that the workspace root automatically, or do we need a marker file? Probably automatic: the top-level scan target is the root.
+8. **`run_build_from` incremental behavior for slugs with continuation batches.** Does it rebuild only nodes whose chunks are new (chunk_index ≥ chunk_offset), or does it re-run the whole episodic chain across every chunk? If the former, incremental ingest gives proportional LLM-cost savings. If the latter, the chain executor still re-runs everything and we only save on chunking, not on LLM work. Read `build.rs` + `chain_executor.rs` before Commit 8; if full re-run is the reality, Commit 8 should either add a `--from-chunk-offset` flag OR flag an explicit follow-up for the chain-executor side of the optimization.
+9. **LockManager write-lock semantics for `ingest_continuation` vs `ingest_conversation`.** Pipeline B's current `fire_ingest_chain` takes `LockManager::global().write(slug)` around the ingest call. The incremental path needs the same lock discipline. Verify no ordering hazard exists when the DADBEAR tick loop dispatches both an `ingest_continuation` AND a chain rebuild in sequence while the write lock is held.
+10. **`scan_jsonl_metadata` efficiency on large `.jsonl` files.** The existing helper reads the file to extract session_id, timestamps, and message count. On a 100MB session file, this is slow. Verify the cost on real files and, if needed, cache the session_id/mtime/sha256/file_size in the filemap so the scanner only re-parses when sha256 differs.
+11. **`ingest_continuation` message count semantics.** The function's `skip_messages` parameter counts only user+assistant messages (filtering toolUseResult), matching the same filter in the initial `ingest_conversation`. Verify the filter is identical in both paths so the cursor stays consistent. If they diverge (e.g., continuation counts tool_use as a message but initial doesn't), the cursor will drift and re-dispatches will either skip real content or re-ingest already-processed content.
+12. **`pyramid_batches.chunk_offset` persistence across app restarts.** The batch record stores the offset when the batch was created. On restart, a new continuation batch is created with a fresh `count_chunks(slug)` call — verify this returns the cumulative count (including all prior batches), not just the latest batch's chunks.
 
 ---
 
@@ -863,13 +998,19 @@ Adam confirmed these during plan review. They are baked into the relevant sectio
 
 2. **Onboarding handle registration — follow-up, not MVP.** MVP is local-only, 8 commits, no scope bump. Onboarding lands when the publish pipeline does (its own dedicated sprint).
 
-3. **Conversation canonical-path tail-follow — follow-up, not MVP.** Definition (for reference):
+3. **Conversation ingest is first-class MVP, NOT a follow-up.** Adam corrected me on this. Previous draft said "conversation tail-follow is deferred because we'd need a new extractor." That was wrong on two counts: (a) the extractor already exists (conversation-episodic chain, 5 prompts under `chains/prompts/conversation-episodic/`), and (b) what I was calling "tail-follow" is just the combination of DADBEAR change detection (already exists for code/docs) plus `ingest_continuation` (already exists as a library function). The work is plumbing, not new primitives.
 
-   Every folder the user works in has a corresponding conversation history in a canonical location — Claude Code writes one `.jsonl` per session into `~/.claude/projects/<encoded-project-path>/`, ChatGPT/Cursor/Windsurf all have similar. The filemap records these locations in `conversation_sources[]` at scan time. "Tail-follow" means `tail -f` semantics: the scanner/DADBEAR watches for new files in the canonical directory AND new lines appended to existing `.jsonl` files, treats each new chunk as a delta, never re-reads whole files.
+   The actual MVP scope for conversations:
+   - **Commit 2 (scanner)** calls `pyramid_find_claude_code_conversations` and writes results into `folder.md.conversation_sources[].sessions[]` with per-session state (session_id, jsonl_path, mtime, sha256, message_count cursor).
+   - **Commit 5 (builder)** sees `bunch_slug: null` entries in the filemap, creates bunches via the existing `CreateVine`/`CreatePyramid`/`AddChildToVine`/`RegisterDadbearConfig` ops (Phase 17/18e primitives), runs the episodic chain, writes bunch_slug + initial `ingested_message_count` back into the filemap.
+   - **Commit 8 (DADBEAR retarget)** on detected change reads `ingested_message_count` from the filemap, calls `ingest_continuation(slug, path, skip_messages=ingested_message_count)` — NOT `clear_chunks + ingest_conversation` — then writes the new total back to the filemap. Full re-ingest on conversation change is deleted, not carried forward.
 
-   Why it's valuable: ingesting `agent-wire-node/` gives you the code, but the *thinking* behind the code lives in the ~40 Claude Code sessions under `~/.claude/projects/-Users-...agent-wire-node/`. Building both into the same pyramid means "why does this module exist" can be answered by the conversation where the decision was made.
+   The Phase 0b shortcut that currently re-ingests the whole JSONL on every change (flagged inline at `dadbear_extend.rs:731-734`) gets dropped. Both `ingest_continuation` (already built) and the filemap cursor (new in this plan) cover the state gap the shortcut was working around.
 
-   Why deferred: needs a conversation extractor (chain prompts tuned for chat-shaped input), append-only stale detection (different from whole-file sha256), a chunking strategy for long sessions, and cross-folder conversation attribution (one session can touch multiple folders). MVP records `conversation_sources[]` so the scanner documents where the conversations live, but the build pipeline for them is deferred.
+   **Explicitly deferred (genuine follow-ups, not MVP):**
+   - Non-Claude-Code conversation sources (ChatGPT, Cursor, Windsurf). MVP handles Claude Code only. Other sources need per-source format adapters.
+   - Cross-folder conversation attribution — a session that touches multiple workspaces lives in the first-scanned workspace's filemap.
+   - `run_build_from` intelligent incremental rebuild. This plan closes the ingest side (new messages only get chunked). Whether the chain executor rebuilds only the new chunks' nodes vs re-running the whole episodic chain is a separate question that needs verification at Commit 8 implementation time — if `run_build_from` always rebuilds the whole pyramid, the LLM cost savings from incremental ingest are partially lost and a further fix is needed. Flagged in "Assumptions to verify."
 
 4. **`chains/defaults/*.yaml` bundling — in scope for Commit 7.** Cycle 2 Stage 2 B found 5 conversation chain YAMLs aren't embedded via `include_str!` and `tauri.conf.json` has no `resources` block. Commit 7 must bundle all of `chains/defaults/` alongside `.understanding/configs/` or the fresh install is missing chains.
 
