@@ -109,7 +109,7 @@
       "contribution_id": "bundled-tier_routing-default-v1",
       "schema_type": "tier_routing",
       "slug": null,
-      "yaml_content": "schema_type: tier_routing\nentries:\n  - tier_name: fast_extract\n    provider_id: openrouter\n    model_id: inception/mercury-2\n    priority: 1\n  - tier_name: synth_heavy\n    provider_id: openrouter\n    model_id: inception/mercury-2\n    priority: 1\n  - tier_name: stale_local\n    provider_id: openrouter\n    model_id: inception/mercury-2\n    priority: 1\n",
+      "yaml_content": "schema_type: tier_routing\nentries:\n  - tier_name: fast_extract\n    provider_id: openrouter\n    model_id: inception/mercury-2\n    priority: 1\n  - tier_name: synth_heavy\n    provider_id: openrouter\n    model_id: inception/mercury-2\n    priority: 1\n  - tier_name: stale_local\n    provider_id: openrouter\n    model_id: inception/mercury-2\n    priority: 1\n  - tier_name: high\n    provider_id: openrouter\n    model_id: qwen/qwen3.5-flash-02-23\n    priority: 1\n  - tier_name: max\n    provider_id: openrouter\n    model_id: x-ai/grok-4.20-beta\n    priority: 1\n",
       "triggering_note": "Bundled default tier_routing (wire-node v0.2.0)"
     },
 

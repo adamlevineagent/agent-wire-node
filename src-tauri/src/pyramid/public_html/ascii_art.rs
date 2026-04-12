@@ -92,12 +92,19 @@ pub async fn generate_banner_for_slug(
             .unwrap_or_else(|| slug.to_string())
     };
 
-    // 3. source hash
+    // 2b. resolve model from tier routing so it respects active provider
+    let resolved_model = state
+        .provider_registry
+        .resolve_tier("max", None, None, None)
+        .map(|r| r.tier.model_id.clone())
+        .unwrap_or_else(|_| ASCII_ART_MODEL.to_string());
+
+    // 3. source hash — includes resolved model so cache invalidates on provider switch
     let source_hash = {
         let mut h = Sha256::new();
         h.update(apex_headline.as_bytes());
         h.update(b":banner:");
-        h.update(ASCII_ART_MODEL.as_bytes());
+        h.update(resolved_model.as_bytes());
         let full = format!("{:x}", h.finalize());
         full[..16].to_string()
     };
@@ -130,11 +137,11 @@ pub async fn generate_banner_for_slug(
         safe_headline
     );
 
-    // 6. call Grok 4.2 directly
+    // 6. call via resolved model (from step 2b)
     let config = state.config.read().await.clone();
     let raw = crate::pyramid::llm::call_model_direct(
         &config,
-        ASCII_ART_MODEL,
+        &resolved_model,
         system_prompt,
         &user_prompt,
         800,
@@ -154,7 +161,7 @@ pub async fn generate_banner_for_slug(
             "banner",
             &source_hash,
             &validated,
-            ASCII_ART_MODEL,
+            &resolved_model,
         )
         .map_err(|e| format!("insert_with_supersession: {e}"))?;
     }

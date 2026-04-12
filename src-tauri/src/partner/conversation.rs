@@ -634,12 +634,22 @@ pub async fn handle_message(
                     .llm_config_with_cache(&slug, &format!("partner-warm-{}", slug))
                     .await;
                 let model = llm_config.partner_model.clone();
+                // Resolve collapse model from the "max" tier so it
+                // respects the active provider (Ollama vs OpenRouter).
                 let collapse_model = state
                     .pyramid
-                    .data_dir
-                    .as_ref()
-                    .map(|d| crate::pyramid::PyramidConfig::load(d).collapse_model)
-                    .unwrap_or_else(|| "x-ai/grok-4.20-beta".into());
+                    .provider_registry
+                    .resolve_tier("max", None, None, None)
+                    .map(|r| r.tier.model_id.clone())
+                    .unwrap_or_else(|_| {
+                        // Fallback: read from config on disk (legacy path).
+                        state
+                            .pyramid
+                            .data_dir
+                            .as_ref()
+                            .map(|d| crate::pyramid::PyramidConfig::load(d).collapse_model)
+                            .unwrap_or_else(|| "x-ai/grok-4.20-beta".into())
+                    });
                 let warm_in_progress = state.warm_in_progress.clone();
                 let slug_for_cleanup = slug.clone();
 

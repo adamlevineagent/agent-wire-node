@@ -3645,9 +3645,23 @@ async fn handle_config_profile(
             ));
         }
         
-        // Update the running LlmConfig
-        *config_lock = pyramid_config.to_llm_config();
-        
+        // Update the running LlmConfig via to_llm_config_with_runtime
+        // so model fields are resolved from the active tier routing
+        // (not hardcoded OpenRouter slugs). Preserve api_key + auth_token
+        // from the live config — profiles only override model selection.
+        let preserved_api_key = config_lock.api_key.clone();
+        let preserved_auth_token = config_lock.auth_token.clone();
+        *config_lock = pyramid_config.to_llm_config_with_runtime(
+            state.provider_registry.clone(),
+            state.credential_store.clone(),
+        );
+        if config_lock.api_key.is_empty() {
+            config_lock.api_key = preserved_api_key;
+        }
+        if config_lock.auth_token.is_empty() {
+            config_lock.auth_token = preserved_auth_token;
+        }
+
         Ok(json_ok(&serde_json::json!({
             "status": "profile_applied",
             "profile": profile_name,

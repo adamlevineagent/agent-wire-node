@@ -13013,6 +13013,24 @@ pub fn seed_default_provider_registry(conn: &Connection) -> Result<()> {
             "Conversation extraction tier — same model as fast_extract (Adam's default)",
         ),
     )?;
+    save_tier_routing(
+        conn,
+        &seed_tier(
+            "high",
+            "qwen/qwen3.5-flash-02-23",
+            Some(900_000),
+            "Large-context fallback tier for cascade (Adam's default)",
+        ),
+    )?;
+    save_tier_routing(
+        conn,
+        &seed_tier(
+            "max",
+            "x-ai/grok-4.20-beta",
+            Some(1_000_000),
+            "Maximum-context fallback tier for cascade (Adam's default)",
+        ),
+    )?;
 
     Ok(())
 }
@@ -13028,6 +13046,8 @@ pub fn ensure_standard_tiers_exist(conn: &Connection) -> Result<()> {
         ("stale_remote", "minimax/minimax-m2.7", 200_000, "Upper-layer stale checks"),
         ("mid", "inception/mercury-2", 120_000, "Default tier for code/document chains"),
         ("extractor", "inception/mercury-2", 120_000, "Conversation extraction tier"),
+        ("high", "qwen/qwen3.5-flash-02-23", 900_000, "Large-context fallback tier for cascade"),
+        ("max", "x-ai/grok-4.20-beta", 1_000_000, "Maximum-context fallback tier for cascade"),
     ];
     for &(tier_name, model_id, context_limit, notes) in standard_tiers {
         conn.execute(

@@ -7938,6 +7938,12 @@ async fn pyramid_enable_local_mode(
         drop(writer);
         snapshot
     };
+    // After the registry refresh inside commit_enable_local_mode,
+    // rebuild the cascade model fields on the live LlmConfig so
+    // call_model_unified sends the right model name (e.g. an Ollama
+    // model instead of an OpenRouter slug).
+    rebuild_cascade_from_registry(&state).await;
+
     // Refresh reachability OUTSIDE the lock so the probe doesn't
     // block concurrent reader-bound IPCs. The snapshot already has
     // the just-committed state, so this only updates the `reachable`
@@ -7966,7 +7972,43 @@ async fn pyramid_disable_local_mode(
         drop(writer);
         snapshot
     };
+
+    // Same rebuild as enable — switching back to OpenRouter needs
+    // the cascade models updated from the restored tier routing.
+    rebuild_cascade_from_registry(&state).await;
+
     Ok(wire_node_lib::pyramid::local_mode::refresh_status_reachability(snapshot).await)
+}
+
+/// After a provider-registry refresh (local mode toggle, tier routing
+/// contribution apply, etc.), re-resolve the cascade model fields on the
+/// live LlmConfig from the current tier routing table. This ensures
+/// `call_model_unified`'s cascade sends the correct model name for
+/// whichever provider is now active.
+async fn rebuild_cascade_from_registry(state: &tauri::State<'_, SharedState>) {
+    let reg = &state.pyramid.provider_registry;
+    let mut live = state.pyramid.config.write().await;
+    if let Ok(r) = reg.resolve_tier("mid", None, None, None) {
+        live.primary_model = r.tier.model_id.clone();
+        if let Some(limit) = r.tier.context_limit {
+            live.primary_context_limit = limit;
+        }
+    }
+    if let Ok(r) = reg.resolve_tier("high", None, None, None) {
+        live.fallback_model_1 = r.tier.model_id.clone();
+        if let Some(limit) = r.tier.context_limit {
+            live.fallback_1_context_limit = limit;
+        }
+    }
+    if let Ok(r) = reg.resolve_tier("max", None, None, None) {
+        live.fallback_model_2 = r.tier.model_id.clone();
+    }
+    tracing::info!(
+        primary = %live.primary_model,
+        fallback_1 = %live.fallback_model_1,
+        fallback_2 = %live.fallback_model_2,
+        "rebuilt cascade model fields from tier routing",
+    );
 }
 
 #[tauri::command]

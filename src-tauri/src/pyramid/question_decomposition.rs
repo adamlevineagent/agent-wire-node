@@ -1598,7 +1598,7 @@ pub fn question_tree_to_question_set(
             prompt: l2_reduce_prompt,
             cluster_prompt: Some(l2_cluster_prompt),
             model: None,
-            cluster_model: Some("qwen/qwen3.5-flash-02-23".to_string()),
+            cluster_model: None, // resolved from tier routing at dispatch time
             temperature: None,
             parallel: None,
             retry: Some(2),

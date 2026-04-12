@@ -686,7 +686,7 @@ impl PyramidConfig {
         credential_store: SharedCredentialStore,
     ) -> LlmConfig {
         let mut cfg = self.to_llm_config();
-        cfg.provider_registry = Some(provider_registry);
+        cfg.provider_registry = Some(provider_registry.clone());
         cfg.credential_store = Some(credential_store.clone());
         // Populate api_key cache from credential store (canonical source).
         // Falls back to the PyramidConfig value (already set by to_llm_config)
@@ -694,6 +694,38 @@ impl PyramidConfig {
         if let Ok(secret) = credential_store.resolve_var("OPENROUTER_KEY") {
             cfg.api_key = secret.raw_clone();
         }
+
+        // ── Resolve cascade model fields from tier routing ──────────
+        // The cascade in call_model_unified picks primary/fallback_1/fallback_2
+        // based on input token count. Without this resolution, these fields
+        // carry OpenRouter slugs even when Ollama (or another provider) is
+        // active — the HTTP request goes to the right endpoint but sends a
+        // model name the provider doesn't recognize.
+        //
+        // Mapping: primary → mid, fallback_1 → high, fallback_2 → max.
+        // Failures are non-fatal: the field keeps its default (OpenRouter slug),
+        // which is correct when OpenRouter IS the active provider.
+        let tier_map: &[(&str, fn(&mut LlmConfig, String, Option<usize>))] = &[
+            ("mid", |c, model, ctx| {
+                c.primary_model = model;
+                if let Some(limit) = ctx { c.primary_context_limit = limit; }
+            }),
+            ("high", |c, model, ctx| {
+                c.fallback_model_1 = model;
+                if let Some(limit) = ctx { c.fallback_1_context_limit = limit; }
+            }),
+            ("max", |c, model, _ctx| {
+                c.fallback_model_2 = model;
+                // fallback_2 has no dedicated context_limit field — it's the
+                // "everything bigger than fallback_1_context_limit" bucket.
+            }),
+        ];
+        for &(tier_name, apply) in tier_map {
+            if let Ok(resolved) = provider_registry.resolve_tier(tier_name, None, None, None) {
+                apply(&mut cfg, resolved.tier.model_id.clone(), resolved.tier.context_limit);
+            }
+        }
+
         cfg
     }
 }

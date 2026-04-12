@@ -510,6 +510,8 @@ pub fn commit_enable_local_mode(
         "stale_local",
         "mid",        // code.yaml, document.yaml default tier
         "extractor",  // conversation chain extraction tier
+        "high",       // cascade fallback tier (large context)
+        "max",        // cascade fallback tier (maximum context)
     ] {
         prior_tier_names.insert(required.to_string());
     }
