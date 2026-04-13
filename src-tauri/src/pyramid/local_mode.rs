@@ -469,7 +469,17 @@ pub fn commit_enable_local_mode(
         auto_detect_context: true,
         supports_broadcast: false,
         broadcast_config_json: None,
-        config_json: serde_json::json!({"num_ctx": effective_context}).to_string(),
+        config_json: {
+            // Read-modify-write: preserve existing keys (e.g. extra_headers
+            // for nginx-fronted Ollama) while merging num_ctx.
+            let mut cfg: serde_json::Value = db::get_provider(conn, OLLAMA_LOCAL_PROVIDER_ID)
+                .ok()
+                .flatten()
+                .and_then(|p| serde_json::from_str(&p.config_json).ok())
+                .unwrap_or_else(|| serde_json::json!({}));
+            cfg["num_ctx"] = serde_json::json!(effective_context);
+            cfg.to_string()
+        },
         enabled: true,
     };
     save_provider(conn, &provider)?;
@@ -646,6 +656,7 @@ pub fn commit_enable_local_mode(
     let dispatch_policy_yaml = "schema_type: dispatch_policy\n\
                                 version: 1\n\
                                 provider_pools:\n  ollama-local:\n    concurrency: 1\n\
+                                routing_rules:\n  - name: ollama-catchall\n    match_config: {}\n    route_to:\n      - provider_id: ollama-local\n\
                                 build_coordination:\n  defer_maintenance_during_build: true\n";
     let prior_dispatch_policy =
         load_active_config_contribution(conn, "dispatch_policy", None)?;
@@ -922,14 +933,30 @@ pub use db::save_local_mode_state as write_state;
 
 // ── Hot-swap (AD-1) ────────────────────────────────────────────────────────
 
-/// Async prepare phase for model hot-swap. Validates the model name and
-/// probes `/api/show` for the context window. No DB work.
+/// Async prepare phase for model hot-swap. Validates the model name,
+/// checks Ollama reachability, verifies the model exists, and probes
+/// `/api/show` for the context window. No DB work.
 pub async fn prepare_switch_local_model(
     base_url: &str,
     model: &str,
 ) -> Result<(String, usize)> {
     if model.trim().is_empty() {
         bail!("Model name must not be empty");
+    }
+    // Verify Ollama is reachable and the model exists (matches enable validation)
+    let probe = probe_ollama(base_url).await;
+    if !probe.reachable {
+        return Err(anyhow!(
+            "Cannot reach Ollama at {base_url}: {}. Is Ollama running?",
+            probe.reachability_error.unwrap_or_else(|| "unknown error".to_string())
+        ));
+    }
+    if !probe.available_models.iter().any(|m| m == model) {
+        return Err(anyhow!(
+            "Model '{}' not found on Ollama at {base_url}. Available: {}",
+            model,
+            probe.available_models.join(", ")
+        ));
     }
     let detected_context = detect_ollama_context_window(base_url, model)
         .await
@@ -1000,8 +1027,12 @@ pub fn commit_switch_local_model(
     let new_tier_yaml_string = build_tier_routing_yaml_string(&new_tier_yaml)?;
 
     // Update provider config_json with num_ctx so Ollama allocates the context window.
+    // Read-modify-write: preserve existing keys (e.g. extra_headers for nginx-fronted Ollama).
     if let Ok(Some(mut provider)) = super::db::get_provider(conn, OLLAMA_LOCAL_PROVIDER_ID) {
-        provider.config_json = serde_json::json!({"num_ctx": effective_context}).to_string();
+        let mut cfg: serde_json::Value = serde_json::from_str(&provider.config_json)
+            .unwrap_or_else(|_| serde_json::json!({}));
+        cfg["num_ctx"] = serde_json::json!(effective_context);
+        provider.config_json = cfg.to_string();
         super::db::save_provider(conn, &provider)?;
     }
 

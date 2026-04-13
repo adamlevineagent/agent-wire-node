@@ -8256,6 +8256,18 @@ async fn pyramid_switch_local_model(
     state: tauri::State<'_, SharedState>,
     model: String,
 ) -> Result<wire_node_lib::pyramid::local_mode::LocalModeStatus, String> {
+    // Active build guard (AD-1): check BEFORE the slow Ollama probe.
+    {
+        let active = state.pyramid.active_build.read().await;
+        if !active.is_empty() {
+            return Err(
+                "Cannot change model routing while a build is in progress — \
+                 wait for it to complete or cancel it."
+                    .to_string(),
+            );
+        }
+    }
+
     // Phase 1: async prepare — read base_url from state, probe context.
     let base_url = {
         let reader = state.pyramid.reader.lock().await;
@@ -8273,15 +8285,16 @@ async fn pyramid_switch_local_model(
             .await
             .map_err(|e| e.to_string())?;
 
-    // Phase 2: sync commit under writer lock — check active builds first.
+    // Phase 2: sync commit under writer lock.
     let snapshot = {
-        // Active build guard (AD-1): refuse if any build is in progress.
+        // Re-check active builds inside the lock (TOCTOU: a build may have
+        // started during the Ollama probe window).
         {
             let active = state.pyramid.active_build.read().await;
             if !active.is_empty() {
                 return Err(
-                    "Cannot change model routing while a build is in progress — \
-                     wait for it to complete or cancel it."
+                    "A build started while probing the model — \
+                     cannot change routing while a build is in progress."
                         .to_string(),
                 );
             }
