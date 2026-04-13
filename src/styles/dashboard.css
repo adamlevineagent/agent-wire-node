@@ -22489,3 +22489,10 @@ body {
     margin: 0;
     opacity: 0.8;
 }
+
+.ps-window-body {
+    display: flex;
+    flex: 1;
+    overflow: hidden;
+    position: relative;
+}

@@ -10,7 +10,9 @@ import { useState, useCallback, useEffect } from 'react';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { PyramidSurface } from './PyramidSurface';
 import { GridView } from './GridView';
+import { NodeInspectorPanel } from '../theatre/NodeInspectorPanel';
 import { useVizConfig } from '../../hooks/useVizConfig';
+import type { LiveNodeInfo } from '../theatre/types';
 
 interface PyramidSurfaceWindowProps {
     slug?: string;
@@ -18,6 +20,7 @@ interface PyramidSurfaceWindowProps {
 
 export function PyramidSurfaceWindow({ slug: initialSlug }: PyramidSurfaceWindowProps) {
     const [currentSlug, setCurrentSlug] = useState<string | undefined>(initialSlug);
+    const [inspectedNodeId, setInspectedNodeId] = useState<string | null>(null);
     const { config } = useVizConfig(currentSlug);
 
     // Show the window once React is ready
@@ -28,17 +31,28 @@ export function PyramidSurfaceWindow({ slug: initialSlug }: PyramidSurfaceWindow
     // Navigate to a specific pyramid
     const handleSelectPyramid = useCallback((slug: string) => {
         setCurrentSlug(slug);
+        setInspectedNodeId(null);
     }, []);
 
     // Navigate back to grid
     const handleBackToGrid = useCallback(() => {
         setCurrentSlug(undefined);
+        setInspectedNodeId(null);
     }, []);
 
-    // Handle node click — for now, just log (inspector integration comes later)
+    // Handle node click — open the inspector panel
     const handleNodeClick = useCallback((nodeId: string) => {
-        console.log('Node clicked in pyramid window:', nodeId);
-        // TODO: Open NodeInspectorPanel in this window
+        setInspectedNodeId(nodeId);
+    }, []);
+
+    // Handle inspector navigation (arrow keys between nodes)
+    const handleInspectorNavigate = useCallback((nodeId: string) => {
+        setInspectedNodeId(nodeId);
+    }, []);
+
+    // Close inspector
+    const handleCloseInspector = useCallback(() => {
+        setInspectedNodeId(null);
     }, []);
 
     // Grid View (no slug selected)
@@ -65,11 +79,22 @@ export function PyramidSurfaceWindow({ slug: initialSlug }: PyramidSurfaceWindow
                 </button>
                 <h2 className="ps-window-title">{currentSlug}</h2>
             </div>
-            <PyramidSurface
-                slug={currentSlug}
-                mode="full"
-                onNodeClick={handleNodeClick}
-            />
+            <div className="ps-window-body">
+                <PyramidSurface
+                    slug={currentSlug}
+                    mode="full"
+                    onNodeClick={handleNodeClick}
+                />
+                {inspectedNodeId && currentSlug && (
+                    <NodeInspectorPanel
+                        slug={currentSlug}
+                        nodeId={inspectedNodeId}
+                        allNodes={[]}
+                        onClose={handleCloseInspector}
+                        onNavigate={handleInspectorNavigate}
+                    />
+                )}
+            </div>
         </div>
     );
 }

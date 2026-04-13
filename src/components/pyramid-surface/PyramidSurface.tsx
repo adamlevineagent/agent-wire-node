@@ -6,6 +6,7 @@ import { useVisualEncoding } from './useVisualEncoding';
 import { useChronicleStream } from './useChronicleStream';
 import { CanvasRenderer } from './CanvasRenderer';
 import { DomRenderer } from './DomRenderer';
+import { GpuRenderer } from './GpuRenderer';
 import { MiniaturePyramid } from './MiniaturePyramid';
 import { Chronicle } from './Chronicle';
 import { EventTicker } from './EventTicker';
@@ -122,12 +123,33 @@ export function PyramidSurface({
         const el = containerRef.current;
         if (!el || mode === 'ticker') return;
 
-        // Create renderer based on tier
-        const tier = config.rendering.tier === 'auto' ? 'standard' : config.rendering.tier;
-        const renderer: PyramidRenderer =
-            tier === 'minimal' ? new DomRenderer() : new CanvasRenderer();
+        // Create renderer based on tier with auto-detection
+        let detectedTier = config.rendering.tier;
+        if (detectedTier === 'auto') {
+            // Auto-detect: try WebGL2, fall back to Canvas 2D
+            const testCanvas = document.createElement('canvas');
+            detectedTier = testCanvas.getContext('webgl2') ? 'rich' : 'standard';
+        }
 
-        renderer.attach(el);
+        let renderer: PyramidRenderer;
+        if (detectedTier === 'minimal') {
+            renderer = new DomRenderer();
+            renderer.attach(el);
+        } else if (detectedTier === 'rich') {
+            try {
+                const gpu = new GpuRenderer();
+                gpu.attach(el); // attach() throws if WebGL2 unavailable
+                renderer = gpu;
+            } catch {
+                // WebGL2 not available — fall back to Canvas 2D
+                renderer = new CanvasRenderer();
+                renderer.attach(el);
+            }
+        } else {
+            renderer = new CanvasRenderer();
+            renderer.attach(el);
+        }
+
         rendererRef.current = renderer;
 
         return () => {
