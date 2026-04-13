@@ -20369,3 +20369,1326 @@ body {
     background: rgba(64, 208, 128, 0.1);
     color: var(--accent-green);
 }
+
+/* ═══════════════════════════════════════════════════════════════════
+   Node Inspector Panel (ni-*)
+   Slide-in panel replacing the old modal inspector.
+   ═══════════════════════════════════════════════════════════════════ */
+
+/* ─── Slide-in animation ─────────────────────────────────────────── */
+
+@keyframes ni-slide-in {
+    from { transform: translateX(100%); }
+    to   { transform: translateX(0); }
+}
+
+@keyframes ni-fade-in {
+    from { opacity: 0; }
+    to   { opacity: 1; }
+}
+
+/* ─── Panel layout ───────────────────────────────────────────────── */
+
+.ni-panel {
+    position: fixed;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    width: 480px;
+    max-width: 100vw;
+    background: var(--bg-surface);
+    border-left: 1px solid var(--glass-border);
+    display: flex;
+    flex-direction: column;
+    z-index: 1000;
+    animation: ni-slide-in 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+    box-shadow: -8px 0 32px rgba(0, 0, 0, 0.5);
+}
+
+/* ─── Header ─────────────────────────────────────────────────────── */
+
+.ni-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--glass-border);
+    flex-shrink: 0;
+}
+
+.ni-nav {
+    display: flex;
+    gap: 4px;
+}
+
+.ni-nav-btn {
+    width: 28px;
+    height: 28px;
+    border: 1px solid var(--glass-border);
+    border-radius: 4px;
+    background: transparent;
+    color: var(--text-secondary);
+    cursor: pointer;
+    font-size: 12px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: background var(--transition), color var(--transition);
+}
+
+.ni-nav-btn:disabled {
+    opacity: 0.3;
+    cursor: default;
+}
+
+.ni-nav-btn:not(:disabled):hover {
+    background: var(--glass);
+    color: var(--text-primary);
+}
+
+.ni-title {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+    overflow: hidden;
+}
+
+.ni-headline {
+    font-weight: 600;
+    font-size: 14px;
+    color: var(--text-primary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.ni-depth-badge {
+    background: var(--accent-cyan);
+    color: #000;
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: 700;
+    flex-shrink: 0;
+}
+
+.ni-close {
+    width: 28px;
+    height: 28px;
+    border: none;
+    background: transparent;
+    color: var(--text-muted);
+    cursor: pointer;
+    font-size: 14px;
+    border-radius: 4px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: background var(--transition), color var(--transition);
+}
+
+.ni-close:hover {
+    background: var(--glass);
+    color: var(--text-primary);
+}
+
+.ni-expand-toggle {
+    padding: 4px 8px;
+    border: 1px solid var(--glass-border);
+    border-radius: 4px;
+    background: transparent;
+    color: var(--text-secondary);
+    cursor: pointer;
+    font-size: 11px;
+    transition: background var(--transition), color var(--transition);
+}
+
+.ni-expand-toggle:hover {
+    background: var(--glass);
+    color: var(--text-primary);
+}
+
+/* ─── Scrollable body ────────────────────────────────────────────── */
+
+.ni-body {
+    flex: 1;
+    overflow-y: auto;
+    padding: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+}
+
+.ni-body::-webkit-scrollbar {
+    width: 6px;
+}
+
+.ni-body::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+.ni-body::-webkit-scrollbar-thumb {
+    background: var(--glass-border);
+    border-radius: 3px;
+}
+
+.ni-body::-webkit-scrollbar-thumb:hover {
+    background: rgba(255, 255, 255, 0.15);
+}
+
+/* ─── Content section — Narrative ────────────────────────────────── */
+
+.ni-narrative-level {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 12px;
+    background: var(--glass);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-sm);
+    font-size: 12px;
+    color: var(--text-secondary);
+}
+
+.ni-topic {
+    padding: 12px;
+    background: var(--glass);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-sm);
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.ni-topic-name {
+    font-weight: 600;
+    font-size: 13px;
+    color: var(--text-primary);
+}
+
+.ni-topic-current {
+    font-size: 12px;
+    color: var(--text-secondary);
+    line-height: 1.5;
+}
+
+.ni-correction {
+    padding: 8px 12px;
+    margin-top: 4px;
+    background: rgba(240, 192, 64, 0.06);
+    border-left: 3px solid var(--accent-warm);
+    border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+    font-size: 12px;
+    color: var(--text-secondary);
+    line-height: 1.5;
+}
+
+.ni-decision {
+    padding: 8px 12px;
+    margin-top: 4px;
+    background: rgba(167, 139, 250, 0.06);
+    border-left: 3px solid var(--accent-purple);
+    border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+    font-size: 12px;
+    color: var(--text-secondary);
+    line-height: 1.5;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.ni-stance-badge {
+    display: inline-block;
+    padding: 1px 6px;
+    border-radius: 3px;
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    background: rgba(167, 139, 250, 0.15);
+    color: var(--accent-purple);
+}
+
+.ni-entity-tag {
+    display: inline-block;
+    padding: 1px 6px;
+    border-radius: 3px;
+    font-size: 11px;
+    font-weight: 500;
+    background: rgba(34, 211, 238, 0.1);
+    color: var(--accent-cyan);
+    border: 1px solid rgba(34, 211, 238, 0.15);
+}
+
+.ni-term-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+}
+
+.ni-term-table td {
+    padding: 6px 8px;
+    border-bottom: 1px solid var(--glass-border);
+    vertical-align: top;
+}
+
+.ni-term-table td:first-child {
+    font-weight: 600;
+    color: var(--text-primary);
+    width: 35%;
+    white-space: nowrap;
+}
+
+.ni-term-table td:last-child {
+    color: var(--text-secondary);
+}
+
+.ni-quote {
+    padding: 10px 12px;
+    background: var(--glass);
+    border-left: 3px solid var(--accent-cyan);
+    border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+    font-size: 12px;
+    font-style: italic;
+    color: var(--text-secondary);
+    line-height: 1.5;
+}
+
+.ni-quote-meta {
+    display: flex;
+    gap: 8px;
+    margin-top: 4px;
+    font-size: 11px;
+    font-style: normal;
+    color: var(--text-muted);
+}
+
+.ni-dead-end {
+    padding: 6px 12px;
+    font-size: 12px;
+    color: var(--text-muted);
+    border-left: 3px solid rgba(255, 255, 255, 0.08);
+    border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+}
+
+/* ─── Content section — Structure ────────────────────────────────── */
+
+.ni-child-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 12px;
+    background: var(--glass);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+    transition: background var(--transition), border-color var(--transition);
+}
+
+.ni-child-item:hover {
+    background: var(--bg-card-hover);
+    border-color: rgba(34, 211, 238, 0.2);
+}
+
+.ni-child-headline {
+    flex: 1;
+    font-size: 12px;
+    color: var(--text-primary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.ni-child-id {
+    font-size: 11px;
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    color: var(--text-muted);
+    flex-shrink: 0;
+}
+
+.ni-evidence-item {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    padding: 8px 12px;
+    background: var(--glass);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-sm);
+}
+
+.ni-verdict-badge {
+    display: inline-block;
+    padding: 1px 6px;
+    border-radius: 3px;
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    flex-shrink: 0;
+}
+
+.ni-verdict-keep {
+    background: rgba(64, 208, 128, 0.15);
+    color: var(--accent-green);
+}
+
+.ni-verdict-disconnect {
+    background: rgba(240, 160, 64, 0.15);
+    color: #f0a040;
+}
+
+.ni-verdict-missing {
+    background: rgba(240, 192, 64, 0.15);
+    color: var(--accent-warm);
+}
+
+.ni-evidence-source {
+    font-size: 11px;
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    color: var(--accent-cyan);
+    cursor: pointer;
+    transition: color var(--transition);
+}
+
+.ni-evidence-source:hover {
+    color: #5ce4f8;
+}
+
+.ni-evidence-weight {
+    font-size: 11px;
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    color: var(--text-secondary);
+    flex-shrink: 0;
+}
+
+.ni-evidence-reason {
+    font-size: 11px;
+    color: var(--text-muted);
+    line-height: 1.4;
+    flex: 1;
+}
+
+.ni-superseded {
+    opacity: 0.5;
+    text-decoration: line-through;
+}
+
+.ni-web-edge {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 12px;
+    background: var(--glass);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-sm);
+}
+
+.ni-edge-target {
+    flex: 1;
+    font-size: 12px;
+    color: var(--text-primary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.ni-edge-rel {
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--accent-purple);
+    flex-shrink: 0;
+}
+
+.ni-edge-strength {
+    font-size: 11px;
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    color: var(--text-secondary);
+    flex-shrink: 0;
+}
+
+.ni-transition {
+    padding: 8px 12px;
+    font-size: 12px;
+    color: var(--text-secondary);
+    background: var(--glass);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-sm);
+    line-height: 1.5;
+}
+
+.ni-question-context {
+    padding: 12px;
+    background: rgba(167, 139, 250, 0.04);
+    border: 1px solid rgba(167, 139, 250, 0.1);
+    border-radius: var(--radius-sm);
+    font-size: 12px;
+    color: var(--text-secondary);
+    line-height: 1.5;
+}
+
+/* ─── Episodic section ───────────────────────────────────────────── */
+
+.ni-entity-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 0;
+    border-bottom: 1px solid var(--glass-border);
+    font-size: 12px;
+}
+
+.ni-entity-row:last-child {
+    border-bottom: none;
+}
+
+.ni-entity-name {
+    font-weight: 600;
+    color: var(--text-primary);
+    min-width: 100px;
+}
+
+.ni-entity-role {
+    font-size: 11px;
+    color: var(--text-muted);
+    flex-shrink: 0;
+}
+
+.ni-importance-bar {
+    height: 4px;
+    border-radius: 2px;
+    background: var(--glass-border);
+    flex: 1;
+    min-width: 40px;
+    overflow: hidden;
+}
+
+.ni-importance-bar::after {
+    content: '';
+    display: block;
+    height: 100%;
+    border-radius: 2px;
+    background: var(--accent-cyan);
+    width: var(--importance, 0%);
+    transition: width var(--transition);
+}
+
+.ni-liveness {
+    font-size: 11px;
+    font-weight: 600;
+    padding: 1px 6px;
+    border-radius: 3px;
+    flex-shrink: 0;
+}
+
+.ni-liveness[data-status="alive"] {
+    background: rgba(64, 208, 128, 0.15);
+    color: var(--accent-green);
+}
+
+.ni-liveness[data-status="dead"] {
+    background: rgba(255, 80, 80, 0.15);
+    color: #ff5050;
+}
+
+.ni-liveness[data-status="unknown"] {
+    background: var(--glass);
+    color: var(--text-muted);
+}
+
+.ni-temporal {
+    font-size: 11px;
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    color: var(--text-muted);
+}
+
+.ni-weight-value {
+    font-size: 12px;
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    color: var(--accent-cyan);
+    font-weight: 600;
+}
+
+.ni-provisional-badge {
+    display: inline-block;
+    padding: 1px 6px;
+    border-radius: 3px;
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    background: rgba(240, 192, 64, 0.15);
+    color: var(--accent-warm);
+}
+
+.ni-promoted-from {
+    font-size: 11px;
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    color: var(--text-muted);
+    cursor: pointer;
+    transition: color var(--transition);
+}
+
+.ni-promoted-from:hover {
+    color: var(--accent-cyan);
+}
+
+/* ─── Provenance section ─────────────────────────────────────────── */
+
+.ni-self-prompt {
+    background: var(--bg-card);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-sm);
+    padding: 12px;
+    font-size: 12px;
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 200px;
+    overflow-y: auto;
+    color: var(--text-secondary);
+    line-height: 1.5;
+}
+
+.ni-provenance-row {
+    display: flex;
+    gap: 8px;
+    padding: 4px 0;
+    font-size: 12px;
+    align-items: baseline;
+}
+
+.ni-provenance-label {
+    color: var(--text-muted);
+    min-width: 100px;
+    flex-shrink: 0;
+}
+
+.ni-provenance-value {
+    color: var(--text-secondary);
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    word-break: break-all;
+}
+
+/* ─── LLM Record section ────────────────────────────────────────── */
+
+.ni-prompt-text {
+    background: var(--bg-card);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-sm);
+    padding: 12px;
+    font-size: 12px;
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 300px;
+    overflow-y: auto;
+    margin: 0;
+    color: var(--text-secondary);
+    line-height: 1.5;
+}
+
+.ni-prompt-charcount {
+    display: inline-block;
+    padding: 1px 6px;
+    border-radius: 3px;
+    font-size: 10px;
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    color: var(--text-muted);
+    background: var(--glass);
+}
+
+.ni-response-toggle {
+    display: flex;
+    gap: 4px;
+}
+
+.ni-response-toggle button {
+    padding: 4px 12px;
+    border: 1px solid var(--glass-border);
+    border-radius: 4px;
+    background: transparent;
+    color: var(--text-muted);
+    cursor: pointer;
+    font-size: 12px;
+    transition: background var(--transition), color var(--transition);
+}
+
+.ni-response-toggle button:hover {
+    background: var(--glass);
+}
+
+.ni-response-toggle button.active {
+    background: var(--glass);
+    color: var(--text-primary);
+    border-color: rgba(255, 255, 255, 0.15);
+}
+
+.ni-response-structured {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.ni-response-raw {
+    background: var(--bg-card);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-sm);
+    padding: 12px;
+    font-size: 12px;
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 400px;
+    overflow-y: auto;
+    margin: 0;
+    color: var(--text-secondary);
+    line-height: 1.5;
+}
+
+.ni-meta-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+}
+
+.ni-meta-table td {
+    padding: 4px 0;
+    vertical-align: top;
+}
+
+.ni-meta-label {
+    color: var(--text-muted);
+    padding-right: 12px;
+    white-space: nowrap;
+    width: 1%;
+}
+
+.ni-meta-value {
+    color: var(--text-secondary);
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    word-break: break-all;
+}
+
+/* ─── Footer ─────────────────────────────────────────────────────── */
+
+.ni-footer {
+    display: flex;
+    gap: 16px;
+    padding: 8px 16px;
+    border-top: 1px solid var(--glass-border);
+    font-size: 11px;
+    color: var(--text-muted);
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    flex-shrink: 0;
+}
+
+/* ─── Accordion transitions for ni-* sections ────────────────────── */
+
+.ni-section-collapse {
+    overflow: hidden;
+    transition: max-height 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/* ─── Missing structural / utility rules ────────────────────────── */
+
+.ni-empty {
+    padding: 16px;
+    font-size: 12px;
+    color: var(--text-muted);
+    text-align: center;
+}
+
+.ni-loading {
+    padding: 32px 16px;
+    font-size: 13px;
+    color: var(--text-muted);
+    text-align: center;
+}
+
+.ni-header-actions {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    flex-shrink: 0;
+}
+
+.ni-sections {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.ni-children-list,
+.ni-evidence-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+/* ─── Remote web edges ──────────────────────────────────────────── */
+
+.ni-remote-web-edges {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.ni-remote-edge-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 12px;
+    background: var(--glass);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-sm);
+}
+
+.ni-remote-edge-slug {
+    font-weight: 600;
+    font-size: 12px;
+    color: var(--text-primary);
+    flex-shrink: 0;
+}
+
+.ni-remote-edge-path {
+    font-size: 11px;
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    color: var(--text-muted);
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.ni-remote-edge-rel {
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--accent-purple);
+    flex-shrink: 0;
+}
+
+.ni-remote-edge-relevance {
+    font-size: 11px;
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    color: var(--text-secondary);
+    flex-shrink: 0;
+}
+
+/* ─── Narrative sub-elements ────────────────────────────────────── */
+
+.ni-narrative {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.ni-narrative-zoom {
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--accent-cyan);
+    flex-shrink: 0;
+}
+
+.ni-narrative-text {
+    margin: 0;
+    flex: 1;
+    line-height: 1.5;
+}
+
+/* ─── Topic sub-elements ────────────────────────────────────────── */
+
+.ni-topic-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.ni-topic-sub-label {
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-muted);
+}
+
+.ni-topic-corrections,
+.ni-topic-decisions {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.ni-topic-entities {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+}
+
+.ni-correction-wrong {
+    color: rgba(255, 80, 80, 0.8);
+    text-decoration: line-through;
+}
+
+.ni-correction-arrow {
+    color: var(--text-muted);
+    margin: 0 4px;
+}
+
+.ni-correction-right {
+    color: var(--accent-green);
+}
+
+.ni-correction-who {
+    color: var(--text-muted);
+    font-size: 11px;
+    margin-left: 4px;
+}
+
+.ni-decision-text {
+    font-weight: 500;
+    color: var(--text-primary);
+}
+
+.ni-decision-why {
+    color: var(--text-secondary);
+    font-size: 11px;
+}
+
+.ni-decision-importance {
+    font-size: 10px;
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    color: var(--text-muted);
+}
+
+/* ─── Quote sub-elements ────────────────────────────────────────── */
+
+.ni-quotes {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.ni-quote-text {
+    margin: 0;
+}
+
+.ni-quote-speaker {
+    color: var(--text-secondary);
+    font-weight: 500;
+}
+
+.ni-quote-role {
+    color: var(--text-muted);
+    font-weight: 400;
+}
+
+.ni-quote-importance {
+    font-size: 10px;
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    color: var(--text-muted);
+}
+
+.ni-quote-chunk-ref {
+    font-size: 10px;
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    color: var(--text-muted);
+}
+
+/* ─── Dead ends ─────────────────────────────────────────────────── */
+
+.ni-dead-ends {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+/* ─── Structure sub-elements ────────────────────────────────────── */
+
+.ni-child-excerpt {
+    font-size: 11px;
+    color: var(--text-muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    flex: 1;
+}
+
+.ni-web-edges {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.ni-transitions {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.ni-transition-label {
+    font-weight: 600;
+    font-size: 11px;
+    color: var(--text-muted);
+    margin-right: 6px;
+}
+
+.ni-transition-text {
+    color: var(--text-secondary);
+}
+
+.ni-question-label {
+    font-weight: 600;
+    font-size: 11px;
+    color: var(--text-muted);
+    display: block;
+    margin-bottom: 4px;
+}
+
+.ni-question-text {
+    color: var(--text-secondary);
+}
+
+.ni-question-parent {
+    margin-bottom: 8px;
+}
+
+.ni-question-siblings {
+    display: flex;
+    flex-direction: column;
+}
+
+.ni-sibling-list {
+    list-style: disc;
+    margin: 4px 0 0 16px;
+    padding: 0;
+}
+
+.ni-sibling-question {
+    font-size: 12px;
+    color: var(--text-secondary);
+    margin-bottom: 2px;
+}
+
+/* ─── Evidence sub-elements ─────────────────────────────────────── */
+
+.ni-evidence-status {
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    flex-shrink: 0;
+}
+
+.ni-evidence-status.ni-live {
+    color: var(--accent-green);
+}
+
+.ni-evidence-status.ni-superseded {
+    color: var(--text-muted);
+}
+
+/* ─── LLM Record sub-elements ───────────────────────────────────── */
+
+.ni-llm-record {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.ni-llm-pending {
+    padding: 16px;
+    font-size: 12px;
+    color: var(--text-muted);
+    text-align: center;
+}
+
+.ni-response {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.ni-response-error {
+    padding: 12px;
+    background: rgba(255, 80, 80, 0.08);
+    border: 1px solid rgba(255, 80, 80, 0.2);
+    border-radius: var(--radius-sm);
+    font-size: 12px;
+    color: #ff5050;
+}
+
+.ni-response-field {
+    font-size: 12px;
+    color: var(--text-secondary);
+    line-height: 1.5;
+}
+
+.ni-verdict-list {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin-top: 4px;
+}
+
+.ni-verdict-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 11px;
+}
+
+.ni-verdict-node {
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 11px;
+    color: var(--text-secondary);
+}
+
+/* ─── Provenance sub-elements ───────────────────────────────────── */
+
+.ni-chain-phase {
+    font-size: 11px;
+    color: var(--text-muted);
+}
+
+/* ─── Episodic sub-elements ─────────────────────────────────────── */
+
+.ni-weight-status {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    align-items: center;
+}
+
+.ni-weight-field,
+.ni-promoted-field {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.ni-weight-label,
+.ni-promoted-label {
+    font-size: 12px;
+    color: var(--text-muted);
+}
+
+.ni-promoted-value {
+    font-size: 11px;
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    color: var(--text-muted);
+}
+
+.ni-temporal-field {
+    display: flex;
+    gap: 8px;
+    align-items: baseline;
+    margin-bottom: 4px;
+}
+
+.ni-temporal-label {
+    font-weight: 600;
+    color: var(--text-muted);
+    min-width: 40px;
+}
+
+.ni-temporal-value {
+    color: var(--text-secondary);
+}
+
+.ni-topics {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.ni-distilled {
+    padding: 12px;
+    background: var(--glass);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-sm);
+}
+
+.ni-distilled-text {
+    margin: 0;
+    font-size: 13px;
+    color: var(--text-secondary);
+    line-height: 1.6;
+}
+
+/* ─── Gaps (DrillResult) ────────────────────────────────────────── */
+
+.ni-gaps {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.ni-gap-item {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    padding: 8px 12px;
+    background: var(--glass);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-sm);
+    font-size: 12px;
+}
+
+.ni-gap-resolved {
+    opacity: 0.5;
+}
+
+.ni-gap-description {
+    flex: 1;
+    color: var(--text-secondary);
+    line-height: 1.4;
+}
+
+.ni-gap-layer {
+    font-size: 10px;
+    font-weight: 700;
+    color: var(--accent-cyan);
+    flex-shrink: 0;
+}
+
+.ni-gap-confidence {
+    font-size: 10px;
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    color: var(--text-muted);
+    flex-shrink: 0;
+}
+
+.clickable {
+    cursor: pointer;
+    transition: color var(--transition);
+}
+
+.clickable:hover {
+    color: var(--accent-cyan);
+}
+
+.mono {
+    font-family: 'SF Mono', 'Fira Code', monospace;
+}
+
+/* ─── Section containers ───────────────────────────────────────── */
+
+.ni-content,
+.ni-structure,
+.ni-episodic,
+.ni-provenance {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+/* ─── Provenance field layout ──────────────────────────────────── */
+/* Component uses ni-provenance-field; CSS had ni-provenance-row. */
+
+.ni-provenance-field {
+    display: flex;
+    gap: 8px;
+    padding: 4px 0;
+    font-size: 12px;
+    align-items: baseline;
+}
+
+.ni-provenance-text {
+    background: var(--bg-card);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-sm);
+    padding: 12px;
+    font-size: 12px;
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 200px;
+    overflow-y: auto;
+    color: var(--text-secondary);
+    line-height: 1.5;
+    margin: 0;
+}
+
+/* ─── LLM audit status colors ─────────────────────────────────── */
+
+.ni-status-complete {
+    color: var(--accent-green);
+}
+
+.ni-status-failed {
+    color: #ff5050;
+}
+
+.ni-status-pending {
+    color: var(--accent-warm);
+}
+
+/* ─── Term table sub-elements ──────────────────────────────────── */
+
+.ni-term-row {
+    border-bottom: 1px solid var(--glass-border);
+}
+
+.ni-term-row:last-child {
+    border-bottom: none;
+}
+
+.ni-term-name {
+    font-weight: 600;
+    color: var(--text-primary);
+    white-space: nowrap;
+}
+
+.ni-term-def {
+    color: var(--text-secondary);
+    font-size: 12px;
+    line-height: 1.4;
+}
+
+/* ─── LLM verdict sub-elements ─────────────────────────────────── */
+
+.ni-verdict-weight {
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 11px;
+    color: var(--text-muted);
+}
+
+.ni-verdict-reason {
+    font-size: 11px;
+    color: var(--text-secondary);
+    flex: 1;
+}
+
+/* ─── Toggle button (explicit class) ──────────────────────────── */
+
+.ni-toggle-btn {
+    padding: 4px 12px;
+    border: 1px solid var(--glass-border);
+    border-radius: 4px;
+    background: transparent;
+    color: var(--text-muted);
+    cursor: pointer;
+    font-size: 12px;
+    transition: background var(--transition), color var(--transition);
+}
+
+.ni-toggle-btn:hover {
+    background: var(--glass);
+}
+
+.ni-toggle-btn.active {
+    background: var(--glass);
+    color: var(--text-primary);
+    border-color: rgba(255, 255, 255, 0.15);
+}

@@ -68,6 +68,7 @@ export interface LlmAuditRecord {
     status: string; // "pending" | "complete" | "failed"
     created_at: string;
     completed_at: string | null;
+    cache_hit: boolean;
 }
 
 /** Spatial node for canvas rendering */
