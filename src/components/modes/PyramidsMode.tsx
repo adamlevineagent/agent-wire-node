@@ -17,6 +17,11 @@ export function PyramidsMode() {
     const [checking, setChecking] = useState(true);
     const [tab, setTab] = useState<PyramidsTab>('dashboard');
 
+    // When a card is clicked in the grid, switch to dashboard tab
+    const handleGridSelectPyramid = useCallback((_slug: string) => {
+        setTab('dashboard');
+    }, []);
+
     useEffect(() => {
         (async () => {
             try {
@@ -24,7 +29,6 @@ export function PyramidsMode() {
                     invoke<SlugInfo[]>('pyramid_list_slugs'),
                     invoke<PyramidConfigInfo>('pyramid_get_config'),
                 ]);
-                // Show first-run if no slugs AND no API key configured
                 if (slugs.length === 0 && !config.api_key_set) {
                     setShowFirstRun(true);
                 }
@@ -43,12 +47,6 @@ export function PyramidsMode() {
             </div>
         );
     }
-
-    // When a card is clicked in the grid, switch to dashboard tab
-    // (PyramidDashboard manages its own selected slug internally)
-    const handleGridSelectPyramid = useCallback((_slug: string) => {
-        setTab('dashboard');
-    }, []);
 
     if (showFirstRun) {
         return <PyramidFirstRun onComplete={() => setShowFirstRun(false)} />;
