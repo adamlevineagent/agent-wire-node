@@ -4152,6 +4152,21 @@ pub async fn execute_chain_from(
             }).await.unwrap_or(false);
             if sentinel_exists {
                 info!("[CHAIN] step \"{}\" skipped (sentinel: already completed)", step.name);
+
+                // Phase 3a: emit NodeSkipped for sentinel-matched step
+                let _ = state.build_event_bus.tx.send(
+                    crate::pyramid::event_bus::TaggedBuildEvent {
+                        slug: slug.to_string(),
+                        kind: crate::pyramid::event_bus::TaggedKind::NodeSkipped {
+                            slug: slug.to_string(),
+                            build_id: chain_build_id.clone(),
+                            step_name: step.name.clone(),
+                            node_id: format!("__step__:{}", step.name),
+                            reason: "sentinel".to_string(),
+                        },
+                    },
+                );
+
                 // Try to hydrate cached output so downstream steps can reference it
                 if let Some(hydrated_output) =
                     hydrate_skipped_step_output(step, &ctx, &state.reader).await?
@@ -5504,14 +5519,27 @@ async fn execute_evidence_loop(
             let aids = answered_ids;
             let lids = lower_ids;
             let l = layer;
-            tokio::task::spawn_blocking(move || {
+            let recon_result = tokio::task::spawn_blocking(move || {
                 let c = conn.blocking_lock();
-                let _ =
+                let result =
                     super::reconciliation::reconcile_layer(&c, &slug_owned, l, &aids, &lids)?;
-                Ok::<(), anyhow::Error>(())
+                Ok::<super::types::ReconciliationResult, anyhow::Error>(result)
             })
             .await
             .map_err(|e| anyhow!("Reconciliation panicked: {e}"))??;
+
+            // Phase 3a: emit ReconciliationEmitted with orphan/central counts
+            let _ = state.build_event_bus.tx.send(
+                crate::pyramid::event_bus::TaggedBuildEvent {
+                    slug: slug.to_string(),
+                    kind: crate::pyramid::event_bus::TaggedKind::ReconciliationEmitted {
+                        slug: slug.to_string(),
+                        build_id: build_id.clone(),
+                        orphan_count: recon_result.orphans.len(),
+                        central_count: recon_result.central_nodes.len(),
+                    },
+                },
+            );
         }
 
         total_nodes += layer_node_count;

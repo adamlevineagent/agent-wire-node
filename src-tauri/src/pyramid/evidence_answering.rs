@@ -655,6 +655,25 @@ pub async fn answer_questions(
             Ok(answered) => {
                 total_evidence += answered.evidence.len();
                 total_missing += answered.missing.len();
+
+                // Phase 3a: emit VerdictProduced for each evidence link
+                if let Some(bus) = bus_for_events.as_ref() {
+                    for ev in &answered.evidence {
+                        let _ = bus.tx.send(crate::pyramid::event_bus::TaggedBuildEvent {
+                            slug: slug.clone(),
+                            kind: crate::pyramid::event_bus::TaggedKind::VerdictProduced {
+                                slug: slug.clone(),
+                                build_id: build_id_for_events.clone(),
+                                step_name: step_name_for_events.clone(),
+                                node_id: ev.target_node_id.clone(),
+                                verdict: ev.verdict.as_str().to_string(),
+                                source_id: ev.source_node_id.clone(),
+                                weight: ev.weight,
+                            },
+                        });
+                    }
+                }
+
                 answered_nodes.push(answered);
                 if let Some(tx) = on_answer {
                     let _ = tx.send(()).await;

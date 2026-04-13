@@ -5248,6 +5248,70 @@ async fn pyramid_check_staleness(
     }
 }
 
+/// Phase 3a: return the resolved chain YAML for a given slug as JSON.
+///
+/// Resolution order: per-slug assignment → content-type default → fallback.
+/// The chain YAML file is loaded, parsed, and returned as a serde_json::Value
+/// so the frontend can render step timelines, inspect primitives, etc.
+#[tauri::command]
+async fn pyramid_get_build_chain(
+    state: tauri::State<'_, SharedState>,
+    slug: String,
+) -> Result<serde_json::Value, String> {
+    use wire_node_lib::pyramid::{chain_loader, chain_registry, db as pyramid_db};
+
+    let reader = state.pyramid.reader.lock().await;
+
+    // 1. Get content_type and evidence_mode for the slug
+    let slug_info = pyramid_db::get_slug(&reader, &slug)
+        .map_err(|e| format!("failed to get slug info: {e}"))?
+        .ok_or_else(|| format!("slug '{}' not found", slug))?;
+
+    let content_type_str = slug_info.content_type.as_str();
+    // Default evidence_mode to "deep" — the most common build mode
+    let evidence_mode = "deep";
+
+    // 2. Resolve chain_id via the three-tier resolver
+    let chain_id = chain_registry::resolve_chain_for_slug(&reader, &slug, content_type_str, evidence_mode)
+        .map_err(|e| format!("failed to resolve chain: {e}"))?;
+    drop(reader);
+
+    // 3. Discover chains and find the YAML file path
+    let chains_dir = state.pyramid.chains_dir.clone();
+    let all_chains = chain_loader::discover_chains(&chains_dir)
+        .map_err(|e| format!("failed to discover chains: {e}"))?;
+
+    let meta = all_chains
+        .iter()
+        .find(|m| m.id == chain_id)
+        .ok_or_else(|| {
+            format!(
+                "chain '{}' not found in chains directory ({})",
+                chain_id,
+                chains_dir.display()
+            )
+        })?;
+
+    // 4. Load the raw YAML and parse to JSON
+    let yaml_path = std::path::Path::new(&meta.file_path);
+    let raw_yaml = std::fs::read_to_string(yaml_path)
+        .map_err(|e| format!("failed to read chain file: {e}"))?;
+
+    let yaml_value: serde_yaml::Value = serde_yaml::from_str(&raw_yaml)
+        .map_err(|e| format!("failed to parse chain YAML: {e}"))?;
+
+    let json_value = serde_json::to_value(yaml_value)
+        .map_err(|e| format!("failed to convert YAML to JSON: {e}"))?;
+
+    Ok(serde_json::json!({
+        "chain_id": chain_id,
+        "content_type": content_type_str,
+        "evidence_mode": evidence_mode,
+        "file_path": meta.file_path,
+        "chain": json_value,
+    }))
+}
+
 /// IPC equivalent of POST /pyramid/chain/import — import a chain or question set from the Wire.
 #[tauri::command]
 async fn pyramid_chain_import(
@@ -11793,6 +11857,8 @@ fn main() {
             pyramid_publish_question_set,
             pyramid_check_staleness,
             pyramid_chain_import,
+            // Phase 3a: chain introspection
+            pyramid_get_build_chain,
             // WS-ONLINE-D: Remote pyramid commands
             pyramid_remote_query,
             pyramid_pin_remote,

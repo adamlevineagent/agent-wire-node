@@ -421,6 +421,50 @@ pub enum TaggedKind {
         auto_update: bool,
     },
 
+    // ── Phase 3a: Fine-grained build introspection ───────────────────
+    //
+    // Per-edge, per-verdict, per-skip, and reconciliation events that
+    // supplement the coarser step-level events above. All four are
+    // discrete (low-frequency, individually meaningful).
+
+    /// Per-edge event during webbing steps. Supplements WebEdgeStarted/Completed.
+    EdgeCreated {
+        slug: String,
+        build_id: String,
+        step_name: String,
+        source_id: String,
+        target_id: String,
+        depth: i64,
+    },
+
+    /// Per-verdict during evidence answering. Supplements EvidenceProcessing.
+    VerdictProduced {
+        slug: String,
+        build_id: String,
+        step_name: String,
+        node_id: String,
+        verdict: String, // "KEEP" | "DISCONNECT"
+        source_id: String,
+        weight: Option<f64>,
+    },
+
+    /// Delta skip or sentinel match during for_each.
+    NodeSkipped {
+        slug: String,
+        build_id: String,
+        step_name: String,
+        node_id: String,
+        reason: String, // "cached" | "unchanged" | "sentinel"
+    },
+
+    /// Post-evidence-loop reconciliation summary.
+    ReconciliationEmitted {
+        slug: String,
+        build_id: String,
+        orphan_count: usize,
+        central_count: usize,
+    },
+
     // ── Phase 4 Daemon Control Plane: Ollama model pull progress ────
     //
     // Emitted by `pull_ollama_model` as it streams the chunked JSON
@@ -652,6 +696,71 @@ mod phase13_tests {
         for v in variants {
             assert!(v.is_discrete(), "variant should be discrete: {:?}", v);
         }
+    }
+
+    #[test]
+    fn test_phase3a_edge_created_serde() {
+        let kind = TaggedKind::EdgeCreated {
+            slug: "s".into(),
+            build_id: "b".into(),
+            step_name: "l0_webbing".into(),
+            source_id: "L0-001".into(),
+            target_id: "L0-002".into(),
+            depth: 0,
+        };
+        let json = serde_json::to_value(&kind).unwrap();
+        assert_eq!(json["type"], "edge_created");
+        assert_eq!(json["source_id"], "L0-001");
+        assert_eq!(json["target_id"], "L0-002");
+        assert!(kind.is_discrete());
+    }
+
+    #[test]
+    fn test_phase3a_verdict_produced_serde() {
+        let kind = TaggedKind::VerdictProduced {
+            slug: "s".into(),
+            build_id: "b".into(),
+            step_name: "answer_questions".into(),
+            node_id: "L2-003".into(),
+            verdict: "KEEP".into(),
+            source_id: "L0-001".into(),
+            weight: Some(0.85),
+        };
+        let json = serde_json::to_value(&kind).unwrap();
+        assert_eq!(json["type"], "verdict_produced");
+        assert_eq!(json["verdict"], "KEEP");
+        assert_eq!(json["weight"], 0.85);
+        assert!(kind.is_discrete());
+    }
+
+    #[test]
+    fn test_phase3a_node_skipped_serde() {
+        let kind = TaggedKind::NodeSkipped {
+            slug: "s".into(),
+            build_id: "b".into(),
+            step_name: "extract".into(),
+            node_id: "L0-001".into(),
+            reason: "sentinel".into(),
+        };
+        let json = serde_json::to_value(&kind).unwrap();
+        assert_eq!(json["type"], "node_skipped");
+        assert_eq!(json["reason"], "sentinel");
+        assert!(kind.is_discrete());
+    }
+
+    #[test]
+    fn test_phase3a_reconciliation_emitted_serde() {
+        let kind = TaggedKind::ReconciliationEmitted {
+            slug: "s".into(),
+            build_id: "b".into(),
+            orphan_count: 3,
+            central_count: 7,
+        };
+        let json = serde_json::to_value(&kind).unwrap();
+        assert_eq!(json["type"], "reconciliation_emitted");
+        assert_eq!(json["orphan_count"], 3);
+        assert_eq!(json["central_count"], 7);
+        assert!(kind.is_discrete());
     }
 }
 

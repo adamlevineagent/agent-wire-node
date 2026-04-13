@@ -33,7 +33,12 @@ export type KnownTaggedKind =
     | { type: 'node_rerolled'; slug: string; build_id: string; node_id: string | null; step_name: string; note: string; new_cache_entry_id: number; manifest_id: number | null }
     | { type: 'cache_invalidated'; slug: string; build_id: string; cache_key: string; reason: string }
     | { type: 'manifest_generated'; slug: string; build_id: string; manifest_id: number; depth: number; node_id: string }
-    | { type: 'cost_update'; cost_so_far_usd: number; estimate_usd: number };
+    | { type: 'cost_update'; cost_so_far_usd: number; estimate_usd: number }
+    // Phase 3a: Pyramid Surface viz enrichment
+    | { type: 'edge_created'; slug: string; build_id: string; step_name: string; source_id: string; target_id: string; depth: number }
+    | { type: 'verdict_produced'; slug: string; build_id: string; step_name: string; node_id: string; verdict: string; source_id: string; weight: number | null }
+    | { type: 'node_skipped'; slug: string; build_id: string; step_name: string; node_id: string; reason: string }
+    | { type: 'reconciliation_emitted'; slug: string; build_id: string; orphan_count: number; central_count: number };
 
 // Wider type used by the listener so unknown variants don't break
 // parsing. The reducer filters down to `KnownTaggedKind` by
@@ -219,6 +224,11 @@ const KNOWN_EVENT_TYPES = new Set<string>([
     'cache_invalidated',
     'manifest_generated',
     'cost_update',
+    // Phase 3a: Pyramid Surface viz enrichment
+    'edge_created',
+    'verdict_produced',
+    'node_skipped',
+    'reconciliation_emitted',
 ]);
 
 function isKnownEvent(event: TaggedKind): event is KnownTaggedKind {
@@ -444,6 +454,45 @@ export function reduceBuildRowEvent(state: BuildRowState, event: TaggedKind): Bu
         }
         case 'cost_update': {
             next.cost.actualUsd = event.cost_so_far_usd;
+            break;
+        }
+        // ── Phase 3a: Pyramid Surface viz enrichment ──
+        case 'edge_created': {
+            const step = next.steps.find(s => s.stepName === event.step_name);
+            if (step) {
+                step.activityHint = `Edge: ${event.source_id} → ${event.target_id}`;
+            }
+            break;
+        }
+        case 'verdict_produced': {
+            const step = next.steps.find(s => s.stepName === event.step_name);
+            if (step) {
+                step.activityHint = `${event.verdict}: ${event.source_id} → ${event.node_id}${event.weight != null ? ` (w=${Number(event.weight).toFixed(2)})` : ''}`;
+            }
+            logActivity(next, {
+                kind: 'verdict',
+                stepName: event.step_name,
+                message: `${event.verdict} ${event.source_id} → ${event.node_id}`,
+            });
+            break;
+        }
+        case 'node_skipped': {
+            const step = next.steps.find(s => s.stepName === event.step_name);
+            if (step) {
+                step.activityHint = `Skipped: ${event.node_id} (${event.reason})`;
+            }
+            logActivity(next, {
+                kind: 'skip',
+                stepName: event.step_name,
+                message: `Skipped ${event.node_id}: ${event.reason}`,
+            });
+            break;
+        }
+        case 'reconciliation_emitted': {
+            logActivity(next, {
+                kind: 'reconciliation',
+                message: `Reconciliation: ${event.orphan_count} orphans, ${event.central_count} central nodes`,
+            });
             break;
         }
         default:
