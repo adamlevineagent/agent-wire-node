@@ -21,13 +21,9 @@ export function NodeInspectorPanel({ slug, nodeId, allNodes, onClose, onNavigate
     const [auditRecords, setAuditRecords] = useState<LlmAuditRecord[]>([]);
     const [drillData, setDrillData] = useState<DrillResultFull | null>(null);
     const [loading, setLoading] = useState(true);
-    // Toggling allExpanded bumps the key seed, causing AccordionSections
-    // to remount with the desired defaultOpen value.
-    const [allExpanded, setAllExpanded] = useState(false);
-    // accordionSeed > 0 means the user has explicitly toggled expand/collapse,
-    // so all sections should respect allExpanded. On first render (seed 0),
-    // Content defaults open while others default closed.
-    const [accordionSeed, setAccordionSeed] = useState(0);
+    // Track which sections are open — persists across node navigation.
+    // Keyed by section title. Initialized with Content open.
+    const [openSections, setOpenSections] = useState<Set<string>>(() => new Set(['Content']));
 
     // Current node info
     const currentNode = allNodes.find(n => n.node_id === nodeId);
@@ -70,10 +66,25 @@ export function NodeInspectorPanel({ slug, nodeId, allNodes, onClose, onNavigate
         return () => window.removeEventListener('keydown', handler);
     }, [prevSibling, nextSibling, parent, children, onClose, onNavigate]);
 
+    // ── Section toggle handler (persists across navigation) ───────────
+    const handleSectionToggle = useCallback((title: string, open: boolean) => {
+        setOpenSections(prev => {
+            const next = new Set(prev);
+            if (open) next.add(title);
+            else next.delete(title);
+            return next;
+        });
+    }, []);
+
+    const allSections = ['Content', 'Structure', 'Episodic', 'Provenance', 'LLM Record'];
+    const allExpanded = allSections.every(s => openSections.has(s));
+
     // ── Expand / Collapse All ───────────────────────────────────────────
     const toggleExpandAll = useCallback(() => {
-        setAllExpanded(prev => !prev);
-        setAccordionSeed(prev => prev + 1);
+        setOpenSections(prev => {
+            const allOpen = allSections.every(s => prev.has(s));
+            return allOpen ? new Set<string>() : new Set(allSections);
+        });
     }, []);
 
     return (
@@ -129,37 +140,62 @@ export function NodeInspectorPanel({ slug, nodeId, allNodes, onClose, onNavigate
                 {loading ? (
                     <div className="ni-loading">Loading...</div>
                 ) : (
-                    <div className="ni-sections" key={`sections-${accordionSeed}`}>
+                    <div className="ni-sections">
                         {/* Content */}
                         {drillData && (
-                            <AccordionSection title="Content" defaultOpen={accordionSeed === 0 || allExpanded}>
+                            <AccordionSection
+                                key={`Content-${openSections.has('Content')}`}
+                                title="Content"
+                                defaultOpen={openSections.has('Content')}
+                                onToggle={(open) => handleSectionToggle('Content', open)}
+                            >
                                 <ContentSection node={drillData.node} />
                             </AccordionSection>
                         )}
 
                         {/* Structure */}
                         {drillData && (
-                            <AccordionSection title="Structure" defaultOpen={allExpanded}>
+                            <AccordionSection
+                                key={`Structure-${openSections.has('Structure')}`}
+                                title="Structure"
+                                defaultOpen={openSections.has('Structure')}
+                                onToggle={(open) => handleSectionToggle('Structure', open)}
+                            >
                                 <StructureSection drill={drillData} onNavigate={onNavigate} />
                             </AccordionSection>
                         )}
 
                         {/* Episodic */}
                         {drillData && (
-                            <AccordionSection title="Episodic" defaultOpen={allExpanded}>
+                            <AccordionSection
+                                key={`Episodic-${openSections.has('Episodic')}`}
+                                title="Episodic"
+                                defaultOpen={openSections.has('Episodic')}
+                                onToggle={(open) => handleSectionToggle('Episodic', open)}
+                            >
                                 <EpisodicSection node={drillData.node} />
                             </AccordionSection>
                         )}
 
                         {/* Provenance */}
                         {drillData && (
-                            <AccordionSection title="Provenance" defaultOpen={allExpanded}>
+                            <AccordionSection
+                                key={`Provenance-${openSections.has('Provenance')}`}
+                                title="Provenance"
+                                defaultOpen={openSections.has('Provenance')}
+                                onToggle={(open) => handleSectionToggle('Provenance', open)}
+                            >
                                 <ProvenanceSection node={drillData.node} />
                             </AccordionSection>
                         )}
 
                         {/* LLM Record */}
-                        <AccordionSection title="LLM Record" defaultOpen={allExpanded}>
+                        <AccordionSection
+                            key={`LLM Record-${openSections.has('LLM Record')}`}
+                            title="LLM Record"
+                            defaultOpen={openSections.has('LLM Record')}
+                            onToggle={(open) => handleSectionToggle('LLM Record', open)}
+                        >
                             <LlmRecordSection audit={latestAudit} />
                         </AccordionSection>
                     </div>
