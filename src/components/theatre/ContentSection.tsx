@@ -3,9 +3,16 @@ import type { PyramidNodeFull } from './inspector-types';
 
 interface ContentSectionProps {
     node: PyramidNodeFull;
+    /** Tracked open state for nested accordions — persists across navigation */
+    openSubs?: Set<string>;
+    onSubToggle?: (key: string, open: boolean) => void;
 }
 
-export function ContentSection({ node }: ContentSectionProps) {
+export function ContentSection({ node, openSubs, onSubToggle }: ContentSectionProps) {
+    const isOpen = (key: string, fallback: boolean) =>
+        openSubs ? openSubs.has(key) : fallback;
+    const handleToggle = (key: string) => (open: boolean) =>
+        onSubToggle?.(key, open);
     const hasDistilled = !!(node.distilled);
     const narrativeLevels = [...(node.narrative?.levels ?? [])].sort(
         (a, b) => a.zoom - b.zoom
@@ -47,8 +54,10 @@ export function ContentSection({ node }: ContentSectionProps) {
             {/* Narrative */}
             {narrativeLevels.length > 0 && (
                 <AccordionSection
+                    key={`narrative-${isOpen('narrative', firstNonEmptyIndex === 1)}`}
                     title={`Narrative (${narrativeLevels.length} level${narrativeLevels.length !== 1 ? 's' : ''})`}
-                    defaultOpen={firstNonEmptyIndex === 1}
+                    defaultOpen={isOpen('narrative', firstNonEmptyIndex === 1)}
+                    onToggle={handleToggle('narrative')}
                 >
                     <div className="ni-narrative">
                         {narrativeLevels.map((level, i) => (
@@ -64,8 +73,10 @@ export function ContentSection({ node }: ContentSectionProps) {
             {/* Topics */}
             {topics.length > 0 && (
                 <AccordionSection
+                    key={`topics-${isOpen('topics', firstNonEmptyIndex === 2)}`}
                     title={`Topics (${topics.length})`}
-                    defaultOpen={firstNonEmptyIndex === 2}
+                    defaultOpen={isOpen('topics', firstNonEmptyIndex === 2)}
+                    onToggle={handleToggle('topics')}
                 >
                     <div className="ni-topics">
                         {topics.map((topic, i) => (
@@ -126,8 +137,10 @@ export function ContentSection({ node }: ContentSectionProps) {
             {/* Node-level Corrections */}
             {corrections.length > 0 && (
                 <AccordionSection
+                    key={`corrections-${isOpen('corrections', firstNonEmptyIndex === 3)}`}
                     title={`Corrections (${corrections.length})`}
-                    defaultOpen={firstNonEmptyIndex === 3}
+                    defaultOpen={isOpen('corrections', firstNonEmptyIndex === 3)}
+                    onToggle={handleToggle('corrections')}
                 >
                     <div className="ni-topic-corrections">
                         {corrections.map((c, ci) => (
@@ -145,8 +158,10 @@ export function ContentSection({ node }: ContentSectionProps) {
             {/* Node-level Decisions */}
             {decisions.length > 0 && (
                 <AccordionSection
+                    key={`decisions-${isOpen('decisions', firstNonEmptyIndex === 4)}`}
                     title={`Decisions (${decisions.length})`}
-                    defaultOpen={firstNonEmptyIndex === 4}
+                    defaultOpen={isOpen('decisions', firstNonEmptyIndex === 4)}
+                    onToggle={handleToggle('decisions')}
                 >
                     <div className="ni-topic-decisions">
                         {decisions.map((d, di) => (
@@ -164,8 +179,10 @@ export function ContentSection({ node }: ContentSectionProps) {
             {/* Terms */}
             {terms.length > 0 && (
                 <AccordionSection
+                    key={`terms-${isOpen('terms', firstNonEmptyIndex === 5)}`}
                     title={`Terms (${terms.length})`}
-                    defaultOpen={firstNonEmptyIndex === 5}
+                    defaultOpen={isOpen('terms', firstNonEmptyIndex === 5)}
+                    onToggle={handleToggle('terms')}
                 >
                     <table className="ni-term-table">
                         <thead>
@@ -189,8 +206,10 @@ export function ContentSection({ node }: ContentSectionProps) {
             {/* Key Quotes */}
             {keyQuotes.length > 0 && (
                 <AccordionSection
+                    key={`quotes-${isOpen('quotes', firstNonEmptyIndex === 6)}`}
                     title={`Key Quotes (${keyQuotes.length})`}
-                    defaultOpen={firstNonEmptyIndex === 6}
+                    defaultOpen={isOpen('quotes', firstNonEmptyIndex === 6)}
+                    onToggle={handleToggle('quotes')}
                 >
                     <div className="ni-quotes">
                         {keyQuotes.map((q, i) => (
@@ -219,8 +238,10 @@ export function ContentSection({ node }: ContentSectionProps) {
             {/* Dead Ends */}
             {deadEnds.length > 0 && (
                 <AccordionSection
+                    key={`deadends-${isOpen('deadends', firstNonEmptyIndex === 7)}`}
                     title={`Dead Ends (${deadEnds.length})`}
-                    defaultOpen={firstNonEmptyIndex === 7}
+                    defaultOpen={isOpen('deadends', firstNonEmptyIndex === 7)}
+                    onToggle={handleToggle('deadends')}
                 >
                     <ul className="ni-dead-ends">
                         {deadEnds.map((d, i) => (

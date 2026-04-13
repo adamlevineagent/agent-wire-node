@@ -4,6 +4,9 @@ import type { LlmAuditRecord } from './types';
 
 interface LlmRecordSectionProps {
     audit: LlmAuditRecord | null;
+    /** Tracked open state for nested accordions — persists across navigation */
+    openSubs?: Set<string>;
+    onSubToggle?: (key: string, open: boolean) => void;
 }
 
 interface ParsedResponse {
@@ -14,7 +17,11 @@ interface ParsedResponse {
     missing?: string[];
 }
 
-export function LlmRecordSection({ audit }: LlmRecordSectionProps) {
+export function LlmRecordSection({ audit, openSubs, onSubToggle }: LlmRecordSectionProps) {
+    const isOpen = (key: string, fallback: boolean) =>
+        openSubs ? openSubs.has(key) : fallback;
+    const handleToggle = (key: string) => (open: boolean) =>
+        onSubToggle?.(key, open);
     const [showRaw, setShowRaw] = useState(false);
 
     const parsed = useMemo<ParsedResponse | null>(() => {
@@ -52,19 +59,31 @@ export function LlmRecordSection({ audit }: LlmRecordSectionProps) {
         <div className="ni-llm-record">
             {/* System Prompt */}
             <AccordionSection
+                key={`sysprompt-${isOpen('sysprompt', false)}`}
                 title={`System Prompt (${audit.system_prompt?.length?.toLocaleString() ?? 0} chars)`}
-                defaultOpen={false}
+                defaultOpen={isOpen('sysprompt', false)}
+                onToggle={handleToggle('sysprompt')}
             >
                 <pre className="ni-prompt-text">{audit.system_prompt}</pre>
             </AccordionSection>
 
             {/* User Prompt */}
-            <AccordionSection title="User Prompt" defaultOpen>
+            <AccordionSection
+                key={`userprompt-${isOpen('userprompt', true)}`}
+                title="User Prompt"
+                defaultOpen={isOpen('userprompt', true)}
+                onToggle={handleToggle('userprompt')}
+            >
                 <pre className="ni-prompt-text">{audit.user_prompt}</pre>
             </AccordionSection>
 
             {/* Response */}
-            <AccordionSection title="Response" defaultOpen>
+            <AccordionSection
+                key={`response-${isOpen('response', true)}`}
+                title="Response"
+                defaultOpen={isOpen('response', true)}
+                onToggle={handleToggle('response')}
+            >
                 <div className="ni-response">
                     {audit.status === 'failed' ? (
                         <div className="ni-response-error">
@@ -165,7 +184,12 @@ export function LlmRecordSection({ audit }: LlmRecordSectionProps) {
             </AccordionSection>
 
             {/* Metadata */}
-            <AccordionSection title="Metadata" defaultOpen>
+            <AccordionSection
+                key={`metadata-${isOpen('metadata', true)}`}
+                title="Metadata"
+                defaultOpen={isOpen('metadata', true)}
+                onToggle={handleToggle('metadata')}
+            >
                 <table className="ni-meta-table">
                     <tbody>
                         <tr>

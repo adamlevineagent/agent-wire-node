@@ -7,6 +7,9 @@ import type {
 interface StructureSectionProps {
     drill: DrillResultFull;
     onNavigate: (nodeId: string) => void;
+    /** Tracked open state for nested accordions — persists across navigation */
+    openSubs?: Set<string>;
+    onSubToggle?: (key: string, open: boolean) => void;
 }
 
 function truncate(text: string, max: number): string {
@@ -14,7 +17,11 @@ function truncate(text: string, max: number): string {
     return text.slice(0, max) + '\u2026';
 }
 
-export function StructureSection({ drill, onNavigate }: StructureSectionProps) {
+export function StructureSection({ drill, onNavigate, openSubs, onSubToggle }: StructureSectionProps) {
+    const isOpen = (key: string, fallback: boolean) =>
+        openSubs ? openSubs.has(key) : fallback;
+    const handleToggle = (key: string) => (open: boolean) =>
+        onSubToggle?.(key, open);
     const children = drill.children ?? [];
     const evidence = drill.evidence ?? [];
     const webEdges = drill.web_edges ?? [];
@@ -50,8 +57,10 @@ export function StructureSection({ drill, onNavigate }: StructureSectionProps) {
             {/* Children */}
             {children.length > 0 && (
                 <AccordionSection
+                    key={`children-${isOpen('children', firstNonEmptyIndex === 0)}`}
                     title={`Children (${children.length})`}
-                    defaultOpen={firstNonEmptyIndex === 0}
+                    defaultOpen={isOpen('children', firstNonEmptyIndex === 0)}
+                    onToggle={handleToggle('children')}
                 >
                     <div className="ni-children-list">
                         {children.map((child) => (
@@ -75,8 +84,10 @@ export function StructureSection({ drill, onNavigate }: StructureSectionProps) {
             {/* Evidence */}
             {evidence.length > 0 && (
                 <AccordionSection
+                    key={`evidence-${isOpen('evidence', firstNonEmptyIndex === 1)}`}
                     title={`Evidence (${evidence.length})`}
-                    defaultOpen={firstNonEmptyIndex === 1}
+                    defaultOpen={isOpen('evidence', firstNonEmptyIndex === 1)}
+                    onToggle={handleToggle('evidence')}
                 >
                     <div className="ni-evidence-list">
                         {evidence.map((link, i) => (
@@ -93,8 +104,10 @@ export function StructureSection({ drill, onNavigate }: StructureSectionProps) {
             {/* Web Edges */}
             {webEdges.length > 0 && (
                 <AccordionSection
+                    key={`webedges-${isOpen('webedges', firstNonEmptyIndex === 2)}`}
                     title={`Web Edges (${webEdges.length})`}
-                    defaultOpen={firstNonEmptyIndex === 2}
+                    defaultOpen={isOpen('webedges', firstNonEmptyIndex === 2)}
+                    onToggle={handleToggle('webedges')}
                 >
                     <div className="ni-web-edges">
                         {webEdges.map((edge, i) => (
@@ -115,8 +128,10 @@ export function StructureSection({ drill, onNavigate }: StructureSectionProps) {
             {/* Remote Web Edges */}
             {remoteWebEdges.length > 0 && (
                 <AccordionSection
+                    key={`remoteedges-${isOpen('remoteedges', firstNonEmptyIndex === 3)}`}
                     title={`Remote Web Edges (${remoteWebEdges.length})`}
-                    defaultOpen={firstNonEmptyIndex === 3}
+                    defaultOpen={isOpen('remoteedges', firstNonEmptyIndex === 3)}
+                    onToggle={handleToggle('remoteedges')}
                 >
                     <div className="ni-remote-web-edges">
                         {remoteWebEdges.map((edge, i) => (
@@ -136,8 +151,10 @@ export function StructureSection({ drill, onNavigate }: StructureSectionProps) {
             {/* Transitions */}
             {hasTransitions && (
                 <AccordionSection
+                    key={`transitions-${isOpen('transitions', firstNonEmptyIndex === 4)}`}
                     title="Transitions"
-                    defaultOpen={firstNonEmptyIndex === 4}
+                    defaultOpen={isOpen('transitions', firstNonEmptyIndex === 4)}
+                    onToggle={handleToggle('transitions')}
                 >
                     <div className="ni-transitions">
                         {hasPrior && (
@@ -159,8 +176,10 @@ export function StructureSection({ drill, onNavigate }: StructureSectionProps) {
             {/* Question Context */}
             {hasQuestionContext && (
                 <AccordionSection
+                    key={`questionctx-${isOpen('questionctx', firstNonEmptyIndex === 5)}`}
                     title="Question Context"
-                    defaultOpen={firstNonEmptyIndex === 5}
+                    defaultOpen={isOpen('questionctx', firstNonEmptyIndex === 5)}
+                    onToggle={handleToggle('questionctx')}
                 >
                     <div className="ni-question-context">
                         {questionContext!.parent_question && (
@@ -189,8 +208,10 @@ export function StructureSection({ drill, onNavigate }: StructureSectionProps) {
             {/* Gaps */}
             {gaps.length > 0 && (
                 <AccordionSection
+                    key={`gaps-${isOpen('gaps', firstNonEmptyIndex === 6)}`}
                     title={`Gaps (${gaps.length})`}
-                    defaultOpen={firstNonEmptyIndex === 6}
+                    defaultOpen={isOpen('gaps', firstNonEmptyIndex === 6)}
+                    onToggle={handleToggle('gaps')}
                 >
                     <div className="ni-gaps">
                         {gaps.map((gap, i) => (

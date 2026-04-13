@@ -3,6 +3,9 @@ import type { PyramidNodeFull } from './inspector-types';
 
 interface EpisodicSectionProps {
     node: PyramidNodeFull;
+    /** Tracked open state for nested accordions — persists across navigation */
+    openSubs?: Set<string>;
+    onSubToggle?: (key: string, open: boolean) => void;
 }
 
 function formatDate(iso: string): string {
@@ -19,7 +22,11 @@ function formatDate(iso: string): string {
     }
 }
 
-export function EpisodicSection({ node }: EpisodicSectionProps) {
+export function EpisodicSection({ node, openSubs, onSubToggle }: EpisodicSectionProps) {
+    const isOpen = (key: string, fallback: boolean) =>
+        openSubs ? openSubs.has(key) : fallback;
+    const handleToggle = (key: string) => (open: boolean) =>
+        onSubToggle?.(key, open);
     const entities = node.entities ?? [];
     const timeRange = node.time_range;
     const hasTimeRange = !!(timeRange?.start || timeRange?.end);
@@ -41,8 +48,10 @@ export function EpisodicSection({ node }: EpisodicSectionProps) {
             {/* Entities */}
             {entities.length > 0 && (
                 <AccordionSection
+                    key={`entities-${isOpen('entities', firstNonEmptyIndex === 0)}`}
                     title={`Entities (${entities.length})`}
-                    defaultOpen={firstNonEmptyIndex === 0}
+                    defaultOpen={isOpen('entities', firstNonEmptyIndex === 0)}
+                    onToggle={handleToggle('entities')}
                 >
                     <div>
                         {entities.map((entity, i) => (
@@ -68,8 +77,10 @@ export function EpisodicSection({ node }: EpisodicSectionProps) {
             {/* Temporal */}
             {hasTimeRange && (
                 <AccordionSection
+                    key={`temporal-${isOpen('temporal', firstNonEmptyIndex === 1)}`}
                     title="Temporal"
-                    defaultOpen={firstNonEmptyIndex === 1}
+                    defaultOpen={isOpen('temporal', firstNonEmptyIndex === 1)}
+                    onToggle={handleToggle('temporal')}
                 >
                     <div className="ni-temporal">
                         {timeRange?.start && (
@@ -95,8 +106,10 @@ export function EpisodicSection({ node }: EpisodicSectionProps) {
             {/* Weight & Status */}
             {hasWeightStatus && (
                 <AccordionSection
+                    key={`weightstatus-${isOpen('weightstatus', firstNonEmptyIndex === 2)}`}
                     title="Weight & Status"
-                    defaultOpen={firstNonEmptyIndex === 2}
+                    defaultOpen={isOpen('weightstatus', firstNonEmptyIndex === 2)}
+                    onToggle={handleToggle('weightstatus')}
                 >
                     <div className="ni-weight-status">
                         {node.weight != null && (

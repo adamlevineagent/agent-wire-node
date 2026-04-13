@@ -149,7 +149,11 @@ export function NodeInspectorPanel({ slug, nodeId, allNodes, onClose, onNavigate
                                 defaultOpen={openSections.has('Content')}
                                 onToggle={(open) => handleSectionToggle('Content', open)}
                             >
-                                <ContentSection node={drillData.node} />
+                                <ContentSection
+                                    node={drillData.node}
+                                    openSubs={openSections}
+                                    onSubToggle={handleSectionToggle}
+                                />
                             </AccordionSection>
                         )}
 
@@ -161,7 +165,12 @@ export function NodeInspectorPanel({ slug, nodeId, allNodes, onClose, onNavigate
                                 defaultOpen={openSections.has('Structure')}
                                 onToggle={(open) => handleSectionToggle('Structure', open)}
                             >
-                                <StructureSection drill={drillData} onNavigate={onNavigate} />
+                                <StructureSection
+                                    drill={drillData}
+                                    onNavigate={onNavigate}
+                                    openSubs={openSections}
+                                    onSubToggle={handleSectionToggle}
+                                />
                             </AccordionSection>
                         )}
 
@@ -173,7 +182,11 @@ export function NodeInspectorPanel({ slug, nodeId, allNodes, onClose, onNavigate
                                 defaultOpen={openSections.has('Episodic')}
                                 onToggle={(open) => handleSectionToggle('Episodic', open)}
                             >
-                                <EpisodicSection node={drillData.node} />
+                                <EpisodicSection
+                                    node={drillData.node}
+                                    openSubs={openSections}
+                                    onSubToggle={handleSectionToggle}
+                                />
                             </AccordionSection>
                         )}
 
@@ -196,7 +209,11 @@ export function NodeInspectorPanel({ slug, nodeId, allNodes, onClose, onNavigate
                             defaultOpen={openSections.has('LLM Record')}
                             onToggle={(open) => handleSectionToggle('LLM Record', open)}
                         >
-                            <LlmRecordSection audit={latestAudit} />
+                            <LlmRecordSection
+                                audit={latestAudit}
+                                openSubs={openSections}
+                                onSubToggle={handleSectionToggle}
+                            />
                         </AccordionSection>
                     </div>
                 )}
