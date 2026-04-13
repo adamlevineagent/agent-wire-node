@@ -3,12 +3,14 @@ import { useState, useRef, useId, type ReactNode } from "react";
 interface AccordionSectionProps {
     title: string;
     defaultOpen?: boolean;
+    onToggle?: (open: boolean) => void;
     children: ReactNode;
 }
 
 export function AccordionSection({
     title,
     defaultOpen = false,
+    onToggle,
     children,
 }: AccordionSectionProps) {
     const [open, setOpen] = useState(defaultOpen);
@@ -17,7 +19,13 @@ export function AccordionSection({
     const headerId = `${id}-header`;
     const panelId = `${id}-panel`;
 
-    const toggle = () => setOpen((prev) => !prev);
+    const toggle = () => {
+        setOpen((prev) => {
+            const next = !prev;
+            onToggle?.(next);
+            return next;
+        });
+    };
 
     const handleKeyDown = (e: React.KeyboardEvent) => {
         if (e.key === "Enter" || e.key === " ") {

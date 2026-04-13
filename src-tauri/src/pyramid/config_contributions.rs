@@ -29,6 +29,7 @@ use tracing::{debug, warn};
 use crate::pyramid::chain_registry;
 use crate::pyramid::db;
 use crate::pyramid::event_bus::{BuildEventBus, TaggedBuildEvent, TaggedKind};
+use crate::pyramid::provider::ProviderRegistry;
 use crate::pyramid::schema_registry::{flag_configs_needing_migration, SchemaRegistry};
 use crate::pyramid::wire_native_metadata::{default_wire_native_metadata, WireNativeMetadata};
 
@@ -92,6 +93,22 @@ pub fn validate_note(note: &str) -> Result<(), String> {
         return Err("note must not be empty or whitespace-only".to_string());
     }
     Ok(())
+}
+
+/// Phase 5 (Config History + Rollback): lightweight history entry
+/// returned by `load_config_history`. Contains only the fields the
+/// frontend timeline needs — no wire_native_metadata, no publication
+/// state. Avoids deserializing the full `ConfigContribution` for each
+/// row in the history list.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ConfigHistoryEntry {
+    pub contribution_id: String,
+    pub yaml_content: String,
+    pub triggering_note: Option<String>,
+    pub created_by: Option<String>,
+    pub created_at: String,
+    pub superseded_by_id: Option<String>,
+    pub is_active: bool,
 }
 
 // ── CRUD helpers ──────────────────────────────────────────────────────────────
@@ -421,6 +438,51 @@ pub fn load_config_version_history(
 
     chain.reverse();
     Ok(chain)
+}
+
+/// Phase 5 (Config History + Rollback): load config history via a
+/// single SQL query. Returns most-recent-first, capped by `limit`.
+///
+/// Unlike `load_config_version_history` (which walks the supersedes
+/// chain via O(N) individual queries), this is a single indexed
+/// query — O(1) regardless of chain length. Used by the
+/// `pyramid_get_config_history` IPC.
+///
+/// Only returns global configs (slug IS NULL). Per-slug history
+/// (e.g. per-pyramid dadbear_policy) would need a separate call
+/// with a slug parameter; the Phase 5 UI only surfaces global
+/// config history (tier_routing, build_strategy).
+pub fn load_config_history(
+    conn: &Connection,
+    schema_type: &str,
+    limit: usize,
+) -> Result<Vec<ConfigHistoryEntry>> {
+    let mut stmt = conn.prepare(
+        "SELECT contribution_id, yaml_content, triggering_note,
+                created_by, created_at, superseded_by_id, status
+         FROM pyramid_config_contributions
+         WHERE schema_type = ?1 AND slug IS NULL
+           AND status IN ('active', 'superseded')
+         ORDER BY created_at DESC
+         LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![schema_type, limit as i64], |row| {
+        let status: String = row.get(6)?;
+        Ok(ConfigHistoryEntry {
+            contribution_id: row.get(0)?,
+            yaml_content: row.get(1)?,
+            triggering_note: row.get(2)?,
+            created_by: row.get(3)?,
+            created_at: row.get(4)?,
+            superseded_by_id: row.get(5)?,
+            is_active: status == "active",
+        })
+    })?;
+    let mut entries = Vec::new();
+    for row in rows {
+        entries.push(row?);
+    }
+    Ok(entries)
 }
 
 /// Look up a single contribution by its contribution_id UUID.
@@ -1177,6 +1239,154 @@ fn register_chain_with_registry(
         contribution_id,
         "register_chain_with_registry: Phase 4 stub (Phase 9 wires this up)"
     );
+    Ok(())
+}
+
+// ── Phase 5: Rollback ────────────────────────────────────────────────────────
+
+/// Phase 5 (Config History + Rollback): roll back to a previous config
+/// contribution. Creates a new superseding contribution with the
+/// target's yaml_content and `triggering_note: "manual rollback to
+/// {contribution_id}"`.
+///
+/// Guards:
+/// - **Local mode:** if local mode is enabled, refuse rollback of
+///   `tier_routing` or `build_strategy` to prevent state splits.
+/// - **Schema validation:** parse the target's yaml_content against its
+///   schema_type to catch schema evolution breakage before committing.
+///
+/// After the supersession, syncs the new contribution to the operational
+/// table and refreshes the provider registry so `call_model_unified`
+/// picks up the rolled-back tier routing immediately.
+pub fn rollback_config(
+    conn: &mut Connection,
+    bus: &Arc<BuildEventBus>,
+    registry: &ProviderRegistry,
+    contribution_id: &str,
+) -> Result<()> {
+    // 1. Load the target contribution.
+    let target = load_contribution_by_id(conn, contribution_id)?
+        .ok_or_else(|| anyhow::anyhow!("contribution {contribution_id} not found"))?;
+
+    // 2. Local mode guard: refuse rollback of tier_routing or
+    //    build_strategy while local mode is enabled to prevent
+    //    state splits (AD-7).
+    if target.schema_type == "tier_routing" || target.schema_type == "build_strategy" {
+        let local_state = db::load_local_mode_state(conn)?;
+        if local_state.enabled {
+            anyhow::bail!(
+                "Disable local mode before rolling back tier routing configuration."
+            );
+        }
+    }
+
+    // 3. Schema validation: parse the target YAML against its
+    //    schema_type to catch schema evolution breakage. If the
+    //    schema has changed since this version, the parse will fail
+    //    and we refuse the rollback.
+    validate_rollback_yaml(&target.yaml_content, &target.schema_type)?;
+
+    // 4. Find the current active contribution for this schema_type.
+    let current_active = load_active_config_contribution(
+        conn,
+        &target.schema_type,
+        target.slug.as_deref(),
+    )?
+    .ok_or_else(|| {
+        anyhow::anyhow!(
+            "no active {} contribution to roll back from",
+            target.schema_type
+        )
+    })?;
+
+    // 5. Create a new contribution superseding the active one with
+    //    the target's yaml_content.
+    let triggering_note = format!("manual rollback to {contribution_id}");
+    let new_id = supersede_config_contribution(
+        conn,
+        &current_active.contribution_id,
+        &target.yaml_content,
+        &triggering_note,
+        "local",
+        Some("user"),
+    )?;
+
+    // 6. Sync the new contribution to operational.
+    let new_contribution = load_contribution_by_id(conn, &new_id)?
+        .ok_or_else(|| {
+            anyhow::anyhow!("rollback contribution disappeared immediately after create")
+        })?;
+    sync_config_to_operational(conn, bus, &new_contribution)?;
+
+    // 7. Refresh the provider registry so downstream resolvers
+    //    (call_model_unified, tier cascade) pick up the change.
+    registry.load_from_db(conn)?;
+
+    Ok(())
+}
+
+/// Validate that a YAML string parses correctly for its schema_type.
+/// Used by rollback to catch schema evolution breakage before
+/// committing the supersession.
+fn validate_rollback_yaml(yaml_content: &str, schema_type: &str) -> Result<()> {
+    match schema_type {
+        "tier_routing" => {
+            serde_yaml::from_str::<db::TierRoutingYaml>(yaml_content)
+                .map_err(|e| anyhow::anyhow!(
+                    "Cannot roll back — configuration schema has changed since this version: {e}"
+                ))?;
+        }
+        "build_strategy" => {
+            serde_yaml::from_str::<db::BuildStrategyYaml>(yaml_content)
+                .map_err(|e| anyhow::anyhow!(
+                    "Cannot roll back — configuration schema has changed since this version: {e}"
+                ))?;
+        }
+        "dadbear_policy" => {
+            serde_yaml::from_str::<db::DadbearPolicyYaml>(yaml_content)
+                .map_err(|e| anyhow::anyhow!(
+                    "Cannot roll back — configuration schema has changed since this version: {e}"
+                ))?;
+        }
+        "evidence_policy" => {
+            serde_yaml::from_str::<db::EvidencePolicyYaml>(yaml_content)
+                .map_err(|e| anyhow::anyhow!(
+                    "Cannot roll back — configuration schema has changed since this version: {e}"
+                ))?;
+        }
+        "custom_prompts" => {
+            serde_yaml::from_str::<db::CustomPromptsYaml>(yaml_content)
+                .map_err(|e| anyhow::anyhow!(
+                    "Cannot roll back — configuration schema has changed since this version: {e}"
+                ))?;
+        }
+        "step_overrides" => {
+            serde_yaml::from_str::<db::StepOverridesBundleYaml>(yaml_content)
+                .map_err(|e| anyhow::anyhow!(
+                    "Cannot roll back — configuration schema has changed since this version: {e}"
+                ))?;
+        }
+        "folder_ingestion_heuristics" => {
+            serde_yaml::from_str::<db::FolderIngestionHeuristicsYaml>(yaml_content)
+                .map_err(|e| anyhow::anyhow!(
+                    "Cannot roll back — configuration schema has changed since this version: {e}"
+                ))?;
+        }
+        "auto_update_policy" => {
+            serde_yaml::from_str::<db::AutoUpdatePolicyYaml>(yaml_content)
+                .map_err(|e| anyhow::anyhow!(
+                    "Cannot roll back — configuration schema has changed since this version: {e}"
+                ))?;
+        }
+        _ => {
+            // For schema types without a dedicated struct (stubs,
+            // future types), basic YAML validity check is sufficient.
+            serde_yaml::from_str::<serde_yaml::Value>(yaml_content)
+                .map_err(|e| anyhow::anyhow!(
+                    "Cannot roll back — YAML is malformed: {e}"
+                ))?;
+        }
+    }
     Ok(())
 }
 

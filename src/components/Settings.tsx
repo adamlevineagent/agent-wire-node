@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { useLocalMode, type OllamaProbeResult, type OllamaModelInfo } from "../hooks/useLocalMode";
+import { useLocalMode, type OllamaProbeResult, type OllamaModelInfo, type ConfigHistoryEntry } from "../hooks/useLocalMode";
 import { AccordionSection } from "./AccordionSection";
 import type { TaggedBuildEvent } from "../hooks/useBuildRowState";
 
@@ -81,6 +81,11 @@ export function Settings() {
     // being confirmed for deletion, or null when no confirmation is active.
     const [deletingModel, setDeletingModel] = useState<string | null>(null);
 
+    // Phase 5: Config history state
+    const [configHistory, setConfigHistory] = useState<ConfigHistoryEntry[]>([]);
+    const [historyLoaded, setHistoryLoaded] = useState(false);
+    const [confirmingRollback, setConfirmingRollback] = useState<string | null>(null);
+
     // Sync local form state with the hook's status whenever it
     // refreshes — so the URL and dropdown reflect the persisted
     // ollama_base_url / ollama_model from the state row.
@@ -92,6 +97,12 @@ export function Settings() {
             setLocalModelChoice(localMode.status.model);
         }
     }, [localMode.status]);
+
+    // Reset history loaded flag when status changes (model switch, enable/disable)
+    // so the next accordion open fetches fresh data.
+    useEffect(() => {
+        setHistoryLoaded(false);
+    }, [localMode.status?.model, localMode.status?.enabled]);
 
     // Sync context/concurrency override inputs from status
     useEffect(() => {
@@ -253,6 +264,57 @@ export function Settings() {
             // Error is surfaced via localMode.error
         }
     }, [localMode, handleProbe]);
+
+    // Phase 5: Fetch config history on demand (when accordion opens).
+    const fetchConfigHistory = useCallback(async () => {
+        try {
+            const history = await localMode.getConfigHistory("tier_routing", 20);
+            setConfigHistory(history);
+            setHistoryLoaded(true);
+        } catch {
+            // Silently fail — history is secondary info
+            setHistoryLoaded(true);
+        }
+    }, [localMode]);
+
+    // Phase 5: Rollback handler — confirms, then rolls back and refreshes the list.
+    const handleRollback = useCallback(async (contributionId: string) => {
+        setConfirmingRollback(null);
+        await localMode.rollbackConfig(contributionId);
+        // Refresh history list after rollback creates a new entry.
+        await fetchConfigHistory();
+    }, [localMode, fetchConfigHistory]);
+
+    // Phase 5: Format a created_at timestamp as relative time or short date.
+    const formatHistoryTime = (iso: string): string => {
+        try {
+            // SQLite datetime('now') produces "YYYY-MM-DD HH:MM:SS" (space, no T, no Z).
+            // Normalize to ISO 8601 for reliable cross-engine parsing.
+            const normalized = iso.includes("T") ? iso : iso.replace(" ", "T") + "Z";
+            const date = new Date(normalized);
+            const now = new Date();
+            const diffMs = now.getTime() - date.getTime();
+            const diffSec = Math.floor(diffMs / 1000);
+            const diffMin = Math.floor(diffSec / 60);
+            const diffHr = Math.floor(diffMin / 60);
+            const diffDay = Math.floor(diffHr / 24);
+
+            if (diffSec < 60) return "just now";
+            if (diffMin < 60) return `${diffMin}m ago`;
+            if (diffHr < 24) return `${diffHr}h ago`;
+            if (diffDay < 7) return `${diffDay}d ago`;
+
+            // Fall back to short date
+            return date.toLocaleDateString(undefined, {
+                month: "short",
+                day: "numeric",
+                hour: "2-digit",
+                minute: "2-digit",
+            });
+        } catch {
+            return iso;
+        }
+    };
 
     // Format bytes as human-readable (MB/GB).
     const formatBytes = (bytes: number): string => {
@@ -935,6 +997,115 @@ export function Settings() {
                         </div>
                     </AccordionSection>
                 </div>
+
+                {/* Phase 5: Configuration History — always visible when
+                   the Ollama panel is loaded so users can see history even
+                   after disabling local mode. The empty state inside the
+                   accordion handles "no changes yet." Prior condition
+                   (enabled || configHistory.length > 0) hid the accordion
+                   on fresh page loads when local mode was disabled but
+                   history existed in the DB, because configHistory starts
+                   as [] before the lazy fetch fires. */}
+                {localMode.status != null && (
+                    <div style={{ marginTop: 12 }}>
+                        <AccordionSection
+                            title="Configuration History"
+                            onToggle={(open) => {
+                                if (open && !historyLoaded) {
+                                    fetchConfigHistory();
+                                }
+                            }}
+                        >
+                            <div className="config-history-list">
+                                {!historyLoaded ? (
+                                    <div className="config-history-loading">Loading history...</div>
+                                ) : configHistory.length === 0 ? (
+                                    <div className="config-history-empty">No configuration changes recorded yet.</div>
+                                ) : (
+                                    <>
+                                        {configHistory.map((entry) => (
+                                            <div
+                                                key={entry.contribution_id}
+                                                className={`config-history-entry ${entry.is_active ? "config-history-entry-active" : ""}`}
+                                            >
+                                                <div className="config-history-entry-row">
+                                                    <div className="config-history-entry-info">
+                                                        <span className="config-history-timestamp">
+                                                            {formatHistoryTime(entry.created_at)}
+                                                        </span>
+                                                        {entry.triggering_note && (
+                                                            <span className="config-history-note">
+                                                                {entry.triggering_note}
+                                                            </span>
+                                                        )}
+                                                    </div>
+                                                    <div className="config-history-entry-actions">
+                                                        {entry.created_by && (
+                                                            <span className="config-history-badge">
+                                                                {entry.created_by}
+                                                            </span>
+                                                        )}
+                                                        {entry.is_active && (
+                                                            <span className="config-history-badge config-history-badge-active">
+                                                                Active
+                                                            </span>
+                                                        )}
+                                                        {!entry.is_active && (
+                                                            <button
+                                                                type="button"
+                                                                className="config-history-rollback-btn"
+                                                                disabled={localMode.status?.enabled || localMode.loading}
+                                                                title={
+                                                                    localMode.status?.enabled
+                                                                        ? "Disable local mode first"
+                                                                        : `Roll back to this version`
+                                                                }
+                                                                onClick={() => setConfirmingRollback(entry.contribution_id)}
+                                                            >
+                                                                Rollback
+                                                            </button>
+                                                        )}
+                                                    </div>
+                                                </div>
+                                                {/* Rollback confirmation inline */}
+                                                {confirmingRollback === entry.contribution_id && (
+                                                    <div className="config-history-confirm">
+                                                        <span className="config-history-confirm-text">
+                                                            Roll back tier routing to the version from{" "}
+                                                            {formatHistoryTime(entry.created_at)}?
+                                                        </span>
+                                                        <div className="config-history-confirm-actions">
+                                                            <button
+                                                                type="button"
+                                                                className="compose-btn"
+                                                                onClick={() => setConfirmingRollback(null)}
+                                                            >
+                                                                Cancel
+                                                            </button>
+                                                            <button
+                                                                type="button"
+                                                                className="config-history-confirm-btn"
+                                                                disabled={localMode.loading}
+                                                                onClick={() => handleRollback(entry.contribution_id)}
+                                                            >
+                                                                Confirm rollback
+                                                            </button>
+                                                        </div>
+                                                    </div>
+                                                )}
+                                            </div>
+                                        ))}
+                                        {configHistory.length >= 20 && (
+                                            <div className="config-history-truncated">
+                                                Showing most recent 20 entries
+                                            </div>
+                                        )}
+                                    </>
+                                )}
+                            </div>
+                        </AccordionSection>
+                    </div>
+                )}
 
                 {/* Status line */}
                 <div style={{ marginTop: 12, fontSize: 12 }}>

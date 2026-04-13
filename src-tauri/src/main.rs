@@ -8869,6 +8869,26 @@ async fn pyramid_config_version_history(
     .map_err(|e| e.to_string())
 }
 
+/// Phase 5 (Config History + Rollback): efficient config history query.
+/// Single SQL query (O(1) regardless of chain length) returning
+/// most-recent-first entries capped by `limit`. Replaces the
+/// `pyramid_config_version_history` IPC for the frontend timeline
+/// where full `ConfigContribution` fields are unnecessary.
+#[tauri::command]
+async fn pyramid_get_config_history(
+    state: tauri::State<'_, SharedState>,
+    schema_type: String,
+    limit: usize,
+) -> Result<Vec<wire_node_lib::pyramid::config_contributions::ConfigHistoryEntry>, String> {
+    let reader = state.pyramid.reader.lock().await;
+    wire_node_lib::pyramid::config_contributions::load_config_history(
+        &reader,
+        &schema_type,
+        limit,
+    )
+    .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 async fn pyramid_propose_config(
     state: tauri::State<'_, SharedState>,
@@ -8960,77 +8980,54 @@ async fn pyramid_reject_proposal(
     Ok(RejectProposalResponse { ok: true })
 }
 
+/// Phase 5 (Config History + Rollback): roll back to a previous config
+/// version. Creates a new superseding contribution with the target's
+/// YAML content, syncs to operational, and refreshes the provider
+/// registry.
+///
+/// Guards:
+/// - **Active build:** refuse if any build is in progress.
+/// - **Local mode:** refuse rollback of tier_routing / build_strategy
+///   while local mode is enabled (AD-7, prevents state splits).
+/// - **Schema validation:** parse the target YAML before committing
+///   to catch schema evolution breakage.
 #[tauri::command]
 async fn pyramid_rollback_config(
     state: tauri::State<'_, SharedState>,
     contribution_id: String,
-    note: String,
-) -> Result<SupersedeConfigResponse, String> {
-    // Rollback creates a NEW version with the rolled-back content.
-    // Per the spec's Notes Capture Lifecycle, rollback requires a
-    // non-empty note to preserve supersession provenance.
-    wire_node_lib::pyramid::config_contributions::validate_note(&note)?;
+) -> Result<String, String> {
+    // Active build guard: refuse if any build is in progress.
+    {
+        let active = state.pyramid.active_build.read().await;
+        if !active.is_empty() {
+            return Err(
+                "Cannot roll back configuration while a build is in progress — \
+                 wait for it to complete or cancel it."
+                    .to_string(),
+            );
+        }
+    }
 
-    // Load the target contribution to get its yaml_content.
-    let target = {
-        let reader = state.pyramid.reader.lock().await;
-        wire_node_lib::pyramid::config_contributions::load_contribution_by_id(
-            &reader,
+    // Delegate to the library function which handles: local mode
+    // guard, schema validation, supersession, sync to operational,
+    // and registry refresh.
+    {
+        let mut writer = state.pyramid.writer.lock().await;
+        wire_node_lib::pyramid::config_contributions::rollback_config(
+            &mut writer,
+            &state.pyramid.build_event_bus,
+            &state.pyramid.provider_registry,
             &contribution_id,
         )
-        .map_err(|e| e.to_string())?
-    };
-    let target = target.ok_or_else(|| format!("contribution {contribution_id} not found"))?;
+        .map_err(|e| e.to_string())?;
+    }
 
-    // Find the current active contribution for this (slug, schema_type).
-    let current_active = {
-        let reader = state.pyramid.reader.lock().await;
-        wire_node_lib::pyramid::config_contributions::load_active_config_contribution(
-            &reader,
-            &target.schema_type,
-            target.slug.as_deref(),
-        )
-        .map_err(|e| e.to_string())?
-    };
-    let current_active = current_active
-        .ok_or_else(|| "no active contribution to roll back from".to_string())?;
+    // Rebuild the cascade model fields on the live LlmConfig so
+    // call_model_unified sends the correct model name for whichever
+    // provider is now active after the rollback.
+    rebuild_cascade_from_registry(&state).await;
 
-    // Supersede the current active with a new version carrying the
-    // target's yaml_content. The new row gets its own contribution_id;
-    // the supersedes chain walks: new → current_active → … → target.
-    let mut writer = state.pyramid.writer.lock().await;
-    let new_id = wire_node_lib::pyramid::config_contributions::supersede_config_contribution(
-        &mut writer,
-        &current_active.contribution_id,
-        &target.yaml_content,
-        &note,
-        "local",
-        Some("user"),
-    )
-    .map_err(|e| e.to_string())?;
-
-    // Phase 4 invariant: rollback produces a new `active` contribution
-    // carrying the target's YAML. Sync it to the operational table so
-    // the executor picks up the rolled-back value. Without this, the
-    // rollback is cosmetic — the audit trail shows a rollback but the
-    // runtime keeps using the pre-rollback value.
-    let new_contribution =
-        wire_node_lib::pyramid::config_contributions::load_contribution_by_id(
-            &writer,
-            &new_id,
-        )
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "rollback contribution disappeared immediately after create".to_string())?;
-    wire_node_lib::pyramid::config_contributions::sync_config_to_operational(
-        &writer,
-        &state.pyramid.build_event_bus,
-        &new_contribution,
-    )
-    .map_err(|e| e.to_string())?;
-
-    Ok(SupersedeConfigResponse {
-        new_contribution_id: new_id,
-    })
+    Ok(format!("Rolled back to {contribution_id}"))
 }
 
 // --- Phase 5: Wire Contribution Publication IPC ----------------------------
@@ -11797,6 +11794,7 @@ fn main() {
             pyramid_supersede_config,
             pyramid_active_config_contribution,
             pyramid_config_version_history,
+            pyramid_get_config_history,
             pyramid_propose_config,
             pyramid_pending_proposals,
             pyramid_accept_proposal,

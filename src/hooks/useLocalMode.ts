@@ -50,6 +50,16 @@ export interface OllamaProbeResult {
   available_model_details: OllamaModelInfo[];
 }
 
+export interface ConfigHistoryEntry {
+  contribution_id: string;
+  yaml_content: string;
+  triggering_note: string | null;
+  created_by: string | null;
+  created_at: string;
+  superseded_by_id: string | null;
+  is_active: boolean;
+}
+
 export interface UseLocalModeResult {
   status: LocalModeStatus | null;
   loading: boolean;
@@ -65,6 +75,8 @@ export interface UseLocalModeResult {
   pullModel: (model: string) => Promise<void>;
   cancelPull: () => Promise<void>;
   deleteModel: (model: string) => Promise<void>;
+  getConfigHistory: (schemaType: string, limit: number) => Promise<ConfigHistoryEntry[]>;
+  rollbackConfig: (contributionId: string) => Promise<void>;
 }
 
 export function useLocalMode(): UseLocalModeResult {
@@ -205,5 +217,23 @@ export function useLocalMode(): UseLocalModeResult {
     }
   }, [refresh]);
 
-  return { status, loading, error, refresh, enable, disable, probe, switchModel, getModelDetails, setContextOverride, setConcurrencyOverride, pullModel, cancelPull, deleteModel };
+  const getConfigHistory = useCallback(async (schemaType: string, limit: number): Promise<ConfigHistoryEntry[]> => {
+    // Background fetch — does NOT set loading so it doesn't block the UI.
+    return await invoke<ConfigHistoryEntry[]>("pyramid_get_config_history", { schemaType, limit });
+  }, []);
+
+  const rollbackConfig = useCallback(async (contributionId: string) => {
+    setLoading(true);
+    setError(null);
+    try {
+      await invoke<void>("pyramid_rollback_config", { contributionId });
+      await refresh();
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setLoading(false);
+    }
+  }, [refresh]);
+
+  return { status, loading, error, refresh, enable, disable, probe, switchModel, getModelDetails, setContextOverride, setConcurrencyOverride, pullModel, cancelPull, deleteModel, getConfigHistory, rollbackConfig };
 }
