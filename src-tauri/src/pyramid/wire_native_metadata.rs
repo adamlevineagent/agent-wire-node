@@ -870,6 +870,14 @@ pub fn resolve_wire_type(schema_type: &str) -> Result<(WireContributionType, Vec
                 "stale_engine".to_string(),
             ],
         )),
+        "dispatch_policy" => Ok((
+            WireContributionType::Template,
+            vec![
+                "config".to_string(),
+                "wire-node".to_string(),
+                "dispatch".to_string(),
+            ],
+        )),
         "wire_update_polling" => Ok((
             WireContributionType::Template,
             vec![
@@ -1424,6 +1432,7 @@ wire:
             ("wire_discovery_weights", WireContributionType::Template),
             ("wire_auto_update_settings", WireContributionType::Template),
             ("auto_update_policy", WireContributionType::Template),
+            ("dispatch_policy", WireContributionType::Template),
             ("wire_update_polling", WireContributionType::Template),
         ];
         for (schema_type, expected) in cases {

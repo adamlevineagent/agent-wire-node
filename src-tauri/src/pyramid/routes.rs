@@ -4045,6 +4045,9 @@ async fn handle_config_profile(
         // from the live config — profiles only override model selection.
         let preserved_api_key = config_lock.api_key.clone();
         let preserved_auth_token = config_lock.auth_token.clone();
+        // Phase A: preserve dispatch_policy + provider_pools across profile apply.
+        let preserved_dispatch_policy = config_lock.dispatch_policy.clone();
+        let preserved_provider_pools = config_lock.provider_pools.clone();
         *config_lock = pyramid_config.to_llm_config_with_runtime(
             state.provider_registry.clone(),
             state.credential_store.clone(),
@@ -4054,6 +4057,12 @@ async fn handle_config_profile(
         }
         if config_lock.auth_token.is_empty() {
             config_lock.auth_token = preserved_auth_token;
+        }
+        if config_lock.dispatch_policy.is_none() {
+            config_lock.dispatch_policy = preserved_dispatch_policy;
+        }
+        if config_lock.provider_pools.is_none() {
+            config_lock.provider_pools = preserved_provider_pools;
         }
 
         Ok(json_ok(&serde_json::json!({

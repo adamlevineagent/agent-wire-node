@@ -5731,12 +5731,22 @@ async fn pyramid_apply_profile(
     let mut live = state.pyramid.config.write().await;
     let preserved_api_key = live.api_key.clone();
     let preserved_auth_token = live.auth_token.clone();
+    // Phase A: preserve dispatch_policy + provider_pools across profile apply.
+    // Profiles only change model selection, not the dispatch topology.
+    let preserved_dispatch_policy = live.dispatch_policy.clone();
+    let preserved_provider_pools = live.provider_pools.clone();
     *live = new_llm;
     if live.api_key.is_empty() {
         live.api_key = preserved_api_key;
     }
     if live.auth_token.is_empty() {
         live.auth_token = preserved_auth_token;
+    }
+    if live.dispatch_policy.is_none() {
+        live.dispatch_policy = preserved_dispatch_policy;
+    }
+    if live.provider_pools.is_none() {
+        live.provider_pools = preserved_provider_pools;
     }
 
     tracing::info!(
@@ -10236,6 +10246,35 @@ fn main() {
         let reader = pyramid_state.reader.blocking_lock();
         if let Err(e) = pyramid_state.event_bus.load_from_db_sync(&reader) {
             tracing::warn!("Failed to load event subscriptions from DB: {e}");
+        }
+    }
+
+    // Phase A: hydrate dispatch policy + provider pools from DB.
+    // Uses a one-shot connection (same pattern as registry/schema hydration
+    // above). When a policy exists, the per-provider pools replace the
+    // global LOCAL_PROVIDER_SEMAPHORE and global rate_limit_wait.
+    {
+        match wire_node_lib::pyramid::db::open_pyramid_connection(&pyramid_db_path) {
+            Ok(conn) => {
+                if let Ok(Some(yaml_str)) = wire_node_lib::pyramid::db::read_dispatch_policy(&conn) {
+                    match serde_yaml::from_str::<wire_node_lib::pyramid::dispatch_policy::DispatchPolicyYaml>(&yaml_str) {
+                        Ok(yaml) => {
+                            let policy = wire_node_lib::pyramid::dispatch_policy::DispatchPolicy::from_yaml(&yaml);
+                            let pools = wire_node_lib::pyramid::provider_pools::ProviderPools::new(&policy);
+                            let mut cfg = pyramid_state.config.blocking_write();
+                            cfg.dispatch_policy = Some(std::sync::Arc::new(policy));
+                            cfg.provider_pools = Some(std::sync::Arc::new(pools));
+                            tracing::info!("Dispatch policy loaded from DB — per-provider pools active");
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to parse dispatch policy YAML: {e}");
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Failed to open pyramid connection for dispatch policy hydration: {e}");
+            }
         }
     }
 

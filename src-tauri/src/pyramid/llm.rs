@@ -176,6 +176,14 @@ pub struct LlmConfig {
     /// that intentionally bypass the cache (e.g. diagnostics, ASCII art,
     /// semantic search).
     pub cache_access: Option<CacheAccess>,
+    /// Dispatch policy for routing LLM calls to providers.
+    /// When Some, routing rules determine which provider handles each call.
+    /// When None (tests, pre-init), fall through to legacy behavior.
+    pub dispatch_policy: Option<std::sync::Arc<crate::pyramid::dispatch_policy::DispatchPolicy>>,
+    /// Per-provider concurrency pools. When Some, replaces the global
+    /// LOCAL_PROVIDER_SEMAPHORE with per-provider semaphores.
+    /// When None (tests, pre-init), fall through to global semaphore.
+    pub provider_pools: Option<std::sync::Arc<crate::pyramid::provider_pools::ProviderPools>>,
 }
 
 /// Phase 12: cache plumbing that lives on an LlmConfig so every call
@@ -244,6 +252,8 @@ impl std::fmt::Debug for LlmConfig {
                 &self.credential_store.as_ref().map(|_| "<store>"),
             )
             .field("cache_access", &self.cache_access)
+            .field("dispatch_policy", &self.dispatch_policy.as_ref().map(|_| "<policy>"))
+            .field("provider_pools", &self.provider_pools.as_ref().map(|_| "<pools>"))
             .finish()
     }
 }
@@ -272,6 +282,8 @@ impl Default for LlmConfig {
             provider_registry: None,
             credential_store: None,
             cache_access: None,
+            dispatch_policy: None,
+            provider_pools: None,
         }
     }
 }
@@ -345,7 +357,7 @@ pub struct LlmCallOptions {
 /// backend handled the call.
 pub(crate) fn build_call_provider(
     config: &LlmConfig,
-) -> Result<(Box<dyn LlmProvider>, Option<ResolvedSecret>, ProviderType)> {
+) -> Result<(Box<dyn LlmProvider>, Option<ResolvedSecret>, ProviderType, String)> {
     if let Some(registry) = &config.provider_registry {
         // Use the active provider: ollama-local when local mode is on,
         // openrouter otherwise. active_provider_id() checks which
@@ -356,7 +368,7 @@ pub(crate) fn build_call_provider(
             .ok_or_else(|| anyhow!("provider '{}' is not registered — run DB init", provider_id))?;
         let (impl_box, secret) = registry.instantiate_provider(&provider)?;
         let provider_type = provider.provider_type;
-        return Ok((impl_box, secret, provider_type));
+        return Ok((impl_box, secret, provider_type, provider_id));
     }
 
     // Transitional fallback path: no registry, no credential store.
@@ -375,7 +387,7 @@ pub(crate) fn build_call_provider(
     } else {
         Some(ResolvedSecret::new(config.api_key.clone()))
     };
-    Ok((Box::new(provider), secret, ProviderType::Openrouter))
+    Ok((Box::new(provider), secret, ProviderType::Openrouter, "openrouter".to_string()))
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -667,14 +679,14 @@ pub async fn call_model_unified_with_audit_and_ctx(
     // fields. Either way the resulting `Box<dyn LlmProvider>` owns the
     // URL, headers, and response parser — `llm.rs` no longer encodes
     // any of that.
-    let (provider_impl, secret, provider_type) = build_call_provider(config)?;
+    let (provider_impl, secret, provider_type, provider_id) = build_call_provider(config)?;
 
     // Phase 11 wanderer fix: provider_id used for the health hook. The
     // seeded registry row's `id` matches the provider_type tag on the
     // default install (`"openrouter"`), so using the type string here
     // resolves against the correct row in `pyramid_providers` for both
     // the registry and transitional fallback paths in `build_call_provider`.
-    let health_provider_id = provider_type.as_str().to_string();
+    let health_provider_id = provider_id.clone();
 
     // Model selection based on INPUT size only — max_tokens (output budget) is
     // irrelevant to whether the prompt fits in the model's context window.
@@ -744,8 +756,12 @@ pub async fn call_model_unified_with_audit_and_ctx(
             .unwrap_or_default();
         provider_impl.augment_request_body(&mut body, &metadata);
 
-        // Rate limit: wait for sliding window capacity
-        rate_limit_wait(config.rate_limit_max_requests, config.rate_limit_window_secs).await;
+        // Rate limit: when provider pools are configured, rate limiting is
+        // handled per-pool inside pools.acquire(). Otherwise fall back to the
+        // global sliding-window limiter.
+        if config.provider_pools.is_none() {
+            rate_limit_wait(config.rate_limit_max_requests, config.rate_limit_window_secs).await;
+        }
 
         // Phase 13: emit LlmCallStarted once per HTTP dispatch. We
         // emit inside the retry loop so every attempt gets its own
@@ -760,10 +776,17 @@ pub async fn call_model_unified_with_audit_and_ctx(
             .unwrap_or_default();
         emit_llm_call_started(ctx, &use_model, &cache_key_for_event);
 
-        // For local providers (Ollama), acquire the global semaphore so
-        // only one HTTP request hits the local model at a time. Multiple
-        // subsystems (builds, stale engines, Pipeline B) all converge here.
-        let _local_permit = if provider_type == ProviderType::OpenaiCompat {
+        // Per-provider concurrency pool (Phase A dispatch). When provider_pools
+        // is configured, acquire from the named pool (which also handles rate
+        // limiting internally). Falls back to the global LOCAL_PROVIDER_SEMAPHORE
+        // for local providers when pools are not configured.
+        let _pool_permit: Option<tokio::sync::OwnedSemaphorePermit> = if let Some(pools) = &config.provider_pools {
+            pools.acquire(&provider_id).await.ok()
+        } else {
+            None
+        };
+        // Global semaphore fallback (borrowed, for tests/pre-init without pools)
+        let _local_permit = if _pool_permit.is_none() && provider_type == ProviderType::OpenaiCompat {
             Some(LOCAL_PROVIDER_SEMAPHORE.acquire().await.map_err(|e| anyhow!("local provider semaphore closed: {e}"))?)
         } else {
             None
@@ -774,8 +797,9 @@ pub async fn call_model_unified_with_audit_and_ctx(
             request = request.header(k, v);
         }
         let resp = request.json(&body).send().await;
-        // Drop the local provider permit after the HTTP call completes
-        // (before response parsing) so the next caller can proceed.
+        // Drop permits after the HTTP call completes (before response
+        // parsing) so the next caller can proceed.
+        drop(_pool_permit);
         drop(_local_permit);
 
         let resp = match resp {
@@ -1923,13 +1947,22 @@ pub async fn call_model_via_registry(
         }
         provider_impl.augment_request_body(&mut body, &metadata);
 
-        rate_limit_wait(config.rate_limit_max_requests, config.rate_limit_window_secs).await;
+        // Rate limiting: per-pool when available, global fallback otherwise.
+        if config.provider_pools.is_none() {
+            rate_limit_wait(config.rate_limit_max_requests, config.rate_limit_window_secs).await;
+        }
 
         // Phase 13: emit LlmCallStarted once per HTTP dispatch.
         emit_llm_call_started(ctx, &resolved.tier.model_id, &cache_key_for_event);
 
-        // Global local-provider semaphore (see call_model_unified path).
-        let _local_permit = if provider_type == ProviderType::OpenaiCompat {
+        // Per-provider concurrency pool (Phase A dispatch).
+        let _pool_permit: Option<tokio::sync::OwnedSemaphorePermit> = if let Some(pools) = &config.provider_pools {
+            pools.acquire(&resolved.provider.id).await.ok()
+        } else {
+            None
+        };
+        // Global semaphore fallback (for tests/pre-init without pools)
+        let _local_permit = if _pool_permit.is_none() && provider_type == ProviderType::OpenaiCompat {
             Some(LOCAL_PROVIDER_SEMAPHORE.acquire().await.map_err(|e| anyhow!("local provider semaphore closed: {e}"))?)
         } else {
             None
@@ -1980,7 +2013,8 @@ pub async fn call_model_via_registry(
                 return Err(anyhow!(err_msg));
             }
         };
-        // Release the local provider permit before response parsing.
+        // Release permits before response parsing.
+        drop(_pool_permit);
         drop(_local_permit);
 
         let status = resp.status().as_u16();
@@ -2366,7 +2400,7 @@ pub async fn call_model_direct(
     user_prompt: &str,
     max_tokens: u32,
 ) -> Result<String> {
-    let (provider_impl, secret, provider_type) = build_call_provider(config)?;
+    let (provider_impl, secret, provider_type, provider_id) = build_call_provider(config)?;
     let client = &*HTTP_CLIENT;
     let url = provider_impl.chat_completions_url();
     let built_headers = provider_impl.prepare_headers(secret.as_ref())?;
@@ -2384,10 +2418,19 @@ pub async fn call_model_direct(
         });
         provider_impl.augment_request_body(&mut body, &RequestMetadata::default());
 
-        rate_limit_wait(config.rate_limit_max_requests, config.rate_limit_window_secs).await;
+        // Rate limiting: per-pool when available, global fallback otherwise.
+        if config.provider_pools.is_none() {
+            rate_limit_wait(config.rate_limit_max_requests, config.rate_limit_window_secs).await;
+        }
 
-        // Global local-provider semaphore (see call_model_unified path).
-        let _local_permit = if provider_type == ProviderType::OpenaiCompat {
+        // Per-provider concurrency pool (Phase A dispatch).
+        let _pool_permit: Option<tokio::sync::OwnedSemaphorePermit> = if let Some(pools) = &config.provider_pools {
+            pools.acquire(&provider_id).await.ok()
+        } else {
+            None
+        };
+        // Global semaphore fallback (for tests/pre-init without pools)
+        let _local_permit = if _pool_permit.is_none() && provider_type == ProviderType::OpenaiCompat {
             Some(LOCAL_PROVIDER_SEMAPHORE.acquire().await.map_err(|e| anyhow!("local provider semaphore closed: {e}"))?)
         } else {
             None
@@ -2398,6 +2441,7 @@ pub async fn call_model_direct(
             request = request.header(k, v);
         }
         let resp = request.json(&body).send().await;
+        drop(_pool_permit);
         drop(_local_permit);
 
         let resp = match resp {

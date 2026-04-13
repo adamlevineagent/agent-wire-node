@@ -715,6 +715,13 @@ pub fn sync_config_to_operational_with_registry(
             // (runaway_threshold, min_changed_files, auto_update) are
             // re-read per drain cycle.
         }
+        "dispatch_policy" => {
+            // LLM dispatch policy: provider pools, routing rules, escalation,
+            // build coordination. The operational table stores the YAML; the
+            // runtime ProviderPools + DispatchPolicy are rebuilt from it via
+            // a ConfigSynced event listener in server.rs.
+            db::upsert_dispatch_policy(conn, &slug_opt, &contribution.yaml_content, &contribution.contribution_id)?;
+        }
         "chain_assignment" => {
             // Per-pyramid chain override. Syncs to the
             // `pyramid_chain_assignments` operational table via

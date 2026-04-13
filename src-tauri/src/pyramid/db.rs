@@ -1960,6 +1960,16 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
     // to pyramid_config_contributions. Same pattern as DADBEAR migration.
     migrate_legacy_auto_update_to_contributions(conn)?;
 
+    // Dispatch policy operational table (stores active YAML for hot-reload).
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS pyramid_dispatch_policy (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            yaml_content TEXT NOT NULL DEFAULT '',
+            contribution_id TEXT,
+            updated_at TEXT DEFAULT (datetime('now'))
+        )"
+    )?;
+
     Ok(())
 }
 
@@ -14758,6 +14768,35 @@ pub fn upsert_auto_update_policy(
         ],
     )?;
     Ok(())
+}
+
+/// Store the active dispatch policy YAML. Singleton table (id=1).
+pub fn upsert_dispatch_policy(
+    conn: &Connection,
+    _slug: &Option<String>,
+    yaml_content: &str,
+    contribution_id: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO pyramid_dispatch_policy (id, yaml_content, contribution_id, updated_at)
+         VALUES (1, ?1, ?2, datetime('now'))
+         ON CONFLICT(id) DO UPDATE SET
+            yaml_content = excluded.yaml_content,
+            contribution_id = excluded.contribution_id,
+            updated_at = datetime('now')",
+        rusqlite::params![yaml_content, contribution_id],
+    )?;
+    Ok(())
+}
+
+/// Read the active dispatch policy YAML. Returns None if no policy is set.
+pub fn read_dispatch_policy(conn: &Connection) -> Result<Option<String>> {
+    let result: Option<String> = conn.query_row(
+        "SELECT yaml_content FROM pyramid_dispatch_policy WHERE id = 1",
+        [],
+        |row| row.get(0),
+    ).optional()?;
+    Ok(result.filter(|s| !s.is_empty()))
 }
 
 /// Minimal tier routing YAML struct — a list of tier entries. Used by

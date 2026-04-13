@@ -109,6 +109,8 @@ pub mod wire_publish;
 pub mod wire_pull;
 pub mod wire_update_poller;
 pub mod yaml_renderer;
+pub mod dispatch_policy;
+pub mod provider_pools;
 
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -673,6 +675,8 @@ impl PyramidConfig {
             provider_registry: None,
             credential_store: None,
             cache_access: None,
+            dispatch_policy: None,
+            provider_pools: None,
         }
     }
 
