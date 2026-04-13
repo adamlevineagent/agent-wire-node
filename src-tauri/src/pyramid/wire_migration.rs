@@ -54,7 +54,7 @@ use tracing::{debug, warn};
 
 use crate::pyramid::chain_registry;
 use crate::pyramid::config_contributions::create_config_contribution_with_metadata;
-use crate::pyramid::db::ChainDefaultsYaml;
+use crate::pyramid::db::{ChainAssignmentYaml, ChainDefaultsYaml};
 use crate::pyramid::prompt_cache::normalize_prompt_path;
 use crate::pyramid::wire_native_metadata::{
     default_wire_native_metadata, WireContributionType, WireMaturity, WireNativeMetadata,
@@ -1108,6 +1108,7 @@ pub fn walk_bundled_contributions_manifest(
     // contribution and replay it to the operational table. This is
     // idempotent (DELETE + re-INSERT) and fast (handful of rows).
     sync_chain_defaults_to_operational(conn);
+    sync_chain_assignments_to_operational(conn);
 
     Ok(report)
 }
@@ -1166,6 +1167,68 @@ fn sync_chain_defaults_to_operational(conn: &Connection) {
                 );
             }
         }
+    }
+}
+
+/// Replay all active `chain_assignment` contributions to the
+/// `pyramid_chain_assignments` operational table. Ensures per-slug
+/// overrides survive a table rebuild (schema migration) and are
+/// consistent with the contribution store on every boot.
+fn sync_chain_assignments_to_operational(conn: &Connection) {
+    let rows: Vec<(String, String, String)> = conn
+        .prepare(
+            "SELECT contribution_id, slug, yaml_content
+             FROM pyramid_config_contributions
+             WHERE schema_type = 'chain_assignment'
+               AND status = 'active'
+             ORDER BY accepted_at DESC",
+        )
+        .and_then(|mut stmt| {
+            stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+        })
+        .unwrap_or_else(|e| {
+            warn!(error = %e, "boot sync: failed to query chain_assignment contributions");
+            Vec::new()
+        });
+
+    let mut replayed = 0u32;
+    for (contribution_id, slug, yaml_content) in &rows {
+        match serde_yaml::from_str::<ChainAssignmentYaml>(yaml_content) {
+            Ok(yaml) => {
+                if yaml.chain_id == "default" {
+                    // "default" means "no override" — skip on boot sync since
+                    // the table starts empty (or was just rebuilt).
+                    continue;
+                }
+                if let Err(e) = chain_registry::assign_chain(conn, slug, &yaml.chain_id) {
+                    warn!(
+                        error = %e,
+                        slug = %slug,
+                        "boot sync: failed to replay chain_assignment"
+                    );
+                } else {
+                    replayed += 1;
+                }
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    contribution_id = %contribution_id,
+                    "boot sync: failed to parse chain_assignment YAML"
+                );
+            }
+        }
+    }
+
+    if replayed > 0 {
+        debug!(count = replayed, "boot sync: chain_assignments replayed");
     }
 }
 

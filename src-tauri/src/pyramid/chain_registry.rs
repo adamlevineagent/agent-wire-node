@@ -19,33 +19,65 @@ use super::db::ChainDefaultMapping;
 /// contribution in `pyramid_config_contributions`. External access goes
 /// through contribution CRUD; these helpers are called by the sync dispatcher.
 pub fn init_chain_tables(conn: &Connection) -> Result<()> {
+    // Per-slug chain override (tier 1). Both tables are contribution-backed
+    // operational caches — source of truth is pyramid_config_contributions.
     conn.execute_batch(
-        "
-        -- Per-slug chain override (tier 1).
-        -- The old schema had an extra `chain_file TEXT` column that no call
-        -- site ever read. We leave it in place on existing installs (harmless)
-        -- rather than DROP+CREATE, which would destroy any user-set per-slug
-        -- assignments on every boot. New installs get the clean schema.
-        CREATE TABLE IF NOT EXISTS pyramid_chain_assignments (
+        "CREATE TABLE IF NOT EXISTS pyramid_chain_assignments (
             slug TEXT PRIMARY KEY REFERENCES pyramid_slugs(slug) ON DELETE CASCADE,
             chain_id TEXT NOT NULL,
             assigned_at TEXT NOT NULL DEFAULT (datetime('now'))
-        );
+        );",
+    )?;
 
-        -- Content-type default mapping (tier 2).
-        -- Populated from the active chain_defaults contribution. The wildcard
-        -- content_type '*' serves as the global fallback within the table;
-        -- evidence_mode '*' matches any mode.
-        CREATE TABLE IF NOT EXISTS pyramid_chain_defaults (
+    // Content-type default mapping (tier 2).
+    // Schema evolved: added evidence_mode column + compound PK. Old installs
+    // have a table missing this column. CREATE IF NOT EXISTS is a no-op on
+    // existing tables, so we detect the old schema and rebuild.
+    //
+    // IMPORTANT: init_pyramid_db() is called multiple times during boot
+    // (writer, reader, partner_reader). This check must be idempotent —
+    // only DROP+CREATE when the old schema is actually present.
+    let needs_rebuild = if table_exists(conn, "pyramid_chain_defaults")? {
+        !column_exists(conn, "pyramid_chain_defaults", "evidence_mode")?
+    } else {
+        false
+    };
+
+    if needs_rebuild {
+        info!("pyramid_chain_defaults: migrating old schema (adding evidence_mode, compound PK)");
+        conn.execute_batch("DROP TABLE pyramid_chain_defaults;")?;
+    }
+
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS pyramid_chain_defaults (
             content_type TEXT NOT NULL,
             evidence_mode TEXT NOT NULL DEFAULT '*',
             chain_id TEXT NOT NULL,
             contribution_id TEXT NOT NULL,
             PRIMARY KEY (content_type, evidence_mode)
-        );
-        ",
+        );",
     )?;
+
     Ok(())
+}
+
+/// Check whether a table exists in the database.
+fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+        rusqlite::params![table],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
+/// Check whether a column exists on a table via PRAGMA table_info.
+fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({})", table))?;
+    let has_col = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .any(|name| name.map(|n| n == column).unwrap_or(false));
+    Ok(has_col)
 }
 
 // ── Tier 1: per-slug assignment (operational helpers) ────────────────────────
