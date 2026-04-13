@@ -14,7 +14,7 @@ use rusqlite::Connection;
 use tracing::{error, info, warn};
 
 use super::config_helper::estimate_cost;
-use super::llm::{call_model_with_usage_and_ctx, extract_json, LlmConfig};
+use super::llm::{call_model_unified_and_ctx, extract_json, LlmConfig};
 use super::step_context::{compute_prompt_hash, StepContext};
 use super::naming::{clean_headline, headline_for_node};
 use super::stale_engine::batch_items;
@@ -606,15 +606,20 @@ pub async fn dispatch_node_stale_check(
     )
     .with_model_resolution("stale_local", model.to_string())
     .with_prompt_hash(compute_prompt_hash(system_prompt));
-    let (response, usage) = call_model_with_usage_and_ctx(
+    let llm_resp = call_model_unified_and_ctx(
         &config,
         Some(&ctx),
         system_prompt,
         &user_prompt,
         0.1,
         2048,
+        None,
     )
     .await?;
+    let response = llm_resp.content;
+    let usage = llm_resp.usage;
+    let generation_id = llm_resp.generation_id;
+    let _provider_id = llm_resp.provider_id;
 
     // Log cost to pyramid_cost_log
     {
@@ -625,12 +630,13 @@ pub async fn dispatch_node_stale_check(
         let ct = usage.completion_tokens;
         let cost = estimate_cost(&usage);
         let lyr = batch[0].layer;
+        let gen_id = generation_id.clone();
         let _ = tokio::task::spawn_blocking(move || {
             if let Ok(conn) = super::db::open_pyramid_connection(Path::new(&db_cost)) {
                 let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
                 let _ = conn.execute(
-                    "INSERT INTO pyramid_cost_log (slug, operation, model, input_tokens, output_tokens, estimated_cost, source, layer, check_type, created_at, chain_id, step_name, tier, latency_ms, generation_id, estimated_cost_usd) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'auto-stale', ?7, ?8, ?9, NULL, NULL, NULL, NULL, NULL, NULL)",
-                    rusqlite::params![slug_cost, "stale_check", model_cost, pt, ct, cost, lyr, "node_stale", now],
+                    "INSERT INTO pyramid_cost_log (slug, operation, model, input_tokens, output_tokens, estimated_cost, source, layer, check_type, created_at, chain_id, step_name, tier, latency_ms, generation_id, estimated_cost_usd) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'auto-stale', ?7, ?8, ?9, NULL, NULL, NULL, NULL, ?10, NULL)",
+                    rusqlite::params![slug_cost, "stale_check", model_cost, pt, ct, cost, lyr, "node_stale", now, gen_id],
                 );
             }
         }).await;
@@ -931,15 +937,20 @@ pub async fn dispatch_connection_check(
         )
         .with_model_resolution("stale_local", model.to_string())
         .with_prompt_hash(compute_prompt_hash(system_prompt));
-        let (response, conn_usage) = call_model_with_usage_and_ctx(
+        let llm_resp = call_model_unified_and_ctx(
             &config,
             Some(&ctx),
             system_prompt,
             &user_prompt,
             0.1,
             2048,
+            None,
         )
         .await?;
+        let response = llm_resp.content;
+        let conn_usage = llm_resp.usage;
+        let generation_id = llm_resp.generation_id;
+        let _provider_id = llm_resp.provider_id;
 
         // Log cost to pyramid_cost_log
         {
@@ -949,12 +960,13 @@ pub async fn dispatch_connection_check(
             let pt = conn_usage.prompt_tokens;
             let ct = conn_usage.completion_tokens;
             let cost = estimate_cost(&conn_usage);
+            let gen_id = generation_id.clone();
             let _ = tokio::task::spawn_blocking(move || {
                 if let Ok(conn) = super::db::open_pyramid_connection(Path::new(&db_cost)) {
                     let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
                     let _ = conn.execute(
-                        "INSERT INTO pyramid_cost_log (slug, operation, model, input_tokens, output_tokens, estimated_cost, source, layer, check_type, created_at, chain_id, step_name, tier, latency_ms, generation_id, estimated_cost_usd) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'auto-stale', ?7, ?8, ?9, NULL, NULL, NULL, NULL, NULL, NULL)",
-                        rusqlite::params![slug_cost, "stale_check", model_cost, pt, ct, cost, old_depth, "connection_check", now],
+                        "INSERT INTO pyramid_cost_log (slug, operation, model, input_tokens, output_tokens, estimated_cost, source, layer, check_type, created_at, chain_id, step_name, tier, latency_ms, generation_id, estimated_cost_usd) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'auto-stale', ?7, ?8, ?9, NULL, NULL, NULL, NULL, ?10, NULL)",
+                        rusqlite::params![slug_cost, "stale_check", model_cost, pt, ct, cost, old_depth, "connection_check", now, gen_id],
                     );
                 }
             }).await;
@@ -1288,15 +1300,20 @@ pub async fn dispatch_edge_stale_check(
         )
         .with_model_resolution("stale_local", model.to_string())
         .with_prompt_hash(compute_prompt_hash(system_prompt));
-        let (response, usage) = call_model_with_usage_and_ctx(
+        let llm_resp = call_model_unified_and_ctx(
             &config,
             Some(&ctx),
             system_prompt,
             &user_prompt,
             0.1,
             1024,
+            None,
         )
         .await?;
+        let response = llm_resp.content;
+        let usage = llm_resp.usage;
+        let generation_id = llm_resp.generation_id;
+        let _provider_id = llm_resp.provider_id;
 
         // Log cost to pyramid_cost_log
         {
@@ -1307,12 +1324,13 @@ pub async fn dispatch_edge_stale_check(
             let ct = usage.completion_tokens;
             let cost = estimate_cost(&usage);
             let lyr = mutation.layer;
+            let gen_id = generation_id.clone();
             let _ = tokio::task::spawn_blocking(move || {
                 if let Ok(conn) = super::db::open_pyramid_connection(Path::new(&db_cost)) {
                     let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
                     let _ = conn.execute(
-                        "INSERT INTO pyramid_cost_log (slug, operation, model, input_tokens, output_tokens, estimated_cost, source, layer, check_type, created_at, chain_id, step_name, tier, latency_ms, generation_id, estimated_cost_usd) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'auto-stale', ?7, ?8, ?9, NULL, NULL, NULL, NULL, NULL, NULL)",
-                        rusqlite::params![slug_cost, "stale_check", model_cost, pt, ct, cost, lyr, "edge_stale", now],
+                        "INSERT INTO pyramid_cost_log (slug, operation, model, input_tokens, output_tokens, estimated_cost, source, layer, check_type, created_at, chain_id, step_name, tier, latency_ms, generation_id, estimated_cost_usd) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'auto-stale', ?7, ?8, ?9, NULL, NULL, NULL, NULL, ?10, NULL)",
+                        rusqlite::params![slug_cost, "stale_check", model_cost, pt, ct, cost, lyr, "edge_stale", now, gen_id],
                     );
                 }
             }).await;
@@ -1352,15 +1370,17 @@ pub async fn dispatch_edge_stale_check(
             )
             .with_model_resolution("stale_local", model.to_string())
             .with_prompt_hash(compute_prompt_hash(system_prompt));
-            let (re_eval_response, _) = call_model_with_usage_and_ctx(
+            let re_eval_llm_resp = call_model_unified_and_ctx(
                 &config,
                 Some(&re_eval_ctx),
                 system_prompt,
                 &re_eval_prompt,
                 0.3,
                 512,
+                None,
             )
             .await?;
+            let re_eval_response = re_eval_llm_resp.content;
 
             let re_eval_json = extract_json(&re_eval_response)?;
             let new_relationship = re_eval_json
@@ -3066,15 +3086,20 @@ async fn execute_supersession_identity_change(
     )
     .with_model_resolution("stale_local", model.to_string())
     .with_prompt_hash(compute_prompt_hash(system_prompt));
-    let (supersession_response, supersession_usage) = call_model_with_usage_and_ctx(
+    let supersession_llm_resp = call_model_unified_and_ctx(
         &config,
         Some(&supersession_ctx),
         system_prompt,
         &user_prompt,
         0.2,
         4096,
+        None,
     )
     .await?;
+    let supersession_response = supersession_llm_resp.content;
+    let supersession_usage = supersession_llm_resp.usage;
+    let supersession_generation_id = supersession_llm_resp.generation_id;
+    let _supersession_provider_id = supersession_llm_resp.provider_id;
     let supersession_json = extract_json(&supersession_response).ok();
     let new_headline = supersession_json
         .as_ref()
@@ -3120,12 +3145,13 @@ async fn execute_supersession_identity_change(
         let pt = supersession_usage.prompt_tokens;
         let ct = supersession_usage.completion_tokens;
         let cost = estimate_cost(&supersession_usage);
+        let gen_id = supersession_generation_id.clone();
         let _ = tokio::task::spawn_blocking(move || {
             if let Ok(conn) = super::db::open_pyramid_connection(Path::new(&db_cost)) {
                 let now = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
                 let _ = conn.execute(
-                    "INSERT INTO pyramid_cost_log (slug, operation, model, input_tokens, output_tokens, estimated_cost, source, layer, check_type, created_at, chain_id, step_name, tier, latency_ms, generation_id, estimated_cost_usd) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'auto-stale', ?7, ?8, ?9, NULL, NULL, NULL, NULL, NULL, NULL)",
-                    rusqlite::params![slug_cost, "supersession", model_cost, pt, ct, cost, 0i32, "supersession_identity_change", now],
+                    "INSERT INTO pyramid_cost_log (slug, operation, model, input_tokens, output_tokens, estimated_cost, source, layer, check_type, created_at, chain_id, step_name, tier, latency_ms, generation_id, estimated_cost_usd) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'auto-stale', ?7, ?8, ?9, NULL, NULL, NULL, NULL, ?10, NULL)",
+                    rusqlite::params![slug_cost, "supersession", model_cost, pt, ct, cost, 0i32, "supersession_identity_change", now, gen_id],
                 );
             }
         }).await;

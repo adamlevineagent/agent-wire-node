@@ -7748,12 +7748,13 @@ async fn handle_navigate(
     (state, _auth_source): (Arc<PyramidState>, AuthSource),
     body: NavigateBody,
 ) -> Result<warp::reply::Response, warp::Rejection> {
-    // Check LLM configuration
+    // Phase C fix: Check whether ANY provider is available, not just the legacy api_key.
     let config = state.config.read().await;
-    if config.api_key.is_empty() {
+    let has_provider = config.provider_registry.is_some() || !config.api_key.is_empty();
+    if !has_provider {
         return Ok(json_error(
             warp::http::StatusCode::SERVICE_UNAVAILABLE,
-            "LLM not configured. Set an OpenRouter API key to use navigate.",
+            "LLM not configured. Set an API key or configure a provider to use navigate.",
         ));
     }
     let llm_config = config.clone();
@@ -7823,7 +7824,38 @@ async fn handle_navigate(
             .join("\n\n---\n\n")
     );
 
-    match super::llm::call_model_unified(&llm_config, system, &user, 0.2, 600, None).await {
+    // Phase C fix: Construct a synthetic StepContext so navigate gets caching.
+    let navigate_build_id = format!(
+        "navigate-{}-{}",
+        slug_name,
+        chrono::Utc::now().timestamp()
+    );
+    let db_path = state
+        .data_dir
+        .as_ref()
+        .and_then(|d| d.join("pyramid.db").to_str().map(String::from))
+        .unwrap_or_default();
+    let ctx = super::step_context::StepContext::new(
+        slug_name.clone(),
+        navigate_build_id,
+        "navigate",
+        "navigate",
+        0,
+        None,
+        db_path,
+    );
+
+    match super::llm::call_model_unified_and_ctx(
+        &llm_config,
+        Some(&ctx),
+        system,
+        &user,
+        0.2,
+        600,
+        None,
+    )
+    .await
+    {
         Ok(response) => {
             let cited_nodes: Vec<&str> = node_contents
                 .iter()

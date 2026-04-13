@@ -19,7 +19,7 @@ use tracing::{info, warn};
 
 
 use super::config_helper::estimate_cost;
-use super::llm::{call_model_with_usage_and_ctx, extract_json, LlmConfig};
+use super::llm::{call_model_unified_and_ctx, extract_json, LlmConfig};
 use super::step_context::{compute_prompt_hash, StepContext};
 use super::naming::{headline_from_path, tombstone_headline};
 use super::stale_helpers_upper::{
@@ -303,15 +303,20 @@ Output JSON only. Array of objects, one per file:
     )
     .with_model_resolution("stale_local", model.to_string())
     .with_prompt_hash(compute_prompt_hash(system_prompt));
-    let (response, usage) = call_model_with_usage_and_ctx(
+    let llm_resp = call_model_unified_and_ctx(
         &config,
         Some(&ctx),
         system_prompt,
         &user_prompt,
         0.1,
         1024,
+        None,
     )
     .await?;
+    let response = llm_resp.content;
+    let usage = llm_resp.usage;
+    let generation_id = llm_resp.generation_id;
+    let _provider_id = llm_resp.provider_id;
 
     let total_tokens = usage.prompt_tokens + usage.completion_tokens;
     let cost_usd = estimate_cost(&usage);
@@ -331,12 +336,13 @@ Output JSON only. Array of objects, one per file:
         let pt = usage.prompt_tokens;
         let ct = usage.completion_tokens;
         let cost = cost_usd;
+        let gen_id = generation_id.clone();
         let _ = tokio::task::spawn_blocking(move || {
             if let Ok(conn) = super::db::open_pyramid_connection(Path::new(&db_cost)) {
                 let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
                 let _ = conn.execute(
-                    "INSERT INTO pyramid_cost_log (slug, operation, model, input_tokens, output_tokens, estimated_cost, source, layer, check_type, created_at, chain_id, step_name, tier, latency_ms, generation_id, estimated_cost_usd) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'auto-stale', ?7, ?8, ?9, NULL, NULL, NULL, NULL, NULL, NULL)",
-                    rusqlite::params![slug_cost, "stale_check", model_cost, pt, ct, cost, 0, "file_stale", now],
+                    "INSERT INTO pyramid_cost_log (slug, operation, model, input_tokens, output_tokens, estimated_cost, source, layer, check_type, created_at, chain_id, step_name, tier, latency_ms, generation_id, estimated_cost_usd) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'auto-stale', ?7, ?8, ?9, NULL, NULL, NULL, NULL, ?10, NULL)",
+                    rusqlite::params![slug_cost, "stale_check", model_cost, pt, ct, cost, 0, "file_stale", now, gen_id],
                 );
             }
         }).await;
@@ -818,15 +824,20 @@ Output JSON only:
     )
     .with_model_resolution("stale_local", model.to_string())
     .with_prompt_hash(compute_prompt_hash(system_prompt));
-    let (response, usage) = call_model_with_usage_and_ctx(
+    let llm_resp = call_model_unified_and_ctx(
         &config,
         Some(&ctx),
         system_prompt,
         &user_prompt,
         0.1,
         256,
+        None,
     )
     .await?;
+    let response = llm_resp.content;
+    let usage = llm_resp.usage;
+    let generation_id = llm_resp.generation_id;
+    let _provider_id = llm_resp.provider_id;
 
     let cost_usd = estimate_cost(&usage);
     info!(
@@ -844,12 +855,13 @@ Output JSON only:
         let pt = usage.prompt_tokens;
         let ct = usage.completion_tokens;
         let cost = cost_usd;
+        let gen_id = generation_id.clone();
         let _ = tokio::task::spawn_blocking(move || {
             if let Ok(conn) = super::db::open_pyramid_connection(Path::new(&db_cost)) {
                 let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
                 let _ = conn.execute(
-                    "INSERT INTO pyramid_cost_log (slug, operation, model, input_tokens, output_tokens, estimated_cost, source, layer, check_type, created_at, chain_id, step_name, tier, latency_ms, generation_id, estimated_cost_usd) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'auto-stale', ?7, ?8, ?9, NULL, NULL, NULL, NULL, NULL, NULL)",
-                    rusqlite::params![slug_cost, "stale_check", model_cost, pt, ct, cost, 0, "rename_check", now],
+                    "INSERT INTO pyramid_cost_log (slug, operation, model, input_tokens, output_tokens, estimated_cost, source, layer, check_type, created_at, chain_id, step_name, tier, latency_ms, generation_id, estimated_cost_usd) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'auto-stale', ?7, ?8, ?9, NULL, NULL, NULL, NULL, ?10, NULL)",
+                    rusqlite::params![slug_cost, "stale_check", model_cost, pt, ct, cost, 0, "rename_check", now, gen_id],
                 );
             }
         }).await;
@@ -1231,15 +1243,20 @@ Output JSON only:
         )
         .with_model_resolution("stale_local", model.to_string())
         .with_prompt_hash(compute_prompt_hash(system_prompt));
-        let (response, usage) = call_model_with_usage_and_ctx(
+        let llm_resp = call_model_unified_and_ctx(
             &config,
             Some(&ctx),
             system_prompt,
             &user_prompt,
             0.2,
             1024,
+            None,
         )
         .await?;
+        let response = llm_resp.content;
+        let usage = llm_resp.usage;
+        let generation_id = llm_resp.generation_id;
+        let _provider_id = llm_resp.provider_id;
 
         let cost_usd = estimate_cost(&usage);
         let total_tokens = usage.prompt_tokens + usage.completion_tokens;
@@ -1260,12 +1277,13 @@ Output JSON only:
             let pt = usage.prompt_tokens;
             let ct = usage.completion_tokens;
             let cost = cost_usd;
+            let gen_id = generation_id.clone();
             let _ = tokio::task::spawn_blocking(move || {
                 if let Ok(conn) = super::db::open_pyramid_connection(Path::new(&db_cost)) {
                     let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
                     let _ = conn.execute(
-                        "INSERT INTO pyramid_cost_log (slug, operation, model, input_tokens, output_tokens, estimated_cost, source, layer, check_type, created_at, chain_id, step_name, tier, latency_ms, generation_id, estimated_cost_usd) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'auto-stale', ?7, ?8, ?9, NULL, NULL, NULL, NULL, NULL, NULL)",
-                        rusqlite::params![slug_cost, "stale_check", model_cost, pt, ct, cost, 0, "evidence_set_apex", now],
+                        "INSERT INTO pyramid_cost_log (slug, operation, model, input_tokens, output_tokens, estimated_cost, source, layer, check_type, created_at, chain_id, step_name, tier, latency_ms, generation_id, estimated_cost_usd) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'auto-stale', ?7, ?8, ?9, NULL, NULL, NULL, NULL, ?10, NULL)",
+                        rusqlite::params![slug_cost, "stale_check", model_cost, pt, ct, cost, 0, "evidence_set_apex", now, gen_id],
                     );
                 }
             }).await;
@@ -1508,15 +1526,20 @@ Output JSON only:
         )
         .with_model_resolution("stale_local", model.to_string())
         .with_prompt_hash(compute_prompt_hash(system_prompt));
-        let (response, usage) = call_model_with_usage_and_ctx(
+        let llm_resp = call_model_unified_and_ctx(
             &config,
             Some(&ctx),
             system_prompt,
             &user_prompt,
             0.1,
             256,
+            None,
         )
         .await?;
+        let response = llm_resp.content;
+        let usage = llm_resp.usage;
+        let generation_id = llm_resp.generation_id;
+        let _provider_id = llm_resp.provider_id;
 
         let cost_usd = estimate_cost(&usage);
         let total_tokens = usage.prompt_tokens + usage.completion_tokens;
@@ -1537,12 +1560,13 @@ Output JSON only:
             let pt = usage.prompt_tokens;
             let ct = usage.completion_tokens;
             let cost = cost_usd;
+            let gen_id = generation_id.clone();
             let _ = tokio::task::spawn_blocking(move || {
                 if let Ok(conn) = super::db::open_pyramid_connection(Path::new(&db_cost)) {
                     let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
                     let _ = conn.execute(
-                        "INSERT INTO pyramid_cost_log (slug, operation, model, input_tokens, output_tokens, estimated_cost, source, layer, check_type, created_at, chain_id, step_name, tier, latency_ms, generation_id, estimated_cost_usd) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'auto-stale', ?7, ?8, ?9, NULL, NULL, NULL, NULL, NULL, NULL)",
-                        rusqlite::params![slug_cost, "stale_check", model_cost, pt, ct, cost, 0, "targeted_l0_stale", now],
+                        "INSERT INTO pyramid_cost_log (slug, operation, model, input_tokens, output_tokens, estimated_cost, source, layer, check_type, created_at, chain_id, step_name, tier, latency_ms, generation_id, estimated_cost_usd) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'auto-stale', ?7, ?8, ?9, NULL, NULL, NULL, NULL, ?10, NULL)",
+                        rusqlite::params![slug_cost, "stale_check", model_cost, pt, ct, cost, 0, "targeted_l0_stale", now, gen_id],
                     );
                 }
             })

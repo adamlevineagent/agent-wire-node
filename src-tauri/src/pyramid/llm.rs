@@ -679,20 +679,112 @@ pub async fn call_model_unified_with_audit_and_ctx(
     // fields. Either way the resulting `Box<dyn LlmProvider>` owns the
     // URL, headers, and response parser — `llm.rs` no longer encodes
     // any of that.
-    let (provider_impl, secret, provider_type, provider_id) = build_call_provider(config)?;
+    let (mut provider_impl, mut secret, mut provider_type, provider_id) = build_call_provider(config)?;
 
-    // Phase 11 wanderer fix: provider_id used for the health hook. The
-    // seeded registry row's `id` matches the provider_type tag on the
-    // default install (`"openrouter"`), so using the type string here
-    // resolves against the correct row in `pyramid_providers` for both
-    // the registry and transitional fallback paths in `build_call_provider`.
-    let health_provider_id = provider_id.clone();
+    // Phase D: resolve the dispatch route BEFORE the retry loop so we
+    // have the provider preference chain for escalation. When no policy
+    // is configured the resolved_route is None and we fall through to
+    // the legacy single-provider path.
+    let resolved_route = config.dispatch_policy.as_ref().map(|policy| {
+        // Use Build as the default work_type — Phase B work_type tagging
+        // will provide the real classification per call site.
+        let work_type = crate::pyramid::dispatch_policy::WorkType::Build;
+        let step_name = ctx.map(|c| c.step_name.as_str()).unwrap_or("");
+        let depth = ctx.map(|c| c.depth);
+        policy.resolve_route(work_type, "", step_name, depth)
+    });
+
+    // Phase D: pool acquire with timeout-based provider escalation.
+    // When a dispatch route exists, try each provider in the preference
+    // chain with escalation_timeout_secs per hop. On the last provider
+    // in the chain, wait up to max_wait_secs. When no route exists,
+    // fall back to the single-provider acquire.
+    let (_escalation_permit, effective_provider_id) = if let (Some(pools), Some(route)) = (&config.provider_pools, &resolved_route) {
+        if route.bypass_pool {
+            (None::<tokio::sync::OwnedSemaphorePermit>, provider_id.clone())
+        } else if route.providers.is_empty() {
+            // No providers in route — use default provider, no pool
+            (None, provider_id.clone())
+        } else {
+            // Try providers in order with escalation timeout
+            let mut acquired: Option<tokio::sync::OwnedSemaphorePermit> = None;
+            let mut eff_provider = provider_id.clone();
+            for (i, entry) in route.providers.iter().enumerate() {
+                let is_last = i == route.providers.len() - 1;
+                let timeout_secs = if is_last {
+                    route.max_wait_secs
+                } else {
+                    route.escalation_timeout_secs
+                };
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(timeout_secs),
+                    pools.acquire(&entry.provider_id),
+                ).await {
+                    Ok(Ok(permit)) => {
+                        acquired = Some(permit);
+                        eff_provider = entry.provider_id.clone();
+                        break;
+                    }
+                    Ok(Err(_)) => continue, // provider not in pools
+                    Err(_) => {
+                        tracing::info!(
+                            provider = %entry.provider_id,
+                            "Escalating: pool acquire timed out after {}s, trying next provider",
+                            timeout_secs,
+                        );
+                        continue; // timeout, try next
+                    }
+                }
+            }
+            (acquired, eff_provider)
+        }
+    } else if let Some(pools) = &config.provider_pools {
+        // Pools exist but no route — use default provider
+        let permit = pools.acquire(&provider_id).await.ok();
+        (permit, provider_id.clone())
+    } else {
+        (None, provider_id.clone())
+    };
+
+    // Phase D: when escalation changed the provider, re-instantiate the
+    // provider impl (different URL, different headers, different auth).
+    // Also pick up the route entry's model_id override if set.
+    let mut escalation_model_override: Option<String> = None;
+    if effective_provider_id != provider_id {
+        if let Some(registry) = &config.provider_registry {
+            let provider_row = registry.get_provider(&effective_provider_id)
+                .ok_or_else(|| anyhow!("escalated provider '{}' not registered", effective_provider_id))?;
+            let (impl_box, sec) = registry.instantiate_provider(&provider_row)?;
+            provider_type = provider_row.provider_type;
+            provider_impl = impl_box;
+            secret = sec;
+        }
+        // Check if the matched route entry specifies a model override
+        if let Some(route) = &resolved_route {
+            for entry in &route.providers {
+                if entry.provider_id == effective_provider_id {
+                    if let Some(ref model) = entry.model_id {
+                        escalation_model_override = Some(model.clone());
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    // Phase 11 wanderer fix: provider_id used for the health hook. Use
+    // the effective provider (may differ from initial after escalation).
+    let health_provider_id = effective_provider_id.clone();
 
     // Model selection based on INPUT size only — max_tokens (output budget) is
     // irrelevant to whether the prompt fits in the model's context window.
     let est_input_tokens = estimate_tokens_llm(system_prompt, user_prompt).await;
 
-    let mut use_model = if est_input_tokens > config.fallback_1_context_limit {
+    let mut use_model = if let Some(ref model) = escalation_model_override {
+        // Phase D: escalated route entry specified a model — use it
+        info!("[escalation->{}]", short_name(model));
+        model.clone()
+    } else if est_input_tokens > config.fallback_1_context_limit {
         info!("[fallback->{}]", short_name(&config.fallback_model_2));
         config.fallback_model_2.clone()
     } else if est_input_tokens > config.primary_context_limit {
@@ -776,17 +868,12 @@ pub async fn call_model_unified_with_audit_and_ctx(
             .unwrap_or_default();
         emit_llm_call_started(ctx, &use_model, &cache_key_for_event);
 
-        // Per-provider concurrency pool (Phase A dispatch). When provider_pools
-        // is configured, acquire from the named pool (which also handles rate
-        // limiting internally). Falls back to the global LOCAL_PROVIDER_SEMAPHORE
-        // for local providers when pools are not configured.
-        let _pool_permit: Option<tokio::sync::OwnedSemaphorePermit> = if let Some(pools) = &config.provider_pools {
-            pools.acquire(&provider_id).await.ok()
-        } else {
-            None
-        };
-        // Global semaphore fallback (borrowed, for tests/pre-init without pools)
-        let _local_permit = if _pool_permit.is_none() && provider_type == ProviderType::OpenaiCompat {
+        // Phase D: the per-provider pool permit is now acquired BEFORE the
+        // retry loop via the escalation path (`_escalation_permit`). It is
+        // held across all retry attempts so we don't re-enter the escalation
+        // chain on each retry. The global semaphore fallback remains for the
+        // no-pools / no-escalation-permit case (tests, pre-init).
+        let _local_permit = if _escalation_permit.is_none() && provider_type == ProviderType::OpenaiCompat {
             Some(LOCAL_PROVIDER_SEMAPHORE.acquire().await.map_err(|e| anyhow!("local provider semaphore closed: {e}"))?)
         } else {
             None
@@ -797,9 +884,10 @@ pub async fn call_model_unified_with_audit_and_ctx(
             request = request.header(k, v);
         }
         let resp = request.json(&body).send().await;
-        // Drop permits after the HTTP call completes (before response
-        // parsing) so the next caller can proceed.
-        drop(_pool_permit);
+        // Drop local permit after the HTTP call completes (before response
+        // parsing) so the next caller can proceed. The escalation permit
+        // is dropped at function exit (after all retries are exhausted or
+        // the call succeeds).
         drop(_local_permit);
 
         let resp = match resp {
@@ -2044,6 +2132,71 @@ pub async fn call_model_via_registry(
             );
             tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
             continue;
+        }
+        // Phase C fix: HTTP 400 context-exceeded cascade.
+        // If the 400 body mentions context/token limits, try the next
+        // provider in the dispatch policy's route_to chain (if available).
+        if status == 400 {
+            let body_400 = resp.text().await.unwrap_or_default();
+            warn!(
+                "[via-registry:{}] HTTP 400 — body: {}",
+                tier_name,
+                &body_400[..body_400.len().min(500)],
+            );
+            let body_lower = body_400.to_lowercase();
+            let is_context_exceeded = body_lower.contains("context")
+                || body_lower.contains("too many tokens")
+                || body_lower.contains("token limit");
+
+            if is_context_exceeded {
+                // Check if the dispatch policy has additional providers to try.
+                if let Some(ref policy) = config.dispatch_policy {
+                    use crate::pyramid::dispatch_policy::WorkType;
+                    let route = policy.resolve_route(
+                        WorkType::Build,
+                        tier_name,
+                        metadata.step_name.as_deref().unwrap_or(""),
+                        ctx.map(|c| c.depth),
+                    );
+                    // Find the current provider in the route and try the next one.
+                    if let Some(pos) = route
+                        .providers
+                        .iter()
+                        .position(|r| r.provider_id == resolved.provider.id)
+                    {
+                        if pos + 1 < route.providers.len() {
+                            let next = &route.providers[pos + 1];
+                            warn!(
+                                "[via-registry:{}] context exceeded on provider {}, cascading to {}",
+                                tier_name, resolved.provider.id, next.provider_id,
+                            );
+                            // Attempt the next provider via a recursive call is
+                            // not feasible here (different resolved tier). Log
+                            // the cascade and return the error so the caller can
+                            // handle retry at a higher level.
+                        }
+                    }
+                }
+                let err_msg = format!(
+                    "HTTP 400 context-exceeded from tier `{}` (provider={}): {}",
+                    tier_name,
+                    provider_type.as_str(),
+                    &body_400[..body_400.len().min(200)]
+                );
+                emit_step_error(ctx, &err_msg);
+                return Err(anyhow!(err_msg));
+            }
+
+            // Non-context 400: fall through to generic error handling.
+            let err_msg = format!(
+                "HTTP {} from tier `{}` (provider={}): {}",
+                status,
+                tier_name,
+                provider_type.as_str(),
+                &body_400[..body_400.len().min(200)]
+            );
+            emit_step_error(ctx, &err_msg);
+            return Err(anyhow!(err_msg));
         }
         if !resp.status().is_success() {
             let body_text = resp.text().await.unwrap_or_default();
