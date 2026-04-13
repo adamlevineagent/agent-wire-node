@@ -19637,3 +19637,72 @@ body {
     margin: 2px 0 0 0;
     overflow-x: auto;
 }
+
+/* ─── Accordion Section (shared) ────────────────────────────────── */
+
+.accordion-section {
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-sm);
+    background: var(--bg-card);
+    overflow: hidden;
+}
+
+.accordion-section-open {
+    border-color: rgba(255, 255, 255, 0.12);
+}
+
+.accordion-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    padding: 10px 14px;
+    background: none;
+    border: none;
+    color: var(--text-primary);
+    font-size: 13px;
+    font-weight: 600;
+    font-family: inherit;
+    cursor: pointer;
+    user-select: none;
+    text-align: left;
+    transition: background var(--transition);
+}
+
+.accordion-header:hover {
+    background: rgba(255, 255, 255, 0.02);
+}
+
+.accordion-header:focus-visible {
+    outline: 2px solid var(--accent-cyan);
+    outline-offset: -2px;
+}
+
+.accordion-chevron {
+    font-size: 10px;
+    color: var(--accent-cyan);
+    width: 14px;
+    flex-shrink: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    transition: transform 0.2s ease;
+}
+
+.accordion-chevron-open {
+    transform: rotate(90deg);
+}
+
+.accordion-title {
+    flex: 1;
+}
+
+.accordion-content {
+    overflow: hidden;
+    transition: max-height 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.accordion-content-inner {
+    padding: 0 14px 14px;
+    border-top: 1px solid var(--glass-border);
+}

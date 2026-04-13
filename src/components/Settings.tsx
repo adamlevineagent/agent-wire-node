@@ -71,6 +71,12 @@ export function Settings() {
         }
     }, [localMode.status]);
 
+    // Dismiss the disable confirmation dialog whenever the enabled
+    // state actually changes (e.g. the disable IPC succeeded).
+    useEffect(() => {
+        setConfirmingDisable(false);
+    }, [localMode.status?.enabled]);
+
     const handleProbe = useCallback(async () => {
         setProbeBusy(true);
         setProbeResult(null);
@@ -96,6 +102,19 @@ export function Settings() {
             setProbeBusy(false);
         }
     }, [localMode, localUrl, localModelChoice]);
+
+    // Auto-probe on mount: fires once when status has loaded,
+    // local mode is off, and a base_url was previously configured.
+    useEffect(() => {
+        if (
+            localMode.status &&
+            !localMode.status.enabled &&
+            localMode.status.base_url &&
+            !probeResult
+        ) {
+            handleProbe();
+        }
+    }, [localMode.status]); // eslint-disable-line react-hooks/exhaustive-deps
 
     const handleEnableLocalMode = useCallback(async () => {
         // Need a model selection — fall back to the probe's first
@@ -307,6 +326,7 @@ export function Settings() {
                         type="checkbox"
                         checked={localMode.status?.enabled ?? false}
                         disabled={localMode.loading}
+                        aria-label="Use local models (Ollama)"
                         onChange={async (e) => {
                             if (e.target.checked) {
                                 await handleEnableLocalMode();
@@ -328,6 +348,7 @@ export function Settings() {
                 {/* URL field — read-only when toggle is on */}
                 <div style={{ marginTop: 12, display: "flex", flexDirection: "column", gap: 6 }}>
                     <label
+                        htmlFor="ollama-base-url"
                         style={{
                             fontSize: 11,
                             color: "var(--text-secondary)",
@@ -339,6 +360,7 @@ export function Settings() {
                     </label>
                     <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
                         <input
+                            id="ollama-base-url"
                             type="text"
                             value={localUrl}
                             onChange={(e) => setLocalUrl(e.target.value)}
@@ -353,12 +375,15 @@ export function Settings() {
                             onClick={handleProbe}
                             disabled={
                                 probeBusy ||
-                                localMode.loading ||
-                                localMode.status?.enabled === true
+                                localMode.loading
                             }
                             title="Reach Ollama at the URL above and list available models"
                         >
-                            {probeBusy ? "Testing…" : "Test connection"}
+                            {probeBusy
+                                ? "Testing…"
+                                : localMode.status?.enabled
+                                    ? "Refresh models"
+                                    : "Test connection"}
                         </button>
                     </div>
                     {!localUrl.startsWith("http://") && !localUrl.startsWith("https://") && (
@@ -366,11 +391,40 @@ export function Settings() {
                             URL must start with http:// or https://
                         </span>
                     )}
+                    {(() => {
+                        try {
+                            const host = new URL(localUrl).hostname;
+                            const isLocal = host === "localhost" || host === "127.0.0.1" || host === "::1";
+                            if (!isLocal) {
+                                return (
+                                    <div
+                                        style={{
+                                            marginTop: 8,
+                                            padding: "8px 12px",
+                                            borderRadius: 6,
+                                            background: "rgba(251, 146, 60, 0.1)",
+                                            border: "1px solid rgba(251, 146, 60, 0.3)",
+                                            fontSize: 12,
+                                            color: "#fdba74",
+                                        }}
+                                    >
+                                        You are pointing at a remote server. All prompts and
+                                        build data will be sent there. Ollama does not use
+                                        authentication.
+                                    </div>
+                                );
+                            }
+                        } catch {
+                            // invalid URL — the protocol check above handles this
+                        }
+                        return null;
+                    })()}
                 </div>
 
                 {/* Model dropdown */}
                 <div style={{ marginTop: 12, display: "flex", flexDirection: "column", gap: 6 }}>
                     <label
+                        htmlFor="ollama-model"
                         style={{
                             fontSize: 11,
                             color: "var(--text-secondary)",
@@ -381,10 +435,17 @@ export function Settings() {
                         Model
                     </label>
                     <select
+                        id="ollama-model"
                         value={localModelChoice}
-                        onChange={(e) => setLocalModelChoice(e.target.value)}
+                        onChange={async (e) => {
+                            const val = e.target.value;
+                            if (localMode.status?.enabled) {
+                                await localMode.switchModel(val);
+                            } else {
+                                setLocalModelChoice(val);
+                            }
+                        }}
                         disabled={
-                            localMode.status?.enabled ||
                             localMode.loading ||
                             availableModels.length === 0
                         }

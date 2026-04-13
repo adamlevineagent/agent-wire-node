@@ -42,6 +42,7 @@ export interface UseLocalModeResult {
   enable: (baseUrl: string, model: string | null) => Promise<void>;
   disable: () => Promise<void>;
   probe: (baseUrl: string) => Promise<OllamaProbeResult>;
+  switchModel: (model: string) => Promise<void>;
 }
 
 export function useLocalMode(): UseLocalModeResult {
@@ -102,5 +103,18 @@ export function useLocalMode(): UseLocalModeResult {
     return await invoke<OllamaProbeResult>("pyramid_probe_ollama", { baseUrl });
   }, []);
 
-  return { status, loading, error, refresh, enable, disable, probe };
+  const switchModel = useCallback(async (model: string) => {
+    setLoading(true);
+    setError(null);
+    try {
+      const next = await invoke<LocalModeStatus>("pyramid_switch_local_model", { model });
+      setStatus(next);
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  return { status, loading, error, refresh, enable, disable, probe, switchModel };
 }

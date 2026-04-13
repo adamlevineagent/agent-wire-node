@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -107,10 +108,11 @@ pub struct PyramidStaleEngine {
     /// Phase B: shared active-build map from PyramidState. Used to defer
     /// stale-engine maintenance ticks while builds are running.
     pub active_build: Arc<tokio::sync::RwLock<HashMap<String, crate::pyramid::BuildHandle>>>,
-    /// Phase B: when true, skip maintenance ticks while any build is active.
-    /// Set at construction time from the dispatch policy's
-    /// `build_coordination.defer_maintenance_during_build`.
-    pub defer_maintenance_during_build: bool,
+    /// Phase B / Phase 1 daemon control plane: when true, skip maintenance
+    /// ticks while any build is active. Hot-reloaded via the ConfigSynced
+    /// listener when the dispatch_policy changes (Arc<AtomicBool> instead
+    /// of plain bool so runtime updates don't require engine reconstruction).
+    pub defer_maintenance_during_build: Arc<AtomicBool>,
 }
 
 impl PyramidStaleEngine {
@@ -134,6 +136,7 @@ impl PyramidStaleEngine {
         active_build: Arc<tokio::sync::RwLock<HashMap<String, crate::pyramid::BuildHandle>>>,
         defer_maintenance_during_build: bool,
     ) -> Self {
+        let defer_maintenance_during_build = Arc::new(AtomicBool::new(defer_maintenance_during_build));
         let debounce = Duration::from_secs((config.debounce_minutes as u64) * 60);
         let mut layers = HashMap::new();
         let max_depth = query_max_depth(db_path, slug);
@@ -203,7 +206,7 @@ impl PyramidStaleEngine {
         let ops_arc = self.ops.clone();
         let event_bus = self.event_bus.clone();
         let active_build = self.active_build.clone();
-        let defer_maintenance = self.defer_maintenance_during_build;
+        let defer_maintenance = self.defer_maintenance_during_build.clone();
 
         let handle = tokio::spawn(async move {
             loop {
@@ -213,7 +216,7 @@ impl PyramidStaleEngine {
                 tokio::time::sleep(Duration::from_secs(60)).await;
 
                 // Phase B: defer maintenance if any build is active and policy says so.
-                if defer_maintenance {
+                if defer_maintenance.load(Ordering::Relaxed) {
                     let builds = active_build.read().await;
                     if !builds.is_empty() {
                         debug!(slug = %slug, "Deferring stale engine: {} active builds", builds.len());
@@ -298,6 +301,8 @@ impl PyramidStaleEngine {
                         summary_arc.clone(),
                         &ops_arc,
                         Some(&event_bus),
+                        active_build.clone(),
+                        defer_maintenance.clone(),
                     )
                     .await
                     {
@@ -511,6 +516,8 @@ impl PyramidStaleEngine {
         let summary_arc = self.last_result_summary.clone();
         let ops_arc = self.ops.clone();
         let event_bus = self.event_bus.clone();
+        let active_build = self.active_build.clone();
+        let defer_maintenance = self.defer_maintenance_during_build.clone();
 
         // Update timer_fires_at
         {
@@ -544,6 +551,8 @@ impl PyramidStaleEngine {
                 summary_arc,
                 &ops_arc,
                 Some(&event_bus),
+                active_build,
+                defer_maintenance,
             )
             .await
             {
@@ -633,6 +642,8 @@ impl PyramidStaleEngine {
             self.last_result_summary.clone(),
             &self.ops,
             Some(&self.event_bus),
+            self.active_build.clone(),
+            self.defer_maintenance_during_build.clone(),
         )
         .await;
     }
@@ -707,7 +718,20 @@ pub async fn drain_and_dispatch(
     summary_arc: Arc<std::sync::Mutex<Option<String>>>,
     ops: &OperationalConfig,
     event_bus: Option<&Arc<BuildEventBus>>,
+    active_build: Arc<tokio::sync::RwLock<HashMap<String, crate::pyramid::BuildHandle>>>,
+    defer_maintenance: Arc<AtomicBool>,
 ) -> Result<()> {
+    // Phase 1 daemon control plane (AD-8 Part 3): defer maintenance dispatch
+    // while any build is active and the dispatch_policy says so. Mutations
+    // accumulate during the build and batch-drain afterward.
+    if defer_maintenance.load(Ordering::Relaxed) {
+        let builds = active_build.read().await;
+        if !builds.is_empty() {
+            debug!(slug = %slug, "Deferring stale dispatch: {} active builds", builds.len());
+            return Ok(());
+        }
+    }
+
     let slug_owned = slug.to_string();
     let db_owned = db_path.to_string();
     let base_config_owned = base_config.clone();

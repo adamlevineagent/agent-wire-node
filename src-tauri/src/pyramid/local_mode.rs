@@ -54,8 +54,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::pyramid::config_contributions::{
-    load_active_config_contribution, load_contribution_by_id, supersede_config_contribution,
-    sync_config_to_operational,
+    create_config_contribution, load_active_config_contribution, load_contribution_by_id,
+    supersede_config_contribution, sync_config_to_operational,
 };
 use crate::pyramid::db::{
     self, load_local_mode_state, save_local_mode_state, save_provider, LocalModeStateRow,
@@ -157,8 +157,7 @@ pub fn native_root_for(base_url: &str) -> String {
 pub async fn fetch_ollama_models(base_url: &str) -> Result<Vec<String>> {
     let native = native_root_for(base_url);
     let url = format!("{native}/api/tags");
-    let client = reqwest::Client::new();
-    let response = client
+    let response = crate::pyramid::llm::HTTP_CLIENT
         .get(&url)
         .timeout(Duration::from_secs(5))
         .send()
@@ -218,9 +217,8 @@ pub async fn probe_ollama(base_url: &str) -> OllamaProbeResult {
 pub async fn detect_ollama_context_window(base_url: &str, model: &str) -> Option<usize> {
     let native = native_root_for(base_url);
     let url = format!("{native}/api/show");
-    let client = reqwest::Client::new();
     let body = serde_json::json!({ "model": model });
-    let resp = client
+    let resp = crate::pyramid::llm::HTTP_CLIENT
         .post(&url)
         .json(&body)
         .timeout(Duration::from_secs(10))
@@ -452,7 +450,16 @@ pub fn commit_enable_local_mode(
         available_models: _,
     } = plan;
 
+    // Read existing state to check for context_override (AD-4).
+    let pre_existing_row = load_local_mode_state(conn)?;
+    let effective_context = pre_existing_row
+        .context_override
+        .map(|n| n as usize)
+        .unwrap_or(detected_context);
+
     // Step 5: upsert the `ollama-local` provider row.
+    // Include num_ctx in config_json so Ollama allocates the context window
+    // Wire Node expects (AD-4 num_ctx pass-through).
     let provider = Provider {
         id: OLLAMA_LOCAL_PROVIDER_ID.to_string(),
         display_name: "Ollama (local)".to_string(),
@@ -462,7 +469,7 @@ pub fn commit_enable_local_mode(
         auto_detect_context: true,
         supports_broadcast: false,
         broadcast_config_json: None,
-        config_json: "{}".to_string(),
+        config_json: serde_json::json!({"num_ctx": effective_context}).to_string(),
         enabled: true,
     };
     save_provider(conn, &provider)?;
@@ -522,7 +529,7 @@ pub fn commit_enable_local_mode(
             tier_name,
             provider_id: OLLAMA_LOCAL_PROVIDER_ID.to_string(),
             model_id: chosen_model.clone(),
-            context_limit: Some(detected_context as i64),
+            context_limit: Some(effective_context as i64),
             max_completion_tokens: None,
             pricing_json: Some("{}".to_string()),
             supported_parameters_json: Some(r#"["response_format"]"#.to_string()),
@@ -541,6 +548,9 @@ pub fn commit_enable_local_mode(
     // supersede so a crash between the two writes doesn't leave us
     // unable to restore. The state row is a single UPSERT so the
     // post-condition is also atomic.
+    //
+    // Read-modify-write: preserve context_override, concurrency_override
+    // from the pre-existing row so user overrides survive enable cycles.
     save_local_mode_state(
         conn,
         &LocalModeStateRow {
@@ -552,6 +562,9 @@ pub fn commit_enable_local_mode(
             restore_build_strategy_contribution_id: prior_build_strategy_contribution
                 .as_ref()
                 .map(|c| c.contribution_id.clone()),
+            context_override: pre_existing_row.context_override,
+            concurrency_override: pre_existing_row.concurrency_override,
+            restore_dispatch_policy_contribution_id: None, // filled by dispatch_policy step below
             updated_at: String::new(),
         },
     )?;
@@ -626,7 +639,55 @@ pub fn commit_enable_local_mode(
     // contribution. See `docs/plans/pyramid-folders-model-routing-friction-log.md`
     // for the carry-forward note.
 
-    // Step 10: commit is done; caller rebuilds the status snapshot
+    // Step 10 (AD-8 Part 1): create a dispatch_policy contribution with
+    // provider_pools for ollama-local and build_coordination deferral.
+    // This wires the per-provider semaphore so Ollama calls route through
+    // ProviderPools instead of the global LOCAL_PROVIDER_SEMAPHORE fallback.
+    let dispatch_policy_yaml = "schema_type: dispatch_policy\n\
+                                version: 1\n\
+                                provider_pools:\n  ollama-local:\n    concurrency: 1\n\
+                                build_coordination:\n  defer_maintenance_during_build: true\n";
+    let prior_dispatch_policy =
+        load_active_config_contribution(conn, "dispatch_policy", None)?;
+    let new_dp_id = if let Some(prior_dp) = &prior_dispatch_policy {
+        supersede_config_contribution(
+            conn,
+            &prior_dp.contribution_id,
+            dispatch_policy_yaml,
+            "local mode enabled — ollama-local pool + build deferral",
+            "local_mode_toggle",
+            Some("user"),
+        )?
+    } else {
+        create_config_contribution(
+            conn,
+            "dispatch_policy",
+            None,
+            dispatch_policy_yaml,
+            Some("local mode enabled — ollama-local pool + build deferral"),
+            "local_mode_toggle",
+            Some("user"),
+            "active",
+        )?
+    };
+    let new_dp_contribution = load_contribution_by_id(conn, &new_dp_id)?
+        .ok_or_else(|| anyhow!("local-mode dispatch_policy contribution missing after create/supersede"))?;
+    sync_config_to_operational(conn, bus, &new_dp_contribution)?;
+
+    // Update the state row with the restore_dispatch_policy_contribution_id.
+    // Read-modify-write: preserve all fields, only update the dispatch_policy restore ID.
+    let current_row = load_local_mode_state(conn)?;
+    save_local_mode_state(
+        conn,
+        &LocalModeStateRow {
+            restore_dispatch_policy_contribution_id: prior_dispatch_policy
+                .as_ref()
+                .map(|c| c.contribution_id.clone()),
+            ..current_row
+        },
+    )?;
+
+    // Step 11: commit is done; caller rebuilds the status snapshot
     // via `load_status_snapshot` (sync) or `get_local_mode_status`
     // (async) as they see fit.
     Ok(())
@@ -774,6 +835,49 @@ pub fn commit_disable_local_mode(
         }
     }
 
+    // Restore dispatch_policy (AD-8 Part 1 disable path).
+    if let Some(restore_id) = row.restore_dispatch_policy_contribution_id.as_deref() {
+        // Prior dispatch_policy exists — restore it.
+        if let Some(restore) = load_contribution_by_id(conn, restore_id)? {
+            if let Some(active_now) =
+                load_active_config_contribution(conn, "dispatch_policy", None)?
+            {
+                let new_id = supersede_config_contribution(
+                    conn,
+                    &active_now.contribution_id,
+                    &restore.yaml_content,
+                    "local mode disabled — restoring prior dispatch_policy",
+                    "local_mode_toggle",
+                    Some("user"),
+                )?;
+                let new_contribution = load_contribution_by_id(conn, &new_id)?.ok_or_else(|| {
+                    anyhow!("restored dispatch_policy contribution missing after supersede")
+                })?;
+                sync_config_to_operational(conn, bus, &new_contribution)?;
+            }
+        }
+    } else {
+        // No prior dispatch_policy — supersede the current one with a
+        // minimal default that restores the "no policy" state.
+        if let Some(active_now) =
+            load_active_config_contribution(conn, "dispatch_policy", None)?
+        {
+            let default_yaml = "schema_type: dispatch_policy\nversion: 1\nprovider_pools: {}\nbuild_coordination:\n  defer_maintenance_during_build: false\n";
+            let new_id = supersede_config_contribution(
+                conn,
+                &active_now.contribution_id,
+                default_yaml,
+                "local mode disabled — restoring default dispatch_policy",
+                "local_mode_toggle",
+                Some("user"),
+            )?;
+            let new_contribution = load_contribution_by_id(conn, &new_id)?.ok_or_else(|| {
+                anyhow!("default dispatch_policy contribution missing after supersede")
+            })?;
+            sync_config_to_operational(conn, bus, &new_contribution)?;
+        }
+    }
+
     // Disable the local provider so active_provider_id() falls back to
     // openrouter. Without this, the provider row stays enabled and all
     // LLM calls continue routing to Ollama after the user toggles off.
@@ -791,6 +895,7 @@ pub fn commit_disable_local_mode(
     // Flip the state row to disabled but keep the URL/model so the
     // next enable starts from the user's last picks. Clear the
     // restore IDs because they no longer apply to the current state.
+    // Preserve context_override + concurrency_override (AD-4 persistence rule).
     save_local_mode_state(
         conn,
         &LocalModeStateRow {
@@ -800,6 +905,9 @@ pub fn commit_disable_local_mode(
             detected_context_limit: row.detected_context_limit,
             restore_from_contribution_id: None,
             restore_build_strategy_contribution_id: None,
+            context_override: row.context_override,
+            concurrency_override: row.concurrency_override,
+            restore_dispatch_policy_contribution_id: None,
             updated_at: String::new(),
         },
     )?;
@@ -811,6 +919,121 @@ pub fn commit_disable_local_mode(
 // namespace from the IPC layer's perspective.
 pub use db::load_local_mode_state as read_state;
 pub use db::save_local_mode_state as write_state;
+
+// ── Hot-swap (AD-1) ────────────────────────────────────────────────────────
+
+/// Async prepare phase for model hot-swap. Validates the model name and
+/// probes `/api/show` for the context window. No DB work.
+pub async fn prepare_switch_local_model(
+    base_url: &str,
+    model: &str,
+) -> Result<(String, usize)> {
+    if model.trim().is_empty() {
+        bail!("Model name must not be empty");
+    }
+    let detected_context = detect_ollama_context_window(base_url, model)
+        .await
+        .unwrap_or(DEFAULT_OLLAMA_CONTEXT_FALLBACK);
+    Ok((model.to_string(), detected_context))
+}
+
+/// Sync commit phase for model hot-swap. Runs under the writer lock.
+/// Updates tier_routing with the new model, writes num_ctx to provider
+/// config_json, and read-modify-writes the state row.
+pub fn commit_switch_local_model(
+    conn: &mut Connection,
+    bus: &Arc<BuildEventBus>,
+    registry: &ProviderRegistry,
+    model: String,
+    detected_context: usize,
+) -> Result<()> {
+    // Read current state — need base_url, context_override, etc.
+    let row = load_local_mode_state(conn)?;
+    if !row.enabled {
+        bail!("Local mode is not enabled — cannot switch model");
+    }
+    let base_url = row
+        .ollama_base_url
+        .as_deref()
+        .ok_or_else(|| anyhow!("local mode enabled but no base_url in state row"))?;
+
+    // Effective context: override wins over detected.
+    let effective_context = row
+        .context_override
+        .map(|n| n as usize)
+        .unwrap_or(detected_context);
+
+    // Find the currently-active tier_routing contribution (NOT restore_from —
+    // that points at the PRE-local-mode contribution for the disable path).
+    let active_tier = load_active_config_contribution(conn, "tier_routing", None)?
+        .ok_or_else(|| anyhow!("no active tier_routing contribution to supersede during model switch"))?;
+
+    // Build new tier_routing YAML with the new model + effective context.
+    let prior_tier_yaml: TierRoutingYaml =
+        serde_yaml::from_str(&active_tier.yaml_content)
+            .with_context(|| format!("parsing active tier_routing for model switch"))?;
+    let mut prior_tier_names: std::collections::BTreeSet<String> =
+        prior_tier_yaml.entries.iter().map(|e| e.tier_name.clone()).collect();
+    for required in [
+        "fast_extract", "web", "synth_heavy", "stale_remote", "stale_local",
+        "mid", "extractor", "high", "max",
+    ] {
+        prior_tier_names.insert(required.to_string());
+    }
+    let new_entries: Vec<TierRoutingYamlEntry> = prior_tier_names
+        .into_iter()
+        .map(|tier_name| TierRoutingYamlEntry {
+            tier_name,
+            provider_id: OLLAMA_LOCAL_PROVIDER_ID.to_string(),
+            model_id: model.clone(),
+            context_limit: Some(effective_context as i64),
+            max_completion_tokens: None,
+            pricing_json: Some("{}".to_string()),
+            supported_parameters_json: Some(r#"["response_format"]"#.to_string()),
+            notes: Some(format!("local mode — model switch via Ollama at {base_url}")),
+            priority: Some(1),
+            prompt_price_per_token: Some(0.0),
+            completion_price_per_token: Some(0.0),
+        })
+        .collect();
+    let new_tier_yaml = TierRoutingYaml { entries: new_entries };
+    let new_tier_yaml_string = build_tier_routing_yaml_string(&new_tier_yaml)?;
+
+    // Update provider config_json with num_ctx so Ollama allocates the context window.
+    if let Ok(Some(mut provider)) = super::db::get_provider(conn, OLLAMA_LOCAL_PROVIDER_ID) {
+        provider.config_json = serde_json::json!({"num_ctx": effective_context}).to_string();
+        super::db::save_provider(conn, &provider)?;
+    }
+
+    // Supersede tier_routing.
+    let new_tier_id = supersede_config_contribution(
+        conn,
+        &active_tier.contribution_id,
+        &new_tier_yaml_string,
+        &format!("model switch to {model}"),
+        "local_mode_switch",
+        Some("user"),
+    )?;
+    let new_tier_contribution = load_contribution_by_id(conn, &new_tier_id)?
+        .ok_or_else(|| anyhow!("model-switch tier contribution missing after supersede"))?;
+    sync_config_to_operational(conn, bus, &new_tier_contribution)?;
+
+    // Read-modify-write state row: update model + detected_context,
+    // preserve everything else (AD-1: does NOT touch restore columns).
+    save_local_mode_state(
+        conn,
+        &LocalModeStateRow {
+            ollama_model: Some(model),
+            detected_context_limit: Some(detected_context as i64),
+            ..row
+        },
+    )?;
+
+    // Refresh in-memory registry.
+    registry.load_from_db(conn)?;
+
+    Ok(())
+}
 
 // ── Tests ───────────────────────────────────────────────────────────────────
 
@@ -909,6 +1132,9 @@ mod tests {
                 detected_context_limit: Some(131_072),
                 restore_from_contribution_id: Some("prior-tier-id".into()),
                 restore_build_strategy_contribution_id: Some("prior-bs-id".into()),
+                context_override: None,
+                concurrency_override: None,
+                restore_dispatch_policy_contribution_id: None,
                 updated_at: String::new(),
             },
         )
@@ -1086,6 +1312,9 @@ mod tests {
                 detected_context_limit: Some(131_072),
                 restore_from_contribution_id: Some("prior-tier".into()),
                 restore_build_strategy_contribution_id: Some("prior-bs".into()),
+                context_override: None,
+                concurrency_override: None,
+                restore_dispatch_policy_contribution_id: None,
                 updated_at: String::new(),
             },
         )

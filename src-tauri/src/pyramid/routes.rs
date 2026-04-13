@@ -5868,6 +5868,7 @@ async fn handle_auto_update_l0_sweep(
                 engine.current_phase.clone(),
                 engine.phase_detail.clone(),
                 engine.last_result_summary.clone(),
+                engine.defer_maintenance_during_build.clone(),
             )
         })
     };
@@ -5880,6 +5881,7 @@ async fn handle_auto_update_l0_sweep(
         phase_arc,
         detail_arc,
         summary_arc,
+        defer_maintenance,
     )) = engine_data
     {
         for layer in 0..=3 {
@@ -5896,6 +5898,8 @@ async fn handle_auto_update_l0_sweep(
                 summary_arc.clone(),
                 &state.operational,
                 Some(&state.build_event_bus),
+                state.active_build.clone(),
+                defer_maintenance.clone(),
             )
             .await;
         }

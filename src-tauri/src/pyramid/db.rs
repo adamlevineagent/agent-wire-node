@@ -1670,6 +1670,9 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
             detected_context_limit INTEGER,
             restore_from_contribution_id TEXT,
             restore_build_strategy_contribution_id TEXT,
+            context_override INTEGER,
+            concurrency_override INTEGER,
+            restore_dispatch_policy_contribution_id TEXT,
             updated_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
         ",
@@ -1679,6 +1682,19 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
         "INSERT OR IGNORE INTO pyramid_local_mode_state (id, enabled) VALUES (1, 0)",
         [],
     )?;
+    // Migration-safe column additions for existing databases (Phase 1 daemon control plane).
+    let _ = conn.execute(
+        "ALTER TABLE pyramid_local_mode_state ADD COLUMN context_override INTEGER",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE pyramid_local_mode_state ADD COLUMN concurrency_override INTEGER",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE pyramid_local_mode_state ADD COLUMN restore_dispatch_policy_contribution_id TEXT",
+        [],
+    );
 
     // ── Phase 4: Config Contribution Foundation ───────────────────────────────
     //
@@ -13297,6 +13313,12 @@ pub struct LocalModeStateRow {
     pub detected_context_limit: Option<i64>,
     pub restore_from_contribution_id: Option<String>,
     pub restore_build_strategy_contribution_id: Option<String>,
+    /// Phase 1 daemon control plane: user-set context override (None = auto-detect).
+    pub context_override: Option<i64>,
+    /// Phase 1 daemon control plane: user-set concurrency override (None = default 1).
+    pub concurrency_override: Option<i64>,
+    /// Phase 1 daemon control plane: prior dispatch_policy contribution_id to restore on disable.
+    pub restore_dispatch_policy_contribution_id: Option<String>,
     pub updated_at: String,
 }
 
@@ -13310,6 +13332,9 @@ pub fn load_local_mode_state(conn: &Connection) -> Result<LocalModeStateRow> {
                     detected_context_limit,
                     restore_from_contribution_id,
                     restore_build_strategy_contribution_id,
+                    context_override,
+                    concurrency_override,
+                    restore_dispatch_policy_contribution_id,
                     updated_at
              FROM pyramid_local_mode_state
              WHERE id = 1",
@@ -13322,7 +13347,10 @@ pub fn load_local_mode_state(conn: &Connection) -> Result<LocalModeStateRow> {
                     detected_context_limit: row.get(3)?,
                     restore_from_contribution_id: row.get(4)?,
                     restore_build_strategy_contribution_id: row.get(5)?,
-                    updated_at: row.get(6)?,
+                    context_override: row.get(6)?,
+                    concurrency_override: row.get(7)?,
+                    restore_dispatch_policy_contribution_id: row.get(8)?,
+                    updated_at: row.get(9)?,
                 })
             },
         )
@@ -13334,6 +13362,9 @@ pub fn load_local_mode_state(conn: &Connection) -> Result<LocalModeStateRow> {
         detected_context_limit: None,
         restore_from_contribution_id: None,
         restore_build_strategy_contribution_id: None,
+        context_override: None,
+        concurrency_override: None,
+        restore_dispatch_policy_contribution_id: None,
         updated_at: String::new(),
     }))
 }
@@ -13348,9 +13379,12 @@ pub fn save_local_mode_state(conn: &Connection, state: &LocalModeStateRow) -> Re
             detected_context_limit,
             restore_from_contribution_id,
             restore_build_strategy_contribution_id,
+            context_override,
+            concurrency_override,
+            restore_dispatch_policy_contribution_id,
             updated_at
          ) VALUES (
-            1, ?1, ?2, ?3, ?4, ?5, ?6, datetime('now')
+            1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, datetime('now')
          )
          ON CONFLICT(id) DO UPDATE SET
             enabled = excluded.enabled,
@@ -13359,6 +13393,9 @@ pub fn save_local_mode_state(conn: &Connection, state: &LocalModeStateRow) -> Re
             detected_context_limit = excluded.detected_context_limit,
             restore_from_contribution_id = excluded.restore_from_contribution_id,
             restore_build_strategy_contribution_id = excluded.restore_build_strategy_contribution_id,
+            context_override = excluded.context_override,
+            concurrency_override = excluded.concurrency_override,
+            restore_dispatch_policy_contribution_id = excluded.restore_dispatch_policy_contribution_id,
             updated_at = datetime('now')
         ",
         rusqlite::params![
@@ -13368,6 +13405,9 @@ pub fn save_local_mode_state(conn: &Connection, state: &LocalModeStateRow) -> Re
             state.detected_context_limit,
             state.restore_from_contribution_id,
             state.restore_build_strategy_contribution_id,
+            state.context_override,
+            state.concurrency_override,
+            state.restore_dispatch_policy_contribution_id,
         ],
     )?;
     Ok(())

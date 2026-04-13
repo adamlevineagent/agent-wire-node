@@ -7532,7 +7532,7 @@ async fn pyramid_auto_update_run_now(
     // + credential_store runtime handles. The old `api_key`/`model`
     // call into drain_and_dispatch was left dead by the fix pass;
     // Phase 4 picks it up here under the "fix all bugs found" rule.
-    let (db_path, base_config, model, semaphore, phase_arc, detail_arc, summary_arc) = {
+    let (db_path, base_config, model, semaphore, phase_arc, detail_arc, summary_arc, defer_maintenance) = {
         let engines = state.pyramid.stale_engines.lock().await;
         let engine = engines
             .get(&slug)
@@ -7545,6 +7545,7 @@ async fn pyramid_auto_update_run_now(
             engine.current_phase.clone(),
             engine.phase_detail.clone(),
             engine.last_result_summary.clone(),
+            engine.defer_maintenance_during_build.clone(),
         )
     };
     // Lock released here — no mutex held across LLM calls
@@ -7564,6 +7565,8 @@ async fn pyramid_auto_update_run_now(
             summary_arc.clone(),
             &state.pyramid.operational,
             Some(&state.pyramid.build_event_bus),
+            state.pyramid.active_build.clone(),
+            defer_maintenance.clone(),
         )
         .await;
     }
@@ -7600,7 +7603,7 @@ async fn pyramid_auto_update_l0_sweep(
     };
 
     // Phase 3 fix — `engine.api_key` is retired; use `base_config`.
-    let (db_path, base_config, model, semaphore, phase_arc, detail_arc, summary_arc) = {
+    let (db_path, base_config, model, semaphore, phase_arc, detail_arc, summary_arc, defer_maintenance) = {
         let engines = state.pyramid.stale_engines.lock().await;
         let engine = engines
             .get(&slug)
@@ -7613,6 +7616,7 @@ async fn pyramid_auto_update_l0_sweep(
             engine.current_phase.clone(),
             engine.phase_detail.clone(),
             engine.last_result_summary.clone(),
+            engine.defer_maintenance_during_build.clone(),
         )
     };
 
@@ -7630,6 +7634,8 @@ async fn pyramid_auto_update_l0_sweep(
             summary_arc.clone(),
             &state.pyramid.operational,
             Some(&state.pyramid.build_event_bus),
+            state.pyramid.active_build.clone(),
+            defer_maintenance.clone(),
         )
         .await;
     }
@@ -8114,6 +8120,18 @@ async fn pyramid_enable_local_mode(
     base_url: String,
     model: Option<String>,
 ) -> Result<wire_node_lib::pyramid::local_mode::LocalModeStatus, String> {
+    // Active build guard (AD-1): refuse if any build is in progress.
+    {
+        let active = state.pyramid.active_build.read().await;
+        if !active.is_empty() {
+            return Err(
+                "Cannot change model routing while a build is in progress — \
+                 wait for it to complete or cancel it."
+                    .to_string(),
+            );
+        }
+    }
+
     // Phase 18a fix-pass: split the async probe phase from the sync
     // DB commit phase so the IPC handler's future stays `Send`.
     // Holding a `&mut Connection` across `.await` in an async Tauri
@@ -8155,6 +8173,18 @@ async fn pyramid_enable_local_mode(
 async fn pyramid_disable_local_mode(
     state: tauri::State<'_, SharedState>,
 ) -> Result<wire_node_lib::pyramid::local_mode::LocalModeStatus, String> {
+    // Active build guard (AD-1): refuse if any build is in progress.
+    {
+        let active = state.pyramid.active_build.read().await;
+        if !active.is_empty() {
+            return Err(
+                "Cannot change model routing while a build is in progress — \
+                 wait for it to complete or cancel it."
+                    .to_string(),
+            );
+        }
+    }
+
     // Phase 18a fix-pass: same split-phase pattern as enable. The
     // sync commit runs under the writer lock; the async reachability
     // refresh runs after the lock drops so the command future stays
@@ -8216,6 +8246,66 @@ async fn pyramid_probe_ollama(
     base_url: String,
 ) -> Result<wire_node_lib::pyramid::local_mode::OllamaProbeResult, String> {
     Ok(wire_node_lib::pyramid::local_mode::probe_ollama(&base_url).await)
+}
+
+/// Phase 1 daemon control plane (AD-1): hot-swap the active Ollama model
+/// without disable/re-enable. Split-phase pattern: async prepare (probe),
+/// sync commit (writer lock), async follow-up (cascade rebuild).
+#[tauri::command]
+async fn pyramid_switch_local_model(
+    state: tauri::State<'_, SharedState>,
+    model: String,
+) -> Result<wire_node_lib::pyramid::local_mode::LocalModeStatus, String> {
+    // Phase 1: async prepare — read base_url from state, probe context.
+    let base_url = {
+        let reader = state.pyramid.reader.lock().await;
+        let row = wire_node_lib::pyramid::db::load_local_mode_state(&reader)
+            .map_err(|e| e.to_string())?;
+        if !row.enabled {
+            return Err("Local mode is not enabled — cannot switch model".to_string());
+        }
+        row.ollama_base_url
+            .unwrap_or_else(|| "http://localhost:11434/v1".to_string())
+    };
+
+    let (validated_model, detected_context) =
+        wire_node_lib::pyramid::local_mode::prepare_switch_local_model(&base_url, &model)
+            .await
+            .map_err(|e| e.to_string())?;
+
+    // Phase 2: sync commit under writer lock — check active builds first.
+    let snapshot = {
+        // Active build guard (AD-1): refuse if any build is in progress.
+        {
+            let active = state.pyramid.active_build.read().await;
+            if !active.is_empty() {
+                return Err(
+                    "Cannot change model routing while a build is in progress — \
+                     wait for it to complete or cancel it."
+                        .to_string(),
+                );
+            }
+        }
+
+        let mut writer = state.pyramid.writer.lock().await;
+        wire_node_lib::pyramid::local_mode::commit_switch_local_model(
+            &mut writer,
+            &state.pyramid.build_event_bus,
+            &state.pyramid.provider_registry,
+            validated_model,
+            detected_context,
+        )
+        .map_err(|e| e.to_string())?;
+        let snapshot = wire_node_lib::pyramid::local_mode::load_status_snapshot(&writer)
+            .map_err(|e| e.to_string())?;
+        drop(writer);
+        snapshot
+    };
+
+    // Phase 3: async follow-up — rebuild cascade models.
+    rebuild_cascade_from_registry(&state).await;
+
+    Ok(wire_node_lib::pyramid::local_mode::refresh_status_reachability(snapshot).await)
 }
 
 #[derive(serde::Serialize)]
@@ -10294,6 +10384,85 @@ fn main() {
         }
     }
 
+    // Phase 1 daemon control plane (AD-8 Part 1): ConfigSynced listener for
+    // dispatch_policy. When a dispatch_policy contribution is synced to the
+    // operational table, rebuild the in-memory ProviderPools and update the
+    // stale engine's defer_maintenance AtomicBool. Without this listener,
+    // creating a dispatch_policy contribution writes YAML but the live
+    // LlmConfig.provider_pools stays None — the pool wiring is dead on arrival.
+    {
+        let ps = pyramid_state.clone();
+        let db_path = pyramid_db_path.to_string_lossy().to_string();
+        let mut rx = ps.build_event_bus.tx.subscribe();
+        tauri::async_runtime::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(event) => {
+                        if let wire_node_lib::pyramid::event_bus::TaggedKind::ConfigSynced {
+                            schema_type,
+                            ..
+                        } = &event.kind
+                        {
+                            if schema_type == "dispatch_policy" {
+                                // Read the updated YAML from the operational table.
+                                let yaml_opt = {
+                                    let conn_result = wire_node_lib::pyramid::db::open_pyramid_connection(
+                                        std::path::Path::new(&db_path),
+                                    );
+                                    match conn_result {
+                                        Ok(conn) => wire_node_lib::pyramid::db::read_dispatch_policy(&conn)
+                                            .ok()
+                                            .flatten(),
+                                        Err(_) => None,
+                                    }
+                                };
+                                if let Some(yaml_str) = yaml_opt {
+                                    match serde_yaml::from_str::<wire_node_lib::pyramid::dispatch_policy::DispatchPolicyYaml>(&yaml_str) {
+                                        Ok(yaml) => {
+                                            let policy = wire_node_lib::pyramid::dispatch_policy::DispatchPolicy::from_yaml(&yaml);
+                                            let pools = wire_node_lib::pyramid::provider_pools::ProviderPools::new(&policy);
+
+                                            // Update stale engines' defer_maintenance atomic.
+                                            let new_defer = policy.build_coordination.defer_maintenance_during_build;
+                                            {
+                                                let engines = ps.stale_engines.lock().await;
+                                                for engine in engines.values() {
+                                                    engine.defer_maintenance_during_build.store(
+                                                        new_defer,
+                                                        std::sync::atomic::Ordering::Relaxed,
+                                                    );
+                                                }
+                                            }
+
+                                            // Write dispatch_policy + provider_pools onto the live LlmConfig.
+                                            let mut cfg = ps.config.write().await;
+                                            cfg.dispatch_policy = Some(std::sync::Arc::new(policy));
+                                            cfg.provider_pools = Some(std::sync::Arc::new(pools));
+                                            tracing::info!(
+                                                "ConfigSynced: dispatch_policy reloaded — provider_pools rebuilt, defer_maintenance={}",
+                                                new_defer,
+                                            );
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!("ConfigSynced: failed to parse dispatch_policy YAML: {e}");
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::debug!("ConfigSynced listener lagged by {n} events");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        tracing::debug!("ConfigSynced listener: bus closed, exiting");
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
     tracing::info!(
         "Pyramid engine initialized at {:?}, ir_executor={}",
         pyramid_db_path,
@@ -11350,6 +11519,8 @@ fn main() {
             pyramid_enable_local_mode,
             pyramid_disable_local_mode,
             pyramid_probe_ollama,
+            // Phase 1 daemon control plane: hot-swap model
+            pyramid_switch_local_model,
             pyramid_preview_pull_contribution,
             // Phase 11: Broadcast webhook + provider health oversight
             pyramid_provider_health,

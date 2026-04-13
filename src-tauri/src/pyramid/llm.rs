@@ -52,7 +52,9 @@ static LOCAL_PROVIDER_SEMAPHORE: LazyLock<tokio::sync::Semaphore> =
     LazyLock::new(|| tokio::sync::Semaphore::new(1));
 
 /// Shared HTTP client — reuses TCP connections and TLS sessions across all LLM calls.
-static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+/// `pub(crate)` so Ollama API calls in `local_mode.rs` reuse the same client
+/// instead of creating `reqwest::Client::new()` per call (Phase 0 fix).
+pub(crate) static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
         .pool_max_idle_per_host(8)
         .build()
