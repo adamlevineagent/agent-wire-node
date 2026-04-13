@@ -10394,6 +10394,94 @@ async fn pyramid_import_cancel(
     })
 }
 
+// --- Phase 6: Multi-Window + Nesting ----------------------------------------
+
+/// Creates a new pyramid surface window.  When `slug` is provided the window
+/// opens pre-bound to that pyramid; otherwise it opens as a blank surface the
+/// user can attach later.  Returns the unique Tauri window label.
+#[tauri::command]
+async fn pyramid_open_window(
+    app: tauri::AppHandle,
+    slug: Option<String>,
+) -> Result<String, String> {
+    // Unique label — only the first segment of a v4 UUID (8 hex chars) to keep it short.
+    let label = format!(
+        "pyramid-surface-{}",
+        uuid::Uuid::new_v4()
+            .to_string()
+            .split('-')
+            .next()
+            .unwrap()
+    );
+
+    // Build the frontend URL with query params so React knows what to render.
+    let url = if let Some(ref s) = slug {
+        format!("index.html?window=pyramid-surface&slug={}", s)
+    } else {
+        "index.html?window=pyramid-surface".to_string()
+    };
+
+    let _window = tauri::WebviewWindowBuilder::new(
+        &app,
+        &label,
+        tauri::WebviewUrl::App(url.into()),
+    )
+    .title(if let Some(ref s) = slug {
+        format!("Pyramid: {}", s)
+    } else {
+        "Pyramid Surface".to_string()
+    })
+    .inner_size(1000.0, 700.0)
+    .resizable(true)
+    .decorations(true)
+    .build()
+    .map_err(|e| e.to_string())?;
+
+    Ok(label)
+}
+
+/// Closes a pyramid surface window by its Tauri label.  Silently succeeds if
+/// the window has already been closed.
+#[tauri::command]
+async fn pyramid_close_window(
+    app: tauri::AppHandle,
+    label: String,
+) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window(&label) {
+        window.close().map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Returns the window context (label, whether it is a pyramid surface, and the
+/// bound slug if any).  The frontend calls this on mount to decide what to
+/// render.
+#[tauri::command]
+async fn pyramid_get_window_context(
+    window: tauri::WebviewWindow,
+) -> Result<serde_json::Value, String> {
+    let label = window.label().to_string();
+
+    // The webview URL contains the query params we set during creation
+    // (e.g. tauri://localhost/index.html?window=pyramid-surface&slug=foo).
+    let url = window.url().map_err(|e| e.to_string())?;
+
+    let is_pyramid_surface = url
+        .query_pairs()
+        .any(|(k, v)| k == "window" && v == "pyramid-surface");
+
+    let slug = url
+        .query_pairs()
+        .find(|(k, _)| k == "slug")
+        .map(|(_, v)| v.to_string());
+
+    Ok(serde_json::json!({
+        "label": label,
+        "isPyramidSurface": is_pyramid_surface,
+        "slug": slug,
+    }))
+}
+
 // --- App Setup --------------------------------------------------------------
 
 fn main() {
@@ -11994,6 +12082,10 @@ fn main() {
             pyramid_dadbear_pause,
             pyramid_dadbear_resume,
             pyramid_acknowledge_orphan_broadcast,
+            // Phase 6: Multi-Window + Nesting
+            pyramid_open_window,
+            pyramid_close_window,
+            pyramid_get_window_context,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Wire Node");

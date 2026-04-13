@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { useVizConfig } from '../../hooks/useVizConfig';
+import { usePyramidWindow } from '../../hooks/usePyramidWindow';
 import { usePyramidData } from './usePyramidData';
 import { useVisualEncoding } from './useVisualEncoding';
 import { useChronicleStream } from './useChronicleStream';
@@ -39,6 +40,7 @@ export function PyramidSurface({
     const idleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
     const { config } = useVizConfig(slug);
+    const { openWindow } = usePyramidWindow();
     const [containerSize, setContainerSize] = useState({ width: 0, height: 0 });
     const [hoveredNodeId, setHoveredNodeId] = useState<string | null>(null);
     const [layoutMode, setLayoutMode] = useState<LayoutMode>('pyramid');
@@ -228,6 +230,17 @@ export function PyramidSurface({
         setOverlays((prev) => ({ ...prev, [key]: !prev[key] }));
     }, []);
 
+    // ── Toggle chronicle panel ────────────────────────────────────────
+    // (Must be above conditional returns to satisfy React hook rules)
+    const toggleChronicle = useCallback(() => {
+        setChronicleOpen((prev) => !prev);
+    }, []);
+
+    // ── Handle ticker entry click → open chronicle ─────────────────
+    const handleTickerClick = useCallback(() => {
+        setChronicleOpen(true);
+    }, []);
+
     // ── Ticker mode: render miniature only ──────────────────────────
     if (mode === 'ticker') {
         return (
@@ -254,22 +267,12 @@ export function PyramidSurface({
                     height={80}
                     forceAllNodes={config.rendering.force_all_nodes}
                 />
-                <button className="ps-open-btn" title="Open Pyramid">
+                <button className="ps-open-btn" title="Open Pyramid" onClick={() => openWindow(slug)}>
                     Open
                 </button>
             </div>
         );
     }
-
-    // ── Toggle chronicle panel ────────────────────────────────────────
-    const toggleChronicle = useCallback(() => {
-        setChronicleOpen((prev) => !prev);
-    }, []);
-
-    // ── Handle ticker entry click → open chronicle ─────────────────
-    const handleTickerClick = useCallback(() => {
-        setChronicleOpen(true);
-    }, []);
 
     // ── Full mode ───────────────────────────────────────────────────
     return (

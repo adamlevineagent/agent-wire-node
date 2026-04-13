@@ -22445,3 +22445,47 @@ body {
     from { opacity: 0.4; }
     to { opacity: 1; }
 }
+
+/* ─── Phase 6: Pyramid Surface Window ────────────────────────────── */
+
+.ps-window {
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+    background: var(--bg-surface, #0a0e12);
+    color: var(--text-primary, #e2e8f0);
+    font-family: var(--font-sans, 'Inter', sans-serif);
+    overflow: hidden;
+}
+
+.ps-window-header {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 8px 16px;
+    background: var(--bg-card, #141a22);
+    border-bottom: 1px solid var(--glass-border, rgba(34, 211, 238, 0.08));
+    flex-shrink: 0;
+}
+
+.ps-window-back {
+    background: none;
+    border: 1px solid var(--glass-border, rgba(34, 211, 238, 0.1));
+    color: var(--accent-cyan, #22d3ee);
+    padding: 4px 12px;
+    border-radius: var(--radius-sm, 4px);
+    cursor: pointer;
+    font-size: 13px;
+    transition: background 0.15s ease;
+}
+
+.ps-window-back:hover {
+    background: rgba(34, 211, 238, 0.08);
+}
+
+.ps-window-title {
+    font-size: 14px;
+    font-weight: 500;
+    margin: 0;
+    opacity: 0.8;
+}

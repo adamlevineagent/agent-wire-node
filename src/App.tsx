@@ -5,6 +5,7 @@ import { AppShell } from "./components/AppShell";
 import { AppProvider } from "./contexts/AppContext";
 import { LoginScreen } from "./components/LoginScreen";
 import { OnboardingWizard } from "./components/OnboardingWizard";
+import { PyramidSurfaceWindow } from "./components/pyramid-surface/PyramidSurfaceWindow";
 
 interface AuthState {
     access_token: string | null;
@@ -13,7 +14,22 @@ interface AuthState {
     user_id: string | null;
 }
 
+// ── Phase 6: Detect pyramid surface popup window (outside component to avoid hook issues) ──
+const urlParams = new URLSearchParams(window.location.search);
+const isPyramidWindow = urlParams.get('window') === 'pyramid-surface';
+const windowSlug = urlParams.get('slug') ?? undefined;
+
 export default function App() {
+    // If this is a pyramid surface window, render it directly (no auth shell).
+    // This check uses module-level constants so no hooks are skipped.
+    if (isPyramidWindow) {
+        return <PyramidSurfaceWindow slug={windowSlug} />;
+    }
+
+    return <MainApp />;
+}
+
+function MainApp() {
     const [authState, setAuthState] = useState<AuthState | null>(null);
     const [checking, setChecking] = useState(true);
     const [onboarded, setOnboarded] = useState<boolean | null>(null);
