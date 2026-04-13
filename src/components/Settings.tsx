@@ -499,7 +499,7 @@ export function Settings() {
                                     : "Click Test connection to populate"}
                             </div>
                         ) : (
-                            <div className="model-card-list">
+                            <div className={`model-card-list ${localMode.loading ? "model-card-list-loading" : ""}`}>
                                 {availableModelDetails.map((m) => {
                                     const isActive =
                                         localModelChoice === m.name ||
@@ -507,7 +507,7 @@ export function Settings() {
                                     return (
                                         <div
                                             key={m.name}
-                                            className={`model-card ${isActive ? "model-card-active" : ""}`}
+                                            className={`model-card ${isActive ? "model-card-active" : ""} ${localMode.loading ? "model-card-disabled" : ""}`}
                                             role="button"
                                             tabIndex={0}
                                             aria-pressed={isActive}

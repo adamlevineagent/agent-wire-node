@@ -19794,3 +19794,12 @@ body {
     color: var(--text-muted);
     padding: 8px 0;
 }
+
+.model-card-list-loading {
+    opacity: 0.5;
+    pointer-events: none;
+}
+
+.model-card-disabled {
+    cursor: not-allowed;
+}
