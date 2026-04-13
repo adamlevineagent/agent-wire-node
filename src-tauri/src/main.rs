@@ -8248,6 +8248,23 @@ async fn pyramid_probe_ollama(
     Ok(wire_node_lib::pyramid::local_mode::probe_ollama(&base_url).await)
 }
 
+/// Phase 2 daemon control plane (AD-2): fetch rich model details for a
+/// single model via `/api/show`. Returns `OllamaModelInfo` with
+/// context_window and architecture filled in. Used by the frontend to
+/// lazy-load per-model detail cards without blocking the model list on
+/// N serial `/api/show` calls.
+#[tauri::command]
+async fn pyramid_get_model_details(
+    base_url: String,
+    model: String,
+) -> Result<wire_node_lib::pyramid::local_mode::OllamaModelInfo, String> {
+    let normalized =
+        wire_node_lib::pyramid::local_mode::normalize_base_url(&base_url).map_err(|e| e.to_string())?;
+    wire_node_lib::pyramid::local_mode::fetch_model_details(&normalized, &model)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// Phase 1 daemon control plane (AD-1): hot-swap the active Ollama model
 /// without disable/re-enable. Split-phase pattern: async prepare (probe),
 /// sync commit (writer lock), async follow-up (cascade rebuild).
@@ -11532,6 +11549,8 @@ fn main() {
             pyramid_enable_local_mode,
             pyramid_disable_local_mode,
             pyramid_probe_ollama,
+            // Phase 2 daemon control plane: rich model details
+            pyramid_get_model_details,
             // Phase 1 daemon control plane: hot-swap model
             pyramid_switch_local_model,
             pyramid_preview_pull_contribution,

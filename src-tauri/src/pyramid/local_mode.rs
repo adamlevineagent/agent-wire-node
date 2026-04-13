@@ -87,6 +87,10 @@ pub struct LocalModeStatus {
     /// reachability check. Empty when the call failed or the user
     /// hasn't enabled local mode yet.
     pub available_models: Vec<String>,
+    /// Rich model info from `/api/tags` (Phase 2). Parallel to
+    /// `available_models` for backward compat — new consumers read
+    /// this field for size, quant, parameter count, etc.
+    pub available_model_details: Vec<OllamaModelInfo>,
     pub reachable: bool,
     pub reachability_error: Option<String>,
     pub ollama_provider_id: String,
@@ -104,6 +108,7 @@ impl LocalModeStatus {
             model: None,
             detected_context_limit: None,
             available_models: Vec::new(),
+            available_model_details: Vec::new(),
             reachable: false,
             reachability_error: None,
             ollama_provider_id: OLLAMA_LOCAL_PROVIDER_ID.to_string(),
@@ -121,6 +126,26 @@ pub struct OllamaProbeResult {
     pub reachable: bool,
     pub reachability_error: Option<String>,
     pub available_models: Vec<String>,
+    /// Rich model info from `/api/tags` (Phase 2). Parallel to
+    /// `available_models` for backward compat.
+    pub available_model_details: Vec<OllamaModelInfo>,
+}
+
+/// Rich model info extracted from Ollama's `/api/tags` and `/api/show`.
+/// Phase 2 daemon control plane: populated by `fetch_ollama_models_rich`
+/// (from `/api/tags` — context_window and architecture are None) and
+/// enriched lazily by `pyramid_get_model_details` (which calls `/api/show`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OllamaModelInfo {
+    pub name: String,
+    pub size_bytes: u64,
+    pub family: Option<String>,
+    pub families: Option<Vec<String>>,
+    pub parameter_size: Option<String>,
+    pub quantization_level: Option<String>,
+    pub context_window: Option<usize>,
+    pub architecture: Option<String>,
+    pub modified_at: Option<String>,
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -152,9 +177,10 @@ pub fn native_root_for(base_url: &str) -> String {
         .unwrap_or_else(|| trimmed.to_string())
 }
 
-/// Probe `GET {base}/api/tags`. Returns the parsed model name list on
-/// success or a clear error otherwise. Caller decides how to surface.
-pub async fn fetch_ollama_models(base_url: &str) -> Result<Vec<String>> {
+/// Probe `GET {base}/api/tags` and return rich model info for every
+/// installed model. Context_window and architecture are left as None —
+/// those come from `/api/show` which is lazy-loaded per model.
+pub async fn fetch_ollama_models_rich(base_url: &str) -> Result<Vec<OllamaModelInfo>> {
     let native = native_root_for(base_url);
     let url = format!("{native}/api/tags");
     let response = crate::pyramid::llm::HTTP_CLIENT
@@ -170,43 +196,106 @@ pub async fn fetch_ollama_models(base_url: &str) -> Result<Vec<String>> {
         .json()
         .await
         .with_context(|| format!("parsing /api/tags response from {url}"))?;
-    Ok(parse_tags_response(&body))
+    Ok(parse_tags_response_rich(&body))
 }
 
-/// Parse Ollama's `/api/tags` response shape into a sorted, unique
-/// list of model names. The shape is `{ "models": [{ "name": "x" }, …] }`
-/// per the Ollama HTTP API. Returns an empty list when the structure
-/// is missing or malformed — never panics.
-pub fn parse_tags_response(body: &serde_json::Value) -> Vec<String> {
-    let mut out = std::collections::BTreeSet::new();
+/// Probe `GET {base}/api/tags`. Returns the parsed model name list on
+/// success or a clear error otherwise. Delegates to
+/// `fetch_ollama_models_rich` and maps to `Vec<String>` for backward
+/// compatibility with all existing callers.
+pub async fn fetch_ollama_models(base_url: &str) -> Result<Vec<String>> {
+    let rich = fetch_ollama_models_rich(base_url).await?;
+    Ok(rich.into_iter().map(|m| m.name).collect())
+}
+
+/// Parse Ollama's `/api/tags` response into rich `OllamaModelInfo` entries.
+/// Extracts name, size, details (family, families, parameter_size,
+/// quantization_level), and modified_at from each model entry.
+/// Context_window and architecture are None (populated lazily via `/api/show`).
+/// Returns a sorted (by name), deduplicated list. Never panics.
+pub fn parse_tags_response_rich(body: &serde_json::Value) -> Vec<OllamaModelInfo> {
+    let mut seen = std::collections::BTreeMap::<String, OllamaModelInfo>::new();
     let Some(models) = body.get("models").and_then(|v| v.as_array()) else {
         return Vec::new();
     };
     for entry in models {
-        if let Some(name) = entry.get("name").and_then(|v| v.as_str()) {
-            if !name.trim().is_empty() {
-                out.insert(name.to_string());
-            }
+        let Some(name) = entry.get("name").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if name.trim().is_empty() {
+            continue;
         }
+        let size_bytes = entry.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
+        let details = entry.get("details");
+        let family = details
+            .and_then(|d| d.get("family"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let families = details
+            .and_then(|d| d.get("families"))
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            });
+        let parameter_size = details
+            .and_then(|d| d.get("parameter_size"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let quantization_level = details
+            .and_then(|d| d.get("quantization_level"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let modified_at = entry
+            .get("modified_at")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        seen.entry(name.to_string()).or_insert(OllamaModelInfo {
+            name: name.to_string(),
+            size_bytes,
+            family,
+            families,
+            parameter_size,
+            quantization_level,
+            context_window: None,
+            architecture: None,
+            modified_at,
+        });
     }
-    out.into_iter().collect()
+    seen.into_values().collect()
+}
+
+/// Parse Ollama's `/api/tags` response shape into a sorted, unique
+/// list of model names. Backward-compat wrapper around
+/// `parse_tags_response_rich`.
+pub fn parse_tags_response(body: &serde_json::Value) -> Vec<String> {
+    parse_tags_response_rich(body)
+        .into_iter()
+        .map(|m| m.name)
+        .collect()
 }
 
 /// Probe `GET {base}/api/tags` and return both the reachability state
-/// and the model list in a single round trip. Wraps
-/// `fetch_ollama_models` in a probe-shaped result so callers can
-/// surface "test connection" output without two separate calls.
+/// and the model list (with rich details) in a single round trip.
+/// Wraps `fetch_ollama_models_rich` in a probe-shaped result so
+/// callers can surface "test connection" output without two calls.
 pub async fn probe_ollama(base_url: &str) -> OllamaProbeResult {
-    match fetch_ollama_models(base_url).await {
-        Ok(models) => OllamaProbeResult {
-            reachable: true,
-            reachability_error: None,
-            available_models: models,
-        },
+    match fetch_ollama_models_rich(base_url).await {
+        Ok(rich_models) => {
+            let names: Vec<String> = rich_models.iter().map(|m| m.name.clone()).collect();
+            OllamaProbeResult {
+                reachable: true,
+                reachability_error: None,
+                available_models: names,
+                available_model_details: rich_models,
+            }
+        }
         Err(err) => OllamaProbeResult {
             reachable: false,
             reachability_error: Some(err.to_string()),
             available_models: Vec::new(),
+            available_model_details: Vec::new(),
         },
     }
 }
@@ -232,6 +321,86 @@ pub async fn detect_ollama_context_window(base_url: &str, model: &str) -> Option
     crate::pyramid::provider::parse_ollama_context_length(&v)
 }
 
+/// Fetch full model details for a single model via `/api/show`.
+/// Returns an `OllamaModelInfo` with `context_window` and
+/// `architecture` filled in (from `/api/show`'s `model_info` object).
+/// The base fields (size_bytes, family, etc.) come from `/api/show`'s
+/// top-level `details` object. Used by the `pyramid_get_model_details`
+/// IPC for lazy-loading per-model detail cards.
+pub async fn fetch_model_details(base_url: &str, model: &str) -> Result<OllamaModelInfo> {
+    let native = native_root_for(base_url);
+    let url = format!("{native}/api/show");
+    let req_body = serde_json::json!({ "model": model });
+    let resp = crate::pyramid::llm::HTTP_CLIENT
+        .post(&url)
+        .json(&req_body)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .with_context(|| format!("POST {url} for model {model} failed"))?;
+    if !resp.status().is_success() {
+        bail!("POST {url} for model {model} returned status {}", resp.status());
+    }
+    let v: serde_json::Value = resp
+        .json()
+        .await
+        .with_context(|| format!("parsing /api/show response for {model}"))?;
+
+    // Extract context_window via the existing parser.
+    let context_window = crate::pyramid::provider::parse_ollama_context_length(&v);
+
+    // Extract architecture from model_info.general.architecture.
+    let architecture = v
+        .get("model_info")
+        .and_then(|mi| mi.get("general.architecture"))
+        .and_then(|a| a.as_str())
+        .map(|s| s.to_string());
+
+    // Extract details from the top-level details object (same structure
+    // as /api/tags entries but at the root level of /api/show).
+    let details = v.get("details");
+    let family = details
+        .and_then(|d| d.get("family"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let families = details
+        .and_then(|d| d.get("families"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        });
+    let parameter_size = details
+        .and_then(|d| d.get("parameter_size"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let quantization_level = details
+        .and_then(|d| d.get("quantization_level"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    // /api/show exposes size at the top level (same as /api/tags).
+    let size_bytes = v.get("size").and_then(|s| s.as_u64()).unwrap_or(0);
+
+    let modified_at = v
+        .get("modified_at")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    Ok(OllamaModelInfo {
+        name: model.to_string(),
+        size_bytes,
+        family,
+        families,
+        parameter_size,
+        quantization_level,
+        context_window,
+        architecture,
+        modified_at,
+    })
+}
+
 // ── Status read ─────────────────────────────────────────────────────────────
 
 /// Synchronous DB-only fetch: snapshot the state row into a partial
@@ -252,6 +421,7 @@ pub fn load_status_snapshot(conn: &Connection) -> Result<LocalModeStatus> {
         model: row.ollama_model,
         detected_context_limit: row.detected_context_limit.map(|n| n as usize),
         available_models: Vec::new(),
+        available_model_details: Vec::new(),
         // `reachable` starts false; the probe-refresh step upgrades it
         // to true only when the probe succeeds. The UI distinguishes
         // "enabled + unreachable" (red X) from "disabled" (grey).
@@ -280,6 +450,7 @@ pub async fn refresh_status_reachability(mut status: LocalModeStatus) -> LocalMo
     let probe = probe_ollama(&base_url).await;
     status.base_url = Some(base_url);
     status.available_models = probe.available_models;
+    status.available_model_details = probe.available_model_details;
     status.reachable = probe.reachable;
     status.reachability_error = probe.reachability_error;
     status

@@ -15,12 +15,25 @@
 import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
+export interface OllamaModelInfo {
+  name: string;
+  size_bytes: number;
+  family: string | null;
+  families: string[] | null;
+  parameter_size: string | null;
+  quantization_level: string | null;
+  context_window: number | null;
+  architecture: string | null;
+  modified_at: string | null;
+}
+
 export interface LocalModeStatus {
   enabled: boolean;
   base_url: string | null;
   model: string | null;
   detected_context_limit: number | null;
   available_models: string[];
+  available_model_details: OllamaModelInfo[];
   reachable: boolean;
   reachability_error: string | null;
   ollama_provider_id: string;
@@ -32,6 +45,7 @@ export interface OllamaProbeResult {
   reachable: boolean;
   reachability_error: string | null;
   available_models: string[];
+  available_model_details: OllamaModelInfo[];
 }
 
 export interface UseLocalModeResult {
@@ -43,6 +57,7 @@ export interface UseLocalModeResult {
   disable: () => Promise<void>;
   probe: (baseUrl: string) => Promise<OllamaProbeResult>;
   switchModel: (model: string) => Promise<void>;
+  getModelDetails: (baseUrl: string, model: string) => Promise<OllamaModelInfo>;
 }
 
 export function useLocalMode(): UseLocalModeResult {
@@ -103,6 +118,10 @@ export function useLocalMode(): UseLocalModeResult {
     return await invoke<OllamaProbeResult>("pyramid_probe_ollama", { baseUrl });
   }, []);
 
+  const getModelDetails = useCallback(async (baseUrl: string, model: string): Promise<OllamaModelInfo> => {
+    return await invoke<OllamaModelInfo>("pyramid_get_model_details", { baseUrl, model });
+  }, []);
+
   const switchModel = useCallback(async (model: string) => {
     setLoading(true);
     setError(null);
@@ -116,5 +135,5 @@ export function useLocalMode(): UseLocalModeResult {
     }
   }, []);
 
-  return { status, loading, error, refresh, enable, disable, probe, switchModel };
+  return { status, loading, error, refresh, enable, disable, probe, switchModel, getModelDetails };
 }

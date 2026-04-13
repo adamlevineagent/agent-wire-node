@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { useLocalMode, type OllamaProbeResult } from "../hooks/useLocalMode";
+import { useLocalMode, type OllamaProbeResult, type OllamaModelInfo } from "../hooks/useLocalMode";
+import { AccordionSection } from "./AccordionSection";
 
 // --- Types ------------------------------------------------------------------
 
@@ -58,6 +59,8 @@ export function Settings() {
     const [probeResult, setProbeResult] = useState<OllamaProbeResult | null>(null);
     const [probeBusy, setProbeBusy] = useState(false);
     const [confirmingDisable, setConfirmingDisable] = useState(false);
+    const [detailsCache, setDetailsCache] = useState<Record<string, OllamaModelInfo>>({});
+    const [detailsLoading, setDetailsLoading] = useState<Record<string, boolean>>({});
 
     // Sync local form state with the hook's status whenever it
     // refreshes — so the URL and dropdown reflect the persisted
@@ -97,6 +100,7 @@ export function Settings() {
                 reachable: false,
                 reachability_error: String(err),
                 available_models: [],
+                available_model_details: [],
             });
         } finally {
             setProbeBusy(false);
@@ -136,17 +140,81 @@ export function Settings() {
         await localMode.disable();
     }, [localMode, confirmingDisable]);
 
-    // The list of models the dropdown shows: prefer the live status
-    // (when toggle is on) or the probe result (when off).
-    const availableModels: string[] = (() => {
-        if (localMode.status?.enabled && localMode.status.available_models.length > 0) {
-            return localMode.status.available_models;
+    // Format bytes as human-readable (MB/GB).
+    const formatBytes = (bytes: number): string => {
+        if (bytes >= 1_000_000_000) {
+            return `${(bytes / 1_073_741_824).toFixed(1)} GB`;
         }
-        if (probeResult && probeResult.available_models.length > 0) {
-            return probeResult.available_models;
+        return `${(bytes / 1_048_576).toFixed(0)} MB`;
+    };
+
+    // Lazy-load context window for a model via /api/show when not
+    // already known. Caches results in component state.
+    const loadModelDetails = useCallback(async (modelName: string) => {
+        if (detailsCache[modelName] || detailsLoading[modelName]) return;
+        const baseUrl = localMode.status?.base_url || localUrl;
+        setDetailsLoading((prev) => ({ ...prev, [modelName]: true }));
+        try {
+            const details = await localMode.getModelDetails(baseUrl, modelName);
+            setDetailsCache((prev) => ({ ...prev, [modelName]: details }));
+        } catch {
+            // Silently fail — card still shows "..." for context
+        } finally {
+            setDetailsLoading((prev) => ({ ...prev, [modelName]: false }));
         }
-        return [];
+    }, [detailsCache, detailsLoading, localMode, localUrl]);
+
+    // The list of models: prefer available_model_details from status/probe
+    // when present; fall back to constructing minimal OllamaModelInfo from
+    // the string list. Merge in any cached details from lazy loading.
+    const availableModelDetails: OllamaModelInfo[] = (() => {
+        let details: OllamaModelInfo[] = [];
+
+        // Prefer rich details from status or probe
+        if (localMode.status?.enabled && localMode.status.available_model_details?.length > 0) {
+            details = localMode.status.available_model_details;
+        } else if (probeResult && probeResult.available_model_details?.length > 0) {
+            details = probeResult.available_model_details;
+        } else {
+            // Fallback: construct minimal objects from string list
+            const names: string[] =
+                (localMode.status?.enabled && localMode.status.available_models.length > 0)
+                    ? localMode.status.available_models
+                    : (probeResult && probeResult.available_models.length > 0)
+                        ? probeResult.available_models
+                        : [];
+            details = names.map((name) => ({
+                name,
+                size_bytes: 0,
+                family: null,
+                families: null,
+                parameter_size: null,
+                quantization_level: null,
+                context_window: null,
+                architecture: null,
+                modified_at: null,
+            }));
+        }
+
+        // Merge in any lazily-loaded details (context_window, architecture)
+        return details.map((m) => {
+            const cached = detailsCache[m.name];
+            if (!cached) return m;
+            return {
+                ...m,
+                context_window: cached.context_window ?? m.context_window,
+                architecture: cached.architecture ?? m.architecture,
+                parameter_size: cached.parameter_size ?? m.parameter_size,
+                quantization_level: cached.quantization_level ?? m.quantization_level,
+                size_bytes: cached.size_bytes || m.size_bytes,
+                family: cached.family ?? m.family,
+                families: cached.families ?? m.families,
+            };
+        });
     })();
+
+    // Keep a flat string list for backward compat with enable logic
+    const availableModels: string[] = availableModelDetails.map((m) => m.name);
 
     const fetchData = useCallback(async () => {
         try {
@@ -421,50 +489,78 @@ export function Settings() {
                     })()}
                 </div>
 
-                {/* Model dropdown */}
-                <div style={{ marginTop: 12, display: "flex", flexDirection: "column", gap: 6 }}>
-                    <label
-                        htmlFor="ollama-model"
-                        style={{
-                            fontSize: 11,
-                            color: "var(--text-secondary)",
-                            textTransform: "uppercase",
-                            letterSpacing: 0.5,
-                        }}
-                    >
-                        Model
-                    </label>
-                    <select
-                        id="ollama-model"
-                        value={localModelChoice}
-                        onChange={async (e) => {
-                            const val = e.target.value;
-                            if (localMode.status?.enabled) {
-                                await localMode.switchModel(val);
-                            } else {
-                                setLocalModelChoice(val);
-                            }
-                        }}
-                        disabled={
-                            localMode.loading ||
-                            availableModels.length === 0
-                        }
-                        className="settings-input"
-                        style={{ padding: "6px 8px", fontSize: 12 }}
-                    >
-                        {availableModels.length === 0 && (
-                            <option value="">
+                {/* Model cards */}
+                <div style={{ marginTop: 12 }}>
+                    <AccordionSection title="Models" defaultOpen={true}>
+                        {availableModelDetails.length === 0 ? (
+                            <div className="model-card-empty">
                                 {probeResult
-                                    ? "No models found — pull a model with `ollama pull` first"
+                                    ? "No models found \u2014 pull a model with `ollama pull` first"
                                     : "Click Test connection to populate"}
-                            </option>
+                            </div>
+                        ) : (
+                            <div className="model-card-list">
+                                {availableModelDetails.map((m) => {
+                                    const isActive =
+                                        localModelChoice === m.name ||
+                                        (localMode.status?.enabled && localMode.status.model === m.name);
+                                    return (
+                                        <div
+                                            key={m.name}
+                                            className={`model-card ${isActive ? "model-card-active" : ""}`}
+                                            role="button"
+                                            tabIndex={0}
+                                            aria-pressed={isActive}
+                                            onClick={async () => {
+                                                if (localMode.loading) return;
+                                                if (localMode.status?.enabled) {
+                                                    await localMode.switchModel(m.name);
+                                                } else {
+                                                    setLocalModelChoice(m.name);
+                                                }
+                                                // Lazy-load context window if missing
+                                                if (m.context_window == null && !detailsCache[m.name]) {
+                                                    loadModelDetails(m.name);
+                                                }
+                                            }}
+                                            onKeyDown={(e) => {
+                                                if (e.key === "Enter" || e.key === " ") {
+                                                    e.preventDefault();
+                                                    (e.currentTarget as HTMLElement).click();
+                                                }
+                                            }}
+                                        >
+                                            <div className="model-card-top-row">
+                                                <span className="model-card-name">{m.name}</span>
+                                                <div className="model-card-badges">
+                                                    {isActive && (
+                                                        <span className="model-card-badge model-card-badge-active">Active</span>
+                                                    )}
+                                                    {m.parameter_size && (
+                                                        <span className="model-card-badge">{m.parameter_size}</span>
+                                                    )}
+                                                    {m.quantization_level && (
+                                                        <span className="model-card-badge">{m.quantization_level}</span>
+                                                    )}
+                                                </div>
+                                            </div>
+                                            {(m.size_bytes > 0 || m.context_window != null) && (
+                                                <div className="model-card-size">
+                                                    {m.size_bytes > 0 && formatBytes(m.size_bytes)}
+                                                    {m.size_bytes > 0 && m.context_window != null && " \u00b7 "}
+                                                    {m.context_window != null
+                                                        ? `${Math.round(m.context_window / 1000)}K ctx`
+                                                        : detailsLoading[m.name]
+                                                            ? "\u2026"
+                                                            : null}
+                                                </div>
+                                            )}
+                                        </div>
+                                    );
+                                })}
+                            </div>
                         )}
-                        {availableModels.map((m) => (
-                            <option key={m} value={m}>
-                                {m}
-                            </option>
-                        ))}
-                    </select>
+                    </AccordionSection>
                 </div>
 
                 {/* Status line */}
