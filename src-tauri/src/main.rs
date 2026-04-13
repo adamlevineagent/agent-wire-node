@@ -8684,6 +8684,19 @@ async fn pyramid_set_viz_config(
     Ok("Viz config updated".to_string())
 }
 
+/// Phase 3b: Returns visual encoding data for the three-axis system
+/// (brightness, saturation, border thickness) plus evidence link graph.
+#[tauri::command]
+async fn pyramid_get_visual_encoding_data(
+    state: tauri::State<'_, SharedState>,
+    slug: String,
+) -> Result<serde_json::Value, String> {
+    let reader = state.pyramid.reader.lock().await;
+    let data = pyramid_query::get_visual_encoding_data(&reader, &slug)
+        .map_err(|e| e.to_string())?;
+    serde_json::to_value(&data).map_err(|e| e.to_string())
+}
+
 #[derive(serde::Serialize)]
 struct PreviewPullContributionResponse {
     yaml: String,
@@ -11914,6 +11927,8 @@ fn main() {
             // Pyramid visualization config
             pyramid_get_viz_config,
             pyramid_set_viz_config,
+            // Phase 3b: Visual encoding data
+            pyramid_get_visual_encoding_data,
             pyramid_preview_pull_contribution,
             // Phase 11: Broadcast webhook + provider health oversight
             pyramid_provider_health,

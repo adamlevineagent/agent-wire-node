@@ -75,6 +75,7 @@ export class DomRenderer implements PyramidRenderer {
             const scale = isHovered ? 1.4 : 1;
             const encoding = this.encodings.get(node.id);
 
+            const saturateFilter = this.nodeSaturateFilter(encoding, overlays);
             el.style.cssText = `
                 position:absolute;
                 left:${node.x - node.radius}px;
@@ -82,11 +83,13 @@ export class DomRenderer implements PyramidRenderer {
                 width:${size}px;
                 height:${size}px;
                 border-radius:50%;
+                box-sizing:border-box;
                 transform:scale(${scale});
                 transition:transform 0.1s ease;
                 cursor:pointer;
                 background:${this.nodeColor(node, overlays, encoding)};
-                border:${this.nodeBorder(node, encoding)};
+                border:${this.nodeBorder(encoding, overlays)};
+                filter:${saturateFilter};
                 opacity:${node.depth < 0 ? 0.3 : 1};
             `;
 
@@ -123,8 +126,19 @@ export class DomRenderer implements PyramidRenderer {
         }
     }
 
-    private nodeBorder(node: SurfaceNode, encoding?: NodeEncoding): string {
-        const thickness = encoding ? Math.round(encoding.borderThickness * 3) : 0;
+    /** Axis 2 — Saturation via CSS filter. Returns saturate() value string.
+     *  0.2 base keeps desaturated nodes visible; 0.8 range for full encoding. */
+    private nodeSaturateFilter(encoding: NodeEncoding | undefined, overlays: OverlayState): string {
+        if (!encoding || !overlays.weightIntensity) return 'none';
+        // saturate(0) = grayscale, saturate(1) = original, saturate(>1) = boosted
+        // Map encoding.saturation [0,1] to filter range [0.2, 1.0]
+        const filterValue = 0.2 + encoding.saturation * 0.8;
+        return `saturate(${filterValue.toFixed(2)})`;
+    }
+
+    private nodeBorder(encoding: NodeEncoding | undefined, overlays: OverlayState): string {
+        if (!encoding || !overlays.weightIntensity) return 'none';
+        const thickness = Math.round(encoding.borderThickness * 3);
         if (thickness <= 0) return 'none';
         return `${thickness}px solid rgba(34, 211, 238, 0.4)`;
     }

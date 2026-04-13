@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { useVizConfig } from '../../hooks/useVizConfig';
 import { usePyramidData } from './usePyramidData';
+import { useVisualEncoding } from './useVisualEncoding';
 import { CanvasRenderer } from './CanvasRenderer';
 import { DomRenderer } from './DomRenderer';
 import { MiniaturePyramid } from './MiniaturePyramid';
@@ -55,6 +56,19 @@ export function PyramidSurface({
         buildProgress: buildProg,
         loading,
     } = usePyramidData(slug, containerSize.width, containerSize.height, staleLog);
+
+    // ── Visual encoding (three-axis: brightness, saturation, border) ──
+    const { encodings: visualEncodings } = useVisualEncoding(
+        slug,
+        overlays.weightIntensity && !isBuilding,
+    );
+
+    // Apply encodings to renderer when they change
+    useEffect(() => {
+        if (visualEncodings.size > 0 && rendererRef.current) {
+            rendererRef.current.setNodeEncodings(visualEncodings);
+        }
+    }, [visualEncodings]);
 
     // Auto-enable build overlay when building
     useEffect(() => {

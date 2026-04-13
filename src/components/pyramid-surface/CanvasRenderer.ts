@@ -98,6 +98,58 @@ function withAlpha(rgba: string, alphaMultiplier: number): string {
     return `rgba(${parsed.r}, ${parsed.g}, ${parsed.b}, ${a.toFixed(3)})`;
 }
 
+/**
+ * Modulate color saturation via HSL.
+ * saturationFactor: 0 = fully desaturated (gray), 1 = original color.
+ */
+function withSaturation(rgba: string, saturationFactor: number): string {
+    const parsed = parseRgba(rgba);
+    if (!parsed) return rgba;
+    const { r, g, b, a } = parsed;
+
+    // Convert RGB [0-255] to HSL
+    const rn = r / 255, gn = g / 255, bn = b / 255;
+    const max = Math.max(rn, gn, bn), min = Math.min(rn, gn, bn);
+    const l = (max + min) / 2;
+    let h = 0, s = 0;
+
+    if (max !== min) {
+        const d = max - min;
+        s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+        switch (max) {
+            case rn: h = ((gn - bn) / d + (gn < bn ? 6 : 0)) / 6; break;
+            case gn: h = ((bn - rn) / d + 2) / 6; break;
+            case bn: h = ((rn - gn) / d + 4) / 6; break;
+        }
+    }
+
+    // Apply saturation modulation
+    s = s * Math.max(0, Math.min(1, saturationFactor));
+
+    // Convert HSL back to RGB
+    const hue2rgb = (p: number, q: number, t: number): number => {
+        if (t < 0) t += 1;
+        if (t > 1) t -= 1;
+        if (t < 1/6) return p + (q - p) * 6 * t;
+        if (t < 1/2) return q;
+        if (t < 2/3) return p + (q - p) * (2/3 - t) * 6;
+        return p;
+    };
+
+    let ro: number, go: number, bo: number;
+    if (s === 0) {
+        ro = go = bo = l;
+    } else {
+        const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
+        const p = 2 * l - q;
+        ro = hue2rgb(p, q, h + 1/3);
+        go = hue2rgb(p, q, h);
+        bo = hue2rgb(p, q, h - 1/3);
+    }
+
+    return `rgba(${Math.round(ro * 255)}, ${Math.round(go * 255)}, ${Math.round(bo * 255)}, ${a.toFixed(3)})`;
+}
+
 // ── CanvasRenderer ──────────────────────────────────────────────────
 
 export class CanvasRenderer implements PyramidRenderer {
@@ -380,16 +432,19 @@ export class CanvasRenderer implements PyramidRenderer {
         let fillColor = isHovered ? colors.hover : colors.fill;
         const drawRadius = isHovered ? node.radius * 1.4 : node.radius;
 
-        // Encoding modulation (Phase 2b: brightness as alpha, borderThickness as stroke width)
+        // Three-axis encoding modulation (Phase 3b: brightness, saturation, border)
         const encoding = overlays.weightIntensity
             ? this.nodeEncodings.get(node.id)
             : undefined;
         let strokeWidth = 0;
 
         if (encoding) {
-            // Brightness modulates fill alpha
+            // Axis 1 — Brightness modulates fill alpha
             fillColor = withAlpha(fillColor, 0.3 + encoding.brightness * 0.7);
-            // borderThickness maps to stroke width (0-1 => 0-3px)
+            // Axis 2 — Saturation modulates color vividness via HSL
+            // 0.2 base keeps desaturated nodes visible; 0.8 range for full encoding
+            fillColor = withSaturation(fillColor, 0.2 + encoding.saturation * 0.8);
+            // Axis 3 — borderThickness maps to stroke width (0-1 => 0-3px)
             strokeWidth = encoding.borderThickness * 3;
         }
 

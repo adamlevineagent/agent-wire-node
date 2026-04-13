@@ -1688,6 +1688,137 @@ pub fn terms(conn: &Connection, slug: &str) -> Result<Vec<TermWithSource>> {
     Ok(entries)
 }
 
+// ── Phase 3b: Visual Encoding Data ──────────────────────────────────
+
+#[derive(Debug, Clone, Serialize)]
+pub struct VisualEncodingData {
+    /// Per-node: aggregate KEEP weight + web edge count
+    pub nodes: Vec<NodeEncodingRow>,
+    /// All KEEP evidence links with weights (for propagation BFS)
+    pub evidence_links: Vec<EvidenceLinkRow>,
+    /// Node IDs at maximum depth (propagation start points)
+    pub apex_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct NodeEncodingRow {
+    pub node_id: String,
+    pub depth: i64,
+    /// Sum of all KEEP verdict weights where this node is the source
+    pub aggregate_keep_weight: f64,
+    /// Number of web edges this node participates in (via thread mapping)
+    pub web_edge_count: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EvidenceLinkRow {
+    pub source_id: String,
+    pub target_id: String,
+    pub weight: f64,
+}
+
+/// Returns the data needed for the three-axis visual encoding system
+/// (brightness, saturation, border thickness) plus the evidence link graph
+/// for importance propagation.
+pub fn get_visual_encoding_data(conn: &Connection, slug: &str) -> Result<VisualEncodingData> {
+    // 1. Get all live nodes with depth
+    let mut node_stmt = conn.prepare(
+        "SELECT id, depth FROM live_pyramid_nodes WHERE slug = ?1",
+    )?;
+    let node_rows: Vec<(String, i64)> = node_stmt
+        .query_map(rusqlite::params![slug], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    if node_rows.is_empty() {
+        return Ok(VisualEncodingData {
+            nodes: Vec::new(),
+            evidence_links: Vec::new(),
+            apex_ids: Vec::new(),
+        });
+    }
+
+    // 2. Aggregate KEEP weights per source node
+    let mut keep_stmt = conn.prepare(
+        "SELECT source_node_id, SUM(COALESCE(weight, 0.0)) as total_weight
+         FROM pyramid_evidence
+         WHERE slug = ?1 AND verdict = 'KEEP'
+         GROUP BY source_node_id",
+    )?;
+    let keep_weights: HashMap<String, f64> = keep_stmt
+        .query_map(rusqlite::params![slug], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    // 3. Count web edges per node (via thread → canonical_id mapping)
+    //    Web edges connect threads, so we join through pyramid_threads to
+    //    resolve to canonical node IDs. A node participates as either side.
+    let mut edge_stmt = conn.prepare(
+        "SELECT node_id, COUNT(*) as edge_count FROM (
+            SELECT ta.current_canonical_id as node_id
+            FROM pyramid_web_edges e
+            JOIN pyramid_threads ta ON ta.slug = e.slug AND ta.thread_id = e.thread_a_id
+            WHERE e.slug = ?1 AND e.archived_at IS NULL
+            UNION ALL
+            SELECT tb.current_canonical_id as node_id
+            FROM pyramid_web_edges e
+            JOIN pyramid_threads tb ON tb.slug = e.slug AND tb.thread_id = e.thread_b_id
+            WHERE e.slug = ?1 AND e.archived_at IS NULL
+        ) GROUP BY node_id",
+    )?;
+    let edge_counts: HashMap<String, i64> = edge_stmt
+        .query_map(rusqlite::params![slug], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    // 4. Find max depth for apex identification
+    let max_depth = node_rows.iter().map(|(_, d)| *d).max().unwrap_or(0);
+
+    // 5. Build node encoding rows and collect apex IDs
+    let mut nodes = Vec::with_capacity(node_rows.len());
+    let mut apex_ids = Vec::new();
+    for (node_id, depth) in &node_rows {
+        nodes.push(NodeEncodingRow {
+            node_id: node_id.clone(),
+            depth: *depth,
+            aggregate_keep_weight: keep_weights.get(node_id).copied().unwrap_or(0.0),
+            web_edge_count: edge_counts.get(node_id).copied().unwrap_or(0),
+        });
+        if *depth == max_depth {
+            apex_ids.push(node_id.clone());
+        }
+    }
+
+    // 6. Get KEEP evidence links with weights (for propagation BFS)
+    let mut link_stmt = conn.prepare(
+        "SELECT source_node_id, target_node_id, COALESCE(weight, 0.5) as weight
+         FROM pyramid_evidence
+         WHERE slug = ?1 AND verdict = 'KEEP'",
+    )?;
+    let evidence_links: Vec<EvidenceLinkRow> = link_stmt
+        .query_map(rusqlite::params![slug], |row| {
+            Ok(EvidenceLinkRow {
+                source_id: row.get::<_, String>(0)?,
+                target_id: row.get::<_, String>(1)?,
+                weight: row.get::<_, f64>(2)?,
+            })
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    Ok(VisualEncodingData {
+        nodes,
+        evidence_links,
+        apex_ids,
+    })
+}
+
 // ── rusqlite optional helper ─────────────────────────────────────────
 
 /// Extension trait to add `.optional()` to rusqlite query results,
