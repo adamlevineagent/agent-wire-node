@@ -805,10 +805,28 @@ pub fn default_ingest_config() -> IngestConfig {
 pub fn scan_source_directory(path: &str, content_type: &ContentType) -> Result<Vec<SourceFile>> {
     let dir = Path::new(path);
     if !dir.exists() {
-        anyhow::bail!("Source directory does not exist: {}", path);
+        anyhow::bail!("Source path does not exist: {}", path);
     }
+
+    // Conversation type accepts either a single .jsonl file OR a directory
+    // containing .jsonl files. All other types require a directory.
+    if dir.is_file() {
+        if *content_type == ContentType::Conversation {
+            if let Some(ext) = dir.extension().and_then(|e| e.to_str()) {
+                if ext == "jsonl" {
+                    if let Some(sf) = source_file_from_path(dir) {
+                        return Ok(vec![sf]);
+                    }
+                }
+            }
+            anyhow::bail!("Conversation file must be .jsonl: {}", path);
+        } else {
+            anyhow::bail!("Source path is not a directory: {}", path);
+        }
+    }
+
     if !dir.is_dir() {
-        anyhow::bail!("Source path is not a directory: {}", path);
+        anyhow::bail!("Source path is not a file or directory: {}", path);
     }
 
     let mut results = Vec::new();
