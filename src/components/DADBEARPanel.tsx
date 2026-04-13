@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { PyramidVisualization } from './PyramidVisualization';
+import { PyramidSurface } from './pyramid-surface/PyramidSurface';
 
 interface AutoUpdateConfig {
     slug: string;
@@ -683,12 +683,10 @@ Last check: ${lastCheckStr}
             <div className="dadbear-body-layout">
                 {/* ── Left column: pyramid visualization ──────────────── */}
                 <div className="dadbear-left-col">
-                    <PyramidVisualization
+                    <PyramidSurface
                         slug={slug}
-                        contentType={contentType}
-                        referencingSlugs={referencingSlugs}
+                        mode="full"
                         staleLog={staleLog}
-                        status={status}
                         onNavigateToSlug={onNavigateToSlug}
                     />
                 </div>

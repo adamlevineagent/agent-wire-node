@@ -1,7 +1,7 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
 import { useBuildPolling } from '../hooks/useBuildPolling';
 import { PipelineTimeline } from './theatre/PipelineTimeline';
-import { LivePyramidStage } from './theatre/LivePyramidStage';
+import { PyramidSurface } from './pyramid-surface/PyramidSurface';
 import { ActivityLog } from './theatre/ActivityLog';
 import { NodeInspectorPanel } from './theatre/NodeInspectorPanel';
 import type { BuildStatus } from './theatre/types';
@@ -81,10 +81,9 @@ export function PyramidTheatre({ slug, onComplete, onClose, onRetry }: PyramidTh
             />
 
             {/* Live spatial pyramid */}
-            <LivePyramidStage
-                nodes={liveNodes ?? []}
-                currentStep={progress?.current_step ?? null}
-                isActive={isActive}
+            <PyramidSurface
+                slug={slug}
+                mode="full"
                 onNodeClick={handleNodeClick}
             />
 

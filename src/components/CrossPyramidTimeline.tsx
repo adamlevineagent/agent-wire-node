@@ -23,7 +23,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { useCrossPyramidTimeline } from '../hooks/useCrossPyramidTimeline';
 import { ActiveBuildRow } from './ActiveBuildRow';
 import { CrossPyramidCostFooter } from './CrossPyramidCostFooter';
-import { PyramidBuildViz } from './PyramidBuildViz';
+import { PyramidSurface } from './pyramid-surface/PyramidSurface';
 import {
     DadbearPauseScopeModal,
     type DadbearPauseScope,
@@ -163,7 +163,7 @@ export function CrossPyramidTimeline() {
                         >
                             ×
                         </button>
-                        <PyramidBuildViz slug={viewSlug} onClose={() => setViewSlug(null)} />
+                        <PyramidSurface slug={viewSlug} mode="full" />
                     </div>
                 </div>
             )}

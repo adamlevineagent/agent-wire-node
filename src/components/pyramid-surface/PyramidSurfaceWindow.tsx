@@ -8,6 +8,7 @@
 
 import { useState, useCallback, useEffect } from 'react';
 import { getCurrentWindow } from '@tauri-apps/api/window';
+import { invoke } from '@tauri-apps/api/core';
 import { PyramidSurface } from './PyramidSurface';
 import { GridView } from './GridView';
 import { NodeInspectorPanel } from '../theatre/NodeInspectorPanel';
@@ -21,7 +22,19 @@ interface PyramidSurfaceWindowProps {
 export function PyramidSurfaceWindow({ slug: initialSlug }: PyramidSurfaceWindowProps) {
     const [currentSlug, setCurrentSlug] = useState<string | undefined>(initialSlug);
     const [inspectedNodeId, setInspectedNodeId] = useState<string | null>(null);
+    const [allNodes, setAllNodes] = useState<LiveNodeInfo[]>([]);
     const { config } = useVizConfig(currentSlug);
+
+    // Load node data for the inspector panel whenever slug changes
+    useEffect(() => {
+        if (!currentSlug) {
+            setAllNodes([]);
+            return;
+        }
+        invoke<LiveNodeInfo[]>('pyramid_build_live_nodes', { slug: currentSlug })
+            .then(setAllNodes)
+            .catch(() => setAllNodes([]));
+    }, [currentSlug]);
 
     // Show the window once React is ready
     useEffect(() => {
@@ -89,7 +102,7 @@ export function PyramidSurfaceWindow({ slug: initialSlug }: PyramidSurfaceWindow
                     <NodeInspectorPanel
                         slug={currentSlug}
                         nodeId={inspectedNodeId}
-                        allNodes={[]}
+                        allNodes={allNodes}
                         onClose={handleCloseInspector}
                         onNavigate={handleInspectorNavigate}
                     />
