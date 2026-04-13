@@ -4640,6 +4640,7 @@ async fn execute_cross_build_input(
             let question_tree = db::get_question_tree(conn, &s)?;
             let unresolved_gaps = db::get_unresolved_gaps_for_slug(conn, &s).unwrap_or_default();
             let l0_count = db::count_nodes_at_depth(conn, &s, 0)?;
+            let source_count = db::count_chunks(conn, &s)?;
             let has_overlay = db::has_existing_question_overlay(conn, &s)?;
             let referenced_slugs = db::get_slug_references(conn, &s)?;
             let l0_nodes = db::get_nodes_at_depth(conn, &s, 0)?;
@@ -4755,6 +4756,7 @@ async fn execute_cross_build_input(
                 "question_tree": question_tree.unwrap_or(Value::Null),
                 "unresolved_gaps": serde_json::to_value(&unresolved_gaps)?,
                 "l0_count": l0_count,
+                "source_count": source_count,
                 "l0_summary": effective_l0_summary,
                 "has_overlay": has_overlay,
                 "is_cross_slug": is_cross_slug,

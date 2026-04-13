@@ -37,7 +37,7 @@ steps:
     primitive: extract
     instruction: "$prompts/conversation/source_extract_v2.md"
     for_each: "$chunks"
-    when: "$load_prior_state.l0_count == 0"
+    when: "$load_prior_state.l0_count < $load_prior_state.source_count"
     dispatch_order: "largest_first"
     concurrency: 10
     node_id_pattern: "Q-L0-{index:03}"
@@ -99,7 +99,7 @@ steps:
     model_tier: web
     temperature: 0.2
     on_error: "skip"
-    when: "$load_prior_state.l0_count == 0"
+    when: "$load_prior_state.l0_count < $load_prior_state.source_count"
 
   # ── Phase 3: Refresh state after extraction ─────────────────────────
   - name: refresh_state

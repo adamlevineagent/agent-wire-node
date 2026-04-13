@@ -97,7 +97,7 @@ steps:
     instruction: "$prompts/conversation-episodic/combine_l0.md"
     for_each: "$chunks"
     sequential: true
-    when: "$load_prior_state.l0_count == 0"
+    when: "$load_prior_state.l0_count < $load_prior_state.source_count"
     input:
       chunk: "$item.content"
       chunk_index: "$item.index"
@@ -161,7 +161,7 @@ steps:
     model_tier: web
     temperature: 0.2
     on_error: "skip"
-    when: "$load_prior_state.l0_count == 0"
+    when: "$load_prior_state.l0_count < $load_prior_state.source_count"
 
   # ── Phase 3: Build lifecycle (overlay cleanup) ─────────────────────
   - name: build_lifecycle

@@ -117,7 +117,7 @@ steps:
     instruction: "$prompts/conversation-chronological/combine.md"
     for_each: "$chunks"
     sequential: true
-    when: "$load_prior_state.l0_count == 0"
+    when: "$load_prior_state.l0_count < $load_prior_state.source_count"
     input:
       chunk: "$item.content"
       chunk_index: "$item.index"
@@ -183,7 +183,7 @@ steps:
     model_tier: web
     temperature: 0.2
     on_error: "skip"
-    when: "$load_prior_state.l0_count == 0"
+    when: "$load_prior_state.l0_count < $load_prior_state.source_count"
 
   # ── Phase 3: Refresh state after extraction ─────────────────────────
   - name: refresh_state
