@@ -897,6 +897,12 @@ pub fn sync_config_to_operational_with_registry(
             // and is readable via standard contribution queries.
             debug!("experimental_territory synced; no operational table — metadata only");
         }
+        "pyramid_viz_config" => {
+            // Pyramid visualization engine configuration.
+            // No operational table needed — the viz engine reads the
+            // active contribution directly via viz_config::get_pyramid_viz_config.
+            debug!("pyramid_viz_config synced; no operational table — read from contribution store");
+        }
         other => {
             // Per the spec: unknown types are a bug — fail loudly
             // rather than silently skipping sync.

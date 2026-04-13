@@ -111,6 +111,7 @@ pub mod wire_update_poller;
 pub mod yaml_renderer;
 pub mod dispatch_policy;
 pub mod provider_pools;
+pub mod viz_config;
 
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};

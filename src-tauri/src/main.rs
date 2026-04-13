@@ -8590,6 +8590,36 @@ async fn pyramid_set_experimental_territory(
     Ok("Territory updated".to_string())
 }
 
+/// Read the active pyramid viz config contribution.
+/// Tries slug-scoped first, then global, then returns a default.
+#[tauri::command]
+async fn pyramid_get_viz_config(
+    state: tauri::State<'_, SharedState>,
+    slug: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let reader = state.pyramid.reader.lock().await;
+    wire_node_lib::pyramid::viz_config::get_pyramid_viz_config(&reader, slug.as_deref())
+        .map_err(|e| e.to_string())
+}
+
+/// Creates or supersedes the `pyramid_viz_config` contribution.
+#[tauri::command]
+async fn pyramid_set_viz_config(
+    state: tauri::State<'_, SharedState>,
+    slug: Option<String>,
+    config: serde_json::Value,
+) -> Result<String, String> {
+    let mut writer = state.pyramid.writer.lock().await;
+    wire_node_lib::pyramid::viz_config::set_pyramid_viz_config(
+        &mut writer,
+        &state.pyramid.build_event_bus,
+        slug.as_deref(),
+        config,
+    )
+    .map_err(|e| e.to_string())?;
+    Ok("Viz config updated".to_string())
+}
+
 #[derive(serde::Serialize)]
 struct PreviewPullContributionResponse {
     yaml: String,
@@ -11815,6 +11845,9 @@ fn main() {
             // Phase 6 daemon control plane: experimental territory markers
             pyramid_get_experimental_territory,
             pyramid_set_experimental_territory,
+            // Pyramid visualization config
+            pyramid_get_viz_config,
+            pyramid_set_viz_config,
             pyramid_preview_pull_contribution,
             // Phase 11: Broadcast webhook + provider health oversight
             pyramid_provider_health,

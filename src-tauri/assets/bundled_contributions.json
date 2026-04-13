@@ -212,6 +212,22 @@
     },
 
     {
+      "contribution_id": "bundled-schema_definition-pyramid_viz_config-v1",
+      "schema_type": "schema_definition",
+      "slug": "pyramid_viz_config",
+      "yaml_content": "{\"$schema\":\"http://json-schema.org/draft-07/schema#\",\"title\":\"Pyramid Viz Config\",\"description\":\"Configuration for the pyramid visualization engine\",\"type\":\"object\",\"required\":[\"schema_type\"],\"properties\":{\"schema_type\":{\"type\":\"string\",\"const\":\"pyramid_viz_config\"},\"rendering\":{\"type\":\"object\",\"properties\":{\"tier\":{\"type\":\"string\",\"enum\":[\"auto\",\"minimal\",\"standard\",\"rich\"]},\"max_dots_per_layer\":{\"type\":\"integer\",\"minimum\":1},\"always_collapse\":{\"type\":\"boolean\"},\"force_all_nodes\":{\"type\":\"boolean\"}}},\"overlays\":{\"type\":\"object\",\"properties\":{\"structure\":{\"type\":\"boolean\"},\"web_edges\":{\"type\":\"boolean\"},\"staleness\":{\"type\":\"boolean\"},\"provenance\":{\"type\":\"boolean\"},\"weight_intensity\":{\"type\":\"boolean\"}}},\"chronicle\":{\"type\":\"object\",\"properties\":{\"show_mechanical_ops\":{\"type\":\"boolean\"},\"auto_expand_decisions\":{\"type\":\"boolean\"}}},\"ticker\":{\"type\":\"object\",\"properties\":{\"enabled\":{\"type\":\"boolean\"},\"position\":{\"type\":\"string\",\"enum\":[\"top\",\"bottom\"]}}},\"window\":{\"type\":\"object\",\"properties\":{\"auto_pop_on_build\":{\"type\":\"boolean\"}}}}}",
+      "triggering_note": "Bundled JSON schema for pyramid_viz_config (wire-node v0.2.0)",
+      "applies_to": "pyramid_viz_config"
+    },
+    {
+      "contribution_id": "bundled-pyramid_viz_config-default-v1",
+      "schema_type": "pyramid_viz_config",
+      "slug": null,
+      "yaml_content": "schema_type: pyramid_viz_config\nrendering:\n  tier: auto\n  max_dots_per_layer: 10\n  always_collapse: false\n  force_all_nodes: false\noverlays:\n  structure: true\n  web_edges: true\n  staleness: true\n  provenance: true\n  weight_intensity: true\nchronicle:\n  show_mechanical_ops: false\n  auto_expand_decisions: true\nticker:\n  enabled: true\n  position: bottom\nwindow:\n  auto_pop_on_build: true\n",
+      "triggering_note": "Bundled default pyramid_viz_config (wire-node v0.2.0)"
+    },
+
+    {
       "contribution_id": "bundled-skill-migration-migrate_config-v1",
       "schema_type": "skill",
       "slug": "migration/migrate_config.md",

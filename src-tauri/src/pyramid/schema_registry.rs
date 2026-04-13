@@ -468,6 +468,7 @@ fn display_name_for(schema_type: &str) -> String {
         "step_overrides" => "Step Overrides".to_string(),
         "wire_discovery_weights" => "Wire Discovery Weights".to_string(),
         "wire_auto_update_settings" => "Wire Auto-Update Settings".to_string(),
+        "pyramid_viz_config" => "Pyramid Viz Config".to_string(),
         other => other.replace('_', " "),
     }
 }
@@ -493,6 +494,9 @@ fn description_for(schema_type: &str) -> String {
         }
         "folder_ingestion_heuristics" => {
             "File patterns and ignore rules for folder ingestion".to_string()
+        }
+        "pyramid_viz_config" => {
+            "Configuration for the pyramid visualization engine".to_string()
         }
         _ => format!("Configuration for {schema_type}"),
     }
