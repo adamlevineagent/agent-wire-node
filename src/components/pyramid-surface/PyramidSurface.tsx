@@ -4,6 +4,7 @@ import { usePyramidWindow } from '../../hooks/usePyramidWindow';
 import { usePyramidData } from './usePyramidData';
 import { useVisualEncoding } from './useVisualEncoding';
 import { useChronicleStream } from './useChronicleStream';
+import { useVizMapping } from './useVizMapping';
 import { CanvasRenderer } from './CanvasRenderer';
 import { DomRenderer } from './DomRenderer';
 import { GpuRenderer } from './GpuRenderer';
@@ -65,21 +66,37 @@ export function PyramidSurface({
         isBuilding,
         currentStep,
         buildProgress: buildProg,
+        buildVizState,
         loading,
     } = usePyramidData(slug, containerSize.width, containerSize.height, staleLog);
 
+    // ── Viz-from-YAML: map current step to viz primitive (AD-1) ─────
+    const { getVizPrimitive } = useVizMapping(slug, isBuilding);
+    const activeVizPrimitive = isBuilding && currentStep
+        ? getVizPrimitive(currentStep)
+        : null;
+
+    // Apply viz primitive + build viz state to renderer
+    useEffect(() => {
+        if (rendererRef.current) {
+            rendererRef.current.setActiveVizPrimitive(activeVizPrimitive);
+            rendererRef.current.setBuildVizState(buildVizState);
+        }
+    }, [activeVizPrimitive, buildVizState]);
+
     // ── Visual encoding (three-axis: brightness, saturation, border) ──
-    const { encodings: visualEncodings } = useVisualEncoding(
+    const { encodings: visualEncodings, linkIntensities } = useVisualEncoding(
         slug,
         overlays.weightIntensity && !isBuilding,
     );
 
-    // Apply encodings to renderer when they change
+    // Apply encodings + link intensities to renderer when they change
     useEffect(() => {
-        if (visualEncodings.size > 0 && rendererRef.current) {
-            rendererRef.current.setNodeEncodings(visualEncodings);
+        if (rendererRef.current) {
+            if (visualEncodings.size > 0) rendererRef.current.setNodeEncodings(visualEncodings);
+            if (linkIntensities.size > 0) rendererRef.current.setLinkIntensities(linkIntensities);
         }
-    }, [visualEncodings]);
+    }, [visualEncodings, linkIntensities]);
 
     // Auto-enable build overlay and open chronicle when building
     useEffect(() => {

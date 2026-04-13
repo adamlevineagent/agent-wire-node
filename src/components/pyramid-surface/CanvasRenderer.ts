@@ -1,5 +1,5 @@
 import type { PyramidRenderer } from './PyramidRenderer';
-import type { SurfaceNode, SurfaceEdge, NodeEncoding, OverlayState, HitTestResult } from './types';
+import type { SurfaceNode, SurfaceEdge, NodeEncoding, OverlayState, HitTestResult, VizPrimitive, BuildVizState } from './types';
 import { NodeVisualState, EdgeCategory } from './types';
 
 // ── Node color map ──────────────────────────────────────────────────
@@ -163,6 +163,9 @@ export class CanvasRenderer implements PyramidRenderer {
     private nodeEncodings = new Map<string, NodeEncoding>();
     private pulsePhase = 0;
     private lastPulseTime = 0;
+    private activeVizPrimitive: VizPrimitive | null = null;
+    private buildVizState: BuildVizState | null = null;
+    private linkIntensities = new Map<string, number>();
 
     // ── Lifecycle ───────────────────────────────────────────────────
 
@@ -226,6 +229,18 @@ export class CanvasRenderer implements PyramidRenderer {
 
     setNodeEncodings(encodings: Map<string, NodeEncoding>): void {
         this.nodeEncodings = new Map(encodings);
+    }
+
+    setActiveVizPrimitive(primitive: VizPrimitive | null): void {
+        this.activeVizPrimitive = primitive;
+    }
+
+    setBuildVizState(state: BuildVizState): void {
+        this.buildVizState = state;
+    }
+
+    setLinkIntensities(intensities: Map<string, number>): void {
+        this.linkIntensities = new Map(intensities);
     }
 
     // ── Hit testing ─────────────────────────────────────────────────
@@ -294,7 +309,10 @@ export class CanvasRenderer implements PyramidRenderer {
         // 4. Draw nodes (sorted by depth ascending; apex renders on top)
         this.drawNodes(ctx, nodes, overlays, hoveredNodeId);
 
-        // 5. Apex label
+        // 5. Viz primitive overlay (build-time visuals)
+        this.drawVizOverlay(ctx, nodes);
+
+        // 6. Apex label
         this.drawApexLabel(ctx, nodes);
     }
 
@@ -331,8 +349,18 @@ export class CanvasRenderer implements PyramidRenderer {
             const style = EDGE_STYLES[edge.category] ?? EDGE_STYLES[EdgeCategory.STRUCTURAL];
 
             ctx.save();
-            ctx.strokeStyle = style.color;
-            ctx.lineWidth = style.lineWidth;
+
+            // Link intensity modulation
+            const intensityKey = `${edge.fromId}\u2192${edge.toId}`;
+            const intensity = this.linkIntensities.get(intensityKey);
+            if (intensity !== undefined && overlays.weightIntensity) {
+                ctx.lineWidth = 0.5 + intensity * 3;
+                ctx.globalAlpha = 0.1 + intensity * 0.5;
+                ctx.strokeStyle = style.color;
+            } else {
+                ctx.strokeStyle = style.color;
+                ctx.lineWidth = style.lineWidth;
+            }
 
             if (style.dash) {
                 ctx.setLineDash(style.dash);
@@ -508,6 +536,166 @@ export class CanvasRenderer implements PyramidRenderer {
             ctx.lineWidth = 0.5;
             ctx.strokeStyle = 'rgba(34, 211, 238, 0.4)';
             ctx.stroke();
+            ctx.restore();
+        }
+    }
+
+    private drawVizOverlay(
+        ctx: CanvasRenderingContext2D,
+        nodes: SurfaceNode[],
+    ): void {
+        if (!this.activeVizPrimitive || !this.buildVizState) return;
+
+        if (this.activeVizPrimitive === 'node_fill' || this.activeVizPrimitive === 'progress_only') {
+            return; // No overlay for these primitives
+        }
+
+        if (this.activeVizPrimitive === 'edge_draw') {
+            this.drawEdgeDrawOverlay(ctx, nodes);
+        } else if (this.activeVizPrimitive === 'verdict_mark') {
+            this.drawVerdictMarkOverlay(ctx, nodes);
+        } else if (this.activeVizPrimitive === 'cluster_form') {
+            this.drawClusterFormOverlay(ctx, nodes);
+        }
+    }
+
+    private drawEdgeDrawOverlay(
+        ctx: CanvasRenderingContext2D,
+        nodes: SurfaceNode[],
+    ): void {
+        const newEdges = this.buildVizState?.newEdges;
+        if (!newEdges || newEdges.length === 0) return;
+
+        const fadeAlpha = 0.4 + 0.6 * (0.5 + 0.5 * Math.sin(this.pulsePhase));
+
+        for (const edge of newEdges) {
+            const source = nodes.find((n) => n.id === edge.sourceId);
+            const target = nodes.find((n) => n.id === edge.targetId);
+            if (!source || !target) continue;
+
+            ctx.save();
+            ctx.globalAlpha = fadeAlpha;
+
+            // Glow
+            ctx.shadowBlur = 8;
+            ctx.shadowColor = 'rgba(0, 255, 255, 0.5)';
+
+            ctx.strokeStyle = 'rgba(0, 255, 255, 0.7)';
+            ctx.lineWidth = 1.5;
+
+            ctx.beginPath();
+            ctx.moveTo(source.x, source.y);
+            ctx.lineTo(target.x, target.y);
+            ctx.stroke();
+
+            ctx.restore();
+        }
+
+        // Subtle label
+        ctx.save();
+        ctx.font = '10px Inter, sans-serif';
+        ctx.fillStyle = `rgba(0, 255, 255, ${0.2 + 0.15 * Math.sin(this.pulsePhase)})`;
+        ctx.textAlign = 'right';
+        ctx.fillText('creating connections...', this.w - 16, this.h - 16);
+        ctx.restore();
+    }
+
+    private drawVerdictMarkOverlay(
+        ctx: CanvasRenderingContext2D,
+        nodes: SurfaceNode[],
+    ): void {
+        const verdicts = this.buildVizState?.verdictsByNode;
+        if (!verdicts || verdicts.size === 0) return;
+
+        for (const [nodeId, verdict] of verdicts) {
+            const node = nodes.find((n) => n.id === nodeId);
+            if (!node) continue;
+
+            const ringRadius = node.radius + 4;
+
+            ctx.save();
+            ctx.lineWidth = 2;
+
+            if (verdict === 'KEEP') {
+                ctx.strokeStyle = 'rgba(64, 208, 128, 0.8)';
+            } else if (verdict === 'DISCONNECT') {
+                ctx.strokeStyle = 'rgba(255, 165, 0, 0.8)';
+            } else {
+                // MISSING: yellow pulsing ring
+                const pulseAlpha = 0.4 + 0.4 * Math.sin(this.pulsePhase);
+                ctx.strokeStyle = `rgba(255, 220, 50, ${pulseAlpha})`;
+            }
+
+            ctx.beginPath();
+            ctx.arc(node.x, node.y, ringRadius, 0, Math.PI * 2);
+            ctx.stroke();
+            ctx.restore();
+        }
+    }
+
+    private drawClusterFormOverlay(
+        ctx: CanvasRenderingContext2D,
+        nodes: SurfaceNode[],
+    ): void {
+        const clusters = this.buildVizState?.clusterMembers;
+        if (!clusters || clusters.size === 0) return;
+
+        const clusterKeys = Array.from(clusters.keys());
+        const hueStep = 360 / Math.max(clusterKeys.length, 1);
+
+        for (let ci = 0; ci < clusterKeys.length; ci++) {
+            const memberIds = clusters.get(clusterKeys[ci]);
+            if (!memberIds || memberIds.length === 0) continue;
+
+            const memberNodes: SurfaceNode[] = [];
+            for (const mid of memberIds) {
+                const n = nodes.find((nd) => nd.id === mid);
+                if (n) memberNodes.push(n);
+            }
+            if (memberNodes.length === 0) continue;
+
+            const hue = ci * hueStep;
+
+            // Compute bounding box with padding
+            let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+            for (const n of memberNodes) {
+                minX = Math.min(minX, n.x - n.radius);
+                minY = Math.min(minY, n.y - n.radius);
+                maxX = Math.max(maxX, n.x + n.radius);
+                maxY = Math.max(maxY, n.y + n.radius);
+            }
+            const pad = 8;
+            minX -= pad; minY -= pad; maxX += pad; maxY += pad;
+
+            // Tinted background
+            ctx.save();
+            ctx.fillStyle = `hsla(${hue}, 60%, 50%, 0.06)`;
+            ctx.strokeStyle = `hsla(${hue}, 60%, 60%, 0.2)`;
+            ctx.lineWidth = 1;
+
+            const rx = 6; // corner radius
+            ctx.beginPath();
+            ctx.moveTo(minX + rx, minY);
+            ctx.lineTo(maxX - rx, minY);
+            ctx.arcTo(maxX, minY, maxX, minY + rx, rx);
+            ctx.lineTo(maxX, maxY - rx);
+            ctx.arcTo(maxX, maxY, maxX - rx, maxY, rx);
+            ctx.lineTo(minX + rx, maxY);
+            ctx.arcTo(minX, maxY, minX, maxY - rx, rx);
+            ctx.lineTo(minX, minY + rx);
+            ctx.arcTo(minX, minY, minX + rx, minY, rx);
+            ctx.closePath();
+            ctx.fill();
+            ctx.stroke();
+
+            // Shared glow on each member node
+            for (const n of memberNodes) {
+                ctx.beginPath();
+                ctx.arc(n.x, n.y, n.radius + 2, 0, Math.PI * 2);
+                ctx.fillStyle = `hsla(${hue}, 70%, 60%, 0.1)`;
+                ctx.fill();
+            }
+
             ctx.restore();
         }
     }

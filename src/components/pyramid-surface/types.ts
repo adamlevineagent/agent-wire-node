@@ -93,3 +93,21 @@ export interface StaleLogEntry {
     checked_at: string;
     reason?: string;
 }
+
+/** Viz primitive types from AD-1: chain YAML drives visualization */
+export type VizPrimitive =
+    | 'node_fill'       // Dots appearing in a layer band
+    | 'edge_draw'       // Lines forming between existing nodes
+    | 'cluster_form'    // Nodes visually grouping, parent appearing
+    | 'verdict_mark'    // KEEP/DISCONNECT/MISSING indicators on nodes
+    | 'progress_only';  // Status text, no structural change
+
+/** Build-time viz state accumulated from events during a build */
+export interface BuildVizState {
+    /** Per-node verdict from VerdictProduced events */
+    verdictsByNode: Map<string, 'KEEP' | 'DISCONNECT' | 'MISSING'>;
+    /** Cluster membership from ClusterAssignment events: cluster_id → node_ids */
+    clusterMembers: Map<string, string[]>;
+    /** New edges from EdgeCreated events (source_id, target_id) */
+    newEdges: Array<{ sourceId: string; targetId: string }>;
+}

@@ -1,5 +1,5 @@
 import type { PyramidRenderer } from './PyramidRenderer';
-import type { SurfaceNode, SurfaceEdge, NodeEncoding, OverlayState, HitTestResult } from './types';
+import type { SurfaceNode, SurfaceEdge, NodeEncoding, OverlayState, HitTestResult, VizPrimitive, BuildVizState } from './types';
 import { NodeVisualState, EdgeCategory } from './types';
 
 // ── Node color map (RGBA float arrays for GPU upload) ──────────────
@@ -399,6 +399,9 @@ export class GpuRenderer implements PyramidRenderer {
     private height = 0;
     private dpr = 1;
     private encodings = new Map<string, NodeEncoding>();
+    private activeVizPrimitive: VizPrimitive | null = null;
+    private buildVizState: BuildVizState | null = null;
+    private linkIntensities = new Map<string, number>();
 
     // Shader programs
     private nodeProgram: WebGLProgram | null = null;
@@ -566,6 +569,18 @@ export class GpuRenderer implements PyramidRenderer {
 
     setNodeEncodings(encodings: Map<string, NodeEncoding>): void {
         this.encodings = new Map(encodings);
+    }
+
+    setActiveVizPrimitive(primitive: VizPrimitive | null): void {
+        this.activeVizPrimitive = primitive;
+    }
+
+    setBuildVizState(state: BuildVizState): void {
+        this.buildVizState = state;
+    }
+
+    setLinkIntensities(intensities: Map<string, number>): void {
+        this.linkIntensities = new Map(intensities);
     }
 
     // ── Hit testing ─────────────────────────────────────────────────
@@ -812,6 +827,9 @@ export class GpuRenderer implements PyramidRenderer {
 
         // Draw nodes (sorted by depth ascending so apex renders on top via painter's)
         this.drawNodes(gl, nodes, overlays, hoveredNodeId);
+
+        // Draw viz primitive overlays (build-time visuals)
+        this.drawVizOverlay(gl, nodes);
     }
 
     // ── Edge rendering ──────────────────────────────────────────────
@@ -849,7 +867,14 @@ export class GpuRenderer implements PyramidRenderer {
 
         for (const edge of filteredEdges) {
             const style = EDGE_STYLES_F[edge.category] ?? EDGE_STYLES_F[EdgeCategory.STRUCTURAL];
-            const c = style.color;
+            let c = style.color;
+
+            // Link intensity modulation
+            const intensityKey = `${edge.fromId}\u2192${edge.toId}`;
+            const intensity = this.linkIntensities.get(intensityKey);
+            if (intensity !== undefined && overlays.weightIntensity) {
+                c = { ...c, a: 0.1 + intensity * 0.5 };
+            }
 
             const pts = tessellateQuadBezier(
                 edge.fromX, edge.fromY,
@@ -1016,6 +1041,220 @@ export class GpuRenderer implements PyramidRenderer {
         // Draw all nodes in one instanced call: 6 vertices per quad, instanceCount instances
         gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, instanceCount);
 
+        gl.bindVertexArray(null);
+    }
+
+    // ── Viz primitive overlay ───────────────────────────────────────
+
+    private drawVizOverlay(
+        gl: WebGL2RenderingContext,
+        nodes: SurfaceNode[],
+    ): void {
+        if (!this.activeVizPrimitive || !this.buildVizState) return;
+
+        if (this.activeVizPrimitive === 'node_fill' || this.activeVizPrimitive === 'progress_only') {
+            return;
+        }
+
+        if (this.activeVizPrimitive === 'edge_draw') {
+            this.drawEdgeDrawOverlay(gl, nodes);
+        } else if (this.activeVizPrimitive === 'verdict_mark') {
+            this.drawVerdictMarkOverlay(gl, nodes);
+        } else if (this.activeVizPrimitive === 'cluster_form') {
+            this.drawClusterFormOverlay(gl, nodes);
+        }
+    }
+
+    /** Draw animated new edges as cyan lines via the edge shader. */
+    private drawEdgeDrawOverlay(
+        gl: WebGL2RenderingContext,
+        nodes: SurfaceNode[],
+    ): void {
+        const newEdges = this.buildVizState?.newEdges;
+        if (!newEdges || newEdges.length === 0) return;
+
+        const fadeAlpha = 0.4 + 0.6 * (0.5 + 0.5 * Math.sin(this.pulsePhase));
+        const cyan: ColorF = { r: 0, g: 1, b: 1, a: 0.7 * fadeAlpha };
+
+        // Build line segment data for new edges (straight lines, no bezier)
+        const maxVerts = newEdges.length * 2;
+        const overlayData = new Float32Array(maxVerts * EDGE_VERTEX_FLOATS);
+        let vertCount = 0;
+
+        for (const edge of newEdges) {
+            const source = nodes.find((n) => n.id === edge.sourceId);
+            const target = nodes.find((n) => n.id === edge.targetId);
+            if (!source || !target) continue;
+
+            const base = vertCount * EDGE_VERTEX_FLOATS;
+            overlayData[base + 0] = source.x;
+            overlayData[base + 1] = source.y;
+            overlayData[base + 2] = cyan.r;
+            overlayData[base + 3] = cyan.g;
+            overlayData[base + 4] = cyan.b;
+            overlayData[base + 5] = cyan.a;
+            overlayData[base + 6] = target.x;
+            overlayData[base + 7] = target.y;
+            overlayData[base + 8] = cyan.r;
+            overlayData[base + 9] = cyan.g;
+            overlayData[base + 10] = cyan.b;
+            overlayData[base + 11] = cyan.a;
+            vertCount += 2;
+        }
+
+        if (vertCount === 0) return;
+
+        gl.useProgram(this.edgeProgram);
+        gl.uniform2f(this.edgeUniforms.resolution, this.width, this.height);
+
+        gl.bindVertexArray(this.edgeVAO);
+        gl.bindBuffer(gl.ARRAY_BUFFER, this.edgeVBO);
+        gl.bufferData(gl.ARRAY_BUFFER, overlayData.subarray(0, vertCount * EDGE_VERTEX_FLOATS), gl.DYNAMIC_DRAW);
+        // Reset edge vertex tracking so the next frame re-uploads the standard edge data
+        this.lastEdgeVertexCount = 0;
+
+        gl.lineWidth(1.0);
+        gl.drawArrays(gl.LINES, 0, vertCount);
+        gl.bindVertexArray(null);
+    }
+
+    /** Draw verdict rings as additional circle instances via the node shader. */
+    private drawVerdictMarkOverlay(
+        gl: WebGL2RenderingContext,
+        nodes: SurfaceNode[],
+    ): void {
+        const verdicts = this.buildVizState?.verdictsByNode;
+        if (!verdicts || verdicts.size === 0) return;
+
+        // Build ring instances — one per verdict node
+        const ringData = new Float32Array(verdicts.size * NODE_INSTANCE_FLOATS);
+        let ringCount = 0;
+
+        for (const [nodeId, verdict] of verdicts) {
+            const node = nodes.find((n) => n.id === nodeId);
+            if (!node) continue;
+
+            let color: ColorF;
+            if (verdict === 'KEEP') {
+                color = { r: 64 / 255, g: 208 / 255, b: 128 / 255, a: 0.8 };
+            } else if (verdict === 'DISCONNECT') {
+                color = { r: 1, g: 165 / 255, b: 0, a: 0.8 };
+            } else {
+                // MISSING: yellow pulsing
+                const pulseAlpha = 0.4 + 0.4 * Math.sin(this.pulsePhase);
+                color = { r: 1, g: 220 / 255, b: 50 / 255, a: pulseAlpha };
+            }
+
+            const ringRadius = node.radius + 4;
+            const base = ringCount * NODE_INSTANCE_FLOATS;
+            ringData[base + 0] = node.x;
+            ringData[base + 1] = node.y;
+            ringData[base + 2] = ringRadius;
+            ringData[base + 3] = color.r;
+            ringData[base + 4] = color.g;
+            ringData[base + 5] = color.b;
+            // Use very low fill alpha — the ring effect comes from the border
+            ringData[base + 6] = 0.0;
+            ringData[base + 7] = 1;
+            ringData[base + 8] = 1;
+            // borderThickness drives the ring in the fragment shader
+            ringData[base + 9] = 0.7;
+            ringData[base + 10] = 0;
+            ringCount++;
+        }
+
+        if (ringCount === 0) return;
+
+        gl.useProgram(this.nodeProgram);
+        gl.uniform2f(this.nodeUniforms.resolution, this.width, this.height);
+        gl.uniform1f(this.nodeUniforms.pulsePhase, this.pulsePhase);
+
+        gl.bindVertexArray(this.nodeVAO);
+        gl.bindBuffer(gl.ARRAY_BUFFER, this.nodeInstanceVBO);
+        gl.bufferData(gl.ARRAY_BUFFER, ringData.subarray(0, ringCount * NODE_INSTANCE_FLOATS), gl.DYNAMIC_DRAW);
+        // Reset capacity tracking so drawNodes re-uploads properly next frame
+        this.lastNodeInstanceCount = 0;
+
+        gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, ringCount);
+        gl.bindVertexArray(null);
+    }
+
+    /** Draw tinted quads behind cluster members via the edge shader (filled rectangles). */
+    private drawClusterFormOverlay(
+        gl: WebGL2RenderingContext,
+        nodes: SurfaceNode[],
+    ): void {
+        const clusters = this.buildVizState?.clusterMembers;
+        if (!clusters || clusters.size === 0) return;
+
+        const clusterKeys = Array.from(clusters.keys());
+        const hueStep = 360 / Math.max(clusterKeys.length, 1);
+
+        // Build filled quad geometry as two triangles per cluster, using the edge shader
+        // (position + color per vertex). Each cluster = 6 vertices (2 triangles).
+        const maxVerts = clusterKeys.length * 6;
+        const quadData = new Float32Array(maxVerts * EDGE_VERTEX_FLOATS);
+        let vertCount = 0;
+
+        for (let ci = 0; ci < clusterKeys.length; ci++) {
+            const memberIds = clusters.get(clusterKeys[ci]);
+            if (!memberIds || memberIds.length === 0) continue;
+
+            const memberNodes: SurfaceNode[] = [];
+            for (const mid of memberIds) {
+                const n = nodes.find((nd) => nd.id === mid);
+                if (n) memberNodes.push(n);
+            }
+            if (memberNodes.length === 0) continue;
+
+            // Compute bounding box
+            let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+            for (const n of memberNodes) {
+                minX = Math.min(minX, n.x - n.radius);
+                minY = Math.min(minY, n.y - n.radius);
+                maxX = Math.max(maxX, n.x + n.radius);
+                maxY = Math.max(maxY, n.y + n.radius);
+            }
+            const pad = 8;
+            minX -= pad; minY -= pad; maxX += pad; maxY += pad;
+
+            // HSL to RGB for cluster hue
+            const hue = (ci * hueStep) / 360;
+            const rgb = hslToRgb(hue, 0.6, 0.5);
+            const c: ColorF = { r: rgb.r, g: rgb.g, b: rgb.b, a: 0.06 };
+
+            // Two triangles: (minX,minY), (maxX,minY), (maxX,maxY) and (minX,minY), (maxX,maxY), (minX,maxY)
+            const writeVert = (x: number, y: number): void => {
+                const base = vertCount * EDGE_VERTEX_FLOATS;
+                quadData[base + 0] = x;
+                quadData[base + 1] = y;
+                quadData[base + 2] = c.r;
+                quadData[base + 3] = c.g;
+                quadData[base + 4] = c.b;
+                quadData[base + 5] = c.a;
+                vertCount++;
+            };
+
+            writeVert(minX, minY);
+            writeVert(maxX, minY);
+            writeVert(maxX, maxY);
+            writeVert(minX, minY);
+            writeVert(maxX, maxY);
+            writeVert(minX, maxY);
+        }
+
+        if (vertCount === 0) return;
+
+        gl.useProgram(this.edgeProgram);
+        gl.uniform2f(this.edgeUniforms.resolution, this.width, this.height);
+
+        gl.bindVertexArray(this.edgeVAO);
+        gl.bindBuffer(gl.ARRAY_BUFFER, this.edgeVBO);
+        gl.bufferData(gl.ARRAY_BUFFER, quadData.subarray(0, vertCount * EDGE_VERTEX_FLOATS), gl.DYNAMIC_DRAW);
+        // Reset edge vertex tracking
+        this.lastEdgeVertexCount = 0;
+
+        gl.drawArrays(gl.TRIANGLES, 0, vertCount);
         gl.bindVertexArray(null);
     }
 

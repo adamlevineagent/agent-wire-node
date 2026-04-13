@@ -10,7 +10,7 @@
 import { useState, useEffect, useRef, useMemo } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import type { SurfaceNode, SurfaceEdge, StaleLogEntry } from './types';
+import type { SurfaceNode, SurfaceEdge, StaleLogEntry, BuildVizState } from './types';
 import { NodeVisualState } from './types';
 import { flattenTree, addBedrockLayer, computeLayout, deriveNodeStates } from './useUnifiedLayout';
 
@@ -91,6 +91,8 @@ export interface PyramidDataResult {
     buildProgress: { done: number; total: number } | null;
     /** Activity log entries from the build */
     buildLog: LogEntry[];
+    /** Build-time viz state (verdicts, clusters, edges) for primitive-specific rendering */
+    buildVizState: BuildVizState;
     /** Loading state (initial tree fetch) */
     loading: boolean;
 }
@@ -107,6 +109,11 @@ export function usePyramidData(
     const [buildStatus, setBuildStatus] = useState<BuildStatus | null>(null);
     const [buildProgress, setBuildProgress] = useState<BuildProgressV2 | null>(null);
     const [buildNodeStates, setBuildNodeStates] = useState<Map<string, NodeVisualState>>(new Map());
+    const [buildVizState, setBuildVizState] = useState<BuildVizState>({
+        verdictsByNode: new Map(),
+        clusterMembers: new Map(),
+        newEdges: [],
+    });
 
     const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
     const isBuilding = buildStatus?.status === 'running';
@@ -118,6 +125,7 @@ export function usePyramidData(
         setBuildStatus(null);
         setBuildProgress(null);
         setBuildNodeStates(new Map());
+        setBuildVizState({ verdictsByNode: new Map(), clusterMembers: new Map(), newEdges: [] });
         invoke<TreeResponse[]>('pyramid_tree', { slug })
             .then(setTreeData)
             .catch(() => setTreeData(null))
@@ -201,6 +209,49 @@ export function usePyramidData(
                     return next;
                 });
             }
+
+            // ── S2-1: Accumulate viz-primitive-specific state ──
+            if (kind.type === 'verdict_produced' && typeof kind.node_id === 'string') {
+                const verdict = kind.verdict as string;
+                if (verdict === 'KEEP' || verdict === 'DISCONNECT' || verdict === 'MISSING') {
+                    setBuildVizState((prev) => {
+                        const next = { ...prev, verdictsByNode: new Map(prev.verdictsByNode) };
+                        next.verdictsByNode.set(kind.node_id as string, verdict);
+                        return next;
+                    });
+                }
+            }
+
+            if (kind.type === 'cluster_assignment') {
+                const nodeCount = kind.node_count as number;
+                const clusterCount = kind.cluster_count as number;
+                const stepName = kind.step_name as string;
+                if (nodeCount > 0 && clusterCount > 0) {
+                    // ClusterAssignment gives aggregate counts, not per-node membership.
+                    // Store as a synthetic entry — the renderer can use this for step-level indication.
+                    setBuildVizState((prev) => {
+                        const next = { ...prev, clusterMembers: new Map(prev.clusterMembers) };
+                        next.clusterMembers.set(stepName, [`${clusterCount} clusters from ${nodeCount} nodes`]);
+                        return next;
+                    });
+                }
+            }
+
+            if (kind.type === 'edge_created' && typeof kind.source_id === 'string' && typeof kind.target_id === 'string') {
+                setBuildVizState((prev) => ({
+                    ...prev,
+                    newEdges: [...prev.newEdges.slice(-200), { sourceId: kind.source_id as string, targetId: kind.target_id as string }],
+                }));
+            }
+
+            // Clear viz state when a new step starts (fresh state per step)
+            if (kind.type === 'chain_step_started') {
+                setBuildVizState({
+                    verdictsByNode: new Map(),
+                    clusterMembers: new Map(),
+                    newEdges: [],
+                });
+            }
         });
 
         return () => { unlisten.then((fn) => fn()); };
@@ -270,6 +321,7 @@ export function usePyramidData(
             ? { done: buildProgress.done, total: buildProgress.total }
             : null,
         buildLog: buildProgress?.log ?? [],
+        buildVizState,
         loading,
     };
 }

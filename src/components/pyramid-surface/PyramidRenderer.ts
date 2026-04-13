@@ -1,4 +1,4 @@
-import type { SurfaceNode, SurfaceEdge, NodeEncoding, OverlayState, HitTestResult } from './types';
+import type { SurfaceNode, SurfaceEdge, NodeEncoding, OverlayState, HitTestResult, VizPrimitive, BuildVizState } from './types';
 
 /**
  * Abstract renderer interface for the Pyramid Surface.
@@ -27,6 +27,15 @@ export interface PyramidRenderer {
 
     /** Apply encodings in bulk (more efficient than per-node calls). */
     setNodeEncodings(encodings: Map<string, NodeEncoding>): void;
+
+    /** Set the active viz primitive for the current build step. Drives rendering mode. */
+    setActiveVizPrimitive(primitive: VizPrimitive | null): void;
+
+    /** Set build-time viz state (verdicts, clusters, new edges) for primitive-specific rendering. */
+    setBuildVizState(state: BuildVizState): void;
+
+    /** Set per-link visual intensities for importance-weighted edge rendering. */
+    setLinkIntensities(intensities: Map<string, number>): void;
 
     /** Hit test: given viewport coordinates, return the node under the cursor (if any). */
     hitTest(x: number, y: number, nodes: SurfaceNode[]): HitTestResult | null;

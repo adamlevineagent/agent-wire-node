@@ -8,29 +8,35 @@
 
 import { useState, useEffect, useMemo } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import type { VizPrimitive } from './types';
 
-/** Viz primitive types from AD-1 */
-export type VizPrimitive =
-    | 'node_fill'      // Dots appearing in a layer band
-    | 'edge_draw'      // Lines forming between nodes
-    | 'cluster_form'   // Nodes grouping, parent appearing
-    | 'verdict_mark'   // KEEP/DISCONNECT/MISSING indicators
-    | 'progress_only'; // Status text, no structural change
-
-/** Default primitive inference from chain step primitive type */
+/** Default primitive inference from chain step primitive type.
+ *
+ * Keys are the `primitive:` values from chain YAML files (e.g., extract,
+ * web, evidence_loop). NOT the IR dispatch modes (for_each, pair_adjacent,
+ * single) — those are internal to the Rust executor and never appear in
+ * the chain YAML that the IPC returns. */
 const PRIMITIVE_TO_VIZ: Record<string, VizPrimitive> = {
-    for_each: 'node_fill',
-    pair_adjacent: 'node_fill',
-    single: 'node_fill',
-    recursive_cluster: 'cluster_form',
-    recursive_pair: 'cluster_form',
+    // Node-producing primitives → dots appearing
+    extract: 'node_fill',
+    synthesize: 'node_fill',
+    compress: 'node_fill',
+    fuse: 'node_fill',
+    // Edge-producing primitives → lines forming
     web: 'edge_draw',
+    // Evidence primitives → verdict indicators
     evidence_loop: 'verdict_mark',
-    // Recipe primitives → progress only
+    // Clustering primitives → grouping visuals
+    recursive_cluster: 'cluster_form',
+    // Progress-only primitives (no structural viz)
     build_lifecycle: 'progress_only',
     cross_build_input: 'progress_only',
     process_gaps: 'progress_only',
     recursive_decompose: 'progress_only',
+    classify: 'progress_only',
+    container: 'progress_only',
+    loop: 'progress_only',
+    gate: 'progress_only',
 };
 
 interface ChainStep {

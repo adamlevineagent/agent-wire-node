@@ -1,5 +1,5 @@
 import type { PyramidRenderer } from './PyramidRenderer';
-import type { SurfaceNode, SurfaceEdge, NodeEncoding, OverlayState, HitTestResult } from './types';
+import type { SurfaceNode, SurfaceEdge, NodeEncoding, OverlayState, HitTestResult, VizPrimitive, BuildVizState } from './types';
 import { NodeVisualState, EdgeCategory } from './types';
 
 /**
@@ -149,6 +149,18 @@ export class DomRenderer implements PyramidRenderer {
 
     setNodeEncodings(encodings: Map<string, NodeEncoding>): void {
         this.encodings = new Map(encodings);
+    }
+
+    setActiveVizPrimitive(_primitive: VizPrimitive | null): void {
+        // No-op: DOM mode does not render viz overlays
+    }
+
+    setBuildVizState(_state: BuildVizState): void {
+        // No-op: DOM mode does not render viz overlays
+    }
+
+    setLinkIntensities(_intensities: Map<string, number>): void {
+        // No-op: DOM mode does not render link intensities
     }
 
     hitTest(x: number, y: number, nodes: SurfaceNode[]): HitTestResult | null {
