@@ -1,7 +1,6 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
-import { invoke } from '@tauri-apps/api/core';
 import { useVizConfig } from '../../hooks/useVizConfig';
-import { useUnifiedLayout } from './useUnifiedLayout';
+import { usePyramidData } from './usePyramidData';
 import { CanvasRenderer } from './CanvasRenderer';
 import { DomRenderer } from './DomRenderer';
 import { MiniaturePyramid } from './MiniaturePyramid';
@@ -10,7 +9,6 @@ import type {
     SurfaceMode,
     LayoutMode,
     OverlayState,
-    SurfaceNode,
     StaleLogEntry,
 } from './types';
 
@@ -20,17 +18,6 @@ interface PyramidSurfaceProps {
     staleLog?: StaleLogEntry[];
     onNodeClick?: (nodeId: string) => void;
     onNavigateToSlug?: (slug: string, nodeId: string) => void;
-}
-
-interface TreeResponse {
-    id: string;
-    depth: number;
-    headline: string;
-    distilled: string;
-    self_prompt?: string | null;
-    thread_id?: string | null;
-    source_path?: string | null;
-    children: TreeResponse[];
 }
 
 export function PyramidSurface({
@@ -47,7 +34,6 @@ export function PyramidSurface({
     const idleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
     const { config } = useVizConfig(slug);
-    const [treeData, setTreeData] = useState<TreeResponse[] | null>(null);
     const [containerSize, setContainerSize] = useState({ width: 0, height: 0 });
     const [hoveredNodeId, setHoveredNodeId] = useState<string | null>(null);
     const [layoutMode, setLayoutMode] = useState<LayoutMode>('pyramid');
@@ -60,12 +46,22 @@ export function PyramidSurface({
         weightIntensity: config.overlays.weight_intensity,
     });
 
-    // ── Load tree data ──────────────────────────────────────────────
+    // ── Unified data: static tree + build progress + event bus ───────
+    const {
+        nodes,
+        edges,
+        isBuilding,
+        currentStep,
+        buildProgress: buildProg,
+        loading,
+    } = usePyramidData(slug, containerSize.width, containerSize.height, staleLog);
+
+    // Auto-enable build overlay when building
     useEffect(() => {
-        invoke<TreeResponse[]>('pyramid_tree', { slug })
-            .then(setTreeData)
-            .catch(() => setTreeData(null));
-    }, [slug]);
+        if (isBuilding) {
+            setOverlays((prev) => ({ ...prev, build: true }));
+        }
+    }, [isBuilding]);
 
     // ── Observe container size ──────────────────────────────────────
     useEffect(() => {
@@ -83,14 +79,6 @@ export function PyramidSurface({
         ro.observe(el);
         return () => ro.disconnect();
     }, []);
-
-    // ── Compute layout ──────────────────────────────────────────────
-    const { nodes, edges } = useUnifiedLayout(
-        treeData,
-        containerSize.width,
-        containerSize.height,
-        staleLog,
-    );
 
     // ── Miniature mode (for ticker/nested) ──────────────────────────
     const miniatureLayers = useMemo(() => {
@@ -282,6 +270,23 @@ export function PyramidSurface({
                     ))}
                 </div>
             </div>
+
+            {/* Build status bar */}
+            {isBuilding && (
+                <div className="ps-build-bar">
+                    <span className="ps-build-step">{currentStep ?? 'Building...'}</span>
+                    {buildProg && (
+                        <span className="ps-build-progress">
+                            {buildProg.done}/{buildProg.total}
+                        </span>
+                    )}
+                </div>
+            )}
+
+            {/* Loading indicator */}
+            {loading && nodes.length === 0 && (
+                <div className="ps-loading">Loading pyramid...</div>
+            )}
 
             {/* Canvas container — tooltip lives here so node coords align */}
             <div
