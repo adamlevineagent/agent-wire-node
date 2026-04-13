@@ -2,9 +2,13 @@ import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { useVizConfig } from '../../hooks/useVizConfig';
 import { usePyramidData } from './usePyramidData';
 import { useVisualEncoding } from './useVisualEncoding';
+import { useChronicleStream } from './useChronicleStream';
 import { CanvasRenderer } from './CanvasRenderer';
 import { DomRenderer } from './DomRenderer';
 import { MiniaturePyramid } from './MiniaturePyramid';
+import { Chronicle } from './Chronicle';
+import { EventTicker } from './EventTicker';
+import { Minimap } from './Minimap';
 import type { PyramidRenderer } from './PyramidRenderer';
 import type {
     SurfaceMode,
@@ -47,6 +51,10 @@ export function PyramidSurface({
         weightIntensity: config.overlays.weight_intensity,
     });
 
+    // ── Chronicle event stream (Phase 4) ─────────────────────────────
+    const { entries: chronicleEntries, generation: chronicleGen, clear: _clearChronicle } = useChronicleStream(slug);
+    const [chronicleOpen, setChronicleOpen] = useState(false);
+
     // ── Unified data: static tree + build progress + event bus ───────
     const {
         nodes,
@@ -70,10 +78,11 @@ export function PyramidSurface({
         }
     }, [visualEncodings]);
 
-    // Auto-enable build overlay when building
+    // Auto-enable build overlay and open chronicle when building
     useEffect(() => {
         if (isBuilding) {
             setOverlays((prev) => ({ ...prev, build: true }));
+            setChronicleOpen(true);
         }
     }, [isBuilding]);
 
@@ -252,6 +261,16 @@ export function PyramidSurface({
         );
     }
 
+    // ── Toggle chronicle panel ────────────────────────────────────────
+    const toggleChronicle = useCallback(() => {
+        setChronicleOpen((prev) => !prev);
+    }, []);
+
+    // ── Handle ticker entry click → open chronicle ─────────────────
+    const handleTickerClick = useCallback(() => {
+        setChronicleOpen(true);
+    }, []);
+
     // ── Full mode ───────────────────────────────────────────────────
     return (
         <div className="ps-full">
@@ -282,6 +301,13 @@ export function PyramidSurface({
                             {key === 'weightIntensity' ? 'Weight' : key.charAt(0).toUpperCase() + key.slice(1)}
                         </button>
                     ))}
+                    <button
+                        className={`ps-overlay-btn ${chronicleOpen ? 'active' : ''}`}
+                        onClick={toggleChronicle}
+                        title="Chronicle"
+                    >
+                        Chronicle
+                    </button>
                 </div>
             </div>
 
@@ -335,7 +361,38 @@ export function PyramidSurface({
                         </div>
                     );
                 })()}
+
+                {/* Minimap overlay — top-right corner of canvas */}
+                {miniatureLayers.length > 0 && (
+                    <div className="ps-minimap-overlay">
+                        <Minimap
+                            layers={miniatureLayers}
+                            maxDotsPerLayer={config.rendering.max_dots_per_layer}
+                        />
+                    </div>
+                )}
             </div>
+
+            {/* Chronicle panel — collapsible below the canvas */}
+            {chronicleOpen && (
+                <Chronicle
+                    slug={slug}
+                    entries={chronicleEntries}
+                    generation={chronicleGen}
+                    onArtifactClick={onNodeClick}
+                    showMechanicalOps={config.chronicle.show_mechanical_ops}
+                    autoExpandDecisions={config.chronicle.auto_expand_decisions}
+                />
+            )}
+
+            {/* Event Ticker — bottom bar, always visible when entries exist */}
+            {config.ticker.enabled && (
+                <EventTicker
+                    entries={chronicleEntries}
+                    generation={chronicleGen}
+                    onEntryClick={handleTickerClick}
+                />
+            )}
         </div>
     );
 }
