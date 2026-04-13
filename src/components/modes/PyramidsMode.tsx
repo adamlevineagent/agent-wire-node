@@ -1,12 +1,16 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { PyramidDashboard } from '../PyramidDashboard';
 import { PyramidFirstRun } from '../PyramidFirstRun';
 import { CrossPyramidTimeline } from '../CrossPyramidTimeline';
 import { DadbearOversightPage } from '../DadbearOversightPage';
+import { GridView } from '../pyramid-surface/GridView';
 import { SlugInfo, PyramidConfigInfo } from '../pyramid-types';
 
-type PyramidsTab = 'dashboard' | 'builds' | 'oversight';
+type PyramidsTab = 'dashboard' | 'grid' | 'builds' | 'oversight';
+
+/** Default max dots per layer — matches useVizConfig default */
+const GRID_MAX_DOTS_PER_LAYER = 10;
 
 export function PyramidsMode() {
     const [showFirstRun, setShowFirstRun] = useState(false);
@@ -40,6 +44,12 @@ export function PyramidsMode() {
         );
     }
 
+    // When a card is clicked in the grid, switch to dashboard tab
+    // (PyramidDashboard manages its own selected slug internally)
+    const handleGridSelectPyramid = useCallback((_slug: string) => {
+        setTab('dashboard');
+    }, []);
+
     if (showFirstRun) {
         return <PyramidFirstRun onComplete={() => setShowFirstRun(false)} />;
     }
@@ -52,6 +62,12 @@ export function PyramidsMode() {
                     onClick={() => setTab('dashboard')}
                 >
                     Dashboard
+                </button>
+                <button
+                    className={`pyramids-mode-tab ${tab === 'grid' ? 'pyramids-mode-tab-active' : ''}`}
+                    onClick={() => setTab('grid')}
+                >
+                    Grid
                 </button>
                 <button
                     className={`pyramids-mode-tab ${tab === 'builds' ? 'pyramids-mode-tab-active' : ''}`}
@@ -67,6 +83,12 @@ export function PyramidsMode() {
                 </button>
             </div>
             {tab === 'dashboard' && <PyramidDashboard />}
+            {tab === 'grid' && (
+                <GridView
+                    onSelectPyramid={handleGridSelectPyramid}
+                    maxDotsPerLayer={GRID_MAX_DOTS_PER_LAYER}
+                />
+            )}
             {tab === 'builds' && <CrossPyramidTimeline />}
             {tab === 'oversight' && <DadbearOversightPage />}
         </div>

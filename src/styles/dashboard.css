@@ -22177,3 +22177,271 @@ body {
     padding: 4px;
     pointer-events: none;
 }
+
+/* ══════════════════════════════════════════════════════════════════
+   Phase 5: Grid View / Mission Control
+   ══════════════════════════════════════════════════════════════════ */
+
+/* ── Grid wrapper + controls ──────────────────────────────────── */
+
+.ps-grid-wrapper {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    padding: 16px;
+    height: 100%;
+    overflow-y: auto;
+}
+
+.ps-grid-controls {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    flex-shrink: 0;
+}
+
+.ps-grid-sort-group {
+    display: flex;
+    gap: 2px;
+    background: var(--glass);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-sm);
+    padding: 2px;
+}
+
+.ps-grid-sort-btn {
+    background: none;
+    border: none;
+    color: var(--text-muted);
+    font-size: 11px;
+    font-weight: 500;
+    padding: 4px 10px;
+    border-radius: 6px;
+    cursor: pointer;
+    transition: color var(--transition), background var(--transition);
+}
+
+.ps-grid-sort-btn:hover {
+    color: var(--text-secondary);
+    background: rgba(255, 255, 255, 0.04);
+}
+
+.ps-grid-sort-btn.active {
+    color: var(--accent-cyan);
+    background: rgba(34, 211, 238, 0.1);
+}
+
+.ps-grid-refresh-btn {
+    background: none;
+    border: 1px solid var(--glass-border);
+    color: var(--text-muted);
+    font-size: 11px;
+    font-weight: 500;
+    padding: 4px 10px;
+    border-radius: 6px;
+    cursor: pointer;
+    transition: color var(--transition), border-color var(--transition);
+}
+
+.ps-grid-refresh-btn:hover {
+    color: var(--text-secondary);
+    border-color: rgba(255, 255, 255, 0.15);
+}
+
+/* ── Responsive CSS grid ──────────────────────────────────────── */
+
+.ps-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+    gap: 12px;
+    align-content: start;
+}
+
+/* ── Individual card ──────────────────────────────────────────── */
+
+.ps-card {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+    padding: 14px 10px 12px;
+    background: var(--bg-card);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-md);
+    cursor: pointer;
+    transition: background var(--transition), border-color var(--transition), transform var(--transition);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+    overflow: hidden;
+    text-align: center;
+    /* Reset button styles */
+    font-family: inherit;
+    font-size: inherit;
+    color: inherit;
+    line-height: inherit;
+}
+
+.ps-card:hover {
+    background: var(--bg-card-hover);
+    border-color: rgba(255, 255, 255, 0.14);
+    transform: translateY(-1px);
+}
+
+.ps-card:active {
+    transform: translateY(0);
+}
+
+/* ── Activity glow overlay ────────────────────────────────────── */
+
+.ps-card-glow {
+    position: absolute;
+    inset: -1px;
+    border-radius: var(--radius-md);
+    pointer-events: none;
+    opacity: calc(var(--glow-intensity, 0) * 0.6);
+    background: radial-gradient(
+        ellipse at center,
+        rgba(34, 211, 238, 0.25) 0%,
+        rgba(34, 211, 238, 0.08) 50%,
+        transparent 80%
+    );
+    transition: opacity 1s ease-out;
+}
+
+/* ── Miniature pyramid container ──────────────────────────────── */
+
+.ps-card-mini {
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 140px;
+    height: 80px;
+    flex-shrink: 0;
+}
+
+/* ── Slug name ────────────────────────────────────────────────── */
+
+.ps-card-name {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-primary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 100%;
+    letter-spacing: 0.01em;
+}
+
+/* ── Stats row ────────────────────────────────────────────────── */
+
+.ps-card-stats {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    font-size: 10px;
+    color: var(--text-muted);
+}
+
+.ps-card-stat {
+    white-space: nowrap;
+}
+
+/* ── Content type badge ───────────────────────────────────────── */
+
+.ps-card-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    font-size: 9px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    padding: 1px 6px;
+    border-radius: 8px;
+    border: 1px solid;
+    background: rgba(255, 255, 255, 0.03);
+    white-space: nowrap;
+}
+
+/* ── Building indicator ───────────────────────────────────────── */
+
+.ps-card-building {
+    position: absolute;
+    bottom: 4px;
+    left: 50%;
+    transform: translateX(-50%);
+    display: flex;
+    gap: 4px;
+    align-items: center;
+}
+
+.ps-card-building-dot {
+    display: block;
+    width: 4px;
+    height: 4px;
+    border-radius: 50%;
+    background: var(--accent-cyan);
+    animation: ps-building-pulse 1.4s ease-in-out infinite;
+}
+
+.ps-card-building-dot:nth-child(2) {
+    animation-delay: 0.2s;
+}
+
+.ps-card-building-dot:nth-child(3) {
+    animation-delay: 0.4s;
+}
+
+@keyframes ps-building-pulse {
+    0%, 80%, 100% { opacity: 0.25; transform: scale(0.8); }
+    40% { opacity: 1; transform: scale(1.2); }
+}
+
+/* ── Empty state ──────────────────────────────────────────────── */
+
+.ps-grid-empty {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    padding: 60px 20px;
+    height: 100%;
+}
+
+.ps-grid-empty-title {
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--text-secondary);
+}
+
+.ps-grid-empty-sub {
+    font-size: 12px;
+    color: var(--text-muted);
+}
+
+/* ── Loading state ────────────────────────────────────────────── */
+
+.ps-grid-loading {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 60px 20px;
+    height: 100%;
+}
+
+.ps-grid-loading-text {
+    font-size: 13px;
+    color: var(--text-muted);
+    animation: ps-grid-loading-fade 1.5s ease-in-out infinite alternate;
+}
+
+@keyframes ps-grid-loading-fade {
+    from { opacity: 0.4; }
+    to { opacity: 1; }
+}
