@@ -975,6 +975,8 @@ pub async fn build_bunch(
             credential_store: state.credential_store.clone(),
             schema_registry: state.schema_registry.clone(),
             cross_pyramid_router: state.cross_pyramid_router.clone(),
+            ollama_pull_cancel: state.ollama_pull_cancel.clone(),
+            ollama_pull_in_progress: state.ollama_pull_in_progress.clone(),
         }),
     };
 

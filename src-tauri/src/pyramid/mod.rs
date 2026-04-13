@@ -878,6 +878,16 @@ pub struct PyramidState {
     /// re-emits every build event as a `cross-build-event` so the
     /// frontend can listen once across all slugs.
     pub cross_pyramid_router: Arc<cross_pyramid_router::CrossPyramidEventRouter>,
+    /// Phase 4 Daemon Control Plane: cancellation flag for an in-flight
+    /// Ollama model pull. The pull IPC sets this to `false` on start;
+    /// the cancel IPC sets it to `true`. The pull loop in
+    /// `local_mode::pull_ollama_model` checks between chunks.
+    pub ollama_pull_cancel: Arc<AtomicBool>,
+    /// Phase 4 Daemon Control Plane: guards against concurrent pulls.
+    /// Contains `Some(model_name)` while a pull is active, `None`
+    /// otherwise. The pull IPC checks this before starting and sets it;
+    /// the cancel and completion paths clear it.
+    pub ollama_pull_in_progress: Arc<tokio::sync::Mutex<Option<String>>>,
 }
 
 impl PyramidState {
@@ -992,6 +1002,8 @@ impl PyramidState {
             credential_store: self.credential_store.clone(),
             schema_registry: self.schema_registry.clone(),
             cross_pyramid_router: self.cross_pyramid_router.clone(),
+            ollama_pull_cancel: self.ollama_pull_cancel.clone(),
+            ollama_pull_in_progress: self.ollama_pull_in_progress.clone(),
         }))
     }
 }

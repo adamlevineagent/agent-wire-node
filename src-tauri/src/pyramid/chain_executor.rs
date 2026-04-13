@@ -14970,6 +14970,8 @@ mod tests {
             cross_pyramid_router: std::sync::Arc::new(
                 crate::pyramid::cross_pyramid_router::CrossPyramidEventRouter::new(),
             ),
+            ollama_pull_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            ollama_pull_in_progress: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
         };
 
         let chain = make_integration_code_chain();
@@ -15074,6 +15076,8 @@ mod tests {
             cross_pyramid_router: std::sync::Arc::new(
                 crate::pyramid::cross_pyramid_router::CrossPyramidEventRouter::new(),
             ),
+            ollama_pull_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            ollama_pull_in_progress: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
         };
 
         let chain = make_integration_code_chain();
@@ -15198,6 +15202,8 @@ mod tests {
             cross_pyramid_router: std::sync::Arc::new(
                 crate::pyramid::cross_pyramid_router::CrossPyramidEventRouter::new(),
             ),
+            ollama_pull_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            ollama_pull_in_progress: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
         };
 
         assert!(!pyramid_state
@@ -15286,6 +15292,8 @@ mod tests {
             cross_pyramid_router: std::sync::Arc::new(
                 crate::pyramid::cross_pyramid_router::CrossPyramidEventRouter::new(),
             ),
+            ollama_pull_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            ollama_pull_in_progress: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
         };
 
         let chain = make_integration_code_chain();

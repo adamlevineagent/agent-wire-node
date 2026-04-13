@@ -1,7 +1,9 @@
 import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { useLocalMode, type OllamaProbeResult, type OllamaModelInfo } from "../hooks/useLocalMode";
 import { AccordionSection } from "./AccordionSection";
+import type { TaggedBuildEvent } from "../hooks/useBuildRowState";
 
 // --- Types ------------------------------------------------------------------
 
@@ -65,6 +67,19 @@ export function Settings() {
     // Phase 3: Context and concurrency override form state
     const [contextInput, setContextInput] = useState<string>("");
     const [concurrencyInput, setConcurrencyInput] = useState<number>(1);
+
+    // Phase 4: Pull model state
+    const [pullModelInput, setPullModelInput] = useState("");
+    const [pulling, setPulling] = useState(false);
+    const [pullProgress, setPullProgress] = useState<{
+        model: string;
+        status: string;
+        completedBytes: number | null;
+        totalBytes: number | null;
+    } | null>(null);
+    // Phase 4: Delete model confirmation state — holds the model name
+    // being confirmed for deletion, or null when no confirmation is active.
+    const [deletingModel, setDeletingModel] = useState<string | null>(null);
 
     // Sync local form state with the hook's status whenever it
     // refreshes — so the URL and dropdown reflect the persisted
@@ -134,6 +149,49 @@ export function Settings() {
         }
     }, [localMode.status]); // eslint-disable-line react-hooks/exhaustive-deps
 
+    // Phase 4: Subscribe to Ollama pull progress events from the
+    // BuildEventBus. The backend emits TaggedBuildEvent with slug
+    // "__ollama__" and kind.type "ollama_pull" for pull progress.
+    useEffect(() => {
+        let unlisten: UnlistenFn | null = null;
+        let active = true;
+
+        (async () => {
+            try {
+                unlisten = await listen<TaggedBuildEvent>("cross-build-event", (ev) => {
+                    if (!active) return;
+                    const payload = ev.payload;
+                    if (!payload || payload.slug !== "__ollama__") return;
+                    const kind = payload.kind;
+                    if (kind.type !== "ollama_pull") return;
+
+                    // Extract pull progress fields from the event.
+                    const model = (kind as Record<string, unknown>).model as string;
+                    const status = (kind as Record<string, unknown>).status as string;
+                    const completedBytes = (kind as Record<string, unknown>).completed_bytes as number | null;
+                    const totalBytes = (kind as Record<string, unknown>).total_bytes as number | null;
+
+                    if (status === "success") {
+                        // Pull completed — clear progress and refresh model list.
+                        setPullProgress(null);
+                        setPulling(false);
+                        // Trigger a probe refresh to pick up the new model.
+                        handleProbe();
+                    } else {
+                        setPullProgress({ model, status, completedBytes, totalBytes });
+                    }
+                });
+            } catch (e) {
+                console.warn("Settings: listen for pull events failed", e);
+            }
+        })();
+
+        return () => {
+            active = false;
+            if (unlisten) unlisten();
+        };
+    }, [handleProbe]);
+
     const handleEnableLocalMode = useCallback(async () => {
         // Need a model selection — fall back to the probe's first
         // result if the dropdown is empty.
@@ -153,6 +211,48 @@ export function Settings() {
         setConfirmingDisable(false);
         await localMode.disable();
     }, [localMode, confirmingDisable]);
+
+    // Phase 4: Pull model handler
+    const handlePullModel = useCallback(async () => {
+        const model = pullModelInput.trim();
+        if (!model) return;
+        setPulling(true);
+        setPullProgress({ model, status: "starting pull...", completedBytes: null, totalBytes: null });
+        try {
+            await localMode.pullModel(model);
+            // pullModel calls refresh() internally on success.
+            // The event listener handles clearing progress on "success" event,
+            // but if the IPC returns before we get the final event (unlikely),
+            // clean up here too.
+            setPullProgress(null);
+            setPulling(false);
+            setPullModelInput("");
+            // Re-probe to pick up new model in the list.
+            handleProbe();
+        } catch {
+            // Error is surfaced via localMode.error
+            setPullProgress(null);
+            setPulling(false);
+        }
+    }, [pullModelInput, localMode, handleProbe]);
+
+    const handleCancelPull = useCallback(async () => {
+        await localMode.cancelPull();
+        setPullProgress(null);
+        setPulling(false);
+    }, [localMode]);
+
+    // Phase 4: Delete model handler
+    const handleDeleteModel = useCallback(async (model: string) => {
+        setDeletingModel(null);
+        try {
+            await localMode.deleteModel(model);
+            // deleteModel calls refresh() internally. Re-probe to update card list.
+            handleProbe();
+        } catch {
+            // Error is surfaced via localMode.error
+        }
+    }, [localMode, handleProbe]);
 
     // Format bytes as human-readable (MB/GB).
     const formatBytes = (bytes: number): string => {
@@ -519,54 +619,104 @@ export function Settings() {
                                         localModelChoice === m.name ||
                                         (localMode.status?.enabled && localMode.status.model === m.name);
                                     return (
-                                        <div
-                                            key={m.name}
-                                            className={`model-card ${isActive ? "model-card-active" : ""} ${localMode.loading ? "model-card-disabled" : ""}`}
-                                            role="button"
-                                            tabIndex={0}
-                                            aria-pressed={isActive}
-                                            onClick={async () => {
-                                                if (localMode.loading) return;
-                                                if (localMode.status?.enabled) {
-                                                    await localMode.switchModel(m.name);
-                                                } else {
-                                                    setLocalModelChoice(m.name);
-                                                }
-                                                // Lazy-load context window if missing
-                                                if (m.context_window == null && !detailsCache[m.name]) {
-                                                    loadModelDetails(m.name);
-                                                }
-                                            }}
-                                            onKeyDown={(e) => {
-                                                if (e.key === "Enter" || e.key === " ") {
-                                                    e.preventDefault();
-                                                    (e.currentTarget as HTMLElement).click();
-                                                }
-                                            }}
-                                        >
-                                            <div className="model-card-top-row">
-                                                <span className="model-card-name">{m.name}</span>
-                                                <div className="model-card-badges">
-                                                    {isActive && (
-                                                        <span className="model-card-badge model-card-badge-active">Active</span>
-                                                    )}
-                                                    {m.parameter_size && (
-                                                        <span className="model-card-badge">{m.parameter_size}</span>
-                                                    )}
-                                                    {m.quantization_level && (
-                                                        <span className="model-card-badge">{m.quantization_level}</span>
+                                        <div key={m.name}>
+                                            <div
+                                                className={`model-card ${isActive ? "model-card-active" : ""} ${localMode.loading ? "model-card-disabled" : ""}`}
+                                                role="button"
+                                                tabIndex={0}
+                                                aria-pressed={isActive}
+                                                onClick={async () => {
+                                                    if (localMode.loading) return;
+                                                    if (localMode.status?.enabled) {
+                                                        await localMode.switchModel(m.name);
+                                                    } else {
+                                                        setLocalModelChoice(m.name);
+                                                    }
+                                                    // Lazy-load context window if missing
+                                                    if (m.context_window == null && !detailsCache[m.name]) {
+                                                        loadModelDetails(m.name);
+                                                    }
+                                                }}
+                                                onKeyDown={(e) => {
+                                                    if (e.key === "Enter" || e.key === " ") {
+                                                        e.preventDefault();
+                                                        (e.currentTarget as HTMLElement).click();
+                                                    }
+                                                }}
+                                            >
+                                                <div className="model-card-top-row">
+                                                    <span className="model-card-name">{m.name}</span>
+                                                    <div className="model-card-badges">
+                                                        {isActive && (
+                                                            <span className="model-card-badge model-card-badge-active">Active</span>
+                                                        )}
+                                                        {m.parameter_size && (
+                                                            <span className="model-card-badge">{m.parameter_size}</span>
+                                                        )}
+                                                        {m.quantization_level && (
+                                                            <span className="model-card-badge">{m.quantization_level}</span>
+                                                        )}
+                                                    </div>
+                                                    {/* Phase 4: Delete button — hidden on active model */}
+                                                    {!isActive && (
+                                                        <button
+                                                            type="button"
+                                                            className="model-card-delete"
+                                                            title={`Delete ${m.name}`}
+                                                            onClick={(e) => {
+                                                                e.stopPropagation();
+                                                                setDeletingModel(m.name);
+                                                            }}
+                                                            disabled={localMode.loading}
+                                                        >
+                                                            &times;
+                                                        </button>
                                                     )}
                                                 </div>
+                                                {(m.size_bytes > 0 || m.context_window != null) && (
+                                                    <div className="model-card-size">
+                                                        {m.size_bytes > 0 && formatBytes(m.size_bytes)}
+                                                        {m.size_bytes > 0 && m.context_window != null && " \u00b7 "}
+                                                        {m.context_window != null
+                                                            ? `${Math.round(m.context_window / 1000)}K ctx`
+                                                            : detailsLoading[m.name]
+                                                                ? "\u2026"
+                                                                : null}
+                                                    </div>
+                                                )}
                                             </div>
-                                            {(m.size_bytes > 0 || m.context_window != null) && (
-                                                <div className="model-card-size">
-                                                    {m.size_bytes > 0 && formatBytes(m.size_bytes)}
-                                                    {m.size_bytes > 0 && m.context_window != null && " \u00b7 "}
-                                                    {m.context_window != null
-                                                        ? `${Math.round(m.context_window / 1000)}K ctx`
-                                                        : detailsLoading[m.name]
-                                                            ? "\u2026"
-                                                            : null}
+                                            {/* Phase 4: Delete confirmation */}
+                                            {deletingModel === m.name && (
+                                                <div className="model-delete-confirm">
+                                                    <div className="model-delete-confirm-text">
+                                                        Delete <strong>{m.name}</strong>? This removes model files from Ollama.
+                                                    </div>
+                                                    <div className="model-delete-confirm-warning">
+                                                        If a build is in progress, deleting may cause it to fail.
+                                                    </div>
+                                                    <div className="model-delete-confirm-actions">
+                                                        <button
+                                                            type="button"
+                                                            className="compose-btn"
+                                                            onClick={(e) => {
+                                                                e.stopPropagation();
+                                                                setDeletingModel(null);
+                                                            }}
+                                                        >
+                                                            Cancel
+                                                        </button>
+                                                        <button
+                                                            type="button"
+                                                            className="model-delete-confirm-btn"
+                                                            disabled={localMode.loading}
+                                                            onClick={(e) => {
+                                                                e.stopPropagation();
+                                                                handleDeleteModel(m.name);
+                                                            }}
+                                                        >
+                                                            Delete
+                                                        </button>
+                                                    </div>
                                                 </div>
                                             )}
                                         </div>
@@ -715,6 +865,76 @@ export function Settings() {
                         </AccordionSection>
                     </div>
                 )}
+
+                {/* Phase 4: Pull Model */}
+                <div style={{ marginTop: 12 }}>
+                    <AccordionSection title="Pull Model">
+                        <div className="pull-section">
+                            <div className="pull-input-row">
+                                <input
+                                    type="text"
+                                    className="settings-input pull-input"
+                                    value={pullModelInput}
+                                    onChange={(e) => setPullModelInput(e.target.value)}
+                                    placeholder="e.g. llama3.2:latest"
+                                    disabled={pulling}
+                                    onKeyDown={(e) => {
+                                        if (e.key === "Enter" && !pulling && pullModelInput.trim()) {
+                                            handlePullModel();
+                                        }
+                                    }}
+                                />
+                                <button
+                                    type="button"
+                                    className="compose-btn"
+                                    disabled={pulling || localMode.loading || !pullModelInput.trim()}
+                                    onClick={handlePullModel}
+                                >
+                                    Pull Model
+                                </button>
+                                {pulling && (
+                                    <button
+                                        type="button"
+                                        className="pull-cancel-btn"
+                                        onClick={handleCancelPull}
+                                    >
+                                        Cancel
+                                    </button>
+                                )}
+                            </div>
+                            <a
+                                href="https://ollama.com/library"
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="pull-browse-link"
+                            >
+                                Browse Ollama Library
+                            </a>
+                            {pullProgress && (
+                                <div className="pull-progress-area">
+                                    <div className="pull-status">
+                                        {pullProgress.status}
+                                        {pullProgress.completedBytes != null && pullProgress.totalBytes != null && pullProgress.totalBytes > 0 && (
+                                            <span className="pull-status-bytes">
+                                                {" "}{formatBytes(pullProgress.completedBytes)} / {formatBytes(pullProgress.totalBytes)}
+                                            </span>
+                                        )}
+                                    </div>
+                                    {pullProgress.totalBytes != null && pullProgress.totalBytes > 0 && (
+                                        <div className="pull-progress">
+                                            <div
+                                                className="pull-progress-bar"
+                                                style={{
+                                                    width: `${Math.min(100, Math.round(((pullProgress.completedBytes ?? 0) / pullProgress.totalBytes) * 100))}%`,
+                                                }}
+                                            />
+                                        </div>
+                                    )}
+                                </div>
+                            )}
+                        </div>
+                    </AccordionSection>
+                </div>
 
                 {/* Status line */}
                 <div style={{ marginTop: 12, fontSize: 12 }}>

@@ -420,6 +420,29 @@ pub enum TaggedKind {
         breaker_tripped: bool,
         auto_update: bool,
     },
+
+    // ── Phase 4 Daemon Control Plane: Ollama model pull progress ────
+    //
+    // Emitted by `pull_ollama_model` as it streams the chunked JSON
+    // response from `POST /api/pull`. The outer `TaggedBuildEvent.slug`
+    // is set to `"__ollama__"` (a reserved non-pyramid slug per AD-3)
+    // so downstream consumers can distinguish pull events from pyramid
+    // build events. The frontend event handler must filter `__ollama__`
+    // slug events out of pyramid timeline rendering and route them to
+    // the Ollama pull progress UI instead.
+    //
+    // Ollama pull phases:
+    //   1. "pulling manifest" (no bytes)
+    //   2. "pulling <digest>" with total/completed (progress)
+    //   3. "verifying sha256 digest" (no bytes)
+    //   4. "writing manifest" (no bytes)
+    //   5. "success" (complete)
+    OllamaPull {
+        model: String,
+        status: String,
+        completed_bytes: Option<u64>,
+        total_bytes: Option<u64>,
+    },
 }
 
 impl TaggedKind {
@@ -429,7 +452,9 @@ impl TaggedKind {
     pub fn is_discrete(&self) -> bool {
         !matches!(
             self,
-            TaggedKind::Progress { .. } | TaggedKind::V2Snapshot(_)
+            TaggedKind::Progress { .. }
+                | TaggedKind::V2Snapshot(_)
+                | TaggedKind::OllamaPull { .. }
         )
     }
 }

@@ -843,6 +843,8 @@ mod tests {
             cross_pyramid_router: Arc::new(
                 crate::pyramid::cross_pyramid_router::CrossPyramidEventRouter::new(),
             ),
+            ollama_pull_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            ollama_pull_in_progress: Arc::new(tokio::sync::Mutex::new(None)),
         });
         (state, dir)
     }

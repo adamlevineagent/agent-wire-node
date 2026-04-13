@@ -88,6 +88,9 @@ export function useCrossPyramidTimeline() {
                     if (!active) return;
                     const payload = ev.payload;
                     if (!payload) return;
+                    // Filter out non-pyramid events (e.g. __ollama__ pull
+                    // progress) so they don't create phantom timeline rows.
+                    if (payload.slug === '__ollama__') return;
                     setState(prev => {
                         const nextMap = new Map(prev.byslug);
                         const slugState =

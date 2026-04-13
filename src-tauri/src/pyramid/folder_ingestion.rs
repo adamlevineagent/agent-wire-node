@@ -3560,6 +3560,8 @@ mod phase18e_tests {
             cross_pyramid_router: StdArc::new(
                 crate::pyramid::cross_pyramid_router::CrossPyramidEventRouter::new(),
             ),
+            ollama_pull_cancel: StdArc::new(std::sync::atomic::AtomicBool::new(false)),
+            ollama_pull_in_progress: StdArc::new(tokio::sync::Mutex::new(None)),
         });
         (state, dir)
     }

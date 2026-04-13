@@ -50,6 +50,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -1508,6 +1509,180 @@ pub fn set_concurrency_override(
 
     // Refresh in-memory registry.
     registry.load_from_db(conn)?;
+
+    Ok(())
+}
+
+// ── Phase 4 Daemon Control Plane: Pull + Delete ────────────────────────────
+
+/// Reserved non-pyramid slug for Ollama pull events (AD-3). Used as the
+/// outer `TaggedBuildEvent.slug` so downstream consumers can distinguish
+/// pull progress from pyramid build events. Must NOT be empty string —
+/// empty-slug events pollute the `useCrossPyramidTimeline` hook's `bySlug`
+/// Map, creating a phantom timeline entry for a non-existent pyramid.
+pub const OLLAMA_EVENT_SLUG: &str = "__ollama__";
+
+/// Pull an Ollama model with streaming progress, broadcasting each chunk
+/// as a `TaggedBuildEvent` on the build event bus.
+///
+/// Ollama's `POST /api/pull` returns newline-delimited JSON chunks in
+/// phases:
+///   1. `{"status": "pulling manifest"}` (no bytes)
+///   2. `{"status": "pulling <digest>", "digest": "...", "total": N, "completed": N}`
+///   3. `{"status": "verifying sha256 digest"}` (no bytes)
+///   4. `{"status": "writing manifest"}` (no bytes)
+///   5. `{"status": "success"}` (complete)
+///
+/// Between chunks, the `cancel` flag is checked. If set, the stream is
+/// dropped and the function returns an error. The caller (the IPC handler)
+/// is responsible for managing the `cancel` flag and the `pull_in_progress`
+/// mutex.
+pub async fn pull_ollama_model(
+    base_url: &str,
+    model: &str,
+    bus: &Arc<BuildEventBus>,
+    cancel: &AtomicBool,
+) -> Result<()> {
+    use crate::pyramid::event_bus::{TaggedBuildEvent, TaggedKind};
+
+    let native = native_root_for(base_url);
+    let url = format!("{native}/api/pull");
+    let req_body = serde_json::json!({ "model": model });
+
+    let response = crate::pyramid::llm::HTTP_CLIENT
+        .post(&url)
+        .json(&req_body)
+        .send()
+        .await
+        .with_context(|| format!("POST {url} for model {model} failed (is Ollama running?)"))?;
+
+    if !response.status().is_success() {
+        bail!(
+            "POST {url} for model {model} returned status {}",
+            response.status()
+        );
+    }
+
+    // Stream the response body chunk by chunk. Ollama sends newline-
+    // delimited JSON — each chunk may contain one or more complete JSON
+    // lines, or a partial line that spans two chunks. We accumulate a
+    // line buffer and process complete lines as they arrive.
+    let mut line_buf = String::new();
+    let mut response = response;
+
+    loop {
+        // Check cancellation before each chunk read.
+        if cancel.load(Ordering::Relaxed) {
+            // Drop the response (closes the connection) and report.
+            drop(response);
+            bail!("Pull of model {model} was cancelled");
+        }
+
+        let chunk = response
+            .chunk()
+            .await
+            .with_context(|| format!("reading pull stream for model {model}"))?;
+
+        let Some(chunk) = chunk else {
+            // Stream ended without a "success" status. This can happen
+            // if the model was already present and Ollama short-circuits.
+            break;
+        };
+
+        // Append raw bytes to the line buffer.
+        let text = String::from_utf8_lossy(&chunk);
+        line_buf.push_str(&text);
+
+        // Process complete lines (newline-delimited JSON).
+        while let Some(newline_pos) = line_buf.find('\n') {
+            let line: String = line_buf.drain(..=newline_pos).collect();
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+
+            // Parse the JSON line. If it fails, log and skip — Ollama
+            // occasionally sends empty or malformed lines during early
+            // manifest phases.
+            let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) else {
+                tracing::debug!(line = line, "skipping unparseable pull chunk");
+                continue;
+            };
+
+            let status = obj
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let completed_bytes = obj.get("completed").and_then(|v| v.as_u64());
+            let total_bytes = obj.get("total").and_then(|v| v.as_u64());
+
+            // Broadcast the event.
+            let _ = bus.tx.send(TaggedBuildEvent {
+                slug: OLLAMA_EVENT_SLUG.to_string(),
+                kind: TaggedKind::OllamaPull {
+                    model: model.to_string(),
+                    status: status.clone(),
+                    completed_bytes,
+                    total_bytes,
+                },
+            });
+
+            // Terminal condition: Ollama sends {"status": "success"}
+            // when the pull is fully complete.
+            if status == "success" {
+                return Ok(());
+            }
+        }
+    }
+
+    // If we exit the loop without seeing "success", the pull completed
+    // (no more chunks) but may have been a no-op (model already present).
+    // Emit a synthetic success event so the frontend always gets a
+    // terminal event.
+    let _ = bus.tx.send(crate::pyramid::event_bus::TaggedBuildEvent {
+        slug: OLLAMA_EVENT_SLUG.to_string(),
+        kind: crate::pyramid::event_bus::TaggedKind::OllamaPull {
+            model: model.to_string(),
+            status: "success".to_string(),
+            completed_bytes: None,
+            total_bytes: None,
+        },
+    });
+
+    Ok(())
+}
+
+/// Delete an Ollama model via `DELETE /api/delete`.
+///
+/// Note: DELETE with a JSON body is non-standard HTTP but matches
+/// Ollama's API. reqwest handles it correctly.
+///
+/// The caller (IPC handler) is responsible for checking that the model
+/// is not the currently-active model before calling this function.
+pub async fn delete_ollama_model(base_url: &str, model: &str) -> Result<()> {
+    let native = native_root_for(base_url);
+    let url = format!("{native}/api/delete");
+    let req_body = serde_json::json!({ "model": model });
+
+    let response = crate::pyramid::llm::HTTP_CLIENT
+        .delete(&url)
+        .json(&req_body)
+        .send()
+        .await
+        .with_context(|| format!("DELETE {url} for model {model} failed (is Ollama running?)"))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        // Try to read error body for a better message.
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "(no body)".to_string());
+        bail!(
+            "DELETE {url} for model {model} returned status {status}: {body}"
+        );
+    }
 
     Ok(())
 }

@@ -19887,3 +19887,167 @@ body {
     background: rgba(251, 146, 60, 0.15);
     border-color: rgba(251, 146, 60, 0.4);
 }
+
+/* ─── Phase 4: Pull Model + Delete ──────────────────────────────── */
+
+.pull-section {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.pull-input-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.pull-input {
+    flex: 1;
+    padding: 6px 8px;
+    font-size: 12px;
+    min-width: 0;
+}
+
+.pull-browse-link {
+    font-size: 11px;
+    color: var(--text-muted);
+    text-decoration: none;
+    transition: color var(--transition);
+}
+
+.pull-browse-link:hover {
+    color: var(--text-secondary);
+    text-decoration: underline;
+}
+
+.pull-cancel-btn {
+    background: none;
+    border: 1px solid rgba(248, 113, 113, 0.4);
+    color: #fca5a5;
+    font-size: 12px;
+    font-family: inherit;
+    cursor: pointer;
+    padding: 5px 10px;
+    border-radius: var(--radius-sm);
+    transition: background var(--transition), border-color var(--transition);
+    white-space: nowrap;
+}
+
+.pull-cancel-btn:hover {
+    background: rgba(248, 113, 113, 0.1);
+    border-color: rgba(248, 113, 113, 0.6);
+}
+
+.pull-progress-area {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.pull-status {
+    font-size: 11px;
+    color: var(--text-secondary);
+}
+
+.pull-status-bytes {
+    color: var(--text-muted);
+}
+
+.pull-progress {
+    height: 6px;
+    background: var(--glass);
+    border-radius: 3px;
+    overflow: hidden;
+    border: 1px solid var(--glass-border);
+}
+
+.pull-progress-bar {
+    height: 100%;
+    background: var(--accent-cyan);
+    border-radius: 3px;
+    transition: width 0.3s ease;
+    min-width: 0;
+}
+
+/* Delete button on model cards */
+
+.model-card-delete {
+    background: none;
+    border: none;
+    color: var(--text-muted);
+    font-size: 16px;
+    line-height: 1;
+    cursor: pointer;
+    padding: 0 4px;
+    border-radius: var(--radius-sm);
+    opacity: 0;
+    transition: opacity var(--transition), color var(--transition), background var(--transition);
+    flex-shrink: 0;
+}
+
+.model-card:hover .model-card-delete {
+    opacity: 1;
+}
+
+.model-card-delete:hover {
+    color: #f87171;
+    background: rgba(248, 113, 113, 0.1);
+}
+
+.model-card-delete:disabled {
+    opacity: 0;
+    cursor: not-allowed;
+}
+
+/* Delete confirmation inline below model card */
+
+.model-delete-confirm {
+    padding: 8px 12px;
+    margin-top: 2px;
+    margin-bottom: 2px;
+    border-radius: var(--radius-sm);
+    background: rgba(248, 113, 113, 0.08);
+    border: 1px solid rgba(248, 113, 113, 0.25);
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.model-delete-confirm-text {
+    font-size: 12px;
+    color: #fca5a5;
+}
+
+.model-delete-confirm-warning {
+    font-size: 11px;
+    color: var(--text-muted);
+}
+
+.model-delete-confirm-actions {
+    display: flex;
+    gap: 6px;
+    justify-content: flex-end;
+}
+
+.model-delete-confirm-btn {
+    background: rgba(248, 113, 113, 0.15);
+    border: 1px solid rgba(248, 113, 113, 0.4);
+    color: #fca5a5;
+    font-size: 12px;
+    font-family: inherit;
+    cursor: pointer;
+    padding: 4px 10px;
+    border-radius: var(--radius-sm);
+    transition: background var(--transition), border-color var(--transition);
+}
+
+.model-delete-confirm-btn:hover {
+    background: rgba(248, 113, 113, 0.25);
+    border-color: rgba(248, 113, 113, 0.6);
+}
+
+.model-delete-confirm-btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}

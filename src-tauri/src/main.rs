@@ -6132,6 +6132,8 @@ async fn pyramid_vine_integrity(
         credential_store: state.pyramid.credential_store.clone(),
         schema_registry: state.pyramid.schema_registry.clone(),
         cross_pyramid_router: state.pyramid.cross_pyramid_router.clone(),
+        ollama_pull_cancel: state.pyramid.ollama_pull_cancel.clone(),
+        ollama_pull_in_progress: state.pyramid.ollama_pull_in_progress.clone(),
     });
 
     let summary = vine::run_integrity_check(&pyramid_state, &slug)
@@ -6186,6 +6188,8 @@ async fn pyramid_vine_rebuild_upper(
         credential_store: state.pyramid.credential_store.clone(),
         schema_registry: state.pyramid.schema_registry.clone(),
         cross_pyramid_router: state.pyramid.cross_pyramid_router.clone(),
+        ollama_pull_cancel: state.pyramid.ollama_pull_cancel.clone(),
+        ollama_pull_in_progress: state.pyramid.ollama_pull_in_progress.clone(),
     });
 
     let cancel = tokio_util::sync::CancellationToken::new();
@@ -8338,6 +8342,117 @@ async fn pyramid_switch_local_model(
     Ok(wire_node_lib::pyramid::local_mode::refresh_status_reachability(snapshot).await)
 }
 
+/// Phase 4 Daemon Control Plane (AD-3): pull an Ollama model with streaming
+/// progress. Concurrent pull guard prevents multiple simultaneous pulls.
+/// Progress events are broadcast on the build event bus with slug `__ollama__`.
+#[tauri::command]
+async fn pyramid_ollama_pull_model(
+    state: tauri::State<'_, SharedState>,
+    model: String,
+) -> Result<(), String> {
+    // Read base_url from the local mode state row.
+    let base_url = {
+        let reader = state.pyramid.reader.lock().await;
+        let row = wire_node_lib::pyramid::db::load_local_mode_state(&reader)
+            .map_err(|e| e.to_string())?;
+        row.ollama_base_url
+            .unwrap_or_else(|| "http://localhost:11434/v1".to_string())
+    };
+    let normalized = wire_node_lib::pyramid::local_mode::normalize_base_url(&base_url)
+        .map_err(|e| e.to_string())?;
+
+    // Concurrent pull guard: refuse if another pull is active.
+    {
+        let mut guard = state.pyramid.ollama_pull_in_progress.lock().await;
+        if let Some(ref active_model) = *guard {
+            return Err(format!(
+                "A pull is already in progress for model '{}' — wait for it to complete or cancel it.",
+                active_model
+            ));
+        }
+        *guard = Some(model.clone());
+    }
+
+    // Reset the cancel flag before starting.
+    state
+        .pyramid
+        .ollama_pull_cancel
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+
+    // Run the pull. On completion (success or error), clear the in-progress guard.
+    let result = wire_node_lib::pyramid::local_mode::pull_ollama_model(
+        &normalized,
+        &model,
+        &state.pyramid.build_event_bus,
+        &state.pyramid.ollama_pull_cancel,
+    )
+    .await;
+
+    // Always clear the in-progress guard, regardless of success/failure.
+    {
+        let mut guard = state.pyramid.ollama_pull_in_progress.lock().await;
+        *guard = None;
+    }
+
+    result.map_err(|e| e.to_string())
+}
+
+/// Phase 4 Daemon Control Plane (AD-3): cancel an in-flight Ollama model pull.
+/// Sets the cancellation flag — the pull loop checks it between chunks and
+/// drops the response stream. Returns immediately; the pull IPC will return
+/// an error once it observes the flag.
+#[tauri::command]
+async fn pyramid_ollama_cancel_pull(
+    state: tauri::State<'_, SharedState>,
+) -> Result<(), String> {
+    state
+        .pyramid
+        .ollama_pull_cancel
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
+
+/// Phase 4 Daemon Control Plane: delete an Ollama model. Refuses to delete
+/// the currently-active model. Returns a refreshed model list after deletion.
+#[tauri::command]
+async fn pyramid_ollama_delete_model(
+    state: tauri::State<'_, SharedState>,
+    model: String,
+) -> Result<wire_node_lib::pyramid::local_mode::OllamaProbeResult, String> {
+    // Read the active model and base_url from state.
+    let (base_url, active_model) = {
+        let reader = state.pyramid.reader.lock().await;
+        let row = wire_node_lib::pyramid::db::load_local_mode_state(&reader)
+            .map_err(|e| e.to_string())?;
+        let base = row
+            .ollama_base_url
+            .unwrap_or_else(|| "http://localhost:11434/v1".to_string());
+        (base, row.ollama_model)
+    };
+
+    // Guard: refuse to delete the active model.
+    if let Some(ref active) = active_model {
+        if active == &model {
+            return Err(format!(
+                "Cannot delete model '{}' — it is the currently active model. \
+                 Switch to a different model first.",
+                model
+            ));
+        }
+    }
+
+    let normalized = wire_node_lib::pyramid::local_mode::normalize_base_url(&base_url)
+        .map_err(|e| e.to_string())?;
+
+    // Delete the model.
+    wire_node_lib::pyramid::local_mode::delete_ollama_model(&normalized, &model)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // Re-probe to return a refreshed model list.
+    Ok(wire_node_lib::pyramid::local_mode::probe_ollama(&normalized).await)
+}
+
 /// Phase 3 daemon control plane (AD-4): set or clear the context window override.
 /// Sync-only — no Ollama probe needed. Split-phase: active-build guard,
 /// sync commit (writer lock), async follow-up (cascade rebuild).
@@ -10484,6 +10599,9 @@ fn main() {
         cross_pyramid_router: Arc::new(
             wire_node_lib::pyramid::cross_pyramid_router::CrossPyramidEventRouter::new(),
         ),
+        // Phase 4 Daemon Control Plane: Ollama pull state.
+        ollama_pull_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        ollama_pull_in_progress: Arc::new(tokio::sync::Mutex::new(None)),
     });
 
     // Load persisted event subscriptions into the in-memory event bus
@@ -11662,6 +11780,10 @@ fn main() {
             pyramid_get_model_details,
             // Phase 1 daemon control plane: hot-swap model
             pyramid_switch_local_model,
+            // Phase 4 daemon control plane: model pull + delete
+            pyramid_ollama_pull_model,
+            pyramid_ollama_cancel_pull,
+            pyramid_ollama_delete_model,
             // Phase 3 daemon control plane: context + concurrency overrides
             pyramid_set_context_override,
             pyramid_set_concurrency_override,

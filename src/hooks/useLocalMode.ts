@@ -62,6 +62,9 @@ export interface UseLocalModeResult {
   getModelDetails: (baseUrl: string, model: string) => Promise<OllamaModelInfo>;
   setContextOverride: (limit: number | null) => Promise<void>;
   setConcurrencyOverride: (concurrency: number | null) => Promise<void>;
+  pullModel: (model: string) => Promise<void>;
+  cancelPull: () => Promise<void>;
+  deleteModel: (model: string) => Promise<void>;
 }
 
 export function useLocalMode(): UseLocalModeResult {
@@ -165,5 +168,42 @@ export function useLocalMode(): UseLocalModeResult {
     }
   }, []);
 
-  return { status, loading, error, refresh, enable, disable, probe, switchModel, getModelDetails, setContextOverride, setConcurrencyOverride };
+  const pullModel = useCallback(async (model: string) => {
+    setLoading(true);
+    setError(null);
+    try {
+      await invoke<void>("pyramid_ollama_pull_model", { model });
+      // Pull completed — refresh model list to pick up the new model.
+      await refresh();
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setLoading(false);
+    }
+  }, [refresh]);
+
+  const cancelPull = useCallback(async () => {
+    // Fire-and-forget — sets the cancellation flag on the backend.
+    try {
+      await invoke<void>("pyramid_ollama_cancel_pull");
+    } catch {
+      // Silently ignore cancel errors.
+    }
+  }, []);
+
+  const deleteModel = useCallback(async (model: string) => {
+    setLoading(true);
+    setError(null);
+    try {
+      await invoke<void>("pyramid_ollama_delete_model", { model });
+      // Refresh model list after deletion.
+      await refresh();
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setLoading(false);
+    }
+  }, [refresh]);
+
+  return { status, loading, error, refresh, enable, disable, probe, switchModel, getModelDetails, setContextOverride, setConcurrencyOverride, pullModel, cancelPull, deleteModel };
 }
