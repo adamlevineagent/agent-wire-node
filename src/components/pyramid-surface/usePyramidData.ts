@@ -69,6 +69,15 @@ interface TaggedBuildEvent {
     kind: Record<string, unknown> & { type: string };
 }
 
+interface LiveNodeInfo {
+    node_id: string;
+    depth: number;
+    headline: string;
+    parent_id: string | null;
+    children: string[];
+    status: string;
+}
+
 // ── Hook ─────────────────────────────────────────────────────────────
 
 export interface PyramidDataResult {
@@ -93,6 +102,7 @@ export function usePyramidData(
     staleLog: StaleLogEntry[],
 ): PyramidDataResult {
     const [treeData, setTreeData] = useState<TreeResponse[] | null>(null);
+    const [liveNodes, setLiveNodes] = useState<LiveNodeInfo[]>([]);
     const [loading, setLoading] = useState(true);
     const [buildStatus, setBuildStatus] = useState<BuildStatus | null>(null);
     const [buildProgress, setBuildProgress] = useState<BuildProgressV2 | null>(null);
@@ -143,6 +153,17 @@ export function usePyramidData(
                         }
                     }
                     setBuildNodeStates(nodeStates);
+
+                    // Fetch live nodes for rendering during build
+                    const live = await invoke<LiveNodeInfo[]>(
+                        'pyramid_build_live_nodes',
+                        { slug },
+                    ).catch(() => [] as LiveNodeInfo[]);
+                    setLiveNodes(live);
+
+                    // Also refresh tree (nodes commit to DB as build progresses)
+                    const tree = await invoke<TreeResponse[]>('pyramid_tree', { slug }).catch(() => null);
+                    if (tree && tree.length > 0) setTreeData(tree);
                 }
             } catch {
                 // Not building or IPC error — ignore
@@ -187,11 +208,40 @@ export function usePyramidData(
 
     // ── Compute layout ──────────────────────────────────────────────
     const computeResult = useMemo(() => {
-        if (!treeData || treeData.length === 0 || width === 0 || height === 0) {
+        if (width === 0 || height === 0) {
             return { nodes: [] as SurfaceNode[], edges: [] as SurfaceEdge[] };
         }
 
-        const { nodes: flat, edges: dagEdges } = flattenTree(treeData);
+        // Use tree data if available, otherwise build from live nodes during build
+        let flat: ReturnType<typeof flattenTree>['nodes'] = [];
+        let dagEdges: ReturnType<typeof flattenTree>['edges'] = [];
+
+        if (treeData && treeData.length > 0) {
+            const result = flattenTree(treeData);
+            flat = result.nodes;
+            dagEdges = result.edges;
+        } else if (isBuilding && liveNodes.length > 0) {
+            // Convert live nodes to flat layout nodes during build
+            flat = liveNodes.map((ln) => ({
+                id: ln.node_id,
+                depth: ln.depth,
+                headline: ln.headline,
+                distilled: '',
+                parentId: ln.parent_id,
+                childIds: ln.children,
+            }));
+            // Build edges from parent relationships
+            for (const ln of liveNodes) {
+                if (ln.parent_id) {
+                    dagEdges.push({ childId: ln.node_id, parentId: ln.parent_id });
+                }
+            }
+        }
+
+        if (flat.length === 0) {
+            return { nodes: [] as SurfaceNode[], edges: [] as SurfaceEdge[] };
+        }
+
         const withBedrock = addBedrockLayer(flat);
         let { nodes, edges } = computeLayout(withBedrock, dagEdges, width, height);
 
@@ -209,7 +259,7 @@ export function usePyramidData(
         }
 
         return { nodes, edges };
-    }, [treeData, width, height, isBuilding, buildNodeStates, staleLog]);
+    }, [treeData, liveNodes, width, height, isBuilding, buildNodeStates, staleLog]);
 
     return {
         nodes: computeResult.nodes,
