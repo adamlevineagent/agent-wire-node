@@ -96,6 +96,10 @@ pub struct LocalModeStatus {
     pub ollama_provider_id: String,
     pub prior_tier_routing_contribution_id: Option<String>,
     pub prior_build_strategy_contribution_id: Option<String>,
+    /// Phase 3 daemon control plane: user-set context window override (None = auto-detect).
+    pub context_override: Option<usize>,
+    /// Phase 3 daemon control plane: user-set concurrency override (None = default 1).
+    pub concurrency_override: Option<usize>,
 }
 
 impl LocalModeStatus {
@@ -114,6 +118,8 @@ impl LocalModeStatus {
             ollama_provider_id: OLLAMA_LOCAL_PROVIDER_ID.to_string(),
             prior_tier_routing_contribution_id: None,
             prior_build_strategy_contribution_id: None,
+            context_override: None,
+            concurrency_override: None,
         }
     }
 }
@@ -430,6 +436,8 @@ pub fn load_status_snapshot(conn: &Connection) -> Result<LocalModeStatus> {
         ollama_provider_id: OLLAMA_LOCAL_PROVIDER_ID.to_string(),
         prior_tier_routing_contribution_id: row.restore_from_contribution_id,
         prior_build_strategy_contribution_id: row.restore_build_strategy_contribution_id,
+        context_override: row.context_override.map(|n| n as usize),
+        concurrency_override: row.concurrency_override.map(|n| n as usize),
     })
 }
 
@@ -869,7 +877,18 @@ pub fn commit_enable_local_mode(
         },
     )?;
 
-    // Step 11: commit is done; caller rebuilds the status snapshot
+    // Step 11: re-apply concurrency override if it was set before disable.
+    // The enable path hardcodes concurrency=1 in build_strategy and
+    // dispatch_policy. If the user had a concurrency override, we need
+    // to re-apply it now so the contributions match the state row.
+    let current_row = load_local_mode_state(conn)?;
+    if let Some(c) = current_row.concurrency_override {
+        if c > 1 {
+            set_concurrency_override(conn, bus, registry, Some(c as usize))?;
+        }
+    }
+
+    // Step 12: commit is done; caller rebuilds the status snapshot
     // via `load_status_snapshot` (sync) or `get_local_mode_status`
     // (async) as they see fit.
     Ok(())
@@ -1227,6 +1246,262 @@ pub fn commit_switch_local_model(
         &LocalModeStateRow {
             ollama_model: Some(model),
             detected_context_limit: Some(detected_context as i64),
+            ..row
+        },
+    )?;
+
+    // Refresh in-memory registry.
+    registry.load_from_db(conn)?;
+
+    Ok(())
+}
+
+// ── Context Override (AD-4, Phase 3) ──────────────────────────────────────
+
+/// Sync commit: set or clear the context window override.
+///
+/// When `limit` is `Some(n)`: stores `context_override = n` in the state
+/// row, supersedes the active `tier_routing` contribution with the
+/// override value as `context_limit`, and writes `num_ctx` to the
+/// `ollama-local` provider's `config_json` so Ollama actually allocates
+/// the context window Wire Node expects.
+///
+/// When `limit` is `None`: clears the override, restoring the
+/// auto-detected context limit from the state row's
+/// `detected_context_limit`.
+///
+/// Must be called under the writer lock. Caller is responsible for
+/// the active-build guard (checked in the IPC layer).
+pub fn set_context_override(
+    conn: &mut Connection,
+    bus: &Arc<BuildEventBus>,
+    registry: &ProviderRegistry,
+    limit: Option<usize>,
+) -> Result<()> {
+    let row = load_local_mode_state(conn)?;
+    if !row.enabled {
+        bail!("Local mode is not enabled — cannot set context override");
+    }
+    let base_url = row
+        .ollama_base_url
+        .as_deref()
+        .ok_or_else(|| anyhow!("local mode enabled but no base_url in state row"))?;
+
+    // Compute effective context: override wins, else auto-detected.
+    let detected = row
+        .detected_context_limit
+        .map(|n| n as usize)
+        .unwrap_or(DEFAULT_OLLAMA_CONTEXT_FALLBACK);
+    let effective_context = limit.unwrap_or(detected);
+
+    // --- Supersede tier_routing with the effective context ---
+    let active_tier = load_active_config_contribution(conn, "tier_routing", None)?
+        .ok_or_else(|| anyhow!("no active tier_routing contribution for context override"))?;
+
+    let prior_tier_yaml: TierRoutingYaml =
+        serde_yaml::from_str(&active_tier.yaml_content)
+            .with_context(|| "parsing active tier_routing for context override")?;
+    let mut prior_tier_names: std::collections::BTreeSet<String> =
+        prior_tier_yaml.entries.iter().map(|e| e.tier_name.clone()).collect();
+    for required in [
+        "fast_extract", "web", "synth_heavy", "stale_remote", "stale_local",
+        "mid", "extractor", "high", "max",
+    ] {
+        prior_tier_names.insert(required.to_string());
+    }
+    let model = row
+        .ollama_model
+        .as_deref()
+        .ok_or_else(|| anyhow!("local mode enabled but no model in state row"))?;
+    let new_entries: Vec<TierRoutingYamlEntry> = prior_tier_names
+        .into_iter()
+        .map(|tier_name| TierRoutingYamlEntry {
+            tier_name,
+            provider_id: OLLAMA_LOCAL_PROVIDER_ID.to_string(),
+            model_id: model.to_string(),
+            context_limit: Some(effective_context as i64),
+            max_completion_tokens: None,
+            pricing_json: Some("{}".to_string()),
+            supported_parameters_json: Some(r#"["response_format"]"#.to_string()),
+            notes: Some(format!(
+                "local mode — context override via Ollama at {base_url}"
+            )),
+            priority: Some(1),
+            prompt_price_per_token: Some(0.0),
+            completion_price_per_token: Some(0.0),
+        })
+        .collect();
+    let new_tier_yaml = TierRoutingYaml { entries: new_entries };
+    let new_tier_yaml_string = build_tier_routing_yaml_string(&new_tier_yaml)?;
+
+    let note = match limit {
+        Some(n) => format!("context override set to {n}"),
+        None => "context override cleared — using auto-detected".to_string(),
+    };
+    let new_tier_id = supersede_config_contribution(
+        conn,
+        &active_tier.contribution_id,
+        &new_tier_yaml_string,
+        &note,
+        "local_mode_context_override",
+        Some("user"),
+    )?;
+    let new_tier_contribution = load_contribution_by_id(conn, &new_tier_id)?
+        .ok_or_else(|| anyhow!("context-override tier contribution missing after supersede"))?;
+    sync_config_to_operational(conn, bus, &new_tier_contribution)?;
+
+    // --- Update provider config_json num_ctx (read-modify-write) ---
+    if let Ok(Some(mut provider)) = super::db::get_provider(conn, OLLAMA_LOCAL_PROVIDER_ID) {
+        let mut cfg: serde_json::Value = serde_json::from_str(&provider.config_json)
+            .unwrap_or_else(|_| serde_json::json!({}));
+        cfg["num_ctx"] = serde_json::json!(effective_context);
+        provider.config_json = cfg.to_string();
+        super::db::save_provider(conn, &provider)?;
+    }
+
+    // --- Read-modify-write state row: set context_override, preserve everything else ---
+    save_local_mode_state(
+        conn,
+        &LocalModeStateRow {
+            context_override: limit.map(|n| n as i64),
+            ..row
+        },
+    )?;
+
+    // Refresh in-memory registry.
+    registry.load_from_db(conn)?;
+
+    Ok(())
+}
+
+// ── Concurrency Override (AD-5, Phase 3) ──────────────────────────────────
+
+/// Maximum concurrency the user can set via the override.
+pub const MAX_CONCURRENCY: usize = 12;
+
+/// Sync commit: set or clear the concurrency override.
+///
+/// When `concurrency` is `Some(n)`: clamps to 1..=MAX_CONCURRENCY, then
+/// supersedes BOTH the active `build_strategy` (for_each cap) AND the
+/// active `dispatch_policy` (provider_pools.ollama-local.concurrency)
+/// contributions in lockstep.
+///
+/// When `concurrency` is `None`: restores default concurrency (1).
+///
+/// Must be called under the writer lock. Caller is responsible for
+/// the active-build guard.
+pub fn set_concurrency_override(
+    conn: &mut Connection,
+    bus: &Arc<BuildEventBus>,
+    registry: &ProviderRegistry,
+    concurrency: Option<usize>,
+) -> Result<()> {
+    let row = load_local_mode_state(conn)?;
+    if !row.enabled {
+        bail!("Local mode is not enabled — cannot set concurrency override");
+    }
+
+    // Clamp or default to 1.
+    let effective = concurrency
+        .map(|n| n.clamp(1, MAX_CONCURRENCY))
+        .unwrap_or(1);
+
+    // --- Supersede build_strategy with the concurrency value ---
+    let active_bs = load_active_config_contribution(conn, "build_strategy", None)?
+        .ok_or_else(|| anyhow!("no active build_strategy contribution for concurrency override"))?;
+
+    // Parse, modify concurrency in both phases, re-serialize.
+    let mut bs_value: serde_yaml::Value = serde_yaml::from_str(&active_bs.yaml_content)
+        .context("parsing active build_strategy for concurrency override")?;
+    let bs_map = bs_value
+        .as_mapping_mut()
+        .ok_or_else(|| anyhow!("active build_strategy YAML is not a mapping"))?;
+    bs_map.insert(
+        serde_yaml::Value::String("schema_type".into()),
+        serde_yaml::Value::String("build_strategy".into()),
+    );
+    for phase in ["initial_build", "maintenance"] {
+        let key = serde_yaml::Value::String(phase.into());
+        let phase_map = bs_map
+            .entry(key.clone())
+            .or_insert_with(|| serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
+        if let Some(phase_map) = phase_map.as_mapping_mut() {
+            phase_map.insert(
+                serde_yaml::Value::String("concurrency".into()),
+                serde_yaml::Value::Number(serde_yaml::Number::from(effective as u64)),
+            );
+        }
+    }
+    let new_bs_yaml = serde_yaml::to_string(&bs_value)
+        .context("rendering build_strategy YAML for concurrency override")?;
+
+    let bs_note = match concurrency {
+        Some(n) => format!("concurrency override set to {}", n.clamp(1, MAX_CONCURRENCY)),
+        None => "concurrency override cleared — restoring default 1".to_string(),
+    };
+    let new_bs_id = supersede_config_contribution(
+        conn,
+        &active_bs.contribution_id,
+        &new_bs_yaml,
+        &bs_note,
+        "local_mode_concurrency_override",
+        Some("user"),
+    )?;
+    let new_bs_contribution = load_contribution_by_id(conn, &new_bs_id)?
+        .ok_or_else(|| anyhow!("concurrency-override build_strategy contribution missing after supersede"))?;
+    sync_config_to_operational(conn, bus, &new_bs_contribution)?;
+
+    // --- Supersede dispatch_policy with updated provider_pools concurrency ---
+    let active_dp = load_active_config_contribution(conn, "dispatch_policy", None)?
+        .ok_or_else(|| anyhow!("no active dispatch_policy contribution for concurrency override"))?;
+
+    // Parse, modify provider_pools.ollama-local.concurrency, re-serialize.
+    let mut dp_value: serde_yaml::Value = serde_yaml::from_str(&active_dp.yaml_content)
+        .context("parsing active dispatch_policy for concurrency override")?;
+    let dp_map = dp_value
+        .as_mapping_mut()
+        .ok_or_else(|| anyhow!("active dispatch_policy YAML is not a mapping"))?;
+    // Ensure provider_pools mapping exists.
+    let pools_key = serde_yaml::Value::String("provider_pools".into());
+    let pools = dp_map
+        .entry(pools_key.clone())
+        .or_insert_with(|| serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
+    if let Some(pools_map) = pools.as_mapping_mut() {
+        let ollama_key = serde_yaml::Value::String(OLLAMA_LOCAL_PROVIDER_ID.into());
+        let ollama_pool = pools_map
+            .entry(ollama_key.clone())
+            .or_insert_with(|| serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
+        if let Some(ollama_map) = ollama_pool.as_mapping_mut() {
+            ollama_map.insert(
+                serde_yaml::Value::String("concurrency".into()),
+                serde_yaml::Value::Number(serde_yaml::Number::from(effective as u64)),
+            );
+        }
+    }
+    let new_dp_yaml = serde_yaml::to_string(&dp_value)
+        .context("rendering dispatch_policy YAML for concurrency override")?;
+
+    let dp_note = match concurrency {
+        Some(n) => format!("concurrency override set to {} — pool updated", n.clamp(1, MAX_CONCURRENCY)),
+        None => "concurrency override cleared — pool restored to 1".to_string(),
+    };
+    let new_dp_id = supersede_config_contribution(
+        conn,
+        &active_dp.contribution_id,
+        &new_dp_yaml,
+        &dp_note,
+        "local_mode_concurrency_override",
+        Some("user"),
+    )?;
+    let new_dp_contribution = load_contribution_by_id(conn, &new_dp_id)?
+        .ok_or_else(|| anyhow!("concurrency-override dispatch_policy contribution missing after supersede"))?;
+    sync_config_to_operational(conn, bus, &new_dp_contribution)?;
+
+    // --- Read-modify-write state row: set concurrency_override, preserve everything else ---
+    save_local_mode_state(
+        conn,
+        &LocalModeStateRow {
+            concurrency_override: concurrency.map(|n| n.clamp(1, MAX_CONCURRENCY) as i64),
             ..row
         },
     )?;

@@ -62,6 +62,10 @@ export function Settings() {
     const [detailsCache, setDetailsCache] = useState<Record<string, OllamaModelInfo>>({});
     const [detailsLoading, setDetailsLoading] = useState<Record<string, boolean>>({});
 
+    // Phase 3: Context and concurrency override form state
+    const [contextInput, setContextInput] = useState<string>("");
+    const [concurrencyInput, setConcurrencyInput] = useState<number>(1);
+
     // Sync local form state with the hook's status whenever it
     // refreshes — so the URL and dropdown reflect the persisted
     // ollama_base_url / ollama_model from the state row.
@@ -73,6 +77,16 @@ export function Settings() {
             setLocalModelChoice(localMode.status.model);
         }
     }, [localMode.status]);
+
+    // Sync context/concurrency override inputs from status
+    useEffect(() => {
+        if (localMode.status?.context_override != null) {
+            setContextInput(String(localMode.status.context_override));
+        } else {
+            setContextInput("");
+        }
+        setConcurrencyInput(localMode.status?.concurrency_override ?? 1);
+    }, [localMode.status?.context_override, localMode.status?.concurrency_override]);
 
     // Dismiss the disable confirmation dialog whenever the enabled
     // state actually changes (e.g. the disable IPC succeeded).
@@ -563,6 +577,145 @@ export function Settings() {
                     </AccordionSection>
                 </div>
 
+                {/* Phase 3: Context Window Override */}
+                {localMode.status?.enabled && (
+                    <div style={{ marginTop: 12 }}>
+                        <AccordionSection title="Context Window">
+                            <div className="context-override-section">
+                                <div className="override-status-line">
+                                    <span style={{ fontSize: 12, color: "var(--text-secondary)" }}>
+                                        Detected:{" "}
+                                        {localMode.status.detected_context_limit
+                                            ? `${Math.round(localMode.status.detected_context_limit / 1000)}K tokens`
+                                            : "unknown"}
+                                    </span>
+                                    {localMode.status.context_override != null && (
+                                        <span style={{ fontSize: 12, color: "var(--accent-cyan)" }}>
+                                            Override: {Math.round(localMode.status.context_override / 1000)}K tokens
+                                        </span>
+                                    )}
+                                </div>
+                                <div className="override-effective-line">
+                                    <span style={{ fontSize: 11, color: "var(--text-muted)" }}>
+                                        Effective context:{" "}
+                                        <strong style={{ color: "var(--text-primary)" }}>
+                                            {(() => {
+                                                const effective = localMode.status.context_override ?? localMode.status.detected_context_limit;
+                                                return effective ? `${Math.round(effective / 1000)}K tokens` : "unknown";
+                                            })()}
+                                        </strong>
+                                    </span>
+                                </div>
+                                <div className="override-input-row">
+                                    <input
+                                        type="number"
+                                        className="settings-input override-input"
+                                        value={contextInput}
+                                        onChange={(e) => setContextInput(e.target.value)}
+                                        placeholder={
+                                            localMode.status.detected_context_limit
+                                                ? String(localMode.status.detected_context_limit)
+                                                : "e.g. 32768"
+                                        }
+                                        min={1024}
+                                        step={1024}
+                                    />
+                                    <button
+                                        type="button"
+                                        className="compose-btn"
+                                        disabled={localMode.loading || !contextInput}
+                                        onClick={async () => {
+                                            const val = parseInt(contextInput, 10);
+                                            if (!isNaN(val) && val > 0) {
+                                                await localMode.setContextOverride(val);
+                                            }
+                                        }}
+                                    >
+                                        Apply
+                                    </button>
+                                    {localMode.status.context_override != null && (
+                                        <button
+                                            type="button"
+                                            className="override-reset-btn"
+                                            disabled={localMode.loading}
+                                            onClick={async () => {
+                                                await localMode.setContextOverride(null);
+                                            }}
+                                        >
+                                            Reset to auto-detect
+                                        </button>
+                                    )}
+                                </div>
+                                {(() => {
+                                    const val = parseInt(contextInput, 10);
+                                    const detected = localMode.status?.detected_context_limit;
+                                    if (!isNaN(val) && detected && val > detected) {
+                                        return (
+                                            <div className="override-warning-banner">
+                                                Model may not support this context length — use at your own risk
+                                            </div>
+                                        );
+                                    }
+                                    return null;
+                                })()}
+                            </div>
+                        </AccordionSection>
+                    </div>
+                )}
+
+                {/* Phase 3: Concurrency Override */}
+                {localMode.status?.enabled && (
+                    <div style={{ marginTop: 12 }}>
+                        <AccordionSection title="Concurrency">
+                            <div className="concurrency-section">
+                                <div className="override-input-row">
+                                    <input
+                                        type="number"
+                                        className="settings-input override-input"
+                                        value={concurrencyInput}
+                                        onChange={(e) => {
+                                            const v = parseInt(e.target.value, 10);
+                                            if (!isNaN(v)) setConcurrencyInput(Math.max(1, Math.min(12, v)));
+                                        }}
+                                        min={1}
+                                        max={12}
+                                    />
+                                    <button
+                                        type="button"
+                                        className="compose-btn"
+                                        disabled={localMode.loading}
+                                        onClick={async () => {
+                                            await localMode.setConcurrencyOverride(concurrencyInput);
+                                        }}
+                                    >
+                                        Apply
+                                    </button>
+                                    {localMode.status.concurrency_override != null && localMode.status.concurrency_override !== 1 && (
+                                        <button
+                                            type="button"
+                                            className="override-reset-btn"
+                                            disabled={localMode.loading}
+                                            onClick={async () => {
+                                                await localMode.setConcurrencyOverride(null);
+                                            }}
+                                        >
+                                            Reset to default (1)
+                                        </button>
+                                    )}
+                                </div>
+                                <div className="override-warning-banner">
+                                    Most home users should leave this on 1 to prevent issues.
+                                </div>
+                                {concurrencyInput > 1 && (
+                                    <div className="override-warning-banner override-warning-elevated">
+                                        Higher concurrency increases memory pressure on your GPU.
+                                    </div>
+                                )}
+                            </div>
+                        </AccordionSection>
+                    </div>
+                )}
+
                 {/* Status line */}
                 <div style={{ marginTop: 12, fontSize: 12 }}>
                     {localMode.status?.enabled && localMode.status.reachable ? (
@@ -570,12 +723,12 @@ export function Settings() {
                             ✓ Enabled — routing all tiers through{" "}
                             <strong>{localMode.status.model ?? "?"}</strong> on{" "}
                             <strong>{localMode.status.base_url ?? "?"}</strong>
-                            {localMode.status.detected_context_limit && (
+                            {(localMode.status.context_override ?? localMode.status.detected_context_limit) && (
                                 <>
                                     {" "}
                                     · context limit{" "}
                                     {Math.round(
-                                        localMode.status.detected_context_limit / 1000,
+                                        (localMode.status.context_override ?? localMode.status.detected_context_limit!) / 1000,
                                     )}
                                     K tokens
                                 </>
@@ -617,8 +770,13 @@ export function Settings() {
                             color: "#fdba74",
                         }}
                     >
-                        Local mode sets concurrency to 1 (home hardware constraint).
-                        Builds run entirely on your machine but will be slower.
+                        {(() => {
+                            const c = localMode.status?.concurrency_override ?? 1;
+                            if (c <= 1) {
+                                return "Builds run entirely on your machine with concurrency 1. Adjust in the Concurrency section above if your hardware supports it.";
+                            }
+                            return `Concurrency set to ${c}. Builds run entirely on your machine with ${c} parallel workers.`;
+                        })()}
                     </div>
                 )}
 

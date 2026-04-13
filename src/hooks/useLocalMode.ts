@@ -32,6 +32,8 @@ export interface LocalModeStatus {
   base_url: string | null;
   model: string | null;
   detected_context_limit: number | null;
+  context_override: number | null;
+  concurrency_override: number | null;
   available_models: string[];
   available_model_details: OllamaModelInfo[];
   reachable: boolean;
@@ -58,6 +60,8 @@ export interface UseLocalModeResult {
   probe: (baseUrl: string) => Promise<OllamaProbeResult>;
   switchModel: (model: string) => Promise<void>;
   getModelDetails: (baseUrl: string, model: string) => Promise<OllamaModelInfo>;
+  setContextOverride: (limit: number | null) => Promise<void>;
+  setConcurrencyOverride: (concurrency: number | null) => Promise<void>;
 }
 
 export function useLocalMode(): UseLocalModeResult {
@@ -135,5 +139,31 @@ export function useLocalMode(): UseLocalModeResult {
     }
   }, []);
 
-  return { status, loading, error, refresh, enable, disable, probe, switchModel, getModelDetails };
+  const setContextOverride = useCallback(async (limit: number | null) => {
+    setLoading(true);
+    setError(null);
+    try {
+      const next = await invoke<LocalModeStatus>("pyramid_set_context_override", { limit });
+      setStatus(next);
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  const setConcurrencyOverride = useCallback(async (concurrency: number | null) => {
+    setLoading(true);
+    setError(null);
+    try {
+      const next = await invoke<LocalModeStatus>("pyramid_set_concurrency_override", { concurrency });
+      setStatus(next);
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  return { status, loading, error, refresh, enable, disable, probe, switchModel, getModelDetails, setContextOverride, setConcurrencyOverride };
 }

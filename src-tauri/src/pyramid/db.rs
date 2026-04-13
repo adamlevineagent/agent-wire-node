@@ -14184,7 +14184,10 @@ pub fn read_build_strategy_concurrency(conn: &Connection) -> Result<Option<usize
     if let Some(json_str) = result {
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(&json_str) {
             if let Some(c) = val.get("concurrency").and_then(|v| v.as_u64()) {
-                return Ok(Some(c as usize));
+                // Defense-in-depth: clamp against MAX_CONCURRENCY so a
+                // direct YAML edit can't exceed the hard ceiling (AD-5).
+                let clamped = (c as usize).min(super::local_mode::MAX_CONCURRENCY);
+                return Ok(Some(clamped));
             }
         }
     }

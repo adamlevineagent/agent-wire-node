@@ -19803,3 +19803,87 @@ body {
 .model-card-disabled {
     cursor: not-allowed;
 }
+
+/* ─── Phase 3: Context / Concurrency Override Controls ─────────── */
+
+.context-override-section,
+.concurrency-section {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.override-status-line {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+
+.override-effective-line {
+    margin-bottom: 4px;
+}
+
+.override-input-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.override-input {
+    width: 80px;
+    padding: 6px 8px;
+    font-size: 12px;
+    text-align: center;
+    -moz-appearance: textfield;
+}
+
+.override-input::-webkit-outer-spin-button,
+.override-input::-webkit-inner-spin-button {
+    -webkit-appearance: none;
+    margin: 0;
+}
+
+.concurrency-section .override-input {
+    -moz-appearance: initial;
+}
+
+.concurrency-section .override-input::-webkit-outer-spin-button,
+.concurrency-section .override-input::-webkit-inner-spin-button {
+    -webkit-appearance: auto;
+}
+
+.override-reset-btn {
+    background: none;
+    border: none;
+    color: var(--text-muted);
+    font-size: 11px;
+    font-family: inherit;
+    cursor: pointer;
+    padding: 4px 6px;
+    border-radius: var(--radius-sm);
+    transition: color var(--transition), background var(--transition);
+}
+
+.override-reset-btn:hover {
+    color: var(--text-secondary);
+    background: rgba(255, 255, 255, 0.04);
+}
+
+.override-reset-btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+
+.override-warning-banner {
+    padding: 6px 10px;
+    border-radius: 6px;
+    background: rgba(251, 146, 60, 0.1);
+    border: 1px solid rgba(251, 146, 60, 0.3);
+    font-size: 11px;
+    color: #fdba74;
+}
+
+.override-warning-elevated {
+    background: rgba(251, 146, 60, 0.15);
+    border-color: rgba(251, 146, 60, 0.4);
+}

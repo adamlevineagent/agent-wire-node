@@ -8338,6 +8338,115 @@ async fn pyramid_switch_local_model(
     Ok(wire_node_lib::pyramid::local_mode::refresh_status_reachability(snapshot).await)
 }
 
+/// Phase 3 daemon control plane (AD-4): set or clear the context window override.
+/// Sync-only — no Ollama probe needed. Split-phase: active-build guard,
+/// sync commit (writer lock), async follow-up (cascade rebuild).
+#[tauri::command]
+async fn pyramid_set_context_override(
+    state: tauri::State<'_, SharedState>,
+    limit: Option<usize>,
+) -> Result<wire_node_lib::pyramid::local_mode::LocalModeStatus, String> {
+    // Active build guard.
+    {
+        let active = state.pyramid.active_build.read().await;
+        if !active.is_empty() {
+            return Err(
+                "Cannot change context override while a build is in progress — \
+                 wait for it to complete or cancel it."
+                    .to_string(),
+            );
+        }
+    }
+
+    // Sync commit under writer lock.
+    let snapshot = {
+        // Re-check active builds inside the lock (TOCTOU guard).
+        {
+            let active = state.pyramid.active_build.read().await;
+            if !active.is_empty() {
+                return Err(
+                    "A build started while acquiring the lock — \
+                     cannot change context override while a build is in progress."
+                        .to_string(),
+                );
+            }
+        }
+
+        let mut writer = state.pyramid.writer.lock().await;
+        wire_node_lib::pyramid::local_mode::set_context_override(
+            &mut writer,
+            &state.pyramid.build_event_bus,
+            &state.pyramid.provider_registry,
+            limit,
+        )
+        .map_err(|e| e.to_string())?;
+        let snapshot = wire_node_lib::pyramid::local_mode::load_status_snapshot(&writer)
+            .map_err(|e| e.to_string())?;
+        drop(writer);
+        snapshot
+    };
+
+    // Async follow-up: rebuild cascade models.
+    rebuild_cascade_from_registry(&state).await;
+
+    Ok(wire_node_lib::pyramid::local_mode::refresh_status_reachability(snapshot).await)
+}
+
+/// Phase 3 daemon control plane (AD-5): set or clear the concurrency override.
+/// Updates BOTH build_strategy AND dispatch_policy contributions in lockstep.
+/// Sync-only — no Ollama probe needed. Split-phase: active-build guard,
+/// sync commit (writer lock), async follow-up (cascade rebuild).
+#[tauri::command]
+async fn pyramid_set_concurrency_override(
+    state: tauri::State<'_, SharedState>,
+    concurrency: Option<usize>,
+) -> Result<wire_node_lib::pyramid::local_mode::LocalModeStatus, String> {
+    // Active build guard.
+    {
+        let active = state.pyramid.active_build.read().await;
+        if !active.is_empty() {
+            return Err(
+                "Cannot change concurrency override while a build is in progress — \
+                 wait for it to complete or cancel it."
+                    .to_string(),
+            );
+        }
+    }
+
+    // Sync commit under writer lock.
+    let snapshot = {
+        // Re-check active builds inside the lock (TOCTOU guard).
+        {
+            let active = state.pyramid.active_build.read().await;
+            if !active.is_empty() {
+                return Err(
+                    "A build started while acquiring the lock — \
+                     cannot change concurrency override while a build is in progress."
+                        .to_string(),
+                );
+            }
+        }
+
+        let mut writer = state.pyramid.writer.lock().await;
+        wire_node_lib::pyramid::local_mode::set_concurrency_override(
+            &mut writer,
+            &state.pyramid.build_event_bus,
+            &state.pyramid.provider_registry,
+            concurrency,
+        )
+        .map_err(|e| e.to_string())?;
+        let snapshot = wire_node_lib::pyramid::local_mode::load_status_snapshot(&writer)
+            .map_err(|e| e.to_string())?;
+        drop(writer);
+        snapshot
+    };
+
+    // Async follow-up: rebuild cascade models.
+    rebuild_cascade_from_registry(&state).await;
+
+    Ok(wire_node_lib::pyramid::local_mode::refresh_status_reachability(snapshot).await)
+}
+
 #[derive(serde::Serialize)]
 struct PreviewPullContributionResponse {
     yaml: String,
@@ -11553,6 +11662,9 @@ fn main() {
             pyramid_get_model_details,
             // Phase 1 daemon control plane: hot-swap model
             pyramid_switch_local_model,
+            // Phase 3 daemon control plane: context + concurrency overrides
+            pyramid_set_context_override,
+            pyramid_set_concurrency_override,
             pyramid_preview_pull_contribution,
             // Phase 11: Broadcast webhook + provider health oversight
             pyramid_provider_health,
