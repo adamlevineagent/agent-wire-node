@@ -5,6 +5,7 @@ import { PyramidFirstRun } from '../PyramidFirstRun';
 import { CrossPyramidTimeline } from '../CrossPyramidTimeline';
 import { DadbearOversightPage } from '../DadbearOversightPage';
 import { GridView } from '../pyramid-surface/GridView';
+import { usePyramidWindow } from '../../hooks/usePyramidWindow';
 import { SlugInfo, PyramidConfigInfo } from '../pyramid-types';
 
 type PyramidsTab = 'dashboard' | 'grid' | 'builds' | 'oversight';
@@ -17,10 +18,12 @@ export function PyramidsMode() {
     const [checking, setChecking] = useState(true);
     const [tab, setTab] = useState<PyramidsTab>('dashboard');
 
-    // When a card is clicked in the grid, switch to dashboard tab
-    const handleGridSelectPyramid = useCallback((_slug: string) => {
-        setTab('dashboard');
-    }, []);
+    const { openWindow } = usePyramidWindow();
+
+    // When a card is clicked in the grid, open the pyramid surface window
+    const handleGridSelectPyramid = useCallback((slug: string) => {
+        openWindow(slug);
+    }, [openWindow]);
 
     useEffect(() => {
         (async () => {
