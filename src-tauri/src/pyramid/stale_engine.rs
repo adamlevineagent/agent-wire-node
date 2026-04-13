@@ -104,6 +104,13 @@ pub struct PyramidStaleEngine {
     pub last_result_summary: Arc<std::sync::Mutex<Option<String>>>,
     /// Runtime operational config (WS5 fix: wired instead of using defaults)
     pub ops: Arc<OperationalConfig>,
+    /// Phase B: shared active-build map from PyramidState. Used to defer
+    /// stale-engine maintenance ticks while builds are running.
+    pub active_build: Arc<tokio::sync::RwLock<HashMap<String, crate::pyramid::BuildHandle>>>,
+    /// Phase B: when true, skip maintenance ticks while any build is active.
+    /// Set at construction time from the dispatch policy's
+    /// `build_coordination.defer_maintenance_during_build`.
+    pub defer_maintenance_during_build: bool,
 }
 
 impl PyramidStaleEngine {
@@ -124,6 +131,8 @@ impl PyramidStaleEngine {
         model: &str,
         ops: OperationalConfig,
         event_bus: Arc<BuildEventBus>,
+        active_build: Arc<tokio::sync::RwLock<HashMap<String, crate::pyramid::BuildHandle>>>,
+        defer_maintenance_during_build: bool,
     ) -> Self {
         let debounce = Duration::from_secs((config.debounce_minutes as u64) * 60);
         let mut layers = HashMap::new();
@@ -158,6 +167,8 @@ impl PyramidStaleEngine {
             timer_fires_at: Arc::new(std::sync::Mutex::new(None)),
             last_result_summary: Arc::new(std::sync::Mutex::new(None)),
             ops: Arc::new(ops),
+            active_build,
+            defer_maintenance_during_build,
         }
     }
 
@@ -191,6 +202,8 @@ impl PyramidStaleEngine {
         let timer_fires_arc = self.timer_fires_at.clone();
         let ops_arc = self.ops.clone();
         let event_bus = self.event_bus.clone();
+        let active_build = self.active_build.clone();
+        let defer_maintenance = self.defer_maintenance_during_build;
 
         let handle = tokio::spawn(async move {
             loop {
@@ -198,6 +211,15 @@ impl PyramidStaleEngine {
                 // wal_poll_interval_secs field is added to Tier2Config / Tier3Config.
                 // Currently structural: belt-and-suspenders fallback for mutation pickup.
                 tokio::time::sleep(Duration::from_secs(60)).await;
+
+                // Phase B: defer maintenance if any build is active and policy says so.
+                if defer_maintenance {
+                    let builds = active_build.read().await;
+                    if !builds.is_empty() {
+                        debug!(slug = %slug, "Deferring stale engine: {} active builds", builds.len());
+                        continue;
+                    }
+                }
 
                 // Check each layer for unprocessed mutations
                 let pending_by_layer: Vec<(i32, i64)> = match tokio::task::spawn_blocking({
@@ -1724,6 +1746,8 @@ mod tests {
             "inception/mercury-2",
             super::OperationalConfig::default(),
             Arc::new(BuildEventBus::new()),
+            Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            false,
         );
         assert_eq!(engine.slug, "test");
         assert_eq!(engine.layers.len(), 4);

@@ -223,6 +223,28 @@ pub fn start_dadbear_extend_loop(
                 flag.store(true, Ordering::Relaxed);
                 let _guard = InFlightGuard(flag.clone());
 
+                // Phase B: defer DADBEAR if any build is active and policy says so.
+                {
+                    let should_defer = {
+                        let cfg = state.config.read().await;
+                        cfg.dispatch_policy
+                            .as_ref()
+                            .map(|p| p.build_coordination.defer_dadbear_during_build)
+                            .unwrap_or(false)
+                    };
+                    if should_defer {
+                        let builds = state.active_build.read().await;
+                        if !builds.is_empty() {
+                            debug!(
+                                slug = %config.slug,
+                                active_builds = builds.len(),
+                                "DADBEAR-EXTEND: deferring tick, builds active"
+                            );
+                            continue;
+                        }
+                    }
+                }
+
                 // Run the tick for this config
                 if let Err(e) = run_tick_for_config(&state, &db_path, config, &event_bus).await {
                     error!(

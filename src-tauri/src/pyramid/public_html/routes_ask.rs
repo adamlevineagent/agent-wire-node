@@ -677,7 +677,7 @@ async fn create_question_pyramid_and_redirect(
     let qslug = question_slug.clone();
     let q = question.to_string();
     tokio::spawn(async move {
-        if let Err(e) = crate::pyramid::question_build::spawn_question_build(
+        match crate::pyramid::question_build::spawn_question_build(
             &state_for_build,
             qslug.clone(),
             q,
@@ -688,11 +688,16 @@ async fn create_question_pyramid_and_redirect(
         )
         .await
         {
-            tracing::error!(
-                question_slug = %qslug,
-                error = %e,
-                "spawn_question_build failed from web surface"
-            );
+            Ok((_json, _completion_rx)) => {
+                // Fire-and-forget: web surface doesn't await build completion.
+            }
+            Err(e) => {
+                tracing::error!(
+                    question_slug = %qslug,
+                    error = %e,
+                    "spawn_question_build failed from web surface"
+                );
+            }
         }
     });
 

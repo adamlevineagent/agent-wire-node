@@ -187,9 +187,13 @@ pub async fn init_stale_engines(pyramid_state: &Arc<pyramid::PyramidState>) {
     // Phase 3 fix pass: clone the live LlmConfig (with provider_registry +
     // credential_store) so every PyramidStaleEngine constructed below
     // carries the registry path through dispatched helpers.
-    let (base_config, model) = {
+    let (base_config, model, defer_maintenance) = {
         let config = pyramid_state.config.read().await;
-        (config.clone(), config.primary_model.clone())
+        let defer = config.dispatch_policy
+            .as_ref()
+            .map(|p| p.build_coordination.defer_maintenance_during_build)
+            .unwrap_or(false);
+        (config.clone(), config.primary_model.clone(), defer)
     };
 
     // Get the DB path from data_dir
@@ -276,6 +280,8 @@ pub async fn init_stale_engines(pyramid_state: &Arc<pyramid::PyramidState>) {
             &model,
             pyramid_state.operational.as_ref().clone(),
             pyramid_state.build_event_bus.clone(),
+            pyramid_state.active_build.clone(),
+            defer_maintenance,
         );
 
         // Breaker-tripped: create engine in tripped state, log warning, no watcher

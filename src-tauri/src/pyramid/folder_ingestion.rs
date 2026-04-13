@@ -1819,6 +1819,15 @@ pub fn spawn_initial_builds(state: &Arc<PyramidState>, plan: &IngestionPlan) {
     tokio::spawn(async move {
         ensure_dadbear_loop_running(&state).await;
 
+        // Phase B: check dispatch policy for sequential folder builds.
+        let sequential = {
+            let cfg = state.config.read().await;
+            cfg.dispatch_policy
+                .as_ref()
+                .map(|p| p.build_coordination.folder_builds_sequential)
+                .unwrap_or(false)
+        };
+
         // ── Leaves ────────────────────────────────────────────────────────
         for dispatch in &leaves {
             if let Err(e) = prepopulate_chunks_for(&state, dispatch).await {
@@ -1841,11 +1850,32 @@ pub fn spawn_initial_builds(state: &Arc<PyramidState>, plan: &IngestionPlan) {
             )
             .await
             {
-                Ok(_) => info!(
-                    slug = %dispatch.slug,
-                    content_type = %dispatch.content_type.as_str(),
-                    "folder_ingestion: first build spawned"
-                ),
+                Ok((_json, completion_rx)) => {
+                    info!(
+                        slug = %dispatch.slug,
+                        content_type = %dispatch.content_type.as_str(),
+                        sequential,
+                        "folder_ingestion: first build spawned"
+                    );
+                    if sequential {
+                        // Await completion before spawning the next build.
+                        match completion_rx.await {
+                            Ok(Ok(())) => info!(
+                                slug = %dispatch.slug,
+                                "folder_ingestion: sequential build completed"
+                            ),
+                            Ok(Err(e)) => warn!(
+                                slug = %dispatch.slug,
+                                error = %e,
+                                "folder_ingestion: sequential build finished with error"
+                            ),
+                            Err(_) => warn!(
+                                slug = %dispatch.slug,
+                                "folder_ingestion: sequential build completion channel dropped"
+                            ),
+                        }
+                    }
+                }
                 Err(e) => warn!(
                     slug = %dispatch.slug,
                     content_type = %dispatch.content_type.as_str(),
@@ -1862,7 +1892,8 @@ pub fn spawn_initial_builds(state: &Arc<PyramidState>, plan: &IngestionPlan) {
         // finished, and the regular change-propagation cascade picks up
         // slack on leaf completion via `notify_vine_of_child_completion`
         // (for vines that already have upper-layer nodes).
-        if !vines.is_empty() {
+        if !vines.is_empty() && !sequential {
+            // When sequential, leaves are already complete — no settle delay needed.
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         }
 
@@ -1879,10 +1910,30 @@ pub fn spawn_initial_builds(state: &Arc<PyramidState>, plan: &IngestionPlan) {
             )
             .await
             {
-                Ok(_) => info!(
-                    slug = %dispatch.slug,
-                    "folder_ingestion: first vine build spawned"
-                ),
+                Ok((_json, completion_rx)) => {
+                    info!(
+                        slug = %dispatch.slug,
+                        sequential,
+                        "folder_ingestion: first vine build spawned"
+                    );
+                    if sequential {
+                        match completion_rx.await {
+                            Ok(Ok(())) => info!(
+                                slug = %dispatch.slug,
+                                "folder_ingestion: sequential vine build completed"
+                            ),
+                            Ok(Err(e)) => warn!(
+                                slug = %dispatch.slug,
+                                error = %e,
+                                "folder_ingestion: sequential vine build finished with error"
+                            ),
+                            Err(_) => warn!(
+                                slug = %dispatch.slug,
+                                "folder_ingestion: sequential vine build completion channel dropped"
+                            ),
+                        }
+                    }
+                }
                 Err(e) => {
                     // Treat "Build already running" as expected — a prior
                     // dispatch may have beaten us to it. Every other error

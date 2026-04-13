@@ -25,6 +25,11 @@ use crate::pyramid::{BuildHandle, PyramidState};
 /// Returns immediately after registering the build handle and spawning the
 /// background task. Returns `Err` if the slug does not exist, the question is
 /// empty, or another build is already running for the slug.
+///
+/// The second element of the returned tuple is a oneshot receiver that fires
+/// when the build completes (or fails). Callers that need to sequence builds
+/// (e.g. sequential folder builds) await this receiver; fire-and-forget
+/// callers simply drop it.
 pub async fn spawn_question_build(
     state: &Arc<PyramidState>,
     slug: String,
@@ -33,7 +38,7 @@ pub async fn spawn_question_build(
     max_depth: u32,
     from_depth: i64,
     characterization: Option<CharacterizationResult>,
-) -> Result<serde_json::Value, String> {
+) -> Result<(serde_json::Value, tokio::sync::oneshot::Receiver<Result<(), String>>), String> {
     if question.trim().is_empty() {
         return Err("question cannot be empty".to_string());
     }
@@ -85,6 +90,8 @@ pub async fn spawn_question_build(
     let pyramid_state = state
         .with_build_reader()
         .map_err(|e| format!("Failed to create build reader: {e}"))?;
+    let (completion_tx, completion_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+
     let build_status = status.clone();
     let build_question = question.clone();
     let build_slug = slug.clone();
@@ -260,10 +267,11 @@ pub async fn spawn_question_build(
             }
         }
 
-        {
+        let completion_result = {
             let mut s = build_status.write().await;
-            if cancel.is_cancelled() {
+            let cr = if cancel.is_cancelled() {
                 s.status = "cancelled".to_string();
+                Err("cancelled".to_string())
             } else {
                 match result {
                     Ok((_apex, failures, activities)) => {
@@ -274,16 +282,24 @@ pub async fn spawn_question_build(
                         }
                         s.failures = failures;
                         s.steps = activities;
+                        Ok(())
                     }
                     Err(e) => {
                         tracing::error!(slug = %build_slug, error = %e, "question build failed");
                         s.status = "failed".to_string();
                         s.failures = -1;
+                        Err(e.to_string())
                     }
                 }
-            }
+            };
             s.elapsed_seconds = start.elapsed().as_secs_f64();
-        }
+            cr
+        };
+
+        // Signal completion to any awaiter (sequential folder builds).
+        // Receiver may have been dropped (fire-and-forget callers), so
+        // ignore the send error.
+        let _ = completion_tx.send(completion_result);
     });
 
     // Monitor: catch panics in the build task.
@@ -298,7 +314,7 @@ pub async fn spawn_question_build(
         }
     });
 
-    Ok(serde_json::json!({
+    Ok((serde_json::json!({
         "status": "started",
         "slug": slug,
         "build_type": "question_decomposition",
@@ -306,5 +322,5 @@ pub async fn spawn_question_build(
         "granularity": granularity,
         "max_depth": max_depth,
         "from_depth": from_depth,
-    }))
+    }), completion_rx))
 }

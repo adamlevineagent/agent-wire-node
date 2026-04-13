@@ -3495,6 +3495,13 @@ async fn post_build_seed(
         .map_err(|e| e.to_string())?
     };
 
+    let defer_maintenance = {
+        let cfg = pyramid_state.config.read().await;
+        cfg.dispatch_policy
+            .as_ref()
+            .map(|p| p.build_coordination.defer_maintenance_during_build)
+            .unwrap_or(false)
+    };
     let mut engine = wire_node_lib::pyramid::stale_engine::PyramidStaleEngine::new(
         slug,
         config,
@@ -3503,6 +3510,8 @@ async fn post_build_seed(
         &model,
         pyramid_state.operational.as_ref().clone(),
         pyramid_state.build_event_bus.clone(),
+        pyramid_state.active_build.clone(),
+        defer_maintenance,
     );
     engine.start_poll_loop();
 
@@ -4668,7 +4677,7 @@ async fn pyramid_question_build_inner(
     from_depth: i64,
     characterization: Option<wire_node_lib::pyramid::types::CharacterizationResult>,
 ) -> Result<serde_json::Value, String> {
-    wire_node_lib::pyramid::question_build::spawn_question_build(
+    let (json, _completion_rx) = wire_node_lib::pyramid::question_build::spawn_question_build(
         &state.pyramid,
         slug,
         question,
@@ -4677,7 +4686,8 @@ async fn pyramid_question_build_inner(
         from_depth,
         characterization,
     )
-    .await
+    .await?;
+    Ok(json)
 }
 
 /// Rebuild a pyramid using the question from its last build.
@@ -6342,14 +6352,18 @@ async fn pyramid_auto_update_config_init(
             // through every dispatched helper.
             // Phase 12 verifier fix: attach cache_access so stale helpers
             // (faq, etc.) that read llm_config.cache_access reach the cache.
-            let (base_config, model) = {
+            let (base_config, model, defer_maintenance) = {
                 let cfg = state.pyramid.config.read().await;
                 let stale_build_id = format!("stale-{}", slug);
                 let with_cache = state
                     .pyramid
                     .attach_cache_access(cfg.clone(), &slug, &stale_build_id);
                 let model = cfg.primary_model.clone();
-                (with_cache, model)
+                let defer = cfg.dispatch_policy
+                    .as_ref()
+                    .map(|p| p.build_coordination.defer_maintenance_during_build)
+                    .unwrap_or(false);
+                (with_cache, model, defer)
             };
 
             let mut engine = wire_node_lib::pyramid::stale_engine::PyramidStaleEngine::new(
@@ -6360,6 +6374,8 @@ async fn pyramid_auto_update_config_init(
                 &model,
                 state.pyramid.operational.as_ref().clone(),
                 state.pyramid.build_event_bus.clone(),
+                state.pyramid.active_build.clone(),
+                defer_maintenance,
             );
             engine.start_poll_loop();
             engines.insert(slug.clone(), engine);
