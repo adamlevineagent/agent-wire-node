@@ -516,7 +516,12 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
             });
             if (selected) {
                 const filePath = selected as string;
-                addPathAndAutoSlug(filePath);
+                // Replace paths entirely (not append) — conversation needs
+                // exactly one JSONL file, not a folder from step 1.
+                setPaths([filePath]);
+                const parts = filePath.split('/');
+                const name = (parts[parts.length - 1] || 'conversation').replace('.jsonl', '');
+                setSlug(slugify(name));
                 setContentType('conversation');
                 setStep('conversation-preset');
             }
