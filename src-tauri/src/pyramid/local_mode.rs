@@ -1687,6 +1687,67 @@ pub async fn delete_ollama_model(base_url: &str, model: &str) -> Result<()> {
     Ok(())
 }
 
+// ── Phase 6 Daemon Control Plane: Experimental Territory (AD-6) ─────────────
+
+/// Read the current experimental territory contribution.
+/// Returns the YAML content as a JSON value, or a default if none exists.
+pub fn get_experimental_territory(conn: &Connection) -> Result<serde_json::Value> {
+    match load_active_config_contribution(conn, "experimental_territory", None)? {
+        Some(contrib) => {
+            let val: serde_json::Value = serde_yaml::from_str(&contrib.yaml_content)?;
+            Ok(val)
+        }
+        None => Ok(default_experimental_territory()),
+    }
+}
+
+fn default_experimental_territory() -> serde_json::Value {
+    serde_json::json!({
+        "schema_type": "experimental_territory",
+        "dimensions": {
+            "model_selection": { "status": "locked" },
+            "context_limit": { "status": "locked" },
+            "concurrency": { "status": "locked" }
+        }
+    })
+}
+
+/// Set the experimental territory. Creates or supersedes the contribution.
+pub fn set_experimental_territory(
+    conn: &mut Connection,
+    bus: &Arc<BuildEventBus>,
+    territory_json: serde_json::Value,
+) -> Result<()> {
+    let yaml_str = serde_yaml::to_string(&territory_json)?;
+    let prior = load_active_config_contribution(conn, "experimental_territory", None)?;
+    if let Some(prior_contrib) = prior {
+        supersede_config_contribution(
+            conn,
+            &prior_contrib.contribution_id,
+            &yaml_str,
+            "experimental territory updated",
+            "user",
+            Some("user"),
+        )?;
+    } else {
+        create_config_contribution(
+            conn,
+            "experimental_territory",
+            None,
+            &yaml_str,
+            Some("experimental territory created"),
+            "user",
+            Some("user"),
+            "active",
+        )?;
+    }
+    // Sync (no-op for this type, but fires ConfigSynced event).
+    if let Some(contrib) = load_active_config_contribution(conn, "experimental_territory", None)? {
+        sync_config_to_operational(conn, bus, &contrib)?;
+    }
+    Ok(())
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

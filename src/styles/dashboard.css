@@ -20212,3 +20212,160 @@ body {
     text-align: center;
     font-style: italic;
 }
+
+/* ─── Phase 6: Experimental Territory ────────────────────────────── */
+
+.territory-section {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    padding: 4px 0;
+}
+
+.territory-explainer {
+    font-size: 12px;
+    color: var(--text-muted);
+    line-height: 1.5;
+    padding: 0 4px;
+}
+
+.territory-loading {
+    font-size: 12px;
+    color: var(--text-muted);
+    padding: 8px 4px;
+}
+
+.territory-dimension {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 10px 12px;
+    border-radius: var(--radius-sm);
+    background: var(--glass);
+    border: 1px solid var(--glass-border);
+    transition: border-color var(--transition);
+}
+
+.territory-dimension:hover {
+    border-color: rgba(255, 255, 255, 0.12);
+}
+
+.territory-dimension-header {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.territory-dimension-name {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-primary);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.territory-dimension-icon {
+    font-size: 11px;
+    font-weight: 400;
+    color: var(--text-muted);
+    font-family: monospace;
+    min-width: 20px;
+    text-align: center;
+}
+
+.territory-dimension-desc {
+    font-size: 11px;
+    color: var(--text-muted);
+    line-height: 1.4;
+}
+
+.territory-status-selector {
+    display: flex;
+    gap: 0;
+    border-radius: 6px;
+    overflow: hidden;
+    border: 1px solid var(--glass-border);
+    background: rgba(0, 0, 0, 0.2);
+}
+
+.territory-status-option {
+    flex: 1;
+    font-size: 11px;
+    font-family: inherit;
+    font-weight: 500;
+    padding: 5px 8px;
+    border: none;
+    background: transparent;
+    color: var(--text-secondary);
+    cursor: pointer;
+    transition: background var(--transition), color var(--transition);
+    text-align: center;
+    white-space: nowrap;
+}
+
+.territory-status-option:not(:last-child) {
+    border-right: 1px solid var(--glass-border);
+}
+
+.territory-status-option:hover:not(.territory-status-option-active) {
+    background: rgba(255, 255, 255, 0.04);
+    color: var(--text-primary);
+}
+
+.territory-status-option-active {
+    background: var(--accent-cyan);
+    color: #000;
+    font-weight: 600;
+}
+
+.territory-bounds {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    padding-top: 2px;
+}
+
+.territory-bounds-label {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 11px;
+    color: var(--text-secondary);
+}
+
+.territory-bounds-input {
+    width: 80px;
+    padding: 4px 6px !important;
+    font-size: 12px !important;
+    text-align: center;
+}
+
+.territory-save-btn {
+    align-self: flex-end;
+    padding: 6px 16px;
+    font-size: 12px;
+    font-family: inherit;
+    font-weight: 600;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--accent-cyan);
+    background: rgba(34, 211, 238, 0.1);
+    color: var(--accent-cyan);
+    cursor: pointer;
+    transition: background var(--transition), border-color var(--transition), color var(--transition);
+}
+
+.territory-save-btn:hover:not(:disabled) {
+    background: rgba(34, 211, 238, 0.2);
+}
+
+.territory-save-btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+
+.territory-save-btn-saved {
+    border-color: var(--accent-green);
+    background: rgba(64, 208, 128, 0.1);
+    color: var(--accent-green);
+}

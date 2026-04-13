@@ -889,6 +889,14 @@ pub fn sync_config_to_operational_with_registry(
             // on the next cycle automatically.
             debug!("wire_update_polling synced; poller will pick up new interval on next cycle");
         }
+        "experimental_territory" => {
+            // Phase 6 daemon control plane (AD-6): per-dimension
+            // lock/experimental territory markers for the future steward.
+            // No operational table needed — metadata for future steward.
+            // The contribution persists in pyramid_config_contributions
+            // and is readable via standard contribution queries.
+            debug!("experimental_territory synced; no operational table — metadata only");
+        }
         other => {
             // Per the spec: unknown types are a bug — fail loudly
             // rather than silently skipping sync.

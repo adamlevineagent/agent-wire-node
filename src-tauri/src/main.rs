@@ -8562,6 +8562,34 @@ async fn pyramid_set_concurrency_override(
     Ok(wire_node_lib::pyramid::local_mode::refresh_status_reachability(snapshot).await)
 }
 
+/// Phase 6 daemon control plane (AD-6): read experimental territory markers.
+/// Returns the active contribution's YAML as JSON, or a default (all locked).
+#[tauri::command]
+async fn pyramid_get_experimental_territory(
+    state: tauri::State<'_, SharedState>,
+) -> Result<serde_json::Value, String> {
+    let reader = state.pyramid.reader.lock().await;
+    wire_node_lib::pyramid::local_mode::get_experimental_territory(&reader)
+        .map_err(|e| e.to_string())
+}
+
+/// Phase 6 daemon control plane (AD-6): set experimental territory markers.
+/// Creates or supersedes the `experimental_territory` contribution.
+#[tauri::command]
+async fn pyramid_set_experimental_territory(
+    state: tauri::State<'_, SharedState>,
+    territory: serde_json::Value,
+) -> Result<String, String> {
+    let mut writer = state.pyramid.writer.lock().await;
+    wire_node_lib::pyramid::local_mode::set_experimental_territory(
+        &mut writer,
+        &state.pyramid.build_event_bus,
+        territory,
+    )
+    .map_err(|e| e.to_string())?;
+    Ok("Territory updated".to_string())
+}
+
 #[derive(serde::Serialize)]
 struct PreviewPullContributionResponse {
     yaml: String,
@@ -11784,6 +11812,9 @@ fn main() {
             // Phase 3 daemon control plane: context + concurrency overrides
             pyramid_set_context_override,
             pyramid_set_concurrency_override,
+            // Phase 6 daemon control plane: experimental territory markers
+            pyramid_get_experimental_territory,
+            pyramid_set_experimental_territory,
             pyramid_preview_pull_contribution,
             // Phase 11: Broadcast webhook + provider health oversight
             pyramid_provider_health,

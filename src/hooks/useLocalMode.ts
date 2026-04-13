@@ -50,6 +50,14 @@ export interface OllamaProbeResult {
   available_model_details: OllamaModelInfo[];
 }
 
+export interface ExperimentalTerritory {
+  schema_type: string;
+  dimensions: Record<string, {
+    status: "locked" | "experimental" | "experimental_within_bounds";
+    bounds?: { min?: number; max?: number } | null;
+  }>;
+}
+
 export interface ConfigHistoryEntry {
   contribution_id: string;
   yaml_content: string;
@@ -77,6 +85,8 @@ export interface UseLocalModeResult {
   deleteModel: (model: string) => Promise<void>;
   getConfigHistory: (schemaType: string, limit: number) => Promise<ConfigHistoryEntry[]>;
   rollbackConfig: (contributionId: string) => Promise<void>;
+  getExperimentalTerritory: () => Promise<ExperimentalTerritory>;
+  setExperimentalTerritory: (territory: ExperimentalTerritory) => Promise<void>;
 }
 
 export function useLocalMode(): UseLocalModeResult {
@@ -235,5 +245,20 @@ export function useLocalMode(): UseLocalModeResult {
     }
   }, [refresh]);
 
-  return { status, loading, error, refresh, enable, disable, probe, switchModel, getModelDetails, setContextOverride, setConcurrencyOverride, pullModel, cancelPull, deleteModel, getConfigHistory, rollbackConfig };
+  const getExperimentalTerritory = useCallback(async (): Promise<ExperimentalTerritory> => {
+    return await invoke<ExperimentalTerritory>("pyramid_get_experimental_territory");
+  }, []);
+
+  const setExperimentalTerritory = useCallback(async (territory: ExperimentalTerritory) => {
+    // Don't set global loading — territory save is metadata-only and
+    // shouldn't disable the entire Ollama settings panel.
+    setError(null);
+    try {
+      await invoke<void>("pyramid_set_experimental_territory", { territory });
+    } catch (err) {
+      setError(String(err));
+    }
+  }, []);
+
+  return { status, loading, error, refresh, enable, disable, probe, switchModel, getModelDetails, setContextOverride, setConcurrencyOverride, pullModel, cancelPull, deleteModel, getConfigHistory, rollbackConfig, getExperimentalTerritory, setExperimentalTerritory };
 }

@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { useLocalMode, type OllamaProbeResult, type OllamaModelInfo, type ConfigHistoryEntry } from "../hooks/useLocalMode";
+import { useLocalMode, type OllamaProbeResult, type OllamaModelInfo, type ConfigHistoryEntry, type ExperimentalTerritory } from "../hooks/useLocalMode";
 import { AccordionSection } from "./AccordionSection";
 import type { TaggedBuildEvent } from "../hooks/useBuildRowState";
 
@@ -86,6 +86,12 @@ export function Settings() {
     const [historyLoaded, setHistoryLoaded] = useState(false);
     const [confirmingRollback, setConfirmingRollback] = useState<string | null>(null);
 
+    // Phase 6: Experimental territory state
+    const [territory, setTerritory] = useState<ExperimentalTerritory | null>(null);
+    const [territoryLoaded, setTerritoryLoaded] = useState(false);
+    const [territorySaving, setTerritorySaving] = useState(false);
+    const [territorySaved, setTerritorySaved] = useState(false);
+
     // Sync local form state with the hook's status whenever it
     // refreshes — so the URL and dropdown reflect the persisted
     // ollama_base_url / ollama_model from the state row.
@@ -98,10 +104,11 @@ export function Settings() {
         }
     }, [localMode.status]);
 
-    // Reset history loaded flag when status changes (model switch, enable/disable)
-    // so the next accordion open fetches fresh data.
+    // Reset history + territory loaded flags when status changes (model switch,
+    // enable/disable) so the next accordion open fetches fresh data.
     useEffect(() => {
         setHistoryLoaded(false);
+        setTerritoryLoaded(false);
     }, [localMode.status?.model, localMode.status?.enabled]);
 
     // Sync context/concurrency override inputs from status
@@ -284,6 +291,92 @@ export function Settings() {
         // Refresh history list after rollback creates a new entry.
         await fetchConfigHistory();
     }, [localMode, fetchConfigHistory]);
+
+    // Phase 6: Dimension metadata for the territory UI.
+    const TERRITORY_DIMENSIONS: { key: string; label: string; description: string }[] = [
+        { key: "model_selection", label: "Model Selection", description: "Which Ollama model is used for builds" },
+        { key: "context_limit", label: "Context Limit", description: "Token context window size for the model" },
+        { key: "concurrency", label: "Concurrency", description: "Number of parallel build workers" },
+        // Future dimensions (compute market):
+        // { key: "pricing", label: "Pricing", description: "Cost constraints for inference" },
+        // { key: "job_acceptance", label: "Job Acceptance", description: "Which jobs to accept from the mesh" },
+        // { key: "scheduling", label: "Scheduling", description: "When builds are allowed to run" },
+    ];
+
+    // Phase 6: Fetch territory on demand (when accordion opens).
+    const fetchTerritory = useCallback(async () => {
+        try {
+            const t = await localMode.getExperimentalTerritory();
+            setTerritory(t);
+        } catch {
+            // If no territory exists yet, initialize with all dimensions locked.
+            const defaultDimensions: ExperimentalTerritory["dimensions"] = {};
+            for (const dim of TERRITORY_DIMENSIONS) {
+                defaultDimensions[dim.key] = { status: "locked", bounds: null };
+            }
+            setTerritory({ schema_type: "experimental_territory", dimensions: defaultDimensions });
+        }
+        setTerritoryLoaded(true);
+    }, [localMode]);
+
+    // Phase 6: Update a single dimension's status in the local territory state.
+    const setDimensionStatus = useCallback((dimKey: string, status: "locked" | "experimental" | "experimental_within_bounds") => {
+        setTerritory((prev) => {
+            if (!prev) return prev;
+            const dim = prev.dimensions[dimKey] || { status: "locked", bounds: null };
+            return {
+                ...prev,
+                dimensions: {
+                    ...prev.dimensions,
+                    [dimKey]: {
+                        ...dim,
+                        status,
+                        bounds: status === "experimental_within_bounds" ? (dim.bounds || { min: undefined, max: undefined }) : null,
+                    },
+                },
+            };
+        });
+        setTerritorySaved(false);
+    }, []);
+
+    // Phase 6: Update a dimension's bounds in the local territory state.
+    const setDimensionBounds = useCallback((dimKey: string, field: "min" | "max", value: string) => {
+        setTerritory((prev) => {
+            if (!prev) return prev;
+            const dim = prev.dimensions[dimKey];
+            if (!dim) return prev;
+            const parsed = value === "" ? undefined : parseInt(value, 10);
+            return {
+                ...prev,
+                dimensions: {
+                    ...prev.dimensions,
+                    [dimKey]: {
+                        ...dim,
+                        bounds: {
+                            ...(dim.bounds || {}),
+                            [field]: isNaN(parsed as number) ? undefined : parsed,
+                        },
+                    },
+                },
+            };
+        });
+        setTerritorySaved(false);
+    }, []);
+
+    // Phase 6: Save territory to backend.
+    const handleSaveTerritory = useCallback(async () => {
+        if (!territory) return;
+        setTerritorySaving(true);
+        try {
+            await localMode.setExperimentalTerritory(territory);
+            setTerritorySaved(true);
+            setTimeout(() => setTerritorySaved(false), 2000);
+        } catch {
+            // Error is surfaced via localMode.error
+        } finally {
+            setTerritorySaving(false);
+        }
+    }, [territory, localMode]);
 
     // Phase 5: Format a created_at timestamp as relative time or short date.
     const formatHistoryTime = (iso: string): string => {
@@ -1102,6 +1195,109 @@ export function Settings() {
                                         )}
                                     </>
                                 )}
+                            </div>
+                        </AccordionSection>
+                    </div>
+                )}
+
+                {/* Phase 6: Experimental Territory — only visible when local mode is enabled */}
+                {localMode.status?.enabled && (
+                    <div style={{ marginTop: 12 }}>
+                        <AccordionSection
+                            title="Optimization Territory"
+                            onToggle={(open) => {
+                                if (open && !territoryLoaded) {
+                                    fetchTerritory();
+                                }
+                            }}
+                        >
+                            <div className="territory-section">
+                                <p className="territory-explainer">
+                                    When the steward arrives, it will only optimize dimensions
+                                    you've marked as experimental. Locked dimensions are never
+                                    touched.
+                                </p>
+                                {!territoryLoaded ? (
+                                    <div className="territory-loading">Loading territory...</div>
+                                ) : territory ? (
+                                    <>
+                                        {TERRITORY_DIMENSIONS.map((dim) => {
+                                            const dimState = territory.dimensions[dim.key] || { status: "locked", bounds: null };
+                                            return (
+                                                <div key={dim.key} className="territory-dimension">
+                                                    <div className="territory-dimension-header">
+                                                        <span className="territory-dimension-name">
+                                                            <span className="territory-dimension-icon">
+                                                                {dimState.status === "locked"
+                                                                    ? "[x]"
+                                                                    : dimState.status === "experimental"
+                                                                        ? "[ ]"
+                                                                        : "[~]"}
+                                                            </span>
+                                                            {dim.label}
+                                                        </span>
+                                                        <span className="territory-dimension-desc">{dim.description}</span>
+                                                    </div>
+                                                    <div className="territory-status-selector">
+                                                        <button
+                                                            type="button"
+                                                            className={`territory-status-option ${dimState.status === "locked" ? "territory-status-option-active" : ""}`}
+                                                            onClick={() => setDimensionStatus(dim.key, "locked")}
+                                                        >
+                                                            Locked
+                                                        </button>
+                                                        <button
+                                                            type="button"
+                                                            className={`territory-status-option ${dimState.status === "experimental" ? "territory-status-option-active" : ""}`}
+                                                            onClick={() => setDimensionStatus(dim.key, "experimental")}
+                                                        >
+                                                            Experimental
+                                                        </button>
+                                                        <button
+                                                            type="button"
+                                                            className={`territory-status-option ${dimState.status === "experimental_within_bounds" ? "territory-status-option-active" : ""}`}
+                                                            onClick={() => setDimensionStatus(dim.key, "experimental_within_bounds")}
+                                                        >
+                                                            Bounded
+                                                        </button>
+                                                    </div>
+                                                    {dimState.status === "experimental_within_bounds" && dim.key !== "model_selection" && (
+                                                        <div className="territory-bounds">
+                                                            <label className="territory-bounds-label">
+                                                                Min
+                                                                <input
+                                                                    type="number"
+                                                                    className="settings-input territory-bounds-input"
+                                                                    value={dimState.bounds?.min ?? ""}
+                                                                    onChange={(e) => setDimensionBounds(dim.key, "min", e.target.value)}
+                                                                    placeholder="none"
+                                                                />
+                                                            </label>
+                                                            <label className="territory-bounds-label">
+                                                                Max
+                                                                <input
+                                                                    type="number"
+                                                                    className="settings-input territory-bounds-input"
+                                                                    value={dimState.bounds?.max ?? ""}
+                                                                    onChange={(e) => setDimensionBounds(dim.key, "max", e.target.value)}
+                                                                    placeholder="none"
+                                                                />
+                                                            </label>
+                                                        </div>
+                                                    )}
+                                                </div>
+                                            );
+                                        })}
+                                        <button
+                                            type="button"
+                                            className={`territory-save-btn ${territorySaved ? "territory-save-btn-saved" : ""}`}
+                                            disabled={territorySaving || localMode.loading}
+                                            onClick={handleSaveTerritory}
+                                        >
+                                            {territorySaved ? "Saved" : territorySaving ? "Saving..." : "Save Territory"}
+                                        </button>
+                                    </>
+                                ) : null}
                             </div>
                         </AccordionSection>
                     </div>

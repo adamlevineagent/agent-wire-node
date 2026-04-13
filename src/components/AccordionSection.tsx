@@ -1,4 +1,4 @@
-import { useState, useRef, useId, type ReactNode } from "react";
+import { useState, useRef, useEffect, useId, type ReactNode } from "react";
 
 interface AccordionSectionProps {
     title: string;
@@ -14,6 +14,7 @@ export function AccordionSection({
     children,
 }: AccordionSectionProps) {
     const [open, setOpen] = useState(defaultOpen);
+    const [height, setHeight] = useState<number | null>(null);
     const contentRef = useRef<HTMLDivElement>(null);
     const id = useId();
     const headerId = `${id}-header`;
@@ -27,12 +28,19 @@ export function AccordionSection({
         });
     };
 
-    const handleKeyDown = (e: React.KeyboardEvent) => {
-        if (e.key === "Enter" || e.key === " ") {
-            e.preventDefault();
-            toggle();
-        }
-    };
+    // ResizeObserver: recalculate height when children change size
+    // (async-loaded content, confirmation dialogs, etc.)
+    useEffect(() => {
+        const el = contentRef.current;
+        if (!el || !open) return;
+
+        const update = () => setHeight(el.scrollHeight);
+        update();
+
+        const observer = new ResizeObserver(update);
+        observer.observe(el);
+        return () => observer.disconnect();
+    }, [open, children]);
 
     return (
         <div className={`accordion-section ${open ? "accordion-section-open" : ""}`}>
@@ -41,7 +49,6 @@ export function AccordionSection({
                 type="button"
                 className="accordion-header"
                 onClick={toggle}
-                onKeyDown={handleKeyDown}
                 aria-expanded={open}
                 aria-controls={panelId}
             >
@@ -57,8 +64,8 @@ export function AccordionSection({
                 className="accordion-content"
                 style={{
                     maxHeight: open
-                        ? contentRef.current
-                            ? `${contentRef.current.scrollHeight}px`
+                        ? height != null
+                            ? `${height}px`
                             : "2000px"
                         : "0px",
                 }}
