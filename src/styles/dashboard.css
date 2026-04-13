@@ -21702,7 +21702,7 @@ body {
     display: flex;
     flex-direction: column;
     min-height: 400px;
-    height: 400px;
+    flex: 1;
     border-radius: var(--radius-md);
     overflow: visible;
 }
