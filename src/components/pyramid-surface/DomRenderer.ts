@@ -163,6 +163,10 @@ export class DomRenderer implements PyramidRenderer {
         // No-op: DOM mode does not render link intensities
     }
 
+    setDensityLabelThreshold(_minRadius: number): void {
+        // No-op: DOM mode does not render density labels
+    }
+
     hitTest(x: number, y: number, nodes: SurfaceNode[]): HitTestResult | null {
         // DOM hit testing: check which element is at the point
         if (!this.wrapper) return null;

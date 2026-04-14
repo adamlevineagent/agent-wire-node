@@ -73,6 +73,15 @@ fn default_pyramid_viz_config() -> serde_json::Value {
         },
         "window": {
             "auto_pop_on_build": true
+        },
+        "density": {
+            "repulsion": "auto",
+            "attraction": "auto",
+            "damping": "auto",
+            "settle_threshold": "auto",
+            "label_min_radius": "auto",
+            "max_iterations": "auto",
+            "center_gravity": "auto"
         }
     })
 }

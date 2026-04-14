@@ -29,6 +29,15 @@ export interface PyramidVizConfig {
     window: {
         auto_pop_on_build: boolean;
     };
+    density: {
+        repulsion: number | 'auto';
+        attraction: number | 'auto';
+        damping: number | 'auto';
+        settle_threshold: number | 'auto';
+        label_min_radius: number | 'auto';
+        max_iterations: number | 'auto';
+        center_gravity: number | 'auto';
+    };
 }
 
 const DEFAULT_VIZ_CONFIG: PyramidVizConfig = {
@@ -56,6 +65,15 @@ const DEFAULT_VIZ_CONFIG: PyramidVizConfig = {
     },
     window: {
         auto_pop_on_build: true,
+    },
+    density: {
+        repulsion: 'auto',
+        attraction: 'auto',
+        damping: 'auto',
+        settle_threshold: 'auto',
+        label_min_radius: 'auto',
+        max_iterations: 'auto',
+        center_gravity: 'auto',
     },
 };
 

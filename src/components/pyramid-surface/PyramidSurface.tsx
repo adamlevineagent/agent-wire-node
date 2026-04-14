@@ -4,6 +4,8 @@ import { useRenderTier } from './useRenderTier';
 import { usePyramidWindow } from '../../hooks/usePyramidWindow';
 import { usePyramidData } from './usePyramidData';
 import { useVisualEncoding } from './useVisualEncoding';
+import { useDensityLayout } from './useDensityLayout';
+import type { DensityConfig } from './useDensityLayout';
 import { useChronicleStream } from './useChronicleStream';
 import { useVizMapping } from './useVizMapping';
 import { CanvasRenderer } from './CanvasRenderer';
@@ -92,6 +94,39 @@ export function PyramidSurface({
         overlays.weightIntensity && !isBuilding,
     );
 
+    // ── Density layout (force-directed, S2-6) ──────────────────────────
+    const densityConfig = useMemo((): DensityConfig => {
+        const d = config.density;
+        return {
+            repulsion: d?.repulsion ?? 'auto',
+            attraction: d?.attraction ?? 'auto',
+            damping: d?.damping ?? 'auto',
+            settle_threshold: d?.settle_threshold ?? 'auto',
+            label_min_radius: d?.label_min_radius ?? 'auto',
+            max_iterations: d?.max_iterations ?? 'auto',
+            center_gravity: d?.center_gravity ?? 'auto',
+        };
+    }, [config]);
+
+    const {
+        nodes: densityNodes,
+        edges: densityEdges,
+        settled: _densitySettled,
+        labelMinRadius,
+    } = useDensityLayout(
+        nodes,
+        edges,
+        containerSize.width,
+        containerSize.height,
+        visualEncodings,
+        densityConfig,
+        layoutMode === 'density',
+    );
+
+    // Choose the active layout's output
+    const activeNodes = layoutMode === 'density' ? densityNodes : nodes;
+    const activeEdges = layoutMode === 'density' ? densityEdges : edges;
+
     // Apply encodings + link intensities to renderer when they change
     useEffect(() => {
         if (rendererRef.current) {
@@ -99,6 +134,15 @@ export function PyramidSurface({
             if (linkIntensities.size > 0) rendererRef.current.setLinkIntensities(linkIntensities);
         }
     }, [visualEncodings, linkIntensities]);
+
+    // Pass density label threshold to renderer when in density mode
+    useEffect(() => {
+        if (rendererRef.current) {
+            rendererRef.current.setDensityLabelThreshold(
+                layoutMode === 'density' ? labelMinRadius : 0,
+            );
+        }
+    }, [layoutMode, labelMinRadius]);
 
     // Auto-enable build overlay and open chronicle when building
     useEffect(() => {
@@ -181,7 +225,7 @@ export function PyramidSurface({
         if (mode === 'ticker' || !rendererRef.current) return;
 
         const draw = () => {
-            rendererRef.current?.render(nodes, edges, overlays, hoveredNodeId);
+            rendererRef.current?.render(activeNodes, activeEdges, overlays, hoveredNodeId);
         };
 
         const loop = () => {
@@ -205,7 +249,7 @@ export function PyramidSurface({
             cancelAnimationFrame(rafRef.current);
             if (idleTimerRef.current) clearTimeout(idleTimerRef.current);
         };
-    }, [nodes, edges, overlays, hoveredNodeId, mode]);
+    }, [activeNodes, activeEdges, overlays, hoveredNodeId, mode]);
 
     // ── Mouse interaction ───────────────────────────────────────────
     const lastMoveRef = useRef(0);
@@ -218,7 +262,7 @@ export function PyramidSurface({
             const renderer = rendererRef.current;
             if (!renderer) return;
 
-            const hit = renderer.hitTest(e.clientX, e.clientY, nodes);
+            const hit = renderer.hitTest(e.clientX, e.clientY, activeNodes);
             setHoveredNodeId(hit?.nodeId ?? null);
 
             // Wake from idle
@@ -229,19 +273,19 @@ export function PyramidSurface({
                     isIdleRef.current = true;
                 }, 5000);
                 rafRef.current = requestAnimationFrame(function loop() {
-                    rendererRef.current?.render(nodes, edges, overlays, hoveredNodeId);
+                    rendererRef.current?.render(activeNodes, activeEdges, overlays, hoveredNodeId);
                     if (!isIdleRef.current) rafRef.current = requestAnimationFrame(loop);
                 });
             }
         },
-        [nodes, edges, overlays, hoveredNodeId],
+        [activeNodes, activeEdges, overlays, hoveredNodeId],
     );
 
     const handleClick = useCallback(
         (e: React.MouseEvent) => {
             const renderer = rendererRef.current;
             if (!renderer) return;
-            const hit = renderer.hitTest(e.clientX, e.clientY, nodes);
+            const hit = renderer.hitTest(e.clientX, e.clientY, activeNodes);
             if (hit) {
                 // Check for cross-slug navigation
                 if (hit.nodeId.includes('/') && onNavigateToSlug) {
@@ -252,7 +296,7 @@ export function PyramidSurface({
                 }
             }
         },
-        [nodes, onNodeClick, onNavigateToSlug],
+        [activeNodes, onNodeClick, onNavigateToSlug],
     );
 
     const handleMouseLeave = useCallback(() => {
@@ -375,7 +419,7 @@ export function PyramidSurface({
             >
                 {/* Tooltip */}
                 {hoveredNodeId && (() => {
-                    const node = nodes.find((n) => n.id === hoveredNodeId);
+                    const node = activeNodes.find((n) => n.id === hoveredNodeId);
                     if (!node) return null;
                     return (
                         <div

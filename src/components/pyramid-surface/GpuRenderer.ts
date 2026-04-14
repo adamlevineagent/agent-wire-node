@@ -402,6 +402,11 @@ export class GpuRenderer implements PyramidRenderer {
     private activeVizPrimitive: VizPrimitive | null = null;
     private buildVizState: BuildVizState | null = null;
     private linkIntensities = new Map<string, number>();
+    private densityLabelThreshold = 0;
+
+    // 2D canvas overlay for text rendering (density labels, layer labels, apex)
+    private textCanvas: HTMLCanvasElement | null = null;
+    private textCtx: CanvasRenderingContext2D | null = null;
 
     // Shader programs
     private nodeProgram: WebGLProgram | null = null;
@@ -478,6 +483,19 @@ export class GpuRenderer implements PyramidRenderer {
         this.gl = gl;
         this.dpr = window.devicePixelRatio || 1;
 
+        // Create a transparent 2D canvas overlay for text rendering
+        // (density labels, layer labels, apex label). Layered on top of
+        // the WebGL canvas so text is crisp and GPU draws are undisturbed.
+        const textCanvas = document.createElement('canvas');
+        textCanvas.style.display = 'block';
+        textCanvas.style.position = 'absolute';
+        textCanvas.style.top = '0';
+        textCanvas.style.left = '0';
+        textCanvas.style.pointerEvents = 'none';
+        container.appendChild(textCanvas);
+        this.textCanvas = textCanvas;
+        this.textCtx = textCanvas.getContext('2d');
+
         // Enable blending for transparent nodes/edges
         gl.enable(gl.BLEND);
         gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
@@ -516,6 +534,12 @@ export class GpuRenderer implements PyramidRenderer {
             // Delete bloom resources
             this.destroyBloomResources(gl);
         }
+
+        if (this.textCanvas && this.container) {
+            this.container.removeChild(this.textCanvas);
+        }
+        this.textCanvas = null;
+        this.textCtx = null;
 
         if (this.canvas && this.container) {
             this.container.removeChild(this.canvas);
@@ -557,6 +581,15 @@ export class GpuRenderer implements PyramidRenderer {
 
         this.gl.viewport(0, 0, pw, ph);
 
+        // Size the 2D text overlay canvas to match
+        if (this.textCanvas && this.textCtx) {
+            this.textCanvas.width = pw;
+            this.textCanvas.height = ph;
+            this.textCanvas.style.width = `${width}px`;
+            this.textCanvas.style.height = `${height}px`;
+            this.textCtx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
+        }
+
         // Recreate bloom FBOs at new size
         this.initBloomFBOs(this.gl, pw, ph);
     }
@@ -581,6 +614,10 @@ export class GpuRenderer implements PyramidRenderer {
 
     setLinkIntensities(intensities: Map<string, number>): void {
         this.linkIntensities = new Map(intensities);
+    }
+
+    setDensityLabelThreshold(minRadius: number): void {
+        this.densityLabelThreshold = minRadius;
     }
 
     // ── Hit testing ─────────────────────────────────────────────────
@@ -808,6 +845,81 @@ export class GpuRenderer implements PyramidRenderer {
             gl.viewport(0, 0, this.canvas!.width, this.canvas!.height);
             this.renderScene(gl, nodes, edges, overlays, hoveredNodeId);
         }
+
+        // Text overlay pass (2D canvas): density labels, layer labels, apex
+        this.renderTextOverlay(nodes);
+    }
+
+    // ── Text overlay (2D canvas on top of WebGL) ───────────────────
+
+    private renderTextOverlay(nodes: SurfaceNode[]): void {
+        const ctx = this.textCtx;
+        if (!ctx) return;
+
+        ctx.clearRect(0, 0, this.width, this.height);
+        if (nodes.length === 0) return;
+
+        // Layer labels (left edge)
+        this.drawLayerLabels(ctx, nodes);
+
+        // Apex label
+        this.drawApexLabel(ctx, nodes);
+
+        // Density-mode node labels (nodes above threshold)
+        this.drawDensityLabels(ctx, nodes);
+    }
+
+    private drawLayerLabels(ctx: CanvasRenderingContext2D, nodes: SurfaceNode[]): void {
+        ctx.font = '10px monospace';
+        ctx.fillStyle = 'rgba(255, 255, 255, 0.2)';
+        ctx.textAlign = 'left';
+
+        const drawnDepths = new Set<number>();
+        for (const node of nodes) {
+            if (drawnDepths.has(node.depth)) continue;
+            drawnDepths.add(node.depth);
+            const label = node.depth === -1 ? 'BEDROCK' : `L${node.depth}`;
+            ctx.fillText(label, 12, node.y + 3);
+        }
+    }
+
+    private drawApexLabel(ctx: CanvasRenderingContext2D, nodes: SurfaceNode[]): void {
+        if (nodes.length === 0) return;
+        const maxDepth = Math.max(...nodes.map((n) => n.depth));
+        const apexNodes = nodes.filter((n) => n.depth === maxDepth);
+        if (apexNodes.length !== 1) return;
+
+        const apex = apexNodes[0];
+        const title = apex.selfPrompt?.trim() || apex.headline?.trim() || apex.id;
+        const label = title.length > 34 ? title.slice(0, 34) + '...' : title;
+
+        ctx.font = '11px Inter, sans-serif';
+        ctx.fillStyle = 'rgba(255, 255, 255, 0.6)';
+        ctx.textAlign = 'center';
+        ctx.fillText(label, apex.x, apex.y + apex.radius + 16);
+    }
+
+    private drawDensityLabels(ctx: CanvasRenderingContext2D, nodes: SurfaceNode[]): void {
+        if (this.densityLabelThreshold <= 0) return;
+
+        ctx.save();
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'top';
+
+        for (const node of nodes) {
+            if (node.radius < this.densityLabelThreshold) continue;
+            if (node.depth < 0) continue; // skip bedrock
+
+            const title = node.selfPrompt?.trim() || node.headline?.trim() || node.id;
+            const label = title.length > 28 ? title.slice(0, 26) + '..' : title;
+
+            const fontSize = Math.max(9, Math.min(14, node.radius * 0.6));
+            ctx.font = `${fontSize}px Inter, sans-serif`;
+            ctx.fillStyle = 'rgba(255, 255, 255, 0.7)';
+            ctx.fillText(label, node.x, node.y + node.radius + 4);
+        }
+
+        ctx.restore();
     }
 
     private renderScene(

@@ -37,6 +37,9 @@ export interface PyramidRenderer {
     /** Set per-link visual intensities for importance-weighted edge rendering. */
     setLinkIntensities(intensities: Map<string, number>): void;
 
+    /** Set the minimum node radius for density-mode labels. 0 = no labels. */
+    setDensityLabelThreshold(minRadius: number): void;
+
     /** Hit test: given viewport coordinates, return the node under the cursor (if any). */
     hitTest(x: number, y: number, nodes: SurfaceNode[]): HitTestResult | null;
 

@@ -166,6 +166,7 @@ export class CanvasRenderer implements PyramidRenderer {
     private activeVizPrimitive: VizPrimitive | null = null;
     private buildVizState: BuildVizState | null = null;
     private linkIntensities = new Map<string, number>();
+    private densityLabelThreshold = 0;
 
     // ── Lifecycle ───────────────────────────────────────────────────
 
@@ -243,6 +244,10 @@ export class CanvasRenderer implements PyramidRenderer {
         this.linkIntensities = new Map(intensities);
     }
 
+    setDensityLabelThreshold(minRadius: number): void {
+        this.densityLabelThreshold = minRadius;
+    }
+
     // ── Hit testing ─────────────────────────────────────────────────
 
     hitTest(x: number, y: number, nodes: SurfaceNode[]): HitTestResult | null {
@@ -314,6 +319,9 @@ export class CanvasRenderer implements PyramidRenderer {
 
         // 6. Apex label
         this.drawApexLabel(ctx, nodes);
+
+        // 7. Density-mode node labels (nodes above threshold)
+        this.drawDensityLabels(ctx, nodes);
     }
 
     // ── Draw sub-routines ───────────────────────────────────────────
@@ -721,5 +729,34 @@ export class CanvasRenderer implements PyramidRenderer {
         ctx.fillStyle = 'rgba(255, 255, 255, 0.6)';
         ctx.textAlign = 'center';
         ctx.fillText(label, apex.x, apex.y + apex.radius + 16);
+    }
+
+    private drawDensityLabels(
+        ctx: CanvasRenderingContext2D,
+        nodes: SurfaceNode[],
+    ): void {
+        if (this.densityLabelThreshold <= 0) return;
+
+        ctx.save();
+        ctx.shadowBlur = 0;
+        ctx.shadowColor = 'transparent';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'top';
+
+        for (const node of nodes) {
+            if (node.radius < this.densityLabelThreshold) continue;
+            if (node.depth < 0) continue; // skip bedrock
+
+            const title = nodeTitle(node);
+            const label = title.length > 28 ? title.slice(0, 26) + '..' : title;
+
+            // Scale font size with node radius
+            const fontSize = Math.max(9, Math.min(14, node.radius * 0.6));
+            ctx.font = `${fontSize}px Inter, sans-serif`;
+            ctx.fillStyle = 'rgba(255, 255, 255, 0.7)';
+            ctx.fillText(label, node.x, node.y + node.radius + 4);
+        }
+
+        ctx.restore();
     }
 }
