@@ -1159,7 +1159,7 @@ fn resolve_ir_llm_call_options(step: &Step, tier1: &Tier1Config) -> llm::LlmCall
         None
     };
 
-    llm::LlmCallOptions { min_timeout_secs }
+    llm::LlmCallOptions { min_timeout_secs, ..Default::default() }
 }
 
 /// Dispatch an IR Step to the appropriate execution path.

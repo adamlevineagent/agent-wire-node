@@ -5,7 +5,7 @@ import type { OperationEntry } from '../types/planner';
 
 // --- Types -------------------------------------------------------------------
 
-export type Mode = 'pyramids' | 'knowledge' | 'tools' | 'fleet' | 'operations' | 'search' | 'compose' | 'dashboard' | 'identity' | 'settings';
+export type Mode = 'pyramids' | 'knowledge' | 'tools' | 'fleet' | 'operations' | 'market' | 'search' | 'compose' | 'dashboard' | 'identity' | 'settings';
 
 export interface ViewStackEntry {
     view: string;
@@ -69,7 +69,7 @@ type AppAction =
 
 // --- Initial State -----------------------------------------------------------
 
-const ALL_MODES: Mode[] = ['pyramids', 'knowledge', 'tools', 'fleet', 'operations', 'search', 'compose', 'dashboard', 'identity', 'settings'];
+const ALL_MODES: Mode[] = ['pyramids', 'knowledge', 'tools', 'fleet', 'operations', 'market', 'search', 'compose', 'dashboard', 'identity', 'settings'];
 
 function createInitialModeStacks(): Record<Mode, ViewStackEntry[]> {
     const stacks: Record<string, ViewStackEntry[]> = {};

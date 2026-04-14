@@ -44,12 +44,14 @@ static RATE_LIMITER: LazyLock<TokioMutex<VecDeque<std::time::Instant>>> =
     LazyLock::new(|| TokioMutex::new(VecDeque::new()));
 
 /// Global semaphore for local LLM providers (Ollama).
-/// All subsystems (builds, stale engines, Pipeline B) share this single
-/// bottleneck so only one HTTP request hits the local provider at a time.
-/// OpenRouter calls bypass this entirely — they use the sliding-window
-/// rate limiter above instead.
+///
+/// Phase 1 compute queue: set to usize::MAX (effectively a no-op).
+/// The per-model FIFO queue in ComputeQueueManager is now the real
+/// serializer. The semaphore stays at usize::MAX (not deleted) so
+/// tests that don't construct ProviderPools or a ComputeQueueHandle
+/// still compile and fall through without blocking.
 static LOCAL_PROVIDER_SEMAPHORE: LazyLock<tokio::sync::Semaphore> =
-    LazyLock::new(|| tokio::sync::Semaphore::new(1));
+    LazyLock::new(|| tokio::sync::Semaphore::new(usize::MAX));
 
 /// Shared HTTP client — reuses TCP connections and TLS sessions across all LLM calls.
 /// `pub(crate)` so Ollama API calls in `local_mode.rs` reuse the same client
@@ -186,6 +188,16 @@ pub struct LlmConfig {
     /// LOCAL_PROVIDER_SEMAPHORE with per-provider semaphores.
     /// When None (tests, pre-init), fall through to global semaphore.
     pub provider_pools: Option<std::sync::Arc<crate::pyramid::provider_pools::ProviderPools>>,
+    /// Phase 1 compute queue handle. When Some, LLM calls are enqueued
+    /// to the per-model FIFO queue and processed by the GPU loop.
+    /// When None (tests, pre-init), calls go straight to HTTP.
+    pub compute_queue: Option<crate::compute_queue::ComputeQueueHandle>,
+    /// Fleet roster handle. When Some, fleet peers are checked BEFORE the
+    /// local compute queue — if a peer has the model loaded with capacity,
+    /// the call is dispatched to the peer via HTTP. On failure, falls
+    /// through to the local queue. When None (tests, pre-init), fleet
+    /// routing is skipped.
+    pub fleet_roster: Option<Arc<tokio::sync::RwLock<crate::fleet::FleetRoster>>>,
 }
 
 /// Phase 12: cache plumbing that lives on an LlmConfig so every call
@@ -256,6 +268,8 @@ impl std::fmt::Debug for LlmConfig {
             .field("cache_access", &self.cache_access)
             .field("dispatch_policy", &self.dispatch_policy.as_ref().map(|_| "<policy>"))
             .field("provider_pools", &self.provider_pools.as_ref().map(|_| "<pools>"))
+            .field("compute_queue", &self.compute_queue.as_ref().map(|_| "<queue>"))
+            .field("fleet_roster", &self.fleet_roster.as_ref().map(|_| "<fleet>"))
             .finish()
     }
 }
@@ -286,6 +300,8 @@ impl Default for LlmConfig {
             cache_access: None,
             dispatch_policy: None,
             provider_pools: None,
+            compute_queue: None,
+            fleet_roster: None,
         }
     }
 }
@@ -340,6 +356,9 @@ impl LlmConfig {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct LlmCallOptions {
     pub min_timeout_secs: Option<u64>,
+    /// When true, the GPU processing loop bypasses semaphore/pool
+    /// acquisition. Set by the queue consumer; callers never set this.
+    pub skip_concurrency_gate: bool,
 }
 
 // ── Provider synthesis (Phase 3 bridge) ──────────────────────────────────────
@@ -605,6 +624,142 @@ pub async fn call_model_unified_with_audit_and_ctx(
     response_format: Option<&serde_json::Value>,
     options: LlmCallOptions,
 ) -> Result<LlmResponse> {
+    // ── Fleet Routing: check fleet peers before local queue ─────────
+    //
+    // If a fleet peer has this model loaded with capacity, dispatch to
+    // the peer instead of enqueueing locally. This happens BEFORE the
+    // compute queue check because fleet dispatch is transparent to the
+    // caller — same return type, same behavior.
+    //
+    // Only attempt fleet if:
+    // 1. Config has a fleet_roster (not tests/pre-init)
+    // 2. Caller is not the GPU loop (skip_concurrency_gate == false)
+    // 3. Fleet roster has a peer with this model and capacity
+    if let Some(ref fleet_roster_handle) = config.fleet_roster {
+        if !options.skip_concurrency_gate {
+            // Derive model_id from StepContext resolved model or config primary.
+            let fleet_model_id = ctx
+                .and_then(|c| c.resolved_model_id.clone())
+                .filter(|m| !m.is_empty())
+                .unwrap_or_else(|| config.primary_model.clone());
+
+            let roster = fleet_roster_handle.read().await;
+            if let Some(peer) = roster.find_peer_for_model(&fleet_model_id) {
+                let jwt = roster.fleet_jwt.clone().unwrap_or_default();
+                if !jwt.is_empty() {
+                    let request = crate::fleet::FleetDispatchRequest {
+                        model: fleet_model_id.clone(),
+                        system_prompt: system_prompt.to_string(),
+                        user_prompt: user_prompt.to_string(),
+                        temperature,
+                        max_tokens: _max_tokens,
+                        response_format: response_format.cloned(),
+                        fleet_jwt: jwt,
+                    };
+                    let peer_clone = peer.clone();
+                    // Drop the roster read lock before the async dispatch call.
+                    drop(roster);
+
+                    match crate::fleet::fleet_dispatch(&peer_clone, &request).await {
+                        Ok(fleet_resp) => {
+                            // Convert FleetDispatchResponse to LlmResponse.
+                            return Ok(LlmResponse {
+                                content: fleet_resp.content,
+                                usage: super::types::TokenUsage {
+                                    prompt_tokens: fleet_resp.prompt_tokens.unwrap_or(0),
+                                    completion_tokens: fleet_resp.completion_tokens.unwrap_or(0),
+                                },
+                                generation_id: None,
+                                actual_cost_usd: None, // Fleet is free (same operator)
+                                provider_id: Some("fleet".to_string()),
+                            });
+                        }
+                        Err(e) => {
+                            // Fleet dispatch failed — remove dead peer and fall
+                            // through to local queue. Never retry fleet.
+                            warn!("Fleet dispatch failed, falling through to local: {}", e);
+                            let mut roster_w = fleet_roster_handle.write().await;
+                            roster_w.remove_peer(&peer_clone.node_id);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Phase 1 Compute Queue: Transparent routing ─────────────────
+    //
+    // When the config has a compute_queue attached AND the caller is
+    // NOT the GPU loop itself (skip_concurrency_gate == false), enqueue
+    // the call and block on the oneshot result. This is the single
+    // interception point that routes ALL unified LLM calls through the
+    // per-model FIFO queue without changing any caller.
+    if let Some(ref queue_handle) = config.compute_queue {
+        if !options.skip_concurrency_gate {
+            // Derive queue routing key from the resolved model in ctx,
+            // or fall back to the config's primary model.
+            let queue_model_id = ctx
+                .and_then(|c| c.resolved_model_id.clone())
+                .filter(|m| !m.is_empty())
+                .unwrap_or_else(|| config.primary_model.clone());
+
+            let (tx, rx) = tokio::sync::oneshot::channel();
+
+            // Clone config WITHOUT queue handle (prevents re-enqueue loop)
+            // and WITHOUT fleet roster (prevents fleet re-dispatch).
+            let mut gpu_config = config.clone();
+            gpu_config.compute_queue = None;
+            gpu_config.fleet_roster = None;
+
+            // Set skip_concurrency_gate on the forwarded options so the
+            // GPU loop's execution bypasses semaphore/pool acquisition.
+            let mut gpu_options = options;
+            gpu_options.skip_concurrency_gate = true;
+
+            let depth = {
+                let mut q = queue_handle.queue.lock().await;
+                q.enqueue_local(
+                    &queue_model_id,
+                    crate::compute_queue::QueueEntry {
+                        result_tx: tx,
+                        config: gpu_config,
+                        system_prompt: system_prompt.to_string(),
+                        user_prompt: user_prompt.to_string(),
+                        temperature,
+                        max_tokens: _max_tokens,
+                        response_format: response_format.cloned(),
+                        options: gpu_options,
+                        step_ctx: ctx.cloned(), // Law 4: StepContext flows through
+                        model_id: queue_model_id.clone(),
+                        enqueued_at: std::time::Instant::now(),
+                    },
+                );
+                q.queue_depth(&queue_model_id)
+            };
+
+            // Emit QueueJobEnqueued event via BuildEventBus.
+            // Use slug "__compute__" (reserved non-pyramid slug).
+            if let Some(step) = ctx {
+                if let Some(ref bus) = step.bus {
+                    let _ = bus.tx.send(super::event_bus::TaggedBuildEvent {
+                        slug: "__compute__".to_string(),
+                        kind: super::event_bus::TaggedKind::QueueJobEnqueued {
+                            model_id: queue_model_id.clone(),
+                            queue_depth: depth,
+                        },
+                    });
+                }
+            }
+
+            queue_handle.notify.notify_one();
+
+            // Block until the GPU loop processes this item and sends result.
+            return rx
+                .await
+                .map_err(|_| anyhow!("compute queue: GPU loop dropped the job"))?;
+        }
+    }
+
     // ── Phase 6: Cache lookup path ──────────────────────────────────
     //
     // Delegated to `try_cache_lookup_or_key`, which is shared with
@@ -875,7 +1030,13 @@ pub async fn call_model_unified_with_audit_and_ctx(
         // held across all retry attempts so we don't re-enter the escalation
         // chain on each retry. The global semaphore fallback remains for the
         // no-pools / no-escalation-permit case (tests, pre-init).
-        let _local_permit = if _escalation_permit.is_none() && provider_type == ProviderType::OpenaiCompat {
+        //
+        // Phase 1 compute queue: when skip_concurrency_gate is true (GPU
+        // loop execution), skip ALL concurrency gates — the queue already
+        // serialized access.
+        let _local_permit = if options.skip_concurrency_gate {
+            None
+        } else if _escalation_permit.is_none() && provider_type == ProviderType::OpenaiCompat {
             Some(LOCAL_PROVIDER_SEMAPHORE.acquire().await.map_err(|e| anyhow!("local provider semaphore closed: {e}"))?)
         } else {
             None
@@ -2873,6 +3034,7 @@ mod tests {
             33_000,
             LlmCallOptions {
                 min_timeout_secs: Some(420),
+                ..Default::default()
             },
             defaults.base_timeout_secs,
             defaults.max_timeout_secs,

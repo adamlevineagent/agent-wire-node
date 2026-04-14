@@ -113,6 +113,14 @@ export function Sidebar() {
             shouldGlow: () => state.notificationCount > 0 || state.messageCount > 0,
         },
         {
+            key: 'market' as Mode,
+            label: 'Market',
+            section: 'IN MOTION' as const,
+            headline: () => '',
+            context: () => 'compute queue',
+            shouldGlow: () => false,
+        },
+        {
             key: 'search' as Mode,
             label: 'Search',
             section: 'THE WIRE' as const,

@@ -26,6 +26,11 @@ pub struct ServerState {
     pub node_id: Arc<RwLock<String>>,
     pub pyramid: Arc<pyramid::PyramidState>,
     pub partner: Arc<partner::PartnerState>,
+    /// Fleet roster for receiving fleet dispatch jobs and announcements.
+    pub fleet_roster: Arc<RwLock<crate::fleet::FleetRoster>>,
+    /// Compute queue handle for enqueuing fleet-dispatched jobs into the
+    /// same per-model FIFO queue as local builds (Law 1).
+    pub compute_queue: crate::compute_queue::ComputeQueueHandle,
 }
 
 #[derive(Serialize)]
@@ -424,6 +429,8 @@ pub async fn start_server(
     node_id: Arc<RwLock<String>>,
     pyramid: Arc<pyramid::PyramidState>,
     partner: Arc<partner::PartnerState>,
+    fleet_roster: Arc<RwLock<crate::fleet::FleetRoster>>,
+    compute_queue: crate::compute_queue::ComputeQueueHandle,
 ) {
     let state = ServerState {
         cache_dir,
@@ -435,6 +442,8 @@ pub async fn start_server(
         node_id,
         pyramid,
         partner,
+        fleet_roster,
+        compute_queue,
     };
 
     // Phase 7: Initialize stale engines for auto-update pyramids (background)
@@ -1055,9 +1064,52 @@ pub async fn start_server(
         ]);
     let openrouter_webhook_with_cors = openrouter_webhook.with(webhook_cors);
 
+    // ── Fleet endpoints (v1 prefix) ─────────────────────────────
+    // Fleet routes are API-to-API (peer tunnel traffic), not browser-
+    // originated. They use a permissive CORS since they arrive from
+    // Cloudflare tunnel origins, not localhost.
+
+    // POST /v1/compute/fleet-dispatch — receive fleet LLM job from peer
+    let fleet_dispatch_route = {
+        let state = state.clone();
+        warp::path!("v1" / "compute" / "fleet-dispatch")
+            .and(warp::post())
+            .and(warp::header::<String>("authorization"))
+            .and(warp::body::json())
+            .and_then(move |auth_header: String, body: serde_json::Value| {
+                let state = state.clone();
+                async move {
+                    handle_fleet_dispatch(auth_header, body, state).await
+                }
+            })
+    };
+
+    // POST /v1/fleet/announce — receive fleet peer announcement
+    let fleet_announce_route = {
+        let state = state.clone();
+        warp::path!("v1" / "fleet" / "announce")
+            .and(warp::post())
+            .and(warp::header::<String>("authorization"))
+            .and(warp::body::json())
+            .and_then(move |auth_header: String, body: serde_json::Value| {
+                let state = state.clone();
+                async move {
+                    handle_fleet_announce(auth_header, body, state).await
+                }
+            })
+    };
+
+    // Fleet CORS: permissive (peer-to-peer via Cloudflare tunnels).
+    let fleet_cors = warp::cors()
+        .allow_any_origin()
+        .allow_methods(vec!["POST", "OPTIONS"])
+        .allow_headers(vec!["Content-Type", "Authorization"]);
+    let fleet_routes = fleet_dispatch_route.or(fleet_announce_route).with(fleet_cors);
+
     let routes = preflight
         .or(public_html_with_cors)
         .or(openrouter_webhook_with_cors)
+        .or(fleet_routes)
         .or(pyramid_routes
             .or(partner_routes)
             .or(auth_callback
@@ -1374,4 +1426,227 @@ pub fn verify_pyramid_query_jwt(
     }
 
     Ok(token_data.claims)
+}
+
+// ── Fleet JWT verification and handlers ─────────────────────────────────
+
+/// JWT claims for fleet-internal authentication.
+/// aud: "fleet", op: operator_id, nid: source node_id
+#[derive(Debug, Deserialize)]
+pub struct FleetJwtClaims {
+    #[allow(dead_code)]
+    pub aud: Option<String>,
+    #[serde(alias = "op")]
+    pub op: Option<String>,
+    #[allow(dead_code)]
+    pub nid: Option<String>,
+    #[allow(dead_code)]
+    pub exp: Option<u64>,
+}
+
+/// Verify a fleet JWT using Ed25519 public key.
+/// Validates audience is "fleet". Returns claims for operator matching.
+pub fn verify_fleet_jwt(
+    token: &str,
+    public_key_pem: &str,
+) -> Result<FleetJwtClaims, String> {
+    use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
+
+    let decoding_key = DecodingKey::from_ed_pem(public_key_pem.as_bytes())
+        .map_err(|e| format!("Invalid public key: {}", e))?;
+
+    let mut validation = Validation::new(Algorithm::EdDSA);
+    validation.validate_exp = true;
+    validation.set_required_spec_claims(&["exp"]);
+    validation.set_audience(&["fleet"]);
+
+    let token_data = decode::<FleetJwtClaims>(token, &decoding_key, &validation)
+        .map_err(|e| format!("Fleet JWT decode failed: {}", e))?;
+
+    Ok(token_data.claims)
+}
+
+/// Handle POST /v1/compute/fleet-dispatch — receive fleet LLM job from peer.
+///
+/// Verifies fleet JWT, checks same-operator, parses request, enqueues into
+/// the SAME compute queue as local builds (Law 1), awaits result, returns
+/// FleetDispatchResponse.
+async fn handle_fleet_dispatch(
+    auth_header: String,
+    body: serde_json::Value,
+    state: ServerState,
+) -> Result<impl warp::Reply, warp::Rejection> {
+    // 1. Extract and verify fleet JWT
+    let token = auth_header.strip_prefix("Bearer ").unwrap_or("");
+    let jwt_pk = state.jwt_public_key.read().await;
+    if jwt_pk.is_empty() {
+        return Ok(warp::reply::with_status(
+            warp::reply::json(&serde_json::json!({"error": "No JWT public key configured"})),
+            warp::http::StatusCode::SERVICE_UNAVAILABLE,
+        ));
+    }
+
+    let claims = match verify_fleet_jwt(token, &jwt_pk) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("Fleet dispatch JWT verification failed: {}", e);
+            return Ok(warp::reply::with_status(
+                warp::reply::json(&serde_json::json!({"error": format!("JWT verification failed: {}", e)})),
+                warp::http::StatusCode::FORBIDDEN,
+            ));
+        }
+    };
+    // Drop the read lock on jwt_public_key.
+    drop(jwt_pk);
+
+    // 2. Verify same operator
+    let self_operator_id = state.auth.read().await.operator_id.clone().unwrap_or_default();
+    let jwt_operator_id = claims.op.unwrap_or_default();
+    if self_operator_id.is_empty()
+        || jwt_operator_id.is_empty()
+        || self_operator_id != jwt_operator_id
+    {
+        return Ok(warp::reply::with_status(
+            warp::reply::json(&serde_json::json!({"error": "Operator mismatch — not same fleet"})),
+            warp::http::StatusCode::FORBIDDEN,
+        ));
+    }
+
+    // 3. Parse request
+    let model = body["model"].as_str().unwrap_or("").to_string();
+    let system_prompt = body["system_prompt"].as_str().unwrap_or("").to_string();
+    let user_prompt = body["user_prompt"].as_str().unwrap_or("").to_string();
+    let temperature = body["temperature"].as_f64().unwrap_or(0.0) as f32;
+    let max_tokens = body["max_tokens"].as_u64().unwrap_or(4096) as usize;
+    let response_format = body.get("response_format").cloned();
+
+    if model.is_empty() || user_prompt.is_empty() {
+        return Ok(warp::reply::with_status(
+            warp::reply::json(&serde_json::json!({"error": "Missing model or user_prompt"})),
+            warp::http::StatusCode::BAD_REQUEST,
+        ));
+    }
+
+    // 4. Build a minimal LlmConfig for this fleet job.
+    // Clone the pyramid's base LlmConfig and override model + clear
+    // queue/fleet handles to prevent re-dispatch loops.
+    let fleet_config = {
+        let cfg = state.pyramid.config.read().await;
+        let mut fc = cfg.clone();
+        fc.primary_model = model.clone();
+        fc.fallback_model_1 = model.clone();
+        fc.fallback_model_2 = model.clone();
+        fc.compute_queue = None; // prevent re-enqueue
+        fc.fleet_roster = None; // prevent fleet re-dispatch
+        fc
+    };
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let options = crate::pyramid::llm::LlmCallOptions {
+        skip_concurrency_gate: true,
+        ..Default::default()
+    };
+
+    // 5. Enqueue the fleet job into the same per-model FIFO queue (Law 1).
+    {
+        let mut q = state.compute_queue.queue.lock().await;
+        q.enqueue_local(
+            &model,
+            crate::compute_queue::QueueEntry {
+                result_tx: tx,
+                config: fleet_config,
+                system_prompt,
+                user_prompt,
+                temperature,
+                max_tokens,
+                response_format,
+                options,
+                step_ctx: None, // Fleet jobs have no StepContext (Law 4)
+                model_id: model.clone(),
+                enqueued_at: std::time::Instant::now(),
+            },
+        );
+    }
+    state.compute_queue.notify.notify_one();
+
+    // 6. Await result (synchronous — fleet dispatch blocks until GPU completes)
+    match rx.await {
+        Ok(Ok(llm_response)) => {
+            let response = serde_json::json!({
+                "content": llm_response.content,
+                "prompt_tokens": llm_response.usage.prompt_tokens,
+                "completion_tokens": llm_response.usage.completion_tokens,
+                "model": model,
+                "finish_reason": null,
+            });
+            Ok(warp::reply::with_status(
+                warp::reply::json(&response),
+                warp::http::StatusCode::OK,
+            ))
+        }
+        Ok(Err(e)) => Ok(warp::reply::with_status(
+            warp::reply::json(&serde_json::json!({"error": format!("LLM call failed: {}", e)})),
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+        )),
+        Err(_) => Ok(warp::reply::with_status(
+            warp::reply::json(&serde_json::json!({"error": "Queue channel closed"})),
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+        )),
+    }
+}
+
+/// Handle POST /v1/fleet/announce — receive fleet peer announcement.
+///
+/// Verifies fleet JWT, checks same-operator, parses announcement,
+/// updates the fleet roster.
+async fn handle_fleet_announce(
+    auth_header: String,
+    body: serde_json::Value,
+    state: ServerState,
+) -> Result<impl warp::Reply, warp::Rejection> {
+    // 1. Verify fleet JWT
+    let token = auth_header.strip_prefix("Bearer ").unwrap_or("");
+    let jwt_pk = state.jwt_public_key.read().await;
+
+    let claims = match verify_fleet_jwt(token, &jwt_pk) {
+        Ok(c) => c,
+        Err(e) => {
+            return Ok(warp::reply::with_status(
+                warp::reply::json(&serde_json::json!({"error": format!("JWT verification failed: {}", e)})),
+                warp::http::StatusCode::FORBIDDEN,
+            ));
+        }
+    };
+    drop(jwt_pk);
+
+    // 2. Verify same operator
+    let self_operator_id = state.auth.read().await.operator_id.clone().unwrap_or_default();
+    let jwt_operator_id = claims.op.unwrap_or_default();
+    if self_operator_id.is_empty() || self_operator_id != jwt_operator_id {
+        return Ok(warp::reply::with_status(
+            warp::reply::json(&serde_json::json!({"error": "Operator mismatch"})),
+            warp::http::StatusCode::FORBIDDEN,
+        ));
+    }
+
+    // 3. Parse announcement and update roster
+    let announcement: crate::fleet::FleetAnnouncement = match serde_json::from_value(body) {
+        Ok(a) => a,
+        Err(e) => {
+            return Ok(warp::reply::with_status(
+                warp::reply::json(&serde_json::json!({"error": format!("Invalid announcement: {}", e)})),
+                warp::http::StatusCode::BAD_REQUEST,
+            ));
+        }
+    };
+
+    {
+        let mut roster = state.fleet_roster.write().await;
+        roster.update_from_announcement(announcement);
+    }
+
+    Ok(warp::reply::with_status(
+        warp::reply::json(&serde_json::json!({"status": "ok"})),
+        warp::http::StatusCode::OK,
+    ))
 }

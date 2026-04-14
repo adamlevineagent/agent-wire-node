@@ -4048,6 +4048,8 @@ async fn handle_config_profile(
         // Phase A: preserve dispatch_policy + provider_pools across profile apply.
         let preserved_dispatch_policy = config_lock.dispatch_policy.clone();
         let preserved_provider_pools = config_lock.provider_pools.clone();
+        // Phase 1 compute queue: preserve across profile apply.
+        let preserved_compute_queue = config_lock.compute_queue.clone();
         *config_lock = pyramid_config.to_llm_config_with_runtime(
             state.provider_registry.clone(),
             state.credential_store.clone(),
@@ -4063,6 +4065,9 @@ async fn handle_config_profile(
         }
         if config_lock.provider_pools.is_none() {
             config_lock.provider_pools = preserved_provider_pools;
+        }
+        if config_lock.compute_queue.is_none() {
+            config_lock.compute_queue = preserved_compute_queue;
         }
 
         Ok(json_ok(&serde_json::json!({

@@ -11,6 +11,9 @@
 //   retention — Proof-of-retention challenges and purge handling
 
 pub mod auth;
+pub mod compute_market;
+pub mod compute_queue;
+pub mod fleet;
 pub mod credits;
 pub mod http_utils;
 pub mod market;
@@ -41,6 +44,14 @@ pub struct AppState {
     pub partner: Arc<partner::PartnerState>,
     /// Pyramid sync state for publication (WS-ONLINE-A) and pinned refresh (WS-ONLINE-D).
     pub pyramid_sync_state: Arc<tokio::sync::Mutex<pyramid::sync::PyramidSyncState>>,
+    /// Phase 1 compute queue: per-model FIFO queues replacing the global
+    /// LOCAL_PROVIDER_SEMAPHORE. The GPU processing loop drains from this.
+    pub compute_queue: compute_queue::ComputeQueueHandle,
+    /// Fleet roster: same-operator peers discovered via heartbeat and
+    /// direct announcements. Fleet dispatch and HTTP endpoints both need
+    /// access. Arc<RwLock<>> for concurrent read from LLM path + write
+    /// from heartbeat/announce handlers.
+    pub fleet_roster: Arc<RwLock<fleet::FleetRoster>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -7,6 +7,7 @@ import { FleetMode } from './modes/FleetMode';
 import { KnowledgeMode } from './modes/KnowledgeMode';
 import { ToolsMode } from './modes/ToolsMode';
 import { OperationsMode } from './modes/OperationsMode';
+import { MarketMode } from './modes/MarketMode';
 import { IdentityMode } from './modes/IdentityMode';
 import { SettingsMode } from './modes/SettingsMode';
 
@@ -30,6 +31,8 @@ export function ModeRouter() {
             return <FleetMode />;
         case 'operations':
             return <OperationsMode />;
+        case 'market':
+            return <MarketMode />;
         case 'identity':
             return <IdentityMode />;
         case 'settings':

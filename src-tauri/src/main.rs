@@ -16,6 +16,7 @@ use std::sync::Arc;
 use tauri::menu::{MenuBuilder, MenuItemBuilder};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{Emitter, Manager};
+use futures_util::FutureExt;
 use tokio::io::AsyncBufReadExt;
 use tokio::sync::RwLock;
 
@@ -499,6 +500,10 @@ async fn attempt_wire_registration(state: &AppState) -> bool {
                 let mut auth = state.auth.write().await;
                 auth.api_token = Some(reg.api_token.clone());
                 auth.node_id = Some(reg.node_id.clone());
+                // Propagate operator_id so fleet routing has same-operator identity.
+                if auth.operator_id.is_none() {
+                    auth.operator_id = Some(reg.operator_id.clone());
+                }
                 let config = state.config.read().await;
                 save_session(&config, &auth);
                 tracing::info!("Wire registration succeeded (existing session)");
@@ -528,6 +533,10 @@ async fn attempt_wire_registration(state: &AppState) -> bool {
                         let mut auth = state.auth.write().await;
                         auth.api_token = Some(reg.api_token.clone());
                         auth.node_id = Some(reg.node_id.clone());
+                        // Propagate operator_id so fleet routing has same-operator identity.
+                        if auth.operator_id.is_none() {
+                            auth.operator_id = Some(reg.operator_id.clone());
+                        }
                         let config = state.config.read().await;
                         save_session(&config, &auth);
                         tracing::info!("Wire registration succeeded after session refresh");
@@ -5862,6 +5871,10 @@ async fn pyramid_apply_profile(
     // Profiles only change model selection, not the dispatch topology.
     let preserved_dispatch_policy = live.dispatch_policy.clone();
     let preserved_provider_pools = live.provider_pools.clone();
+    // Phase 1 compute queue: preserve across profile apply (same reason).
+    let preserved_compute_queue = live.compute_queue.clone();
+    // Fleet roster: preserve across profile apply (same pattern).
+    let preserved_fleet_roster = live.fleet_roster.clone();
     *live = new_llm;
     if live.api_key.is_empty() {
         live.api_key = preserved_api_key;
@@ -5874,6 +5887,12 @@ async fn pyramid_apply_profile(
     }
     if live.provider_pools.is_none() {
         live.provider_pools = preserved_provider_pools;
+    }
+    if live.compute_queue.is_none() {
+        live.compute_queue = preserved_compute_queue;
+    }
+    if live.fleet_roster.is_none() {
+        live.fleet_roster = preserved_fleet_roster;
     }
 
     tracing::info!(
@@ -10780,6 +10799,14 @@ async fn pyramid_get_build_chronicle(
     Ok(entries)
 }
 
+// --- Fleet Roster IPC --------------------------------------------------------
+
+#[tauri::command]
+async fn get_fleet_roster(state: tauri::State<'_, SharedState>) -> Result<serde_json::Value, String> {
+    let roster = state.fleet_roster.read().await;
+    serde_json::to_value(&*roster).map_err(|e| e.to_string())
+}
+
 // --- App Setup --------------------------------------------------------------
 
 fn main() {
@@ -11130,6 +11157,14 @@ fn main() {
         }
     }
 
+    // Phase 1 compute queue: construct early so it can be wired onto
+    // the LlmConfig alongside dispatch_policy + provider_pools.
+    let compute_queue_handle = wire_node_lib::compute_queue::ComputeQueueHandle::new();
+
+    // Fleet roster: construct early so it can be wired onto LlmConfig
+    // alongside compute_queue. Same Arc<RwLock<>> pattern.
+    let fleet_roster = Arc::new(RwLock::new(wire_node_lib::fleet::FleetRoster::default()));
+
     // Phase A: hydrate dispatch policy + provider pools from DB.
     // Uses a one-shot connection (same pattern as registry/schema hydration
     // above). When a policy exists, the per-provider pools replace the
@@ -11145,7 +11180,9 @@ fn main() {
                             let mut cfg = pyramid_state.config.blocking_write();
                             cfg.dispatch_policy = Some(std::sync::Arc::new(policy));
                             cfg.provider_pools = Some(std::sync::Arc::new(pools));
-                            tracing::info!("Dispatch policy loaded from DB — per-provider pools active");
+                            cfg.compute_queue = Some(compute_queue_handle.clone());
+                            cfg.fleet_roster = Some(fleet_roster.clone());
+                            tracing::info!("Dispatch policy loaded from DB — per-provider pools active, compute queue wired");
                         }
                         Err(e) => {
                             tracing::warn!("Failed to parse dispatch policy YAML: {e}");
@@ -11155,6 +11192,18 @@ fn main() {
             }
             Err(e) => {
                 tracing::warn!("Failed to open pyramid connection for dispatch policy hydration: {e}");
+            }
+        }
+        // Even when no dispatch policy exists (e.g. fresh install), wire
+        // the compute queue onto the LlmConfig so local builds route
+        // through the queue from the start.
+        {
+            let mut cfg = pyramid_state.config.blocking_write();
+            if cfg.compute_queue.is_none() {
+                cfg.compute_queue = Some(compute_queue_handle.clone());
+            }
+            if cfg.fleet_roster.is_none() {
+                cfg.fleet_roster = Some(fleet_roster.clone());
             }
         }
     }
@@ -11243,6 +11292,103 @@ fn main() {
         pyramid_db_path,
         pyramid_config.use_ir_executor
     );
+
+    // ── Phase 1 Compute Queue: GPU processing loop ──────────────────
+    //
+    // MUST start consuming BEFORE any producer (stale engine, builds,
+    // DADBEAR) tries to enqueue. If this runs after stale engine init,
+    // enqueued items block forever with no consumer.
+    //
+    // The loop waits on the Notify signal, then drains all available
+    // items from the round-robin queue. Each item is a complete LLM
+    // call context; the loop executes it through the existing LLM path
+    // with compute_queue: None (prevents re-enqueue) and
+    // skip_concurrency_gate: true (bypasses semaphore).
+    {
+        let queue_handle = compute_queue_handle.clone();
+        let bus = pyramid_state.build_event_bus.clone();
+        tauri::async_runtime::spawn(async move {
+            tracing::info!("Compute queue GPU processing loop started");
+            loop {
+                queue_handle.notify.notified().await;
+                // Drain all available items.
+                loop {
+                    let entry = {
+                        let mut q = queue_handle.queue.lock().await;
+                        q.dequeue_next()
+                    };
+                    match entry {
+                        Some(entry) => {
+                            let start = std::time::Instant::now();
+                            let model_id = entry.model_id.clone();
+
+                            // Emit QueueJobStarted event.
+                            // source: "local" if entry has a StepContext (from a local build),
+                            //         "fleet" if step_ctx is None (received from a fleet peer).
+                            let job_source = if entry.step_ctx.is_some() { "local" } else { "fleet" };
+                            let _ = bus.tx.send(wire_node_lib::pyramid::event_bus::TaggedBuildEvent {
+                                slug: "__compute__".to_string(),
+                                kind: wire_node_lib::pyramid::event_bus::TaggedKind::QueueJobStarted {
+                                    model_id: model_id.clone(),
+                                    source: job_source.to_string(),
+                                },
+                            });
+
+                            // Execute through the existing LLM path.
+                            // entry.config has compute_queue: None (won't re-enqueue).
+                            // entry.options has skip_concurrency_gate: true.
+                            //
+                            // Panic guard: if the LLM call panics, catch it and
+                            // convert to an error so the GPU loop survives and
+                            // continues draining. Without this, a single panic
+                            // kills the loop and all subsequent callers hang.
+                            let result = std::panic::AssertUnwindSafe(
+                                wire_node_lib::pyramid::llm::call_model_unified_with_audit_and_ctx(
+                                    &entry.config,
+                                    entry.step_ctx.as_ref(),
+                                    None, // no audit context in queue replay
+                                    &entry.system_prompt,
+                                    &entry.user_prompt,
+                                    entry.temperature,
+                                    entry.max_tokens,
+                                    entry.response_format.as_ref(),
+                                    entry.options,
+                                )
+                            )
+                            .catch_unwind()
+                            .await
+                            .unwrap_or_else(|panic_payload| {
+                                let msg = if let Some(s) = panic_payload.downcast_ref::<&str>() {
+                                    format!("GPU loop: LLM call panicked: {s}")
+                                } else if let Some(s) = panic_payload.downcast_ref::<String>() {
+                                    format!("GPU loop: LLM call panicked: {s}")
+                                } else {
+                                    "GPU loop: LLM call panicked (unknown payload)".to_string()
+                                };
+                                tracing::error!("{}", msg);
+                                Err(anyhow::anyhow!("{}", msg))
+                            });
+
+                            let elapsed_ms = start.elapsed().as_millis() as u64;
+
+                            // Emit QueueJobCompleted event.
+                            let _ = bus.tx.send(wire_node_lib::pyramid::event_bus::TaggedBuildEvent {
+                                slug: "__compute__".to_string(),
+                                kind: wire_node_lib::pyramid::event_bus::TaggedKind::QueueJobCompleted {
+                                    model_id: model_id.clone(),
+                                    latency_ms: elapsed_ms,
+                                },
+                            });
+
+                            // Send result back to the waiting caller.
+                            let _ = entry.result_tx.send(result);
+                        }
+                        None => break, // All queues drained, go back to notify.wait
+                    }
+                }
+            }
+        });
+    }
 
     // Start DADBEAR extend loop if any enabled watch configs exist.
     // Deferred via tauri::async_runtime::spawn because Tauri's setup() callback
@@ -11416,6 +11562,8 @@ fn main() {
         pyramid: pyramid_state,
         partner: partner_state,
         pyramid_sync_state: pyramid_sync_state,
+        compute_queue: compute_queue_handle.clone(),
+        fleet_roster: fleet_roster.clone(),
     });
 
     tauri::Builder::default()
@@ -11606,6 +11754,8 @@ fn main() {
                     nid_shared,
                     server_state.pyramid.clone(),
                     server_state.partner.clone(),
+                    server_state.fleet_roster.clone(),
+                    server_state.compute_queue.clone(),
                 ).await;
             });
 
@@ -11705,6 +11855,12 @@ fn main() {
                                             let mut auth_write = startup_state.auth.write().await;
                                             auth_write.node_id = Some(reg.node_id.clone());
                                             auth_write.api_token = Some(reg.api_token.clone());
+                                            // Propagate operator_id from registration response.
+                                            // Without this, fleet routing can't verify same-operator
+                                            // identity if session.json was lost or this is a fresh start.
+                                            if auth_write.operator_id.is_none() {
+                                                auth_write.operator_id = Some(reg.operator_id.clone());
+                                            }
                                         }
                                         // Update shared JWT public key and node ID
                                         {
@@ -11898,6 +12054,79 @@ fn main() {
                                                 heartbeat_config.mesh_hosting_enabled,
                                             ).await;
                                             market::save_market_state(&heartbeat_config.data_dir(), &ms);
+                                        }
+                                    }
+                                }
+
+                                // ── Fleet roster from heartbeat ──────────────────
+                                // Extract fleet_roster array and fleet_jwt from
+                                // the heartbeat response. Update the shared roster.
+                                if let Some(fleet_array) = response.get("fleet_roster").and_then(|v| v.as_array()) {
+                                    let entries: Vec<wire_node_lib::fleet::HeartbeatFleetEntry> = fleet_array
+                                        .iter()
+                                        .filter_map(|v| serde_json::from_value(v.clone()).ok())
+                                        .collect();
+                                    let jwt = response
+                                        .get("fleet_jwt")
+                                        .and_then(|v| v.as_str())
+                                        .map(|s| s.to_string());
+
+                                    {
+                                        let mut roster = heartbeat_state.fleet_roster.write().await;
+                                        roster.update_from_heartbeat(entries, jwt);
+
+                                        // Set operator_id on roster if not yet set.
+                                        if roster.self_operator_id.is_none() {
+                                            let auth = heartbeat_state.auth.read().await;
+                                            roster.self_operator_id = auth.operator_id.clone();
+                                        }
+                                    }
+
+                                    // Announce to fleet peers on every heartbeat
+                                    // that has peers. Peers need fresh model lists
+                                    // and queue depths — only announcements carry
+                                    // these; the heartbeat roster is tunnel/name only.
+                                    {
+                                        let roster = heartbeat_state.fleet_roster.read().await;
+                                        if !roster.peers.is_empty() {
+                                            let auth = heartbeat_state.auth.read().await;
+                                            let self_node_id = auth.node_id.clone().unwrap_or_default();
+                                            let self_operator_id = auth.operator_id.clone().unwrap_or_default();
+                                            drop(auth);
+
+                                            let tunnel_url = {
+                                                let ts = heartbeat_state.tunnel_state.read().await;
+                                                ts.tunnel_url.clone().unwrap_or_default()
+                                            };
+
+                                            // Read loaded models from local mode state (Ollama).
+                                            // The DB stores the active model; for fleet routing,
+                                            // this is the model this node can serve.
+                                            let models_loaded = {
+                                                let reader = heartbeat_state.pyramid.reader.lock().await;
+                                                match wire_node_lib::pyramid::db::load_local_mode_state(&reader) {
+                                                    Ok(row) if row.enabled => {
+                                                        row.ollama_model.into_iter().collect::<Vec<_>>()
+                                                    }
+                                                    _ => Vec::new(),
+                                                }
+                                            };
+
+                                            // Read real queue depths from compute queue.
+                                            let queue_depths = {
+                                                let q = heartbeat_state.compute_queue.queue.lock().await;
+                                                q.all_depths()
+                                            };
+
+                                            let announcement = wire_node_lib::fleet::FleetAnnouncement {
+                                                node_id: self_node_id,
+                                                name: None,
+                                                tunnel_url,
+                                                models_loaded,
+                                                queue_depths,
+                                                operator_id: self_operator_id,
+                                            };
+                                            wire_node_lib::fleet::announce_to_fleet(&roster, &announcement).await;
                                         }
                                     }
                                 }
@@ -12387,6 +12616,8 @@ fn main() {
             // S2-5: Chronicle Post-Build Review
             pyramid_latest_build_id,
             pyramid_get_build_chronicle,
+            // Fleet roster IPC
+            get_fleet_roster,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Wire Node");

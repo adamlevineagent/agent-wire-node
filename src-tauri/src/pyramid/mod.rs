@@ -678,6 +678,8 @@ impl PyramidConfig {
             cache_access: None,
             dispatch_policy: None,
             provider_pools: None,
+            compute_queue: None,
+            fleet_roster: None,
         }
     }
 

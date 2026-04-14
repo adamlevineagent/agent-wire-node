@@ -503,6 +503,35 @@ pub enum TaggedKind {
         completed_bytes: Option<u64>,
         total_bytes: Option<u64>,
     },
+
+    // ── Phase 1: Compute Queue Lifecycle ────────────────────────────
+    //
+    // Emitted by the transparent queue routing in llm.rs and the GPU
+    // processing loop in main.rs. Outer `TaggedBuildEvent.slug` is set
+    // to `"__compute__"` (reserved non-pyramid slug, same pattern as
+    // `"__ollama__"` for pull events).
+
+    /// Emitted when an LLM call is enqueued for GPU processing.
+    /// `queue_depth` is the depth of the specific model queue AFTER
+    /// the enqueue (including this item).
+    QueueJobEnqueued {
+        model_id: String,
+        queue_depth: usize,
+    },
+    /// Emitted when the GPU processing loop picks up a queued item
+    /// and begins executing the LLM call.
+    QueueJobStarted {
+        model_id: String,
+        /// "local" when the entry has a StepContext (from a local build),
+        /// "fleet" when step_ctx is None (received from a fleet peer).
+        source: String,
+    },
+    /// Emitted when the GPU processing loop completes an LLM call.
+    /// `latency_ms` is wall-clock time from dequeue to result send.
+    QueueJobCompleted {
+        model_id: String,
+        latency_ms: u64,
+    },
 }
 
 impl TaggedKind {
