@@ -144,9 +144,10 @@ function mapEvent(event: TaggedKind): ChronicleEntry | null {
             return {
                 id: nextId(),
                 timestamp: ts,
-                kind: 'mechanical',
+                kind: 'decision',
                 category: 'edge',
                 headline: `Edge: ${known.source_id} \u2192 ${known.target_id} (L${known.depth})`,
+                detail: `Intelligence connected ${known.source_id} to ${known.target_id} at depth ${known.depth}`,
                 stepName: known.step_name,
             };
         }
@@ -154,7 +155,7 @@ function mapEvent(event: TaggedKind): ChronicleEntry | null {
             return {
                 id: nextId(),
                 timestamp: ts,
-                kind: 'mechanical',
+                kind: 'decision',
                 category: 'edge',
                 headline: `Webbing: ${known.source_node_count} source nodes`,
                 stepName: known.step_name,
@@ -164,7 +165,7 @@ function mapEvent(event: TaggedKind): ChronicleEntry | null {
             return {
                 id: nextId(),
                 timestamp: ts,
-                kind: 'mechanical',
+                kind: 'decision',
                 category: 'edge',
                 headline: `Webbing complete: ${known.edges_created} edges (${known.latency_ms}ms)`,
                 stepName: known.step_name,
@@ -194,9 +195,10 @@ function mapEvent(event: TaggedKind): ChronicleEntry | null {
             return {
                 id: nextId(),
                 timestamp: ts,
-                kind: 'mechanical',
+                kind: 'decision',
                 category: 'llm',
                 headline: `LLM: ${known.model_id} ${known.tokens_prompt + known.tokens_completion}tok ${known.latency_ms}ms`,
+                detail: `Model: ${known.model_id}, Step: ${known.step_name}, Prompt: ${known.tokens_prompt}tok, Completion: ${known.tokens_completion}tok, Latency: ${known.latency_ms}ms`,
                 stepName: known.step_name,
             };
         }

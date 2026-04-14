@@ -10559,10 +10559,14 @@ async fn pyramid_get_build_chronicle(
                         status, model, total_tokens, latency_ms, step_name
                     )
                 };
-                let category = if cache_hit == 1 { "cache" } else { "llm" };
+                let (category, kind) = if cache_hit == 1 {
+                    ("cache", "mechanical")  // cache hit = no intelligence, served from disk
+                } else {
+                    ("llm", "decision")      // LLM call = intelligence working
+                };
                 Ok(serde_json::json!({
                     "timestamp": ts,
-                    "kind": "mechanical",
+                    "kind": kind,
                     "category": category,
                     "headline": headline,
                     "detail": format!(
