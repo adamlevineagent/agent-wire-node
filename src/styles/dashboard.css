@@ -16368,8 +16368,7 @@ body {
 .pyramid-theatre {
     display: flex;
     flex-direction: column;
-    height: 100%;
-    min-height: 400px;
+    min-height: 600px;
     background: var(--bg-primary, #111);
     border-radius: 8px;
     overflow: hidden;
@@ -20542,9 +20541,9 @@ body {
 
 .ni-narrative-level {
     display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 8px 12px;
+    flex-direction: column;
+    gap: 6px;
+    padding: 10px 14px;
     background: var(--glass);
     border: 1px solid var(--glass-border);
     border-radius: var(--radius-sm);
@@ -20552,29 +20551,48 @@ body {
     color: var(--text-secondary);
 }
 
+.ni-narrative-level + .ni-narrative-level {
+    margin-top: 2px;
+}
+
+/* ─── Content section — Topics ──────────────────────────────────── */
+
 .ni-topic {
-    padding: 12px;
-    background: var(--glass);
+    padding: 14px 16px;
+    background: var(--bg-card);
     border: 1px solid var(--glass-border);
     border-radius: var(--radius-sm);
     display: flex;
     flex-direction: column;
-    gap: 8px;
+    gap: 10px;
+    transition: border-color var(--transition);
+}
+
+.ni-topic:hover {
+    border-color: rgba(255, 255, 255, 0.12);
 }
 
 .ni-topic-name {
-    font-weight: 600;
-    font-size: 13px;
+    font-weight: 700;
+    font-size: 14px;
     color: var(--text-primary);
+    letter-spacing: -0.01em;
 }
 
 .ni-topic-current {
-    font-size: 12px;
+    font-size: 12.5px;
     color: var(--text-secondary);
-    line-height: 1.5;
+    line-height: 1.65;
+    max-width: 56ch;
 }
 
+/* ─── Content section — Corrections ─────────────────────────────── */
+
 .ni-correction {
+    display: flex;
+    align-items: baseline;
+    flex-wrap: wrap;
+    gap: 0;
     padding: 8px 12px;
     margin-top: 4px;
     background: rgba(240, 192, 64, 0.06);
@@ -20582,45 +20600,88 @@ body {
     border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
     font-size: 12px;
     color: var(--text-secondary);
-    line-height: 1.5;
+    line-height: 1.6;
 }
 
+/* ─── Content section — Decisions ───────────────────────────────── */
+
 .ni-decision {
-    padding: 8px 12px;
+    padding: 10px 14px;
     margin-top: 4px;
     background: rgba(167, 139, 250, 0.06);
     border-left: 3px solid var(--accent-purple);
     border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
     font-size: 12px;
     color: var(--text-secondary);
-    line-height: 1.5;
+    line-height: 1.6;
     display: flex;
     flex-direction: column;
-    gap: 4px;
+    gap: 6px;
 }
 
+/* Stance badge — base + per-stance color coding */
 .ni-stance-badge {
     display: inline-block;
-    padding: 1px 6px;
-    border-radius: 3px;
+    padding: 2px 8px;
+    border-radius: 4px;
     font-size: 10px;
     font-weight: 700;
     text-transform: uppercase;
     letter-spacing: 0.5px;
     background: rgba(167, 139, 250, 0.15);
     color: var(--accent-purple);
+    align-self: flex-start;
 }
+
+.ni-stance-badge[data-stance="committed"] {
+    background: rgba(64, 208, 128, 0.15);
+    color: var(--accent-green);
+}
+
+.ni-stance-badge[data-stance="open"] {
+    background: rgba(34, 211, 238, 0.15);
+    color: var(--accent-cyan);
+}
+
+.ni-stance-badge[data-stance="ruled_out"] {
+    background: rgba(255, 80, 80, 0.15);
+    color: #ff6b6b;
+}
+
+.ni-stance-badge[data-stance="deferred"] {
+    background: rgba(240, 192, 64, 0.15);
+    color: var(--accent-warm);
+}
+
+.ni-stance-badge[data-stance="exploring"] {
+    background: rgba(167, 139, 250, 0.15);
+    color: var(--accent-purple);
+}
+
+.ni-stance-badge[data-stance="superseded"] {
+    background: rgba(255, 255, 255, 0.06);
+    color: var(--text-muted);
+}
+
+/* ─── Content section — Entity tags ─────────────────────────────── */
 
 .ni-entity-tag {
     display: inline-block;
-    padding: 1px 6px;
-    border-radius: 3px;
+    padding: 2px 8px;
+    border-radius: 10px;
     font-size: 11px;
     font-weight: 500;
-    background: rgba(34, 211, 238, 0.1);
+    background: rgba(34, 211, 238, 0.08);
     color: var(--accent-cyan);
-    border: 1px solid rgba(34, 211, 238, 0.15);
+    border: 1px solid rgba(34, 211, 238, 0.2);
+    transition: background var(--transition);
 }
+
+.ni-entity-tag:hover {
+    background: rgba(34, 211, 238, 0.14);
+}
+
+/* ─── Content section — Term table ──────────────────────────────── */
 
 .ni-term-table {
     width: 100%;
@@ -20628,49 +20689,82 @@ body {
     font-size: 12px;
 }
 
+.ni-term-table thead th {
+    text-align: left;
+    padding: 6px 10px;
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-muted);
+    border-bottom: 1px solid var(--glass-border);
+}
+
 .ni-term-table td {
-    padding: 6px 8px;
+    padding: 8px 10px;
     border-bottom: 1px solid var(--glass-border);
     vertical-align: top;
+}
+
+.ni-term-table tbody tr:nth-child(even) {
+    background: rgba(255, 255, 255, 0.02);
+}
+
+.ni-term-table tbody tr:last-child td {
+    border-bottom: none;
 }
 
 .ni-term-table td:first-child {
     font-weight: 600;
     color: var(--text-primary);
-    width: 35%;
+    width: 30%;
     white-space: nowrap;
 }
 
 .ni-term-table td:last-child {
     color: var(--text-secondary);
+    line-height: 1.5;
 }
 
+/* ─── Content section — Key Quotes ──────────────────────────────── */
+
 .ni-quote {
-    padding: 10px 12px;
-    background: var(--glass);
+    padding: 12px 16px;
+    background: rgba(34, 211, 238, 0.04);
     border-left: 3px solid var(--accent-cyan);
     border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
-    font-size: 12px;
+    font-size: 13px;
     font-style: italic;
     color: var(--text-secondary);
-    line-height: 1.5;
+    line-height: 1.65;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
 }
 
 .ni-quote-meta {
     display: flex;
+    flex-wrap: wrap;
     gap: 8px;
-    margin-top: 4px;
+    align-items: center;
     font-size: 11px;
     font-style: normal;
     color: var(--text-muted);
+    padding-top: 6px;
+    border-top: 1px solid rgba(255, 255, 255, 0.05);
 }
 
+/* ─── Content section — Dead Ends ───────────────────────────────── */
+
 .ni-dead-end {
-    padding: 6px 12px;
+    padding: 8px 12px;
     font-size: 12px;
     color: var(--text-muted);
-    border-left: 3px solid rgba(255, 255, 255, 0.08);
+    line-height: 1.5;
+    border-left: 3px solid rgba(255, 255, 255, 0.06);
     border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+    background: rgba(255, 255, 255, 0.015);
+    opacity: 0.8;
 }
 
 /* ─── Content section — Structure ────────────────────────────────── */
@@ -21185,7 +21279,7 @@ body {
 .ni-narrative {
     display: flex;
     flex-direction: column;
-    gap: 8px;
+    gap: 6px;
 }
 
 .ni-narrative-zoom {
@@ -21195,12 +21289,19 @@ body {
     letter-spacing: 0.5px;
     color: var(--accent-cyan);
     flex-shrink: 0;
+    padding: 2px 6px;
+    background: rgba(34, 211, 238, 0.08);
+    border-radius: 3px;
+    align-self: flex-start;
 }
 
 .ni-narrative-text {
     margin: 0;
     flex: 1;
-    line-height: 1.5;
+    line-height: 1.65;
+    font-size: 12.5px;
+    color: var(--text-secondary);
+    max-width: 56ch;
 }
 
 /* ─── Topic sub-elements ────────────────────────────────────────── */
@@ -21217,55 +21318,70 @@ body {
     text-transform: uppercase;
     letter-spacing: 0.5px;
     color: var(--text-muted);
+    margin-bottom: 2px;
 }
 
 .ni-topic-corrections,
 .ni-topic-decisions {
     display: flex;
     flex-direction: column;
-    gap: 4px;
+    gap: 6px;
+    padding-top: 4px;
+    border-top: 1px solid rgba(255, 255, 255, 0.04);
 }
 
 .ni-topic-entities {
     display: flex;
     flex-wrap: wrap;
-    gap: 4px;
+    gap: 6px;
+    padding-top: 6px;
+    border-top: 1px solid rgba(255, 255, 255, 0.04);
 }
 
+/* Correction inline parts */
 .ni-correction-wrong {
-    color: rgba(255, 80, 80, 0.8);
+    color: #ff6b6b;
     text-decoration: line-through;
+    text-decoration-color: rgba(255, 107, 107, 0.5);
 }
 
 .ni-correction-arrow {
     color: var(--text-muted);
-    margin: 0 4px;
+    margin: 0 6px;
+    font-size: 13px;
 }
 
 .ni-correction-right {
     color: var(--accent-green);
+    font-weight: 500;
 }
 
 .ni-correction-who {
     color: var(--text-muted);
     font-size: 11px;
-    margin-left: 4px;
+    margin-left: 8px;
+    font-style: italic;
 }
 
+/* Decision inline parts */
 .ni-decision-text {
-    font-weight: 500;
+    font-weight: 600;
     color: var(--text-primary);
+    line-height: 1.5;
 }
 
 .ni-decision-why {
     color: var(--text-secondary);
-    font-size: 11px;
+    font-size: 11.5px;
+    line-height: 1.5;
+    opacity: 0.85;
 }
 
 .ni-decision-importance {
     font-size: 10px;
     font-family: 'SF Mono', 'Fira Code', monospace;
     color: var(--text-muted);
+    align-self: flex-start;
 }
 
 /* ─── Quote sub-elements ────────────────────────────────────────── */
@@ -21273,16 +21389,19 @@ body {
 .ni-quotes {
     display: flex;
     flex-direction: column;
-    gap: 8px;
+    gap: 10px;
 }
 
 .ni-quote-text {
     margin: 0;
+    font-size: 13px;
+    line-height: 1.65;
 }
 
 .ni-quote-speaker {
     color: var(--text-secondary);
-    font-weight: 500;
+    font-weight: 600;
+    font-style: normal;
 }
 
 .ni-quote-role {
@@ -21294,12 +21413,18 @@ body {
     font-size: 10px;
     font-family: 'SF Mono', 'Fira Code', monospace;
     color: var(--text-muted);
+    padding: 1px 5px;
+    background: rgba(255, 255, 255, 0.04);
+    border-radius: 3px;
 }
 
 .ni-quote-chunk-ref {
     font-size: 10px;
     font-family: 'SF Mono', 'Fira Code', monospace;
     color: var(--text-muted);
+    padding: 1px 5px;
+    background: rgba(255, 255, 255, 0.04);
+    border-radius: 3px;
 }
 
 /* ─── Dead ends ─────────────────────────────────────────────────── */
@@ -21310,7 +21435,7 @@ body {
     margin: 0;
     display: flex;
     flex-direction: column;
-    gap: 4px;
+    gap: 6px;
 }
 
 /* ─── Structure sub-elements ────────────────────────────────────── */
@@ -21509,21 +21634,24 @@ body {
 .ni-topics {
     display: flex;
     flex-direction: column;
-    gap: 8px;
+    gap: 10px;
 }
 
 .ni-distilled {
-    padding: 12px;
-    background: var(--glass);
+    padding: 14px 16px;
+    background: var(--bg-card);
     border: 1px solid var(--glass-border);
     border-radius: var(--radius-sm);
+    border-left: 3px solid var(--accent-cyan);
 }
 
 .ni-distilled-text {
     margin: 0;
     font-size: 13px;
-    color: var(--text-secondary);
-    line-height: 1.6;
+    color: var(--text-primary);
+    line-height: 1.7;
+    max-width: 56ch;
+    letter-spacing: 0.005em;
 }
 
 /* ─── Gaps (DrillResult) ────────────────────────────────────────── */
@@ -21637,23 +21765,24 @@ body {
 /* ─── Term table sub-elements ──────────────────────────────────── */
 
 .ni-term-row {
-    border-bottom: 1px solid var(--glass-border);
+    transition: background var(--transition);
 }
 
-.ni-term-row:last-child {
-    border-bottom: none;
+.ni-term-row:hover {
+    background: rgba(255, 255, 255, 0.03);
 }
 
 .ni-term-name {
     font-weight: 600;
     color: var(--text-primary);
     white-space: nowrap;
+    font-size: 12px;
 }
 
 .ni-term-def {
     color: var(--text-secondary);
     font-size: 12px;
-    line-height: 1.4;
+    line-height: 1.55;
 }
 
 /* ─── LLM verdict sub-elements ─────────────────────────────────── */
@@ -21781,7 +21910,7 @@ body {
 .ps-canvas-container {
     position: relative;
     flex: 1;
-    min-height: 0;
+    min-height: 350px;
     background: var(--bg-card);
     border: 1px solid var(--glass-border);
     border-top: none;

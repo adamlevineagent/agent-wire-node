@@ -349,6 +349,60 @@ export function useDensityLayout(
             centerGravity,
         );
 
+        // ── Auto-fit: scale and translate to fill the canvas ────────────
+        // After the simulation settles, the nodes may occupy only a small
+        // region.  Compute their bounding box and rescale so they fill the
+        // available canvas area with some padding.
+        if (simNodes.length > 1) {
+            const padding = 40;
+
+            // Bounding box including radii
+            let minX = Infinity;
+            let minY = Infinity;
+            let maxX = -Infinity;
+            let maxY = -Infinity;
+            for (const sn of simNodes) {
+                if (sn.x - sn.radius < minX) minX = sn.x - sn.radius;
+                if (sn.y - sn.radius < minY) minY = sn.y - sn.radius;
+                if (sn.x + sn.radius > maxX) maxX = sn.x + sn.radius;
+                if (sn.y + sn.radius > maxY) maxY = sn.y + sn.radius;
+            }
+
+            const bboxW = maxX - minX;
+            const bboxH = maxY - minY;
+
+            if (bboxW > 0 && bboxH > 0) {
+                const availW = width - padding * 2;
+                const availH = height - padding * 2;
+                const fitScale = Math.min(availW / bboxW, availH / bboxH);
+
+                // Cap scale so the largest node doesn't exceed 1/4 of
+                // the smaller canvas dimension — prevents 2-3 node
+                // clusters from blowing up into giant blobs.
+                let maxRadius = 0;
+                for (const sn of simNodes) {
+                    if (sn.radius > maxRadius) maxRadius = sn.radius;
+                }
+                const maxAllowedRadius = Math.min(width, height) / 4;
+                const maxScale = maxRadius > 0
+                    ? maxAllowedRadius / maxRadius
+                    : fitScale;
+                const scale = Math.min(fitScale, maxScale);
+
+                // Center of the bounding box → center of the canvas
+                const bboxCx = (minX + maxX) / 2;
+                const bboxCy = (minY + maxY) / 2;
+                const canvasCx = width / 2;
+                const canvasCy = height / 2;
+
+                for (const sn of simNodes) {
+                    sn.x = (sn.x - bboxCx) * scale + canvasCx;
+                    sn.y = (sn.y - bboxCy) * scale + canvasCy;
+                    sn.radius = sn.radius * scale;
+                }
+            }
+        }
+
         // Map simulation positions back to SurfaceNodes
         const densityNodes: SurfaceNode[] = nodes.map((node, i) => ({
             ...node,

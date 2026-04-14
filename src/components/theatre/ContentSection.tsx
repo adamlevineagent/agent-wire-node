@@ -107,11 +107,11 @@ export function ContentSection({ node, openSubs, onSubToggle }: ContentSectionPr
                                         <span className="ni-topic-sub-label">Decisions:</span>
                                         {topic.decisions.map((d, di) => (
                                             <div key={di} className="ni-decision">
-                                                <span className="ni-decision-text">{d.decided}</span>
-                                                <span className="ni-decision-why">{d.why}</span>
-                                                <span className="ni-stance-badge">
+                                                <span className="ni-stance-badge" data-stance={d.stance}>
                                                     {d.stance}
                                                 </span>
+                                                <span className="ni-decision-text">{d.decided}</span>
+                                                <span className="ni-decision-why">{d.why}</span>
                                                 <span className="ni-decision-importance">
                                                     imp: {d.importance}
                                                 </span>
@@ -166,9 +166,9 @@ export function ContentSection({ node, openSubs, onSubToggle }: ContentSectionPr
                     <div className="ni-topic-decisions">
                         {decisions.map((d, di) => (
                             <div key={di} className="ni-decision">
+                                <span className="ni-stance-badge" data-stance={d.stance}>{d.stance}</span>
                                 <span className="ni-decision-text">{d.decided}</span>
                                 <span className="ni-decision-why">{d.why}</span>
-                                <span className="ni-stance-badge">{d.stance}</span>
                                 <span className="ni-decision-importance">imp: {d.importance}</span>
                             </div>
                         ))}
