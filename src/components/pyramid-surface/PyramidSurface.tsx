@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { useVizConfig } from '../../hooks/useVizConfig';
+import { useRenderTier } from './useRenderTier';
 import { usePyramidWindow } from '../../hooks/usePyramidWindow';
 import { usePyramidData } from './usePyramidData';
 import { useVisualEncoding } from './useVisualEncoding';
@@ -42,6 +43,7 @@ export function PyramidSurface({
     const idleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
     const { config } = useVizConfig(slug);
+    const tierInfo = useRenderTier(config.rendering.tier);
     const { openWindow } = usePyramidWindow();
     const [containerSize, setContainerSize] = useState({ width: 0, height: 0 });
     const [hoveredNodeId, setHoveredNodeId] = useState<string | null>(null);
@@ -140,19 +142,12 @@ export function PyramidSurface({
         const el = containerRef.current;
         if (!el || mode === 'ticker') return;
 
-        // Create renderer based on tier with auto-detection
-        let detectedTier = config.rendering.tier;
-        if (detectedTier === 'auto') {
-            // Auto-detect: try WebGL2, fall back to Canvas 2D
-            const testCanvas = document.createElement('canvas');
-            detectedTier = testCanvas.getContext('webgl2') ? 'rich' : 'standard';
-        }
-
+        // Create renderer based on detected tier (from useRenderTier hook)
         let renderer: PyramidRenderer;
-        if (detectedTier === 'minimal') {
+        if (tierInfo.tier === 'minimal') {
             renderer = new DomRenderer();
             renderer.attach(el);
-        } else if (detectedTier === 'rich') {
+        } else if (tierInfo.tier === 'rich') {
             try {
                 const gpu = new GpuRenderer();
                 gpu.attach(el); // attach() throws if WebGL2 unavailable
@@ -174,7 +169,7 @@ export function PyramidSurface({
             rendererRef.current = null;
             cancelAnimationFrame(rafRef.current);
         };
-    }, [mode, config.rendering.tier]);
+    }, [mode, tierInfo.tier]);
 
     // ── Resize renderer when container changes ──────────────────────
     useEffect(() => {

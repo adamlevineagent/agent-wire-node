@@ -1,6 +1,8 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { PyramidSurface } from './pyramid-surface/PyramidSurface';
+import { NodeInspectorPanel } from './theatre/NodeInspectorPanel';
+import type { LiveNodeInfo } from './theatre/types';
 
 interface AutoUpdateConfig {
     slug: string;
@@ -173,6 +175,10 @@ export function DADBEARPanel({ slug, contentType, referencingSlugs, onBack, onNa
     const [agentInstructionsCopied, setAgentInstructionsCopied] = useState(false);
     const agentCopyTimeout = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+    // Inspector state
+    const [inspectedNodeId, setInspectedNodeId] = useState<string | null>(null);
+    const [allNodes, setAllNodes] = useState<LiveNodeInfo[]>([]);
+
     // ── Load initial data ───────────────────────────────────────────
 
     const loadConfig = useCallback(async () => {
@@ -308,6 +314,38 @@ export function DADBEARPanel({ slug, contentType, referencingSlugs, onBack, onNa
                 setNodeCounts(counts);
             }).catch(() => {});
         });
+    }, [slug]);
+
+    // ── Load tree for inspector navigation ─────────────────────────
+
+    useEffect(() => {
+        interface TreeNode {
+            id: string;
+            depth: number;
+            headline: string;
+            children?: TreeNode[];
+        }
+        function flattenTree(nodes: TreeNode[], parentId: string | null): LiveNodeInfo[] {
+            const result: LiveNodeInfo[] = [];
+            for (const node of nodes) {
+                const childIds = (node.children ?? []).map(c => c.id);
+                result.push({
+                    node_id: node.id,
+                    depth: node.depth,
+                    headline: node.headline,
+                    parent_id: parentId,
+                    children: childIds,
+                    status: 'complete',
+                });
+                if (node.children && node.children.length > 0) {
+                    result.push(...flattenTree(node.children, node.id));
+                }
+            }
+            return result;
+        }
+        invoke<TreeNode[]>('pyramid_tree', { slug })
+            .then(tree => setAllNodes(flattenTree(tree, null)))
+            .catch(() => setAllNodes([]));
     }, [slug]);
 
     // ── Evidence density (load once on mount, NOT polled) ────────────
@@ -687,6 +725,7 @@ Last check: ${lastCheckStr}
                         slug={slug}
                         mode="full"
                         staleLog={staleLog}
+                        onNodeClick={(nodeId) => setInspectedNodeId(nodeId)}
                         onNavigateToSlug={onNavigateToSlug}
                     />
                 </div>
@@ -1173,6 +1212,17 @@ Last check: ${lastCheckStr}
                     )}
                 </div>
             </div>
+
+            {/* Node Inspector Panel */}
+            {inspectedNodeId && (
+                <NodeInspectorPanel
+                    slug={slug}
+                    nodeId={inspectedNodeId}
+                    allNodes={allNodes}
+                    onClose={() => setInspectedNodeId(null)}
+                    onNavigate={(nodeId) => setInspectedNodeId(nodeId)}
+                />
+            )}
         </div>
     );
 }
