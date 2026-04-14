@@ -10482,6 +10482,247 @@ async fn pyramid_get_window_context(
     }))
 }
 
+// --- S2-5: Chronicle Post-Build Review IPCs ---------------------------------
+
+/// Returns the most recent build_id for a slug. Uses `pyramid_builds`
+/// (which has timestamps) rather than `pyramid_step_cache` so we get
+/// the authoritative build_id even when the cache was pruned.
+#[tauri::command]
+async fn pyramid_latest_build_id(
+    state: tauri::State<'_, SharedState>,
+    slug: String,
+) -> Result<Option<String>, String> {
+    let conn = state.pyramid.reader.lock().await;
+    let row: Option<String> = match conn.query_row(
+        "SELECT build_id FROM pyramid_builds
+         WHERE slug = ?1
+         ORDER BY started_at DESC
+         LIMIT 1",
+        rusqlite::params![slug],
+        |row| row.get(0),
+    ) {
+        Ok(v) => Some(v),
+        Err(rusqlite::Error::QueryReturnedNoRows) => None,
+        Err(e) => return Err(e.to_string()),
+    };
+    Ok(row)
+}
+
+/// Returns a chronologically sorted array of build operations for a
+/// given slug + build_id. Merges records from:
+///   - pyramid_llm_audit (LLM calls)
+///   - pyramid_evidence (KEEP/DISCONNECT verdicts)
+///   - pyramid_gaps (gap reports)
+///   - pyramid_config_contributions WHERE schema_type='reconciliation_result'
+/// Each record is a chronicle entry with timestamp, kind, category,
+/// headline, optional detail, and optional node_id.
+#[tauri::command]
+async fn pyramid_get_build_chronicle(
+    state: tauri::State<'_, SharedState>,
+    slug: String,
+    build_id: String,
+) -> Result<Vec<serde_json::Value>, String> {
+    let conn = state.pyramid.reader.lock().await;
+
+    let mut entries: Vec<serde_json::Value> = Vec::new();
+
+    // 1. LLM calls from pyramid_llm_audit
+    {
+        let mut stmt = conn
+            .prepare(
+                "SELECT created_at, model, prompt_tokens, completion_tokens,
+                        latency_ms, step_name, status, node_id, call_purpose, cache_hit
+                 FROM pyramid_llm_audit
+                 WHERE slug = ?1 AND build_id = ?2
+                 ORDER BY created_at ASC
+                 LIMIT 5000",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(rusqlite::params![slug, build_id], |row| {
+                let ts: String = row.get(0)?;
+                let model: String = row.get(1)?;
+                let prompt_tokens: i64 = row.get::<_, Option<i64>>(2)?.unwrap_or(0);
+                let completion_tokens: i64 = row.get::<_, Option<i64>>(3)?.unwrap_or(0);
+                let latency_ms: i64 = row.get::<_, Option<i64>>(4)?.unwrap_or(0);
+                let step_name: String = row.get(5)?;
+                let status: String = row.get(6)?;
+                let node_id: Option<String> = row.get(7)?;
+                let call_purpose: String = row.get(8)?;
+                let cache_hit: i64 = row.get::<_, Option<i64>>(9)?.unwrap_or(0);
+                let total_tokens = prompt_tokens + completion_tokens;
+                let headline = if cache_hit == 1 {
+                    format!("Cache hit: {} ({})", step_name, call_purpose)
+                } else {
+                    format!(
+                        "LLM {}: {} {}tok {}ms [{}]",
+                        status, model, total_tokens, latency_ms, step_name
+                    )
+                };
+                let category = if cache_hit == 1 { "cache" } else { "llm" };
+                Ok(serde_json::json!({
+                    "timestamp": ts,
+                    "kind": "mechanical",
+                    "category": category,
+                    "headline": headline,
+                    "detail": format!(
+                        "Model: {}, Purpose: {}, Prompt: {}tok, Completion: {}tok, Latency: {}ms, Step: {}, Status: {}{}",
+                        model, call_purpose, prompt_tokens, completion_tokens,
+                        latency_ms, step_name, status,
+                        if cache_hit == 1 { " (cache hit)" } else { "" }
+                    ),
+                    "node_id": node_id,
+                }))
+            })
+            .map_err(|e| e.to_string())?;
+        for row in rows {
+            entries.push(row.map_err(|e| e.to_string())?);
+        }
+    }
+
+    // 2. Evidence verdicts from pyramid_evidence
+    {
+        let mut stmt = conn
+            .prepare(
+                "SELECT created_at, source_node_id, target_node_id, verdict, weight, reason
+                 FROM pyramid_evidence
+                 WHERE slug = ?1 AND build_id = ?2
+                 ORDER BY created_at ASC
+                 LIMIT 5000",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(rusqlite::params![slug, build_id], |row| {
+                let ts: String = row.get(0)?;
+                let source: String = row.get(1)?;
+                let target: String = row.get(2)?;
+                let verdict: String = row.get(3)?;
+                let weight: Option<f64> = row.get(4)?;
+                let reason: Option<String> = row.get(5)?;
+                let weight_str = weight
+                    .map(|w| format!(" (w={:.2})", w))
+                    .unwrap_or_default();
+                Ok(serde_json::json!({
+                    "timestamp": ts,
+                    "kind": "decision",
+                    "category": "verdict",
+                    "headline": format!("{} {} \u{2192} {}{}", verdict, source, target, weight_str),
+                    "detail": reason,
+                    "node_id": target,
+                }))
+            })
+            .map_err(|e| e.to_string())?;
+        for row in rows {
+            entries.push(row.map_err(|e| e.to_string())?);
+        }
+    }
+
+    // 3. Gap reports from pyramid_gaps
+    //    build_id is nullable; filter by it when present, fall back to slug-only
+    {
+        let mut stmt = conn
+            .prepare(
+                "SELECT created_at, description, layer, resolved, question_id, build_id
+                 FROM pyramid_gaps
+                 WHERE slug = ?1 AND (build_id = ?2 OR build_id IS NULL)
+                 ORDER BY created_at ASC
+                 LIMIT 2000",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(rusqlite::params![slug, build_id], |row| {
+                let ts: String = row.get(0)?;
+                let description: String = row.get(1)?;
+                let layer: i64 = row.get(2)?;
+                let resolved: i64 = row.get::<_, Option<i64>>(3)?.unwrap_or(0);
+                let question_id: String = row.get(4)?;
+                let gap_build_id: Option<String> = row.get(5)?;
+                let resolved_str = if resolved == 1 { " [resolved]" } else { "" };
+                Ok(serde_json::json!({
+                    "timestamp": ts,
+                    "kind": "decision",
+                    "category": "gap",
+                    "headline": format!("Gap L{}: {}{}", layer, description, resolved_str),
+                    "detail": format!(
+                        "Question: {}, Layer: {}, Resolved: {}, Build: {}",
+                        question_id, layer, resolved == 1,
+                        gap_build_id.as_deref().unwrap_or("(unscoped)")
+                    ),
+                    "node_id": serde_json::Value::Null,
+                }))
+            })
+            .map_err(|e| e.to_string())?;
+        for row in rows {
+            entries.push(row.map_err(|e| e.to_string())?);
+        }
+    }
+
+    // 4. Reconciliation summaries from pyramid_config_contributions
+    //    The build_id is embedded in yaml_content; filter by triggering_note
+    //    which contains the build_id string.
+    {
+        let pattern = format!("%{}%", build_id);
+        let mut stmt = conn
+            .prepare(
+                "SELECT created_at, yaml_content, triggering_note
+                 FROM pyramid_config_contributions
+                 WHERE slug = ?1
+                   AND schema_type = 'reconciliation_result'
+                   AND triggering_note LIKE ?2
+                 ORDER BY created_at ASC
+                 LIMIT 100",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(rusqlite::params![slug, pattern], |row| {
+                let ts: String = row.get(0)?;
+                let yaml_content: String = row.get(1)?;
+                let note: Option<String> = row.get(2)?;
+
+                // Parse yaml_content to extract orphan/central/gap counts
+                let headline = if let Ok(doc) = serde_yaml::from_str::<serde_yaml::Value>(&yaml_content) {
+                    let orphans = doc.get("orphans")
+                        .and_then(|v| v.as_sequence())
+                        .map(|s| s.len())
+                        .unwrap_or(0);
+                    let central = doc.get("central_nodes")
+                        .and_then(|v| v.as_sequence())
+                        .map(|s| s.len())
+                        .unwrap_or(0);
+                    let gaps = doc.get("gaps")
+                        .and_then(|v| v.as_sequence())
+                        .map(|s| s.len())
+                        .unwrap_or(0);
+                    format!("Reconciliation: {} orphans, {} central, {} gaps", orphans, central, gaps)
+                } else {
+                    "Reconciliation summary".to_string()
+                };
+
+                Ok(serde_json::json!({
+                    "timestamp": ts,
+                    "kind": "decision",
+                    "category": "reconciliation",
+                    "headline": headline,
+                    "detail": note,
+                    "node_id": serde_json::Value::Null,
+                }))
+            })
+            .map_err(|e| e.to_string())?;
+        for row in rows {
+            entries.push(row.map_err(|e| e.to_string())?);
+        }
+    }
+
+    // Sort all entries by timestamp (ISO 8601 strings sort lexicographically)
+    entries.sort_by(|a, b| {
+        let ta = a.get("timestamp").and_then(|v| v.as_str()).unwrap_or("");
+        let tb = b.get("timestamp").and_then(|v| v.as_str()).unwrap_or("");
+        ta.cmp(tb)
+    });
+
+    Ok(entries)
+}
+
 // --- App Setup --------------------------------------------------------------
 
 fn main() {
@@ -12086,6 +12327,9 @@ fn main() {
             pyramid_open_window,
             pyramid_close_window,
             pyramid_get_window_context,
+            // S2-5: Chronicle Post-Build Review
+            pyramid_latest_build_id,
+            pyramid_get_build_chronicle,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Wire Node");

@@ -57,10 +57,6 @@ export function PyramidSurface({
         weightIntensity: config.overlays.weight_intensity,
     });
 
-    // ── Chronicle event stream (Phase 4) ─────────────────────────────
-    const { entries: chronicleEntries, generation: chronicleGen, clear: _clearChronicle } = useChronicleStream(slug);
-    const [chronicleOpen, setChronicleOpen] = useState(false);
-
     // ── Unified data: static tree + build progress + event bus ───────
     const {
         nodes,
@@ -71,6 +67,10 @@ export function PyramidSurface({
         buildVizState,
         loading,
     } = usePyramidData(slug, containerSize.width, containerSize.height, staleLog);
+
+    // ── Chronicle event stream (Phase 4, S2-5 history) ──────────────
+    const { entries: chronicleEntries, generation: chronicleGen, clear: _clearChronicle } = useChronicleStream(slug, isBuilding);
+    const [chronicleOpen, setChronicleOpen] = useState(false);
 
     // ── Viz-from-YAML: map current step to viz primitive (AD-1) ─────
     const { getVizPrimitive } = useVizMapping(slug, isBuilding);

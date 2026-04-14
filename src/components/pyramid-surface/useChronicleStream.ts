@@ -9,7 +9,8 @@
  * EventTicker.tsx consume the same entries array.
  */
 
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
+import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type { TaggedBuildEvent, TaggedKind, KnownTaggedKind } from '../../hooks/useBuildRowState';
 
@@ -204,23 +205,90 @@ function mapEvent(event: TaggedKind): ChronicleEntry | null {
     }
 }
 
+// ── Historical entry converter ─────────────────────────────────────
+
+/** Shape of a chronicle row returned by pyramid_get_build_chronicle. */
+interface ChronicleRow {
+    timestamp: string;
+    kind: 'decision' | 'mechanical';
+    category: string;
+    headline: string;
+    detail?: string | null;
+    node_id?: string | null;
+}
+
+function historicalToEntry(row: ChronicleRow, index: number): ChronicleEntry {
+    return {
+        id: `hist-${index}-${row.timestamp}`,
+        // Convert ISO datetime to epoch ms; fall back to 0 if unparseable.
+        timestamp: row.timestamp ? new Date(row.timestamp + 'Z').getTime() || 0 : 0,
+        kind: row.kind,
+        category: row.category,
+        headline: row.headline,
+        detail: row.detail ?? undefined,
+        nodeId: row.node_id ?? undefined,
+    };
+}
+
 // ── Hook ────────────────────────────────────────────────────────────
 
-export function useChronicleStream(slug: string): ChronicleStreamResult {
+export function useChronicleStream(slug: string, isBuilding: boolean): ChronicleStreamResult {
     const [entries, setEntries] = useState<ChronicleEntry[]>([]);
     const [generation, setGeneration] = useState(0);
+    // Track whether we've loaded history for the current slug to avoid
+    // re-fetching on every render cycle.
+    const historyLoadedRef = useRef<string | null>(null);
 
     // Clear resets the entry buffer and generation.
     const clear = useCallback(() => {
         setEntries([]);
         setGeneration(0);
+        historyLoadedRef.current = null;
     }, []);
 
     // Reset on slug change.
     useEffect(() => {
         setEntries([]);
         setGeneration(0);
+        historyLoadedRef.current = null;
     }, [slug]);
+
+    // ── S2-5: Load historical chronicle when no build is active ─────
+    useEffect(() => {
+        // Only load when not building and we haven't already loaded for
+        // this slug (prevents duplicate fetches).
+        if (isBuilding || historyLoadedRef.current === slug) return;
+
+        let cancelled = false;
+
+        (async () => {
+            try {
+                // Step 1: resolve the latest build_id for this slug.
+                const buildId = await invoke<string | null>(
+                    'pyramid_latest_build_id',
+                    { slug },
+                );
+                if (cancelled || !buildId) return;
+
+                // Step 2: fetch the historical chronicle entries.
+                const rows = await invoke<ChronicleRow[]>(
+                    'pyramid_get_build_chronicle',
+                    { slug, buildId },
+                );
+                if (cancelled || !rows || rows.length === 0) return;
+
+                const historical = rows.map(historicalToEntry);
+
+                setEntries(historical.slice(-MAX_ENTRIES));
+                setGeneration((g) => g + 1);
+                historyLoadedRef.current = slug;
+            } catch (e) {
+                console.warn('useChronicleStream: history load failed', e);
+            }
+        })();
+
+        return () => { cancelled = true; };
+    }, [slug, isBuilding]);
 
     // Subscribe to cross-build-event, filter by slug, map to
     // ChronicleEntry, and append to the bounded array.
