@@ -68,10 +68,15 @@ export function Chronicle({
     const [autoScroll, setAutoScroll] = useState(true);
     const prevGenRef = useRef(0);
 
-    // Filter entries based on showMechanicalOps setting.
-    const visibleEntries = showMechanicalOps
+    // Show all events during builds (mechanical ops are the main activity
+    // during extraction/webbing). Filter only in post-build review mode.
+    const hasAnyEntries = entries.length > 0;
+    const allDecision = entries.filter((e) => e.kind === 'decision');
+    const effectiveShowMechanical = showMechanicalOps || (hasAnyEntries && allDecision.length === 0);
+    const visibleEntries = effectiveShowMechanical
         ? entries
-        : entries.filter((e) => e.kind === 'decision');
+        : allDecision;
+    const hiddenCount = entries.length - visibleEntries.length;
 
     // Toggle expansion for decision entries.
     const toggleExpanded = useCallback((id: string) => {
@@ -128,8 +133,13 @@ export function Chronicle({
                 ref={listRef}
                 onScroll={handleScroll}
             >
-                {visibleEntries.length === 0 && (
+                {visibleEntries.length === 0 && hiddenCount === 0 && (
                     <div className="ps-chronicle-empty">Awaiting events...</div>
+                )}
+                {visibleEntries.length === 0 && hiddenCount > 0 && (
+                    <div className="ps-chronicle-empty">
+                        {hiddenCount} mechanical event{hiddenCount !== 1 ? 's' : ''} hidden
+                    </div>
                 )}
                 {visibleEntries.map((entry) => {
                     const isDecision = entry.kind === 'decision';
