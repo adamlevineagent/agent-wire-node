@@ -903,6 +903,13 @@ pub fn sync_config_to_operational_with_registry(
             // active contribution directly via viz_config::get_pyramid_viz_config.
             debug!("pyramid_viz_config synced; no operational table — read from contribution store");
         }
+        "reconciliation_result" => {
+            // Post-evidence-loop reconciliation summary (orphans, central
+            // nodes, weight map, gaps). Persisted per-build by the chain
+            // executor. No operational table — queryable from the
+            // contribution store directly.
+            debug!("reconciliation_result synced; no operational table — queryable from contribution store");
+        }
         other => {
             // Per the spec: unknown types are a bug — fail loudly
             // rather than silently skipping sync.

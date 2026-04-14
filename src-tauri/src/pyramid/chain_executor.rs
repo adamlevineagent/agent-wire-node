@@ -31,9 +31,10 @@ use super::chain_dispatch::{self, build_node_from_output, generate_node_id, norm
 use super::chain_engine::{ChainDefinition, ChainStep};
 use super::chain_loader;
 use super::chain_resolve::{resolve_prompt_template, ChainContext};
+use super::config_contributions::create_config_contribution;
 use super::db;
 use super::stale_helpers_upper::resolve_stale_target_for_node;
-use super::types::{BuildProgress, LayerEvent, PyramidNode, WebEdge};
+use super::types::{BuildProgress, LayerEvent, PyramidNode, ReconciliationResult, WebEdge};
 use super::PyramidState;
 
 const CODE_THREAD_SPLIT_PROMPT: &str =
@@ -5282,6 +5283,15 @@ async fn execute_evidence_loop(
 
     let reused_set: HashSet<String> = reused_question_ids.into_iter().collect();
 
+    // S2-4: accumulate per-layer reconciliation results for a single
+    // per-build summary contribution persisted after the loop.
+    let mut combined_recon = ReconciliationResult {
+        orphans: Vec::new(),
+        gaps: Vec::new(),
+        central_nodes: Vec::new(),
+        weight_map: HashMap::new(),
+    };
+
     for layer in evidence_start_layer..=max_layer {
         if cancel.is_cancelled() {
             warn!(slug, layer, "build cancelled during evidence loop");
@@ -5540,6 +5550,12 @@ async fn execute_evidence_loop(
                     },
                 },
             );
+
+            // S2-4: merge this layer's reconciliation into the per-build accumulator
+            combined_recon.orphans.extend(recon_result.orphans);
+            combined_recon.gaps.extend(recon_result.gaps);
+            combined_recon.central_nodes.extend(recon_result.central_nodes);
+            combined_recon.weight_map.extend(recon_result.weight_map);
         }
 
         total_nodes += layer_node_count;
@@ -5585,6 +5601,67 @@ async fn execute_evidence_loop(
             nodes_created = layer_node_count,
             total_nodes,
             "layer complete"
+        );
+    }
+
+    // ── S2-4: Persist reconciliation summary as a contribution ─────────
+    // One contribution per build, merging all per-layer reconciliation
+    // results. Persisted before delta-apex and build-complete so it's
+    // queryable even if later steps fail.
+    {
+        let recon_yaml = {
+            let mut doc = serde_yaml::Mapping::new();
+            doc.insert(
+                serde_yaml::Value::String("schema_type".into()),
+                serde_yaml::Value::String("reconciliation_result".into()),
+            );
+            doc.insert(
+                serde_yaml::Value::String("build_id".into()),
+                serde_yaml::Value::String(build_id.clone()),
+            );
+            doc.insert(
+                serde_yaml::Value::String("layers_completed".into()),
+                serde_yaml::Value::Number(serde_yaml::Number::from(layers_completed as u64)),
+            );
+            // Serialize the full ReconciliationResult fields via serde
+            let recon_value = serde_yaml::to_value(&combined_recon)
+                .unwrap_or_else(|_| serde_yaml::Value::Null);
+            if let serde_yaml::Value::Mapping(m) = recon_value {
+                for (k, v) in m {
+                    doc.insert(k, v);
+                }
+            }
+            serde_yaml::to_string(&doc).unwrap_or_default()
+        };
+        let conn = state.writer.clone();
+        let slug_owned = slug.to_string();
+        let bid = build_id.clone();
+        let lc = layers_completed;
+        let yaml = recon_yaml;
+        tokio::task::spawn_blocking(move || {
+            let c = conn.blocking_lock();
+            let _id = create_config_contribution(
+                &c,
+                "reconciliation_result",
+                Some(&slug_owned),
+                &yaml,
+                Some(&format!("reconciliation build {} ({} layers)", bid, lc)),
+                "build",
+                Some("chain_executor"),
+                "active",
+            )?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .map_err(|e| anyhow!("Reconciliation persist panicked: {e}"))??;
+
+        info!(
+            slug,
+            build_id = %build_id,
+            orphans = combined_recon.orphans.len(),
+            central = combined_recon.central_nodes.len(),
+            gaps = combined_recon.gaps.len(),
+            "reconciliation_result contribution persisted"
         );
     }
 

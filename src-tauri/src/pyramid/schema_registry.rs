@@ -469,6 +469,7 @@ fn display_name_for(schema_type: &str) -> String {
         "wire_discovery_weights" => "Wire Discovery Weights".to_string(),
         "wire_auto_update_settings" => "Wire Auto-Update Settings".to_string(),
         "pyramid_viz_config" => "Pyramid Viz Config".to_string(),
+        "reconciliation_result" => "Reconciliation Result".to_string(),
         other => other.replace('_', " "),
     }
 }
@@ -497,6 +498,10 @@ fn description_for(schema_type: &str) -> String {
         }
         "pyramid_viz_config" => {
             "Configuration for the pyramid visualization engine".to_string()
+        }
+        "reconciliation_result" => {
+            "Post-evidence-loop reconciliation summary (orphans, central nodes, weight map, gaps)"
+                .to_string()
         }
         _ => format!("Configuration for {schema_type}"),
     }

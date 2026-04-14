@@ -228,6 +228,15 @@
     },
 
     {
+      "contribution_id": "bundled-schema_definition-reconciliation_result-v1",
+      "schema_type": "schema_definition",
+      "slug": "reconciliation_result",
+      "yaml_content": "{\"$schema\":\"http://json-schema.org/draft-07/schema#\",\"title\":\"Reconciliation Result\",\"description\":\"Post-evidence-loop reconciliation summary persisted per-build\",\"type\":\"object\",\"required\":[\"schema_type\",\"build_id\",\"layers_completed\"],\"properties\":{\"schema_type\":{\"type\":\"string\",\"const\":\"reconciliation_result\"},\"build_id\":{\"type\":\"string\",\"description\":\"Build ID this reconciliation belongs to\"},\"layers_completed\":{\"type\":\"integer\",\"description\":\"Number of layers included in this summary\"},\"orphans\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":\"Node IDs never referenced by any other node\"},\"central_nodes\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":\"High-citation node IDs\"},\"weight_map\":{\"type\":\"object\",\"additionalProperties\":{\"type\":\"number\"},\"description\":\"Node ID to aggregate weight mapping\"},\"gaps\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"question_id\":{\"type\":\"string\"},\"description\":{\"type\":\"string\"},\"layer\":{\"type\":\"integer\"},\"resolved\":{\"type\":\"boolean\"},\"resolution_confidence\":{\"type\":\"number\"}},\"required\":[\"question_id\",\"description\",\"layer\"]},\"description\":\"Missing evidence gap reports\"}}}",
+      "triggering_note": "Bundled JSON schema for reconciliation_result (wire-node v0.3.0)",
+      "applies_to": "reconciliation_result"
+    },
+
+    {
       "contribution_id": "bundled-skill-migration-migrate_config-v1",
       "schema_type": "skill",
       "slug": "migration/migrate_config.md",
