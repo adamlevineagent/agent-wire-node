@@ -9526,6 +9526,21 @@ async fn execute_web_step(
     let saved_edge_count =
         persist_web_edges_for_depth(&persist_writer, &ctx.slug, depth, &normalized_edges).await?;
 
+    // S2-2: Emit per-edge EdgeCreated events (cap at 100 per step to avoid flooding).
+    for edge in normalized_edges.iter().take(100) {
+        emit_chain_event(
+            dispatch_ctx,
+            crate::pyramid::event_bus::TaggedKind::EdgeCreated {
+                slug: ctx.slug.clone(),
+                build_id: dispatch_build_id(dispatch_ctx),
+                step_name: step.name.clone(),
+                source_id: edge.source_node_id.clone(),
+                target_id: edge.target_node_id.clone(),
+                depth: depth as i64,
+            },
+        );
+    }
+
     let final_output = serde_json::json!({
         "edges": output.get("edges").cloned().unwrap_or_else(|| serde_json::json!([])),
         "webbed_depth": depth,
@@ -12158,6 +12173,18 @@ async fn execute_ir_web_edges(
         ));
     }
 
+    // S2-2: Emit WebEdgeStarted before the webbing LLM dispatch.
+    let webbing_started_at = std::time::Instant::now();
+    emit_chain_event(
+        dispatch_ctx,
+        crate::pyramid::event_bus::TaggedKind::WebEdgeStarted {
+            slug: exec_state.slug.clone(),
+            build_id: dispatch_build_id(dispatch_ctx),
+            step_name: step_name.to_string(),
+            source_node_count: nodes.len() as i64,
+        },
+    );
+
     // 5. Build webbing input, dispatch, and parse edges
     let normalized_edges = if nodes.len() >= 2 {
         let web_input = build_webbing_input(&nodes, depth, &resolved_input, step.compact_inputs);
@@ -12295,6 +12322,33 @@ async fn execute_ir_web_edges(
         depth,
         nodes.len(),
         saved_edge_count
+    );
+
+    // S2-2: Emit per-edge EdgeCreated events (cap at 100 per step to avoid flooding).
+    for edge in normalized_edges.iter().take(100) {
+        emit_chain_event(
+            dispatch_ctx,
+            crate::pyramid::event_bus::TaggedKind::EdgeCreated {
+                slug: exec_state.slug.clone(),
+                build_id: dispatch_build_id(dispatch_ctx),
+                step_name: step_name.to_string(),
+                source_id: edge.source_node_id.clone(),
+                target_id: edge.target_node_id.clone(),
+                depth: depth as i64,
+            },
+        );
+    }
+
+    // S2-2: Emit WebEdgeCompleted after edges are persisted.
+    emit_chain_event(
+        dispatch_ctx,
+        crate::pyramid::event_bus::TaggedKind::WebEdgeCompleted {
+            slug: exec_state.slug.clone(),
+            build_id: dispatch_build_id(dispatch_ctx),
+            step_name: step_name.to_string(),
+            edges_created: saved_edge_count as i64,
+            latency_ms: webbing_started_at.elapsed().as_millis() as i64,
+        },
     );
 
     Ok(final_output)

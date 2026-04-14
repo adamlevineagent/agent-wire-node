@@ -139,6 +139,16 @@ function mapEvent(event: TaggedKind): ChronicleEntry | null {
                 stepName: known.step_name,
             };
         }
+        case 'edge_created': {
+            return {
+                id: nextId(),
+                timestamp: ts,
+                kind: 'mechanical',
+                category: 'edge',
+                headline: `Edge: ${known.source_id} \u2192 ${known.target_id} (L${known.depth})`,
+                stepName: known.step_name,
+            };
+        }
         case 'web_edge_started': {
             return {
                 id: nextId(),
