@@ -107,6 +107,7 @@ export function computeLayout(
     dagEdges: DagEdge[],
     width: number,
     height: number,
+    expectedMaxDepth?: number,
 ): { nodes: SurfaceNode[]; edges: SurfaceEdge[] } {
     if (flatNodes.length === 0 || width === 0 || height === 0) {
         return { nodes: [], edges: [] };
@@ -114,7 +115,14 @@ export function computeLayout(
 
     const depths = flatNodes.map((n) => n.depth);
     const minDepth = Math.min(...depths);
-    const maxDepth = Math.max(...depths);
+    const actualMaxDepth = Math.max(...depths);
+    // When expectedMaxDepth is provided (question/conversation builds),
+    // use it to anchor the depth range even before higher layers exist.
+    // This prevents L0 nodes from floating at the top during early build
+    // phases — they stay near the bottom where they belong.
+    const maxDepth = expectedMaxDepth != null
+        ? Math.max(actualMaxDepth, expectedMaxDepth)
+        : actualMaxDepth;
     const depthRange = Math.max(maxDepth - minDepth, 1);
 
     const usableWidth = width - PADDING * 2;

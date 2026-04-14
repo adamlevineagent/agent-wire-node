@@ -52,14 +52,31 @@ function mapEvent(event: TaggedKind): ChronicleEntry | null {
 
     switch (known.type) {
         // ── Decision events ─────────────────────────────────────────
+        case 'node_produced': {
+            return {
+                id: nextId(),
+                timestamp: ts,
+                kind: 'decision',
+                category: 'node',
+                headline: `Extracted: **${known.headline}** at L${known.depth}`,
+                detail: `Node ${known.node_id} produced at depth ${known.depth}. Step: ${known.step_name}`,
+                nodeId: known.node_id,
+                stepName: known.step_name,
+            };
+        }
         case 'verdict_produced': {
             const weight = known.weight != null ? ` (w=${Number(known.weight).toFixed(2)})` : '';
+            const srcLabel = known.source_headline ?? known.source_id;
+            const tgtLabel = known.target_headline ?? known.node_id;
+            const headline = (known.source_headline || known.target_headline)
+                ? `Evidence ${known.verdict}: **${srcLabel}** \u2192 **${tgtLabel}**${weight}`
+                : `${known.verdict} ${known.source_id} \u2192 ${known.node_id}${weight}`;
             return {
                 id: nextId(),
                 timestamp: ts,
                 kind: 'decision',
                 category: 'verdict',
-                headline: `${known.verdict} ${known.source_id} \u2192 ${known.node_id}${weight}`,
+                headline,
                 detail: `Verdict: ${known.verdict} linking source ${known.source_id} to node ${known.node_id}${weight}. Step: ${known.step_name}`,
                 nodeId: known.node_id,
                 stepName: known.step_name,
@@ -141,12 +158,17 @@ function mapEvent(event: TaggedKind): ChronicleEntry | null {
             };
         }
         case 'edge_created': {
+            const srcLabel = known.source_headline ?? known.source_id;
+            const tgtLabel = known.target_headline ?? known.target_id;
+            const edgeHeadline = (known.source_headline || known.target_headline)
+                ? `Connected: **${srcLabel}** \u2194 **${tgtLabel}** at L${known.depth}`
+                : `Edge: ${known.source_id} \u2192 ${known.target_id} (L${known.depth})`;
             return {
                 id: nextId(),
                 timestamp: ts,
                 kind: 'decision',
                 category: 'edge',
-                headline: `Edge: ${known.source_id} \u2192 ${known.target_id} (L${known.depth})`,
+                headline: edgeHeadline,
                 detail: `Intelligence connected ${known.source_id} to ${known.target_id} at depth ${known.depth}`,
                 stepName: known.step_name,
             };
@@ -195,7 +217,7 @@ function mapEvent(event: TaggedKind): ChronicleEntry | null {
             return {
                 id: nextId(),
                 timestamp: ts,
-                kind: 'decision',
+                kind: 'mechanical',
                 category: 'llm',
                 headline: `LLM: ${known.model_id} ${known.tokens_prompt + known.tokens_completion}tok ${known.latency_ms}ms`,
                 detail: `Model: ${known.model_id}, Step: ${known.step_name}, Prompt: ${known.tokens_prompt}tok, Completion: ${known.tokens_completion}tok, Latency: ${known.latency_ms}ms`,

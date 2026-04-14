@@ -70,6 +70,8 @@ export function AskQuestion({ baseSlug, allSlugs, onClose, onSlugCreated }: AskQ
     const [showAdvanced, setShowAdvanced] = useState(false);
     const [granularity, setGranularity] = useState(3);
     const [maxDepth, setMaxDepth] = useState(5);
+    // Build fullscreen: collapse dialog chrome when build is running
+    const [buildFullScreen, setBuildFullScreen] = useState(false);
 
     // Compute the accreted reference set:
     // The base slug + all question slugs that already reference it
@@ -157,13 +159,41 @@ export function AskQuestion({ baseSlug, allSlugs, onClose, onSlugCreated }: AskQ
     // Building phase — show build progress
     if (phase === 'building') {
         return (
-            <BuildProgress
-                slug={slug}
-                onComplete={() => {
-                    onSlugCreated();
-                }}
-                onClose={onClose}
-            />
+            <div className="ask-question-overlay">
+                <div className={`ask-question-dialog${buildFullScreen ? ' ask-question-fullscreen' : ''}`}>
+                    {buildFullScreen ? (
+                        <div className="build-fullscreen-header">
+                            <span className="build-fullscreen-title">Building: {slug}</span>
+                            <button
+                                className="btn btn-ghost btn-sm"
+                                onClick={() => setBuildFullScreen(false)}
+                            >
+                                Back to question
+                            </button>
+                        </div>
+                    ) : (
+                        <div className="ask-question-header">
+                            <h3>Building Question Pyramid</h3>
+                            <button
+                                className="ask-question-close"
+                                onClick={onClose}
+                                title="Close"
+                            >
+                                &times;
+                            </button>
+                        </div>
+                    )}
+                    <BuildProgress
+                        slug={slug}
+                        onComplete={() => {
+                            setBuildFullScreen(false);
+                            onSlugCreated();
+                        }}
+                        onClose={onClose}
+                        requestFullScreen={(active) => setBuildFullScreen(active)}
+                    />
+                </div>
+            </div>
         );
     }
 

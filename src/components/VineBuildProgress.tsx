@@ -16,9 +16,10 @@ interface VineBuildProgressProps {
     slug: string;
     onComplete?: () => void;
     onClose?: () => void;
+    requestFullScreen?: (active: boolean) => void;
 }
 
-export function VineBuildProgress({ slug, onComplete, onClose }: VineBuildProgressProps) {
+export function VineBuildProgress({ slug, onComplete, onClose, requestFullScreen }: VineBuildProgressProps) {
     const [buildStatus, setBuildStatus] = useState<VineBuildStatus | null>(null);
     const [bunches, setBunches] = useState<BunchStatus[]>([]);
     const [error, setError] = useState<string | null>(null);
@@ -78,6 +79,16 @@ export function VineBuildProgress({ slug, onComplete, onClose }: VineBuildProgre
         poll();
         return () => { active = false; };
     }, [slug, onComplete]);
+
+    // Request fullscreen when build starts, release when it finishes
+    useEffect(() => {
+        if (!requestFullScreen) return;
+        if (buildStatus?.status === 'running') {
+            requestFullScreen(true);
+        } else if (buildStatus && ['complete', 'failed'].includes(buildStatus.status)) {
+            requestFullScreen(false);
+        }
+    }, [buildStatus?.status, requestFullScreen]);
 
     const isComplete = buildStatus?.status === 'complete';
     const isFailed = buildStatus?.status === 'failed';

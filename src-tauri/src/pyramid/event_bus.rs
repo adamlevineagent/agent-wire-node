@@ -435,6 +435,8 @@ pub enum TaggedKind {
         source_id: String,
         target_id: String,
         depth: i64,
+        source_headline: Option<String>,
+        target_headline: Option<String>,
     },
 
     /// Per-verdict during evidence answering. Supplements EvidenceProcessing.
@@ -446,6 +448,20 @@ pub enum TaggedKind {
         verdict: String, // "KEEP" | "DISCONNECT"
         source_id: String,
         weight: Option<f64>,
+        source_headline: Option<String>,
+        target_headline: Option<String>,
+    },
+
+    /// Emitted after build_node_from_output produces a node. Carries the
+    /// node's headline so the chronicle can show what was produced, not
+    /// just IDs and stats.
+    NodeProduced {
+        slug: String,
+        build_id: String,
+        step_name: String,
+        node_id: String,
+        headline: String,
+        depth: i64,
     },
 
     /// Delta skip or sentinel match during for_each.
@@ -707,11 +723,15 @@ mod phase13_tests {
             source_id: "L0-001".into(),
             target_id: "L0-002".into(),
             depth: 0,
+            source_headline: Some("Source headline".into()),
+            target_headline: None,
         };
         let json = serde_json::to_value(&kind).unwrap();
         assert_eq!(json["type"], "edge_created");
         assert_eq!(json["source_id"], "L0-001");
         assert_eq!(json["target_id"], "L0-002");
+        assert_eq!(json["source_headline"], "Source headline");
+        assert!(json["target_headline"].is_null());
         assert!(kind.is_discrete());
     }
 
@@ -725,11 +745,32 @@ mod phase13_tests {
             verdict: "KEEP".into(),
             source_id: "L0-001".into(),
             weight: Some(0.85),
+            source_headline: Some("Source node".into()),
+            target_headline: Some("Target node".into()),
         };
         let json = serde_json::to_value(&kind).unwrap();
         assert_eq!(json["type"], "verdict_produced");
         assert_eq!(json["verdict"], "KEEP");
         assert_eq!(json["weight"], 0.85);
+        assert_eq!(json["source_headline"], "Source node");
+        assert_eq!(json["target_headline"], "Target node");
+        assert!(kind.is_discrete());
+    }
+
+    #[test]
+    fn test_node_produced_serde() {
+        let kind = TaggedKind::NodeProduced {
+            slug: "s".into(),
+            build_id: "b".into(),
+            step_name: "extract".into(),
+            node_id: "L0-001".into(),
+            headline: "Key finding about X".into(),
+            depth: 0,
+        };
+        let json = serde_json::to_value(&kind).unwrap();
+        assert_eq!(json["type"], "node_produced");
+        assert_eq!(json["headline"], "Key finding about X");
+        assert_eq!(json["node_id"], "L0-001");
         assert!(kind.is_discrete());
     }
 

@@ -659,6 +659,10 @@ pub async fn answer_questions(
                 // Phase 3a: emit VerdictProduced for each evidence link
                 if let Some(bus) = bus_for_events.as_ref() {
                     for ev in &answered.evidence {
+                        let source_headline = node_map
+                            .get(ev.source_node_id.as_str())
+                            .map(|n| n.headline.clone());
+                        let target_headline = Some(answered.node.headline.clone());
                         let _ = bus.tx.send(crate::pyramid::event_bus::TaggedBuildEvent {
                             slug: slug.clone(),
                             kind: crate::pyramid::event_bus::TaggedKind::VerdictProduced {
@@ -669,6 +673,8 @@ pub async fn answer_questions(
                                 verdict: ev.verdict.as_str().to_string(),
                                 source_id: ev.source_node_id.clone(),
                                 weight: ev.weight,
+                                source_headline,
+                                target_headline,
                             },
                         });
                     }

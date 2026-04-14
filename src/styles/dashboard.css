@@ -22050,15 +22050,67 @@ body {
 /* ── Chronicle ──────────────────────────────────────────────────── */
 
 .ps-chronicle {
-    position: relative;
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    right: 0;
     display: flex;
     flex-direction: column;
-    background: var(--bg-card);
+    max-height: 40%;
+    overflow-y: auto;
+    background: rgba(10, 14, 18, 0.92);
+    backdrop-filter: blur(8px);
+    border-top: 1px solid var(--glass-border);
+    z-index: 5;
+}
+
+.ps-chronicle-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 5px 10px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+    flex-shrink: 0;
+    position: sticky;
+    top: 0;
+    background: rgba(10, 14, 18, 0.96);
+    z-index: 1;
+}
+
+.ps-chronicle-title {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-secondary);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+.ps-chronicle-hidden-count {
+    font-size: 10px;
+    color: var(--text-muted);
+    margin-left: auto;
+}
+
+.ps-chronicle-close {
+    background: none;
     border: 1px solid var(--glass-border);
     border-radius: var(--radius-sm);
-    overflow: hidden;
-    max-height: 400px;
-    min-height: 120px;
+    color: var(--text-muted);
+    font-size: 16px;
+    line-height: 1;
+    width: 22px;
+    height: 22px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    transition: color var(--transition), border-color var(--transition);
+    flex-shrink: 0;
+}
+
+.ps-chronicle-close:hover {
+    color: var(--text-primary);
+    border-color: rgba(255, 255, 255, 0.2);
 }
 
 .ps-chronicle-list {
@@ -22187,28 +22239,7 @@ body {
     text-decoration-color: var(--accent-cyan);
 }
 
-.ps-chronicle-jump {
-    position: absolute;
-    bottom: 8px;
-    left: 50%;
-    transform: translateX(-50%);
-    background: rgba(14, 21, 37, 0.92);
-    color: var(--accent-cyan);
-    border: 1px solid rgba(34, 211, 238, 0.3);
-    border-radius: 12px;
-    padding: 3px 12px;
-    font-size: 10px;
-    font-weight: 500;
-    cursor: pointer;
-    backdrop-filter: blur(8px);
-    transition: border-color var(--transition), box-shadow var(--transition);
-    z-index: 2;
-}
-
-.ps-chronicle-jump:hover {
-    border-color: var(--accent-cyan);
-    box-shadow: 0 0 8px rgba(34, 211, 238, 0.2);
-}
+/* .ps-chronicle-jump removed — chronicle now shows newest-first, no auto-scroll needed */
 
 /* ── Event Ticker ───────────────────────────────────────────────── */
 
@@ -22624,4 +22655,29 @@ body {
     flex: 1;
     overflow: hidden;
     position: relative;
+}
+
+/* ── Build Fullscreen Header ─────────────────────────────────────── */
+/* Minimal header shown in AddWorkspace/AskQuestion when build is running */
+
+.build-fullscreen-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 8px 0;
+    margin-bottom: 12px;
+    border-bottom: 1px solid var(--glass-border);
+}
+
+.build-fullscreen-title {
+    font-size: 14px;
+    font-weight: 500;
+    color: var(--text-secondary);
+}
+
+/* AskQuestion dialog expands when build goes fullscreen */
+.ask-question-dialog.ask-question-fullscreen {
+    width: 90vw;
+    max-width: 900px;
+    max-height: 90vh;
 }

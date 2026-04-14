@@ -220,6 +220,8 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
     const [profiles, setProfiles] = useState<string[]>([]);
     const [selectedProfile, setSelectedProfile] = useState<string>('');
     const [profilesError, setProfilesError] = useState<string | null>(null);
+    // Build fullscreen: collapse wizard chrome when build is running
+    const [buildFullScreen, setBuildFullScreen] = useState(false);
 
     // Auth token for HTTP fetches
     const [authToken, setAuthToken] = useState('');
@@ -846,32 +848,47 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
 
     return (
         <div className="add-workspace-panel">
-            {/* Step indicator */}
-            <div className="workspace-steps">
-                {getStepSequence().map((s, i) => {
-                    const stepOrder = getStepSequence();
-                    const currentIndex = stepOrder.indexOf(step);
-                    return (
-                        <div
-                            key={s}
-                            className={`workspace-step ${step === s ? 'active' : ''} ${
-                                currentIndex > i ? 'done' : ''
-                            }`}
-                        >
-                            <span className="step-number">{i + 1}</span>
-                            <span className="step-label">{stepLabels[s]}</span>
-                        </div>
-                    );
-                })}
-            </div>
-
-            {error && (
-                <div className="workspace-error">
-                    {error}
-                    <button className="workspace-error-dismiss" onClick={() => setError(null)}>
-                        Dismiss
+            {/* When build is fullscreen, show minimal header instead of wizard chrome */}
+            {buildFullScreen && step === 'building' ? (
+                <div className="build-fullscreen-header">
+                    <span className="build-fullscreen-title">Building: {slug}</span>
+                    <button
+                        className="btn btn-ghost btn-sm"
+                        onClick={() => setBuildFullScreen(false)}
+                    >
+                        Back to wizard
                     </button>
                 </div>
+            ) : (
+                <>
+                    {/* Step indicator */}
+                    <div className="workspace-steps">
+                        {getStepSequence().map((s, i) => {
+                            const stepOrder = getStepSequence();
+                            const currentIndex = stepOrder.indexOf(step);
+                            return (
+                                <div
+                                    key={s}
+                                    className={`workspace-step ${step === s ? 'active' : ''} ${
+                                        currentIndex > i ? 'done' : ''
+                                    }`}
+                                >
+                                    <span className="step-number">{i + 1}</span>
+                                    <span className="step-label">{stepLabels[s]}</span>
+                                </div>
+                            );
+                        })}
+                    </div>
+
+                    {error && (
+                        <div className="workspace-error">
+                            {error}
+                            <button className="workspace-error-dismiss" onClick={() => setError(null)}>
+                                Dismiss
+                            </button>
+                        </div>
+                    )}
+                </>
             )}
 
             {/* Step 1: Pick Directories */}
@@ -1989,6 +2006,7 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
                     slug={slug}
                     onComplete={NOOP}
                     onClose={onComplete}
+                    requestFullScreen={(active) => setBuildFullScreen(active)}
                 />
             )}
             {step === 'building' && contentType !== 'vine' && (
@@ -1996,6 +2014,7 @@ export function AddWorkspace({ onComplete, onCancel }: AddWorkspaceProps) {
                     slug={slug}
                     onComplete={NOOP}
                     onClose={onComplete}
+                    requestFullScreen={(active) => setBuildFullScreen(active)}
                 />
             )}
         </div>

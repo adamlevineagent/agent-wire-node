@@ -3249,6 +3249,14 @@ async fn execute_container_step(
                     if saves_node {
                         let chunk_index = item.get("index").and_then(|v| v.as_i64()).unwrap_or(index as i64);
                         if let Ok(node) = build_node_from_output(&last_output, &node_id, &ctx.slug, depth, Some(chunk_index)) {
+                            emit_chain_event(dispatch_ctx, crate::pyramid::event_bus::TaggedKind::NodeProduced {
+                                slug: ctx.slug.clone(),
+                                build_id: dispatch_build_id(dispatch_ctx),
+                                step_name: step.name.clone(),
+                                node_id: node.id.clone(),
+                                headline: node.headline.clone(),
+                                depth: node.depth,
+                            });
                             let topics_json = serde_json::to_string(
                                 last_output.get("topics").unwrap_or(&serde_json::json!([]))
                             )?;
@@ -6716,6 +6724,14 @@ async fn execute_for_each(
                                 depth,
                                 Some(chunk_index),
                             )?;
+                            emit_chain_event(dispatch_ctx, crate::pyramid::event_bus::TaggedKind::NodeProduced {
+                                slug: ctx.slug.clone(),
+                                build_id: dispatch_build_id(dispatch_ctx),
+                                step_name: step.name.clone(),
+                                node_id: node.id.clone(),
+                                headline: node.headline.clone(),
+                                depth: node.depth,
+                            });
                             let topics_json = serde_json::to_string(
                                 sub_output.get("topics").unwrap_or(&serde_json::json!([])),
                             )?;
@@ -6758,6 +6774,14 @@ async fn execute_for_each(
                         depth,
                         Some(chunk_index),
                     )?;
+                    emit_chain_event(dispatch_ctx, crate::pyramid::event_bus::TaggedKind::NodeProduced {
+                        slug: ctx.slug.clone(),
+                        build_id: dispatch_build_id(dispatch_ctx),
+                        step_name: step.name.clone(),
+                        node_id: node.id.clone(),
+                        headline: node.headline.clone(),
+                        depth: node.depth,
+                    });
                     let topics_json = serde_json::to_string(
                         analysis.get("topics").unwrap_or(&serde_json::json!([])),
                     )?;
@@ -6898,6 +6922,14 @@ async fn execute_for_each(
                         }
                     }
 
+                    emit_chain_event(dispatch_ctx, crate::pyramid::event_bus::TaggedKind::NodeProduced {
+                        slug: ctx.slug.clone(),
+                        build_id: dispatch_build_id(dispatch_ctx),
+                        step_name: step.name.clone(),
+                        node_id: node.id.clone(),
+                        headline: node.headline.clone(),
+                        depth: node.depth,
+                    });
                     let topics_json = serde_json::to_string(
                         analysis.get("topics").unwrap_or(&serde_json::json!([])),
                     )?;
@@ -7317,6 +7349,14 @@ async fn execute_for_each_concurrent(
                             if saves_node {
                                 match build_node_from_output(&analysis, &node_id, &ctx_snap_work.slug, depth, Some(chunk_index)) {
                                     Ok(node) => {
+                                        emit_chain_event(&dispatch_ctx_work, crate::pyramid::event_bus::TaggedKind::NodeProduced {
+                                            slug: ctx_snap_work.slug.clone(),
+                                            build_id: dispatch_build_id(&dispatch_ctx_work),
+                                            step_name: step_work.name.clone(),
+                                            node_id: node.id.clone(),
+                                            headline: node.headline.clone(),
+                                            depth: node.depth,
+                                        });
                                         let topics_json = serde_json::to_string(analysis.get("topics").unwrap_or(&serde_json::json!([]))).unwrap_or_default();
                                         send_save_node(&writer_tx_work, node, Some(topics_json)).await;
                                     }
@@ -7357,6 +7397,14 @@ async fn execute_for_each_concurrent(
                                     if let Ok(node) = build_node_from_output(
                                         &sub_output, &sub_node_id, &ctx_snap_work.slug, depth, Some(chunk_index),
                                     ) {
+                                        emit_chain_event(&dispatch_ctx_work, crate::pyramid::event_bus::TaggedKind::NodeProduced {
+                                            slug: ctx_snap_work.slug.clone(),
+                                            build_id: dispatch_build_id(&dispatch_ctx_work),
+                                            step_name: step_work.name.clone(),
+                                            node_id: node.id.clone(),
+                                            headline: node.headline.clone(),
+                                            depth: node.depth,
+                                        });
                                         let topics_json = serde_json::to_string(
                                             sub_output.get("topics").unwrap_or(&serde_json::json!([])),
                                         ).unwrap_or_default();
@@ -7402,6 +7450,14 @@ async fn execute_for_each_concurrent(
                             if saves_node {
                                 match build_node_from_output(&analysis, &node_id, &ctx_snap_work.slug, depth, Some(chunk_index)) {
                                     Ok(node) => {
+                                        emit_chain_event(&dispatch_ctx_work, crate::pyramid::event_bus::TaggedKind::NodeProduced {
+                                            slug: ctx_snap_work.slug.clone(),
+                                            build_id: dispatch_build_id(&dispatch_ctx_work),
+                                            step_name: step_work.name.clone(),
+                                            node_id: node.id.clone(),
+                                            headline: node.headline.clone(),
+                                            depth: node.depth,
+                                        });
                                         let topics_json = serde_json::to_string(analysis.get("topics").unwrap_or(&serde_json::json!([]))).unwrap_or_default();
                                         send_save_node(&writer_tx_work, node, Some(topics_json)).await;
                                     }
@@ -7703,6 +7759,14 @@ async fn execute_for_each_work_item(
             }
         }
 
+        emit_chain_event(dispatch_ctx, crate::pyramid::event_bus::TaggedKind::NodeProduced {
+            slug: ctx_snapshot.slug.clone(),
+            build_id: dispatch_build_id(dispatch_ctx),
+            step_name: step.name.clone(),
+            node_id: node.id.clone(),
+            headline: node.headline.clone(),
+            depth: node.depth,
+        });
         let topics_json =
             serde_json::to_string(analysis.get("topics").unwrap_or(&serde_json::json!([])))?;
         let child_ids = node.children.clone();
@@ -8076,6 +8140,14 @@ async fn dispatch_pair(
     if saves_node {
         let mut node = build_node_from_output(&analysis, node_id, &ctx.slug, target_depth, None)?;
         node.children = vec![left.id.clone(), right.id.clone()];
+        emit_chain_event(dispatch_ctx, crate::pyramid::event_bus::TaggedKind::NodeProduced {
+            slug: ctx.slug.clone(),
+            build_id: dispatch_build_id(dispatch_ctx),
+            step_name: step.name.clone(),
+            node_id: node.id.clone(),
+            headline: node.headline.clone(),
+            depth: node.depth,
+        });
         let topics_json =
             serde_json::to_string(analysis.get("topics").unwrap_or(&serde_json::json!([])))?;
         send_save_node(writer_tx, node, Some(topics_json)).await;
@@ -9227,6 +9299,14 @@ async fn dispatch_group(
     if saves_node {
         let mut node = build_node_from_output(&analysis, node_id, &ctx.slug, target_depth, None)?;
         node.children = nodes.iter().map(|n| n.id.clone()).collect();
+        emit_chain_event(dispatch_ctx, crate::pyramid::event_bus::TaggedKind::NodeProduced {
+            slug: ctx.slug.clone(),
+            build_id: dispatch_build_id(dispatch_ctx),
+            step_name: step.name.clone(),
+            node_id: node.id.clone(),
+            headline: node.headline.clone(),
+            depth: node.depth,
+        });
         let topics_json =
             serde_json::to_string(analysis.get("topics").unwrap_or(&serde_json::json!([])))?;
         send_save_node(writer_tx, node, Some(topics_json)).await;
@@ -9604,6 +9684,10 @@ async fn execute_web_step(
         persist_web_edges_for_depth(&persist_writer, &ctx.slug, depth, &normalized_edges).await?;
 
     // S2-2: Emit per-edge EdgeCreated events (cap at 100 per step to avoid flooding).
+    let headline_map: std::collections::HashMap<&str, &str> = nodes
+        .iter()
+        .map(|n| (n.id.as_str(), n.headline.as_str()))
+        .collect();
     for edge in normalized_edges.iter().take(100) {
         emit_chain_event(
             dispatch_ctx,
@@ -9614,6 +9698,8 @@ async fn execute_web_step(
                 source_id: edge.source_node_id.clone(),
                 target_id: edge.target_node_id.clone(),
                 depth: depth as i64,
+                source_headline: headline_map.get(edge.source_node_id.as_str()).map(|s| s.to_string()),
+                target_headline: headline_map.get(edge.target_node_id.as_str()).map(|s| s.to_string()),
             },
         );
     }
@@ -9776,6 +9862,14 @@ async fn execute_single(
     // Save node if configured
     if saves_node {
         let node = build_node_from_output(&analysis, &node_id, &ctx.slug, depth, None)?;
+        emit_chain_event(dispatch_ctx, crate::pyramid::event_bus::TaggedKind::NodeProduced {
+            slug: ctx.slug.clone(),
+            build_id: dispatch_build_id(dispatch_ctx),
+            step_name: step.name.clone(),
+            node_id: node.id.clone(),
+            headline: node.headline.clone(),
+            depth: node.depth,
+        });
         let topics_json =
             serde_json::to_string(analysis.get("topics").unwrap_or(&serde_json::json!([])))?;
         send_save_node(writer_tx, node, Some(topics_json)).await;
@@ -11436,6 +11530,15 @@ async fn execute_ir_single(
         )
         .await?;
 
+        emit_chain_event(dispatch_ctx, crate::pyramid::event_bus::TaggedKind::NodeProduced {
+            slug: exec_state.slug.clone(),
+            build_id: dispatch_build_id(dispatch_ctx),
+            step_name: step_name.to_string(),
+            node_id: node.id.clone(),
+            headline: node.headline.clone(),
+            depth: node.depth,
+        });
+
         // Wire children
         let children = node.children.clone();
         exec_state.send_save_node(node, None).await;
@@ -11659,6 +11762,14 @@ async fn execute_ir_parallel_foreach(
                                     step_name_owned, node_id_clone,
                                 );
                             }
+                            emit_chain_event(&ctx_clone, crate::pyramid::event_bus::TaggedKind::NodeProduced {
+                                slug: slug.clone(),
+                                build_id: dispatch_build_id(&ctx_clone),
+                                step_name: step_name_owned.clone(),
+                                node_id: node.id.clone(),
+                                headline: node.headline.clone(),
+                                depth: node.depth,
+                            });
                             let children = node.children.clone();
                             if let Err(e) = writer_tx
                                 .send(IrWriteOp::SaveNode {
@@ -11924,6 +12035,14 @@ async fn execute_ir_sequential_foreach(
                         &exec_state.reader,
                     )
                     .await?;
+                    emit_chain_event(dispatch_ctx, crate::pyramid::event_bus::TaggedKind::NodeProduced {
+                        slug: exec_state.slug.clone(),
+                        build_id: dispatch_build_id(dispatch_ctx),
+                        step_name: step_name.to_string(),
+                        node_id: node.id.clone(),
+                        headline: node.headline.clone(),
+                        depth: node.depth,
+                    });
                     let children = node.children.clone();
                     exec_state.send_save_node(node, None).await;
                     for child_id in &children {
@@ -12402,6 +12521,10 @@ async fn execute_ir_web_edges(
     );
 
     // S2-2: Emit per-edge EdgeCreated events (cap at 100 per step to avoid flooding).
+    let ir_headline_map: std::collections::HashMap<&str, &str> = nodes
+        .iter()
+        .map(|n| (n.id.as_str(), n.headline.as_str()))
+        .collect();
     for edge in normalized_edges.iter().take(100) {
         emit_chain_event(
             dispatch_ctx,
@@ -12412,6 +12535,8 @@ async fn execute_ir_web_edges(
                 source_id: edge.source_node_id.clone(),
                 target_id: edge.target_node_id.clone(),
                 depth: depth as i64,
+                source_headline: ir_headline_map.get(edge.source_node_id.as_str()).map(|s| s.to_string()),
+                target_headline: ir_headline_map.get(edge.target_node_id.as_str()).map(|s| s.to_string()),
             },
         );
     }

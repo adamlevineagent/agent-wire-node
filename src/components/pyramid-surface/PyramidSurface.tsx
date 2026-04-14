@@ -59,6 +59,11 @@ export function PyramidSurface({
         weightIntensity: config.overlays.weight_intensity,
     });
 
+    // ── Viz-from-YAML: chain mapping loaded eagerly for expectedMaxDepth ──
+    // Must be called before usePyramidData so expectedMaxDepth is available
+    // for layout computation during early build phases (Fix A).
+    const { getVizPrimitive, expectedMaxDepth } = useVizMapping(slug);
+
     // ── Unified data: static tree + build progress + event bus ───────
     const {
         nodes,
@@ -68,14 +73,11 @@ export function PyramidSurface({
         buildProgress: buildProg,
         buildVizState,
         loading,
-    } = usePyramidData(slug, containerSize.width, containerSize.height, staleLog);
+    } = usePyramidData(slug, containerSize.width, containerSize.height, staleLog, expectedMaxDepth);
 
     // ── Chronicle event stream (Phase 4, S2-5 history) ──────────────
     const { entries: chronicleEntries, generation: chronicleGen, clear: _clearChronicle } = useChronicleStream(slug, isBuilding);
     const [chronicleOpen, setChronicleOpen] = useState(false);
-
-    // ── Viz-from-YAML: map current step to viz primitive (AD-1) ─────
-    const { getVizPrimitive } = useVizMapping(slug, isBuilding);
     const activeVizPrimitive = isBuilding && currentStep
         ? getVizPrimitive(currentStep)
         : null;
@@ -452,19 +454,19 @@ export function PyramidSurface({
                         />
                     </div>
                 )}
+                {/* Chronicle overlay — absolute-positioned at bottom of canvas */}
+                {chronicleOpen && (
+                    <Chronicle
+                        slug={slug}
+                        entries={chronicleEntries}
+                        generation={chronicleGen}
+                        onArtifactClick={onNodeClick}
+                        onClose={toggleChronicle}
+                        showMechanicalOps={config.chronicle.show_mechanical_ops}
+                        autoExpandDecisions={config.chronicle.auto_expand_decisions}
+                    />
+                )}
             </div>
-
-            {/* Chronicle panel — collapsible below the canvas */}
-            {chronicleOpen && (
-                <Chronicle
-                    slug={slug}
-                    entries={chronicleEntries}
-                    generation={chronicleGen}
-                    onArtifactClick={onNodeClick}
-                    showMechanicalOps={config.chronicle.show_mechanical_ops}
-                    autoExpandDecisions={config.chronicle.auto_expand_decisions}
-                />
-            )}
 
             {/* Event Ticker — bottom bar, always visible when entries exist */}
             {config.ticker.enabled && (

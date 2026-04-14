@@ -102,6 +102,7 @@ export function usePyramidData(
     width: number,
     height: number,
     staleLog: StaleLogEntry[],
+    expectedMaxDepth?: number | null,
 ): PyramidDataResult {
     const [treeData, setTreeData] = useState<TreeResponse[] | null>(null);
     const [liveNodes, setLiveNodes] = useState<LiveNodeInfo[]>([]);
@@ -210,6 +211,16 @@ export function usePyramidData(
                 });
             }
 
+            // Fix D: NodeProduced events mark the node as build-complete
+            // in real time, before the next poll cycle refreshes the tree.
+            if (kind.type === 'node_produced' && typeof kind.node_id === 'string') {
+                setBuildNodeStates((prev) => {
+                    const next = new Map(prev);
+                    next.set(kind.node_id as string, NodeVisualState.BUILD_COMPLETE);
+                    return next;
+                });
+            }
+
             // ── S2-1: Accumulate viz-primitive-specific state ──
             if (kind.type === 'verdict_produced' && typeof kind.node_id === 'string') {
                 const verdict = kind.verdict as string;
@@ -294,7 +305,13 @@ export function usePyramidData(
         }
 
         const withBedrock = addBedrockLayer(flat);
-        let { nodes, edges } = computeLayout(withBedrock, dagEdges, width, height);
+        let { nodes, edges } = computeLayout(
+            withBedrock,
+            dagEdges,
+            width,
+            height,
+            expectedMaxDepth ?? undefined,
+        );
 
         // Apply stale states (static mode)
         if (!isBuilding) {
@@ -310,7 +327,7 @@ export function usePyramidData(
         }
 
         return { nodes, edges };
-    }, [treeData, liveNodes, width, height, isBuilding, buildNodeStates, staleLog]);
+    }, [treeData, liveNodes, width, height, isBuilding, buildNodeStates, staleLog, expectedMaxDepth]);
 
     return {
         nodes: computeResult.nodes,

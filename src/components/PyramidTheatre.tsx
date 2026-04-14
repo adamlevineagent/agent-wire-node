@@ -11,9 +11,10 @@ interface PyramidTheatreProps {
     onComplete?: (status: BuildStatus) => void;
     onClose?: () => void;
     onRetry?: (slug: string) => void;
+    requestFullScreen?: (active: boolean) => void;
 }
 
-export function PyramidTheatre({ slug, onComplete, onClose, onRetry }: PyramidTheatreProps) {
+export function PyramidTheatre({ slug, onComplete, onClose, onRetry, requestFullScreen }: PyramidTheatreProps) {
     const { status, progress, liveNodes, isActive, error, cancel, forceReset } = useBuildPolling(slug);
     const [inspectedNodeId, setInspectedNodeId] = useState<string | null>(null);
     const [logCollapsed, setLogCollapsed] = useState(false);
@@ -26,6 +27,16 @@ export function PyramidTheatre({ slug, onComplete, onClose, onRetry }: PyramidTh
             onCompleteRef.current?.(status);
         }
     }, [status?.status]);
+
+    // Request fullscreen when build starts, release when it finishes
+    useEffect(() => {
+        if (!requestFullScreen) return;
+        if (status?.status === 'running') {
+            requestFullScreen(true);
+        } else if (status && ['complete', 'complete_with_errors', 'failed', 'cancelled'].includes(status.status)) {
+            requestFullScreen(false);
+        }
+    }, [status?.status, requestFullScreen]);
 
     const handleNodeClick = useCallback((nodeId: string) => {
         setInspectedNodeId(nodeId);

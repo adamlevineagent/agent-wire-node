@@ -35,10 +35,12 @@ export type KnownTaggedKind =
     | { type: 'manifest_generated'; slug: string; build_id: string; manifest_id: number; depth: number; node_id: string }
     | { type: 'cost_update'; cost_so_far_usd: number; estimate_usd: number }
     // Phase 3a: Pyramid Surface viz enrichment
-    | { type: 'edge_created'; slug: string; build_id: string; step_name: string; source_id: string; target_id: string; depth: number }
-    | { type: 'verdict_produced'; slug: string; build_id: string; step_name: string; node_id: string; verdict: string; source_id: string; weight: number | null }
+    | { type: 'edge_created'; slug: string; build_id: string; step_name: string; source_id: string; target_id: string; depth: number; source_headline: string | null; target_headline: string | null }
+    | { type: 'verdict_produced'; slug: string; build_id: string; step_name: string; node_id: string; verdict: string; source_id: string; weight: number | null; source_headline: string | null; target_headline: string | null }
     | { type: 'node_skipped'; slug: string; build_id: string; step_name: string; node_id: string; reason: string }
-    | { type: 'reconciliation_emitted'; slug: string; build_id: string; orphan_count: number; central_count: number };
+    | { type: 'reconciliation_emitted'; slug: string; build_id: string; orphan_count: number; central_count: number }
+    // Fix D: Content enrichment
+    | { type: 'node_produced'; slug: string; build_id: string; step_name: string; node_id: string; headline: string; depth: number };
 
 // Wider type used by the listener so unknown variants don't break
 // parsing. The reducer filters down to `KnownTaggedKind` by
@@ -229,6 +231,8 @@ const KNOWN_EVENT_TYPES = new Set<string>([
     'verdict_produced',
     'node_skipped',
     'reconciliation_emitted',
+    // Fix D: Content enrichment
+    'node_produced',
 ]);
 
 function isKnownEvent(event: TaggedKind): event is KnownTaggedKind {
@@ -492,6 +496,18 @@ export function reduceBuildRowEvent(state: BuildRowState, event: TaggedKind): Bu
             logActivity(next, {
                 kind: 'reconciliation',
                 message: `Reconciliation: ${event.orphan_count} orphans, ${event.central_count} central nodes`,
+            });
+            break;
+        }
+        case 'node_produced': {
+            const step = next.steps.find(s => s.stepName === event.step_name);
+            if (step) {
+                step.activityHint = `Produced: ${event.headline.slice(0, 60)} (L${event.depth})`;
+            }
+            logActivity(next, {
+                kind: 'node_produced',
+                stepName: event.step_name,
+                message: `Produced ${event.node_id}: ${event.headline.slice(0, 80)}`,
             });
             break;
         }

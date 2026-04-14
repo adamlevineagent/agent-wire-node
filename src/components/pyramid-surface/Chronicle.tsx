@@ -1,18 +1,19 @@
 /**
  * Phase 4 — Chronicle view.
  *
- * Full scrollable list of build operations, split into decision
- * (expandable) and mechanical (compact single-line) entries.
- * Auto-scrolls to bottom during active builds; shows a "Jump to
- * latest" button when the user scrolls up.
+ * Absolute-positioned bottom overlay showing build operations in
+ * reverse chronological order (newest first). Entries are split into
+ * decision (expandable) and mechanical (compact single-line) kinds.
+ * Includes a header bar with close button for dismissal.
  */
 
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useRef, useCallback, useMemo } from 'react';
 import type { ChronicleEntry } from './useChronicleStream';
 
 // ── Category badge labels ───────────────────────────────────────────
 
 const CATEGORY_LABELS: Record<string, string> = {
+    node: 'NOD',
     verdict: 'VRD',
     triage: 'TRI',
     gap: 'GAP',
@@ -45,6 +46,8 @@ interface ChronicleProps {
      *  even when the bounded buffer wraps at MAX_ENTRIES. */
     generation: number;
     onArtifactClick?: (nodeId: string) => void;
+    /** Close/dismiss the chronicle overlay. */
+    onClose?: () => void;
     /** When false (default), hide mechanical ops (cache hits, step starts).
      *  Driven by viz config `chronicle.show_mechanical_ops`. */
     showMechanicalOps?: boolean;
@@ -60,13 +63,12 @@ export function Chronicle({
     entries,
     generation,
     onArtifactClick,
+    onClose,
     showMechanicalOps = false,
     autoExpandDecisions = true,
 }: ChronicleProps) {
     const listRef = useRef<HTMLDivElement>(null);
     const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set());
-    const [autoScroll, setAutoScroll] = useState(true);
-    const prevGenRef = useRef(0);
 
     // Show all events during builds (mechanical ops are the main activity
     // during extraction/webbing). Filter only in post-build review mode.
@@ -77,6 +79,12 @@ export function Chronicle({
         ? entries
         : allDecision;
     const hiddenCount = entries.length - visibleEntries.length;
+
+    // Reverse chronological — newest first.
+    const reversedEntries = useMemo(
+        () => [...visibleEntries].reverse(),
+        [visibleEntries],
+    );
 
     // Toggle expansion for decision entries.
     const toggleExpanded = useCallback((id: string) => {
@@ -91,57 +99,46 @@ export function Chronicle({
         });
     }, []);
 
-    // Detect user scroll — disable auto-scroll when scrolled up.
-    const handleScroll = useCallback(() => {
-        const el = listRef.current;
-        if (!el) return;
-        const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
-        setAutoScroll(atBottom);
-    }, []);
-
-    // Auto-scroll to bottom when new entries arrive and autoScroll is on.
-    // Uses `generation` (monotonic counter) instead of entries.length so
-    // scroll still fires when the bounded buffer wraps at MAX_ENTRIES.
-    useEffect(() => {
-        if (!autoScroll) return;
-        if (generation <= prevGenRef.current) {
-            prevGenRef.current = generation;
-            return;
-        }
-        prevGenRef.current = generation;
-        const el = listRef.current;
-        if (el) {
-            el.scrollTop = el.scrollHeight;
-        }
-    }, [generation, autoScroll]);
-
-    // Jump to latest.
-    const jumpToLatest = useCallback(() => {
-        const el = listRef.current;
-        if (el) {
-            el.scrollTop = el.scrollHeight;
-        }
-        setAutoScroll(true);
-    }, []);
-
+    // The first timestamp in the original (chronological) order, used for relative offsets.
     const firstTs = visibleEntries.length > 0 ? visibleEntries[0].timestamp : Date.now();
+
+    // Suppress unused var warning — generation drives parent re-render
+    // which feeds us new `entries`, so the list updates automatically.
+    void generation;
 
     return (
         <div className="ps-chronicle">
+            {/* Header bar with title and close button */}
+            <div className="ps-chronicle-header">
+                <span className="ps-chronicle-title">Chronicle</span>
+                {hiddenCount > 0 && (
+                    <span className="ps-chronicle-hidden-count">
+                        {hiddenCount} mechanical hidden
+                    </span>
+                )}
+                {onClose && (
+                    <button
+                        className="ps-chronicle-close"
+                        onClick={onClose}
+                        title="Close chronicle"
+                    >
+                        &times;
+                    </button>
+                )}
+            </div>
             <div
                 className="ps-chronicle-list"
                 ref={listRef}
-                onScroll={handleScroll}
             >
-                {visibleEntries.length === 0 && hiddenCount === 0 && (
+                {reversedEntries.length === 0 && hiddenCount === 0 && (
                     <div className="ps-chronicle-empty">Awaiting events...</div>
                 )}
-                {visibleEntries.length === 0 && hiddenCount > 0 && (
+                {reversedEntries.length === 0 && hiddenCount > 0 && (
                     <div className="ps-chronicle-empty">
                         {hiddenCount} mechanical event{hiddenCount !== 1 ? 's' : ''} hidden
                     </div>
                 )}
-                {visibleEntries.map((entry) => {
+                {reversedEntries.map((entry) => {
                     const isDecision = entry.kind === 'decision';
                     // When autoExpandDecisions is on, decisions start expanded
                     // unless the user explicitly collapsed them.
@@ -193,11 +190,6 @@ export function Chronicle({
                     );
                 })}
             </div>
-            {!autoScroll && visibleEntries.length > 0 && (
-                <button className="ps-chronicle-jump" onClick={jumpToLatest}>
-                    Jump to latest
-                </button>
-            )}
         </div>
     );
 }

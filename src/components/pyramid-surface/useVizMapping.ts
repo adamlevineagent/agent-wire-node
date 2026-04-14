@@ -1,9 +1,10 @@
 /**
- * Maps chain step definitions to viz primitives.
+ * Maps chain step definitions to viz primitives and exposes chain metadata.
  *
- * Loads the chain YAML at build start via pyramid_get_build_chain,
- * then provides a step_name → viz primitive mapping. The CanvasRenderer
- * uses this to decide how to visualize each build step.
+ * Eagerly loads the chain YAML via pyramid_get_build_chain so that
+ * expectedMaxDepth is available for layout anchoring before builds start.
+ * Also provides a step_name → viz primitive mapping that the CanvasRenderer
+ * uses to decide how to visualize each build step.
  */
 
 import { useState, useEffect, useMemo } from 'react';
@@ -52,6 +53,8 @@ interface ChainStep {
 interface ChainResponse {
     chain_id: string;
     content_type: string;
+    /** Configured max pyramid depth for question/conversation builds; null for mechanical. */
+    max_depth: number | null;
     chain: {
         steps?: ChainStep[];
         [key: string]: unknown;
@@ -63,18 +66,21 @@ export interface VizMapping {
     getVizPrimitive(stepName: string): VizPrimitive;
     /** Whether the chain has been loaded */
     loaded: boolean;
+    /** Configured max depth for question/conversation builds, null for mechanical or unknown */
+    expectedMaxDepth: number | null;
 }
 
-export function useVizMapping(slug: string, isBuilding: boolean): VizMapping {
+export function useVizMapping(slug: string, _isBuilding?: boolean): VizMapping {
     const [chainData, setChainData] = useState<ChainResponse | null>(null);
 
-    // Load chain definition when a build is active
+    // Always load chain definition for the slug so expectedMaxDepth is
+    // available before a build starts. The IPC just reads slug info +
+    // chain YAML — fast and safe to call any time.
     useEffect(() => {
-        if (!isBuilding) return;
         invoke<ChainResponse>('pyramid_get_build_chain', { slug })
             .then(setChainData)
             .catch(() => setChainData(null));
-    }, [slug, isBuilding]);
+    }, [slug]);
 
     // Build the step→viz mapping
     const stepMap = useMemo(() => {
@@ -105,5 +111,6 @@ export function useVizMapping(slug: string, isBuilding: boolean): VizMapping {
     return {
         getVizPrimitive,
         loaded: chainData !== null,
+        expectedMaxDepth: chainData?.max_depth ?? null,
     };
 }

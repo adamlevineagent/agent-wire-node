@@ -5303,12 +5303,65 @@ async fn pyramid_get_build_chain(
     let json_value = serde_json::to_value(yaml_value)
         .map_err(|e| format!("failed to convert YAML to JSON: {e}"))?;
 
+    // 5. Derive max_depth for the frontend layout.
+    //
+    // Question and conversation builds have a configured max_depth (the
+    // $max_depth chain variable, which the executor defaults to 3).
+    // Mechanical builds (code/document) have emergent depth — return null
+    // so the frontend doesn't override the actual depth range.
+    //
+    // Resolution order:
+    //   a) Parse the chain YAML steps for a recursive_decompose step with
+    //      an explicit numeric max_depth input.
+    //   b) If the input is a variable ref ("$max_depth"), use the executor's
+    //      resolution default (3) — matching chain_executor.rs logic.
+    //   c) For mechanical content types (code, document, vine), return null.
+    let max_depth: Option<u64> = match slug_info.content_type {
+        wire_node_lib::pyramid::types::ContentType::Question
+        | wire_node_lib::pyramid::types::ContentType::Conversation => {
+            // Try to extract from the chain YAML's recursive_decompose step
+            let from_yaml = json_value
+                .get("steps")
+                .and_then(|s| s.as_array())
+                .and_then(|steps| {
+                    steps.iter().find_map(|step| {
+                        let prim = step.get("primitive").and_then(|p| p.as_str());
+                        if prim == Some("recursive_decompose") {
+                            step.get("input")
+                                .and_then(|inp| inp.get("max_depth"))
+                                .and_then(|md| {
+                                    // If it's a number, use it directly
+                                    if let Some(n) = md.as_u64() {
+                                        return Some(n);
+                                    }
+                                    // If it's a variable ref like "$max_depth", the
+                                    // executor resolves it with a default of 3
+                                    // (see chain_executor.rs execute_recursive_decompose)
+                                    if md.as_str().map_or(false, |s| s.starts_with('$')) {
+                                        return Some(3);
+                                    }
+                                    None
+                                })
+                        } else {
+                            None
+                        }
+                    })
+                });
+            // Fall back to 3 for question/conversation builds — this is the
+            // executor default in chain_executor.rs and pyramid_rebuild.
+            Some(from_yaml.unwrap_or(3))
+        }
+        // Mechanical builds: depth is emergent from the corpus, not configured
+        _ => None,
+    };
+
     Ok(serde_json::json!({
         "chain_id": chain_id,
         "content_type": content_type_str,
         "evidence_mode": evidence_mode,
         "file_path": meta.file_path,
         "chain": json_value,
+        "max_depth": max_depth,
     }))
 }
 
