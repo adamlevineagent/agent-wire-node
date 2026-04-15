@@ -879,9 +879,30 @@ pub async fn call_model_unified_with_audit_and_ctx(
             if has_fleet {
                 if let Some(ref roster_handle) = config.fleet_roster {
                     let roster = roster_handle.read().await;
+                    // Diagnostic: log fleet routing decision
+                    tracing::info!(
+                        rule = %route.matched_rule_name,
+                        peer_count = roster.peers.len(),
+                        has_jwt = roster.fleet_jwt.is_some(),
+                        peers_with_rules = roster.peers.values()
+                            .filter(|p| !p.serving_rules.is_empty())
+                            .count(),
+                        "Fleet Phase A: checking roster for rule match"
+                    );
+                    for (pid, peer) in &roster.peers {
+                        tracing::info!(
+                            peer_id = %pid,
+                            serving_rules = ?peer.serving_rules,
+                            models = ?peer.models_loaded,
+                            handle = ?peer.handle_path,
+                            stale = %(chrono::Utc::now() - peer.last_seen).num_seconds() > 120,
+                            "Fleet peer state"
+                        );
+                    }
                     if let Some(peer) = roster.find_peer_for_rule(&route.matched_rule_name) {
                         let jwt = roster.fleet_jwt.clone().unwrap_or_default();
                         if !jwt.is_empty() {
+                            // (fleet dispatch proceeds below)
                             let peer_clone = peer.clone();
                             let rule_name = route.matched_rule_name.clone();
                             // Fleet timeout reads from the matched rule's escalation config
@@ -1018,7 +1039,19 @@ pub async fn call_model_unified_with_audit_and_ctx(
                                     warn!("Fleet dispatch failed, trying pool providers: {}", e);
                                 }
                             }
+                        } else {
+                            tracing::warn!(
+                                rule = %route.matched_rule_name,
+                                "Fleet dispatch skipped: fleet JWT is empty"
+                            );
                         }
+                    } else {
+                        tracing::warn!(
+                            rule = %route.matched_rule_name,
+                            peer_count = roster.peers.len(),
+                            "Fleet dispatch skipped: no peer serves rule '{}'",
+                            route.matched_rule_name
+                        );
                     }
                 }
             }

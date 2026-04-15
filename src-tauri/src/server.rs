@@ -1662,15 +1662,24 @@ async fn handle_fleet_announce(
     }
 
     // 3. Parse announcement and update roster
-    let announcement: crate::fleet::FleetAnnouncement = match serde_json::from_value(body) {
+    let announcement: crate::fleet::FleetAnnouncement = match serde_json::from_value(body.clone()) {
         Ok(a) => a,
         Err(e) => {
+            tracing::warn!("Fleet announce parse failed: {}. Body: {}", e, body);
             return Ok(warp::reply::with_status(
                 warp::reply::json(&serde_json::json!({"error": format!("Invalid announcement: {}", e)})),
                 warp::http::StatusCode::BAD_REQUEST,
             ));
         }
     };
+
+    tracing::info!(
+        from_node = %announcement.node_id,
+        serving_rules = ?announcement.serving_rules,
+        models = ?announcement.models_loaded,
+        handle = ?announcement.node_handle,
+        "Fleet announce received"
+    );
 
     {
         let mut roster = state.fleet_roster.write().await;

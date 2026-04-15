@@ -102,6 +102,7 @@ async fn verify_magic_link(
         api_token: api_token.clone(),
         first_started_at: first_started.clone(),
         operator_handle: registration.operator_handle.clone(),
+        jwt_public_key: registration.jwt_public_key.clone(),
         ..auth_state
     };
 
@@ -187,6 +188,7 @@ async fn verify_otp(
         api_token: api_token.clone(),
         first_started_at: first_started.clone(),
         operator_handle: registration.operator_handle.clone(),
+        jwt_public_key: registration.jwt_public_key.clone(),
         ..auth_state
     };
 
@@ -272,6 +274,7 @@ async fn login(
         api_token: api_token.clone(),
         first_started_at: first_started.clone(),
         operator_handle: registration.operator_handle.clone(),
+        jwt_public_key: registration.jwt_public_key.clone(),
         ..auth_state
     };
 
@@ -11269,8 +11272,11 @@ fn main() {
     let shared_auth: Arc<RwLock<auth::AuthState>> = Arc::new(RwLock::new(initial_auth.clone()));
     let shared_tunnel: Arc<RwLock<tunnel::TunnelState>> = Arc::new(RwLock::new(initial_tunnel));
 
-    // Shared JWT public key and node ID for the server module
-    let jwt_public_key = Arc::new(RwLock::new(config.jwt_public_key.clone()));
+    // Shared JWT public key and node ID for the server module.
+    // Prefer the key from AuthState (persisted in session.json) over the config default.
+    let jwt_public_key = Arc::new(RwLock::new(
+        initial_auth.jwt_public_key.clone().unwrap_or_else(|| config.jwt_public_key.clone())
+    ));
     let node_id_shared = Arc::new(RwLock::new(config.node_id.clone()));
 
     // Initialize pyramid SQLite database (reader + writer connections)

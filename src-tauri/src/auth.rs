@@ -154,6 +154,11 @@ pub struct AuthState {
     /// Operator's Wire handle (e.g. "hello") — populated from registration/heartbeat response.
     #[serde(default)]
     pub operator_handle: Option<String>,
+    /// Ed25519 public key for JWT verification (fleet, document tokens).
+    /// Received from Wire server at registration. Persisted so fleet
+    /// announce verification works across app restarts.
+    #[serde(default)]
+    pub jwt_public_key: Option<String>,
 }
 
 impl AuthState {
@@ -286,6 +291,7 @@ pub async fn verify_magic_link_token(
         operator_id: None,
         operator_session_expires_at: None,
         operator_handle: None,
+        jwt_public_key: None,
     })
 }
 
@@ -343,6 +349,7 @@ pub async fn verify_otp(
         operator_id: None,
         operator_session_expires_at: None,
         operator_handle: None,
+        jwt_public_key: None,
     })
 }
 
@@ -395,6 +402,7 @@ pub async fn login(
         operator_id: None,
         operator_session_expires_at: None,
         operator_handle: None,
+        jwt_public_key: None,
     })
 }
 
