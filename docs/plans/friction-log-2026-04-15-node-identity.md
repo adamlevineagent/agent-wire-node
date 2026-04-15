@@ -75,6 +75,12 @@
 - **Transition strategy:** Both old fields (node_id, operator_id UUID) and new fields (handle_path) coexist during transition. Old nodes work unchanged.
 - **No secret revocation:** Registration adds secrets, doesn't revoke. Orphan cleanup on a separate schedule.
 
+### F9: fleet_roster None on build's LlmConfig — the final fleet dispatch blocker
+**What:** Everything else works — both nodes online, announces succeeding, serving_rules propagating, dispatch policy has fleet first, matched_rule_name correct. But `config.fleet_roster` is `None` on the LlmConfig used during builds.
+**Impact:** Fleet dispatch never fires. All LLM calls go local despite idle fleet peer available.
+**Diagnosis:** `fleet_roster` is set on `pyramid_state.config` at startup (confirmed by logs). Builds clone from the same config via `llm_config_with_cache` → `self.config.read().await.clone()`. Yet the clone has `fleet_roster: None`. No code path was found that explicitly resets it. Either a full-config replacement is happening that we haven't found, or there's a timing issue between config construction and fleet_roster wiring.
+**Status:** Handoff to debugger. See `handoff-fleet-dispatch-debug.md`.
+
 ## Implementation Status
 
 | Item | Status |

@@ -876,6 +876,14 @@ pub async fn call_model_unified_with_audit_and_ctx(
     if let Some(ref route) = resolved_route {
         if !options.skip_fleet_dispatch && !route.matched_rule_name.is_empty() {
             let has_fleet = route.providers.iter().any(|e| e.provider_id == "fleet");
+            tracing::info!(
+                has_fleet,
+                rule = %route.matched_rule_name,
+                fleet_roster_present = config.fleet_roster.is_some(),
+                provider_count = route.providers.len(),
+                providers = ?route.providers.iter().map(|p| &p.provider_id).collect::<Vec<_>>(),
+                "Fleet Phase A: entry check"
+            );
             if has_fleet {
                 if let Some(ref roster_handle) = config.fleet_roster {
                     let roster = roster_handle.read().await;
