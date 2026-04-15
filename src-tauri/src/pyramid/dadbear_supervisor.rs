@@ -576,6 +576,9 @@ impl DadbearSupervisor {
             enqueued_at: std::time::Instant::now(),
             work_item_id: Some(wi_id.clone()),
             attempt_id: Some(attempt_id.clone()),
+            source: "local".to_string(),
+            job_path: format!("dadbear/{}/{}", slug, item.primitive),
+            chronicle_job_path: None,
         };
 
         // (c) Submit to compute queue.
@@ -1890,9 +1893,9 @@ fn reconstruct_step_context(
         resolved_provider_id: item.resolved_provider_id.clone(),
         prompt_hash: item.prompt_hash.clone().unwrap_or_default(),
         // Chronicle integration fields (added by compute chronicle cascade)
-        chain_name: None,
-        content_type: None,
-        task_label: Some(format!("dadbear:{}", item.primitive)),
+        chain_name: String::new(),
+        content_type: String::new(),
+        task_label: format!("dadbear:{}", item.primitive),
     }
 }
 
