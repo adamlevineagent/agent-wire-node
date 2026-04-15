@@ -145,6 +145,12 @@ impl FleetRoster {
 #[derive(Debug, Clone, Deserialize)]
 pub struct HeartbeatFleetEntry {
     pub node_id: String,
+    /// Node display name — optional because Phase 1a heartbeat response
+    /// only returns `{ node_id, handle_path, tunnel_url }` (no `name` key).
+    /// Without `serde(default)`, deserialization would silently fail for
+    /// every entry via `filter_map(|v| from_value(v).ok())`, dropping the
+    /// entire fleet roster.
+    #[serde(default)]
     pub name: String,
     pub tunnel_url: String,
     /// Handle path (e.g. "@hello/BEHEM") — present when server supports node identity.
