@@ -803,6 +803,15 @@ pub async fn call_model_unified_with_audit_and_ctx(
     // Fleet is not pool-limited. Try fleet dispatch before the pool
     // acquisition loop. On success: return immediately with fleet
     // provenance. On failure: filter fleet from providers, continue.
+    //
+    // TODO: LOAD BALANCING — Currently fleet is "try first, use exclusively."
+    // If a fleet peer is found, we dispatch and return. The local GPU never
+    // gets a turn. The right behavior: compare fleet peer queue depth vs
+    // local queue depth, and route each call to whichever has more capacity.
+    // This turns [fleet, ollama-local] from a priority chain into a load
+    // balancer. Both GPUs should be working simultaneously on a build.
+    // The local queue depth is available from config.compute_queue.
+    // The fleet peer's queue depth is on FleetPeer.total_queue_depth.
     if let Some(ref route) = resolved_route {
         if !options.skip_fleet_dispatch && !route.matched_rule_name.is_empty() {
             let has_fleet = route.providers.iter().any(|e| e.provider_id == "fleet");
