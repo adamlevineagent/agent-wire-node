@@ -7179,22 +7179,22 @@ async fn pyramid_dadbear_overview(
                 })
         });
 
-        if db_row.enabled {
-            active_count += 1;
-        } else {
+        // Hierarchical classification: Breaker > Frozen > Active.
+        // States are mutually exclusive so the operator sees a clean picture.
+        if db_row.breaker_tripped {
+            breaker_count += 1;
+        } else if db_row.frozen {
+            frozen_count += 1;
+            // Frozen IS the paused state now — unified with per-card toggle.
             paused_count += 1;
+        } else {
+            active_count += 1;
         }
         total_estimated_24h_usd += db_row.cost_24h_estimated_usd;
         total_actual_24h_usd += db_row.cost_24h_actual_usd;
         total_pending_mutations += db_row.pending_mutations_count;
         total_in_flight_checks += in_flight_stale_checks;
         total_deferred_questions += db_row.deferred_questions_count;
-        if db_row.frozen {
-            frozen_count += 1;
-        }
-        if db_row.breaker_tripped {
-            breaker_count += 1;
-        }
 
         pyramids.push(DadbearOverviewRow {
             slug: db_row.slug.clone(),
@@ -7394,31 +7394,77 @@ async fn pyramid_dadbear_activity_log(
     Ok(entries)
 }
 
-/// Phase 15: per-slug pause. Thin wrapper around the existing
-/// `disable_dadbear_for_slug` helper. The global `*_all` variants
-/// stay put for Phase 13's Pause All button. Returns the number of
-/// `pyramid_dadbear_config` rows whose `enabled` flipped.
+/// Per-slug pause. Freezes via `auto_update_ops::freeze` so the per-card
+/// and global pause share the same mechanism (pyramid_auto_update_config.frozen).
+/// Also syncs in-memory stale engine + file watcher, matching pyramid_freeze_all.
 #[tauri::command]
 async fn pyramid_dadbear_pause(
     state: tauri::State<'_, SharedState>,
     slug: String,
 ) -> Result<serde_json::Value, String> {
-    let conn = state.pyramid.writer.lock().await;
-    let affected = pyramid_db::disable_dadbear_for_slug(&conn, &slug)
+    {
+        let conn = state.pyramid.writer.lock().await;
+        wire_node_lib::pyramid::auto_update_ops::freeze(
+            &conn,
+            &state.pyramid.build_event_bus,
+            &slug,
+        )
         .map_err(|e| e.to_string())?;
-    Ok(serde_json::json!({ "ok": true, "affected": affected }))
+    }
+    // Sync in-memory state
+    {
+        let mut engines = state.pyramid.stale_engines.lock().await;
+        if let Some(engine) = engines.get_mut(&slug) {
+            engine.freeze();
+        }
+    }
+    {
+        let mut watchers = state.pyramid.file_watchers.lock().await;
+        if let Some(watcher) = watchers.get_mut(&slug) {
+            watcher.pause();
+        }
+    }
+    Ok(serde_json::json!({ "ok": true, "affected": 1 }))
 }
 
-/// Phase 15: per-slug resume. Mirror of `pyramid_dadbear_pause`.
+/// Per-slug resume. Unfreezes via `auto_update_ops::unfreeze` — mirror of
+/// `pyramid_dadbear_pause`. Syncs stale engine + file watcher.
 #[tauri::command]
 async fn pyramid_dadbear_resume(
     state: tauri::State<'_, SharedState>,
     slug: String,
 ) -> Result<serde_json::Value, String> {
-    let conn = state.pyramid.writer.lock().await;
-    let affected = pyramid_db::enable_dadbear_for_slug(&conn, &slug)
+    {
+        let conn = state.pyramid.writer.lock().await;
+        wire_node_lib::pyramid::auto_update_ops::unfreeze(
+            &conn,
+            &state.pyramid.build_event_bus,
+            &slug,
+        )
         .map_err(|e| e.to_string())?;
-    Ok(serde_json::json!({ "ok": true, "affected": affected }))
+    }
+    // Sync in-memory state
+    {
+        let mut engines = state.pyramid.stale_engines.lock().await;
+        if let Some(engine) = engines.get_mut(&slug) {
+            engine.unfreeze();
+        }
+    }
+    {
+        let db_path = state
+            .pyramid
+            .data_dir
+            .as_ref()
+            .expect("data_dir not set")
+            .join("pyramid.db")
+            .to_string_lossy()
+            .to_string();
+        let mut watchers = state.pyramid.file_watchers.lock().await;
+        if let Some(watcher) = watchers.get_mut(&slug) {
+            watcher.resume(&db_path);
+        }
+    }
+    Ok(serde_json::json!({ "ok": true, "affected": 1 }))
 }
 
 /// Phase 15: acknowledge a single orphan broadcast row after review.
@@ -10873,6 +10919,12 @@ fn main() {
     let data_dir = config.data_dir();
     let initial_tunnel = tunnel::load_tunnel_state(&data_dir).unwrap_or_default();
 
+    // Hoist auth + tunnel into shared Arcs early so the ConfigSynced
+    // listener (spawned before AppState construction) can announce to
+    // fleet with real node_id and tunnel_url.
+    let shared_auth: Arc<RwLock<auth::AuthState>> = Arc::new(RwLock::new(initial_auth.clone()));
+    let shared_tunnel: Arc<RwLock<tunnel::TunnelState>> = Arc::new(RwLock::new(initial_tunnel));
+
     // Shared JWT public key and node ID for the server module
     let jwt_public_key = Arc::new(RwLock::new(config.jwt_public_key.clone()));
     let node_id_shared = Arc::new(RwLock::new(config.node_id.clone()));
@@ -11217,6 +11269,10 @@ fn main() {
     {
         let ps = pyramid_state.clone();
         let db_path = pyramid_db_path.to_string_lossy().to_string();
+        let config_fleet_roster = fleet_roster.clone();
+        let config_compute_queue = compute_queue_handle.clone();
+        let config_auth = shared_auth.clone();
+        let config_tunnel = shared_tunnel.clone();
         let mut rx = ps.build_event_bus.tx.subscribe();
         tauri::async_runtime::spawn(async move {
             loop {
@@ -11255,6 +11311,59 @@ fn main() {
                                                         new_defer,
                                                         std::sync::atomic::Ordering::Relaxed,
                                                     );
+                                                }
+                                            }
+
+                                            // Re-announce to fleet when dispatch policy changes.
+                                            // Derive new serving_rules from the updated policy.
+                                            {
+                                                let loaded_models = {
+                                                    let reader = ps.reader.lock().await;
+                                                    match wire_node_lib::pyramid::db::load_local_mode_state(&reader) {
+                                                        Ok(row) if row.enabled => {
+                                                            row.ollama_model.into_iter().collect::<Vec<_>>()
+                                                        }
+                                                        _ => Vec::new(),
+                                                    }
+                                                };
+                                                let serving_rules = wire_node_lib::fleet::derive_serving_rules(&policy, &loaded_models);
+                                                let roster = config_fleet_roster.read().await;
+                                                if !roster.peers.is_empty() {
+                                                    let total_queue_depth = {
+                                                        let q = config_compute_queue.queue.lock().await;
+                                                        q.total_depth()
+                                                    };
+                                                    // Queue depths for observability
+                                                    let queue_depths = {
+                                                        let q = config_compute_queue.queue.lock().await;
+                                                        q.all_depths()
+                                                    };
+                                                    // Note: node_id and operator_id come from the roster's
+                                                    // self_operator_id; for a full announcement we'd need
+                                                    // auth state too. Use the fleet_jwt presence as a
+                                                    // signal that we have auth.
+                                                    if roster.fleet_jwt.is_some() {
+                                                        let auth = config_auth.read().await;
+                                                        let self_node_id = auth.node_id.clone().unwrap_or_default();
+                                                        let self_operator_id = auth.operator_id.clone().unwrap_or_default();
+                                                        drop(auth);
+                                                        let tunnel_url = {
+                                                            let ts = config_tunnel.read().await;
+                                                            ts.tunnel_url.clone().unwrap_or_default()
+                                                        };
+                                                        let announcement = wire_node_lib::fleet::FleetAnnouncement {
+                                                            node_id: self_node_id,
+                                                            name: None,
+                                                            tunnel_url,
+                                                            models_loaded: loaded_models,
+                                                            serving_rules,
+                                                            queue_depths,
+                                                            total_queue_depth,
+                                                            operator_id: self_operator_id,
+                                                        };
+                                                        wire_node_lib::fleet::announce_to_fleet(&roster, &announcement).await;
+                                                        tracing::info!("ConfigSynced: re-announced to fleet with updated serving_rules");
+                                                    }
                                                 }
                                             }
 
@@ -11548,12 +11657,12 @@ fn main() {
     };
 
     let state = Arc::new(AppState {
-        auth: Arc::new(RwLock::new(initial_auth.clone())),
+        auth: shared_auth.clone(),
         sync_state: Arc::new(RwLock::new(
             sync::load_sync_state(&config.data_dir()).unwrap_or_default(),
         )),
         credits: Arc::new(RwLock::new(initial_credits)),
-        tunnel_state: Arc::new(RwLock::new(initial_tunnel)),
+        tunnel_state: shared_tunnel.clone(),
         market_state: Arc::new(RwLock::new(
             market::load_market_state(&config.data_dir()).unwrap_or_default(),
         )),
@@ -12118,12 +12227,27 @@ fn main() {
                                                 q.all_depths()
                                             };
 
+                                            // Derive serving_rules from dispatch policy + loaded models
+                                            let serving_rules = {
+                                                let cfg = heartbeat_state.pyramid.config.read().await;
+                                                if let Some(ref policy) = cfg.dispatch_policy {
+                                                    wire_node_lib::fleet::derive_serving_rules(policy, &models_loaded)
+                                                } else {
+                                                    vec![]
+                                                }
+                                            };
+                                            let total_queue_depth = {
+                                                let q = heartbeat_state.compute_queue.queue.lock().await;
+                                                q.total_depth()
+                                            };
                                             let announcement = wire_node_lib::fleet::FleetAnnouncement {
                                                 node_id: self_node_id,
                                                 name: None,
                                                 tunnel_url,
                                                 models_loaded,
+                                                serving_rules,
                                                 queue_depths,
+                                                total_queue_depth,
                                                 operator_id: self_operator_id,
                                             };
                                             wire_node_lib::fleet::announce_to_fleet(&roster, &announcement).await;

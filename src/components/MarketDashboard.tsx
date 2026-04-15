@@ -8,7 +8,9 @@ interface FleetPeer {
     name: string;
     tunnel_url: string;
     models_loaded: string[];
+    serving_rules: string[];
     queue_depths: Record<string, number>;
+    total_queue_depth: number;
     last_seen: string; // ISO 8601 from chrono
 }
 
@@ -140,6 +142,20 @@ function FleetPeerCard({ peer }: { peer: FleetPeer }) {
                 />
             </div>
 
+            {/* Serving rules */}
+            {peer.serving_rules && peer.serving_rules.length > 0 && (
+                <div className="fleet-peer-models">
+                    <div className="fleet-peer-models-label">Serving Rules</div>
+                    <div className="fleet-peer-models-list">
+                        {peer.serving_rules.map(rule => (
+                            <span key={rule} className="fleet-peer-model-tag" title={rule}>
+                                {rule}
+                            </span>
+                        ))}
+                    </div>
+                </div>
+            )}
+
             {/* Models loaded */}
             {peer.models_loaded.length > 0 && (
                 <div className="fleet-peer-models">
@@ -154,18 +170,18 @@ function FleetPeerCard({ peer }: { peer: FleetPeer }) {
                 </div>
             )}
 
-            {/* Queue depths */}
-            {queueEntries.length > 0 && (
-                <div className="fleet-peer-queues">
-                    <div className="fleet-peer-queues-label">Queue Depths</div>
-                    {queueEntries.map(([model, depth]) => (
-                        <div key={model} className="fleet-peer-queue-row">
-                            <span className="fleet-peer-queue-model">{formatModelName(model)}</span>
-                            <span className="fleet-peer-queue-depth">{depth}</span>
-                        </div>
-                    ))}
+            {/* Queue load */}
+            <div className="fleet-peer-queues">
+                <div className="fleet-peer-queues-label">
+                    Queue Load: {peer.total_queue_depth ?? 0}
                 </div>
-            )}
+                {queueEntries.length > 0 && queueEntries.map(([model, depth]) => (
+                    <div key={model} className="fleet-peer-queue-row">
+                        <span className="fleet-peer-queue-model">{formatModelName(model)}</span>
+                        <span className="fleet-peer-queue-depth">{depth}</span>
+                    </div>
+                ))}
+            </div>
 
             {/* Tunnel URL (debug) */}
             <div className="fleet-peer-tunnel" title={peer.tunnel_url}>

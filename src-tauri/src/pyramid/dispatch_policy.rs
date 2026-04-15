@@ -35,6 +35,10 @@ pub struct RouteEntry {
     /// Optional tier name for context_limit/pricing lookups.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tier_name: Option<String>,
+    /// True for providers that run on local hardware (Ollama, local GPU).
+    /// Used by fleet to determine which rules this node can serve.
+    #[serde(default)]
+    pub is_local: bool,
 }
 
 // ── Match config ────────────────────────────────────────────────────────────
@@ -183,6 +187,8 @@ pub struct ResolvedRoute {
     pub providers: Vec<RouteEntry>,
     pub bypass_pool: bool,
     pub sequential_rule_name: Option<String>,
+    /// The name of the routing rule that matched. Empty string when no rule matched.
+    pub matched_rule_name: String,
     pub escalation_timeout_secs: u64,
     pub max_wait_secs: u64,
 }
@@ -198,6 +204,25 @@ impl DispatchPolicy {
             build_coordination: yaml.build_coordination.clone().unwrap_or_default(),
             pool_configs: yaml.provider_pools.clone(),
         }
+    }
+
+    /// Resolve by rule name (for fleet dispatch receiving).
+    /// Returns the first non-fleet local provider's (provider_id, model_id).
+    pub fn resolve_local_for_rule(&self, rule_name: &str) -> Option<(String, Option<String>)> {
+        for rule in &self.rules {
+            if rule.name == rule_name {
+                // Find the first non-fleet provider with is_local == true.
+                // No fallback to cloud providers — if no local provider
+                // is found, return None so the fleet handler returns an
+                // error (prevents surprise cloud billing on fleet jobs).
+                for entry in &rule.route_to {
+                    if entry.provider_id != "fleet" && entry.is_local {
+                        return Some((entry.provider_id.clone(), entry.model_id.clone()));
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Resolve a work call to a route. Walks rules in order; first match wins.
@@ -223,6 +248,7 @@ impl DispatchPolicy {
                     } else {
                         None
                     },
+                    matched_rule_name: rule.name.clone(),
                     escalation_timeout_secs: self.escalation.wait_timeout_secs,
                     max_wait_secs: self.escalation.max_wait_secs,
                 };
@@ -234,6 +260,7 @@ impl DispatchPolicy {
             providers: Vec::new(),
             bypass_pool: false,
             sequential_rule_name: None,
+            matched_rule_name: String::new(),
             escalation_timeout_secs: self.escalation.wait_timeout_secs,
             max_wait_secs: self.escalation.max_wait_secs,
         }
@@ -348,6 +375,7 @@ mod tests {
                         provider_id: "ollama".into(),
                         model_id: None,
                         tier_name: None,
+                        is_local: false,
                     }],
                     bypass_pool: false,
                     sequential: true,
@@ -363,6 +391,7 @@ mod tests {
                         provider_id: "openrouter".into(),
                         model_id: None,
                         tier_name: None,
+                        is_local: false,
                     }],
                     bypass_pool: false,
                     sequential: false,
@@ -397,6 +426,7 @@ mod tests {
                     provider_id: "ollama".into(),
                     model_id: None,
                     tier_name: None,
+                    is_local: false,
                 }],
                 bypass_pool: false,
                 sequential: false,

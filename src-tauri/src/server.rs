@@ -1512,84 +1512,109 @@ async fn handle_fleet_dispatch(
         ));
     }
 
-    // 3. Parse request
-    let model = body["model"].as_str().unwrap_or("").to_string();
+    // 3. Parse request — rule_name only, no model field
+    let rule_name = body["rule_name"].as_str().unwrap_or("").to_string();
     let system_prompt = body["system_prompt"].as_str().unwrap_or("").to_string();
     let user_prompt = body["user_prompt"].as_str().unwrap_or("").to_string();
     let temperature = body["temperature"].as_f64().unwrap_or(0.0) as f32;
     let max_tokens = body["max_tokens"].as_u64().unwrap_or(4096) as usize;
     let response_format = body.get("response_format").cloned();
 
-    if model.is_empty() || user_prompt.is_empty() {
+    if rule_name.is_empty() || user_prompt.is_empty() {
         return Ok(warp::reply::with_status(
-            warp::reply::json(&serde_json::json!({"error": "Missing model or user_prompt"})),
+            warp::reply::json(&serde_json::json!({"error": "Missing rule_name or user_prompt"})),
             warp::http::StatusCode::BAD_REQUEST,
         ));
     }
 
-    // 4. Build a minimal LlmConfig for this fleet job.
-    // Clone the pyramid's base LlmConfig and override model + clear
-    // queue/fleet handles to prevent re-dispatch loops.
+    // 4. Resolve model from dispatch policy by rule name — LOCAL providers only.
+    // If no local provider resolves, return error (never fall through to cloud).
+    // When the route entry has model_id: None (wildcard catchall like
+    // "ollama-catchall"), fall back to the config's primary_model — which
+    // commit_enable_local_mode already set to the chosen Ollama model.
+    let resolved_model = {
+        let cfg = state.pyramid.config.read().await;
+        if let Some(ref policy) = cfg.dispatch_policy {
+            match policy.resolve_local_for_rule(&rule_name) {
+                Some((_provider_id, model_id)) => {
+                    // model_id is None when the route entry is a wildcard
+                    // (e.g. ollama-catchall with no explicit model_id).
+                    // Fall back to the config's primary_model.
+                    model_id.unwrap_or_else(|| cfg.primary_model.clone())
+                }
+                None => {
+                    return Ok(warp::reply::with_status(
+                        warp::reply::json(&serde_json::json!({"error": "No local provider for rule"})),
+                        warp::http::StatusCode::BAD_REQUEST,
+                    ));
+                }
+            }
+        } else {
+            return Ok(warp::reply::with_status(
+                warp::reply::json(&serde_json::json!({"error": "No dispatch policy configured"})),
+                warp::http::StatusCode::SERVICE_UNAVAILABLE,
+            ));
+        }
+    };
+
+    if resolved_model.is_empty() {
+        return Ok(warp::reply::with_status(
+            warp::reply::json(&serde_json::json!({"error": "Cannot resolve model for rule"})),
+            warp::http::StatusCode::BAD_REQUEST,
+        ));
+    }
+
+    // 5. CRITICAL: Fleet jobs go THROUGH the queue, not around it.
+    // The queue serializes fleet jobs with local builds — same GPU.
+    // Clone base LlmConfig, set model to resolved model, keep
+    // compute_queue as Some, set fleet_roster to None, set
+    // skip_fleet_dispatch: true. Call through the normal LLM path.
     let fleet_config = {
         let cfg = state.pyramid.config.read().await;
         let mut fc = cfg.clone();
-        fc.primary_model = model.clone();
-        fc.fallback_model_1 = model.clone();
-        fc.fallback_model_2 = model.clone();
-        fc.compute_queue = None; // prevent re-enqueue
-        fc.fleet_roster = None; // prevent fleet re-dispatch
+        fc.primary_model = resolved_model.clone();
+        fc.fallback_model_1 = resolved_model.clone();
+        fc.fallback_model_2 = resolved_model.clone();
+        // compute_queue stays Some — job enters the queue (Law 1)
+        fc.fleet_roster = None; // prevent re-dispatch to fleet
         fc
     };
 
-    let (tx, rx) = tokio::sync::oneshot::channel();
     let options = crate::pyramid::llm::LlmCallOptions {
-        skip_concurrency_gate: true,
+        skip_fleet_dispatch: true, // prevent re-dispatch loop
         ..Default::default()
     };
 
-    // 5. Enqueue the fleet job into the same per-model FIFO queue (Law 1).
+    // 6. Call through normal LLM path — transparent queue routing
+    // enqueues the job, GPU loop executes it, result flows back.
+    match crate::pyramid::llm::call_model_unified_with_options_and_ctx(
+        &fleet_config,
+        None, // Fleet jobs have no StepContext (Law 4)
+        &system_prompt,
+        &user_prompt,
+        temperature,
+        max_tokens,
+        response_format.as_ref(),
+        options,
+    )
+    .await
     {
-        let mut q = state.compute_queue.queue.lock().await;
-        q.enqueue_local(
-            &model,
-            crate::compute_queue::QueueEntry {
-                result_tx: tx,
-                config: fleet_config,
-                system_prompt,
-                user_prompt,
-                temperature,
-                max_tokens,
-                response_format,
-                options,
-                step_ctx: None, // Fleet jobs have no StepContext (Law 4)
-                model_id: model.clone(),
-                enqueued_at: std::time::Instant::now(),
-            },
-        );
-    }
-    state.compute_queue.notify.notify_one();
-
-    // 6. Await result (synchronous — fleet dispatch blocks until GPU completes)
-    match rx.await {
-        Ok(Ok(llm_response)) => {
+        Ok(llm_response) => {
             let response = serde_json::json!({
                 "content": llm_response.content,
                 "prompt_tokens": llm_response.usage.prompt_tokens,
                 "completion_tokens": llm_response.usage.completion_tokens,
-                "model": model,
+                "model": resolved_model,
                 "finish_reason": null,
+                "peer_model": resolved_model,
             });
             Ok(warp::reply::with_status(
                 warp::reply::json(&response),
                 warp::http::StatusCode::OK,
             ))
         }
-        Ok(Err(e)) => Ok(warp::reply::with_status(
+        Err(e) => Ok(warp::reply::with_status(
             warp::reply::json(&serde_json::json!({"error": format!("LLM call failed: {}", e)})),
-            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
-        )),
-        Err(_) => Ok(warp::reply::with_status(
-            warp::reply::json(&serde_json::json!({"error": "Queue channel closed"})),
             warp::http::StatusCode::INTERNAL_SERVER_ERROR,
         )),
     }

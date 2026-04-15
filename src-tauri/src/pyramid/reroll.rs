@@ -854,6 +854,8 @@ mod tests {
             generation_id: Some("gen-test".to_string()),
             actual_cost_usd: Some(0.00042),
             provider_id: Some("openrouter".to_string()),
+            fleet_peer_id: None,
+            fleet_peer_model: None,
         }
     }
 

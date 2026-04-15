@@ -121,6 +121,12 @@ pub struct LlmResponse {
     /// leak-detection sweep and provider-health state machine can
     /// group rows per provider.
     pub provider_id: Option<String>,
+    /// Fleet provenance: node_id of the peer that served this call.
+    /// None for non-fleet calls.
+    pub fleet_peer_id: Option<String>,
+    /// Fleet provenance: model the peer actually used (returned in
+    /// the fleet dispatch response). None for non-fleet calls.
+    pub fleet_peer_model: Option<String>,
 }
 
 // ── Config ───────────────────────────────────────────────────────────────────
@@ -359,6 +365,9 @@ pub struct LlmCallOptions {
     /// When true, the GPU processing loop bypasses semaphore/pool
     /// acquisition. Set by the queue consumer; callers never set this.
     pub skip_concurrency_gate: bool,
+    /// When true, skip fleet dispatch (prevents re-dispatch loop).
+    /// Set by the fleet handler on the receiving node.
+    pub skip_fleet_dispatch: bool,
 }
 
 // ── Provider synthesis (Phase 3 bridge) ──────────────────────────────────────
@@ -624,69 +633,6 @@ pub async fn call_model_unified_with_audit_and_ctx(
     response_format: Option<&serde_json::Value>,
     options: LlmCallOptions,
 ) -> Result<LlmResponse> {
-    // ── Fleet Routing: check fleet peers before local queue ─────────
-    //
-    // If a fleet peer has this model loaded with capacity, dispatch to
-    // the peer instead of enqueueing locally. This happens BEFORE the
-    // compute queue check because fleet dispatch is transparent to the
-    // caller — same return type, same behavior.
-    //
-    // Only attempt fleet if:
-    // 1. Config has a fleet_roster (not tests/pre-init)
-    // 2. Caller is not the GPU loop (skip_concurrency_gate == false)
-    // 3. Fleet roster has a peer with this model and capacity
-    if let Some(ref fleet_roster_handle) = config.fleet_roster {
-        if !options.skip_concurrency_gate {
-            // Derive model_id from StepContext resolved model or config primary.
-            let fleet_model_id = ctx
-                .and_then(|c| c.resolved_model_id.clone())
-                .filter(|m| !m.is_empty())
-                .unwrap_or_else(|| config.primary_model.clone());
-
-            let roster = fleet_roster_handle.read().await;
-            if let Some(peer) = roster.find_peer_for_model(&fleet_model_id) {
-                let jwt = roster.fleet_jwt.clone().unwrap_or_default();
-                if !jwt.is_empty() {
-                    let request = crate::fleet::FleetDispatchRequest {
-                        model: fleet_model_id.clone(),
-                        system_prompt: system_prompt.to_string(),
-                        user_prompt: user_prompt.to_string(),
-                        temperature,
-                        max_tokens: _max_tokens,
-                        response_format: response_format.cloned(),
-                        fleet_jwt: jwt,
-                    };
-                    let peer_clone = peer.clone();
-                    // Drop the roster read lock before the async dispatch call.
-                    drop(roster);
-
-                    match crate::fleet::fleet_dispatch(&peer_clone, &request).await {
-                        Ok(fleet_resp) => {
-                            // Convert FleetDispatchResponse to LlmResponse.
-                            return Ok(LlmResponse {
-                                content: fleet_resp.content,
-                                usage: super::types::TokenUsage {
-                                    prompt_tokens: fleet_resp.prompt_tokens.unwrap_or(0),
-                                    completion_tokens: fleet_resp.completion_tokens.unwrap_or(0),
-                                },
-                                generation_id: None,
-                                actual_cost_usd: None, // Fleet is free (same operator)
-                                provider_id: Some("fleet".to_string()),
-                            });
-                        }
-                        Err(e) => {
-                            // Fleet dispatch failed — remove dead peer and fall
-                            // through to local queue. Never retry fleet.
-                            warn!("Fleet dispatch failed, falling through to local: {}", e);
-                            let mut roster_w = fleet_roster_handle.write().await;
-                            roster_w.remove_peer(&peer_clone.node_id);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
     // ── Phase 1 Compute Queue: Transparent routing ─────────────────
     //
     // When the config has a compute_queue attached AND the caller is
@@ -842,7 +788,7 @@ pub async fn call_model_unified_with_audit_and_ctx(
     // have the provider preference chain for escalation. When no policy
     // is configured the resolved_route is None and we fall through to
     // the legacy single-provider path.
-    let resolved_route = config.dispatch_policy.as_ref().map(|policy| {
+    let mut resolved_route = config.dispatch_policy.as_ref().map(|policy| {
         // Use Build as the default work_type — Phase B work_type tagging
         // will provide the real classification per call site.
         let work_type = crate::pyramid::dispatch_policy::WorkType::Build;
@@ -850,6 +796,72 @@ pub async fn call_model_unified_with_audit_and_ctx(
         let depth = ctx.map(|c| c.depth);
         policy.resolve_route(work_type, "", step_name, depth)
     });
+
+    // ── Phase A: Fleet providers (pre-pool) ──────────────────────────
+    // Fleet is not pool-limited. Try fleet dispatch before the pool
+    // acquisition loop. On success: return immediately with fleet
+    // provenance. On failure: filter fleet from providers, continue.
+    if let Some(ref route) = resolved_route {
+        if !options.skip_fleet_dispatch && !route.matched_rule_name.is_empty() {
+            let has_fleet = route.providers.iter().any(|e| e.provider_id == "fleet");
+            if has_fleet {
+                if let Some(ref roster_handle) = config.fleet_roster {
+                    let roster = roster_handle.read().await;
+                    if let Some(peer) = roster.find_peer_for_rule(&route.matched_rule_name) {
+                        let jwt = roster.fleet_jwt.clone().unwrap_or_default();
+                        if !jwt.is_empty() {
+                            let peer_clone = peer.clone();
+                            let rule_name = route.matched_rule_name.clone();
+                            // Fleet timeout reads from the matched rule's escalation config
+                            let fleet_timeout_secs = route.max_wait_secs;
+                            drop(roster); // release lock before async
+
+                            match crate::fleet::fleet_dispatch_by_rule(
+                                &peer_clone,
+                                &rule_name,
+                                system_prompt,
+                                user_prompt,
+                                temperature,
+                                _max_tokens,
+                                response_format,
+                                &jwt,
+                                fleet_timeout_secs,
+                            )
+                            .await
+                            {
+                                Ok(fleet_resp) => {
+                                    // Return with fleet provenance on the LlmResponse
+                                    return Ok(LlmResponse {
+                                        content: fleet_resp.content,
+                                        usage: super::types::TokenUsage {
+                                            prompt_tokens: fleet_resp.prompt_tokens.unwrap_or(0),
+                                            completion_tokens: fleet_resp.completion_tokens.unwrap_or(0),
+                                        },
+                                        generation_id: None,
+                                        actual_cost_usd: None, // fleet is free (same operator)
+                                        provider_id: Some("fleet".to_string()),
+                                        fleet_peer_id: Some(peer_clone.node_id.clone()),
+                                        fleet_peer_model: fleet_resp.peer_model.clone(),
+                                    });
+                                }
+                                Err(e) => {
+                                    // Remove dead peer, continue to pool providers
+                                    let mut roster_w = roster_handle.write().await;
+                                    roster_w.remove_peer(&peer_clone.node_id);
+                                    warn!("Fleet dispatch failed, trying pool providers: {}", e);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Filter "fleet" from providers before pool loop (fleet already tried or skipped)
+    if let Some(ref mut route) = resolved_route {
+        route.providers.retain(|e| e.provider_id != "fleet");
+    }
 
     // Phase D: pool acquire with timeout-based provider escalation.
     // When a dispatch route exists, try each provider in the preference
@@ -1361,6 +1373,8 @@ pub async fn call_model_unified_with_audit_and_ctx(
             // sweep. Phase 11's registry path (below) sets a real
             // provider_id from the resolved registry row.
             provider_id: Some(provider_type.as_str().to_string()),
+            fleet_peer_id: None,
+            fleet_peer_model: None,
         };
 
         // ── Phase 6: Cache store path ──────────────────────────────
@@ -1500,6 +1514,8 @@ fn parse_cached_response(cached: &super::step_context::CachedStepOutput) -> Resu
         generation_id,
         actual_cost_usd,
         provider_id,
+        fleet_peer_id: value.get("fleet_peer_id").and_then(|v| v.as_str()).map(|s| s.to_string()),
+        fleet_peer_model: value.get("fleet_peer_model").and_then(|v| v.as_str()).map(|s| s.to_string()),
     })
 }
 
@@ -2426,6 +2442,8 @@ pub async fn call_model_via_registry(
             generation_id: parsed.generation_id,
             actual_cost_usd: parsed.actual_cost_usd,
             provider_id: Some(resolved.provider.id.clone()),
+            fleet_peer_id: None,
+            fleet_peer_model: None,
         };
 
         // ── Phase 6 (fix pass): Cache store path ───────────────────

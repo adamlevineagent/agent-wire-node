@@ -836,7 +836,7 @@ pub fn commit_enable_local_mode(
     let dispatch_policy_yaml = "schema_type: dispatch_policy\n\
                                 version: 1\n\
                                 provider_pools:\n  ollama-local:\n    concurrency: 1\n\
-                                routing_rules:\n  - name: ollama-catchall\n    match_config: {}\n    route_to:\n      - provider_id: ollama-local\n\
+                                routing_rules:\n  - name: ollama-catchall\n    match_config: {}\n    route_to:\n      - provider_id: fleet\n      - provider_id: ollama-local\n        is_local: true\n\
                                 build_coordination:\n  defer_maintenance_during_build: true\n";
     let prior_dispatch_policy =
         load_active_config_contribution(conn, "dispatch_policy", None)?;
