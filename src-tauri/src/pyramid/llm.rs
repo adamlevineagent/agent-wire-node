@@ -97,6 +97,39 @@ async fn rate_limit_wait(max_requests: usize, window_secs: f64) {
     }
 }
 
+fn should_enqueue_local_execution(
+    resolved_route: Option<&crate::pyramid::dispatch_policy::ResolvedRoute>,
+    provider_type: ProviderType,
+    options: &LlmCallOptions,
+) -> bool {
+    if options.skip_concurrency_gate {
+        return false;
+    }
+
+    match resolved_route {
+        Some(route) if !route.providers.is_empty() => route.providers.iter().any(|entry| entry.is_local),
+        _ => provider_type == ProviderType::OpenaiCompat,
+    }
+}
+
+fn queue_model_id_for_local_execution(
+    config: &LlmConfig,
+    ctx: Option<&StepContext>,
+    resolved_route: Option<&crate::pyramid::dispatch_policy::ResolvedRoute>,
+) -> String {
+    if let Some(model_id) = resolved_route
+        .and_then(|route| route.providers.iter().find(|entry| entry.is_local))
+        .and_then(|entry| entry.model_id.clone())
+        .filter(|model_id| !model_id.is_empty())
+    {
+        return model_id;
+    }
+
+    ctx.and_then(|c| c.resolved_model_id.clone())
+        .filter(|model_id| !model_id.is_empty())
+        .unwrap_or_else(|| config.primary_model.clone())
+}
+
 // ── Response types ───────────────────────────────────────────────────────────
 
 /// Unified response from the LLM client. Every call returns content, token usage,
@@ -703,124 +736,6 @@ pub async fn call_model_unified_with_audit_and_ctx(
     // Save chronicle_job_path before it might move into the queue path.
     let saved_chronicle_job_path = options.chronicle_job_path.clone();
 
-    // ── Phase 1 Compute Queue: Transparent routing ─────────────────
-    //
-    // When the config has a compute_queue attached AND the caller is
-    // NOT the GPU loop itself (skip_concurrency_gate == false), enqueue
-    // the call and block on the oneshot result. This is the single
-    // interception point that routes ALL unified LLM calls through the
-    // per-model FIFO queue without changing any caller.
-    if let Some(ref queue_handle) = config.compute_queue {
-        if !options.skip_concurrency_gate {
-            // Derive queue routing key from the resolved model in ctx,
-            // or fall back to the config's primary model.
-            let queue_model_id = ctx
-                .and_then(|c| c.resolved_model_id.clone())
-                .filter(|m| !m.is_empty())
-                .unwrap_or_else(|| config.primary_model.clone());
-
-            let (tx, rx) = tokio::sync::oneshot::channel();
-
-            // Clone config WITHOUT queue handle (prevents re-enqueue loop)
-            // and WITHOUT fleet roster (prevents fleet re-dispatch).
-            let mut gpu_config = config.clone();
-            gpu_config.compute_queue = None;
-            gpu_config.fleet_roster = None;
-
-            // Set skip_concurrency_gate on the forwarded options so the
-            // GPU loop's execution bypasses semaphore/pool acquisition.
-            // Determine source and job_path BEFORE moving options.
-            // If options.chronicle_job_path is set (fleet_received path), use it.
-            let entry_source = if options.skip_fleet_dispatch && options.chronicle_job_path.is_some() {
-                "fleet_received".to_string()
-            } else {
-                "local".to_string()
-            };
-            let chronicle_job_path_val = options.chronicle_job_path.clone().unwrap_or_else(|| {
-                super::compute_chronicle::generate_job_path(ctx, None, &queue_model_id, &entry_source)
-            });
-            let entry_chronicle_jp = options.chronicle_job_path.clone();
-
-            let mut gpu_options = options;
-            gpu_options.skip_concurrency_gate = true;
-
-            let depth = {
-                let mut q = queue_handle.queue.lock().await;
-                q.enqueue_local(
-                    &queue_model_id,
-                    crate::compute_queue::QueueEntry {
-                        result_tx: tx,
-                        config: gpu_config,
-                        system_prompt: system_prompt.to_string(),
-                        user_prompt: user_prompt.to_string(),
-                        temperature,
-                        max_tokens: _max_tokens,
-                        response_format: response_format.cloned(),
-                        options: gpu_options,
-                        step_ctx: ctx.cloned(), // Law 4: StepContext flows through
-                        model_id: queue_model_id.clone(),
-                        enqueued_at: std::time::Instant::now(),
-                        work_item_id: None, // Non-DADBEAR path
-                        attempt_id: None,
-                        source: entry_source.clone(),
-                        job_path: chronicle_job_path_val.clone(),
-                        chronicle_job_path: entry_chronicle_jp,
-                    },
-                );
-                q.queue_depth(&queue_model_id)
-            };
-
-            // WP-1: Chronicle enqueue event
-            {
-                let db_path = ctx
-                    .map(|c| c.db_path.clone())
-                    .or_else(|| config.cache_access.as_ref().map(|ca| ca.db_path.to_string()));
-                let chronicle_ctx = if let Some(sc) = ctx {
-                    super::compute_chronicle::ChronicleEventContext::from_step_ctx(
-                        sc, &chronicle_job_path_val, "enqueued", &entry_source,
-                    )
-                } else {
-                    super::compute_chronicle::ChronicleEventContext::minimal(
-                        &chronicle_job_path_val, "enqueued", &entry_source,
-                    )
-                    .with_model_id(queue_model_id.clone())
-                };
-                let chronicle_ctx = chronicle_ctx.with_metadata(serde_json::json!({
-                    "queue_depth": depth,
-                    "queue_model_depth": depth,
-                }));
-                if let Some(db_path) = db_path {
-                    tokio::task::spawn_blocking(move || {
-                        if let Ok(conn) = rusqlite::Connection::open(&db_path) {
-                            let _ = super::compute_chronicle::record_event(&conn, &chronicle_ctx);
-                        }
-                    });
-                }
-            }
-
-            // Emit QueueJobEnqueued event via BuildEventBus.
-            // Use slug "__compute__" (reserved non-pyramid slug).
-            if let Some(step) = ctx {
-                if let Some(ref bus) = step.bus {
-                    let _ = bus.tx.send(super::event_bus::TaggedBuildEvent {
-                        slug: "__compute__".to_string(),
-                        kind: super::event_bus::TaggedKind::QueueJobEnqueued {
-                            model_id: queue_model_id.clone(),
-                            queue_depth: depth,
-                        },
-                    });
-                }
-            }
-
-            queue_handle.notify.notify_one();
-
-            // Block until the GPU loop processes this item and sends result.
-            return rx
-                .await
-                .map_err(|_| anyhow!("compute queue: GPU loop dropped the job"))?;
-        }
-    }
-
     // ── Phase 6: Cache lookup path ──────────────────────────────────
     //
     // Delegated to `try_cache_lookup_or_key`, which is shared with
@@ -862,34 +777,6 @@ pub async fn call_model_unified_with_audit_and_ctx(
         }
         CacheProbeOutcome::MissOrBypass(lookup) => lookup,
     };
-
-    // ── Phase 18b: Audit pending row insert ─────────────────────────
-    //
-    // Mirror the legacy `call_model_audited` flow: insert a pending row
-    // BEFORE the HTTP call so a crash mid-call leaves a trace. The row
-    // is updated to 'complete' or 'failed' below. When no AuditContext
-    // was supplied this is a no-op and the function reduces to the
-    // pre-Phase-18b cache-aware path.
-    let audit_id: Option<i64> = if let Some(audit_ctx) = audit {
-        let conn = audit_ctx.conn.lock().await;
-        super::db::insert_llm_audit_pending(
-            &conn,
-            &audit_ctx.slug,
-            &audit_ctx.build_id,
-            audit_ctx.node_id.as_deref(),
-            &audit_ctx.step_name,
-            &audit_ctx.call_purpose,
-            audit_ctx.depth,
-            &config.primary_model,
-            system_prompt,
-            user_prompt,
-        )
-        .ok()
-    } else {
-        None
-    };
-
-    let call_started = std::time::Instant::now();
 
     // Resolve the provider trait impl + credential for this call. The
     // registry path is preferred; if no registry is attached to the
@@ -1113,6 +1000,144 @@ pub async fn call_model_unified_with_audit_and_ctx(
     if let Some(ref mut route) = resolved_route {
         route.providers.retain(|e| e.provider_id != "fleet");
     }
+
+    // ── Phase 1 Compute Queue: local execution only ────────────────
+    //
+    // Outgoing fleet dispatch must get first shot so calls that can be
+    // served by a peer do not queue behind local GPU work. After fleet
+    // routing has had its chance, enqueue only calls that may execute on
+    // local hardware. Cloud-only routes bypass the queue entirely.
+    if let Some(ref queue_handle) = config.compute_queue {
+        if should_enqueue_local_execution(resolved_route.as_ref(), provider_type, &options) {
+            let queue_model_id =
+                queue_model_id_for_local_execution(config, ctx, resolved_route.as_ref());
+            let (tx, rx) = tokio::sync::oneshot::channel();
+
+            // Clone config WITHOUT queue handle (prevents re-enqueue loop)
+            // and WITHOUT fleet roster. Queue replay is a pure local
+            // execution path: fleet dispatch already had its chance.
+            let mut gpu_config = config.clone();
+            gpu_config.compute_queue = None;
+            gpu_config.fleet_roster = None;
+
+            // Set skip flags on the forwarded options so the GPU loop
+            // performs the local execution directly rather than treating
+            // replay as a second routing decision point.
+            let entry_source = if options.skip_fleet_dispatch && options.chronicle_job_path.is_some() {
+                "fleet_received".to_string()
+            } else {
+                "local".to_string()
+            };
+            let chronicle_job_path_val = options.chronicle_job_path.clone().unwrap_or_else(|| {
+                super::compute_chronicle::generate_job_path(ctx, None, &queue_model_id, &entry_source)
+            });
+            let entry_chronicle_jp = options.chronicle_job_path.clone();
+
+            let mut gpu_options = options;
+            gpu_options.skip_concurrency_gate = true;
+            gpu_options.skip_fleet_dispatch = true;
+
+            let depth = {
+                let mut q = queue_handle.queue.lock().await;
+                q.enqueue_local(
+                    &queue_model_id,
+                    crate::compute_queue::QueueEntry {
+                        result_tx: tx,
+                        config: gpu_config,
+                        system_prompt: system_prompt.to_string(),
+                        user_prompt: user_prompt.to_string(),
+                        temperature,
+                        max_tokens: _max_tokens,
+                        response_format: response_format.cloned(),
+                        options: gpu_options,
+                        step_ctx: ctx.cloned(), // Law 4: StepContext flows through
+                        model_id: queue_model_id.clone(),
+                        enqueued_at: std::time::Instant::now(),
+                        work_item_id: None, // Non-DADBEAR path
+                        attempt_id: None,
+                        source: entry_source.clone(),
+                        job_path: chronicle_job_path_val.clone(),
+                        chronicle_job_path: entry_chronicle_jp,
+                    },
+                );
+                q.queue_depth(&queue_model_id)
+            };
+
+            // WP-1: Chronicle enqueue event
+            {
+                let db_path = ctx
+                    .map(|c| c.db_path.clone())
+                    .or_else(|| config.cache_access.as_ref().map(|ca| ca.db_path.to_string()));
+                let chronicle_ctx = if let Some(sc) = ctx {
+                    super::compute_chronicle::ChronicleEventContext::from_step_ctx(
+                        sc, &chronicle_job_path_val, "enqueued", &entry_source,
+                    )
+                } else {
+                    super::compute_chronicle::ChronicleEventContext::minimal(
+                        &chronicle_job_path_val, "enqueued", &entry_source,
+                    )
+                    .with_model_id(queue_model_id.clone())
+                };
+                let chronicle_ctx = chronicle_ctx.with_metadata(serde_json::json!({
+                    "queue_depth": depth,
+                    "queue_model_depth": depth,
+                }));
+                if let Some(db_path) = db_path {
+                    tokio::task::spawn_blocking(move || {
+                        if let Ok(conn) = rusqlite::Connection::open(&db_path) {
+                            let _ = super::compute_chronicle::record_event(&conn, &chronicle_ctx);
+                        }
+                    });
+                }
+            }
+
+            if let Some(step) = ctx {
+                if let Some(ref bus) = step.bus {
+                    let _ = bus.tx.send(super::event_bus::TaggedBuildEvent {
+                        slug: "__compute__".to_string(),
+                        kind: super::event_bus::TaggedKind::QueueJobEnqueued {
+                            model_id: queue_model_id.clone(),
+                            queue_depth: depth,
+                        },
+                    });
+                }
+            }
+
+            queue_handle.notify.notify_one();
+
+            return rx
+                .await
+                .map_err(|_| anyhow!("compute queue: GPU loop dropped the job"))?;
+        }
+    }
+
+    // ── Phase 18b: Audit pending row insert ─────────────────────────
+    //
+    // Mirror the legacy `call_model_audited` flow: insert a pending row
+    // BEFORE the HTTP call so a crash mid-call leaves a trace. The row
+    // is updated to 'complete' or 'failed' below. Queueing and fleet
+    // dispatch both happen earlier, so this row now tracks only the
+    // actual execution path that will perform the provider HTTP call.
+    let audit_id: Option<i64> = if let Some(audit_ctx) = audit {
+        let conn = audit_ctx.conn.lock().await;
+        super::db::insert_llm_audit_pending(
+            &conn,
+            &audit_ctx.slug,
+            &audit_ctx.build_id,
+            audit_ctx.node_id.as_deref(),
+            &audit_ctx.step_name,
+            &audit_ctx.call_purpose,
+            audit_ctx.depth,
+            &config.primary_model,
+            system_prompt,
+            user_prompt,
+        )
+        .ok()
+    } else {
+        None
+    };
+
+    let call_started = std::time::Instant::now();
 
     // Phase D: pool acquire with timeout-based provider escalation.
     // When a dispatch route exists, try each provider in the preference
