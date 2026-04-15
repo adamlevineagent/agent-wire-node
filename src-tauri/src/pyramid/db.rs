@@ -2114,6 +2114,132 @@ pub fn init_pyramid_db(conn: &Connection) -> Result<()> {
 
     // ── end DADBEAR Canonical State Model tables ────────────────────────────
 
+    // ── Compute Chronicle: persistent compute observability ────────────────
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS pyramid_compute_events (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_path       TEXT NOT NULL,
+            event_type     TEXT NOT NULL,
+            timestamp      TEXT NOT NULL,
+            model_id       TEXT,
+            source         TEXT NOT NULL,
+            slug           TEXT,
+            build_id       TEXT,
+            chain_name     TEXT,
+            content_type   TEXT,
+            step_name      TEXT,
+            primitive      TEXT,
+            depth          INTEGER,
+            task_label     TEXT,
+            metadata       TEXT,
+            work_item_id   TEXT,
+            attempt_id     TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_compute_events_pyramid
+            ON pyramid_compute_events(slug, build_id, timestamp);
+
+        CREATE INDEX IF NOT EXISTS idx_compute_events_source_type
+            ON pyramid_compute_events(source, event_type, timestamp);
+
+        CREATE INDEX IF NOT EXISTS idx_compute_events_model
+            ON pyramid_compute_events(model_id, timestamp);
+
+        CREATE INDEX IF NOT EXISTS idx_compute_events_layer
+            ON pyramid_compute_events(chain_name, depth, timestamp);
+
+        CREATE INDEX IF NOT EXISTS idx_compute_events_job_path
+            ON pyramid_compute_events(job_path);
+
+        CREATE INDEX IF NOT EXISTS idx_compute_events_work_item
+            ON pyramid_compute_events(work_item_id)
+            WHERE work_item_id IS NOT NULL;
+        ",
+    )?;
+
+    // ── Chronicle views (lazy, computed on query) ──────────────────────────
+    conn.execute_batch(
+        "
+        CREATE VIEW IF NOT EXISTS v_compute_hourly_by_model AS
+        SELECT
+            strftime('%Y-%m-%d %H:00:00', timestamp) AS hour,
+            model_id,
+            source,
+            COUNT(CASE WHEN event_type = 'completed' THEN 1 END) AS completed,
+            COUNT(CASE WHEN event_type = 'failed' THEN 1 END) AS failed,
+            AVG(CASE WHEN event_type = 'completed' THEN CAST(json_extract(metadata, '$.latency_ms') AS REAL) END) AS avg_latency_ms,
+            SUM(CASE WHEN event_type = 'completed' THEN CAST(json_extract(metadata, '$.tokens_prompt') AS INTEGER) ELSE 0 END) AS total_tokens_in,
+            SUM(CASE WHEN event_type = 'completed' THEN CAST(json_extract(metadata, '$.tokens_completion') AS INTEGER) ELSE 0 END) AS total_tokens_out,
+            SUM(CASE WHEN event_type IN ('completed', 'cloud_returned') THEN CAST(json_extract(metadata, '$.cost_usd') AS REAL) ELSE 0.0 END) AS total_cost_usd
+        FROM pyramid_compute_events
+        GROUP BY hour, model_id, source;
+
+        CREATE VIEW IF NOT EXISTS v_compute_by_build AS
+        SELECT
+            slug,
+            build_id,
+            chain_name,
+            content_type,
+            COUNT(CASE WHEN event_type = 'completed' THEN 1 END) AS total_calls,
+            SUM(CASE WHEN event_type = 'completed' THEN CAST(json_extract(metadata, '$.latency_ms') AS INTEGER) ELSE 0 END) AS total_gpu_ms,
+            AVG(CASE WHEN event_type = 'started' THEN CAST(json_extract(metadata, '$.queue_wait_ms') AS REAL) END) AS avg_queue_wait_ms,
+            COUNT(CASE WHEN source = 'fleet' THEN 1 END) AS fleet_steps,
+            COUNT(CASE WHEN source = 'local' THEN 1 END) AS local_steps,
+            COUNT(CASE WHEN source = 'cloud' THEN 1 END) AS cloud_steps,
+            GROUP_CONCAT(DISTINCT model_id) AS models_used,
+            SUM(CASE WHEN event_type IN ('completed', 'cloud_returned') THEN CAST(json_extract(metadata, '$.cost_usd') AS REAL) ELSE 0.0 END) AS total_cost_usd,
+            MIN(timestamp) AS started_at,
+            MAX(timestamp) AS finished_at
+        FROM pyramid_compute_events
+        WHERE slug IS NOT NULL AND build_id IS NOT NULL
+        GROUP BY slug, build_id, chain_name, content_type;
+
+        CREATE VIEW IF NOT EXISTS v_compute_by_depth AS
+        SELECT
+            slug,
+            build_id,
+            depth,
+            primitive,
+            COUNT(CASE WHEN event_type = 'completed' THEN 1 END) AS step_count,
+            SUM(CASE WHEN event_type = 'completed' THEN CAST(json_extract(metadata, '$.latency_ms') AS INTEGER) ELSE 0 END) AS total_gpu_ms,
+            AVG(CASE WHEN event_type = 'completed' THEN CAST(json_extract(metadata, '$.latency_ms') AS REAL) END) AS avg_latency_ms,
+            SUM(CASE WHEN event_type = 'completed' THEN CAST(json_extract(metadata, '$.tokens_completion') AS INTEGER) ELSE 0 END) AS total_tokens_out,
+            GROUP_CONCAT(DISTINCT source) AS sources_used
+        FROM pyramid_compute_events
+        WHERE slug IS NOT NULL AND depth IS NOT NULL
+        GROUP BY slug, build_id, depth, primitive;
+
+        CREATE VIEW IF NOT EXISTS v_compute_fleet_peers AS
+        SELECT
+            json_extract(metadata, '$.peer_id') AS peer_id,
+            COUNT(CASE WHEN event_type = 'fleet_dispatched' THEN 1 END) AS dispatch_count,
+            COUNT(CASE WHEN event_type = 'fleet_returned' THEN 1 END) AS success_count,
+            COUNT(CASE WHEN event_type = 'fleet_dispatch_failed' THEN 1 END) AS failed_count,
+            ROUND(
+                CAST(COUNT(CASE WHEN event_type = 'fleet_returned' THEN 1 END) AS REAL) /
+                NULLIF(COUNT(CASE WHEN event_type = 'fleet_dispatched' THEN 1 END), 0) * 100,
+                1
+            ) AS success_rate_pct,
+            AVG(CASE WHEN event_type = 'fleet_returned' THEN CAST(json_extract(metadata, '$.latency_ms') AS REAL) END) AS avg_round_trip_ms,
+            GROUP_CONCAT(DISTINCT model_id) AS models_served
+        FROM pyramid_compute_events
+        WHERE source = 'fleet'
+        GROUP BY peer_id;
+
+        CREATE VIEW IF NOT EXISTS v_compute_by_source AS
+        SELECT
+            source,
+            COUNT(CASE WHEN event_type IN ('completed', 'fleet_returned', 'cloud_returned') THEN 1 END) AS total_completed,
+            SUM(CASE WHEN event_type IN ('completed', 'cloud_returned') THEN CAST(json_extract(metadata, '$.cost_usd') AS REAL) ELSE 0.0 END) AS total_cost_usd,
+            AVG(CASE WHEN event_type IN ('completed', 'fleet_returned', 'cloud_returned') THEN CAST(json_extract(metadata, '$.latency_ms') AS REAL) END) AS avg_latency_ms,
+            SUM(CASE WHEN event_type IN ('completed', 'fleet_returned', 'cloud_returned') THEN CAST(json_extract(metadata, '$.tokens_prompt') AS INTEGER) ELSE 0 END) AS total_tokens_in,
+            SUM(CASE WHEN event_type IN ('completed', 'fleet_returned', 'cloud_returned') THEN CAST(json_extract(metadata, '$.tokens_completion') AS INTEGER) ELSE 0 END) AS total_tokens_out
+        FROM pyramid_compute_events
+        GROUP BY source;
+        ",
+    )?;
+
     Ok(())
 }
 

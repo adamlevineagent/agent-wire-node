@@ -1,8 +1,9 @@
 import { useState } from 'react';
 import { QueueLiveView } from '../QueueLiveView';
 import { MarketDashboard } from '../MarketDashboard';
+import { ComputeChronicle } from '../ComputeChronicle';
 
-type MarketTab = 'queue' | 'market';
+type MarketTab = 'queue' | 'chronicle' | 'market';
 
 export function MarketMode() {
     const [activeTab, setActiveTab] = useState<MarketTab>('queue');
@@ -18,6 +19,12 @@ export function MarketMode() {
                     Queue
                 </button>
                 <button
+                    className={`node-tab ${activeTab === 'chronicle' ? 'node-tab-active' : ''}`}
+                    onClick={() => setActiveTab('chronicle')}
+                >
+                    Chronicle
+                </button>
+                <button
                     className={`node-tab ${activeTab === 'market' ? 'node-tab-active' : ''}`}
                     onClick={() => setActiveTab('market')}
                 >
@@ -28,6 +35,7 @@ export function MarketMode() {
             {/* Tab content */}
             <div className="node-tab-content">
                 {activeTab === 'queue' && <QueueLiveView />}
+                {activeTab === 'chronicle' && <ComputeChronicle />}
                 {activeTab === 'market' && <MarketDashboard />}
             </div>
         </div>

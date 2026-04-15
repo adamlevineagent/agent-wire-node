@@ -49,6 +49,12 @@ pub struct CacheDispatchBase {
     /// cache hit / miss / verification-failed events flow out during
     /// lookups and writes.
     pub bus: Option<Arc<BuildEventBus>>,
+    /// Chain name for chronicle task context (e.g., "code-mechanical").
+    /// Flows through to StepContext.chain_name via CacheAccess.
+    pub chain_name: Option<String>,
+    /// Content type for chronicle task context (e.g., "code", "document").
+    /// Flows through to StepContext.content_type via CacheAccess.
+    pub content_type: Option<String>,
     /// Phase 6 lazy cache: prompt template path → SHA-256 hex. The same
     /// template path used by multiple steps in the same build hashes
     /// exactly once. Populated by `dispatch_ir_llm` via
@@ -151,9 +157,18 @@ impl CacheDispatchBase {
             db_path: db_path.into(),
             build_id: build_id.into(),
             bus,
+            chain_name: None,
+            content_type: None,
             prompt_hashes: Arc::new(StdMutex::new(HashMap::new())),
             resolved_models: Arc::new(StdMutex::new(HashMap::new())),
         }
+    }
+
+    /// Set chain context for chronicle task context.
+    pub fn with_chain_context(mut self, chain_name: String, content_type: String) -> Self {
+        self.chain_name = Some(chain_name);
+        self.content_type = Some(content_type);
+        self
     }
 }
 
@@ -308,6 +323,9 @@ async fn dispatch_llm(
                 resolved_model.clone(),
             )
             .with_prompt_hash(prompt_hash);
+            if let (Some(cn), Some(ct)) = (&cb.chain_name, &cb.content_type) {
+                c = c.with_chain_context(cn.clone(), ct.clone());
+            }
             if let Some(bus) = &cb.bus {
                 c = c.with_bus(bus.clone());
             }
@@ -352,6 +370,9 @@ async fn dispatch_llm(
                             resolved_model.clone(),
                         )
                         .with_prompt_hash(prompt_hash);
+                        if let (Some(cn), Some(ct)) = (&cb.chain_name, &cb.content_type) {
+                            c = c.with_chain_context(cn.clone(), ct.clone());
+                        }
                         if let Some(bus) = &cb.bus {
                             c = c.with_bus(bus.clone());
                         }
@@ -397,6 +418,9 @@ async fn dispatch_llm(
             resolved_model.clone(),
         )
         .with_prompt_hash(prompt_hash);
+        if let (Some(cn), Some(ct)) = (&cb.chain_name, &cb.content_type) {
+            c = c.with_chain_context(cn.clone(), ct.clone());
+        }
         if let Some(bus) = &cb.bus {
             c = c.with_bus(bus.clone());
         }
@@ -456,6 +480,9 @@ async fn dispatch_llm(
                         resolved_model.clone(),
                     )
                     .with_prompt_hash(prompt_hash);
+                    if let (Some(cn), Some(ct)) = (&cb.chain_name, &cb.content_type) {
+                        c = c.with_chain_context(cn.clone(), ct.clone());
+                    }
                     if let Some(bus) = &cb.bus {
                         c = c.with_bus(bus.clone());
                     }
@@ -498,6 +525,9 @@ async fn dispatch_llm(
                         resolved_model.clone(),
                     )
                     .with_prompt_hash(prompt_hash);
+                    if let (Some(cn), Some(ct)) = (&cb.chain_name, &cb.content_type) {
+                        c = c.with_chain_context(cn.clone(), ct.clone());
+                    }
                     if let Some(bus) = &cb.bus {
                         c = c.with_bus(bus.clone());
                     }
@@ -1354,7 +1384,7 @@ pub async fn dispatch_ir_llm(
         temperature,
         max_tokens,
         None,
-        llm_options,
+        llm_options.clone(),
     )
     .await?;
 
@@ -1492,6 +1522,9 @@ fn build_cache_ctx_for_ir_step(
     )
     .with_model_resolution(tier, resolved_model.to_string())
     .with_prompt_hash(prompt_hash);
+    if let (Some(cn), Some(ct)) = (&base.chain_name, &base.content_type) {
+        cache_ctx = cache_ctx.with_chain_context(cn.clone(), ct.clone());
+    }
     if let Some(bus) = base.bus.as_ref() {
         cache_ctx = cache_ctx.with_bus(bus.clone());
     }

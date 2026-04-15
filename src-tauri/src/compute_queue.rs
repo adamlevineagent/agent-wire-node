@@ -75,6 +75,16 @@ pub struct QueueEntry {
     pub work_item_id: Option<String>,
     /// DADBEAR attempt ID for this dispatch attempt. None for non-DADBEAR callers.
     pub attempt_id: Option<String>,
+    /// Compute source: "local" for own builds, "fleet_received" for fleet peer work.
+    /// Set explicitly at enqueue time — the GPU loop reads this directly.
+    pub source: String,
+    /// Semantic job_path for chronicle event grouping.
+    /// Generated at enqueue time via generate_job_path.
+    pub job_path: String,
+    /// Pre-assigned job_path from upstream handlers (fleet_received).
+    /// When Some, the enqueue site uses this instead of generating a new path,
+    /// so one logical fleet job keeps a single job_path across its entire lifecycle.
+    pub chronicle_job_path: Option<String>,
 }
 
 impl ComputeQueueManager {

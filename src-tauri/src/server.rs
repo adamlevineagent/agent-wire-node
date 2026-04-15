@@ -1,3 +1,4 @@
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -1558,8 +1559,36 @@ async fn handle_fleet_dispatch(
         fc
     };
 
+    // WP-7: Chronicle fleet_received event.
+    // Generate the job_path ONCE here. This same job_path flows through the QueueEntry
+    // (via chronicle_job_path) to WP-1/2/3/4, so one logical fleet job has one job_path.
+    let fleet_received_job_path = {
+        let ts = Utc::now().timestamp();
+        format!("fleet-recv:{}:{}", resolved_model, ts)
+    };
+    let fleet_db_path = state.pyramid.data_dir.as_ref().map(|d| d.join("pyramid.db"));
+    if let Some(ref db_path) = fleet_db_path {
+        let requester_node_id = claims.nid.clone().unwrap_or_default();
+        let chronicle_ctx = crate::pyramid::compute_chronicle::ChronicleEventContext::minimal(
+            &fleet_received_job_path, "fleet_received", "fleet_received",
+        )
+        .with_model_id(resolved_model.clone())
+        .with_metadata(serde_json::json!({
+            "requester_node_id": requester_node_id,
+            "rule_name": rule_name,
+            "resolved_model": resolved_model,
+        }));
+        let db_path_clone = db_path.to_string_lossy().to_string();
+        tokio::task::spawn_blocking(move || {
+            if let Ok(conn) = rusqlite::Connection::open(&db_path_clone) {
+                let _ = crate::pyramid::compute_chronicle::record_event(&conn, &chronicle_ctx);
+            }
+        });
+    }
+
     let options = crate::pyramid::llm::LlmCallOptions {
         skip_fleet_dispatch: true, // prevent re-dispatch loop
+        chronicle_job_path: Some(fleet_received_job_path.clone()),
         ..Default::default()
     };
 

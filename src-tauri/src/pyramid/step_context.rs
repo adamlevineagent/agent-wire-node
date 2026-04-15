@@ -298,6 +298,18 @@ pub struct StepContext {
     /// caller did not compute a prompt hash — cache lookup is skipped
     /// in that case (equivalent to a forced cache miss).
     pub prompt_hash: String,
+
+    // ── Chronicle context (populated via .with_chain_context()) ─────
+    /// Chain strategy name: "code-mechanical", "conversation-episodic", etc.
+    /// Empty string when not in a chain build (stale checks, tests).
+    pub chain_name: String,
+    /// Content type: "code", "document", "conversation".
+    /// Empty string when not in a chain build.
+    pub content_type: String,
+    /// Human-readable task label derived at construction time.
+    /// Format: "{step_name} depth {depth} ({chain_name})" when chain_name is set,
+    /// or "{step_name} depth {depth}" when chain_name is empty.
+    pub task_label: String,
 }
 
 impl std::fmt::Debug for StepContext {
@@ -316,6 +328,9 @@ impl std::fmt::Debug for StepContext {
             .field("resolved_model_id", &self.resolved_model_id)
             .field("resolved_provider_id", &self.resolved_provider_id)
             .field("prompt_hash", &self.prompt_hash)
+            .field("chain_name", &self.chain_name)
+            .field("content_type", &self.content_type)
+            .field("task_label", &self.task_label)
             .finish()
     }
 }
@@ -349,6 +364,9 @@ impl StepContext {
             resolved_model_id: None,
             resolved_provider_id: None,
             prompt_hash: String::new(),
+            chain_name: String::new(),
+            content_type: String::new(),
+            task_label: String::new(),
         }
     }
 
@@ -386,6 +404,20 @@ impl StepContext {
     /// Flip to force-fresh (reroll bypass path).
     pub fn with_force_fresh(mut self, force: bool) -> Self {
         self.force_fresh = force;
+        self
+    }
+
+    /// Set chain context and derive task_label mechanically.
+    /// Only call sites with ChainContext in scope (chain_dispatch, evidence_answering)
+    /// use this builder. All other sites get empty defaults via StepContext::new().
+    pub fn with_chain_context(
+        mut self,
+        chain_name: impl Into<String>,
+        content_type: impl Into<String>,
+    ) -> Self {
+        self.chain_name = chain_name.into();
+        self.content_type = content_type.into();
+        self.task_label = derive_task_label(&self.step_name, self.depth, &self.chain_name);
         self
     }
 
@@ -513,7 +545,24 @@ pub fn make_step_ctx_from_llm_config(
     if let Some(bus) = &cache.bus {
         ctx = ctx.with_bus(bus.clone());
     }
+    // Populate chain context from CacheAccess when present.
+    if let Some(ref cn) = cache.chain_name {
+        let ct = cache.content_type.as_deref().unwrap_or("");
+        ctx = ctx.with_chain_context(cn.clone(), ct.to_string());
+    }
     Some(ctx)
+}
+
+/// Derive a human-readable task label from step context fields.
+/// Conditional formatting: if chain_name is non-empty, include it in
+/// parentheses. If empty (stale checks, tests), omit to avoid garbled
+/// empty parenthetical like "stale_check depth 2 ()".
+pub fn derive_task_label(step_name: &str, depth: i64, chain_name: &str) -> String {
+    if chain_name.is_empty() {
+        format!("{} depth {}", step_name, depth)
+    } else {
+        format!("{} depth {} ({})", step_name, depth, chain_name)
+    }
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────

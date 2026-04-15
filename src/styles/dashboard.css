@@ -23410,3 +23410,348 @@ body {
     margin-left: 4px;
     line-height: 1.4;
 }
+
+/* ── Compute Chronicle ──────────────────────────────────────────────── */
+
+.chronicle-container {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.chronicle-view-tabs {
+    display: flex;
+    gap: 4px;
+    margin-bottom: 4px;
+}
+
+.chronicle-view-tab {
+    background: transparent;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    color: rgba(255, 255, 255, 0.5);
+    padding: 4px 12px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 0.8rem;
+    transition: all 0.15s;
+}
+
+.chronicle-view-tab:hover {
+    color: rgba(255, 255, 255, 0.8);
+    border-color: rgba(255, 255, 255, 0.2);
+}
+
+.chronicle-view-tab-active {
+    color: #00D4FF;
+    border-color: rgba(0, 212, 255, 0.3);
+    background: rgba(0, 212, 255, 0.08);
+}
+
+.chronicle-stats {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: 8px;
+}
+
+.chronicle-stat-card {
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: 6px;
+    padding: 10px 12px;
+}
+
+.chronicle-stat-label {
+    font-size: 0.7rem;
+    color: rgba(255, 255, 255, 0.4);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin-bottom: 4px;
+}
+
+.chronicle-stat-value {
+    font-size: 1.2rem;
+    font-weight: 600;
+    color: rgba(255, 255, 255, 0.9);
+}
+
+.chronicle-stat-failed {
+    color: #EF4444;
+}
+
+.chronicle-stat-breakdown {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    font-size: 0.8rem;
+}
+
+.chronicle-filters {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    flex-wrap: wrap;
+}
+
+.chronicle-time-range {
+    display: flex;
+    gap: 2px;
+}
+
+.chronicle-time-btn {
+    background: transparent;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    color: rgba(255, 255, 255, 0.5);
+    padding: 3px 8px;
+    border-radius: 3px;
+    cursor: pointer;
+    font-size: 0.75rem;
+    transition: all 0.15s;
+}
+
+.chronicle-time-btn:hover {
+    color: rgba(255, 255, 255, 0.8);
+}
+
+.chronicle-time-btn-active {
+    color: #00D4FF;
+    border-color: rgba(0, 212, 255, 0.3);
+    background: rgba(0, 212, 255, 0.08);
+}
+
+.chronicle-filter-select {
+    background: rgba(255, 255, 255, 0.05);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    color: rgba(255, 255, 255, 0.8);
+    padding: 3px 6px;
+    border-radius: 3px;
+    font-size: 0.75rem;
+    min-width: 100px;
+}
+
+.chronicle-filter-select option {
+    background: #1a1a2e;
+    color: #e0e0e0;
+}
+
+.chronicle-refresh-btn {
+    background: transparent;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    color: rgba(255, 255, 255, 0.5);
+    padding: 3px 10px;
+    border-radius: 3px;
+    cursor: pointer;
+    font-size: 0.75rem;
+    transition: all 0.15s;
+}
+
+.chronicle-refresh-btn:hover {
+    color: rgba(255, 255, 255, 0.8);
+    border-color: rgba(255, 255, 255, 0.2);
+}
+
+.chronicle-table-container {
+    overflow-x: auto;
+}
+
+.chronicle-loading {
+    text-align: center;
+    padding: 20px;
+    color: rgba(255, 255, 255, 0.4);
+    font-size: 0.85rem;
+}
+
+.chronicle-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.78rem;
+}
+
+.chronicle-table th {
+    text-align: left;
+    padding: 6px 8px;
+    font-weight: 600;
+    color: rgba(255, 255, 255, 0.5);
+    border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    white-space: nowrap;
+}
+
+.chronicle-table td {
+    padding: 5px 8px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+    color: rgba(255, 255, 255, 0.7);
+    white-space: nowrap;
+}
+
+.chronicle-row:hover td {
+    background: rgba(255, 255, 255, 0.03);
+}
+
+.chronicle-empty {
+    text-align: center;
+    padding: 30px;
+    color: rgba(255, 255, 255, 0.3);
+    font-style: italic;
+}
+
+.chronicle-cell-time {
+    color: rgba(255, 255, 255, 0.4);
+    font-variant-numeric: tabular-nums;
+}
+
+.chronicle-cell-job {
+    color: rgba(255, 255, 255, 0.5);
+    font-family: monospace;
+    font-size: 0.72rem;
+    max-width: 200px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.chronicle-cell-model {
+    font-family: monospace;
+    font-size: 0.72rem;
+}
+
+.chronicle-cell-slug {
+    color: #00D4FF;
+    font-size: 0.72rem;
+}
+
+.chronicle-cell-step {
+    font-family: monospace;
+    font-size: 0.72rem;
+    color: rgba(255, 255, 255, 0.5);
+}
+
+.chronicle-cell-latency {
+    font-variant-numeric: tabular-nums;
+}
+
+.chronicle-cell-tokens {
+    font-variant-numeric: tabular-nums;
+    font-size: 0.72rem;
+    color: rgba(255, 255, 255, 0.5);
+}
+
+.chronicle-cell-cost {
+    font-variant-numeric: tabular-nums;
+}
+
+.chronicle-event-badge {
+    display: inline-block;
+    padding: 1px 6px;
+    border-radius: 3px;
+    font-size: 0.68rem;
+    font-weight: 500;
+    color: white;
+    line-height: 1.4;
+}
+
+.chronicle-source-dot {
+    display: inline-block;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    margin-right: 4px;
+    vertical-align: middle;
+}
+
+.chronicle-pagination {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 12px;
+    padding: 8px 0;
+}
+
+.chronicle-page-btn {
+    background: transparent;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    color: rgba(255, 255, 255, 0.5);
+    padding: 3px 10px;
+    border-radius: 3px;
+    cursor: pointer;
+    font-size: 0.75rem;
+}
+
+.chronicle-page-btn:disabled {
+    opacity: 0.3;
+    cursor: default;
+}
+
+.chronicle-page-btn:not(:disabled):hover {
+    color: rgba(255, 255, 255, 0.8);
+    border-color: rgba(255, 255, 255, 0.2);
+}
+
+.chronicle-page-info {
+    font-size: 0.75rem;
+    color: rgba(255, 255, 255, 0.4);
+}
+
+.chronicle-fleet-analytics {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.chronicle-fleet-title {
+    font-size: 0.95rem;
+    font-weight: 600;
+    color: rgba(255, 255, 255, 0.8);
+    margin: 0;
+}
+
+.chronicle-fleet-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 10px;
+}
+
+.chronicle-fleet-card {
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: 6px;
+    padding: 12px;
+}
+
+.chronicle-fleet-card-title {
+    font-size: 0.72rem;
+    color: rgba(255, 255, 255, 0.4);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    margin-bottom: 6px;
+}
+
+.chronicle-fleet-card-value {
+    font-size: 1.1rem;
+    font-weight: 600;
+    color: rgba(255, 255, 255, 0.9);
+    margin-bottom: 4px;
+}
+
+.chronicle-fleet-card-detail {
+    font-size: 0.78rem;
+    color: rgba(255, 255, 255, 0.5);
+}
+
+.chronicle-fleet-latency-bars {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.chronicle-fleet-latency-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 0.8rem;
+    color: rgba(255, 255, 255, 0.6);
+}
+
+.chronicle-fleet-latency-label {
+    font-weight: 500;
+}

@@ -4095,7 +4095,7 @@ pub async fn execute_chain_from(
             dir.join("pyramid.db").to_string_lossy().to_string(),
             chain_build_id.clone(),
             Some(state.build_event_bus.clone()),
-        ))
+        ).with_chain_context(chain.name.clone(), chain.content_type.clone()))
     });
     // Read the build strategy concurrency cap from the operational table.
     // Local mode sets this to 1 so Ollama (single-request) isn't overwhelmed.
@@ -11269,11 +11269,16 @@ pub async fn execute_plan(
     // Phase 6 fix pass: same as execute_chain_from — attach a
     // CacheDispatchBase so IR executor LLM calls reach the cache.
     let cache_base = state.data_dir.as_ref().map(|dir| {
-        Arc::new(chain_dispatch::CacheDispatchBase::new(
+        let mut base = chain_dispatch::CacheDispatchBase::new(
             dir.join("pyramid.db").to_string_lossy().to_string(),
             ir_build_id.clone(),
             Some(state.build_event_bus.clone()),
-        ))
+        );
+        if let Some(ref cn) = plan.source_chain_id {
+            let ct = plan.source_content_type.clone().unwrap_or_else(|| "code".to_string());
+            base = base.with_chain_context(cn.clone(), ct);
+        }
+        Arc::new(base)
     });
     let dispatch_ctx = chain_dispatch::StepContext {
         db_reader: state.reader.clone(),

@@ -23,6 +23,7 @@ pub mod chain_registry;
 pub mod chain_resolve;
 pub mod characterize;
 pub mod collapse;
+pub mod compute_chronicle;
 pub mod config_contributions;
 pub mod config_helper;
 pub mod prompt_cache;

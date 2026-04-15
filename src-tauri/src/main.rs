@@ -11064,6 +11064,126 @@ async fn pyramid_get_build_chronicle(
     Ok(entries)
 }
 
+// --- Compute Chronicle IPC ---------------------------------------------------
+
+#[tauri::command]
+async fn get_compute_events(
+    state: tauri::State<'_, SharedState>,
+    slug: Option<String>,
+    build_id: Option<String>,
+    chain_name: Option<String>,
+    content_type: Option<String>,
+    step_name: Option<String>,
+    primitive: Option<String>,
+    depth: Option<i64>,
+    model_id: Option<String>,
+    source: Option<String>,
+    event_type: Option<String>,
+    after: Option<String>,
+    before: Option<String>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+) -> Result<Vec<wire_node_lib::pyramid::compute_chronicle::ComputeEvent>, String> {
+    let db_path = state
+        .pyramid
+        .data_dir
+        .as_ref()
+        .map(|d| d.join("pyramid.db"))
+        .ok_or_else(|| "No pyramid data_dir configured".to_string())?;
+    tokio::task::spawn_blocking(move || {
+        let conn = rusqlite::Connection::open(&db_path).map_err(|e| e.to_string())?;
+        let filters = wire_node_lib::pyramid::compute_chronicle::ChronicleQueryFilters {
+            slug,
+            build_id,
+            chain_name,
+            content_type,
+            step_name,
+            primitive,
+            depth,
+            model_id,
+            source,
+            event_type,
+            after,
+            before,
+            limit: limit.unwrap_or(100),
+            offset: offset.unwrap_or(0),
+        };
+        wire_node_lib::pyramid::compute_chronicle::query_events(&conn, &filters)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn get_compute_summary(
+    state: tauri::State<'_, SharedState>,
+    period_start: String,
+    period_end: String,
+    group_by: String,
+) -> Result<Vec<wire_node_lib::pyramid::compute_chronicle::ComputeSummary>, String> {
+    let db_path = state
+        .pyramid
+        .data_dir
+        .as_ref()
+        .map(|d| d.join("pyramid.db"))
+        .ok_or_else(|| "No pyramid data_dir configured".to_string())?;
+    tokio::task::spawn_blocking(move || {
+        let conn = rusqlite::Connection::open(&db_path).map_err(|e| e.to_string())?;
+        wire_node_lib::pyramid::compute_chronicle::query_summary(
+            &conn,
+            &period_start,
+            &period_end,
+            &group_by,
+        )
+        .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn get_compute_timeline(
+    state: tauri::State<'_, SharedState>,
+    start: String,
+    end: String,
+    bucket_size_minutes: i64,
+) -> Result<Vec<wire_node_lib::pyramid::compute_chronicle::TimelineBucket>, String> {
+    let db_path = state
+        .pyramid
+        .data_dir
+        .as_ref()
+        .map(|d| d.join("pyramid.db"))
+        .ok_or_else(|| "No pyramid data_dir configured".to_string())?;
+    tokio::task::spawn_blocking(move || {
+        let conn = rusqlite::Connection::open(&db_path).map_err(|e| e.to_string())?;
+        wire_node_lib::pyramid::compute_chronicle::query_timeline(
+            &conn, &start, &end, bucket_size_minutes,
+        )
+        .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn get_chronicle_dimensions(
+    state: tauri::State<'_, SharedState>,
+) -> Result<wire_node_lib::pyramid::compute_chronicle::ChronicleDimensions, String> {
+    let db_path = state
+        .pyramid
+        .data_dir
+        .as_ref()
+        .map(|d| d.join("pyramid.db"))
+        .ok_or_else(|| "No pyramid data_dir configured".to_string())?;
+    tokio::task::spawn_blocking(move || {
+        let conn = rusqlite::Connection::open(&db_path).map_err(|e| e.to_string())?;
+        wire_node_lib::pyramid::compute_chronicle::query_distinct_dimensions(&conn)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 // --- Fleet Roster IPC --------------------------------------------------------
 
 #[tauri::command]
@@ -11646,6 +11766,7 @@ fn main() {
     {
         let queue_handle = compute_queue_handle.clone();
         let bus = pyramid_state.build_event_bus.clone();
+        let chronicle_db_path = pyramid_db_path.to_string_lossy().to_string();
         tauri::async_runtime::spawn(async move {
             tracing::info!("Compute queue GPU processing loop started");
             loop {
@@ -11657,21 +11778,51 @@ fn main() {
                         q.dequeue_next()
                     };
                     match entry {
-                        Some(entry) => {
+                        Some(mut entry) => {
                             let start = std::time::Instant::now();
                             let model_id = entry.model_id.clone();
 
+                            // Use explicit entry.source instead of inferring from step_ctx.
+                            let job_source = entry.source.clone();
+
                             // Emit QueueJobStarted event.
-                            // source: "local" if entry has a StepContext (from a local build),
-                            //         "fleet" if step_ctx is None (received from a fleet peer).
-                            let job_source = if entry.step_ctx.is_some() { "local" } else { "fleet" };
                             let _ = bus.tx.send(wire_node_lib::pyramid::event_bus::TaggedBuildEvent {
                                 slug: "__compute__".to_string(),
                                 kind: wire_node_lib::pyramid::event_bus::TaggedKind::QueueJobStarted {
                                     model_id: model_id.clone(),
-                                    source: job_source.to_string(),
+                                    source: job_source.clone(),
                                 },
                             });
+
+                            // WP-2: Chronicle started event
+                            {
+                                let queue_wait_ms = entry.enqueued_at.elapsed().as_millis() as u64;
+                                let db_path = chronicle_db_path.clone();
+                                let source = job_source.clone();
+                                let job_path = entry.job_path.clone();
+                                let chronicle_ctx = if let Some(ref sc) = entry.step_ctx {
+                                    wire_node_lib::pyramid::compute_chronicle::ChronicleEventContext::from_step_ctx(
+                                        sc, &job_path, "started", &source,
+                                    )
+                                } else {
+                                    wire_node_lib::pyramid::compute_chronicle::ChronicleEventContext::minimal(
+                                        &job_path, "started", &source,
+                                    )
+                                    .with_model_id(model_id.clone())
+                                };
+                                let chronicle_ctx = chronicle_ctx
+                                    .with_metadata(serde_json::json!({ "queue_wait_ms": queue_wait_ms }))
+                                    .with_work_item(entry.work_item_id.clone(), entry.attempt_id.clone());
+                                tokio::task::spawn_blocking(move || {
+                                    if let Ok(conn) = rusqlite::Connection::open(&db_path) {
+                                        let _ = wire_node_lib::pyramid::compute_chronicle::record_event(&conn, &chronicle_ctx);
+                                    }
+                                });
+                            }
+
+                            // Thread chronicle_job_path through LlmCallOptions so cloud
+                            // fallthrough events (WP-8) share the same job_path.
+                            entry.options.chronicle_job_path = Some(entry.job_path.clone());
 
                             // Execute through the existing LLM path.
                             // entry.config has compute_queue: None (won't re-enqueue).
@@ -11691,7 +11842,7 @@ fn main() {
                                     entry.temperature,
                                     entry.max_tokens,
                                     entry.response_format.as_ref(),
-                                    entry.options,
+                                    entry.options.clone(),
                                 )
                             )
                             .catch_unwind()
@@ -11709,6 +11860,66 @@ fn main() {
                             });
 
                             let elapsed_ms = start.elapsed().as_millis() as u64;
+
+                            // WP-3/WP-4: Chronicle completed/failed events
+                            match &result {
+                                Ok(response) => {
+                                    let db_path = chronicle_db_path.clone();
+                                    let source = job_source.clone();
+                                    let job_path = entry.job_path.clone();
+                                    let chronicle_ctx = if let Some(ref sc) = entry.step_ctx {
+                                        wire_node_lib::pyramid::compute_chronicle::ChronicleEventContext::from_step_ctx(
+                                            sc, &job_path, "completed", &source,
+                                        )
+                                    } else {
+                                        wire_node_lib::pyramid::compute_chronicle::ChronicleEventContext::minimal(
+                                            &job_path, "completed", &source,
+                                        )
+                                        .with_model_id(model_id.clone())
+                                    };
+                                    let chronicle_ctx = chronicle_ctx
+                                        .with_metadata(serde_json::json!({
+                                            "latency_ms": elapsed_ms,
+                                            "tokens_prompt": response.usage.prompt_tokens,
+                                            "tokens_completion": response.usage.completion_tokens,
+                                            "cost_usd": response.actual_cost_usd,
+                                            "generation_id": response.generation_id,
+                                        }))
+                                        .with_work_item(entry.work_item_id.clone(), entry.attempt_id.clone());
+                                    tokio::task::spawn_blocking(move || {
+                                        if let Ok(conn) = rusqlite::Connection::open(&db_path) {
+                                            let _ = wire_node_lib::pyramid::compute_chronicle::record_event(&conn, &chronicle_ctx);
+                                        }
+                                    });
+                                }
+                                Err(e) => {
+                                    let db_path = chronicle_db_path.clone();
+                                    let source = job_source.clone();
+                                    let job_path = entry.job_path.clone();
+                                    let error_msg = e.to_string();
+                                    let chronicle_ctx = if let Some(ref sc) = entry.step_ctx {
+                                        wire_node_lib::pyramid::compute_chronicle::ChronicleEventContext::from_step_ctx(
+                                            sc, &job_path, "failed", &source,
+                                        )
+                                    } else {
+                                        wire_node_lib::pyramid::compute_chronicle::ChronicleEventContext::minimal(
+                                            &job_path, "failed", &source,
+                                        )
+                                        .with_model_id(model_id.clone())
+                                    };
+                                    let chronicle_ctx = chronicle_ctx
+                                        .with_metadata(serde_json::json!({
+                                            "error": error_msg,
+                                            "latency_ms": elapsed_ms,
+                                        }))
+                                        .with_work_item(entry.work_item_id.clone(), entry.attempt_id.clone());
+                                    tokio::task::spawn_blocking(move || {
+                                        if let Ok(conn) = rusqlite::Connection::open(&db_path) {
+                                            let _ = wire_node_lib::pyramid::compute_chronicle::record_event(&conn, &chronicle_ctx);
+                                        }
+                                    });
+                                }
+                            }
 
                             // Emit QueueJobCompleted event.
                             let _ = bus.tx.send(wire_node_lib::pyramid::event_bus::TaggedBuildEvent {
@@ -13050,6 +13261,11 @@ fn main() {
             pyramid_get_build_chronicle,
             // Fleet roster IPC
             get_fleet_roster,
+            // Compute Chronicle IPC
+            get_compute_events,
+            get_compute_summary,
+            get_compute_timeline,
+            get_chronicle_dimensions,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Wire Node");

@@ -223,6 +223,22 @@ pub struct CacheAccess {
     pub build_id: String,
     pub db_path: Arc<str>,
     pub bus: Option<Arc<super::event_bus::BuildEventBus>>,
+    /// Chain strategy name — set to Some only by the chain executor path.
+    /// Default None; stale engine, evidence answering, tests leave as None.
+    pub chain_name: Option<String>,
+    /// Content type — set alongside chain_name by the chain executor path.
+    pub content_type: Option<String>,
+}
+
+impl CacheAccess {
+    /// Builder: set chain context on a CacheAccess instance.
+    /// Only the chain executor call sites use this; all others leave
+    /// chain_name/content_type as None.
+    pub fn with_chain_context(mut self, chain_name: String, content_type: String) -> Self {
+        self.chain_name = Some(chain_name);
+        self.content_type = Some(content_type);
+        self
+    }
 }
 
 impl std::fmt::Debug for CacheAccess {
@@ -232,6 +248,8 @@ impl std::fmt::Debug for CacheAccess {
             .field("build_id", &self.build_id)
             .field("db_path", &self.db_path)
             .field("bus", &self.bus.as_ref().map(|_| "<bus>"))
+            .field("chain_name", &self.chain_name)
+            .field("content_type", &self.content_type)
             .finish()
     }
 }
@@ -344,6 +362,8 @@ impl LlmConfig {
             build_id: build_id.into(),
             db_path: db_path.into(),
             bus,
+            chain_name: None,
+            content_type: None,
         });
         cloned
     }
@@ -359,7 +379,7 @@ impl LlmConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct LlmCallOptions {
     pub min_timeout_secs: Option<u64>,
     /// When true, the GPU processing loop bypasses semaphore/pool
@@ -368,6 +388,10 @@ pub struct LlmCallOptions {
     /// When true, skip fleet dispatch (prevents re-dispatch loop).
     /// Set by the fleet handler on the receiving node.
     pub skip_fleet_dispatch: bool,
+    /// Pre-assigned job_path from the GPU loop for cloud fallthrough.
+    /// When Some, WP-8 uses this value instead of generating a new path,
+    /// preserving lifecycle grouping with queue events.
+    pub chronicle_job_path: Option<String>,
 }
 
 // ── Provider synthesis (Phase 3 bridge) ──────────────────────────────────────
@@ -466,7 +490,7 @@ fn short_name(model: &str) -> &str {
 
 fn compute_timeout(
     prompt_chars: usize,
-    options: LlmCallOptions,
+    options: &LlmCallOptions,
     base_secs: u64,
     max_secs: u64,
     chars_per_increment: usize,
@@ -633,6 +657,9 @@ pub async fn call_model_unified_with_audit_and_ctx(
     response_format: Option<&serde_json::Value>,
     options: LlmCallOptions,
 ) -> Result<LlmResponse> {
+    // Save chronicle_job_path before it might move into the queue path.
+    let saved_chronicle_job_path = options.chronicle_job_path.clone();
+
     // ── Phase 1 Compute Queue: Transparent routing ─────────────────
     //
     // When the config has a compute_queue attached AND the caller is
@@ -659,6 +686,18 @@ pub async fn call_model_unified_with_audit_and_ctx(
 
             // Set skip_concurrency_gate on the forwarded options so the
             // GPU loop's execution bypasses semaphore/pool acquisition.
+            // Determine source and job_path BEFORE moving options.
+            // If options.chronicle_job_path is set (fleet_received path), use it.
+            let entry_source = if options.skip_fleet_dispatch && options.chronicle_job_path.is_some() {
+                "fleet_received".to_string()
+            } else {
+                "local".to_string()
+            };
+            let chronicle_job_path_val = options.chronicle_job_path.clone().unwrap_or_else(|| {
+                super::compute_chronicle::generate_job_path(ctx, None, &queue_model_id, &entry_source)
+            });
+            let entry_chronicle_jp = options.chronicle_job_path.clone();
+
             let mut gpu_options = options;
             gpu_options.skip_concurrency_gate = true;
 
@@ -680,10 +719,41 @@ pub async fn call_model_unified_with_audit_and_ctx(
                         enqueued_at: std::time::Instant::now(),
                         work_item_id: None, // Non-DADBEAR path
                         attempt_id: None,
+                        source: entry_source.clone(),
+                        job_path: chronicle_job_path_val.clone(),
+                        chronicle_job_path: entry_chronicle_jp,
                     },
                 );
                 q.queue_depth(&queue_model_id)
             };
+
+            // WP-1: Chronicle enqueue event
+            {
+                let db_path = ctx
+                    .map(|c| c.db_path.clone())
+                    .or_else(|| config.cache_access.as_ref().map(|ca| ca.db_path.to_string()));
+                let chronicle_ctx = if let Some(sc) = ctx {
+                    super::compute_chronicle::ChronicleEventContext::from_step_ctx(
+                        sc, &chronicle_job_path_val, "enqueued", &entry_source,
+                    )
+                } else {
+                    super::compute_chronicle::ChronicleEventContext::minimal(
+                        &chronicle_job_path_val, "enqueued", &entry_source,
+                    )
+                    .with_model_id(queue_model_id.clone())
+                };
+                let chronicle_ctx = chronicle_ctx.with_metadata(serde_json::json!({
+                    "queue_depth": depth,
+                    "queue_model_depth": depth,
+                }));
+                if let Some(db_path) = db_path {
+                    tokio::task::spawn_blocking(move || {
+                        if let Ok(conn) = rusqlite::Connection::open(&db_path) {
+                            let _ = super::compute_chronicle::record_event(&conn, &chronicle_ctx);
+                        }
+                    });
+                }
+            }
 
             // Emit QueueJobEnqueued event via BuildEventBus.
             // Use slug "__compute__" (reserved non-pyramid slug).
@@ -818,6 +888,42 @@ pub async fn call_model_unified_with_audit_and_ctx(
                             let fleet_timeout_secs = route.max_wait_secs;
                             drop(roster); // release lock before async
 
+                            // WP-5: Chronicle fleet_dispatched event
+                            let fleet_job_path = super::compute_chronicle::generate_job_path(
+                                ctx, None, &config.primary_model, "fleet",
+                            );
+                            let fleet_start = std::time::Instant::now();
+                            let fleet_db_path = ctx
+                                .map(|c| c.db_path.clone())
+                                .or_else(|| config.cache_access.as_ref().map(|ca| ca.db_path.to_string()));
+                            {
+                                let chronicle_ctx = if let Some(sc) = ctx {
+                                    super::compute_chronicle::ChronicleEventContext::from_step_ctx(
+                                        sc, &fleet_job_path, "fleet_dispatched", "fleet",
+                                    )
+                                } else {
+                                    super::compute_chronicle::ChronicleEventContext::minimal(
+                                        &fleet_job_path, "fleet_dispatched", "fleet",
+                                    )
+                                    .with_model_id(config.primary_model.clone())
+                                };
+                                let chronicle_ctx = chronicle_ctx.with_metadata(serde_json::json!({
+                                    "peer_id": peer_clone.node_id,
+                                    "peer_name": peer_clone.name,
+                                    "rule_name": rule_name,
+                                    "timeout_secs": fleet_timeout_secs,
+                                }));
+                                if let Some(ref db_path) = fleet_db_path {
+                                    let db_path = db_path.clone();
+                                    let chronicle_ctx = chronicle_ctx.clone();
+                                    tokio::task::spawn_blocking(move || {
+                                        if let Ok(conn) = rusqlite::Connection::open(&db_path) {
+                                            let _ = super::compute_chronicle::record_event(&conn, &chronicle_ctx);
+                                        }
+                                    });
+                                }
+                            }
+
                             match crate::fleet::fleet_dispatch_by_rule(
                                 &peer_clone,
                                 &rule_name,
@@ -832,6 +938,36 @@ pub async fn call_model_unified_with_audit_and_ctx(
                             .await
                             {
                                 Ok(fleet_resp) => {
+                                    // WP-6: Chronicle fleet_returned event
+                                    {
+                                        let chronicle_ctx = if let Some(sc) = ctx {
+                                            super::compute_chronicle::ChronicleEventContext::from_step_ctx(
+                                                sc, &fleet_job_path, "fleet_returned", "fleet",
+                                            )
+                                        } else {
+                                            super::compute_chronicle::ChronicleEventContext::minimal(
+                                                &fleet_job_path, "fleet_returned", "fleet",
+                                            )
+                                            .with_model_id(config.primary_model.clone())
+                                        };
+                                        let chronicle_ctx = chronicle_ctx.with_metadata(serde_json::json!({
+                                            "peer_id": peer_clone.node_id,
+                                            "peer_name": peer_clone.name,
+                                            "peer_model": fleet_resp.peer_model,
+                                            "latency_ms": fleet_start.elapsed().as_millis() as u64,
+                                            "tokens_prompt": fleet_resp.prompt_tokens.unwrap_or(0),
+                                            "tokens_completion": fleet_resp.completion_tokens.unwrap_or(0),
+                                        }));
+                                        if let Some(ref db_path) = fleet_db_path {
+                                            let db_path = db_path.clone();
+                                            tokio::task::spawn_blocking(move || {
+                                                if let Ok(conn) = rusqlite::Connection::open(&db_path) {
+                                                    let _ = super::compute_chronicle::record_event(&conn, &chronicle_ctx);
+                                                }
+                                            });
+                                        }
+                                    }
+
                                     // Return with fleet provenance on the LlmResponse
                                     return Ok(LlmResponse {
                                         content: fleet_resp.content,
@@ -848,6 +984,34 @@ pub async fn call_model_unified_with_audit_and_ctx(
                                     });
                                 }
                                 Err(e) => {
+                                    // Chronicle fleet_dispatch_failed event
+                                    {
+                                        let chronicle_ctx = if let Some(sc) = ctx {
+                                            super::compute_chronicle::ChronicleEventContext::from_step_ctx(
+                                                sc, &fleet_job_path, "fleet_dispatch_failed", "fleet",
+                                            )
+                                        } else {
+                                            super::compute_chronicle::ChronicleEventContext::minimal(
+                                                &fleet_job_path, "fleet_dispatch_failed", "fleet",
+                                            )
+                                            .with_model_id(config.primary_model.clone())
+                                        };
+                                        let chronicle_ctx = chronicle_ctx.with_metadata(serde_json::json!({
+                                            "peer_id": peer_clone.node_id,
+                                            "peer_name": peer_clone.name,
+                                            "error": e.to_string(),
+                                            "latency_ms": fleet_start.elapsed().as_millis() as u64,
+                                        }));
+                                        if let Some(ref db_path) = fleet_db_path {
+                                            let db_path = db_path.clone();
+                                            tokio::task::spawn_blocking(move || {
+                                                if let Ok(conn) = rusqlite::Connection::open(&db_path) {
+                                                    let _ = super::compute_chronicle::record_event(&conn, &chronicle_ctx);
+                                                }
+                                            });
+                                        }
+                                    }
+
                                     // Remove dead peer, continue to pool providers
                                     let mut roster_w = roster_handle.write().await;
                                     roster_w.remove_peer(&peer_clone.node_id);
@@ -978,7 +1142,7 @@ pub async fn call_model_unified_with_audit_and_ctx(
     let local_timeout_scale = if provider_type == ProviderType::OpenaiCompat { 5 } else { 1 };
     let timeout = compute_timeout(
         prompt_chars,
-        options,
+        &options,
         config.base_timeout_secs * local_timeout_scale,
         config.max_timeout_secs * local_timeout_scale,
         config.timeout_chars_per_increment,
@@ -1403,6 +1567,46 @@ pub async fn call_model_unified_with_audit_and_ctx(
             cost_usd,
             latency_ms,
         );
+
+        // WP-8: Chronicle cloud_returned event.
+        // Cloud detection: ProviderType::Openrouter is cloud (not local).
+        // ProviderType::OpenaiCompat is local (Ollama).
+        if provider_type == ProviderType::Openrouter {
+            let cloud_job_path = saved_chronicle_job_path.clone().unwrap_or_else(|| {
+                super::compute_chronicle::generate_job_path(
+                    ctx, None, &use_model, "cloud",
+                )
+            });
+            let chronicle_ctx = if let Some(sc) = ctx {
+                super::compute_chronicle::ChronicleEventContext::from_step_ctx(
+                    sc, &cloud_job_path, "cloud_returned", "cloud",
+                )
+            } else {
+                super::compute_chronicle::ChronicleEventContext::minimal(
+                    &cloud_job_path, "cloud_returned", "cloud",
+                )
+                .with_model_id(use_model.clone())
+            };
+            let chronicle_ctx = chronicle_ctx.with_metadata(serde_json::json!({
+                "provider_id": response.provider_id,
+                "latency_ms": latency_ms,
+                "tokens_prompt": response.usage.prompt_tokens,
+                "tokens_completion": response.usage.completion_tokens,
+                "cost_usd": cost_usd,
+                "generation_id": response.generation_id,
+                "actual_cost_usd": response.actual_cost_usd,
+            }));
+            let db_path = ctx
+                .map(|c| c.db_path.clone())
+                .or_else(|| config.cache_access.as_ref().map(|ca| ca.db_path.to_string()));
+            if let Some(db_path) = db_path {
+                tokio::task::spawn_blocking(move || {
+                    if let Ok(conn) = rusqlite::Connection::open(&db_path) {
+                        let _ = super::compute_chronicle::record_event(&conn, &chronicle_ctx);
+                    }
+                });
+            }
+        }
 
         // ── Phase 18b: Audit complete row write ──────────────────────
         //
@@ -2186,7 +2390,7 @@ pub async fn call_model_via_registry(
     let local_timeout_scale = if provider_type == ProviderType::OpenaiCompat { 5 } else { 1 };
     let timeout = compute_timeout(
         prompt_chars,
-        LlmCallOptions::default(),
+        &LlmCallOptions::default(),
         config.base_timeout_secs * local_timeout_scale,
         config.max_timeout_secs * local_timeout_scale,
         config.timeout_chars_per_increment,
@@ -2465,6 +2669,42 @@ pub async fn call_model_via_registry(
             cost_usd,
             latency_ms,
         );
+
+        // WP-8 (registry path): Chronicle cloud_returned event.
+        if provider_type == ProviderType::Openrouter {
+            let cloud_job_path = super::compute_chronicle::generate_job_path(
+                ctx, None, &resolved.tier.model_id, "cloud",
+            );
+            let chronicle_ctx = if let Some(sc) = ctx {
+                super::compute_chronicle::ChronicleEventContext::from_step_ctx(
+                    sc, &cloud_job_path, "cloud_returned", "cloud",
+                )
+            } else {
+                super::compute_chronicle::ChronicleEventContext::minimal(
+                    &cloud_job_path, "cloud_returned", "cloud",
+                )
+                .with_model_id(resolved.tier.model_id.clone())
+            };
+            let chronicle_ctx = chronicle_ctx.with_metadata(serde_json::json!({
+                "provider_id": response.provider_id,
+                "latency_ms": latency_ms,
+                "tokens_prompt": response.usage.prompt_tokens,
+                "tokens_completion": response.usage.completion_tokens,
+                "cost_usd": cost_usd,
+                "generation_id": response.generation_id,
+                "actual_cost_usd": response.actual_cost_usd,
+            }));
+            let db_path = ctx
+                .map(|c| c.db_path.clone())
+                .or_else(|| config.cache_access.as_ref().map(|ca| ca.db_path.to_string()));
+            if let Some(db_path) = db_path {
+                tokio::task::spawn_blocking(move || {
+                    if let Ok(conn) = rusqlite::Connection::open(&db_path) {
+                        let _ = super::compute_chronicle::record_event(&conn, &chronicle_ctx);
+                    }
+                });
+            }
+        }
 
         return Ok(response);
     }
@@ -3053,7 +3293,7 @@ mod tests {
         let defaults = LlmConfig::default();
         let timeout = compute_timeout(
             33_000,
-            LlmCallOptions {
+            &LlmCallOptions {
                 min_timeout_secs: Some(420),
                 ..Default::default()
             },
@@ -3071,7 +3311,7 @@ mod tests {
         // 200k chars = 2 increments * 60s = 120s added to base 120s = 240s
         let timeout = compute_timeout(
             200_000,
-            LlmCallOptions::default(),
+            &LlmCallOptions::default(),
             defaults.base_timeout_secs,
             defaults.max_timeout_secs,
             defaults.timeout_chars_per_increment,
@@ -3086,7 +3326,7 @@ mod tests {
         // Very large prompt should be capped at max_timeout_secs (600)
         let timeout = compute_timeout(
             10_000_000,
-            LlmCallOptions::default(),
+            &LlmCallOptions::default(),
             defaults.base_timeout_secs,
             defaults.max_timeout_secs,
             defaults.timeout_chars_per_increment,
